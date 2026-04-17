@@ -85,8 +85,12 @@ target_link_libraries(xs_parity PRIVATE pos2_gpu_host)
 add_executable(xs_bench tools/parity/xs_bench.cu)
 target_link_libraries(xs_bench PRIVATE pos2_gpu_host)
 
-add_executable(t1_parity tools/parity/t1_parity.cpp)
+add_executable(t1_parity tools/parity/t1_parity.cu)
 target_link_libraries(t1_parity PRIVATE pos2_gpu_host)
+
+add_executable(t1_debug tools/parity/t1_debug.cu)
+target_link_libraries(t1_debug PRIVATE pos2_gpu_host)
+set_target_properties(t1_debug PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 add_executable(t2_parity tools/parity/t2_parity.cpp)
 target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
