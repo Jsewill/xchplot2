@@ -1,0 +1,6 @@
+build/
+*.plot2
+.cache/
+compile_commands.json
+.vscode/
+.idea/
