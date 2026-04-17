@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace pos2gpu {
 
@@ -24,6 +25,14 @@ struct GpuPlotOptions {
     bool testnet = false;
     bool verbose = false;
     std::array<uint8_t, 32> plot_id{};
+
+    // Memo bytes to embed in the plot file. Empty → 112 bytes of zeros
+    // (test-only; the harvester will reject this).
+    std::vector<uint8_t> memo;
+
+    // If non-empty, used as the output filename (basename only — joined to
+    // output_dir). Otherwise the legacy gpu_plotter test naming is used.
+    std::string out_name;
 
     PhaseStrategy t1 = PhaseStrategy::Cpu;
     PhaseStrategy t2 = PhaseStrategy::Cpu;

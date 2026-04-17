@@ -19,18 +19,41 @@ void print_usage(char const* prog)
     std::cerr
         << "Usage:\n"
         << "  " << prog << " test <k> <plot_id_hex> [strength] [plot_index] [meta_group] [verbose] "
-        << "[--testnet] [--out DIR] [--gpu-t1] [--gpu-t2] [--gpu-t3] [--gpu-all]\n"
+        << "[--testnet] [--out DIR] [--memo HEX] [--out-name NAME] "
+        << "[--gpu-t1] [--gpu-t2] [--gpu-t3] [--gpu-all]\n"
         << "\n"
-        << "    <k>           : even integer in [18, 32]\n"
-        << "    <plot_id_hex> : 64 hex characters\n"
-        << "    [strength]    : optional, defaults to 2\n"
-        << "    [plot_index]  : optional, defaults to 0\n"
-        << "    [meta_group]  : optional, defaults to 0\n"
-        << "    [verbose]     : optional, 0/1, default 0\n"
-        << "    --testnet     : use testnet proof parameters\n"
-        << "    --out DIR     : output directory, defaults to .\n"
-        << "    --gpu-tN      : run phase N on GPU (T1/T2/T3); default CPU\n"
-        << "    --gpu-all     : run all phases on GPU (where implemented)\n";
+        << "    <k>            : even integer in [18, 32]\n"
+        << "    <plot_id_hex>  : 64 hex characters\n"
+        << "    [strength]     : optional, defaults to 2\n"
+        << "    [plot_index]   : optional, defaults to 0\n"
+        << "    [meta_group]   : optional, defaults to 0\n"
+        << "    [verbose]      : optional, 0/1, default 0\n"
+        << "    --testnet      : use testnet proof parameters\n"
+        << "    --out DIR      : output directory, defaults to .\n"
+        << "    --memo HEX     : memo bytes (hex); required for farmable plots\n"
+        << "    --out-name NAME: override output filename (basename only)\n"
+        << "    --gpu-tN       : run phase N on GPU (T1/T2/T3); default CPU\n"
+        << "    --gpu-all      : run all phases on GPU (where implemented)\n";
+}
+
+bool parse_hex_bytes(std::string const& s, std::vector<uint8_t>& out)
+{
+    if (s.size() % 2 != 0) return false;
+    auto val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    out.clear();
+    out.reserve(s.size() / 2);
+    for (size_t i = 0; i < s.size(); i += 2) {
+        int hi = val(s[i]);
+        int lo = val(s[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return true;
 }
 
 bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
@@ -76,6 +99,16 @@ int main(int argc, char* argv[])
         }
         else if (a == "--out" && i + 1 < argc) {
             output_dir = argv[++i];
+        }
+        else if (a == "--memo" && i + 1 < argc) {
+            std::string memo_hex = argv[++i];
+            if (!parse_hex_bytes(memo_hex, opts.memo)) {
+                std::cerr << "Error: --memo must be even-length hex\n";
+                return 1;
+            }
+        }
+        else if (a == "--out-name" && i + 1 < argc) {
+            opts.out_name = argv[++i];
         }
         else {
             pos.push_back(a);

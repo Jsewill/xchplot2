@@ -88,33 +88,49 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         plot = plotter.run(plotter_opts);
     }
 
-    // Build output filename matching pos2-chip's plotter_main.cpp scheme.
-    std::string plot_id_hex;
-    plot_id_hex.reserve(64);
-    static char const hex[] = "0123456789abcdef";
-    for (uint8_t b : opts.plot_id) {
-        plot_id_hex += hex[b >> 4];
-        plot_id_hex += hex[b & 0xF];
+    // Build output filename. Caller may override via opts.out_name (used
+    // by chia plots create --gpu to match its naming convention). Default
+    // is the legacy gpu_plotter test scheme.
+    std::string filename;
+    if (!opts.out_name.empty()) {
+        filename = opts.out_name;
+    } else {
+        std::string plot_id_hex;
+        plot_id_hex.reserve(64);
+        static char const hex[] = "0123456789abcdef";
+        for (uint8_t b : opts.plot_id) {
+            plot_id_hex += hex[b >> 4];
+            plot_id_hex += hex[b & 0xF];
+        }
+        filename = "plot_" + std::to_string(opts.k)
+                 + "_" + std::to_string(opts.strength)
+                 + "_" + std::to_string(opts.plot_index)
+                 + "_" + std::to_string(opts.meta_group)
+                 + (opts.testnet ? "_testnet" : "")
+                 + "_" + plot_id_hex
+                 + ".plot2";
     }
-    std::string filename = "plot_" + std::to_string(opts.k)
-                         + "_" + std::to_string(opts.strength)
-                         + "_" + std::to_string(opts.plot_index)
-                         + "_" + std::to_string(opts.meta_group)
-                         + (opts.testnet ? "_testnet" : "")
-                         + "_" + plot_id_hex
-                         + ".plot2";
 
     std::filesystem::create_directories(output_dir);
     auto full_path = std::filesystem::path(output_dir) / filename;
 
-    std::array<uint8_t, 32 + 48 + 32> stub_memo{}; // gpu_plotter is a test tool;
-                                                   // real keys come via chia plots create
+    // Memo: caller-supplied bytes if present (real farmable plots), else
+    // a 112-byte stub (test plots only — harvester will reject).
+    std::vector<uint8_t> memo_bytes;
+    if (!opts.memo.empty()) {
+        memo_bytes = opts.memo;
+    } else {
+        memo_bytes.assign(32 + 48 + 32, 0);
+    }
+    if (memo_bytes.size() > 255) {
+        throw std::runtime_error("memo too long (max 255 bytes; PlotFile uses uint8 length)");
+    }
     PlotFile::writeData(full_path.string(),
                         plot,
                         params,
                         static_cast<uint16_t>(opts.plot_index),
                         static_cast<uint8_t>(opts.meta_group),
-                        std::span<uint8_t const>(stub_memo.data(), stub_memo.size()));
+                        std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
     return full_path.string();
 }
