@@ -1,6 +1,7 @@
 // BatchPlotter.cu — implementation of staggered multi-plot pipeline.
 
 #include "host/BatchPlotter.hpp"
+#include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 
@@ -143,6 +144,38 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     BatchResult res;
     if (entries.empty()) return res;
 
+    // All entries in a batch must share (k, strength, testnet) so one pool
+    // fits all plots. Mixed-shape batches could be supported by splitting
+    // into homogeneous sub-batches; not needed in practice.
+    int  pool_k        = entries[0].k;
+    int  pool_strength = entries[0].strength;
+    bool pool_testnet  = entries[0].testnet;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        if (entries[i].k != pool_k
+            || entries[i].strength != pool_strength
+            || entries[i].testnet  != pool_testnet)
+        {
+            throw std::runtime_error(
+                "run_batch: all entries must share (k, strength, testnet)");
+        }
+    }
+
+    // Allocate the pool once; destructor frees at function exit. This is
+    // the whole point of the batch path — eliminate the per-plot ~2.4 s
+    // allocator cost (dominated by cudaMallocHost(2 GB)).
+    GpuBufferPool pool(pool_k, pool_strength, pool_testnet);
+    if (verbose) {
+        double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
+        std::fprintf(stderr,
+            "[batch] pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
+            "sort_scratch=%.2f GB pinned=%.2f GB (Xs scratch aliased in pair_b)\n",
+            pool.storage_bytes * gb,
+            pool.pair_bytes    * gb,
+            pool.pair_bytes    * gb,
+            pool.sort_scratch_bytes * gb,
+            pool.pinned_bytes       * gb);
+    }
+
     Channel chan;
     std::atomic<bool>     consumer_failed{false};
     std::atomic<size_t>   plots_done{0};
@@ -203,7 +236,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             WorkItem item;
             item.entry  = entries[i];
             item.index  = i;
-            item.result = run_gpu_pipeline(cfg);
+            item.result = run_gpu_pipeline(cfg, pool);
 
             if (verbose) {
                 auto ms = std::chrono::duration<double, std::milli>(
