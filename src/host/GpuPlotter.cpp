@@ -5,6 +5,7 @@
 
 #include "host/GpuPlotter.hpp"
 #include "host/GpuPipeline.hpp"
+#include "host/PlotFileWriterParallel.hpp"
 
 // pos2-chip headers (relative include surface set in CMake).
 #include "plot/Plotter.hpp"
@@ -126,12 +127,12 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     if (memo_bytes.size() > 255) {
         throw std::runtime_error("memo too long (max 255 bytes; PlotFile uses uint8 length)");
     }
-    PlotFile::writeData(full_path.string(),
-                        plot,
-                        params,
-                        static_cast<uint16_t>(opts.plot_index),
-                        static_cast<uint8_t>(opts.meta_group),
-                        std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+    write_plot_file_parallel(full_path.string(),
+                             plot,
+                             params,
+                             static_cast<uint16_t>(opts.plot_index),
+                             static_cast<uint8_t>(opts.meta_group),
+                             std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
     return full_path.string();
 }
