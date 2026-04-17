@@ -5,6 +5,10 @@
 // Per-chunk FSE compression is independent — easy parallel win.
 //
 // Output bytes are byte-identical to PlotFile::writeData.
+//
+// Takes a span<uint64_t const> instead of PlotData so callers can pass
+// pinned-host memory directly, avoiding a ~1 s pinned→heap memcpy per plot
+// in batch mode.
 
 #pragma once
 
@@ -18,6 +22,7 @@
 #include <cstdint>
 #include <fstream>
 #include <future>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,9 +30,36 @@
 
 namespace pos2gpu {
 
+// Inline equivalent of pos2-chip's ChunkedProofFragments::convertToChunkedProofFragments
+// but operating on a span so callers can point at pinned memory directly.
+inline ChunkedProofFragments chunkify_proof_fragments_span(
+    std::span<uint64_t const> t3_fragments, uint64_t range_per_chunk)
+{
+    if (range_per_chunk == 0) {
+        throw std::invalid_argument("range_per_chunk must be > 0");
+    }
+    ChunkedProofFragments chunked;
+    if (t3_fragments.empty()) return chunked;
+
+    uint64_t const max_value = t3_fragments.back();
+    uint64_t const num_spans = max_value / range_per_chunk + 1;
+    chunked.proof_fragments_chunks.resize(static_cast<std::size_t>(num_spans));
+
+    std::size_t current_span = 0;
+    uint64_t current_span_end = range_per_chunk;
+    for (uint64_t fragment : t3_fragments) {
+        while (fragment >= current_span_end) {
+            ++current_span;
+            current_span_end += range_per_chunk;
+        }
+        chunked.proof_fragments_chunks[current_span].push_back(fragment);
+    }
+    return chunked;
+}
+
 inline size_t write_plot_file_parallel(
     std::string const& filename,
-    PlotData const& data,
+    std::span<uint64_t const> t3_fragments,
     ProofParams const& params,
     uint16_t const index,
     uint8_t const meta_group,
@@ -42,7 +74,7 @@ inline size_t write_plot_file_parallel(
     // Build chunked representation (cheap; single pass over fragments)
     uint64_t const range_per_chunk = (1ULL << (params.get_k() + PlotFile::CHUNK_SPAN_RANGE_BITS));
     ChunkedProofFragments chunked
-        = ChunkedProofFragments::convertToChunkedProofFragments(data, range_per_chunk);
+        = chunkify_proof_fragments_span(t3_fragments, range_per_chunk);
 
     uint64_t const num_chunks = static_cast<uint64_t>(chunked.proof_fragments_chunks.size());
     int const stub_bits = params.get_k() - PlotFile::MINUS_STUB_BITS;

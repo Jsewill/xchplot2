@@ -64,7 +64,12 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                        static_cast<uint8_t>(opts.strength),
                        opts.testnet ? uint8_t{1} : uint8_t{0});
 
+    // Either path produces a vector of ProofFragments we pass to the writer
+    // as a span. GPU path owns via GpuPipelineResult::t3_fragments_storage;
+    // CPU path owns via PlotData::t3_proof_fragments.
     PlotData plot;
+    GpuPipelineResult pr;
+    std::span<uint64_t const> fragments;
     if (all_gpu) {
         // Run the full pipeline on GPU; hand the sorted T3 fragments to
         // the CPU PlotFile writer for FSE compression and serialization.
@@ -74,8 +79,8 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         cfg.strength = opts.strength;
         cfg.testnet  = opts.testnet;
         cfg.profile  = opts.profile;
-        auto pr = run_gpu_pipeline(cfg);
-        plot.t3_proof_fragments = std::move(pr.t3_fragments);
+        pr = run_gpu_pipeline(cfg);
+        fragments = pr.fragments();
         if (opts.verbose) {
             std::cerr << "[gpu_plotter] T1=" << pr.t1_count
                       << " T2=" << pr.t2_count
@@ -88,6 +93,8 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         plotter_opts.verbose = opts.verbose;
         Plotter plotter(params);
         plot = plotter.run(plotter_opts);
+        fragments = std::span<uint64_t const>(plot.t3_proof_fragments.data(),
+                                              plot.t3_proof_fragments.size());
     }
 
     // Build output filename. Caller may override via opts.out_name (used
@@ -128,7 +135,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         throw std::runtime_error("memo too long (max 255 bytes; PlotFile uses uint8 length)");
     }
     write_plot_file_parallel(full_path.string(),
-                             plot,
+                             fragments,
                              params,
                              static_cast<uint16_t>(opts.plot_index),
                              static_cast<uint8_t>(opts.meta_group),

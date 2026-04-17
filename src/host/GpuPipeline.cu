@@ -98,7 +98,8 @@ __global__ void extract_t2_keys(
 } // namespace
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
-                                   GpuBufferPool& pool)
+                                   GpuBufferPool& pool,
+                                   int pinned_index)
 {
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
@@ -111,6 +112,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     {
         throw std::runtime_error(
             "GpuBufferPool was sized for different (k, strength, testnet)");
+    }
+    if (pinned_index < 0 || pinned_index > 1) {
+        throw std::runtime_error("pinned_index must be 0 or 1");
     }
 
     uint64_t const total_xs = pool.total_xs;
@@ -142,7 +146,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // so we alias it rather than allocating separately.
     void*           d_xs_temp      = pool.d_pair_b;
     void*           d_sort_scratch = pool.d_sort_scratch;
-    uint64_t*       h_pinned_t3    = pool.h_pinned_t3;
+    uint64_t*       h_pinned_t3    = pool.h_pinned_t3[pinned_index];
     // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
     // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
     // when bytes==0. Point them at d_sort_scratch (idle during match) to
@@ -336,9 +340,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     end_phase(p_d2h);
 
     if (t3_count > 0) {
-        result.t3_fragments.resize(t3_count);
-        std::memcpy(result.t3_fragments.data(), h_pinned_t3,
-                    sizeof(uint64_t) * t3_count);
+        // Borrow: caller (batch producer) promises to finish consuming this
+        // pinned slot before reusing it for another plot.
+        result.external_fragments_ptr   = h_pinned_t3;
+        result.external_fragments_count = t3_count;
     }
 
     // Inject Xs gen / sort timings before reporting (avoids the double-event
@@ -365,7 +370,18 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
     // Pays the full per-call allocator overhead (~2.4 s for k=28). Batch
     // callers should construct a pool once and reuse it via the overload.
     GpuBufferPool pool(cfg.k, cfg.strength, cfg.testnet);
-    return run_gpu_pipeline(cfg, pool);
+    GpuPipelineResult r = run_gpu_pipeline(cfg, pool, /*pinned_index=*/0);
+    // Pool (and its pinned buffer) is about to be destroyed, so materialise
+    // a self-contained copy before returning.
+    if (r.external_fragments_ptr && r.external_fragments_count > 0) {
+        r.t3_fragments_storage.resize(r.external_fragments_count);
+        std::memcpy(r.t3_fragments_storage.data(),
+                    r.external_fragments_ptr,
+                    sizeof(uint64_t) * r.external_fragments_count);
+    }
+    r.external_fragments_ptr   = nullptr;
+    r.external_fragments_count = 0;
+    return r;
 }
 
 } // namespace pos2gpu

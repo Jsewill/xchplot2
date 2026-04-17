@@ -168,7 +168,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
             "[batch] pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
-            "sort_scratch=%.2f GB pinned=%.2f GB (Xs scratch aliased in pair_b)\n",
+            "sort_scratch=%.2f GB pinned=2x%.2f GB "
+            "(Xs scratch aliased in pair_b)\n",
             pool.storage_bytes * gb,
             pool.pair_bytes    * gb,
             pool.pair_bytes    * gb,
@@ -192,8 +193,6 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
                                    static_cast<uint8_t>(item.entry.k),
                                    static_cast<uint8_t>(item.entry.strength),
                                    item.entry.testnet ? uint8_t{1} : uint8_t{0});
-                PlotData plot;
-                plot.t3_proof_fragments = std::move(item.result.t3_fragments);
 
                 std::filesystem::create_directories(item.entry.out_dir);
                 auto full_path = std::filesystem::path(item.entry.out_dir) / item.entry.out_name;
@@ -201,8 +200,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
                 std::vector<uint8_t> memo_bytes = item.entry.memo;
                 if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
 
+                // Fragments are borrowed from the pool's pinned slot; the
+                // producer is synchronised via the depth-1 channel so that
+                // slot won't be reused until we're done here.
                 write_plot_file_parallel(
-                    full_path.string(), plot, params,
+                    full_path.string(), item.result.fragments(), params,
                     static_cast<uint16_t>(item.entry.plot_index),
                     static_cast<uint8_t>(item.entry.meta_group),
                     std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
@@ -236,7 +238,9 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             WorkItem item;
             item.entry  = entries[i];
             item.index  = i;
-            item.result = run_gpu_pipeline(cfg, pool);
+            // Alternate pinned buffer per plot so the current D2H doesn't
+            // clobber pinned data the consumer is still reading.
+            item.result = run_gpu_pipeline(cfg, pool, static_cast<int>(i % 2));
 
             if (verbose) {
                 auto ms = std::chrono::duration<double, std::milli>(

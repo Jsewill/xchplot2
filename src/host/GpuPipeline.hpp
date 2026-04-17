@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,21 +35,43 @@ struct GpuPipelineConfig {
     bool profile = false;   // print per-phase cudaEvent timing breakdown to stderr
 };
 
+// T3 fragment ownership depends on which overload produced this result.
+//   run_gpu_pipeline(cfg)                        — t3_fragments_storage owns.
+//   run_gpu_pipeline(cfg, pool, pinned_index)    — external_fragments_ptr
+//       borrows pool.h_pinned_t3[pinned_index]; valid until producer reuses
+//       that pinned slot for a subsequent plot.
+// Consumers should prefer fragments() which hides the distinction.
 struct GpuPipelineResult {
-    std::vector<uint64_t> t3_fragments; // sorted by proof_fragment, low 2k bits
-    // Counts per phase (for diagnostics)
+    std::vector<uint64_t> t3_fragments_storage;          // one-shot path
+    uint64_t const*       external_fragments_ptr   = nullptr;  // pool path
+    size_t                external_fragments_count = 0;
+
+    std::span<uint64_t const> fragments() const noexcept
+    {
+        if (!t3_fragments_storage.empty()) {
+            return {t3_fragments_storage.data(), t3_fragments_storage.size()};
+        }
+        return {external_fragments_ptr, external_fragments_count};
+    }
+
     uint64_t t1_count = 0;
     uint64_t t2_count = 0;
     uint64_t t3_count = 0;
 };
 
-// Runs the full GPU plotter pipeline. Throws std::runtime_error on CUDA
-// failure. Caller must have called pos2gpu::initialize_aes_tables() once.
+// One-shot path: allocates a transient pool, runs the pipeline, then copies
+// the pinned T3 fragments into t3_fragments_storage so the result is
+// self-contained after the pool is destroyed.
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 
-// Same as above, but reuses the caller-provided pool. `pool` must have been
-// sized with the same (k, strength, testnet) as cfg — otherwise throws.
+// Batch path: runs the pipeline writing D2H into pool.h_pinned_t3[pinned_index]
+// and returns a borrowing result. The consumer must process the fragments
+// before the producer reuses the same pinned_index for a future plot.
+//
+// `pool` must have been sized with the same (k, strength, testnet) as cfg —
+// otherwise throws.
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
-                                   GpuBufferPool& pool);
+                                   GpuBufferPool& pool,
+                                   int pinned_index);
 
 } // namespace pos2gpu
