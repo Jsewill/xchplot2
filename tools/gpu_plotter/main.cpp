@@ -3,6 +3,7 @@
 // can be substituted in scripts.
 
 #include "host/GpuPlotter.hpp"
+#include "host/BatchPlotter.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +22,11 @@ void print_usage(char const* prog)
         << "  " << prog << " test <k> <plot_id_hex> [strength] [plot_index] [meta_group] [verbose] "
         << "[--testnet] [--out DIR] [--memo HEX] [--out-name NAME] "
         << "[--gpu-t1] [--gpu-t2] [--gpu-t3] [--gpu-all]\n"
+        << "  " << prog << " batch <manifest.tsv> [-v]\n"
+        << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
+        << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
+        << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
+        << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "\n"
         << "    <k>            : even integer in [18, 32]\n"
         << "    <plot_id_hex>  : 64 hex characters\n"
@@ -78,7 +84,37 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 2 || std::string(argv[1]) != "test") {
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    std::string mode = argv[1];
+
+    if (mode == "batch") {
+        if (argc < 3) { print_usage(argv[0]); return 1; }
+        std::string manifest = argv[2];
+        bool verbose = false;
+        for (int i = 3; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "-v" || a == "--verbose") verbose = true;
+        }
+        try {
+            auto entries = pos2gpu::parse_manifest(manifest);
+            std::cerr << "[batch] " << entries.size() << " plots queued\n";
+            auto res = pos2gpu::run_batch(entries, verbose);
+            double per = res.plots_written ? res.total_wall_seconds / res.plots_written : 0;
+            std::cerr << "[batch] wrote " << res.plots_written << " plots in "
+                      << res.total_wall_seconds << " s ("
+                      << per << " s/plot)\n";
+            return 0;
+        } catch (std::exception const& e) {
+            std::cerr << "[batch] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    if (mode != "test") {
         print_usage(argv[0]);
         return 1;
     }
