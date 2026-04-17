@@ -97,6 +97,7 @@ int main(int argc, char* argv[])
         else if (a == "--gpu-all") {
             opts.t1 = opts.t2 = opts.t3 = pos2gpu::PhaseStrategy::Gpu;
         }
+        else if (a == "--profile") opts.profile = true;
         else if (a == "--out" && i + 1 < argc) {
             output_dir = argv[++i];
         }

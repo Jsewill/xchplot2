@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -133,6 +134,42 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 
     cudaStream_t stream = nullptr; // default stream
 
+    // ---- profiling: cudaEvent helpers ----
+    struct PhaseTimer {
+        cudaEvent_t start, stop;
+        std::string label;
+    };
+    std::vector<PhaseTimer> phases;
+    auto begin_phase = [&](char const* label) -> int {
+        if (!cfg.profile) return -1;
+        PhaseTimer pt;
+        pt.label = label;
+        cudaEventCreate(&pt.start);
+        cudaEventCreate(&pt.stop);
+        cudaEventRecord(pt.start, stream);
+        phases.push_back(pt);
+        return int(phases.size()) - 1;
+    };
+    auto end_phase = [&](int idx) {
+        if (!cfg.profile || idx < 0) return;
+        cudaEventRecord(phases[idx].stop, stream);
+    };
+    auto report_phases = [&]() {
+        if (!cfg.profile) return;
+        cudaDeviceSynchronize();
+        std::fprintf(stderr, "=== gpu_pipeline phase breakdown ===\n");
+        float total_ms = 0;
+        for (auto& pt : phases) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, pt.start, pt.stop);
+            std::fprintf(stderr, "  %-30s %8.2f ms\n", pt.label.c_str(), ms);
+            total_ms += ms;
+            cudaEventDestroy(pt.start);
+            cudaEventDestroy(pt.stop);
+        }
+        std::fprintf(stderr, "  %-30s %8.2f ms\n", "TOTAL device time:", total_ms);
+    };
+
     // ---------- Phase Xs ----------
     XsCandidateGpu* d_xs = dmalloc<XsCandidateGpu>(total_xs);
     void* d_xs_temp = nullptr;
@@ -141,8 +178,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
                               nullptr, nullptr, &xs_temp_bytes));
     d_xs_temp = nullptr;
     CHECK(cudaMalloc(&d_xs_temp, xs_temp_bytes));
+    int p_xs = begin_phase("Xs (g_x + sort)");
     CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
                               d_xs, d_xs_temp, &xs_temp_bytes, stream));
+    end_phase(p_xs);
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
@@ -154,9 +193,11 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
                           d_t1, d_t1_count, cap,
                           nullptr, &t1_temp_bytes));
     CHECK(cudaMalloc(&d_t1_temp, t1_temp_bytes));
+    int p_t1 = begin_phase("T1 match");
     CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           d_t1, d_t1_count, cap,
                           d_t1_temp, &t1_temp_bytes, stream));
+    end_phase(p_t1);
     CHECK(cudaStreamSynchronize(stream));
 
     uint64_t t1_count = 0;
@@ -171,6 +212,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 
     // Sort T1 by match_info (low k bits)
     T1PairingGpu* d_t1_sorted = dmalloc<T1PairingGpu>(t1_count);
+    int p_t1_sort = begin_phase("T1 sort");
     {
         uint32_t* d_keys_in   = dmalloc<uint32_t>(t1_count);
         uint32_t* d_keys_out  = dmalloc<uint32_t>(t1_count);
@@ -200,6 +242,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
         cudaFree(d_sort_scratch);
         dfree(d_keys_in); dfree(d_keys_out); dfree(d_vals_in); dfree(d_vals_out);
     }
+    end_phase(p_t1_sort);
     dfree(d_t1); dfree(d_t1_count);
 
     // ---------- Phase T2 ----------
@@ -212,9 +255,11 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
                           d_t2, d_t2_count, cap,
                           nullptr, &t2_temp_bytes));
     CHECK(cudaMalloc(&d_t2_temp, t2_temp_bytes));
+    int p_t2 = begin_phase("T2 match");
     CHECK(launch_t2_match(cfg.plot_id.data(), t2p, d_t1_sorted, t1_count,
                           d_t2, d_t2_count, cap,
                           d_t2_temp, &t2_temp_bytes, stream));
+    end_phase(p_t2);
     CHECK(cudaStreamSynchronize(stream));
 
     uint64_t t2_count = 0;
@@ -227,6 +272,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 
     // Sort T2 by match_info (low k bits)
     T2PairingGpu* d_t2_sorted = dmalloc<T2PairingGpu>(t2_count);
+    int p_t2_sort = begin_phase("T2 sort");
     {
         uint32_t* d_keys_in  = dmalloc<uint32_t>(t2_count);
         uint32_t* d_keys_out = dmalloc<uint32_t>(t2_count);
@@ -256,6 +302,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
         cudaFree(d_sort_scratch);
         dfree(d_keys_in); dfree(d_keys_out); dfree(d_vals_in); dfree(d_vals_out);
     }
+    end_phase(p_t2_sort);
     dfree(d_t2); dfree(d_t2_count);
 
     // ---------- Phase T3 ----------
@@ -268,9 +315,11 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
                           d_t3, d_t3_count, cap,
                           nullptr, &t3_temp_bytes));
     CHECK(cudaMalloc(&d_t3_temp, t3_temp_bytes));
+    int p_t3 = begin_phase("T3 match + Feistel");
     CHECK(launch_t3_match(cfg.plot_id.data(), t3p, d_t2_sorted, t2_count,
                           d_t3, d_t3_count, cap,
                           d_t3_temp, &t3_temp_bytes, stream));
+    end_phase(p_t3);
     CHECK(cudaStreamSynchronize(stream));
 
     uint64_t t3_count = 0;
@@ -285,6 +334,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
     // post_construct_span sort key.
     uint64_t* d_frags_in  = nullptr;
     uint64_t* d_frags_out = nullptr;
+    int p_t3_sort = begin_phase("T3 sort");
     {
         // T3PairingGpu IS just { uint64_t proof_fragment }, so reinterpret
         // d_t3 as a uint64_t array directly.
@@ -305,8 +355,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
         CHECK(cudaStreamSynchronize(stream));
         cudaFree(d_sort_scratch);
     }
+    end_phase(p_t3_sort);
 
     // Copy sorted T3 fragments to host
+    int p_d2h = begin_phase("D2H copy T3 fragments");
     GpuPipelineResult result;
     result.t1_count = t1_count;
     result.t2_count = t2_count;
@@ -316,8 +368,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
         CHECK(cudaMemcpy(result.t3_fragments.data(), d_frags_out,
                          sizeof(uint64_t) * t3_count, cudaMemcpyDeviceToHost));
     }
+    end_phase(p_d2h);
     dfree(d_t3); dfree(d_t3_count); dfree(d_frags_out);
 
+    report_phases();
     return result;
 }
 

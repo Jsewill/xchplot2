@@ -24,6 +24,7 @@ struct GpuPlotOptions {
     int meta_group = 0;
     bool testnet = false;
     bool verbose = false;
+    bool profile = false;   // print GPU phase breakdown to stderr
     std::array<uint8_t, 32> plot_id{};
 
     // Memo bytes to embed in the plot file. Empty → 112 bytes of zeros

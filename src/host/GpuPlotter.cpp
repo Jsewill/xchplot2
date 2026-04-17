@@ -72,6 +72,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         cfg.k        = opts.k;
         cfg.strength = opts.strength;
         cfg.testnet  = opts.testnet;
+        cfg.profile  = opts.profile;
         auto pr = run_gpu_pipeline(cfg);
         plot.t3_proof_fragments = std::move(pr.t3_fragments);
         if (opts.verbose) {

@@ -92,4 +92,52 @@ __host__ __device__ inline AesState set_int_vec_i128(int32_t i3, int32_t i2, int
 // per program from host code before any kernel that touches AesGpu runs.
 void initialize_aes_tables();
 
+// =========================================================================
+// Shared-memory variant. Each kernel block can call load_aes_tables_smem
+// at start to populate per-block 4×256 uint32 tables (16 KB shared mem)
+// from constant memory; subsequent rounds read from SRAM, avoiding the
+// constant-memory broadcast serialization that hurts when each warp lane
+// looks up a different byte value.
+//
+// Usage in a kernel with blockDim.x ∈ [128, 1024]:
+//
+//   __shared__ uint32_t sT[4 * 256];
+//   load_aes_tables_smem(sT);
+//   __syncthreads();
+//   AesState state = ...;
+//   state = aesenc_round_smem(state, round_key, sT);
+// =========================================================================
+
+__device__ __forceinline__ void load_aes_tables_smem(uint32_t* sT)
+{
+    // sT layout: [T0|T1|T2|T3], 256 entries each (4096 entries total).
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    #pragma unroll 1
+    for (int i = tid; i < 256; i += stride) {
+        sT[0 * 256 + i] = kAesT0[i];
+        sT[1 * 256 + i] = kAesT1[i];
+        sT[2 * 256 + i] = kAesT2[i];
+        sT[3 * 256 + i] = kAesT3[i];
+    }
+}
+
+__device__ __forceinline__ AesState aesenc_round_smem(
+    AesState s, AesState const& key, uint32_t const* __restrict__ sT)
+{
+    auto byte = [](uint32_t w, int n) -> uint32_t {
+        return (w >> (8 * n)) & 0xFFu;
+    };
+    AesState out;
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        uint32_t v = sT[0 * 256 + byte(s.w[c],         0)]
+                   ^ sT[1 * 256 + byte(s.w[(c + 1) & 3], 1)]
+                   ^ sT[2 * 256 + byte(s.w[(c + 2) & 3], 2)]
+                   ^ sT[3 * 256 + byte(s.w[(c + 3) & 3], 3)];
+        out.w[c] = v ^ key.w[c];
+    }
+    return out;
+}
+
 } // namespace pos2gpu

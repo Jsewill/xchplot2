@@ -77,33 +77,53 @@ __global__ void compute_bucket_offsets(
     offsets[num_buckets] = total;
 }
 
-// Process one (section_l, match_key_r) bucket. Each thread handles one L
-// candidate from the entire section_l (across all its match_keys).
-__global__ void match_one_bucket(
+// Fused match kernel: handles all (section_l, match_key_r) buckets in a
+// single launch. blockIdx.y identifies the bucket, blockIdx.x slices L.
+// Loads AES T-tables into shared memory once per block.
+__global__ void match_all_buckets(
     AesHashKeys keys,
     XsCandidateGpu const* __restrict__ sorted_xs,
-    uint64_t l_start, uint64_t l_end,
-    uint64_t r_start, uint64_t r_end,
-    uint32_t match_key_r,
+    uint64_t const* __restrict__ d_offsets, // [num_buckets+1]
+    uint32_t num_match_keys,
     int k,
-    int extra_rounds_bits,    // strength - 2
-    uint32_t target_mask,     // (1 << num_match_target_bits) - 1
-    int num_test_bits,        // for T1: num_match_key_bits = 2
-    int num_match_info_bits,  // for T1: k
+    int num_section_bits,
+    int extra_rounds_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    int num_match_info_bits,
     T1PairingGpu* __restrict__ out,
     unsigned long long* __restrict__ out_count,
     uint64_t out_capacity)
 {
+    __shared__ uint32_t sT[4 * 256];
+    load_aes_tables_smem(sT);
+    __syncthreads();
+
+    uint32_t bucket_id   = blockIdx.y;            // 0..num_buckets
+    uint32_t section_l   = bucket_id / num_match_keys;
+    uint32_t match_key_r = bucket_id % num_match_keys;
+
+    uint32_t section_r;
+    {
+        uint32_t mask = (1u << num_section_bits) - 1u;
+        uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
+        uint32_t rl1  = (rl + 1) & mask;
+        section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
+    }
+
+    uint64_t l_start = d_offsets[section_l * num_match_keys];
+    uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+    uint64_t r_start = d_offsets[section_r * num_match_keys + match_key_r];
+    uint64_t r_end   = d_offsets[section_r * num_match_keys + match_key_r + 1];
+
     uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (l >= l_end) return;
 
     uint32_t x_l = sorted_xs[l].x;
 
-    // matching_target: table_id=1 (T1), match_key=match_key_r, meta=x_l
-    uint32_t target_l = matching_target(keys, 1u, match_key_r, uint64_t(x_l), 0)
+    uint32_t target_l = matching_target_smem(keys, 1u, match_key_r, uint64_t(x_l), sT, 0)
                       & target_mask;
 
-    // Binary search R [r_start, r_end) for first entry with target == target_l.
     uint64_t lo = r_start, hi = r_end;
     while (lo < hi) {
         uint64_t mid = lo + ((hi - lo) >> 1);
@@ -117,13 +137,12 @@ __global__ void match_one_bucket(
     uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
                                                      : ((1u << num_match_info_bits) - 1u);
 
-    // Walk forward while target_r matches.
     for (uint64_t r = lo; r < r_end; ++r) {
         uint32_t target_r = sorted_xs[r].match_info & target_mask;
         if (target_r != target_l) break;
 
         uint32_t x_r = sorted_xs[r].x;
-        Result128 res = pairing(keys, uint64_t(x_l), uint64_t(x_r), extra_rounds_bits);
+        Result128 res = pairing_smem(keys, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits);
 
         uint32_t test_result = res.r[3] & test_mask;
         if (test_result != 0) continue;
@@ -191,12 +210,7 @@ cudaError_t launch_t1_match(
     err = cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
     if (err != cudaSuccess) return err;
 
-    // 2) For each (section_l, match_key_r): launch a match kernel.
-    // L = entire section_l; R = (section_r, match_key_r) bucket.
-    // Need offsets back on the host? No — we can derive section bounds from
-    // bucket offsets directly (offsets[section * num_match_keys] for L_start,
-    // offsets[(section+1) * num_match_keys] for L_end). But kernel-launch
-    // arguments are host-side; we need to read d_offsets back to pick bounds.
+    // 2) Compute max L-count across sections (small H2D copy only for sizing).
     std::vector<uint64_t> h_offsets(num_buckets + 1);
     err = cudaMemcpyAsync(h_offsets.data(), d_offsets,
                           sizeof(uint64_t) * (num_buckets + 1),
@@ -205,48 +219,36 @@ cudaError_t launch_t1_match(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return err;
 
+    uint64_t l_count_max = 0;
+    for (uint32_t s = 0; s < num_sections; ++s) {
+        uint64_t l_count = h_offsets[(s + 1) * num_match_keys]
+                         - h_offsets[s * num_match_keys];
+        if (l_count > l_count_max) l_count_max = l_count;
+    }
+
     uint32_t target_mask = (params.num_match_target_bits >= 32)
                             ? 0xFFFFFFFFu
                             : ((1u << params.num_match_target_bits) - 1u);
     int extra_rounds_bits = params.strength - 2;
-    int num_test_bits     = params.num_match_key_bits; // T1 uses match_key_bits
+    int num_test_bits     = params.num_match_key_bits;
     int num_info_bits     = params.k;
 
     constexpr int kThreads = 256;
+    uint64_t blocks_x_u64 = (l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets, 1);
 
-    for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
-        uint32_t section_r = matching_section(section_l, params.num_section_bits);
-        uint64_t l_start = h_offsets[section_l * num_match_keys];
-        uint64_t l_end   = h_offsets[(section_l + 1) * num_match_keys];
-        if (l_end <= l_start) continue;
-        uint64_t l_count = l_end - l_start;
-
-        uint64_t blocks_u64 = (l_count + kThreads - 1) / kThreads;
-        if (blocks_u64 > UINT_MAX) return cudaErrorInvalidValue;
-        unsigned blocks = static_cast<unsigned>(blocks_u64);
-
-        for (uint32_t match_key_r = 0; match_key_r < num_match_keys; ++match_key_r) {
-            uint64_t r_start = h_offsets[section_r * num_match_keys + match_key_r];
-            uint64_t r_end   = h_offsets[section_r * num_match_keys + match_key_r + 1];
-            if (r_end <= r_start) continue;
-
-            match_one_bucket<<<blocks, kThreads, 0, stream>>>(
-                keys, d_sorted_xs,
-                l_start, l_end,
-                r_start, r_end,
-                match_key_r,
-                params.k,
-                extra_rounds_bits,
-                target_mask,
-                num_test_bits,
-                num_info_bits,
-                d_out_pairings,
-                reinterpret_cast<unsigned long long*>(d_out_count),
-                capacity);
-            err = cudaGetLastError();
-            if (err != cudaSuccess) return err;
-        }
-    }
+    match_all_buckets<<<grid, kThreads, 0, stream>>>(
+        keys, d_sorted_xs, d_offsets,
+        num_match_keys,
+        params.k, params.num_section_bits,
+        extra_rounds_bits, target_mask,
+        num_test_bits, num_info_bits,
+        d_out_pairings,
+        reinterpret_cast<unsigned long long*>(d_out_count),
+        capacity);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
     return cudaSuccess;
 }
 

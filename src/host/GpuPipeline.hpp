@@ -21,6 +21,7 @@ struct GpuPipelineConfig {
     int k = 28;
     int strength = 2;
     bool testnet = false;
+    bool profile = false;   // print per-phase cudaEvent timing breakdown to stderr
 };
 
 struct GpuPipelineResult {
