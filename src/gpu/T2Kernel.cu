@@ -1,62 +1,247 @@
-// T2Kernel.cu — sort T1 pairings by (section, match_key, target) using
-// CUB DeviceRadixSort, then run a sliding-window match kernel to emit
-// T2Pairings (4-x sequences).
+// T2Kernel.cu — port of pos2-chip Table2Constructor.
 //
-// CPU reference: pos2-chip/src/plot/TableConstructorGeneric.hpp
-//   Table2Constructor::construct(t1_pairs, out, post_sort_tmp).
-//
-// Status: skeleton. The CUB sort call site is wired but the matching
-// predicate kernel is a TODO until t1_parity passes (no point matching
-// what we can't yet produce identically).
+// Differences from T1 (see T1Kernel.cu):
+//   - Input is T1Pairing (12 bytes, has 64-bit meta accessor), not Xs_Candidate.
+//   - matching_target uses table_id=2 and meta=T1Pairing.meta() (64-bit).
+//     ProofHashing::matching_target sets extra_rounds_bits=0 for table_id != 1.
+//   - pairing_t2 calls AesHash::pairing without extra_rounds_bits (always 0).
+//   - num_match_key_bits = strength (not hard-coded 2 like T1).
+//   - Output T2Pairing has the AES pair.meta_result (64-bit) + x_bits derived
+//     from upper-k bits of meta_l/meta_r.
 
+#include "gpu/AesGpu.cuh"
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/T2Kernel.cuh"
 
 #include <cuda_runtime.h>
+#include <climits>
 #include <cstdint>
+#include <vector>
 
 namespace pos2gpu {
 
-cudaError_t launch_t2(
-    AesHashKeys const& /*keys*/,
-    void const* /*d_t1_pairings*/,
-    uint64_t /*t1_count*/,
-    void* /*d_t2_pairings*/,
-    uint64_t* /*d_t2_count*/,
-    void* /*d_temp_storage*/,
-    size_t /*temp_storage_bytes*/,
-    cudaStream_t /*stream*/)
+T2MatchParams make_t2_params(int k, int strength)
 {
-    // TODO:
-    //   1. Pack each T1Pairing into a (key, value) pair where the key is
-    //      (section << match_key_bits | match_key) and the value is the
-    //      pairing's array index.
-    //   2. cub::DeviceRadixSort::SortPairs on (key, value).
-    //   3. Launch a per-thread match kernel: each thread inspects a window
-    //      of N adjacent sorted entries and tests pairing(meta_l, meta_r)
-    //      against the matching predicate (see AesHash::matching_target
-    //      with table_id=2 in TableConstructorGeneric.hpp).
-    //   4. cub::DeviceSelect::Flagged to compact matches into d_t2_pairings.
-    //
-    // For sizing d_temp_storage, the host should:
-    //   size_t bytes = 0;
-    //   cub::DeviceRadixSort::SortPairs(nullptr, bytes, ...);
-    //   cudaMalloc(&d_temp_storage, bytes);
-    return cudaErrorNotSupported;
+    T2MatchParams p{};
+    p.k                     = k;
+    p.strength              = strength;
+    p.num_section_bits      = (k < 28) ? 2 : (k - 26);
+    p.num_match_key_bits    = strength; // T2 uses strength match_key bits
+    p.num_match_target_bits = k - p.num_section_bits - p.num_match_key_bits;
+    return p;
 }
 
-// Helper to query the temp-storage requirement for the radix sort step.
-// Once implemented, callers do:
-//   size_t bytes = 0;
-//   query_t2_temp_bytes(t1_count, &bytes);
-//   cudaMalloc(&temp, bytes);
-cudaError_t query_t2_temp_bytes(uint64_t /*t1_count*/, size_t* out_bytes)
+namespace {
+
+__host__ __device__ inline uint32_t matching_section(uint32_t section, int num_section_bits)
 {
-    // Conservative initial estimate: 4 × t1_count × sizeof(uint64_t) for
-    // (key, value) plus CUB scratch. Real value comes from CUB's
-    // SortPairs(nullptr, bytes, ...) once the implementation is filled in.
-    *out_bytes = 0;
-    return cudaErrorNotSupported;
+    uint32_t num_sections = 1u << num_section_bits;
+    uint32_t mask = num_sections - 1u;
+    uint32_t rotated_left = ((section << 1) | (section >> (num_section_bits - 1))) & mask;
+    uint32_t rotated_left_plus_1 = (rotated_left + 1) & mask;
+    uint32_t section_new = ((rotated_left_plus_1 >> 1)
+                          | (rotated_left_plus_1 << (num_section_bits - 1))) & mask;
+    return section_new;
+}
+
+__global__ void compute_bucket_offsets(
+    T1PairingGpu const* __restrict__ sorted,
+    uint64_t total,
+    int num_match_target_bits,
+    uint32_t num_buckets,
+    uint64_t* __restrict__ offsets)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t bucket_shift = static_cast<uint32_t>(num_match_target_bits);
+
+    uint64_t pos = 0;
+    for (uint32_t b = 0; b < num_buckets; ++b) {
+        uint64_t lo = pos, hi = total;
+        while (lo < hi) {
+            uint64_t mid = lo + ((hi - lo) >> 1);
+            uint32_t bucket_mid = sorted[mid].match_info >> bucket_shift;
+            if (bucket_mid < b) lo = mid + 1;
+            else                hi = mid;
+        }
+        offsets[b] = lo;
+        pos = lo;
+    }
+    offsets[num_buckets] = total;
+}
+
+__global__ void match_one_bucket(
+    AesHashKeys keys,
+    T1PairingGpu const* __restrict__ sorted_t1,
+    uint64_t l_start, uint64_t l_end,
+    uint64_t r_start, uint64_t r_end,
+    uint32_t match_key_r,
+    int k,
+    uint32_t target_mask,
+    int num_test_bits,        // = strength for T2
+    int num_match_info_bits,  // = k for T2
+    int half_k,               // = k / 2
+    T2PairingGpu* __restrict__ out,
+    unsigned long long* __restrict__ out_count,
+    uint64_t out_capacity)
+{
+    uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (l >= l_end) return;
+
+    uint64_t meta_l = (uint64_t(sorted_t1[l].meta_hi) << 32)
+                    | uint64_t(sorted_t1[l].meta_lo);
+
+    // matching_target for T2: table_id=2, meta=meta_l (64-bit), extra_rounds_bits=0
+    uint32_t target_l = matching_target(keys, 2u, match_key_r, meta_l, 0)
+                      & target_mask;
+
+    uint64_t lo = r_start, hi = r_end;
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) >> 1);
+        uint32_t target_mid = sorted_t1[mid].match_info & target_mask;
+        if (target_mid < target_l) lo = mid + 1;
+        else                       hi = mid;
+    }
+
+    uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                                                : ((1u << num_test_bits) - 1u);
+    uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
+                                                     : ((1u << num_match_info_bits) - 1u);
+    int meta_bits = 2 * k; // num_pairing_meta_bits
+
+    for (uint64_t r = lo; r < r_end; ++r) {
+        uint32_t target_r = sorted_t1[r].match_info & target_mask;
+        if (target_r != target_l) break;
+
+        uint64_t meta_r = (uint64_t(sorted_t1[r].meta_hi) << 32)
+                        | uint64_t(sorted_t1[r].meta_lo);
+
+        // pairing_t2: AES pairing(meta_l, meta_r, extra_rounds_bits=0)
+        Result128 res = pairing(keys, meta_l, meta_r, 0);
+
+        uint32_t test_result = res.r[3] & test_mask;
+        if (test_result != 0) continue;
+
+        uint32_t match_info_result = res.r[0] & info_mask;
+
+        // meta_result = (res.r[1] | res.r[2] << 32) & mask(2k); for k<=32 this is full 64
+        uint64_t meta_result_full = uint64_t(res.r[1]) | (uint64_t(res.r[2]) << 32);
+        uint64_t meta_result = (meta_bits == 64)
+                               ? meta_result_full
+                               : (meta_result_full & ((1ULL << meta_bits) - 1ULL));
+
+        // x_bits = ((meta_l >> k) >> half_k) << half_k | ((meta_r >> k) >> half_k)
+        uint32_t x_bits_l = static_cast<uint32_t>((meta_l >> k) >> half_k);
+        uint32_t x_bits_r = static_cast<uint32_t>((meta_r >> k) >> half_k);
+        uint32_t x_bits   = (x_bits_l << half_k) | x_bits_r;
+
+        unsigned long long out_idx = atomicAdd(out_count, 1ULL);
+        if (out_idx >= out_capacity) return;
+
+        T2PairingGpu p;
+        p.meta       = meta_result;
+        p.match_info = match_info_result;
+        p.x_bits     = x_bits;
+        out[out_idx] = p;
+    }
+}
+
+} // namespace
+
+cudaError_t launch_t2_match(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    T1PairingGpu const* d_sorted_t1,
+    uint64_t t1_count,
+    T2PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
+    if (params.strength < 2)            return cudaErrorInvalidValue;
+
+    uint32_t num_sections    = 1u << params.num_section_bits;
+    uint32_t num_match_keys  = 1u << params.num_match_key_bits;
+    uint32_t num_buckets     = num_sections * num_match_keys;
+
+    size_t needed = sizeof(uint64_t) * (num_buckets + 1);
+
+    if (d_temp_storage == nullptr) {
+        *temp_bytes = needed;
+        return cudaSuccess;
+    }
+    if (*temp_bytes < needed)        return cudaErrorInvalidValue;
+    if (!d_sorted_t1 || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+
+    auto* d_offsets = reinterpret_cast<uint64_t*>(d_temp_storage);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+
+    compute_bucket_offsets<<<1, 1, 0, stream>>>(
+        d_sorted_t1, t1_count,
+        params.num_match_target_bits,
+        num_buckets,
+        d_offsets);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    err = cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
+    if (err != cudaSuccess) return err;
+
+    std::vector<uint64_t> h_offsets(num_buckets + 1);
+    err = cudaMemcpyAsync(h_offsets.data(), d_offsets,
+                          sizeof(uint64_t) * (num_buckets + 1),
+                          cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) return err;
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) return err;
+
+    uint32_t target_mask = (params.num_match_target_bits >= 32)
+                            ? 0xFFFFFFFFu
+                            : ((1u << params.num_match_target_bits) - 1u);
+    int num_test_bits = params.num_match_key_bits; // = strength
+    int num_info_bits = params.k;
+    int half_k        = params.k / 2;
+
+    constexpr int kThreads = 256;
+
+    for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
+        uint32_t section_r = matching_section(section_l, params.num_section_bits);
+        uint64_t l_start = h_offsets[section_l * num_match_keys];
+        uint64_t l_end   = h_offsets[(section_l + 1) * num_match_keys];
+        if (l_end <= l_start) continue;
+        uint64_t l_count = l_end - l_start;
+
+        uint64_t blocks_u64 = (l_count + kThreads - 1) / kThreads;
+        if (blocks_u64 > UINT_MAX) return cudaErrorInvalidValue;
+        unsigned blocks = static_cast<unsigned>(blocks_u64);
+
+        for (uint32_t match_key_r = 0; match_key_r < num_match_keys; ++match_key_r) {
+            uint64_t r_start = h_offsets[section_r * num_match_keys + match_key_r];
+            uint64_t r_end   = h_offsets[section_r * num_match_keys + match_key_r + 1];
+            if (r_end <= r_start) continue;
+
+            match_one_bucket<<<blocks, kThreads, 0, stream>>>(
+                keys, d_sorted_t1,
+                l_start, l_end,
+                r_start, r_end,
+                match_key_r,
+                params.k,
+                target_mask,
+                num_test_bits,
+                num_info_bits,
+                half_k,
+                d_out_pairings,
+                reinterpret_cast<unsigned long long*>(d_out_count),
+                capacity);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) return err;
+        }
+    }
+    return cudaSuccess;
 }
 
 } // namespace pos2gpu

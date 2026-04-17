@@ -92,10 +92,10 @@ add_executable(t1_debug tools/parity/t1_debug.cu)
 target_link_libraries(t1_debug PRIVATE pos2_gpu_host)
 set_target_properties(t1_debug PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
-add_executable(t2_parity tools/parity/t2_parity.cpp)
+add_executable(t2_parity tools/parity/t2_parity.cu)
 target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
 
-add_executable(t3_parity tools/parity/t3_parity.cpp)
+add_executable(t3_parity tools/parity/t3_parity.cu)
 target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
 
 # Group binaries under build/tools/...
