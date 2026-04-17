@@ -45,4 +45,17 @@ cudaError_t launch_construct_xs(
     size_t* temp_bytes,
     cudaStream_t stream = nullptr);
 
+// Optional callback fired between the gen kernel and the sort, useful for
+// per-stage cudaEvent timing. Pass nullptr to skip.
+cudaError_t launch_construct_xs_profiled(
+    uint8_t const* plot_id_bytes,
+    int k,
+    bool testnet,
+    XsCandidateGpu* d_out,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    cudaEvent_t after_gen,    // nullable; recorded after gen kernel queued
+    cudaEvent_t after_sort,   // nullable; recorded after sort queued
+    cudaStream_t stream = nullptr);
+
 } // namespace pos2gpu

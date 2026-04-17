@@ -35,11 +35,15 @@ __global__ void gen_kernel(
     int k,
     uint32_t xor_const)
 {
+    __shared__ uint32_t sT[4 * 256];
+    load_aes_tables_smem(sT);
+    __syncthreads();
+
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= total) return;
     uint32_t x = static_cast<uint32_t>(idx);
     uint32_t mixed = x ^ xor_const;
-    keys_out[idx] = g_x(keys, mixed, k, kAesGRounds);
+    keys_out[idx] = g_x_smem(keys, mixed, k, sT, kAesGRounds);
     vals_out[idx] = x;
 }
 
@@ -93,12 +97,24 @@ ScratchLayout layout_for(uint64_t total, size_t cub_bytes)
 } // namespace
 
 cudaError_t launch_construct_xs(
+    uint8_t const* plot_id_bytes, int k, bool testnet,
+    XsCandidateGpu* d_out, void* d_temp_storage, size_t* temp_bytes,
+    cudaStream_t stream)
+{
+    return launch_construct_xs_profiled(plot_id_bytes, k, testnet,
+                                        d_out, d_temp_storage, temp_bytes,
+                                        nullptr, nullptr, stream);
+}
+
+cudaError_t launch_construct_xs_profiled(
     uint8_t const* plot_id_bytes,
     int k,
     bool testnet,
     XsCandidateGpu* d_out,
     void* d_temp_storage,
     size_t* temp_bytes,
+    cudaEvent_t after_gen,
+    cudaEvent_t after_sort,
     cudaStream_t stream)
 {
     if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
@@ -144,6 +160,7 @@ cudaError_t launch_construct_xs(
     gen_kernel<<<blocks, kThreads, 0, stream>>>(keys, keys_a, vals_a, total, k, xor_const);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
+    if (after_gen) cudaEventRecord(after_gen, stream);
 
     // Phase 2: stable radix sort by (key low k bits)
     cub::DoubleBuffer<uint32_t> keys_buf(keys_a, keys_b);
@@ -157,6 +174,7 @@ cudaError_t launch_construct_xs(
     // Phase 3: pack the side CUB ended up writing into d_out
     pack_kernel<<<blocks, kThreads, 0, stream>>>(
         keys_buf.Current(), vals_buf.Current(), d_out, total);
+    if (after_sort) cudaEventRecord(after_sort, stream);
     return cudaGetLastError();
 }
 

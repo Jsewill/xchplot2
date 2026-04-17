@@ -178,10 +178,16 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
                               nullptr, nullptr, &xs_temp_bytes));
     d_xs_temp = nullptr;
     CHECK(cudaMalloc(&d_xs_temp, xs_temp_bytes));
-    int p_xs = begin_phase("Xs (g_x + sort)");
-    CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              d_xs, d_xs_temp, &xs_temp_bytes, stream));
-    end_phase(p_xs);
+    cudaEvent_t e_xs_start = nullptr, e_xs_gen_done = nullptr, e_xs_sort_done = nullptr;
+    if (cfg.profile) {
+        cudaEventCreate(&e_xs_start);
+        cudaEventCreate(&e_xs_gen_done);
+        cudaEventCreate(&e_xs_sort_done);
+        cudaEventRecord(e_xs_start, stream);
+    }
+    CHECK(launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                                       d_xs, d_xs_temp, &xs_temp_bytes,
+                                       e_xs_gen_done, e_xs_sort_done, stream));
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
@@ -370,6 +376,20 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
     }
     end_phase(p_d2h);
     dfree(d_t3); dfree(d_t3_count); dfree(d_frags_out);
+
+    // Inject Xs gen / sort timings before reporting (avoids the double-event
+    // ownership headache by handling them out-of-band here).
+    if (cfg.profile) {
+        cudaDeviceSynchronize();
+        float gen_ms = 0, sort_ms = 0;
+        cudaEventElapsedTime(&gen_ms,  e_xs_start,    e_xs_gen_done);
+        cudaEventElapsedTime(&sort_ms, e_xs_gen_done, e_xs_sort_done);
+        std::fprintf(stderr, "  %-30s %8.2f ms\n", "Xs gen (g_x)", gen_ms);
+        std::fprintf(stderr, "  %-30s %8.2f ms\n", "Xs sort", sort_ms);
+        cudaEventDestroy(e_xs_start);
+        cudaEventDestroy(e_xs_gen_done);
+        cudaEventDestroy(e_xs_sort_done);
+    }
 
     report_phases();
     return result;
