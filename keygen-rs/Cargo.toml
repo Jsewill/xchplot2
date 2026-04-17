@@ -1,0 +1,18 @@
+[package]
+name = "pos2_keygen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+chia = "0.42"
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"

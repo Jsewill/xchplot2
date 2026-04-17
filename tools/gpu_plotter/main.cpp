@@ -4,12 +4,17 @@
 
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
+#include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -27,6 +32,18 @@ void print_usage(char const* prog)
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
+        << "  " << prog << " plot --k K --num N --farmer-pk HEX\n"
+        << "         ( --pool-pk HEX | --pool-ph HEX )\n"
+        << "         [--strength S] [--out DIR] [--testnet] [--seed HEX] [-v]\n"
+        << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
+        << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
+        << "    --farmer-pk HEX  : 96 hex chars (48 B G1 public key).\n"
+        << "    --pool-pk HEX    : 96 hex chars. Pool public key mode.\n"
+        << "    --pool-ph HEX    : 64 hex chars (raw puzzle hash). NFT pool mode.\n"
+        << "    --num N          : number of plots to create.\n"
+        << "    --seed HEX       : optional 64 hex chars of master-SK entropy for\n"
+        << "                       the first plot; subsequent plots advance the seed\n"
+        << "                       deterministically. Defaults to /dev/urandom.\n"
         << "\n"
         << "    <k>            : even integer in [18, 32]\n"
         << "    <plot_id_hex>  : 64 hex characters\n"
@@ -80,6 +97,31 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
     return true;
 }
 
+// Read exactly `n` bytes of entropy from /dev/urandom. Throws on failure.
+void read_urandom(uint8_t* out, size_t n)
+{
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open /dev/urandom");
+    f.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
+    if (f.gcount() != static_cast<std::streamsize>(n)) {
+        throw std::runtime_error("short read from /dev/urandom");
+    }
+}
+
+std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
+{
+    // Match chia plots create's v2 filename scheme: plot-k{size}-{id}.plot2
+    static char const hex[] = "0123456789abcdef";
+    std::string out = "plot-k" + std::to_string(k) + "-";
+    out.reserve(out.size() + 64 + 6);
+    for (uint8_t b : plot_id) {
+        out += hex[b >> 4];
+        out += hex[b & 0xF];
+    }
+    out += ".plot2";
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -110,6 +152,137 @@ int main(int argc, char* argv[])
             return 0;
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    if (mode == "plot") {
+        // Standalone farmable-plot path: derive plot_id + memo internally.
+        int k = 28;
+        int strength = 2;
+        int num = 1;
+        bool testnet = false;
+        bool verbose = false;
+        std::string out_dir = ".";
+        std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            auto need = [&](int more) -> bool {
+                if (i + more >= argc) {
+                    std::cerr << "Error: " << a << " requires " << more << " arg(s)\n";
+                    return false;
+                }
+                return true;
+            };
+            if (a == "--k"          && need(1)) k        = std::atoi(argv[++i]);
+            else if (a == "--num"   && need(1)) num      = std::atoi(argv[++i]);
+            else if (a == "--strength"  && need(1)) strength = std::atoi(argv[++i]);
+            else if (a == "--out"       && need(1)) out_dir  = argv[++i];
+            else if (a == "--farmer-pk" && need(1)) farmer_pk_hex = argv[++i];
+            else if (a == "--pool-pk"   && need(1)) pool_pk_hex   = argv[++i];
+            else if (a == "--pool-ph"   && need(1)) pool_ph_hex   = argv[++i];
+            else if (a == "--testnet")  testnet = true;
+            else if (a == "-v" || a == "--verbose") verbose = true;
+            else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+
+        if (farmer_pk_hex.empty()) {
+            std::cerr << "Error: --farmer-pk is required\n";
+            return 1;
+        }
+        if (pool_pk_hex.empty() == pool_ph_hex.empty()) {
+            std::cerr << "Error: exactly one of --pool-pk or --pool-ph is required\n";
+            return 1;
+        }
+        if (num < 1) {
+            std::cerr << "Error: --num must be >= 1\n";
+            return 1;
+        }
+
+        std::vector<uint8_t> farmer_pk;
+        if (!parse_hex_bytes(farmer_pk_hex, farmer_pk) || farmer_pk.size() != 48) {
+            std::cerr << "Error: --farmer-pk must be 96 hex chars (48 bytes)\n";
+            return 1;
+        }
+
+        std::vector<uint8_t> pool_key;
+        int pool_kind;
+        if (!pool_pk_hex.empty()) {
+            if (!parse_hex_bytes(pool_pk_hex, pool_key) || pool_key.size() != 48) {
+                std::cerr << "Error: --pool-pk must be 96 hex chars (48 bytes)\n";
+                return 1;
+            }
+            pool_kind = POS2_POOL_PK;
+        } else {
+            if (!parse_hex_bytes(pool_ph_hex, pool_key) || pool_key.size() != 32) {
+                std::cerr << "Error: --pool-ph must be 64 hex chars (32 bytes)\n";
+                return 1;
+            }
+            pool_kind = POS2_POOL_PH;
+        }
+
+        try {
+            std::vector<pos2gpu::BatchEntry> entries;
+            entries.reserve(static_cast<size_t>(num));
+            for (int i = 0; i < num; ++i) {
+                // Fresh 32 bytes of entropy per plot so each plot has an
+                // independent master secret key.
+                uint8_t seed[32];
+                read_urandom(seed, sizeof(seed));
+
+                uint8_t plot_id[32];
+                std::vector<uint8_t> memo(128); // max across pool_pk / pool_ph modes
+                size_t memo_len = memo.size();
+                int rc = pos2_keygen_derive_plot(
+                    seed, sizeof(seed),
+                    farmer_pk.data(),
+                    pool_key.data(), pool_kind,
+                    static_cast<uint8_t>(strength),
+                    static_cast<uint16_t>(0),  // plot_index — TODO plumb through
+                    static_cast<uint8_t>(0),   // meta_group
+                    plot_id,
+                    memo.data(), &memo_len);
+                if (rc != POS2_OK) {
+                    std::cerr << "Error: pos2_keygen_derive_plot failed (rc=" << rc << ")\n";
+                    return 2;
+                }
+                memo.resize(memo_len);
+
+                pos2gpu::BatchEntry e;
+                e.k          = k;
+                e.strength   = strength;
+                e.plot_index = 0;
+                e.meta_group = 0;
+                e.testnet    = testnet;
+                std::copy(plot_id, plot_id + 32, e.plot_id.begin());
+                e.memo       = std::move(memo);
+                e.out_dir    = out_dir;
+                e.out_name   = plot_id_to_filename(k, e.plot_id);
+                entries.push_back(std::move(e));
+
+                if (verbose) {
+                    std::cerr << "[plot] prepared " << (i + 1) << "/" << num
+                              << " " << e.out_name << "\n";
+                }
+            }
+
+            auto res = pos2gpu::run_batch(entries, verbose);
+            double per = res.plots_written
+                ? res.total_wall_seconds / double(res.plots_written) : 0;
+            std::cerr << "[plot] wrote " << res.plots_written << " plots in "
+                      << res.total_wall_seconds << " s ("
+                      << per << " s/plot)\n";
+            for (auto const& e : entries) {
+                std::cout << out_dir << "/" << e.out_name << "\n";
+            }
+            return 0;
+        } catch (std::exception const& e) {
+            std::cerr << "[plot] FAILED: " << e.what() << "\n";
             return 2;
         }
     }

@@ -74,9 +74,53 @@ add_library(pos2_gpu_host STATIC
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
 
+# ----------------------------------------------------------------------------
+# pos2_keygen — Rust staticlib that wraps chia-rs (BLS + compute_plot_id_v2)
+# so the standalone plotter can derive v2 plot_ids + memos without the chia
+# Python toolchain.
+#
+# Built via cargo in keygen-rs/. We shell out to cargo from a custom_command
+# rather than taking the Corrosion dependency, to keep the build system
+# self-contained.
+# ----------------------------------------------------------------------------
+set(POS2_KEYGEN_CRATE_DIR "${CMAKE_SOURCE_DIR}/keygen-rs")
+set(POS2_KEYGEN_TARGET_DIR "${CMAKE_BINARY_DIR}/keygen-rs-target")
+set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/libpos2_keygen.a")
+
+# Collect the sources so CMake knows when to rebuild.
+file(GLOB_RECURSE POS2_KEYGEN_SRCS
+    "${POS2_KEYGEN_CRATE_DIR}/src/*.rs"
+    "${POS2_KEYGEN_CRATE_DIR}/Cargo.toml"
+    "${POS2_KEYGEN_CRATE_DIR}/Cargo.lock"
+)
+
+add_custom_command(
+    OUTPUT "${POS2_KEYGEN_STATIC_LIB}"
+    COMMAND ${CMAKE_COMMAND} -E env
+            CARGO_TARGET_DIR=${POS2_KEYGEN_TARGET_DIR}
+            cargo build --release --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
+    DEPENDS ${POS2_KEYGEN_SRCS}
+    WORKING_DIRECTORY "${POS2_KEYGEN_CRATE_DIR}"
+    COMMENT "cargo build --release (pos2_keygen Rust shim)"
+    VERBATIM
+)
+add_custom_target(pos2_keygen_build DEPENDS "${POS2_KEYGEN_STATIC_LIB}")
+
+add_library(pos2_keygen STATIC IMPORTED GLOBAL)
+set_target_properties(pos2_keygen PROPERTIES
+    IMPORTED_LOCATION "${POS2_KEYGEN_STATIC_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${POS2_KEYGEN_CRATE_DIR}/include"
+)
+add_dependencies(pos2_keygen pos2_keygen_build)
+
+# Rust staticlibs link in std, which needs these system libs at final link.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(pos2_keygen INTERFACE pthread dl m)
+endif()
+
 # CLI: gpu_plotter
 add_executable(gpu_plotter tools/gpu_plotter/main.cpp)
-target_link_libraries(gpu_plotter PRIVATE pos2_gpu_host)
+target_link_libraries(gpu_plotter PRIVATE pos2_gpu_host pos2_keygen)
 
 # Parity tests
 add_executable(aes_parity tools/parity/aes_parity.cu)
