@@ -134,6 +134,13 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 
     cudaStream_t stream = nullptr; // default stream
 
+    // Pre-allocate the pinned destination buffer for the final D2H copy.
+    // cudaMallocHost on multi-GB pinned blocks is expensive (~600ms for 2GB)
+    // because it page-locks RAM. Doing it up-front lets the cost overlap
+    // with the GPU work for Xs/T1/T2 (~1.3s).
+    uint64_t* h_pinned_t3 = nullptr;
+    CHECK(cudaMallocHost(&h_pinned_t3, sizeof(uint64_t) * cap));
+
     // ---- profiling: cudaEvent helpers ----
     struct PhaseTimer {
         cudaEvent_t start, stop;
@@ -363,19 +370,29 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
     }
     end_phase(p_t3_sort);
 
-    // Copy sorted T3 fragments to host
-    int p_d2h = begin_phase("D2H copy T3 fragments");
+    // Copy sorted T3 fragments to host via pinned memory (DMA directly,
+    // avoids CUDA's pageable-staging buffer that costs ~10x throughput).
+    int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
     GpuPipelineResult result;
     result.t1_count = t1_count;
     result.t2_count = t2_count;
     result.t3_count = t3_count;
-    result.t3_fragments.resize(t3_count);
+
     if (t3_count > 0) {
-        CHECK(cudaMemcpy(result.t3_fragments.data(), d_frags_out,
-                         sizeof(uint64_t) * t3_count, cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpyAsync(h_pinned_t3, d_frags_out,
+                              sizeof(uint64_t) * t3_count,
+                              cudaMemcpyDeviceToHost, stream));
+        CHECK(cudaStreamSynchronize(stream));
     }
     end_phase(p_d2h);
     dfree(d_t3); dfree(d_t3_count); dfree(d_frags_out);
+
+    // Move pinned data into the result vector at DDR bandwidth.
+    if (t3_count > 0) {
+        result.t3_fragments.resize(t3_count);
+        std::memcpy(result.t3_fragments.data(), h_pinned_t3, sizeof(uint64_t) * t3_count);
+    }
+    cudaFreeHost(h_pinned_t3);
 
     // Inject Xs gen / sort timings before reporting (avoids the double-event
     // ownership headache by handling them out-of-band here).
