@@ -89,6 +89,30 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
 
     pinned_bytes = cap * sizeof(uint64_t);
 
+    // Check free VRAM before attempting allocation so we can give a useful
+    // diagnostic instead of a generic cudaErrorMemoryAllocation. The margin
+    // covers CUDA driver/context state, CUB internal scratch, AES T-tables,
+    // and other small runtime allocations.
+    {
+        size_t const required_device =
+            storage_bytes + 2 * pair_bytes + sort_scratch_bytes + sizeof(uint64_t);
+        size_t const margin = 512ULL * 1024 * 1024; // 512 MB
+        size_t free_b = 0, total_b = 0;
+        POOL_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        if (free_b < required_device + margin) {
+            auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
+            throw std::runtime_error(
+                "GpuBufferPool: insufficient device VRAM for k=" +
+                std::to_string(k) + " strength=" + std::to_string(strength) +
+                "; need ~" + std::to_string(to_gib(required_device + margin)).substr(0, 5) +
+                " GiB (pool " + std::to_string(to_gib(required_device)).substr(0, 5) +
+                " GiB + ~0.5 GiB runtime), only " +
+                std::to_string(to_gib(free_b)).substr(0, 5) +
+                " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
+                " GiB total. Use a smaller k or a GPU with more VRAM.");
+        }
+    }
+
     if (getenv("POS2GPU_POOL_DEBUG")) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
