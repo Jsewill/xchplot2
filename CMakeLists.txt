@@ -51,6 +51,7 @@ add_library(pos2_gpu STATIC
     src/gpu/T1Kernel.cu
     src/gpu/T2Kernel.cu
     src/gpu/T3Kernel.cu
+    src/host/GpuPipeline.cu
 )
 target_include_directories(pos2_gpu PUBLIC
     src

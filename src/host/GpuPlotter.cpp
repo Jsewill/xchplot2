@@ -4,6 +4,7 @@
 // so we always end on the CPU regardless.
 
 #include "host/GpuPlotter.hpp"
+#include "host/GpuPipeline.hpp"
 
 // pos2-chip headers (relative include surface set in CMake).
 #include "plot/Plotter.hpp"
@@ -48,19 +49,44 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     }
 
     initialize_aes_tables();
-    warn_if_gpu_requested_but_unimplemented(opts);
+
+    bool const all_gpu = (opts.t1 == PhaseStrategy::Gpu)
+                      && (opts.t2 == PhaseStrategy::Gpu)
+                      && (opts.t3 == PhaseStrategy::Gpu);
+
+    if (!all_gpu) {
+        warn_if_gpu_requested_but_unimplemented(opts);
+    }
 
     ProofParams params(opts.plot_id.data(),
                        static_cast<uint8_t>(opts.k),
                        static_cast<uint8_t>(opts.strength),
                        opts.testnet ? uint8_t{1} : uint8_t{0});
 
-    Plotter::Options plotter_opts{};
-    plotter_opts.validate = false;
-    plotter_opts.verbose = opts.verbose;
-
-    Plotter plotter(params);
-    PlotData plot = plotter.run(plotter_opts);
+    PlotData plot;
+    if (all_gpu) {
+        // Run the full pipeline on GPU; hand the sorted T3 fragments to
+        // the CPU PlotFile writer for FSE compression and serialization.
+        GpuPipelineConfig cfg;
+        cfg.plot_id  = opts.plot_id;
+        cfg.k        = opts.k;
+        cfg.strength = opts.strength;
+        cfg.testnet  = opts.testnet;
+        auto pr = run_gpu_pipeline(cfg);
+        plot.t3_proof_fragments = std::move(pr.t3_fragments);
+        if (opts.verbose) {
+            std::cerr << "[gpu_plotter] T1=" << pr.t1_count
+                      << " T2=" << pr.t2_count
+                      << " T3=" << pr.t3_count
+                      << " (all on GPU)\n";
+        }
+    } else {
+        Plotter::Options plotter_opts{};
+        plotter_opts.validate = false;
+        plotter_opts.verbose = opts.verbose;
+        Plotter plotter(params);
+        plot = plotter.run(plotter_opts);
+    }
 
     // Build output filename matching pos2-chip's plotter_main.cpp scheme.
     std::string plot_id_hex;
@@ -85,7 +111,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                                                    // real keys come via chia plots create
     PlotFile::writeData(full_path.string(),
                         plot,
-                        plotter.getProofParams(),
+                        params,
                         static_cast<uint16_t>(opts.plot_index),
                         static_cast<uint8_t>(opts.meta_group),
                         std::span<uint8_t const>(stub_memo.data(), stub_memo.size()));
