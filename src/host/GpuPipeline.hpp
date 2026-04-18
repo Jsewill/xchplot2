@@ -12,7 +12,7 @@
 //
 // Implementation in src/host/GpuPipeline.cu (CUDA TU). This header is
 // intentionally CUDA-free so plain .cpp consumers (GpuPlotter.cpp,
-// gpu_plotter/main.cpp) can include it without dragging in nvcc.
+// xchplot2/main.cpp) can include it without dragging in nvcc.
 
 #pragma once
 

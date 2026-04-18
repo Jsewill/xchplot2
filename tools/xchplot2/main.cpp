@@ -1,6 +1,10 @@
-// gpu_plotter — CLI wrapper around pos2gpu::plot_to_file. Mirrors
-// pos2-chip/src/tools/plotter/plotter_main.cpp's argument surface so it
-// can be substituted in scripts.
+// xchplot2 — standalone Chia v2 plot creator on GPU. Three modes:
+//   test  : low-level single-plot harness (caller supplies plot_id + memo).
+//   batch : drive a TSV manifest of pre-computed plots through the GPU
+//           pipeline with producer/consumer staggering.
+//   plot  : full standalone — derives plot_id + memo from caller-supplied
+//           BLS keys via the keygen-rs Rust shim, then dispatches through
+//           batch internally. The "real" entrypoint for users.
 
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"

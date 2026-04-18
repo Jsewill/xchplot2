@@ -118,9 +118,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
 endif()
 
-# CLI: gpu_plotter
-add_executable(gpu_plotter tools/gpu_plotter/main.cpp)
-target_link_libraries(gpu_plotter PRIVATE pos2_gpu_host pos2_keygen)
+# CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
+add_executable(xchplot2 tools/xchplot2/main.cpp)
+target_link_libraries(xchplot2 PRIVATE pos2_gpu_host pos2_keygen)
 
 # Parity tests
 add_executable(aes_parity tools/parity/aes_parity.cu)
@@ -146,7 +146,7 @@ add_executable(t3_parity tools/parity/t3_parity.cu)
 target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
 
 # Group binaries under build/tools/...
-set_target_properties(gpu_plotter PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/gpu_plotter")
+set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
 foreach(t aes_parity xs_parity xs_bench t1_parity t2_parity t3_parity)
     set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 endforeach()

@@ -30,7 +30,7 @@ namespace {
 void warn_if_gpu_requested_but_unimplemented(GpuPlotOptions const& o)
 {
     auto warn = [&](char const* phase) {
-        std::cerr << "[gpu_plotter] WARNING: " << phase
+        std::cerr << "[xchplot2] WARNING: " << phase
                   << " GPU path not implemented yet — falling back to CPU.\n";
     };
     if (o.t1 == PhaseStrategy::Gpu) warn("T1");
@@ -82,7 +82,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         pr = run_gpu_pipeline(cfg);
         fragments = pr.fragments();
         if (opts.verbose) {
-            std::cerr << "[gpu_plotter] T1=" << pr.t1_count
+            std::cerr << "[xchplot2] T1=" << pr.t1_count
                       << " T2=" << pr.t2_count
                       << " T3=" << pr.t3_count
                       << " (all on GPU)\n";
@@ -99,7 +99,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
 
     // Build output filename. Caller may override via opts.out_name (used
     // by chia plots create --gpu to match its naming convention). Default
-    // is the legacy gpu_plotter test scheme.
+    // is the legacy xchplot2 test scheme.
     std::string filename;
     if (!opts.out_name.empty()) {
         filename = opts.out_name;

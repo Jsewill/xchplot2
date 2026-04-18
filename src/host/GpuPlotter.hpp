@@ -32,7 +32,7 @@ struct GpuPlotOptions {
     std::vector<uint8_t> memo;
 
     // If non-empty, used as the output filename (basename only — joined to
-    // output_dir). Otherwise the legacy gpu_plotter test naming is used.
+    // output_dir). Otherwise the legacy xchplot2 test naming is used.
     std::string out_name;
 
     PhaseStrategy t1 = PhaseStrategy::Cpu;

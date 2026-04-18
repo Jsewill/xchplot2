@@ -35,7 +35,7 @@ struct BatchResult {
     double total_wall_seconds = 0.0;
 };
 
-// Parse a manifest file in the format described in tools/gpu_plotter/main.cpp
+// Parse a manifest file in the format described in tools/xchplot2/main.cpp
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
 std::vector<BatchEntry> parse_manifest(std::string const& path);
 
