@@ -1,97 +1,110 @@
-# pos2-gpu
+# xchplot2
 
-GPU plotter for Chia PoS2 (CHIP-48), built on top of the
-[pos2-chip](../pos2-chip) reference implementation.
+GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
+`.plot2` files at the GPU compute floor — **~2.68 s/plot at k=28
+strength=2 on an RTX 4090**, byte-identical to the
+[pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference and
+to `chia plots create --v2`.
 
-## Status — first-cut scaffold
+## Performance
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| AES core (`AesHashGpu`) | Implemented | T-table AES round on device; mirrors `_mm_aesenc_si128` semantics. **Must pass `aes_parity` before anything else is trusted.** |
-| T1 GPU kernel | Skeleton | F1 / `g_x` parallelised; matching deferred to CPU helper until parity confirmed. |
-| T2 GPU kernel | Skeleton | CUB radix sort wired; matching predicate parked at TODO. |
-| T3 GPU kernel | Skeleton | Same shape as T2; second AES pass + bit-drop TODO. |
-| `gpu_plotter` CLI | Builds | Mirrors `plotter test <k> <plot_id> ...` arg surface; falls back to CPU per phase via flags. |
-| Parity tests | Stubs | `aes_parity`, `t1_parity`, `t2_parity`, `t3_parity` — start with `aes_parity`. |
+k=28, strength=2, on an RTX 4090, sm_89:
 
-**Correctness gate:** every GPU phase must be byte-for-byte equal to the
-CPU reference for a fixed `(plot_id, k, strength)` before it ships. PoS2
-is consensus-critical — there are no acceptable shortcuts.
+| Mode | Per-plot wall |
+|------|---------------|
+| pos2-chip CPU baseline | ~50 s |
+| `xchplot2 plot --num 1` | ~3.6 s |
+| `xchplot2 plot --num 10` (steady-state batch) | **2.68 s** |
+| Theoretical floor (kernel-time only) | 2.69 s |
+
+The pipeline sits at the GPU compute floor — further gains require
+kernel algorithm work, not orchestration.
 
 ## Build
 
 Requires:
 
-- CUDA Toolkit 12+ (tested 13.x at `/opt/cuda`)
-- C++20 compiler (g++ ≥ 11 or clang++ ≥ 14)
+- CUDA Toolkit 12+ with C++20 nvcc (tested on 13.x)
+- C++20 host compiler (g++ ≥ 11 or clang++ ≥ 14)
 - CMake ≥ 3.24
-- pos2-chip checked out at `../pos2-chip` relative to this directory
+- Rust toolchain (`rustc` / `cargo`) — only at build time, for `keygen-rs`
 
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CUDA_ARCHITECTURES=89   # 89 = sm_89 = RTX 4090; adjust per GPU
+      -DCMAKE_CUDA_ARCHITECTURES=89   # 89 = sm_89 / RTX 4090; adjust per GPU
 cmake --build build -j
 ```
 
+`pos2-chip` is auto-fetched into `third_party/pos2-chip` at configure
+time (pinned to a specific commit). Override with
+`-DPOS2_CHIP_DIR=/abs/path/to/pos2-chip` if you want to point at a local
+checkout.
+
 Produces:
 
-- `build/tools/gpu_plotter/gpu_plotter`
-- `build/tools/parity/aes_parity`
-- `build/tools/parity/t1_parity`
-- `build/tools/parity/t2_parity`
-- `build/tools/parity/t3_parity`
+- `build/tools/xchplot2/xchplot2`
+- `build/tools/parity/{aes,xs,t1,t2,t3}_parity` — CPU↔GPU bit-exactness tests
 
-## Run order (testing)
+## Use
 
-1. `./build/tools/parity/aes_parity` — confirms GPU AES round produces the same
-   state as CPU `_mm_aesenc_si128` for a deterministic input set. **Must pass.**
-2. `./build/tools/parity/t1_parity` — confirms GPU T1 output matches CPU T1
-   for `(plot_id = 0xab × 32, k = 18, strength = 2)`.
-3. `./build/tools/parity/t2_parity`
-4. `./build/tools/parity/t3_parity`
-5. `./build/tools/gpu_plotter/gpu_plotter test 18 <plot_id_hex> 2` —
-   produces a `.plot2` file. Cross-check with `pos2-chip/build/.../prover check`.
+### Standalone (farmable plots)
+
+```bash
+xchplot2 plot --k 28 --num 10 \
+    --farmer-pk    <96 hex chars> \
+    --pool-contract-address xch1...      \
+    --out          /mnt/plots
+```
+
+Other pool flavours: `--pool-pk <hex>` (96 hex), `--pool-ph <hex>`
+(64 hex). Optional: `--strength S`, `--testnet`, `--seed <64 hex>` for
+reproducible runs, `--plot-index N`, `--meta-group N`.
+
+### Lower-level subcommands
+
+```bash
+xchplot2 test  <k> <plot_id_hex> [strength] ...   # single plot, raw inputs
+xchplot2 batch <manifest.tsv> [-v]                # batched, raw inputs
+```
 
 ## Architecture
 
 ```
-                pos2-chip (reference, header-only)
-                ├── src/pos/aes/AesHash.hpp      <-- mirrored on GPU
-                ├── src/pos/ProofParams.hpp      <-- shared
-                ├── src/plot/Plotter.hpp         <-- CPU pipeline (fallback)
-                └── src/plot/TableConstructor*   <-- T1/T2/T3 reference
-
-                pos2-gpu (this repo)
-                ├── src/gpu/AesGpu.cuh           AES T-table device functions
-                ├── src/gpu/AesHashGpu.cuh       AesHash mirror (g_x, pairing, chain)
-                ├── src/gpu/T1Kernel.cu          T1 generation kernel
-                ├── src/gpu/T2Kernel.cu          T2 sort + match
-                ├── src/gpu/T3Kernel.cu          T3 sort + AES + bit-drop
-                ├── src/host/GpuPlotter.hpp      Host orchestration
-                ├── tools/gpu_plotter/main.cpp   CLI
-                └── tools/parity/                CPU↔GPU bit-exactness tests
+xchplot2 (this repo)
+├── src/gpu/                  CUDA kernels — AES, Xs, T1, T2, T3
+├── src/host/
+│   ├── GpuPipeline.{hpp,cu}  end-to-end Xs → T1 → T2 → T3 orchestration
+│   ├── GpuBufferPool         persistent device + 2× pinned host pool
+│   ├── BatchPlotter          producer / consumer batch driver
+│   └── PlotFileWriterParallel sole TU touching pos2-chip headers
+│                              (parallel FSE compress + write)
+├── tools/xchplot2/main.cpp   CLI: test / batch / plot
+├── tools/parity/             CPU↔GPU bit-exactness tests
+└── keygen-rs/                Rust staticlib over chia-rs:
+                                 plot_id_v2, BLS HD derivation,
+                                 bech32m address decode
 ```
 
-The GPU phases are designed to be **drop-in replaceable** with the CPU
-implementation. `GpuPlotter` exposes per-phase flags so you can run e.g.
-T1-on-GPU + T2/T3-on-CPU while debugging.
+## VRAM requirements
 
-## What stays on CPU
+PoS2 plots are k=28 by spec. The persistent buffer pool needs **~15 GB
+of device VRAM**, so a 16 GB or larger card is required (RTX 4080 /
+4090 / 5080 / 5090, A6000, etc.). `xchplot2` queries `cudaMemGetInfo`
+at startup and refuses with an actionable error if the pool won't fit.
 
-- FSE entropy compression (`ChunkCompressor.hpp`) — serial.
-- `PlotFile::writeData` — disk I/O.
-- `ProofParams` construction, `ProofValidator`, all framing.
+## Acknowledgments
 
-## What's not done yet
-
-- Full bit-exact T1/T2/T3 kernels. The match/pairing/bit-drop logic in
-  `TableConstructor*Generic.hpp` is hundreds of lines and needs to be
-  ported with care. This scaffold establishes the build, the AES core,
-  and the harness — the actual phase ports are clearly-marked TODOs.
-- Multi-GPU sharding.
-- Direct-IO plot file writer.
-- Strength > 2 hot-paths (current plan is to validate at strength=2 first).
+Built collaboratively with [Claude](https://claude.ai/code) (Anthropic),
+acting as a pair-programmer under human direction. Co-author lines on
+the relevant commits make the split explicit.
 
 ## License
 
-Apache-2.0 (matching pos2-chip).
+[MIT](LICENSE).
+
+Depends on (built/fetched separately, not vendored):
+
+- `pos2-chip` — Apache-2.0, fetched via CMake `FetchContent`.
+- `chia` 0.42 (chia-bls, chia-protocol, chia-sha2) — Apache-2.0, via
+  cargo.
+- `bech32` 0.11 — MIT, via cargo.
