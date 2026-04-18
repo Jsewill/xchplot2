@@ -1,16 +1,16 @@
 // GpuPlotter.cpp — orchestrates per-phase CPU/GPU strategy. For any
 // phase not yet implemented on GPU, dispatches to the pos2-chip CPU
-// reference. The CPU plotter writes the final plot file via PlotFile,
-// so we always end on the CPU regardless.
+// reference (via run_cpu_plotter_to_fragments in PlotFileWriterParallel.cpp).
+// We then call write_plot_file_parallel for the FSE compression and
+// serialization, regardless of which path produced the fragments.
+//
+// Deliberately includes NO pos2-chip headers — those all live behind
+// PlotFileWriterParallel.{hpp,cpp} so that one .cpp is the sole TU
+// pulling soft_aes.hpp into the link.
 
 #include "host/GpuPlotter.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
-
-// pos2-chip headers (relative include surface set in CMake).
-#include "plot/Plotter.hpp"
-#include "plot/PlotFile.hpp"
-#include "pos/ProofParams.hpp"
 
 namespace pos2gpu {
 // Host-callable, defined in src/gpu/AesGpu.cu. We forward-declare here so
@@ -22,6 +22,7 @@ void initialize_aes_tables();
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace pos2gpu {
 
@@ -59,16 +60,11 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
         warn_if_gpu_requested_but_unimplemented(opts);
     }
 
-    ProofParams params(opts.plot_id.data(),
-                       static_cast<uint8_t>(opts.k),
-                       static_cast<uint8_t>(opts.strength),
-                       opts.testnet ? uint8_t{1} : uint8_t{0});
-
     // Either path produces a vector of ProofFragments we pass to the writer
     // as a span. GPU path owns via GpuPipelineResult::t3_fragments_storage;
-    // CPU path owns via PlotData::t3_proof_fragments.
-    PlotData plot;
+    // CPU path owns via cpu_fragments below.
     GpuPipelineResult pr;
+    std::vector<uint64_t> cpu_fragments;
     std::span<uint64_t const> fragments;
     if (all_gpu) {
         // Run the full pipeline on GPU; hand the sorted T3 fragments to
@@ -88,13 +84,14 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                       << " (all on GPU)\n";
         }
     } else {
-        Plotter::Options plotter_opts{};
-        plotter_opts.validate = false;
-        plotter_opts.verbose = opts.verbose;
-        Plotter plotter(params);
-        plot = plotter.run(plotter_opts);
-        fragments = std::span<uint64_t const>(plot.t3_proof_fragments.data(),
-                                              plot.t3_proof_fragments.size());
+        cpu_fragments = run_cpu_plotter_to_fragments(
+            opts.plot_id.data(),
+            static_cast<uint8_t>(opts.k),
+            static_cast<uint8_t>(opts.strength),
+            opts.testnet ? uint8_t{1} : uint8_t{0},
+            opts.verbose);
+        fragments = std::span<uint64_t const>(cpu_fragments.data(),
+                                              cpu_fragments.size());
     }
 
     // Build output filename. Caller may override via opts.out_name (used
@@ -136,7 +133,10 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     }
     write_plot_file_parallel(full_path.string(),
                              fragments,
-                             params,
+                             opts.plot_id.data(),
+                             static_cast<uint8_t>(opts.k),
+                             static_cast<uint8_t>(opts.strength),
+                             opts.testnet ? uint8_t{1} : uint8_t{0},
                              static_cast<uint16_t>(opts.plot_index),
                              static_cast<uint8_t>(opts.meta_group),
                              std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));

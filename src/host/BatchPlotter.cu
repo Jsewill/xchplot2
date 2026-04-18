@@ -5,8 +5,7 @@
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 
-#include "plot/PlotData.hpp"
-#include "pos/ProofParams.hpp"
+// Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
 #include <algorithm>
 #include <atomic>
@@ -189,11 +188,6 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
         try {
             WorkItem item;
             while (chan.pop(item)) {
-                ProofParams params(item.entry.plot_id.data(),
-                                   static_cast<uint8_t>(item.entry.k),
-                                   static_cast<uint8_t>(item.entry.strength),
-                                   item.entry.testnet ? uint8_t{1} : uint8_t{0});
-
                 std::filesystem::create_directories(item.entry.out_dir);
                 auto full_path = std::filesystem::path(item.entry.out_dir) / item.entry.out_name;
 
@@ -204,7 +198,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
                 // producer is synchronised via the depth-1 channel so that
                 // slot won't be reused until we're done here.
                 write_plot_file_parallel(
-                    full_path.string(), item.result.fragments(), params,
+                    full_path.string(),
+                    item.result.fragments(),
+                    item.entry.plot_id.data(),
+                    static_cast<uint8_t>(item.entry.k),
+                    static_cast<uint8_t>(item.entry.strength),
+                    item.entry.testnet ? uint8_t{1} : uint8_t{0},
                     static_cast<uint16_t>(item.entry.plot_index),
                     static_cast<uint8_t>(item.entry.meta_group),
                     std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));

@@ -15,14 +15,38 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
-# Locate pos2-chip relative to this repo. Override with -DPOS2_CHIP_DIR=/path
+# pos2-chip dependency.
+#
+# Default behavior: FetchContent auto-clones Chia-Network/pos2-chip into
+# third_party/pos2-chip at configure time, pinned to a specific commit.
+# We use FetchContent rather than `git submodule` because pos2-gpu was
+# created with SHA-256 object format and the upstream pos2-chip repo
+# uses SHA-1 — git refuses to mix the two within a submodule.
+#
+# Devs hacking on pos2-chip locally can override the default by passing
+# -DPOS2_CHIP_DIR=/abs/path/to/pos2-chip on the cmake command line; the
+# fetch is then skipped entirely.
+set(POS2_CHIP_GIT_TAG "0a69995b21a30ee201408300043336c8415e0b81"
+    CACHE STRING "pos2-chip commit / tag to fetch")
+
 if(NOT DEFINED POS2_CHIP_DIR)
-    set(POS2_CHIP_DIR "${CMAKE_SOURCE_DIR}/../pos2-chip" CACHE PATH "pos2-chip checkout")
+    include(FetchContent)
+    FetchContent_Declare(
+        pos2_chip
+        GIT_REPOSITORY https://github.com/Chia-Network/pos2-chip
+        GIT_TAG        ${POS2_CHIP_GIT_TAG}
+        SOURCE_DIR     "${CMAKE_SOURCE_DIR}/third_party/pos2-chip"
+        SOURCE_SUBDIR  ".no-cmakelists-here"   # suppress auto add_subdirectory
+    )
+    FetchContent_MakeAvailable(pos2_chip)
+    set(POS2_CHIP_DIR "${pos2_chip_SOURCE_DIR}")
 endif()
+
 if(NOT EXISTS "${POS2_CHIP_DIR}/src/pos/aes/AesHash.hpp")
     message(FATAL_ERROR
         "pos2-chip not found at ${POS2_CHIP_DIR}. "
-        "Pass -DPOS2_CHIP_DIR=/abs/path/to/pos2-chip.")
+        "Either remove -DPOS2_CHIP_DIR to let CMake fetch it automatically, "
+        "or pass -DPOS2_CHIP_DIR=/abs/path/to/pos2-chip.")
 endif()
 message(STATUS "pos2-chip: ${POS2_CHIP_DIR}")
 
@@ -67,9 +91,13 @@ set_target_properties(pos2_gpu PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF
 )
 
-# Host orchestration (no CUDA code, just thin wrappers)
+# Host orchestration (no CUDA code, just thin wrappers).
+# PlotFileWriterParallel is the SOLE TU pulling in pos2-chip's plot/PlotFile.hpp
+# + pos/ProofParams.hpp chain. Keeping it in one .cpp avoids multiple-definition
+# link errors caused by non-inline soft_aesenc/soft_aesdec in pos2-chip headers.
 add_library(pos2_gpu_host STATIC
     src/host/GpuPlotter.cpp
+    src/host/PlotFileWriterParallel.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
