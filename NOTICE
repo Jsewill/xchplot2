@@ -1,0 +1,61 @@
+xchplot2
+Copyright (c) 2026 Abraham Sewill
+Distributed under the MIT License (see LICENSE).
+
+This product includes or links against software developed by third
+parties under the licenses listed below. None of the upstream projects
+ship a NOTICE file at the time of writing, so attribution is provided
+here directly.
+
+================================================================================
+pos2-chip
+    https://github.com/Chia-Network/pos2-chip
+    Copyright (c) Chia Network Inc.
+    Licensed under the Apache License, Version 2.0.
+
+    Fetched at build time via CMake FetchContent (see CMakeLists.txt).
+    Header surface and the FSE static library from lib/fse are linked
+    into xchplot2 binaries.
+================================================================================
+chia (chia-bls, chia-protocol, chia-sha2, chia-traits, chia-serde,
+chia-puzzle-types, and other transitive crates of the chia 0.42 meta-crate)
+    https://github.com/Chia-Network/chia_rs
+    Copyright (c) Chia Network Inc.
+    Licensed under the Apache License, Version 2.0.
+
+    Statically linked into xchplot2 via the keygen-rs Rust shim. Provides
+    BLS12-381 / EIP-2333 key derivation and compute_plot_id_v2.
+================================================================================
+sha2 (Rust crate)
+    https://github.com/RustCrypto/hashes
+    Copyright (c) RustCrypto Developers
+    Dual-licensed under MIT OR Apache-2.0; we use under Apache-2.0.
+
+    Statically linked into xchplot2 via the keygen-rs Rust shim.
+================================================================================
+bech32 (Rust crate)
+    https://github.com/rust-bitcoin/rust-bech32
+    Copyright (c) 2017 Clark Moody
+    Licensed under the MIT License.
+
+    Statically linked into xchplot2 via the keygen-rs Rust shim. Used for
+    decoding xch1.../txch1... pool contract addresses.
+================================================================================
+FSE (Finite State Entropy)
+    https://github.com/Cyan4973/FiniteStateEntropy
+    Copyright (c) 2013, Yann Collet
+    Licensed under the BSD 2-Clause License.
+
+    Vendored upstream by pos2-chip at lib/fse/ and statically linked into
+    xchplot2. Provides the entropy-coding step of v2 plot file compression.
+================================================================================
+NVIDIA CUDA Toolkit (runtime + CUB)
+    Used at build time and dynamically at run time.
+    Subject to the NVIDIA CUDA Toolkit End User License Agreement
+    (https://docs.nvidia.com/cuda/eula/).
+================================================================================
+
+Full license texts for each Apache-2.0 component are reproduced in their
+respective upstream source trees, which CMake FetchContent / cargo will
+make available alongside any source distribution. For binary releases,
+include the Apache-2.0 license text alongside this NOTICE.

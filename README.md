@@ -100,11 +100,13 @@ the relevant commits make the split explicit.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). See [NOTICE](NOTICE) for third-party attributions.
 
-Depends on (built/fetched separately, not vendored):
+Depends on (built / fetched separately, not vendored):
 
 - `pos2-chip` — Apache-2.0, fetched via CMake `FetchContent`.
-- `chia` 0.42 (chia-bls, chia-protocol, chia-sha2) — Apache-2.0, via
-  cargo.
+- `chia` 0.42 (chia-bls, chia-protocol, chia-sha2, etc.) — Apache-2.0,
+  via cargo.
 - `bech32` 0.11 — MIT, via cargo.
+- `sha2` (Rust) — MIT/Apache-2.0, via cargo.
+- FSE (Yann Collet) — BSD 2-Clause, vendored upstream by pos2-chip.
