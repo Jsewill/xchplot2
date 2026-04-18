@@ -95,8 +95,7 @@ at startup and refuses with an actionable error if the pool won't fit.
 ## Acknowledgments
 
 Built collaboratively with [Claude](https://claude.ai/code) (Anthropic),
-acting as a pair-programmer under human direction. Co-author lines on
-the relevant commits make the split explicit.
+acting as a pair-programmer under human direction.
 
 ## License
 
