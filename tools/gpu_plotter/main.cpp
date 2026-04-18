@@ -33,17 +33,23 @@ void print_usage(char const* prog)
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "  " << prog << " plot --k K --num N --farmer-pk HEX\n"
-        << "         ( --pool-pk HEX | --pool-ph HEX )\n"
-        << "         [--strength S] [--out DIR] [--testnet] [--seed HEX] [-v]\n"
+        << "         ( --pool-pk HEX | --pool-ph HEX | --pool-contract-address xch1... )\n"
+        << "         [--strength S] [--out DIR] [--testnet]\n"
+        << "         [--plot-index N] [--meta-group N] [--seed HEX] [-v]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
-        << "    --farmer-pk HEX  : 96 hex chars (48 B G1 public key).\n"
-        << "    --pool-pk HEX    : 96 hex chars. Pool public key mode.\n"
-        << "    --pool-ph HEX    : 64 hex chars (raw puzzle hash). NFT pool mode.\n"
-        << "    --num N          : number of plots to create.\n"
-        << "    --seed HEX       : optional 64 hex chars of master-SK entropy for\n"
-        << "                       the first plot; subsequent plots advance the seed\n"
-        << "                       deterministically. Defaults to /dev/urandom.\n"
+        << "    --farmer-pk HEX             : 96 hex chars (48 B G1 public key).\n"
+        << "    --pool-pk HEX               : 96 hex chars. Pool public key mode.\n"
+        << "    --pool-ph HEX               : 64 hex chars (raw puzzle hash).\n"
+        << "    --pool-contract-address ADR : Chia bech32m address (xch1.../txch1...);\n"
+        << "                                  decoded internally to a 32-byte hash.\n"
+        << "    --num N                     : number of plots to create.\n"
+        << "    --plot-index N              : v2 PoS plot_index field (default 0).\n"
+        << "    --meta-group N              : v2 PoS meta_group field (default 0).\n"
+        << "    --seed HEX                  : optional 64 hex chars of master-SK\n"
+        << "                                  entropy. Per-plot seed = SHA256(seed || i).\n"
+        << "                                  Reproducible across runs. Defaults to\n"
+        << "                                  fresh /dev/urandom per plot.\n"
         << "\n"
         << "    <k>            : even integer in [18, 32]\n"
         << "    <plot_id_hex>  : 64 hex characters\n"
@@ -161,10 +167,13 @@ int main(int argc, char* argv[])
         int k = 28;
         int strength = 2;
         int num = 1;
+        int plot_index_base = 0;
+        int meta_group = 0;
         bool testnet = false;
         bool verbose = false;
         std::string out_dir = ".";
-        std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex;
+        std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex, pool_addr;
+        std::string seed_hex;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -182,6 +191,10 @@ int main(int argc, char* argv[])
             else if (a == "--farmer-pk" && need(1)) farmer_pk_hex = argv[++i];
             else if (a == "--pool-pk"   && need(1)) pool_pk_hex   = argv[++i];
             else if (a == "--pool-ph"   && need(1)) pool_ph_hex   = argv[++i];
+            else if (a == "--pool-contract-address" && need(1)) pool_addr = argv[++i];
+            else if (a == "--plot-index" && need(1)) plot_index_base = std::atoi(argv[++i]);
+            else if (a == "--meta-group" && need(1)) meta_group      = std::atoi(argv[++i]);
+            else if (a == "--seed"       && need(1)) seed_hex        = argv[++i];
             else if (a == "--testnet")  testnet = true;
             else if (a == "-v" || a == "--verbose") verbose = true;
             else {
@@ -195,12 +208,25 @@ int main(int argc, char* argv[])
             std::cerr << "Error: --farmer-pk is required\n";
             return 1;
         }
-        if (pool_pk_hex.empty() == pool_ph_hex.empty()) {
-            std::cerr << "Error: exactly one of --pool-pk or --pool-ph is required\n";
+        // Exactly one pool source.
+        int const pool_specs = int(!pool_pk_hex.empty())
+                             + int(!pool_ph_hex.empty())
+                             + int(!pool_addr.empty());
+        if (pool_specs != 1) {
+            std::cerr << "Error: exactly one of --pool-pk, --pool-ph, "
+                         "--pool-contract-address is required\n";
             return 1;
         }
         if (num < 1) {
             std::cerr << "Error: --num must be >= 1\n";
+            return 1;
+        }
+        if (plot_index_base < 0 || plot_index_base > 0xFFFF) {
+            std::cerr << "Error: --plot-index must be in [0, 65535]\n";
+            return 1;
+        }
+        if (meta_group < 0 || meta_group > 0xFF) {
+            std::cerr << "Error: --meta-group must be in [0, 255]\n";
             return 1;
         }
 
@@ -211,40 +237,70 @@ int main(int argc, char* argv[])
         }
 
         std::vector<uint8_t> pool_key;
-        int pool_kind;
+        int pool_kind = POS2_POOL_PH; // default unused; set in branches below
         if (!pool_pk_hex.empty()) {
             if (!parse_hex_bytes(pool_pk_hex, pool_key) || pool_key.size() != 48) {
                 std::cerr << "Error: --pool-pk must be 96 hex chars (48 bytes)\n";
                 return 1;
             }
             pool_kind = POS2_POOL_PK;
-        } else {
+        } else if (!pool_ph_hex.empty()) {
             if (!parse_hex_bytes(pool_ph_hex, pool_key) || pool_key.size() != 32) {
                 std::cerr << "Error: --pool-ph must be 64 hex chars (32 bytes)\n";
                 return 1;
             }
             pool_kind = POS2_POOL_PH;
+        } else {
+            // --pool-contract-address (bech32m); decode via Rust shim.
+            pool_key.assign(32, 0);
+            int rc = pos2_keygen_decode_address(pool_addr.c_str(), pool_key.data());
+            if (rc != POS2_OK) {
+                std::cerr << "Error: --pool-contract-address invalid (rc=" << rc
+                          << "; expected xch1.../txch1...)\n";
+                return 1;
+            }
+            pool_kind = POS2_POOL_PH;
+        }
+
+        // Optional reproducible-build base seed.
+        std::array<uint8_t, 32> base_seed{};
+        bool have_base_seed = false;
+        if (!seed_hex.empty()) {
+            if (!parse_hex(seed_hex, base_seed)) {
+                std::cerr << "Error: --seed must be 64 hex chars\n";
+                return 1;
+            }
+            have_base_seed = true;
         }
 
         try {
             std::vector<pos2gpu::BatchEntry> entries;
             entries.reserve(static_cast<size_t>(num));
             for (int i = 0; i < num; ++i) {
-                // Fresh 32 bytes of entropy per plot so each plot has an
-                // independent master secret key.
                 uint8_t seed[32];
-                read_urandom(seed, sizeof(seed));
+                if (have_base_seed) {
+                    int rc = pos2_keygen_derive_subseed(
+                        base_seed.data(),
+                        static_cast<uint64_t>(i),
+                        seed);
+                    if (rc != POS2_OK) {
+                        std::cerr << "Error: subseed derivation failed (rc=" << rc << ")\n";
+                        return 2;
+                    }
+                } else {
+                    read_urandom(seed, sizeof(seed));
+                }
 
                 uint8_t plot_id[32];
-                std::vector<uint8_t> memo(128); // max across pool_pk / pool_ph modes
+                std::vector<uint8_t> memo(128);
                 size_t memo_len = memo.size();
                 int rc = pos2_keygen_derive_plot(
                     seed, sizeof(seed),
                     farmer_pk.data(),
                     pool_key.data(), pool_kind,
                     static_cast<uint8_t>(strength),
-                    static_cast<uint16_t>(0),  // plot_index — TODO plumb through
-                    static_cast<uint8_t>(0),   // meta_group
+                    static_cast<uint16_t>(plot_index_base),
+                    static_cast<uint8_t>(meta_group),
                     plot_id,
                     memo.data(), &memo_len);
                 if (rc != POS2_OK) {
@@ -256,8 +312,8 @@ int main(int argc, char* argv[])
                 pos2gpu::BatchEntry e;
                 e.k          = k;
                 e.strength   = strength;
-                e.plot_index = 0;
-                e.meta_group = 0;
+                e.plot_index = plot_index_base;
+                e.meta_group = meta_group;
                 e.testnet    = testnet;
                 std::copy(plot_id, plot_id + 32, e.plot_id.begin());
                 e.memo       = std::move(memo);

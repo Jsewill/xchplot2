@@ -21,6 +21,8 @@ extern "C" {
 #define POS2_BAD_POOL_KIND      -3
 #define POS2_MEMO_BUF_TOO_SMALL -4
 #define POS2_BAD_SEED           -5
+#define POS2_BAD_ADDRESS        -6
+#define POS2_BAD_HRP            -7
 
 // pool_kind values
 #define POS2_POOL_PK  0  // pool_key_ptr points to 48 bytes (G1 public key)
@@ -53,6 +55,21 @@ int pos2_keygen_derive_plot(
     uint8_t strength, uint16_t plot_index, uint8_t meta_group,
     uint8_t* out_plot_id,
     uint8_t* out_memo_buf, size_t* inout_memo_len);
+
+// Decode a Chia bech32m address ("xch1..." mainnet or "txch1..." testnet)
+// into a 32-byte puzzle hash. `address` must be a NUL-terminated C string.
+// Returns POS2_OK / POS2_BAD_ADDRESS / POS2_BAD_HRP.
+int pos2_keygen_decode_address(
+    const char* address,
+    uint8_t out_puzzle_hash[32]);
+
+// Derive a deterministic per-plot seed from a caller-supplied 32-byte base
+// seed and a plot index, as SHA256(base_seed || idx_le_u64). Lets `--seed`
+// drive reproducible multi-plot batches.
+int pos2_keygen_derive_subseed(
+    const uint8_t base_seed[32],
+    uint64_t idx,
+    uint8_t out_seed[32]);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -22,6 +22,8 @@ pub const POS2_BAD_POOL_KEY: i32       = -2;
 pub const POS2_BAD_POOL_KIND: i32      = -3;
 pub const POS2_MEMO_BUF_TOO_SMALL: i32 = -4;
 pub const POS2_BAD_SEED: i32           = -5;
+pub const POS2_BAD_ADDRESS: i32        = -6;
+pub const POS2_BAD_HRP: i32            = -7;
 
 // pool_kind values.
 pub const POS2_POOL_PK: i32 = 0; // pool_key_or_ph points to 48 bytes (G1)
@@ -199,6 +201,73 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     POS2_OK
 }
 
+/// Decode a Chia bech32m address ("xch1..." mainnet, "txch1..." testnet) into
+/// the 32-byte puzzle hash bytes.
+///
+/// # Safety
+/// `address_ptr` must be a NUL-terminated C string. `out_puzzle_hash` must
+/// point to at least 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_keygen_decode_address(
+    address_ptr: *const core::ffi::c_char,
+    out_puzzle_hash: *mut u8,
+) -> i32 {
+    if address_ptr.is_null() || out_puzzle_hash.is_null() {
+        return POS2_BAD_ADDRESS;
+    }
+    let cstr = unsafe { core::ffi::CStr::from_ptr(address_ptr) };
+    let s = match cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return POS2_BAD_ADDRESS,
+    };
+
+    // bech32 0.11: decode returns (Hrp, Vec<u8>) with the 8-bit payload.
+    let (hrp, data) = match bech32::decode(s) {
+        Ok(x)  => x,
+        Err(_) => return POS2_BAD_ADDRESS,
+    };
+    let h = hrp.as_str();
+    if h != "xch" && h != "txch" {
+        return POS2_BAD_HRP;
+    }
+    if data.len() != 32 {
+        return POS2_BAD_ADDRESS;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), out_puzzle_hash, 32);
+    }
+    POS2_OK
+}
+
+/// Deterministically derive a 32-byte subseed for plot `idx` from a caller's
+/// base seed. Matches SHA256(base_seed || idx_little_endian_u64), so callers
+/// who record a base seed can reproduce any plot in the batch. Keeps
+/// per-plot master SKs independent even when the user supplied a fixed seed
+/// for the whole run.
+///
+/// # Safety
+/// Both pointers must be valid 32-byte regions.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_keygen_derive_subseed(
+    base_seed: *const u8, // 32 bytes
+    idx: u64,
+    out_seed: *mut u8,    // 32 bytes
+) -> i32 {
+    use sha2::{Digest, Sha256};
+    if base_seed.is_null() || out_seed.is_null() {
+        return POS2_BAD_SEED;
+    }
+    let base = unsafe { std::slice::from_raw_parts(base_seed, 32) };
+    let mut h = Sha256::new();
+    h.update(base);
+    h.update(idx.to_le_bytes());
+    let digest = h.finalize();
+    unsafe {
+        std::ptr::copy_nonoverlapping(digest.as_ptr(), out_seed, 32);
+    }
+    POS2_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +316,44 @@ mod tests {
         assert_eq!(pid1, pid2);
         assert_eq!(memo1, memo2);
         assert_eq!(memo1.len(), 32 + 48 + 32); // ph-mode memo
+    }
+
+    #[test]
+    fn subseed_is_deterministic_and_index_dependent() {
+        let base = [0x11_u8; 32];
+        let mut a = [0u8; 32];
+        let mut a2 = [0u8; 32];
+        let mut b = [0u8; 32];
+        let r1 = unsafe { pos2_keygen_derive_subseed(base.as_ptr(), 0, a.as_mut_ptr()) };
+        let r2 = unsafe { pos2_keygen_derive_subseed(base.as_ptr(), 0, a2.as_mut_ptr()) };
+        let r3 = unsafe { pos2_keygen_derive_subseed(base.as_ptr(), 1, b.as_mut_ptr()) };
+        assert_eq!(r1, POS2_OK);
+        assert_eq!(r2, POS2_OK);
+        assert_eq!(r3, POS2_OK);
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn decode_address_accepts_xch_and_txch() {
+        // Produce an "xch1..." address programmatically (so we don't need to
+        // depend on a specific well-known vector) and round-trip through
+        // our decoder.
+        use bech32::{Bech32m, Hrp};
+        let ph = [0x42_u8; 32];
+        let hrp = Hrp::parse("xch").unwrap();
+        let addr = bech32::encode::<Bech32m>(hrp, &ph).unwrap();
+        let c = std::ffi::CString::new(addr).unwrap();
+
+        let mut out = [0u8; 32];
+        let rc = unsafe { pos2_keygen_decode_address(c.as_ptr(), out.as_mut_ptr()) };
+        assert_eq!(rc, POS2_OK);
+        assert_eq!(out, ph);
+
+        // Rejects unknown HRP.
+        let bad = std::ffi::CString::new("btc1qaaaaaaaaaaaa").unwrap();
+        let mut dummy = [0u8; 32];
+        let rc = unsafe { pos2_keygen_decode_address(bad.as_ptr(), dummy.as_mut_ptr()) };
+        assert_ne!(rc, POS2_OK);
     }
 }
