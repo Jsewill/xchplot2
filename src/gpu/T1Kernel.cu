@@ -80,7 +80,7 @@ __global__ void compute_bucket_offsets(
 // Fused match kernel: handles all (section_l, match_key_r) buckets in a
 // single launch. blockIdx.y identifies the bucket, blockIdx.x slices L.
 // Loads AES T-tables into shared memory once per block.
-__global__ void match_all_buckets(
+__global__ __launch_bounds__(256, 4) void match_all_buckets(
     AesHashKeys keys,
     XsCandidateGpu const* __restrict__ sorted_xs,
     uint64_t const* __restrict__ d_offsets, // [num_buckets+1]

@@ -1,0 +1,19 @@
+[package]
+name        = "xchplot2"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Abraham Sewill <abraham.sewill@proton.me>"]
+license     = "MIT"
+description = "GPU plotter for Chia v2 proofs of space (CHIP-48)"
+repository  = "https://github.com/Chia-Network/xchplot2"
+readme      = "README.md"
+build       = "build.rs"
+
+[[bin]]
+name = "xchplot2"
+path = "src/main.rs"
+
+# Don't auto-include the nested keygen-rs package — it's built by CMake's
+# add_custom_command (via build.rs), not as a Rust workspace member.
+[workspace]
+exclude = ["keygen-rs"]

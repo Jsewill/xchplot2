@@ -45,7 +45,7 @@ __host__ __device__ inline uint32_t matching_section(uint32_t section, int num_s
 }
 
 __global__ void compute_bucket_offsets(
-    T1PairingGpu const* __restrict__ sorted,
+    uint32_t const* __restrict__ sorted_mi,
     uint64_t total,
     int num_match_target_bits,
     uint32_t num_buckets,
@@ -59,7 +59,7 @@ __global__ void compute_bucket_offsets(
         uint64_t lo = pos, hi = total;
         while (lo < hi) {
             uint64_t mid = lo + ((hi - lo) >> 1);
-            uint32_t bucket_mid = sorted[mid].match_info >> bucket_shift;
+            uint32_t bucket_mid = sorted_mi[mid] >> bucket_shift;
             if (bucket_mid < b) lo = mid + 1;
             else                hi = mid;
         }
@@ -69,9 +69,10 @@ __global__ void compute_bucket_offsets(
     offsets[num_buckets] = total;
 }
 
-__global__ void match_all_buckets(
+__global__ __launch_bounds__(256, 4) void match_all_buckets(
     AesHashKeys keys,
-    T1PairingGpu const* __restrict__ sorted_t1,
+    uint64_t const* __restrict__ sorted_meta,
+    uint32_t const* __restrict__ sorted_mi,
     uint64_t const* __restrict__ d_offsets,
     uint32_t num_match_keys,
     int k,
@@ -108,8 +109,7 @@ __global__ void match_all_buckets(
     uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (l >= l_end) return;
 
-    uint64_t meta_l = (uint64_t(sorted_t1[l].meta_hi) << 32)
-                    | uint64_t(sorted_t1[l].meta_lo);
+    uint64_t meta_l = sorted_meta[l];
 
     uint32_t target_l = matching_target_smem(keys, 2u, match_key_r, meta_l, sT, 0)
                       & target_mask;
@@ -117,7 +117,7 @@ __global__ void match_all_buckets(
     uint64_t lo = r_start, hi = r_end;
     while (lo < hi) {
         uint64_t mid = lo + ((hi - lo) >> 1);
-        uint32_t target_mid = sorted_t1[mid].match_info & target_mask;
+        uint32_t target_mid = sorted_mi[mid] & target_mask;
         if (target_mid < target_l) lo = mid + 1;
         else                       hi = mid;
     }
@@ -129,11 +129,10 @@ __global__ void match_all_buckets(
     int meta_bits = 2 * k;
 
     for (uint64_t r = lo; r < r_end; ++r) {
-        uint32_t target_r = sorted_t1[r].match_info & target_mask;
+        uint32_t target_r = sorted_mi[r] & target_mask;
         if (target_r != target_l) break;
 
-        uint64_t meta_r = (uint64_t(sorted_t1[r].meta_hi) << 32)
-                        | uint64_t(sorted_t1[r].meta_lo);
+        uint64_t meta_r = sorted_meta[r];
 
         Result128 res = pairing_smem(keys, meta_l, meta_r, sT, 0);
 
@@ -166,7 +165,8 @@ __global__ void match_all_buckets(
 cudaError_t launch_t2_match(
     uint8_t const* plot_id_bytes,
     T2MatchParams const& params,
-    T1PairingGpu const* d_sorted_t1,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
     uint64_t t1_count,
     T2PairingGpu* d_out_pairings,
     uint64_t* d_out_count,
@@ -190,14 +190,14 @@ cudaError_t launch_t2_match(
         return cudaSuccess;
     }
     if (*temp_bytes < needed)        return cudaErrorInvalidValue;
-    if (!d_sorted_t1 || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+    if (!d_sorted_meta || !d_sorted_mi || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
 
     auto* d_offsets = reinterpret_cast<uint64_t*>(d_temp_storage);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
 
     compute_bucket_offsets<<<1, 1, 0, stream>>>(
-        d_sorted_t1, t1_count,
+        d_sorted_mi, t1_count,
         params.num_match_target_bits,
         num_buckets,
         d_offsets);
@@ -235,7 +235,7 @@ cudaError_t launch_t2_match(
     dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets, 1);
 
     match_all_buckets<<<grid, kThreads, 0, stream>>>(
-        keys, d_sorted_t1, d_offsets,
+        keys, d_sorted_meta, d_sorted_mi, d_offsets,
         num_match_keys,
         params.k, params.num_section_bits,
         target_mask, num_test_bits, num_info_bits, half_k,

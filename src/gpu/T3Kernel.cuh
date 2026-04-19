@@ -32,10 +32,15 @@ struct T3MatchParams {
 
 T3MatchParams make_t3_params(int k, int strength);
 
+// sorted_t2 input is SoA-split: d_sorted_meta[i] is T2Pairing.meta and
+// d_sorted_xbits[i] is T2Pairing.x_bits after the T2 sort. match_info is
+// carried in the parallel d_sorted_mi stream.
 cudaError_t launch_t3_match(
     uint8_t const* plot_id_bytes,
     T3MatchParams const& params,
-    T2PairingGpu const* d_sorted_t2, // sorted by match_info ascending
+    uint64_t const* d_sorted_meta,   // cap entries, uint64 meta
+    uint32_t const* d_sorted_xbits,  // cap entries, uint32 x_bits
+    uint32_t const* d_sorted_mi,     // parallel match_info stream, may be nullptr
     uint64_t t2_count,
     T3PairingGpu* d_out_pairings,
     uint64_t* d_out_count,

@@ -5,6 +5,16 @@ compile_commands.json
 .vscode/
 .idea/
 
+# cargo build output (top-level workspace; keygen-rs/target/ has its own
+# .gitignore).
+target/
+
+# nsys / nsight-compute profile artifacts
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.ncu-rep
+
 # pos2-chip is fetched here automatically by CMake at configure time.
 # See CMakeLists.txt → FetchContent_Declare(pos2_chip).
 third_party/

@@ -114,11 +114,27 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     static_assert(sizeof(T2Pairing) == sizeof(pos2gpu::T2PairingGpu),
                   "T2Pairing layout drift");
 
-    pos2gpu::T2PairingGpu* d_t2 = nullptr;
-    CHECK(cudaMalloc(&d_t2, sizeof(pos2gpu::T2PairingGpu) * t2_snapshot.size()));
-    CHECK(cudaMemcpy(d_t2, t2_snapshot.data(),
-                     sizeof(pos2gpu::T2PairingGpu) * t2_snapshot.size(),
-                     cudaMemcpyHostToDevice));
+    // T3 input is SoA: separate meta / xbits / match_info streams.
+    std::vector<uint64_t> h_t2_meta(t2_snapshot.size());
+    std::vector<uint32_t> h_t2_xbits(t2_snapshot.size());
+    std::vector<uint32_t> h_t2_mi(t2_snapshot.size());
+    for (size_t i = 0; i < t2_snapshot.size(); ++i) {
+        h_t2_meta[i]  = t2_snapshot[i].meta;
+        h_t2_xbits[i] = t2_snapshot[i].x_bits;
+        h_t2_mi[i]    = t2_snapshot[i].match_info;
+    }
+    uint64_t* d_t2_meta = nullptr;
+    uint32_t* d_t2_xbits = nullptr;
+    uint32_t* d_t2_mi = nullptr;
+    CHECK(cudaMalloc(&d_t2_meta,  sizeof(uint64_t) * h_t2_meta.size()));
+    CHECK(cudaMalloc(&d_t2_xbits, sizeof(uint32_t) * h_t2_xbits.size()));
+    CHECK(cudaMalloc(&d_t2_mi,    sizeof(uint32_t) * h_t2_mi.size()));
+    CHECK(cudaMemcpy(d_t2_meta,  h_t2_meta.data(),
+                     sizeof(uint64_t) * h_t2_meta.size(),  cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_t2_xbits, h_t2_xbits.data(),
+                     sizeof(uint32_t) * h_t2_xbits.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_t2_mi,    h_t2_mi.data(),
+                     sizeof(uint32_t) * h_t2_mi.size(),    cudaMemcpyHostToDevice));
 
     auto t3p = pos2gpu::make_t3_params(k, strength);
     uint64_t capacity = static_cast<uint64_t>(max_pairs);
@@ -129,12 +145,16 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     CHECK(cudaMalloc(&d_t3_count, sizeof(uint64_t)));
 
     size_t t3_temp_bytes = 0;
-    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p, d_t2, t2_snapshot.size(),
+    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p,
+                                   d_t2_meta, d_t2_xbits, nullptr,
+                                   t2_snapshot.size(),
                                    d_t3, d_t3_count, capacity,
                                    nullptr, &t3_temp_bytes));
     void* d_t3_temp = nullptr;
     CHECK(cudaMalloc(&d_t3_temp, t3_temp_bytes));
-    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p, d_t2, t2_snapshot.size(),
+    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p,
+                                   d_t2_meta, d_t2_xbits, d_t2_mi,
+                                   t2_snapshot.size(),
                                    d_t3, d_t3_count, capacity,
                                    d_t3_temp, &t3_temp_bytes));
     CHECK(cudaDeviceSynchronize());
@@ -145,7 +165,8 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     if (gpu_count > capacity) {
         std::printf("  GPU OVERFLOW: %llu / %llu\n",
                     (unsigned long long)gpu_count, (unsigned long long)capacity);
-        cudaFree(d_t3_temp); cudaFree(d_t3_count); cudaFree(d_t3); cudaFree(d_t2);
+        cudaFree(d_t3_temp); cudaFree(d_t3_count); cudaFree(d_t3);
+        cudaFree(d_t2_mi); cudaFree(d_t2_xbits); cudaFree(d_t2_meta);
         return false;
     }
 
@@ -155,7 +176,8 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
                          sizeof(pos2gpu::T3PairingGpu) * gpu_count,
                          cudaMemcpyDeviceToHost));
     }
-    cudaFree(d_t3_temp); cudaFree(d_t3_count); cudaFree(d_t3); cudaFree(d_t2);
+    cudaFree(d_t3_temp); cudaFree(d_t3_count); cudaFree(d_t3);
+        cudaFree(d_t2_mi); cudaFree(d_t2_xbits); cudaFree(d_t2_meta);
 
     std::vector<uint64_t> gpu_fragments;
     gpu_fragments.reserve(gpu_pairs.size());

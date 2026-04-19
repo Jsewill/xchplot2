@@ -21,6 +21,13 @@
 
 namespace pos2gpu {
 
+// FeistelKey is 40 bytes (32-byte plot_id + 2 ints). Passed by value as
+// a kernel arg, the compiler spilled it to local memory (STACK:40), so
+// `fk.plot_id[i]` accesses inside feistel_encrypt became scattered LMEM
+// LDGs — brutal for an L1-bound kernel. Stashing it in __constant__
+// memory makes those loads broadcast-cached across the warp instead.
+__constant__ FeistelKey g_t3_fk;
+
 T3MatchParams make_t3_params(int k, int strength)
 {
     T3MatchParams p{};
@@ -46,7 +53,7 @@ __host__ __device__ inline uint32_t matching_section(uint32_t section, int num_s
 }
 
 __global__ void compute_bucket_offsets(
-    T2PairingGpu const* __restrict__ sorted,
+    uint32_t const* __restrict__ sorted_mi,
     uint64_t total,
     int num_match_target_bits,
     uint32_t num_buckets,
@@ -60,7 +67,7 @@ __global__ void compute_bucket_offsets(
         uint64_t lo = pos, hi = total;
         while (lo < hi) {
             uint64_t mid = lo + ((hi - lo) >> 1);
-            uint32_t bucket_mid = sorted[mid].match_info >> bucket_shift;
+            uint32_t bucket_mid = sorted_mi[mid] >> bucket_shift;
             if (bucket_mid < b) lo = mid + 1;
             else                hi = mid;
         }
@@ -70,10 +77,11 @@ __global__ void compute_bucket_offsets(
     offsets[num_buckets] = total;
 }
 
-__global__ void match_all_buckets(
+__global__ __launch_bounds__(256, 4) void match_all_buckets(
     AesHashKeys keys,
-    FeistelKey fk,
-    T2PairingGpu const* __restrict__ sorted_t2,
+    uint64_t const* __restrict__ sorted_meta,
+    uint32_t const* __restrict__ sorted_xbits,
+    uint32_t const* __restrict__ sorted_mi,
     uint64_t const* __restrict__ d_offsets,
     uint32_t num_match_keys,
     int k,
@@ -108,8 +116,8 @@ __global__ void match_all_buckets(
     uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (l >= l_end) return;
 
-    uint64_t meta_l = sorted_t2[l].meta;
-    uint32_t xb_l   = sorted_t2[l].x_bits;
+    uint64_t meta_l = sorted_meta[l];
+    uint32_t xb_l   = sorted_xbits[l];
 
     uint32_t target_l = matching_target_smem(keys, 3u, match_key_r, meta_l, sT, 0)
                       & target_mask;
@@ -117,7 +125,7 @@ __global__ void match_all_buckets(
     uint64_t lo = r_start, hi = r_end;
     while (lo < hi) {
         uint64_t mid = lo + ((hi - lo) >> 1);
-        uint32_t target_mid = sorted_t2[mid].match_info & target_mask;
+        uint32_t target_mid = sorted_mi[mid] & target_mask;
         if (target_mid < target_l) lo = mid + 1;
         else                       hi = mid;
     }
@@ -126,18 +134,18 @@ __global__ void match_all_buckets(
                                                 : ((1u << num_test_bits) - 1u);
 
     for (uint64_t r = lo; r < r_end; ++r) {
-        uint32_t target_r = sorted_t2[r].match_info & target_mask;
+        uint32_t target_r = sorted_mi[r] & target_mask;
         if (target_r != target_l) break;
 
-        uint64_t meta_r = sorted_t2[r].meta;
-        uint32_t xb_r   = sorted_t2[r].x_bits;
+        uint64_t meta_r = sorted_meta[r];
+        uint32_t xb_r   = sorted_xbits[r];
 
         Result128 res = pairing_smem(keys, meta_l, meta_r, sT, 0);
         uint32_t test_result = res.r[3] & test_mask;
         if (test_result != 0) continue;
 
         uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
-        uint64_t fragment   = feistel_encrypt(fk, all_x_bits);
+        uint64_t fragment   = feistel_encrypt(g_t3_fk, all_x_bits);
 
         unsigned long long out_idx = atomicAdd(out_count, 1ULL);
         if (out_idx >= out_capacity) return;
@@ -153,7 +161,9 @@ __global__ void match_all_buckets(
 cudaError_t launch_t3_match(
     uint8_t const* plot_id_bytes,
     T3MatchParams const& params,
-    T2PairingGpu const* d_sorted_t2,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
     uint64_t t2_count,
     T3PairingGpu* d_out_pairings,
     uint64_t* d_out_count,
@@ -177,15 +187,19 @@ cudaError_t launch_t3_match(
         return cudaSuccess;
     }
     if (*temp_bytes < needed)        return cudaErrorInvalidValue;
-    if (!d_sorted_t2 || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+    if (!d_sorted_meta || !d_sorted_xbits || !d_sorted_mi
+        || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
 
     auto* d_offsets = reinterpret_cast<uint64_t*>(d_temp_storage);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
     FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    cudaError_t fk_err = cudaMemcpyToSymbolAsync(g_t3_fk, &fk, sizeof(fk),
+                                                 0, cudaMemcpyHostToDevice, stream);
+    if (fk_err != cudaSuccess) return fk_err;
 
     compute_bucket_offsets<<<1, 1, 0, stream>>>(
-        d_sorted_t2, t2_count,
+        d_sorted_mi, t2_count,
         params.num_match_target_bits,
         num_buckets,
         d_offsets);
@@ -221,7 +235,7 @@ cudaError_t launch_t3_match(
     dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets, 1);
 
     match_all_buckets<<<grid, kThreads, 0, stream>>>(
-        keys, fk, d_sorted_t2, d_offsets,
+        keys, d_sorted_meta, d_sorted_xbits, d_sorted_mi, d_offsets,
         num_match_keys,
         params.k, params.num_section_bits,
         target_mask, num_test_bits,

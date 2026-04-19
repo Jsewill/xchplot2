@@ -40,6 +40,7 @@ __host__ __device__ inline AesHashKeys make_keys(uint8_t const* plot_id_bytes)
 //   for r in 0..Rounds: state = aesenc(state, k1); state = aesenc(state, k2);
 __device__ __forceinline__ AesState run_rounds(AesState state, AesHashKeys const& keys, int rounds)
 {
+    #pragma unroll 2
     for (int r = 0; r < rounds; ++r) {
         state = aesenc_round(state, keys.round_key_1);
         state = aesenc_round(state, keys.round_key_2);
@@ -119,6 +120,7 @@ __device__ __forceinline__ uint64_t chain(AesHashKeys const& keys, uint64_t inpu
 __device__ __forceinline__ AesState run_rounds_smem(
     AesState state, AesHashKeys const& keys, int rounds, uint32_t const* __restrict__ sT)
 {
+    #pragma unroll 2
     for (int r = 0; r < rounds; ++r) {
         state = aesenc_round_smem(state, keys.round_key_1, sT);
         state = aesenc_round_smem(state, keys.round_key_2, sT);

@@ -1,10 +1,9 @@
 # xchplot2
 
 GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
-`.plot2` files at the GPU compute floor — **~2.68 s/plot at k=28
-strength=2 on an RTX 4090**, byte-identical to the
-[pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference and
-to `chia plots create --v2`.
+`.plot2` files at **~2.43 s wall per k=28 plot on an RTX 4090
+(~2.29 s GPU)**, byte-identical to the
+[pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
 ## Performance
 
@@ -13,25 +12,54 @@ k=28, strength=2, on an RTX 4090, sm_89:
 | Mode | Per-plot wall |
 |------|---------------|
 | pos2-chip CPU baseline | ~50 s |
-| `xchplot2 plot --num 1` | ~3.6 s |
-| `xchplot2 plot --num 10` (steady-state batch) | **2.68 s** |
-| Theoretical floor (kernel-time only) | 2.69 s |
+| `xchplot2 test` single plot (cold) | ~8 s |
+| `xchplot2 batch` 10-plot steady-state | **2.43 s** |
+| Producer-side GPU time (steady-state) | 2.29 s |
+| Device-kernel floor (nsys, k=28 single) | 1.98 s |
 
-The pipeline sits at the GPU compute floor — further gains require
-kernel algorithm work, not orchestration.
+The match kernels (T1/T2/T3 pairing) own ~89 % of GPU time. Reusing
+the slim sorted-match_info stream that CUB's SortPairs already emits
+(instead of re-reading match_info out of the wider T{1,2}Pairing
+struct in the inner loop), plus `__launch_bounds__` / `#pragma unroll`
+tuning, cut kernel time ~23 % from the prior floor without algorithm
+changes. Further gains from inside the match kernel are now split
+roughly 30 % AES / 70 % non-AES (global-memory and control flow) —
+further attacks likely target that non-AES 70 %.
 
 ## Build
 
-Requires:
+Requires (all paths):
 
 - CUDA Toolkit 12+ with C++20 nvcc (tested on 13.x)
 - C++20 host compiler (g++ ≥ 11 or clang++ ≥ 14)
 - CMake ≥ 3.24
-- Rust toolchain (`rustc` / `cargo`) — only at build time, for `keygen-rs`
+- Rust toolchain (`rustc` / `cargo`) — for `keygen-rs` (and for the
+  `cargo install` path below)
+
+### `cargo install`
 
 ```bash
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CUDA_ARCHITECTURES=89   # 89 = sm_89 / RTX 4090; adjust per GPU
+cargo install --git https://github.com/Chia-Network/xchplot2
+# or, from a local checkout:
+cargo install --path .
+# pin a specific target arch (e.g. 120 for RTX 50-series, "89;120" for fat):
+CUDA_ARCHITECTURES=120 cargo install --path .
+```
+
+The crate's `build.rs` invokes the CMake build internally; the resulting
+binary is functionally identical to the CMake-built one (same SHA on
+the same inputs).
+
+By default `build.rs` probes `nvidia-smi --query-gpu=compute_cap` and
+hands the result to CMake (`sm_89` for an RTX 4090, `sm_120` for a
+5090, etc.), so the binary is built for the GPU on the build machine
+without further configuration. Falls back to `sm_89` on hosts without
+`nvidia-smi`. Override with `$CUDA_ARCHITECTURES` when cross-targeting.
+
+### CMake (also produces the parity tests)
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build -j
 ```
 
@@ -50,20 +78,24 @@ Produces:
 ### Standalone (farmable plots)
 
 ```bash
-xchplot2 plot --k 28 --num 10 \
-    --farmer-pk    <96 hex chars> \
-    --pool-contract-address xch1...      \
-    --out          /mnt/plots
+xchplot2 plot -k 28 -n 10 \
+    -f <farmer-pk> \
+    -c <pool-contract-address> \
+    -o <output-dir>
 ```
 
-Other pool flavours: `--pool-pk <hex>` (96 hex), `--pool-ph <hex>`
-(64 hex). Optional: `--strength S`, `--testnet`, `--seed <64 hex>` for
-reproducible runs, `--plot-index N`, `--meta-group N`.
+Other pool flavours: `-p <pool-pk>` (96 hex G1) or `--pool-ph <pool-ph>`
+(64 hex raw puzzle hash). Optional: `-s <strength>`, `-T` (testnet),
+`-S <seed>` for reproducible runs, `-i <plot-index>`, `-g <meta-group>`,
+`-v` (verbose).
+
+Long forms (`--farmer-pk`, `--pool-pk`, `--strength`, …) are accepted
+everywhere too; `xchplot2 -h` prints both.
 
 ### Lower-level subcommands
 
 ```bash
-xchplot2 test  <k> <plot_id_hex> [strength] ...   # single plot, raw inputs
+xchplot2 test  <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
 xchplot2 batch <manifest.tsv> [-v]                # batched, raw inputs
 ```
 

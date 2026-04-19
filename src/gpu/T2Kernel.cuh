@@ -38,10 +38,18 @@ struct T2MatchParams {
 
 T2MatchParams make_t2_params(int k, int strength);
 
+// The sorted T1 input is now split into two parallel arrays:
+//   d_sorted_meta : uint64 meta per entry (was T1PairingGpu.meta_lo|meta_hi).
+//   d_sorted_mi   : uint32 match_info per entry — the CUB SortPairs key output,
+//                   reused so we don't rematerialise it from the struct.
+// Dropping the 4-byte match_info from the permuted stream trims the sorted-T1
+// footprint 12 B → 8 B per entry and removes wasted bandwidth on the match
+// kernel's hot meta loads.
 cudaError_t launch_t2_match(
     uint8_t const* plot_id_bytes,
     T2MatchParams const& params,
-    T1PairingGpu const* d_sorted_t1, // sorted by match_info ascending
+    uint64_t const* d_sorted_meta,  // meta, sorted by match_info ascending
+    uint32_t const* d_sorted_mi,    // parallel match_info stream
     uint64_t t1_count,
     T2PairingGpu* d_out_pairings,
     uint64_t* d_out_count,

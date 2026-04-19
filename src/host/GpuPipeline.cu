@@ -45,15 +45,20 @@ namespace {
 // (key=match_info, value=index) then permutes T1Pairings.
 // =====================================================================
 
+// Permute the T1 match output by sort indices, writing only the 8-byte
+// meta (meta_hi << 32 | meta_lo). match_info already lives in the sort's
+// key-output stream so we don't rematerialise it; the T2 match kernel
+// consumes (sorted_meta, sorted_mi) directly.
 __global__ void permute_t1(
     T1PairingGpu const* __restrict__ src,
     uint32_t const* __restrict__ indices,
-    T1PairingGpu* __restrict__ dst,
+    uint64_t* __restrict__ dst_meta,
     uint64_t count)
 {
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= count) return;
-    dst[idx] = src[indices[idx]];
+    T1PairingGpu s = src[indices[idx]];
+    dst_meta[idx] = (uint64_t(s.meta_hi) << 32) | uint64_t(s.meta_lo);
 }
 
 __global__ void extract_t1_keys(
@@ -72,15 +77,23 @@ __global__ void extract_t1_keys(
 // T2 sort: same shape — sort indices by match_info.
 // =====================================================================
 
+// T3 match reads meta (8 B) and x_bits (4 B) from sorted_t2 but does not
+// touch match_info (passed as the parallel sorted_mi stream). Splitting
+// the sort output into meta[] and xbits[] arrays drops the per-access
+// line footprint from 16 B to 12 B, cutting L1/TEX line fetches on an
+// L1-throughput-bound kernel.
 __global__ void permute_t2(
     T2PairingGpu const* __restrict__ src,
     uint32_t const* __restrict__ indices,
-    T2PairingGpu* __restrict__ dst,
+    uint64_t* __restrict__ dst_meta,
+    uint32_t* __restrict__ dst_xbits,
     uint64_t count)
 {
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= count) return;
-    dst[idx] = src[indices[idx]];
+    T2PairingGpu p = src[indices[idx]];
+    dst_meta[idx]  = p.meta;
+    dst_xbits[idx] = p.x_bits;
 }
 
 __global__ void extract_t2_keys(
@@ -132,13 +145,19 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // d_pair_b carries the "current phase sort output": sorted T1, sorted T2,
     // then final uint64_t fragments. Each subsequent phase's output overwrites
     // the previous (consumed) contents in the same slot.
-    XsCandidateGpu* d_xs        = static_cast<XsCandidateGpu*>(pool.d_storage);
-    T1PairingGpu*   d_t1        = static_cast<T1PairingGpu*>  (pool.d_pair_a);
-    T1PairingGpu*   d_t1_sorted = static_cast<T1PairingGpu*>  (pool.d_pair_b);
-    T2PairingGpu*   d_t2        = static_cast<T2PairingGpu*>  (pool.d_pair_a);
-    T2PairingGpu*   d_t2_sorted = static_cast<T2PairingGpu*>  (pool.d_pair_b);
-    T3PairingGpu*   d_t3        = static_cast<T3PairingGpu*>  (pool.d_pair_a);
-    uint64_t*       d_frags_out = static_cast<uint64_t*>      (pool.d_pair_b);
+    XsCandidateGpu* d_xs             = static_cast<XsCandidateGpu*>(pool.d_storage);
+    T1PairingGpu*   d_t1             = static_cast<T1PairingGpu*>  (pool.d_pair_a);
+    // Sorted T1 is now just meta (8 B/entry) — match_info comes from sort keys.
+    uint64_t*       d_t1_meta_sorted = static_cast<uint64_t*>      (pool.d_pair_b);
+    T2PairingGpu*   d_t2             = static_cast<T2PairingGpu*>  (pool.d_pair_a);
+    // Sorted T2 is SoA-split across d_pair_b: meta[cap] then xbits[cap],
+    // 12 B total per entry (fits in d_pair_b's 16 B/entry budget). T3
+    // match reads both; frags_out later reuses d_pair_b from offset 0.
+    uint64_t*       d_t2_meta_sorted  = static_cast<uint64_t*>      (pool.d_pair_b);
+    uint32_t*       d_t2_xbits_sorted = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(pool.d_pair_b) + pool.cap * sizeof(uint64_t));
+    T3PairingGpu*   d_t3             = static_cast<T3PairingGpu*>  (pool.d_pair_a);
+    uint64_t*       d_frags_out      = static_cast<uint64_t*>      (pool.d_pair_b);
 
     uint64_t*       d_count        = pool.d_counter;
     // Xs phase needs ~4.34 GB scratch at k=28; d_pair_b is idle through
@@ -224,8 +243,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                           d_t1, d_count, cap,
                           d_match_temp, &t1_temp_bytes, stream));
     end_phase(p_t1);
-    CHECK(cudaStreamSynchronize(stream));
 
+    // No explicit sync: the next cudaMemcpy (non-async, default stream)
+    // implicitly drains prior stream work before the host reads t1_count.
     uint64_t t1_count = 0;
     CHECK(cudaMemcpy(&t1_count, d_count, sizeof(uint64_t),
                      cudaMemcpyDeviceToHost));
@@ -247,25 +267,26 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             t1_count, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
 
         permute_t1<<<blocks(t1_count), kThreads, 0, stream>>>(
-            d_t1, d_vals_out, d_t1_sorted, t1_count);
+            d_t1, d_vals_out, d_t1_meta_sorted, t1_count);
         CHECK(cudaGetLastError());
-        CHECK(cudaStreamSynchronize(stream));
     }
     end_phase(p_t1_sort);
 
     // ---------- Phase T2 ----------
+    // Sorted T1 = (d_t1_meta_sorted: uint64 meta, d_keys_out: uint32 match_info).
+    // No AoS struct anymore — saves 33 % of sorted-T1 bandwidth on both the
+    // permute write and the match-kernel hot path.
     auto t2p = make_t2_params(cfg.k, cfg.strength);
     size_t t2_temp_bytes = 0;
-    CHECK(launch_t2_match(cfg.plot_id.data(), t2p, d_t1_sorted, t1_count,
+    CHECK(launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           d_t2, d_count, cap,
                           nullptr, &t2_temp_bytes));
     CHECK(cudaMemsetAsync(d_count, 0, sizeof(uint64_t), stream));
     int p_t2 = begin_phase("T2 match");
-    CHECK(launch_t2_match(cfg.plot_id.data(), t2p, d_t1_sorted, t1_count,
+    CHECK(launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
                           d_t2, d_count, cap,
                           d_match_temp, &t2_temp_bytes, stream));
     end_phase(p_t2);
-    CHECK(cudaStreamSynchronize(stream));
 
     uint64_t t2_count = 0;
     CHECK(cudaMemcpy(&t2_count, d_count, sizeof(uint64_t),
@@ -285,25 +306,29 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             t2_count, 0, cfg.k, stream));
 
         permute_t2<<<blocks(t2_count), kThreads, 0, stream>>>(
-            d_t2, d_vals_out, d_t2_sorted, t2_count);
+            d_t2, d_vals_out, d_t2_meta_sorted, d_t2_xbits_sorted, t2_count);
         CHECK(cudaGetLastError());
-        CHECK(cudaStreamSynchronize(stream));
     }
     end_phase(p_t2_sort);
 
     // ---------- Phase T3 ----------
+    // d_keys_out now holds the T2 sorted match_info (T1's was overwritten by
+    // the T2 sort above) — pass as the slim stream for binary search in T3.
     auto t3p = make_t3_params(cfg.k, cfg.strength);
     size_t t3_temp_bytes = 0;
-    CHECK(launch_t3_match(cfg.plot_id.data(), t3p, d_t2_sorted, t2_count,
+    CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
+                          d_t2_meta_sorted, d_t2_xbits_sorted,
+                          nullptr, t2_count,
                           d_t3, d_count, cap,
                           nullptr, &t3_temp_bytes));
     CHECK(cudaMemsetAsync(d_count, 0, sizeof(uint64_t), stream));
     int p_t3 = begin_phase("T3 match + Feistel");
-    CHECK(launch_t3_match(cfg.plot_id.data(), t3p, d_t2_sorted, t2_count,
+    CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
+                          d_t2_meta_sorted, d_t2_xbits_sorted,
+                          d_keys_out, t2_count,
                           d_t3, d_count, cap,
                           d_match_temp, &t3_temp_bytes, stream));
     end_phase(p_t3);
-    CHECK(cudaStreamSynchronize(stream));
 
     uint64_t t3_count = 0;
     CHECK(cudaMemcpy(&t3_count, d_count, sizeof(uint64_t),
@@ -320,7 +345,6 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             d_sort_scratch, sort_bytes,
             d_frags_in, d_frags_out,
             t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
-        CHECK(cudaStreamSynchronize(stream));
     }
     end_phase(p_t3_sort);
 

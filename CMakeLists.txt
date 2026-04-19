@@ -15,6 +15,11 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
+# Optional: compile in clock64 instrumentation for T3 match_all_buckets.
+# Prints a per-region cycle breakdown to stderr on every launch_t3_match
+# call. Off by default — enable with -DXCHPLOT2_INSTRUMENT_MATCH=ON.
+option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 breakdown" OFF)
+
 # pos2-chip dependency.
 #
 # Default behavior: FetchContent auto-clones Chia-Network/pos2-chip into
@@ -71,19 +76,22 @@ endif()
 # owns the constant-memory T-tables that all later kernels reference.
 add_library(pos2_gpu STATIC
     src/gpu/AesGpu.cu
+    src/gpu/AesGpuBitsliced.cu
     src/gpu/XsKernel.cu
     src/gpu/T1Kernel.cu
     src/gpu/T2Kernel.cu
     src/gpu/T3Kernel.cu
     src/host/GpuBufferPool.cu
     src/host/GpuPipeline.cu
-    src/host/BatchPlotter.cu
 )
 target_include_directories(pos2_gpu PUBLIC
     src
 )
 target_link_libraries(pos2_gpu PUBLIC pos2_chip_headers)
 target_compile_features(pos2_gpu PUBLIC cxx_std_20)
+if(XCHPLOT2_INSTRUMENT_MATCH)
+    target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
+endif()
 set_target_properties(pos2_gpu PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     # Do NOT pre-resolve device symbols — consumers (e.g. aes_parity.cu)
@@ -98,6 +106,7 @@ set_target_properties(pos2_gpu PROPERTIES
 add_library(pos2_gpu_host STATIC
     src/host/GpuPlotter.cpp
     src/host/PlotFileWriterParallel.cpp
+    src/host/BatchPlotter.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -146,13 +155,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
 endif()
 
+# xchplot2_cli: the CLI dispatch logic as a static library, with the
+# entrypoint exported as `extern "C" int xchplot2_main(int, char**)`.
+# Two consumers:
+#   - tools/xchplot2/main.cpp builds the standalone executable below.
+#   - the top-level Cargo crate (build.rs + src/main.rs) wraps this in a
+#     Rust `[[bin]]` so `cargo install --git ...` produces the same binary.
+#
+# CUDA_RESOLVE_DEVICE_SYMBOLS ON makes this static lib self-contained at
+# the device-symbol level, so a non-CMake linker (rustc) doesn't need to
+# do its own `nvcc -dlink` step. We set it on this aggregate lib rather
+# than on `pos2_gpu` so the parity tests (which reference device symbols
+# externally) keep working unchanged.
+add_library(xchplot2_cli STATIC tools/xchplot2/cli.cpp)
+target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
+target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
+set_target_properties(xchplot2_cli PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
 add_executable(xchplot2 tools/xchplot2/main.cpp)
-target_link_libraries(xchplot2 PRIVATE pos2_gpu_host pos2_keygen)
+target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
 
 # Parity tests
 add_executable(aes_parity tools/parity/aes_parity.cu)
 target_link_libraries(aes_parity PRIVATE pos2_gpu_host)
+
+add_executable(aes_bs_parity tools/parity/aes_bs_parity.cu)
+target_link_libraries(aes_bs_parity PRIVATE pos2_gpu_host)
+
+add_executable(aes_bs_bench tools/parity/aes_bs_bench.cu)
+target_link_libraries(aes_bs_bench PRIVATE pos2_gpu_host)
+
+add_executable(aes_tezcan_bench tools/parity/aes_tezcan_bench.cu)
+target_link_libraries(aes_tezcan_bench PRIVATE pos2_gpu_host)
 
 add_executable(xs_parity tools/parity/xs_parity.cu)
 target_link_libraries(xs_parity PRIVATE pos2_gpu_host)
@@ -175,7 +213,7 @@ target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
 
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
-foreach(t aes_parity xs_parity xs_bench t1_parity t2_parity t3_parity)
+foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t2_parity t3_parity)
     set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 endforeach()
 
