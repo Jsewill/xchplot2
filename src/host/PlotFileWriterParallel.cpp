@@ -122,7 +122,7 @@ size_t write_plot_file_parallel(
     // each loops over a contiguous range of chunks. Avoids the O(num_chunks)
     // std::async thread-creation overhead of one-task-per-chunk.
     std::vector<std::vector<uint8_t>> compressed(num_chunks);
-    {
+    if (num_chunks > 0) {
         uint64_t const tasks_n       = std::min<uint64_t>(thread_count, num_chunks);
         uint64_t const chunks_per_tk = (num_chunks + tasks_n - 1) / tasks_n;
         std::vector<std::future<void>> tasks;
@@ -192,6 +192,19 @@ size_t write_plot_file_parallel(
     out.seekp(0, std::ios::end);
 
     return bytes_written;
+}
+
+std::vector<uint64_t> read_plot_file_fragments(std::string const& filename)
+{
+    PlotFile::PlotFileContents contents = PlotFile::readAllChunkedData(filename);
+    std::vector<uint64_t> flat;
+    size_t total = 0;
+    for (auto const& chunk : contents.data.proof_fragments_chunks) total += chunk.size();
+    flat.reserve(total);
+    for (auto const& chunk : contents.data.proof_fragments_chunks) {
+        flat.insert(flat.end(), chunk.begin(), chunk.end());
+    }
+    return flat;
 }
 
 std::vector<uint64_t> run_cpu_plotter_to_fragments(

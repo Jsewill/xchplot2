@@ -211,6 +211,10 @@ target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
 add_executable(t3_parity tools/parity/t3_parity.cu)
 target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
 
+add_executable(plot_file_parity tools/parity/plot_file_parity.cpp)
+target_link_libraries(plot_file_parity PRIVATE pos2_gpu_host)
+set_target_properties(plot_file_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
 foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t2_parity t3_parity)

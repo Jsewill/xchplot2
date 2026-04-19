@@ -57,4 +57,11 @@ std::vector<uint64_t> run_cpu_plotter_to_fragments(
     uint8_t testnet,
     bool    verbose);
 
+// Reads a .plot2 file written by `write_plot_file_parallel` (or
+// pos2-chip's CPU writer) and returns the concatenated decompressed
+// T3 proof fragments in on-disk order. Used by plot_file_parity to
+// verify write + read round-trip without exposing pos2-chip's
+// plot/PlotFile.hpp to other TUs.
+std::vector<uint64_t> read_plot_file_fragments(std::string const& filename);
+
 } // namespace pos2gpu

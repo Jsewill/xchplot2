@@ -246,9 +246,12 @@ int main()
     }
     // Wide seed coverage at strength=2, k=18.
     for (uint32_t seed : {
+            // primes
             1u, 2u, 3u, 5u, 7u, 11u, 13u, 17u,
             19u, 23u, 29u, 31u, 42u, 1337u,
             0xCAFEBABEu, 0xDEADBEEFu,
+            // boundary seeds
+            0u, 0xFFFFFFFFu, 0x80000000u,
          }) {
         all_ok = run_for_id(derive_plot_id(seed),
                             (std::string("seed=") + std::to_string(seed)).c_str(),
