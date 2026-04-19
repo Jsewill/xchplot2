@@ -11,9 +11,9 @@ k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
 | Mode | Per plot |
 |---|---|
 | pos2-chip CPU baseline | ~50 s |
-| `xchplot2 batch` steady-state wall | **2.11 s** |
-| Producer GPU time, steady-state | 1.99 s |
-| Device-kernel floor (single-plot nsys) | 1.92 s |
+| `xchplot2 batch` steady-state wall | **2.06 s** |
+| Producer GPU time, steady-state | 1.96 s |
+| Device-kernel floor (single-plot nsys) | 1.91 s |
 
 A physically narrower PCIe slot (e.g. Gen4 x4) adds ~240 ms per plot to
 the final fragment D2H copy. Check `cat /sys/bus/pci/devices/*/current_link_width`
