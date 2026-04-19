@@ -49,7 +49,7 @@ void print_usage(char const* prog)
         << "    -n, --num N                     : number of plots to create.\n"
         << "    -s, --strength S                : v2 PoS strength (default 2).\n"
         << "    -o, --out DIR                   : output directory.\n"
-        << "    -i, --plot-index N              : v2 PoS plot_index field (default 0).\n"
+        << "    -i, --plot-index N              : base v2 PoS plot_index (default 0); increments per plot.\n"
         << "    -g, --meta-group N              : v2 PoS meta_group field (default 0).\n"
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
         << "                                      entropy. Per-plot seed = SHA256(seed || i).\n"
@@ -235,6 +235,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::cerr << "Error: --plot-index must be in [0, 65535]\n";
             return 1;
         }
+        // plot_index auto-increments across `-n N`; reject upfront if the
+        // final plot's plot_index would exceed the u16 range.
+        if (plot_index_base + num - 1 > 0xFFFF) {
+            std::cerr << "Error: --plot-index + (--num - 1) exceeds 65535 "
+                         "(base=" << plot_index_base << ", num=" << num << ")\n";
+            return 1;
+        }
         if (meta_group < 0 || meta_group > 0xFF) {
             std::cerr << "Error: --meta-group must be in [0, 255]\n";
             return 1;
@@ -304,12 +311,18 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 uint8_t plot_id[32];
                 std::vector<uint8_t> memo(128);
                 size_t memo_len = memo.size();
+                // plot_index increments per plot so a single `plot -n N`
+                // run produces plots with distinct plot_index values —
+                // this is the within-group identifier the grouped-file
+                // layout planned in pos2-chip will expect.
+                uint16_t const plot_index_i =
+                    static_cast<uint16_t>(plot_index_base + i);
                 int rc = pos2_keygen_derive_plot(
                     seed, sizeof(seed),
                     farmer_pk.data(),
                     pool_key.data(), pool_kind,
                     static_cast<uint8_t>(strength),
-                    static_cast<uint16_t>(plot_index_base),
+                    plot_index_i,
                     static_cast<uint8_t>(meta_group),
                     plot_id,
                     memo.data(), &memo_len);
@@ -322,7 +335,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 pos2gpu::BatchEntry e;
                 e.k          = k;
                 e.strength   = strength;
-                e.plot_index = plot_index_base;
+                e.plot_index = plot_index_base + i;
                 e.meta_group = meta_group;
                 e.testnet    = testnet;
                 std::copy(plot_id, plot_id + 32, e.plot_id.begin());
