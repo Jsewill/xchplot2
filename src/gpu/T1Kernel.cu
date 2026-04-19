@@ -163,7 +163,12 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
 
     uint32_t x_l = sorted_xs[l].x;
 
-    uint32_t target_l = matching_target_smem(keys, 1u, match_key_r, uint64_t(x_l), sT, 0)
+    // Per pos2-chip/src/pos/ProofHashing.hpp:160, T1's matching_target uses
+    // extra_rounds_bits = strength - 2 (only T1, not T2/T3). The kernel arg
+    // already carries that value; we were passing 0 here, producing wrong
+    // target_l values at strength > 2.
+    uint32_t target_l = matching_target_smem(keys, 1u, match_key_r, uint64_t(x_l),
+                                              sT, extra_rounds_bits)
                       & target_mask;
 
     // Fine-bucket pre-index; see T3Kernel.cu for rationale.

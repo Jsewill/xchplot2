@@ -234,10 +234,22 @@ int main()
         for (auto& b : id) b = 0xab;
         all_ok = run_for_id(id, "plot_id=0xab*32", /*k=*/18, /*strength=*/2) && all_ok;
     }
-    for (uint32_t seed : {1u, 2u}) {
+    for (uint32_t seed : {
+            1u, 2u, 3u, 5u, 7u, 11u, 13u, 17u,
+            19u, 23u, 29u, 31u, 42u, 1337u,
+            0xCAFEBABEu, 0xDEADBEEFu,
+         }) {
         all_ok = run_for_id(derive_plot_id(seed),
                             (std::string("seed=") + std::to_string(seed)).c_str(),
                             /*k=*/18, /*strength=*/2) && all_ok;
+    }
+    for (int strength : {3, 4, 5, 6, 7}) {
+        for (uint32_t seed : {1u, 17u}) {
+            char label[64];
+            std::snprintf(label, sizeof(label), "seed=%u strength=%d", seed, strength);
+            all_ok = run_for_id(derive_plot_id(seed), label,
+                                /*k=*/18, strength) && all_ok;
+        }
     }
 
     std::printf("\n==> %s\n", all_ok ? "ALL OK" : "FAIL");
