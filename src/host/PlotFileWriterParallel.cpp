@@ -34,7 +34,8 @@ namespace {
 // ChunkedProofFragments::convertToChunkedProofFragments, but operating on
 // a span so callers can point at pinned memory directly.
 ChunkedProofFragments chunkify_proof_fragments_span(
-    std::span<uint64_t const> t3_fragments, uint64_t range_per_chunk)
+    std::span<uint64_t const> t3_fragments, uint64_t range_per_chunk,
+    unsigned thread_count)
 {
     if (range_per_chunk == 0) {
         throw std::invalid_argument("range_per_chunk must be > 0");
@@ -43,18 +44,48 @@ ChunkedProofFragments chunkify_proof_fragments_span(
     if (t3_fragments.empty()) return chunked;
 
     uint64_t const max_value = t3_fragments.back();
-    uint64_t const num_spans = max_value / range_per_chunk + 1;
-    chunked.proof_fragments_chunks.resize(static_cast<std::size_t>(num_spans));
+    std::size_t const num_spans = static_cast<std::size_t>(max_value / range_per_chunk + 1);
+    chunked.proof_fragments_chunks.resize(num_spans);
 
-    std::size_t current_span = 0;
-    uint64_t    current_span_end = range_per_chunk;
-    for (uint64_t fragment : t3_fragments) {
-        while (fragment >= current_span_end) {
-            ++current_span;
-            current_span_end += range_per_chunk;
+    // Step 1: find chunk boundaries in the already-sorted fragment array.
+    // fragments are ascending, each chunk i covers [i*R, (i+1)*R) where R =
+    // range_per_chunk, so a single O(N) sweep records the position where
+    // each chunk starts. No per-fragment allocations.
+    std::vector<std::size_t> boundaries(num_spans + 1);
+    boundaries[0] = 0;
+    std::size_t ci          = 0;
+    uint64_t    chunk_end   = range_per_chunk;
+    std::size_t const N     = t3_fragments.size();
+    for (std::size_t i = 0; i < N; ++i) {
+        while (t3_fragments[i] >= chunk_end) {
+            boundaries[++ci] = i;
+            chunk_end += range_per_chunk;
         }
-        chunked.proof_fragments_chunks[current_span].push_back(fragment);
     }
+    for (std::size_t c = ci + 1; c <= num_spans; ++c) boundaries[c] = N;
+
+    // Step 2: parallel copy, one async task per contiguous range of chunks.
+    // We spawn thread_count tasks total (not one per chunk), amortising
+    // std::async thread-creation cost across many chunks per task.
+    std::size_t const tasks_n       = std::min<std::size_t>(thread_count, num_spans);
+    std::size_t const chunks_per_tk = (num_spans + tasks_n - 1) / tasks_n;
+
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(tasks_n);
+    for (std::size_t tstart = 0; tstart < num_spans; tstart += chunks_per_tk) {
+        std::size_t const tend = std::min<std::size_t>(tstart + chunks_per_tk, num_spans);
+        tasks.emplace_back(std::async(std::launch::async,
+            [&, tstart, tend]() {
+                for (std::size_t c = tstart; c < tend; ++c) {
+                    std::size_t const a = boundaries[c];
+                    std::size_t const b = boundaries[c + 1];
+                    chunked.proof_fragments_chunks[c].assign(
+                        t3_fragments.begin() + a, t3_fragments.begin() + b);
+                }
+            }));
+    }
+    for (auto& f : tasks) f.get();
+
     return chunked;
 }
 
@@ -82,31 +113,32 @@ size_t write_plot_file_parallel(
     // Build chunked representation (cheap; single pass over fragments)
     uint64_t const range_per_chunk = (1ULL << (params.get_k() + PlotFile::CHUNK_SPAN_RANGE_BITS));
     ChunkedProofFragments chunked
-        = chunkify_proof_fragments_span(t3_fragments, range_per_chunk);
+        = chunkify_proof_fragments_span(t3_fragments, range_per_chunk, thread_count);
 
     uint64_t const num_chunks = static_cast<uint64_t>(chunked.proof_fragments_chunks.size());
     int const stub_bits = params.get_k() - PlotFile::MINUS_STUB_BITS;
 
-    // Parallel chunk compression. Each chunk's compressProofFragments call
-    // is independent and CPU-bound — perfect for std::async.
+    // Parallel chunk compression. Static partitioning: thread_count tasks,
+    // each loops over a contiguous range of chunks. Avoids the O(num_chunks)
+    // std::async thread-creation overhead of one-task-per-chunk.
     std::vector<std::vector<uint8_t>> compressed(num_chunks);
     {
+        uint64_t const tasks_n       = std::min<uint64_t>(thread_count, num_chunks);
+        uint64_t const chunks_per_tk = (num_chunks + tasks_n - 1) / tasks_n;
         std::vector<std::future<void>> tasks;
-        // Simple fan-out: fire one async task per chunk, but cap concurrency
-        // by waiting in batches.
-        for (uint64_t start = 0; start < num_chunks; start += thread_count) {
-            uint64_t end = std::min<uint64_t>(start + thread_count, num_chunks);
-            tasks.clear();
-            tasks.reserve(end - start);
-            for (uint64_t i = start; i < end; ++i) {
-                tasks.emplace_back(std::async(std::launch::async, [&, i] {
-                    uint64_t start_range = i * range_per_chunk;
-                    compressed[i] = ChunkCompressor::compressProofFragments(
-                        chunked.proof_fragments_chunks[i], start_range, stub_bits);
+        tasks.reserve(tasks_n);
+        for (uint64_t tstart = 0; tstart < num_chunks; tstart += chunks_per_tk) {
+            uint64_t const tend = std::min<uint64_t>(tstart + chunks_per_tk, num_chunks);
+            tasks.emplace_back(std::async(std::launch::async,
+                [&, tstart, tend]() {
+                    for (uint64_t i = tstart; i < tend; ++i) {
+                        uint64_t start_range = i * range_per_chunk;
+                        compressed[i] = ChunkCompressor::compressProofFragments(
+                            chunked.proof_fragments_chunks[i], start_range, stub_bits);
+                    }
                 }));
-            }
-            for (auto& f : tasks) f.get();
         }
+        for (auto& f : tasks) f.get();
     }
 
     // Serial write phase — file I/O is sequential anyway.
