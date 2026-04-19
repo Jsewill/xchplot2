@@ -91,6 +91,27 @@ xchplot2 test  <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
 xchplot2 batch <manifest.tsv> [-v]                # batched, raw inputs
 ```
 
+## Testing farming on a testnet
+
+v2 (CHIP-48) farming in stock chia-blockchain is presently unfinished
+upstream — services aren't wired into the farmer group, a message
+handler's signature doesn't match its decorator, `ProofOfSpace.
+challenge` is computed from the wrong input, and the dependency pin
+on `chia_rs` excludes the 0.42 release where `compute_plot_id_v2`
+lives. `contrib/testnet-farming.patch` is a minimal self-contained
+fix-up that gets a private testnet running end-to-end:
+
+```bash
+git clone https://github.com/Chia-Network/chia-blockchain
+cd chia-blockchain
+git checkout 39f8bec88   # 2.7.0 Checkpoint Merge
+git apply /path/to/xchplot2/contrib/testnet-farming.patch
+```
+
+The patch's header comment describes each hunk. None of the changes
+are xchplot2-specific — they're the farmer / harvester / daemon
+pieces any v2 plot needs for farming, regardless of who produced it.
+
 ## Architecture
 
 ```

@@ -1,0 +1,158 @@
+# chia-blockchain farming fixes for pos2 / CHIP-48 (v2) plots
+#
+# These changes address presently unfinished upstream implementation of
+# v2 farming in chia-blockchain. The code paths for v2 proof-of-space
+# exist but are half-wired: services aren't started in the farmer
+# group, the solver peer set is never populated, a message-handler
+# signature doesn't match its decorator, ProofOfSpace.challenge is
+# computed from the wrong input, and the harvester treats v2's bare
+# absolute-path plot_identifier as though it carried a v1 quality-hex
+# prefix. The dependency pin on chia_rs also excludes 0.42, which is
+# where compute_plot_id_v2 landed.
+#
+# Target: Chia-Network/chia-blockchain @ commit 39f8bec88
+#         ("2.7.0 Checkpoint Merge (#20725)")
+#
+# Apply:
+#     git clone https://github.com/Chia-Network/chia-blockchain
+#     cd chia-blockchain
+#     git checkout 39f8bec88
+#     git apply /path/to/testnet-farming.patch
+#
+# What this enables:
+#   1. chia_solver in service_groups.py and the daemon name_map so
+#      `chia start farmer` / `chia start solver` actually launch it.
+#   2. start_farmer.py wires farmer.solver_peers into the farmer's
+#      peer set so send_to_all(NodeType.SOLVER) reaches the solver.
+#   3. FarmerAPI.solution_response handler's signature matches its
+#      @metadata.request() decorator — current code raises TypeError
+#      on every solver response and closes the connection in a loop.
+#   4. Farmer computes ProofOfSpace.challenge as
+#      calculate_pos_challenge(plot_id, challenge_hash, sp_hash)
+#      instead of using the raw sub-slot challenge, so the local
+#      validator stops rejecting solved proofs with "Calculated pos
+#      challenge doesn't match the provided one".
+#   5. Harvester request_signatures treats v2's bare-absolute-path
+#      plot_identifier correctly (v1 prepends a 64-char quality hex,
+#      v2 does not; current code unconditionally slices 64 chars off).
+#   6. chia_rs dependency pin bumped from ">=0.41.1, <0.42" to
+#      ">=0.42.0, <0.43" so compute_plot_id_v2 is available.
+#
+# Not included: the `chia plots create --v2` CPU-plotter CLI wiring.
+# xchplot2 users plot with `xchplot2 plot` and farm the resulting
+# .plot2 files via this patch, so that wiring is unnecessary here.
+
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -53,7 +53,7 @@ boto3 = ">=1.35.43"  # AWS S3 for Data Layer S3 plugin
+ chiabip158 = ">=1.5.2"  # bip158-style wallet filters
+ chiapos = ">=2.0.10"  # proof of space
+ chia-puzzles-py = ">=0.20.1"
+-chia_rs = ">=0.41.1, <0.42"
++chia_rs = ">=0.42.0, <0.43"
+ chiavdf = ">=1.1.10"  # timelord and vdf verification
+ click = ">=8.1.7"  # For the CLI
+ clvm = ">=0.9.14"
+diff --git a/chia/daemon/server.py b/chia/daemon/server.py
+index 2ffa03a25..d50b9cff1 100644
+--- a/chia/daemon/server.py
++++ b/chia/daemon/server.py
+@@ -112,6 +112,7 @@ if getattr(sys, "frozen", False):
+         "chia_full_node_simulator": "start_simulator",
+         "chia_seeder": "start_seeder",
+         "chia_crawler": "start_crawler",
++        "chia_solver": "start_solver",
+     }
+ 
+     def executable_for_service(service_name: str) -> str:
+diff --git a/chia/farmer/farmer_api.py b/chia/farmer/farmer_api.py
+index 0a5c790b8..bc3ec391d 100644
+--- a/chia/farmer/farmer_api.py
++++ b/chia/farmer/farmer_api.py
+@@ -41,6 +41,7 @@ from chia.server.server import ssl_context_for_root
+ from chia.server.ws_connection import WSChiaConnection
+ from chia.ssl.create_ssl import get_mozilla_ca_crt
+ from chia.types.blockchain_format.proof_of_space import (
++    calculate_pos_challenge,
+     calculate_prefix_bits,
+     generate_plot_public_key,
+     generate_taproot_sk,
+@@ -531,7 +532,7 @@ class FarmerAPI:
+                 if key in self.farmer.pending_solver_requests:
+                     del self.farmer.pending_solver_requests[key]
+ 
+-    @metadata.request()
++    @metadata.request(peer_required=True)
+     async def solution_response(self, response: SolverResponse, peer: WSChiaConnection) -> None:
+         """
+         Handle solution response from solver service.
+@@ -560,7 +561,11 @@ class FarmerAPI:
+             self.farmer.log.warning(f"Received empty proof from solver for proof {partial_proof.fragments[:5]}...")
+             return
+ 
+-        sp_challenge_hash = proof_data.challenge_hash
++        sp_challenge_hash = calculate_pos_challenge(
++            proof_data.plot_id,
++            proof_data.challenge_hash,
++            proof_data.sp_hash,
++        )
+         new_proof_of_space = harvester_protocol.NewProofOfSpace(
+             proof_data.challenge_hash,
+             proof_data.sp_hash,
+diff --git a/chia/farmer/start_farmer.py b/chia/farmer/start_farmer.py
+index bd7e30df6..37e65d1f9 100644
+--- a/chia/farmer/start_farmer.py
++++ b/chia/farmer/start_farmer.py
+@@ -57,6 +57,7 @@ def create_farmer_service(
+         rpc_info = (FarmerRpcApi, service_config["rpc_port"])
+ 
+     connect_peers = get_unresolved_peer_infos(service_config, NodeType.FULL_NODE)
++    connect_peers |= get_unresolved_peer_infos(service_config, NodeType.SOLVER)
+     if solver_peer is not None:
+         connect_peers.add(solver_peer)
+ 
+diff --git a/chia/harvester/harvester_api.py b/chia/harvester/harvester_api.py
+index 03c3628fd..4fd35db66 100644
+--- a/chia/harvester/harvester_api.py
++++ b/chia/harvester/harvester_api.py
+@@ -481,8 +481,13 @@ class HarvesterAPI:
+         A signature is created on the header hash using the harvester private key. This can also
+         be used for pooling.
+         """
+-        plot_filename = Path(request.plot_identifier[64:]).resolve()
++        # v1 plot_identifier is "<64 hex quality_str><absolute filename>".
++        # v2 plot_identifier is a bare absolute filename (no quality prefix) — see
++        # blocking_lookup_v2_partial_proofs which sets it to str(filename.resolve()).
+         with self.harvester.plot_manager:
++            plot_filename = Path(request.plot_identifier).resolve()
++            if plot_filename not in self.harvester.plot_manager.plots:
++                plot_filename = Path(request.plot_identifier[64:]).resolve()
+             try:
+                 plot_info = self.harvester.plot_manager.plots[plot_filename]
+             except KeyError:
+diff --git a/chia/util/service_groups.py b/chia/util/service_groups.py
+index b5c05ddce..6c32e54be 100644
+--- a/chia/util/service_groups.py
++++ b/chia/util/service_groups.py
+@@ -12,6 +12,7 @@ SERVICES_FOR_GROUP: dict[str, list[str]] = {
+         "chia_wallet",
+         "chia_data_layer",
+         "chia_data_layer_http",
++        "chia_solver",
+     ],
+     "daemon": [],
+     # TODO: should this be `data_layer`?
+@@ -19,9 +20,10 @@ SERVICES_FOR_GROUP: dict[str, list[str]] = {
+     "data_layer_http": ["chia_data_layer_http"],
+     "node": ["chia_full_node"],
+     "harvester": ["chia_harvester"],
+-    "farmer": ["chia_harvester", "chia_farmer", "chia_full_node", "chia_wallet"],
+-    "farmer-no-wallet": ["chia_harvester", "chia_farmer", "chia_full_node"],
++    "farmer": ["chia_harvester", "chia_farmer", "chia_full_node", "chia_wallet", "chia_solver"],
++    "farmer-no-wallet": ["chia_harvester", "chia_farmer", "chia_full_node", "chia_solver"],
+     "farmer-only": ["chia_farmer"],
++    "solver": ["chia_solver"],
+     "timelord": ["chia_timelord_launcher", "chia_timelord", "chia_full_node"],
+     "timelord-only": ["chia_timelord"],
+     "timelord-launcher-only": ["chia_timelord_launcher"],
