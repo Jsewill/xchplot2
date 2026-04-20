@@ -125,9 +125,9 @@ if(XCHPLOT2_BUILD_CUDA)
         src/gpu/AesGpuBitsliced.cu
         src/gpu/SortCuda.cu)
 else()
-    # Non-CUDA path: SortSycl.cpp stub (returns NotSupported until a
-    # hand-rolled SYCL radix sort lands) + AesStub.cpp no-op for
-    # initialize_aes_tables. Both compiled by acpp via add_sycl_to_target.
+    # Non-CUDA path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) +
+    # AesStub.cpp no-op for initialize_aes_tables. Both compiled by acpp
+    # via add_sycl_to_target.
     set(POS2_GPU_CUDA_SRC)
     list(APPEND POS2_GPU_SYCL_SRC
         src/gpu/SortSycl.cpp
@@ -347,6 +347,18 @@ target_compile_features(sycl_g_x_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_g_x_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Slice-18 standalone: exercises launch_sort_pairs_u32_u32 and
+# launch_sort_keys_u64 against a std::sort reference. Built always — runs
+# the CUB-backed wrappers when XCHPLOT2_BUILD_CUDA=ON, the hand-rolled
+# SYCL radix when OFF. Lets the SYCL sort path be validated on NVIDIA
+# hardware without needing AMD/Intel access.
+add_executable(sycl_sort_parity tools/parity/sycl_sort_parity.cpp)
+add_sycl_to_target(TARGET sycl_sort_parity
+                   SOURCES tools/parity/sycl_sort_parity.cpp)
+target_link_libraries(sycl_sort_parity PRIVATE pos2_gpu)
+# cuda_fp16.h transitively required by SyclBackend.hpp → sycl/sycl.hpp
+# (AdaptiveCpp's half.hpp uses cuda_fp16 intrinsics on the CUDA backend).
+target_include_directories(sycl_sort_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
