@@ -22,9 +22,7 @@
 #include <cstdint>
 #include <cstddef>
 
-#include <cuda_fp16.h>
 #include <sycl/sycl.hpp>
-#include <cuda_runtime.h>   // cudaError_t
 
 namespace pos2gpu {
 

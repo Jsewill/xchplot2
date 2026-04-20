@@ -8,6 +8,10 @@
 // natively. Two host fences per sort call (~50µs each, well under
 // 1ms/plot at the typical 3 sorts/plot rate).
 
+// cuda_fp16.h must be included before sycl/sycl.hpp (pulled in via Sort.cuh)
+// so AdaptiveCpp's half.hpp sees the __hdiv / __hlt / __hge intrinsics.
+#include <cuda_fp16.h>
+
 #include "gpu/Sort.cuh"
 
 #include <cub/cub.cuh>
