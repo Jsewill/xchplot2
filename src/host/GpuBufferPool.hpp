@@ -31,12 +31,26 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace pos2gpu {
 
+// Typed exception for the "pool sizing exceeds available device VRAM"
+// case. Callers that want to fall back to the streaming pipeline when
+// the pool does not fit should catch this specifically rather than
+// string-matching a generic std::runtime_error.
+struct InsufficientVramError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+    size_t required_bytes = 0;
+    size_t free_bytes     = 0;
+    size_t total_bytes    = 0;
+};
+
 struct GpuBufferPool {
-    // Allocates all buffers sized for (k, strength, testnet). Throws on any
-    // CUDA allocation failure.
+    // Allocates all buffers sized for (k, strength, testnet). Throws
+    // InsufficientVramError when the sized pool will not fit in free
+    // device VRAM; throws std::runtime_error on any other CUDA
+    // allocation or API failure.
     GpuBufferPool(int k, int strength, bool testnet);
     ~GpuBufferPool();
 

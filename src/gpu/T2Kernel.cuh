@@ -45,13 +45,22 @@ T2MatchParams make_t2_params(int k, int strength);
 // Dropping the 4-byte match_info from the permuted stream trims the sorted-T1
 // footprint 12 B → 8 B per entry and removes wasted bandwidth on the match
 // kernel's hot meta loads.
+//
+// Output is also SoA: three parallel streams instead of a packed
+// T2PairingGpu array. This lets the streaming pipeline free the mi
+// stream early (after it's consumed by the subsequent CUB sort as the
+// key input) without touching the meta/xbits streams, shaving ~1 GB
+// off the k=28 T2-sort peak. The matching-parity tool rebuilds
+// T2PairingGpu locally when it needs the AoS form.
 cudaError_t launch_t2_match(
     uint8_t const* plot_id_bytes,
     T2MatchParams const& params,
     uint64_t const* d_sorted_meta,  // meta, sorted by match_info ascending
     uint32_t const* d_sorted_mi,    // parallel match_info stream
     uint64_t t1_count,
-    T2PairingGpu* d_out_pairings,
+    uint64_t* d_out_meta,           // uint64 meta per emitted pair
+    uint32_t* d_out_mi,             // uint32 match_info per emitted pair
+    uint32_t* d_out_xbits,          // uint32 x_bits per emitted pair
     uint64_t* d_out_count,
     uint64_t capacity,
     void* d_temp_storage,
