@@ -6,6 +6,7 @@
 // correctness, which is already validated by t1_parity.
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/SyclBackend.hpp"
 #include "gpu/T1Kernel.cuh"
 #include "gpu/T2Kernel.cuh"
 
@@ -160,16 +161,16 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     CHECK(cudaMalloc(&d_t2_count, sizeof(uint64_t)));
 
     size_t t2_temp_bytes = 0;
-    CHECK(pos2gpu::launch_t2_match(plot_id.data(), t2p, nullptr, nullptr, t1_snapshot.size(),
+    pos2gpu::launch_t2_match(plot_id.data(), t2p, nullptr, nullptr, t1_snapshot.size(),
                                    nullptr, nullptr, nullptr,
                                    d_t2_count, capacity,
-                                   nullptr, &t2_temp_bytes));
+                                   nullptr, &t2_temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_t2_temp = nullptr;
     CHECK(cudaMalloc(&d_t2_temp, t2_temp_bytes));
-    CHECK(pos2gpu::launch_t2_match(plot_id.data(), t2p, d_t1_meta, d_t1_mi, t1_snapshot.size(),
+    pos2gpu::launch_t2_match(plot_id.data(), t2p, d_t1_meta, d_t1_mi, t1_snapshot.size(),
                                    d_t2_meta, d_t2_mi, d_t2_xbits,
                                    d_t2_count, capacity,
-                                   d_t2_temp, &t2_temp_bytes));
+                                   d_t2_temp, &t2_temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     uint64_t gpu_count = 0;

@@ -10,6 +10,9 @@
 #include "gpu/XsKernel.cuh"
 
 #include <cuda_runtime.h>
+
+#include <cuda_fp16.h>
+#include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
 
@@ -50,7 +53,7 @@ T1MatchParams make_t1_params(int k, int strength);
 // touching the meta stream. Saves ~1 GB at k=28 during the T1 sort
 // phase. t1_parity and other consumers rebuild the AoS form locally if
 // they need it.
-cudaError_t launch_t1_match(
+void launch_t1_match(
     uint8_t const* plot_id_bytes,
     T1MatchParams const& params,
     XsCandidateGpu const* d_sorted_xs,
@@ -61,6 +64,6 @@ cudaError_t launch_t1_match(
     uint64_t capacity,
     void* d_temp_storage,
     size_t* temp_bytes,
-    cudaStream_t stream = nullptr);
+    sycl::queue& q);
 
 } // namespace pos2gpu

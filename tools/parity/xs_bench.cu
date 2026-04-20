@@ -4,6 +4,7 @@
 // chase further down the pipeline.
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernel.cuh"
 
 #include "plot/TableConstructorGeneric.hpp"
@@ -62,16 +63,16 @@ static double bench_gpu(uint8_t const* plot_id, int k)
     CHECK(cudaMalloc(&d_out, sizeof(pos2gpu::XsCandidateGpu) * total));
 
     size_t temp_bytes = 0;
-    CHECK(pos2gpu::launch_construct_xs(plot_id, k, false, nullptr, nullptr, &temp_bytes));
+    pos2gpu::launch_construct_xs(plot_id, k, false, nullptr, nullptr, &temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_temp = nullptr;
     CHECK(cudaMalloc(&d_temp, temp_bytes));
 
     // Warm up to amortise context init.
-    CHECK(pos2gpu::launch_construct_xs(plot_id, k, false, d_out, d_temp, &temp_bytes));
+    pos2gpu::launch_construct_xs(plot_id, k, false, d_out, d_temp, &temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     auto t0 = std::chrono::steady_clock::now();
-    CHECK(pos2gpu::launch_construct_xs(plot_id, k, false, d_out, d_temp, &temp_bytes));
+    pos2gpu::launch_construct_xs(plot_id, k, false, d_out, d_temp, &temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
 

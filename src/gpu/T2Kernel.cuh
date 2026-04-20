@@ -10,6 +10,9 @@
 #include "gpu/T1Kernel.cuh"
 
 #include <cuda_runtime.h>
+
+#include <cuda_fp16.h>
+#include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
 
@@ -52,7 +55,7 @@ T2MatchParams make_t2_params(int k, int strength);
 // key input) without touching the meta/xbits streams, shaving ~1 GB
 // off the k=28 T2-sort peak. The matching-parity tool rebuilds
 // T2PairingGpu locally when it needs the AoS form.
-cudaError_t launch_t2_match(
+void launch_t2_match(
     uint8_t const* plot_id_bytes,
     T2MatchParams const& params,
     uint64_t const* d_sorted_meta,  // meta, sorted by match_info ascending
@@ -65,6 +68,6 @@ cudaError_t launch_t2_match(
     uint64_t capacity,
     void* d_temp_storage,
     size_t* temp_bytes,
-    cudaStream_t stream = nullptr);
+    sycl::queue& q);
 
 } // namespace pos2gpu

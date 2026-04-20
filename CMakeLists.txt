@@ -1,24 +1,54 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(pos2-gpu LANGUAGES C CXX CUDA)
+project(pos2-gpu LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+# CUDA toolchain is conditional in slice 15. The CUDA path provides:
+#   - SortCuda.cu (CUB radix sort — best perf on NVIDIA)
+#   - AesGpu.cu (T-tables in __constant__ memory + cudaMemcpyToSymbol init)
+#   - AesGpuBitsliced.cu (bench-only bitsliced AES; needs nvcc)
+#   - The cuda-flavoured parity tests in tools/parity/
+# The non-CUDA path uses SortSycl.cpp + AesStub.cpp — runs on AMD/Intel via
+# AdaptiveCpp's HIP / Level Zero backends. Default ON to preserve the
+# existing NVIDIA workflow.
+#
+# CAVEAT: with XCHPLOT2_BUILD_CUDA=OFF the build still needs the CUDA
+# Toolkit *headers* on the include path (the SYCL TUs reference cudaError_t
+# / cudaStream_t / cuda_fp16.h via the kernel-wrapper headers). Lifting
+# those CUDA-type dependencies out of the public SYCL API is a follow-up
+# refactor (see slice 17 in docs/gpu-portability-sketch.md). nvcc itself is
+# NOT required when XCHPLOT2_BUILD_CUDA=OFF — only the headers.
+option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ON)
 
-# Default arch: sm_89 (RTX 4090). Override via -DCMAKE_CUDA_ARCHITECTURES=...
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
+if(XCHPLOT2_BUILD_CUDA)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
+    # Default arch: sm_89 (RTX 4090). Override via -DCMAKE_CUDA_ARCHITECTURES=...
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 89)
+    endif()
 endif()
 
 # Optional: compile in clock64 instrumentation for T3 match_all_buckets.
 # Prints a per-region cycle breakdown to stderr on every launch_t3_match
 # call. Off by default — enable with -DXCHPLOT2_INSTRUMENT_MATCH=ON.
 option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 breakdown" OFF)
+
+# SYCL kernels via AdaptiveCpp are the only backend; the previous
+# XCHPLOT2_BACKEND={cuda,sycl} toggle was retired in slice 9 once the
+# CUDA-native wrapper TUs (T*OffsetsCuda.cu, PipelineKernelsCuda.cu)
+# were deleted. AdaptiveCpp is now a hard build dependency.
+find_package(AdaptiveCpp REQUIRED)
+if(NOT ACPP_TARGETS)
+    set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+endif()
+message(STATUS "xchplot2: ACPP_TARGETS=${ACPP_TARGETS}")
 
 # pos2-chip dependency.
 #
@@ -74,15 +104,39 @@ endif()
 
 # Shared GPU support library (kernels). AesGpu.cu MUST come first — it
 # owns the constant-memory T-tables that all later kernels reference.
+# All backend-dispatched wrapper TUs (T*OffsetsSycl.cpp, PipelineKernelsSycl.cpp)
+# go through AdaptiveCpp via add_sycl_to_target below.
+set(POS2_GPU_SYCL_SRC
+    src/gpu/T1OffsetsSycl.cpp
+    src/gpu/T2OffsetsSycl.cpp
+    src/gpu/T3OffsetsSycl.cpp
+    src/gpu/PipelineKernelsSycl.cpp
+    src/gpu/XsKernel.cpp
+    src/gpu/XsKernelsSycl.cpp
+    src/gpu/T1Kernel.cpp
+    src/gpu/T2Kernel.cpp
+    src/gpu/T3Kernel.cpp
+    src/host/GpuBufferPool.cpp
+    src/host/GpuPipeline.cpp)
+
+if(XCHPLOT2_BUILD_CUDA)
+    set(POS2_GPU_CUDA_SRC
+        src/gpu/AesGpu.cu
+        src/gpu/AesGpuBitsliced.cu
+        src/gpu/SortCuda.cu)
+else()
+    # Non-CUDA path: SortSycl.cpp stub (returns NotSupported until a
+    # hand-rolled SYCL radix sort lands) + AesStub.cpp no-op for
+    # initialize_aes_tables. Both compiled by acpp via add_sycl_to_target.
+    set(POS2_GPU_CUDA_SRC)
+    list(APPEND POS2_GPU_SYCL_SRC
+        src/gpu/SortSycl.cpp
+        src/gpu/AesStub.cpp)
+endif()
+
 add_library(pos2_gpu STATIC
-    src/gpu/AesGpu.cu
-    src/gpu/AesGpuBitsliced.cu
-    src/gpu/XsKernel.cu
-    src/gpu/T1Kernel.cu
-    src/gpu/T2Kernel.cu
-    src/gpu/T3Kernel.cu
-    src/host/GpuBufferPool.cu
-    src/host/GpuPipeline.cu
+    ${POS2_GPU_CUDA_SRC}
+    ${POS2_GPU_SYCL_SRC}
 )
 target_include_directories(pos2_gpu PUBLIC
     src
@@ -92,6 +146,47 @@ target_compile_features(pos2_gpu PUBLIC cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
+add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
+# The SYCL TUs include CUDA headers (cuda_fp16.h, transitively cuda_runtime.h
+# from the kernel-wrapper headers) on both the CUDA and non-CUDA paths
+# (slice 17 will lift the CUDA-type dependencies out of the public API).
+# On the CUDA build we already have CMAKE_CUDA_COMPILER. On the non-CUDA
+# build we need to locate the CUDA Toolkit headers via find_package
+# (CUDAToolkit) — which does NOT require enable_language(CUDA).
+if(XCHPLOT2_BUILD_CUDA)
+    get_filename_component(_xchplot2_cuda_bin ${CMAKE_CUDA_COMPILER} DIRECTORY)
+    get_filename_component(_xchplot2_cuda_root ${_xchplot2_cuda_bin} DIRECTORY)
+    set(_xchplot2_cuda_include "${_xchplot2_cuda_root}/include")
+else()
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_INCLUDE_DIRS)
+        set(_xchplot2_cuda_include ${CUDAToolkit_INCLUDE_DIRS})
+    else()
+        # Last-resort guess; matches Arch / CachyOS layout.
+        set(_xchplot2_cuda_include "/opt/cuda/include")
+    endif()
+endif()
+target_include_directories(pos2_gpu PRIVATE ${_xchplot2_cuda_include})
+
+# Slice 17 removed the last SYCL-TU reference to a cudart *function* — only
+# cuda* types survive (used for API compatibility), and types don't require
+# a link against libcudart.so. On the NVIDIA build path the nvcc-compiled
+# TUs (AesGpu.cu, SortCuda.cu, AesGpuBitsliced.cu) bring in cudart
+# automatically. On non-NVIDIA builds cudart isn't needed at all.
+# Now that the kernel-wrapper headers (T*Offsets.cuh, PipelineKernels.cuh,
+# T*Kernel.cuh, XsKernel.cuh) take sycl::queue&, every TU that includes them
+# needs sycl/sycl.hpp on its include path — including the parity tests
+# compiled by nvcc. Make AdaptiveCpp's include dir PUBLIC so it propagates.
+get_filename_component(_xchplot2_acpp_cmake_dir
+    "${AdaptiveCpp_DIR}" DIRECTORY)  # /opt/adaptivecpp/lib/cmake/AdaptiveCpp/.. = /opt/adaptivecpp/lib/cmake
+get_filename_component(_xchplot2_acpp_lib_dir
+    "${_xchplot2_acpp_cmake_dir}" DIRECTORY)  # /opt/adaptivecpp/lib
+get_filename_component(_xchplot2_acpp_root
+    "${_xchplot2_acpp_lib_dir}" DIRECTORY)  # /opt/adaptivecpp
+target_include_directories(pos2_gpu PUBLIC
+    ${_xchplot2_acpp_root}/include
+    ${_xchplot2_acpp_root}/include/AdaptiveCpp)
+
 set_target_properties(pos2_gpu PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     # Do NOT pre-resolve device symbols — consumers (e.g. aes_parity.cu)
@@ -179,46 +274,79 @@ set_target_properties(xchplot2_cli PROPERTIES
 add_executable(xchplot2 tools/xchplot2/main.cpp)
 target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
 
-# Parity tests
-add_executable(aes_parity tools/parity/aes_parity.cu)
-target_link_libraries(aes_parity PRIVATE pos2_gpu_host)
+# Parity tests are nvcc-compiled (.cu) and reference __global__ kernels
+# from the bench-specific bitsliced AES path. They build only on the CUDA
+# target. The two SYCL-native parity tests below (sycl_*_parity) stay
+# unconditional so AMD/Intel builds still have correctness coverage.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(aes_parity tools/parity/aes_parity.cu)
+    target_link_libraries(aes_parity PRIVATE pos2_gpu_host)
 
-add_executable(aes_bs_parity tools/parity/aes_bs_parity.cu)
-target_link_libraries(aes_bs_parity PRIVATE pos2_gpu_host)
+    add_executable(aes_bs_parity tools/parity/aes_bs_parity.cu)
+    target_link_libraries(aes_bs_parity PRIVATE pos2_gpu_host)
 
-add_executable(aes_bs_bench tools/parity/aes_bs_bench.cu)
-target_link_libraries(aes_bs_bench PRIVATE pos2_gpu_host)
+    add_executable(aes_bs_bench tools/parity/aes_bs_bench.cu)
+    target_link_libraries(aes_bs_bench PRIVATE pos2_gpu_host)
 
-add_executable(aes_tezcan_bench tools/parity/aes_tezcan_bench.cu)
-target_link_libraries(aes_tezcan_bench PRIVATE pos2_gpu_host)
+    add_executable(aes_tezcan_bench tools/parity/aes_tezcan_bench.cu)
+    target_link_libraries(aes_tezcan_bench PRIVATE pos2_gpu_host)
 
-add_executable(xs_parity tools/parity/xs_parity.cu)
-target_link_libraries(xs_parity PRIVATE pos2_gpu_host)
+    add_executable(xs_parity tools/parity/xs_parity.cu)
+    target_link_libraries(xs_parity PRIVATE pos2_gpu_host)
 
-add_executable(xs_bench tools/parity/xs_bench.cu)
-target_link_libraries(xs_bench PRIVATE pos2_gpu_host)
+    add_executable(xs_bench tools/parity/xs_bench.cu)
+    target_link_libraries(xs_bench PRIVATE pos2_gpu_host)
 
-add_executable(t1_parity tools/parity/t1_parity.cu)
-target_link_libraries(t1_parity PRIVATE pos2_gpu_host)
+    add_executable(t1_parity tools/parity/t1_parity.cu)
+    target_link_libraries(t1_parity PRIVATE pos2_gpu_host)
 
-add_executable(t1_debug tools/parity/t1_debug.cu)
-target_link_libraries(t1_debug PRIVATE pos2_gpu_host)
-set_target_properties(t1_debug PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+    add_executable(t1_debug tools/parity/t1_debug.cu)
+    target_link_libraries(t1_debug PRIVATE pos2_gpu_host)
+    set_target_properties(t1_debug PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
-add_executable(t2_parity tools/parity/t2_parity.cu)
-target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
+    add_executable(t2_parity tools/parity/t2_parity.cu)
+    target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
 
-add_executable(t3_parity tools/parity/t3_parity.cu)
-target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
+    add_executable(t3_parity tools/parity/t3_parity.cu)
+    target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
 
-add_executable(plot_file_parity tools/parity/plot_file_parity.cpp)
-target_link_libraries(plot_file_parity PRIVATE pos2_gpu_host)
-set_target_properties(plot_file_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+    add_executable(plot_file_parity tools/parity/plot_file_parity.cpp)
+    target_link_libraries(plot_file_parity PRIVATE pos2_gpu_host)
+    set_target_properties(plot_file_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+    foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t2_parity t3_parity)
+        set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+    endforeach()
+
+    message(STATUS "pos2-gpu configured for CUDA arch(es): ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
-foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t2_parity t3_parity)
-    set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-endforeach()
 
-message(STATUS "pos2-gpu configured for CUDA arch(es): ${CMAKE_CUDA_ARCHITECTURES}")
+# Slice-1 standalone SYCL parity test: exercises compute_bucket_offsets in
+# isolation against a CPU reference on synthetic input — orthogonal to the
+# t1_parity full-pipeline test, useful for narrowing any divergence to the
+# SYCL kernel itself.
+add_executable(sycl_bucket_offsets_parity tools/parity/sycl_bucket_offsets_parity.cpp)
+add_sycl_to_target(TARGET sycl_bucket_offsets_parity
+                   SOURCES tools/parity/sycl_bucket_offsets_parity.cpp)
+target_compile_features(sycl_bucket_offsets_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_bucket_offsets_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Slice-4 standalone: validates the SYCL-compiled AES g_x_smem against the
+# same function run on the host. Pulls the AES headers (now portable behind
+# PortableAttrs.hpp) directly, so a host-vs-device divergence in the AES
+# math isolates here without t1_parity scaffolding.
+add_executable(sycl_g_x_parity tools/parity/sycl_g_x_parity.cpp)
+add_sycl_to_target(TARGET sycl_g_x_parity
+                   SOURCES tools/parity/sycl_g_x_parity.cpp)
+target_include_directories(sycl_g_x_parity PRIVATE src)
+target_compile_features(sycl_g_x_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_g_x_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_sort_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")

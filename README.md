@@ -34,7 +34,7 @@ Requires CUDA Toolkit 12+ (tested on 13.x), C++20 host compiler, CMake
 ### `cargo install`
 
 ```bash
-cargo install --git https://github.com/Chia-Network/xchplot2
+cargo install --git https://github.com/Jsewill/xchplot2
 ```
 
 `build.rs` auto-detects the local GPU's compute capability by querying
@@ -53,10 +53,10 @@ architectures — override with `$CUDA_ARCHITECTURES`:
 
 ```bash
 # Fat build for Ada (4090) and Blackwell (5090):
-CUDA_ARCHITECTURES="89;120" cargo install --git https://github.com/Chia-Network/xchplot2
+CUDA_ARCHITECTURES="89;120" cargo install --git https://github.com/Jsewill/xchplot2
 
 # Single target (e.g. Turing 2080 Ti):
-CUDA_ARCHITECTURES=75 cargo install --git https://github.com/Chia-Network/xchplot2
+CUDA_ARCHITECTURES=75 cargo install --git https://github.com/Jsewill/xchplot2
 ```
 
 Common values: `61` GTX 10-series, `70` Volta, `75` Turing, `80` A100,
