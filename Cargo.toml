@@ -5,7 +5,7 @@ edition     = "2021"
 authors     = ["Abraham Sewill <abraham.sewill@proton.me>"]
 license     = "MIT"
 description = "GPU plotter for Chia v2 proofs of space (CHIP-48)"
-repository  = "https://github.com/Chia-Network/xchplot2"
+repository  = "https://github.com/Jsewill/xchplot2"
 readme      = "README.md"
 build       = "build.rs"
 
