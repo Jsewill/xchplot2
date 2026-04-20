@@ -12,11 +12,11 @@
 #include "gpu/AesGpu.cuh"
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/T2Kernel.cuh"
+#include "host/PoolSizing.hpp"
 
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstdint>
-#include <vector>
 
 namespace pos2gpu {
 
@@ -44,6 +44,7 @@ __host__ __device__ inline uint32_t matching_section(uint32_t section, int num_s
     return section_new;
 }
 
+// One thread per bucket; last thread writes the sentinel.
 __global__ void compute_bucket_offsets(
     uint32_t const* __restrict__ sorted_mi,
     uint64_t total,
@@ -51,22 +52,22 @@ __global__ void compute_bucket_offsets(
     uint32_t num_buckets,
     uint64_t* __restrict__ offsets)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    uint32_t bucket_shift = static_cast<uint32_t>(num_match_target_bits);
-
-    uint64_t pos = 0;
-    for (uint32_t b = 0; b < num_buckets; ++b) {
-        uint64_t lo = pos, hi = total;
-        while (lo < hi) {
-            uint64_t mid = lo + ((hi - lo) >> 1);
-            uint32_t bucket_mid = sorted_mi[mid] >> bucket_shift;
-            if (bucket_mid < b) lo = mid + 1;
-            else                hi = mid;
-        }
-        offsets[b] = lo;
-        pos = lo;
+    uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b > num_buckets) return;
+    if (b == num_buckets) {
+        offsets[num_buckets] = total;
+        return;
     }
-    offsets[num_buckets] = total;
+
+    uint32_t bucket_shift = static_cast<uint32_t>(num_match_target_bits);
+    uint64_t lo = 0, hi = total;
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) >> 1);
+        uint32_t bucket_mid = sorted_mi[mid] >> bucket_shift;
+        if (bucket_mid < b) lo = mid + 1;
+        else                hi = mid;
+    }
+    offsets[b] = lo;
 }
 
 // See T3Kernel.cu for the rationale — one offset per (r_bucket, top
@@ -261,11 +262,16 @@ cudaError_t launch_t2_match(
 
     AesHashKeys keys = make_keys(plot_id_bytes);
 
-    compute_bucket_offsets<<<1, 1, 0, stream>>>(
-        d_sorted_mi, t1_count,
-        params.num_match_target_bits,
-        num_buckets,
-        d_offsets);
+    {
+        constexpr int kOffThreads = 256;
+        unsigned off_blocks = static_cast<unsigned>(
+            (num_buckets + 1 + kOffThreads - 1) / kOffThreads);
+        compute_bucket_offsets<<<off_blocks, kOffThreads, 0, stream>>>(
+            d_sorted_mi, t1_count,
+            params.num_match_target_bits,
+            num_buckets,
+            d_offsets);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
@@ -281,20 +287,10 @@ cudaError_t launch_t2_match(
     err = cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
     if (err != cudaSuccess) return err;
 
-    std::vector<uint64_t> h_offsets(num_buckets + 1);
-    err = cudaMemcpyAsync(h_offsets.data(), d_offsets,
-                          sizeof(uint64_t) * (num_buckets + 1),
-                          cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) return err;
-
-    uint64_t l_count_max = 0;
-    for (uint32_t s = 0; s < num_sections; ++s) {
-        uint64_t l_count = h_offsets[(s + 1) * num_match_keys]
-                         - h_offsets[s * num_match_keys];
-        if (l_count > l_count_max) l_count_max = l_count;
-    }
+    // See T1Kernel.cu for rationale: static per-section cap as over-
+    // launch upper bound, excess threads early-exit on `l >= l_end`.
+    uint64_t l_count_max =
+        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
 
     uint32_t target_mask = (params.num_match_target_bits >= 32)
                             ? 0xFFFFFFFFu

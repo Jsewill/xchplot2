@@ -11,6 +11,7 @@
 
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/PoolSizing.hpp"
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/XsKernel.cuh"
@@ -134,13 +135,6 @@ __global__ void gather_u32(uint32_t const* __restrict__ src,
     dst[p] = src[indices[p]];
 }
 
-// Mirror of the formula in GpuBufferPool.cu / pos2-chip
-// TableConstructorGeneric.hpp:23 — duplicated here so the streaming path
-// does not need to instantiate a GpuBufferPool just to learn its cap.
-inline size_t max_pairs_per_section_streaming(int k, int num_section_bits) {
-    int extra_margin_bits = 8 - ((28 - k) / 2);
-    return (1ULL << (k - num_section_bits)) + (1ULL << (k - extra_margin_bits));
-}
 
 
 // =====================================================================
@@ -778,7 +772,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     int const num_section_bits = (cfg.k < 28) ? 2 : (cfg.k - 26);
     uint64_t const total_xs = 1ULL << cfg.k;
     uint64_t const cap =
-        max_pairs_per_section_streaming(cfg.k, num_section_bits) *
+        max_pairs_per_section(cfg.k, num_section_bits) *
         (1ULL << num_section_bits);
 
     constexpr int kThreads = 256;
