@@ -5,7 +5,8 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "gpu/PortableAttrs.hpp"
+
 #include <cstdint>
 
 namespace pos2gpu {
@@ -16,7 +17,7 @@ struct FeistelKey {
     int rounds;
 };
 
-__host__ __device__ inline FeistelKey make_feistel_key(uint8_t const* plot_id, int k, int rounds = 4)
+POS2_HOST_DEVICE_INLINE FeistelKey make_feistel_key(uint8_t const* plot_id, int k, int rounds = 4)
 {
     FeistelKey fk;
     fk.k = k;
@@ -26,14 +27,14 @@ __host__ __device__ inline FeistelKey make_feistel_key(uint8_t const* plot_id, i
     return fk;
 }
 
-__host__ __device__ inline uint64_t feistel_rotate_left(uint64_t value, uint64_t shift, uint64_t bit_length)
+POS2_HOST_DEVICE_INLINE uint64_t feistel_rotate_left(uint64_t value, uint64_t shift, uint64_t bit_length)
 {
     if (shift > bit_length) shift = bit_length;
     uint64_t mask = (bit_length == 64 ? ~0ULL : ((1ULL << bit_length) - 1));
     return ((value << shift) & mask) | (value >> (bit_length - shift));
 }
 
-__host__ __device__ inline uint64_t feistel_slice_key(FeistelKey const& fk, int start_bit, int num_bits)
+POS2_HOST_DEVICE_INLINE uint64_t feistel_slice_key(FeistelKey const& fk, int start_bit, int num_bits)
 {
     int start_byte    = start_bit / 8;
     int bit_offset    = start_bit % 8;
@@ -49,7 +50,7 @@ __host__ __device__ inline uint64_t feistel_slice_key(FeistelKey const& fk, int 
     return (key_segment >> shift_amount) & mask;
 }
 
-__host__ __device__ inline uint64_t feistel_round_key(FeistelKey const& fk, int round_num)
+POS2_HOST_DEVICE_INLINE uint64_t feistel_round_key(FeistelKey const& fk, int round_num)
 {
     int half_length    = fk.k;
     int bits_for_round = 3 * half_length;
@@ -61,7 +62,7 @@ __host__ __device__ inline uint64_t feistel_round_key(FeistelKey const& fk, int 
 
 struct FeistelResultGpu { uint64_t left, right; };
 
-__host__ __device__ inline FeistelResultGpu feistel_round(
+POS2_HOST_DEVICE_INLINE FeistelResultGpu feistel_round(
     FeistelKey const& fk, uint64_t left, uint64_t right, uint64_t round_key)
 {
     int k = fk.k;
@@ -87,7 +88,7 @@ __host__ __device__ inline FeistelResultGpu feistel_round(
     return res;
 }
 
-__host__ __device__ inline uint64_t feistel_encrypt(FeistelKey const& fk, uint64_t input_value)
+POS2_HOST_DEVICE_INLINE uint64_t feistel_encrypt(FeistelKey const& fk, uint64_t input_value)
 {
     int k = fk.k;
     uint64_t bitmask = (k == 64 ? ~0ULL : ((1ULL << k) - 1));

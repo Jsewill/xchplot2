@@ -11,6 +11,9 @@
 #include "gpu/T2Kernel.cuh"
 
 #include <cuda_runtime.h>
+
+#include <cuda_fp16.h>
+#include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
 
@@ -35,7 +38,7 @@ T3MatchParams make_t3_params(int k, int strength);
 // sorted_t2 input is SoA-split: d_sorted_meta[i] is T2Pairing.meta and
 // d_sorted_xbits[i] is T2Pairing.x_bits after the T2 sort. match_info is
 // carried in the parallel d_sorted_mi stream.
-cudaError_t launch_t3_match(
+void launch_t3_match(
     uint8_t const* plot_id_bytes,
     T3MatchParams const& params,
     uint64_t const* d_sorted_meta,   // cap entries, uint64 meta
@@ -47,6 +50,6 @@ cudaError_t launch_t3_match(
     uint64_t capacity,
     void* d_temp_storage,
     size_t* temp_bytes,
-    cudaStream_t stream = nullptr);
+    sycl::queue& q);
 
 } // namespace pos2gpu

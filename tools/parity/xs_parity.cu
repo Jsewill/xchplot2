@@ -6,6 +6,7 @@
 // (match_info, x) pair matches in order.
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernel.cuh"
 
 // pos2-chip headers for the CPU reference.
@@ -84,26 +85,16 @@ bool run_for(uint32_t seed, int k, bool testnet)
     CHECK(cudaMalloc(&d_out, sizeof(pos2gpu::XsCandidateGpu) * total));
 
     size_t temp_bytes = 0;
-    auto err = pos2gpu::launch_construct_xs(
+    pos2gpu::launch_construct_xs(
         plot_id.data(), k, testnet,
         /*d_out=*/nullptr,
         /*d_temp_storage=*/nullptr,
-        &temp_bytes);
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "  query temp_bytes failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
-
+        &temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_temp = nullptr;
     CHECK(cudaMalloc(&d_temp, temp_bytes));
 
-    err = pos2gpu::launch_construct_xs(
-        plot_id.data(), k, testnet, d_out, d_temp, &temp_bytes);
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "  launch failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_temp); cudaFree(d_out);
-        return false;
-    }
+    pos2gpu::launch_construct_xs(
+        plot_id.data(), k, testnet, d_out, d_temp, &temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     std::vector<pos2gpu::XsCandidateGpu> gpu_out(total);

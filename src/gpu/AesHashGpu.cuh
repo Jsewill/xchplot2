@@ -8,10 +8,21 @@
 // The CPU code uses 16 alternating rounds (round_key_1, round_key_2). We
 // keep the same round count constants here so a single binary can be a
 // drop-in for the CPU code.
+//
+// Backend portability:
+//
+// The `_smem` family (run_rounds_smem, g_x_smem, pairing_smem,
+// matching_target_smem, chain_smem) is fully pointer-driven (table
+// pointer passed as an argument) and decorated with portable macros, so
+// it compiles under both nvcc and acpp/clang. The non-smem family reads
+// the constant-memory T-tables directly via aesenc_round and is
+// therefore CUDA-only.
 
 #pragma once
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/PortableAttrs.hpp"
+
 #include <cstdint>
 
 namespace pos2gpu {
@@ -28,7 +39,7 @@ struct AesHashKeys {
 
 // Build the two round keys from a 32-byte plot_id, matching
 // load_plot_id_as_aes_key in AesHash.hpp.
-__host__ __device__ inline AesHashKeys make_keys(uint8_t const* plot_id_bytes)
+POS2_HOST_DEVICE inline AesHashKeys make_keys(uint8_t const* plot_id_bytes)
 {
     AesHashKeys k;
     k.round_key_1 = load_state_le(plot_id_bytes + 0);
@@ -36,8 +47,10 @@ __host__ __device__ inline AesHashKeys make_keys(uint8_t const* plot_id_bytes)
     return k;
 }
 
+#if defined(__CUDACC__)
 // One full alternating round-pair. The CPU loop is:
 //   for r in 0..Rounds: state = aesenc(state, k1); state = aesenc(state, k2);
+// CUDA-only: calls aesenc_round which reads constant-memory T-tables.
 __device__ __forceinline__ AesState run_rounds(AesState state, AesHashKeys const& keys, int rounds)
 {
     #pragma unroll 2
@@ -56,12 +69,14 @@ __device__ __forceinline__ uint32_t g_x(AesHashKeys const& keys, uint32_t x, int
     s = run_rounds(s, keys, rounds);
     return s.w[0] & ((1u << k) - 1u);
 }
+#endif
 
 // pairing: load (meta_l_lo, meta_l_hi, meta_r_lo, meta_r_hi) into i0..i3,
 // run AES_PAIRING_ROUNDS << extra_rounds_bits, return all 4 u32s.
 // Mirrors AesHash::pairing<Soft>.
 struct Result128 { uint32_t r[4]; };
 
+#if defined(__CUDACC__)
 __device__ __forceinline__ Result128 pairing(
     AesHashKeys const& keys,
     uint64_t meta_l, uint64_t meta_r,
@@ -110,14 +125,17 @@ __device__ __forceinline__ uint64_t chain(AesHashKeys const& keys, uint64_t inpu
     s = run_rounds(s, keys, kAesChainingRounds);
     return uint64_t(s.w[0]) | (uint64_t(s.w[1]) << 32);
 }
+#endif // __CUDACC__
 
 // =========================================================================
 // Shared-memory T-table variants. Use after load_aes_tables_smem(sT) +
-// __syncthreads(). All four functions mirror their constant-memory peers
-// above; only the inner aesenc_round call changes.
+// __syncthreads() in CUDA, or after a SYCL local_accessor + barrier in
+// SYCL. All five functions mirror their constant-memory peers above;
+// only the inner aesenc_round_smem call (and the table pointer arg)
+// differ. Fully portable — compile under both backends.
 // =========================================================================
 
-__device__ __forceinline__ AesState run_rounds_smem(
+POS2_DEVICE_INLINE AesState run_rounds_smem(
     AesState state, AesHashKeys const& keys, int rounds, uint32_t const* __restrict__ sT)
 {
     #pragma unroll 2
@@ -128,7 +146,7 @@ __device__ __forceinline__ AesState run_rounds_smem(
     return state;
 }
 
-__device__ __forceinline__ uint32_t g_x_smem(
+POS2_DEVICE_INLINE uint32_t g_x_smem(
     AesHashKeys const& keys, uint32_t x, int k,
     uint32_t const* __restrict__ sT, int rounds = kAesGRounds)
 {
@@ -137,7 +155,7 @@ __device__ __forceinline__ uint32_t g_x_smem(
     return s.w[0] & ((1u << k) - 1u);
 }
 
-__device__ __forceinline__ Result128 pairing_smem(
+POS2_DEVICE_INLINE Result128 pairing_smem(
     AesHashKeys const& keys,
     uint64_t meta_l, uint64_t meta_r,
     uint32_t const* __restrict__ sT,
@@ -156,7 +174,7 @@ __device__ __forceinline__ Result128 pairing_smem(
     return out;
 }
 
-__device__ __forceinline__ uint32_t matching_target_smem(
+POS2_DEVICE_INLINE uint32_t matching_target_smem(
     AesHashKeys const& keys,
     uint32_t table_id, uint32_t match_key, uint64_t meta,
     uint32_t const* __restrict__ sT,
@@ -172,7 +190,7 @@ __device__ __forceinline__ uint32_t matching_target_smem(
     return s.w[0];
 }
 
-__device__ __forceinline__ uint64_t chain_smem(
+POS2_DEVICE_INLINE uint64_t chain_smem(
     AesHashKeys const& keys, uint64_t input,
     uint32_t const* __restrict__ sT)
 {

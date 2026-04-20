@@ -7,6 +7,7 @@
 // downstream T2/T3/proof pipeline.
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
 
@@ -111,10 +112,10 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     pos2gpu::XsCandidateGpu* d_xs = nullptr;
     CHECK(cudaMalloc(&d_xs, sizeof(pos2gpu::XsCandidateGpu) * total));
     size_t xs_temp_bytes = 0;
-    CHECK(pos2gpu::launch_construct_xs(plot_id.data(), k, false, nullptr, nullptr, &xs_temp_bytes));
+    pos2gpu::launch_construct_xs(plot_id.data(), k, false, nullptr, nullptr, &xs_temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_xs_temp = nullptr;
     CHECK(cudaMalloc(&d_xs_temp, xs_temp_bytes));
-    CHECK(pos2gpu::launch_construct_xs(plot_id.data(), k, false, d_xs, d_xs_temp, &xs_temp_bytes));
+    pos2gpu::launch_construct_xs(plot_id.data(), k, false, d_xs, d_xs_temp, &xs_temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     auto t1p = pos2gpu::make_t1_params(k, strength);
@@ -131,14 +132,14 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     CHECK(cudaMalloc(&d_t1_count, sizeof(uint64_t)));
 
     size_t t1_temp_bytes = 0;
-    CHECK(pos2gpu::launch_t1_match(plot_id.data(), t1p, d_xs, total,
+    pos2gpu::launch_t1_match(plot_id.data(), t1p, d_xs, total,
                                    nullptr, nullptr, d_t1_count, capacity,
-                                   nullptr, &t1_temp_bytes));
+                                   nullptr, &t1_temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_t1_temp = nullptr;
     CHECK(cudaMalloc(&d_t1_temp, t1_temp_bytes));
-    CHECK(pos2gpu::launch_t1_match(plot_id.data(), t1p, d_xs, total,
+    pos2gpu::launch_t1_match(plot_id.data(), t1p, d_xs, total,
                                    d_t1_meta, d_t1_mi, d_t1_count, capacity,
-                                   d_t1_temp, &t1_temp_bytes));
+                                   d_t1_temp, &t1_temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     uint64_t gpu_count = 0;

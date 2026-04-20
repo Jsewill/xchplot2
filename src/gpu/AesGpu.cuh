@@ -20,26 +20,44 @@
 //
 // Cross-check against pos2-chip/src/pos/aes/intrin_portable.h which
 // defines `rx_aesenc_vec_i128 _mm_aesenc_si128`.
+//
+// Backend portability:
+//
+// The SYCL path (compiled by acpp/clang in non-CUDA mode) cannot see
+// __constant__ memory, threadIdx, or __device__ markup. The pieces it
+// needs — aesenc_round_smem, set_int_vec_i128, load_state_le, and the
+// AesState struct itself — are decorated with the portable macros from
+// PortableAttrs.hpp and stay outside the __CUDACC__ gate. The constant-
+// memory T-tables, the aesenc_round variant that reads them, and
+// load_aes_tables_smem (uses threadIdx) are CUDA-only.
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "gpu/PortableAttrs.hpp"
+
 #include <cstdint>
+
+#if defined(__CUDACC__)
+  #include <cuda_runtime.h>
+#endif
 
 namespace pos2gpu {
 
-// AES S-box (Rijndael forward S-box).
+#if defined(__CUDACC__)
+// AES T-tables in constant memory. Defined in AesGpu.cu, populated by
+// initialize_aes_tables() at startup.
 __device__ __constant__ extern uint32_t kAesT0[256];
 __device__ __constant__ extern uint32_t kAesT1[256];
 __device__ __constant__ extern uint32_t kAesT2[256];
 __device__ __constant__ extern uint32_t kAesT3[256];
+#endif
 
 struct AesState {
     uint32_t w[4];
 };
 
 // Load 16 bytes (little-endian) into an AesState.
-__host__ __device__ inline AesState load_state_le(uint8_t const* bytes)
+POS2_HOST_DEVICE_INLINE AesState load_state_le(uint8_t const* bytes)
 {
     AesState s;
     #pragma unroll
@@ -52,12 +70,11 @@ __host__ __device__ inline AesState load_state_le(uint8_t const* bytes)
     return s;
 }
 
-// One AES round equivalent to _mm_aesenc_si128(state, key).
-// Implemented with T-tables. ShiftRows is folded into the byte-extraction
-// indices, then SubBytes+MixColumns is the table lookup.
-//
-// AESENC operates per-column. For column c (0..3), the output column is:
-//   T0[s[c, 0]] ^ T1[s[(c+1) mod 4, 1]] ^ T2[s[(c+2) mod 4, 2]] ^ T3[s[(c+3) mod 4, 3]] ^ key[c]
+#if defined(__CUDACC__)
+// One AES round equivalent to _mm_aesenc_si128(state, key), reading the
+// T-tables from constant memory. CUDA-only because __constant__ has no
+// SYCL equivalent — the SYCL path uses aesenc_round_smem with tables
+// preloaded into local memory.
 __device__ __forceinline__ AesState aesenc_round(AesState s, AesState const& key)
 {
     auto byte = [](uint32_t w, int n) -> uint32_t {
@@ -75,10 +92,11 @@ __device__ __forceinline__ AesState aesenc_round(AesState s, AesState const& key
     }
     return out;
 }
+#endif
 
 // Convenience: load an i128 from four little-endian 32-bit ints, matching
 // rx_set_int_vec_i128(i3, i2, i1, i0).
-__host__ __device__ inline AesState set_int_vec_i128(int32_t i3, int32_t i2, int32_t i1, int32_t i0)
+POS2_HOST_DEVICE_INLINE AesState set_int_vec_i128(int32_t i3, int32_t i2, int32_t i1, int32_t i0)
 {
     AesState s;
     s.w[0] = static_cast<uint32_t>(i0);
@@ -90,6 +108,7 @@ __host__ __device__ inline AesState set_int_vec_i128(int32_t i3, int32_t i2, int
 
 // Initialize the constant-memory T-tables on first use. Must be called once
 // per program from host code before any kernel that touches AesGpu runs.
+// Implemented in AesGpu.cu (CUDA TU only).
 void initialize_aes_tables();
 
 // =========================================================================
@@ -106,8 +125,14 @@ void initialize_aes_tables();
 //   __syncthreads();
 //   AesState state = ...;
 //   state = aesenc_round_smem(state, round_key, sT);
+//
+// The SYCL path uses the same aesenc_round_smem (pointer-based, fully
+// portable) but provides its own loader — local_accessor + nd_item barrier
+// in place of __shared__ + __syncthreads — and supplies the table data
+// from a USM buffer initialised from AesTables.inl on the host side.
 // =========================================================================
 
+#if defined(__CUDACC__)
 __device__ __forceinline__ void load_aes_tables_smem(uint32_t* sT)
 {
     // sT layout: [T0|T1|T2|T3], 256 entries each (4096 entries total).
@@ -121,8 +146,9 @@ __device__ __forceinline__ void load_aes_tables_smem(uint32_t* sT)
         sT[3 * 256 + i] = kAesT3[i];
     }
 }
+#endif
 
-__device__ __forceinline__ AesState aesenc_round_smem(
+POS2_DEVICE_INLINE AesState aesenc_round_smem(
     AesState s, AesState const& key, uint32_t const* __restrict__ sT)
 {
     auto byte = [](uint32_t w, int n) -> uint32_t {

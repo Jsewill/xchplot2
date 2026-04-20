@@ -9,18 +9,16 @@
 #pragma once
 
 #include "gpu/AesHashGpu.cuh"
+#include "gpu/XsCandidateGpu.hpp"
 
 #include <cuda_runtime.h>
+
+#include <cuda_fp16.h>
+#include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
 
 namespace pos2gpu {
-
-struct XsCandidateGpu {
-    uint32_t match_info;
-    uint32_t x;
-};
-static_assert(sizeof(XsCandidateGpu) == 8, "must match pos2-chip Xs_Candidate layout");
 
 // Generate Xs_Candidate[2^k], sorted by match_info (low k bits, stable).
 // Caller must have called initialize_aes_tables() once before invocation.
@@ -36,18 +34,18 @@ static_assert(sizeof(XsCandidateGpu) == 8, "must match pos2-chip Xs_Candidate la
 //
 // Returns cudaSuccess on launch success. The sort is asynchronous on the
 // stream — synchronize before reading d_out on the host.
-cudaError_t launch_construct_xs(
+void launch_construct_xs(
     uint8_t const* plot_id_bytes,
     int k,
     bool testnet,
     XsCandidateGpu* d_out,
     void* d_temp_storage,
     size_t* temp_bytes,
-    cudaStream_t stream = nullptr);
+    sycl::queue& q);
 
 // Optional callback fired between the gen kernel and the sort, useful for
 // per-stage cudaEvent timing. Pass nullptr to skip.
-cudaError_t launch_construct_xs_profiled(
+void launch_construct_xs_profiled(
     uint8_t const* plot_id_bytes,
     int k,
     bool testnet,
@@ -56,6 +54,6 @@ cudaError_t launch_construct_xs_profiled(
     size_t* temp_bytes,
     cudaEvent_t after_gen,    // nullable; recorded after gen kernel queued
     cudaEvent_t after_sort,   // nullable; recorded after sort queued
-    cudaStream_t stream = nullptr);
+    sycl::queue& q);
 
 } // namespace pos2gpu

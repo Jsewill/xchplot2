@@ -5,6 +5,7 @@
 // from upstream phases (already validated by t1_parity / t2_parity).
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/SyclBackend.hpp"
 #include "gpu/T2Kernel.cuh"
 #include "gpu/T3Kernel.cuh"
 
@@ -145,18 +146,18 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     CHECK(cudaMalloc(&d_t3_count, sizeof(uint64_t)));
 
     size_t t3_temp_bytes = 0;
-    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p,
+    pos2gpu::launch_t3_match(plot_id.data(), t3p,
                                    d_t2_meta, d_t2_xbits, nullptr,
                                    t2_snapshot.size(),
                                    d_t3, d_t3_count, capacity,
-                                   nullptr, &t3_temp_bytes));
+                                   nullptr, &t3_temp_bytes, pos2gpu::sycl_backend::queue());
     void* d_t3_temp = nullptr;
     CHECK(cudaMalloc(&d_t3_temp, t3_temp_bytes));
-    CHECK(pos2gpu::launch_t3_match(plot_id.data(), t3p,
+    pos2gpu::launch_t3_match(plot_id.data(), t3p,
                                    d_t2_meta, d_t2_xbits, d_t2_mi,
                                    t2_snapshot.size(),
                                    d_t3, d_t3_count, capacity,
-                                   d_t3_temp, &t3_temp_bytes));
+                                   d_t3_temp, &t3_temp_bytes, pos2gpu::sycl_backend::queue());
     CHECK(cudaDeviceSynchronize());
 
     uint64_t gpu_count = 0;
