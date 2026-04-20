@@ -29,12 +29,32 @@ Requires CUDA Toolkit 12+ (tested on 13.x), C++20 host compiler, CMake
 
 ```bash
 cargo install --git https://github.com/Chia-Network/xchplot2
-# or fat build:
-CUDA_ARCHITECTURES="89;120" cargo install --git https://github.com/Chia-Network/xchplot2
 ```
 
-`build.rs` auto-detects the local GPU's compute capability via
-`nvidia-smi` (falling back to `sm_89`). Override with `$CUDA_ARCHITECTURES`.
+`build.rs` auto-detects the local GPU's compute capability by querying
+`nvidia-smi --query-gpu=compute_cap` and builds for only that
+architecture. That keeps the binary small and the build fast when the
+install and the target GPU are the same machine.
+
+If auto-detection fails (no `nvidia-smi` in `PATH`, or
+`nvidia-smi` can't see a GPU — common when building inside a container
+or on a headless build host that lacks the CUDA driver), the build
+falls back to `sm_89`.
+
+If you need to target a GPU that isn't the one doing the build — or if
+you want a single "fat build" binary that covers multiple
+architectures — override with `$CUDA_ARCHITECTURES`:
+
+```bash
+# Fat build for Ada (4090) and Blackwell (5090):
+CUDA_ARCHITECTURES="89;120" cargo install --git https://github.com/Chia-Network/xchplot2
+
+# Single target (e.g. Turing 2080 Ti):
+CUDA_ARCHITECTURES=75 cargo install --git https://github.com/Chia-Network/xchplot2
+```
+
+Common values: `61` GTX 10-series, `70` Volta, `75` Turing, `80` A100,
+`86` RTX 30-series, `89` RTX 40-series, `90` H100, `120` RTX 50-series.
 
 ### CMake (also builds the parity tests)
 
