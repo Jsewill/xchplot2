@@ -4,21 +4,27 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 `.plot2` files byte-identical to the
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
-## Performance
+## Hardware compatibility
 
-k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
-
-| Mode | Per plot |
-|---|---|
-| pos2-chip CPU baseline | ~50 s |
-| `xchplot2 batch` steady-state wall (pool path) | **2.06 s** |
-| `xchplot2 batch` steady-state wall (streaming path, ≤8 GB cards) | ~3.7 s |
-| Producer GPU time, steady-state | 1.96 s |
-| Device-kernel floor (single-plot nsys) | 1.91 s |
-
-A physically narrower PCIe slot (e.g. Gen4 x4) adds ~240 ms per plot to
-the final fragment D2H copy. Check `cat /sys/bus/pci/devices/*/current_link_width`
-under load if numbers look off by that much.
+- **GPU:** NVIDIA, compute capability ≥ 6.1 (Pascal / GTX 10-series
+  and newer). Builds auto-detect the installed GPU's `compute_cap`
+  via `nvidia-smi`; override with `$CUDA_ARCHITECTURES` for fat or
+  cross-target builds (see [Build](#build)).
+- **VRAM:** 8 GB minimum. Cards with < 15 GB free transparently use
+  the streaming pipeline; 16 GB+ cards use the persistent buffer pool
+  for faster steady-state. Both paths produce byte-identical plots.
+  Detailed breakdown in [VRAM](#vram).
+- **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
+  (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
+  copy; check `cat /sys/bus/pci/devices/*/current_link_width`
+  under load if throughput looks off.
+- **Host RAM:** ≥ 16 GB recommended; `batch` mode pins ~4 GB of host
+  memory for D2H double-buffering (pool or streaming).
+- **CUDA Toolkit:** 12+ required to build (tested on 13.x). Runtime
+  users on RTX 50-series (Blackwell, `sm_120`) need a driver bundle
+  that ships Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
+- **OS:** Linux (tested on modern glibc distributions). Windows and
+  macOS are not currently tested.
 
 ## Build
 
@@ -172,6 +178,18 @@ smaller peak regardless.
 
 Plot output is bit-identical between the two paths — the streaming
 code reorganises memory, not algorithms.
+
+## Performance
+
+k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
+
+| Mode | Per plot |
+|---|---|
+| pos2-chip CPU baseline | ~50 s |
+| `xchplot2 batch` steady-state wall (pool path) | **2.15 s** |
+| `xchplot2 batch` steady-state wall (streaming path, ≤8 GB cards) | ~3.7 s |
+| Producer GPU time, steady-state | 1.96 s |
+| Device-kernel floor (single-plot nsys) | 1.91 s |
 
 ## License
 
