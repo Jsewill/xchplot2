@@ -2,6 +2,7 @@
 // worst-case-sized persistent buffers.
 
 #include "host/GpuBufferPool.hpp"
+#include "host/PoolSizing.hpp"
 
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -29,13 +30,6 @@ namespace {
                                  cudaGetErrorString(err));               \
     }                                                                    \
 } while (0)
-
-// Mirrors GpuPipeline.cu's max_pairs_per_section (and pos2-chip's
-// TableConstructorGeneric.hpp:23).
-inline size_t max_pairs_per_section(int k, int num_section_bits) {
-    int extra_margin_bits = 8 - ((28 - k) / 2);
-    return (1ULL << (k - num_section_bits)) + (1ULL << (k - extra_margin_bits));
-}
 
 } // namespace
 

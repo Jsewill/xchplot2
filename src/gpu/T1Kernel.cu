@@ -16,6 +16,8 @@
 //           pairing_t1(x_l, x_r); if test_result == 0, emit T1Pairing
 //             { meta = (x_l << k) | x_r, match_info = pair.r[0] mask k }
 
+#include "host/PoolSizing.hpp"
+
 #include "gpu/AesGpu.cuh"
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -23,7 +25,6 @@
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstdint>
-#include <vector>
 
 namespace pos2gpu {
 
@@ -52,6 +53,9 @@ __host__ __device__ inline uint32_t matching_section(uint32_t section, int num_s
     return section_new;
 }
 
+// One thread per bucket: lower_bound on (sorted[i].match_info >> shift).
+// Thread num_buckets writes the sentinel offsets[num_buckets] = total.
+// Launched with blocks = (num_buckets + 1 + threads - 1) / threads.
 __global__ void compute_bucket_offsets(
     XsCandidateGpu const* __restrict__ sorted,
     uint64_t total,
@@ -59,22 +63,22 @@ __global__ void compute_bucket_offsets(
     uint32_t num_buckets,      // num_sections * num_match_keys
     uint64_t* __restrict__ offsets) // offsets[num_buckets + 1]
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    uint32_t bucket_shift = static_cast<uint32_t>(num_match_target_bits);
-
-    uint64_t pos = 0;
-    for (uint32_t b = 0; b < num_buckets; ++b) {
-        uint64_t lo = pos, hi = total;
-        while (lo < hi) {
-            uint64_t mid = lo + ((hi - lo) >> 1);
-            uint32_t bucket_mid = sorted[mid].match_info >> bucket_shift;
-            if (bucket_mid < b) lo = mid + 1;
-            else                hi = mid;
-        }
-        offsets[b] = lo;
-        pos = lo;
+    uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b > num_buckets) return;
+    if (b == num_buckets) {
+        offsets[num_buckets] = total;
+        return;
     }
-    offsets[num_buckets] = total;
+
+    uint32_t bucket_shift = static_cast<uint32_t>(num_match_target_bits);
+    uint64_t lo = 0, hi = total;
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) >> 1);
+        uint32_t bucket_mid = sorted[mid].match_info >> bucket_shift;
+        if (bucket_mid < b) lo = mid + 1;
+        else                hi = mid;
+    }
+    offsets[b] = lo;
 }
 
 // See T3Kernel.cu for the rationale. T1's sorted stream is
@@ -259,12 +263,18 @@ cudaError_t launch_t1_match(
 
     AesHashKeys keys = make_keys(plot_id_bytes);
 
-    // 1) Bucket offsets.
-    compute_bucket_offsets<<<1, 1, 0, stream>>>(
-        d_sorted_xs, total,
-        params.num_match_target_bits,
-        num_buckets,
-        d_offsets);
+    // 1) Bucket offsets — one thread per bucket, blocks cover num_buckets+1
+    //    (last thread writes the sentinel).
+    {
+        constexpr int kOffThreads = 256;
+        unsigned off_blocks = static_cast<unsigned>(
+            (num_buckets + 1 + kOffThreads - 1) / kOffThreads);
+        compute_bucket_offsets<<<off_blocks, kOffThreads, 0, stream>>>(
+            d_sorted_xs, total,
+            params.num_match_target_bits,
+            num_buckets,
+            d_offsets);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
@@ -282,21 +292,13 @@ cudaError_t launch_t1_match(
     err = cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
     if (err != cudaSuccess) return err;
 
-    // 2) Compute max L-count across sections (small H2D copy only for sizing).
-    std::vector<uint64_t> h_offsets(num_buckets + 1);
-    err = cudaMemcpyAsync(h_offsets.data(), d_offsets,
-                          sizeof(uint64_t) * (num_buckets + 1),
-                          cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) return err;
-
-    uint64_t l_count_max = 0;
-    for (uint32_t s = 0; s < num_sections; ++s) {
-        uint64_t l_count = h_offsets[(s + 1) * num_match_keys]
-                         - h_offsets[s * num_match_keys];
-        if (l_count > l_count_max) l_count_max = l_count;
-    }
+    // Use the static per-section capacity as the over-launch upper
+    // bound for blocks_x. Avoids a D2H copy + stream sync that the
+    // actual-max computation would need; excess threads early-exit on
+    // `l >= l_end` inside match_all_buckets. Saves ~50–150 µs of host
+    // fence per plot (× 3 phases) and unblocks stream-level overlap.
+    uint64_t l_count_max =
+        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
 
     uint32_t target_mask = (params.num_match_target_bits >= 32)
                             ? 0xFFFFFFFFu
