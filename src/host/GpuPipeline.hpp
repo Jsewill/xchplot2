@@ -62,6 +62,10 @@ struct GpuPipelineResult {
 // One-shot path: allocates a transient pool, runs the pipeline, then copies
 // the pinned T3 fragments into t3_fragments_storage so the result is
 // self-contained after the pool is destroyed.
+//
+// If XCHPLOT2_STREAMING=1 is set in the environment, this routes through
+// run_gpu_pipeline_streaming() instead — useful for exercising the low-VRAM
+// path from unchanged call sites.
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 
 // Batch path: runs the pipeline writing D2H into pool.h_pinned_t3[pinned_index]
@@ -73,5 +77,34 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    int pinned_index);
+
+// Streaming path: per-phase cudaMalloc / cudaFree instead of a persistent
+// pool. Targets GPUs where the full pool (~15 GB at k=28) will not fit.
+//
+// Two overloads:
+//   run_gpu_pipeline_streaming(cfg)
+//     Allocates an internal pinned staging buffer for the final D2H,
+//     copies fragments into an owning std::vector, frees the pinned
+//     buffer. Self-contained result. Simplest for one-shot callers.
+//
+//   run_gpu_pipeline_streaming(cfg, pinned_dst, pinned_capacity)
+//     Caller supplies a pinned host buffer (size ≥ cap × sizeof(uint64_t))
+//     that the pipeline uses as the D2H target. Result borrows into
+//     pinned_dst via external_fragments_ptr; caller must not overwrite
+//     pinned_dst while the consumer is still reading it. Use this from
+//     BatchPlotter's streaming fallback to amortise the ~600 ms
+//     cudaMallocHost cost across plots and double-buffer D2H with the
+//     FSE consumer thread the same way the pool path does.
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg);
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity);
+
+// Allocate / free host-pinned memory — thin wrappers around
+// cudaMallocHost / cudaFreeHost, exposed so plain .cpp consumers (which
+// do not have cuda_runtime.h on the include path) can own the pinned
+// buffers the streaming overload expects. Returns nullptr on failure.
+uint64_t* streaming_alloc_pinned_uint64(size_t count);
+void      streaming_free_pinned_uint64(uint64_t* ptr);
 
 } // namespace pos2gpu

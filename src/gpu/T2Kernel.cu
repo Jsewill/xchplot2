@@ -125,7 +125,9 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     int num_test_bits,
     int num_match_info_bits,
     int half_k,
-    T2PairingGpu* __restrict__ out,
+    uint64_t* __restrict__ out_meta,
+    uint32_t* __restrict__ out_mi,
+    uint32_t* __restrict__ out_xbits,
     unsigned long long* __restrict__ out_count,
     uint64_t out_capacity)
 {
@@ -202,11 +204,9 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
         unsigned long long out_idx = atomicAdd(out_count, 1ULL);
         if (out_idx >= out_capacity) return;
 
-        T2PairingGpu p;
-        p.meta       = meta_result;
-        p.match_info = match_info_result;
-        p.x_bits     = x_bits;
-        out[out_idx] = p;
+        out_meta [out_idx] = meta_result;
+        out_mi   [out_idx] = match_info_result;
+        out_xbits[out_idx] = x_bits;
     }
 }
 
@@ -218,7 +218,9 @@ cudaError_t launch_t2_match(
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
     uint64_t t1_count,
-    T2PairingGpu* d_out_pairings,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
     uint64_t* d_out_count,
     uint64_t capacity,
     void* d_temp_storage,
@@ -247,7 +249,11 @@ cudaError_t launch_t2_match(
         return cudaSuccess;
     }
     if (*temp_bytes < needed)        return cudaErrorInvalidValue;
-    if (!d_sorted_meta || !d_sorted_mi || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+    if (!d_sorted_meta || !d_sorted_mi ||
+        !d_out_meta || !d_out_mi || !d_out_xbits || !d_out_count)
+    {
+        return cudaErrorInvalidValue;
+    }
     if (params.num_match_target_bits <= FINE_BITS) return cudaErrorInvalidValue;
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
@@ -309,7 +315,7 @@ cudaError_t launch_t2_match(
         params.k, params.num_section_bits,
         params.num_match_target_bits, FINE_BITS,
         target_mask, num_test_bits, num_info_bits, half_k,
-        d_out_pairings,
+        d_out_meta, d_out_mi, d_out_xbits,
         reinterpret_cast<unsigned long long*>(d_out_count),
         capacity);
     err = cudaGetLastError();

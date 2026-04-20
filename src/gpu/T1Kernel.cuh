@@ -37,17 +37,26 @@ T1MatchParams make_t1_params(int k, int strength);
 // Run the full T1 phase.
 //   d_sorted_xs        : output of launch_construct_xs (sorted by match_info)
 //   total              : 1 << k
-//   d_out_pairings     : caller-allocated, capacity entries
+//   d_out_meta         : caller-allocated, capacity entries (uint64 meta).
+//   d_out_mi           : caller-allocated, capacity entries (uint32 match_info).
 //   d_out_count        : single uint64_t, will hold actual emitted count
-//   capacity           : max number of T1Pairings d_out_pairings can hold
+//   capacity           : max number of T1Pairings the output arrays can hold
 //   d_temp_storage     : nullptr to query *temp_bytes; otherwise must be
 //                        at least *temp_bytes large
+//
+// Output is SoA (two parallel streams) rather than an AoS T1PairingGpu
+// array so the streaming pipeline can feed d_out_mi straight into CUB
+// as the sort-key input and free it as soon as CUB consumes it, without
+// touching the meta stream. Saves ~1 GB at k=28 during the T1 sort
+// phase. t1_parity and other consumers rebuild the AoS form locally if
+// they need it.
 cudaError_t launch_t1_match(
     uint8_t const* plot_id_bytes,
     T1MatchParams const& params,
     XsCandidateGpu const* d_sorted_xs,
     uint64_t total,
-    T1PairingGpu* d_out_pairings,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
     uint64_t* d_out_count,
     uint64_t capacity,
     void* d_temp_storage,

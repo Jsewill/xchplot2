@@ -101,7 +101,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         POOL_CHECK(cudaMemGetInfo(&free_b, &total_b));
         if (free_b < required_device + margin) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
-            throw std::runtime_error(
+            InsufficientVramError e(
                 "GpuBufferPool: insufficient device VRAM for k=" +
                 std::to_string(k) + " strength=" + std::to_string(strength) +
                 "; need ~" + std::to_string(to_gib(required_device + margin)).substr(0, 5) +
@@ -110,6 +110,10 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
                 " GiB total. Use a smaller k or a GPU with more VRAM.");
+            e.required_bytes = required_device + margin;
+            e.free_bytes     = free_b;
+            e.total_bytes    = total_b;
+            throw e;
         }
     }
 

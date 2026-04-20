@@ -134,7 +134,8 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     uint32_t target_mask,
     int num_test_bits,
     int num_match_info_bits,
-    T1PairingGpu* __restrict__ out,
+    uint64_t* __restrict__ out_meta,
+    uint32_t* __restrict__ out_mi,
     unsigned long long* __restrict__ out_count,
     uint64_t out_capacity)
 {
@@ -207,11 +208,8 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
         if (out_idx >= out_capacity) return;
 
         uint64_t meta = (uint64_t(x_l) << k) | uint64_t(x_r);
-        T1PairingGpu p;
-        p.meta_lo    = uint32_t(meta);
-        p.meta_hi    = uint32_t(meta >> 32);
-        p.match_info = match_info_result;
-        out[out_idx] = p;
+        out_meta[out_idx] = meta;
+        out_mi  [out_idx] = match_info_result;
     }
 }
 
@@ -222,7 +220,8 @@ cudaError_t launch_t1_match(
     T1MatchParams const& params,
     XsCandidateGpu const* d_sorted_xs,
     uint64_t total,
-    T1PairingGpu* d_out_pairings,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
     uint64_t* d_out_count,
     uint64_t capacity,
     void* d_temp_storage,
@@ -251,7 +250,8 @@ cudaError_t launch_t1_match(
         return cudaSuccess;
     }
     if (*temp_bytes < needed)        return cudaErrorInvalidValue;
-    if (!d_sorted_xs || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+    if (!d_sorted_xs || !d_out_meta || !d_out_mi || !d_out_count)
+        return cudaErrorInvalidValue;
     if (params.num_match_target_bits <= FINE_BITS) return cudaErrorInvalidValue;
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
@@ -317,7 +317,7 @@ cudaError_t launch_t1_match(
         params.num_match_target_bits, FINE_BITS,
         extra_rounds_bits, target_mask,
         num_test_bits, num_info_bits,
-        d_out_pairings,
+        d_out_meta, d_out_mi,
         reinterpret_cast<unsigned long long*>(d_out_count),
         capacity);
     err = cudaGetLastError();

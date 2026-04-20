@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <sstream>
@@ -162,18 +163,77 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     // Allocate the pool once; destructor frees at function exit. This is
     // the whole point of the batch path — eliminate the per-plot ~2.4 s
     // allocator cost (dominated by cudaMallocHost(2 GB)).
-    GpuBufferPool pool(pool_k, pool_strength, pool_testnet);
-    if (verbose) {
+    //
+    // On insufficient device VRAM (small card), the pool ctor throws
+    // InsufficientVramError. Fall back to the streaming pipeline per
+    // plot — slower (no buffer amortisation across plots, no
+    // producer/consumer overlap between GPU D2H and consumer I/O on
+    // pinned double-buffered pool slots), but it fits inside the card's
+    // VRAM and is still overlapped via the Channel between the producer
+    // thread's streaming call and the consumer thread's FSE compression
+    // + plot-file write.
+    std::unique_ptr<GpuBufferPool> pool_ptr;
+    // Streaming-fallback pinned buffers — double-buffered the same way the
+    // pool does, so producer's D2H of plot N+1 can run concurrently with
+    // the consumer reading plot N. cudaMallocHost is ~600 ms, so doing it
+    // once instead of per plot is a significant win on long batches.
+    uint64_t* stream_pinned[2] = {nullptr, nullptr};
+    size_t    stream_pinned_cap = 0;
+
+    // Force-streaming override (matches the one-shot run_gpu_pipeline
+    // dispatch). Useful for testing the streaming path on a high-VRAM
+    // card and for users who want the smaller peak even when the pool
+    // would fit.
+    bool const force_streaming = [] {
+        char const* v = std::getenv("XCHPLOT2_STREAMING");
+        return v && v[0] == '1';
+    }();
+
+    try {
+        if (force_streaming) {
+            throw InsufficientVramError("XCHPLOT2_STREAMING=1 forced");
+        }
+        pool_ptr = std::make_unique<GpuBufferPool>(
+            pool_k, pool_strength, pool_testnet);
+    } catch (InsufficientVramError const& e) {
+        if (force_streaming) {
+            std::fprintf(stderr, "[batch] XCHPLOT2_STREAMING=1 — using "
+                                 "streaming pipeline per plot\n");
+        } else {
+            std::fprintf(stderr,
+                "[batch] pool needs %.2f GiB, only %.2f GiB free — using "
+                "streaming pipeline per plot\n",
+                e.required_bytes / double(1ULL << 30),
+                e.free_bytes     / double(1ULL << 30));
+        }
+        // Size the pinned buffers using the same cap formula as the pool.
+        int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
+        int const extra_margin_bits = 8 - ((28 - pool_k) / 2);
+        uint64_t const per_section =
+            (1ULL << (pool_k - num_section_bits)) +
+            (1ULL << (pool_k - extra_margin_bits));
+        uint64_t const cap = per_section * (1ULL << num_section_bits);
+        stream_pinned_cap = size_t(cap);
+        stream_pinned[0] = streaming_alloc_pinned_uint64(stream_pinned_cap);
+        stream_pinned[1] = streaming_alloc_pinned_uint64(stream_pinned_cap);
+        if (!stream_pinned[0] || !stream_pinned[1]) {
+            if (stream_pinned[0]) streaming_free_pinned_uint64(stream_pinned[0]);
+            if (stream_pinned[1]) streaming_free_pinned_uint64(stream_pinned[1]);
+            throw std::runtime_error(
+                "[batch] streaming-fallback: pinned D2H buffer allocation failed");
+        }
+    }
+    if (verbose && pool_ptr) {
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
             "[batch] pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
             "sort_scratch=%.2f GB pinned=2x%.2f GB "
             "(Xs scratch aliased in pair_b)\n",
-            pool.storage_bytes * gb,
-            pool.pair_bytes    * gb,
-            pool.pair_bytes    * gb,
-            pool.sort_scratch_bytes * gb,
-            pool.pinned_bytes       * gb);
+            pool_ptr->storage_bytes * gb,
+            pool_ptr->pair_bytes    * gb,
+            pool_ptr->pair_bytes    * gb,
+            pool_ptr->sort_scratch_bytes * gb,
+            pool_ptr->pinned_bytes       * gb);
     }
 
     Channel chan;
@@ -237,9 +297,23 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             WorkItem item;
             item.entry  = entries[i];
             item.index  = i;
-            // Alternate pinned buffer per plot so the current D2H doesn't
-            // clobber pinned data the consumer is still reading.
-            item.result = run_gpu_pipeline(cfg, pool, static_cast<int>(i % 2));
+            if (pool_ptr) {
+                // Pool path: alternate pinned buffer per plot so the
+                // current D2H doesn't clobber pinned data the consumer is
+                // still reading.
+                item.result = run_gpu_pipeline(cfg, *pool_ptr,
+                                               static_cast<int>(i % 2));
+            } else {
+                // Streaming path with externally-owned pinned: double-
+                // buffered same as the pool path (i % 2). Producer of
+                // plot N writes to slot N%2 while consumer reads slot
+                // (N-1)%2. The Channel's depth-1 push holds the producer
+                // back if the consumer hasn't popped yet, matching the
+                // pool-path invariant.
+                int const slot = static_cast<int>(i % 2);
+                item.result = run_gpu_pipeline_streaming(
+                    cfg, stream_pinned[slot], stream_pinned_cap);
+            }
 
             if (verbose) {
                 auto ms = std::chrono::duration<double, std::milli>(
@@ -265,6 +339,9 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     consumer.join();
 
     if (consumer_failed && consumer_err) std::rethrow_exception(consumer_err);
+
+    streaming_free_pinned_uint64(stream_pinned[0]);
+    streaming_free_pinned_uint64(stream_pinned[1]);
 
     res.plots_written = plots_done.load();
     res.total_wall_seconds = std::chrono::duration<double>(

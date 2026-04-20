@@ -23,17 +23,21 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace pos2gpu {
 
 namespace {
 
-#define CHECK(call) do {                                                 \
-    cudaError_t err = (call);                                            \
+// Variadic so the preprocessor does not split on template-argument commas
+// (e.g. cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(...)).
+#define CHECK(...) do {                                                  \
+    cudaError_t err = (__VA_ARGS__);                                     \
     if (err != cudaSuccess) {                                            \
         throw std::runtime_error(std::string("CUDA: ") +                 \
                                  cudaGetErrorString(err));               \
@@ -82,8 +86,11 @@ __global__ void extract_t1_keys(
 // the sort output into meta[] and xbits[] arrays drops the per-access
 // line footprint from 16 B to 12 B, cutting L1/TEX line fetches on an
 // L1-throughput-bound kernel.
+//
+// Reads SoA input (src_meta/src_xbits) since T2 match emits SoA.
 __global__ void permute_t2(
-    T2PairingGpu const* __restrict__ src,
+    uint64_t const* __restrict__ src_meta,
+    uint32_t const* __restrict__ src_xbits,
     uint32_t const* __restrict__ indices,
     uint64_t* __restrict__ dst_meta,
     uint32_t* __restrict__ dst_xbits,
@@ -91,21 +98,281 @@ __global__ void permute_t2(
 {
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= count) return;
-    T2PairingGpu p = src[indices[idx]];
-    dst_meta[idx]  = p.meta;
-    dst_xbits[idx] = p.x_bits;
+    uint32_t i = indices[idx];
+    dst_meta[idx]  = src_meta[i];
+    dst_xbits[idx] = src_xbits[i];
 }
 
-__global__ void extract_t2_keys(
-    T2PairingGpu const* __restrict__ src,
-    uint32_t* __restrict__ keys_out,
-    uint32_t* __restrict__ vals_out,
-    uint64_t count)
+// Fills vals[i] = i — used in place of the old extract_t2_keys, now
+// that T2 match emits match_info directly as a SoA stream (no need to
+// pull it out of a struct on host).
+__global__ void init_u32_identity(uint32_t* __restrict__ vals, uint64_t count)
 {
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= count) return;
-    keys_out[idx] = src[idx].match_info;
-    vals_out[idx] = uint32_t(idx);
+    vals[idx] = uint32_t(idx);
+}
+
+// Gather-by-index helpers. Used to split the fused merge-permute into
+// merge + per-column gather, letting the streaming path free the source
+// column between gather passes and shrink the peak VRAM window.
+__global__ void gather_u64(uint64_t const* __restrict__ src,
+                           uint32_t const* __restrict__ indices,
+                           uint64_t* __restrict__ dst, uint64_t count)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= count) return;
+    dst[p] = src[indices[p]];
+}
+
+__global__ void gather_u32(uint32_t const* __restrict__ src,
+                           uint32_t const* __restrict__ indices,
+                           uint32_t* __restrict__ dst, uint64_t count)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= count) return;
+    dst[p] = src[indices[p]];
+}
+
+// Mirror of the formula in GpuBufferPool.cu / pos2-chip
+// TableConstructorGeneric.hpp:23 — duplicated here so the streaming path
+// does not need to instantiate a GpuBufferPool just to learn its cap.
+inline size_t max_pairs_per_section_streaming(int k, int num_section_bits) {
+    int extra_margin_bits = 8 - ((28 - k) / 2);
+    return (1ULL << (k - num_section_bits)) + (1ULL << (k - extra_margin_bits));
+}
+
+
+// =====================================================================
+// Streaming allocation tracker.
+//
+// Wraps cudaMalloc / cudaFree so we can: (a) account for live/peak VRAM
+// used by the streaming pipeline, (b) honour a soft device-memory cap
+// set via POS2GPU_MAX_VRAM_MB (throws before the underlying cudaMalloc
+// when an alloc would push live past the cap), and (c) emit a per-alloc
+// trace under POS2GPU_STREAMING_STATS=1 for manual audits.
+//
+// Pinned host allocations are NOT counted — the cap is specifically for
+// device VRAM, and the pinned D2H staging buffer is host-resident.
+// =====================================================================
+struct StreamingStats {
+    size_t cap  = 0;   // 0 = no cap
+    size_t live = 0;
+    size_t peak = 0;
+    std::unordered_map<void*, size_t> sizes;
+    bool        verbose = false;
+    char const* phase   = "(init)";
+};
+
+inline void s_init_from_env(StreamingStats& s)
+{
+    if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
+        s.cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+    }
+    if (char const* v = std::getenv("POS2GPU_STREAMING_STATS"); v && v[0] == '1') {
+        s.verbose = true;
+    }
+}
+
+template <typename T>
+inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reason)
+{
+    if (s.cap && s.live + bytes > s.cap) {
+        throw std::runtime_error(
+            std::string("streaming VRAM cap: phase=") + s.phase +
+            " alloc=" + reason +
+            " live=" + std::to_string(s.live >> 20) +
+            " + new="  + std::to_string(bytes  >> 20) +
+            " would exceed cap=" + std::to_string(s.cap >> 20) + " MB");
+    }
+    void* p = nullptr;
+    cudaError_t err = cudaMalloc(&p, bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMalloc(") + reason + "): " +
+                                 cudaGetErrorString(err));
+    }
+    out = static_cast<T*>(p);
+    s.live += bytes;
+    if (s.live > s.peak) s.peak = s.live;
+    s.sizes[p] = bytes;
+    if (s.verbose) {
+        std::fprintf(stderr,
+            "[stream %-8s] +%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
+            s.phase, bytes / 1048576.0, reason,
+            s.live / 1048576.0, s.peak / 1048576.0);
+    }
+}
+
+template <typename T>
+inline void s_free(StreamingStats& s, T*& ptr)
+{
+    if (!ptr) return;
+    void* raw = static_cast<void*>(ptr);
+    auto it = s.sizes.find(raw);
+    if (it != s.sizes.end()) {
+        s.live -= it->second;
+        if (s.verbose) {
+            std::fprintf(stderr,
+                "[stream %-8s] -%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
+                s.phase, it->second / 1048576.0, "(free)",
+                s.live / 1048576.0, s.peak / 1048576.0);
+        }
+        s.sizes.erase(it);
+    }
+    cudaFree(raw);
+    ptr = nullptr;
+}
+
+// =====================================================================
+// Stable 2-way merge of two sorted (key, value) runs — used by the
+// streaming path to recombine per-tile CUB sort outputs into a single
+// sorted stream. Stability (A wins on ties) is load-bearing: the pool
+// path's single CUB radix sort is stable, and we want the merged
+// streaming output to be bit-identical to it for parity testing.
+//
+// Algorithm: per-thread binary merge-path (Odeh/Green/Bader). Each output
+// position p independently locates the path partition (i, j) with
+// i + j = p such that A[i-1] <= B[j] and B[j-1] < A[i], then emits
+// A[i] or B[j] — whichever is smaller, with A winning ties.
+//
+// Work is O(total × log total) — not linear. That is fine at k=18 (a few
+// hundred microseconds) and bearable at k=28; a block-cooperative
+// linear-work version is the natural Phase 6 upgrade if merge time
+// becomes the bottleneck.
+// =====================================================================
+template <typename K, typename V>
+__global__ void merge_pairs_stable_2way(
+    K const* __restrict__ A_keys, V const* __restrict__ A_vals, uint64_t nA,
+    K const* __restrict__ B_keys, V const* __restrict__ B_vals, uint64_t nB,
+    K* __restrict__ out_keys, V* __restrict__ out_vals, uint64_t total)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= total) return;
+
+    // i in [max(0, p-nB), min(p, nA)]. Upper-biased midpoint so the loop
+    // converges to `lo = i` (not lo = i+1), letting us index A[i-1]
+    // unconditionally inside the body.
+    uint64_t lo = (p > nB) ? (p - nB) : 0;
+    uint64_t hi = (p < nA) ? p : nA;
+    while (lo < hi) {
+        uint64_t i = lo + (hi - lo + 1) / 2;  // i in [lo+1, hi]
+        uint64_t j = p - i;
+        K a_prev = A_keys[i - 1];
+        K b_here = (j < nB) ? B_keys[j] : K(~K(0));
+        if (a_prev > b_here) {
+            hi = i - 1;       // consumed too many from A
+        } else {
+            lo = i;
+        }
+    }
+    uint64_t i = lo;
+    uint64_t j = p - i;
+
+    bool take_a;
+    if (i >= nA)      take_a = false;
+    else if (j >= nB) take_a = true;
+    else              take_a = A_keys[i] <= B_keys[j];  // A wins ties → stable
+
+    if (take_a) {
+        out_keys[p] = A_keys[i];
+        out_vals[p] = A_vals[i];
+    } else {
+        out_keys[p] = B_keys[j];
+        out_vals[p] = B_vals[j];
+    }
+}
+
+// =====================================================================
+// Fused merge-path + permute kernels.
+//
+// The streaming pipeline does (tile-sort → merge → permute) in three
+// passes. The merge pass only exists to materialise merged (keys, vals)
+// arrays that the permute pass then consumes. Fusing merge with permute
+// lets us skip materialising `merged_vals` entirely — each thread
+// computes its merge-path winner, then gathers src[winner].meta
+// directly and writes it to the permuted meta stream.
+//
+// The win is that `d_vals_in` (or equivalent) can be freed before the
+// fused kernel runs, reclaiming ~1 GB at k=28. See
+// docs/streaming-pipeline-design.md Phase 6 section for the budget.
+//
+// merged_keys is still written out (downstream match kernels want
+// match_info as a separate slim stream for binary search) — that slot
+// aliases the CUB extract-input buffer, which is dead by the time the
+// fused kernel runs.
+// =====================================================================
+__global__ void merge_permute_t1(
+    uint32_t const* __restrict__ A_keys, uint32_t const* __restrict__ A_vals, uint64_t nA,
+    uint32_t const* __restrict__ B_keys, uint32_t const* __restrict__ B_vals, uint64_t nB,
+    uint64_t const* __restrict__ src_meta,
+    uint32_t* __restrict__ out_keys, uint64_t* __restrict__ out_meta, uint64_t total)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= total) return;
+
+    uint64_t lo = (p > nB) ? (p - nB) : 0;
+    uint64_t hi = (p < nA) ? p : nA;
+    while (lo < hi) {
+        uint64_t i = lo + (hi - lo + 1) / 2;
+        uint64_t j = p - i;
+        uint32_t a_prev = A_keys[i - 1];
+        uint32_t b_here = (j < nB) ? B_keys[j] : 0xFFFFFFFFu;
+        if (a_prev > b_here) hi = i - 1;
+        else                 lo = i;
+    }
+    uint64_t i = lo;
+    uint64_t j = p - i;
+
+    bool take_a;
+    if (i >= nA)      take_a = false;
+    else if (j >= nB) take_a = true;
+    else              take_a = A_keys[i] <= B_keys[j];
+
+    uint32_t val; uint32_t key;
+    if (take_a) { val = A_vals[i]; key = A_keys[i]; }
+    else        { val = B_vals[j]; key = B_keys[j]; }
+
+    out_keys[p] = key;
+    out_meta[p] = src_meta[val];
+}
+
+__global__ void merge_permute_t2(
+    uint32_t const* __restrict__ A_keys, uint32_t const* __restrict__ A_vals, uint64_t nA,
+    uint32_t const* __restrict__ B_keys, uint32_t const* __restrict__ B_vals, uint64_t nB,
+    uint64_t const* __restrict__ src_meta,
+    uint32_t const* __restrict__ src_xbits,
+    uint32_t* __restrict__ out_keys,
+    uint64_t* __restrict__ out_meta, uint32_t* __restrict__ out_xbits,
+    uint64_t total)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= total) return;
+
+    uint64_t lo = (p > nB) ? (p - nB) : 0;
+    uint64_t hi = (p < nA) ? p : nA;
+    while (lo < hi) {
+        uint64_t i = lo + (hi - lo + 1) / 2;
+        uint64_t j = p - i;
+        uint32_t a_prev = A_keys[i - 1];
+        uint32_t b_here = (j < nB) ? B_keys[j] : 0xFFFFFFFFu;
+        if (a_prev > b_here) hi = i - 1;
+        else                 lo = i;
+    }
+    uint64_t i = lo;
+    uint64_t j = p - i;
+
+    bool take_a;
+    if (i >= nA)      take_a = false;
+    else if (j >= nB) take_a = true;
+    else              take_a = A_keys[i] <= B_keys[j];
+
+    uint32_t val; uint32_t key;
+    if (take_a) { val = A_vals[i]; key = A_keys[i]; }
+    else        { val = B_vals[j]; key = B_keys[j]; }
+
+    out_keys[p]  = key;
+    out_meta[p]  = src_meta[val];
+    out_xbits[p] = src_xbits[val];
 }
 
 } // namespace
@@ -146,10 +413,22 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // then final uint64_t fragments. Each subsequent phase's output overwrites
     // the previous (consumed) contents in the same slot.
     XsCandidateGpu* d_xs             = static_cast<XsCandidateGpu*>(pool.d_storage);
-    T1PairingGpu*   d_t1             = static_cast<T1PairingGpu*>  (pool.d_pair_a);
+    // T1 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
+    // (cap·8 B) then mi[cap] (cap·4 B). Total cap·12 B, fits in d_pair_a's
+    // cap·16 B budget.
+    uint64_t*       d_t1_meta = static_cast<uint64_t*>(pool.d_pair_a);
+    uint32_t*       d_t1_mi   = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * sizeof(uint64_t));
     // Sorted T1 is now just meta (8 B/entry) — match_info comes from sort keys.
     uint64_t*       d_t1_meta_sorted = static_cast<uint64_t*>      (pool.d_pair_b);
-    T2PairingGpu*   d_t2             = static_cast<T2PairingGpu*>  (pool.d_pair_a);
+    // T2 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
+    // (cap·8 B), then mi[cap] (cap·4 B), then xbits[cap] (cap·4 B). Total
+    // cap·16 B, matching d_pair_a's size.
+    uint64_t*       d_t2_meta  = static_cast<uint64_t*>(pool.d_pair_a);
+    uint32_t*       d_t2_mi    = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * sizeof(uint64_t));
+    uint32_t*       d_t2_xbits = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
     // Sorted T2 is SoA-split across d_pair_b: meta[cap] then xbits[cap],
     // 12 B total per entry (fits in d_pair_b's 16 B/entry budget). T3
     // match reads both; frags_out later reuses d_pair_b from offset 0.
@@ -235,12 +514,12 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     auto t1p = make_t1_params(cfg.k, cfg.strength);
     size_t t1_temp_bytes = 0;
     CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          d_t1, d_count, cap,
+                          nullptr, nullptr, d_count, cap,
                           nullptr, &t1_temp_bytes));
     CHECK(cudaMemsetAsync(d_count, 0, sizeof(uint64_t), stream));
     int p_t1 = begin_phase("T1 match");
     CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          d_t1, d_count, cap,
+                          d_t1_meta, d_t1_mi, d_count, cap,
                           d_match_temp, &t1_temp_bytes, stream));
     end_phase(p_t1);
 
@@ -251,23 +530,26 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                      cudaMemcpyDeviceToHost));
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
 
+
     // Sort T1 by match_info (low k bits). d_storage is now repurposed
     // as (keys_in, keys_out, vals_in, vals_out), Xs having been fully
-    // consumed by T1 match above.
+    // consumed by T1 match above. T1 match emits match_info in a SoA
+    // stream (d_t1_mi), so we feed that directly to CUB as the sort key
+    // input rather than extracting from a packed struct.
     int p_t1_sort = begin_phase("T1 sort");
     {
-        extract_t1_keys<<<blocks(t1_count), kThreads, 0, stream>>>(
-            d_t1, d_keys_in, d_vals_in, t1_count);
+        init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_vals_in, t1_count);
         CHECK(cudaGetLastError());
 
         size_t sort_bytes = pool.sort_scratch_bytes;
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, sort_bytes,
-            d_keys_in, d_keys_out, d_vals_in, d_vals_out,
+            d_t1_mi, d_keys_out, d_vals_in, d_vals_out,
             t1_count, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
 
-        permute_t1<<<blocks(t1_count), kThreads, 0, stream>>>(
-            d_t1, d_vals_out, d_t1_meta_sorted, t1_count);
+        gather_u64<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_t1_meta, d_vals_out, d_t1_meta_sorted, t1_count);
         CHECK(cudaGetLastError());
     }
     end_phase(p_t1_sort);
@@ -279,12 +561,12 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     auto t2p = make_t2_params(cfg.k, cfg.strength);
     size_t t2_temp_bytes = 0;
     CHECK(launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
-                          d_t2, d_count, cap,
+                          nullptr, nullptr, nullptr, d_count, cap,
                           nullptr, &t2_temp_bytes));
     CHECK(cudaMemsetAsync(d_count, 0, sizeof(uint64_t), stream));
     int p_t2 = begin_phase("T2 match");
     CHECK(launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
-                          d_t2, d_count, cap,
+                          d_t2_meta, d_t2_mi, d_t2_xbits, d_count, cap,
                           d_match_temp, &t2_temp_bytes, stream));
     end_phase(p_t2);
 
@@ -295,18 +577,23 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 
     int p_t2_sort = begin_phase("T2 sort");
     {
-        extract_t2_keys<<<blocks(t2_count), kThreads, 0, stream>>>(
-            d_t2, d_keys_in, d_vals_in, t2_count);
+        // T2 match emitted match_info as a SoA stream (d_t2_mi) — feed
+        // it straight into CUB as the sort key input rather than
+        // re-extracting from a packed struct. vals_in just needs a
+        // 0..n-1 identity fill.
+        init_u32_identity<<<blocks(t2_count), kThreads, 0, stream>>>(
+            d_vals_in, t2_count);
         CHECK(cudaGetLastError());
 
         size_t sort_bytes = pool.sort_scratch_bytes;
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, sort_bytes,
-            d_keys_in, d_keys_out, d_vals_in, d_vals_out,
+            d_t2_mi, d_keys_out, d_vals_in, d_vals_out,
             t2_count, 0, cfg.k, stream));
 
         permute_t2<<<blocks(t2_count), kThreads, 0, stream>>>(
-            d_t2, d_vals_out, d_t2_meta_sorted, d_t2_xbits_sorted, t2_count);
+            d_t2_meta, d_t2_xbits, d_vals_out,
+            d_t2_meta_sorted, d_t2_xbits_sorted, t2_count);
         CHECK(cudaGetLastError());
     }
     end_phase(p_t2_sort);
@@ -390,22 +677,538 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 {
-    // One-shot convenience path: build a transient pool and run through it.
-    // Pays the full per-call allocator overhead (~2.4 s for k=28). Batch
-    // callers should construct a pool once and reuse it via the overload.
-    GpuBufferPool pool(cfg.k, cfg.strength, cfg.testnet);
-    GpuPipelineResult r = run_gpu_pipeline(cfg, pool, /*pinned_index=*/0);
-    // Pool (and its pinned buffer) is about to be destroyed, so materialise
-    // a self-contained copy before returning.
-    if (r.external_fragments_ptr && r.external_fragments_count > 0) {
-        r.t3_fragments_storage.resize(r.external_fragments_count);
-        std::memcpy(r.t3_fragments_storage.data(),
-                    r.external_fragments_ptr,
-                    sizeof(uint64_t) * r.external_fragments_count);
+    // Explicit override for callers that want the streaming path without
+    // having to rebuild anything. Handy for testing and for users who know
+    // their hardware won't fit the pool.
+    if (char const* env = std::getenv("XCHPLOT2_STREAMING");
+        env && env[0] == '1')
+    {
+        return run_gpu_pipeline_streaming(cfg);
     }
-    r.external_fragments_ptr   = nullptr;
-    r.external_fragments_count = 0;
-    return r;
+
+    // Default: build a transient pool and run through it. Pays the full
+    // per-call allocator overhead (~2.4 s for k=28) — batch callers should
+    // construct a pool once and reuse it via the 3-arg overload.
+    //
+    // On insufficient device VRAM the pool ctor throws
+    // InsufficientVramError; catch it specifically and fall back to
+    // streaming so users on small-VRAM cards get a working plot with no
+    // flags. Other CUDA errors propagate.
+    try {
+        GpuBufferPool pool(cfg.k, cfg.strength, cfg.testnet);
+        GpuPipelineResult r = run_gpu_pipeline(cfg, pool, /*pinned_index=*/0);
+        // Pool (and its pinned buffer) is about to be destroyed, so
+        // materialise a self-contained copy before returning.
+        if (r.external_fragments_ptr && r.external_fragments_count > 0) {
+            r.t3_fragments_storage.resize(r.external_fragments_count);
+            std::memcpy(r.t3_fragments_storage.data(),
+                        r.external_fragments_ptr,
+                        sizeof(uint64_t) * r.external_fragments_count);
+        }
+        r.external_fragments_ptr   = nullptr;
+        r.external_fragments_count = 0;
+        return r;
+    } catch (InsufficientVramError const& e) {
+        std::fprintf(stderr,
+            "[xchplot2] pool needs %.2f GiB, only %.2f GiB free of "
+            "%.2f GiB — falling back to streaming pipeline\n",
+            e.required_bytes / double(1ULL << 30),
+            e.free_bytes     / double(1ULL << 30),
+            e.total_bytes    / double(1ULL << 30));
+        return run_gpu_pipeline_streaming(cfg);
+    }
+}
+
+// =====================================================================
+// Streaming pipeline — per-phase cudaMalloc / cudaFree, no persistent pool.
+//
+// Only buffers required for the CURRENT and NEXT phase are resident at any
+// point. Tiled sorts + SoA emission drive the peak down under 8 GB at
+// k=28, so an 8 GB card can run this path.
+//
+// The implementation body below accepts an optional caller-provided
+// pinned D2H buffer — used by BatchPlotter to amortise cudaMallocHost
+// across plots and double-buffer the D2H with the FSE consumer.
+//
+// Exception safety: on throw mid-pipeline we currently leak the
+// still-live device allocations. The CLI terminates on exception anyway,
+// so the OS reclaims the context. If we later embed this in a long-lived
+// process we can add RAII owners without changing the public surface.
+// =====================================================================
+namespace { // anon: shared impl, not part of the public API.
+
+GpuPipelineResult run_gpu_pipeline_streaming_impl(
+    GpuPipelineConfig const& cfg,
+    uint64_t* pinned_dst,         // nullable
+    size_t    pinned_capacity);   // count, not bytes; ignored if pinned_dst null
+
+} // namespace
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg)
+{
+    return run_gpu_pipeline_streaming_impl(cfg, /*pinned_dst=*/nullptr,
+                                                /*pinned_capacity=*/0);
+}
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity)
+{
+    if (!pinned_dst || pinned_capacity == 0) {
+        throw std::runtime_error(
+            "run_gpu_pipeline_streaming(cfg, pinned, cap): pinned buffer must be non-null");
+    }
+    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity);
+}
+
+namespace {
+
+GpuPipelineResult run_gpu_pipeline_streaming_impl(
+    GpuPipelineConfig const& cfg,
+    uint64_t* pinned_dst,
+    size_t    pinned_capacity)
+{
+    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 32]");
+    }
+    if (cfg.strength < 2) {
+        throw std::runtime_error("strength must be >= 2");
+    }
+
+    int const num_section_bits = (cfg.k < 28) ? 2 : (cfg.k - 26);
+    uint64_t const total_xs = 1ULL << cfg.k;
+    uint64_t const cap =
+        max_pairs_per_section_streaming(cfg.k, num_section_bits) *
+        (1ULL << num_section_bits);
+
+    constexpr int kThreads = 256;
+    auto blocks = [&](uint64_t n) {
+        return unsigned((n + kThreads - 1) / kThreads);
+    };
+
+    cudaStream_t stream = nullptr;  // default stream
+
+    StreamingStats stats;
+    s_init_from_env(stats);
+
+    // --- pipeline-wide tiny allocations ---
+    // d_counter: per-phase uint64 count output (reused).
+    // The match kernels each need their own temp-storage buffer sized via
+    // their size query; we allocate it per-phase rather than globally so
+    // that the peak VRAM is the phase's alone.
+    stats.phase = "init";
+    uint64_t* d_counter = nullptr;
+    s_malloc(stats, d_counter, sizeof(uint64_t), "d_counter");
+
+    // ---------- Phase Xs ----------
+    stats.phase = "Xs";
+    size_t xs_temp_bytes = 0;
+    CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                              nullptr, nullptr, &xs_temp_bytes));
+    XsCandidateGpu* d_xs      = nullptr;
+    void*           d_xs_temp = nullptr;
+    s_malloc(stats, d_xs,      total_xs * sizeof(XsCandidateGpu), "d_xs");
+    s_malloc(stats, d_xs_temp, xs_temp_bytes,                     "d_xs_temp");
+
+    CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                              d_xs, d_xs_temp, &xs_temp_bytes));
+
+    // Xs gen writes to d_xs_temp while sorting, but by the time
+    // launch_construct_xs returns the result is in d_xs and xs_temp is
+    // dead. cudaFree is device-synchronous so it blocks until the default
+    // stream drains, which means any in-flight access to d_xs_temp has
+    // completed before we free it.
+    s_free(stats, d_xs_temp);
+
+    // ---------- Phase T1 match ----------
+    stats.phase = "T1 match";
+    auto t1p = make_t1_params(cfg.k, cfg.strength);
+    size_t t1_temp_bytes = 0;
+    CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                          nullptr, nullptr, d_counter, cap,
+                          nullptr, &t1_temp_bytes));
+    // SoA output: meta (uint64) + mi (uint32). Same 12 B/pair as the old
+    // AoS struct, but the two streams can be freed independently — we
+    // drop d_t1_mi as soon as CUB consumes it in the T1 sort phase.
+    uint64_t* d_t1_meta = nullptr;
+    uint32_t* d_t1_mi   = nullptr;
+    void*     d_t1_match_temp = nullptr;
+    s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
+    s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
+    s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
+
+    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+    CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                          d_t1_meta, d_t1_mi, d_counter, cap,
+                          d_t1_match_temp, &t1_temp_bytes, stream));
+
+    uint64_t t1_count = 0;
+    CHECK(cudaMemcpy(&t1_count, d_counter, sizeof(uint64_t),
+                     cudaMemcpyDeviceToHost));
+    if (t1_count > cap) throw std::runtime_error("T1 overflow");
+
+    s_free(stats, d_t1_match_temp);
+    // Xs fully consumed.
+    s_free(stats, d_xs);
+
+    // ---------- Phase T1 sort (tiled, N=2) ----------
+    // Partition T1 into two halves by index, CUB-sort each with scratch
+    // sized for the larger half, then stable 2-way merge the sorted runs
+    // back into the extract-input slot (d_keys_in / d_vals_in) — that
+    // slot is free because the CUB sort has already consumed it.
+    //
+    // N=2 is the minimal case that exercises the tile + merge path; a
+    // larger N shrinks per-tile CUB scratch further but needs a multi-
+    // way merge or a tree of pairwise merges. Phase 6 can bump N once
+    // Phase 4's k=28 VRAM measurement shows how tight the budget is.
+    uint64_t const t1_tile_n0  = t1_count / 2;
+    uint64_t const t1_tile_n1  = t1_count - t1_tile_n0;
+    uint64_t const t1_tile_max = (t1_tile_n0 > t1_tile_n1) ? t1_tile_n0 : t1_tile_n1;
+
+    size_t t1_sort_bytes = 0;
+    CHECK(cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+        nullptr, t1_sort_bytes,
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        t1_tile_max, 0, cfg.k, stream));
+
+    stats.phase = "T1 sort";
+    // With T1 SoA emission, d_t1_mi IS the CUB key input. We only need
+    // d_keys_out (CUB sort output), d_vals_in (identity) + d_vals_out
+    // (sorted vals). d_t1_mi is freed as soon as CUB consumes it.
+    uint32_t* d_keys_out     = nullptr;
+    uint32_t* d_vals_in      = nullptr;
+    uint32_t* d_vals_out     = nullptr;
+    void*     d_sort_scratch = nullptr;
+    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+    s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
+
+    init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
+        d_vals_in, t1_count);
+    CHECK(cudaGetLastError());
+
+    if (t1_tile_n0 > 0) {
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            d_sort_scratch, t1_sort_bytes,
+            d_t1_mi + 0, d_keys_out + 0,
+            d_vals_in + 0, d_vals_out + 0,
+            t1_tile_n0, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+    }
+    if (t1_tile_n1 > 0) {
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            d_sort_scratch, t1_sort_bytes,
+            d_t1_mi + t1_tile_n0, d_keys_out + t1_tile_n0,
+            d_vals_in + t1_tile_n0, d_vals_out + t1_tile_n0,
+            t1_tile_n1, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+    }
+
+    // Scratch + vals_in + d_t1_mi dead after CUB.
+    s_free(stats, d_sort_scratch);
+    s_free(stats, d_vals_in);
+    s_free(stats, d_t1_mi);
+
+    // 3-pass post-CUB (merge → gather meta) — same shape as T2 sort,
+    // but T1 only has one gather stream (meta) so it's 2 passes here.
+    uint32_t* d_t1_keys_merged  = nullptr;
+    uint32_t* d_t1_merged_vals  = nullptr;
+    s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
+    s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
+
+    merge_pairs_stable_2way<<<blocks(t1_count), kThreads, 0, stream>>>(
+        d_keys_out + 0,          d_vals_out + 0,          t1_tile_n0,
+        d_keys_out + t1_tile_n0, d_vals_out + t1_tile_n0, t1_tile_n1,
+        d_t1_keys_merged, d_t1_merged_vals, t1_count);
+    CHECK(cudaGetLastError());
+
+    s_free(stats, d_keys_out);
+    s_free(stats, d_vals_out);
+
+    uint64_t* d_t1_meta_sorted = nullptr;
+    s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
+    gather_u64<<<blocks(t1_count), kThreads, 0, stream>>>(
+        d_t1_meta, d_t1_merged_vals, d_t1_meta_sorted, t1_count);
+    CHECK(cudaGetLastError());
+
+    s_free(stats, d_t1_meta);
+    s_free(stats, d_t1_merged_vals);
+
+    // ---------- Phase T2 match ----------
+    stats.phase = "T2 match";
+    auto t2p = make_t2_params(cfg.k, cfg.strength);
+    size_t t2_temp_bytes = 0;
+    CHECK(launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
+                          nullptr, nullptr, nullptr, d_counter, cap,
+                          nullptr, &t2_temp_bytes));
+    // T2 match emits SoA: three separate streams instead of a packed
+    // T2PairingGpu array. Total bytes same (cap·16) but each stream can
+    // be freed independently — crucial at k=28 where d_t2_mi becomes
+    // dead after the T2 sort's CUB consumes it.
+    uint64_t* d_t2_meta  = nullptr;
+    uint32_t* d_t2_mi    = nullptr;
+    uint32_t* d_t2_xbits = nullptr;
+    void*     d_t2_match_temp = nullptr;
+    s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
+    s_malloc(stats, d_t2_mi,         cap * sizeof(uint32_t), "d_t2_mi");
+    s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
+    s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
+
+    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+    CHECK(launch_t2_match(cfg.plot_id.data(), t2p,
+                          d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                          d_t2_meta, d_t2_mi, d_t2_xbits,
+                          d_counter, cap,
+                          d_t2_match_temp, &t2_temp_bytes, stream));
+
+    uint64_t t2_count = 0;
+    CHECK(cudaMemcpy(&t2_count, d_counter, sizeof(uint64_t),
+                     cudaMemcpyDeviceToHost));
+    if (t2_count > cap) throw std::runtime_error("T2 overflow");
+
+    s_free(stats, d_t2_match_temp);
+    s_free(stats, d_t1_meta_sorted);
+    s_free(stats, d_t1_keys_merged);
+
+    // ---------- Phase T2 sort (tiled, N=2) ----------
+    // Mirror of T1 sort above — same tile-and-merge shape, but permute
+    // writes a meta-xbits pair (T2 match output is 16 B, split SoA for
+    // T3's L1-bound read pattern) instead of plain meta.
+    // N=4 tiling halves the CUB scratch peak (~1044 MB → ~522 MB at
+    // k=28), bringing the T2 CUB-alloc peak under 8 GB. Merge is done
+    // as a tree of three 2-way merges: (0+1)→AB, (2+3)→CD, (AB+CD)→final.
+    constexpr int kNumT2Tiles = 4;
+    uint64_t t2_tile_n  [kNumT2Tiles];
+    uint64_t t2_tile_off[kNumT2Tiles + 1];
+    uint64_t const t2_base_tile = t2_count / kNumT2Tiles;
+    uint64_t       t2_rem       = t2_count % kNumT2Tiles;
+    t2_tile_off[0] = 0;
+    for (int t = 0; t < kNumT2Tiles; ++t) {
+        t2_tile_n[t]     = t2_base_tile + (t2_rem > 0 ? 1 : 0);
+        if (t2_rem > 0) --t2_rem;
+        t2_tile_off[t+1] = t2_tile_off[t] + t2_tile_n[t];
+    }
+    uint64_t t2_tile_max = 0;
+    for (int t = 0; t < kNumT2Tiles; ++t)
+        if (t2_tile_n[t] > t2_tile_max) t2_tile_max = t2_tile_n[t];
+
+    size_t t2_sort_bytes = 0;
+    CHECK(cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+        nullptr, t2_sort_bytes,
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        t2_tile_max, 0, cfg.k, stream));
+
+    stats.phase = "T2 sort";
+    // CUB sort key input = d_t2_mi (emitted SoA by T2 match); no extract
+    // needed, so d_keys_in only needs to hold the merged sorted-MI output
+    // that downstream T3 match will consume. Allocate it AFTER the CUB
+    // tile-sort has freed d_t2_mi to keep peak narrow.
+    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+    s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
+
+    init_u32_identity<<<blocks(t2_count), kThreads, 0, stream>>>(
+        d_vals_in, t2_count);
+    CHECK(cudaGetLastError());
+
+    for (int t = 0; t < kNumT2Tiles; ++t) {
+        if (t2_tile_n[t] == 0) continue;
+        uint64_t off = t2_tile_off[t];
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            d_sort_scratch, t2_sort_bytes,
+            d_t2_mi    + off, d_keys_out + off,
+            d_vals_in  + off, d_vals_out + off,
+            t2_tile_n[t], 0, cfg.k, stream));
+    }
+
+    s_free(stats, d_sort_scratch);
+    s_free(stats, d_vals_in);
+    s_free(stats, d_t2_mi);
+
+    // Tree-of-2-way-merges: (tile 0 + tile 1) → AB, (tile 2 + tile 3) → CD,
+    // then (AB + CD) → final merged stream. AB and CD buffers hold half
+    // of the total output each, so their combined footprint (2080 MB at
+    // k=28) fits under the budget freed by shrinking the CUB scratch.
+    uint64_t const ab_count = t2_tile_n[0] + t2_tile_n[1];
+    uint64_t const cd_count = t2_tile_n[2] + t2_tile_n[3];
+    uint32_t* d_AB_keys = nullptr;
+    uint32_t* d_AB_vals = nullptr;
+    uint32_t* d_CD_keys = nullptr;
+    uint32_t* d_CD_vals = nullptr;
+    s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
+    s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
+    s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
+    s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
+
+    if (ab_count > 0) {
+        merge_pairs_stable_2way<<<blocks(ab_count), kThreads, 0, stream>>>(
+            d_keys_out + t2_tile_off[0], d_vals_out + t2_tile_off[0], t2_tile_n[0],
+            d_keys_out + t2_tile_off[1], d_vals_out + t2_tile_off[1], t2_tile_n[1],
+            d_AB_keys, d_AB_vals, ab_count);
+        CHECK(cudaGetLastError());
+    }
+    if (cd_count > 0) {
+        merge_pairs_stable_2way<<<blocks(cd_count), kThreads, 0, stream>>>(
+            d_keys_out + t2_tile_off[2], d_vals_out + t2_tile_off[2], t2_tile_n[2],
+            d_keys_out + t2_tile_off[3], d_vals_out + t2_tile_off[3], t2_tile_n[3],
+            d_CD_keys, d_CD_vals, cd_count);
+        CHECK(cudaGetLastError());
+    }
+
+    // Per-tile CUB outputs are consumed; free before alloc'ing the
+    // final merged buffers.
+    s_free(stats, d_keys_out);
+    s_free(stats, d_vals_out);
+
+    uint32_t* d_t2_keys_merged = nullptr;   // merged sorted MI for T3.
+    uint32_t* d_merged_vals    = nullptr;   // merged sorted src indices.
+    s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
+    s_malloc(stats, d_merged_vals,    cap * sizeof(uint32_t), "d_merged_vals");
+
+    merge_pairs_stable_2way<<<blocks(t2_count), kThreads, 0, stream>>>(
+        d_AB_keys, d_AB_vals, ab_count,
+        d_CD_keys, d_CD_vals, cd_count,
+        d_t2_keys_merged, d_merged_vals, t2_count);
+    CHECK(cudaGetLastError());
+
+    s_free(stats, d_AB_keys);
+    s_free(stats, d_AB_vals);
+    s_free(stats, d_CD_keys);
+    s_free(stats, d_CD_vals);
+
+    uint64_t* d_t2_meta_sorted = nullptr;
+    s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
+    gather_u64<<<blocks(t2_count), kThreads, 0, stream>>>(
+        d_t2_meta, d_merged_vals, d_t2_meta_sorted, t2_count);
+    CHECK(cudaGetLastError());
+    s_free(stats, d_t2_meta);
+
+    uint32_t* d_t2_xbits_sorted = nullptr;
+    s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
+    gather_u32<<<blocks(t2_count), kThreads, 0, stream>>>(
+        d_t2_xbits, d_merged_vals, d_t2_xbits_sorted, t2_count);
+    CHECK(cudaGetLastError());
+    s_free(stats, d_t2_xbits);
+    s_free(stats, d_merged_vals);
+
+    // ---------- Phase T3 match ----------
+    stats.phase = "T3 match";
+    auto t3p = make_t3_params(cfg.k, cfg.strength);
+    size_t t3_temp_bytes = 0;
+    CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
+                          d_t2_meta_sorted, d_t2_xbits_sorted,
+                          nullptr, t2_count,
+                          nullptr, d_counter, cap,
+                          nullptr, &t3_temp_bytes));
+    T3PairingGpu* d_t3 = nullptr;
+    void*         d_t3_match_temp = nullptr;
+    s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
+    s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
+
+    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+    CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
+                          d_t2_meta_sorted, d_t2_xbits_sorted,
+                          d_t2_keys_merged, t2_count,
+                          d_t3, d_counter, cap,
+                          d_t3_match_temp, &t3_temp_bytes, stream));
+
+    uint64_t t3_count = 0;
+    CHECK(cudaMemcpy(&t3_count, d_counter, sizeof(uint64_t),
+                     cudaMemcpyDeviceToHost));
+    if (t3_count > cap) throw std::runtime_error("T3 overflow");
+
+    s_free(stats, d_t3_match_temp);
+    s_free(stats, d_t2_meta_sorted);
+    s_free(stats, d_t2_xbits_sorted);
+    s_free(stats, d_t2_keys_merged);
+
+    // ---------- Phase T3 sort ----------
+    size_t t3_sort_bytes = 0;
+    CHECK(cub::DeviceRadixSort::SortKeys<uint64_t>(
+        nullptr, t3_sort_bytes,
+        static_cast<uint64_t const*>(nullptr), static_cast<uint64_t*>(nullptr),
+        cap, 0, 2 * cfg.k, stream));
+
+    stats.phase = "T3 sort";
+    uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
+    uint64_t* d_frags_out = nullptr;
+    s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
+    s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
+
+    CHECK(cub::DeviceRadixSort::SortKeys(
+        d_sort_scratch, t3_sort_bytes,
+        d_frags_in, d_frags_out,
+        t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+
+    s_free(stats, d_t3);
+    s_free(stats, d_sort_scratch);
+
+    // ---------- D2H ----------
+    // Two destination modes:
+    //   caller-supplied pinned_dst (batch): copy D2H into pinned_dst and
+    //     return a BORROWING result (external_fragments_ptr). Consumer
+    //     must finish reading pinned_dst before the caller reuses it.
+    //   no pinned_dst (one-shot): alloc a temp pinned region sized to
+    //     t3_count, D2H, copy to an OWNING vector, free the temp.
+    stats.phase = "D2H";
+    GpuPipelineResult result;
+    result.t1_count = t1_count;
+    result.t2_count = t2_count;
+    result.t3_count = t3_count;
+
+    if (t3_count > 0) {
+        if (pinned_dst) {
+            if (pinned_capacity < t3_count) {
+                throw std::runtime_error(
+                    "run_gpu_pipeline_streaming: pinned_capacity " +
+                    std::to_string(pinned_capacity) +
+                    " < t3_count " + std::to_string(t3_count));
+            }
+            CHECK(cudaMemcpyAsync(pinned_dst, d_frags_out,
+                                  sizeof(uint64_t) * t3_count,
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            result.external_fragments_ptr   = pinned_dst;
+            result.external_fragments_count = t3_count;
+        } else {
+            uint64_t* h_pinned = nullptr;
+            CHECK(cudaMallocHost(&h_pinned, sizeof(uint64_t) * t3_count));
+            CHECK(cudaMemcpyAsync(h_pinned, d_frags_out,
+                                  sizeof(uint64_t) * t3_count,
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            result.t3_fragments_storage.resize(t3_count);
+            std::memcpy(result.t3_fragments_storage.data(), h_pinned,
+                        sizeof(uint64_t) * t3_count);
+            CHECK(cudaFreeHost(h_pinned));
+        }
+    }
+
+    s_free(stats, d_frags_out);
+    s_free(stats, d_counter);
+
+    if (stats.verbose) {
+        std::fprintf(stderr,
+            "[streaming] k=%d strength=%d  peak device VRAM = %.2f MB\n",
+            cfg.k, cfg.strength, stats.peak / 1048576.0);
+    }
+    return result;
+}
+
+} // namespace (anon — streaming impl)
+
+uint64_t* streaming_alloc_pinned_uint64(size_t count)
+{
+    uint64_t* p = nullptr;
+    if (cudaMallocHost(&p, count * sizeof(uint64_t)) != cudaSuccess) return nullptr;
+    return p;
+}
+
+void streaming_free_pinned_uint64(uint64_t* ptr)
+{
+    if (ptr) cudaFreeHost(ptr);
 }
 
 } // namespace pos2gpu
