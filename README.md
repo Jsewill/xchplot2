@@ -11,7 +11,8 @@ k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
 | Mode | Per plot |
 |---|---|
 | pos2-chip CPU baseline | ~50 s |
-| `xchplot2 batch` steady-state wall | **2.06 s** |
+| `xchplot2 batch` steady-state wall (pool path) | **2.06 s** |
+| `xchplot2 batch` steady-state wall (streaming path, ≤8 GB cards) | ~3.7 s |
 | Producer GPU time, steady-state | 1.96 s |
 | Device-kernel floor (single-plot nsys) | 1.91 s |
 
@@ -117,7 +118,8 @@ pieces any v2 plot needs for farming, regardless of who produced it.
 ```
 src/gpu/                 CUDA kernels — AES, Xs, T1, T2, T3
 src/host/
-├── GpuPipeline          Xs → T1 → T2 → T3 device orchestration
+├── GpuPipeline          Xs → T1 → T2 → T3 device orchestration;
+│                          pool + streaming (low-VRAM) variants
 ├── GpuBufferPool        persistent device + 2× pinned host pool
 ├── BatchPlotter         producer / consumer batch driver
 └── PlotFileWriterParallel  sole TU touching pos2-chip headers
@@ -128,10 +130,28 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 
 ## VRAM
 
-PoS2 plots are k=28 by spec; the persistent buffer pool needs **~15 GB
-of device VRAM**, so a 16 GB+ card is required (RTX 4080 / 4090 /
-5080 / 5090, A6000, etc.). `xchplot2` queries `cudaMemGetInfo` at
-startup and refuses with an actionable error if the pool won't fit.
+PoS2 plots are k=28 by spec. Two code paths, dispatched automatically
+based on available VRAM:
+
+- **Pool path (~15 GB, 16 GB+ cards).** The persistent buffer pool is
+  sized worst-case and reused across plots in `batch` mode for
+  amortised allocator cost and double-buffered D2H. Targets for
+  steady-state: RTX 4080 / 4090 / 5080 / 5090, A6000, etc.
+- **Streaming path (~8 GB).** Allocates per-phase and frees between
+  phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
+  merge-with-gather is split into three passes so the live set stays
+  under 8 GB. Targets 8 GB cards (GTX 1070 class and up). Slower per
+  plot (~3.7 s vs ~2.1 s at k=28 on a 4090) because it pays per-phase
+  `cudaMalloc`/`cudaFree` instead of amortising.
+
+`xchplot2` queries `cudaMemGetInfo` at pool construction; if the
+pool doesn't fit, it transparently falls back to the streaming
+pipeline with no flag needed. Force streaming on any card with
+`XCHPLOT2_STREAMING=1`, useful for testing or for users who want the
+smaller peak regardless.
+
+Plot output is bit-identical between the two paths — the streaming
+code reorganises memory, not algorithms.
 
 ## License
 
