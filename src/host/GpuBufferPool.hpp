@@ -79,10 +79,16 @@ struct GpuBufferPool {
     void*     d_sort_scratch = nullptr;
     uint64_t* d_counter      = nullptr;
 
-    // Pinned host buffers for final T3 fragment D2H. Double-buffered so the
-    // consumer can read plot N directly from one slot while producer writes
-    // plot N+1 into the other — no intermediate ~2 GB heap copy per plot.
-    uint64_t* h_pinned_t3[2] = {nullptr, nullptr};
+    // Number of rotating pinned slots for the final T3-fragment D2H.
+    // Set to 3 so the channel can hold depth-2 of in-flight plots
+    // without the producer ever overwriting a slot the consumer is
+    // still reading — useful when consumer wall > producer wall
+    // (slow disk / FSE-heavy strengths). 2 was enough for the
+    // previously measured producer-slower-than-consumer case, but
+    // 3 costs only ~2 GB of host pinned at k=28 and widens the
+    // "safe" consumer/producer ratio.
+    static constexpr int kNumPinnedBuffers = 3;
+    uint64_t* h_pinned_t3[kNumPinnedBuffers] = {};
 };
 
 } // namespace pos2gpu

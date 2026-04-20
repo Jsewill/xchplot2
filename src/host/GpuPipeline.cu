@@ -387,8 +387,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
         throw std::runtime_error(
             "GpuBufferPool was sized for different (k, strength, testnet)");
     }
-    if (pinned_index < 0 || pinned_index > 1) {
-        throw std::runtime_error("pinned_index must be 0 or 1");
+    if (pinned_index < 0 || pinned_index >= GpuBufferPool::kNumPinnedBuffers) {
+        throw std::runtime_error(
+            "pinned_index must be in [0, GpuBufferPool::kNumPinnedBuffers)");
     }
 
     uint64_t const total_xs = pool.total_xs;

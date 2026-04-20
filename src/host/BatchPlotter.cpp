@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -101,24 +102,32 @@ struct WorkItem {
     size_t            index = 0;
 };
 
-// Bounded SPSC queue of depth 1 plus end-of-stream signal.
+// Bounded SPSC queue + end-of-stream signal.
+//
+// Depth = kNumPinnedBuffers - 1 so the producer never overtakes the
+// consumer by more than (num_pinned - 1) plots. The pinned slot the
+// producer writes is slot (i % kNumPinnedBuffers); with depth-(N-1)
+// the consumer is guaranteed to have popped plot (i - N) before the
+// producer overwrites its slot.
 class Channel {
 public:
+    explicit Channel(std::size_t capacity) : capacity_(capacity) {}
+
     void push(WorkItem item) {
         std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [&]{ return !item_.has_value() && !closed_; });
+        cv_not_full_.wait(lock, [&]{ return q_.size() < capacity_ || closed_; });
         if (closed_) return;
-        item_ = std::move(item);
-        cv_.notify_all();
+        q_.push(std::move(item));
+        cv_not_empty_.notify_one();
     }
-    // Returns false when channel is closed AND empty.
+    // Returns false when the channel is closed AND empty.
     bool pop(WorkItem& out) {
         std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [&]{ return item_.has_value() || closed_; });
-        if (item_.has_value()) {
-            out = std::move(*item_);
-            item_.reset();
-            cv_.notify_all();
+        cv_not_empty_.wait(lock, [&]{ return !q_.empty() || closed_; });
+        if (!q_.empty()) {
+            out = std::move(q_.front());
+            q_.pop();
+            cv_not_full_.notify_one();
             return true;
         }
         return false;
@@ -126,12 +135,14 @@ public:
     void close() {
         std::lock_guard<std::mutex> lock(mu_);
         closed_ = true;
-        cv_.notify_all();
+        cv_not_empty_.notify_all();
+        cv_not_full_.notify_all();
     }
 private:
     std::mutex                mu_;
-    std::condition_variable   cv_;
-    std::optional<WorkItem>   item_;
+    std::condition_variable   cv_not_empty_, cv_not_full_;
+    std::queue<WorkItem>      q_;
+    std::size_t               capacity_;
     bool                      closed_ = false;
 };
 
@@ -177,7 +188,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     // pool does, so producer's D2H of plot N+1 can run concurrently with
     // the consumer reading plot N. cudaMallocHost is ~600 ms, so doing it
     // once instead of per plot is a significant win on long batches.
-    uint64_t* stream_pinned[2] = {nullptr, nullptr};
+    uint64_t* stream_pinned[GpuBufferPool::kNumPinnedBuffers] = {};
     size_t    stream_pinned_cap = 0;
 
     // Force-streaming override (matches the one-shot run_gpu_pipeline
@@ -214,11 +225,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             (1ULL << (pool_k - extra_margin_bits));
         uint64_t const cap = per_section * (1ULL << num_section_bits);
         stream_pinned_cap = size_t(cap);
-        stream_pinned[0] = streaming_alloc_pinned_uint64(stream_pinned_cap);
-        stream_pinned[1] = streaming_alloc_pinned_uint64(stream_pinned_cap);
-        if (!stream_pinned[0] || !stream_pinned[1]) {
-            if (stream_pinned[0]) streaming_free_pinned_uint64(stream_pinned[0]);
-            if (stream_pinned[1]) streaming_free_pinned_uint64(stream_pinned[1]);
+        bool any_fail = false;
+        for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+            stream_pinned[s] = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            if (!stream_pinned[s]) { any_fail = true; break; }
+        }
+        if (any_fail) {
+            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+            }
             throw std::runtime_error(
                 "[batch] streaming-fallback: pinned D2H buffer allocation failed");
         }
@@ -236,7 +251,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             pool_ptr->pinned_bytes       * gb);
     }
 
-    Channel chan;
+    // Depth = kNumPinnedBuffers - 1. See Channel's comment block above.
+    Channel chan(static_cast<std::size_t>(GpuBufferPool::kNumPinnedBuffers - 1));
     std::atomic<bool>     consumer_failed{false};
     std::atomic<size_t>   plots_done{0};
     std::exception_ptr    consumer_err;
@@ -297,20 +313,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             WorkItem item;
             item.entry  = entries[i];
             item.index  = i;
+            int const slot = static_cast<int>(i % GpuBufferPool::kNumPinnedBuffers);
             if (pool_ptr) {
-                // Pool path: alternate pinned buffer per plot so the
-                // current D2H doesn't clobber pinned data the consumer is
-                // still reading.
-                item.result = run_gpu_pipeline(cfg, *pool_ptr,
-                                               static_cast<int>(i % 2));
+                // Pool path: rotate pinned slot per plot. The channel's
+                // (kNumPinnedBuffers - 1) depth holds the producer back
+                // before it overtakes the consumer's read of that slot.
+                item.result = run_gpu_pipeline(cfg, *pool_ptr, slot);
             } else {
-                // Streaming path with externally-owned pinned: double-
-                // buffered same as the pool path (i % 2). Producer of
-                // plot N writes to slot N%2 while consumer reads slot
-                // (N-1)%2. The Channel's depth-1 push holds the producer
-                // back if the consumer hasn't popped yet, matching the
-                // pool-path invariant.
-                int const slot = static_cast<int>(i % 2);
+                // Streaming path with externally-owned pinned: same
+                // rotation + channel-depth invariant.
                 item.result = run_gpu_pipeline_streaming(
                     cfg, stream_pinned[slot], stream_pinned_cap);
             }
@@ -340,8 +351,9 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
 
     if (consumer_failed && consumer_err) std::rethrow_exception(consumer_err);
 
-    streaming_free_pinned_uint64(stream_pinned[0]);
-    streaming_free_pinned_uint64(stream_pinned[1]);
+    for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+        streaming_free_pinned_uint64(stream_pinned[s]);
+    }
 
     res.plots_written = plots_done.load();
     res.total_wall_seconds = std::chrono::duration<double>(
