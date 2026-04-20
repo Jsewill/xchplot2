@@ -131,8 +131,9 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     POOL_CHECK(cudaMalloc(&d_pair_b,       pair_bytes));
     POOL_CHECK(cudaMalloc(&d_sort_scratch, sort_scratch_bytes));
     POOL_CHECK(cudaMalloc(&d_counter,      sizeof(uint64_t)));
-    POOL_CHECK(cudaMallocHost(&h_pinned_t3[0], pinned_bytes));
-    POOL_CHECK(cudaMallocHost(&h_pinned_t3[1], pinned_bytes));
+    for (int i = 0; i < kNumPinnedBuffers; ++i) {
+        POOL_CHECK(cudaMallocHost(&h_pinned_t3[i], pinned_bytes));
+    }
 }
 
 GpuBufferPool::~GpuBufferPool()
@@ -142,8 +143,9 @@ GpuBufferPool::~GpuBufferPool()
     if (d_pair_b)        cudaFree(d_pair_b);
     if (d_sort_scratch)  cudaFree(d_sort_scratch);
     if (d_counter)       cudaFree(d_counter);
-    if (h_pinned_t3[0])  cudaFreeHost(h_pinned_t3[0]);
-    if (h_pinned_t3[1])  cudaFreeHost(h_pinned_t3[1]);
+    for (int i = 0; i < kNumPinnedBuffers; ++i) {
+        if (h_pinned_t3[i]) cudaFreeHost(h_pinned_t3[i]);
+    }
 }
 
 } // namespace pos2gpu
