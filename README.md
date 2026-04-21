@@ -50,19 +50,26 @@ Three ways to get the dependencies in place, easiest first:
 
 ### 1. Container (`podman compose` or `docker compose`)
 
-[`compose.yaml`](compose.yaml) wires up three vendor-specific services
-sharing one [`Containerfile`](Containerfile) — pick one based on your
-GPU and `compose build` handles the right base image, AdaptiveCpp
-target, and CUDA-on/off setting:
+Easiest path — let the wrapper detect your GPU and pick the right
+compose service automatically:
+
+```bash
+./scripts/build-container.sh    # auto: nvidia-smi → cuda, rocminfo → rocm
+podman compose run --rm cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+```
+
+[`compose.yaml`](compose.yaml) defines three vendor-specific services
+sharing one [`Containerfile`](Containerfile); the script just runs
+`compose build` against whichever matches your hardware. Override
+manually if you prefer:
 
 ```bash
 # NVIDIA (default sm_89; override via $CUDA_ARCH=120 etc.)
 podman compose build cuda
-podman compose run --rm cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
 
 # AMD ROCm — set $ACPP_GFX from `rocminfo | grep gfx`.
-ACPP_GFX=gfx1031 podman compose build rocm
-podman compose run --rm rocm plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+ACPP_GFX=gfx1031 podman compose build rocm    # Navi 22
+ACPP_GFX=gfx1100 podman compose build rocm    # Navi 31 (default)
 
 # Intel oneAPI (experimental, untested).
 podman compose build intel
