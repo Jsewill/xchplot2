@@ -4,6 +4,16 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 `.plot2` files byte-identical to the
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
+> **Status — work in progress.** The plotter produces correct,
+> spec-compliant `.plot2` output: per-phase parity tests verify
+> byte-identical agreement with pos2-chip's CPU reference at every
+> stage, the CUB and SYCL backends produce bit-identical files, and
+> determinism holds across runs. The project is still actively under
+> development — performance, cross-vendor support (AMD / Intel), and
+> the install / CI story are evolving. Expect rough edges; use the
+> [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
+> branch if you want the most-tested code path.
+
 > **Branches:** `main` carries the SYCL/AdaptiveCpp port that lets the
 > plotter run on AMD and Intel GPUs (with an opt-out CUB sort path
 > preserved for NVIDIA). The original CUDA-only implementation, which
