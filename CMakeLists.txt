@@ -123,6 +123,27 @@ if(NOT AdaptiveCpp_FOUND)
     endif()
 endif()
 
+# Export the AdaptiveCpp lib directory to a file so build.rs knows where
+# to add -L for libacpp-rt / libacpp-common at link time. Without this,
+# the Rust binary fails to link on machines where AdaptiveCpp lives
+# anywhere other than /opt/adaptivecpp or /usr/local (and on FetchContent
+# builds, which leave the artifacts in CMake's _deps/ build tree).
+set(_xchplot2_acpp_lib_dir "")
+if(TARGET acpp-rt)
+    # FetchContent-built target: ask CMake where it'll land.
+    set(_xchplot2_acpp_lib_dir "$<TARGET_FILE_DIR:acpp-rt>")
+elseif(AdaptiveCpp_DIR)
+    # Installed AdaptiveCpp: AdaptiveCpp_DIR is <prefix>/lib/cmake/AdaptiveCpp,
+    # so two parent dirs up gives <prefix>/lib.
+    get_filename_component(_xchplot2_acpp_cmake_root "${AdaptiveCpp_DIR}" DIRECTORY)
+    get_filename_component(_xchplot2_acpp_lib_dir    "${_xchplot2_acpp_cmake_root}" DIRECTORY)
+endif()
+if(_xchplot2_acpp_lib_dir)
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/acpp-prefix.txt"
+                  CONTENT "${_xchplot2_acpp_lib_dir}\n")
+    message(STATUS "xchplot2: AdaptiveCpp lib dir = ${_xchplot2_acpp_lib_dir}")
+endif()
+
 # pos2-chip dependency.
 #
 # Default behavior: FetchContent auto-clones Chia-Network/pos2-chip into
