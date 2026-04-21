@@ -46,18 +46,21 @@ services:
       context: .
       dockerfile: Containerfile
       args:
-        BASE_DEVEL:           docker.io/rocm/dev-ubuntu-24.04:latest
-        BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-24.04:latest
+        # Pinned to ROCm 6.2.x for two reasons:
+        #   1. ROCm 7.x's rocm-llvm package no longer ships LLVMConfig.cmake,
+        #      so AdaptiveCpp's find_package(LLVM) can't run.
+        #   2. ROCm 6.2 ships LLVM 18.0git, matching Ubuntu's llvm-18 so the
+        #      device bitcode (ocml.bc, ockl.bc) is readable by AdaptiveCpp
+        #      built against Ubuntu's LLVM. No "Unknown attribute kind"
+        #      mismatch.
+        # AdaptiveCpp is therefore built against Ubuntu's /usr/lib/llvm-18
+        # (the Containerfile default), and ROCm provides its own clang +
+        # device libs at /opt/rocm/llvm for the HIP backend at runtime.
+        BASE_DEVEL:           docker.io/rocm/dev-ubuntu-22.04:6.2-complete
+        BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-22.04:6.2-complete
         ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         INSTALL_CUDA_HEADERS: "1"
-        # ROCm bundles its own LLVM (currently dev-tip / LLVM 22). The
-        # ROCm device-bitcode (ocml.bc, ockl.bc, …) is produced with that
-        # LLVM, so we MUST build AdaptiveCpp with it too — otherwise the
-        # HIP backend chokes with "Unknown attribute kind (102)" because
-        # Ubuntu's llvm-18 can't read LLVM 22 bitcode.
-        LLVM_ROOT:            /opt/rocm/llvm
-        LLVM_CMAKE_DIR:       /opt/rocm/llvm/lib/cmake/llvm
     image: xchplot2:rocm
     devices:
       - /dev/kfd
