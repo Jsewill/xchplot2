@@ -36,39 +36,57 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 
 ## Build
 
-**Required toolchain**
+Three ways to get the dependencies in place, easiest first:
 
-- **AdaptiveCpp 25.10+** — the SYCL implementation. Distro packages
-  typically lag; install from source per
-  https://adaptivecpp.github.io/AdaptiveCpp/install/. CMake locates it
-  via `find_package(AdaptiveCpp REQUIRED)`; pass `-DAdaptiveCpp_DIR=...`
-  if it lives outside the default search paths.
-- **CUDA Toolkit 12+** (tested on 13.x). Headers are required on **every**
-  build path because AdaptiveCpp's `half.hpp` pulls `cuda_fp16.h`.
-  `nvcc` itself is only invoked when `XCHPLOT2_BUILD_CUDA=ON` (default).
-  Runtime users on RTX 50-series (Blackwell, `sm_120`) need a driver
-  bundle that ships Toolkit 12.8+; earlier toolkits lack Blackwell
-  codegen.
-- **C++20 host compiler** (clang ≥ 18 or gcc ≥ 13).
-- **CMake ≥ 3.24**.
-- **Rust toolchain** (stable; for `keygen-rs` and the `cargo install`
-  entry point).
+### 1. Container (`podman` or `docker`)
 
-**Auto-fetched at CMake configure time**
+```bash
+podman build -t xchplot2 .
+podman run --rm --device nvidia.com/gpu=all -v $PWD/plots:/out \
+    xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+```
 
-- **pos2-chip** — Chia Network's CPU reference. Vendored to
-  `third_party/pos2-chip` via `FetchContent`. Override with
-  `-DPOS2_CHIP_DIR=/abs/path` to point at a local checkout.
-- **FSE** (Finite-State Entropy compression) — built from pos2-chip's
-  vendored copy under `pos2-chip/lib/fse`.
+The [`Containerfile`](Containerfile) bundles CUDA Toolkit 13, LLVM 18,
+AdaptiveCpp 25.10, and Rust. AMD ROCm and Intel oneAPI variants are
+documented in the file's header comments — pass `--build-arg
+BASE_DEVEL=...` to switch bases. First build is ~15-30 min (AdaptiveCpp
+compile); subsequent rebuilds reuse the cached layer. GPU performance
+inside the container is identical to native (the device is passed
+through via CDI; kernels run on real hardware).
 
-**Optional GPU runtimes** (set `ACPP_TARGETS` automatically when present)
+### 2. Native install via `scripts/install-deps.sh`
 
-- **ROCm 6+** (NVIDIA-alternative): `rocminfo` is probed at configure
-  time; if it reports a `gfxXXXX` device, the build switches to
-  `ACPP_TARGETS=hip:gfxXXXX`. Untested by us.
-- **Intel oneAPI Level Zero / compute-runtime** for Intel Arc / iGPU.
-  Untested by us; override `ACPP_TARGETS` manually for now.
+```bash
+./scripts/install-deps.sh        # auto-detects distro + GPU vendor
+```
+
+Installs the toolchain via the system package manager (Arch, Ubuntu /
+Debian, Fedora) plus AdaptiveCpp from source into `/opt/adaptivecpp`.
+Pass `--gpu amd` to force the AMD path (CUDA Toolkit headers only,
+plus ROCm). Pass `--no-acpp` to skip the AdaptiveCpp build and let
+CMake fall back to FetchContent.
+
+### 3. Manual / FetchContent fallback
+
+If you'd rather install dependencies yourself, the toolchain is:
+
+| Dep | Notes |
+|---|---|
+| **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches it via FetchContent if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
+| **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON` (default; pass `OFF` for AMD/Intel). |
+| **LLVM / Clang ≥ 18** | clang + libclang dev packages. |
+| **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
+| **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
+| **Boost.Context, libnuma, libomp** | AdaptiveCpp runtime deps. |
+| **Rust toolchain** (stable) | for `keygen-rs` and `cargo install`. |
+
+`pos2-chip` and `FSE` are auto-fetched at CMake configure time
+(`FetchContent`); override `-DPOS2_CHIP_DIR=/abs/path` for a local
+checkout.
+
+For non-NVIDIA targets, the build also probes:
+- **ROCm 6+** (`rocminfo`): if found, sets `ACPP_TARGETS=hip:gfxXXXX`.
+- **Intel oneAPI** (Level Zero / compute-runtime): manual `ACPP_TARGETS`.
 
 ### `cargo install`
 
