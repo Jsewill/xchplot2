@@ -98,6 +98,12 @@ fn main() {
     };
     println!("cargo:warning=xchplot2: ACPP_TARGETS={acpp_targets} ({acpp_source})");
 
+    // XCHPLOT2_BUILD_CUDA toggles whether the CUB sort + nvcc-compiled
+    // CUDA TUs (AesGpu.cu, SortCuda.cu, AesGpuBitsliced.cu) are built.
+    // Default ON keeps the existing NVIDIA fast path; AMD/Intel container
+    // builds set XCHPLOT2_BUILD_CUDA=OFF to skip nvcc.
+    let build_cuda = env::var("XCHPLOT2_BUILD_CUDA").unwrap_or_else(|_| "ON".into());
+
     // ---- configure ----
     let status = Command::new("cmake")
         .args([
@@ -107,6 +113,7 @@ fn main() {
         ])
         .arg(format!("-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"))
         .arg(format!("-DACPP_TARGETS={acpp_targets}"))
+        .arg(format!("-DXCHPLOT2_BUILD_CUDA={build_cuda}"))
         .status()
         .expect("failed to invoke cmake — is it installed?");
     if !status.success() {

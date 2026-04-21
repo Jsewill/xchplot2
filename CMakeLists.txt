@@ -44,7 +44,42 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 # XCHPLOT2_BACKEND={cuda,sycl} toggle was retired in slice 9 once the
 # CUDA-native wrapper TUs (T*OffsetsCuda.cu, PipelineKernelsCuda.cu)
 # were deleted. AdaptiveCpp is now a hard build dependency.
-find_package(AdaptiveCpp REQUIRED)
+#
+# Lookup precedence:
+#   1. find_package(AdaptiveCpp) — system or local install (e.g. /opt/adaptivecpp).
+#      This is what scripts/install-deps.sh and the Containerfile produce.
+#   2. FetchContent fallback — clones AdaptiveCpp at v25.10.0 and adds it as
+#      a CMake subproject. Slow first build (LLVM compilation, ~15-30 min) but
+#      removes the manual install step. Opt out with -DXCHPLOT2_FETCH_ADAPTIVECPP=OFF.
+option(XCHPLOT2_FETCH_ADAPTIVECPP "Fall back to FetchContent if AdaptiveCpp not found" ON)
+
+find_package(AdaptiveCpp QUIET)
+if(NOT AdaptiveCpp_FOUND)
+    if(XCHPLOT2_FETCH_ADAPTIVECPP)
+        message(STATUS "xchplot2: AdaptiveCpp not found — fetching v25.10.0 via FetchContent")
+        message(STATUS "xchplot2:   first build will take ~15-30 min while AdaptiveCpp compiles")
+        message(STATUS "xchplot2:   pre-install via scripts/install-deps.sh to skip this")
+        include(FetchContent)
+        FetchContent_Declare(
+            adaptivecpp
+            GIT_REPOSITORY https://github.com/AdaptiveCpp/AdaptiveCpp.git
+            GIT_TAG        v25.10.0
+        )
+        FetchContent_MakeAvailable(adaptivecpp)
+        # Some AdaptiveCpp builds expose add_sycl_to_target only after install;
+        # if it's missing here, the user needs to install AdaptiveCpp normally.
+        if(NOT COMMAND add_sycl_to_target)
+            message(FATAL_ERROR
+                "xchplot2: FetchContent built AdaptiveCpp but add_sycl_to_target "
+                "wasn't exported. Install AdaptiveCpp via scripts/install-deps.sh "
+                "or use the Containerfile.")
+        endif()
+    else()
+        message(FATAL_ERROR
+            "xchplot2: AdaptiveCpp not found. Install it via scripts/install-deps.sh, "
+            "use the Containerfile, or re-run with -DXCHPLOT2_FETCH_ADAPTIVECPP=ON.")
+    endif()
+endif()
 
 # AdaptiveCpp target autodetect:
 #   1. NVIDIA: stay on "generic" (LLVM SSCP). Empirically a few percent
