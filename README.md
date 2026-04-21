@@ -36,8 +36,39 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 
 ## Build
 
-Requires CUDA Toolkit 12+ (tested on 13.x), C++20 host compiler, CMake
-≥ 3.24, and a Rust toolchain (for `keygen-rs`).
+**Required toolchain**
+
+- **AdaptiveCpp 25.10+** — the SYCL implementation. Distro packages
+  typically lag; install from source per
+  https://adaptivecpp.github.io/AdaptiveCpp/install/. CMake locates it
+  via `find_package(AdaptiveCpp REQUIRED)`; pass `-DAdaptiveCpp_DIR=...`
+  if it lives outside the default search paths.
+- **CUDA Toolkit 12+** (tested on 13.x). Headers are required on **every**
+  build path because AdaptiveCpp's `half.hpp` pulls `cuda_fp16.h`.
+  `nvcc` itself is only invoked when `XCHPLOT2_BUILD_CUDA=ON` (default).
+  Runtime users on RTX 50-series (Blackwell, `sm_120`) need a driver
+  bundle that ships Toolkit 12.8+; earlier toolkits lack Blackwell
+  codegen.
+- **C++20 host compiler** (clang ≥ 18 or gcc ≥ 13).
+- **CMake ≥ 3.24**.
+- **Rust toolchain** (stable; for `keygen-rs` and the `cargo install`
+  entry point).
+
+**Auto-fetched at CMake configure time**
+
+- **pos2-chip** — Chia Network's CPU reference. Vendored to
+  `third_party/pos2-chip` via `FetchContent`. Override with
+  `-DPOS2_CHIP_DIR=/abs/path` to point at a local checkout.
+- **FSE** (Finite-State Entropy compression) — built from pos2-chip's
+  vendored copy under `pos2-chip/lib/fse`.
+
+**Optional GPU runtimes** (set `ACPP_TARGETS` automatically when present)
+
+- **ROCm 6+** (NVIDIA-alternative): `rocminfo` is probed at configure
+  time; if it reports a `gfxXXXX` device, the build switches to
+  `ACPP_TARGETS=hip:gfxXXXX`. Untested by us.
+- **Intel oneAPI Level Zero / compute-runtime** for Intel Arc / iGPU.
+  Untested by us; override `ACPP_TARGETS` manually for now.
 
 ### `cargo install`
 
