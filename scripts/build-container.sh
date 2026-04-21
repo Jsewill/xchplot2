@@ -28,10 +28,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Detect vendor ───────────────────────────────────────────────────────────
+# Capture output first so `set -o pipefail` doesn't bite us — rocminfo and
+# some nvidia-smi configurations exit non-zero even when they print useful
+# information, and the pipefail bash setting then makes the entire pipeline
+# return non-zero regardless of grep's match status.
 if [[ -z "$GPU" ]]; then
-    if command -v nvidia-smi >/dev/null && nvidia-smi -L 2>/dev/null | grep -q GPU; then
+    nvidia_out=""
+    rocm_out=""
+    if command -v nvidia-smi >/dev/null; then
+        nvidia_out=$(nvidia-smi -L 2>/dev/null || true)
+    fi
+    if command -v rocminfo >/dev/null; then
+        rocm_out=$(rocminfo 2>/dev/null || true)
+    fi
+
+    if [[ "$nvidia_out" == *GPU* ]]; then
         GPU=nvidia
-    elif command -v rocminfo >/dev/null && rocminfo 2>/dev/null | grep -q gfx; then
+    elif [[ "$rocm_out" == *gfx* ]]; then
         GPU=amd
     else
         echo "[build-container] No GPU detected via nvidia-smi or rocminfo." >&2
