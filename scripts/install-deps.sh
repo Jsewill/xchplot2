@@ -2,7 +2,7 @@
 #
 # install-deps.sh — bootstrap xchplot2's native build dependencies.
 #
-# Installs CUDA Toolkit (or CUDA *headers*-only on AMD systems), LLVM 18+,
+# Installs CUDA Toolkit on NVIDIA, ROCm HIP SDK on AMD, LLVM 18+,
 # AdaptiveCpp 25.10, and a Rust toolchain via rustup. After this completes,
 # you can build with either:
 #   cargo install --git https://github.com/Jsewill/xchplot2
@@ -67,7 +67,10 @@ install_arch() {
         nvidia) pkgs+=(cuda) ;;
         # rocminfo: needed by build-container.sh + scripts/install-deps.sh
         # autodetection (rocm-hip-sdk doesn't pull it transitively).
-        amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo cuda) ;;  # cuda for headers
+        # No CUDA pkg on the AMD path — CudaHalfShim.hpp guards the CUDA
+        # headers via __has_include, and pulling CUDA alongside HIP causes
+        # uchar1/char1 typedef redefinitions.
+        amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo) ;;
     esac
     sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 }
@@ -78,22 +81,17 @@ install_apt() {
                 libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
     case "$GPU" in
         nvidia) pkgs+=(nvidia-cuda-toolkit) ;;
-        amd)    pkgs+=(rocm-hip-sdk rocm-libs rocminfo nvidia-cuda-toolkit-headers)
+        amd)    pkgs+=(rocm-hip-sdk rocm-libs rocminfo)
                 # rocminfo is the discovery tool build-container.sh probes;
                 # not pulled in transitively by rocm-hip-sdk.
-                # nvidia-cuda-toolkit-headers may not exist on all releases;
-                # fall back to the full toolkit (headers only used).
+                # No nvidia-cuda-toolkit-headers on the AMD path —
+                # CudaHalfShim.hpp guards the CUDA headers via
+                # __has_include, and pulling CUDA alongside HIP causes
+                # uchar1/char1 typedef redefinitions.
                 ;;
     esac
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends "${pkgs[@]}" || {
-        if [[ "$GPU" == "amd" ]]; then
-            echo "[install-deps] retrying with full nvidia-cuda-toolkit (headers only used)"
-            sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
-        else
-            exit 1
-        fi
-    }
+    sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
 install_dnf() {
@@ -102,7 +100,10 @@ install_dnf() {
                 boost-devel numactl-devel libomp-devel curl)
     case "$GPU" in
         nvidia) pkgs+=(cuda-toolkit) ;;
-        amd)    pkgs+=(rocm-hip-devel rocminfo cuda-toolkit) ;;  # cuda for headers
+        # No cuda-toolkit on the AMD path — CudaHalfShim.hpp guards the
+        # CUDA headers via __has_include, and pulling CUDA alongside HIP
+        # causes uchar1/char1 typedef redefinitions.
+        amd)    pkgs+=(rocm-hip-devel rocminfo) ;;
     esac
     sudo dnf install -y "${pkgs[@]}"
 }
@@ -123,7 +124,7 @@ case "$DISTRO" in
                 if [[ "$GPU" == "nvidia" ]]; then
                     echo "  CUDA Toolkit 12+ (with nvcc)"
                 else
-                    echo "  ROCm 6+ HIP SDK + CUDA Toolkit *headers* (no driver needed)"
+                    echo "  ROCm 6+ HIP SDK (rocm-hip-sdk / rocm-hip-devel)"
                 fi
                 echo "Then re-run with --no-acpp to skip pkg install and only build AdaptiveCpp."
                 exit 1
