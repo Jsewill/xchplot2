@@ -14,7 +14,6 @@
 #include "gpu/XsKernel.cuh"
 #include "gpu/XsKernels.cuh"
 
-#include <cuda_runtime.h>   // cudaError_t / cudaErrorInvalidValue / cudaEvent_t (signature-only)
 #include <sycl/sycl.hpp>
 
 #include <climits>

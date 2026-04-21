@@ -23,7 +23,6 @@
 #include "gpu/T1Kernel.cuh"
 #include "gpu/T1Offsets.cuh"
 
-#include <cuda_runtime.h>
 #include <climits>
 #include <cstdint>
 

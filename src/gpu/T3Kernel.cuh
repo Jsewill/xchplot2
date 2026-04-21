@@ -10,8 +10,6 @@
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/T2Kernel.cuh"
 
-#include <cuda_runtime.h>
-
 #include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 #include <cstddef>
