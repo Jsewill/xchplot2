@@ -35,7 +35,16 @@ if [[ -z "$GPU" ]]; then
         GPU=amd
     else
         echo "[build-container] No GPU detected via nvidia-smi or rocminfo." >&2
-        echo "[build-container] Use --gpu nvidia|amd|intel to force a service." >&2
+        echo "[build-container]" >&2
+        echo "[build-container] Either:" >&2
+        echo "[build-container]   1. Install the discovery tool for your vendor:" >&2
+        echo "[build-container]        Arch:    sudo pacman -S nvidia-utils    (NVIDIA)" >&2
+        echo "[build-container]                 sudo pacman -S rocminfo        (AMD)" >&2
+        echo "[build-container]        Ubuntu:  sudo apt install nvidia-utils-XXX  (NVIDIA)" >&2
+        echo "[build-container]                 sudo apt install rocminfo          (AMD)" >&2
+        echo "[build-container]        (or run scripts/install-deps.sh which does this)" >&2
+        echo "[build-container]   2. Force a service explicitly:" >&2
+        echo "[build-container]        $0 --gpu nvidia | amd | intel" >&2
         exit 1
     fi
 fi

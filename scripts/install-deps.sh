@@ -65,7 +65,9 @@ install_arch() {
                 boost numactl curl)
     case "$GPU" in
         nvidia) pkgs+=(cuda) ;;
-        amd)    pkgs+=(rocm-hip-sdk rocm-device-libs cuda) ;;  # cuda for headers
+        # rocminfo: needed by build-container.sh + scripts/install-deps.sh
+        # autodetection (rocm-hip-sdk doesn't pull it transitively).
+        amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo cuda) ;;  # cuda for headers
     esac
     sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 }
@@ -76,9 +78,11 @@ install_apt() {
                 libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
     case "$GPU" in
         nvidia) pkgs+=(nvidia-cuda-toolkit) ;;
-        amd)    pkgs+=(rocm-hip-sdk rocm-libs nvidia-cuda-toolkit-headers)
+        amd)    pkgs+=(rocm-hip-sdk rocm-libs rocminfo nvidia-cuda-toolkit-headers)
+                # rocminfo is the discovery tool build-container.sh probes;
+                # not pulled in transitively by rocm-hip-sdk.
                 # nvidia-cuda-toolkit-headers may not exist on all releases;
-                # fall back to the full toolkit (headers only used)
+                # fall back to the full toolkit (headers only used).
                 ;;
     esac
     sudo apt-get update
@@ -98,7 +102,7 @@ install_dnf() {
                 boost-devel numactl-devel libomp-devel curl)
     case "$GPU" in
         nvidia) pkgs+=(cuda-toolkit) ;;
-        amd)    pkgs+=(rocm-hip-devel cuda-toolkit) ;;  # cuda for headers
+        amd)    pkgs+=(rocm-hip-devel rocminfo cuda-toolkit) ;;  # cuda for headers
     esac
     sudo dnf install -y "${pkgs[@]}"
 }
