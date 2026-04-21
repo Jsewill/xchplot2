@@ -34,6 +34,11 @@ inline void cuda_check_or_throw(cudaError_t err, char const* what)
 
 } // namespace
 
+// CUB DoubleBuffer mode: caller passes both buffers as a ping-pong pair,
+// CUB picks which one the result lands in (db.Current()), and CUB's own
+// scratch shrinks to ~MB of histograms instead of ~2 GB of internal
+// temp keys/vals buffers it would otherwise allocate. We then memcpy
+// db.Current() to keys_out if needed so the public API contract holds.
 void launch_sort_pairs_u32_u32(
     void* d_temp_storage,
     size_t& temp_bytes,
@@ -44,29 +49,39 @@ void launch_sort_pairs_u32_u32(
     sycl::queue& q)
 {
     if (d_temp_storage == nullptr) {
-        // Sizing query — stream argument is unused.
+        cub::DoubleBuffer<uint32_t> d_keys(keys_in, keys_out);
+        cub::DoubleBuffer<uint32_t> d_vals(vals_in, vals_out);
         cuda_check_or_throw(cub::DeviceRadixSort::SortPairs(
             nullptr, temp_bytes,
-            keys_in, keys_out,
-            vals_in, vals_out,
-            count, begin_bit, end_bit, /*stream=*/nullptr),
+            d_keys, d_vals,
+            static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
             "SortPairs (sizing)");
         return;
     }
 
-    // Drain the SYCL queue so any prior kernel writes to keys_in / vals_in
-    // are visible before CUB runs.
     q.wait();
 
+    cub::DoubleBuffer<uint32_t> d_keys(keys_in, keys_out);
+    cub::DoubleBuffer<uint32_t> d_vals(vals_in, vals_out);
     cuda_check_or_throw(cub::DeviceRadixSort::SortPairs(
         d_temp_storage, temp_bytes,
-        keys_in, keys_out,
-        vals_in, vals_out,
-        count, begin_bit, end_bit, /*stream=*/nullptr),
+        d_keys, d_vals,
+        static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
         "SortPairs");
 
-    // Wait for CUB to finish on the default stream so subsequent SYCL
-    // submits see the sorted result.
+    // CUB picks the output buffer; copy to keys_out/vals_out if it landed
+    // in keys_in/vals_in instead.
+    if (d_keys.Current() != keys_out) {
+        cuda_check_or_throw(cudaMemcpyAsync(keys_out, d_keys.Current(),
+            count * sizeof(uint32_t), cudaMemcpyDeviceToDevice, nullptr),
+            "memcpy keys_out");
+    }
+    if (d_vals.Current() != vals_out) {
+        cuda_check_or_throw(cudaMemcpyAsync(vals_out, d_vals.Current(),
+            count * sizeof(uint32_t), cudaMemcpyDeviceToDevice, nullptr),
+            "memcpy vals_out");
+    }
+
     cuda_check_or_throw(cudaStreamSynchronize(nullptr),
         "cudaStreamSynchronize after SortPairs");
 }
@@ -80,21 +95,30 @@ void launch_sort_keys_u64(
     sycl::queue& q)
 {
     if (d_temp_storage == nullptr) {
+        cub::DoubleBuffer<uint64_t> d_keys(keys_in, keys_out);
         cuda_check_or_throw(cub::DeviceRadixSort::SortKeys(
             nullptr, temp_bytes,
-            keys_in, keys_out,
-            count, begin_bit, end_bit, /*stream=*/nullptr),
+            d_keys,
+            static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
             "SortKeys (sizing)");
         return;
     }
 
     q.wait();
 
+    cub::DoubleBuffer<uint64_t> d_keys(keys_in, keys_out);
     cuda_check_or_throw(cub::DeviceRadixSort::SortKeys(
         d_temp_storage, temp_bytes,
-        keys_in, keys_out,
-        count, begin_bit, end_bit, /*stream=*/nullptr),
+        d_keys,
+        static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
         "SortKeys");
+
+    if (d_keys.Current() != keys_out) {
+        cuda_check_or_throw(cudaMemcpyAsync(keys_out, d_keys.Current(),
+            count * sizeof(uint64_t), cudaMemcpyDeviceToDevice, nullptr),
+            "memcpy keys_out");
+    }
+
     cuda_check_or_throw(cudaStreamSynchronize(nullptr),
         "cudaStreamSynchronize after SortKeys");
 }
