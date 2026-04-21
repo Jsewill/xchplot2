@@ -70,6 +70,20 @@ services:
       - /dev/dri
     group_add:
       - video
+    # Rootless podman's default seccomp filter + capability set blocks
+    # some of the KFD IOCTLs libhsa-runtime64 issues during DMA setup,
+    # which surfaces as a segfault inside the HSA runtime on the first
+    # host→device copy (rocminfo-level queries still work, so the
+    # failure is subtle and confusing). Loosen the sandbox just enough
+    # for HSA's DMA path. If rootless still fails on your host, run
+    # rootful + privileged instead:
+    #   sudo podman run --rm --privileged --device /dev/kfd \
+    #        --device /dev/dri -v $PWD/plots:/out xchplot2:rocm \
+    #        plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
     volumes:
       - ./plots:/out
 

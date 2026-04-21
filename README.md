@@ -88,6 +88,21 @@ subsequent rebuilds reuse the cached layers. GPU performance inside
 the container is identical to native (devices pass through via CDI on
 NVIDIA, `/dev/kfd`+`/dev/dri` on AMD; kernels run on real hardware).
 
+On AMD, rootless podman's default seccomp filter + capability set
+blocks some of the KFD IOCTLs `libhsa-runtime64` needs during DMA
+setup — the crash is a segfault deep inside the HSA runtime on the
+very first host→device copy, even though `rocminfo` works fine.
+[`compose.yaml`](compose.yaml) already sets
+`security_opt: [seccomp=unconfined]` + `cap_add: [SYS_ADMIN]` on the
+`rocm` service to loosen the sandbox. If that still isn't enough on
+your host, fall back to rootful + privileged:
+
+```bash
+sudo podman run --rm --privileged --device /dev/kfd --device /dev/dri \
+    -v $PWD/plots:/out xchplot2:rocm \
+    plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+```
+
 ### 2. Native install via `scripts/install-deps.sh`
 
 ```bash
