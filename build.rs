@@ -166,21 +166,26 @@ fn main() {
 
     // ---- AdaptiveCpp runtime ----
     // The static archives produced by CMake reference hipsycl::rt::* symbols
-    // that live in libacpp-rt + libacpp-common (shared). Honour $ACPP_PREFIX
-    // / $AdaptiveCpp_DIR / standard locations; the install paths in
-    // scripts/install-deps.sh and Containerfile both default to /opt/adaptivecpp.
-    let acpp_prefix = env::var("ACPP_PREFIX")
-        .or_else(|_| env::var("AdaptiveCpp_ROOT"))
-        .unwrap_or_else(|_| {
-            for guess in ["/opt/adaptivecpp", "/usr/local"] {
-                if std::path::Path::new(&format!("{guess}/lib/libacpp-rt.so")).exists() {
+    // that live in libacpp-rt + libacpp-common (shared). CMake writes the
+    // exact lib directory to $cmake_build/acpp-prefix.txt during configure;
+    // honour that, then $ACPP_PREFIX / standard locations as fallbacks.
+    let acpp_lib_dir = std::fs::read_to_string(cmake_build.join("acpp-prefix.txt"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::var("ACPP_PREFIX").ok().map(|p| format!("{p}/lib")))
+        .or_else(|| env::var("AdaptiveCpp_ROOT").ok().map(|p| format!("{p}/lib")))
+        .unwrap_or_else(|| {
+            for guess in ["/opt/adaptivecpp/lib", "/usr/local/lib",
+                          "/usr/lib/x86_64-linux-gnu", "/usr/lib"] {
+                if std::path::Path::new(&format!("{guess}/libacpp-rt.so")).exists() {
                     return guess.to_string();
                 }
             }
-            "/opt/adaptivecpp".to_string()
+            "/opt/adaptivecpp/lib".to_string()
         });
-    println!("cargo:rustc-link-search=native={acpp_prefix}/lib");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{acpp_prefix}/lib");
+    println!("cargo:rustc-link-search=native={acpp_lib_dir}");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{acpp_lib_dir}");
     println!("cargo:rustc-link-lib=acpp-rt");
     println!("cargo:rustc-link-lib=acpp-common");
 
