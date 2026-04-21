@@ -1,0 +1,77 @@
+# compose.yaml — podman-first (also works with docker compose).
+#
+# Three vendor-specific services share one Containerfile, parameterized
+# via build args. Pick one based on your GPU; the build context is the
+# same so the AdaptiveCpp + xchplot2 build layers cache across services.
+#
+# Build & run examples:
+#
+#   # NVIDIA (default sm_89 / RTX 4090; override via $CUDA_ARCH=120 etc.)
+#   podman compose build cuda
+#   podman compose run --rm cuda test 22 <plot_id_hex> 2 0 0 -G -o /out
+#
+#   # AMD ROCm — set $ACPP_GFX to your card's gfx target (rocminfo | grep gfx).
+#   #   gfx1031 = Navi 22 (RX 6700/6700 XT/6800M)
+#   #   gfx1100 = Navi 31 (RX 7900 XTX/XT)   ← default
+#   #   gfx900  = Vega 10 (RX Vega 56/64, MI25)
+#   ACPP_GFX=gfx1031 podman compose build rocm
+#   podman compose run --rm rocm test 22 <plot_id_hex> 2 0 0 -G -o /out
+#
+#   # Intel oneAPI (experimental, untested).
+#   podman compose build intel
+#
+# Plot files land in ./plots/ on the host (mounted at /out in the
+# container).
+
+services:
+  cuda:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        BASE_DEVEL:           docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+        BASE_RUNTIME:         docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+        ACPP_TARGETS:         "generic"
+        XCHPLOT2_BUILD_CUDA:  "ON"
+        INSTALL_CUDA_HEADERS: "0"
+        CUDA_ARCH:            "${CUDA_ARCH:-89}"
+    image: xchplot2:cuda
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - ./plots:/out
+
+  rocm:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        BASE_DEVEL:           docker.io/rocm/dev-ubuntu-24.04:latest
+        BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-24.04:latest
+        ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
+        XCHPLOT2_BUILD_CUDA:  "OFF"
+        INSTALL_CUDA_HEADERS: "1"
+    image: xchplot2:rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    volumes:
+      - ./plots:/out
+
+  intel:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        BASE_DEVEL:           docker.io/intel/oneapi-basekit:latest
+        BASE_RUNTIME:         docker.io/intel/oneapi-runtime:latest
+        ACPP_TARGETS:         "generic"
+        XCHPLOT2_BUILD_CUDA:  "OFF"
+        INSTALL_CUDA_HEADERS: "1"
+    image: xchplot2:intel
+    devices:
+      - /dev/dri
+    volumes:
+      - ./plots:/out

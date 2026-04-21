@@ -106,6 +106,24 @@ RUN CUDA_ARCHITECTURES=${CUDA_ARCH} \
     XCHPLOT2_BUILD_CUDA=${XCHPLOT2_BUILD_CUDA} \
     cargo install --path . --root /usr/local --locked
 
+# Also build the parity tests via plain CMake so they're available
+# inside the container for first-port validation on new GPUs (especially
+# AMD/Intel). Reuses the static libs cargo install just built.
+RUN cmake -S . -B build-tests -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        -DACPP_TARGETS=${ACPP_TARGETS} \
+        -DXCHPLOT2_BUILD_CUDA=${XCHPLOT2_BUILD_CUDA} \
+ && cmake --build build-tests --parallel --target sycl_sort_parity \
+                                          sycl_bucket_offsets_parity \
+                                          sycl_g_x_parity \
+                                          plot_file_parity \
+ && install -m 0755 build-tests/tools/parity/sycl_sort_parity            /usr/local/bin/ \
+ && install -m 0755 build-tests/tools/parity/sycl_bucket_offsets_parity  /usr/local/bin/ \
+ && install -m 0755 build-tests/tools/parity/sycl_g_x_parity             /usr/local/bin/ \
+ && install -m 0755 build-tests/tools/parity/plot_file_parity            /usr/local/bin/ \
+ && rm -rf build-tests target
+
 # ─── runtime ────────────────────────────────────────────────────────────────
 FROM ${BASE_RUNTIME}
 
@@ -120,8 +138,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/bin/xchplot2 /usr/local/bin/xchplot2
-COPY --from=builder /opt/adaptivecpp        /opt/adaptivecpp
+COPY --from=builder /usr/local/bin/xchplot2                    /usr/local/bin/xchplot2
+COPY --from=builder /usr/local/bin/sycl_sort_parity            /usr/local/bin/sycl_sort_parity
+COPY --from=builder /usr/local/bin/sycl_bucket_offsets_parity  /usr/local/bin/sycl_bucket_offsets_parity
+COPY --from=builder /usr/local/bin/sycl_g_x_parity             /usr/local/bin/sycl_g_x_parity
+COPY --from=builder /usr/local/bin/plot_file_parity            /usr/local/bin/plot_file_parity
+COPY --from=builder /opt/adaptivecpp                           /opt/adaptivecpp
 
 ENV LD_LIBRARY_PATH=/opt/adaptivecpp/lib:${LD_LIBRARY_PATH}
 ENV PATH=/opt/adaptivecpp/bin:${PATH}
