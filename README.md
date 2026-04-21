@@ -189,15 +189,24 @@ code reorganises memory, not algorithms.
 
 ## Performance
 
-k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
+k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16. Steady-state per-plot
+wall from `xchplot2 batch` (10-plot manifest, mean):
 
-| Mode | Per plot |
-|---|---|
-| pos2-chip CPU baseline | ~50 s |
-| `xchplot2 batch` steady-state wall (pool path) | **2.15 s** |
-| `xchplot2 batch` steady-state wall (streaming path, ≤8 GB cards) | ~3.7 s |
-| Producer GPU time, steady-state | 1.96 s |
-| Device-kernel floor (single-plot nsys) | 1.91 s |
+| Build | Per plot | Notes |
+|---|---|---|
+| pos2-chip CPU baseline | ~50 s | reference |
+| `cuda-only` branch | **2.15 s** | original CUDA-only path |
+| `main`, `XCHPLOT2_BUILD_CUDA=ON` (CUB sort) | 2.41 s | NVIDIA fast path on the SYCL/AdaptiveCpp port |
+| `main`, `XCHPLOT2_BUILD_CUDA=OFF` (hand-rolled SYCL radix) | 3.79 s | cross-vendor fallback (AMD/Intel) on AdaptiveCpp |
+| streaming path, ≤8 GB cards | ~3.7 s | pool path is preferred when VRAM allows |
+
+The `main`/CUB row is +12% over `cuda-only` from extra AdaptiveCpp
+scheduling overhead. The SYCL row is +57% over CUB on the same NVIDIA
+hardware; ~88% of GPU compute is identical between the two paths
+(`nsys` per-kernel breakdown), and the gap is dominated by host-side
+runtime overhead in AdaptiveCpp's DAG manager rather than kernel
+performance. AMD and Intel runtimes are untested; expect roughly the
+SYCL-row latency adjusted for relative GPU throughput.
 
 ## License
 
