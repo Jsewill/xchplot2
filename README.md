@@ -18,10 +18,10 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
   and newer). Builds auto-detect the installed GPU's `compute_cap`
   via `nvidia-smi`; override with `$CUDA_ARCHITECTURES` for fat or
   cross-target builds (see [Build](#build)).
-- **VRAM:** 8 GB minimum. Cards with < 15 GB free transparently use
-  the streaming pipeline; 16 GB+ cards use the persistent buffer pool
-  for faster steady-state. Both paths produce byte-identical plots.
-  Detailed breakdown in [VRAM](#vram).
+- **VRAM:** 8 GB minimum. Cards with less than ~17 GB free
+  transparently use the streaming pipeline; 18 GB+ cards reliably use
+  the persistent buffer pool for faster steady-state. Both paths
+  produce byte-identical plots. Detailed breakdown in [VRAM](#vram).
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
@@ -216,15 +216,17 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 PoS2 plots are k=28 by spec. Two code paths, dispatched automatically
 based on available VRAM:
 
-- **Pool path (~15 GB, 16 GB+ cards).** The persistent buffer pool is
-  sized worst-case and reused across plots in `batch` mode for
-  amortised allocator cost and double-buffered D2H. Targets for
-  steady-state: RTX 4080 / 4090 / 5080 / 5090, A6000, etc.
+- **Pool path (~16 GB device + ~6 GB pinned host; 18 GB+ cards
+  reliably).** The persistent buffer pool is sized worst-case and
+  reused across plots in `batch` mode for amortised allocator cost and
+  double-buffered D2H. Targets for steady-state: RTX 4090 / 5090,
+  A6000, H100, etc. RTX 4080 (16 GB) may transparently fall back to
+  streaming after driver overhead.
 - **Streaming path (~8 GB).** Allocates per-phase and frees between
   phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
   merge-with-gather is split into three passes so the live set stays
   under 8 GB. Targets 8 GB cards (GTX 1070 class and up). Slower per
-  plot (~3.7 s vs ~2.1 s at k=28 on a 4090) because it pays per-phase
+  plot (~3.7 s vs ~2.4 s at k=28 on a 4090) because it pays per-phase
   `cudaMalloc`/`cudaFree` instead of amortising.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
