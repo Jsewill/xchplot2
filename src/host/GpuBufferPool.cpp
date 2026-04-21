@@ -70,25 +70,22 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
         static_cast<size_t>(cap) * 4 * sizeof(uint32_t));
 
-    // d_pair_*: worst case across T1 (12 B), T2 (16 B), T3 (8 B), uint64 frags (8 B).
+    // d_pair_*: worst case across T1 (12 B), T2 (16 B), T3 (8 B), uint64
+    // frags (8 B), AND the aliased Xs scratch. Xs wants ~4.34 GB at k=28 —
+    // we alias d_pair_b for that, so the buffer must be sized to fit either
+    // the largest pairing struct OR the Xs construction scratch (which is
+    // 4 × total_xs uint32s plus the radix-sort temp). The CUB sort scratch
+    // alone is ~8 × total_xs, which often exceeds the pairing-only budget.
+    uint8_t dummy_plot_id[32] = {};
+    launch_construct_xs(dummy_plot_id, k, testnet,
+                                   nullptr, nullptr, &xs_temp_bytes, q);
     pair_bytes = std::max({
         static_cast<size_t>(cap) * sizeof(T1PairingGpu),
         static_cast<size_t>(cap) * sizeof(T2PairingGpu),
         static_cast<size_t>(cap) * sizeof(T3PairingGpu),
         static_cast<size_t>(cap) * sizeof(uint64_t),
+        xs_temp_bytes,
     });
-
-    // Only the Xs phase asks for kernel scratch; T1/T2/T3 match report 0.
-    // Xs wants ~4.34 GB at k=28 — we alias d_pair_b for that, so no separate
-    // allocation.
-    uint8_t dummy_plot_id[32] = {};
-    launch_construct_xs(dummy_plot_id, k, testnet,
-                                   nullptr, nullptr, &xs_temp_bytes, q);
-    if (xs_temp_bytes > pair_bytes) {
-        throw std::runtime_error(
-            "GpuBufferPool: Xs scratch exceeds pair buffer size; aliasing "
-            "d_pair_b as Xs temp is no longer safe");
-    }
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
     size_t s_pairs = 0;
