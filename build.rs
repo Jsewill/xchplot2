@@ -190,20 +190,27 @@ fn main() {
     println!("cargo:rustc-link-lib=acpp-common");
 
     // ---- CUDA runtime ----
-    // Honour $CUDA_PATH / $CUDA_HOME if set, else fall back to /opt/cuda
-    // (Arch / CachyOS) then /usr/local/cuda (Debian-ish).
-    let cuda_root = env::var("CUDA_PATH")
-        .or_else(|_| env::var("CUDA_HOME"))
-        .unwrap_or_else(|_| {
-            for guess in ["/opt/cuda", "/usr/local/cuda"] {
-                if std::path::Path::new(guess).exists() { return guess.to_string(); }
-            }
-            "/opt/cuda".to_string()
-        });
-    println!("cargo:rustc-link-search=native={cuda_root}/lib64");
-    println!("cargo:rustc-link-search=native={cuda_root}/lib");
-    println!("cargo:rustc-link-lib=cudart");
-    println!("cargo:rustc-link-lib=cudadevrt");
+    // Only needed when XCHPLOT2_BUILD_CUDA=ON — then the nvcc-compiled
+    // TUs (SortCuda, AesGpu, AesGpuBitsliced) pull in cudart / cudadevrt.
+    // On the AMD/Intel OFF path there's no CUDA Toolkit on the image and
+    // nothing in the static archives references cudart, so emitting
+    // `-lcudart` would make rust-lld fail with "unable to find library".
+    if build_cuda == "ON" {
+        // Honour $CUDA_PATH / $CUDA_HOME if set, else fall back to
+        // /opt/cuda (Arch / CachyOS) then /usr/local/cuda (Debian-ish).
+        let cuda_root = env::var("CUDA_PATH")
+            .or_else(|_| env::var("CUDA_HOME"))
+            .unwrap_or_else(|_| {
+                for guess in ["/opt/cuda", "/usr/local/cuda"] {
+                    if std::path::Path::new(guess).exists() { return guess.to_string(); }
+                }
+                "/opt/cuda".to_string()
+            });
+        println!("cargo:rustc-link-search=native={cuda_root}/lib64");
+        println!("cargo:rustc-link-search=native={cuda_root}/lib");
+        println!("cargo:rustc-link-lib=cudart");
+        println!("cargo:rustc-link-lib=cudadevrt");
+    }
 
     // C++ stdlib + POSIX bits the static libs (Rust std + pthread inside
     // pos2_keygen, std::async + std::thread in pos2_gpu_host) reach for.
