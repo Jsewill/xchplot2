@@ -45,8 +45,45 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 # CUDA-native wrapper TUs (T*OffsetsCuda.cu, PipelineKernelsCuda.cu)
 # were deleted. AdaptiveCpp is now a hard build dependency.
 find_package(AdaptiveCpp REQUIRED)
+
+# AdaptiveCpp target autodetect:
+#   1. NVIDIA: stay on "generic" (LLVM SSCP). Empirically a few percent
+#      faster than cuda:sm_XX on our kernels at k=28 — SSCP's runtime
+#      specialization beats the CUDA-AOT path for this workload.
+#   2. AMD:    rocminfo Name: gfxXXXX → hip:gfxXXXX. SSCP's HIP path is
+#      less mature, so AOT-compiling for the actual gfx target is the
+#      safer pick on AMD.
+#   3. Fallback: generic (works everywhere; JITs on first use).
+# Override with -DACPP_TARGETS=... on the cmake command line.
 if(NOT ACPP_TARGETS)
-    set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+    execute_process(
+        COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
+        OUTPUT_VARIABLE _xchplot2_cuda_cap
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _xchplot2_nvsmi_rc
+        ERROR_QUIET)
+    if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_cuda_cap)
+        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+        message(STATUS "xchplot2: NVIDIA GPU detected; using ACPP_TARGETS=generic (SSCP)")
+    else()
+        execute_process(
+            COMMAND rocminfo
+            OUTPUT_VARIABLE _xchplot2_rocm_out
+            RESULT_VARIABLE _xchplot2_rocminfo_rc
+            ERROR_QUIET)
+        if(_xchplot2_rocminfo_rc EQUAL 0)
+            string(REGEX MATCH "Name:[ \t]+gfx[0-9a-f]+" _xchplot2_gfx_match "${_xchplot2_rocm_out}")
+            string(REGEX REPLACE "Name:[ \t]+" "" _xchplot2_gfx "${_xchplot2_gfx_match}")
+            if(_xchplot2_gfx)
+                set(ACPP_TARGETS "hip:${_xchplot2_gfx}" CACHE STRING "AdaptiveCpp target list" FORCE)
+                message(STATUS "xchplot2: ACPP_TARGETS auto-detected via rocminfo: ${ACPP_TARGETS}")
+            endif()
+        endif()
+    endif()
+    if(NOT ACPP_TARGETS)
+        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+        message(STATUS "xchplot2: ACPP_TARGETS fell back to generic (no nvidia-smi/rocminfo)")
+    endif()
 endif()
 message(STATUS "xchplot2: ACPP_TARGETS=${ACPP_TARGETS}")
 
