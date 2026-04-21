@@ -91,13 +91,13 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     size_t s_pairs = 0;
     launch_sort_pairs_u32_u32(
         nullptr, s_pairs,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
         cap, 0, k, q);
     size_t s_keys = 0;
     launch_sort_keys_u64(
         nullptr, s_keys,
-        static_cast<uint64_t const*>(nullptr), static_cast<uint64_t*>(nullptr),
+        static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
         cap, 0, 2 * k, q);
     sort_scratch_bytes = std::max(s_pairs, s_keys);
 

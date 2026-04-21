@@ -37,8 +37,8 @@ inline void cuda_check_or_throw(cudaError_t err, char const* what)
 void launch_sort_pairs_u32_u32(
     void* d_temp_storage,
     size_t& temp_bytes,
-    uint32_t const* keys_in, uint32_t* keys_out,
-    uint32_t const* vals_in, uint32_t* vals_out,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint32_t* vals_in, uint32_t* vals_out,
     uint64_t count,
     int begin_bit, int end_bit,
     sycl::queue& q)
@@ -74,7 +74,7 @@ void launch_sort_pairs_u32_u32(
 void launch_sort_keys_u64(
     void* d_temp_storage,
     size_t& temp_bytes,
-    uint64_t const* keys_in, uint64_t* keys_out,
+    uint64_t* keys_in, uint64_t* keys_out,
     uint64_t count,
     int begin_bit, int end_bit,
     sycl::queue& q)

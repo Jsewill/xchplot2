@@ -301,52 +301,51 @@ void radix_pass_keys_u64(
 
 } // namespace
 
+// DoubleBuffer-style ping-pong over caller's buffers — no internal alt
+// allocation. Scratch is just tile_hist + tile_offsets (a few MB at k=28
+// vs the ~6 GB the old keys_alt/vals_alt cost there). The result lands
+// in keys_out; if the pass count is odd we do one final memcpy from
+// keys_in (which holds the result after the last swap).
 void launch_sort_pairs_u32_u32(
     void* d_temp_storage,
     size_t& temp_bytes,
-    uint32_t const* keys_in, uint32_t* keys_out,
-    uint32_t const* vals_in, uint32_t* vals_out,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint32_t* vals_in, uint32_t* vals_out,
     uint64_t count,
     int begin_bit, int end_bit,
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const bytes = sizeof(uint32_t) * count * 2
-                       + sizeof(uint32_t) * RADIX * num_tiles * 2;
+    size_t const bytes = sizeof(uint32_t) * RADIX * num_tiles * 2;
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
     }
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
-    uint32_t* keys_alt     = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * count;
-    uint32_t* vals_alt     = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * count;
     uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * RADIX * num_tiles;
     uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
 
-    q.memcpy(keys_out, keys_in, sizeof(uint32_t) * count);
-    q.memcpy(vals_out, vals_in, sizeof(uint32_t) * count).wait();
-
-    uint32_t const* cur_keys = keys_out;
-    uint32_t const* cur_vals = vals_out;
-    uint32_t*       dst_keys = keys_alt;
-    uint32_t*       dst_vals = vals_alt;
+    // First pass reads from keys_in (caller's input). Subsequent passes
+    // ping-pong between keys_in and keys_out — we treat keys_in as
+    // scratch from here on, which the public API documents.
+    uint32_t* cur_keys = keys_in;
+    uint32_t* cur_vals = vals_in;
+    uint32_t* dst_keys = keys_out;
+    uint32_t* dst_vals = vals_out;
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
         radix_pass_pairs_u32(q, cur_keys, cur_vals, dst_keys, dst_vals,
                              tile_hist, tile_offsets, count, bit);
-
-        uint32_t const* next_in_keys  = dst_keys;
-        uint32_t const* next_in_vals  = dst_vals;
-        uint32_t*       next_out_keys = const_cast<uint32_t*>(cur_keys);
-        uint32_t*       next_out_vals = const_cast<uint32_t*>(cur_vals);
-        cur_keys = next_in_keys;
-        cur_vals = next_in_vals;
-        dst_keys = next_out_keys;
-        dst_vals = next_out_vals;
+        std::swap(cur_keys, dst_keys);
+        std::swap(cur_vals, dst_vals);
     }
     q.wait();
 
+    // After the loop, cur_keys/cur_vals point to the buffer holding the
+    // sorted result (because radix_pass writes to dst, then we swap so
+    // dst becomes the input for the next pass). If that's not keys_out,
+    // copy the result over.
     if (cur_keys != keys_out) {
         q.memcpy(keys_out, cur_keys, sizeof(uint32_t) * count);
         q.memcpy(vals_out, cur_vals, sizeof(uint32_t) * count).wait();
@@ -356,35 +355,28 @@ void launch_sort_pairs_u32_u32(
 void launch_sort_keys_u64(
     void* d_temp_storage,
     size_t& temp_bytes,
-    uint64_t const* keys_in, uint64_t* keys_out,
+    uint64_t* keys_in, uint64_t* keys_out,
     uint64_t count,
     int begin_bit, int end_bit,
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const bytes = sizeof(uint64_t) * count
-                       + sizeof(uint32_t) * RADIX * num_tiles * 2;
+    size_t const bytes = sizeof(uint32_t) * RADIX * num_tiles * 2;
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
     }
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
-    uint64_t* keys_alt     = reinterpret_cast<uint64_t*>(p);  p += sizeof(uint64_t) * count;
     uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * RADIX * num_tiles;
     uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
 
-    q.memcpy(keys_out, keys_in, sizeof(uint64_t) * count).wait();
-
-    uint64_t const* cur = keys_out;
-    uint64_t*       dst = keys_alt;
+    uint64_t* cur = keys_in;
+    uint64_t* dst = keys_out;
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
         radix_pass_keys_u64(q, cur, dst, tile_hist, tile_offsets, count, bit);
-        uint64_t const* next_in  = dst;
-        uint64_t*       next_out = const_cast<uint64_t*>(cur);
-        cur = next_in;
-        dst = next_out;
+        std::swap(cur, dst);
     }
     q.wait();
 
