@@ -36,6 +36,27 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
+/// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
+/// an RX 7900 XTX. Returns None when rocminfo is missing or there's no AMD
+/// GPU. Used to set ACPP_TARGETS=hip:gfxXXXX so AdaptiveCpp can AOT-compile
+/// the kernels for the actual hardware.
+fn detect_amd_gfx() -> Option<String> {
+    let out = Command::new("rocminfo").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&out.stdout).ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Name:") {
+            let name = rest.trim();
+            if name.starts_with("gfx") {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir      = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -56,6 +77,27 @@ fn main() {
     };
     println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({source})");
 
+    // AdaptiveCpp target precedence:
+    //   1. $ACPP_TARGETS if set.
+    //   2. NVIDIA: "generic" (LLVM SSCP). Empirically a few percent
+    //      faster than cuda:sm_<arch> on our kernels.
+    //   3. AMD:    hip:gfx<...> via rocminfo. SSCP's HIP path is less
+    //      mature, so AOT-compile for the gfx target.
+    //   4. generic (LLVM SSCP, JITs on first use).
+    let (acpp_targets, acpp_source) = match env::var("ACPP_TARGETS") {
+        Ok(v) => (v, "$ACPP_TARGETS"),
+        Err(_) => {
+            if source != "fallback (no nvidia-smi)" {
+                ("generic".to_string(), "NVIDIA detected — using SSCP")
+            } else if let Some(gfx) = detect_amd_gfx() {
+                (format!("hip:{gfx}"), "rocminfo probe")
+            } else {
+                ("generic".to_string(), "fallback (LLVM SSCP)")
+            }
+        }
+    };
+    println!("cargo:warning=xchplot2: ACPP_TARGETS={acpp_targets} ({acpp_source})");
+
     // ---- configure ----
     let status = Command::new("cmake")
         .args([
@@ -64,6 +106,7 @@ fn main() {
             "-DCMAKE_BUILD_TYPE=Release",
         ])
         .arg(format!("-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"))
+        .arg(format!("-DACPP_TARGETS={acpp_targets}"))
         .status()
         .expect("failed to invoke cmake — is it installed?");
     if !status.success() {
