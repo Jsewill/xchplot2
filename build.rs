@@ -85,8 +85,11 @@ fn main() {
     //      mature, so AOT-compile for the gfx target.
     //   4. generic (LLVM SSCP, JITs on first use).
     let (acpp_targets, acpp_source) = match env::var("ACPP_TARGETS") {
-        Ok(v) => (v, "$ACPP_TARGETS"),
-        Err(_) => {
+        // Treat an empty env var the same as unset — Containerfile build
+        // args propagate as `ACPP_TARGETS=` when the user doesn't override
+        // them, and acpp rejects an empty target string.
+        Ok(v) if !v.is_empty() => (v, "$ACPP_TARGETS"),
+        Ok(_) | Err(_) => {
             if source != "fallback (no nvidia-smi)" {
                 ("generic".to_string(), "NVIDIA detected — using SSCP")
             } else if let Some(gfx) = detect_amd_gfx() {
@@ -160,6 +163,26 @@ fn main() {
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
+
+    // ---- AdaptiveCpp runtime ----
+    // The static archives produced by CMake reference hipsycl::rt::* symbols
+    // that live in libacpp-rt + libacpp-common (shared). Honour $ACPP_PREFIX
+    // / $AdaptiveCpp_DIR / standard locations; the install paths in
+    // scripts/install-deps.sh and Containerfile both default to /opt/adaptivecpp.
+    let acpp_prefix = env::var("ACPP_PREFIX")
+        .or_else(|_| env::var("AdaptiveCpp_ROOT"))
+        .unwrap_or_else(|_| {
+            for guess in ["/opt/adaptivecpp", "/usr/local"] {
+                if std::path::Path::new(&format!("{guess}/lib/libacpp-rt.so")).exists() {
+                    return guess.to_string();
+                }
+            }
+            "/opt/adaptivecpp".to_string()
+        });
+    println!("cargo:rustc-link-search=native={acpp_prefix}/lib");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{acpp_prefix}/lib");
+    println!("cargo:rustc-link-lib=acpp-rt");
+    println!("cargo:rustc-link-lib=acpp-common");
 
     // ---- CUDA runtime ----
     // Honour $CUDA_PATH / $CUDA_HOME if set, else fall back to /opt/cuda
