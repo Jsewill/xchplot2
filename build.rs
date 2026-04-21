@@ -235,6 +235,23 @@ fn main() {
         println!("cargo:rustc-link-lib=cudadevrt");
     }
 
+    // ---- HIP runtime ----
+    // When ACPP_TARGETS is "hip:gfxXXXX", AdaptiveCpp's HIP backend
+    // compiles SYCL kernels into HIP fat binaries whose host-side
+    // launcher stubs reference __hipPushCallConfiguration /
+    // __hipRegisterFatBinary / hipLaunchKernel from libamdhip64. Without
+    // -lamdhip64 rust-lld fails with "undefined symbol: __hip*".
+    // Honour $ROCM_PATH if set, else fall back to /opt/rocm (standard
+    // bare-metal + all official ROCm container images).
+    if acpp_targets.starts_with("hip:") {
+        let rocm_root = env::var("ROCM_PATH")
+            .unwrap_or_else(|_| "/opt/rocm".to_string());
+        println!("cargo:rustc-link-search=native={rocm_root}/lib");
+        println!("cargo:rustc-link-search=native={rocm_root}/hip/lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{rocm_root}/lib");
+        println!("cargo:rustc-link-lib=amdhip64");
+    }
+
     // C++ stdlib + POSIX bits the static libs (Rust std + pthread inside
     // pos2_keygen, std::async + std::thread in pos2_gpu_host) reach for.
     println!("cargo:rustc-link-lib=stdc++");
