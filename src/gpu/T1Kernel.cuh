@@ -9,8 +9,6 @@
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/XsKernel.cuh"
 
-#include <cuda_runtime.h>
-
 #include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 #include <cstddef>

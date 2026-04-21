@@ -88,6 +88,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fi \
  && rm -rf /var/lib/apt/lists/*
 
+# On ROCm 6.2's dev-ubuntu image, /opt/rocm/llvm/bin/ is missing
+# clang-offload-bundler even though the rest of clang-18 is there. That
+# binary is what the clang driver execs when amdgcn compilation produces
+# fat binaries, so without it any HIP kernel build fails with
+# "Executable 'clang-offload-bundler' doesn't exist". Ubuntu's llvm-18
+# ships its own copy; both LLVMs are 18-series so the bundler formats
+# are compatible. Symlink it into ROCm's clang dir when the gap exists.
+RUN if [ -d /opt/rocm/llvm/bin ] && [ ! -e /opt/rocm/llvm/bin/clang-offload-bundler ]; then \
+        for cand in /usr/lib/llvm-18/bin/clang-offload-bundler \
+                    /usr/bin/clang-offload-bundler-18 \
+                    /usr/bin/clang-offload-bundler; do \
+            if [ -x "$cand" ]; then \
+                ln -sf "$cand" /opt/rocm/llvm/bin/clang-offload-bundler; \
+                echo "[container] linked $cand -> /opt/rocm/llvm/bin/clang-offload-bundler"; \
+                break; \
+            fi; \
+        done; \
+    fi
+
 # Rust toolchain (for keygen-rs and the `cargo install` entry point).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --default-toolchain stable --profile minimal

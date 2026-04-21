@@ -17,7 +17,6 @@
 #include "gpu/T3Offsets.cuh"
 #include "host/PoolSizing.hpp"
 
-#include <cuda_runtime.h>
 #include <climits>
 #include <cstdint>
 
