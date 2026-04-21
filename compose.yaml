@@ -56,8 +56,8 @@ services:
         # AdaptiveCpp is therefore built against Ubuntu's /usr/lib/llvm-18
         # (the Containerfile default), and ROCm provides its own clang +
         # device libs at /opt/rocm/llvm for the HIP backend at runtime.
-        BASE_DEVEL:           docker.io/rocm/dev-ubuntu-22.04:6.2-complete
-        BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-22.04:6.2-complete
+        BASE_DEVEL:           docker.io/rocm/dev-ubuntu-24.04:6.2-complete
+        BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-24.04:6.2-complete
         ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         INSTALL_CUDA_HEADERS: "1"
