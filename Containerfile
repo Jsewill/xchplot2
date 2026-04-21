@@ -45,6 +45,15 @@ ARG ACPP_TARGETS=
 ARG XCHPLOT2_BUILD_CUDA=ON
 ARG INSTALL_CUDA_HEADERS=0
 ARG CUDA_ARCH=89
+# LLVM/clang root used to build AdaptiveCpp. Default = Ubuntu's llvm-18.
+# AMD/ROCm overrides this to /opt/rocm/llvm so the LLVM version matches
+# ROCm's bitcode libraries (ocml.bc / ockl.bc), avoiding "Unknown
+# attribute kind (102)" bitcode-version errors when targeting HIP.
+# LLVM_CMAKE_DIR is the dir containing LLVMConfig.cmake (Ubuntu and
+# ROCm lay these out differently — Ubuntu: $LLVM_ROOT/cmake, ROCm:
+# $LLVM_ROOT/lib/cmake/llvm).
+ARG LLVM_ROOT=/usr/lib/llvm-18
+ARG LLVM_CMAKE_DIR=/usr/lib/llvm-18/cmake
 
 # ─── builder ────────────────────────────────────────────────────────────────
 FROM ${BASE_DEVEL} AS builder
@@ -54,6 +63,8 @@ ARG ACPP_TARGETS
 ARG XCHPLOT2_BUILD_CUDA
 ARG INSTALL_CUDA_HEADERS
 ARG CUDA_ARCH
+ARG LLVM_ROOT
+ARG LLVM_CMAKE_DIR
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -84,10 +95,10 @@ RUN git clone --depth 1 --branch ${ACPP_REF} \
  && cmake -S /tmp/acpp-src -B /tmp/acpp-build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/adaptivecpp \
-        -DCMAKE_C_COMPILER=clang-18 \
-        -DCMAKE_CXX_COMPILER=clang++-18 \
-        -DLLVM_DIR=/usr/lib/llvm-18/cmake \
-        -DACPP_LLD_PATH=/usr/lib/llvm-18/bin/ld.lld \
+        -DCMAKE_C_COMPILER=${LLVM_ROOT}/bin/clang \
+        -DCMAKE_CXX_COMPILER=${LLVM_ROOT}/bin/clang++ \
+        -DLLVM_DIR=${LLVM_CMAKE_DIR} \
+        -DACPP_LLD_PATH=${LLVM_ROOT}/bin/ld.lld \
  && cmake --build /tmp/acpp-build --parallel \
  && cmake --install /tmp/acpp-build \
  && rm -rf /tmp/acpp-src /tmp/acpp-build
