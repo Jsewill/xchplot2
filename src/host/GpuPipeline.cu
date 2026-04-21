@@ -860,17 +860,24 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t const t1_tile_n1  = t1_count - t1_tile_n0;
     uint64_t const t1_tile_max = (t1_tile_n0 > t1_tile_n1) ? t1_tile_n0 : t1_tile_n1;
 
+    // CUB DoubleBuffer mode: caller's two buffers act as the radix
+    // ping-pong, so CUB's internal scratch shrinks from ~2 GB at k=28
+    // down to ~MB of histograms. Frees enough VRAM to fit on 8 GB cards.
     size_t t1_sort_bytes = 0;
-    CHECK(cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
-        nullptr, t1_sort_bytes,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        t1_tile_max, 0, cfg.k, stream));
+    {
+        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, t1_sort_bytes,
+            probe_keys, probe_vals,
+            t1_tile_max, 0, cfg.k, stream));
+    }
 
     stats.phase = "T1 sort";
-    // With T1 SoA emission, d_t1_mi IS the CUB key input. We only need
-    // d_keys_out (CUB sort output), d_vals_in (identity) + d_vals_out
-    // (sorted vals). d_t1_mi is freed as soon as CUB consumes it.
+    // With T1 SoA emission, d_t1_mi IS the CUB key input. With DoubleBuffer
+    // mode CUB ping-pongs between d_t1_mi and d_keys_out, so the result
+    // may land in either; we cudaMemcpyAsync to d_keys_out when it lands
+    // in d_t1_mi to keep downstream code unchanged.
     uint32_t* d_keys_out     = nullptr;
     uint32_t* d_vals_in      = nullptr;
     uint32_t* d_vals_out     = nullptr;
@@ -884,20 +891,25 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         d_vals_in, t1_count);
     CHECK(cudaGetLastError());
 
-    if (t1_tile_n0 > 0) {
+    auto sort_t1_tile = [&](uint64_t off, uint64_t n) {
+        if (n == 0) return;
+        cub::DoubleBuffer<uint32_t> dk(d_t1_mi + off, d_keys_out + off);
+        cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, t1_sort_bytes,
-            d_t1_mi + 0, d_keys_out + 0,
-            d_vals_in + 0, d_vals_out + 0,
-            t1_tile_n0, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
-    }
-    if (t1_tile_n1 > 0) {
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            d_sort_scratch, t1_sort_bytes,
-            d_t1_mi + t1_tile_n0, d_keys_out + t1_tile_n0,
-            d_vals_in + t1_tile_n0, d_vals_out + t1_tile_n0,
-            t1_tile_n1, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
-    }
+            dk, dv,
+            n, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+        if (dk.Current() != d_keys_out + off) {
+            CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
+                n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+        }
+        if (dv.Current() != d_vals_out + off) {
+            CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
+                n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+        }
+    };
+    sort_t1_tile(0, t1_tile_n0);
+    sort_t1_tile(t1_tile_n0, t1_tile_n1);
 
     // Scratch + vals_in + d_t1_mi dead after CUB.
     s_free(stats, d_sort_scratch);
@@ -988,17 +1000,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         if (t2_tile_n[t] > t2_tile_max) t2_tile_max = t2_tile_n[t];
 
     size_t t2_sort_bytes = 0;
-    CHECK(cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
-        nullptr, t2_sort_bytes,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        t2_tile_max, 0, cfg.k, stream));
+    {
+        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, t2_sort_bytes,
+            probe_keys, probe_vals,
+            t2_tile_max, 0, cfg.k, stream));
+    }
 
     stats.phase = "T2 sort";
-    // CUB sort key input = d_t2_mi (emitted SoA by T2 match); no extract
-    // needed, so d_keys_in only needs to hold the merged sorted-MI output
-    // that downstream T3 match will consume. Allocate it AFTER the CUB
-    // tile-sort has freed d_t2_mi to keep peak narrow.
+    // DoubleBuffer mode: ping-pong over d_t2_mi/d_keys_out (and
+    // d_vals_in/d_vals_out). Internal scratch shrinks ~2 GB → ~MB.
     s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
     s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
     s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
@@ -1011,11 +1024,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     for (int t = 0; t < kNumT2Tiles; ++t) {
         if (t2_tile_n[t] == 0) continue;
         uint64_t off = t2_tile_off[t];
+        cub::DoubleBuffer<uint32_t> dk(d_t2_mi + off, d_keys_out + off);
+        cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, t2_sort_bytes,
-            d_t2_mi    + off, d_keys_out + off,
-            d_vals_in  + off, d_vals_out + off,
+            dk, dv,
             t2_tile_n[t], 0, cfg.k, stream));
+        if (dk.Current() != d_keys_out + off) {
+            CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
+                t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+        }
+        if (dv.Current() != d_vals_out + off) {
+            CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
+                t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+        }
     }
 
     s_free(stats, d_sort_scratch);
@@ -1121,10 +1143,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     // ---------- Phase T3 sort ----------
     size_t t3_sort_bytes = 0;
-    CHECK(cub::DeviceRadixSort::SortKeys<uint64_t>(
-        nullptr, t3_sort_bytes,
-        static_cast<uint64_t const*>(nullptr), static_cast<uint64_t*>(nullptr),
-        cap, 0, 2 * cfg.k, stream));
+    {
+        cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
+        CHECK(cub::DeviceRadixSort::SortKeys(
+            nullptr, t3_sort_bytes,
+            probe,
+            cap, 0, 2 * cfg.k, stream));
+    }
 
     stats.phase = "T3 sort";
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
@@ -1132,10 +1157,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
     s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
 
-    CHECK(cub::DeviceRadixSort::SortKeys(
-        d_sort_scratch, t3_sort_bytes,
-        d_frags_in, d_frags_out,
-        t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+    {
+        cub::DoubleBuffer<uint64_t> dk(d_frags_in, d_frags_out);
+        CHECK(cub::DeviceRadixSort::SortKeys(
+            d_sort_scratch, t3_sort_bytes,
+            dk,
+            t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+        if (dk.Current() != d_frags_out) {
+            CHECK(cudaMemcpyAsync(d_frags_out, dk.Current(),
+                t3_count * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
+        }
+    }
 
     s_free(stats, d_t3);
     s_free(stats, d_sort_scratch);
