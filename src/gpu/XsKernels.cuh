@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-#include <cuda_fp16.h>
+#include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 
 namespace pos2gpu {
