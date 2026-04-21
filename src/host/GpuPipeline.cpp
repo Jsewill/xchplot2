@@ -585,8 +585,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     size_t t1_sort_bytes = 0;
     launch_sort_pairs_u32_u32(
         nullptr, t1_sort_bytes,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
         t1_tile_max, 0, cfg.k, q);
 
     stats.phase = "T1 sort";
@@ -703,8 +703,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     size_t t2_sort_bytes = 0;
     launch_sort_pairs_u32_u32(
         nullptr, t2_sort_bytes,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
         t2_tile_max, 0, cfg.k, q);
 
     stats.phase = "T2 sort";
@@ -824,7 +824,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     size_t t3_sort_bytes = 0;
     launch_sort_keys_u64(
         nullptr, t3_sort_bytes,
-        static_cast<uint64_t const*>(nullptr), static_cast<uint64_t*>(nullptr),
+        static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
         cap, 0, 2 * cfg.k, q);
 
     stats.phase = "T3 sort";
