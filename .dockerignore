@@ -1,0 +1,26 @@
+# Build artifacts (out-of-source, copied per Containerfile)
+build/
+build-*/
+target/
+
+# pos2-chip is FetchContent-cloned at CMake configure time inside the
+# container; no need to ship a host-side copy.
+third_party/
+
+# Generated plot files left over from local benchmarks.
+*.plot2
+
+# Editor / tooling
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# Profiling artifacts
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.ncu-rep
+
+# git history is irrelevant to the build itself.
+.git/
