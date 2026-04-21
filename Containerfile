@@ -88,22 +88,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fi \
  && rm -rf /var/lib/apt/lists/*
 
-# On ROCm 6.2's dev-ubuntu image, /opt/rocm/llvm/bin/ is missing
-# clang-offload-bundler even though the rest of clang-18 is there. That
-# binary is what the clang driver execs when amdgcn compilation produces
-# fat binaries, so without it any HIP kernel build fails with
-# "Executable 'clang-offload-bundler' doesn't exist". Ubuntu's llvm-18
-# ships its own copy; both LLVMs are 18-series so the bundler formats
-# are compatible. Symlink it into ROCm's clang dir when the gap exists.
-RUN if [ -d /opt/rocm/llvm/bin ] && [ ! -e /opt/rocm/llvm/bin/clang-offload-bundler ]; then \
-        for cand in /usr/lib/llvm-18/bin/clang-offload-bundler \
-                    /usr/bin/clang-offload-bundler-18 \
-                    /usr/bin/clang-offload-bundler; do \
-            if [ -x "$cand" ]; then \
-                ln -sf "$cand" /opt/rocm/llvm/bin/clang-offload-bundler; \
-                echo "[container] linked $cand -> /opt/rocm/llvm/bin/clang-offload-bundler"; \
-                break; \
-            fi; \
+# AdaptiveCpp's HIP backend invokes a clang driver that expects
+# clang-offload-bundler in its own bin dir (clang looks for helper tools
+# next to itself). On ROCm 6.2-complete images /opt/rocm/llvm/bin is
+# missing that one binary even though clang-18 itself is there. Ubuntu's
+# llvm-18 ships the bundler; both LLVMs are 18-series so the format is
+# compatible.
+#
+# Because we don't know up-front which clang++ AdaptiveCpp will pick
+# (ROCm's /opt/rocm/llvm/bin/clang++, Ubuntu's /usr/lib/llvm-18/bin/
+# clang++, or the /usr/bin shim), symlink the bundler into every clang
+# bin dir we can find. Cheap, belt-and-braces, no per-base-image logic.
+RUN set -eux; \
+    echo "=== clang-offload-bundler discovery ==="; \
+    find / -xdev -name 'clang-offload-bundler*' -executable -type f 2>/dev/null | head -20 || true; \
+    BUNDLER=""; \
+    for c in /usr/lib/llvm-18/bin/clang-offload-bundler \
+             /opt/rocm/llvm/bin/clang-offload-bundler \
+             /usr/bin/clang-offload-bundler-18 \
+             /usr/bin/clang-offload-bundler; do \
+        if [ -x "$c" ]; then BUNDLER="$c"; break; fi; \
+    done; \
+    if [ -z "$BUNDLER" ]; then \
+        BUNDLER=$(find / -xdev -name clang-offload-bundler -executable -type f 2>/dev/null | head -1 || true); \
+    fi; \
+    echo "=== bundler resolved to: ${BUNDLER:-<none>} ==="; \
+    if [ -n "$BUNDLER" ]; then \
+        for d in /opt/rocm/llvm/bin /opt/rocm/bin /usr/lib/llvm-18/bin /usr/bin; do \
+            [ -d "$d" ] || continue; \
+            [ -e "$d/clang-offload-bundler" ] && continue; \
+            ln -sf "$BUNDLER" "$d/clang-offload-bundler"; \
+            echo "linked -> $d/clang-offload-bundler"; \
         done; \
     fi
 

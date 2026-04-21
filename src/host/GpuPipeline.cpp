@@ -22,7 +22,6 @@
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
 
-#include <cuda_fp16.h>
 #include <sycl/sycl.hpp>
 
 
