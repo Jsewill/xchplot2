@@ -51,6 +51,13 @@ services:
         ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         INSTALL_CUDA_HEADERS: "1"
+        # ROCm bundles its own LLVM (currently dev-tip / LLVM 22). The
+        # ROCm device-bitcode (ocml.bc, ockl.bc, …) is produced with that
+        # LLVM, so we MUST build AdaptiveCpp with it too — otherwise the
+        # HIP backend chokes with "Unknown attribute kind (102)" because
+        # Ubuntu's llvm-18 can't read LLVM 22 bitcode.
+        LLVM_ROOT:            /opt/rocm/llvm
+        LLVM_CMAKE_DIR:       /opt/rocm/llvm/lib/cmake/llvm
     image: xchplot2:rocm
     devices:
       - /dev/kfd
