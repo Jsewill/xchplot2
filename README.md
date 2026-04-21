@@ -4,6 +4,14 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 `.plot2` files byte-identical to the
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
+> **Branches:** `main` carries the SYCL/AdaptiveCpp port that lets the
+> plotter run on AMD and Intel GPUs (with an opt-out CUB sort path
+> preserved for NVIDIA). The original CUDA-only implementation, which
+> is ~1.5× faster on NVIDIA than the SYCL fallback at k=28, lives on
+> the [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
+> branch — use it if you only ever target NVIDIA and want the last
+> bit of throughput.
+
 ## Hardware compatibility
 
 - **GPU:** NVIDIA, compute capability ≥ 6.1 (Pascal / GTX 10-series
