@@ -36,6 +36,19 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
+/// Check whether nvcc is on $PATH and runnable. Used to autodetect
+/// XCHPLOT2_BUILD_CUDA: when nvcc is available we assume a CUDA Toolkit
+/// is installed and flip the flag ON; otherwise OFF so AMD / Intel hosts
+/// don't fail the CMake configure looking for nvcc. Runs `nvcc --version`
+/// rather than a simple PATH lookup so stale symlinks don't pass.
+fn detect_nvcc() -> bool {
+    Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
 /// an RX 7900 XTX. Returns None when rocminfo is missing or there's no AMD
 /// GPU. Used to set ACPP_TARGETS=hip:gfxXXXX so AdaptiveCpp can AOT-compile
@@ -103,9 +116,19 @@ fn main() {
 
     // XCHPLOT2_BUILD_CUDA toggles whether the CUB sort + nvcc-compiled
     // CUDA TUs (AesGpu.cu, SortCuda.cu, AesGpuBitsliced.cu) are built.
-    // Default ON keeps the existing NVIDIA fast path; AMD/Intel container
-    // builds set XCHPLOT2_BUILD_CUDA=OFF to skip nvcc.
-    let build_cuda = env::var("XCHPLOT2_BUILD_CUDA").unwrap_or_else(|_| "ON".into());
+    // Autodetect from nvcc availability when the user hasn't set the env
+    // var: NVIDIA hosts with a CUDA Toolkit keep the fast CUB path; AMD /
+    // Intel bare-metal hosts (no nvcc) fall back to the SYCL-only path
+    // rather than failing CMake configure.
+    let (build_cuda, bc_source) = match env::var("XCHPLOT2_BUILD_CUDA") {
+        Ok(v) if !v.is_empty() => (v, "$XCHPLOT2_BUILD_CUDA"),
+        _ => if detect_nvcc() {
+            ("ON".to_string(), "nvcc detected")
+        } else {
+            ("OFF".to_string(), "no nvcc — skipping CUDA TUs")
+        },
+    };
+    println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda} ({bc_source})");
 
     // ---- configure ----
     let status = Command::new("cmake")
