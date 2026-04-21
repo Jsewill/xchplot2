@@ -77,11 +77,15 @@ case "$GPU" in
         ;;
     amd)
         SERVICE=rocm
-        if command -v rocminfo >/dev/null; then
-            gfx=$(rocminfo 2>/dev/null | awk '/^[[:space:]]*Name:[[:space:]]+gfx[0-9a-f]+/ {print $2; exit}')
-            if [[ -n "$gfx" ]]; then
-                export ACPP_GFX="$gfx"
-            fi
+        # Reuse the rocminfo output captured during vendor detection (or
+        # capture it now if --gpu amd was forced and rocm_out is empty).
+        # Avoid `rocminfo | awk '...; exit'` because awk's early exit
+        # SIGPIPEs rocminfo, and pipefail + set -e then kills the script.
+        if [[ -z "${rocm_out:-}" ]] && command -v rocminfo >/dev/null; then
+            rocm_out=$(rocminfo 2>/dev/null || true)
+        fi
+        if [[ -n "${rocm_out:-}" && "$rocm_out" =~ (gfx[0-9a-f]+) ]]; then
+            export ACPP_GFX="${BASH_REMATCH[1]}"
         fi
         if [[ -z "${ACPP_GFX:-}" ]]; then
             echo "[build-container] couldn't detect gfx target; falling back to gfx1100." >&2
