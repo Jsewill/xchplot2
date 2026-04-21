@@ -24,7 +24,7 @@
 // include this header without dragging in nvcc-only intrinsics from the
 // transitive AesGpu.cuh chain. CUDA-side TUs include <cuda_runtime.h>
 // themselves; the typedef redeclaration to the same type is permitted.
-#include <cuda_fp16.h>
+#include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 
 namespace pos2gpu {

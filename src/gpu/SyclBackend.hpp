@@ -17,7 +17,7 @@
 // cuda_fp16.h must precede sycl/sycl.hpp when this header is consumed
 // from an nvcc TU — AdaptiveCpp's libkernel/detail/half_representation.hpp
 // references __half, which only exists once cuda_fp16 has been seen.
-#include <cuda_fp16.h>
+#include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 
 #include <vector>

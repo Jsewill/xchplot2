@@ -60,7 +60,10 @@ services:
         BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-24.04:6.2-complete
         ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
-        INSTALL_CUDA_HEADERS: "1"
+        # No CUDA headers on the AMD path — they conflict with HIP's
+        # uchar1/etc. typedefs. CudaHalfShim.hpp's __has_include guard
+        # handles the absence cleanly.
+        INSTALL_CUDA_HEADERS: "0"
     image: xchplot2:rocm
     devices:
       - /dev/kfd

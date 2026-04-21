@@ -11,7 +11,7 @@
 
 #include <cuda_runtime.h>
 
-#include <cuda_fp16.h>
+#include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 #include <cstddef>
 #include <cstdint>
