@@ -76,8 +76,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake git ninja-build build-essential python3 pkg-config \
         curl ca-certificates \
-        llvm-18 llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev lld-18 \
-        libboost-context-dev libnuma-dev libomp-18-dev \
+        libboost-context-dev libnuma-dev \
+ && if [ "${LLVM_ROOT}" = "/usr/lib/llvm-18" ]; then \
+        apt-get install -y --no-install-recommends \
+            llvm-18 llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev \
+            lld-18 libomp-18-dev; \
+    fi \
  && if [ "${INSTALL_CUDA_HEADERS}" = "1" ]; then \
         apt-get install -y --no-install-recommends nvidia-cuda-toolkit-headers \
             || apt-get install -y --no-install-recommends nvidia-cuda-toolkit; \
@@ -101,6 +105,9 @@ RUN git clone --depth 1 --branch ${ACPP_REF} \
         -DACPP_LLD_PATH=${LLVM_ROOT}/bin/ld.lld \
  && cmake --build /tmp/acpp-build --parallel \
  && cmake --install /tmp/acpp-build \
+ && echo "=== AdaptiveCpp LLVM linkage ===" \
+ && (ldd /opt/adaptivecpp/lib/libacpp-rt.so | grep -iE "llvm|libomp" || true) \
+ && (ldd /opt/adaptivecpp/lib/libacpp-common.so | grep -iE "llvm|libomp" || true) \
  && rm -rf /tmp/acpp-src /tmp/acpp-build
 
 ENV CMAKE_PREFIX_PATH=/opt/adaptivecpp:${CMAKE_PREFIX_PATH}
