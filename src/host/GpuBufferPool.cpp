@@ -152,15 +152,34 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             sort_scratch_bytes/1e9, pinned_bytes/1e9);
     }
 
-    d_storage      = sycl_alloc_device_or_throw(storage_bytes,      q, "d_storage");
-    d_pair_a       = sycl_alloc_device_or_throw(pair_bytes,         q, "d_pair_a");
-    d_pair_b       = sycl_alloc_device_or_throw(pair_bytes,         q, "d_pair_b");
-    d_sort_scratch = sycl_alloc_device_or_throw(sort_scratch_bytes, q, "d_sort_scratch");
-    d_counter      = static_cast<uint64_t*>(
-        sycl_alloc_device_or_throw(sizeof(uint64_t),                q, "d_counter"));
-    for (int i = 0; i < kNumPinnedBuffers; ++i) {
-        h_pinned_t3[i] = static_cast<uint64_t*>(
-            sycl_alloc_host_or_throw(pinned_bytes,                  q, "h_pinned_t3"));
+    // Wrap allocations so a mid-sequence failure (e.g. d_pair_b OOM after
+    // d_storage + d_pair_a have already succeeded) frees the pre-allocated
+    // buffers instead of leaking ~10 GB of device VRAM and ~7 GB of host
+    // pinned memory per failed pool ctor across a batch retry loop.
+    auto cleanup_partial = [&]{
+        if (d_storage)       { sycl::free(d_storage,      q); d_storage      = nullptr; }
+        if (d_pair_a)        { sycl::free(d_pair_a,       q); d_pair_a       = nullptr; }
+        if (d_pair_b)        { sycl::free(d_pair_b,       q); d_pair_b       = nullptr; }
+        if (d_sort_scratch)  { sycl::free(d_sort_scratch, q); d_sort_scratch = nullptr; }
+        if (d_counter)       { sycl::free(d_counter,      q); d_counter      = nullptr; }
+        for (int i = 0; i < kNumPinnedBuffers; ++i) {
+            if (h_pinned_t3[i]) { sycl::free(h_pinned_t3[i], q); h_pinned_t3[i] = nullptr; }
+        }
+    };
+    try {
+        d_storage      = sycl_alloc_device_or_throw(storage_bytes,      q, "d_storage");
+        d_pair_a       = sycl_alloc_device_or_throw(pair_bytes,         q, "d_pair_a");
+        d_pair_b       = sycl_alloc_device_or_throw(pair_bytes,         q, "d_pair_b");
+        d_sort_scratch = sycl_alloc_device_or_throw(sort_scratch_bytes, q, "d_sort_scratch");
+        d_counter      = static_cast<uint64_t*>(
+            sycl_alloc_device_or_throw(sizeof(uint64_t),                q, "d_counter"));
+        for (int i = 0; i < kNumPinnedBuffers; ++i) {
+            h_pinned_t3[i] = static_cast<uint64_t*>(
+                sycl_alloc_host_or_throw(pinned_bytes,                  q, "h_pinned_t3"));
+        }
+    } catch (...) {
+        cleanup_partial();
+        throw;
     }
 }
 
