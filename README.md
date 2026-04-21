@@ -48,21 +48,38 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 
 Three ways to get the dependencies in place, easiest first:
 
-### 1. Container (`podman` or `docker`)
+### 1. Container (`podman compose` or `docker compose`)
+
+[`compose.yaml`](compose.yaml) wires up three vendor-specific services
+sharing one [`Containerfile`](Containerfile) — pick one based on your
+GPU and `compose build` handles the right base image, AdaptiveCpp
+target, and CUDA-on/off setting:
 
 ```bash
-podman build -t xchplot2 .
-podman run --rm --device nvidia.com/gpu=all -v $PWD/plots:/out \
-    xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+# NVIDIA (default sm_89; override via $CUDA_ARCH=120 etc.)
+podman compose build cuda
+podman compose run --rm cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+
+# AMD ROCm — set $ACPP_GFX from `rocminfo | grep gfx`.
+ACPP_GFX=gfx1031 podman compose build rocm
+podman compose run --rm rocm plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
+
+# Intel oneAPI (experimental, untested).
+podman compose build intel
 ```
 
-The [`Containerfile`](Containerfile) bundles CUDA Toolkit 13, LLVM 18,
-AdaptiveCpp 25.10, and Rust. AMD ROCm and Intel oneAPI variants are
-documented in the file's header comments — pass `--build-arg
-BASE_DEVEL=...` to switch bases. First build is ~15-30 min (AdaptiveCpp
-compile); subsequent rebuilds reuse the cached layer. GPU performance
-inside the container is identical to native (the device is passed
-through via CDI; kernels run on real hardware).
+Plot files land in `./plots/` on the host. The container also bundles
+the parity tests (`sycl_sort_parity`, `sycl_g_x_parity`, etc.) under
+`/usr/local/bin/` for quick first-port validation on a new GPU:
+
+```bash
+podman compose run --rm --entrypoint /usr/local/bin/sycl_sort_parity rocm
+```
+
+First build is ~15-30 min (AdaptiveCpp + LLVM 18 compile from source);
+subsequent rebuilds reuse the cached layers. GPU performance inside
+the container is identical to native (devices pass through via CDI on
+NVIDIA, `/dev/kfd`+`/dev/dri` on AMD; kernels run on real hardware).
 
 ### 2. Native install via `scripts/install-deps.sh`
 
