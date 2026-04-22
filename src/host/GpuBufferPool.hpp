@@ -126,8 +126,19 @@ struct GpuBufferPool {
     // failure.
     uint64_t* ensure_pinned(int idx);
 
+    // Returns pool.d_pair_a, allocating it on first use. Deferred
+    // from ctor so run_gpu_pipeline can submit Xs gen *before*
+    // paying this 4.36 GB malloc_device (~400-700 ms at k=28) —
+    // the alloc then overlaps with the ~750 ms of Xs GPU work.
+    // On the first plot of a batch this saves most of the alloc
+    // cost outright; on plots 2+ the pointer is cached and the
+    // fast path returns in O(1). Thread-safe via double-checked
+    // locking on pair_a_mu_.
+    void* ensure_pair_a();
+
 private:
     std::mutex pinned_mu_[kNumPinnedBuffers];
+    std::mutex pair_a_mu_;
 };
 
 } // namespace pos2gpu
