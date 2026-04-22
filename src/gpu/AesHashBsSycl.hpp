@@ -38,17 +38,35 @@ inline uint32_t bs_shfl(sycl::sub_group const& sg, uint32_t x, int lane)
     return sycl::select_from_group(sg, x, lane);
 }
 
-// Ballot via reduce_over_group + bit_or. Each lane contributes bit `lane`
-// set iff its predicate is true. SYCL 2020 lacks a native 32-bit ballot
-// collective; log-n reduction is 5 shuffles on wave32/warp32, vs the
-// 1-instruction __ballot_sync the CUDA original uses. Only called from
-// bs32_pack (once per AES invocation), so the extra cost is amortised
-// across ~32 rounds of ~22 shuffles each.
+// Ballot: 32 lanes each contribute one bit, collected into a single
+// uint32 mask (bit l of the result == lane l's predicate).
+//
+// Fast path on AdaptiveCpp's HIP target: __builtin_amdgcn_ballot_w32
+// lowers to a single v_cmp + s_mov on RDNA2/3 — one native amdgcn
+// instruction instead of the log-n reduction the portable fallback
+// compiles to. This is the critical piece for bitsliced AES to win
+// on amdgcn: bs32_pack calls ballot 128× per hash, so a 5× speedup
+// per call is the difference between a +23 % regression (the first
+// attempt with reduce_over_group<bit_or>) and a net win.
+//
+// Wave-size caveat: we hard-code _w32 because gfx1031 (RDNA2) is
+// wave32 and the entire bitsliced scheme is wave32-only (reqd_sub_
+// group_size(32) on the kernels, 32-way pack/unpack layout). Using
+// _w64 on a wave32 target miscompiles — LLVM issue #62477.
+//
+// Recipe source: AdaptiveCpp doc/hip-source-interop.md — use
+// __acpp_if_target_hip(...) so the amdgcn builtin only materialises
+// during the HIP device pass; the host / SSCP path uses the portable
+// SYCL reduction fallback.
 inline uint32_t bs_ballot(sycl::sub_group const& sg, bool pred)
 {
+#if defined(__AMDGCN__) || defined(__HIP_DEVICE_COMPILE__)
+    return static_cast<uint32_t>(__builtin_amdgcn_ballot_w32(pred));
+#else
     uint32_t lane = sg.get_local_linear_id();
     uint32_t bit  = pred ? (1u << lane) : 0u;
     return sycl::reduce_over_group(sg, bit, sycl::bit_or<uint32_t>{});
+#endif
 }
 
 // ---------- 32-way pack / unpack ----------
