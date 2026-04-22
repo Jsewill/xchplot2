@@ -102,20 +102,83 @@ subsequent rebuilds reuse the cached layers. GPU performance inside
 the container is identical to native (devices pass through via CDI on
 NVIDIA, `/dev/kfd`+`/dev/dri` on AMD; kernels run on real hardware).
 
-On AMD, rootless podman's default seccomp filter + capability set
-blocks some of the KFD IOCTLs `libhsa-runtime64` needs during DMA
-setup — the crash is a segfault deep inside the HSA runtime on the
-very first host→device copy, even though `rocminfo` works fine.
-[`compose.yaml`](compose.yaml) already sets
-`security_opt: [seccomp=unconfined]` + `cap_add: [SYS_ADMIN]` on the
-`rocm` service to loosen the sandbox. If that still isn't enough on
-your host, fall back to rootful + privileged:
+#### AMD container — sudo, `--privileged`, and `ACPP_GFX`
+
+AMD GPUs need three pieces of friction handled correctly. None are
+optional on most hosts, and getting any one wrong tends to fail
+silently or in confusing ways:
+
+1. **`ACPP_GFX` must be set** to your GPU's gfx target. The kernels
+   are AOT-compiled for a specific amdgcn ISA at build time. If the
+   wrong arch is baked in, HIP loads the fatbinary without complaint
+   but the kernels execute as silent no-ops at runtime — sort returns
+   input unchanged, AES match finds zero matches, plots look valid
+   but contain non-canonical proofs that won't qualify against real
+   challenges. `compose.yaml` enforces this — an unset `ACPP_GFX`
+   errors out at compose-parse time. Common values
+   (`rocminfo | grep gfx` to confirm yours):
+
+   - `gfx1030` — RDNA2 Navi 21 (RX 6800 / 6800 XT / 6900 XT)
+   - `gfx1031` — RDNA2 Navi 22 (RX 6700 XT / 6700 / 6800M)
+   - `gfx1100` — RDNA3 Navi 31 (RX 7900 XTX / XT)
+   - `gfx1101` — RDNA3 Navi 32 (RX 7800 XT / 7700 XT)
+
+2. **Rootful `--privileged` for runs.** Rootless podman's default
+   seccomp filter + capability set blocks some of the KFD ioctls
+   `libhsa-runtime64` needs during DMA setup. Without them you get
+   a segfault deep inside the HSA runtime on the very first
+   host→device copy, even though `rocminfo` works fine. Builds don't
+   need GPU access and can stay rootless if you prefer.
+
+3. **`sudo` strips environment variables by default**, including
+   the `ACPP_GFX` you set in your shell. So a bare
+   `sudo podman compose build rocm` loses it. Either invoke the
+   build script (it sets the var inside the sudo'd shell where
+   compose can see it) or pass the var through explicitly.
+
+The recommended invocation pair, in order of how short each one is:
 
 ```bash
-sudo podman run --rm --privileged --device /dev/kfd --device /dev/dri \
+# Build (autodetects ACPP_GFX from rocminfo — works under sudo too):
+sudo ./scripts/build-container.sh
+
+# Run a single test plot at k=22:
+sudo podman run --rm --privileged \
+    --device /dev/kfd --device /dev/dri \
+    -v $PWD/plots:/out xchplot2:rocm \
+    test 22 <plot_id_hex> 2 0 0 -G -o /out
+
+# Run real plotting:
+sudo podman run --rm --privileged \
+    --device /dev/kfd --device /dev/dri \
     -v $PWD/plots:/out xchplot2:rocm \
     plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
 ```
+
+If `sudo` doesn't carry `/opt/rocm/bin` on your distro and the build
+script can't find `rocminfo`, fall back to one of:
+
+```bash
+sudo -E ./scripts/build-container.sh                       # preserve your shell PATH
+sudo ACPP_GFX=gfx1031 ./scripts/build-container.sh         # explicit, no rocminfo needed
+```
+
+Or skip the script entirely:
+
+```bash
+sudo ACPP_GFX=gfx1031 podman compose build rocm
+```
+
+For convenience, drop a wrapper at `~/.local/bin/xchplot2-amd`:
+
+```bash
+#!/bin/bash
+exec sudo podman run --rm --privileged \
+    --device /dev/kfd --device /dev/dri \
+    -v "$PWD/plots:/out" xchplot2:rocm "$@"
+```
+
+Then `xchplot2-amd plot -k 28 -n 10 -f ... -c ... -o /out` just works.
 
 ### 2. Native install via `scripts/install-deps.sh`
 
