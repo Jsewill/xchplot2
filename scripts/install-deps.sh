@@ -156,13 +156,81 @@ fi
 ACPP_BUILD_DIR=$(mktemp -d -t xchplot2-acpp-XXXXXX)
 trap "rm -rf $ACPP_BUILD_DIR" EXIT
 
+# ── Find a compatible LLVM ──────────────────────────────────────────────────
+# AdaptiveCpp 25.10 only supports LLVM 16-20. On rolling distros (Arch,
+# Fedora rawhide) the system LLVM is often 21+, which AdaptiveCpp rejects
+# with "LLVM versions greater than 20 are not yet tested/supported". Probe
+# the conventional install prefixes for the newest usable LLVM and pin
+# AdaptiveCpp to it explicitly. Fail fast with a distro-specific install
+# hint rather than letting AdaptiveCpp's CMake fail mid-configure.
+LLVM_ROOT=""
+for cand in \
+    /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18 \
+    /usr/lib/llvm-17 /usr/lib/llvm-16 \
+    /usr/lib/llvm20  /usr/lib/llvm19  /usr/lib/llvm18 \
+    /usr/lib64/llvm20 /usr/lib64/llvm19 /usr/lib64/llvm18 \
+    /opt/llvm20 /opt/llvm-20 /opt/llvm19 /opt/llvm-19 \
+    /opt/llvm18 /opt/llvm-18; do
+    if [[ -x "$cand/bin/clang" ]] && [[ -x "$cand/bin/ld.lld" ]]; then
+        ver=$("$cand/bin/clang" --version 2>/dev/null \
+              | head -1 | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
+        if [[ -n "$ver" ]] && (( ver >= 16 && ver <= 20 )); then
+            LLVM_ROOT="$cand"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$LLVM_ROOT" ]]; then
+    echo "[install-deps] No compatible LLVM (16-20) with ld.lld found." >&2
+    echo "[install-deps] AdaptiveCpp $ACPP_REF only supports LLVM 16-20." >&2
+    echo "[install-deps] Install one and re-run, or use the container path:" >&2
+    case "$DISTRO" in
+        arch|cachyos|manjaro|endeavouros)
+            echo "  yay -S llvm18-bin lld18-bin   # or paru -S, or any AUR helper" >&2 ;;
+        ubuntu|debian|pop|linuxmint)
+            echo "  sudo apt install llvm-18 llvm-18-dev clang-18 lld-18 libomp-18-dev" >&2 ;;
+        fedora|rhel|centos|rocky|almalinux)
+            echo "  sudo dnf install llvm18 llvm18-devel clang18 lld18-devel" >&2 ;;
+        *)
+            echo "  install LLVM 16-20 + clang + ld.lld for your distro" >&2 ;;
+    esac
+    echo "  ./scripts/build-container.sh   # container has LLVM 18 pinned" >&2
+    exit 1
+fi
+echo "[install-deps] Using LLVM at $LLVM_ROOT for AdaptiveCpp build."
+
+# ── ROCm device libs path (AMD only) ────────────────────────────────────────
+# AdaptiveCpp's HIP backend needs ockl.bc / ocml.bc to compile kernels for
+# amdgcn. The bitcode location moved between ROCm versions; probe the
+# common spots. CMake will warn if the path's missing on AMD; without a
+# match here, the build fails with "ROCm device library path not found".
+ACPP_ROCM_FLAGS=()
+if [[ "$GPU" == "amd" ]]; then
+    for d in \
+        /opt/rocm/amdgcn/bitcode \
+        /opt/rocm/lib/llvm-amdgpu/amdgcn/bitcode \
+        /opt/rocm/share/amdgcn/bitcode; do
+        if [[ -f "$d/ockl.bc" ]]; then
+            ACPP_ROCM_FLAGS+=(-DROCM_DEVICE_LIBS_PATH="$d")
+            echo "[install-deps] ROCm device libs: $d"
+            break
+        fi
+    done
+fi
+
 echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
 git clone --depth 1 --branch "$ACPP_REF" \
     https://github.com/AdaptiveCpp/AdaptiveCpp.git "$ACPP_BUILD_DIR/src"
 
 cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$ACPP_PREFIX"
+    -DCMAKE_INSTALL_PREFIX="$ACPP_PREFIX" \
+    -DCMAKE_C_COMPILER="$LLVM_ROOT/bin/clang" \
+    -DCMAKE_CXX_COMPILER="$LLVM_ROOT/bin/clang++" \
+    -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" \
+    -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
+    "${ACPP_ROCM_FLAGS[@]}"
 cmake --build "$ACPP_BUILD_DIR/build" --parallel
 sudo cmake --install "$ACPP_BUILD_DIR/build"
 
