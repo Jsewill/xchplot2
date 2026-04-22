@@ -49,6 +49,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 
 namespace pos2gpu {
@@ -106,8 +107,27 @@ struct GpuBufferPool {
     // previously measured producer-slower-than-consumer case, but
     // 3 costs only ~2 GB of host pinned at k=28 and widens the
     // "safe" consumer/producer ratio.
+    //
+    // Pinned slots are allocated LAZILY on first use via
+    // ensure_pinned(idx). The ctor no longer pays ~1.8 s at k=28
+    // for the 3 × 2.2 GB malloc_host calls; single-plot runs
+    // (plot -n 1) only ever allocate slot 0, saving ~1.2 s of
+    // ctor time. Batch runs (plot -n N, N ≥ 3) amortise the
+    // allocation cost across the first three plots' D2H phases
+    // instead of the ctor — identical total batch time.
     static constexpr int kNumPinnedBuffers = 3;
     uint64_t* h_pinned_t3[kNumPinnedBuffers] = {};
+
+    // Returns pool.h_pinned_t3[idx], allocating the slot if it
+    // hasn't been used yet. Thread-safe via a per-slot mutex
+    // (concurrent callers with the same idx cooperate through
+    // double-checked locking; different idx values proceed
+    // independently). Throws std::runtime_error on host alloc
+    // failure.
+    uint64_t* ensure_pinned(int idx);
+
+private:
+    std::mutex pinned_mu_[kNumPinnedBuffers];
 };
 
 } // namespace pos2gpu
