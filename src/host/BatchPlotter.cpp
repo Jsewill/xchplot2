@@ -245,8 +245,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             "sort_scratch=%.2f GB pinned=2x%.2f GB "
             "(Xs scratch aliased in pair_b)\n",
             pool_ptr->storage_bytes * gb,
-            pool_ptr->pair_bytes    * gb,
-            pool_ptr->pair_bytes    * gb,
+            pool_ptr->pair_a_bytes  * gb,
+            pool_ptr->pair_b_bytes  * gb,
             pool_ptr->sort_scratch_bytes * gb,
             pool_ptr->pinned_bytes       * gb);
     }
