@@ -186,8 +186,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 # SSCP also shells out to LLVM's `opt` and `llc` binaries at runtime to
 # generate PTX from the SSCP bitcode — install the full llvm-18 package
 # (binaries + lib), not just libllvm18.
+#
+# clang-18 + libclang-cpp18 + libomp-18-dev: empirically required by the
+# HIP backend at runtime. Without them the SYCL kernels execute as
+# silent no-ops on amdgcn — sort kernels return input unchanged, AES
+# match kernels find zero matches, plot output diverges from the
+# canonical reference. The kernel ISA itself is fine (verified by
+# running the same binary inside the builder stage with these packages
+# present), so something AdaptiveCpp's HIP loader pulls in via dlopen
+# is missing without them. libomp5-18 alone provides only libomp.so.5
+# without the libomp.so symlink the HIP loader walks for.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
+        clang-18 libclang-cpp18 libomp-18-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/xchplot2                    /usr/local/bin/xchplot2
