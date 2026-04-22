@@ -47,20 +47,30 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
         static_cast<size_t>(cap) * 4 * sizeof(uint32_t));
 
-    // d_pair_*: worst case across T1 (12 B), T2 (16 B), T3 (8 B), uint64
-    // frags (8 B), AND the aliased Xs scratch. Xs wants ~4.34 GB at k=28 —
-    // d_pair_b is reused for it, so the buffer must be sized to fit either
-    // the largest pairing struct OR the Xs construction scratch (4 *
-    // total_xs uint32s plus the radix-sort temp).
-    uint8_t dummy_plot_id[32] = {};
-    POOL_CHECK(launch_construct_xs(dummy_plot_id, k, testnet,
-                                   nullptr, nullptr, &xs_temp_bytes));
-    pair_bytes = std::max({
+    // d_pair_a holds the *match output* of the current phase: T1 SoA
+    // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
+    // 16 B), then T3 (T3PairingGpu, 8 B). Worst case is T2 at 16 B/entry.
+    // It does NOT alias the Xs construction scratch — that's d_pair_b.
+    pair_a_bytes = std::max({
         static_cast<size_t>(cap) * sizeof(T1PairingGpu),
         static_cast<size_t>(cap) * sizeof(T2PairingGpu),
         static_cast<size_t>(cap) * sizeof(T3PairingGpu),
         static_cast<size_t>(cap) * sizeof(uint64_t),
-        xs_temp_bytes,
+    });
+
+    // d_pair_b holds the *sort output* of the current phase (sorted T1
+    // meta, sorted T2 meta+xbits, T3 frags) AND the Xs construction
+    // scratch (~4.4 GB at k=28: 4 × total_xs uint32s + radix temp). Sized
+    // to the max of those — at k=28 the Xs scratch dominates by ~3 GB
+    // over the largest sorted output (cap·12 B for T2's meta+xbits).
+    uint8_t dummy_plot_id[32] = {};
+    POOL_CHECK(launch_construct_xs(dummy_plot_id, k, testnet,
+                                   nullptr, nullptr, &xs_temp_bytes));
+    pair_b_bytes = std::max({
+        static_cast<size_t>(cap) * sizeof(uint64_t),                          // sorted T1 meta
+        static_cast<size_t>(cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
+        static_cast<size_t>(cap) * sizeof(uint64_t),                          // T3 frags out
+        xs_temp_bytes,                                                        // Xs aliased scratch
     });
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
@@ -85,7 +95,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // and other small runtime allocations.
     {
         size_t const required_device =
-            storage_bytes + 2 * pair_bytes + sort_scratch_bytes + sizeof(uint64_t);
+            storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
         size_t const margin = 512ULL * 1024 * 1024; // 512 MB
         size_t free_b = 0, total_b = 0;
         POOL_CHECK(cudaMemGetInfo(&free_b, &total_b));
@@ -116,10 +126,10 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             k, strength, (unsigned long long)cap, (unsigned long long)total_xs,
             free_b/1e9, total_b/1e9);
         std::fprintf(stderr,
-            "[pool] sizes: storage=%.2fGB pair=%.2fGB xs_temp(alias)=%.2fGB "
-            "sort_scratch=%.2fGB pinned=%.2fGB\n",
-            storage_bytes/1e9, pair_bytes/1e9, xs_temp_bytes/1e9,
-            sort_scratch_bytes/1e9, pinned_bytes/1e9);
+            "[pool] sizes: storage=%.2fGB pair_a=%.2fGB pair_b=%.2fGB "
+            "xs_temp(alias→pair_b)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB\n",
+            storage_bytes/1e9, pair_a_bytes/1e9, pair_b_bytes/1e9,
+            xs_temp_bytes/1e9, sort_scratch_bytes/1e9, pinned_bytes/1e9);
     }
 
     // Wrap allocations so a mid-sequence failure (e.g. d_pair_b OOM after
@@ -138,8 +148,8 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     };
     try {
         POOL_CHECK(cudaMalloc(&d_storage,      storage_bytes));
-        POOL_CHECK(cudaMalloc(&d_pair_a,       pair_bytes));
-        POOL_CHECK(cudaMalloc(&d_pair_b,       pair_bytes));
+        POOL_CHECK(cudaMalloc(&d_pair_a,       pair_a_bytes));
+        POOL_CHECK(cudaMalloc(&d_pair_b,       pair_b_bytes));
         POOL_CHECK(cudaMalloc(&d_sort_scratch, sort_scratch_bytes));
         POOL_CHECK(cudaMalloc(&d_counter,      sizeof(uint64_t)));
         for (int i = 0; i < kNumPinnedBuffers; ++i) {

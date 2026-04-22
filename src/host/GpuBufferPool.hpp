@@ -7,25 +7,33 @@
 // between device time (~2.75 s) and producer wall time (~5.1 s).
 //
 // Memory layout with aliasing (k=28 worst-case sizes in parens):
-//   d_storage      (4.36 GB)  — Xs candidates during Xs phase,
+//   d_storage      (~2-3 GB)  — Xs candidates during Xs phase,
 //                               then 4×uint32[cap] sort keys/vals during sorts
-//   d_pair_a       (4.36 GB)  — T1/T2/T3 match output (reused across phases);
-//                               also serves as Xs phase scratch before T1
-//   d_pair_b       (4.36 GB)  — *_sorted / frags_out (reused across phases);
-//                               also serves as Xs phase scratch before T1
-//   d_sort_scratch (~2.3 GB)  — CUB radix-sort scratch (largest across phases)
+//   d_pair_a       (~1.3 GB)  — T1/T2/T3 match output (reused across phases).
+//                               Sized to the largest match-output: cap·16 B
+//                               for T2 (meta+mi+xbits SoA). Does NOT alias the
+//                               Xs phase scratch — that lives in d_pair_b.
+//   d_pair_b       (~4.4 GB)  — *_sorted / frags_out (reused across phases),
+//                               AND the Xs construction scratch. Sized to
+//                               max(largest sorted-output, xs_temp_bytes);
+//                               at k=28 xs_temp dominates.
+//   d_sort_scratch (~MB)      — CUB DoubleBuffer mode shrinks scratch from
+//                               ~2 GB to ~MB by ping-ponging caller buffers.
 //   d_counter      (8 B)      — reused uint64_t count output
-//   h_pinned_t3[2] (2.18 GB ea) — double-buffered final fragments DMA target.
-//                                 Producer writes plot N to buffer (N%2) while
-//                                 consumer reads plot N-1 from the other slot.
-//                                 With a depth-1 channel + producer being
-//                                 slower than consumer, this is race-free.
+//   h_pinned_t3[N] (~2.2 GB ea) — rotating final-fragments DMA targets.
+//                                 Producer writes plot K into slot K mod N
+//                                 while consumer reads earlier plots from
+//                                 the other slots; channel depth N-1 keeps
+//                                 the producer from overwriting in-flight
+//                                 reads. N defaults to 3 (see kNumPinnedBuffers).
 //
-// Total ~15 GB device + ~4.36 GB pinned host — fits in 17 GB free VRAM on a
-// 24 GB 4090.
+// Total ~9 GB device + ~6.6 GB pinned host at k=28 — fits in 12 GB free VRAM
+// on a Navi 22 / RTX 4080 12 GB. Pre-split this peaked at ~12.7 GB device
+// because pair_bytes was a single max(pairings, xs_temp) and applied to BOTH
+// d_pair_a and d_pair_b, double-counting the Xs scratch.
 //
 // Note: T1/T2/T3 match kernels report temp_bytes = 0 (no scratch needed).
-// Only the Xs phase wants ~4.34 GB of scratch, so we alias d_pair_b for that.
+// Only the Xs phase wants ~4.4 GB of scratch, and we alias d_pair_b for that.
 
 #pragma once
 
@@ -66,7 +74,8 @@ struct GpuBufferPool {
     uint64_t total_xs           = 0;
     uint64_t cap                = 0;
     size_t   storage_bytes      = 0;
-    size_t   pair_bytes         = 0;
+    size_t   pair_a_bytes       = 0; // max(T1/T2/T3 match-output footprints)
+    size_t   pair_b_bytes       = 0; // max(*_sorted footprints, xs_temp_bytes)
     size_t   xs_temp_bytes      = 0; // scratch size the Xs phase asks for
     size_t   sort_scratch_bytes = 0;
     size_t   pinned_bytes       = 0; // per pinned buffer
