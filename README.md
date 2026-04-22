@@ -24,10 +24,21 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 
 ## Hardware compatibility
 
-- **GPU:** NVIDIA, compute capability ≥ 6.1 (Pascal / GTX 10-series
-  and newer). Builds auto-detect the installed GPU's `compute_cap`
-  via `nvidia-smi`; override with `$CUDA_ARCHITECTURES` for fat or
-  cross-target builds (see [Build](#build)).
+- **GPU:**
+  - **NVIDIA**, compute capability ≥ 6.1 (Pascal / GTX 10-series and
+    newer) via the CUDA fast path. Builds auto-detect the installed
+    GPU's `compute_cap` via `nvidia-smi`; override with
+    `$CUDA_ARCHITECTURES` for fat or cross-target builds (see
+    [Build](#build)).
+  - **AMD ROCm** via the SYCL / AdaptiveCpp path. Validated on RDNA2
+    (`gfx1031`, RX 6700 XT, 12 GB) — bit-exact parity with the CUDA
+    backend across the sort / bucket-offsets / g_x kernels, and
+    farmable plots end-to-end. ROCm 6.2 required (newer ROCm versions
+    have LLVM packaging breakage — see [`compose.yaml`](compose.yaml)
+    rocm-service comments). Build picks `ACPP_TARGETS=hip:gfxXXXX`
+    from `rocminfo` automatically. Other gfx targets (`gfx1030` /
+    `gfx1100`) build cleanly but are untested on real hardware.
+  - **Intel oneAPI** is wired up but untested.
 - **VRAM:** 8 GB minimum. Cards with less than ~17 GB free
   transparently use the streaming pipeline; 18 GB+ cards reliably use
   the persistent buffer pool for faster steady-state. Both paths
@@ -38,9 +49,12 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
   under load if throughput looks off.
 - **Host RAM:** ≥ 16 GB recommended; `batch` mode pins ~4 GB of host
   memory for D2H double-buffering (pool or streaming).
-- **CUDA Toolkit:** 12+ required to build (tested on 13.x). Runtime
-  users on RTX 50-series (Blackwell, `sm_120`) need a driver bundle
-  that ships Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
+- **CUDA Toolkit:** 12+ required for the NVIDIA build path (tested on
+  13.x). Skipped automatically on AMD/Intel builds where `nvcc` isn't
+  available — `build.rs` runs `nvcc --version` and flips
+  `XCHPLOT2_BUILD_CUDA=OFF` when missing. Runtime users on RTX
+  50-series (Blackwell, `sm_120`) need a driver bundle that ships
+  Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
 - **OS:** Linux (tested on modern glibc distributions). Windows and
   macOS are not currently tested.
 
@@ -248,7 +262,10 @@ pieces any v2 plot needs for farming, regardless of who produced it.
 ## Architecture
 
 ```
-src/gpu/                 CUDA kernels — AES, Xs, T1, T2, T3
+src/gpu/                 GPU kernels — AES, Xs, T1, T2, T3.
+                           CUDA path: .cu files via nvcc + CUB sort.
+                           SYCL path: matching .cpp files via
+                             AdaptiveCpp + hand-rolled LSD radix.
 src/host/
 ├── GpuPipeline          Xs → T1 → T2 → T3 device orchestration;
 │                          pool + streaming (low-VRAM) variants
