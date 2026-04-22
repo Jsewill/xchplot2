@@ -16,8 +16,11 @@
 
 #include <sycl/sycl.hpp>
 
+#include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace pos2gpu {
 
@@ -118,8 +121,27 @@ void launch_construct_xs_profiled(
     AesHashKeys keys = make_keys(plot_id_bytes);
     uint32_t xor_const = testnet ? kTestnetGXorConst : 0u;
 
+    // Sub-phase wall-time breakdown — useful when GpuPipeline's outer
+    // "Xs gen+sort" phase dominates total wall (notably on the SYCL/HIP
+    // backend, where the Xs phase has been observed at ~40% on RDNA2 vs
+    // ~6% on NVIDIA). Gated on POS2GPU_PHASE_TIMING=1 so the q.wait()s
+    // don't perturb production runs.
+    bool const xs_timing = [] {
+        char const* v = std::getenv("POS2GPU_PHASE_TIMING");
+        return v && v[0] == '1';
+    }();
+    using xs_clock = std::chrono::steady_clock;
+    auto xs_now = [&] { return xs_clock::now(); };
+    auto xs_elapsed_ms = [&](xs_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(xs_now() - t0).count();
+    };
+    auto xs_t0 = xs_now();
+    if (xs_timing) q.wait();
+
     // Phase 1: generate (match_info, x) into keys_a / vals_a
     launch_xs_gen(keys, keys_a, vals_a, total, k, xor_const, q);
+    double t_gen = 0.0;
+    if (xs_timing) { q.wait(); t_gen = xs_elapsed_ms(xs_t0); xs_t0 = xs_now(); }
 
     // Phase 2: stable radix sort by (key low k bits) — keys_a → keys_b,
     // vals_a → vals_b. (We give up CUB's DoubleBuffer optimisation here,
@@ -129,10 +151,23 @@ void launch_construct_xs_profiled(
         keys_a, keys_b,
         vals_a, vals_b,
         total, /*begin_bit=*/0, /*end_bit=*/k, q);
+    double t_sort = 0.0;
+    if (xs_timing) { q.wait(); t_sort = xs_elapsed_ms(xs_t0); xs_t0 = xs_now(); }
 
     // Phase 3: pack the sorted side into AoS XsCandidateGpu in d_out.
     launch_xs_pack(keys_b, vals_b, d_out, total, q);
+    double t_pack = 0.0;
+    if (xs_timing) { q.wait(); t_pack = xs_elapsed_ms(xs_t0); }
 
+    if (xs_timing) {
+        double const total_ms = t_gen + t_sort + t_pack;
+        std::fprintf(stderr,
+            "[xs-timing] gen=%.1fms(%.0f%%) sort=%.1fms(%.0f%%) pack=%.1fms(%.0f%%) total=%.1fms\n",
+            t_gen,  total_ms > 0.0 ? 100.0 * t_gen  / total_ms : 0.0,
+            t_sort, total_ms > 0.0 ? 100.0 * t_sort / total_ms : 0.0,
+            t_pack, total_ms > 0.0 ? 100.0 * t_pack / total_ms : 0.0,
+            total_ms);
+    }
 }
 
 } // namespace pos2gpu
