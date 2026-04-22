@@ -242,18 +242,16 @@ if(XCHPLOT2_INSTRUMENT_MATCH)
 endif()
 add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
 
-# AdaptiveCpp's acpp driver doesn't auto-propagate CMake's standard
-# CMAKE_CXX_FLAGS_RELEASE (-O3 -DNDEBUG) into the SYCL compile step —
-# acpp warns "No optimization flag was given, optimizations are
-# disabled by default" even on Release builds. The result is that the
-# AES-heavy SYCL kernels (Xs gen, T*match) compile at -O0, which is
-# 30-60× slower than -O3 on amdgcn (and noticeably slower even on
-# NVIDIA SSCP). Force the optimization flag onto the SYCL TUs explicitly.
-# We use generator expressions so Debug builds keep -O0 / -g.
-target_compile_options(pos2_gpu PRIVATE
-    $<$<CONFIG:Release>:-O3>
-    $<$<CONFIG:RelWithDebInfo>:-O2>
-    $<$<CONFIG:MinSizeRel>:-Os>)
+# NOTE: do NOT add target_compile_options(... -O2/-O3) here. We tried
+# both — AdaptiveCpp's HIP AOT backend (acpp + clang targeting amdgcn)
+# miscompiles the SYCL kernels at any opt level above -O0, breaking
+# all three SYCL parity tests (sort, g_x, bucket_offsets) and producing
+# plot files whose proof_fragments differ from the NVIDIA reference.
+# The acpp warning "No optimization flag was given" is annoying but
+# correct output beats fast wrong output. Track follow-ups in:
+#   - upstream AdaptiveCpp HIP optimization-pass issues
+#   - or attempt -O2 with -fno-vectorize / -fno-slp-vectorize / etc.
+# When that's resolved we can re-enable optimization here.
 # The SYCL TUs include CUDA headers (cuda_fp16.h, transitively cuda_runtime.h
 # from the kernel-wrapper headers) on both the CUDA and non-CUDA paths
 # (slice 17 will lift the CUDA-type dependencies out of the public API).
