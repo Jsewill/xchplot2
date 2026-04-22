@@ -177,38 +177,24 @@ RUN cmake -S . -B build-tests -G Ninja \
  && rm -rf build-tests target
 
 # ─── runtime ────────────────────────────────────────────────────────────────
-FROM ${BASE_RUNTIME}
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-# AdaptiveCpp's runtime backend loaders dlopen libLLVM (for SSCP runtime
-# specialization), libnuma (OMP backend), libomp, and Boost.Context.
-# SSCP also shells out to LLVM's `opt` and `llc` binaries at runtime to
-# generate PTX from the SSCP bitcode — install the full llvm-18 package
-# (binaries + lib), not just libllvm18.
+# Use the full builder image as the runtime. Earlier multi-stage attempts
+# (slim BASE_RUNTIME + selective COPY --from=builder + minimal apt) produced
+# images that compiled clean and resolved every shared library identically
+# to the builder per `ldd`, but parity tests still failed at runtime: SYCL
+# kernels executed as silent no-ops (sort returned input unchanged, AES
+# match found zero matches, plot SHA-256 diverged from the canonical
+# reference). The same pre-built parity binaries ran correctly when invoked
+# inside the builder stage. The exact dependency the runtime stage was
+# missing isn't pinned down — apt -dev variants, env tweaks, ldd diffs all
+# came back equivalent — so until that's diagnosed we ship the builder as
+# the deployable.
 #
-# clang-18 + libclang-cpp18 + libomp-18-dev: empirically required by the
-# HIP backend at runtime. Without them the SYCL kernels execute as
-# silent no-ops on amdgcn — sort kernels return input unchanged, AES
-# match kernels find zero matches, plot output diverges from the
-# canonical reference. The kernel ISA itself is fine (verified by
-# running the same binary inside the builder stage with these packages
-# present), so something AdaptiveCpp's HIP loader pulls in via dlopen
-# is missing without them. libomp5-18 alone provides only libomp.so.5
-# without the libomp.so symlink the HIP loader walks for.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
-        clang-18 libclang-cpp18 libomp-18-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Trade-off: image is ~1 GB larger (CMake, git, Boost dev headers, full
+# AdaptiveCpp source clone leftovers). Acceptable to guarantee correctness.
+FROM builder
 
-COPY --from=builder /usr/local/bin/xchplot2                    /usr/local/bin/xchplot2
-COPY --from=builder /usr/local/bin/sycl_sort_parity            /usr/local/bin/sycl_sort_parity
-COPY --from=builder /usr/local/bin/sycl_bucket_offsets_parity  /usr/local/bin/sycl_bucket_offsets_parity
-COPY --from=builder /usr/local/bin/sycl_g_x_parity             /usr/local/bin/sycl_g_x_parity
-COPY --from=builder /usr/local/bin/plot_file_parity            /usr/local/bin/plot_file_parity
-COPY --from=builder /opt/adaptivecpp                           /opt/adaptivecpp
-
-ENV LD_LIBRARY_PATH=/opt/adaptivecpp/lib:${LD_LIBRARY_PATH}
+# Tell the dynamic loader where libacpp-rt.so / libacpp-common.so live and
+# put acpp-info etc. on PATH for diagnostic invocations.
 ENV PATH=/opt/adaptivecpp/bin:${PATH}
 
 ENTRYPOINT ["/usr/local/bin/xchplot2"]
