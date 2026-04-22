@@ -49,24 +49,36 @@ inline uint32_t bs_shfl(sycl::sub_group const& sg, uint32_t x, int lane)
 // per call is the difference between a +23 % regression (the first
 // attempt with reduce_over_group<bit_or>) and a net win.
 //
+// Dispatch MUST go through AdaptiveCpp's __acpp_if_target_hip(stmts)
+// macro, not a raw `#if defined(__HIP_DEVICE_COMPILE__)`. AdaptiveCpp
+// compiles each kernel body for every backend target it's configured
+// for (including the OMP host-CPU fallback), so on the OMP pass the
+// preprocessor branch is chosen per-TU but the kernel body is also
+// evaluated as a __host__ function — clang then rejects the
+// __device__-only `__builtin_amdgcn_ballot_w32` with "reference to
+// __device__ function in __host__ function" even though the #if
+// would have eliminated it on the non-HIP backend. __acpp_if_target_hip
+// expands to `stmts` during the HIP device code-gen pass only, and
+// to nothing on all other passes — so the intrinsic truly never
+// appears in a __host__ context.
+//
 // Wave-size caveat: we hard-code _w32 because gfx1031 (RDNA2) is
 // wave32 and the entire bitsliced scheme is wave32-only (reqd_sub_
 // group_size(32) on the kernels, 32-way pack/unpack layout). Using
 // _w64 on a wave32 target miscompiles — LLVM issue #62477.
 //
-// Recipe source: AdaptiveCpp doc/hip-source-interop.md — use
-// __acpp_if_target_hip(...) so the amdgcn builtin only materialises
-// during the HIP device pass; the host / SSCP path uses the portable
-// SYCL reduction fallback.
+// Recipe source: AdaptiveCpp doc/hip-source-interop.md.
 inline uint32_t bs_ballot(sycl::sub_group const& sg, bool pred)
 {
-#if defined(__AMDGCN__) || defined(__HIP_DEVICE_COMPILE__)
-    return static_cast<uint32_t>(__builtin_amdgcn_ballot_w32(pred));
-#else
+    __acpp_if_target_hip(
+        return static_cast<uint32_t>(__builtin_amdgcn_ballot_w32(pred));
+    );
+    // Portable fallback — reachable on every non-HIP target (OMP host,
+    // CUDA, Intel Level Zero, SSCP). The HIP device pass early-returns
+    // above so this branch is dead on amdgcn.
     uint32_t lane = sg.get_local_linear_id();
     uint32_t bit  = pred ? (1u << lane) : 0u;
     return sycl::reduce_over_group(sg, bit, sycl::bit_or<uint32_t>{});
-#endif
 }
 
 // ---------- 32-way pack / unpack ----------
