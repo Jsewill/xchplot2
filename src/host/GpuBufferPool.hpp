@@ -7,9 +7,16 @@
 // between device time (~2.75 s) and producer wall time (~5.1 s).
 //
 // Memory layout with aliasing (k=28 worst-case sizes in parens):
-//   d_storage      (~2-3 GB)  — Xs candidates during Xs phase,
-//                               then 4×uint32[cap] sort keys/vals during sorts
-//   d_pair_a       (~1.3 GB)  — T1/T2/T3 match output (reused across phases).
+//   d_storage      (~3.3 GB)  — Xs candidates during Xs phase (2.1 GB),
+//                               then 3×uint32[cap] sort keys_out/vals_in/
+//                               vals_out during sorts. The fourth
+//                               (keys_in) slot the sort API would want
+//                               is ALWAYS the SoA match-info stream
+//                               from d_pair_a (d_t1_mi / d_t2_mi), so
+//                               d_storage doesn't allocate for it —
+//                               saves cap·4 B (~1.09 GiB at k=28) vs
+//                               the old 4-slot layout.
+//   d_pair_a       (~4.4 GB)  — T1/T2/T3 match output (reused across phases).
 //                               Sized to the largest match-output: cap·16 B
 //                               for T2 (meta+mi+xbits SoA). Does NOT alias the
 //                               Xs phase scratch — that lives in d_pair_b.
@@ -29,10 +36,11 @@
 //                                 the producer from overwriting in-flight
 //                                 reads. N defaults to 3 (see kNumPinnedBuffers).
 //
-// Total ~9 GB device + ~6.6 GB pinned host at k=28 — fits in 12 GB free VRAM
-// on a Navi 22 (RX 6700 XT) or RTX 4080 12 GB. Pre-split this peaked at
-// ~12.7 GB device because pair_bytes was a single max(pairings, xs_temp) and
-// applied to BOTH d_pair_a and d_pair_b, double-counting the Xs scratch.
+// Total ~12 GB device + ~6.6 GB pinned host at k=28 — fits (just) in the
+// 11.98 GiB free VRAM of a Navi 22 (RX 6700 XT) after the d_storage
+// slot-trim above. Pre-trim the total was ~13.1 GB and overshot this
+// card's budget by ~0.7 GiB, forcing a fallback to the streaming
+// pipeline which costs an extra ~5 s at k=28.
 //
 // Note: T1/T2/T3 match kernels report temp_bytes = 0 (no scratch needed).
 // Only the Xs phase wants ~4.4 GB of scratch, and we alias d_pair_b for that.

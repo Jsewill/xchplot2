@@ -63,12 +63,17 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     total_xs = 1ULL << k;
     cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
 
-    // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR four
-    // cap-sized uint32 key/val arrays during sort. Cast everything to size_t
-    // so std::max's template deduction finds one common type.
+    // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR
+    // THREE cap-sized uint32 key/val arrays during sort. Only three, not
+    // four: the sort API signature takes a (keys_in, keys_out, vals_in,
+    // vals_out) quad, but pool-path callers always pass the SoA match-info
+    // stream (d_t1_mi / d_t2_mi, living in d_pair_a) as keys_in, so the
+    // keys_in slot inside d_storage was never read. Dropping it saves
+    // cap·4 B (~1.09 GiB at k=28) — enough to close the 0.71 GiB pool
+    // shortfall on 12 GiB cards.
     storage_bytes = std::max(
         static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
-        static_cast<size_t>(cap) * 4 * sizeof(uint32_t));
+        static_cast<size_t>(cap) * 3 * sizeof(uint32_t));
 
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =

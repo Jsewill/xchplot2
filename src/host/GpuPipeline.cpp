@@ -221,11 +221,16 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 
     // Sort key/val arrays alias d_storage. Safe because Xs is fully consumed
     // by T1 match (stream-synchronised) before we enter T1 sort.
+    //
+    // Only three slots live here — keys_out, vals_in, vals_out. The
+    // sort's keys_input is always the SoA match-info stream from
+    // d_pair_a (d_t1_mi / d_t2_mi), so the fourth slot that would
+    // have hosted "d_keys_in" is neither allocated nor used. See
+    // GpuBufferPool.cpp for the matching storage_bytes shrink.
     auto     storage_u32 = static_cast<uint32_t*>(pool.d_storage);
-    uint32_t* d_keys_in  = storage_u32 + 0 * cap;
-    uint32_t* d_keys_out = storage_u32 + 1 * cap;
-    uint32_t* d_vals_in  = storage_u32 + 2 * cap;
-    uint32_t* d_vals_out = storage_u32 + 3 * cap;
+    uint32_t* d_keys_out = storage_u32 + 0 * cap;
+    uint32_t* d_vals_in  = storage_u32 + 1 * cap;
+    uint32_t* d_vals_out = storage_u32 + 2 * cap;
 
     // ---- per-phase wall-time profiling ----
     // Enabled when either cfg.profile is set (xchplot2 -P / --profile) or
