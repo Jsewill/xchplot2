@@ -122,13 +122,32 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             sort_scratch_bytes/1e9, pinned_bytes/1e9);
     }
 
-    POOL_CHECK(cudaMalloc(&d_storage,      storage_bytes));
-    POOL_CHECK(cudaMalloc(&d_pair_a,       pair_bytes));
-    POOL_CHECK(cudaMalloc(&d_pair_b,       pair_bytes));
-    POOL_CHECK(cudaMalloc(&d_sort_scratch, sort_scratch_bytes));
-    POOL_CHECK(cudaMalloc(&d_counter,      sizeof(uint64_t)));
-    for (int i = 0; i < kNumPinnedBuffers; ++i) {
-        POOL_CHECK(cudaMallocHost(&h_pinned_t3[i], pinned_bytes));
+    // Wrap allocations so a mid-sequence failure (e.g. d_pair_b OOM after
+    // d_storage + d_pair_a have already succeeded) frees the pre-allocated
+    // buffers instead of leaking ~10 GB of device VRAM and ~7 GB of host
+    // pinned memory per failed pool ctor across a batch retry loop.
+    auto cleanup_partial = [&]{
+        if (d_storage)       { cudaFree(d_storage);      d_storage      = nullptr; }
+        if (d_pair_a)        { cudaFree(d_pair_a);       d_pair_a       = nullptr; }
+        if (d_pair_b)        { cudaFree(d_pair_b);       d_pair_b       = nullptr; }
+        if (d_sort_scratch)  { cudaFree(d_sort_scratch); d_sort_scratch = nullptr; }
+        if (d_counter)       { cudaFree(d_counter);      d_counter      = nullptr; }
+        for (int i = 0; i < kNumPinnedBuffers; ++i) {
+            if (h_pinned_t3[i]) { cudaFreeHost(h_pinned_t3[i]); h_pinned_t3[i] = nullptr; }
+        }
+    };
+    try {
+        POOL_CHECK(cudaMalloc(&d_storage,      storage_bytes));
+        POOL_CHECK(cudaMalloc(&d_pair_a,       pair_bytes));
+        POOL_CHECK(cudaMalloc(&d_pair_b,       pair_bytes));
+        POOL_CHECK(cudaMalloc(&d_sort_scratch, sort_scratch_bytes));
+        POOL_CHECK(cudaMalloc(&d_counter,      sizeof(uint64_t)));
+        for (int i = 0; i < kNumPinnedBuffers; ++i) {
+            POOL_CHECK(cudaMallocHost(&h_pinned_t3[i], pinned_bytes));
+        }
+    } catch (...) {
+        cleanup_partial();
+        throw;
     }
 }
 

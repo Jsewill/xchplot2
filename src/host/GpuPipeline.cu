@@ -156,6 +156,20 @@ struct StreamingStats {
     std::unordered_map<void*, size_t> sizes;
     bool        verbose = false;
     char const* phase   = "(init)";
+
+    // Free any allocations still alive on destruction. If the streaming
+    // pipeline throws partway (e.g. d_xs_temp OOM after d_xs already
+    // succeeded), this dtor runs on unwind and releases the still-live
+    // device buffers instead of leaking them across batch iterations.
+    // Without this, an 8 GB card hitting OOM at k=28 leaked ~130 GB of
+    // host-side pinned accounting per failed batch retry.
+    ~StreamingStats() {
+        if (sizes.empty()) return;
+        for (auto& [ptr, _bytes] : sizes) {
+            if (ptr) cudaFree(ptr);
+        }
+        sizes.clear();
+    }
 };
 
 inline void s_init_from_env(StreamingStats& s)
@@ -182,8 +196,13 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
     void* p = nullptr;
     cudaError_t err = cudaMalloc(&p, bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("cudaMalloc(") + reason + "): " +
-                                 cudaGetErrorString(err));
+        throw std::runtime_error(
+            std::string("cudaMalloc(") + reason + "): " + cudaGetErrorString(err) +
+            " — phase=" + s.phase +
+            " requested=" + std::to_string(bytes >> 20) +
+            " MB live=" + std::to_string(s.live >> 20) +
+            " MB. Card likely too small for this k via the streaming "
+            "pipeline; try a smaller k or a card with more VRAM.");
     }
     out = static_cast<T*>(p);
     s.live += bytes;
