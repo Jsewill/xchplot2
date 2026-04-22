@@ -5,7 +5,6 @@
 // fine at this size — if local-memory spills ever bite, switch to a USM
 // upload analogous to the CUDA cudaMemcpyToSymbolAsync path.
 
-#include "gpu/AesHashBsSycl.hpp"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T3Offsets.cuh"
 
@@ -37,8 +36,11 @@ void launch_t3_match_all_buckets(
 {
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    constexpr size_t threads = 256;
-    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
+    constexpr size_t threads  = 256;
+    // Coarsening factor: see T1OffsetsSycl.cpp for rationale.
+    constexpr int    kCoarsen = 2;
+    uint64_t blocks_x_u64 =
+        (l_count_max + threads * kCoarsen - 1) / (threads * kCoarsen);
     size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
 
     auto* d_out_count_ull =
@@ -54,12 +56,7 @@ void launch_t3_match_all_buckets(
                                 blocks_x * threads },
                 sycl::range<2>{ 1, threads }
             },
-            [=, keys_copy = keys, fk_copy = fk](sycl::nd_item<2> it)
-                [[sycl::reqd_sub_group_size(32)]]
-            {
-                // T-table load still needed for the inner per-thread
-                // pairing loop; only the outer matching_target has been
-                // lifted onto the sub_group bitsliced path.
+            [=, keys_copy = keys, fk_copy = fk](sycl::nd_item<2> it) {
                 uint32_t* sT = &sT_local[0];
                 size_t local_id = it.get_local_id(1);
                 #pragma unroll 1
@@ -67,8 +64,6 @@ void launch_t3_match_all_buckets(
                     sT[i] = d_aes_tables[i];
                 }
                 it.barrier(sycl::access::fence_space::local_space);
-
-                auto sg = it.get_sub_group();
 
                 uint32_t bucket_id   = static_cast<uint32_t>(it.get_group(0));
                 uint32_t section_l   = bucket_id / num_match_keys;
@@ -86,64 +81,63 @@ void launch_t3_match_all_buckets(
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
                 uint32_t r_bucket = section_r * num_match_keys + match_key_r;
 
-                uint64_t l = l_start
-                           + it.get_group(1) * uint64_t(threads)
-                           + local_id;
-                bool in_range = (l < l_end);
-
-                // All 32 lanes participate in the bitsliced matching_target;
-                // out-of-range lanes feed a dummy meta_l.
-                uint64_t meta_l = in_range ? d_sorted_meta[l] : uint64_t(0);
-                uint32_t xb_l   = in_range ? d_sorted_xbits[l] : 0u;
-
-                uint32_t target_l = pos2gpu::matching_target_bs32(
-                                        sg, keys_copy, 3u, match_key_r, meta_l, 0)
-                                  & target_mask;
-
-                if (!in_range) return;
-
-                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
-                uint32_t fine_key   = target_l >> fine_shift;
-                uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                uint64_t lo         = d_fine_offsets[fine_idx];
-                uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
-                uint64_t hi         = fine_hi;
-
-                while (lo < hi) {
-                    uint64_t mid = lo + ((hi - lo) >> 1);
-                    uint32_t target_mid = d_sorted_mi[mid] & target_mask;
-                    if (target_mid < target_l) lo = mid + 1;
-                    else                       hi = mid;
-                }
-
                 uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
                                                             : ((1u << num_test_bits) - 1u);
+                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
 
-                for (uint64_t r = lo; r < fine_hi; ++r) {
-                    uint32_t target_r = d_sorted_mi[r] & target_mask;
-                    if (target_r != target_l) break;
+                uint64_t const l_group_base = l_start
+                    + it.get_group(1) * uint64_t(threads * kCoarsen);
+                #pragma unroll
+                for (int c = 0; c < kCoarsen; ++c) {
+                    uint64_t l = l_group_base + uint64_t(c) * threads + local_id;
+                    if (l >= l_end) break;
 
-                    uint64_t meta_r = d_sorted_meta[r];
-                    uint32_t xb_r   = d_sorted_xbits[r];
+                    uint64_t meta_l = d_sorted_meta[l];
+                    uint32_t xb_l   = d_sorted_xbits[l];
 
-                    pos2gpu::Result128 res = pos2gpu::pairing_smem(
-                        keys_copy, meta_l, meta_r, sT, 0);
-                    uint32_t test_result = res.r[3] & test_mask;
-                    if (test_result != 0) continue;
+                    uint32_t target_l = pos2gpu::matching_target_smem(
+                                            keys_copy, 3u, match_key_r, meta_l, sT, 0)
+                                      & target_mask;
 
-                    uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
-                    uint64_t fragment   = pos2gpu::feistel_encrypt(fk_copy, all_x_bits);
+                    uint32_t fine_key = target_l >> fine_shift;
+                    uint64_t fine_idx = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                    uint64_t lo       = d_fine_offsets[fine_idx];
+                    uint64_t fine_hi  = d_fine_offsets[fine_idx + 1];
+                    uint64_t hi       = fine_hi;
 
-                    sycl::atomic_ref<unsigned long long,
-                                     sycl::memory_order::relaxed,
-                                     sycl::memory_scope::device>
-                        out_count_atomic{ *d_out_count_ull };
-                    unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
-                    if (out_idx >= out_capacity) return;
+                    while (lo < hi) {
+                        uint64_t mid = lo + ((hi - lo) >> 1);
+                        uint32_t target_mid = d_sorted_mi[mid] & target_mask;
+                        if (target_mid < target_l) lo = mid + 1;
+                        else                       hi = mid;
+                    }
 
-                    T3PairingGpu p;
-                    p.proof_fragment = fragment;
-                    d_out_pairings[out_idx] = p;
+                    for (uint64_t r = lo; r < fine_hi; ++r) {
+                        uint32_t target_r = d_sorted_mi[r] & target_mask;
+                        if (target_r != target_l) break;
+
+                        uint64_t meta_r = d_sorted_meta[r];
+                        uint32_t xb_r   = d_sorted_xbits[r];
+
+                        pos2gpu::Result128 res = pos2gpu::pairing_smem(
+                            keys_copy, meta_l, meta_r, sT, 0);
+                        uint32_t test_result = res.r[3] & test_mask;
+                        if (test_result != 0) continue;
+
+                        uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
+                        uint64_t fragment   = pos2gpu::feistel_encrypt(fk_copy, all_x_bits);
+
+                        sycl::atomic_ref<unsigned long long,
+                                         sycl::memory_order::relaxed,
+                                         sycl::memory_scope::device>
+                            out_count_atomic{ *d_out_count_ull };
+                        unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
+                        if (out_idx >= out_capacity) return;
+
+                        T3PairingGpu p;
+                        p.proof_fragment = fragment;
+                        d_out_pairings[out_idx] = p;
+                    }
                 }
             });
     }).wait();
