@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace pos2gpu {
@@ -225,31 +227,57 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     uint32_t* d_vals_in  = storage_u32 + 2 * cap;
     uint32_t* d_vals_out = storage_u32 + 3 * cap;
 
-    // ---- profiling: stubbed in slice 17b ----
-    // begin_phase / end_phase / report_phases are no-ops under SYCL until a
-    // sycl::event-based profiling subsystem replaces them. cfg.profile is
-    // honoured for the gating logic only — the report at the end prints
-    // a "profiling unavailable" notice when set.
-    auto begin_phase   = [&](char const* /*label*/) -> int { return -1; };
-    auto end_phase     = [&](int /*idx*/) {};
+    // ---- per-phase wall-time profiling ----
+    // Enabled when either cfg.profile is set (xchplot2 -P / --profile) or
+    // POS2GPU_PHASE_TIMING=1 is in the env. Each phase's wall is measured
+    // around q.wait()s so launches actually drain to the device before the
+    // next start sample — adds a sync point but gives an honest breakdown.
+    // When disabled, begin/end/report are early-out and add ~zero cost.
+    bool const phase_timing = cfg.profile || [] {
+        char const* v = std::getenv("POS2GPU_PHASE_TIMING");
+        return v && v[0] == '1';
+    }();
+    using phase_clock = std::chrono::steady_clock;
+    std::vector<std::pair<char const*, phase_clock::time_point>> phase_starts;
+    std::vector<std::pair<char const*, double>>                  phase_records;
+    auto begin_phase = [&](char const* label) -> int {
+        if (!phase_timing) return -1;
+        q.wait();
+        phase_starts.emplace_back(label, phase_clock::now());
+        return static_cast<int>(phase_starts.size() - 1);
+    };
+    auto end_phase = [&](int idx) {
+        if (idx < 0) return;
+        q.wait();
+        auto const t1 = phase_clock::now();
+        auto const& [name, t0] = phase_starts[idx];
+        double const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        phase_records.emplace_back(name, ms);
+    };
     auto report_phases = [&]() {
-        if (cfg.profile) {
-            std::fprintf(stderr,
-                "=== gpu_pipeline phase breakdown ===\n"
-                "  (profiling unavailable in SYCL build — see slice 17b notes)\n");
+        if (!phase_timing || phase_records.empty()) return;
+        double total = 0.0;
+        for (auto const& [_n, ms] : phase_records) total += ms;
+        std::fprintf(stderr, "[phase-timing]");
+        for (auto const& [name, ms] : phase_records) {
+            std::fprintf(stderr, " %s=%.1fms(%.0f%%)",
+                name, ms, total > 0.0 ? 100.0 * ms / total : 0.0);
         }
+        std::fprintf(stderr, " total=%.1fms\n", total);
     };
 
     // ---------- Phase Xs ----------
     size_t xs_temp_bytes = 0;
     launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
                               nullptr, nullptr, &xs_temp_bytes, q);
+    int p_xs = begin_phase("Xs gen+sort");
     // Xs phase events stubbed in slice 17b — pass nullptr for the (no-op)
     // profiling event slots. The launch_construct_xs_profiled signature still
     // accepts cudaEvent_t for API compatibility but ignores the values.
     launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
                                        d_xs, d_xs_temp, &xs_temp_bytes,
                                        nullptr, nullptr, q);
+    end_phase(p_xs);
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
