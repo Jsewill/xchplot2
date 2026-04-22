@@ -446,6 +446,16 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // Xs gen / sort per-phase timings stubbed in slice 17b — see profiling
     // notes above.
 
+    // Release d_pair_a so it isn't held between plots in a batch run.
+    // At ~5 ms/alloc on amdgcn (sycl::malloc_device effectively just
+    // reserves virtual address space), the per-plot realloc cost is
+    // below noise, but freeing 4.36 GB during the inter-plot gap means
+    // the pool path is viable on cards with ~7-8 GiB free that would
+    // otherwise hit InsufficientVramError and fall back to streaming.
+    // The final q.wait() inside the D2H block above has already drained
+    // T3 sort so the buffer is safe to free.
+    pool.release_pair_a();
+
     report_phases();
     return result;
 }

@@ -211,6 +211,14 @@ void* GpuBufferPool::ensure_pair_a()
     return d_pair_a;
 }
 
+void GpuBufferPool::release_pair_a()
+{
+    std::lock_guard<std::mutex> lk(pair_a_mu_);
+    if (!d_pair_a) return;
+    sycl::free(d_pair_a, sycl_backend::queue());
+    d_pair_a = nullptr;
+}
+
 uint64_t* GpuBufferPool::ensure_pinned(int idx)
 {
     if (idx < 0 || idx >= kNumPinnedBuffers) {
