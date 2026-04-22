@@ -14,7 +14,6 @@
 // SYCL writes). Two extra host syncs vs. the pure-CUDA path; not
 // perf-relevant for slice 2.
 
-#include "gpu/AesHashBsSycl.hpp"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T1Offsets.cuh"
 
@@ -141,14 +140,8 @@ void launch_t1_match_all_buckets(
                                 blocks_x * threads },
                 sycl::range<2>{ 1, threads }
             },
-            [=, keys_copy = keys](sycl::nd_item<2> it)
-                [[sycl::reqd_sub_group_size(32)]]
-            {
-                // T-tables are still loaded because the inner pairing loop
-                // is T-table-based (variable trip count per lane). Only the
-                // outer matching_target has been lifted to the sub_group
-                // bitsliced path — that call is sub_group-uniform so all 32
-                // lanes can cooperate on 32 matching_target hashes at once.
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
+                // Cooperative load of AES T-tables into local memory.
                 uint32_t* sT = &sT_local[0];
                 size_t local_id = it.get_local_id(1);
                 #pragma unroll 1
@@ -156,8 +149,6 @@ void launch_t1_match_all_buckets(
                     sT[i] = d_aes_tables[i];
                 }
                 it.barrier(sycl::access::fence_space::local_space);
-
-                auto sg = it.get_sub_group();
 
                 uint32_t bucket_id   = static_cast<uint32_t>(it.get_group(0));
                 uint32_t section_l   = bucket_id / num_match_keys;
@@ -178,19 +169,14 @@ void launch_t1_match_all_buckets(
                 uint64_t l = l_start
                            + it.get_group(1) * uint64_t(threads)
                            + local_id;
-                bool in_range = (l < l_end);
+                if (l >= l_end) return;
 
-                // All 32 lanes participate in the bitsliced matching_target;
-                // out-of-range lanes feed dummy x_l. Result is discarded
-                // below via the `if (!in_range) return;` early-exit.
-                uint32_t x_l = in_range ? d_sorted_xs[l].x : 0u;
+                uint32_t x_l = d_sorted_xs[l].x;
 
-                uint32_t target_l = pos2gpu::matching_target_bs32(
-                                        sg, keys_copy, 1u, match_key_r, uint64_t(x_l),
-                                        extra_rounds_bits)
+                uint32_t target_l = pos2gpu::matching_target_smem(
+                                        keys_copy, 1u, match_key_r, uint64_t(x_l),
+                                        sT, extra_rounds_bits)
                                   & target_mask;
-
-                if (!in_range) return;
 
                 uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                 uint32_t fine_key   = target_l >> fine_shift;
