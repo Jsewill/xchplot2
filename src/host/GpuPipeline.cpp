@@ -181,30 +181,24 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // then final uint64_t fragments. Each subsequent phase's output overwrites
     // the previous (consumed) contents in the same slot.
     XsCandidateGpu* d_xs             = static_cast<XsCandidateGpu*>(pool.d_storage);
-    // T1 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
-    // (cap·8 B) then mi[cap] (cap·4 B). Total cap·12 B, fits in d_pair_a's
-    // cap·16 B budget.
-    uint64_t*       d_t1_meta = static_cast<uint64_t*>(pool.d_pair_a);
-    uint32_t*       d_t1_mi   = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * sizeof(uint64_t));
-    // Sorted T1 is now just meta (8 B/entry) — match_info comes from sort keys.
-    uint64_t*       d_t1_meta_sorted = static_cast<uint64_t*>      (pool.d_pair_b);
-    // T2 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
-    // (cap·8 B), then mi[cap] (cap·4 B), then xbits[cap] (cap·4 B). Total
-    // cap·16 B, matching d_pair_a's size.
-    uint64_t*       d_t2_meta  = static_cast<uint64_t*>(pool.d_pair_a);
-    uint32_t*       d_t2_mi    = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * sizeof(uint64_t));
-    uint32_t*       d_t2_xbits = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(pool.d_pair_a) + pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
-    // Sorted T2 is SoA-split across d_pair_b: meta[cap] then xbits[cap],
-    // 12 B total per entry (fits in d_pair_b's 16 B/entry budget). T3
-    // match reads both; frags_out later reuses d_pair_b from offset 0.
+    // d_pair_a-derived aliases (d_t1_meta, d_t1_mi, d_t2_meta, d_t2_mi,
+    // d_t2_xbits, d_t3) are NOT declared here. They're declared inside
+    // the Xs phase block below, right after pool.ensure_pair_a()
+    // performs the lazy malloc_device for d_pair_a. Deferring that
+    // alloc until after Xs gen has been submitted to the queue lets
+    // the ~400-500 ms CPU-side malloc_device overlap with Xs's
+    // ~750 ms GPU execution — saves ~400-500 ms off first-plot wall;
+    // batch plots 2+ hit ensure_pair_a's cached-pointer fast path
+    // so the alloc cost is paid exactly once per pool.
+    //
+    // d_pair_b-derived aliases stay up here because d_pair_b is
+    // eager-allocated by the pool ctor: Xs gen needs it as scratch
+    // from the start of the pipeline.
+    uint64_t*       d_t1_meta_sorted  = static_cast<uint64_t*>      (pool.d_pair_b);
     uint64_t*       d_t2_meta_sorted  = static_cast<uint64_t*>      (pool.d_pair_b);
     uint32_t*       d_t2_xbits_sorted = reinterpret_cast<uint32_t*>(
         static_cast<uint8_t*>(pool.d_pair_b) + pool.cap * sizeof(uint64_t));
-    T3PairingGpu*   d_t3             = static_cast<T3PairingGpu*>  (pool.d_pair_a);
-    uint64_t*       d_frags_out      = static_cast<uint64_t*>      (pool.d_pair_b);
+    uint64_t*       d_frags_out       = static_cast<uint64_t*>      (pool.d_pair_b);
 
     uint64_t*       d_count        = pool.d_counter;
     // Xs phase needs ~4.34 GB scratch at k=28; d_pair_b is idle through
@@ -285,7 +279,37 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
                                        d_xs, d_xs_temp, &xs_temp_bytes,
                                        nullptr, nullptr, q);
+    // Overlap d_pair_a's lazy malloc_device (~400-500 ms for 4.36 GB at
+    // k=28) with Xs gen's GPU execution. In production
+    // (POS2GPU_PHASE_TIMING unset), launch_construct_xs_profiled returns
+    // immediately with the kernel in-flight on the queue; this CPU-side
+    // alloc then runs in parallel and its wall is hidden behind Xs's
+    // ~750 ms GPU work. In phase_timing mode xs-timing's internal
+    // q.waits serialise Xs first, then this alloc pays full wall — a
+    // diagnostic-mode trade-off.
+    void* const d_pair_a_raw = pool.ensure_pair_a();
     end_phase(p_xs);
+
+    // d_pair_a-derived aliases, now that the lazy alloc has resolved.
+    // Same layout as the old eager version — just computed from the
+    // local d_pair_a_raw instead of pool.d_pair_a so there's no
+    // confusion about when the pointer became valid.
+    //
+    // T1 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
+    // (cap·8 B) then mi[cap] (cap·4 B). Total cap·12 B, fits in d_pair_a's
+    // cap·16 B budget.
+    uint64_t*     d_t1_meta = static_cast<uint64_t*>(d_pair_a_raw);
+    uint32_t*     d_t1_mi   = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
+    // T2 match output is SoA, carved out of d_pair_a. Layout: meta[cap]
+    // (cap·8 B), then mi[cap] (cap·4 B), then xbits[cap] (cap·4 B). Total
+    // cap·16 B, matching d_pair_a's size.
+    uint64_t*     d_t2_meta  = static_cast<uint64_t*>(d_pair_a_raw);
+    uint32_t*     d_t2_mi    = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * sizeof(uint64_t));
+    uint32_t*     d_t2_xbits = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(d_pair_a_raw) + pool.cap * (sizeof(uint64_t) + sizeof(uint32_t)));
+    T3PairingGpu* d_t3       = static_cast<T3PairingGpu*>(d_pair_a_raw);
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
