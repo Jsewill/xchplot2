@@ -1,18 +1,6 @@
 // XsKernelsSycl.cpp — SYCL implementation of Xs gen/pack kernels.
 // Same shape as the T1/T2/T3 SYCL impls; gen reuses the AES T-table USM
 // buffer from SyclBackend.hpp, pack is a pure grid-stride lambda.
-//
-// Xs gen uses per-thread coarsening (kCoarsen AES hashes per thread).
-// Rationale: each hash is 32 AES rounds of T-table LDS loads; with 1
-// hash/thread the critical path is load-latency-limited and the
-// compiler has nothing to interleave against. Running kCoarsen
-// independent hashes per thread gives the scheduler kCoarsen× the
-// ready instruction pool, which hides LDS latency on both amdgcn
-// (RDNA2/3) and sm_89. No change to total AES count.
-//
-// kCoarsen=4 was picked after measuring: kCoarsen=2 gave most of the
-// win; kCoarsen=8 started spilling registers on RDNA2 (VGPR budget at
-// 256 per wave32 SIMD). 4 sits on the sweet spot.
 
 #include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernels.cuh"
@@ -32,9 +20,8 @@ void launch_xs_gen(
 {
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    constexpr size_t threads  = 256;
-    constexpr int    kCoarsen = 4;
-    size_t const groups = (total + threads * kCoarsen - 1) / (threads * kCoarsen);
+    constexpr size_t threads = 256;
+    size_t   const groups    = (total + threads - 1) / threads;
 
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> sT_local{
@@ -52,20 +39,12 @@ void launch_xs_gen(
                 }
                 it.barrier(sycl::access::fence_space::local_space);
 
-                // Strided layout: iteration c of all 256 threads writes
-                // idx range [group_base + c*threads, group_base + (c+1)*threads),
-                // which is contiguous — coalesced keys_out / vals_out stores.
-                uint64_t const group_base =
-                    uint64_t(it.get_group(0)) * (threads * kCoarsen);
-                #pragma unroll
-                for (int c = 0; c < kCoarsen; ++c) {
-                    uint64_t idx = group_base + uint64_t(c) * threads + local_id;
-                    if (idx >= total) break;
-                    uint32_t x = static_cast<uint32_t>(idx);
-                    uint32_t mixed = x ^ xor_const;
-                    keys_out[idx] = pos2gpu::g_x_smem(keys_copy, mixed, k, sT);
-                    vals_out[idx] = x;
-                }
+                uint64_t idx = it.get_global_id(0);
+                if (idx >= total) return;
+                uint32_t x = static_cast<uint32_t>(idx);
+                uint32_t mixed = x ^ xor_const;
+                keys_out[idx] = pos2gpu::g_x_smem(keys_copy, mixed, k, sT);
+                vals_out[idx] = x;
             });
     }).wait();
 }

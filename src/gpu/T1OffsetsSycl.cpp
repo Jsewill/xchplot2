@@ -123,17 +123,8 @@ void launch_t1_match_all_buckets(
 {
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    constexpr size_t threads  = 256;
-    // Per-thread coarsening: each thread processes kCoarsen L candidates
-    // sequentially. The outer matching_target AES + the fine_offsets
-    // binary search + the inner pairing loop all interleave across
-    // kCoarsen independent streams of work, giving the scheduler
-    // more to hide LDS-load latency against. kCoarsen=2 is the
-    // conservative pick — higher factors bloat VGPRs because the
-    // inner pairing loop already has ~12 live 32-bit values.
-    constexpr int    kCoarsen = 2;
-    uint64_t blocks_x_u64 =
-        (l_count_max + threads * kCoarsen - 1) / (threads * kCoarsen);
+    constexpr size_t threads = 256;
+    uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
     size_t   const blocks_x  = static_cast<size_t>(blocks_x_u64);
 
     auto* d_out_count_ull =
@@ -175,66 +166,60 @@ void launch_t1_match_all_buckets(
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
                 uint32_t r_bucket = section_r * num_match_keys + match_key_r;
 
+                uint64_t l = l_start
+                           + it.get_group(1) * uint64_t(threads)
+                           + local_id;
+                if (l >= l_end) return;
+
+                uint32_t x_l = d_sorted_xs[l].x;
+
+                uint32_t target_l = pos2gpu::matching_target_smem(
+                                        keys_copy, 1u, match_key_r, uint64_t(x_l),
+                                        sT, extra_rounds_bits)
+                                  & target_mask;
+
+                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
+                uint32_t fine_key   = target_l >> fine_shift;
+                uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                uint64_t lo         = d_fine_offsets[fine_idx];
+                uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
+                uint64_t hi         = fine_hi;
+
+                while (lo < hi) {
+                    uint64_t mid = lo + ((hi - lo) >> 1);
+                    uint32_t target_mid = d_sorted_xs[mid].match_info & target_mask;
+                    if (target_mid < target_l) lo = mid + 1;
+                    else                       hi = mid;
+                }
+
                 uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
                                                             : ((1u << num_test_bits) - 1u);
                 uint32_t info_mask = (num_match_info_bits >= 32) ? 0xFFFFFFFFu
                                                                  : ((1u << num_match_info_bits) - 1u);
-                uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
 
-                // Strided coarsening: each thread walks kCoarsen Ls at
-                // stride `threads`, keeping adjacent lanes' L reads
-                // coalesced within each inner iteration.
-                uint64_t const l_group_base = l_start
-                    + it.get_group(1) * uint64_t(threads * kCoarsen);
-                #pragma unroll
-                for (int c = 0; c < kCoarsen; ++c) {
-                    uint64_t l = l_group_base + uint64_t(c) * threads + local_id;
-                    if (l >= l_end) break;
+                for (uint64_t r = lo; r < fine_hi; ++r) {
+                    uint32_t target_r = d_sorted_xs[r].match_info & target_mask;
+                    if (target_r != target_l) break;
 
-                    uint32_t x_l = d_sorted_xs[l].x;
+                    uint32_t x_r = d_sorted_xs[r].x;
+                    pos2gpu::Result128 res = pos2gpu::pairing_smem(
+                        keys_copy, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits);
 
-                    uint32_t target_l = pos2gpu::matching_target_smem(
-                                            keys_copy, 1u, match_key_r, uint64_t(x_l),
-                                            sT, extra_rounds_bits)
-                                      & target_mask;
+                    uint32_t test_result = res.r[3] & test_mask;
+                    if (test_result != 0) continue;
 
-                    uint32_t fine_key = target_l >> fine_shift;
-                    uint64_t fine_idx = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                    uint64_t lo       = d_fine_offsets[fine_idx];
-                    uint64_t fine_hi  = d_fine_offsets[fine_idx + 1];
-                    uint64_t hi       = fine_hi;
+                    uint32_t match_info_result = res.r[0] & info_mask;
 
-                    while (lo < hi) {
-                        uint64_t mid = lo + ((hi - lo) >> 1);
-                        uint32_t target_mid = d_sorted_xs[mid].match_info & target_mask;
-                        if (target_mid < target_l) lo = mid + 1;
-                        else                       hi = mid;
-                    }
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        out_count_atomic{ *d_out_count_ull };
+                    unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
+                    if (out_idx >= out_capacity) return;
 
-                    for (uint64_t r = lo; r < fine_hi; ++r) {
-                        uint32_t target_r = d_sorted_xs[r].match_info & target_mask;
-                        if (target_r != target_l) break;
-
-                        uint32_t x_r = d_sorted_xs[r].x;
-                        pos2gpu::Result128 res = pos2gpu::pairing_smem(
-                            keys_copy, uint64_t(x_l), uint64_t(x_r), sT, extra_rounds_bits);
-
-                        uint32_t test_result = res.r[3] & test_mask;
-                        if (test_result != 0) continue;
-
-                        uint32_t match_info_result = res.r[0] & info_mask;
-
-                        sycl::atomic_ref<unsigned long long,
-                                         sycl::memory_order::relaxed,
-                                         sycl::memory_scope::device>
-                            out_count_atomic{ *d_out_count_ull };
-                        unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
-                        if (out_idx >= out_capacity) return;
-
-                        uint64_t meta = (uint64_t(x_l) << k) | uint64_t(x_r);
-                        d_out_meta[out_idx] = meta;
-                        d_out_mi  [out_idx] = match_info_result;
-                    }
+                    uint64_t meta = (uint64_t(x_l) << k) | uint64_t(x_r);
+                    d_out_meta[out_idx] = meta;
+                    d_out_mi  [out_idx] = match_info_result;
                 }
             });
     }).wait();
