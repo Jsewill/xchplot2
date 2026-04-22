@@ -128,13 +128,35 @@ struct GpuBufferPool {
 
     // Returns pool.d_pair_a, allocating it on first use. Deferred
     // from ctor so run_gpu_pipeline can submit Xs gen *before*
-    // paying this 4.36 GB malloc_device (~400-700 ms at k=28) —
-    // the alloc then overlaps with the ~750 ms of Xs GPU work.
-    // On the first plot of a batch this saves most of the alloc
-    // cost outright; on plots 2+ the pointer is cached and the
-    // fast path returns in O(1). Thread-safe via double-checked
-    // locking on pair_a_mu_.
+    // paying this 4.36 GB malloc_device. Thread-safe via double-
+    // checked locking on pair_a_mu_.
+    //
+    // Measured on RX 6700 XT / ROCm 6.2 / AdaptiveCpp HIP:
+    // sycl::malloc_device of 4.36 GB takes ~5 ms (the driver
+    // almost certainly just reserves virtual-address space and
+    // defers physical commit to first write). Overlap benefit
+    // vs eager alloc is therefore ~5 ms in practice, below noise.
+    // The lazy pattern is kept because (a) it's a drop-in
+    // replacement with zero regression, (b) it mirrors
+    // ensure_pinned, and (c) it enables release_pair_a() below.
     void* ensure_pair_a();
+
+    // Frees d_pair_a if it's allocated, so a subsequent
+    // ensure_pair_a() will re-allocate. Called by the pool path
+    // at the end of each plot in a batch to shrink the
+    // inter-plot VRAM peak. With ~5 ms malloc on AMD, the
+    // release-and-realloc cost is below noise per plot, while
+    // the 4.36 GB VRAM freed during file-write / D2H-consume
+    // phases lets the pool path fit cards with ~7-8 GiB free
+    // that would otherwise hit the InsufficientVramError path
+    // and fall back to streaming.
+    //
+    // Thread-safe via pair_a_mu_; lock-order is
+    // (pair_a_mu_ → sycl::free) so release can run concurrently
+    // with a future ensure_pair_a from a different thread
+    // without deadlock. In practice run_batch is single-producer
+    // so contention is zero.
+    void release_pair_a();
 
 private:
     std::mutex pinned_mu_[kNumPinnedBuffers];
