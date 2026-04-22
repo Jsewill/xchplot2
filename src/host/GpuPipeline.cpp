@@ -536,6 +536,46 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     StreamingStats stats;
     s_init_from_env(stats);
 
+    // ---- per-phase wall-time profiling ----
+    // Identical shape to the pool path (run_gpu_pipeline above); the
+    // [phase-timing] output format matches so POS2GPU_PHASE_TIMING=1 now
+    // produces the same breakdown whether the pipeline runs pool or
+    // falls back to streaming. On 12 GiB cards at k=28 (where pool
+    // overflows and we always streams) this is the only way to see
+    // which phase is eating the wall.
+    bool const phase_timing = cfg.profile || [] {
+        char const* v = std::getenv("POS2GPU_PHASE_TIMING");
+        return v && v[0] == '1';
+    }();
+    using phase_clock = std::chrono::steady_clock;
+    std::vector<std::pair<char const*, phase_clock::time_point>> phase_starts;
+    std::vector<std::pair<char const*, double>>                  phase_records;
+    auto begin_phase = [&](char const* label) -> int {
+        if (!phase_timing) return -1;
+        q.wait();
+        phase_starts.emplace_back(label, phase_clock::now());
+        return static_cast<int>(phase_starts.size() - 1);
+    };
+    auto end_phase = [&](int idx) {
+        if (idx < 0) return;
+        q.wait();
+        auto const t1 = phase_clock::now();
+        auto const& [name, t0] = phase_starts[idx];
+        double const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        phase_records.emplace_back(name, ms);
+    };
+    auto report_phases = [&]() {
+        if (!phase_timing || phase_records.empty()) return;
+        double total = 0.0;
+        for (auto const& [_n, ms] : phase_records) total += ms;
+        std::fprintf(stderr, "[phase-timing]");
+        for (auto const& [name, ms] : phase_records) {
+            std::fprintf(stderr, " %s=%.1fms(%.0f%%)",
+                name, ms, total > 0.0 ? 100.0 * ms / total : 0.0);
+        }
+        std::fprintf(stderr, " total=%.1fms\n", total);
+    };
+
     // --- pipeline-wide tiny allocations ---
     // d_counter: per-phase uint64 count output (reused).
     // The match kernels each need their own temp-storage buffer sized via
@@ -555,8 +595,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_xs,      total_xs * sizeof(XsCandidateGpu), "d_xs");
     s_malloc(stats, d_xs_temp, xs_temp_bytes,                     "d_xs_temp");
 
+    int p_xs = begin_phase("Xs gen+sort");
     launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
                               d_xs, d_xs_temp, &xs_temp_bytes, q);
+    end_phase(p_xs);
 
     // Xs gen writes to d_xs_temp while sorting, but by the time
     // launch_construct_xs returns the result is in d_xs and xs_temp is
@@ -582,10 +624,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
     s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
 
+    int p_t1 = begin_phase("T1 match");
     q.memset(d_counter, 0, sizeof(uint64_t));
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           d_t1_meta, d_t1_mi, d_counter, cap,
                           d_t1_match_temp, &t1_temp_bytes, q);
+    end_phase(p_t1);
 
     uint64_t t1_count = 0;
     q.memcpy(&t1_count, d_counter, sizeof(uint64_t)).wait();
@@ -629,6 +673,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
     s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
 
+    int p_t1_sort = begin_phase("T1 sort");
     launch_init_u32_identity(d_vals_in, t1_count, q);
     if (t1_tile_n0 > 0) {
         launch_sort_pairs_u32_u32(
@@ -667,6 +712,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_t1_meta_sorted = nullptr;
     s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
     launch_gather_u64(d_t1_meta, d_t1_merged_vals, d_t1_meta_sorted, t1_count, q);
+    end_phase(p_t1_sort);
     s_free(stats, d_t1_meta);
     s_free(stats, d_t1_merged_vals);
 
@@ -690,12 +736,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
     s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
 
+    int p_t2 = begin_phase("T2 match");
     q.memset(d_counter, 0, sizeof(uint64_t));
     launch_t2_match(cfg.plot_id.data(), t2p,
                           d_t1_meta_sorted, d_t1_keys_merged, t1_count,
                           d_t2_meta, d_t2_mi, d_t2_xbits,
                           d_counter, cap,
                           d_t2_match_temp, &t2_temp_bytes, q);
+    end_phase(p_t2);
 
     uint64_t t2_count = 0;
     q.memcpy(&t2_count, d_counter, sizeof(uint64_t)).wait();
@@ -744,6 +792,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
     s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
 
+    int p_t2_sort = begin_phase("T2 sort");
     launch_init_u32_identity(d_vals_in, t2_count, q);
     for (int t = 0; t < kNumT2Tiles; ++t) {
         if (t2_tile_n[t] == 0) continue;
@@ -814,6 +863,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint32_t* d_t2_xbits_sorted = nullptr;
     s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
     launch_gather_u32(d_t2_xbits, d_merged_vals, d_t2_xbits_sorted, t2_count, q);
+    end_phase(p_t2_sort);
     s_free(stats, d_t2_xbits);
     s_free(stats, d_merged_vals);
 
@@ -831,12 +881,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
     s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
 
+    int p_t3 = begin_phase("T3 match + Feistel");
     q.memset(d_counter, 0, sizeof(uint64_t));
     launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           d_t2_keys_merged, t2_count,
                           d_t3, d_counter, cap,
                           d_t3_match_temp, &t3_temp_bytes, q);
+    end_phase(p_t3);
 
     uint64_t t3_count = 0;
     q.memcpy(&t3_count, d_counter, sizeof(uint64_t)).wait();
@@ -860,10 +912,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
     s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
 
+    int p_t3_sort = begin_phase("T3 sort");
     launch_sort_keys_u64(
         d_sort_scratch, t3_sort_bytes,
         d_frags_in, d_frags_out,
         t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
+    end_phase(p_t3_sort);
 
     s_free(stats, d_t3);
     s_free(stats, d_sort_scratch);
@@ -881,6 +935,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     result.t2_count = t2_count;
     result.t3_count = t3_count;
 
+    int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
     if (t3_count > 0) {
         if (pinned_dst) {
             if (pinned_capacity < t3_count) {
@@ -906,6 +961,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             sycl::free(h_pinned, sycl_backend::queue());
         }
     }
+    end_phase(p_d2h);
 
     s_free(stats, d_frags_out);
     s_free(stats, d_counter);
@@ -915,6 +971,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             "[streaming] k=%d strength=%d  peak device VRAM = %.2f MB\n",
             cfg.k, cfg.strength, stats.peak / 1048576.0);
     }
+    report_phases();
     return result;
 }
 
