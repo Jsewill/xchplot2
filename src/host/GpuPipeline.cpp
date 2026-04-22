@@ -212,7 +212,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // so we alias it rather than allocating separately.
     void*           d_xs_temp      = pool.d_pair_b;
     void*           d_sort_scratch = pool.d_sort_scratch;
-    uint64_t*       h_pinned_t3    = pool.h_pinned_t3[pinned_index];
+    // Lazy pinned-host alloc: skips ~600 ms × (kNumPinnedBuffers-1)
+    // on single-plot runs (only slot 0 gets allocated). See
+    // GpuBufferPool::ensure_pinned header comment for rationale.
+    uint64_t*       h_pinned_t3    = pool.ensure_pinned(pinned_index);
     // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
     // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
     // when bytes==0. Point them at d_sort_scratch (idle during match) to

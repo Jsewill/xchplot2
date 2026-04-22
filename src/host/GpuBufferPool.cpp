@@ -187,14 +187,35 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         d_sort_scratch = sycl_alloc_device_or_throw(sort_scratch_bytes, q, "d_sort_scratch");
         d_counter      = static_cast<uint64_t*>(
             sycl_alloc_device_or_throw(sizeof(uint64_t),                q, "d_counter"));
-        for (int i = 0; i < kNumPinnedBuffers; ++i) {
-            h_pinned_t3[i] = static_cast<uint64_t*>(
-                sycl_alloc_host_or_throw(pinned_bytes,                  q, "h_pinned_t3"));
-        }
+        // h_pinned_t3[] is allocated lazily in ensure_pinned(); see
+        // the header comment for why. Single-plot runs only ever
+        // touch slot 0 so the other two 2.2 GB malloc_host calls
+        // aren't paid at all.
     } catch (...) {
         cleanup_partial();
         throw;
     }
+}
+
+uint64_t* GpuBufferPool::ensure_pinned(int idx)
+{
+    if (idx < 0 || idx >= kNumPinnedBuffers) {
+        throw std::runtime_error("GpuBufferPool::ensure_pinned: idx out of range");
+    }
+    // Double-checked locking: fast path skips the mutex once the
+    // slot's pointer is visible. Writes inside the mutex are
+    // release-ordered w.r.t. the mutex release; the unlocked read
+    // on the fast path is an acquire (relaxed access is fine here
+    // because x86 and arm64 give us acquire ordering for aligned
+    // pointer reads; if this ever needs to be portable to weaker
+    // architectures, make h_pinned_t3 std::atomic<uint64_t*>[]).
+    if (h_pinned_t3[idx]) return h_pinned_t3[idx];
+    std::lock_guard<std::mutex> lk(pinned_mu_[idx]);
+    if (h_pinned_t3[idx]) return h_pinned_t3[idx];
+    sycl::queue& q = sycl_backend::queue();
+    h_pinned_t3[idx] = static_cast<uint64_t*>(
+        sycl_alloc_host_or_throw(pinned_bytes, q, "h_pinned_t3"));
+    return h_pinned_t3[idx];
 }
 
 GpuBufferPool::~GpuBufferPool()
