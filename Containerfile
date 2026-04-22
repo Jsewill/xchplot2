@@ -177,24 +177,27 @@ RUN cmake -S . -B build-tests -G Ninja \
  && rm -rf build-tests target
 
 # ─── runtime ────────────────────────────────────────────────────────────────
-# Currently shipping the full builder stage as the runtime. ~1 GB heavier
-# than necessary (carries CMake, git, Boost dev headers, the full
-# AdaptiveCpp source clone), but proven correct.
-#
-# History: an earlier slim BASE_RUNTIME stage with selective COPY appeared
-# to silently break SYCL kernels on AMD HIP. We chased that for hours, but
-# it turned out the ACTUAL cause was elsewhere — compose.yaml's rocm
-# service had `ACPP_GFX:-gfx1100` as a default, and `sudo` strips env
-# vars, so any rebuild without inline `ACPP_GFX=gfxNNNN sudo ...` would
-# silently AOT-compile kernels for the wrong amdgcn ISA. compose.yaml is
-# now hardened to require ACPP_GFX explicitly. The slim runtime stage was
-# almost certainly fine — we just kept rebuilding with the wrong gfx
-# target. TODO: re-test slim runtime now that ACPP_GFX is enforced; if it
-# works, restore the COPY-from-builder layout and shrink the image again.
-FROM builder
+FROM ${BASE_RUNTIME}
 
-# Tell the dynamic loader where libacpp-rt.so / libacpp-common.so live and
-# put acpp-info etc. on PATH for diagnostic invocations.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# AdaptiveCpp's runtime backend loaders dlopen libLLVM (for SSCP runtime
+# specialization), libnuma (OMP backend), libomp, and Boost.Context.
+# SSCP also shells out to LLVM's `opt` and `llc` binaries at runtime to
+# generate PTX from the SSCP bitcode — install the full llvm-18 package
+# (binaries + lib), not just libllvm18.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/xchplot2                    /usr/local/bin/xchplot2
+COPY --from=builder /usr/local/bin/sycl_sort_parity            /usr/local/bin/sycl_sort_parity
+COPY --from=builder /usr/local/bin/sycl_bucket_offsets_parity  /usr/local/bin/sycl_bucket_offsets_parity
+COPY --from=builder /usr/local/bin/sycl_g_x_parity             /usr/local/bin/sycl_g_x_parity
+COPY --from=builder /usr/local/bin/plot_file_parity            /usr/local/bin/plot_file_parity
+COPY --from=builder /opt/adaptivecpp                           /opt/adaptivecpp
+
+ENV LD_LIBRARY_PATH=/opt/adaptivecpp/lib:${LD_LIBRARY_PATH}
 ENV PATH=/opt/adaptivecpp/bin:${PATH}
 
 ENTRYPOINT ["/usr/local/bin/xchplot2"]
