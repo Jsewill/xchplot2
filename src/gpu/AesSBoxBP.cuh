@@ -20,12 +20,21 @@
 
 #pragma once
 
+#include "gpu/PortableAttrs.hpp"
+
 #include <cstdint>
 
 namespace pos2gpu {
 
+// Portable markup: POS2_HOST_DEVICE_INLINE expands to
+// __host__ __device__ __forceinline__ under nvcc (CUDA TU) and to
+// inline __attribute__((always_inline)) under acpp/clang (SYCL TU).
+// Raw __host__ / __device__ tokens would fail to parse under
+// AdaptiveCpp's SYCL-to-HIP compilation path (they're not defined
+// outside nvcc/hipcc source-to-source front-ends), which would
+// cascade to "no matching function" errors at every call site.
 template <typename T>
-__host__ __device__ __forceinline__
+POS2_HOST_DEVICE_INLINE
 void bp_sbox_circuit(T U0, T U1, T U2, T U3, T U4, T U5, T U6, T U7,
                      T& S0, T& S1, T& S2, T& S3,
                      T& S4, T& S5, T& S6, T& S7,
@@ -154,7 +163,7 @@ void bp_sbox_circuit(T U0, T U1, T U2, T U3, T U4, T U5, T U6, T U7,
     S5     = tc21 ^ tc17;
 }
 
-__host__ __device__ __forceinline__
+POS2_HOST_DEVICE_INLINE
 uint8_t bp_sbox(uint8_t x)
 {
     uint8_t U0 = uint8_t((x >> 7) & 1u);
