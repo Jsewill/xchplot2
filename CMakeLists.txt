@@ -242,16 +242,26 @@ if(XCHPLOT2_INSTRUMENT_MATCH)
 endif()
 add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
 
-# NOTE: do NOT add target_compile_options(... -O2/-O3) here. We tried
-# both — AdaptiveCpp's HIP AOT backend (acpp + clang targeting amdgcn)
-# miscompiles the SYCL kernels at any opt level above -O0, breaking
-# all three SYCL parity tests (sort, g_x, bucket_offsets) and producing
-# plot files whose proof_fragments differ from the NVIDIA reference.
-# The acpp warning "No optimization flag was given" is annoying but
-# correct output beats fast wrong output. Track follow-ups in:
-#   - upstream AdaptiveCpp HIP optimization-pass issues
-#   - or attempt -O2 with -fno-vectorize / -fno-slp-vectorize / etc.
-# When that's resolved we can re-enable optimization here.
+# AdaptiveCpp's acpp driver doesn't auto-propagate CMake's standard
+# CMAKE_CXX_FLAGS_RELEASE (-O3 -DNDEBUG) into the SYCL compile step.
+# Without an explicit -O flag, acpp warns "No optimization flag was
+# given, optimizations are disabled by default" and the AES-heavy SYCL
+# kernels (Xs gen, T*match) compile at -O0, which is dramatically
+# slower on amdgcn (Xs gen alone was 200 ms / ~25% of wall on RX 6700
+# XT before this fix).
+#
+# An earlier attempt at -O3 was reverted because parity tests appeared
+# to fail with it — but that diagnosis was confounded by an unrelated
+# build-time bug (compose.yaml's silent ACPP_GFX default to gfx1100
+# made every "broken" rebuild produce kernels for the wrong amdgcn
+# ISA, which executed as no-ops regardless of opt level). With
+# ACPP_GFX now enforced via ${VAR:?} in compose.yaml, -O3 should be
+# testable cleanly. Drop to -O2 here if it actually does fail at -O3
+# under correct gfx targeting.
+target_compile_options(pos2_gpu PRIVATE
+    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:RelWithDebInfo>:-O2>
+    $<$<CONFIG:MinSizeRel>:-Os>)
 # The SYCL TUs include CUDA headers (cuda_fp16.h, transitively cuda_runtime.h
 # from the kernel-wrapper headers) on both the CUDA and non-CUDA paths
 # (slice 17 will lift the CUDA-type dependencies out of the public API).
