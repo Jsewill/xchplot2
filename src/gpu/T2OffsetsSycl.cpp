@@ -2,7 +2,6 @@
 // kernels. Pattern mirrors T1OffsetsSycl.cpp; reuses the shared SYCL
 // queue + AES-table USM buffer from SyclBackend.hpp.
 
-#include "gpu/AesHashBsSycl.hpp"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T2Offsets.cuh"
 
@@ -130,11 +129,7 @@ void launch_t2_match_all_buckets(
                                 blocks_x * threads },
                 sycl::range<2>{ 1, threads }
             },
-            [=, keys_copy = keys](sycl::nd_item<2> it)
-                [[sycl::reqd_sub_group_size(32)]]
-            {
-                // T-tables kept for the inner pairing loop; only the
-                // outer matching_target uses the sub_group bitsliced path.
+            [=, keys_copy = keys](sycl::nd_item<2> it) {
                 uint32_t* sT = &sT_local[0];
                 size_t local_id = it.get_local_id(1);
                 #pragma unroll 1
@@ -142,8 +137,6 @@ void launch_t2_match_all_buckets(
                     sT[i] = d_aes_tables[i];
                 }
                 it.barrier(sycl::access::fence_space::local_space);
-
-                auto sg = it.get_sub_group();
 
                 uint32_t bucket_id   = static_cast<uint32_t>(it.get_group(0));
                 uint32_t section_l   = bucket_id / num_match_keys;
@@ -164,15 +157,13 @@ void launch_t2_match_all_buckets(
                 uint64_t l = l_start
                            + it.get_group(1) * uint64_t(threads)
                            + local_id;
-                bool in_range = (l < l_end);
+                if (l >= l_end) return;
 
-                uint64_t meta_l = in_range ? d_sorted_meta[l] : uint64_t(0);
+                uint64_t meta_l = d_sorted_meta[l];
 
-                uint32_t target_l = pos2gpu::matching_target_bs32(
-                                        sg, keys_copy, 2u, match_key_r, meta_l, 0)
+                uint32_t target_l = pos2gpu::matching_target_smem(
+                                        keys_copy, 2u, match_key_r, meta_l, sT, 0)
                                   & target_mask;
-
-                if (!in_range) return;
 
                 uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                 uint32_t fine_key   = target_l >> fine_shift;
