@@ -58,7 +58,27 @@ services:
         # device libs at /opt/rocm/llvm for the HIP backend at runtime.
         BASE_DEVEL:           docker.io/rocm/dev-ubuntu-24.04:6.2-complete
         BASE_RUNTIME:         docker.io/rocm/dev-ubuntu-24.04:6.2-complete
-        ACPP_TARGETS:         "hip:${ACPP_GFX:-gfx1100}"
+        # IMPORTANT: ACPP_GFX is intentionally *required* — no silent default.
+        # If it's unset the SYCL kernels are AOT-compiled for the wrong amdgcn
+        # ISA, which HIP loads without error but the kernels execute as silent
+        # no-ops at runtime (sort returns input, AES match finds zero results,
+        # plot content diverges from the canonical reference). That failure
+        # mode is extremely confusing to diagnose — it looks like a correctness
+        # bug in the kernels rather than a build-time config error.
+        #
+        # Set ACPP_GFX explicitly. If you sudo compose, pass the var through
+        # (sudo strips env by default):
+        #   ACPP_GFX=gfx1031 sudo -E podman compose build rocm
+        #   sudo ACPP_GFX=gfx1031 podman compose build rocm
+        #
+        # Common gfx targets (see `rocminfo | grep gfx`):
+        #   gfx1030 = RDNA2 Navi 21 (RX 6800/6800 XT/6900 XT)
+        #   gfx1031 = RDNA2 Navi 22 (RX 6700/6700 XT/6800M)
+        #   gfx1100 = RDNA3 Navi 31 (RX 7900 XTX/XT)
+        #   gfx1101 = RDNA3 Navi 32 (RX 7800 XT/7700 XT)
+        #   gfx906  = Vega 20 (Radeon VII, MI50)
+        #   gfx900  = Vega 10 (RX Vega 56/64, MI25)
+        ACPP_TARGETS:         "hip:${ACPP_GFX:?set ACPP_GFX to your GPU arch (e.g. gfx1031 for RX 6700 XT) — see rocminfo | grep gfx}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         # No CUDA headers on the AMD path — they conflict with HIP's
         # uchar1/etc. typedefs. CudaHalfShim.hpp's __has_include guard

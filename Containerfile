@@ -177,20 +177,20 @@ RUN cmake -S . -B build-tests -G Ninja \
  && rm -rf build-tests target
 
 # ─── runtime ────────────────────────────────────────────────────────────────
-# Use the full builder image as the runtime. Earlier multi-stage attempts
-# (slim BASE_RUNTIME + selective COPY --from=builder + minimal apt) produced
-# images that compiled clean and resolved every shared library identically
-# to the builder per `ldd`, but parity tests still failed at runtime: SYCL
-# kernels executed as silent no-ops (sort returned input unchanged, AES
-# match found zero matches, plot SHA-256 diverged from the canonical
-# reference). The same pre-built parity binaries ran correctly when invoked
-# inside the builder stage. The exact dependency the runtime stage was
-# missing isn't pinned down — apt -dev variants, env tweaks, ldd diffs all
-# came back equivalent — so until that's diagnosed we ship the builder as
-# the deployable.
+# Currently shipping the full builder stage as the runtime. ~1 GB heavier
+# than necessary (carries CMake, git, Boost dev headers, the full
+# AdaptiveCpp source clone), but proven correct.
 #
-# Trade-off: image is ~1 GB larger (CMake, git, Boost dev headers, full
-# AdaptiveCpp source clone leftovers). Acceptable to guarantee correctness.
+# History: an earlier slim BASE_RUNTIME stage with selective COPY appeared
+# to silently break SYCL kernels on AMD HIP. We chased that for hours, but
+# it turned out the ACTUAL cause was elsewhere — compose.yaml's rocm
+# service had `ACPP_GFX:-gfx1100` as a default, and `sudo` strips env
+# vars, so any rebuild without inline `ACPP_GFX=gfxNNNN sudo ...` would
+# silently AOT-compile kernels for the wrong amdgcn ISA. compose.yaml is
+# now hardened to require ACPP_GFX explicitly. The slim runtime stage was
+# almost certainly fine — we just kept rebuilding with the wrong gfx
+# target. TODO: re-test slim runtime now that ACPP_GFX is enforced; if it
+# works, restore the COPY-from-builder layout and shrink the image again.
 FROM builder
 
 # Tell the dynamic loader where libacpp-rt.so / libacpp-common.so live and
