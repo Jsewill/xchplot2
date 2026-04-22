@@ -84,13 +84,28 @@ case "$GPU" in
         if [[ -z "${rocm_out:-}" ]] && command -v rocminfo >/dev/null; then
             rocm_out=$(rocminfo 2>/dev/null || true)
         fi
-        if [[ -n "${rocm_out:-}" && "$rocm_out" =~ (gfx[0-9a-f]+) ]]; then
-            export ACPP_GFX="${BASH_REMATCH[1]}"
+        # Honour an explicit ACPP_GFX from the env first (lets the user
+        # cross-target a different GPU than the host one), else autodetect.
+        if [[ -z "${ACPP_GFX:-}" ]]; then
+            if [[ -n "${rocm_out:-}" && "$rocm_out" =~ (gfx[0-9a-f]+) ]]; then
+                export ACPP_GFX="${BASH_REMATCH[1]}"
+            fi
         fi
         if [[ -z "${ACPP_GFX:-}" ]]; then
-            echo "[build-container] couldn't detect gfx target; falling back to gfx1100." >&2
-            echo "[build-container] override with ACPP_GFX=gfx1031 (Navi 22) etc." >&2
-            export ACPP_GFX=gfx1100
+            # No silent fallback: a wrong gfx target produces an image that
+            # builds clean and runs without errors, but the AOT amdgcn ISA
+            # is for the wrong arch and the SYCL kernels execute as silent
+            # no-ops at runtime (sort returns input unchanged, AES match
+            # finds zero results, plot output diverges from reference).
+            # Fail loud here instead.
+            echo "[build-container] ERROR: couldn't detect AMD gfx target." >&2
+            echo "[build-container] Either install rocminfo so the host probe finds it," >&2
+            echo "[build-container] or set ACPP_GFX explicitly to your card's arch:" >&2
+            echo "[build-container]   ACPP_GFX=gfx1030  $0  --gpu amd  # RX 6800 / 6800 XT / 6900 XT" >&2
+            echo "[build-container]   ACPP_GFX=gfx1031  $0  --gpu amd  # RX 6700 XT / 6700 / 6800M" >&2
+            echo "[build-container]   ACPP_GFX=gfx1100  $0  --gpu amd  # RX 7900 XTX / XT" >&2
+            echo "[build-container] (run \"rocminfo | grep gfx\" if available)" >&2
+            exit 1
         fi
         echo "[build-container] vendor=amd service=$SERVICE ACPP_GFX=$ACPP_GFX"
         ;;
