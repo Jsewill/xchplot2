@@ -275,6 +275,16 @@ Pool variants: `-p <pool-pk>` or `--pool-ph <pool-ph>`. Other common
 flags: `-s <strength>`, `-T` testnet, `-S <seed>` for reproducible runs,
 `-v` verbose. Full help: `xchplot2 -h`.
 
+For long batches, `--skip-existing` skips plots whose output file is
+already a complete `.plot2` (magic bytes + non-trivial size), and
+`--continue-on-error` logs per-plot failures and keeps going instead of
+aborting the whole run. Both flags work for `plot` and `batch` modes.
+
+Plots are written to `<name>.plot2.partial` and atomically renamed on
+completion, so a crash / `SIGINT` / `ENOSPC` mid-write never leaves a
+malformed plot at the destination. A first `Ctrl-C` asks the plotter to
+finish the plot in flight and stop; a second hard-kills.
+
 #### Grouping plots: `-i <plot-index>` and `-g <meta-group>`
 
 Both are v2 PoS fields and default to 0.
@@ -297,9 +307,30 @@ will expect.
 ### Lower-level subcommands
 
 ```bash
-xchplot2 test  <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
-xchplot2 batch <manifest.tsv> [-v]                # batched, raw inputs
+xchplot2 test   <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
+xchplot2 batch  <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
+xchplot2 verify <file.plot2> [--trials N]           # run N random challenges
 ```
+
+`verify` opens a `.plot2` through pos2-chip's CPU prover and runs N
+(default 100) random challenges. Zero proofs across a reasonable sample
+strongly indicates a corrupt plot; the command exits non-zero in that
+case. Intended as a quick sanity check before farming a newly built
+batch — not a replacement for `chia plots check`.
+
+## Environment variables
+
+| Variable                      | Effect                                                                  |
+|-------------------------------|-------------------------------------------------------------------------|
+| `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
+| `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
+| `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
+| `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
+| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
+| `ACPP_GFX=gfxXXXX`            | AMD only — required at **build** time; sets AOT target for amdgcn ISA. |
+| `ACPP_TARGETS=...`            | Override AdaptiveCpp target selection (defaults: NVIDIA `generic`, AMD `hip:$ACPP_GFX`). |
+| `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
+| `POS2_CHIP_DIR=/path`         | Build-time: point at a local pos2-chip checkout instead of FetchContent.|
 
 ## Testing farming on a testnet
 
