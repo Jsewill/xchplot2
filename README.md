@@ -39,10 +39,14 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
     from `rocminfo` automatically. Other gfx targets (`gfx1030` /
     `gfx1100`) build cleanly but are untested on real hardware.
   - **Intel oneAPI** is wired up but untested.
-- **VRAM:** 8 GB minimum. Cards with less than ~11 GB free
-  transparently use the streaming pipeline; 12 GB+ cards reliably use
-  the persistent buffer pool for faster steady-state. Both paths
-  produce byte-identical plots. Detailed breakdown in [VRAM](#vram).
+- **VRAM:** 10 GB free minimum for k=28 (streaming path). Cards with
+  less than ~11 GB free transparently use the streaming pipeline;
+  12 GB+ cards reliably use the persistent buffer pool for faster
+  steady-state. Both paths produce byte-identical plots. 8 GB cards
+  (3070, 2070 Super, RX 6600) are on the edge — streaming peak is
+  7288 MB but real-world driver overhead + fragmentation adds ~1 GiB,
+  so the preflight typically rejects them. Detailed breakdown in
+  [VRAM](#vram).
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
@@ -384,14 +388,21 @@ based on available VRAM:
   `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
   saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
   RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
-- **Streaming path (~7.3 GB peak; 8 GB cards with ~500 MB driver /
-  compositor headroom).** Allocates per-phase and frees between
-  phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
-  merge-with-gather is split into three passes so the live set stays
-  under 8 GB. Peak at k=28 is **7288 MB** (measured on both sm_89 +
-  CUB and gfx1031 + SortSycl — same algebra: T1 sorted 3.12 GB + T2
-  match output 4.16 GB, with sort scratch in the tens of MB). Targets
-  8 GB cards (GTX 1070 class and up). Slower per plot (~3.7 s vs
+- **Streaming path (~7.3 GB peak + ~1 GB practical overhead; needs
+  ≥ ~8.3 GiB *free* device VRAM at k=28).** Allocates per-phase and
+  frees between phases; T1/T2 sorts are tiled (N=2 and N=4
+  respectively) and the merge-with-gather is split into three passes
+  so the live set stays under 8 GB. Peak at k=28 is **7288 MB**
+  (measured on both sm_89 + CUB and gfx1031 + SortSycl — same
+  algebra: T1 sorted 3.12 GB + T2 match output 4.16 GB, with sort
+  scratch in the tens of MB). Real-world overhead (CUDA context +
+  display framebuffer + fragmentation) adds ~600-900 MB on top, so
+  a BatchPlotter preflight rejects cards reporting less than `peak +
+  1 GiB` free before any queue work — sidestepping mid-pipeline OOM
+  and the AdaptiveCpp teardown path that doesn't survive a failed
+  malloc cleanly. Practical targets: 10 GB cards (RTX 3080) and up;
+  8 GB cards (3070, 2070 Super, RX 6600) are on the edge and tend
+  to fail the preflight. Slower per plot (~3.7 s vs
   ~2.4 s at k=28 on a 4090) because it pays per-phase
   `malloc_device`/`free` instead of amortising. Log the full alloc
   trace with `POS2GPU_STREAMING_STATS=1`.

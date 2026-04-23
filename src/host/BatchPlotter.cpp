@@ -305,15 +305,18 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 e.free_bytes     / double(1ULL << 30));
         }
         // Streaming preflight: bail before the ~4 GiB pinned-host alloc +
-        // queue setup if even the streaming peak won't fit. Cards that
-        // are razor-thin over the peak (e.g. 8 GiB 3070 at k=28) still
-        // pass here and fail later at the d_xs_temp alloc — the SYCL
-        // async_handler in SyclBackend.hpp keeps that failure clean
-        // (std::runtime_error → CLI exit 2, no terminate()).
+        // queue setup if even the streaming peak won't fit. 1 GiB margin
+        // because empirical overhead (CUDA context + display framebuffer
+        // on non-headless cards + cudaMalloc fragmentation) consumes
+        // ~600-900 MB beyond the theoretical peak. Reported against an
+        // RTX 3070 8GB at k=28: 7.66 GiB free, 7.29 GiB peak, 372 MB
+        // apparent slack — still failed at d_xs_temp and triggered a
+        // double-free in AdaptiveCpp's post-throw teardown (outside our
+        // control). Rejecting at preflight sidesteps the whole queue.
         {
             auto const mem  = query_device_memory();
             size_t const peak   = streaming_peak_bytes(pool_k);
-            size_t const margin = 256ULL << 20;  // ~256 MB headroom
+            size_t const margin = 1024ULL << 20;  // ~1 GiB headroom
             if (mem.free_bytes < peak + margin) {
                 auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
                 InsufficientVramError se(
