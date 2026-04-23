@@ -304,6 +304,33 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
+        // Streaming preflight: bail before the ~4 GiB pinned-host alloc +
+        // queue setup if even the streaming peak won't fit. Cards that
+        // are razor-thin over the peak (e.g. 8 GiB 3070 at k=28) still
+        // pass here and fail later at the d_xs_temp alloc — the SYCL
+        // async_handler in SyclBackend.hpp keeps that failure clean
+        // (std::runtime_error → CLI exit 2, no terminate()).
+        {
+            auto const mem  = query_device_memory();
+            size_t const peak   = streaming_peak_bytes(pool_k);
+            size_t const margin = 256ULL << 20;  // ~256 MB headroom
+            if (mem.free_bytes < peak + margin) {
+                auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
+                InsufficientVramError se(
+                    "[batch] streaming pipeline needs ~" +
+                    std::to_string(to_gib(peak + margin)).substr(0, 5) +
+                    " GiB peak for k=" + std::to_string(pool_k) +
+                    ", device reports " +
+                    std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
+                    " GiB free of " +
+                    std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
+                    " GiB total. Use a smaller k or a GPU with more VRAM.");
+                se.required_bytes = peak + margin;
+                se.free_bytes     = mem.free_bytes;
+                se.total_bytes    = mem.total_bytes;
+                throw se;
+            }
+        }
         // Size the pinned buffers using the same cap formula as the pool.
         int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
         int const extra_margin_bits = 8 - ((28 - pool_k) / 2);
