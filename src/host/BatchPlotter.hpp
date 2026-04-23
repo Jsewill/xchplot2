@@ -32,7 +32,23 @@ struct BatchEntry {
 
 struct BatchResult {
     size_t plots_written = 0;
+    size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
+    size_t plots_failed  = 0;  // raised an exception under BatchOptions::continue_on_error
     double total_wall_seconds = 0.0;
+};
+
+// Options controlling batch behavior.
+//   verbose           — per-plot progress on stderr
+//   skip_existing     — if an output .plot2 already exists (and passes a
+//                       lightweight magic/size check), skip the plot
+//                       instead of overwriting it
+//   continue_on_error — catch per-plot exceptions and log rather than
+//                       aborting the batch; plots_failed in the result
+//                       counts how many skipped this way
+struct BatchOptions {
+    bool verbose           = false;
+    bool skip_existing     = false;
+    bool continue_on_error = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
@@ -41,6 +57,16 @@ std::vector<BatchEntry> parse_manifest(std::string const& path);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.
 // The first plot pays the full GPU+FSE cost; subsequent plots overlap.
-BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose = false);
+BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                      BatchOptions const& opts);
+
+// Legacy bool-verbose shim kept for source-compat with older callsites.
+inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                             bool verbose = false)
+{
+    BatchOptions opts;
+    opts.verbose = verbose;
+    return run_batch(entries, opts);
+}
 
 } // namespace pos2gpu
