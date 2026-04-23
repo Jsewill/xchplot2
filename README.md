@@ -405,3 +405,9 @@ SYCL-row latency adjusted for relative GPU throughput.
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party
 attributions. Built collaboratively with
 [Claude](https://claude.ai/code).
+
+## Like this? Send a coin my way!
+
+If you appreciate this, and want to give back, feel free.
+
+xch1d80tfje65xy97fpxg7kl89wugnd6svlv5uag2qays0um5ay5sn0qz8vph8
