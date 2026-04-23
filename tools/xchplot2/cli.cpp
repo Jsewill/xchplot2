@@ -8,6 +8,8 @@
 
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
+#include "host/Cancel.hpp"
+#include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
 #include <algorithm>
@@ -32,12 +34,14 @@ void print_usage(char const* prog)
         << "         [-T|--testnet] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose]\n"
+        << "         [--skip-existing] [--continue-on-error]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
         << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v]\n"
+        << "         [--skip-existing] [--continue-on-error]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
         << "    -f, --farmer-pk HEX             : 96 hex chars (48 B G1 public key).\n"
@@ -57,6 +61,14 @@ void print_usage(char const* prog)
         << "                                      fresh /dev/urandom per plot.\n"
         << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
+        << "    --skip-existing                 : skip plots whose output file is already a\n"
+        << "                                      complete .plot2 (magic + non-trivial size).\n"
+        << "    --continue-on-error             : log per-plot failures and keep going\n"
+        << "                                      instead of aborting the batch.\n"
+        << "  " << prog << " verify <plotfile> [--trials N]\n"
+        << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
+        << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
+        << "    corrupt plot. Default N=100.\n"
         << "\n"
         << "  test-mode positional args:\n"
         << "    <k>            : even integer in [18, 32]\n"
@@ -72,7 +84,18 @@ void print_usage(char const* prog)
         << "    -N, --out-name NAME: override output filename (basename only)\n"
         << "        --gpu-tN       : run phase N on GPU (T1/T2/T3); default CPU\n"
         << "    -G, --gpu-all      : run all phases on GPU (where implemented)\n"
-        << "    -P, --profile      : print per-phase device-time breakdown\n";
+        << "    -P, --profile      : print per-phase device-time breakdown\n"
+        << "\n"
+        << "  Environment variables:\n"
+        << "    XCHPLOT2_STREAMING=1          force the low-VRAM streaming pipeline even\n"
+        << "                                  when the persistent pool would fit.\n"
+        << "    POS2GPU_MAX_VRAM_MB=N         cap the pool/streaming VRAM query to N MB\n"
+        << "                                  (useful for testing the streaming fallback).\n"
+        << "    POS2GPU_STREAMING_STATS=1     log every streaming-path alloc / free.\n"
+        << "    POS2GPU_POOL_DEBUG=1          log pool allocation sizes at construction.\n"
+        << "    POS2GPU_PHASE_TIMING=1        per-phase wall-time breakdown on stderr.\n"
+        << "    ACPP_GFX=gfxXXXX              AMD only — required at build time to AOT\n"
+        << "                                  for the right amdgcn ISA (see README).\n";
 }
 
 bool parse_hex_bytes(std::string const& s, std::vector<uint8_t>& out)
@@ -142,6 +165,8 @@ std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
+    pos2gpu::install_cancel_signal_handlers();
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -152,22 +177,72 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     if (mode == "batch") {
         if (argc < 3) { print_usage(argv[0]); return 1; }
         std::string manifest = argv[2];
-        bool verbose = false;
+        pos2gpu::BatchOptions opts{};
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
-            if (a == "-v" || a == "--verbose") verbose = true;
+            if      (a == "-v" || a == "--verbose")        opts.verbose = true;
+            else if (a == "--skip-existing")               opts.skip_existing = true;
+            else if (a == "--continue-on-error")           opts.continue_on_error = true;
+            else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
         }
         try {
             auto entries = pos2gpu::parse_manifest(manifest);
             std::cerr << "[batch] " << entries.size() << " plots queued\n";
-            auto res = pos2gpu::run_batch(entries, verbose);
-            double per = res.plots_written ? res.total_wall_seconds / res.plots_written : 0;
+            auto res = pos2gpu::run_batch(entries, opts);
+            double per = res.plots_written
+                ? res.total_wall_seconds / double(res.plots_written) : 0;
             std::cerr << "[batch] wrote " << res.plots_written << " plots in "
                       << res.total_wall_seconds << " s ("
-                      << per << " s/plot)\n";
-            return 0;
+                      << per << " s/plot)";
+            if (res.plots_skipped) std::cerr << "; skipped " << res.plots_skipped;
+            if (res.plots_failed)  std::cerr << "; failed "  << res.plots_failed;
+            std::cerr << "\n";
+            return (res.plots_failed > 0) ? 3 : 0;
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    if (mode == "verify") {
+        if (argc < 3) { print_usage(argv[0]); return 1; }
+        std::string plotfile = argv[2];
+        size_t trials = 100;
+        for (int i = 3; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--trials" || a == "-n") && i + 1 < argc) {
+                long v = std::atol(argv[++i]);
+                if (v <= 0) {
+                    std::cerr << "Error: --trials must be > 0\n";
+                    return 1;
+                }
+                trials = static_cast<size_t>(v);
+            } else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        try {
+            std::cerr << "[verify] " << plotfile << ": running " << trials
+                      << " random challenges\n";
+            auto res = pos2gpu::verify_plot_file(plotfile, trials);
+            std::cerr << "[verify] " << res.trials << " trials, "
+                      << res.challenges_with_proof << " with >=1 proof, "
+                      << res.proofs_found << " proofs total\n";
+            if (res.proofs_found == 0) {
+                std::cerr << "[verify] FAIL: no proofs produced — plot is "
+                             "likely corrupt\n";
+                return 4;
+            }
+            std::cerr << "[verify] OK\n";
+            return 0;
+        } catch (std::exception const& e) {
+            std::cerr << "[verify] FAILED: " << e.what() << "\n";
             return 2;
         }
     }
@@ -181,6 +256,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         int meta_group = 0;
         bool testnet = false;
         bool verbose = false;
+        bool skip_existing = false;
+        bool continue_on_error = false;
         std::string out_dir = ".";
         std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex, pool_addr;
         std::string seed_hex;
@@ -207,6 +284,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
+            else if  (a == "--skip-existing")           skip_existing = true;
+            else if  (a == "--continue-on-error")       continue_on_error = true;
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
                 print_usage(argv[0]);
@@ -222,9 +301,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         int const pool_specs = int(!pool_pk_hex.empty())
                              + int(!pool_ph_hex.empty())
                              + int(!pool_addr.empty());
-        if (pool_specs != 1) {
-            std::cerr << "Error: exactly one of --pool-pk, --pool-ph, "
-                         "--pool-contract-address is required\n";
+        if (pool_specs == 0) {
+            std::cerr << "Error: a pool destination is required — pick one of "
+                         "--pool-pk, --pool-ph, --pool-contract-address\n";
+            return 1;
+        }
+        if (pool_specs > 1) {
+            std::cerr << "Error: --pool-pk, --pool-ph, and --pool-contract-address "
+                         "are mutually exclusive (saw " << pool_specs << ")\n";
             return 1;
         }
         if (num < 1) {
@@ -350,16 +434,23 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
             }
 
-            auto res = pos2gpu::run_batch(entries, verbose);
+            pos2gpu::BatchOptions opts{};
+            opts.verbose           = verbose;
+            opts.skip_existing     = skip_existing;
+            opts.continue_on_error = continue_on_error;
+            auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;
             std::cerr << "[plot] wrote " << res.plots_written << " plots in "
                       << res.total_wall_seconds << " s ("
-                      << per << " s/plot)\n";
+                      << per << " s/plot)";
+            if (res.plots_skipped) std::cerr << "; skipped " << res.plots_skipped;
+            if (res.plots_failed)  std::cerr << "; failed "  << res.plots_failed;
+            std::cerr << "\n";
             for (auto const& e : entries) {
                 std::cout << out_dir << "/" << e.out_name << "\n";
             }
-            return 0;
+            return (res.plots_failed > 0) ? 3 : 0;
         } catch (std::exception const& e) {
             std::cerr << "[plot] FAILED: " << e.what() << "\n";
             return 2;

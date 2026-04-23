@@ -1,6 +1,7 @@
 // BatchPlotter.cu — implementation of staggered multi-plot pipeline.
 
 #include "host/BatchPlotter.hpp"
+#include "host/Cancel.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
@@ -8,6 +9,7 @@
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,13 +17,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 
 namespace pos2gpu {
@@ -102,6 +105,85 @@ struct WorkItem {
     size_t            index = 0;
 };
 
+// Rough per-plot upper-bound estimate for the disk preflight. The actual
+// compressed .plot2 is smaller (FSE over proof-fragment stubs); this
+// uncompressed ceiling is deliberately pessimistic so we only WARN when
+// the disk is genuinely too small, not for boundary cases.
+//
+// Formula: 2^k fragments × (proof_fragment_bits) / 8, where
+// proof_fragment_bits ≈ k + (k - MINUS_STUB_BITS) + overhead, ≈ 2k bytes*bits.
+uint64_t approx_plot_bytes_upper_bound(int k)
+{
+    if (k <= 0 || k > 32) return 0;
+    uint64_t const fragments = uint64_t(1) << k;
+    uint64_t const bits_per  = uint64_t(2 * k);  // k stub + k-2 xbits, rounded up
+    return (fragments * bits_per) / 8;
+}
+
+// Check `.plot2` is present at path AND looks like a valid plot file
+// (magic bytes "pos2" + nonzero size). Used for --skip-existing so we
+// don't silently skip a zero-byte or crash-truncated leftover.
+bool looks_like_complete_plot(std::filesystem::path const& path)
+{
+    std::error_code ec;
+    auto const sz = std::filesystem::file_size(path, ec);
+    if (ec || sz < 64) return false;  // header alone is >64 B
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char magic[4]{};
+    in.read(magic, 4);
+    return in.good() && magic[0] == 'p' && magic[1] == 'o'
+                     && magic[2] == 's' && magic[3] == '2';
+}
+
+// Print a warning if the available free space on each unique output
+// directory looks insufficient for the plots targeted there. Purely
+// advisory — the atomic .partial write handles actual ENOSPC cleanly.
+void preflight_disk_space(std::vector<BatchEntry> const& entries,
+                          BatchOptions const& opts)
+{
+    if (entries.empty()) return;
+
+    std::map<std::string, std::pair<size_t, uint64_t>> per_dir;  // dir -> (count, bytes)
+    for (auto const& e : entries) {
+        uint64_t const est = approx_plot_bytes_upper_bound(e.k);
+        auto& slot = per_dir[e.out_dir.empty() ? std::string(".") : e.out_dir];
+        slot.first  += 1;
+        slot.second += est;
+    }
+
+    constexpr double GB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+    for (auto const& [dir, tally] : per_dir) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);  // space() needs it to exist
+        auto const info = std::filesystem::space(dir, ec);
+        if (ec) {
+            if (opts.verbose) {
+                std::fprintf(stderr,
+                    "[batch] preflight: cannot stat free space on %s (%s) — "
+                    "skipping check\n", dir.c_str(), ec.message().c_str());
+            }
+            continue;
+        }
+        double const need_gb = tally.second * GB;
+        double const free_gb = info.available * GB;
+        if (info.available < tally.second) {
+            std::fprintf(stderr,
+                "[batch] WARNING: %s has %.1f GB free but %zu plot(s) may need "
+                "up to ~%.1f GB (uncompressed upper bound). The batch will "
+                "still run; .partial writes are atomic so mid-plot ENOSPC is "
+                "recoverable, but consider freeing space or reducing count.\n",
+                dir.c_str(), free_gb, tally.first, need_gb);
+        } else if (opts.verbose) {
+            std::fprintf(stderr,
+                "[batch] preflight: %s has %.1f GB free, %zu plot(s) need "
+                "up to ~%.1f GB\n",
+                dir.c_str(), free_gb, tally.first, need_gb);
+        }
+    }
+}
+
 // Bounded SPSC queue + end-of-stream signal.
 //
 // Depth = kNumPinnedBuffers - 1 so the producer never overtakes the
@@ -148,12 +230,17 @@ private:
 
 } // namespace
 
-BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
+BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                      BatchOptions const& opts)
 {
     initialize_aes_tables();
 
+    bool const verbose = opts.verbose;
+
     BatchResult res;
     if (entries.empty()) return res;
+
+    preflight_disk_space(entries, opts);
 
     // All entries in a batch must share (k, strength, testnet) so one pool
     // fits all plots. Mixed-shape batches could be supported by splitting
@@ -259,35 +346,50 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
 
     auto t_start = std::chrono::steady_clock::now();
 
+    std::atomic<size_t> plots_failed_consumer{0};
+
     // Consumer: takes finished GpuPipelineResults and writes plot files.
+    // Under continue_on_error, per-plot exceptions (e.g. ENOSPC for a
+    // specific plot) are logged and the loop continues rather than
+    // tearing down the batch. The .partial + rename in
+    // write_plot_file_parallel guarantees failed writes leave nothing
+    // behind at the destination.
     std::thread consumer([&] {
         try {
             WorkItem item;
             while (chan.pop(item)) {
-                std::filesystem::create_directories(item.entry.out_dir);
                 auto full_path = std::filesystem::path(item.entry.out_dir) / item.entry.out_name;
+                try {
+                    std::filesystem::create_directories(item.entry.out_dir);
 
-                std::vector<uint8_t> memo_bytes = item.entry.memo;
-                if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+                    std::vector<uint8_t> memo_bytes = item.entry.memo;
+                    if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
 
-                // Fragments are borrowed from the pool's pinned slot; the
-                // producer is synchronised via the depth-1 channel so that
-                // slot won't be reused until we're done here.
-                write_plot_file_parallel(
-                    full_path.string(),
-                    item.result.fragments(),
-                    item.entry.plot_id.data(),
-                    static_cast<uint8_t>(item.entry.k),
-                    static_cast<uint8_t>(item.entry.strength),
-                    item.entry.testnet ? uint8_t{1} : uint8_t{0},
-                    static_cast<uint16_t>(item.entry.plot_index),
-                    static_cast<uint8_t>(item.entry.meta_group),
-                    std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+                    // Fragments are borrowed from the pool's pinned slot; the
+                    // producer is synchronised via the depth-1 channel so that
+                    // slot won't be reused until we're done here.
+                    write_plot_file_parallel(
+                        full_path.string(),
+                        item.result.fragments(),
+                        item.entry.plot_id.data(),
+                        static_cast<uint8_t>(item.entry.k),
+                        static_cast<uint8_t>(item.entry.strength),
+                        item.entry.testnet ? uint8_t{1} : uint8_t{0},
+                        static_cast<uint16_t>(item.entry.plot_index),
+                        static_cast<uint8_t>(item.entry.meta_group),
+                        std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
-                ++plots_done;
-                if (verbose) {
-                    std::fprintf(stderr, "[batch] consumer wrote plot %zu: %s\n",
-                                 item.index, full_path.string().c_str());
+                    ++plots_done;
+                    if (verbose) {
+                        std::fprintf(stderr, "[batch] consumer wrote plot %zu: %s\n",
+                                     item.index, full_path.string().c_str());
+                    }
+                } catch (std::exception const& e) {
+                    if (!opts.continue_on_error) throw;
+                    ++plots_failed_consumer;
+                    std::fprintf(stderr,
+                        "[batch] plot %zu FAILED (write %s): %s — continuing\n",
+                        item.index, full_path.string().c_str(), e.what());
                 }
             }
         } catch (...) {
@@ -296,10 +398,34 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
         }
     });
 
+    size_t producer_failed = 0;
+
     // Producer (this thread): drives the GPU pipeline, hands off to consumer.
     try {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (consumer_failed) break;
+
+            if (cancel_requested()) {
+                std::fprintf(stderr,
+                    "[batch] cancel received — stopping before plot %zu "
+                    "(%zu plot(s) not started)\n",
+                    i, entries.size() - i);
+                break;
+            }
+
+            if (opts.skip_existing) {
+                auto out_path = std::filesystem::path(entries[i].out_dir)
+                                / entries[i].out_name;
+                if (looks_like_complete_plot(out_path)) {
+                    if (verbose) {
+                        std::fprintf(stderr,
+                            "[batch] skipping plot %zu: %s (already exists)\n",
+                            i, out_path.string().c_str());
+                    }
+                    ++res.plots_skipped;
+                    continue;
+                }
+            }
 
             auto t_plot = std::chrono::steady_clock::now();
 
@@ -314,16 +440,25 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             item.entry  = entries[i];
             item.index  = i;
             int const slot = static_cast<int>(i % GpuBufferPool::kNumPinnedBuffers);
-            if (pool_ptr) {
-                // Pool path: rotate pinned slot per plot. The channel's
-                // (kNumPinnedBuffers - 1) depth holds the producer back
-                // before it overtakes the consumer's read of that slot.
-                item.result = run_gpu_pipeline(cfg, *pool_ptr, slot);
-            } else {
-                // Streaming path with externally-owned pinned: same
-                // rotation + channel-depth invariant.
-                item.result = run_gpu_pipeline_streaming(
-                    cfg, stream_pinned[slot], stream_pinned_cap);
+            try {
+                if (pool_ptr) {
+                    // Pool path: rotate pinned slot per plot. The channel's
+                    // (kNumPinnedBuffers - 1) depth holds the producer back
+                    // before it overtakes the consumer's read of that slot.
+                    item.result = run_gpu_pipeline(cfg, *pool_ptr, slot);
+                } else {
+                    // Streaming path with externally-owned pinned: same
+                    // rotation + channel-depth invariant.
+                    item.result = run_gpu_pipeline_streaming(
+                        cfg, stream_pinned[slot], stream_pinned_cap);
+                }
+            } catch (std::exception const& e) {
+                if (!opts.continue_on_error) throw;
+                ++producer_failed;
+                std::fprintf(stderr,
+                    "[batch] plot %zu FAILED (GPU): %s — continuing\n",
+                    i, e.what());
+                continue;
             }
 
             if (verbose) {
@@ -356,6 +491,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     }
 
     res.plots_written = plots_done.load();
+    res.plots_failed  = producer_failed + plots_failed_consumer.load();
     res.total_wall_seconds = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_start).count();
     return res;
