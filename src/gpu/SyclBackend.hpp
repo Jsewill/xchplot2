@@ -20,16 +20,43 @@
 #include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 
+#include <cstdio>
+#include <exception>
 #include <vector>
 
 namespace pos2gpu::sycl_backend {
+
+// Async-exception handler for the persistent queue. AdaptiveCpp's
+// default policy for unhandled async errors is to call std::terminate()
+// via its `throw_result` path, which is what caused the observed
+// "Aborted (core dumped)" after a synchronous malloc_device failure
+// threw a clean std::runtime_error — secondary async errors (e.g. a
+// CUDA:2 from in-flight work on the now-starved context) hit the
+// default handler and killed the process before the CLI could exit
+// normally. Logging and swallowing here keeps the synchronous
+// std::runtime_error as the primary signal.
+inline void async_error_handler(sycl::exception_list exns) noexcept
+{
+    for (std::exception_ptr const& ep : exns) {
+        try { std::rethrow_exception(ep); }
+        catch (sycl::exception const& e) {
+            std::fprintf(stderr, "[sycl async] %s\n", e.what());
+        }
+        catch (std::exception const& e) {
+            std::fprintf(stderr, "[sycl async] %s\n", e.what());
+        }
+        catch (...) {
+            std::fprintf(stderr, "[sycl async] (unknown exception type)\n");
+        }
+    }
+}
 
 // Persistent SYCL queue. gpu_selector_v ensures the CUDA-backed RTX 4090
 // (or whichever GPU the AdaptiveCpp build was configured for) is picked
 // over the AdaptiveCpp OpenMP host device that's also visible.
 inline sycl::queue& queue()
 {
-    static sycl::queue q{ sycl::gpu_selector_v };
+    static sycl::queue q{ sycl::gpu_selector_v, async_error_handler };
     return q;
 }
 
