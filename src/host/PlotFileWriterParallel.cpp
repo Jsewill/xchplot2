@@ -18,11 +18,18 @@
 #include "plot/PlotIO.hpp"
 #include "plot/Plotter.hpp"
 #include "pos/ProofParams.hpp"
+#include "pos/ProofValidator.hpp"
+#include "prove/Prover.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
+#include <random>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -141,8 +148,23 @@ size_t write_plot_file_parallel(
         for (auto& f : tasks) f.get();
     }
 
-    // Serial write phase — file I/O is sequential anyway.
-    std::ofstream out(filename, std::ios::binary);
+    // Serial write phase — file I/O is sequential anyway. Write to
+    // <filename>.partial and rename on success so SIGINT / crash / ENOSPC
+    // never leaves a malformed .plot2 at the destination. The guard
+    // unlinks the partial on early exit.
+    std::string const partial = filename + ".partial";
+    struct PartialGuard {
+        std::string const& path;
+        bool committed = false;
+        ~PartialGuard() {
+            if (!committed) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        }
+    } guard{partial};
+
+    std::ofstream out(partial, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("Failed to open " + filename);
 
     out.write("pos2", 4);
@@ -191,7 +213,48 @@ size_t write_plot_file_parallel(
     if (!out) throw std::runtime_error("Failed to write chunk offsets to " + filename);
     out.seekp(0, std::ios::end);
 
+    // Close before rename so buffered writes are flushed and the destination
+    // sees the final byte image.
+    out.close();
+    if (!out) throw std::runtime_error("Failed to close " + partial);
+
+    std::error_code ec;
+    std::filesystem::rename(partial, filename, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "Failed to rename " + partial + " -> " + filename + ": " + ec.message());
+    }
+    guard.committed = true;
+
     return bytes_written;
+}
+
+VerifyResult verify_plot_file(std::string const& filename, size_t n_trials)
+{
+    VerifyResult res;
+    if (n_trials == 0) return res;
+
+    Prover prover(filename);
+
+    // Fresh entropy per call; the result only depends on the plot content,
+    // not the specific challenges, beyond being a uniform sample.
+    std::random_device rd;
+    std::mt19937_64    gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+
+    for (size_t i = 0; i < n_trials; ++i) {
+        std::array<uint8_t, 32> challenge{};
+        for (size_t j = 0; j < 32; j += 8) {
+            uint64_t const v = dist(gen);
+            std::memcpy(challenge.data() + j, &v, 8);
+        }
+        auto const chains = prover.prove(
+            std::span<uint8_t const, 32>(challenge.data(), 32));
+        res.trials++;
+        res.proofs_found += chains.size();
+        if (!chains.empty()) res.challenges_with_proof++;
+    }
+    return res;
 }
 
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename)

@@ -64,4 +64,21 @@ std::vector<uint64_t> run_cpu_plotter_to_fragments(
 // plot/PlotFile.hpp to other TUs.
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename);
 
+// Result of a `verify_plot_file` call.
+//   trials                 — how many random challenges were tried
+//   challenges_with_proof  — challenges that produced ≥ 1 proof
+//   proofs_found           — total proofs summed across all trials
+struct VerifyResult {
+    size_t trials                = 0;
+    size_t challenges_with_proof = 0;
+    size_t proofs_found          = 0;
+};
+
+// Opens `filename` via pos2-chip's `Prover` and runs `n_trials` random
+// challenges. Each proof is internally validated by the prover; a result
+// with zero proofs across a sensible sample (>= 100) strongly suggests
+// the plot is corrupt. Lives here because Prover.hpp transitively pulls
+// in pos2-chip plot/pos headers (see top-of-file comment in the .cpp).
+VerifyResult verify_plot_file(std::string const& filename, size_t n_trials);
+
 } // namespace pos2gpu
