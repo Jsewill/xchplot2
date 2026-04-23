@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -273,6 +274,46 @@ GpuBufferPool::~GpuBufferPool()
     for (int i = 0; i < kNumPinnedBuffers; ++i) {
         if (h_pinned_t3[i]) sycl::free(h_pinned_t3[i], q);
     }
+}
+
+DeviceMemInfo query_device_memory()
+{
+    sycl::queue& q = sycl_backend::queue();
+    DeviceMemInfo info;
+    info.total_bytes =
+        q.get_device().get_info<sycl::info::device::global_mem_size>();
+    // SYCL has no portable free-memory query; AdaptiveCpp's
+    // global_mem_size returns the device total. On the CUDA backend
+    // the underlying driver often subtracts active reservations
+    // (framebuffer, compositor) before reporting, which gets us
+    // closer to "free" in practice. Treat the result as an upper
+    // bound; sycl::malloc_device is still the source of truth.
+    info.free_bytes = info.total_bytes;
+
+    if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
+        size_t const cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        info.free_bytes  = std::min(info.free_bytes,  cap);
+        info.total_bytes = std::min(info.total_bytes, cap);
+    }
+    return info;
+}
+
+size_t streaming_peak_bytes(int k)
+{
+    // Anchor: 7288 MB at k=28 (measured, sm_89 + CUB and gfx1031 +
+    // SortSycl agree). Dominant terms scale with 2^k, which is 4× per
+    // k += 2. Extrapolate from the anchor for other k.
+    constexpr size_t anchor_mb = 7288;
+    if (k == 28) return anchor_mb << 20;
+    if (k <  18) return size_t(16) << 20;       // floor for tiny test plots
+    if (k >  32) return size_t(anchor_mb) << (20 + ((32 - 28) * 2));
+
+    if (k < 28) {
+        int const shift = (28 - k) * 2;  // k drops by 2 → 4× smaller
+        return (size_t(anchor_mb) << 20) >> shift;
+    }
+    int const shift = (k - 28) * 2;
+    return (size_t(anchor_mb) << 20) << shift;
 }
 
 } // namespace pos2gpu

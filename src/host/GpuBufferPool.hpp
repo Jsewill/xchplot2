@@ -163,4 +163,21 @@ private:
     std::mutex pair_a_mu_;
 };
 
+// Free + total device VRAM at call time. On SYCL backends without a
+// portable free-memory query, free_bytes is approximated as
+// total_bytes (AdaptiveCpp's global_mem_size = device total). Used as
+// a preflight signal; sycl::malloc_device remains the source of
+// truth. POS2GPU_MAX_VRAM_MB caps both fields when set.
+struct DeviceMemInfo {
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+};
+DeviceMemInfo query_device_memory();
+
+// Upper bound on streaming-pipeline peak device VRAM at given k.
+// Measured: ~7288 MB at k=28 (README §VRAM); dominant terms (T1 sorted
+// ~3.12 GB + T2 match output ~4.16 GB + tens of MB sort scratch) all
+// scale with 2^k, so other k extrapolate linearly from the k=28 anchor.
+size_t streaming_peak_bytes(int k);
+
 } // namespace pos2gpu
