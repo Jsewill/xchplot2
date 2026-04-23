@@ -31,10 +31,14 @@ constexpr uint32_t kTestnetGXorConst = 0xA3B1C4D7u;
 
 // Layout of caller-provided d_temp_storage:
 //   [0                  .. cub_bytes)            CUB sort scratch
-//   [keys_a_off         .. keys_a_off + N*4)     keys_a (uint32)
+//   [keys_a_off         .. keys_a_off + N*4)     keys_a (uint32)  (*)
 //   [keys_b_off         .. keys_b_off + N*4)     keys_b (uint32)
 //   [vals_a_off         .. vals_a_off + N*4)     vals_a (uint32)
 //   [vals_b_off         .. vals_b_off + N*4)     vals_b (uint32)
+// (*) In split mode (split_keys_a != nullptr) the keys_a slot is OMITTED
+// from d_temp_storage — keys_a_off is set to SIZE_MAX as a sentinel and
+// keys_b_off follows directly after cub_scratch. Total bytes drop by
+// one aligned (N*u32) block (~1 GiB at k=28).
 struct ScratchLayout {
     size_t cub_bytes;
     size_t keys_a_off;
@@ -46,12 +50,16 @@ struct ScratchLayout {
 
 inline size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
-ScratchLayout layout_for(uint64_t total, size_t cub_bytes)
+ScratchLayout layout_for(uint64_t total, size_t cub_bytes, bool split_keys_a)
 {
     ScratchLayout s{};
     s.cub_bytes  = cub_bytes;
     size_t cur   = align_up(s.cub_bytes, 256);
-    s.keys_a_off = cur; cur += sizeof(uint32_t) * total; cur = align_up(cur, 256);
+    if (split_keys_a) {
+        s.keys_a_off = ~size_t{0};  // sentinel: keys_a lives externally
+    } else {
+        s.keys_a_off = cur; cur += sizeof(uint32_t) * total; cur = align_up(cur, 256);
+    }
     s.keys_b_off = cur; cur += sizeof(uint32_t) * total; cur = align_up(cur, 256);
     s.vals_a_off = cur; cur += sizeof(uint32_t) * total; cur = align_up(cur, 256);
     s.vals_b_off = cur; cur += sizeof(uint32_t) * total; cur = align_up(cur, 256);
@@ -64,11 +72,11 @@ ScratchLayout layout_for(uint64_t total, size_t cub_bytes)
 void launch_construct_xs(
     uint8_t const* plot_id_bytes, int k, bool testnet,
     XsCandidateGpu* d_out, void* d_temp_storage, size_t* temp_bytes,
-    sycl::queue& q)
+    sycl::queue& q, void* split_keys_a)
 {
     return launch_construct_xs_profiled(plot_id_bytes, k, testnet,
                                         d_out, d_temp_storage, temp_bytes,
-                                        nullptr, nullptr, q);
+                                        nullptr, nullptr, q, split_keys_a);
 }
 
 void launch_construct_xs_profiled(
@@ -80,7 +88,8 @@ void launch_construct_xs_profiled(
     size_t* temp_bytes,
     cudaEvent_t /*after_gen*/,
     cudaEvent_t /*after_sort*/,
-    sycl::queue& q)
+    sycl::queue& q,
+    void* split_keys_a)
 {
     // NOTE: the cudaEvent_t after_gen / after_sort parameters are kept
     // for API compatibility but no longer recorded. xs_bench's per-phase
@@ -101,7 +110,8 @@ void launch_construct_xs_profiled(
         nullptr, nullptr,
         total, /*begin_bit=*/0, /*end_bit=*/k, q);
 
-    auto sl = layout_for(total, cub_bytes);
+    bool const split = (split_keys_a != nullptr);
+    auto sl = layout_for(total, cub_bytes, split);
 
     if (d_temp_storage == nullptr) {
         *temp_bytes = sl.total_bytes;
@@ -113,7 +123,9 @@ void launch_construct_xs_profiled(
 
     auto* base = static_cast<uint8_t*>(d_temp_storage);
     auto* cub_scratch = base; // first cub_bytes
-    auto* keys_a = reinterpret_cast<uint32_t*>(base + sl.keys_a_off);
+    auto* keys_a = split
+        ? static_cast<uint32_t*>(split_keys_a)
+        : reinterpret_cast<uint32_t*>(base + sl.keys_a_off);
     auto* keys_b = reinterpret_cast<uint32_t*>(base + sl.keys_b_off);
     auto* vals_a = reinterpret_cast<uint32_t*>(base + sl.vals_a_off);
     auto* vals_b = reinterpret_cast<uint32_t*>(base + sl.vals_b_off);

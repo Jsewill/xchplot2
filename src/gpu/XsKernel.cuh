@@ -28,7 +28,15 @@ namespace pos2gpu {
 //   d_out          : device buffer of at least (1ULL << k) XsCandidateGpu
 //   d_temp_storage : device scratch; pass nullptr first to query size
 //   temp_bytes     : in/out — when d_temp_storage is null, set to required size
-//   stream         : optional CUDA stream
+//   split_keys_a   : optional device pointer of at least total*sizeof(uint32_t)
+//                    bytes. When non-null, the sort's keys_a slot is placed
+//                    there instead of inside d_temp_storage, and *temp_bytes
+//                    correspondingly shrinks by total*u32 (plus alignment).
+//                    Intended for the pool path, which aliases keys_a into
+//                    d_storage's tail (idle during Xs gen+sort) to drop
+//                    ~1 GiB off the pair_b xs-scratch region at k=28. The
+//                    non-null-ness is the flag in sizing mode (the actual
+//                    pointer is read only when d_temp_storage != nullptr).
 //
 // Returns cudaSuccess on launch success. The sort is asynchronous on the
 // stream — synchronize before reading d_out on the host.
@@ -39,7 +47,8 @@ void launch_construct_xs(
     XsCandidateGpu* d_out,
     void* d_temp_storage,
     size_t* temp_bytes,
-    sycl::queue& q);
+    sycl::queue& q,
+    void* split_keys_a = nullptr);
 
 // Optional callback fired between the gen kernel and the sort, useful for
 // per-stage cudaEvent timing. Pass nullptr to skip.
@@ -52,6 +61,7 @@ void launch_construct_xs_profiled(
     size_t* temp_bytes,
     cudaEvent_t after_gen,    // nullable; recorded after gen kernel queued
     cudaEvent_t after_sort,   // nullable; recorded after sort queued
-    sycl::queue& q);
+    sycl::queue& q,
+    void* split_keys_a = nullptr);
 
 } // namespace pos2gpu
