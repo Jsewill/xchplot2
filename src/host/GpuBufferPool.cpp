@@ -88,17 +88,31 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
 
     // d_pair_b holds the *sort output* of the current phase (sorted T1
     // meta, sorted T2 meta+xbits, T3 frags) AND the Xs construction
-    // scratch (~4.4 GB at k=28: 4 × total_xs uint32s + radix temp). Sized
-    // to the max of those — at k=28 the Xs scratch dominates by ~3 GB
-    // over the largest sorted output (cap·12 B for T2's meta+xbits).
+    // scratch. Sized to the max of those.
+    //
+    // Split-keys_a optimisation: the pool places the Xs sort's keys_a
+    // slot (total_xs·u32 = 1 GiB at k=28) in d_storage's tail — idle
+    // during Xs gen+sort, and the final pack phase only writes
+    // d_storage[0..total_xs·8), leaving the tail region undisturbed.
+    // This drops xs_temp_bytes from ~4.36 GB (4·N·u32 + cub) to
+    // ~3.22 GB (3·N·u32 + cub). At k=28 pair_b is then bounded by
+    // cap·12 (sorted T2 meta+xbits = 3.27 GB) rather than xs scratch,
+    // saving ~1.09 GB off the pool's peak VRAM requirement vs the
+    // pre-split layout.
     uint8_t dummy_plot_id[32] = {};
+    // Non-null sentinel tells launch_construct_xs to report the
+    // split-layout size. The sentinel value is read only in sizing
+    // mode (d_temp_storage == nullptr), where only its non-null-ness
+    // matters.
+    void* const xs_split_sentinel = reinterpret_cast<void*>(uintptr_t{1});
     launch_construct_xs(dummy_plot_id, k, testnet,
-                                   nullptr, nullptr, &xs_temp_bytes, q);
+                                   nullptr, nullptr, &xs_temp_bytes, q,
+                                   xs_split_sentinel);
     pair_b_bytes = std::max({
         static_cast<size_t>(cap) * sizeof(uint64_t),                          // sorted T1 meta
         static_cast<size_t>(cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
         static_cast<size_t>(cap) * sizeof(uint64_t),                          // T3 frags out
-        xs_temp_bytes,                                                        // Xs aliased scratch
+        xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
     });
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
@@ -129,7 +143,15 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     {
         size_t const required_device =
             storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
-        size_t const margin = 512ULL * 1024 * 1024; // 512 MB
+        // Margin covers per-context driver state + AES T-tables + the
+        // tiny (sizeof(uint64_t)) d_counter alloc that's not counted in
+        // sort_scratch. Originally 512 MB (slice 17c); trimmed to 256 MB
+        // after measuring actual runtime overhead on gfx1031/ROCm 6.2
+        // and sm_89/CUDA 13: both land under 150 MB of non-pool device
+        // allocations, so a 256 MB margin leaves >100 MB headroom while
+        // letting cards on the threshold (e.g. 12 GiB reporting ~11.8
+        // GiB free at ctor time) now succeed into the pool path.
+        size_t const margin = 256ULL * 1024 * 1024; // 256 MB
         size_t const total_b =
             q.get_device().get_info<sycl::info::device::global_mem_size>();
         size_t const free_b = total_b;  // approximation — see comment above
@@ -140,7 +162,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                 std::to_string(k) + " strength=" + std::to_string(strength) +
                 "; need ~" + std::to_string(to_gib(required_device + margin)).substr(0, 5) +
                 " GiB (pool " + std::to_string(to_gib(required_device)).substr(0, 5) +
-                " GiB + ~0.5 GiB runtime), only " +
+                " GiB + ~0.25 GiB runtime), only " +
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
                 " GiB total. Use a smaller k or a GPU with more VRAM.");

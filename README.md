@@ -39,8 +39,8 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
     from `rocminfo` automatically. Other gfx targets (`gfx1030` /
     `gfx1100`) build cleanly but are untested on real hardware.
   - **Intel oneAPI** is wired up but untested.
-- **VRAM:** 8 GB minimum. Cards with less than ~17 GB free
-  transparently use the streaming pipeline; 18 GB+ cards reliably use
+- **VRAM:** 8 GB minimum. Cards with less than ~11 GB free
+  transparently use the streaming pipeline; 12 GB+ cards reliably use
   the persistent buffer pool for faster steady-state. Both paths
   produce byte-identical plots. Detailed breakdown in [VRAM](#vram).
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
@@ -345,12 +345,14 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 PoS2 plots are k=28 by spec. Two code paths, dispatched automatically
 based on available VRAM:
 
-- **Pool path (~16 GB device + ~6 GB pinned host; 18 GB+ cards
+- **Pool path (~11 GB device + ~4 GB pinned host; 12 GB+ cards
   reliably).** The persistent buffer pool is sized worst-case and
   reused across plots in `batch` mode for amortised allocator cost and
-  double-buffered D2H. Targets for steady-state: RTX 4090 / 5090,
-  A6000, H100, etc. RTX 4080 (16 GB) may transparently fall back to
-  streaming after driver overhead.
+  double-buffered D2H. Xs sort's keys_a slot aliases d_storage tail
+  (idle during Xs gen+sort), trimming pair_b's worst case from
+  `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
+  saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
+  RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
 - **Streaming path (~8 GB).** Allocates per-phase and frees between
   phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
   merge-with-gather is split into three passes so the live set stays

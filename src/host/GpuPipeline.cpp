@@ -201,9 +201,21 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     uint64_t*       d_frags_out       = static_cast<uint64_t*>      (pool.d_pair_b);
 
     uint64_t*       d_count        = pool.d_counter;
-    // Xs phase needs ~4.34 GB scratch at k=28; d_pair_b is idle through
-    // the whole Xs phase (not touched until T1 sort permute writes to it),
-    // so we alias it rather than allocating separately.
+    // Xs phase needs ~3.22 GB scratch at k=28 in split-keys_a mode
+    // (3 × total_xs × u32 + cub); d_pair_b is idle through the whole
+    // Xs phase (not touched until T1 sort permute writes to it), so
+    // we alias it rather than allocating separately.
+    //
+    // Split-keys_a: the Xs sort's keys_a (total_xs · u32 = 1 GiB at
+    // k=28) lives in d_storage's tail — bytes [total_xs·8, storage_bytes)
+    // which is idle during Xs gen+sort. The final pack phase writes
+    // d_storage[0..total_xs·8) only, leaving keys_a's memory region
+    // undisturbed (and its contents unread after the sort anyway, so
+    // the overlap on T1/T2/T3-sort aliases in d_storage after pack is
+    // a pure write-without-read of stale bytes). Saves ~1 GiB off the
+    // pair_b xs-scratch region — see GpuBufferPool.cpp for sizing.
+    void* const d_xs_split_keys_a = static_cast<uint8_t*>(pool.d_storage)
+                                    + pool.total_xs * sizeof(XsCandidateGpu);
     void*           d_xs_temp      = pool.d_pair_b;
     void*           d_sort_scratch = pool.d_sort_scratch;
     // Lazy pinned-host alloc: skips ~600 ms × (kNumPinnedBuffers-1)
@@ -271,14 +283,16 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // ---------- Phase Xs ----------
     size_t xs_temp_bytes = 0;
     launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              nullptr, nullptr, &xs_temp_bytes, q);
+                              nullptr, nullptr, &xs_temp_bytes, q,
+                              d_xs_split_keys_a);
     int p_xs = begin_phase("Xs gen+sort");
     // Xs phase events stubbed in slice 17b — pass nullptr for the (no-op)
     // profiling event slots. The launch_construct_xs_profiled signature still
     // accepts cudaEvent_t for API compatibility but ignores the values.
     launch_construct_xs_profiled(cfg.plot_id.data(), cfg.k, cfg.testnet,
                                        d_xs, d_xs_temp, &xs_temp_bytes,
-                                       nullptr, nullptr, q);
+                                       nullptr, nullptr, q,
+                                       d_xs_split_keys_a);
     // Overlap d_pair_a's lazy malloc_device (~400-500 ms for 4.36 GB at
     // k=28) with Xs gen's GPU execution. In production
     // (POS2GPU_PHASE_TIMING unset), launch_construct_xs_profiled returns
