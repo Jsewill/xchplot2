@@ -353,18 +353,27 @@ based on available VRAM:
   `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
   saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
   RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
-- **Streaming path (~8 GB).** Allocates per-phase and frees between
+- **Streaming path (~7.3 GB peak; 8 GB cards with ~500 MB driver /
+  compositor headroom).** Allocates per-phase and frees between
   phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
   merge-with-gather is split into three passes so the live set stays
-  under 8 GB. Targets 8 GB cards (GTX 1070 class and up). Slower per
-  plot (~3.7 s vs ~2.4 s at k=28 on a 4090) because it pays per-phase
-  `cudaMalloc`/`cudaFree` instead of amortising.
+  under 8 GB. Peak at k=28 is **7288 MB** (measured on both sm_89 +
+  CUB and gfx1031 + SortSycl — same algebra: T1 sorted 3.12 GB + T2
+  match output 4.16 GB, with sort scratch in the tens of MB). Targets
+  8 GB cards (GTX 1070 class and up). Slower per plot (~3.7 s vs
+  ~2.4 s at k=28 on a 4090) because it pays per-phase
+  `malloc_device`/`free` instead of amortising. Log the full alloc
+  trace with `POS2GPU_STREAMING_STATS=1`.
 
-`xchplot2` queries `cudaMemGetInfo` at pool construction; if the
-pool doesn't fit, it transparently falls back to the streaming
+At pool construction `xchplot2` queries `cudaMemGetInfo` on the
+CUDA-only build, or `global_mem_size` (device total) on the SYCL
+path — SYCL has no portable free-memory query, so the check
+effectively approximates "free == total" and lets the actual
+`malloc_device` failure trigger the fallback. Either way, if the
+pool doesn't fit it transparently falls back to the streaming
 pipeline with no flag needed. Force streaming on any card with
-`XCHPLOT2_STREAMING=1`, useful for testing or for users who want the
-smaller peak regardless.
+`XCHPLOT2_STREAMING=1`, useful for testing or for users who want
+the smaller peak regardless.
 
 Plot output is bit-identical between the two paths — the streaming
 code reorganises memory, not algorithms.
@@ -381,6 +390,7 @@ wall from `xchplot2 batch` (10-plot manifest, mean):
 | `main`, `XCHPLOT2_BUILD_CUDA=ON` (CUB sort) | 2.41 s | NVIDIA fast path on the SYCL/AdaptiveCpp port |
 | `main`, `XCHPLOT2_BUILD_CUDA=OFF` (hand-rolled SYCL radix) | 3.79 s | cross-vendor fallback (AMD/Intel) on AdaptiveCpp |
 | streaming path, ≤8 GB cards | ~3.7 s | pool path is preferred when VRAM allows |
+| `main` on RX 6700 XT (gfx1031 / ROCm 6.2 / AdaptiveCpp HIP) | **9.97 s** | AMD batch steady-state at k=28; T-table AES near-optimal on RDNA2 via this compiler stack |
 
 The `main`/CUB row is +12% over `cuda-only` from extra AdaptiveCpp
 scheduling overhead. The SYCL row is +57% over CUB on the same NVIDIA
