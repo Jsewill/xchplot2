@@ -12,10 +12,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -63,6 +65,10 @@ void print_usage(char const* prog)
         << "                                        0,1,3     — explicit comma list\n"
         << "                                      Omitted = single device via the\n"
         << "                                      CUDA-default device (zero-config).\n"
+        << "  " << prog << " parity-check [--dir PATH]\n"
+        << "    Run every *_parity binary in PATH (default: ./build/tools/parity)\n"
+        << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
+        << "    <build-dir>` first. Useful for post-refactor regression screening.\n"
         << "\n"
         << "  test-mode positional args:\n"
         << "    <k>            : even integer in [18, 32]\n"
@@ -232,6 +238,80 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
             return 2;
         }
+    }
+
+    if (mode == "parity-check") {
+        std::string dir = "./build/tools/parity";
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--dir" || a == "-d") && i + 1 < argc) {
+                dir = argv[++i];
+            } else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+
+        // Glob every *_parity binary in `dir`. Same code path works for
+        // both branches — main ships sycl_*_parity extras that cuda-only
+        // doesn't, and the wildcard picks up whichever actually exists.
+        std::vector<std::filesystem::path> tests;
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) {
+            for (auto const& entry :
+                 std::filesystem::directory_iterator(dir, ec))
+            {
+                auto const name = entry.path().filename().string();
+                constexpr char const kSuffix[] = "_parity";
+                constexpr size_t kLen = sizeof(kSuffix) - 1;
+                bool const ends =
+                    name.size() >= kLen &&
+                    name.compare(name.size() - kLen, kLen, kSuffix) == 0;
+                if (ends && entry.is_regular_file(ec)) {
+                    tests.push_back(entry.path());
+                }
+            }
+        }
+        if (tests.empty()) {
+            std::cerr << "No `*_parity` binaries found under " << dir << ".\n"
+                         "Build them first:\n"
+                         "  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release\n"
+                         "  cmake --build build --parallel\n"
+                         "Then re-run from the repo root, or pass --dir <path>.\n";
+            return 2;
+        }
+        std::sort(tests.begin(), tests.end());
+
+        int pass = 0, fail = 0;
+        std::cerr << "==> parity tests (" << tests.size() << " found in "
+                  << dir << ")\n";
+        for (auto const& test : tests) {
+            auto const name = test.filename().string();
+            std::string const log_path =
+                "/tmp/xchplot2-parity-" + name + ".log";
+            // Redirecting through the shell: `test` is a path we
+            // generated ourselves from a directory listing — no user-
+            // controlled shell metachars reach this string.
+            std::string const cmd =
+                test.string() + " >" + log_path + " 2>&1";
+            auto const t0 = std::chrono::steady_clock::now();
+            int const rc = std::system(cmd.c_str());
+            auto const ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+            if (rc == 0) {
+                std::fprintf(stderr, "  PASS  %-32s  (%.1f ms)\n",
+                             name.c_str(), ms);
+                ++pass;
+            } else {
+                std::fprintf(stderr,
+                             "  FAIL  %-32s  (exit %d; log: %s)\n",
+                             name.c_str(), rc, log_path.c_str());
+                ++fail;
+            }
+        }
+        std::fprintf(stderr, "\n==> %d passed, %d failed\n", pass, fail);
+        return fail > 0 ? 1 : 0;
     }
 
     if (mode == "plot") {

@@ -230,9 +230,25 @@ runs a live k=22 plot across `--devices 0,1`.
 ### Lower-level subcommands
 
 ```bash
-xchplot2 test  <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
-xchplot2 batch <manifest.tsv> [-v] [--devices <SPEC>]
+xchplot2 test          <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
+xchplot2 batch         <manifest.tsv> [-v] [--devices <SPEC>]
+xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression screen
 ```
+
+## Environment variables
+
+| Variable                      | Effect                                                                  |
+|-------------------------------|-------------------------------------------------------------------------|
+| `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
+| `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback.          |
+| `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `cudaMalloc` / `cudaFree`.                     |
+| `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
+| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
+| `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
+| `CUDA_PATH=/path/to/cuda`     | Override the CUDA Toolkit root for linking (default: `/opt/cuda`, `/usr/local/cuda`). Useful on JetPack / non-standard installs. |
+| `CUDA_HOME=/path/to/cuda`     | Fallback for `CUDA_PATH` — same effect.                                 |
+| `POS2_CHIP_DIR=/path`         | Build-time: point at a local pos2-chip checkout instead of FetchContent.|
+| `XCHPLOT2_TEST_GPU_COUNT=N`   | Override `scripts/test-multi-gpu.sh`'s auto-detected GPU count (forces run / skip without consulting `nvidia-smi`). |
 
 ## Testing farming on a testnet
 
