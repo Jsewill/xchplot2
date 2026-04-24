@@ -4,23 +4,17 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 `.plot2` files byte-identical to the
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
-> **Status — work in progress.** The plotter produces correct,
-> spec-compliant `.plot2` output: per-phase parity tests verify
-> byte-identical agreement with pos2-chip's CPU reference at every
-> stage, the CUB and SYCL backends produce bit-identical files, and
-> determinism holds across runs. The project is still actively under
-> development — performance, cross-vendor support (AMD / Intel), and
-> the install / CI story are evolving. Expect rough edges; use the
-> [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
-> branch if you want the most-tested code path.
+> **Status — work in progress.** Plots are byte-identical to the
+> pos2-chip CPU reference and deterministic across runs; performance,
+> AMD/Intel support, and the install/CI story are still evolving. Use
+> [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only) for
+> the most-tested path.
 
-> **Branches:** `main` carries the SYCL/AdaptiveCpp port that lets the
-> plotter run on AMD and Intel GPUs (with an opt-out CUB sort path
-> preserved for NVIDIA). The original CUDA-only implementation, which
-> is ~1.5× faster on NVIDIA than the SYCL fallback at k=28, lives on
-> the [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
-> branch — use it if you only ever target NVIDIA and want the last
-> bit of throughput.
+> **Branches:** `main` — SYCL/AdaptiveCpp port, runs on NVIDIA +
+> AMD + Intel (CUB fast path preserved on NVIDIA).
+> [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only) —
+> original pure-CUDA path, pick it if you only target NVIDIA. See
+> [Performance](#performance) for the tradeoff.
 
 ## Quick start
 
