@@ -364,11 +364,50 @@ decisions. When the grouped layout lands, the auto-incrementing
 `<plot-index>` above is the per-plot within-group identifier it
 will expect.
 
+#### Multi-GPU: `--devices`
+
+Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
+across multiple GPUs — one worker thread per device, each with its own
+buffer pool and writer channel. Plots are partitioned round-robin, so a
+batch of 10 plots on 2 GPUs sends plots 0/2/4/6/8 to the first GPU and
+1/3/5/7/9 to the second.
+
+```bash
+# Every visible GPU — enumerated at runtime.
+xchplot2 plot --k 28 --num 10 -f <farmer-pk> -c <pool-contract> \
+    --out /mnt/plots --devices all
+
+# Only these specific device ids (sorted, deduplicated).
+xchplot2 plot ... --devices 0,2,3
+
+# Explicit single id (same as omitting the flag on a single-GPU host).
+xchplot2 plot ... --devices 0
+```
+
+Omitted flag = single device via the default SYCL / CUDA selector —
+identical to pre-multi-GPU behavior, zero regression risk.
+
+**Caveats for v1:**
+
+- Static round-robin partition. If your GPUs differ in speed the
+  batch finishes only as fast as the slowest worker's slice; use
+  `--devices` to pick matched cards when that matters.
+- Each worker gets its own ~4 GB pinned host pool, so host RAM scales
+  linearly. A 4-GPU rig pins ~16 GB — size accordingly.
+- The workers share `stderr` (line-buffered, atomic per-`fprintf`) so
+  log lines from different GPUs may interleave. Fine for progress,
+  not for parsing.
+
+Smoke test: `scripts/test-multi-gpu.sh` exercises argument parsing
+(works on any host, even single-GPU) and, when 2+ GPUs are visible,
+runs a live k=22 plot across `--devices 0,1`.
+
 ### Lower-level subcommands
 
 ```bash
 xchplot2 test   <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
 xchplot2 batch  <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
+                                    [--devices <SPEC>]
 xchplot2 verify <file.plot2> [--trials N]           # run N random challenges
 ```
 
