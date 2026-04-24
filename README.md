@@ -39,13 +39,19 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
     from `rocminfo` automatically. Other gfx targets (`gfx1030` /
     `gfx1100`) build cleanly but are untested on real hardware.
   - **Intel oneAPI** is wired up but untested.
-- **VRAM:** ~5.4 GB free minimum for k=28 (streaming path). Cards
-  with less than ~11 GB free transparently use the streaming pipeline;
-  12 GB+ cards reliably use the persistent buffer pool for faster
-  steady-state. Both paths produce byte-identical plots. 6 GB cards
-  (RTX 2060, RX 6600) are on the edge and 8 GB cards (3070, 2070 Super)
-  are comfortably supported on the streaming path — peak is 5200 MB.
-  Detailed breakdown in [VRAM](#vram).
+- **VRAM:** three tiers, picked automatically based on free device
+  VRAM at k=28. All three produce byte-identical plots.
+  - **Pool** (~11 GB device + ~4 GB pinned host): fastest steady-state,
+    used on 12 GB+ cards.
+  - **Plain streaming** (~7.3 GB peak + 128 MB margin): per-plot
+    allocations, no pinned-host parks, single-pass T2 match. ~400 ms/
+    plot faster than compact. Used on 10-11 GB cards that can't fit
+    the pool but have headroom above compact.
+  - **Compact streaming** (~5.2 GB peak + 128 MB margin): full
+    park/rehydrate + N=2 T2 match tiling. Used on 6-8 GB cards where
+    plain won't fit. 6 GB cards (RTX 2060, RX 6600) are on the edge;
+    8 GB cards (3070, 2070 Super) comfortably fit. Detailed breakdown
+    in [VRAM](#vram).
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
@@ -326,6 +332,7 @@ batch — not a replacement for `chia plots check`.
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks). |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
@@ -376,8 +383,8 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 
 ## VRAM
 
-PoS2 plots are k=28 by spec. Two code paths, dispatched automatically
-based on available VRAM:
+PoS2 plots are k=28 by spec. Three code paths, dispatched automatically
+based on available VRAM at batch start:
 
 - **Pool path (~11 GB device + ~4 GB pinned host; 12 GB+ cards
   reliably).** The persistent buffer pool is sized worst-case and
@@ -387,9 +394,16 @@ based on available VRAM:
   `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
   saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
   RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
-- **Streaming path (5.2 GB peak + 128 MB margin; needs ≥ ~5.4 GiB
-  *free* device VRAM at k=28).** Allocates per-phase and frees between
-  phases. All three match phases (T1/T2/T3) are tiled N=2 across
+- **Plain streaming (~7.3 GB peak + 128 MB margin; ≥ 7.42 GiB free at
+  k=28).** Allocates per-phase and frees between phases, but keeps
+  large intermediates (`d_t1_meta`, `d_t1_keys_merged`, `d_t2_meta`,
+  `d_t2_xbits`, `d_t2_keys_merged`) alive across their idle windows
+  instead of parking them on pinned host. T2 match runs as a single
+  full-cap pass (N=1). Used on 10-11 GB cards that can't fit the pool
+  but have headroom above the compact floor. ~400 ms/plot faster than
+  compact at k=28 because there are no park/rehydrate PCIe round-trips.
+- **Compact streaming (~5.2 GB peak + 128 MB margin; ≥ 5.33 GiB free
+  at k=28).** All three match phases (T1/T2/T3) are tiled N=2 across
   disjoint bucket ranges with half-cap device staging and
   D2H-to-pinned-host between passes. T1 + T2 sorts are tiled (N=2 and
   N=4) with merge trees, and `d_t1_meta`, `d_t2_meta`, and the
@@ -415,23 +429,20 @@ based on available VRAM:
   Practical targets: 6 GB cards on the edge (card-dependent; RTX 2060
   typically has ~5.5 GiB free which has ~170 MB slack over the
   5328 MB requirement), 8 GB cards comfortable, 10 GB and up ample.
-  Slower per plot (~3.7 s vs ~2.4 s at k=28 on a 4090) because it
-  pays per-phase `malloc_device`/`free` plus ~2.5 GB of pinned-host
-  round-trips for the parked-meta and T3 staging buffers, instead of
-  amortising. Log the full alloc trace with `POS2GPU_STREAMING_STATS=1`.
+  Log the full alloc trace with `POS2GPU_STREAMING_STATS=1`.
 
 At pool construction `xchplot2` queries `cudaMemGetInfo` on the
 CUDA-only build, or `global_mem_size` (device total) on the SYCL
 path — SYCL has no portable free-memory query, so the check
 effectively approximates "free == total" and lets the actual
-`malloc_device` failure trigger the fallback. Either way, if the
-pool doesn't fit it transparently falls back to the streaming
-pipeline with no flag needed. Force streaming on any card with
-`XCHPLOT2_STREAMING=1`, useful for testing or for users who want
-the smaller peak regardless.
+`malloc_device` failure trigger the fallback. If the pool doesn't
+fit, the streaming-tier dispatch picks plain or compact based on
+the same free-VRAM query: plain if free ≥ 7.42 GiB, else compact.
+`XCHPLOT2_STREAMING=1` forces streaming even when the pool would
+fit; `XCHPLOT2_STREAMING_TIER=plain|compact` overrides the auto-pick.
 
-Plot output is bit-identical between the two paths — the streaming
-code reorganises memory, not algorithms.
+Plot output is bit-identical across all three paths — streaming
+reorganises memory, not algorithms.
 
 ## Performance
 
@@ -444,7 +455,8 @@ wall from `xchplot2 batch` (10-plot manifest, mean):
 | `cuda-only` branch | **2.15 s** | original CUDA-only path |
 | `main`, `XCHPLOT2_BUILD_CUDA=ON` (CUB sort) | 2.41 s | NVIDIA fast path on the SYCL/AdaptiveCpp port |
 | `main`, `XCHPLOT2_BUILD_CUDA=OFF` (hand-rolled SYCL radix) | 3.79 s | cross-vendor fallback (AMD/Intel) on AdaptiveCpp |
-| streaming path, ≤8 GB cards | ~3.7 s | pool path is preferred when VRAM allows |
+| plain streaming tier (10-11 GB cards) | ~5.7 s | no parks, single-pass T2 match; ~400 ms/plot faster than compact |
+| compact streaming tier (6-8 GB cards) | ~7.3 s | full parks + N=2 T2 match; minimum peak |
 | `main` on RX 6700 XT (gfx1031 / ROCm 6.2 / AdaptiveCpp HIP) | **9.97 s** | AMD batch steady-state at k=28; T-table AES near-optimal on RDNA2 via this compiler stack |
 
 The `main`/CUB row is +12% over `cuda-only` from extra AdaptiveCpp
