@@ -175,9 +175,12 @@ struct DeviceMemInfo {
 DeviceMemInfo query_device_memory();
 
 // Upper bound on streaming-pipeline peak device VRAM at given k.
-// Measured: ~7288 MB at k=28 (README §VRAM); dominant terms (T1 sorted
-// ~3.12 GB + T2 match output ~4.16 GB + tens of MB sort scratch) all
-// scale with 2^k, so other k extrapolate linearly from the k=28 anchor.
+// streaming_peak_bytes: compact tier (anchored at 5200 MB at k=28).
+// streaming_plain_peak_bytes: plain tier (anchored at 7290 MB at k=28,
+// pre-park pipeline — saves ~400 ms/plot over compact via fewer PCIe
+// round-trips, at the cost of the higher peak).
+// Dominant terms scale with 2^k, so other k extrapolate linearly.
 size_t streaming_peak_bytes(int k);
+size_t streaming_plain_peak_bytes(int k);
 
 } // namespace pos2gpu

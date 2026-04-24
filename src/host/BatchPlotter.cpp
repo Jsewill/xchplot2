@@ -308,32 +308,57 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
-        // Streaming preflight: bail before the ~4 GiB pinned-host alloc +
-        // queue setup if the streaming peak won't fit. 128 MB margin
-        // sits above measured CUDA-context + driver overhead on
-        // headless cards. After stages 1-4b the peak is tightly bounded
-        // (see streaming_peak_bytes comment), so 128 MB is genuine
-        // slack rather than a fudge factor.
+        // Streaming tier dispatch: plain (~7290 MB peak at k=28, no
+        // parks, ~400 ms/plot faster) vs compact (~5200 MB peak, all
+        // parks + N=2 T2 match). Pick the larger tier that fits — use
+        // plain if it fits, otherwise compact. 128 MB margin above
+        // measured CUDA-context + driver overhead on headless cards.
+        //
+        // XCHPLOT2_STREAMING_TIER=plain|compact overrides the auto
+        // pick. Useful for benchmarking/testing.
         {
-            auto const mem  = query_device_memory();
-            size_t const peak   = streaming_peak_bytes(pool_k);
-            size_t const margin = 128ULL << 20;
-            if (mem.free_bytes < peak + margin) {
-                auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
+            auto const mem           = query_device_memory();
+            size_t const plain_peak  = streaming_plain_peak_bytes(pool_k);
+            size_t const compact_peak = streaming_peak_bytes(pool_k);
+            size_t const margin      = 128ULL << 20;
+            auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
+
+            char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
+            if (tier_env && std::string(tier_env) == "plain") {
+                stream_scratch.plain_mode = true;
+            } else if (tier_env && std::string(tier_env) == "compact") {
+                stream_scratch.plain_mode = false;
+            } else {
+                stream_scratch.plain_mode =
+                    (mem.free_bytes >= plain_peak + margin);
+            }
+
+            size_t const required =
+                stream_scratch.plain_mode ? plain_peak : compact_peak;
+            if (mem.free_bytes < required + margin) {
                 InsufficientVramError se(
                     "[batch] streaming pipeline needs ~" +
-                    std::to_string(to_gib(peak + margin)).substr(0, 5) +
+                    std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
-                    ", device reports " +
+                    " (" + (stream_scratch.plain_mode ? "plain" : "compact") +
+                    " tier), device reports " +
                     std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
                     " GiB free of " +
                     std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
                     " GiB total. Use a smaller k or a GPU with more VRAM.");
-                se.required_bytes = peak + margin;
+                se.required_bytes = required + margin;
                 se.free_bytes     = mem.free_bytes;
                 se.total_bytes    = mem.total_bytes;
                 throw se;
             }
+
+            std::fprintf(stderr,
+                "[batch] streaming tier: %s "
+                "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
+                stream_scratch.plain_mode ? "plain" : "compact",
+                to_gib(mem.free_bytes),
+                to_gib(required),
+                to_gib(plain_peak + margin));
         }
         // Size the pinned buffers using the same cap formula as the pool.
         int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
@@ -356,28 +381,34 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 "[batch] streaming-fallback: pinned D2H buffer allocation failed");
         }
 
-        // Stage 4f: amortise streaming-path pinned-host scratch across
-        // all plots in the batch. Lifetime analysis (see
-        // StreamingPinnedScratch doc) lets four shared buffers cover
-        // all six internal park/staging roles. At k=28: h_meta 2080 MB
-        // + h_keys_merged 1040 MB + h_t2_xbits 1040 MB + h_t3 2080 MB
-        // = ~6.24 GB of pinned host, paid ONCE for the whole batch.
-        stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
-        stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
-        stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
-        stream_scratch.h_t3          = streaming_alloc_pinned_uint64(stream_pinned_cap);
-        if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
-            !stream_scratch.h_t2_xbits || !stream_scratch.h_t3)
-        {
-            if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
-            if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
-            if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
-            if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
-            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
-                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+        // Stage 4f (compact tier only): amortise streaming-path
+        // pinned-host scratch across all plots in the batch. Lifetime
+        // analysis (see StreamingPinnedScratch doc) lets four shared
+        // buffers cover all six internal park/staging roles. At k=28:
+        // h_meta 2080 MB + h_keys_merged 1040 MB + h_t2_xbits 1040 MB
+        // + h_t3 2080 MB = ~6.24 GB of pinned host, paid ONCE for the
+        // whole batch.
+        //
+        // Plain tier does not park anything, so these pinned-host
+        // scratch buffers are not needed.
+        if (!stream_scratch.plain_mode) {
+            stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            stream_scratch.h_t3          = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
+                !stream_scratch.h_t2_xbits || !stream_scratch.h_t3)
+            {
+                if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+                if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+                if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+                if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
+                for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                    if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+                }
+                throw std::runtime_error(
+                    "[batch] streaming-fallback: pinned-host scratch allocation failed");
             }
-            throw std::runtime_error(
-                "[batch] streaming-fallback: pinned-host scratch allocation failed");
         }
     }
     if (verbose && pool_ptr) {
