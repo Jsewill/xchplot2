@@ -36,17 +36,43 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
-/// Check whether nvcc is on $PATH and runnable. Used to autodetect
-/// XCHPLOT2_BUILD_CUDA: when nvcc is available we assume a CUDA Toolkit
-/// is installed and flip the flag ON; otherwise OFF so AMD / Intel hosts
-/// don't fail the CMake configure looking for nvcc. Runs `nvcc --version`
-/// rather than a simple PATH lookup so stale symlinks don't pass.
+/// Check whether nvcc is on $PATH and runnable. Used as the fall-back
+/// signal for XCHPLOT2_BUILD_CUDA when no GPU is enumerable (headless
+/// CI / container builds). Runs `nvcc --version` rather than a simple
+/// PATH lookup so stale symlinks don't pass.
 fn detect_nvcc() -> bool {
     Command::new("nvcc")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Probe /sys/class/drm for a display-class PCI device with Intel's
+/// vendor ID (0x8086). Used as a heuristic to default
+/// XCHPLOT2_BUILD_CUDA=OFF on Intel hosts, mirroring what rocminfo
+/// already does for AMD. Returns false on non-Linux or when the sysfs
+/// path isn't accessible — callers fall back to the next signal.
+fn detect_intel_gpu() -> bool {
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip connector nodes like card0-DP-1; we only want the card itself.
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let vendor = entry.path().join("device/vendor");
+        if let Ok(v) = std::fs::read_to_string(&vendor) {
+            if v.trim() == "0x8086" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
@@ -133,16 +159,33 @@ fn main() {
 
     // XCHPLOT2_BUILD_CUDA toggles whether the CUB sort + nvcc-compiled
     // CUDA TUs (AesGpu.cu, SortCuda.cu, AesGpuBitsliced.cu) are built.
-    // Autodetect from nvcc availability when the user hasn't set the env
-    // var: NVIDIA hosts with a CUDA Toolkit keep the fast CUB path; AMD /
-    // Intel bare-metal hosts (no nvcc) fall back to the SYCL-only path
-    // rather than failing CMake configure.
+    // Autodetect prefers actual GPU vendor over toolchain availability:
+    // dual-toolchain hosts (AMD / Intel GPU, CUDA Toolkit also installed)
+    // would otherwise try to compile SortCuda.cu through nvcc + AdaptiveCpp
+    // — which has triggered upstream `half.hpp` compile errors for at
+    // least one Radeon Pro W5700 user. Priority order:
+    //   NVIDIA GPU → ON      (CUB is the fast path)
+    //   AMD GPU    → OFF     (SYCL/HIP path; CUB unused anyway)
+    //   Intel GPU  → OFF     (SYCL/L0 path)
+    //   no GPU, nvcc present → ON  (CI / container build)
+    //   no GPU, no nvcc      → OFF
     let (build_cuda, bc_source) = match env::var("XCHPLOT2_BUILD_CUDA") {
         Ok(v) if !v.is_empty() => (v, "$XCHPLOT2_BUILD_CUDA"),
-        _ => if detect_nvcc() {
-            ("ON".to_string(), "nvcc detected")
-        } else {
-            ("OFF".to_string(), "no nvcc — skipping CUDA TUs")
+        _ => {
+            let nvidia_gpu = detect_cuda_arch().is_some();
+            let amd_gpu    = detect_amd_gfx().is_some();
+            let intel_gpu  = detect_intel_gpu();
+            if nvidia_gpu {
+                ("ON".to_string(), "NVIDIA GPU detected")
+            } else if amd_gpu {
+                ("OFF".to_string(), "AMD GPU detected — skipping CUDA TUs")
+            } else if intel_gpu {
+                ("OFF".to_string(), "Intel GPU detected — skipping CUDA TUs")
+            } else if detect_nvcc() {
+                ("ON".to_string(), "no GPU probe, nvcc present — assuming CI/container")
+            } else {
+                ("OFF".to_string(), "no GPU, no nvcc — skipping CUDA TUs")
+            }
         },
     };
     println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda} ({bc_source})");

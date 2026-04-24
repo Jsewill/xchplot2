@@ -236,7 +236,7 @@ If you'd rather install dependencies yourself, the toolchain is:
 | Dep | Notes |
 |---|---|
 | **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches it via FetchContent if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
-| **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON` (default; pass `OFF` for AMD/Intel). |
+| **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON`. Default is vendor-aware — `ON` for NVIDIA GPUs, `OFF` for AMD / Intel GPUs (even if `nvcc` is installed), falling through to `nvcc`-presence only when no GPU is probed (CI / container). Override with the env var. |
 | **LLVM / Clang ≥ 18** | clang + libclang dev packages. |
 | **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
 | **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
@@ -448,6 +448,7 @@ batch — not a replacement for `chia plots check`.
 
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
+| `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks). |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
