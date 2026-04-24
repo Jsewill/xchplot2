@@ -141,4 +141,23 @@ void      streaming_free_pinned_uint32(uint32_t* ptr);
 // Used by BatchPlotter to pick between plain and compact streaming.
 size_t streaming_query_free_vram_bytes();
 
+// Multi-GPU device binding. bind_current_device() calls cudaSetDevice
+// on the calling thread, which routes all subsequent CUDA runtime
+// calls (cudaMalloc, kernel launches, cudaMemcpyToSymbol, etc.) to the
+// given device. Must be called on the worker thread BEFORE any kernel
+// launch on that thread — ideally as the first statement of the
+// worker lambda.
+//
+// device_id < 0 → leave the current device untouched (use whatever
+// CUDA picked as the default — matches pre-multi-GPU behavior).
+//
+// gpu_device_count() returns the number of visible CUDA devices, or 0
+// on error. BatchPlotter uses it to expand `--devices all` into an
+// explicit id list.
+//
+// Declared here (instead of in a .cuh) so plain .cpp consumers like
+// BatchPlotter.cpp can call them without including cuda_runtime.h.
+void bind_current_device(int device_id);
+int  gpu_device_count();
+
 } // namespace pos2gpu

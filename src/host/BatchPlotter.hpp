@@ -35,12 +35,41 @@ struct BatchResult {
     double total_wall_seconds = 0.0;
 };
 
+// Options controlling batch behavior.
+//   verbose         — per-plot progress on stderr
+//   device_ids      — explicit list of CUDA device ids to use. When
+//                     empty and use_all_devices is false, run on the
+//                     currently-bound CUDA device (pre-multi-GPU
+//                     behavior: device 0 by default).
+//                     With multiple ids the batch is partitioned across
+//                     workers — one thread per device, each with its
+//                     own GpuBufferPool and producer/consumer channel.
+//                     Plots are assigned round-robin (entry i → worker
+//                     i % N).
+//   use_all_devices — enumerate all visible CUDA devices at runtime and
+//                     use them. Overrides device_ids.
+struct BatchOptions {
+    bool             verbose         = false;
+    std::vector<int> device_ids;
+    bool             use_all_devices = false;
+};
+
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
 std::vector<BatchEntry> parse_manifest(std::string const& path);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.
 // The first plot pays the full GPU+FSE cost; subsequent plots overlap.
-BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose = false);
+BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                      BatchOptions const& opts);
+
+// Legacy bool-verbose shim kept for source-compat with older callsites.
+inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                             bool verbose = false)
+{
+    BatchOptions opts;
+    opts.verbose = verbose;
+    return run_batch(entries, opts);
+}
 
 } // namespace pos2gpu

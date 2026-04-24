@@ -1549,4 +1549,29 @@ void streaming_free_pinned_uint64(uint64_t* ptr)
     if (ptr) cudaFreeHost(ptr);
 }
 
+void bind_current_device(int device_id)
+{
+    if (device_id < 0) return;
+    // cudaSetDevice binds the current HOST thread's CUDA context to the
+    // given device. All subsequent cudaMalloc / kernel launches /
+    // cudaMemcpyToSymbol calls from this thread route to that device.
+    // Peer devices share no state by default — each worker effectively
+    // gets its own __constant__ memory after re-running
+    // initialize_aes_tables() on the new current device.
+    cudaError_t const rc = cudaSetDevice(device_id);
+    if (rc != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("bind_current_device(") + std::to_string(device_id) +
+            ") failed: " + cudaGetErrorString(rc));
+    }
+}
+
+int gpu_device_count()
+{
+    int n = 0;
+    cudaError_t const rc = cudaGetDeviceCount(&n);
+    if (rc != cudaSuccess) return 0;
+    return n;
+}
+
 } // namespace pos2gpu
