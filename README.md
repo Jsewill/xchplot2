@@ -286,6 +286,12 @@ k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
 | Producer GPU time, steady-state | 1.96 s |
 | Device-kernel floor (single-plot nsys) | 1.91 s |
 
+Numbers above are single-GPU. With `--devices 0,1,...` the batch is
+partitioned round-robin across N worker threads (one per device), so
+wall-clock throughput is bounded by the slowest device's slice —
+≈ linear scaling on matched cards, less if cards differ. Live
+multi-GPU plots were confirmed end-to-end on NVIDIA.
+
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party
