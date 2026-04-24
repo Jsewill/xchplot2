@@ -22,6 +22,9 @@
 
 #include <cstdio>
 #include <exception>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace pos2gpu::sycl_backend {
@@ -51,22 +54,79 @@ inline void async_error_handler(sycl::exception_list exns) noexcept
     }
 }
 
-// Persistent SYCL queue. gpu_selector_v ensures the CUDA-backed RTX 4090
-// (or whichever GPU the AdaptiveCpp build was configured for) is picked
-// over the AdaptiveCpp OpenMP host device that's also visible.
+// Per-thread target device id. A worker thread sets this once at startup
+// via set_current_device_id() so that its subsequent queue() call returns
+// a queue bound to the requested GPU. Value of -1 (the default) means
+// "use the default gpu_selector_v" — which is the single-device path, the
+// only path pre-multi-GPU and the zero-configuration user experience.
+//
+// Thread-local, not global: the multi-device fan-out in BatchPlotter runs
+// N worker threads, each binding to a distinct GPU. The main thread stays
+// at -1 and sees the default selector.
+inline int& current_device_id_ref()
+{
+    thread_local int id = -1;
+    return id;
+}
+
+inline void set_current_device_id(int id)
+{
+    current_device_id_ref() = id;
+}
+
+inline int current_device_id()
+{
+    return current_device_id_ref();
+}
+
+// Per-thread SYCL queue. Bound to the thread's current device id, or to
+// gpu_selector_v when the id is -1 (default, single-device path). A
+// unique_ptr wrapper lets us defer construction until the thread has had
+// a chance to set its device id.
+//
+// gpu_selector_v ensures the CUDA-backed GPU (or whichever AdaptiveCpp
+// was configured for) is picked over the OpenMP host device.
 inline sycl::queue& queue()
 {
-    static sycl::queue q{ sycl::gpu_selector_v, async_error_handler };
-    return q;
+    thread_local std::unique_ptr<sycl::queue> q;
+    if (!q) {
+        int const id = current_device_id();
+        if (id < 0) {
+            q = std::make_unique<sycl::queue>(sycl::gpu_selector_v,
+                                              async_error_handler);
+        } else {
+            auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+            if (id >= static_cast<int>(devices.size())) {
+                throw std::runtime_error(
+                    "sycl_backend::queue: device id " + std::to_string(id) +
+                    " out of range (found " + std::to_string(devices.size()) +
+                    " GPU device(s))");
+            }
+            q = std::make_unique<sycl::queue>(devices[id], async_error_handler);
+        }
+    }
+    return *q;
+}
+
+// Return the number of SYCL GPU devices visible to the process. Used by
+// BatchOptions::use_all_devices to expand "all" into an explicit list.
+inline int get_gpu_device_count()
+{
+    return static_cast<int>(
+        sycl::device::get_devices(sycl::info::device_type::gpu).size());
 }
 
 // AES T-tables uploaded into a USM device buffer on first use, kept
-// alive for the process lifetime — mirrors the CUDA path's __constant__
-// T-tables, which are also never freed. Pointer layout matches what the
-// _smem family expects: [T0|T1|T2|T3], 256 entries each.
+// alive for the thread's queue lifetime — mirrors the CUDA path's
+// __constant__ T-tables. Thread-local because each worker thread's queue
+// is on a different device; the table upload must happen once per device,
+// not once per process.
+//
+// Pointer layout matches what the _smem family expects: [T0|T1|T2|T3],
+// 256 entries each.
 inline uint32_t* aes_tables_device(sycl::queue& q)
 {
-    static uint32_t* d_tables = nullptr;
+    thread_local uint32_t* d_tables = nullptr;
     if (d_tables) return d_tables;
 
     std::vector<uint32_t> sT_host(4 * 256);
