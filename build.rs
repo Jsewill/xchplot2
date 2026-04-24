@@ -45,13 +45,17 @@ fn main() {
     // Architecture precedence:
     //   1. $CUDA_ARCHITECTURES if set (lets the user pick or list multiple).
     //   2. nvidia-smi probe of the build machine's local GPU.
-    //   3. 89 (sm_89, RTX 4090 / Ada Lovelace) as a sensible default for
-    //      machines without nvidia-smi (e.g. CI, headless package builds).
+    //   3. A sensible default for machines without nvidia-smi (e.g. CI,
+    //      headless package builds). x86_64 defaults to sm_89 (Ada / RTX
+    //      4090); aarch64 defaults to sm_87 (Jetson Orin — Ada doesn't
+    //      exist on ARM). Cross-vendor targets should set
+    //      $CUDA_ARCHITECTURES explicitly.
+    let fallback_arch = if cfg!(target_arch = "aarch64") { "87" } else { "89" };
     let (cuda_arch, source) = match env::var("CUDA_ARCHITECTURES") {
         Ok(v) => (v, "$CUDA_ARCHITECTURES"),
         Err(_) => match detect_cuda_arch() {
             Some(v) => (v, "nvidia-smi probe"),
-            None    => ("89".to_string(), "fallback (no nvidia-smi)"),
+            None    => (fallback_arch.to_string(), "fallback (no nvidia-smi)"),
         },
     };
     println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({source})");
@@ -124,6 +128,12 @@ fn main() {
         });
     println!("cargo:rustc-link-search=native={cuda_root}/lib64");
     println!("cargo:rustc-link-search=native={cuda_root}/lib");
+    // NVIDIA ARM platforms ship CUDA under targets/<triple>/lib:
+    //   Jetson (JetPack / L4T):  targets/aarch64-linux/lib
+    //   GH200 / SBSA servers:    targets/sbsa-linux/lib
+    // Harmless on x86_64 — just silences "no such dir" search misses.
+    println!("cargo:rustc-link-search=native={cuda_root}/targets/aarch64-linux/lib");
+    println!("cargo:rustc-link-search=native={cuda_root}/targets/sbsa-linux/lib");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cudadevrt");
 

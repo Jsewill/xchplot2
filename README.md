@@ -23,6 +23,13 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 - **CUDA Toolkit:** 12+ required to build (tested on 13.x). Runtime
   users on RTX 50-series (Blackwell, `sm_120`) need a driver bundle
   that ships Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
+- **CPU architecture:** `x86_64` is the tested path. `aarch64` is also
+  supported for NVIDIA ARM platforms — Jetson Orin (`sm_87`), IGX
+  Orin, and Grace Hopper / GH200 (`sm_90`, SBSA). `build.rs` picks
+  `sm_87` as the aarch64 fallback arch when `nvidia-smi` isn't
+  available, and searches the JetPack (`targets/aarch64-linux/lib`)
+  and SBSA (`targets/sbsa-linux/lib`) CUDA library layouts. Apple
+  Silicon is not supported (no CUDA on macOS).
 - **OS:** Linux (tested on modern glibc distributions) is the supported
   path. Windows builds are possible via MSVC + CUDA — see
   [Windows (experimental)](#windows-experimental) below. macOS is not
