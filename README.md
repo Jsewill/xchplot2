@@ -53,6 +53,12 @@ paths, and [Use](#use) for every flag.
     rocm-service comments). Build picks `ACPP_TARGETS=hip:gfxXXXX`
     from `rocminfo` automatically. Other gfx targets (`gfx1030` /
     `gfx1100`) build cleanly but are untested on real hardware.
+    RDNA1 cards (`gfx1010`/`gfx1011`/`gfx1012`) aren't a direct
+    AdaptiveCpp target, but a **Radeon Pro W5700 (`gfx1010`)** has
+    been reported to work end-to-end by spoofing as `gfx1013` at
+    build time: `ACPP_GFX=gfx1013 ./scripts/build-container.sh`.
+    Community-tested, not parity-validated — smoke-test any batch
+    with `xchplot2 verify` before committing.
   - **Intel oneAPI** is wired up but untested.
 - **VRAM:** three tiers, picked automatically based on free device
   VRAM at k=28. All three produce byte-identical plots.
