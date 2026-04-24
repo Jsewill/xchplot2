@@ -67,4 +67,41 @@ cudaError_t launch_t2_match(
     size_t* temp_bytes,
     cudaStream_t stream = nullptr);
 
+// Split entry points — compute bucket offsets once, then run the match
+// kernel over one or more disjoint bucket sub-ranges. The compact
+// streaming tier uses these to emit T2 in halves into a half-cap
+// device staging buffer, D2H each half to pinned host between passes,
+// so the cap-sized T2 output never has to be alive on device in full.
+//
+// Across multiple launch_t2_match_range calls sharing the same
+// d_out_* + d_out_count, the kernel's atomic counter accumulates —
+// output is concatenated. If the caller wants non-overlapping output
+// per pass (e.g. separate half-cap staging reused across passes), they
+// must reset d_out_count between passes themselves.
+cudaError_t launch_t2_match_prepare(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint32_t const* d_sorted_mi,
+    uint64_t t1_count,
+    uint64_t* d_out_count,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    cudaStream_t stream = nullptr);
+
+cudaError_t launch_t2_match_range(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
+    uint64_t t1_count,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    cudaStream_t stream = nullptr);
+
 } // namespace pos2gpu

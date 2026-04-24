@@ -130,13 +130,14 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     uint32_t* __restrict__ out_mi,
     uint32_t* __restrict__ out_xbits,
     unsigned long long* __restrict__ out_count,
-    uint64_t out_capacity)
+    uint64_t out_capacity,
+    uint32_t bucket_begin)
 {
     __shared__ uint32_t sT[4 * 256];
     load_aes_tables_smem(sT);
     __syncthreads();
 
-    uint32_t bucket_id   = blockIdx.y;
+    uint32_t bucket_id   = bucket_begin + blockIdx.y;
     uint32_t section_l   = bucket_id / num_match_keys;
     uint32_t match_key_r = bucket_id % num_match_keys;
 
@@ -213,6 +214,156 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
 
 } // namespace
 
+namespace {
+
+constexpr int kT2FineBits = 8;
+
+struct T2Derived {
+    uint32_t num_sections;
+    uint32_t num_match_keys;
+    uint32_t num_buckets;
+    uint64_t fine_entries;
+    size_t   bucket_bytes;
+    size_t   fine_bytes;
+    size_t   temp_needed;
+    uint32_t target_mask;
+    int      num_test_bits;
+    int      num_info_bits;
+    int      half_k;
+    uint64_t l_count_max;
+};
+
+T2Derived derive_t2(T2MatchParams const& params)
+{
+    T2Derived d{};
+    d.num_sections    = 1u << params.num_section_bits;
+    d.num_match_keys  = 1u << params.num_match_key_bits;
+    d.num_buckets     = d.num_sections * d.num_match_keys;
+    uint64_t const fine_count = 1ull << kT2FineBits;
+    d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
+    d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
+    d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
+    d.temp_needed     = d.bucket_bytes + d.fine_bytes;
+    d.target_mask     = (params.num_match_target_bits >= 32)
+                          ? 0xFFFFFFFFu
+                          : ((1u << params.num_match_target_bits) - 1u);
+    d.num_test_bits   = params.num_match_key_bits;
+    d.num_info_bits   = params.k;
+    d.half_k          = params.k / 2;
+    d.l_count_max =
+        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
+    return d;
+}
+
+} // namespace
+
+cudaError_t launch_t2_match_prepare(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint32_t const* d_sorted_mi,
+    uint64_t t1_count,
+    uint64_t* d_out_count,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
+    if (params.strength < 2)            return cudaErrorInvalidValue;
+
+    T2Derived const d = derive_t2(params);
+
+    if (d_temp_storage == nullptr) {
+        *temp_bytes = d.temp_needed;
+        return cudaSuccess;
+    }
+    if (*temp_bytes < d.temp_needed)     return cudaErrorInvalidValue;
+    if (!d_sorted_mi || !d_out_count)    return cudaErrorInvalidValue;
+    if (params.num_match_target_bits <= kT2FineBits) return cudaErrorInvalidValue;
+
+    auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
+    auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    {
+        constexpr int kOffThreads = 256;
+        unsigned off_blocks = static_cast<unsigned>(
+            (d.num_buckets + 1 + kOffThreads - 1) / kOffThreads);
+        compute_bucket_offsets<<<off_blocks, kOffThreads, 0, stream>>>(
+            d_sorted_mi, t1_count,
+            params.num_match_target_bits,
+            d.num_buckets,
+            d_offsets);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    uint32_t fine_threads_total = d.num_buckets * uint32_t(1ull << kT2FineBits);
+    unsigned fine_blocks = (fine_threads_total + 255) / 256;
+    compute_fine_bucket_offsets<<<fine_blocks, 256, 0, stream>>>(
+        d_sorted_mi, d_offsets,
+        params.num_match_target_bits, kT2FineBits,
+        d.num_buckets, d_fine_offsets);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    return cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
+}
+
+cudaError_t launch_t2_match_range(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
+    uint64_t /*t1_count*/,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.strength < 2)                return cudaErrorInvalidValue;
+    if (!d_sorted_meta || !d_sorted_mi ||
+        !d_out_meta || !d_out_mi || !d_out_xbits || !d_out_count)
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    T2Derived const d = derive_t2(params);
+    if (bucket_end > d.num_buckets) return cudaErrorInvalidValue;
+    if (bucket_end <= bucket_begin) return cudaSuccess;  // empty range
+
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    constexpr int kThreads = 256;
+    uint64_t blocks_x_u64 = (d.l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets_in_range, 1);
+
+    auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
+    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+
+    match_all_buckets<<<grid, kThreads, 0, stream>>>(
+        keys, d_sorted_meta, d_sorted_mi,
+        d_offsets, d_fine_offsets,
+        d.num_match_keys,
+        params.k, params.num_section_bits,
+        params.num_match_target_bits, kT2FineBits,
+        d.target_mask, d.num_test_bits, d.num_info_bits, d.half_k,
+        d_out_meta, d_out_mi, d_out_xbits,
+        reinterpret_cast<unsigned long long*>(d_out_count),
+        capacity,
+        bucket_begin);
+    return cudaGetLastError();
+}
+
 cudaError_t launch_t2_match(
     uint8_t const* plot_id_bytes,
     T2MatchParams const& params,
@@ -228,95 +379,21 @@ cudaError_t launch_t2_match(
     size_t* temp_bytes,
     cudaStream_t stream)
 {
-    if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
-    if (params.strength < 2)            return cudaErrorInvalidValue;
-
-    uint32_t num_sections    = 1u << params.num_section_bits;
-    uint32_t num_match_keys  = 1u << params.num_match_key_bits;
-    uint32_t num_buckets     = num_sections * num_match_keys;
-
-    // Fine-bucket pre-index; see T3Kernel.cu for the scheme.
-    constexpr int FINE_BITS = 8;
-    uint64_t const fine_count    = 1ull << FINE_BITS;
-    uint64_t const fine_entries  = uint64_t(num_buckets) * fine_count + 1;
-
-    size_t const bucket_bytes = sizeof(uint64_t) * (num_buckets + 1);
-    size_t const fine_bytes   = sizeof(uint64_t) * fine_entries;
-    size_t const needed       = bucket_bytes + fine_bytes;
-
-    if (d_temp_storage == nullptr) {
-        *temp_bytes = needed;
-        return cudaSuccess;
-    }
-    if (*temp_bytes < needed)        return cudaErrorInvalidValue;
-    if (!d_sorted_meta || !d_sorted_mi ||
-        !d_out_meta || !d_out_mi || !d_out_xbits || !d_out_count)
-    {
-        return cudaErrorInvalidValue;
-    }
-    if (params.num_match_target_bits <= FINE_BITS) return cudaErrorInvalidValue;
-
-    auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
-    auto* d_fine_offsets = d_offsets + (num_buckets + 1);
-
-    AesHashKeys keys = make_keys(plot_id_bytes);
-
-    {
-        constexpr int kOffThreads = 256;
-        unsigned off_blocks = static_cast<unsigned>(
-            (num_buckets + 1 + kOffThreads - 1) / kOffThreads);
-        compute_bucket_offsets<<<off_blocks, kOffThreads, 0, stream>>>(
-            d_sorted_mi, t1_count,
-            params.num_match_target_bits,
-            num_buckets,
-            d_offsets);
-    }
-    cudaError_t err = cudaGetLastError();
+    // Single-shot wrapper: prepare + one full-range match. Preserves
+    // the original API for pool path, test mode, and parity tests.
+    cudaError_t err = launch_t2_match_prepare(
+        plot_id_bytes, params, d_sorted_mi, t1_count,
+        d_out_count, d_temp_storage, temp_bytes, stream);
     if (err != cudaSuccess) return err;
+    if (d_temp_storage == nullptr) return cudaSuccess;  // size-query path
 
-    uint32_t fine_threads_total = num_buckets * uint32_t(fine_count);
-    unsigned fine_blocks = (fine_threads_total + 255) / 256;
-    compute_fine_bucket_offsets<<<fine_blocks, 256, 0, stream>>>(
-        d_sorted_mi, d_offsets,
-        params.num_match_target_bits, FINE_BITS,
-        num_buckets, d_fine_offsets);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    err = cudaMemsetAsync(d_out_count, 0, sizeof(uint64_t), stream);
-    if (err != cudaSuccess) return err;
-
-    // See T1Kernel.cu for rationale: static per-section cap as over-
-    // launch upper bound, excess threads early-exit on `l >= l_end`.
-    uint64_t l_count_max =
-        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
-
-    uint32_t target_mask = (params.num_match_target_bits >= 32)
-                            ? 0xFFFFFFFFu
-                            : ((1u << params.num_match_target_bits) - 1u);
-    int num_test_bits = params.num_match_key_bits;
-    int num_info_bits = params.k;
-    int half_k        = params.k / 2;
-
-    constexpr int kThreads = 256;
-    uint64_t blocks_x_u64 = (l_count_max + kThreads - 1) / kThreads;
-    if (blocks_x_u64 > UINT_MAX) return cudaErrorInvalidValue;
-    dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets, 1);
-
-    match_all_buckets<<<grid, kThreads, 0, stream>>>(
-        keys, d_sorted_meta, d_sorted_mi,
-        d_offsets, d_fine_offsets,
-        num_match_keys,
-        params.k, params.num_section_bits,
-        params.num_match_target_bits, FINE_BITS,
-        target_mask, num_test_bits, num_info_bits, half_k,
-        d_out_meta, d_out_mi, d_out_xbits,
-        reinterpret_cast<unsigned long long*>(d_out_count),
-        capacity);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    return cudaSuccess;
+    T2Derived const d = derive_t2(params);
+    return launch_t2_match_range(
+        plot_id_bytes, params,
+        d_sorted_meta, d_sorted_mi, t1_count,
+        d_out_meta, d_out_mi, d_out_xbits, d_out_count,
+        capacity, d_temp_storage,
+        /*bucket_begin=*/0, /*bucket_end=*/d.num_buckets, stream);
 }
 
 } // namespace pos2gpu
