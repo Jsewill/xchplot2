@@ -431,10 +431,11 @@ runs a live k=22 plot across `--devices 0,1`.
 ### Lower-level subcommands
 
 ```bash
-xchplot2 test   <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
-xchplot2 batch  <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
-                                    [--devices <SPEC>]
-xchplot2 verify <file.plot2> [--trials N]           # run N random challenges
+xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
+xchplot2 batch         <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
+                                             [--devices <SPEC>]
+xchplot2 verify        <file.plot2> [--trials N]           # run N random challenges
+xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen
 ```
 
 `verify` opens a `.plot2` through pos2-chip's CPU prover and runs N
@@ -456,6 +457,8 @@ batch — not a replacement for `chia plots check`.
 | `ACPP_GFX=gfxXXXX`            | AMD only — required at **build** time; sets AOT target for amdgcn ISA. |
 | `ACPP_TARGETS=...`            | Override AdaptiveCpp target selection (defaults: NVIDIA `generic`, AMD `hip:$ACPP_GFX`). |
 | `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
+| `CUDA_PATH=/path/to/cuda`     | Override the CUDA Toolkit root for linking (default: `/opt/cuda`, `/usr/local/cuda`). Useful on JetPack / non-standard installs. |
+| `CUDA_HOME=/path/to/cuda`     | Fallback for `CUDA_PATH` — same effect.                                 |
 | `POS2_CHIP_DIR=/path`         | Build-time: point at a local pos2-chip checkout instead of FetchContent.|
 | `XCHPLOT2_TEST_GPU_COUNT=N`   | Override `scripts/test-multi-gpu.sh`'s auto-detected GPU count (forces run / skip without consulting `nvidia-smi`). |
 
