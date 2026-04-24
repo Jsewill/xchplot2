@@ -113,7 +113,12 @@ void launch_t2_match(
     uint64_t blocks_x_u64 = (l_count_max + kThreads - 1) / kThreads;
     if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
 
-    // Match — backend-dispatched via T2Offsets.cuh.
+    // Match — backend-dispatched via T2Offsets.cuh. Full bucket range:
+    // (0, num_buckets) preserves current single-pass behavior. Callers
+    // that want to split T2 match across temporally-separated passes
+    // (see docs/t2-match-tiling-plan.md) should invoke
+    // launch_t2_match_all_buckets directly with a sub-range instead of
+    // going through this single-shot wrapper.
     launch_t2_match_all_buckets(
         keys, d_sorted_meta, d_sorted_mi,
         d_offsets, d_fine_offsets,
@@ -122,7 +127,9 @@ void launch_t2_match(
         params.num_match_target_bits, FINE_BITS,
         target_mask, num_test_bits, num_info_bits, half_k,
         d_out_meta, d_out_mi, d_out_xbits, d_out_count,
-        capacity, l_count_max, q);
+        capacity, l_count_max,
+        /*bucket_begin=*/0, /*bucket_end=*/num_buckets,
+        q);
 }
 
 } // namespace pos2gpu

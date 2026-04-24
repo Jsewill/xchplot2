@@ -38,6 +38,20 @@ void launch_t2_compute_fine_bucket_offsets(
 // Fused T2 match. table_id=2, no strength scaling on AES rounds. Emits
 // (meta, match_info, x_bits) triples via an atomic cursor; x_bits packs
 // the upper-half-k bits of meta_l and meta_r per Table2Constructor.
+//
+// bucket_begin / bucket_end select which bucket-id range to process
+// (inclusive / exclusive). Passing (0, num_buckets) preserves the
+// original full-pass behavior. Smaller ranges let callers split T2
+// match into temporally-separated passes so downstream memory does
+// not need to hold the full T2 output at once (see
+// docs/t2-match-tiling-plan.md).
+//
+// Across all passes that share the same d_out_{meta,mi,xbits} +
+// d_out_count, results append starting at the current value of
+// d_out_count (atomic). Callers that want pass-disjoint output should
+// sum counts themselves; callers that want the concatenation as a
+// single array should simply leave d_out_count and the buffers untouched
+// between passes.
 void launch_t2_match_all_buckets(
     AesHashKeys keys,
     uint64_t const* d_sorted_meta,
@@ -60,6 +74,8 @@ void launch_t2_match_all_buckets(
     uint64_t* d_out_count,
     uint64_t out_capacity,
     uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
     sycl::queue& q);
 
 } // namespace pos2gpu
