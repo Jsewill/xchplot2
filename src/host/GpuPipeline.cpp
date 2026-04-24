@@ -1088,13 +1088,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t2_xbits);
     s_free(stats, d_merged_vals);
 
-    // ---------- Phase T3 match (tiled, N=2) ----------
-    // Stage 4d.2: split T3 match into two temporally-separated passes
-    // over disjoint bucket-id ranges, sharing the same d_t3 output SoA
-    // and atomic counter. Still cap-sized d_t3 — no VRAM savings at
-    // this commit, validates chunked T3 execution is byte-equivalent.
-    // Stage 4d.3 will replace cap-sized d_t3 with half-cap staging +
-    // D2H to pinned host.
+    // ---------- Phase T3 match (tiled, N=2, half-cap staging + D2H) ----------
+    // Stage 4d.3: allocate only half-cap d_t3 staging on device, run the
+    // two bucket-range passes into it, and D2H each pass to a pinned-host
+    // buffer between passes. Before T3 sort, re-allocate full-cap d_t3
+    // and H2D the concatenated output back. Match-phase peak at k=28:
+    //   d_t2_keys_merged (1040) + d_t2_meta_sorted (2080)
+    //   + d_t2_xbits_sorted (1040) + half-cap d_t3_stage (1040)
+    //   = ~5200 MB
+    // down from 6240 MB. Overall plot peak: 6240 -> 5200 MB (6 GB-card
+    // territory with margin).
     stats.phase = "T3 match";
     auto t3p = make_t3_params(cfg.k, cfg.strength);
     size_t t3_temp_bytes = 0;
@@ -1109,10 +1112,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     sycl::free(h_t2_keys_merged, q);
     h_t2_keys_merged = nullptr;
 
-    T3PairingGpu* d_t3 = nullptr;
+    uint64_t const t3_half_cap = (cap + 1) / 2;
+
+    T3PairingGpu* d_t3_stage    = nullptr;
     void*         d_t3_match_temp = nullptr;
-    s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
-    s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
+    s_malloc(stats, d_t3_stage,      t3_half_cap * sizeof(T3PairingGpu), "d_t3_stage");
+    s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                     "d_t3_match_temp");
+
+    // Full-cap pinned host that will hold the concatenated T3 output.
+    T3PairingGpu* h_t3 = static_cast<T3PairingGpu*>(
+        sycl::malloc_host(cap * sizeof(T3PairingGpu), q));
+    if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
     // Compute bucket + fine-bucket offsets once; both match passes
     // share them. Also zeroes d_counter.
@@ -1124,27 +1134,54 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         (1u << t3p.num_section_bits) * (1u << t3p.num_match_key_bits);
     uint32_t const t3_bucket_mid = t3_num_buckets / 2;
 
+    auto run_t3_pass = [&](uint32_t bucket_begin, uint32_t bucket_end,
+                           uint64_t host_offset) -> uint64_t
+    {
+        launch_t3_match_range(cfg.plot_id.data(), t3p,
+                              d_t2_meta_sorted, d_t2_xbits_sorted,
+                              d_t2_keys_merged, t2_count,
+                              d_t3_stage, d_counter, t3_half_cap,
+                              d_t3_match_temp, bucket_begin, bucket_end, q);
+        uint64_t pass_count = 0;
+        q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+        if (pass_count > t3_half_cap) {
+            throw std::runtime_error(
+                "T3 match pass overflow: bucket range [" +
+                std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
+                ") produced " + std::to_string(pass_count) +
+                " pairs, staging holds " + std::to_string(t3_half_cap) +
+                ". Lower N or widen staging.");
+        }
+        q.memcpy(h_t3 + host_offset, d_t3_stage,
+                 pass_count * sizeof(T3PairingGpu)).wait();
+        // Reset counter so the next pass writes at stage index 0.
+        q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+        return pass_count;
+    };
+
     int p_t3 = begin_phase("T3 match + Feistel");
-    launch_t3_match_range(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          d_t2_keys_merged, t2_count,
-                          d_t3, d_counter, cap, d_t3_match_temp,
-                          /*bucket_begin=*/0, /*bucket_end=*/t3_bucket_mid, q);
-    launch_t3_match_range(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          d_t2_keys_merged, t2_count,
-                          d_t3, d_counter, cap, d_t3_match_temp,
-                          /*bucket_begin=*/t3_bucket_mid, /*bucket_end=*/t3_num_buckets, q);
+    uint64_t const t3_count1 = run_t3_pass(0,              t3_bucket_mid,   /*host_offset=*/0);
+    uint64_t const t3_count2 = run_t3_pass(t3_bucket_mid,  t3_num_buckets,  /*host_offset=*/t3_count1);
     end_phase(p_t3);
 
-    uint64_t t3_count = 0;
-    q.memcpy(&t3_count, d_counter, sizeof(uint64_t)).wait();
+    uint64_t const t3_count = t3_count1 + t3_count2;
     if (t3_count > cap) throw std::runtime_error("T3 overflow");
 
+    // Free everything that was alive across T3 match: staging, temp,
+    // sorted T2 inputs, keys_merged.
     s_free(stats, d_t3_match_temp);
+    s_free(stats, d_t3_stage);
     s_free(stats, d_t2_meta_sorted);
     s_free(stats, d_t2_xbits_sorted);
     s_free(stats, d_t2_keys_merged);
+
+    // Re-hydrate full-cap d_t3 on device for T3 sort (which sorts the
+    // uint64 proof_fragment stream in place).
+    T3PairingGpu* d_t3 = nullptr;
+    s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
+    q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
+    sycl::free(h_t3, q);
+    h_t3 = nullptr;
 
     // ---------- Phase T3 sort ----------
     size_t t3_sort_bytes = 0;
