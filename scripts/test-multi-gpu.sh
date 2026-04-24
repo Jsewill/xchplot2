@@ -118,6 +118,49 @@ else
         fail "batch --devices 0,1 failed (see $TMP_OUT/log)"
         sed 's/^/    /' "$TMP_OUT/log"
     fi
+
+    echo "==> cross-device byte-stability"
+    # 4-entry manifest exercises round-robin (2 plots per worker on a
+    # 2-GPU rig). Plot output must be byte-identical regardless of
+    # which worker ran it; if --devices 0 and --devices 0,1 produce
+    # different SHAs for the same plot_id, the multi-device path has
+    # introduced non-determinism we shouldn't ship.
+    SD_DIR="$TMP_OUT/sd"
+    MD_DIR="$TMP_OUT/md"
+    mkdir -p "$SD_DIR" "$MD_DIR"
+    SD_TSV="$TMP_OUT/parity_sd.tsv"
+    MD_TSV="$TMP_OUT/parity_md.tsv"
+    {
+        a64=$(printf '%64s' '' | tr ' ' a)
+        b64=$(printf '%64s' '' | tr ' ' b)
+        c64=$(printf '%64s' '' | tr ' ' c)
+        d64=$(printf '%64s' '' | tr ' ' d)
+        printf '22\t2\t0\t0\t0\t%s\t00\t%s\tp0.plot2\n' "$a64" "$SD_DIR"
+        printf '22\t2\t1\t0\t0\t%s\t00\t%s\tp1.plot2\n' "$b64" "$SD_DIR"
+        printf '22\t2\t2\t0\t0\t%s\t00\t%s\tp2.plot2\n' "$c64" "$SD_DIR"
+        printf '22\t2\t3\t0\t0\t%s\t00\t%s\tp3.plot2\n' "$d64" "$SD_DIR"
+    } > "$SD_TSV"
+    sed "s|$SD_DIR|$MD_DIR|g" "$SD_TSV" > "$MD_TSV"
+
+    if "$XCHPLOT2" batch "$SD_TSV" --devices 0     >"$TMP_OUT/sd.log" 2>&1 \
+    && "$XCHPLOT2" batch "$MD_TSV" --devices 0,1 >"$TMP_OUT/md.log" 2>&1
+    then
+        parity_ok=1
+        for f in "$SD_DIR"/p?.plot2; do
+            name=$(basename "$f")
+            sd_sha=$(sha256sum "$f"          | awk '{print $1}')
+            md_sha=$(sha256sum "$MD_DIR/$name" | awk '{print $1}')
+            if [[ "$sd_sha" != "$md_sha" ]]; then
+                fail "byte mismatch on $name (sd=${sd_sha:0:12} md=${md_sha:0:12})"
+                parity_ok=0
+            fi
+        done
+        if (( parity_ok )); then
+            pass "single-device and multi-device produced byte-identical plots"
+        fi
+    else
+        fail "cross-device parity batches failed (logs in $TMP_OUT/sd.log, md.log)"
+    fi
 fi
 
 echo
