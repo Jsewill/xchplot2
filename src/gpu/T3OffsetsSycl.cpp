@@ -32,8 +32,14 @@ void launch_t3_match_all_buckets(
     uint64_t* d_out_count,
     uint64_t out_capacity,
     uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
     sycl::queue& q)
 {
+    (void)num_buckets;  // only the [begin, end) sub-range is iterated
+    if (bucket_end <= bucket_begin) return;
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
     constexpr size_t threads = 256;
@@ -49,7 +55,7 @@ void launch_t3_match_all_buckets(
 
         h.parallel_for(
             sycl::nd_range<2>{
-                sycl::range<2>{ static_cast<size_t>(num_buckets),
+                sycl::range<2>{ static_cast<size_t>(num_buckets_in_range),
                                 blocks_x * threads },
                 sycl::range<2>{ 1, threads }
             },
@@ -62,7 +68,7 @@ void launch_t3_match_all_buckets(
                 }
                 it.barrier(sycl::access::fence_space::local_space);
 
-                uint32_t bucket_id   = static_cast<uint32_t>(it.get_group(0));
+                uint32_t bucket_id   = bucket_begin + static_cast<uint32_t>(it.get_group(0));
                 uint32_t section_l   = bucket_id / num_match_keys;
                 uint32_t match_key_r = bucket_id % num_match_keys;
 
