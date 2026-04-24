@@ -431,6 +431,7 @@ batch — not a replacement for `chia plots check`.
 | `ACPP_TARGETS=...`            | Override AdaptiveCpp target selection (defaults: NVIDIA `generic`, AMD `hip:$ACPP_GFX`). |
 | `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
 | `POS2_CHIP_DIR=/path`         | Build-time: point at a local pos2-chip checkout instead of FetchContent.|
+| `XCHPLOT2_TEST_GPU_COUNT=N`   | Override `scripts/test-multi-gpu.sh`'s auto-detected GPU count (forces run / skip without consulting `nvidia-smi`). |
 
 ## Testing farming on a testnet
 
@@ -556,6 +557,14 @@ hardware; ~88% of GPU compute is identical between the two paths
 runtime overhead in AdaptiveCpp's DAG manager rather than kernel
 performance. AMD and Intel runtimes are untested; expect roughly the
 SYCL-row latency adjusted for relative GPU throughput.
+
+Numbers above are single-GPU. With `--devices 0,1,...` the batch is
+partitioned round-robin across N worker threads (one per device), so
+wall-clock throughput is bounded by the slowest device's slice —
+≈ linear scaling on matched cards, less if cards differ in speed.
+Live multi-GPU plots were confirmed end-to-end on NVIDIA; per-device
+numbers will vary with PCIe bandwidth sharing on the host root
+complex.
 
 ## License
 
