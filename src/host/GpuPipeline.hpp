@@ -100,11 +100,41 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
                                              uint64_t* pinned_dst,
                                              size_t    pinned_capacity);
 
+// Caller-provided pinned-host scratch buffers for the streaming path.
+// Allocate once per batch in BatchPlotter, reuse across all plots —
+// avoids paying the ~300–600 ms sycl::malloc_host cost per plot per
+// buffer on NVIDIA (measured as the dominant per-plot overhead in
+// stages 4b-4e streaming runs). Lifetime analysis shows that phases
+// using these buffers do not overlap, so two pairs can share a single
+// allocation each:
+//   h_meta        (cap × u64): T1 meta park → T2 meta park
+//   h_keys_merged (cap × u32): T1 keys_merged park → T2 keys_merged park
+//   h_t2_xbits    (cap × u32): T2 xbits park (distinct)
+//   h_t3          (cap × T3PairingGpu = u64): T3 staging (distinct)
+//
+// Any field left nullptr makes the streaming pipeline allocate-on-
+// demand for that buffer (one-shot `test` mode). A fully-populated
+// StreamingPinnedScratch saves all 6 sycl::malloc_host calls per plot.
+struct StreamingPinnedScratch {
+    uint64_t* h_meta         = nullptr;
+    uint32_t* h_keys_merged  = nullptr;
+    uint32_t* h_t2_xbits     = nullptr;
+    uint64_t* h_t3           = nullptr;  // reinterpreted as T3PairingGpu*
+};
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity,
+                                             StreamingPinnedScratch const& scratch);
+
 // Allocate / free host-pinned memory — thin wrappers around
 // cudaMallocHost / cudaFreeHost, exposed so plain .cpp consumers (which
 // do not have cuda_runtime.h on the include path) can own the pinned
 // buffers the streaming overload expects. Returns nullptr on failure.
 uint64_t* streaming_alloc_pinned_uint64(size_t count);
 void      streaming_free_pinned_uint64(uint64_t* ptr);
+
+uint32_t* streaming_alloc_pinned_uint32(size_t count);
+void      streaming_free_pinned_uint32(uint32_t* ptr);
 
 } // namespace pos2gpu

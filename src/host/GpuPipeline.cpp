@@ -539,8 +539,9 @@ namespace { // anon: shared impl, not part of the public API.
 
 GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
-    uint64_t* pinned_dst,         // nullable
-    size_t    pinned_capacity);   // count, not bytes; ignored if pinned_dst null
+    uint64_t* pinned_dst,                       // nullable
+    size_t    pinned_capacity,                  // count, not bytes; ignored if pinned_dst null
+    StreamingPinnedScratch const& scratch);     // any field nullptr → per-plot malloc_host fallback
 
 } // namespace
 
@@ -549,7 +550,8 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg)
 
     sycl::queue& q = sycl_backend::queue();
     return run_gpu_pipeline_streaming_impl(cfg, /*pinned_dst=*/nullptr,
-                                                /*pinned_capacity=*/0);
+                                                /*pinned_capacity=*/0,
+                                                StreamingPinnedScratch{});
 }
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
@@ -560,7 +562,20 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
         throw std::runtime_error(
             "run_gpu_pipeline_streaming(cfg, pinned, cap): pinned buffer must be non-null");
     }
-    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity);
+    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity,
+                                           StreamingPinnedScratch{});
+}
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity,
+                                             StreamingPinnedScratch const& scratch)
+{
+    if (!pinned_dst || pinned_capacity == 0) {
+        throw std::runtime_error(
+            "run_gpu_pipeline_streaming(cfg, pinned, cap, scratch): pinned buffer must be non-null");
+    }
+    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity, scratch);
 }
 
 namespace {
@@ -568,7 +583,8 @@ namespace {
 GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
     uint64_t* pinned_dst,
-    size_t    pinned_capacity)
+    size_t    pinned_capacity,
+    StreamingPinnedScratch const& scratch)
 {
 
     sycl::queue& q = sycl_backend::queue();
@@ -750,8 +766,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // 2080 + d_t1_mi 1040 + CUB working 3120 + scratch). JIT H2D
     // before the gather below, free right after. Mirror of stage 4a
     // for T2.
-    uint64_t* h_t1_meta = static_cast<uint64_t*>(
-        sycl::malloc_host(cap * sizeof(uint64_t), q));
+    // Stage 4f: use caller-provided scratch when present (amortised
+    // across batch); fall back to per-plot malloc_host otherwise. Same
+    // pattern applied to h_t1_keys_merged, h_t2_*, h_t3 below.
+    bool      const h_meta_owned = (scratch.h_meta == nullptr);
+    uint64_t* h_t1_meta = h_meta_owned
+        ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
+        : scratch.h_meta;
     if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
     q.memcpy(h_t1_meta, d_t1_meta, t1_count * sizeof(uint64_t)).wait();
     s_free(stats, d_t1_meta);
@@ -832,8 +853,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // as the "d_sorted_mi" input. Park it on pinned host across the
     // gather peak so the 1040 MB doesn't coexist with d_t1_merged_vals +
     // d_t1_meta + d_t1_meta_sorted. H2D'd back at T2 match entry.
-    uint32_t* h_t1_keys_merged = static_cast<uint32_t*>(
-        sycl::malloc_host(cap * sizeof(uint32_t), q));
+    bool      const h_keys_owned = (scratch.h_keys_merged == nullptr);
+    uint32_t* h_t1_keys_merged = h_keys_owned
+        ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
+        : scratch.h_keys_merged;
     if (!h_t1_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t1_keys_merged) failed");
     q.memcpy(h_t1_keys_merged, d_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
     s_free(stats, d_t1_keys_merged);
@@ -847,7 +870,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // overall bottleneck on its own.
     s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
     q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
-    sycl::free(h_t1_meta, q);
+    if (h_meta_owned) sycl::free(h_t1_meta, q);
     h_t1_meta = nullptr;
 
     uint64_t* d_t1_meta_sorted = nullptr;
@@ -861,7 +884,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // consumer) is about to start. Pinned host freed after H2D.
     s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
     q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
-    sycl::free(h_t1_keys_merged, q);
+    if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
     h_t1_keys_merged = nullptr;
 
     // ---------- Phase T2 match (tiled, N=2, D2H per pass) ----------
@@ -904,22 +927,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
 
     // Full-cap pinned host that will hold the concatenated T2 output.
-    // sycl::malloc_host is ~600 ms for this total at k=28 — acceptable
-    // since it runs once per plot and the match phase is much longer.
-    // Stage 4 can amortise across batch plots if this becomes the
-    // bottleneck.
+    // Stage 4f: reuse the caller-provided scratch for h_meta / h_xbits
+    // (amortised across batch). h_t2_mi is still allocated per-plot
+    // (smaller savings; keeping simple). On NVIDIA a cold malloc_host
+    // of 2 GB is ~400-600 ms, so amortising the big ones per batch is
+    // the bulk of the win.
     auto alloc_pinned_or_throw = [&](size_t bytes, char const* what) {
         void* p = sycl::malloc_host(bytes, q);
         if (!p) throw std::runtime_error(std::string("sycl::malloc_host(")
                                          + what + ") failed");
         return p;
     };
-    uint64_t* h_t2_meta  = static_cast<uint64_t*>(
-        alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"));
+    uint64_t* h_t2_meta  = h_meta_owned  // reuse the t1_meta flag: same scratch buffer
+        ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
+        : scratch.h_meta;
     uint32_t* h_t2_mi    = static_cast<uint32_t*>(
         alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
-    uint32_t* h_t2_xbits = static_cast<uint32_t*>(
-        alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"));
+    bool      const h_xbits_owned = (scratch.h_t2_xbits == nullptr);
+    uint32_t* h_t2_xbits = h_xbits_owned
+        ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
+        : scratch.h_t2_xbits;
 
     // Compute bucket + fine-bucket offsets once; both passes share them.
     // Also zeroes d_counter.
@@ -1097,8 +1124,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // across the gather peak so the 1040 MB doesn't coexist with
     // d_merged_vals + d_t2_meta + d_t2_meta_sorted. H2D'd back before
     // T3 match.
-    uint32_t* h_t2_keys_merged = static_cast<uint32_t*>(
-        sycl::malloc_host(cap * sizeof(uint32_t), q));
+    uint32_t* h_t2_keys_merged = h_keys_owned  // reuse t1_keys flag: same scratch
+        ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
+        : scratch.h_keys_merged;
     if (!h_t2_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t2_keys_merged) failed");
     q.memcpy(h_t2_keys_merged, d_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
     s_free(stats, d_t2_keys_merged);
@@ -1113,7 +1141,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
     q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
     q.wait();
-    sycl::free(h_t2_meta, q);
+    if (h_meta_owned) sycl::free(h_t2_meta, q);
     h_t2_meta = nullptr;
 
     uint64_t* d_t2_meta_sorted = nullptr;
@@ -1126,7 +1154,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
     q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
     q.wait();
-    sycl::free(h_t2_xbits, q);
+    if (h_xbits_owned) sycl::free(h_t2_xbits, q);
     h_t2_xbits = nullptr;
 
     uint32_t* d_t2_xbits_sorted = nullptr;
@@ -1157,7 +1185,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // after H2D.
     s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
     q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
-    sycl::free(h_t2_keys_merged, q);
+    if (h_keys_owned) sycl::free(h_t2_keys_merged, q);
     h_t2_keys_merged = nullptr;
 
     uint64_t const t3_half_cap = (cap + 1) / 2;
@@ -1168,8 +1196,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                     "d_t3_match_temp");
 
     // Full-cap pinned host that will hold the concatenated T3 output.
-    T3PairingGpu* h_t3 = static_cast<T3PairingGpu*>(
-        sycl::malloc_host(cap * sizeof(T3PairingGpu), q));
+    // Stage 4f: reuse scratch.h_t3 when provided (amortised across
+    // batch). T3PairingGpu is just a uint64 proof_fragment, so the
+    // scratch buffer is declared as uint64_t* and reinterpret-cast.
+    bool const h_t3_owned = (scratch.h_t3 == nullptr);
+    T3PairingGpu* h_t3 = h_t3_owned
+        ? static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q))
+        : reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
     if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
     // Compute bucket + fine-bucket offsets once; both match passes
@@ -1228,7 +1261,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     T3PairingGpu* d_t3 = nullptr;
     s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
     q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
-    sycl::free(h_t3, q);
+    if (h_t3_owned) sycl::free(h_t3, q);
     h_t3 = nullptr;
 
     // ---------- Phase T3 sort ----------
@@ -1316,6 +1349,18 @@ uint64_t* streaming_alloc_pinned_uint64(size_t count)
         sycl::malloc_host(count * sizeof(uint64_t), sycl_backend::queue()));
     if (!p) return nullptr;
     return p;
+}
+
+uint32_t* streaming_alloc_pinned_uint32(size_t count)
+{
+    uint32_t* p = static_cast<uint32_t*>(
+        sycl::malloc_host(count * sizeof(uint32_t), sycl_backend::queue()));
+    return p;  // nullptr on failure
+}
+
+void streaming_free_pinned_uint32(uint32_t* ptr)
+{
+    if (ptr) sycl::free(ptr, sycl_backend::queue());
 }
 
 void streaming_free_pinned_uint64(uint64_t* ptr)

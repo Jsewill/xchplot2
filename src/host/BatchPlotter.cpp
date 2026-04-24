@@ -277,6 +277,10 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // once instead of per plot is a significant win on long batches.
     uint64_t* stream_pinned[GpuBufferPool::kNumPinnedBuffers] = {};
     size_t    stream_pinned_cap = 0;
+    // Stage 4f: amortised streaming-path pinned-host scratch. Populated
+    // in the streaming-fallback branch below; nullptr fields when the
+    // pool path is active (pool_ptr != null).
+    StreamingPinnedScratch stream_scratch{};
 
     // Force-streaming override (matches the one-shot run_gpu_pipeline
     // dispatch). Useful for testing the streaming path on a high-VRAM
@@ -350,6 +354,30 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
             }
             throw std::runtime_error(
                 "[batch] streaming-fallback: pinned D2H buffer allocation failed");
+        }
+
+        // Stage 4f: amortise streaming-path pinned-host scratch across
+        // all plots in the batch. Lifetime analysis (see
+        // StreamingPinnedScratch doc) lets four shared buffers cover
+        // all six internal park/staging roles. At k=28: h_meta 2080 MB
+        // + h_keys_merged 1040 MB + h_t2_xbits 1040 MB + h_t3 2080 MB
+        // = ~6.24 GB of pinned host, paid ONCE for the whole batch.
+        stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
+        stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
+        stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
+        stream_scratch.h_t3          = streaming_alloc_pinned_uint64(stream_pinned_cap);
+        if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
+            !stream_scratch.h_t2_xbits || !stream_scratch.h_t3)
+        {
+            if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+            if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+            if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+            if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
+            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+            }
+            throw std::runtime_error(
+                "[batch] streaming-fallback: pinned-host scratch allocation failed");
         }
     }
     if (verbose && pool_ptr) {
@@ -477,7 +505,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                     // Streaming path with externally-owned pinned: same
                     // rotation + channel-depth invariant.
                     item.result = run_gpu_pipeline_streaming(
-                        cfg, stream_pinned[slot], stream_pinned_cap);
+                        cfg, stream_pinned[slot], stream_pinned_cap,
+                        stream_scratch);
                 }
             } catch (std::exception const& e) {
                 if (!opts.continue_on_error) throw;
@@ -516,6 +545,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
         streaming_free_pinned_uint64(stream_pinned[s]);
     }
+    // Stage 4f: free the amortised streaming scratch (no-op if pool path
+    // was used — all fields stay nullptr in that case).
+    if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+    if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+    if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+    if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
 
     res.plots_written = plots_done.load();
     res.plots_failed  = producer_failed + plots_failed_consumer.load();
