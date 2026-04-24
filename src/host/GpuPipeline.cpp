@@ -772,66 +772,131 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t1_meta);
     s_free(stats, d_t1_merged_vals);
 
-    // ---------- Phase T2 match (tiled, N=2) ----------
-    // Split the match into two temporally-separated passes over
-    // disjoint bucket-id ranges, sharing the same output SoA and atomic
-    // counter. This is stage 2 of C (see docs/t2-match-tiling-plan.md):
-    // allocations and live-set are unchanged, so VRAM peak does not
-    // drop yet — the purpose is to validate that splitting the match
-    // is byte-equivalent after sort. Stage 3+ will replace the
-    // cap-sized device output with a small staging buffer + D2H drain.
+    // ---------- Phase T2 match (tiled, N=2, D2H per pass) ----------
+    // Split the match into two temporally-separated passes over disjoint
+    // bucket-id ranges and route each pass's output through pinned host.
+    // Device staging is half-cap, so the live set during match becomes
+    //   T1 sorted (3.07 GB at k=28) + half-cap T2 staging (2.08 GB)
+    //   = ~5.15 GB
+    // down from T1 + full-cap = 7.29 GB. This is stage 3 of C (see
+    // docs/t2-match-tiling-plan.md). Pool path stays on the single-shot
+    // launch_t2_match — it has the VRAM and doesn't pay the staging
+    // round-trip cost.
     //
-    // Pool path (run_gpu_pipeline with a pool) stays on the single-shot
-    // launch_t2_match — pool has the VRAM and doesn't benefit from
-    // the split overhead.
+    // Per-pass safety: we expect each half to produce ≤ cap/2 pairs
+    // because the match output is roughly uniform across bucket ids.
+    // cap itself has a built-in safety margin (see extra_margin_bits in
+    // PoolSizing), and typical actual utilisation is well under 100 %.
+    // If a pass ever exceeds staging capacity we throw with a clear
+    // message rather than silently dropping pairs.
     stats.phase = "T2 match";
     auto t2p = make_t2_params(cfg.k, cfg.strength);
-    size_t t2_temp_bytes = 0;
-    launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
-                            d_counter, nullptr, &t2_temp_bytes, q);
-    // T2 match emits SoA: three separate streams instead of a packed
-    // T2PairingGpu array. Total bytes same (cap·16) but each stream can
-    // be freed independently — crucial at k=28 where d_t2_mi becomes
-    // dead after the T2 sort's CUB consumes it.
-    uint64_t* d_t2_meta  = nullptr;
-    uint32_t* d_t2_mi    = nullptr;
-    uint32_t* d_t2_xbits = nullptr;
-    void*     d_t2_match_temp = nullptr;
-    s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
-    s_malloc(stats, d_t2_mi,         cap * sizeof(uint32_t), "d_t2_mi");
-    s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
-    s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
-
-    // Compute bucket + fine-bucket offsets once; both match passes
-    // share them. Also zeroes d_counter.
-    launch_t2_match_prepare(cfg.plot_id.data(), t2p,
-                            d_t1_keys_merged, t1_count,
-                            d_counter, d_t2_match_temp, &t2_temp_bytes, q);
 
     uint32_t const t2_num_buckets =
         (1u << t2p.num_section_bits) * (1u << t2p.num_match_key_bits);
     uint32_t const t2_bucket_mid = t2_num_buckets / 2;
+    uint64_t const t2_half_cap   = (cap + 1) / 2;
+
+    size_t t2_temp_bytes = 0;
+    launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
+                            d_counter, nullptr, &t2_temp_bytes, q);
+
+    // Half-cap device staging (reused across both passes).
+    uint64_t* d_t2_meta_stage  = nullptr;
+    uint32_t* d_t2_mi_stage    = nullptr;
+    uint32_t* d_t2_xbits_stage = nullptr;
+    void*     d_t2_match_temp  = nullptr;
+    s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
+    s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
+    s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+    s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
+
+    // Full-cap pinned host that will hold the concatenated T2 output.
+    // sycl::malloc_host is ~600 ms for this total at k=28 — acceptable
+    // since it runs once per plot and the match phase is much longer.
+    // Stage 4 can amortise across batch plots if this becomes the
+    // bottleneck.
+    auto alloc_pinned_or_throw = [&](size_t bytes, char const* what) {
+        void* p = sycl::malloc_host(bytes, q);
+        if (!p) throw std::runtime_error(std::string("sycl::malloc_host(")
+                                         + what + ") failed");
+        return p;
+    };
+    uint64_t* h_t2_meta  = static_cast<uint64_t*>(
+        alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"));
+    uint32_t* h_t2_mi    = static_cast<uint32_t*>(
+        alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
+    uint32_t* h_t2_xbits = static_cast<uint32_t*>(
+        alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"));
+
+    // Compute bucket + fine-bucket offsets once; both passes share them.
+    // Also zeroes d_counter.
+    launch_t2_match_prepare(cfg.plot_id.data(), t2p,
+                            d_t1_keys_merged, t1_count,
+                            d_counter, d_t2_match_temp, &t2_temp_bytes, q);
+
+    auto run_pass_and_stage = [&](uint32_t bucket_begin, uint32_t bucket_end,
+                                  uint64_t host_offset) -> uint64_t
+    {
+        launch_t2_match_range(cfg.plot_id.data(), t2p,
+                              d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                              d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                              d_counter, t2_half_cap, d_t2_match_temp,
+                              bucket_begin, bucket_end, q);
+        uint64_t pass_count = 0;
+        q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+        if (pass_count > t2_half_cap) {
+            throw std::runtime_error(
+                "T2 match pass overflow: bucket range [" +
+                std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
+                ") produced " + std::to_string(pass_count) +
+                " pairs, staging holds " + std::to_string(t2_half_cap) +
+                ". Lower N or widen staging.");
+        }
+        q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
+        q.memcpy(h_t2_mi    + host_offset, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
+        q.memcpy(h_t2_xbits + host_offset, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
+        q.wait();
+        // Reset the counter so the next pass writes at index 0 of the
+        // staging buffer, not at pass_count.
+        q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+        return pass_count;
+    };
 
     int p_t2 = begin_phase("T2 match");
-    launch_t2_match_range(cfg.plot_id.data(), t2p,
-                          d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                          d_t2_meta, d_t2_mi, d_t2_xbits,
-                          d_counter, cap, d_t2_match_temp,
-                          /*bucket_begin=*/0, /*bucket_end=*/t2_bucket_mid, q);
-    launch_t2_match_range(cfg.plot_id.data(), t2p,
-                          d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                          d_t2_meta, d_t2_mi, d_t2_xbits,
-                          d_counter, cap, d_t2_match_temp,
-                          /*bucket_begin=*/t2_bucket_mid, /*bucket_end=*/t2_num_buckets, q);
+    uint64_t const count1 = run_pass_and_stage(0,              t2_bucket_mid,   /*host_offset=*/0);
+    uint64_t const count2 = run_pass_and_stage(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
     end_phase(p_t2);
 
-    uint64_t t2_count = 0;
-    q.memcpy(&t2_count, d_counter, sizeof(uint64_t)).wait();
+    uint64_t const t2_count = count1 + count2;
     if (t2_count > cap) throw std::runtime_error("T2 overflow");
 
+    // Free device staging + T1 sorted + match temp before re-allocating
+    // the full-cap output that T2 sort expects. Frees ~5.2 GB.
     s_free(stats, d_t2_match_temp);
+    s_free(stats, d_t2_meta_stage);
+    s_free(stats, d_t2_mi_stage);
+    s_free(stats, d_t2_xbits_stage);
     s_free(stats, d_t1_meta_sorted);
     s_free(stats, d_t1_keys_merged);
+
+    // Re-hydrate full-cap device buffers that the existing T2 sort
+    // tiling expects. H2D brings the concatenated T2 back onto the
+    // device. Stage 4 will remove this round-trip by sorting per-chunk
+    // on emit and feeding T3 from the host.
+    uint64_t* d_t2_meta  = nullptr;
+    uint32_t* d_t2_mi    = nullptr;
+    uint32_t* d_t2_xbits = nullptr;
+    s_malloc(stats, d_t2_meta,  cap * sizeof(uint64_t), "d_t2_meta");
+    s_malloc(stats, d_t2_mi,    cap * sizeof(uint32_t), "d_t2_mi");
+    s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+    q.memcpy(d_t2_meta,  h_t2_meta,  t2_count * sizeof(uint64_t));
+    q.memcpy(d_t2_mi,    h_t2_mi,    t2_count * sizeof(uint32_t));
+    q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+    q.wait();
+    sycl::free(h_t2_meta,  q);
+    sycl::free(h_t2_mi,    q);
+    sycl::free(h_t2_xbits, q);
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
     // Mirror of T1 sort above — same tile-and-merge shape, but permute
