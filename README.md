@@ -35,6 +35,11 @@ OS requirements, [Build](#build) for alternative install paths, and
   the streaming pipeline; 16 GB+ cards use the persistent buffer pool
   for faster steady-state. Both paths produce byte-identical plots.
   Detailed breakdown in [VRAM](#vram).
+
+  With [`--devices`](#multi-gpu---devices), each worker picks its own
+  pool-vs-streaming path from its own GPU's free VRAM — heterogeneous
+  rigs (e.g. one 16 GB + one 8 GB card) plot concurrently with each
+  device on its matching path.
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
