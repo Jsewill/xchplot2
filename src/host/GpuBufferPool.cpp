@@ -318,4 +318,24 @@ size_t streaming_peak_bytes(int k)
     return (size_t(anchor_mb) << 20) << shift;
 }
 
+size_t streaming_plain_peak_bytes(int k)
+{
+    // Anchor: 7290 MB at k=28 (pre-stage-1-4 peak — d_t1_meta +
+    // d_t1_keys_merged + d_t2_meta + d_t2_mi + d_t2_xbits all live
+    // concurrently during T2 match, no parks). Plain tier skips all
+    // park/rehydrate round-trips for ~400 ms/plot over compact at the
+    // cost of this higher peak. Scales the same way as compact.
+    constexpr size_t anchor_mb = 7290;
+    if (k == 28) return anchor_mb << 20;
+    if (k <  18) return size_t(16) << 20;
+    if (k >  32) return size_t(anchor_mb) << (20 + ((32 - 28) * 2));
+
+    if (k < 28) {
+        int const shift = (28 - k) * 2;
+        return (size_t(anchor_mb) << 20) >> shift;
+    }
+    int const shift = (k - 28) * 2;
+    return (size_t(anchor_mb) << 20) << shift;
+}
+
 } // namespace pos2gpu

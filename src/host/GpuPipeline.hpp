@@ -120,6 +120,15 @@ struct StreamingPinnedScratch {
     uint32_t* h_keys_merged  = nullptr;
     uint32_t* h_t2_xbits     = nullptr;
     uint64_t* h_t3           = nullptr;  // reinterpreted as T3PairingGpu*
+
+    // Plain mode: skip all parks and use single-pass T2 match. Higher
+    // peak (~7.3 GB at k=28) than compact (~5.2 GB) but ~400 ms/plot
+    // faster because there are no PCIe round-trips for T1 meta / T1
+    // keys_merged / T2 meta / T2 xbits / T2 keys_merged parks. The
+    // BatchPlotter picks this tier when free VRAM fits the plain peak
+    // but not the pool (12-14 GB cards). When true, the h_* pointers
+    // above are ignored — plain mode does not park anything.
+    bool plain_mode          = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

@@ -759,24 +759,31 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Xs fully consumed.
     s_free(stats, d_xs);
 
-    // Stage 4b: park d_t1_meta on pinned host across the T1 sort
-    // phase. d_t1_meta is only needed again for launch_gather_u64 at
-    // the end of T1 sort — holding it alive through CUB setup was
-    // responsible for the 6256 MB overall streaming peak (d_t1_meta
-    // 2080 + d_t1_mi 1040 + CUB working 3120 + scratch). JIT H2D
-    // before the gather below, free right after. Mirror of stage 4a
-    // for T2.
+    // Stage 4b (compact only): park d_t1_meta on pinned host across
+    // the T1 sort phase. d_t1_meta is only needed again for
+    // launch_gather_u64 at the end of T1 sort — holding it alive
+    // through CUB setup was responsible for the 6256 MB overall
+    // streaming peak (d_t1_meta 2080 + d_t1_mi 1040 + CUB working 3120
+    // + scratch). JIT H2D before the gather below, free right after.
+    // Mirror of stage 4a for T2.
+    //
     // Stage 4f: use caller-provided scratch when present (amortised
     // across batch); fall back to per-plot malloc_host otherwise. Same
     // pattern applied to h_t1_keys_merged, h_t2_*, h_t3 below.
-    bool      const h_meta_owned = (scratch.h_meta == nullptr);
-    uint64_t* h_t1_meta = h_meta_owned
-        ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
-        : scratch.h_meta;
-    if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
-    q.memcpy(h_t1_meta, d_t1_meta, t1_count * sizeof(uint64_t)).wait();
-    s_free(stats, d_t1_meta);
-    d_t1_meta = nullptr;
+    //
+    // Plain mode skips the park entirely: d_t1_meta stays live through
+    // T1 sort. Costs ~2 GB peak but saves a PCIe round-trip.
+    bool      const h_meta_owned = (!scratch.plain_mode && scratch.h_meta == nullptr);
+    uint64_t* h_t1_meta = nullptr;
+    if (!scratch.plain_mode) {
+        h_t1_meta = h_meta_owned
+            ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
+            : scratch.h_meta;
+        if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
+        q.memcpy(h_t1_meta, d_t1_meta, t1_count * sizeof(uint64_t)).wait();
+        s_free(stats, d_t1_meta);
+        d_t1_meta = nullptr;
+    }
 
     // ---------- Phase T1 sort (tiled, N=2) ----------
     // Partition T1 into two halves by index, CUB-sort each with scratch
@@ -848,30 +855,40 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_keys_out);
     s_free(stats, d_vals_out);
 
-    // Stage 4c: d_t1_keys_merged is not used by the gather below (gather
-    // uses d_t1_merged_vals for indices); it is only consumed by T2 match
-    // as the "d_sorted_mi" input. Park it on pinned host across the
-    // gather peak so the 1040 MB doesn't coexist with d_t1_merged_vals +
-    // d_t1_meta + d_t1_meta_sorted. H2D'd back at T2 match entry.
-    bool      const h_keys_owned = (scratch.h_keys_merged == nullptr);
-    uint32_t* h_t1_keys_merged = h_keys_owned
-        ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
-        : scratch.h_keys_merged;
-    if (!h_t1_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t1_keys_merged) failed");
-    q.memcpy(h_t1_keys_merged, d_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
-    s_free(stats, d_t1_keys_merged);
-    d_t1_keys_merged = nullptr;
+    // Stage 4c (compact only): d_t1_keys_merged is not used by the
+    // gather below (gather uses d_t1_merged_vals for indices); it is
+    // only consumed by T2 match as the "d_sorted_mi" input. Park it on
+    // pinned host across the gather peak so the 1040 MB doesn't coexist
+    // with d_t1_merged_vals + d_t1_meta + d_t1_meta_sorted. H2D'd back
+    // at T2 match entry.
+    //
+    // Plain mode keeps d_t1_keys_merged live across the gather peak.
+    bool      const h_keys_owned = (!scratch.plain_mode && scratch.h_keys_merged == nullptr);
+    uint32_t* h_t1_keys_merged = nullptr;
+    if (!scratch.plain_mode) {
+        h_t1_keys_merged = h_keys_owned
+            ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
+            : scratch.h_keys_merged;
+        if (!h_t1_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t1_keys_merged) failed");
+        q.memcpy(h_t1_keys_merged, d_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
+        s_free(stats, d_t1_keys_merged);
+        d_t1_keys_merged = nullptr;
+    }
 
-    // Stage 4b: JIT H2D d_t1_meta back onto the device for the gather,
-    // then free it immediately. Peak during this window:
+    // Stage 4b (compact only): JIT H2D d_t1_meta back onto the device
+    // for the gather, then free it immediately. Peak during this window:
     //   d_t1_keys_merged (1040) + d_t1_merged_vals (1040)
     //   + d_t1_meta (2080 H2D) + d_t1_meta_sorted (2080 populated)
     //   = 6240 MB — same as T2 sort's gather peak, and no longer the
     // overall bottleneck on its own.
-    s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
-    q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
-    if (h_meta_owned) sycl::free(h_t1_meta, q);
-    h_t1_meta = nullptr;
+    //
+    // Plain mode: d_t1_meta is already live (never parked).
+    if (!scratch.plain_mode) {
+        s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
+        q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
+        if (h_meta_owned) sycl::free(h_t1_meta, q);
+        h_t1_meta = nullptr;
+    }
 
     uint64_t* d_t1_meta_sorted = nullptr;
     s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
@@ -880,141 +897,178 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t1_meta);
     s_free(stats, d_t1_merged_vals);
 
-    // Stage 4c: H2D d_t1_keys_merged back now that T2 match (its
-    // consumer) is about to start. Pinned host freed after H2D.
-    s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
-    q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
-    if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
-    h_t1_keys_merged = nullptr;
+    // Stage 4c (compact only): H2D d_t1_keys_merged back now that T2
+    // match (its consumer) is about to start. Pinned host freed after
+    // H2D. Plain mode: d_t1_keys_merged is already live.
+    if (!scratch.plain_mode) {
+        s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
+        q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
+        if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
+        h_t1_keys_merged = nullptr;
+    }
 
-    // ---------- Phase T2 match (tiled, N=2, D2H per pass) ----------
-    // Split the match into two temporally-separated passes over disjoint
-    // bucket-id ranges and route each pass's output through pinned host.
-    // Device staging is half-cap, so the live set during match becomes
-    //   T1 sorted (3.07 GB at k=28) + half-cap T2 staging (2.08 GB)
-    //   = ~5.15 GB
-    // down from T1 + full-cap = 7.29 GB. This is stage 3 of C (see
-    // docs/t2-match-tiling-plan.md). Pool path stays on the single-shot
+    // ---------- Phase T2 match ----------
+    // Plain mode: single-pass full-cap N=1 match. Device live set
+    // during match is T1 sorted (3.07 GB at k=28) + full-cap T2 output
+    // (4.16 GB) ≈ 7.23 GB. No PCIe round-trips.
+    //
+    // Compact mode (tiled N=2, D2H per pass): two bucket-range passes
+    // through half-cap device staging + pinned host accumulators. Match
+    // live set drops to T1 sorted + half-cap staging ≈ 5.15 GB, at the
+    // cost of ~70 ms of PCIe per pass. This is stage 3 of C (see
+    // docs/t2-match-tiling-plan.md). Pool path uses the single-shot
     // launch_t2_match — it has the VRAM and doesn't pay the staging
     // round-trip cost.
     //
-    // Per-pass safety: we expect each half to produce ≤ cap/2 pairs
-    // because the match output is roughly uniform across bucket ids.
-    // cap itself has a built-in safety margin (see extra_margin_bits in
-    // PoolSizing), and typical actual utilisation is well under 100 %.
-    // If a pass ever exceeds staging capacity we throw with a clear
-    // message rather than silently dropping pairs.
+    // Per-pass compact safety: we expect each half to produce ≤ cap/2
+    // pairs because the match output is roughly uniform across bucket
+    // ids. cap itself has a built-in safety margin (see
+    // extra_margin_bits in PoolSizing), and typical actual utilisation
+    // is well under 100 %. If a pass ever exceeds staging capacity we
+    // throw rather than silently dropping pairs.
     stats.phase = "T2 match";
     auto t2p = make_t2_params(cfg.k, cfg.strength);
 
-    uint32_t const t2_num_buckets =
-        (1u << t2p.num_section_bits) * (1u << t2p.num_match_key_bits);
-    uint32_t const t2_bucket_mid = t2_num_buckets / 2;
-    uint64_t const t2_half_cap   = (cap + 1) / 2;
+    // Shared outputs. In plain mode d_t2_meta / d_t2_xbits / d_t2_mi
+    // all become live full-cap buffers here; the T2 sort / gather
+    // sections below skip the JIT H2D re-hydrations. In compact mode
+    // only d_t2_mi is live here (hydrated from the per-plot h_t2_mi),
+    // and h_t2_meta / h_t2_xbits hold the concatenated outputs on
+    // pinned host until JIT H2D at the gather site.
+    uint64_t* d_t2_meta  = nullptr;
+    uint32_t* d_t2_mi    = nullptr;
+    uint32_t* d_t2_xbits = nullptr;
+    uint64_t t2_count    = 0;
+    uint64_t* h_t2_meta  = nullptr;
+    uint32_t* h_t2_xbits = nullptr;
+    bool      h_xbits_owned = false;
 
-    size_t t2_temp_bytes = 0;
-    launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
-                            d_counter, nullptr, &t2_temp_bytes, q);
+    if (scratch.plain_mode) {
+        // Plain: one-shot launch_t2_match into full-cap device buffers.
+        size_t t2_temp_bytes = 0;
+        launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
+                        nullptr, nullptr, nullptr, d_counter, cap,
+                        nullptr, &t2_temp_bytes, q);
 
-    // Half-cap device staging (reused across both passes).
-    uint64_t* d_t2_meta_stage  = nullptr;
-    uint32_t* d_t2_mi_stage    = nullptr;
-    uint32_t* d_t2_xbits_stage = nullptr;
-    void*     d_t2_match_temp  = nullptr;
-    s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
-    s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
-    s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
-    s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
+        void* d_t2_match_temp = nullptr;
+        s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
+        s_malloc(stats, d_t2_mi,         cap * sizeof(uint32_t), "d_t2_mi");
+        s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
+        s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
 
-    // Full-cap pinned host that will hold the concatenated T2 output.
-    // Stage 4f: reuse the caller-provided scratch for h_meta / h_xbits
-    // (amortised across batch). h_t2_mi is still allocated per-plot
-    // (smaller savings; keeping simple). On NVIDIA a cold malloc_host
-    // of 2 GB is ~400-600 ms, so amortising the big ones per batch is
-    // the bulk of the win.
-    auto alloc_pinned_or_throw = [&](size_t bytes, char const* what) {
-        void* p = sycl::malloc_host(bytes, q);
-        if (!p) throw std::runtime_error(std::string("sycl::malloc_host(")
-                                         + what + ") failed");
-        return p;
-    };
-    uint64_t* h_t2_meta  = h_meta_owned  // reuse the t1_meta flag: same scratch buffer
-        ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
-        : scratch.h_meta;
-    uint32_t* h_t2_mi    = static_cast<uint32_t*>(
-        alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
-    bool      const h_xbits_owned = (scratch.h_t2_xbits == nullptr);
-    uint32_t* h_t2_xbits = h_xbits_owned
-        ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
-        : scratch.h_t2_xbits;
-
-    // Compute bucket + fine-bucket offsets once; both passes share them.
-    // Also zeroes d_counter.
-    launch_t2_match_prepare(cfg.plot_id.data(), t2p,
-                            d_t1_keys_merged, t1_count,
-                            d_counter, d_t2_match_temp, &t2_temp_bytes, q);
-
-    auto run_pass_and_stage = [&](uint32_t bucket_begin, uint32_t bucket_end,
-                                  uint64_t host_offset) -> uint64_t
-    {
-        launch_t2_match_range(cfg.plot_id.data(), t2p,
-                              d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                              d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                              d_counter, t2_half_cap, d_t2_match_temp,
-                              bucket_begin, bucket_end, q);
-        uint64_t pass_count = 0;
-        q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
-        if (pass_count > t2_half_cap) {
-            throw std::runtime_error(
-                "T2 match pass overflow: bucket range [" +
-                std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
-                ") produced " + std::to_string(pass_count) +
-                " pairs, staging holds " + std::to_string(t2_half_cap) +
-                ". Lower N or widen staging.");
-        }
-        q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
-        q.memcpy(h_t2_mi    + host_offset, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
-        q.memcpy(h_t2_xbits + host_offset, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
-        q.wait();
-        // Reset the counter so the next pass writes at index 0 of the
-        // staging buffer, not at pass_count.
         q.memset(d_counter, 0, sizeof(uint64_t)).wait();
-        return pass_count;
-    };
+        int p_t2 = begin_phase("T2 match");
+        launch_t2_match(cfg.plot_id.data(), t2p,
+                        d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                        d_t2_meta, d_t2_mi, d_t2_xbits,
+                        d_counter, cap,
+                        d_t2_match_temp, &t2_temp_bytes, q);
+        end_phase(p_t2);
 
-    int p_t2 = begin_phase("T2 match");
-    uint64_t const count1 = run_pass_and_stage(0,              t2_bucket_mid,   /*host_offset=*/0);
-    uint64_t const count2 = run_pass_and_stage(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
-    end_phase(p_t2);
+        q.memcpy(&t2_count, d_counter, sizeof(uint64_t)).wait();
+        if (t2_count > cap) throw std::runtime_error("T2 overflow");
 
-    uint64_t const t2_count = count1 + count2;
-    if (t2_count > cap) throw std::runtime_error("T2 overflow");
+        s_free(stats, d_t2_match_temp);
+        s_free(stats, d_t1_meta_sorted);
+        s_free(stats, d_t1_keys_merged);
+    } else {
+        // Compact: N=2 tiled half-cap staging with pinned-host
+        // accumulators (stages 1/2/3).
+        uint32_t const t2_num_buckets =
+            (1u << t2p.num_section_bits) * (1u << t2p.num_match_key_bits);
+        uint32_t const t2_bucket_mid = t2_num_buckets / 2;
+        uint64_t const t2_half_cap   = (cap + 1) / 2;
 
-    // Free device staging + T1 sorted + match temp before re-allocating
-    // the full-cap output that T2 sort expects. Frees ~5.2 GB.
-    s_free(stats, d_t2_match_temp);
-    s_free(stats, d_t2_meta_stage);
-    s_free(stats, d_t2_mi_stage);
-    s_free(stats, d_t2_xbits_stage);
-    s_free(stats, d_t1_meta_sorted);
-    s_free(stats, d_t1_keys_merged);
+        size_t t2_temp_bytes = 0;
+        launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
+                                d_counter, nullptr, &t2_temp_bytes, q);
 
-    // Stage 4a: defer d_t2_meta and d_t2_xbits re-hydration until just
-    // before their respective launch_gather_* call. The CUB tile-sort
-    // only needs d_t2_mi on device as its sort key; holding meta + xbits
-    // alive through sort setup was what drove the 7288 MB k=28 peak
-    // (meta+mi+xbits = 4160 MB coexisting with the 3120 MB CUB working
-    // arrays d_keys_out/d_vals_in/d_vals_out). Pinned-host h_t2_meta
-    // and h_t2_xbits stay alive across T2 sort so the gather calls can
-    // H2D them just-in-time.
-    uint32_t* d_t2_mi = nullptr;
-    s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
-    q.memcpy(d_t2_mi, h_t2_mi, t2_count * sizeof(uint32_t));
-    q.wait();
-    sycl::free(h_t2_mi, q);
-    h_t2_mi = nullptr;
-    // h_t2_meta and h_t2_xbits stay live until their gather calls
-    // at the end of T2 sort — see the JIT H2D + free below.
+        // Half-cap device staging (reused across both passes).
+        uint64_t* d_t2_meta_stage  = nullptr;
+        uint32_t* d_t2_mi_stage    = nullptr;
+        uint32_t* d_t2_xbits_stage = nullptr;
+        void*     d_t2_match_temp  = nullptr;
+        s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
+        s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
+        s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+        s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
+
+        // Full-cap pinned host that will hold the concatenated T2 output.
+        // Stage 4f: reuse the caller-provided scratch for h_meta / h_xbits
+        // (amortised across batch). h_t2_mi is still allocated per-plot.
+        auto alloc_pinned_or_throw = [&](size_t bytes, char const* what) {
+            void* p = sycl::malloc_host(bytes, q);
+            if (!p) throw std::runtime_error(std::string("sycl::malloc_host(")
+                                             + what + ") failed");
+            return p;
+        };
+        h_t2_meta  = h_meta_owned
+            ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
+            : scratch.h_meta;
+        uint32_t* h_t2_mi = static_cast<uint32_t*>(
+            alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
+        h_xbits_owned = (scratch.h_t2_xbits == nullptr);
+        h_t2_xbits = h_xbits_owned
+            ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
+            : scratch.h_t2_xbits;
+
+        // Compute bucket + fine-bucket offsets once; both passes share
+        // them. Also zeroes d_counter.
+        launch_t2_match_prepare(cfg.plot_id.data(), t2p,
+                                d_t1_keys_merged, t1_count,
+                                d_counter, d_t2_match_temp, &t2_temp_bytes, q);
+
+        auto run_pass_and_stage = [&](uint32_t bucket_begin, uint32_t bucket_end,
+                                      uint64_t host_offset) -> uint64_t
+        {
+            launch_t2_match_range(cfg.plot_id.data(), t2p,
+                                  d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                                  d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                                  d_counter, t2_half_cap, d_t2_match_temp,
+                                  bucket_begin, bucket_end, q);
+            uint64_t pass_count = 0;
+            q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+            if (pass_count > t2_half_cap) {
+                throw std::runtime_error(
+                    "T2 match pass overflow: bucket range [" +
+                    std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
+                    ") produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t2_half_cap) +
+                    ". Lower N or widen staging.");
+            }
+            q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
+            q.memcpy(h_t2_mi    + host_offset, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
+            q.memcpy(h_t2_xbits + host_offset, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
+            q.wait();
+            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+            return pass_count;
+        };
+
+        int p_t2 = begin_phase("T2 match");
+        uint64_t const count1 = run_pass_and_stage(0,              t2_bucket_mid,   /*host_offset=*/0);
+        uint64_t const count2 = run_pass_and_stage(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
+        end_phase(p_t2);
+
+        t2_count = count1 + count2;
+        if (t2_count > cap) throw std::runtime_error("T2 overflow");
+
+        // Free device staging + T1 sorted + match temp before
+        // re-allocating the full-cap d_t2_mi that T2 sort expects.
+        s_free(stats, d_t2_match_temp);
+        s_free(stats, d_t2_meta_stage);
+        s_free(stats, d_t2_mi_stage);
+        s_free(stats, d_t2_xbits_stage);
+        s_free(stats, d_t1_meta_sorted);
+        s_free(stats, d_t1_keys_merged);
+
+        // Stage 4a: hydrate full-cap d_t2_mi from h_t2_mi. d_t2_meta
+        // and d_t2_xbits are NOT hydrated yet — they stay on pinned
+        // host until their gather calls at the end of T2 sort.
+        s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
+        q.memcpy(d_t2_mi, h_t2_mi, t2_count * sizeof(uint32_t));
+        q.wait();
+        sycl::free(h_t2_mi, q);
+    }
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
     // Mirror of T1 sort above — same tile-and-merge shape, but permute
@@ -1118,31 +1172,40 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_CD_keys);
     s_free(stats, d_CD_vals);
 
-    // Stage 4c: d_t2_keys_merged is not consumed by the gather calls
-    // below (they use d_merged_vals for indices) — it's only needed
-    // later by T3 match as the sorted-MI input. Park it on pinned host
-    // across the gather peak so the 1040 MB doesn't coexist with
-    // d_merged_vals + d_t2_meta + d_t2_meta_sorted. H2D'd back before
-    // T3 match.
-    uint32_t* h_t2_keys_merged = h_keys_owned  // reuse t1_keys flag: same scratch
-        ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
-        : scratch.h_keys_merged;
-    if (!h_t2_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t2_keys_merged) failed");
-    q.memcpy(h_t2_keys_merged, d_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
-    s_free(stats, d_t2_keys_merged);
-    d_t2_keys_merged = nullptr;
+    // Stage 4c (compact only): d_t2_keys_merged is not consumed by the
+    // gather calls below (they use d_merged_vals for indices) — it's
+    // only needed later by T3 match as the sorted-MI input. Park it on
+    // pinned host across the gather peak so the 1040 MB doesn't coexist
+    // with d_merged_vals + d_t2_meta + d_t2_meta_sorted. H2D'd back
+    // before T3 match.
+    //
+    // Plain mode keeps d_t2_keys_merged live across the gather peak.
+    uint32_t* h_t2_keys_merged = nullptr;
+    if (!scratch.plain_mode) {
+        h_t2_keys_merged = h_keys_owned  // reuse t1_keys flag: same scratch
+            ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
+            : scratch.h_keys_merged;
+        if (!h_t2_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t2_keys_merged) failed");
+        q.memcpy(h_t2_keys_merged, d_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
+        s_free(stats, d_t2_keys_merged);
+        d_t2_keys_merged = nullptr;
+    }
 
-    // Stage 4a: JIT H2D the gather source buffers. d_t2_meta is
-    // alive only for the duration of its gather (2080 MB at k=28),
-    // then freed before d_t2_xbits is H2D'd. With stage 4c the gather
-    // peak drops to d_merged_vals (1040) + d_t2_meta (2080) +
-    // d_t2_meta_sorted (2080) = 5200 MB (no more d_t2_keys_merged).
-    uint64_t* d_t2_meta = nullptr;
-    s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
-    q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
-    q.wait();
-    if (h_meta_owned) sycl::free(h_t2_meta, q);
-    h_t2_meta = nullptr;
+    // Stage 4a (compact only): JIT H2D the gather source buffers.
+    // d_t2_meta is alive only for the duration of its gather (2080 MB
+    // at k=28), then freed before d_t2_xbits is H2D'd. With stage 4c
+    // the gather peak drops to d_merged_vals (1040) + d_t2_meta (2080)
+    // + d_t2_meta_sorted (2080) = 5200 MB (no more d_t2_keys_merged).
+    //
+    // Plain mode: d_t2_meta and d_t2_xbits are already live from T2
+    // match (never parked). Gather reads them directly and frees after.
+    if (!scratch.plain_mode) {
+        s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
+        q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
+        q.wait();
+        if (h_meta_owned) sycl::free(h_t2_meta, q);
+        h_t2_meta = nullptr;
+    }
 
     uint64_t* d_t2_meta_sorted = nullptr;
     s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
@@ -1150,12 +1213,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     q.wait();
     s_free(stats, d_t2_meta);
 
-    uint32_t* d_t2_xbits = nullptr;
-    s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
-    q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
-    q.wait();
-    if (h_xbits_owned) sycl::free(h_t2_xbits, q);
-    h_t2_xbits = nullptr;
+    if (!scratch.plain_mode) {
+        s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+        q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+        q.wait();
+        if (h_xbits_owned) sycl::free(h_t2_xbits, q);
+        h_t2_xbits = nullptr;
+    }
 
     uint32_t* d_t2_xbits_sorted = nullptr;
     s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
@@ -1180,13 +1244,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     launch_t3_match_prepare(cfg.plot_id.data(), t3p, nullptr, t2_count,
                             d_counter, nullptr, &t3_temp_bytes, q);
 
-    // Stage 4c: H2D d_t2_keys_merged back from pinned host now that
-    // we're about to enter T3 match (its consumer). Pinned host freed
-    // after H2D.
-    s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
-    q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
-    if (h_keys_owned) sycl::free(h_t2_keys_merged, q);
-    h_t2_keys_merged = nullptr;
+    // Stage 4c (compact only): H2D d_t2_keys_merged back from pinned
+    // host now that we're about to enter T3 match (its consumer).
+    // Pinned host freed after H2D. Plain mode: d_t2_keys_merged is
+    // already live (never parked).
+    if (!scratch.plain_mode) {
+        s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
+        q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
+        if (h_keys_owned) sycl::free(h_t2_keys_merged, q);
+        h_t2_keys_merged = nullptr;
+    }
 
     uint64_t const t3_half_cap = (cap + 1) / 2;
 
