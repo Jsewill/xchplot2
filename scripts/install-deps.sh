@@ -40,6 +40,7 @@ if [[ ! -f /etc/os-release ]]; then
     echo "Cannot detect distro: /etc/os-release missing" >&2
     exit 1
 fi
+# shellcheck source=/dev/null
 . /etc/os-release
 DISTRO=$ID
 DISTRO_LIKE=${ID_LIKE:-}
@@ -154,7 +155,7 @@ if [[ -d "$ACPP_PREFIX" ]] && [[ -f "$ACPP_PREFIX/lib/cmake/AdaptiveCpp/Adaptive
 fi
 
 ACPP_BUILD_DIR=$(mktemp -d -t xchplot2-acpp-XXXXXX)
-trap "rm -rf $ACPP_BUILD_DIR" EXIT
+trap 'rm -rf "$ACPP_BUILD_DIR"' EXIT
 
 # ── Find a compatible LLVM ──────────────────────────────────────────────────
 # AdaptiveCpp 25.10 only supports LLVM 16-20. On rolling distros (Arch,
