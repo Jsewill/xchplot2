@@ -88,7 +88,23 @@ case "$GPU" in
         # cross-target a different GPU than the host one), else autodetect.
         if [[ -z "${ACPP_GFX:-}" ]]; then
             if [[ -n "${rocm_out:-}" && "$rocm_out" =~ (gfx[0-9a-f]+) ]]; then
-                export ACPP_GFX="${BASH_REMATCH[1]}"
+                detected_gfx="${BASH_REMATCH[1]}"
+                # RDNA1 workaround: gfx1010/1011/1012 aren't direct
+                # AdaptiveCpp HIP targets. Community-tested (Radeon Pro
+                # W5700) that gfx1013 is ISA-close enough to run on
+                # gfx1010 silicon. Not parity-validated.
+                case "$detected_gfx" in
+                    gfx1010|gfx1011|gfx1012)
+                        echo "[build-container] RDNA1 $detected_gfx detected — " \
+                             "using gfx1013 spoof (community workaround, not " \
+                             "parity-validated; verify plots with \`xchplot2 " \
+                             "verify\` before farming)" >&2
+                        export ACPP_GFX=gfx1013
+                        ;;
+                    *)
+                        export ACPP_GFX="$detected_gfx"
+                        ;;
+                esac
             fi
         fi
         if [[ -z "${ACPP_GFX:-}" ]]; then
