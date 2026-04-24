@@ -81,25 +81,24 @@ fi
 if [[ "$GPU_COUNT" -lt 2 ]]; then
     skip "need >=2 GPUs (got $GPU_COUNT); set XCHPLOT2_TEST_GPU_COUNT=N to override"
 else
-    # Smallest deterministic plot config we can exercise end-to-end.
-    # k=22 is the smallest the pipeline supports; two plots give each
-    # worker one to process under round-robin.
-    FARMER_PK='a1'$(printf '%.0sa' {1..94})  # fixed-ish 96-hex test key
-    POOL_PH='b2'$(printf '%.0sb' {1..62})    # fixed-ish 64-hex test key
-    SEED='cd'$(printf '%.0sc' {1..62})       # reproducible across runs
+    # k=22 is the smallest k the pipeline supports; two plots give each
+    # worker one entry to process under round-robin partition.
+    #
+    # We build a MANIFEST with pre-computed plot_id_hex + memo_hex (the
+    # `batch` subcommand feeds these straight to run_gpu_pipeline) rather
+    # than invoking `plot` with synthetic BLS keys — pos2_keygen rejects
+    # anything that isn't a real G1 public key with rc=-1 before the
+    # pipeline ever sees it.
+    LIVE_TSV="$TMP_OUT/live.tsv"
+    printf '22\t2\t0\t0\t0\tabababababababababababababababababababababababababababababababab\t00\t%s\tm1.plot2\n22\t2\t1\t0\t0\tcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\t00\t%s\tm2.plot2\n' \
+        "$TMP_OUT" "$TMP_OUT" > "$LIVE_TSV"
 
-    if "$XCHPLOT2" plot \
-        --k 22 --num 2 \
-        --farmer-pk "$FARMER_PK" \
-        --pool-ph "$POOL_PH" \
-        --seed "$SEED" \
-        --out "$TMP_OUT" \
-        --devices 0,1 >"$TMP_OUT/log" 2>&1
+    if "$XCHPLOT2" batch "$LIVE_TSV" --devices 0,1 >"$TMP_OUT/log" 2>&1
     then
         # Two output files expected, each starting with the 'pos2' magic.
         local_ok=1
         shopt -s nullglob
-        plots=("$TMP_OUT"/*.plot2)
+        plots=("$TMP_OUT"/m?.plot2)
         if [[ "${#plots[@]}" -ne 2 ]]; then
             fail "expected 2 plots, got ${#plots[@]}"
             local_ok=0
@@ -116,7 +115,7 @@ else
             pass "wrote 2 k=22 plots across devices 0,1"
         fi
     else
-        fail "plot --devices 0,1 failed (see $TMP_OUT/log)"
+        fail "batch --devices 0,1 failed (see $TMP_OUT/log)"
         sed 's/^/    /' "$TMP_OUT/log"
     fi
 fi
