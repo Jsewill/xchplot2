@@ -16,6 +16,8 @@
 #include "pos/ProofCore.hpp"
 #include "pos/ProofParams.hpp"
 
+#include "ParityCommon.hpp"
+
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -27,6 +29,8 @@
 
 namespace {
 
+using pos2gpu::parity::derive_plot_id;
+
 #define CHECK(call) do {                                                                     \
     cudaError_t err = (call);                                                                \
     if (err != cudaSuccess) {                                                                \
@@ -35,17 +39,6 @@ namespace {
         std::exit(2);                                                                        \
     }                                                                                        \
 } while (0)
-
-std::array<uint8_t, 32> derive_plot_id(uint32_t seed)
-{
-    std::array<uint8_t, 32> id{};
-    uint64_t s = 0x9E3779B97F4A7C15ULL ^ uint64_t(seed) * 0x100000001B3ULL;
-    for (size_t i = 0; i < id.size(); ++i) {
-        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-        id[i] = static_cast<uint8_t>(s >> 56);
-    }
-    return id;
-}
 
 // Sort key for T2Pairing: (match_info, x_bits, meta) — fully canonicalises
 // the pair regardless of emission order.
