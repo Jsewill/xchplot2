@@ -36,6 +36,8 @@ xchplot2 plot ... --devices all
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM
 / OS requirements, [Build](#build) for container / native / CMake
 paths, and [Use](#use) for every flag.
+**Windows users**: this `cargo install` line works under WSL2; for
+native Windows or a non-WSL setup, jump to [Windows](#windows).
 
 ## Hardware compatibility
 
@@ -44,7 +46,11 @@ paths, and [Use](#use) for every flag.
     newer) via the CUDA fast path. Builds auto-detect the installed
     GPU's `compute_cap` via `nvidia-smi`; override with
     `$CUDA_ARCHITECTURES` for fat or cross-target builds (see
-    [Build](#build)).
+    [Build](#build)). On dual-vendor hosts (e.g. AMD primary +
+    secondary NVIDIA), `build.rs` prefers AMD/Intel auto-targeting
+    when the detected NVIDIA arch is below this floor — old or
+    legacy NVIDIA cards no longer steal the CUB path from a real
+    AMD/Intel workhorse.
   - **AMD ROCm** via the SYCL / AdaptiveCpp path. Validated on RDNA2
     (`gfx1031`, RX 6700 XT, 12 GB) — bit-exact parity with the CUDA
     backend across the sort / bucket-offsets / g_x kernels, and
