@@ -35,6 +35,7 @@ void print_usage(char const* prog)
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose]\n"
         << "         [--skip-existing] [--continue-on-error]\n"
+        << "         [--devices <SPEC>]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
@@ -61,10 +62,16 @@ void print_usage(char const* prog)
         << "                                      fresh /dev/urandom per plot.\n"
         << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
-        << "    --skip-existing                 : skip plots whose output file is already a\n"
+    << "    --skip-existing                 : skip plots whose output file is already a\n"
         << "                                      complete .plot2 (magic + non-trivial size).\n"
         << "    --continue-on-error             : log per-plot failures and keep going\n"
         << "                                      instead of aborting the batch.\n"
+        << "    --devices SPEC                  : multi-GPU. SPEC is one of:\n"
+        << "                                        all       — every visible GPU\n"
+        << "                                        0         — a single specific id\n"
+        << "                                        0,1,3     — explicit comma list\n"
+        << "                                      Omitted = single device via default\n"
+        << "                                      SYCL selector (zero-config).\n"
         << "  " << prog << " verify <plotfile> [--trials N]\n"
         << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
         << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
@@ -147,6 +154,49 @@ void read_urandom(uint8_t* out, size_t n)
     }
 }
 
+// Parse a --devices value into BatchOptions.
+//
+// Accepted forms:
+//   "all"              → use every GPU visible at runtime (sets
+//                        use_all_devices; device_ids stays empty).
+//   "0"                → use only GPU id 0.
+//   "0,2,3"            → use these specific device ids, in sorted order.
+//
+// Zero-configuration default (no flag) produces device_ids.empty() and
+// use_all_devices=false — which triggers the single-device
+// gpu_selector_v path, identical to pre-multi-GPU behavior.
+//
+// Returns false on malformed input (caller prints usage + exits 1).
+bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
+{
+    if (s == "all") {
+        opts.use_all_devices = true;
+        return true;
+    }
+    opts.device_ids.clear();
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t const end = s.find(',', start);
+        std::string const tok = s.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (tok.empty()) return false;
+        char* endp = nullptr;
+        long const v = std::strtol(tok.c_str(), &endp, 10);
+        if (endp == tok.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+            return false;
+        }
+        opts.device_ids.push_back(static_cast<int>(v));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (opts.device_ids.empty()) return false;
+    std::sort(opts.device_ids.begin(), opts.device_ids.end());
+    opts.device_ids.erase(
+        std::unique(opts.device_ids.begin(), opts.device_ids.end()),
+        opts.device_ids.end());
+    return true;
+}
+
 std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 {
     // Match chia plots create's v2 filename scheme: plot-k{size}-{id}.plot2
@@ -183,6 +233,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if      (a == "-v" || a == "--verbose")        opts.verbose = true;
             else if (a == "--skip-existing")               opts.skip_existing = true;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
+            else if (a == "--devices" && i + 1 < argc) {
+                if (!parse_devices_arg(argv[++i], opts)) {
+                    std::cerr << "Error: --devices expects 'all' or a comma-"
+                                 "separated list of device ids (got '"
+                              << argv[i] << "')\n";
+                    return 1;
+                }
+            }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
                 print_usage(argv[0]);
@@ -261,6 +319,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string out_dir = ".";
         std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex, pool_addr;
         std::string seed_hex;
+        std::vector<int> plot_device_ids;
+        bool plot_use_all_devices = false;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -286,6 +346,17 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "-v" || a == "--verbose")    verbose = true;
             else if  (a == "--skip-existing")           skip_existing = true;
             else if  (a == "--continue-on-error")       continue_on_error = true;
+            else if  (a == "--devices" && need(1)) {
+                pos2gpu::BatchOptions tmp;
+                if (!parse_devices_arg(argv[++i], tmp)) {
+                    std::cerr << "Error: --devices expects 'all' or a comma-"
+                                 "separated list of device ids (got '"
+                              << argv[i] << "')\n";
+                    return 1;
+                }
+                plot_device_ids      = std::move(tmp.device_ids);
+                plot_use_all_devices = tmp.use_all_devices;
+            }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
                 print_usage(argv[0]);
@@ -438,6 +509,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.verbose           = verbose;
             opts.skip_existing     = skip_existing;
             opts.continue_on_error = continue_on_error;
+            opts.device_ids        = plot_device_ids;
+            opts.use_all_devices   = plot_use_all_devices;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;

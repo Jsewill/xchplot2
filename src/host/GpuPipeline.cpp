@@ -1462,4 +1462,18 @@ void streaming_free_pinned_uint64(uint64_t* ptr)
     if (ptr) sycl::free(ptr, sycl_backend::queue());
 }
 
+void bind_current_device(int device_id)
+{
+    sycl_backend::set_current_device_id(device_id);
+}
+
+int gpu_device_count()
+{
+    try {
+        return sycl_backend::get_gpu_device_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
 } // namespace pos2gpu

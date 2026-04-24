@@ -230,9 +230,29 @@ private:
 
 } // namespace
 
-BatchResult run_batch(std::vector<BatchEntry> const& entries,
-                      BatchOptions const& opts)
+namespace {
+
+// Per-worker pipeline. Extracted from run_batch so the multi-device
+// fan-out can spawn N of these concurrently — one thread per GPU, each
+// with its own pool / channel / consumer. The outer run_batch validates
+// homogeneity and runs the disk-space preflight once; this helper
+// assumes both have already been done on `entries`.
+//
+// device_id < 0  → keep the default SYCL gpu_selector_v (single-device
+//                  default; zero-config users see unchanged behavior).
+// worker_id  < 0 → single-device path; currently unused beyond
+//                  documenting intent but reserved for a future per-
+//                  worker log prefix (see fprintf calls below — one
+//                  line per call means ordering is already atomic
+//                  per-line, so interleaving across workers is
+//                  acceptable for v1 without prefix disambiguation).
+BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
+                            BatchOptions const& opts,
+                            int                 device_id,
+                            int                 worker_id)
 {
+    (void)worker_id;
+    if (device_id >= 0) bind_current_device(device_id);
     initialize_aes_tables();
 
     bool const verbose = opts.verbose;
@@ -240,23 +260,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     BatchResult res;
     if (entries.empty()) return res;
 
-    preflight_disk_space(entries, opts);
-
-    // All entries in a batch must share (k, strength, testnet) so one pool
-    // fits all plots. Mixed-shape batches could be supported by splitting
-    // into homogeneous sub-batches; not needed in practice.
+    // Pool shape from the first entry. Homogeneity (all entries share
+    // k/strength/testnet) was checked by the outer run_batch.
     int  pool_k        = entries[0].k;
     int  pool_strength = entries[0].strength;
     bool pool_testnet  = entries[0].testnet;
-    for (size_t i = 1; i < entries.size(); ++i) {
-        if (entries[i].k != pool_k
-            || entries[i].strength != pool_strength
-            || entries[i].testnet  != pool_testnet)
-        {
-            throw std::runtime_error(
-                "run_batch: all entries must share (k, strength, testnet)");
-        }
-    }
 
     // Allocate the pool once; destructor frees at function exit. This is
     // the whole point of the batch path — eliminate the per-plot ~2.4 s
@@ -588,6 +596,118 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     res.total_wall_seconds = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_start).count();
     return res;
+}
+
+} // namespace
+
+BatchResult run_batch(std::vector<BatchEntry> const& entries,
+                      BatchOptions const& opts)
+{
+    if (entries.empty()) return BatchResult{};
+
+    // Homogeneity check (all entries must share k/strength/testnet) —
+    // runs once on the full list before any per-worker dispatch so both
+    // the single- and multi-device paths share the same error surface.
+    int  const pool_k        = entries[0].k;
+    int  const pool_strength = entries[0].strength;
+    bool const pool_testnet  = entries[0].testnet;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        if (entries[i].k != pool_k
+            || entries[i].strength != pool_strength
+            || entries[i].testnet  != pool_testnet)
+        {
+            throw std::runtime_error(
+                "run_batch: all entries must share (k, strength, testnet)");
+        }
+    }
+
+    preflight_disk_space(entries, opts);
+
+    // Resolve the target device list:
+    //   use_all_devices  → enumerate at runtime, one worker per GPU
+    //   device_ids       → use these explicit ids
+    //   (neither)        → empty list → single-device default selector
+    std::vector<int> device_ids;
+    if (opts.use_all_devices) {
+        int const n = gpu_device_count();
+        if (n <= 0) {
+            std::fprintf(stderr,
+                "[batch] --devices all: runtime enumerated 0 GPUs — "
+                "falling back to the default SYCL selector\n");
+        } else {
+            device_ids.reserve(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) device_ids.push_back(i);
+        }
+    } else if (!opts.device_ids.empty()) {
+        device_ids = opts.device_ids;
+    }
+
+    auto const t_start = std::chrono::steady_clock::now();
+
+    // Fast path: zero-config default or one explicit id. Runs on the
+    // caller thread — identical control flow to pre-multi-GPU except
+    // for the optional thread-local device bind at the top of the
+    // slice.
+    if (device_ids.size() <= 1) {
+        int const dev = device_ids.empty() ? -1 : device_ids[0];
+        BatchResult r = run_batch_slice(entries, opts, dev, -1);
+        r.total_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        return r;
+    }
+
+    // Multi-device: round-robin-partition the entries and spawn one
+    // worker thread per GPU. Each worker constructs its own
+    // GpuBufferPool, producer/consumer channel, and writer thread on
+    // its target device — zero cross-worker shared state beyond stderr
+    // and the filesystem. Plot output names come from the manifest, so
+    // distinct plots already land in distinct files.
+    size_t const N = device_ids.size();
+    std::vector<std::vector<BatchEntry>> buckets(N);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        buckets[i % N].push_back(entries[i]);
+    }
+
+    std::fprintf(stderr,
+        "[batch] multi-device: %zu plots across %zu workers — devices:",
+        entries.size(), N);
+    for (size_t i = 0; i < N; ++i) {
+        std::fprintf(stderr, " %d", device_ids[i]);
+    }
+    std::fprintf(stderr, "\n");
+
+    std::vector<BatchResult>         per_worker(N);
+    std::vector<std::exception_ptr>  per_worker_exc(N);
+    std::vector<std::thread>         workers;
+    workers.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
+        workers.emplace_back([&, i]() {
+            try {
+                per_worker[i] = run_batch_slice(
+                    buckets[i], opts, device_ids[i], static_cast<int>(i));
+            } catch (...) {
+                per_worker_exc[i] = std::current_exception();
+            }
+        });
+    }
+    for (auto& t : workers) t.join();
+
+    // Propagate the first worker exception after every worker has
+    // joined — prevents a fast failure from leaving peer workers still
+    // running and printing to a half-torn-down pipeline.
+    for (auto& ep : per_worker_exc) {
+        if (ep) std::rethrow_exception(ep);
+    }
+
+    BatchResult agg;
+    for (auto const& r : per_worker) {
+        agg.plots_written += r.plots_written;
+        agg.plots_skipped += r.plots_skipped;
+        agg.plots_failed  += r.plots_failed;
+    }
+    agg.total_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+    return agg;
 }
 
 } // namespace pos2gpu

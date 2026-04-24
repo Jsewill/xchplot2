@@ -146,4 +146,24 @@ void      streaming_free_pinned_uint64(uint64_t* ptr);
 uint32_t* streaming_alloc_pinned_uint32(size_t count);
 void      streaming_free_pinned_uint32(uint32_t* ptr);
 
+// Multi-GPU device binding. bind_current_device() sets a thread-local
+// target device id that sycl_backend::queue() reads when lazily
+// constructing the worker thread's queue. Must be called on the worker
+// thread BEFORE any kernel launch on that thread — ideally as the very
+// first statement of the worker lambda.
+//
+// device_id < 0 → use the default SYCL gpu_selector_v (single-device,
+// pre-multi-GPU behavior). Calling with -1 from the main thread is a
+// no-op and is always safe.
+//
+// gpu_device_count() returns the number of SYCL GPU devices the runtime
+// can enumerate, or 0 on error. BatchPlotter uses it to expand
+// `--devices all` into an explicit id list.
+//
+// Declared here (instead of in SyclBackend.hpp) so plain .cpp consumers
+// like BatchPlotter.cpp can call them without pulling <sycl/sycl.hpp>
+// onto their include path.
+void bind_current_device(int device_id);
+int  gpu_device_count();
+
 } // namespace pos2gpu

@@ -45,10 +45,25 @@ struct BatchResult {
 //   continue_on_error — catch per-plot exceptions and log rather than
 //                       aborting the batch; plots_failed in the result
 //                       counts how many skipped this way
+//   device_ids        — explicit list of GPU device ids to use. When empty
+//                       and use_all_devices is false, run on a single
+//                       device picked by the default SYCL gpu_selector_v
+//                       (zero-configuration, pre-multi-GPU behavior).
+//                       With multiple ids, the batch is partitioned
+//                       across workers — one thread per device, each
+//                       with its own GpuBufferPool and producer/consumer
+//                       channel. Plots are assigned round-robin
+//                       (entry i → worker i % N).
+//   use_all_devices   — enumerate all SYCL GPU devices at runtime and
+//                       use them. Overrides device_ids. Useful when the
+//                       caller doesn't know the host's device count up
+//                       front (e.g. `--devices all` on the CLI).
 struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
     bool continue_on_error = false;
+    std::vector<int> device_ids;
+    bool use_all_devices   = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
