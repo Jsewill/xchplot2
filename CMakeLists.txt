@@ -10,6 +10,17 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
+# Every static library here is linked into both the standalone xchplot2
+# executable and the top-level Rust crate's PIE binary (via build.rs +
+# cargo install). rust-lld (the default linker on some distros) rejects
+# non-PIC objects in a PIE output — seen in the wild as "relocation
+# R_X86_64_32 cannot be used against local symbol; recompile with
+# -fPIC" on BatchPlotter.cpp, GpuPlotter.cpp, etc. Setting this globally
+# ensures pos2_gpu, pos2_gpu_host, fse, and any other transitively-
+# compiled object is built with -fPIC, so the linker choice doesn't
+# matter.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Default arch: sm_89 (RTX 4090). Override via -DCMAKE_CUDA_ARCHITECTURES=...
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89)
