@@ -91,9 +91,10 @@ paths, and [Use](#use) for every flag.
   50-series (Blackwell, `sm_120`) need a driver bundle that ships
   Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
 - **OS:** Linux (tested on modern glibc distributions) is the supported
-  path. Windows builds are possible for NVIDIA cards via MSVC + CUDA —
-  see [Windows (experimental, NVIDIA only)](#windows-experimental-nvidia-only)
-  below. macOS is not supported (no CUDA, no modern SYCL runtime).
+  path. Windows users route through either the `cuda-only` branch
+  natively (NVIDIA + MSVC + CUDA) or WSL2 (any vendor WSL2 supports)
+  — see [Windows](#windows) below. macOS is not supported (no CUDA,
+  no modern SYCL runtime).
 
 ## Build
 
