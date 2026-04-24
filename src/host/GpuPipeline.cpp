@@ -695,6 +695,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Xs fully consumed.
     s_free(stats, d_xs);
 
+    // Stage 4b: park d_t1_meta on pinned host across the T1 sort
+    // phase. d_t1_meta is only needed again for launch_gather_u64 at
+    // the end of T1 sort — holding it alive through CUB setup was
+    // responsible for the 6256 MB overall streaming peak (d_t1_meta
+    // 2080 + d_t1_mi 1040 + CUB working 3120 + scratch). JIT H2D
+    // before the gather below, free right after. Mirror of stage 4a
+    // for T2.
+    uint64_t* h_t1_meta = static_cast<uint64_t*>(
+        sycl::malloc_host(cap * sizeof(uint64_t), q));
+    if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
+    q.memcpy(h_t1_meta, d_t1_meta, t1_count * sizeof(uint64_t)).wait();
+    s_free(stats, d_t1_meta);
+    d_t1_meta = nullptr;
+
     // ---------- Phase T1 sort (tiled, N=2) ----------
     // Partition T1 into two halves by index, CUB-sort each with scratch
     // sized for the larger half, then stable 2-way merge the sorted runs
@@ -764,6 +778,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         d_t1_keys_merged, d_t1_merged_vals, t1_count, q);
     s_free(stats, d_keys_out);
     s_free(stats, d_vals_out);
+
+    // Stage 4b: JIT H2D d_t1_meta back onto the device for the gather,
+    // then free it immediately. Peak during this window:
+    //   d_t1_keys_merged (1040) + d_t1_merged_vals (1040)
+    //   + d_t1_meta (2080 H2D) + d_t1_meta_sorted (2080 populated)
+    //   = 6240 MB — same as T2 sort's gather peak, and no longer the
+    // overall bottleneck on its own.
+    s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
+    q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
+    sycl::free(h_t1_meta, q);
+    h_t1_meta = nullptr;
 
     uint64_t* d_t1_meta_sorted = nullptr;
     s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
