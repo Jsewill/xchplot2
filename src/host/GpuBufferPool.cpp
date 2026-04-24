@@ -300,18 +300,12 @@ DeviceMemInfo query_device_memory()
 
 size_t streaming_peak_bytes(int k)
 {
-    // Anchor: 6240 MB at k=28 (measured post-stage-4b on sm_89, with
-    // N=2 T2-match tiling + half-cap staging + JIT H2D for d_t1_meta
-    // and d_t2_{meta,xbits}). Three phases tie at this bound:
-    //   T1 sort gather : d_t1_keys_merged + d_t1_merged_vals
-    //                    + d_t1_meta (H2D) + d_t1_meta_sorted
-    //   T2 sort gather : d_t2_keys_merged + d_merged_vals
-    //                    + d_t2_meta (H2D) + d_t2_meta_sorted
-    //   T3 match       : d_t2_keys_merged + d_t2_meta_sorted
-    //                    + d_t2_xbits_sorted + d_t3
-    // Each sums to ~6240 MB at k=28 (4 × 2080 MB of cap·sizeof(uint64_t)
-    // aliases). Dominant terms scale with 2^k → 4× per k += 2.
-    constexpr size_t anchor_mb = 6240;
+    // Anchor: 5200 MB at k=28 (measured post-stage-4e on sm_89).
+    // After the full T1/T2/T3 match/sort work (stages 1-4d) + Xs
+    // gen+sort+pack inlining (4e), all match + sort phases cap out at
+    // cap·sizeof(uint64_t) × ~2.5 aliases = ~5200 MB. Xs peak is 4128,
+    // T3 sort 4228, all others ≤ 5200. Dominant terms scale with 2^k.
+    constexpr size_t anchor_mb = 5200;
     if (k == 28) return anchor_mb << 20;
     if (k <  18) return size_t(16) << 20;       // floor for tiny test plots
     if (k >  32) return size_t(anchor_mb) << (20 + ((32 - 28) * 2));

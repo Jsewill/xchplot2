@@ -39,15 +39,13 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
     from `rocminfo` automatically. Other gfx targets (`gfx1030` /
     `gfx1100`) build cleanly but are untested on real hardware.
   - **Intel oneAPI** is wired up but untested.
-- **VRAM:** ~6.5 GB free minimum for k=28 (streaming path). Cards
+- **VRAM:** ~5.4 GB free minimum for k=28 (streaming path). Cards
   with less than ~11 GB free transparently use the streaming pipeline;
   12 GB+ cards reliably use the persistent buffer pool for faster
-  steady-state. Both paths produce byte-identical plots. 8 GB cards
-  (3070, 2070 Super, RX 6600) are now comfortably supported on the
-  streaming path — peak is 6240 MB with ~1.3 GiB of slack on a typical
-  7.66 GiB-free card. 6 GB cards still don't fit (the 6240 MB peak is
-  set by three structurally-tied gather/match phases; reaching 6 GB
-  needs further kernel-level work). Detailed breakdown in [VRAM](#vram).
+  steady-state. Both paths produce byte-identical plots. 6 GB cards
+  (RTX 2060, RX 6600) are on the edge and 8 GB cards (3070, 2070 Super)
+  are comfortably supported on the streaming path — peak is 5200 MB.
+  Detailed breakdown in [VRAM](#vram).
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
@@ -389,30 +387,38 @@ based on available VRAM:
   `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
   saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
   RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
-- **Streaming path (6.24 GB peak + 128 MB margin; needs ≥ ~6.5 GiB
+- **Streaming path (5.2 GB peak + 128 MB margin; needs ≥ ~5.4 GiB
   *free* device VRAM at k=28).** Allocates per-phase and frees between
-  phases. T2 match is tiled N=2 across disjoint bucket ranges with
-  half-cap device staging and D2H-to-pinned-host between passes; T1
-  and T2 sorts are tiled (N=2 and N=4) with merge trees, and
-  `d_t1_meta` + `d_t2_meta` are parked on pinned host across their
-  sort phases and JIT-H2D'd only for the final permute-gather. Peak
-  at k=28 is **6240 MB** (measured on sm_89), set by three
-  structurally-tied phases all allocating four cap·sizeof(uint64_t)
-  aliases concurrently:
-  - T1 sort gather: `d_t1_keys_merged + d_t1_merged_vals + d_t1_meta + d_t1_meta_sorted`
-  - T2 sort gather: `d_t2_keys_merged + d_merged_vals + d_t2_meta + d_t2_meta_sorted`
-  - T3 match: `d_t2_keys_merged + d_t2_meta_sorted + d_t2_xbits_sorted + d_t3`
+  phases. All three match phases (T1/T2/T3) are tiled N=2 across
+  disjoint bucket ranges with half-cap device staging and
+  D2H-to-pinned-host between passes. T1 + T2 sorts are tiled (N=2 and
+  N=4) with merge trees, and `d_t1_meta`, `d_t2_meta`, and the
+  `*_keys_merged` buffers are parked on pinned host across their
+  sort phases and JIT-H2D'd only for the next consumer. Xs is inlined
+  as gen → sort → pack with separate-allocation scratch so keys_a +
+  vals_a can be freed right after CUB sort. Peak at k=28 is
+  **5200 MB** (measured on sm_89); per-phase live maxes:
+
+  | Phase     | Peak (MB) |
+  |-----------|----------:|
+  | Xs        | 4128 |
+  | T1 match  | 5168 |
+  | T1 sort   | 5200 |
+  | T2 match  | 5200 |
+  | T2 sort   | 5200 |
+  | T3 match  | 5200 |
+  | T3 sort   | 4228 |
 
   A BatchPlotter preflight rejects cards reporting less than
   `streaming_peak_bytes(k) + 128 MB` free before any queue work, so
-  mid-pipeline OOM is impossible on the supported configurations.
-  Practical targets: 8 GB cards and up. 6 GB cards do not yet fit —
-  reaching them needs further kernel-level work to break the
-  4-cap-alias structural bound. Slower per plot (~3.7 s vs ~2.4 s at
-  k=28 on a 4090) because it pays per-phase `malloc_device`/`free`
-  plus ~2 GB of pinned-host round-trips for the parked-meta buffers,
-  instead of amortising. Log the full alloc trace with
-  `POS2GPU_STREAMING_STATS=1`.
+  mid-pipeline OOM is impossible on supported configurations.
+  Practical targets: 6 GB cards on the edge (card-dependent; RTX 2060
+  typically has ~5.5 GiB free which has ~170 MB slack over the
+  5328 MB requirement), 8 GB cards comfortable, 10 GB and up ample.
+  Slower per plot (~3.7 s vs ~2.4 s at k=28 on a 4090) because it
+  pays per-phase `malloc_device`/`free` plus ~2.5 GB of pinned-host
+  round-trips for the parked-meta and T3 staging buffers, instead of
+  amortising. Log the full alloc trace with `POS2GPU_STREAMING_STATS=1`.
 
 At pool construction `xchplot2` queries `cudaMemGetInfo` on the
 CUDA-only build, or `global_mem_size` (device total) on the SYCL
