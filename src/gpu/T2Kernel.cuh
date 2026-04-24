@@ -68,4 +68,45 @@ void launch_t2_match(
     size_t* temp_bytes,
     sycl::queue& q);
 
+// Two-step entry point for callers that want to run the match kernel
+// in multiple bucket-range passes (e.g. the streaming pipeline's N=2
+// tiling — see docs/t2-match-tiling-plan.md). Equivalent to calling
+// launch_t2_match with (0, num_buckets) when the range covers the
+// whole bucket space.
+//
+// launch_t2_match_prepare: computes bucket + fine-bucket offsets into
+//   d_temp_storage and zeroes d_out_count. Same sizing protocol as
+//   launch_t2_match (d_temp_storage==nullptr fills *temp_bytes).
+//
+// launch_t2_match_range: runs the match kernel for bucket-id range
+//   [bucket_begin, bucket_end). Multiple calls sharing the same
+//   d_temp_storage / d_out_* buffers / d_out_count produce a single
+//   concatenated output (atomic counter), byte-equivalent to a single
+//   full-range call after the subsequent T2 sort.
+void launch_t2_match_prepare(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint32_t const* d_sorted_mi,
+    uint64_t t1_count,
+    uint64_t* d_out_count,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    sycl::queue& q);
+
+void launch_t2_match_range(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint64_t const* d_sorted_meta,
+    uint32_t const* d_sorted_mi,
+    uint64_t t1_count,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu
