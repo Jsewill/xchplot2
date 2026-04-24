@@ -126,9 +126,12 @@ void launch_t3_match(
     uint64_t blocks_x_u64 = (l_count_max + kThreads - 1) / kThreads;
     if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
 
-    // Match — backend-dispatched via T3Offsets.cuh. The CUDA wrapper
-    // uploads `fk` to its own __constant__ slot before launching; the
-    // SYCL wrapper captures it by value into the parallel_for lambda.
+    // Match — backend-dispatched via T3Offsets.cuh. Full bucket range
+    // (0, num_buckets) preserves current single-pass behavior. Callers
+    // wanting to split T3 match across temporally-separated passes
+    // (see stage 4d in docs/t2-match-tiling-plan.md; same shape as T2)
+    // should invoke launch_t3_match_all_buckets directly with a
+    // sub-range.
     launch_t3_match_all_buckets(
         keys, fk,
         d_sorted_meta, d_sorted_xbits, d_sorted_mi,
@@ -138,7 +141,9 @@ void launch_t3_match(
         params.num_match_target_bits, FINE_BITS,
         target_mask, num_test_bits,
         d_out_pairings, d_out_count,
-        capacity, l_count_max, q);
+        capacity, l_count_max,
+        /*bucket_begin=*/0, /*bucket_end=*/num_buckets,
+        q);
 }
 
 } // namespace pos2gpu
