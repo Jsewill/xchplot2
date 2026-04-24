@@ -4,6 +4,27 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 `.plot2` files byte-identical to the
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
+## Quick start
+
+```bash
+# Install — needs CUDA Toolkit 12+, CMake ≥ 3.24, a C++20 compiler,
+# and Rust. NVIDIA only.
+cargo install --git https://github.com/Jsewill/xchplot2 --branch cuda-only
+
+# Plot — 10 × k=28 files, keys derived internally from your BLS pair.
+xchplot2 plot -k 28 -n 10 \
+    -f <farmer-pk-hex> \
+    -c <pool-contract-xch1-or-txch1> \
+    -o /mnt/plots
+
+# Multi-GPU — one worker per device, round-robin partition.
+xchplot2 plot ... --devices all
+```
+
+See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM /
+OS requirements, [Build](#build) for alternative install paths, and
+[Use](#use) for every flag.
+
 ## Hardware compatibility
 
 - **GPU:** NVIDIA, compute capability ≥ 6.1 (Pascal / GTX 10-series
