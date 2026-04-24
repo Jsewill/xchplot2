@@ -23,7 +23,10 @@ xchplot2 plot ... --devices all
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM /
 OS requirements, [Build](#build) for alternative install paths, and
-[Use](#use) for every flag.
+[Use](#use) for every flag. **Windows users**: that `cargo install`
+line works as-is from an x64 Native Tools Command Prompt for VS 2022
+— see [Windows (experimental)](#windows-experimental) for the
+prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
 
 ## Hardware compatibility
 
