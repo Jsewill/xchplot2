@@ -15,6 +15,7 @@
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/XsKernel.cuh"
+#include "gpu/XsKernels.cuh"   // launch_xs_gen / launch_xs_pack (stage 4e)
 #include "gpu/T1Kernel.cuh"
 #include "gpu/T2Kernel.cuh"
 #include "gpu/T3Kernel.cuh"
@@ -641,27 +642,74 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_counter = nullptr;
     s_malloc(stats, d_counter, sizeof(uint64_t), "d_counter");
 
-    // ---------- Phase Xs ----------
+    // ---------- Phase Xs (stage 4e: inlined gen+sort+pack) ----------
+    // launch_construct_xs lumps keys_a/keys_b/vals_a/vals_b into a single
+    // d_xs_temp blob (~4 GB at k=28). keys_a+vals_a are dead after the
+    // CUB sort but can't be freed because they're interior slices of a
+    // single allocation. Inline the three sub-kernels so we can:
+    //   1. alloc cub_scratch + keys_a + vals_a
+    //   2. gen fills keys_a, vals_a
+    //   3. alloc keys_b + vals_b
+    //   4. CUB sort keys_a/vals_a -> keys_b/vals_b; keys_a/vals_a now dead
+    //   5. free cub_scratch + keys_a + vals_a       <- 2078 MB freed
+    //   6. alloc d_xs
+    //   7. pack keys_b/vals_b -> d_xs
+    //   8. free keys_b + vals_b
+    // Phase peak at k=28 drops from d_xs (2048) + d_xs_temp (4128) =
+    // 6176 MB to max(sort 4126 MB, pack 4096 MB) = 4126 MB.
     stats.phase = "Xs";
-    size_t xs_temp_bytes = 0;
-    launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              nullptr, nullptr, &xs_temp_bytes, q);
-    XsCandidateGpu* d_xs      = nullptr;
-    void*           d_xs_temp = nullptr;
-    s_malloc(stats, d_xs,      total_xs * sizeof(XsCandidateGpu), "d_xs");
-    s_malloc(stats, d_xs_temp, xs_temp_bytes,                     "d_xs_temp");
+
+    // Query CUB scratch size via the sort wrapper.
+    size_t xs_cub_bytes = 0;
+    launch_sort_pairs_u32_u32(
+        nullptr, xs_cub_bytes,
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+
+    void*     d_xs_cub_scratch = nullptr;
+    uint32_t* d_xs_keys_a      = nullptr;
+    uint32_t* d_xs_vals_a      = nullptr;
+    s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes,                     "d_xs_cub");
+    s_malloc(stats, d_xs_keys_a,      total_xs * sizeof(uint32_t),      "d_xs_keys_a");
+    s_malloc(stats, d_xs_vals_a,      total_xs * sizeof(uint32_t),      "d_xs_vals_a");
+
+    AesHashKeys const xs_keys = make_keys(cfg.plot_id.data());
+    uint32_t    const xs_xor_const = cfg.testnet ? 0xA3B1C4D7u : 0u;
 
     int p_xs = begin_phase("Xs gen+sort");
-    launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              d_xs, d_xs_temp, &xs_temp_bytes, q);
+    launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
+                  cfg.k, xs_xor_const, q);
+
+    // keys_b + vals_b appear here — minimum Xs-phase live set between
+    // gen and sort.
+    uint32_t* d_xs_keys_b = nullptr;
+    uint32_t* d_xs_vals_b = nullptr;
+    s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+    s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+
+    launch_sort_pairs_u32_u32(
+        d_xs_cub_scratch, xs_cub_bytes,
+        d_xs_keys_a, d_xs_keys_b,
+        d_xs_vals_a, d_xs_vals_b,
+        total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
     end_phase(p_xs);
 
-    // Xs gen writes to d_xs_temp while sorting, but by the time
-    // launch_construct_xs returns the result is in d_xs and xs_temp is
-    // dead. cudaFree is device-synchronous so it blocks until the default
-    // stream drains, which means any in-flight access to d_xs_temp has
-    // completed before we free it.
-    s_free(stats, d_xs_temp);
+    // sort consumed keys_a + vals_a; free them and CUB scratch before
+    // allocating d_xs so the pack phase peak stays under the sort peak.
+    s_free(stats, d_xs_cub_scratch);
+    s_free(stats, d_xs_keys_a);
+    s_free(stats, d_xs_vals_a);
+
+    XsCandidateGpu* d_xs = nullptr;
+    s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+
+    int p_xs_pack = begin_phase("Xs pack");
+    launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs, q);
+    end_phase(p_xs_pack);
+
+    s_free(stats, d_xs_keys_b);
+    s_free(stats, d_xs_vals_b);
 
     // ---------- Phase T1 match ----------
     stats.phase = "T1 match";
