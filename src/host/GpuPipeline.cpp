@@ -779,6 +779,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_keys_out);
     s_free(stats, d_vals_out);
 
+    // Stage 4c: d_t1_keys_merged is not used by the gather below (gather
+    // uses d_t1_merged_vals for indices); it is only consumed by T2 match
+    // as the "d_sorted_mi" input. Park it on pinned host across the
+    // gather peak so the 1040 MB doesn't coexist with d_t1_merged_vals +
+    // d_t1_meta + d_t1_meta_sorted. H2D'd back at T2 match entry.
+    uint32_t* h_t1_keys_merged = static_cast<uint32_t*>(
+        sycl::malloc_host(cap * sizeof(uint32_t), q));
+    if (!h_t1_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t1_keys_merged) failed");
+    q.memcpy(h_t1_keys_merged, d_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
+    s_free(stats, d_t1_keys_merged);
+    d_t1_keys_merged = nullptr;
+
     // Stage 4b: JIT H2D d_t1_meta back onto the device for the gather,
     // then free it immediately. Peak during this window:
     //   d_t1_keys_merged (1040) + d_t1_merged_vals (1040)
@@ -796,6 +808,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     end_phase(p_t1_sort);
     s_free(stats, d_t1_meta);
     s_free(stats, d_t1_merged_vals);
+
+    // Stage 4c: H2D d_t1_keys_merged back now that T2 match (its
+    // consumer) is about to start. Pinned host freed after H2D.
+    s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
+    q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
+    sycl::free(h_t1_keys_merged, q);
+    h_t1_keys_merged = nullptr;
 
     // ---------- Phase T2 match (tiled, N=2, D2H per pass) ----------
     // Split the match into two temporally-separated passes over disjoint
@@ -1024,11 +1043,24 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_CD_keys);
     s_free(stats, d_CD_vals);
 
+    // Stage 4c: d_t2_keys_merged is not consumed by the gather calls
+    // below (they use d_merged_vals for indices) — it's only needed
+    // later by T3 match as the sorted-MI input. Park it on pinned host
+    // across the gather peak so the 1040 MB doesn't coexist with
+    // d_merged_vals + d_t2_meta + d_t2_meta_sorted. H2D'd back before
+    // T3 match.
+    uint32_t* h_t2_keys_merged = static_cast<uint32_t*>(
+        sycl::malloc_host(cap * sizeof(uint32_t), q));
+    if (!h_t2_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t2_keys_merged) failed");
+    q.memcpy(h_t2_keys_merged, d_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
+    s_free(stats, d_t2_keys_merged);
+    d_t2_keys_merged = nullptr;
+
     // Stage 4a: JIT H2D the gather source buffers. d_t2_meta is
     // alive only for the duration of its gather (2080 MB at k=28),
-    // then freed before d_t2_xbits is H2D'd. Peak during the meta
-    // gather = d_merged_vals (1040) + d_t2_meta (2080) + d_t2_meta_sorted
-    // (2080) = ~5200 MB, well under the old 7288 MB.
+    // then freed before d_t2_xbits is H2D'd. With stage 4c the gather
+    // peak drops to d_merged_vals (1040) + d_t2_meta (2080) +
+    // d_t2_meta_sorted (2080) = 5200 MB (no more d_t2_keys_merged).
     uint64_t* d_t2_meta = nullptr;
     s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
     q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
@@ -1065,6 +1097,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                           nullptr, t2_count,
                           nullptr, d_counter, cap,
                           nullptr, &t3_temp_bytes, q);
+
+    // Stage 4c: H2D d_t2_keys_merged back from pinned host now that
+    // we're about to enter T3 match (its consumer). Pinned host freed
+    // after H2D.
+    s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
+    q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
+    sycl::free(h_t2_keys_merged, q);
+    h_t2_keys_merged = nullptr;
+
     T3PairingGpu* d_t3 = nullptr;
     void*         d_t3_match_temp = nullptr;
     s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
