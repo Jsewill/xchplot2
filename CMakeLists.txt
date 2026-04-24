@@ -45,6 +45,23 @@ if(XCHPLOT2_BUILD_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 89)
     endif()
+
+    # Force-include cuda_fp16.h in every CUDA TU as a workaround for an
+    # upstream AdaptiveCpp bug: hipSYCL/sycl/libkernel/cuda/cuda_backend.hpp
+    # gates <cuda_fp16.h> behind __ACPP_ENABLE_CUDA_TARGET__, yet
+    # hipSYCL/sycl/libkernel/half.hpp emits __hadd / __hsub / __hmul /
+    # __hdiv / __hlt / __hle / __hgt / __hge references in the nvcc
+    # device pass regardless of that flag. Third-party .cu TUs that
+    # #include <sycl/sycl.hpp> without first including <cuda_fp16.h>
+    # fail with a cascade of "identifier __hXXX is undefined" errors
+    # (reproduced on Radeon Pro W5700 + CUDA Toolkit dual-install hosts).
+    #
+    # This blanket -include matches what the proposed upstream patch to
+    # AdaptiveCpp's cuda_backend.hpp does (move the cuda_fp16.h include
+    # out of the __ACPP_ENABLE_CUDA_TARGET__ guard). Drop this line once
+    # upstream ships the fix — see docs/adaptivecpp-cuda-fp16-pr.md for
+    # the PR content.
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-include=cuda_fp16.h>)
 endif()
 
 # Optional: compile in clock64 instrumentation for T3 match_all_buckets.
