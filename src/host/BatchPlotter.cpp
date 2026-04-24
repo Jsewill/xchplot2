@@ -244,25 +244,22 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
 
         // Tiered dispatch: pick plain vs compact streaming based on
         // free device VRAM. The plain path's peak at k=28 is ~7290 MB;
-        // compact drops to ~5200 MB by parking big intermediates on
-        // pinned host (T1/T2 meta, keys_merged, T2 xbits). Compact pays
-        // ~1-2 s/plot of PCIe round-trips, so we only opt into it when
-        // the card can't fit plain.
+        // compact drops to ~5200 MB by combining two techniques:
+        //   (a) Park/rehydrate on pinned host across idle windows
+        //       (d_t1_meta, d_t1_keys_merged, d_t2_meta, d_t2_xbits,
+        //        d_t2_keys_merged).
+        //   (b) N=2 T2 match tiling: emit T2 into half-cap device
+        //       staging + pinned host accumulators, skipping the
+        //       full-cap d_t2_meta/mi/xbits peak entirely. Saves
+        //       ~2168 MB at k=28 where T2 match is the overall peak.
+        // Compact pays ~1-2 s/plot of PCIe round-trips, so we only opt
+        // into it when the card can't fit plain.
         //
         // Thresholds (measured on sm_89):
         //   plain:   peak 7290 + margin 128 = 7418 MB floor
-        //   compact: peak 6260 + margin 128 = 6388 MB floor
-        //
-        // Compact is the parks-only variant (stage 4a/4b/4c ports from
-        // main): parks d_t1_meta / d_t1_keys_merged / d_t2_meta /
-        // d_t2_xbits / d_t2_keys_merged on pinned host across their
-        // idle windows. Drops T1 sort + T2 sort peaks from ~7290 to
-        // ~6260 MB. Getting below ~6 GB (main's 5200 MB target) would
-        // additionally need the T2 match N=2 tiling (main's stages
-        // 1/2/3) — a deeper kernel-level port that isn't in this
-        // commit.
+        //   compact: peak 5200 + margin 128 = 5328 MB floor
         constexpr uint64_t kPlainFloorBytes   = 7418ULL * 1024 * 1024;
-        constexpr uint64_t kCompactFloorBytes = 6388ULL * 1024 * 1024;
+        constexpr uint64_t kCompactFloorBytes = 5328ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         if (free_bytes >= kPlainFloorBytes) {

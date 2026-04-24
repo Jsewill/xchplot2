@@ -1080,18 +1080,6 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     CHECK(launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
                           nullptr, nullptr, nullptr, d_counter, cap,
                           nullptr, &t2_temp_bytes));
-    // T2 match emits SoA: three separate streams instead of a packed
-    // T2PairingGpu array. Total bytes same (cap·16) but each stream can
-    // be freed independently — crucial at k=28 where d_t2_mi becomes
-    // dead after the T2 sort's CUB consumes it.
-    uint64_t* d_t2_meta  = nullptr;
-    uint32_t* d_t2_mi    = nullptr;
-    uint32_t* d_t2_xbits = nullptr;
-    void*     d_t2_match_temp = nullptr;
-    s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
-    s_malloc(stats, d_t2_mi,         cap * sizeof(uint32_t), "d_t2_mi");
-    s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
-    s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
 
     // Compact-streaming: H2D d_t1_keys_merged back from pinned host
     // (we parked it across T1 sort's gather peak).
@@ -1102,40 +1090,136 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               cudaMemcpyHostToDevice, stream));
     }
 
-    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
-    CHECK(launch_t2_match(cfg.plot_id.data(), t2p,
-                          d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                          d_t2_meta, d_t2_mi, d_t2_xbits,
-                          d_counter, cap,
-                          d_t2_match_temp, &t2_temp_bytes, stream));
+    // In compact mode the match output is accumulated into the pinned
+    // host slots (scratch.h_meta / scratch.h_t2_xbits) across two
+    // half-cap passes, so the full-cap d_t2_meta / d_t2_xbits are never
+    // live on device — the gather-time JIT H2D blocks below allocate
+    // them when needed. In plain mode the match allocates full-cap on
+    // device directly (the gather path uses them without H2D).
+    uint64_t* d_t2_meta  = nullptr;
+    uint32_t* d_t2_mi    = nullptr;
+    uint32_t* d_t2_xbits = nullptr;
+    void*     d_t2_match_temp = nullptr;
+    uint64_t  t2_count   = 0;
+    bool const t2_compact_path = (scratch.h_meta != nullptr &&
+                                  scratch.h_t2_xbits != nullptr);
 
-    uint64_t t2_count = 0;
-    CHECK(cudaMemcpy(&t2_count, d_counter, sizeof(uint64_t),
-                     cudaMemcpyDeviceToHost));
-    if (t2_count > cap) throw std::runtime_error("T2 overflow");
+    if (t2_compact_path) {
+        // Stages 2+3: N=2 tiled T2 match into half-cap device staging,
+        // D2H each pass into pinned host accumulators. Peak during
+        // match drops from cap*(8+4+4)=4160 MB to half_cap*(8+4+4)=2080
+        // MB at k=28, at the cost of one extra round-trip PCIe + a
+        // per-plot pinned h_t2_mi allocation (freed before T2 sort).
+        // num_buckets = (1<<section_bits) * (1<<match_key_bits). For T2,
+        // num_match_key_bits = strength (≥ 2), so buckets = 16 at
+        // strength=2 regardless of k. Splitting at the midpoint gives
+        // two roughly equal-sized passes.
+        uint32_t const t2_num_buckets = (1u << t2p.num_section_bits)
+                                      * (1u << t2p.num_match_key_bits);
+        uint32_t const t2_bucket_mid  = t2_num_buckets / 2;
+        uint64_t const t2_half_cap    = (cap + 1) / 2;
 
-    s_free(stats, d_t2_match_temp);
-    s_free(stats, d_t1_meta_sorted);
-    s_free(stats, d_t1_keys_merged);
+        uint64_t* d_t2_meta_stage  = nullptr;
+        uint32_t* d_t2_mi_stage    = nullptr;
+        uint32_t* d_t2_xbits_stage = nullptr;
+        s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
+        s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
+        s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+        s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
 
-    // Compact-streaming: park d_t2_meta + d_t2_xbits across T2 sort.
-    // Reuse scratch.h_meta (now free — t1_meta done) and
-    // scratch.h_t2_xbits. Frees ~3 GB at k=28 during T2 sort's CUB
-    // peak. d_t2_mi stays on device — it's the CUB sort key input
-    // and dies after sort anyway.
-    if (scratch.h_meta) {
-        CHECK(cudaMemcpyAsync(scratch.h_meta, d_t2_meta,
-                              t2_count * sizeof(uint64_t),
-                              cudaMemcpyDeviceToHost, stream));
-        s_free(stats, d_t2_meta);
-        d_t2_meta = nullptr;
-    }
-    if (scratch.h_t2_xbits) {
-        CHECK(cudaMemcpyAsync(scratch.h_t2_xbits, d_t2_xbits,
+        // scratch.h_meta (cap * u64) doubles as the pinned accumulator
+        // for T2 meta — its T1 meta park lifetime ended at T1 gather.
+        // Same for scratch.h_t2_xbits (dedicated slot). h_t2_mi has no
+        // scratch slot and is allocated per-plot; it's freed right
+        // after hydrating into d_t2_mi before T2 sort.
+        uint64_t* const h_t2_meta  = scratch.h_meta;
+        uint32_t* const h_t2_xbits = scratch.h_t2_xbits;
+        uint32_t* h_t2_mi = streaming_alloc_pinned_uint32(cap);
+        if (!h_t2_mi) throw std::runtime_error("pinned alloc for h_t2_mi failed");
+
+        CHECK(launch_t2_match_prepare(cfg.plot_id.data(), t2p,
+                                      d_t1_keys_merged, t1_count,
+                                      d_counter,
+                                      d_t2_match_temp, &t2_temp_bytes,
+                                      stream));
+
+        auto run_pass = [&](uint32_t b_begin, uint32_t b_end,
+                            uint64_t host_offset) -> uint64_t {
+            CHECK(launch_t2_match_range(cfg.plot_id.data(), t2p,
+                                        d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                                        d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                                        d_counter, t2_half_cap,
+                                        d_t2_match_temp,
+                                        b_begin, b_end, stream));
+            uint64_t pass_count = 0;
+            CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            if (pass_count > t2_half_cap) {
+                throw std::runtime_error(
+                    "T2 match pass overflow: bucket range [" +
+                    std::to_string(b_begin) + "," + std::to_string(b_end) +
+                    ") produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t2_half_cap));
+            }
+            CHECK(cudaMemcpyAsync(h_t2_meta + host_offset, d_t2_meta_stage,
+                                  pass_count * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(h_t2_mi + host_offset, d_t2_mi_stage,
+                                  pass_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(h_t2_xbits + host_offset, d_t2_xbits_stage,
+                                  pass_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            // Reset counter so the next pass writes at index 0 of the
+            // half-cap staging buffers.
+            CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+            CHECK(cudaStreamSynchronize(stream));
+            return pass_count;
+        };
+
+        uint64_t const count1 = run_pass(0,              t2_bucket_mid,   /*host_offset=*/0);
+        uint64_t const count2 = run_pass(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
+        t2_count = count1 + count2;
+        if (t2_count > cap) throw std::runtime_error("T2 overflow");
+
+        s_free(stats, d_t2_match_temp);
+        s_free(stats, d_t2_meta_stage);
+        s_free(stats, d_t2_mi_stage);
+        s_free(stats, d_t2_xbits_stage);
+        s_free(stats, d_t1_meta_sorted);
+        s_free(stats, d_t1_keys_merged);
+
+        // Hydrate full-cap d_t2_mi from h_t2_mi (T2 sort consumes it as
+        // the CUB sort key input). h_t2_mi is freed immediately after —
+        // its data now lives on-device and no further consumer needs it.
+        s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
+        CHECK(cudaMemcpyAsync(d_t2_mi, h_t2_mi,
                               t2_count * sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, stream));
-        s_free(stats, d_t2_xbits);
-        d_t2_xbits = nullptr;
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        streaming_free_pinned_uint32(h_t2_mi);
+    } else {
+        // Plain streaming: single-pass full-cap match. Unchanged behavior.
+        s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
+        s_malloc(stats, d_t2_mi,         cap * sizeof(uint32_t), "d_t2_mi");
+        s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
+        s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
+
+        CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+        CHECK(launch_t2_match(cfg.plot_id.data(), t2p,
+                              d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                              d_t2_meta, d_t2_mi, d_t2_xbits,
+                              d_counter, cap,
+                              d_t2_match_temp, &t2_temp_bytes, stream));
+
+        CHECK(cudaMemcpy(&t2_count, d_counter, sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost));
+        if (t2_count > cap) throw std::runtime_error("T2 overflow");
+
+        s_free(stats, d_t2_match_temp);
+        s_free(stats, d_t1_meta_sorted);
+        s_free(stats, d_t1_keys_merged);
     }
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
