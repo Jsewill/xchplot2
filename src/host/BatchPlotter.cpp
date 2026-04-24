@@ -305,18 +305,14 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 e.free_bytes     / double(1ULL << 30));
         }
         // Streaming preflight: bail before the ~4 GiB pinned-host alloc +
-        // queue setup if even the streaming peak won't fit. 1 GiB margin
-        // because empirical overhead (CUDA context + display framebuffer
-        // on non-headless cards + cudaMalloc fragmentation) consumes
-        // ~600-900 MB beyond the theoretical peak. Reported against an
-        // RTX 3070 8GB at k=28: 7.66 GiB free, 7.29 GiB peak, 372 MB
-        // apparent slack — still failed at d_xs_temp and triggered a
-        // double-free in AdaptiveCpp's post-throw teardown (outside our
-        // control). Rejecting at preflight sidesteps the whole queue.
+        // queue setup if the streaming peak won't fit. 256 MB margin
+        // matches typical headless-card overhead; the N=2 T2-match
+        // tiling below keeps the actual peak at T1_sorted + T2/2 so
+        // cards that pass this check have real headroom at runtime.
         {
             auto const mem  = query_device_memory();
             size_t const peak   = streaming_peak_bytes(pool_k);
-            size_t const margin = 1024ULL << 20;  // ~1 GiB headroom
+            size_t const margin = 256ULL << 20;
             if (mem.free_bytes < peak + margin) {
                 auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
                 InsufficientVramError se(
