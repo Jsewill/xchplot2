@@ -124,8 +124,13 @@ Prerequisites:
 
 - Windows 10 21H2+ or Windows 11, x64
 - [Visual Studio 2022](https://visualstudio.microsoft.com/) Community
-  with the **"Desktop development with C++"** workload (MSVC + Windows
-  SDK)
+  with the **"Desktop development with C++"** workload. That workload
+  bundles MSVC + the Windows SDK; the SDK is non-optional because it
+  ships `kernel32.lib` / `user32.lib` / etc. that `link.exe`
+  consumes. If you've trimmed the installer to "C++ build tools"
+  only, open **Visual Studio Installer → Modify → Individual
+  components** and tick the latest **Windows 11 SDK** before
+  retrying.
 - [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads) —
   install **after** Visual Studio so the CUDA installer wires up the
   MSBuild integration. 12.8+ required for RTX 50-series (Blackwell,
@@ -136,8 +141,27 @@ Prerequisites:
   Windows](https://gitforwindows.org/)
 
 Launch the **x64 Native Tools Command Prompt for VS 2022** from the
-Start menu (this puts `cl.exe`, `nvcc`, and `cmake` on `PATH` with the
-right environment), then:
+Start menu — there are several similarly-named prompts (x86 /
+x86_64 / 2019 / 2022); the one that matters is the x64 for 2022.
+That prompt is the one that sets `LIB`, `INCLUDE`, and `PATH` so
+`cl.exe`, `link.exe`, `nvcc`, and `cmake` all see each other plus
+the Windows SDK. A plain `cmd` / PowerShell / Windows Terminal tab
+does **not** do this — running `cargo install` from one of those
+produces `LNK1181: cannot open input file 'kernel32.lib'` at the
+first link step.
+
+Quick sanity check in the prompt:
+
+```cmd
+where link.exe
+echo %LIB%
+```
+
+`%LIB%` should include a `...\Windows Kits\10\Lib\...\um\x64`
+entry. If it doesn't, you're in the wrong prompt or the Windows SDK
+component isn't installed.
+
+Build:
 
 ```cmd
 set CUDA_ARCHITECTURES=89
