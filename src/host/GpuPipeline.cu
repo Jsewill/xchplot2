@@ -753,15 +753,17 @@ namespace { // anon: shared impl, not part of the public API.
 
 GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
-    uint64_t* pinned_dst,         // nullable
-    size_t    pinned_capacity);   // count, not bytes; ignored if pinned_dst null
+    uint64_t* pinned_dst,                       // nullable
+    size_t    pinned_capacity,                  // count, not bytes; ignored if pinned_dst null
+    StreamingPinnedScratch const& scratch);     // any nullptr field → plain streaming for that buffer
 
 } // namespace
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg)
 {
     return run_gpu_pipeline_streaming_impl(cfg, /*pinned_dst=*/nullptr,
-                                                /*pinned_capacity=*/0);
+                                                /*pinned_capacity=*/0,
+                                                StreamingPinnedScratch{});
 }
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
@@ -772,7 +774,20 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
         throw std::runtime_error(
             "run_gpu_pipeline_streaming(cfg, pinned, cap): pinned buffer must be non-null");
     }
-    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity);
+    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity,
+                                           StreamingPinnedScratch{});
+}
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity,
+                                             StreamingPinnedScratch const& scratch)
+{
+    if (!pinned_dst || pinned_capacity == 0) {
+        throw std::runtime_error(
+            "run_gpu_pipeline_streaming(cfg, pinned, cap, scratch): pinned buffer must be non-null");
+    }
+    return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity, scratch);
 }
 
 namespace {
@@ -780,7 +795,8 @@ namespace {
 GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
     uint64_t* pinned_dst,
-    size_t    pinned_capacity)
+    size_t    pinned_capacity,
+    StreamingPinnedScratch const& scratch)
 {
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
@@ -929,6 +945,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Xs fully consumed.
     s_free(stats, d_xs);
 
+    // Compact-streaming: park d_t1_meta on pinned host across T1 sort.
+    // The sort only needs d_t1_mi as key; d_t1_meta is only consumed
+    // by the final gather_u64 at the end of this phase. Parking drops
+    // the T1 sort live set by ~2 GB at k=28. No-op when scratch.h_meta
+    // is nullptr (plain streaming).
+    if (scratch.h_meta) {
+        CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
+                              t1_count * sizeof(uint64_t),
+                              cudaMemcpyDeviceToHost, stream));
+        s_free(stats, d_t1_meta);
+        d_t1_meta = nullptr;
+    }
+
     // ---------- Phase T1 sort (tiled, N=2) ----------
     // Partition T1 into two halves by index, CUB-sort each with scratch
     // sized for the larger half, then stable 2-way merge the sorted runs
@@ -1015,6 +1044,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_keys_out);
     s_free(stats, d_vals_out);
 
+    // Compact-streaming: park d_t1_keys_merged across the remainder of
+    // T1 sort. It's only needed again at T2 match entry as the
+    // d_sorted_mi input; freeing it here drops the gather-time and
+    // T2-match-setup live set by 1 GB at k=28.
+    if (scratch.h_keys_merged) {
+        CHECK(cudaMemcpyAsync(scratch.h_keys_merged, d_t1_keys_merged,
+                              t1_count * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, stream));
+        s_free(stats, d_t1_keys_merged);
+        d_t1_keys_merged = nullptr;
+    }
+
+    // Compact-streaming: JIT H2D d_t1_meta back before gather.
+    if (scratch.h_meta) {
+        s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
+        CHECK(cudaMemcpyAsync(d_t1_meta, scratch.h_meta,
+                              t1_count * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream));
+    }
+
     uint64_t* d_t1_meta_sorted = nullptr;
     s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
     gather_u64<<<blocks(t1_count), kThreads, 0, stream>>>(
@@ -1044,6 +1093,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t2_xbits,      cap * sizeof(uint32_t), "d_t2_xbits");
     s_malloc(stats, d_t2_match_temp, t2_temp_bytes,          "d_t2_match_temp");
 
+    // Compact-streaming: H2D d_t1_keys_merged back from pinned host
+    // (we parked it across T1 sort's gather peak).
+    if (scratch.h_keys_merged) {
+        s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
+        CHECK(cudaMemcpyAsync(d_t1_keys_merged, scratch.h_keys_merged,
+                              t1_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+    }
+
     CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
     CHECK(launch_t2_match(cfg.plot_id.data(), t2p,
                           d_t1_meta_sorted, d_t1_keys_merged, t1_count,
@@ -1059,6 +1117,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t2_match_temp);
     s_free(stats, d_t1_meta_sorted);
     s_free(stats, d_t1_keys_merged);
+
+    // Compact-streaming: park d_t2_meta + d_t2_xbits across T2 sort.
+    // Reuse scratch.h_meta (now free — t1_meta done) and
+    // scratch.h_t2_xbits. Frees ~3 GB at k=28 during T2 sort's CUB
+    // peak. d_t2_mi stays on device — it's the CUB sort key input
+    // and dies after sort anyway.
+    if (scratch.h_meta) {
+        CHECK(cudaMemcpyAsync(scratch.h_meta, d_t2_meta,
+                              t2_count * sizeof(uint64_t),
+                              cudaMemcpyDeviceToHost, stream));
+        s_free(stats, d_t2_meta);
+        d_t2_meta = nullptr;
+    }
+    if (scratch.h_t2_xbits) {
+        CHECK(cudaMemcpyAsync(scratch.h_t2_xbits, d_t2_xbits,
+                              t2_count * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, stream));
+        s_free(stats, d_t2_xbits);
+        d_t2_xbits = nullptr;
+    }
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
     // Mirror of T1 sort above — same tile-and-merge shape, but permute
@@ -1178,12 +1256,40 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_CD_keys);
     s_free(stats, d_CD_vals);
 
+    // Compact-streaming: park d_t2_keys_merged across the gather peak.
+    // It's not used by the gather (that reads d_merged_vals as indices)
+    // and only needed again at T3 match entry. Frees 1 GB at k=28
+    // during the gather phase.
+    if (scratch.h_keys_merged) {
+        CHECK(cudaMemcpyAsync(scratch.h_keys_merged, d_t2_keys_merged,
+                              t2_count * sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost, stream));
+        s_free(stats, d_t2_keys_merged);
+        d_t2_keys_merged = nullptr;
+    }
+
+    // Compact-streaming: JIT H2D d_t2_meta back for gather_u64.
+    if (scratch.h_meta) {
+        s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
+        CHECK(cudaMemcpyAsync(d_t2_meta, scratch.h_meta,
+                              t2_count * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream));
+    }
+
     uint64_t* d_t2_meta_sorted = nullptr;
     s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
     gather_u64<<<blocks(t2_count), kThreads, 0, stream>>>(
         d_t2_meta, d_merged_vals, d_t2_meta_sorted, t2_count);
     CHECK(cudaGetLastError());
     s_free(stats, d_t2_meta);
+
+    // Compact-streaming: JIT H2D d_t2_xbits back for gather_u32.
+    if (scratch.h_t2_xbits) {
+        s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+        CHECK(cudaMemcpyAsync(d_t2_xbits, scratch.h_t2_xbits,
+                              t2_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+    }
 
     uint32_t* d_t2_xbits_sorted = nullptr;
     s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
@@ -1202,6 +1308,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                           nullptr, t2_count,
                           nullptr, d_counter, cap,
                           nullptr, &t3_temp_bytes));
+    // Compact-streaming: H2D d_t2_keys_merged back for T3 match (its
+    // consumer). Allocated here so d_t3 + d_t3_match_temp can pick the
+    // freed region left by d_t2_meta during the meta gather above.
+    if (scratch.h_keys_merged) {
+        s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
+        CHECK(cudaMemcpyAsync(d_t2_keys_merged, scratch.h_keys_merged,
+                              t2_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+    }
+
     T3PairingGpu* d_t3 = nullptr;
     void*         d_t3_match_temp = nullptr;
     s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
@@ -1308,6 +1424,34 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 }
 
 } // namespace (anon — streaming impl)
+
+uint32_t* streaming_alloc_pinned_uint32(size_t count)
+{
+    uint32_t* p = nullptr;
+    if (cudaMallocHost(&p, count * sizeof(uint32_t)) != cudaSuccess) {
+        return nullptr;
+    }
+    return p;
+}
+
+void streaming_free_pinned_uint32(uint32_t* ptr)
+{
+    if (ptr) cudaFreeHost(ptr);
+}
+
+size_t streaming_query_free_vram_bytes()
+{
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    // Honour POS2GPU_MAX_VRAM_MB so the tier dispatch can be tested on
+    // a high-VRAM card by capping the reported free memory, matching
+    // how the streaming-path s_malloc tracker also caps.
+    if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
+        size_t const cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        if (cap > 0 && cap < free_b) free_b = cap;
+    }
+    return free_b;
+}
 
 uint64_t* streaming_alloc_pinned_uint64(size_t count)
 {

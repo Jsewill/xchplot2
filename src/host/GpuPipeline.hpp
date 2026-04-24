@@ -100,11 +100,45 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
                                              uint64_t* pinned_dst,
                                              size_t    pinned_capacity);
 
+// Tiered streaming — "compact" variant for low-VRAM cards.
+//
+// The plain streaming path above has a peak of ~7290 MB at k=28 (T2
+// sort + T2 match dominate). 6 GB cards and tight 8 GB cards can't fit
+// that. Populating a StreamingPinnedScratch and passing it to the
+// overload below triggers park-and-rehydrate of the big d_t1_meta /
+// d_t2_meta / d_t2_xbits / *_keys_merged buffers across their idle
+// windows — drops overall peak to ~5200 MB at k=28 at the cost of
+// ~1-2 s/plot of PCIe round-trips.
+//
+// Any field left nullptr makes the pipeline keep that buffer on device
+// (plain behavior for that buffer). Populating all fields gives the
+// full compact path. BatchPlotter picks the tier based on free VRAM at
+// batch start.
+//
+// Lifetime-disjoint sharing: h_meta (cap*u64) is reused for t1_meta
+// then t2_meta; h_keys_merged (cap*u32) is reused for t1 then t2.
+struct StreamingPinnedScratch {
+    uint64_t* h_meta         = nullptr;  // parks t1_meta, then t2_meta
+    uint32_t* h_keys_merged  = nullptr;  // parks t1_keys_merged, then t2_keys_merged
+    uint32_t* h_t2_xbits     = nullptr;  // parks t2_xbits
+};
+
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             uint64_t* pinned_dst,
+                                             size_t    pinned_capacity,
+                                             StreamingPinnedScratch const& scratch);
+
 // Allocate / free host-pinned memory — thin wrappers around
 // cudaMallocHost / cudaFreeHost, exposed so plain .cpp consumers (which
 // do not have cuda_runtime.h on the include path) can own the pinned
 // buffers the streaming overload expects. Returns nullptr on failure.
 uint64_t* streaming_alloc_pinned_uint64(size_t count);
 void      streaming_free_pinned_uint64(uint64_t* ptr);
+uint32_t* streaming_alloc_pinned_uint32(size_t count);
+void      streaming_free_pinned_uint32(uint32_t* ptr);
+
+// Returns an approximate free-VRAM count on the current CUDA device.
+// Used by BatchPlotter to pick between plain and compact streaming.
+size_t streaming_query_free_vram_bytes();
 
 } // namespace pos2gpu

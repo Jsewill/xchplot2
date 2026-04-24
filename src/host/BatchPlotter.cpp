@@ -190,6 +190,10 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
     // once instead of per plot is a significant win on long batches.
     uint64_t* stream_pinned[GpuBufferPool::kNumPinnedBuffers] = {};
     size_t    stream_pinned_cap = 0;
+    // Tiered streaming scratch. Populated only if the compact tier is
+    // selected — see the VRAM dispatch at the end of the catch block.
+    StreamingPinnedScratch stream_scratch{};
+    bool stream_compact = false;
 
     // Force-streaming override (matches the one-shot run_gpu_pipeline
     // dispatch). Useful for testing the streaming path on a high-VRAM
@@ -236,6 +240,73 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
             }
             throw std::runtime_error(
                 "[batch] streaming-fallback: pinned D2H buffer allocation failed");
+        }
+
+        // Tiered dispatch: pick plain vs compact streaming based on
+        // free device VRAM. The plain path's peak at k=28 is ~7290 MB;
+        // compact drops to ~5200 MB by parking big intermediates on
+        // pinned host (T1/T2 meta, keys_merged, T2 xbits). Compact pays
+        // ~1-2 s/plot of PCIe round-trips, so we only opt into it when
+        // the card can't fit plain.
+        //
+        // Thresholds (measured on sm_89):
+        //   plain:   peak 7290 + margin 128 = 7418 MB floor
+        //   compact: peak 6260 + margin 128 = 6388 MB floor
+        //
+        // Compact is the parks-only variant (stage 4a/4b/4c ports from
+        // main): parks d_t1_meta / d_t1_keys_merged / d_t2_meta /
+        // d_t2_xbits / d_t2_keys_merged on pinned host across their
+        // idle windows. Drops T1 sort + T2 sort peaks from ~7290 to
+        // ~6260 MB. Getting below ~6 GB (main's 5200 MB target) would
+        // additionally need the T2 match N=2 tiling (main's stages
+        // 1/2/3) — a deeper kernel-level port that isn't in this
+        // commit.
+        constexpr uint64_t kPlainFloorBytes   = 7418ULL * 1024 * 1024;
+        constexpr uint64_t kCompactFloorBytes = 6388ULL * 1024 * 1024;
+        size_t const free_bytes = streaming_query_free_vram_bytes();
+
+        if (free_bytes >= kPlainFloorBytes) {
+            // Plain tier: zero PCIe overhead, all parks skipped.
+            std::fprintf(stderr,
+                "[batch] streaming tier: plain (%.2f GiB free ≥ %.2f GiB floor)\n",
+                free_bytes / double(1ULL << 30),
+                kPlainFloorBytes / double(1ULL << 30));
+        } else if (free_bytes >= kCompactFloorBytes) {
+            // Compact tier: allocate the shared scratch buffers once
+            // per batch. At k=28 this is ~4.2 GB of pinned host:
+            //   h_meta        cap·u64 = 2.04 GB (reused t1_meta → t2_meta)
+            //   h_keys_merged cap·u32 = 1.02 GB (reused t1_keys → t2_keys)
+            //   h_t2_xbits    cap·u32 = 1.02 GB
+            stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
+                !stream_scratch.h_t2_xbits)
+            {
+                if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+                if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+                if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+                for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                    if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+                }
+                throw std::runtime_error(
+                    "[batch] streaming-fallback: compact-tier pinned scratch alloc failed");
+            }
+            stream_compact = true;
+            std::fprintf(stderr,
+                "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
+                "using park/rehydrate, expect ~1-2 s/plot extra PCIe)\n",
+                free_bytes / double(1ULL << 30),
+                kPlainFloorBytes / double(1ULL << 30));
+        } else {
+            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+            }
+            throw std::runtime_error(
+                "[batch] card too small for k=28 streaming at any tier: " +
+                std::to_string(free_bytes / (1ULL << 20)) + " MB free < " +
+                std::to_string(kCompactFloorBytes / (1ULL << 20)) +
+                " MB compact floor. Use a smaller k or a larger GPU.");
         }
     }
     if (verbose && pool_ptr) {
@@ -323,7 +394,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
                 // Streaming path with externally-owned pinned: same
                 // rotation + channel-depth invariant.
                 item.result = run_gpu_pipeline_streaming(
-                    cfg, stream_pinned[slot], stream_pinned_cap);
+                    cfg, stream_pinned[slot], stream_pinned_cap,
+                    stream_scratch);
             }
 
             if (verbose) {
@@ -353,6 +425,13 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, bool verbose)
 
     for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
         streaming_free_pinned_uint64(stream_pinned[s]);
+    }
+    // Compact-tier scratch (nullptr-safe; no-op if plain tier ran).
+    if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+    if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+    if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+    {
+        (void)stream_compact;  // avoid unused-warning on plain-only builds
     }
 
     res.plots_written = plots_done.load();
