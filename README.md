@@ -23,8 +23,10 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 - **CUDA Toolkit:** 12+ required to build (tested on 13.x). Runtime
   users on RTX 50-series (Blackwell, `sm_120`) need a driver bundle
   that ships Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
-- **OS:** Linux (tested on modern glibc distributions). Windows and
-  macOS are not currently tested.
+- **OS:** Linux (tested on modern glibc distributions) is the supported
+  path. Windows builds are possible via MSVC + CUDA — see
+  [Windows (experimental)](#windows-experimental) below. macOS is not
+  supported (no CUDA).
 
 ## Build
 
@@ -76,6 +78,53 @@ Outputs:
 
 - `build/tools/xchplot2/xchplot2`
 - `build/tools/parity/{aes,xs,t1,t2,t3}_parity` — bit-exact CPU/GPU tests
+
+### Windows (experimental)
+
+This branch is CUDA-only, so a Windows build needs nothing beyond the
+standard NVIDIA toolchain — no SYCL runtime required. Only one POSIX
+site in the code (`Cancel.cpp`) and it's already `#if defined(__unix__)`
+-guarded. This path is **untested** — please file an issue with your
+results.
+
+Prerequisites:
+
+- Windows 10 21H2+ or Windows 11, x64
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) Community
+  with the **"Desktop development with C++"** workload (MSVC + Windows
+  SDK)
+- [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads) —
+  install **after** Visual Studio so the CUDA installer wires up the
+  MSBuild integration. 12.8+ required for RTX 50-series (Blackwell,
+  `sm_120`).
+- [Rust](https://www.rust-lang.org/tools/install) using the MSVC
+  toolchain (`rustup default stable-x86_64-pc-windows-msvc`)
+- [CMake 3.24+](https://cmake.org/download/) and [Git for
+  Windows](https://gitforwindows.org/)
+
+Launch the **x64 Native Tools Command Prompt for VS 2022** from the
+Start menu (this puts `cl.exe`, `nvcc`, and `cmake` on `PATH` with the
+right environment), then:
+
+```cmd
+set CUDA_ARCHITECTURES=89
+cargo install --git https://github.com/Jsewill/xchplot2 --branch cuda-only
+```
+
+Or for a local checkout you can iterate on:
+
+```cmd
+git clone -b cuda-only https://github.com/Jsewill/xchplot2
+cd xchplot2
+set CUDA_ARCHITECTURES=89
+cargo install --path .
+```
+
+Set `CUDA_ARCHITECTURES` to match your card (see the list above).
+PowerShell users: use `$env:CUDA_ARCHITECTURES = "89"` instead of
+`set`. The CMake path (`cmake -B build -S . && cmake --build build`)
+also works inside the same Native Tools prompt if you prefer that over
+`cargo install`.
 
 ## Use
 
