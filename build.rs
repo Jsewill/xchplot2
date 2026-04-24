@@ -63,7 +63,24 @@ fn detect_amd_gfx() -> Option<String> {
         if let Some(rest) = line.trim().strip_prefix("Name:") {
             let name = rest.trim();
             if name.starts_with("gfx") {
-                return Some(name.to_string());
+                // RDNA1 workaround: gfx1010/1011/1012 aren't direct
+                // AdaptiveCpp HIP targets. Community-tested (Radeon Pro
+                // W5700) that gfx1013 is ISA-close enough to run on
+                // gfx1010 silicon. Not parity-validated — flagged via
+                // cargo:warning so users know they're on the workaround
+                // path.
+                let spoofed = match name {
+                    "gfx1010" | "gfx1011" | "gfx1012" => {
+                        println!(
+                            "cargo:warning=xchplot2: RDNA1 {name} detected — \
+                             building for gfx1013 (community workaround, \
+                             not parity-validated; verify plots with \
+                             `xchplot2 verify` before farming)");
+                        "gfx1013".to_string()
+                    }
+                    other => other.to_string(),
+                };
+                return Some(spoofed);
             }
         }
     }
