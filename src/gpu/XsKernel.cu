@@ -106,6 +106,48 @@ cudaError_t launch_construct_xs(
                                         nullptr, nullptr, stream);
 }
 
+// Public sub-kernel launchers used by the streaming path's inline
+// gen+sort+pack sequence (avoids the bundled d_temp_storage blob that
+// otherwise forces keys_a + vals_a to stay alive through pack).
+cudaError_t launch_xs_gen(
+    uint8_t const* plot_id_bytes, int k, bool testnet,
+    uint32_t* d_keys_out, uint32_t* d_vals_out,
+    cudaStream_t stream)
+{
+    if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
+    if (!plot_id_bytes || !d_keys_out || !d_vals_out) return cudaErrorInvalidValue;
+
+    uint64_t const total = 1ULL << k;
+    AesHashKeys keys = make_keys(plot_id_bytes);
+    uint32_t xor_const = testnet ? kTestnetGXorConst : 0u;
+
+    constexpr int kThreads = 256;
+    uint64_t blocks_u64 = (total + kThreads - 1) / kThreads;
+    if (blocks_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    unsigned blocks = static_cast<unsigned>(blocks_u64);
+
+    gen_kernel<<<blocks, kThreads, 0, stream>>>(
+        keys, d_keys_out, d_vals_out, total, k, xor_const);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_xs_pack(
+    uint32_t const* d_keys_in, uint32_t const* d_vals_in,
+    XsCandidateGpu* d_out, uint64_t total,
+    cudaStream_t stream)
+{
+    if (!d_keys_in || !d_vals_in || !d_out) return cudaErrorInvalidValue;
+
+    constexpr int kThreads = 256;
+    uint64_t blocks_u64 = (total + kThreads - 1) / kThreads;
+    if (blocks_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    unsigned blocks = static_cast<unsigned>(blocks_u64);
+
+    pack_kernel<<<blocks, kThreads, 0, stream>>>(
+        d_keys_in, d_vals_in, d_out, total);
+    return cudaGetLastError();
+}
+
 cudaError_t launch_construct_xs_profiled(
     uint8_t const* plot_id_bytes,
     int k,

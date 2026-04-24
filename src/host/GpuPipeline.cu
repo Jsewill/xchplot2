@@ -814,25 +814,89 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_counter = nullptr;
     s_malloc(stats, d_counter, sizeof(uint64_t), "d_counter");
 
-    // ---------- Phase Xs ----------
+    // ---------- Phase Xs (inlined gen+sort+pack) ----------
+    // launch_construct_xs bundles keys_a/b + vals_a/b inside a single
+    // d_xs_temp blob (~4 GB at k=28), so keys_a + vals_a are kept alive
+    // through pack even though they're dead after CUB sort. Inline the
+    // three sub-kernels with separate s_malloc per buffer so we can:
+    //
+    //   1. alloc keys_a + vals_a
+    //   2. launch_xs_gen -> keys_a, vals_a
+    //   3. alloc keys_b + vals_b + cub_scratch
+    //   4. cub::DeviceRadixSort::SortPairs: a -> b
+    //   5. free keys_a + vals_a + cub_scratch    <- 2 GB freed
+    //   6. alloc d_xs
+    //   7. launch_xs_pack: keys_b, vals_b -> d_xs
+    //   8. free keys_b + vals_b
+    //
+    // Phase peak at k=28 drops from d_xs (2048) + d_xs_temp (4096) =
+    // 6144 MB to max(sort ~4080 MB, pack ~4080 MB) ≈ 4080 MB. Zero
+    // extra PCIe cost (purely a lifetime rearrangement of on-device
+    // buffers).
     stats.phase = "Xs";
-    size_t xs_temp_bytes = 0;
-    CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              nullptr, nullptr, &xs_temp_bytes));
-    XsCandidateGpu* d_xs      = nullptr;
-    void*           d_xs_temp = nullptr;
-    s_malloc(stats, d_xs,      total_xs * sizeof(XsCandidateGpu), "d_xs");
-    s_malloc(stats, d_xs_temp, xs_temp_bytes,                     "d_xs_temp");
 
-    CHECK(launch_construct_xs(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                              d_xs, d_xs_temp, &xs_temp_bytes));
+    uint32_t* d_xs_keys_a = nullptr;
+    uint32_t* d_xs_vals_a = nullptr;
+    s_malloc(stats, d_xs_keys_a, total_xs * sizeof(uint32_t), "d_xs_keys_a");
+    s_malloc(stats, d_xs_vals_a, total_xs * sizeof(uint32_t), "d_xs_vals_a");
 
-    // Xs gen writes to d_xs_temp while sorting, but by the time
-    // launch_construct_xs returns the result is in d_xs and xs_temp is
-    // dead. cudaFree is device-synchronous so it blocks until the default
-    // stream drains, which means any in-flight access to d_xs_temp has
-    // completed before we free it.
-    s_free(stats, d_xs_temp);
+    CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                        d_xs_keys_a, d_xs_vals_a));
+
+    // CUB DoubleBuffer mode: ping-pongs between keys_a/keys_b so the
+    // internal scratch shrinks from ~2 GB at k=28 down to ~MB of
+    // histograms (matches launch_construct_xs and the streaming
+    // T1/T2/T3 sorts). Caller canonicalises to keys_b/vals_b via a
+    // conditional D2D copy if CUB landed in the a side.
+    uint32_t* d_xs_keys_b = nullptr;
+    uint32_t* d_xs_vals_b = nullptr;
+    s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+    s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+
+    size_t xs_cub_bytes = 0;
+    {
+        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, xs_cub_bytes,
+            probe_keys, probe_vals,
+            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+    }
+    void* d_xs_cub_scratch = nullptr;
+    s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes, "d_xs_cub");
+
+    {
+        cub::DoubleBuffer<uint32_t> dk(d_xs_keys_a, d_xs_keys_b);
+        cub::DoubleBuffer<uint32_t> dv(d_xs_vals_a, d_xs_vals_b);
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            d_xs_cub_scratch, xs_cub_bytes,
+            dk, dv,
+            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+        // Canonicalise sorted result into keys_b/vals_b so downstream
+        // free-before-pack treats keys_a/vals_a as the disposable pair.
+        if (dk.Current() != d_xs_keys_b) {
+            CHECK(cudaMemcpyAsync(d_xs_keys_b, dk.Current(),
+                total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+        if (dv.Current() != d_xs_vals_b) {
+            CHECK(cudaMemcpyAsync(d_xs_vals_b, dv.Current(),
+                total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        }
+    }
+
+    // Sort consumed keys_a + vals_a; free them + CUB scratch before
+    // allocating d_xs so the pack phase peak stays under the sort peak.
+    s_free(stats, d_xs_cub_scratch);
+    s_free(stats, d_xs_keys_a);
+    s_free(stats, d_xs_vals_a);
+
+    XsCandidateGpu* d_xs = nullptr;
+    s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+
+    CHECK(launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs));
+
+    s_free(stats, d_xs_keys_b);
+    s_free(stats, d_xs_vals_b);
 
     // ---------- Phase T1 match ----------
     stats.phase = "T1 match";

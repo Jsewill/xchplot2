@@ -58,4 +58,31 @@ cudaError_t launch_construct_xs_profiled(
     cudaEvent_t after_sort,   // nullable; recorded after sort queued
     cudaStream_t stream = nullptr);
 
+// Sub-kernel launchers — exposed so the low-VRAM streaming path can
+// allocate keys_a/vals_a/keys_b/vals_b as SEPARATE buffers and free
+// the gen-side pair between the sort and the pack. launch_construct_xs
+// bundles them into a single d_temp_storage blob which makes freeing
+// the intermediate keys_a+vals_a impossible before pack; splitting
+// drops the Xs phase peak at k=28 from ~6.2 GB (d_xs 2 GB + blob
+// 4.1 GB) to ~4.1 GB (max of sort-time and pack-time live sets) at
+// zero per-plot PCIe cost.
+//
+// Caller is responsible for allocating d_keys_out/d_vals_out (each
+// total × sizeof(uint32_t)) and initialising AES tables via
+// initialize_aes_tables() before calling launch_xs_gen.
+cudaError_t launch_xs_gen(
+    uint8_t const* plot_id_bytes,
+    int k,
+    bool testnet,
+    uint32_t* d_keys_out,
+    uint32_t* d_vals_out,
+    cudaStream_t stream = nullptr);
+
+cudaError_t launch_xs_pack(
+    uint32_t const* d_keys_in,
+    uint32_t const* d_vals_in,
+    XsCandidateGpu* d_out,
+    uint64_t total,
+    cudaStream_t stream = nullptr);
+
 } // namespace pos2gpu
