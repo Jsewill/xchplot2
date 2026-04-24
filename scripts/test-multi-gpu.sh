@@ -117,7 +117,7 @@ else
         fi
     else
         fail "plot --devices 0,1 failed (see $TMP_OUT/log)"
-        cat "$TMP_OUT/log" | sed 's/^/    /'
+        sed 's/^/    /' "$TMP_OUT/log"
     fi
 fi
 
