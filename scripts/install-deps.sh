@@ -224,6 +224,20 @@ echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
 git clone --depth 1 --branch "$ACPP_REF" \
     https://github.com/AdaptiveCpp/AdaptiveCpp.git "$ACPP_BUILD_DIR/src"
 
+# AMD-only builds don't need AdaptiveCpp's CUDA backend. Skip the
+# `find_package(CUDA)` probe that AdaptiveCpp's CMakeLists runs at
+# line ~122: on hosts where a CUDA headers subset is installed (distro
+# `cuda` package, JetPack fragments, /usr/lib from some wrappers), the
+# probe finds a partial install and AdaptiveCpp's own `FindCUDA.cmake`
+# emits `CUDAToolkit_LIBRARY_ROOT /usr/lib does not point to the
+# correct directory, try setting it manually`. The warning is cosmetic
+# (AdaptiveCpp continues without CUDA), but it looks like an error to
+# users skimming the install log.
+ACPP_CUDA_DISABLE=()
+if [[ "$GPU" == "amd" ]]; then
+    ACPP_CUDA_DISABLE+=(-DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE)
+fi
+
 cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$ACPP_PREFIX" \
@@ -231,6 +245,7 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_CXX_COMPILER="$LLVM_ROOT/bin/clang++" \
     -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" \
     -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
+    "${ACPP_CUDA_DISABLE[@]}" \
     "${ACPP_ROCM_FLAGS[@]}"
 cmake --build "$ACPP_BUILD_DIR/build" --parallel
 sudo cmake --install "$ACPP_BUILD_DIR/build"
