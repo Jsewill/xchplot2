@@ -36,6 +36,37 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
+/// Same probe as `detect_cuda_arch`, but filters out NVIDIA GPUs
+/// below our README-documented minimum compute capability (sm_61,
+/// Pascal / GTX 10-series). Below sm_53 the GPU also lacks native
+/// FP16 intrinsics (`__hadd` / `__hsub` / `__hmul` / `__hdiv` /
+/// `__hlt` / `__hle` / `__hgt` / `__hge`) that AdaptiveCpp's
+/// `half.hpp` emits unconditionally in any nvcc device pass —
+/// `cuda_fp16.h` guards those behind `__CUDA_ARCH__ >= 530`. Users
+/// with an ancient secondary NVIDIA card (e.g. a GTX 750 Ti sitting
+/// next to a real AMD / NVIDIA workhorse) otherwise get routed onto
+/// the CUB fast path via vendor-precedence and fail to compile
+/// SortCuda.cu with a cascade of "identifier `__hXXX` is undefined".
+///
+/// Returns Some(arch) only when nvidia-smi reports a card at or
+/// above our minimum; emits a cargo:warning and returns None
+/// otherwise so callers fall through to the AMD / Intel detection.
+fn usable_nvidia_arch() -> Option<String> {
+    let arch = detect_cuda_arch()?;
+    let n: u32 = arch.parse().ok()?;
+    if n < 61 {
+        println!(
+            "cargo:warning=xchplot2: nvidia-smi detected sm_{arch} — below our \
+             minimum supported compute capability (sm_61 / Pascal). Ignoring \
+             NVIDIA for default targeting; set CUDA_ARCHITECTURES={arch} + \
+             XCHPLOT2_BUILD_CUDA=ON to force-build the CUB path anyway (not \
+             recommended — AdaptiveCpp half.hpp references sm_53+ FP16 \
+             intrinsics that your card's headers don't provide).");
+        return None;
+    }
+    Some(arch)
+}
+
 /// Check whether nvcc is on $PATH and runnable. Used as the fall-back
 /// signal for XCHPLOT2_BUILD_CUDA when no GPU is enumerable (headless
 /// CI / container builds). Runs `nvcc --version` rather than a simple
@@ -146,7 +177,11 @@ fn main() {
         // them, and acpp rejects an empty target string.
         Ok(v) if !v.is_empty() => (v, "$ACPP_TARGETS"),
         Ok(_) | Err(_) => {
-            if source != "fallback (no nvidia-smi)" {
+            // Prefer a USABLE NVIDIA GPU (sm_61+) over AMD, otherwise fall
+            // through to AMD / fallback. `detect_cuda_arch` alone would
+            // trigger on an ancient secondary NVIDIA card even when AMD is
+            // the real plotting target (see usable_nvidia_arch).
+            if usable_nvidia_arch().is_some() {
                 ("generic".to_string(), "NVIDIA detected — using SSCP")
             } else if let Some(gfx) = detect_amd_gfx() {
                 (format!("hip:{gfx}"), "rocminfo probe")
@@ -172,7 +207,12 @@ fn main() {
     let (build_cuda, bc_source) = match env::var("XCHPLOT2_BUILD_CUDA") {
         Ok(v) if !v.is_empty() => (v, "$XCHPLOT2_BUILD_CUDA"),
         _ => {
-            let nvidia_gpu = detect_cuda_arch().is_some();
+            // Same usable-arch gate as the ACPP_TARGETS block: an
+            // ancient secondary NVIDIA card (e.g. sm_52 alongside an
+            // AMD W5700) must NOT claim the CUB path, because
+            // AdaptiveCpp half.hpp references sm_53+ FP16 intrinsics
+            // that the old card's cuda_fp16.h guards out.
+            let nvidia_gpu = usable_nvidia_arch().is_some();
             let amd_gpu    = detect_amd_gfx().is_some();
             let intel_gpu  = detect_intel_gpu();
             if nvidia_gpu {
