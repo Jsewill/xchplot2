@@ -297,79 +297,34 @@ Outputs:
 - `build/tools/xchplot2/xchplot2`
 - `build/tools/parity/{aes,xs,t1,t2,t3}_parity` — bit-exact CPU/GPU tests
 
-### Windows (experimental, NVIDIA only)
+### Windows
 
-**Use the [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
-branch on Windows, not `main`.** `main` requires AdaptiveCpp, and
-AdaptiveCpp has hard Linux-isms (libnuma, pthreads, LLVM SSCP
-compiler) that make a Windows build fall apart during its
-FetchContent step. `cuda-only` has no AdaptiveCpp dependency — just
-MSVC, the CUDA Toolkit, and Rust — and is the only Windows-viable
-path today. AMD / Intel on Windows route through WSL2 with the
-container build (section 1 above).
+Two supported paths — native `main` doesn't work because AdaptiveCpp
+has hard Linux-isms (libnuma, pthreads, LLVM SSCP) that fall apart on
+Windows.
 
-Prerequisites:
+**NVIDIA only** → use the
+[`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
+branch. Pure MSVC + CUDA Toolkit + Rust, no SYCL runtime involved.
+See that branch's README for the VS 2022 / Windows SDK / `LIB`
+troubleshooting (the `LNK1181: kernel32.lib` and friends).
 
-- Windows 10 21H2+ or Windows 11, x64
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) Community
-  with the **"Desktop development with C++"** workload. That workload
-  bundles MSVC + the Windows SDK; the SDK is non-optional because it
-  ships `kernel32.lib` / `user32.lib` / etc. that `link.exe`
-  consumes. If you've trimmed the installer to "C++ build tools"
-  only, open **Visual Studio Installer → Modify → Individual
-  components** and tick the latest **Windows 11 SDK** before
-  retrying.
-- [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads) —
-  install **after** Visual Studio so the CUDA installer wires up the
-  MSBuild integration. 12.8+ required for RTX 50-series (Blackwell,
-  `sm_120`).
-- [Rust](https://www.rust-lang.org/tools/install) using the MSVC
-  toolchain (`rustup default stable-x86_64-pc-windows-msvc`)
-- [CMake 3.24+](https://cmake.org/download/) and [Git for
-  Windows](https://gitforwindows.org/)
+**AMD or Intel, or if you just want the `main` code path** → run
+under **WSL2**. WSL2 is a full Linux environment, so every install
+option in this README works there unchanged — `cargo install`,
+`scripts/install-deps.sh`, or the container (section 1 above).
+Enable WSL2 once with `wsl --install` in an elevated PowerShell.
+GPU access in WSL2:
 
-Launch the **x64 Native Tools Command Prompt for VS 2022** from the
-Start menu — there are several similarly-named prompts (x86 /
-x86_64 / 2019 / 2022); the one that matters is the x64 for 2022.
-That prompt is the one that sets `LIB`, `INCLUDE`, and `PATH` so
-`cl.exe`, `link.exe`, `nvcc`, and `cmake` all see each other plus
-the Windows SDK. A plain `cmd` / PowerShell / Windows Terminal tab
-does **not** do this — running `cargo install` from one of those
-produces `LNK1181: cannot open input file 'kernel32.lib'` at the
-first link step.
+- **NVIDIA**: install the latest "NVIDIA GPU Driver for Windows",
+  nothing else — CUDA shows up inside WSL2 automatically.
+- **AMD**: ROCm 6.1+ supports a limited card list on WSL2 (RX 7900
+  XTX, Radeon Pro W7900, specific Instincts). Follow AMD's "Install
+  ROCm on WSL" guide.
+- **Intel**: oneAPI on WSL2 via the Intel Linux graphics driver.
 
-Quick sanity check in the prompt:
-
-```cmd
-where link.exe
-echo %LIB%
-```
-
-`%LIB%` should include a `...\Windows Kits\10\Lib\...\um\x64`
-entry. If it doesn't, you're in the wrong prompt or the Windows SDK
-component isn't installed.
-
-Build:
-
-```cmd
-set CUDA_ARCHITECTURES=89
-cargo install --git https://github.com/Jsewill/xchplot2 --branch cuda-only
-```
-
-Or for a local checkout you can iterate on:
-
-```cmd
-git clone -b cuda-only https://github.com/Jsewill/xchplot2
-cd xchplot2
-set CUDA_ARCHITECTURES=89
-cargo install --path .
-```
-
-Set `CUDA_ARCHITECTURES` to match your card (see the list above).
-PowerShell users: use `$env:CUDA_ARCHITECTURES = "89"` instead of
-`set`. The CMake path (`cmake -B build -S . && cmake --build build`)
-also works inside the same Native Tools prompt if you prefer that
-over `cargo install`.
+Once the GPU is visible from a WSL2 shell (`nvidia-smi`, `rocminfo`,
+or `sycl-ls`), proceed with the native Linux instructions above.
 
 ## Use
 
