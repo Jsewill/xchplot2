@@ -880,23 +880,22 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t1_meta_sorted);
     s_free(stats, d_t1_keys_merged);
 
-    // Re-hydrate full-cap device buffers that the existing T2 sort
-    // tiling expects. H2D brings the concatenated T2 back onto the
-    // device. Stage 4 will remove this round-trip by sorting per-chunk
-    // on emit and feeding T3 from the host.
-    uint64_t* d_t2_meta  = nullptr;
-    uint32_t* d_t2_mi    = nullptr;
-    uint32_t* d_t2_xbits = nullptr;
-    s_malloc(stats, d_t2_meta,  cap * sizeof(uint64_t), "d_t2_meta");
-    s_malloc(stats, d_t2_mi,    cap * sizeof(uint32_t), "d_t2_mi");
-    s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
-    q.memcpy(d_t2_meta,  h_t2_meta,  t2_count * sizeof(uint64_t));
-    q.memcpy(d_t2_mi,    h_t2_mi,    t2_count * sizeof(uint32_t));
-    q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+    // Stage 4a: defer d_t2_meta and d_t2_xbits re-hydration until just
+    // before their respective launch_gather_* call. The CUB tile-sort
+    // only needs d_t2_mi on device as its sort key; holding meta + xbits
+    // alive through sort setup was what drove the 7288 MB k=28 peak
+    // (meta+mi+xbits = 4160 MB coexisting with the 3120 MB CUB working
+    // arrays d_keys_out/d_vals_in/d_vals_out). Pinned-host h_t2_meta
+    // and h_t2_xbits stay alive across T2 sort so the gather calls can
+    // H2D them just-in-time.
+    uint32_t* d_t2_mi = nullptr;
+    s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
+    q.memcpy(d_t2_mi, h_t2_mi, t2_count * sizeof(uint32_t));
     q.wait();
-    sycl::free(h_t2_meta,  q);
-    sycl::free(h_t2_mi,    q);
-    sycl::free(h_t2_xbits, q);
+    sycl::free(h_t2_mi, q);
+    h_t2_mi = nullptr;
+    // h_t2_meta and h_t2_xbits stay live until their gather calls
+    // at the end of T2 sort — see the JIT H2D + free below.
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
     // Mirror of T1 sort above — same tile-and-merge shape, but permute
@@ -1000,10 +999,30 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_CD_keys);
     s_free(stats, d_CD_vals);
 
+    // Stage 4a: JIT H2D the gather source buffers. d_t2_meta is
+    // alive only for the duration of its gather (2080 MB at k=28),
+    // then freed before d_t2_xbits is H2D'd. Peak during the meta
+    // gather = d_merged_vals (1040) + d_t2_meta (2080) + d_t2_meta_sorted
+    // (2080) = ~5200 MB, well under the old 7288 MB.
+    uint64_t* d_t2_meta = nullptr;
+    s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
+    q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
+    q.wait();
+    sycl::free(h_t2_meta, q);
+    h_t2_meta = nullptr;
+
     uint64_t* d_t2_meta_sorted = nullptr;
     s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
     launch_gather_u64(d_t2_meta, d_merged_vals, d_t2_meta_sorted, t2_count, q);
+    q.wait();
     s_free(stats, d_t2_meta);
+
+    uint32_t* d_t2_xbits = nullptr;
+    s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+    q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+    q.wait();
+    sycl::free(h_t2_xbits, q);
+    h_t2_xbits = nullptr;
 
     uint32_t* d_t2_xbits_sorted = nullptr;
     s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
