@@ -22,6 +22,27 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
 > branch — use it if you only ever target NVIDIA and want the last
 > bit of throughput.
 
+## Quick start
+
+```bash
+# Install — needs CUDA Toolkit 12+ (or AdaptiveCpp for AMD/Intel),
+# CMake ≥ 3.24, a C++20 compiler, and Rust. See Build for alternatives.
+cargo install --git https://github.com/Jsewill/xchplot2
+
+# Plot — 10 × k=28 files, keys derived internally from your BLS pair.
+xchplot2 plot -k 28 -n 10 \
+    -f <farmer-pk-hex> \
+    -c <pool-contract-xch1-or-txch1> \
+    -o /mnt/plots
+
+# Multi-GPU — one worker per device, round-robin partition.
+xchplot2 plot ... --devices all
+```
+
+See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM
+/ OS requirements, [Build](#build) for container / native / CMake
+paths, and [Use](#use) for every flag.
+
 ## Hardware compatibility
 
 - **GPU:**
@@ -52,6 +73,11 @@ GPU plotter for Chia v2 proofs of space (CHIP-48). Produces farmable
     plain won't fit. 6 GB cards (RTX 2060, RX 6600) are on the edge;
     8 GB cards (3070, 2070 Super) comfortably fit. Detailed breakdown
     in [VRAM](#vram).
+
+  With [`--devices`](#multi-gpu---devices), each worker picks its own
+  tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
+  12 GB + one 8 GB card) plot concurrently with each device on its
+  matching tier.
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
