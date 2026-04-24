@@ -1088,15 +1088,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_free(stats, d_t2_xbits);
     s_free(stats, d_merged_vals);
 
-    // ---------- Phase T3 match ----------
+    // ---------- Phase T3 match (tiled, N=2) ----------
+    // Stage 4d.2: split T3 match into two temporally-separated passes
+    // over disjoint bucket-id ranges, sharing the same d_t3 output SoA
+    // and atomic counter. Still cap-sized d_t3 — no VRAM savings at
+    // this commit, validates chunked T3 execution is byte-equivalent.
+    // Stage 4d.3 will replace cap-sized d_t3 with half-cap staging +
+    // D2H to pinned host.
     stats.phase = "T3 match";
     auto t3p = make_t3_params(cfg.k, cfg.strength);
     size_t t3_temp_bytes = 0;
-    launch_t3_match(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          nullptr, t2_count,
-                          nullptr, d_counter, cap,
-                          nullptr, &t3_temp_bytes, q);
+    launch_t3_match_prepare(cfg.plot_id.data(), t3p, nullptr, t2_count,
+                            d_counter, nullptr, &t3_temp_bytes, q);
 
     // Stage 4c: H2D d_t2_keys_merged back from pinned host now that
     // we're about to enter T3 match (its consumer). Pinned host freed
@@ -1111,13 +1114,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
     s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
 
+    // Compute bucket + fine-bucket offsets once; both match passes
+    // share them. Also zeroes d_counter.
+    launch_t3_match_prepare(cfg.plot_id.data(), t3p,
+                            d_t2_keys_merged, t2_count,
+                            d_counter, d_t3_match_temp, &t3_temp_bytes, q);
+
+    uint32_t const t3_num_buckets =
+        (1u << t3p.num_section_bits) * (1u << t3p.num_match_key_bits);
+    uint32_t const t3_bucket_mid = t3_num_buckets / 2;
+
     int p_t3 = begin_phase("T3 match + Feistel");
-    q.memset(d_counter, 0, sizeof(uint64_t));
-    launch_t3_match(cfg.plot_id.data(), t3p,
+    launch_t3_match_range(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           d_t2_keys_merged, t2_count,
-                          d_t3, d_counter, cap,
-                          d_t3_match_temp, &t3_temp_bytes, q);
+                          d_t3, d_counter, cap, d_t3_match_temp,
+                          /*bucket_begin=*/0, /*bucket_end=*/t3_bucket_mid, q);
+    launch_t3_match_range(cfg.plot_id.data(), t3p,
+                          d_t2_meta_sorted, d_t2_xbits_sorted,
+                          d_t2_keys_merged, t2_count,
+                          d_t3, d_counter, cap, d_t3_match_temp,
+                          /*bucket_begin=*/t3_bucket_mid, /*bucket_end=*/t3_num_buckets, q);
     end_phase(p_t3);
 
     uint64_t t3_count = 0;
