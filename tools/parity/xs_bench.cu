@@ -9,6 +9,8 @@
 #include "plot/TableConstructorGeneric.hpp"
 #include "pos/ProofParams.hpp"
 
+#include "ParityCommon.hpp"
+
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdint>
@@ -26,16 +28,7 @@
     }                                                                                        \
 } while (0)
 
-static std::array<uint8_t, 32> derive_plot_id(uint32_t seed)
-{
-    std::array<uint8_t, 32> id{};
-    uint64_t s = 0x9E3779B97F4A7C15ULL ^ uint64_t(seed) * 0x100000001B3ULL;
-    for (size_t i = 0; i < id.size(); ++i) {
-        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-        id[i] = static_cast<uint8_t>(s >> 56);
-    }
-    return id;
-}
+using pos2gpu::parity::derive_plot_id;
 
 static double bench_cpu(uint8_t const* plot_id, int k)
 {

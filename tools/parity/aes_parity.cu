@@ -19,6 +19,8 @@
 #include "pos/aes/AesHash.hpp"
 #include "pos/aes/intrin_portable.h"
 
+#include "ParityCommon.hpp"
+
 #include <cuda_runtime.h>
 #include <array>
 #include <cstdint>
@@ -28,6 +30,10 @@
 #include <vector>
 
 namespace {
+
+using pos2gpu::parity::derive_plot_id;
+using pos2gpu::parity::Stats;
+using pos2gpu::parity::compare;
 
 #define CHECK(call) do { \
     cudaError_t err = (call); \
@@ -121,40 +127,6 @@ std::vector<T> launch_and_collect(
         CHECK(cudaFree(d_out));                                             \
         return out;                                                         \
     }()
-
-std::array<uint8_t, 32> derive_plot_id(uint32_t seed)
-{
-    std::array<uint8_t, 32> id{};
-    // Deterministic mixing — not crypto, just spreads bits across all 32 bytes.
-    uint64_t s = 0x9E3779B97F4A7C15ULL ^ uint64_t(seed) * 0x100000001B3ULL;
-    for (size_t i = 0; i < id.size(); ++i) {
-        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-        id[i] = static_cast<uint8_t>(s >> 56);
-    }
-    return id;
-}
-
-struct Stats {
-    uint64_t total = 0;
-    uint64_t mismatches = 0;
-    bool ok() const { return mismatches == 0; }
-};
-
-template <typename Cmp>
-Stats compare(uint64_t n, Cmp const& cmp, char const* label, uint32_t seed)
-{
-    Stats s; s.total = n;
-    for (uint64_t i = 0; i < n; ++i) {
-        if (!cmp(i)) {
-            if (s.mismatches < 5) {
-                std::printf("  [seed=%u %s] MISMATCH at i=%llu\n", seed, label,
-                            static_cast<unsigned long long>(i));
-            }
-            ++s.mismatches;
-        }
-    }
-    return s;
-}
 
 // Per-plot-id full sweep.
 bool run_for_plot_id(uint32_t seed)
