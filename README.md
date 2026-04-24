@@ -393,6 +393,87 @@ PowerShell users: use `$env:CUDA_ARCHITECTURES = "89"` instead of
 also works inside the same Native Tools prompt if you prefer that
 over `cargo install`.
 
+#### Native Windows build — SYCL path (adventurous)
+
+**Strongly recommend WSL2 first** (see the top of this section).
+This subsection exists because the path is in principle buildable
+on native Windows; in practice it's days of build-system tinkering
+without hardware the maintainers can iterate on. Not validated by
+us. File an issue with your findings.
+
+What you're signing up for: AdaptiveCpp, built from source on
+Windows, pointed at either **AMD HIP SDK for Windows** (for AMD) or
+the **CUDA Toolkit** (for NVIDIA through SYCL, if you want the
+`main` branch's cross-vendor code path on NVIDIA instead of
+`cuda-only`'s CUB one). xchplot2's CMake then finds that install
+via `find_package(AdaptiveCpp)` and builds normally. AdaptiveCpp's
+FetchContent fallback is **not** viable on native Windows — its own
+CMakeLists assumes Linux-isms (libnuma, pthreads) that fall apart.
+Pre-install is mandatory.
+
+Prerequisites (on top of the cuda-only prereqs above — MSVC,
+Windows SDK, Rust, CMake, Git):
+
+- **LLVM 16–20** with Clang + LLD + the CMake development package
+  (`LLVMConfig.cmake` / `ClangConfig.cmake`). Version coverage of
+  Windows binary installers is patchy for these components; a
+  self-built LLVM is usually the path of least resistance. See
+  [AdaptiveCpp's Windows install guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/develop/doc/installing.md)
+  for the currently-recommended source.
+- **AMD HIP SDK for Windows** (for the AMD target) from AMD's
+  [HIP SDK download page](https://www.amd.com/en/developer/rocm-hub/hip-sdk.html).
+  AMD officially flags it as preview: limited card list, different
+  device-library layout vs Linux ROCm, runtime coverage varies per
+  GPU.
+- **CUDA Toolkit 12+** (for the NVIDIA-via-SYCL target). Same
+  installer as the `cuda-only` path above.
+
+Rough build sequence from a clean **x64 Native Tools Command Prompt
+for VS 2022** (paths are indicative — match your installs):
+
+```cmd
+:: 1. Build AdaptiveCpp
+git clone --branch v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git
+cd AdaptiveCpp
+cmake -B build -S . -G Ninja ^
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DCMAKE_INSTALL_PREFIX=C:\opt\adaptivecpp ^
+    -DLLVM_DIR=C:\path\to\llvm\lib\cmake\llvm ^
+    -DWITH_CUDA_BACKEND=OFF ^
+    -DWITH_HIP_BACKEND=ON ^
+    -DROCM_PATH="C:\Program Files\AMD\ROCm\6.1"
+cmake --build build --parallel
+cmake --install build
+
+:: 2. Build xchplot2 main against the install
+cd \path\to\xchplot2
+set CMAKE_PREFIX_PATH=C:\opt\adaptivecpp
+set ACPP_TARGETS=hip:gfx1101
+set XCHPLOT2_BUILD_CUDA=OFF
+cargo install --path .
+```
+
+Flip `WITH_HIP_BACKEND` ↔ `WITH_CUDA_BACKEND` and set
+`ACPP_TARGETS=cuda:sm_XX` for the NVIDIA-through-SYCL variant.
+
+Failure modes you should expect to triage:
+
+- **Missing LLVM CMake modules** — source-built LLVM with
+  `LLVM_INSTALL_UTILS=ON` and the clang / clang-tools-extra
+  projects enabled is the reliable recipe.
+- **Generic SSCP compiler disabled** (`DEFAULT_TARGETS` warning
+  during AdaptiveCpp configure) — harmless if you set
+  `ACPP_TARGETS=hip:gfxXXXX` explicitly at xchplot2's configure.
+- **`ROCM_PATH` mismatch** — AMD's Windows installer versions the
+  directory (`C:\Program Files\AMD\ROCm\6.1\`); match it exactly.
+- **Clean build, runtime kernel failures** — the HIP SDK for
+  Windows preview doesn't cover every GPU the Linux ROCm path
+  does. Run `scripts/test-multi-gpu.sh` / `xchplot2 test 22 ...`
+  with a k=22 plot first and `xchplot2 verify` the result before
+  committing a large batch.
+
+Seriously, try WSL2 first.
+
 ## Use
 
 ### Standalone (farmable plots)
