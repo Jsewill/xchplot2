@@ -6,6 +6,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Every static library here is linked into both the standalone xchplot2
+# executable and the top-level Rust crate's PIE binary (via build.rs +
+# cargo install). rust-lld (the default linker on some distros) rejects
+# non-PIC objects in a PIE output — seen in the wild as "relocation
+# R_X86_64_32 cannot be used against local symbol; recompile with
+# -fPIC" on Cancel.cpp, BatchPlotter.cpp, etc. Setting this globally
+# ensures pos2_gpu, pos2_gpu_host, fse, and any other transitively-
+# compiled object is built with -fPIC, so the linker choice doesn't
+# matter. The per-target POSITION_INDEPENDENT_CODE ON below stay as
+# explicit markers for the public-interface static libraries.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # CUDA toolchain is conditional in slice 15. The CUDA path provides:
 #   - SortCuda.cu (CUB radix sort — best perf on NVIDIA)
 #   - AesGpu.cu (T-tables in __constant__ memory + cudaMemcpyToSymbol init)
