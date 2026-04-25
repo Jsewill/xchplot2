@@ -78,7 +78,7 @@ install_arch() {
 
 install_apt() {
     local pkgs=(cmake git ninja-build build-essential python3 pkg-config
-                llvm-18 llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev
+                llvm-18 llvm-18-dev clang-18 lld-18 libclang-18-dev libclang-cpp18-dev
                 libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
     case "$GPU" in
         nvidia) pkgs+=(nvidia-cuda-toolkit) ;;
@@ -97,7 +97,7 @@ install_apt() {
 
 install_dnf() {
     local pkgs=(cmake git ninja-build gcc-c++ python3 pkg-config
-                llvm llvm-devel clang clang-devel
+                llvm llvm-devel clang clang-devel lld
                 boost-devel numactl-devel libomp-devel curl)
     case "$GPU" in
         nvidia) pkgs+=(cuda-toolkit) ;;
