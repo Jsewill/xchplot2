@@ -126,12 +126,56 @@ message(STATUS "xchplot2: ACPP_TARGETS=${ACPP_TARGETS}")
 #      removes the manual install step. Opt out with -DXCHPLOT2_FETCH_ADAPTIVECPP=OFF.
 option(XCHPLOT2_FETCH_ADAPTIVECPP "Fall back to FetchContent if AdaptiveCpp not found" ON)
 
-find_package(AdaptiveCpp QUIET)
+# HINTS /opt/adaptivecpp matches scripts/install-deps.sh's default install
+# prefix, and ENV ACPP_PREFIX honours users who installed to a custom
+# location with `ACPP_PREFIX=/elsewhere ./scripts/install-deps.sh`. Without
+# these, find_package wouldn't search /opt (not a standard CMake path), the
+# user would have to remember to `export CMAKE_PREFIX_PATH=/opt/adaptivecpp`
+# between running install-deps.sh and the build (the script can't set env
+# vars in the parent shell), and FetchContent would fire pointlessly.
+find_package(AdaptiveCpp QUIET HINTS /opt/adaptivecpp ENV ACPP_PREFIX)
 if(NOT AdaptiveCpp_FOUND)
     if(XCHPLOT2_FETCH_ADAPTIVECPP)
         message(STATUS "xchplot2: AdaptiveCpp not found — fetching v25.10.0 via FetchContent")
         message(STATUS "xchplot2:   first build will take ~15-30 min while AdaptiveCpp compiles")
         message(STATUS "xchplot2:   pre-install via scripts/install-deps.sh to skip this")
+
+        # AdaptiveCpp's compiler/CMakeLists requires ld.lld at configure
+        # time and aborts with "Cannot find ld.lld. Please provide path
+        # via -DACPP_LLD_PATH=…" otherwise. Auto-probe the conventional
+        # LLVM-{16..20} prefixes and pass the path through so users on a
+        # FetchContent build don't have to know that detail. If the
+        # binary isn't installed at all, fail loud with a copy-paste
+        # install command — far less confusing than AdaptiveCpp's own
+        # message.
+        find_program(_xchplot2_ld_lld
+            NAMES ld.lld
+            HINTS
+                /usr/lib/llvm-20/bin /usr/lib/llvm-19/bin /usr/lib/llvm-18/bin
+                /usr/lib/llvm-17/bin /usr/lib/llvm-16/bin
+                /usr/lib/llvm20/bin  /usr/lib/llvm19/bin  /usr/lib/llvm18/bin
+                /usr/lib64/llvm20/bin /usr/lib64/llvm19/bin /usr/lib64/llvm18/bin
+                /opt/llvm-20/bin /opt/llvm-19/bin /opt/llvm-18/bin
+                /opt/llvm20/bin  /opt/llvm19/bin  /opt/llvm18/bin
+            DOC "ld.lld required by AdaptiveCpp's compiler/CMakeLists")
+        if(_xchplot2_ld_lld)
+            set(ACPP_LLD_PATH "${_xchplot2_ld_lld}" CACHE FILEPATH
+                "Path to ld.lld for AdaptiveCpp's compiler/CMakeLists" FORCE)
+            message(STATUS "xchplot2:   auto-probed ld.lld at ${_xchplot2_ld_lld}")
+        else()
+            message(FATAL_ERROR
+                "xchplot2: AdaptiveCpp's FetchContent build needs ld.lld "
+                "but it isn't installed at any of the standard LLVM-16..20 "
+                "prefixes. Install it:\n"
+                "  Ubuntu/Debian:  sudo apt install lld-18\n"
+                "  Fedora/RHEL:    sudo dnf install lld\n"
+                "  Arch/CachyOS:   sudo pacman -S lld\n"
+                "Or pre-install AdaptiveCpp via scripts/install-deps.sh "
+                "(also installs ld.lld and builds AdaptiveCpp at "
+                "/opt/adaptivecpp). Override the probe with "
+                "-DACPP_LLD_PATH=/path/to/ld.lld.")
+        endif()
+
         include(FetchContent)
         FetchContent_Declare(
             adaptivecpp
