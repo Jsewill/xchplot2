@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(pos2-gpu VERSION 0.5.0 LANGUAGES C CXX)
+project(pos2-gpu VERSION 0.5.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
