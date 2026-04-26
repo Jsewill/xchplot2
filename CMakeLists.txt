@@ -448,6 +448,18 @@ endif()
 add_library(xchplot2_cli STATIC tools/xchplot2/cli.cpp)
 target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
 target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
+# CUDA_RESOLVE_DEVICE_SYMBOLS=ON only fires the nvcc --device-link step
+# on targets that have at least one CUDA source of their own. cli.cpp
+# alone leaves xchplot2_cli a pure-C++ static lib and the property
+# becomes a silent no-op — Rust's host linker then can't resolve the
+# `__cudaRegisterLinkedBinary_*` references emitted by every per-TU
+# `__sti____cudaRegisterAll()` constructor in pos2_gpu. Adding the
+# stub cli_devlink.cu (only on the CUDA build path) flips xchplot2_cli
+# to a CUDA-language target, the device link runs, and the resolution
+# stubs land inside libxchplot2_cli.a. See cli_devlink.cu for details.
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(xchplot2_cli PRIVATE tools/xchplot2/cli_devlink.cu)
+endif()
 set_target_properties(xchplot2_cli PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
