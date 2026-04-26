@@ -47,6 +47,44 @@ fn command_runs(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse nvcc's major version from `nvcc --version` output.
+/// The release line looks like:
+///   "Cuda compilation tools, release 13.0, V13.0.48"
+/// Returns None if nvcc isn't on PATH or the line can't be parsed —
+/// callers treat that as "skip the version-vs-arch compat check"
+/// rather than blocking the build.
+fn detect_nvcc_major() -> Option<u32> {
+    let out = Command::new("nvcc").arg("--version").output().ok()?;
+    if !out.status.success() { return None; }
+    let s = std::str::from_utf8(&out.stdout).ok()?;
+    for line in s.lines() {
+        let mut iter = line.split_whitespace();
+        while let Some(w) = iter.next() {
+            if w == "release" {
+                let next = iter.next()?;
+                let major = next.trim_end_matches(',').split('.').next()?;
+                return major.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Minimum integer arch from a CMake-style CUDA_ARCHITECTURES list
+/// ("61", "61;86", "61;86;120"). Tolerates "sm_61" / "compute_61"
+/// prefixes that Cargo users sometimes pass through. Returns None
+/// when the list parses to nothing.
+fn min_arch(arch_list: &str) -> Option<u32> {
+    arch_list.split(';')
+        .filter_map(|s| {
+            let s = s.trim()
+                .trim_start_matches("sm_")
+                .trim_start_matches("compute_");
+            s.parse().ok()
+        })
+        .min()
+}
+
 /// Walk critical build-time prerequisites and return human-readable
 /// names of anything missing. Cargo install users in particular don't
 /// read the Build section of README.md (and don't expect to need to),
@@ -113,6 +151,40 @@ fn main() {
              dependencies. The main branch's scripts/install-deps.sh \
              does NOT exist on this branch — install manually.\n"
         );
+    }
+
+    // CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely
+    // — its nvcc fails the CMake TryCompile probe with "Unsupported gpu
+    // architecture 'compute_61'" on Pascal, "compute_70" on Volta, etc.
+    // Catch that mismatch HERE so the failure surfaces with a clear fix
+    // path, not buried in a CMakeError.log 40 lines into a TryCompile.
+    // Skipped silently when nvcc version or arch list can't be parsed
+    // (treat as "preflight not actionable, let cmake try" — preserves
+    // prior behaviour for unusual setups).
+    if let (Some(nvcc_major), Some(min)) = (detect_nvcc_major(), min_arch(&cuda_arch)) {
+        if nvcc_major >= 13 && min < 75 {
+            panic!(
+                "\nxchplot2 (cuda-only): CUDA Toolkit {nvcc_major}.x dropped codegen for sm_{min} \
+                 (Pascal / Volta / pre-Turing).\n\
+                 \n\
+                 Detected:\n  \
+                   nvcc {nvcc_major}.x\n  \
+                   target arch: sm_{min} (from CUDA_ARCHITECTURES={cuda_arch})\n\
+                 \n\
+                 Fix one of:\n  \
+                   - Install CUDA 12.9 (last toolkit with Pascal/Volta support):\n      \
+                       Ubuntu/Debian:  sudo apt install cuda-toolkit-12-9\n      \
+                       Arch:           pacman -S cuda  (or pin to a 12.x channel)\n    \
+                     then point the build at it:\n      \
+                       CUDA_PATH=/usr/local/cuda-12.9 cargo install \\\n      \
+                         --git https://github.com/Jsewill/xchplot2 --branch cuda-only --force\n  \
+                   - Or override the arch (only valid if you actually have a Turing+ card):\n      \
+                       CUDA_ARCHITECTURES=75 cargo install \\\n      \
+                         --git https://github.com/Jsewill/xchplot2 --branch cuda-only --force\n  \
+                   - Or use the container path — scripts/build-container.sh auto-pins\n    \
+                     the 12.9 base image when it detects a pre-Turing GPU.\n"
+            );
+        }
     }
 
     // ---- configure ----

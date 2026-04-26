@@ -1,5 +1,62 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Preflight nvcc-vs-arch compatibility BEFORE project(LANGUAGES ... CUDA),
+# which is what triggers the cryptic "Unsupported gpu architecture
+# 'compute_61'" TryCompile failure when Pascal/Volta meets CUDA 13.x.
+# CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely.
+# Skip the check if nvcc isn't findable yet — project() below will
+# surface its own missing-toolchain message in that case.
+find_program(_xchplot2_nvcc nvcc
+    HINTS ENV CUDA_PATH ENV CUDA_HOME /opt/cuda /usr/local/cuda
+    PATH_SUFFIXES bin
+    DOC "nvcc for arch-compat preflight")
+if(_xchplot2_nvcc)
+    execute_process(
+        COMMAND "${_xchplot2_nvcc}" --version
+        OUTPUT_VARIABLE _nvcc_version_out
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_nvcc_version_out MATCHES "release ([0-9]+)")
+        set(_nvcc_major "${CMAKE_MATCH_1}")
+        # Use the user-passed CMAKE_CUDA_ARCHITECTURES if any (cache
+        # var is visible pre-project), else the same default 89 we'll
+        # set below — keeps the check accurate even before project()
+        # runs the default-fallback.
+        if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+            set(_arches "${CMAKE_CUDA_ARCHITECTURES}")
+        else()
+            set(_arches 89)
+        endif()
+        set(_min_arch 9999)
+        foreach(_a IN LISTS _arches)
+            string(REGEX REPLACE "^(sm_|compute_)" "" _a "${_a}")
+            if(_a MATCHES "^[0-9]+$" AND _a LESS _min_arch)
+                set(_min_arch ${_a})
+            endif()
+        endforeach()
+        if(_nvcc_major GREATER_EQUAL 13 AND _min_arch LESS 75)
+            message(FATAL_ERROR
+                "xchplot2 (cuda-only): CUDA Toolkit ${_nvcc_major}.x dropped codegen for "
+                "sm_${_min_arch} (Pascal / Volta / pre-Turing).\n"
+                "\n"
+                "Detected:\n"
+                "  nvcc ${_nvcc_major}.x at ${_xchplot2_nvcc}\n"
+                "  target arch: sm_${_min_arch} (from CMAKE_CUDA_ARCHITECTURES=${_arches})\n"
+                "\n"
+                "Fix one of:\n"
+                "  - Install CUDA 12.9 (last toolkit with Pascal/Volta support) and re-run cmake:\n"
+                "      sudo apt install cuda-toolkit-12-9     (Ubuntu/Debian)\n"
+                "    Then point cmake at it:\n"
+                "      cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -B build -S . [...]\n"
+                "  - Or override the target arch (only valid if you actually have a Turing+ card):\n"
+                "      cmake -DCMAKE_CUDA_ARCHITECTURES=75 -B build -S . [...]\n"
+                "  - Or use the container path — scripts/build-container.sh auto-pins\n"
+                "    the 12.9 base image when it detects a pre-Turing GPU.\n")
+        endif()
+    endif()
+endif()
+unset(_xchplot2_nvcc CACHE)
+
 project(pos2-gpu VERSION 0.5.2 LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
