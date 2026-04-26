@@ -278,7 +278,9 @@ install and the target GPU are the same machine.
 If auto-detection fails (no `nvidia-smi` in `PATH`, or
 `nvidia-smi` can't see a GPU — common when building inside a container
 or on a headless build host that lacks the CUDA driver), the build
-falls back to `sm_89`.
+falls back to `sm_89`. Note that arch-detect picks *which CUDA arch* —
+*whether* CUDA TUs build at all is a separate vendor-aware decision
+(see `XCHPLOT2_BUILD_CUDA` in [Environment variables](#environment-variables)).
 
 If you need to target a GPU that isn't the one doing the build — or if
 you want a single "fat build" binary that covers multiple
@@ -314,7 +316,10 @@ Outputs:
 
 Two supported paths — native `main` doesn't work because AdaptiveCpp
 has hard Linux-isms (libnuma, pthreads, LLVM SSCP) that fall apart on
-Windows.
+Windows. Jump to the relevant subsection below:
+
+- [Native Windows build (`cuda-only` branch)](#native-windows-build-cuda-only-branch) — recommended NVIDIA path.
+- [Native Windows build — SYCL path (adventurous)](#native-windows-build--sycl-path-adventurous) — AMD/Intel/cross-vendor, untested.
 
 **NVIDIA only** → use the
 [`cuda-only`](https://github.com/Jsewill/xchplot2/tree/cuda-only)
@@ -459,6 +464,9 @@ cmake --install build
 
 :: 2. Build xchplot2 main against the install
 cd \path\to\xchplot2
+:: CMAKE_PREFIX_PATH only needed if you installed AdaptiveCpp to a
+:: non-default Windows path. The build's auto-discovery only covers
+:: Linux's /opt/adaptivecpp — Windows users tell CMake explicitly.
 set CMAKE_PREFIX_PATH=C:\opt\adaptivecpp
 set ACPP_TARGETS=hip:gfx1101
 set XCHPLOT2_BUILD_CUDA=OFF
@@ -583,6 +591,13 @@ xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regressio
 strongly indicates a corrupt plot; the command exits non-zero in that
 case. Intended as a quick sanity check before farming a newly built
 batch — not a replacement for `chia plots check`.
+
+`parity-check` execs every `*_parity` binary in `--dir` (default
+`./build/tools/parity`) and summarizes PASS/FAIL with per-test wall
+time. Use after a refactor or driver update to confirm CPU↔GPU
+agreement is still bit-exact across `aes` / `xs` / `t1` / `t2` / `t3` /
+`plot_file`. Requires `cmake --build` to have produced the parity
+binaries first.
 
 ## Environment variables
 
