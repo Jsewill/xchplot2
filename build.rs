@@ -36,6 +36,40 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
+/// Probe whether `cmd` is on PATH and runnable. Used by preflight()
+/// to detect missing toolchain pieces before cmake gets to fail with
+/// a cryptic message.
+fn command_runs(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Walk critical build-time prerequisites and return human-readable
+/// names of anything missing. Cargo install users in particular don't
+/// read the Build section of README.md (and don't expect to need to),
+/// so a friendly preflight is much better than letting CMake fail
+/// with cryptic errors deep into a build.
+///
+/// cuda-only's dep list is intentionally short: no AdaptiveCpp / SYCL
+/// / LLVM / lld plumbing — just cmake, a C++20 compiler, and nvcc.
+fn preflight() -> Vec<String> {
+    let mut missing: Vec<String> = vec![];
+    if !command_runs("cmake") {
+        missing.push("cmake (3.24+) — apt install cmake / dnf install cmake / pacman -S cmake".into());
+    }
+    if !command_runs("c++") && !command_runs("g++") && !command_runs("clang++") {
+        missing.push("C++20 compiler (g++ ≥ 13 or clang++ ≥ 18) — apt install build-essential, dnf install gcc-c++, or pacman -S base-devel".into());
+    }
+    // cuda-only is by definition NVIDIA — nvcc is always required.
+    if !command_runs("nvcc") {
+        missing.push("nvcc (CUDA Toolkit 12+) — install from developer.nvidia.com/cuda-downloads (or the apt cuda-toolkit-12-X package)".into());
+    }
+    missing
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir      = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -59,6 +93,27 @@ fn main() {
         },
     };
     println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({source})");
+
+    // Preflight critical system deps BEFORE invoking cmake. Cargo
+    // install users land here without reading the Build section;
+    // missing deps would otherwise surface as a cryptic CMake error
+    // deep into the configure step.
+    let missing = preflight();
+    if !missing.is_empty() {
+        let bullets = missing.iter()
+            .map(|m| format!("  - {m}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "\nxchplot2 (cuda-only): build prerequisites missing:\n{bullets}\n\n\
+             Recommended fix: install the CUDA Toolkit 12+ from \
+             developer.nvidia.com/cuda-downloads (or your distro's \
+             cuda-toolkit-12-X package), plus a C++20 compiler and \
+             cmake — the cuda-only branch deliberately has no other \
+             dependencies. The main branch's scripts/install-deps.sh \
+             does NOT exist on this branch — install manually.\n"
+        );
+    }
 
     // ---- configure ----
     let status = Command::new("cmake")
