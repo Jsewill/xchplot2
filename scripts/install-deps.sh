@@ -45,17 +45,67 @@ fi
 DISTRO=$ID
 DISTRO_LIKE=${ID_LIKE:-}
 
-# ── Detect GPU vendor (NVIDIA vs AMD) ───────────────────────────────────────
+# ── Detect GPU vendor (NVIDIA / AMD / Intel) ────────────────────────────────
+# Two-tier detection so a fresh OS install (no driver tools yet) still works:
+#   1. Tool-based (nvidia-smi / rocminfo) — authoritative when available,
+#      because it confirms the driver+runtime is functional, not just that
+#      a card is plugged in.
+#   2. PCI vendor ID via /sys/class/drm — works pre-driver. The whole point
+#      of running install-deps.sh is to install the driver/toolkit, so we
+#      can't require the driver tools as a prerequisite for detection.
+#
+# Precedence (when multiple GPUs are present): NVIDIA > AMD > Intel.
+# Matches the build.rs vendor-precedence logic.
+detect_gpu_via_pci() {
+    local found="" entry name vendor
+    for entry in /sys/class/drm/card*; do
+        name=$(basename "$entry")
+        # Skip connector entries like card0-DP-1 — only the bare cardN
+        # nodes have a `device/vendor` attribute we care about.
+        [[ "$name" =~ ^card[0-9]+$ ]] || continue
+        [[ -r "$entry/device/vendor" ]] || continue
+        vendor=$(cat "$entry/device/vendor" 2>/dev/null)
+        case "$vendor" in
+            0x10de) found="nvidia"; break ;;            # highest precedence
+            0x1002) found="amd" ;;                      # overrides intel
+            0x8086) [[ -z "$found" ]] && found="intel" ;; # only if nothing else
+        esac
+    done
+    echo "$found"
+}
+
 if [[ -z "$GPU" ]]; then
     if command -v nvidia-smi >/dev/null && nvidia-smi -L 2>/dev/null | grep -q GPU; then
         GPU=nvidia
+        echo "[install-deps] Detected NVIDIA GPU (nvidia-smi)."
     elif command -v rocminfo >/dev/null && rocminfo 2>/dev/null | grep -q gfx; then
         GPU=amd
+        echo "[install-deps] Detected AMD GPU (rocminfo)."
     else
-        echo "[install-deps] No GPU detected. Defaulting to nvidia (full CUDA install)."
-        echo "[install-deps] Override with --gpu amd if this is an AMD-only host."
-        GPU=nvidia
+        GPU=$(detect_gpu_via_pci)
+        if [[ -n "$GPU" ]]; then
+            echo "[install-deps] Detected $GPU GPU via /sys/class/drm (PCI vendor ID); driver tools not yet installed."
+        fi
     fi
+fi
+
+if [[ -z "$GPU" ]]; then
+    echo "[install-deps] Could not auto-detect a GPU (no nvidia-smi / rocminfo," >&2
+    echo "[install-deps] no usable PCI device under /sys/class/drm)." >&2
+    echo "[install-deps] Pass --gpu nvidia or --gpu amd explicitly to override." >&2
+    echo "[install-deps] Headless / CI builds: --gpu nvidia installs the LLVM" >&2
+    echo "[install-deps] toolchain + CUDA Toolkit headers used by the SYCL path." >&2
+    exit 1
+fi
+
+if [[ "$GPU" == "intel" ]]; then
+    echo "[install-deps] Intel GPU detected, but install-deps.sh has no Intel-" >&2
+    echo "[install-deps] specific package path yet. Options:" >&2
+    echo "[install-deps]   --gpu nvidia     install LLVM + CUDA headers (the SYCL" >&2
+    echo "[install-deps]                    path JITs onto Intel via AdaptiveCpp's" >&2
+    echo "[install-deps]                    generic SSCP target at runtime)" >&2
+    echo "[install-deps]   ./scripts/build-container.sh   container with Intel oneAPI" >&2
+    exit 1
 fi
 echo "[install-deps] distro=$DISTRO, gpu=$GPU, acpp=${ACPP_REF}, prefix=${ACPP_PREFIX}"
 
