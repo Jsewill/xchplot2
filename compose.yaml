@@ -1,0 +1,42 @@
+# compose.yaml — podman-first (also works with docker compose).
+# cuda-only branch: NVIDIA only, no AMD/Intel paths.
+#
+# Build & run examples:
+#
+#   # Default sm_89 / RTX 4090 (override via $CUDA_ARCH=120 etc.)
+#   podman compose build cuda
+#   podman compose run --rm cuda plot -k 28 -n 10 \
+#       -f <farmer-pk> -c <pool-contract> -o /out
+#
+#   # Pascal / Volta (sm_61 GTX 10-series, sm_70 V100): CUDA 13.x
+#   # dropped codegen for pre-Turing archs, so pin to a 12.x base image.
+#   # scripts/build-container.sh does this automatically when it detects
+#   # CUDA_ARCH < 75; if invoking compose directly, set the base manually:
+#   CUDA_ARCH=61 \
+#     BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#     BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#     podman compose build cuda
+#
+# Plot files land in ./plots/ on the host (mounted at /out in the
+# container).
+
+services:
+  cuda:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        # BASE_DEVEL / BASE_RUNTIME default to CUDA 13.x (latest, sm_75+).
+        # scripts/build-container.sh overrides both to nvidia/cuda:12.9.1
+        # when it detects a pre-Turing GPU (Pascal/Volta, CUDA_ARCH < 75)
+        # — CUDA 13.0 dropped codegen for those archs. Set BASE_DEVEL
+        # explicitly to bypass the auto-pick (e.g. for cross-targeting an
+        # arch the host doesn't have).
+        BASE_DEVEL:    "${BASE_DEVEL:-docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04}"
+        BASE_RUNTIME:  "${BASE_RUNTIME:-docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04}"
+        CUDA_ARCH:     "${CUDA_ARCH:-89}"
+    image: xchplot2:cuda-only
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - ./plots:/out
