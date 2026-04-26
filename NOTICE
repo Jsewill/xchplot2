@@ -49,10 +49,39 @@ FSE (Finite State Entropy)
     Vendored upstream by pos2-chip at lib/fse/ and statically linked into
     xchplot2. Provides the entropy-coding step of v2 plot file compression.
 ================================================================================
+AdaptiveCpp (formerly hipSYCL)
+    https://github.com/AdaptiveCpp/AdaptiveCpp
+    Copyright (c) The AdaptiveCpp Contributors
+    Licensed under the BSD 2-Clause "Simplified" License.
+
+    SYCL implementation. Statically linked at build time (libacpp-rt and
+    friends) for the cross-vendor SYCL kernel path. Pulled in via
+    find_package(AdaptiveCpp) from /opt/adaptivecpp (the install-deps.sh
+    default) or via CMake FetchContent at v25.10.0.
+================================================================================
 NVIDIA CUDA Toolkit (runtime + CUB)
     Used at build time and dynamically at run time.
     Subject to the NVIDIA CUDA Toolkit End User License Agreement
     (https://docs.nvidia.com/cuda/eula/).
+================================================================================
+AMD ROCm / HIP
+    https://github.com/ROCm/ROCm
+    Copyright (c) Advanced Micro Devices, Inc.
+
+    Used at build time (HIP toolchain) and dynamically at run time on
+    AMD builds. Components are licensed per-package — primarily MIT and
+    University of Illinois/NCSA Open Source — see the per-component
+    LICENSE files in each ROCm subproject.
+================================================================================
+Intel oneAPI / Level Zero
+    https://github.com/oneapi-src
+    Copyright (c) Intel Corporation
+
+    Used at build time and dynamically at run time on Intel SYCL builds
+    (currently wired up but untested — no Intel GPU in our test matrix).
+    Components are licensed per-package: Apache-2.0 with LLVM exception
+    for the DPC++ compiler, MIT for the Level Zero loader, and the Intel
+    oneAPI End User License Agreement for the proprietary toolkit pieces.
 ================================================================================
 
 Full license texts for each Apache-2.0 component are reproduced in their
