@@ -45,23 +45,6 @@ if(XCHPLOT2_BUILD_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 89)
     endif()
-
-    # Force-include cuda_fp16.h in every CUDA TU as a workaround for an
-    # upstream AdaptiveCpp bug: hipSYCL/sycl/libkernel/cuda/cuda_backend.hpp
-    # gates <cuda_fp16.h> behind __ACPP_ENABLE_CUDA_TARGET__, yet
-    # hipSYCL/sycl/libkernel/half.hpp emits __hadd / __hsub / __hmul /
-    # __hdiv / __hlt / __hle / __hgt / __hge references in the nvcc
-    # device pass regardless of that flag. Third-party .cu TUs that
-    # #include <sycl/sycl.hpp> without first including <cuda_fp16.h>
-    # fail with a cascade of "identifier __hXXX is undefined" errors
-    # (reproduced on Radeon Pro W5700 + CUDA Toolkit dual-install hosts).
-    #
-    # This blanket -include matches what the proposed upstream patch to
-    # AdaptiveCpp's cuda_backend.hpp does (move the cuda_fp16.h include
-    # out of the __ACPP_ENABLE_CUDA_TARGET__ guard). Drop this line once
-    # upstream ships the fix — see docs/adaptivecpp-cuda-fp16-pr.md for
-    # the PR content.
-    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-include=cuda_fp16.h>)
 endif()
 
 # Optional: compile in clock64 instrumentation for T3 match_all_buckets.
@@ -291,6 +274,17 @@ if(XCHPLOT2_BUILD_CUDA)
         src/gpu/AesGpu.cu
         src/gpu/AesGpuBitsliced.cu
         src/gpu/SortCuda.cu)
+    # SortSyclCub.cpp is the SYCL-typed adapter that bridges
+    # sycl::queue → CUB. SortCuda.cu used to provide the SYCL-typed
+    # entry points itself, but mixing nvcc + <sycl/sycl.hpp> in one
+    # TU drags AdaptiveCpp's libkernel half.hpp into the legacy CUDA
+    # arm of __acpp_backend_switch — a path AdaptiveCpp doesn't
+    # support. Splitting the SYCL surface into this acpp-compiled
+    # adapter (does q.wait()) and a pure-CUDA cub_sort_* in
+    # SortCuda.cu (does the work + cudaStreamSync) keeps each
+    # compiler in its lane.
+    list(APPEND POS2_GPU_SYCL_SRC
+        src/gpu/SortSyclCub.cpp)
 else()
     # Non-CUDA path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) +
     # AesStub.cpp no-op for initialize_aes_tables. Both compiled by acpp
