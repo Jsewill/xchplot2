@@ -144,6 +144,77 @@ fn detect_amd_gfx() -> Option<String> {
     None
 }
 
+/// Probe whether `cmd` is on PATH and runnable. Used by preflight()
+/// to detect missing toolchain pieces before cmake gets to fail with
+/// a cryptic message.
+fn command_runs(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Locate `ld.lld` either on PATH or in the conventional LLVM-{16..20}
+/// install prefixes. Mirrors the find_program HINTS list in
+/// CMakeLists.txt's FetchContent block. AdaptiveCpp's CMake aborts
+/// with "Cannot find ld.lld" without it.
+fn ld_lld_findable() -> bool {
+    if command_runs("ld.lld") { return true; }
+    for p in &[
+        "/usr/lib/llvm-20/bin/ld.lld", "/usr/lib/llvm-19/bin/ld.lld",
+        "/usr/lib/llvm-18/bin/ld.lld", "/usr/lib/llvm-17/bin/ld.lld",
+        "/usr/lib/llvm-16/bin/ld.lld",
+        "/usr/lib/llvm20/bin/ld.lld",  "/usr/lib/llvm19/bin/ld.lld",
+        "/usr/lib/llvm18/bin/ld.lld",
+        "/usr/lib64/llvm20/bin/ld.lld", "/usr/lib64/llvm19/bin/ld.lld",
+        "/usr/lib64/llvm18/bin/ld.lld",
+        "/opt/llvm-20/bin/ld.lld", "/opt/llvm-19/bin/ld.lld",
+        "/opt/llvm-18/bin/ld.lld",
+    ] {
+        if std::path::Path::new(p).exists() { return true; }
+    }
+    false
+}
+
+/// True when AdaptiveCpp is already installed — at $ACPP_PREFIX if
+/// set, otherwise the install-deps.sh default of /opt/adaptivecpp.
+/// When this is true the FetchContent fallback won't fire and
+/// AdaptiveCpp's own build-time deps (notably ld.lld) aren't needed
+/// for our build.
+fn adaptivecpp_installed() -> bool {
+    let prefix = env::var("ACPP_PREFIX")
+        .unwrap_or_else(|_| "/opt/adaptivecpp".to_string());
+    std::path::Path::new(&format!(
+        "{prefix}/lib/cmake/AdaptiveCpp/AdaptiveCppConfig.cmake"
+    )).exists()
+}
+
+/// Walk critical build-time prerequisites and return human-readable
+/// names of anything missing. Cargo install users in particular don't
+/// read the Build section of README.md (and don't expect to need to),
+/// so a friendly preflight is much better than letting CMake or
+/// AdaptiveCpp fail with cryptic errors deep into a build.
+fn preflight(build_cuda_on: bool) -> Vec<String> {
+    let mut missing: Vec<String> = vec![];
+    if !command_runs("cmake") {
+        missing.push("cmake (3.24+) — apt install cmake / dnf install cmake / pacman -S cmake".into());
+    }
+    if !command_runs("c++") && !command_runs("g++") && !command_runs("clang++") {
+        missing.push("C++20 compiler (g++ ≥ 13 or clang++ ≥ 18) — apt install build-essential, dnf install gcc-c++, or pacman -S base-devel".into());
+    }
+    // ld.lld is only required when FetchContent will rebuild
+    // AdaptiveCpp; a pre-installed AdaptiveCpp linked against ld.lld
+    // at its own install time, so consumers don't need it again.
+    if !adaptivecpp_installed() && !ld_lld_findable() {
+        missing.push("ld.lld (apt: lld-18, dnf/pacman: lld) — required by AdaptiveCpp's FetchContent build".into());
+    }
+    if build_cuda_on && !detect_nvcc() {
+        missing.push("nvcc (CUDA Toolkit 12+) — XCHPLOT2_BUILD_CUDA=ON requested but no nvcc on PATH".into());
+    }
+    missing
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir      = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -229,6 +300,29 @@ fn main() {
         },
     };
     println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda} ({bc_source})");
+
+    // Preflight critical system deps BEFORE invoking cmake. Cargo
+    // install users land here without reading README.md's Build
+    // section; without preflight, missing deps surface as cryptic
+    // CMake / AdaptiveCpp errors deep in the configure / build.
+    let missing = preflight(build_cuda == "ON");
+    if !missing.is_empty() {
+        let bullets = missing.iter()
+            .map(|m| format!("  - {m}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "\nxchplot2: build prerequisites missing:\n{bullets}\n\n\
+             Recommended fix: run scripts/install-deps.sh from a \
+             repo checkout — auto-detects vendor, installs the \
+             toolchain + AdaptiveCpp. Headless / CI builds need \
+             --gpu nvidia. The Containerfile is another option \
+             (see README's Build section, or scripts/build-container.sh).\n\n\
+             If you already ran install-deps.sh and still see this, \
+             check its tail output — it names the missing package \
+             before exiting.\n"
+        );
+    }
 
     // ---- configure ----
     let status = Command::new("cmake")
