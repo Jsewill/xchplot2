@@ -167,6 +167,18 @@ case "$GPU" in
         ;;
 esac
 
+# podman-compose (and docker compose to varying degrees) evaluates
+# ${VAR:?msg} interpolations across ALL services at YAML-parse time,
+# even when only one service is being built. The rocm service's
+# `${ACPP_GFX:?set ACPP_GFX to your GPU arch ...}` will then abort the
+# parse during a `build cuda` or `build intel` invocation if ACPP_GFX
+# isn't set in the env. Plant a dummy value so the parse succeeds for
+# non-rocm builds; the rocm service is never actually instantiated.
+if [[ "$SERVICE" != "rocm" ]]; then
+    : "${ACPP_GFX:=unused-non-rocm-build}"
+    export ACPP_GFX
+fi
+
 # ── Invoke compose ──────────────────────────────────────────────────────────
 case "$ENGINE" in
     podman) COMPOSE=(podman compose) ;;
