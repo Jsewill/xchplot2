@@ -142,7 +142,20 @@ endif()
 
 # Shared GPU support library (kernels). AesGpu.cu MUST come first — it
 # owns the constant-memory T-tables that all later kernels reference.
-add_library(pos2_gpu STATIC
+#
+# CUDA OBJECT library: compiled once, referenced via $<TARGET_OBJECTS:>
+# from BOTH pos2_gpu (relocatable, for parity tests' exe-level device-
+# link) AND xchplot2_cli (with CUDA_RESOLVE_DEVICE_SYMBOLS=ON, for the
+# cargo install path's archive-time device-link). Sharing the same .o
+# files ensures the nvcc-generated `__cudaRegisterLinkedBinary_<hash>_
+# <source.cu>_<context_hash>` symbol names match across both archives —
+# the host-side hash is derived from the .o file's compile context, so
+# separately compiling these .cu sources twice would produce divergent
+# hashes that wouldn't cross-resolve. xchplot2_cli's dlink.o (produced
+# by its CUDA_RESOLVE_DEVICE_SYMBOLS=ON archive-time step) defines those
+# symbols, satisfying the `__sti____cudaRegisterAll()` constructors
+# emitted into every .cu .o by nvcc.
+add_library(pos2_gpu_cuda_obj OBJECT
     src/gpu/AesGpu.cu
     src/gpu/AesGpuBitsliced.cu
     src/gpu/XsKernel.cu
@@ -152,6 +165,17 @@ add_library(pos2_gpu STATIC
     src/host/GpuBufferPool.cu
     src/host/GpuPipeline.cu
 )
+target_include_directories(pos2_gpu_cuda_obj PRIVATE src)
+target_link_libraries(pos2_gpu_cuda_obj PRIVATE pos2_chip_headers)
+target_compile_features(pos2_gpu_cuda_obj PRIVATE cxx_std_20)
+set_target_properties(pos2_gpu_cuda_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(XCHPLOT2_INSTRUMENT_MATCH)
+    target_compile_definitions(pos2_gpu_cuda_obj PRIVATE XCHPLOT2_INSTRUMENT_MATCH=1)
+endif()
+
+add_library(pos2_gpu STATIC
+    $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
+)
 target_include_directories(pos2_gpu PUBLIC
     src
 )
@@ -160,10 +184,18 @@ target_compile_features(pos2_gpu PUBLIC cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
+# CMake's STATIC archive needs an explicit linker language when the only
+# inputs are TARGET_OBJECTS references — without one it picks C and the
+# AR step emits a warning. Match the CUDA OBJECT lib's language.
 set_target_properties(pos2_gpu PROPERTIES
     POSITION_INDEPENDENT_CODE ON
+    LINKER_LANGUAGE CUDA
     # Do NOT pre-resolve device symbols — consumers (e.g. aes_parity.cu)
     # reference kAesT* directly and need them visible at final device link.
+    # The CUDA .o files inside this archive (via $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+    # therefore stay relocatable. xchplot2_cli archives the SAME .o files
+    # with CUDA_RESOLVE_DEVICE_SYMBOLS=ON for the cargo install path —
+    # see the OBJECT-lib comment above and xchplot2_cli below.
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF
 )
 
@@ -230,21 +262,23 @@ endif()
 #   - the top-level Cargo crate (build.rs + src/main.rs) wraps this in a
 #     Rust `[[bin]]` so `cargo install --git ...` produces the same binary.
 #
-# CUDA_RESOLVE_DEVICE_SYMBOLS ON makes this static lib self-contained at
-# the device-symbol level, so a non-CMake linker (rustc) doesn't need to
-# do its own `nvcc -dlink` step. We set it on this aggregate lib rather
-# than on `pos2_gpu` so the parity tests (which reference device symbols
-# externally) keep working unchanged.
-# cli_devlink.cu is a stub CUDA source whose only job is to make
-# xchplot2_cli a CUDA-language target. CUDA_RESOLVE_DEVICE_SYMBOLS=ON
-# is only honoured by CMake on targets that contain at least one CUDA
-# source — for a pure-C++ static lib it's a silent no-op, leaving
-# `__cudaRegisterLinkedBinary_*` unresolved when Rust's host linker
-# (cargo install) puts the final binary together. See cli_devlink.cu
-# for the long-form explanation.
+# CUDA_RESOLVE_DEVICE_SYMBOLS=ON triggers an nvcc --device-link step at
+# archive creation, producing a host-side dlink.o that defines the
+# `__cudaRegisterLinkedBinary_*` symbols every `__sti____cudaRegisterAll()`
+# constructor references. cli_devlink.cu is the marker that flips
+# xchplot2_cli to a CUDA-language target so the device-link actually
+# fires (it's a silent no-op on pure-C++ targets — see cli_devlink.cu).
+#
+# Just adding cli_devlink.cu isn't enough: the dlink.o it produces only
+# resolves symbols for .cu objects directly compiled into xchplot2_cli.
+# Pulling pos2_gpu's CUDA .o files in via $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
+# brings them into xchplot2_cli's archive-time device-link scope so the
+# resulting dlink.o covers them too. See the pos2_gpu_cuda_obj OBJECT-lib
+# comment above for why we share the .o files instead of recompiling.
 add_library(xchplot2_cli STATIC
     tools/xchplot2/cli.cpp
-    tools/xchplot2/cli_devlink.cu)
+    tools/xchplot2/cli_devlink.cu
+    $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
 target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
 target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
 set_target_properties(xchplot2_cli PROPERTIES
@@ -255,6 +289,16 @@ set_target_properties(xchplot2_cli PROPERTIES
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
 add_executable(xchplot2 tools/xchplot2/main.cpp)
 target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
+# pos2_gpu and xchplot2_cli both archive the same CUDA .o files (via
+# $<TARGET_OBJECTS:pos2_gpu_cuda_obj>). With well-ordered linking the
+# later archive's copies wouldn't be pulled (their symbols are already
+# defined by the first), but --allow-multiple-definition is defensive
+# against link-order shifts. The duplicates are bit-identical (same
+# .o file, one compilation), so first-wins is correctness-safe — the
+# dlink.o (only in xchplot2_cli) provides the unique resolution. The
+# cargo install path already sets this in build.rs for an unrelated
+# keygen-rs / libstd duplication.
+target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
 
 # Parity tests
 add_executable(aes_parity tools/parity/aes_parity.cu)
