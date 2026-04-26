@@ -178,7 +178,16 @@ endif()
 # do its own `nvcc -dlink` step. We set it on this aggregate lib rather
 # than on `pos2_gpu` so the parity tests (which reference device symbols
 # externally) keep working unchanged.
-add_library(xchplot2_cli STATIC tools/xchplot2/cli.cpp)
+# cli_devlink.cu is a stub CUDA source whose only job is to make
+# xchplot2_cli a CUDA-language target. CUDA_RESOLVE_DEVICE_SYMBOLS=ON
+# is only honoured by CMake on targets that contain at least one CUDA
+# source — for a pure-C++ static lib it's a silent no-op, leaving
+# `__cudaRegisterLinkedBinary_*` unresolved when Rust's host linker
+# (cargo install) puts the final binary together. See cli_devlink.cu
+# for the long-form explanation.
+add_library(xchplot2_cli STATIC
+    tools/xchplot2/cli.cpp
+    tools/xchplot2/cli_devlink.cu)
 target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
 target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
 set_target_properties(xchplot2_cli PROPERTIES
