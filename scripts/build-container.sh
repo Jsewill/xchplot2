@@ -11,6 +11,7 @@
 #   ./scripts/build-container.sh --gpu nvidia    # force NVIDIA
 #   ./scripts/build-container.sh --gpu amd       # force AMD
 #   ./scripts/build-container.sh --gpu intel     # force Intel
+#   ./scripts/build-container.sh --gpu cpu       # CPU-only (AdaptiveCpp OpenMP)
 #   ./scripts/build-container.sh --engine docker # use docker compose instead
 
 set -euo pipefail
@@ -58,6 +59,8 @@ if [[ -z "$GPU" ]]; then
         echo "[build-container]        (or run scripts/install-deps.sh which does this)" >&2
         echo "[build-container]   2. Force a service explicitly:" >&2
         echo "[build-container]        $0 --gpu nvidia | amd | intel" >&2
+        echo "[build-container]   3. Or build a CPU-only image (slow plotting, no GPU needed):" >&2
+        echo "[build-container]        $0 --gpu cpu" >&2
         exit 1
     fi
 fi
@@ -161,8 +164,17 @@ case "$GPU" in
         SERVICE=intel
         echo "[build-container] vendor=intel service=$SERVICE (experimental, untested)"
         ;;
+    cpu)
+        # CPU-only build: AdaptiveCpp's OpenMP backend, no GPU at runtime.
+        # Useful for headless CI, dev machines without a GPU, or as a
+        # secondary worker on a `--devices` list alongside real GPUs.
+        # Plotting throughput will be 1-2 orders of magnitude lower than
+        # GPU — see README's CPU section for the perf expectations.
+        SERVICE=cpu
+        echo "[build-container] vendor=cpu service=$SERVICE (AdaptiveCpp OpenMP backend; slow plotting, see README)"
+        ;;
     *)
-        echo "unknown --gpu value: $GPU (expected nvidia|amd|intel)" >&2
+        echo "unknown --gpu value: $GPU (expected nvidia|amd|intel|cpu)" >&2
         exit 1
         ;;
 esac

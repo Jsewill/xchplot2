@@ -137,3 +137,24 @@ services:
       - /dev/dri
     volumes:
       - ./plots:/out
+
+  cpu:
+    # CPU-only image: AdaptiveCpp's OpenMP backend compiles the SYCL
+    # kernels for the host CPU. No GPU runtime needed. Plotting is
+    # 1-2 orders of magnitude slower than GPU; useful for headless CI,
+    # dev machines without a GPU, or as an extra worker on a
+    # heterogeneous `--devices` list. See README's CPU section.
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        BASE_DEVEL:           docker.io/ubuntu:24.04
+        BASE_RUNTIME:         docker.io/ubuntu:24.04
+        ACPP_TARGETS:         "omp"
+        XCHPLOT2_BUILD_CUDA:  "OFF"
+        # AdaptiveCpp's libkernel/half.hpp includes cuda_fp16.h on every
+        # build path; pull the headers (no libcudart link, just headers).
+        INSTALL_CUDA_HEADERS: "1"
+    image: xchplot2:cpu
+    volumes:
+      - ./plots:/out

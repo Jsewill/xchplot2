@@ -41,6 +41,18 @@
 #       --build-arg INSTALL_CUDA_HEADERS=1 \
 #       .
 #
+# ── CPU-only (AdaptiveCpp OpenMP backend; slow plotting) ─────────────────────
+#   podman build -t xchplot2:cpu \
+#       --build-arg BASE_DEVEL=docker.io/ubuntu:24.04 \
+#       --build-arg BASE_RUNTIME=docker.io/ubuntu:24.04 \
+#       --build-arg ACPP_TARGETS=omp \
+#       --build-arg XCHPLOT2_BUILD_CUDA=OFF \
+#       --build-arg INSTALL_CUDA_HEADERS=1 \
+#       .
+#   podman run --rm -v $PWD/plots:/out xchplot2:cpu plot -k 28 -n 1 ...
+#   No GPU needed at build or runtime. Plotting is 1-2 orders of magnitude
+#   slower than GPU — useful for headless CI / dev machines without a GPU.
+#
 # First build pulls + builds AdaptiveCpp from source — expect 10-30 min.
 # Subsequent rebuilds reuse the cached AdaptiveCpp layer.
 
