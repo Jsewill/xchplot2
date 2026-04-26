@@ -9,6 +9,17 @@
 #       xchplot2:cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
 #   (Requires nvidia-container-toolkit + CDI on the host.)
 #
+#   The default base image is CUDA 13.x, which only supports sm_75+ (Turing
+#   and newer). Pascal (sm_61) and Volta (sm_70) builds need a 12.x base —
+#   pass it explicitly:
+#     podman build -t xchplot2:cuda \
+#         --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#         --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#         --build-arg CUDA_ARCH=61 \
+#         .
+#   scripts/build-container.sh handles this automatically by probing
+#   nvidia-smi and pinning the 12.x base when CUDA_ARCH < 75.
+#
 # ── AMD ROCm (hand-rolled SYCL radix; XCHPLOT2_BUILD_CUDA=OFF) ───────────────
 #   podman build -t xchplot2:rocm \
 #       --build-arg BASE_DEVEL=docker.io/rocm/dev-ubuntu-24.04:latest \

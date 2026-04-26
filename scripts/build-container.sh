@@ -73,7 +73,21 @@ case "$GPU" in
                 export CUDA_ARCH=${cap//./}
             fi
         fi
-        echo "[build-container] vendor=nvidia service=$SERVICE CUDA_ARCH=${CUDA_ARCH:-89}"
+        : "${CUDA_ARCH:=89}"
+        export CUDA_ARCH
+        # CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely
+        # — its nvcc fails the CMake TryCompile probe with "Unsupported gpu
+        # architecture 'compute_61'" on Pascal, "compute_70" on Volta, etc.
+        # Pin pre-Turing builds (CUDA_ARCH < 75) to the last 12.x dev image,
+        # which still covers sm_50 (Maxwell) through sm_120 (Blackwell).
+        # Honour an explicit BASE_DEVEL/BASE_RUNTIME override from the env
+        # so users can pin to a different toolkit if they need to.
+        if (( CUDA_ARCH < 75 )) && [[ -z "${BASE_DEVEL:-}" ]]; then
+            export BASE_DEVEL="docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04"
+            export BASE_RUNTIME="${BASE_RUNTIME:-$BASE_DEVEL}"
+            echo "[build-container] sm_${CUDA_ARCH} (pre-Turing) → pinning CUDA 12.9 base (CUDA 13.x dropped sub-Turing codegen)"
+        fi
+        echo "[build-container] vendor=nvidia service=$SERVICE CUDA_ARCH=$CUDA_ARCH"
         ;;
     amd)
         SERVICE=rocm
