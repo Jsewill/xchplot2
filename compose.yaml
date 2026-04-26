@@ -10,6 +10,15 @@
 #   podman compose build cuda
 #   podman compose run --rm cuda test 22 <plot_id_hex> 2 0 0 -G -o /out
 #
+#   # NVIDIA Pascal/Volta (sm_61 / GTX 10-series, sm_70 / V100): CUDA 13.x
+#   # dropped codegen for pre-Turing archs, so pin to a 12.x base image.
+#   # scripts/build-container.sh does this automatically when it detects
+#   # CUDA_ARCH < 75; if invoking compose directly, set the base manually:
+#   CUDA_ARCH=61 \
+#     BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#     BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#     podman compose build cuda
+#
 #   # AMD ROCm — set $ACPP_GFX to your card's gfx target (rocminfo | grep gfx).
 #   #   gfx1031 = Navi 22 (RX 6700/6700 XT/6800M)
 #   #   gfx1100 = Navi 31 (RX 7900 XTX/XT)   ← default
@@ -29,8 +38,14 @@ services:
       context: .
       dockerfile: Containerfile
       args:
-        BASE_DEVEL:           docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
-        BASE_RUNTIME:         docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+        # BASE_DEVEL / BASE_RUNTIME default to CUDA 13.x (latest, sm_75+).
+        # scripts/build-container.sh overrides both to nvidia/cuda:12.9.1
+        # when it detects a pre-Turing GPU (Pascal/Volta, CUDA_ARCH < 75)
+        # — CUDA 13.0 dropped codegen for those archs. Set BASE_DEVEL
+        # explicitly to bypass the auto-pick (e.g. for cross-targeting an
+        # arch the host doesn't have).
+        BASE_DEVEL:           "${BASE_DEVEL:-docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04}"
+        BASE_RUNTIME:         "${BASE_RUNTIME:-docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04}"
         ACPP_TARGETS:         "generic"
         XCHPLOT2_BUILD_CUDA:  "ON"
         INSTALL_CUDA_HEADERS: "0"
