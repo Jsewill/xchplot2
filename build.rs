@@ -233,11 +233,15 @@ fn main() {
     // keygen-rs a Rust workspace member with crate-type = ["rlib"], but
     // that breaks the standalone CMake-only build path which expects a
     // staticlib for the cmake-built executable.
+    // pos2_gpu used to be a STATIC archive containing the CUDA .o
+    // files; it's now an INTERFACE lib (no .a produced), and the .o
+    // files live exclusively in xchplot2_cli to satisfy the nvlink
+    // device-link's "exactly one definition" rule. So we drop the
+    // -lpos2_gpu line — there's nothing to link.
     println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-lib=static=xchplot2_cli");
     println!("cargo:rustc-link-lib=static=pos2_gpu_host");
-    println!("cargo:rustc-link-lib=static=pos2_gpu");
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
     println!("cargo:rustc-link-arg=-Wl,--end-group");

@@ -144,17 +144,20 @@ endif()
 # owns the constant-memory T-tables that all later kernels reference.
 #
 # CUDA OBJECT library: compiled once, referenced via $<TARGET_OBJECTS:>
-# from BOTH pos2_gpu (relocatable, for parity tests' exe-level device-
-# link) AND xchplot2_cli (with CUDA_RESOLVE_DEVICE_SYMBOLS=ON, for the
-# cargo install path's archive-time device-link). Sharing the same .o
-# files ensures the nvcc-generated `__cudaRegisterLinkedBinary_<hash>_
-# <source.cu>_<context_hash>` symbol names match across both archives —
-# the host-side hash is derived from the .o file's compile context, so
-# separately compiling these .cu sources twice would produce divergent
-# hashes that wouldn't cross-resolve. xchplot2_cli's dlink.o (produced
-# by its CUDA_RESOLVE_DEVICE_SYMBOLS=ON archive-time step) defines those
-# symbols, satisfying the `__sti____cudaRegisterAll()` constructors
-# emitted into every .cu .o by nvcc.
+# from each consuming target EXACTLY ONCE. The earlier design tried to
+# put the .o files in BOTH pos2_gpu (STATIC) AND xchplot2_cli for hash
+# matching, but nvlink's device-link step at xchplot2_cli archive
+# creation refuses the duplicate kAesT0..3 / kernel definitions:
+#
+#   nvlink error : Multiple definition of '_ZN7pos2gpu6kAesT0E' in
+#       'libpos2_gpu.a:AesGpu.cu.o', first defined in
+#       'CMakeFiles/pos2_gpu_cuda_obj.dir/src/gpu/AesGpu.cu.o'
+#
+# (--allow-multiple-definition is a host-linker flag — nvlink doesn't
+# honour it.) So pos2_gpu is now an INTERFACE library that only
+# propagates includes and link deps; the actual .o files are added
+# explicitly to each leaf consumer (xchplot2_cli + each parity test
+# below) so they appear EXACTLY once in any link line.
 add_library(pos2_gpu_cuda_obj OBJECT
     src/gpu/AesGpu.cu
     src/gpu/AesGpuBitsliced.cu
@@ -173,31 +176,16 @@ if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu_cuda_obj PRIVATE XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
 
-add_library(pos2_gpu STATIC
-    $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
-)
-target_include_directories(pos2_gpu PUBLIC
-    src
-)
-target_link_libraries(pos2_gpu PUBLIC pos2_chip_headers)
-target_compile_features(pos2_gpu PUBLIC cxx_std_20)
+# pos2_gpu: INTERFACE lib. Only propagates the include path and the
+# pos2_chip_headers / fse / AES compile flags. Carries no .o files —
+# consumers add $<TARGET_OBJECTS:pos2_gpu_cuda_obj> directly.
+add_library(pos2_gpu INTERFACE)
+target_include_directories(pos2_gpu INTERFACE src)
+target_link_libraries(pos2_gpu INTERFACE pos2_chip_headers)
+target_compile_features(pos2_gpu INTERFACE cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
-    target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
+    target_compile_definitions(pos2_gpu INTERFACE XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
-# CMake's STATIC archive needs an explicit linker language when the only
-# inputs are TARGET_OBJECTS references — without one it picks C and the
-# AR step emits a warning. Match the CUDA OBJECT lib's language.
-set_target_properties(pos2_gpu PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
-    LINKER_LANGUAGE CUDA
-    # Do NOT pre-resolve device symbols — consumers (e.g. aes_parity.cu)
-    # reference kAesT* directly and need them visible at final device link.
-    # The CUDA .o files inside this archive (via $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
-    # therefore stay relocatable. xchplot2_cli archives the SAME .o files
-    # with CUDA_RESOLVE_DEVICE_SYMBOLS=ON for the cargo install path —
-    # see the OBJECT-lib comment above and xchplot2_cli below.
-    CUDA_RESOLVE_DEVICE_SYMBOLS OFF
-)
 
 # Host orchestration (no CUDA code, just thin wrappers).
 # PlotFileWriterParallel is the SOLE TU pulling in pos2-chip's plot/PlotFile.hpp
@@ -289,56 +277,29 @@ set_target_properties(xchplot2_cli PROPERTIES
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
 add_executable(xchplot2 tools/xchplot2/main.cpp)
 target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
-# pos2_gpu and xchplot2_cli both archive the same CUDA .o files (via
-# $<TARGET_OBJECTS:pos2_gpu_cuda_obj>). With well-ordered linking the
-# later archive's copies wouldn't be pulled (their symbols are already
-# defined by the first), but --allow-multiple-definition is defensive
-# against link-order shifts. The duplicates are bit-identical (same
-# .o file, one compilation), so first-wins is correctness-safe — the
-# dlink.o (only in xchplot2_cli) provides the unique resolution. The
-# cargo install path already sets this in build.rs for an unrelated
-# keygen-rs / libstd duplication.
-target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
 
-# Parity tests
-add_executable(aes_parity tools/parity/aes_parity.cu)
-target_link_libraries(aes_parity PRIVATE pos2_gpu_host)
+# Parity tests. Each test gets $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
+# explicitly: pos2_gpu (INTERFACE) doesn't carry the .o files, so
+# leaf executables that need kernel symbols (kAesT0..3, host-side
+# kernel-wrapper functions in pos2_gpu_host) must pull them in
+# directly. Doing it here — rather than via pos2_gpu_host — keeps
+# the .o files appearing exactly once in each link, which nvlink's
+# device-link step requires (it doesn't honour
+# --allow-multiple-definition).
+foreach(t IN ITEMS aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench
+                   xs_parity xs_bench t1_parity t1_debug t2_parity t3_parity)
+    add_executable(${t} tools/parity/${t}.cu $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+    target_link_libraries(${t} PRIVATE pos2_gpu_host)
+endforeach()
 
-add_executable(aes_bs_parity tools/parity/aes_bs_parity.cu)
-target_link_libraries(aes_bs_parity PRIVATE pos2_gpu_host)
-
-add_executable(aes_bs_bench tools/parity/aes_bs_bench.cu)
-target_link_libraries(aes_bs_bench PRIVATE pos2_gpu_host)
-
-add_executable(aes_tezcan_bench tools/parity/aes_tezcan_bench.cu)
-target_link_libraries(aes_tezcan_bench PRIVATE pos2_gpu_host)
-
-add_executable(xs_parity tools/parity/xs_parity.cu)
-target_link_libraries(xs_parity PRIVATE pos2_gpu_host)
-
-add_executable(xs_bench tools/parity/xs_bench.cu)
-target_link_libraries(xs_bench PRIVATE pos2_gpu_host)
-
-add_executable(t1_parity tools/parity/t1_parity.cu)
-target_link_libraries(t1_parity PRIVATE pos2_gpu_host)
-
-add_executable(t1_debug tools/parity/t1_debug.cu)
-target_link_libraries(t1_debug PRIVATE pos2_gpu_host)
-set_target_properties(t1_debug PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-add_executable(t2_parity tools/parity/t2_parity.cu)
-target_link_libraries(t2_parity PRIVATE pos2_gpu_host)
-
-add_executable(t3_parity tools/parity/t3_parity.cu)
-target_link_libraries(t3_parity PRIVATE pos2_gpu_host)
-
-add_executable(plot_file_parity tools/parity/plot_file_parity.cpp)
+add_executable(plot_file_parity tools/parity/plot_file_parity.cpp
+    $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
 target_link_libraries(plot_file_parity PRIVATE pos2_gpu_host)
 set_target_properties(plot_file_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
-foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t2_parity t3_parity)
+foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t1_debug t2_parity t3_parity)
     set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 endforeach()
 
