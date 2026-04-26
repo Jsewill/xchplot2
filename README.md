@@ -232,9 +232,15 @@ Then `xchplot2-amd plot -k 28 -n 10 -f ... -c ... -o /out` just works.
 
 Installs the toolchain via the system package manager (Arch, Ubuntu /
 Debian, Fedora) plus AdaptiveCpp from source into `/opt/adaptivecpp`.
-Pass `--gpu amd` to force the AMD path (CUDA Toolkit headers only,
-plus ROCm). Pass `--no-acpp` to skip the AdaptiveCpp build and let
-CMake fall back to FetchContent.
+GPU vendor is auto-detected: `nvidia-smi` / `rocminfo` first,
+`/sys/class/drm` PCI IDs as fallback (so fresh installs without driver
+tools still work). On a no-GPU host (CI / build box) the script
+errors out — pass `--gpu nvidia` to install the toolchain anyway.
+`--gpu amd` forces the AMD path on dual-vendor hosts. Intel detection
+currently errors with a hint pointing at `--gpu nvidia` (the SYCL
+toolchain JITs onto Intel via AdaptiveCpp's generic SSCP target) or
+the container. Pass `--no-acpp` to skip the AdaptiveCpp build and
+let CMake fall back to FetchContent.
 
 ### 3. Manual / FetchContent fallback
 
@@ -244,7 +250,7 @@ If you'd rather install dependencies yourself, the toolchain is:
 |---|---|
 | **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches it via FetchContent if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
 | **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON`. Default is vendor-aware — `ON` for NVIDIA GPUs, `OFF` for AMD / Intel GPUs (even if `nvcc` is installed), falling through to `nvcc`-presence only when no GPU is probed (CI / container). Override with the env var. |
-| **LLVM / Clang ≥ 18** | clang + libclang dev packages. |
+| **LLVM / Clang ≥ 18** | `clang`, `lld` (AdaptiveCpp's CMake requires `ld.lld`), plus the libclang dev packages. `install-deps.sh` installs all of them; manual installs need to add `lld-18` (apt) / `lld` (dnf, pacman) explicitly. |
 | **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
 | **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
 | **Boost.Context, libnuma, libomp** | AdaptiveCpp runtime deps. |
