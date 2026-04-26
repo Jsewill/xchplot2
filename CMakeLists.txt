@@ -640,6 +640,15 @@ add_executable(sycl_sort_parity tools/parity/sycl_sort_parity.cpp)
 add_sycl_to_target(TARGET sycl_sort_parity
                    SOURCES tools/parity/sycl_sort_parity.cpp)
 target_link_libraries(sycl_sort_parity PRIVATE pos2_gpu)
+# On the CUDA build path, pos2_gpu's SortSyclCub.cpp (the SYCL→CUB
+# adapter) calls cub_sort_* defined in SortCuda.cu — now in
+# pos2_gpu_cuda_obj OBJECT lib instead of pos2_gpu STATIC. Pull the
+# OBJECT lib's .o files in directly so the CUB symbols resolve.
+# AMD/Intel builds use SortSycl.cpp (pure SYCL) instead and don't
+# need this.
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_sort_parity PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
 # cuda_fp16.h transitively required by SyclBackend.hpp → sycl/sycl.hpp
 # (AdaptiveCpp's half.hpp uses cuda_fp16 intrinsics on the CUDA backend).
 target_include_directories(sycl_sort_parity PRIVATE ${_xchplot2_cuda_include})
