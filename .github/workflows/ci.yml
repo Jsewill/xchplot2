@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [cuda-only]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint scripts/
+        run: shellcheck scripts/*.sh
+
+  actions:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
+
+  rust:
+    name: Rust (keygen-rs)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: keygen-rs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: keygen-rs
+      - name: cargo check
+        run: cargo check --all-targets --locked || cargo check --all-targets
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets -- -W clippy::all
+        continue-on-error: true
+      - name: cargo test
+        run: cargo test --all-targets
+
+  cuda-build:
+    # Compile-only smoke: catches CMakeLists / nvcc-arch / link-order
+    # regressions without needing a real GPU on the runner. Targets
+    # sm_75 (Turing) so the Pascal/Volta preflight in CMakeLists.txt —
+    # which throws when CUDA 13+ meets sm < 75 — doesn't trip on the
+    # runner's toolkit.
+    name: cuda build smoke (nvcc, no GPU)
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+    steps:
+      - name: Install host tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build curl ca-certificates pkg-config \
+            git build-essential
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: keygen-rs
+      - name: Configure
+        run: cmake -B build -S . -GNinja -DCMAKE_CUDA_ARCHITECTURES=75
+      - name: Build
+        run: cmake --build build -j$(nproc)
