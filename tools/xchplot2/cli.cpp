@@ -68,12 +68,20 @@ void print_usage(char const* prog)
         << "                                      complete .plot2 (magic + non-trivial size).\n"
         << "    --continue-on-error             : log per-plot failures and keep going\n"
         << "                                      instead of aborting the batch.\n"
-        << "    --devices SPEC                  : multi-GPU. SPEC is one of:\n"
+        << "    --devices SPEC                  : multi-device. SPEC is a comma\n"
+        << "                                      list mixing any of:\n"
         << "                                        all       — every visible GPU\n"
-        << "                                        0         — a single specific id\n"
-        << "                                        0,1,3     — explicit comma list\n"
+        << "                                        cpu       — CPU worker (slow)\n"
+        << "                                        0,1,3     — explicit GPU ids\n"
+        << "                                      e.g. all,cpu = every GPU + CPU.\n"
         << "                                      Omitted = single device via default\n"
         << "                                      SYCL selector (zero-config).\n"
+        << "    --cpu                           : add a CPU worker alongside the\n"
+        << "                                      selected GPUs (or use CPU only when\n"
+        << "                                      no GPU is selected). Plotting on CPU\n"
+        << "                                      is 1-2 orders of magnitude slower\n"
+        << "                                      than GPU; intended for GPU-less\n"
+        << "                                      hosts or as an extra worker.\n"
         << "  " << prog << " verify <plotfile> [--trials N]\n"
         << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
         << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
@@ -176,27 +184,40 @@ void read_urandom(uint8_t* out, size_t n)
 // Returns false on malformed input (caller prints usage + exits 1).
 bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
-    if (s == "all") {
-        opts.use_all_devices = true;
-        return true;
-    }
+    // Accept comma-separated mix of:
+    //   "all"      → opts.use_all_devices = true
+    //   "cpu"      → opts.include_cpu     = true
+    //   "<int>"    → opts.device_ids.push_back(int)  (real GPU index)
+    // "cpu" alone is OK; otherwise at least one GPU token is required.
     opts.device_ids.clear();
+    bool any_token = false;
+    bool any_gpu_token = false;
     size_t start = 0;
     while (start <= s.size()) {
         size_t const end = s.find(',', start);
         std::string const tok = s.substr(
             start, end == std::string::npos ? std::string::npos : end - start);
         if (tok.empty()) return false;
-        char* endp = nullptr;
-        long const v = std::strtol(tok.c_str(), &endp, 10);
-        if (endp == tok.c_str() || *endp != '\0' || v < 0 || v > 1023) {
-            return false;
+        any_token = true;
+        if (tok == "all") {
+            opts.use_all_devices = true;
+            any_gpu_token = true;
+        } else if (tok == "cpu") {
+            opts.include_cpu = true;
+        } else {
+            char* endp = nullptr;
+            long const v = std::strtol(tok.c_str(), &endp, 10);
+            if (endp == tok.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+                return false;
+            }
+            opts.device_ids.push_back(static_cast<int>(v));
+            any_gpu_token = true;
         }
-        opts.device_ids.push_back(static_cast<int>(v));
         if (end == std::string::npos) break;
         start = end + 1;
     }
-    if (opts.device_ids.empty()) return false;
+    if (!any_token) return false;
+    if (!any_gpu_token && !opts.include_cpu) return false;
     std::sort(opts.device_ids.begin(), opts.device_ids.end());
     opts.device_ids.erase(
         std::unique(opts.device_ids.begin(), opts.device_ids.end()),
@@ -240,11 +261,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if      (a == "-v" || a == "--verbose")        opts.verbose = true;
             else if (a == "--skip-existing")               opts.skip_existing = true;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
+            else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
-                    std::cerr << "Error: --devices expects 'all' or a comma-"
-                                 "separated list of device ids (got '"
-                              << argv[i] << "')\n";
+                    std::cerr << "Error: --devices expects 'all', 'cpu', or a "
+                                 "comma-separated list of device ids "
+                                 "(got '" << argv[i] << "')\n";
                     return 1;
                 }
             }
@@ -402,6 +424,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string seed_hex;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
+        bool plot_include_cpu     = false;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -427,16 +450,18 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "-v" || a == "--verbose")    verbose = true;
             else if  (a == "--skip-existing")           skip_existing = true;
             else if  (a == "--continue-on-error")       continue_on_error = true;
+            else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
                 if (!parse_devices_arg(argv[++i], tmp)) {
-                    std::cerr << "Error: --devices expects 'all' or a comma-"
-                                 "separated list of device ids (got '"
-                              << argv[i] << "')\n";
+                    std::cerr << "Error: --devices expects 'all', 'cpu', or a "
+                                 "comma-separated list of device ids "
+                                 "(got '" << argv[i] << "')\n";
                     return 1;
                 }
                 plot_device_ids      = std::move(tmp.device_ids);
                 plot_use_all_devices = tmp.use_all_devices;
+                if (tmp.include_cpu) plot_include_cpu = true;
             }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
@@ -592,6 +617,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.continue_on_error = continue_on_error;
             opts.device_ids        = plot_device_ids;
             opts.use_all_devices   = plot_use_all_devices;
+            opts.include_cpu       = plot_include_cpu;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;

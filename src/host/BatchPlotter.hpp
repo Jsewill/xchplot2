@@ -58,12 +58,21 @@ struct BatchResult {
 //                       use them. Overrides device_ids. Useful when the
 //                       caller doesn't know the host's device count up
 //                       front (e.g. `--devices all` on the CLI).
+//   include_cpu       — append the CPU as a worker device alongside any
+//                       GPUs already selected. Set by `--cpu` (orthogonal
+//                       to --devices) or by passing `cpu` as a token in
+//                       --devices. CPU is encoded as kCpuDeviceId (-2) in
+//                       device_ids — see src/gpu/DeviceIds.hpp. Plotting
+//                       on CPU is 1-2 orders of magnitude slower than on
+//                       GPU; this is meant for headless CI / GPU-less
+//                       hosts / heterogeneous device-list mixing.
 struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
     bool continue_on_error = false;
     std::vector<int> device_ids;
     bool use_all_devices   = false;
+    bool include_cpu       = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
