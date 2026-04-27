@@ -2,6 +2,7 @@
 
 #include "host/BatchPlotter.hpp"
 #include "host/Cancel.hpp"
+#include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
@@ -259,6 +260,56 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             int                 worker_id)
 {
     (void)worker_id;
+
+    // CPU worker: bypass the GPU pool / streaming path entirely. pos2-chip's
+    // Plotter manages all internal state itself, so each plot is a
+    // synchronous run_one_plot_cpu() call. Single-threaded internally;
+    // multi-core utilization comes from passing `cpu` multiple times in
+    // --devices (e.g. --devices cpu,cpu,cpu,cpu on a 4-core host).
+    if (device_id == kCpuDeviceId) {
+        BatchResult res;
+        if (entries.empty()) return res;
+        auto const t_start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (opts.skip_existing) {
+                auto out_path = std::filesystem::path(entries[i].out_dir)
+                                / entries[i].out_name;
+                if (looks_like_complete_plot(out_path)) {
+                    if (opts.verbose) {
+                        std::fprintf(stderr,
+                            "[batch:cpu] skipping plot %zu: %s (already exists)\n",
+                            i, out_path.string().c_str());
+                    }
+                    ++res.plots_skipped;
+                    continue;
+                }
+            }
+            try {
+                run_one_plot_cpu(entries[i], opts);
+                ++res.plots_written;
+                if (opts.verbose) {
+                    std::fprintf(stderr,
+                        "[batch:cpu] plot %zu/%zu done: %s\n",
+                        i + 1, entries.size(),
+                        entries[i].out_name.c_str());
+                }
+            } catch (std::exception const& ex) {
+                std::fprintf(stderr,
+                    "[batch:cpu] plot %zu FAILED: %s\n", i, ex.what());
+                ++res.plots_failed;
+                if (!opts.continue_on_error) {
+                    res.total_wall_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_start).count();
+                    return res;
+                }
+            }
+            if (cancel_requested()) break;
+        }
+        res.total_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        return res;
+    }
+
     if (device_id >= 0) bind_current_device(device_id);
     initialize_aes_tables();
 
