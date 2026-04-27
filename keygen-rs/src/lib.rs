@@ -10,20 +10,20 @@
 // byte-identical to `chia plots create --v2`.
 
 use chia::bls::{PublicKey, SecretKey};
-use chia::protocol::{Bytes32, compute_plot_id_v2};
+use chia::protocol::{compute_plot_id_v2, Bytes32};
 use chia::sha2::Sha256;
 
 // ---------------------------------------------------------------------------
 // Result codes returned across the FFI boundary.
 // ---------------------------------------------------------------------------
-pub const POS2_OK: i32                 = 0;
-pub const POS2_BAD_FARMER_PK: i32      = -1;
-pub const POS2_BAD_POOL_KEY: i32       = -2;
-pub const POS2_BAD_POOL_KIND: i32      = -3;
+pub const POS2_OK: i32 = 0;
+pub const POS2_BAD_FARMER_PK: i32 = -1;
+pub const POS2_BAD_POOL_KEY: i32 = -2;
+pub const POS2_BAD_POOL_KIND: i32 = -3;
 pub const POS2_MEMO_BUF_TOO_SMALL: i32 = -4;
-pub const POS2_BAD_SEED: i32           = -5;
-pub const POS2_BAD_ADDRESS: i32        = -6;
-pub const POS2_BAD_HRP: i32            = -7;
+pub const POS2_BAD_SEED: i32 = -5;
+pub const POS2_BAD_ADDRESS: i32 = -6;
+pub const POS2_BAD_HRP: i32 = -7;
 
 // pool_kind values.
 pub const POS2_POOL_PK: i32 = 0; // pool_key_or_ph points to 48 bytes (G1)
@@ -108,8 +108,8 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     strength: u8,
     plot_index: u16,
     meta_group: u8,
-    out_plot_id: *mut u8,    // 32 bytes written
-    out_memo_buf: *mut u8,   // caller-owned buffer
+    out_plot_id: *mut u8,       // 32 bytes written
+    out_memo_buf: *mut u8,      // caller-owned buffer
     inout_memo_len: *mut usize, // in: capacity; out: bytes written
 ) -> i32 {
     if seed_len < 32 {
@@ -117,48 +117,42 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     }
     let seed: &[u8] = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
 
-    let farmer_pk_bytes: &[u8; 48] =
-        match unsafe { (farmer_pk_ptr as *const [u8; 48]).as_ref() } {
-            Some(b) => b,
-            None => return POS2_BAD_FARMER_PK,
-        };
+    let farmer_pk_bytes: &[u8; 48] = match unsafe { (farmer_pk_ptr as *const [u8; 48]).as_ref() } {
+        Some(b) => b,
+        None => return POS2_BAD_FARMER_PK,
+    };
     let farmer_pk = match PublicKey::from_bytes(farmer_pk_bytes) {
         Ok(pk) => pk,
         Err(_) => return POS2_BAD_FARMER_PK,
     };
 
-    let (pool_pk_opt, pool_ph_opt, pool_key_slice): (
-        Option<PublicKey>,
-        Option<Bytes32>,
-        &[u8],
-    ) = match pool_kind {
-        x if x == POS2_POOL_PK => {
-            let bytes: &[u8; 48] =
-                match unsafe { (pool_key_ptr as *const [u8; 48]).as_ref() } {
+    let (pool_pk_opt, pool_ph_opt, pool_key_slice): (Option<PublicKey>, Option<Bytes32>, &[u8]) =
+        match pool_kind {
+            x if x == POS2_POOL_PK => {
+                let bytes: &[u8; 48] = match unsafe { (pool_key_ptr as *const [u8; 48]).as_ref() } {
                     Some(b) => b,
                     None => return POS2_BAD_POOL_KEY,
                 };
-            let pk = match PublicKey::from_bytes(bytes) {
-                Ok(pk) => pk,
-                Err(_) => return POS2_BAD_POOL_KEY,
-            };
-            (Some(pk), None, &bytes[..])
-        }
-        x if x == POS2_POOL_PH => {
-            let bytes: &[u8; 32] =
-                match unsafe { (pool_key_ptr as *const [u8; 32]).as_ref() } {
+                let pk = match PublicKey::from_bytes(bytes) {
+                    Ok(pk) => pk,
+                    Err(_) => return POS2_BAD_POOL_KEY,
+                };
+                (Some(pk), None, &bytes[..])
+            }
+            x if x == POS2_POOL_PH => {
+                let bytes: &[u8; 32] = match unsafe { (pool_key_ptr as *const [u8; 32]).as_ref() } {
                     Some(b) => b,
                     None => return POS2_BAD_POOL_KEY,
                 };
-            let ph: Bytes32 = (*bytes).into();
-            (None, Some(ph), &bytes[..])
-        }
-        _ => return POS2_BAD_POOL_KIND,
-    };
+                let ph: Bytes32 = (*bytes).into();
+                (None, Some(ph), &bytes[..])
+            }
+            _ => return POS2_BAD_POOL_KIND,
+        };
 
     let master_sk = SecretKey::from_seed(seed);
-    let local_sk  = master_sk_to_local_sk(&master_sk);
-    let local_pk  = local_sk.public_key();
+    let local_sk = master_sk_to_local_sk(&master_sk);
+    let local_pk = local_sk.public_key();
 
     let include_taproot = pool_ph_opt.is_some();
     let plot_pk = generate_plot_public_key(&local_pk, &farmer_pk, include_taproot);
@@ -185,11 +179,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
         std::ptr::copy_nonoverlapping(plot_id.as_ref().as_ptr(), out_plot_id, 32);
         let dst = out_memo_buf;
         std::ptr::copy_nonoverlapping(pool_key_slice.as_ptr(), dst, pool_key_slice.len());
-        std::ptr::copy_nonoverlapping(
-            farmer_pk_bytes.as_ptr(),
-            dst.add(pool_key_slice.len()),
-            48,
-        );
+        std::ptr::copy_nonoverlapping(farmer_pk_bytes.as_ptr(), dst.add(pool_key_slice.len()), 48);
         std::ptr::copy_nonoverlapping(
             master_sk_bytes.as_ptr(),
             dst.add(pool_key_slice.len() + 48),
@@ -223,7 +213,7 @@ pub unsafe extern "C" fn pos2_keygen_decode_address(
 
     // bech32 0.11: decode returns (Hrp, Vec<u8>) with the 8-bit payload.
     let (hrp, data) = match bech32::decode(s) {
-        Ok(x)  => x,
+        Ok(x) => x,
         Err(_) => return POS2_BAD_ADDRESS,
     };
     let h = hrp.as_str();
@@ -251,7 +241,7 @@ pub unsafe extern "C" fn pos2_keygen_decode_address(
 pub unsafe extern "C" fn pos2_keygen_derive_subseed(
     base_seed: *const u8, // 32 bytes
     idx: u64,
-    out_seed: *mut u8,    // 32 bytes
+    out_seed: *mut u8, // 32 bytes
 ) -> i32 {
     use sha2::{Digest, Sha256};
     if base_seed.is_null() || out_seed.is_null() {
@@ -275,19 +265,23 @@ mod tests {
     // Same inputs must produce identical plot_id + memo.
     #[test]
     fn deterministic_same_seed() {
-        let seed      = [0xAA_u8; 32];
+        let seed = [0xAA_u8; 32];
         let farmer_pk = SecretKey::from_seed(&[0xBB_u8; 32]).public_key().to_bytes();
-        let pool_ph   = [0xCC_u8; 32];
+        let pool_ph = [0xCC_u8; 32];
 
         let mut pid1 = [0u8; 32];
         let mut memo1 = vec![0u8; 128];
         let mut mlen1: usize = memo1.len();
         let rc1 = unsafe {
             pos2_keygen_derive_plot(
-                seed.as_ptr(), seed.len(),
+                seed.as_ptr(),
+                seed.len(),
                 farmer_pk.as_ptr(),
-                pool_ph.as_ptr(), POS2_POOL_PH,
-                2, 0, 0,
+                pool_ph.as_ptr(),
+                POS2_POOL_PH,
+                2,
+                0,
+                0,
                 pid1.as_mut_ptr(),
                 memo1.as_mut_ptr(),
                 &mut mlen1,
@@ -301,10 +295,14 @@ mod tests {
         let mut mlen2: usize = memo2.len();
         let rc2 = unsafe {
             pos2_keygen_derive_plot(
-                seed.as_ptr(), seed.len(),
+                seed.as_ptr(),
+                seed.len(),
                 farmer_pk.as_ptr(),
-                pool_ph.as_ptr(), POS2_POOL_PH,
-                2, 0, 0,
+                pool_ph.as_ptr(),
+                POS2_POOL_PH,
+                2,
+                0,
+                0,
                 pid2.as_mut_ptr(),
                 memo2.as_mut_ptr(),
                 &mut mlen2,
