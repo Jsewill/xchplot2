@@ -82,14 +82,17 @@ void print_usage(char const* prog)
         << "                                      is 1-2 orders of magnitude slower\n"
         << "                                      than GPU; intended for GPU-less\n"
         << "                                      hosts or as an extra worker.\n"
-        << "    --tier plain|compact|auto       : force streaming pipeline tier\n"
+        << "    --tier plain|compact|minimal|auto : force streaming pipeline tier\n"
         << "                                      when GPU pool doesn't fit. plain =\n"
         << "                                      ~7.24 GB floor (k=28), faster.\n"
         << "                                      compact = ~5.33 GB floor, fits on\n"
-        << "                                      tight 8 GB cards. auto (default) =\n"
-        << "                                      pick plain if it fits, else compact.\n"
-        << "                                      Equivalent to XCHPLOT2_STREAMING_TIER\n"
-        << "                                      env var; CLI flag wins if both set.\n"
+        << "                                      tight 8 GB cards. minimal = ~3.83 GB\n"
+        << "                                      floor, fits on 4 GiB cards (extra\n"
+        << "                                      PCIe round-trips during T2 match).\n"
+        << "                                      auto (default) = pick the largest\n"
+        << "                                      tier that fits. Equivalent to\n"
+        << "                                      XCHPLOT2_STREAMING_TIER env var;\n"
+        << "                                      CLI flag wins if both set.\n"
         << "  " << prog << " verify <plotfile> [--trials N]\n"
         << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
         << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
@@ -272,9 +275,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "auto") {
-                    std::cerr << "Error: --tier expects 'plain', 'compact', or "
-                                 "'auto' (got '" << t << "')\n";
+                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                    std::cerr << "Error: --tier expects 'plain', 'compact', "
+                                 "'minimal', or 'auto' (got '" << t << "')\n";
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
@@ -471,9 +474,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "auto") {
-                    std::cerr << "Error: --tier expects 'plain', 'compact', or "
-                                 "'auto' (got '" << t << "')\n";
+                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                    std::cerr << "Error: --tier expects 'plain', 'compact', "
+                                 "'minimal', or 'auto' (got '" << t << "')\n";
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;
