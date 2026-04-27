@@ -16,11 +16,10 @@
 #include "plot/PlotFile.hpp"
 #include "pos/ProofParams.hpp"
 
-#include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -42,20 +41,21 @@ void run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
     ::Plotter plotter(params);
     ::PlotData plot = plotter.run(pl_opts);
 
-    // pos2-chip's PlotFile::writeData expects the memo as a fixed
-    // 112-byte array (32-byte sk_hash + 48-byte farmer_pk + 32-byte
-    // pool_ph). xchplot2's BatchEntry stores the memo as
-    // std::vector<uint8_t> already in the same v2-format layout —
-    // copy into the expected fixed-size array.
-    constexpr size_t kMemoSize = 32 + 48 + 32;
-    if (entry.memo.size() != kMemoSize) {
+    // pos2-chip's PlotFile::writeData accepts the memo as a span and
+    // writes a 1-byte length prefix on disk, so any size in [0, 255]
+    // is valid. keygen-rs emits two layouts:
+    //   - pool-PH mode: 32-byte pool_ph + 48-byte farmer_pk + 32-byte
+    //                   master_sk = 112 bytes
+    //   - pool-PK mode: 48-byte pool_pk + 48-byte farmer_pk + 32-byte
+    //                   master_sk = 128 bytes
+    // BatchEntry.memo already holds the bytes in the on-disk layout, so
+    // pass them through as a span. The previous strict 112-byte check
+    // rejected pool-PK plots produced via `xchplot2 plot -p ...`.
+    if (entry.memo.size() > 255) {
         throw std::runtime_error(
-            "CpuPlotter: memo size mismatch (got " +
-            std::to_string(entry.memo.size()) + " bytes, expected " +
-            std::to_string(kMemoSize) + ")");
+            "CpuPlotter: memo size " + std::to_string(entry.memo.size()) +
+            " exceeds the 255-byte on-disk limit");
     }
-    std::array<uint8_t, kMemoSize> memo_arr{};
-    std::copy(entry.memo.begin(), entry.memo.end(), memo_arr.begin());
 
     std::filesystem::path const out_path =
         std::filesystem::path(entry.out_dir) / entry.out_name;
@@ -65,7 +65,8 @@ void run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
                           params,
                           static_cast<uint16_t>(entry.plot_index),
                           static_cast<uint8_t>(entry.meta_group),
-                          memo_arr);
+                          std::span<uint8_t const>(entry.memo.data(),
+                                                   entry.memo.size()));
 }
 
 } // namespace pos2gpu
