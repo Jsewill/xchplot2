@@ -66,6 +66,14 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     Community-tested, not parity-validated — smoke-test any batch
     with `xchplot2 verify` before committing.
   - **Intel oneAPI** is wired up but untested.
+  - **CPU** (no GPU) via AdaptiveCpp's OpenMP backend. Opt-in with
+    `--cpu` (or `--devices cpu`) — never the default. Plotting is
+    1-2 orders of magnitude slower than a real GPU; intended for
+    headless CI, GPU-less dev machines, or as an extra worker
+    alongside GPUs (`--cpu --devices all` runs every visible GPU
+    plus a CPU worker on the same batch). Build the container with
+    `scripts/build-container.sh --gpu cpu` for the standalone CPU
+    image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
 - **VRAM:** three tiers, picked automatically based on free device
   VRAM at k=28. All three produce byte-identical plots.
   - **Pool** (~11 GB device + ~4 GB pinned host): fastest steady-state,
@@ -131,6 +139,11 @@ ACPP_GFX=gfx1100 podman compose build rocm    # Navi 31 (default)
 
 # Intel oneAPI (experimental, untested).
 podman compose build intel
+
+# CPU-only (no GPU; AdaptiveCpp OpenMP backend; ~400 MB image).
+# Plotting is 1-2 orders of magnitude slower than GPU — see CPU bullet
+# under Hardware compatibility for the use case.
+podman compose build cpu
 ```
 
 Plot files land in `./plots/` on the host. The container also bundles
@@ -538,25 +551,39 @@ decisions. When the grouped layout lands, the auto-incrementing
 `<plot-index>` above is the per-plot within-group identifier it
 will expect.
 
-#### Multi-GPU: `--devices`
+#### Multi-device: `--devices` and `--cpu`
 
 Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
-across multiple GPUs — one worker thread per device, each with its own
-buffer pool and writer channel. Plots are partitioned round-robin, so a
-batch of 10 plots on 2 GPUs sends plots 0/2/4/6/8 to the first GPU and
-1/3/5/7/9 to the second.
+across multiple devices — one worker thread per device, each with its
+own buffer pool and writer channel. Plots are partitioned round-robin,
+so a batch of 10 plots on 2 GPUs sends plots 0/2/4/6/8 to the first
+GPU and 1/3/5/7/9 to the second.
 
 ```bash
 # Every visible GPU — enumerated at runtime.
 xchplot2 plot --k 28 --num 10 -f <farmer-pk> -c <pool-contract> \
     --out /mnt/plots --devices all
 
-# Only these specific device ids (sorted, deduplicated).
+# Only these specific GPU ids (sorted, deduplicated).
 xchplot2 plot ... --devices 0,2,3
 
 # Explicit single id (same as omitting the flag on a single-GPU host).
 xchplot2 plot ... --devices 0
+
+# CPU-only: AdaptiveCpp OpenMP backend (slow). Use the `cpu` token in
+# --devices, or the standalone --cpu flag (equivalent on its own).
+xchplot2 plot ... --devices cpu
+xchplot2 plot ... --cpu
+
+# Heterogeneous: every GPU PLUS a CPU worker on the same batch.
+# --cpu is orthogonal to --devices and appends a CPU worker.
+xchplot2 plot ... --devices all --cpu
+xchplot2 plot ... --devices 0,1,cpu     # same effect, written as a list
 ```
+
+CPU plotting is **1-2 orders of magnitude slower than GPU** — meant for
+GPU-less hosts, headless CI, or as an extra background worker. Don't
+expect GPU-grade throughput from a CPU worker on a heterogeneous batch.
 
 Omitted flag = single device via the default SYCL / CUDA selector —
 identical to pre-multi-GPU behavior, zero regression risk.
