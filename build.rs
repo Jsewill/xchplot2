@@ -47,6 +47,16 @@ fn command_runs(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Detect a container engine on PATH, preferring podman (matches
+/// scripts/build-container.sh's default). Used to phrase the preflight
+/// panic differently when the user already has tooling that lets them
+/// skip the host-side install entirely.
+fn detect_container_engine() -> Option<&'static str> {
+    if command_runs("podman") { return Some("podman"); }
+    if command_runs("docker") { return Some("docker"); }
+    None
+}
+
 /// Parse nvcc's major version from `nvcc --version` output.
 /// The release line looks like:
 ///   "Cuda compilation tools, release 13.0, V13.0.48"
@@ -142,15 +152,37 @@ fn main() {
             .map(|m| format!("  - {m}"))
             .collect::<Vec<_>>()
             .join("\n");
-        panic!(
-            "\nxchplot2 (cuda-only): build prerequisites missing:\n{bullets}\n\n\
-             Recommended fix: install the CUDA Toolkit 12+ from \
-             developer.nvidia.com/cuda-downloads (or your distro's \
-             cuda-toolkit-12-X package), plus a C++20 compiler and \
-             cmake — the cuda-only branch deliberately has no other \
-             dependencies. The main branch's scripts/install-deps.sh \
-             does NOT exist on this branch — install manually.\n"
-        );
+        // Surface the container path proactively when we can already
+        // see podman/docker — for many users that's the smoothest fix
+        // because the toolchain stays bundled in the image.
+        let next_steps = match detect_container_engine() {
+            Some(engine) => format!(
+                "Two ways forward, pick whichever fits:\n\n  \
+                   - Install those packages on the host (the cuda-only branch keeps\n    \
+                     the dep list intentionally short — no AdaptiveCpp / LLVM / lld):\n      \
+                       # apt example (Ubuntu/Debian):\n      \
+                       sudo apt install cmake build-essential cuda-toolkit-12-9\n\n  \
+                   - Or, since you have {engine} installed, build inside a container —\n    \
+                     toolchain stays in the image, no host changes needed:\n      \
+                       ./scripts/build-container.sh\n      \
+                       {engine} compose run --rm cuda plot ...\n\n\
+                 (cuda-only deliberately has no scripts/install-deps.sh — its small\n\
+                 dep set is meant to be installed manually or via the container.)"
+            ),
+            None => format!(
+                "Two ways forward, pick whichever fits:\n\n  \
+                   - Install those packages on the host (the cuda-only branch keeps\n    \
+                     the dep list intentionally short — no AdaptiveCpp / LLVM / lld):\n      \
+                       # apt example (Ubuntu/Debian):\n      \
+                       sudo apt install cmake build-essential cuda-toolkit-12-9\n\n  \
+                   - Or build inside a container (no host toolchain needed beyond\n    \
+                     podman or docker — install whichever you prefer first):\n      \
+                       ./scripts/build-container.sh\n\n\
+                 (cuda-only deliberately has no scripts/install-deps.sh — its small\n\
+                 dep set is meant to be installed manually or via the container.)"
+            ),
+        };
+        panic!("\nxchplot2 (cuda-only): build prerequisites missing:\n{bullets}\n\n{next_steps}\n");
     }
 
     // CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely
