@@ -57,15 +57,17 @@ if [[ -z "$GPU" ]]; then
         echo "[build-container] No GPU detected via nvidia-smi or rocminfo." >&2
         echo "[build-container]" >&2
         echo "[build-container] Either:" >&2
-        echo "[build-container]   1. Install the discovery tool for your vendor:" >&2
+        echo "[build-container]   1. Run scripts/install-container-deps.sh, which installs the" >&2
+        echo "[build-container]      discovery tool (nvidia-smi / rocminfo) along with the" >&2
+        echo "[build-container]      container engine + GPU runtime." >&2
+        echo "[build-container]   2. Install the discovery tool manually:" >&2
         echo "[build-container]        Arch:    sudo pacman -S nvidia-utils    (NVIDIA)" >&2
         echo "[build-container]                 sudo pacman -S rocminfo        (AMD)" >&2
         echo "[build-container]        Ubuntu:  sudo apt install nvidia-utils-XXX  (NVIDIA)" >&2
         echo "[build-container]                 sudo apt install rocminfo          (AMD)" >&2
-        echo "[build-container]        (or run scripts/install-deps.sh which does this)" >&2
-        echo "[build-container]   2. Force a service explicitly:" >&2
+        echo "[build-container]   3. Force a service explicitly:" >&2
         echo "[build-container]        $0 --gpu nvidia | amd | intel" >&2
-        echo "[build-container]   3. Or build a CPU-only image (slow plotting, no GPU needed):" >&2
+        echo "[build-container]   4. Or build a CPU-only image (slow plotting, no GPU needed):" >&2
         echo "[build-container]        $0 --gpu cpu" >&2
         exit 1
     fi

@@ -122,9 +122,10 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
 ### Which path should I use?
 
 - **"I just want to plot, Linux host"** → **container (path 1)**. Smallest
-  host install (just `podman` + `podman-compose`), all toolchain lives
-  inside the image. Auto-detects your GPU and pins the right CUDA / ROCm
-  base.
+  host install (just `podman` + `podman-compose` + the GPU passthrough
+  bits — `scripts/install-container-deps.sh` installs all of it). All
+  toolchain lives inside the image. Auto-detects your GPU and pins the
+  right CUDA / ROCm base.
 - **"NVIDIA only, native binary, no SYCL/AdaptiveCpp"** → **`cuda-only`
   branch (path 2)**. Three host packages — `cmake` + `build-essential`
   + the CUDA Toolkit. No LLVM/lld/AdaptiveCpp install. Smaller dep
@@ -138,10 +139,15 @@ Three ways to get the dependencies in place, easiest first:
 ### 1. Container (`podman compose` or `docker compose`)
 
 Easiest path — `scripts/build-container.sh` does host-side GPU
-probing and feeds the right env vars to `compose build`:
+probing and feeds the right env vars to `compose build`. If you're
+starting from a fresh host, `scripts/install-container-deps.sh`
+installs the engine + GPU passthrough bits first (podman + GPU probe
++ `nvidia-container-toolkit` / video-render groups, as appropriate;
+no native CUDA / ROCm / LLVM / AdaptiveCpp on the host):
 
 ```bash
-./scripts/build-container.sh    # auto: nvidia-smi → cuda, rocminfo → rocm
+./scripts/install-container-deps.sh    # one-time: engine + GPU passthrough
+./scripts/build-container.sh           # auto: nvidia-smi → cuda, rocminfo → rocm
 podman compose run --rm cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
 ```
 
