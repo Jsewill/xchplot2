@@ -17,7 +17,9 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts/
-        run: shellcheck scripts/*.sh
+        # Recurse so scripts/test/install-container-deps/run.sh and any
+        # future helpers under scripts/ stay covered.
+        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
 
   actions:
     name: actionlint
@@ -49,3 +51,53 @@ jobs:
         continue-on-error: true
       - name: cargo test
         run: cargo test --all-targets
+
+  install-container-deps-dryrun:
+    name: install-container-deps.sh — dry-run fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Diff --dry-run output against fixtures
+        # Runs --dry-run for every (distro × engine × gpu) tuple in
+        # arch / ubuntu / fedora containers and diffs against the
+        # checked-in fixtures under scripts/test/install-container-deps/.
+        # No mutating sudo calls — completes in ~60s.
+        run: scripts/test/install-container-deps/run.sh
+
+  install-container-deps-smoke:
+    name: install-container-deps.sh smoke (${{ matrix.engine }} ${{ matrix.gpu }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: podman
+            gpu: cpu
+          - engine: podman
+            gpu: amd
+          - engine: docker
+            gpu: cpu
+        # NVIDIA smoke is intentionally skipped: nvidia-ctk cdi generate
+        # needs a real GPU + driver to populate the spec, and the dry-run
+        # fixtures already cover the planning logic for that path.
+    steps:
+      - uses: actions/checkout@v5
+      - name: Real install in ubuntu:24.04 + assert idempotent re-run
+        env:
+          ENGINE: ${{ matrix.engine }}
+          GPU: ${{ matrix.gpu }}
+        # Validates that engine + GPU-runtime packages actually install
+        # from the real apt repos (catches package-name drift / repo
+        # availability), and that re-running the script is a no-op.
+        run: |
+          docker run --rm \
+              -e ENGINE -e GPU \
+              -v "$PWD/scripts:/s:ro" \
+              docker.io/ubuntu:24.04 \
+              bash -ec '
+                  apt-get update -qq
+                  apt-get install -y -qq sudo curl ca-certificates gnupg >/dev/null
+                  /s/install-container-deps.sh --engine "$ENGINE" --gpu "$GPU"
+                  # Idempotence: a clean second run must still exit 0.
+                  /s/install-container-deps.sh --engine "$ENGINE" --gpu "$GPU"
+              '
