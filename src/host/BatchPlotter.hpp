@@ -66,6 +66,15 @@ struct BatchResult {
 //                       on CPU is 1-2 orders of magnitude slower than on
 //                       GPU; this is meant for headless CI / GPU-less
 //                       hosts / heterogeneous device-list mixing.
+//   streaming_tier    — optional manual override for the streaming
+//                       pipeline tier (when the GPU pool doesn't fit).
+//                       Accepted values: "plain" (~7.24 GB floor at k=28,
+//                       ~10-15% faster), "compact" (~5.33 GB floor, fits
+//                       on tight 8 GB cards). Empty string = auto (the
+//                       pre-existing behavior: pick plain if it fits,
+//                       else compact). Equivalent to XCHPLOT2_STREAMING_TIER
+//                       env var but settable via --tier on the CLI; the
+//                       struct field takes precedence over the env var.
 struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
@@ -73,6 +82,7 @@ struct BatchOptions {
     std::vector<int> device_ids;
     bool use_all_devices   = false;
     bool include_cpu       = false;
+    std::string streaming_tier;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
