@@ -1,9 +1,11 @@
 // BatchPlotter.cu — implementation of staggered multi-plot pipeline.
 
 #include "host/BatchPlotter.hpp"
+#include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
+#include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
 
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
@@ -168,6 +170,43 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             int                 worker_id)
 {
     (void)worker_id;
+
+    // CPU worker: bypass GPU pool / streaming entirely. pos2-chip's
+    // Plotter manages its own state, so each plot is a synchronous
+    // run_one_plot_cpu() call — no CUDA, no GpuBufferPool. Single-
+    // threaded internally; multi-core utilization comes from passing
+    // `cpu` multiple times in --devices (e.g. --devices cpu,cpu,cpu,cpu
+    // on a 4-core host).
+    if (device_id == kCpuDeviceId) {
+        BatchResult res;
+        if (entries.empty()) return res;
+        auto const t_start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            try {
+                run_one_plot_cpu(entries[i], opts);
+                ++res.plots_written;
+                if (opts.verbose) {
+                    std::fprintf(stderr,
+                        "[batch:cpu] plot %zu/%zu done: %s\n",
+                        i + 1, entries.size(),
+                        entries[i].out_name.c_str());
+                }
+            } catch (std::exception const& ex) {
+                std::fprintf(stderr,
+                    "[batch:cpu] plot %zu FAILED: %s\n", i, ex.what());
+                // cuda-only's BatchOptions doesn't have continue_on_error
+                // — match the GPU path's behavior of returning early on
+                // a per-plot failure (caller decides whether to retry).
+                res.total_wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                return res;
+            }
+        }
+        res.total_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        return res;
+    }
+
     if (device_id >= 0) bind_current_device(device_id);
     // Must happen AFTER bind_current_device so __constant__ uploads
     // land on this worker's device.
@@ -490,6 +529,17 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         }
     } else if (!opts.device_ids.empty()) {
         device_ids = opts.device_ids;
+    }
+    // include_cpu is orthogonal: append a CPU worker (kCpuDeviceId)
+    // alongside whatever GPUs are already selected. Don't dedup —
+    // caller can pass `cpu` multiple times for multi-core CPU
+    // (e.g. --devices cpu,cpu,cpu,cpu on a 4-core host) — but
+    // collapse the case where include_cpu was set both via --cpu
+    // AND via a `cpu` token in --devices.
+    if (opts.include_cpu &&
+        std::find(device_ids.begin(), device_ids.end(), kCpuDeviceId)
+            == device_ids.end()) {
+        device_ids.push_back(kCpuDeviceId);
     }
 
     auto const t_start = std::chrono::steady_clock::now();

@@ -48,10 +48,19 @@ struct BatchResult {
 //                     i % N).
 //   use_all_devices — enumerate all visible CUDA devices at runtime and
 //                     use them. Overrides device_ids.
+//   include_cpu     — append a CPU worker alongside any GPUs already
+//                     selected. Set by `--cpu` (orthogonal to --devices)
+//                     or by passing `cpu` as a token in --devices. CPU
+//                     is encoded as kCpuDeviceId (-2) in device_ids —
+//                     see src/gpu/DeviceIds.hpp. Plotting on CPU goes
+//                     through pos2-chip's Plotter directly (no CUDA
+//                     calls); 1-2 orders of magnitude slower than GPU,
+//                     useful for GPU-less hosts or as an extra worker.
 struct BatchOptions {
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;
+    bool             include_cpu     = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
