@@ -13,7 +13,7 @@ jobs:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts/
@@ -25,7 +25,7 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: reviewdog/action-actionlint@v1
         with:
           fail_level: error
@@ -37,7 +37,7 @@ jobs:
       run:
         working-directory: keygen-rs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -58,7 +58,7 @@ jobs:
     name: hadolint Containerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Containerfile
@@ -75,7 +75,7 @@ jobs:
     name: docker compose config validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: docker compose config --quiet
         # Catches typos in service names / build-arg keys / unresolvable
         # ${VAR} placeholders without ever pulling a base image. ~5s.
@@ -85,14 +85,14 @@ jobs:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: crate-ci/typos@master
 
   markdownlint:
     name: markdownlint README
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: DavidAnson/markdownlint-cli2-action@v18
         with:
           globs: README.md
@@ -101,7 +101,7 @@ jobs:
     name: install-container-deps.sh — dry-run fixtures
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Diff --dry-run output against fixtures
         # Runs --dry-run for every (distro × engine × gpu) tuple in
         # arch / ubuntu / fedora containers and diffs against the
@@ -126,7 +126,7 @@ jobs:
         # needs a real GPU + driver to populate the spec, and the dry-run
         # fixtures already cover the planning logic for that path.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Real install in ubuntu:24.04 + assert idempotent re-run
         env:
           ENGINE: ${{ matrix.engine }}
