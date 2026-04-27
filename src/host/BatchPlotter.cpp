@@ -389,10 +389,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const margin      = 128ULL << 20;
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
+            // Tier selection precedence: opts.streaming_tier (--tier CLI
+            // flag) > XCHPLOT2_STREAMING_TIER env var > auto. Tight-VRAM
+            // cards (8 GB with ~0.7 GB free margin over plain floor) often
+            // OOM mid-plot from fragmentation / driver overhead — `--tier
+            // compact` gives ~2 GB more headroom at a small throughput cost.
             char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
-            if (tier_env && std::string(tier_env) == "plain") {
+            std::string const tier =
+                !opts.streaming_tier.empty() ? opts.streaming_tier :
+                (tier_env ? std::string(tier_env) : std::string());
+            if (tier == "plain") {
                 stream_scratch.plain_mode = true;
-            } else if (tier_env && std::string(tier_env) == "compact") {
+            } else if (tier == "compact") {
                 stream_scratch.plain_mode = false;
             } else {
                 stream_scratch.plain_mode =
