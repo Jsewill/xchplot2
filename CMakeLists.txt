@@ -35,6 +35,34 @@ if(_xchplot2_nvcc)
             endif()
         endforeach()
         if(_nvcc_major GREATER_EQUAL 13 AND _min_arch LESS 75)
+            # Container detection: Docker writes /.dockerenv, Podman writes
+            # /run/.containerenv. Either presence means the host-side fixes
+            # don't apply — the user needs to rebuild the image with a
+            # different BASE_DEVEL.
+            if(EXISTS "/.dockerenv" OR EXISTS "/run/.containerenv")
+                set(_fix_block
+                    "You're building inside a container — the toolkit comes from\n"
+                    "the base image, not the host. Rebuild with a CUDA 12.x base:\n"
+                    "  - Recommended: rerun scripts/build-container.sh on the host;\n"
+                    "    it auto-pins nvidia/cuda:12.9.1 when CUDA_ARCH < 75.\n"
+                    "  - Or pass --build-arg explicitly:\n"
+                    "      podman build -t xchplot2:cuda-only \\\n"
+                    "        --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n"
+                    "        --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n"
+                    "        --build-arg CUDA_ARCH=${_min_arch} \\\n"
+                    "        .\n")
+            else()
+                set(_fix_block
+                    "Fix one of:\n"
+                    "  - Install CUDA 12.9 (last toolkit with Pascal/Volta support) and re-run cmake:\n"
+                    "      sudo apt install cuda-toolkit-12-9     (Ubuntu/Debian)\n"
+                    "    Then point cmake at it:\n"
+                    "      cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -B build -S . [...]\n"
+                    "  - Or override the target arch (only valid if you actually have a Turing+ card):\n"
+                    "      cmake -DCMAKE_CUDA_ARCHITECTURES=75 -B build -S . [...]\n"
+                    "  - Or use the container path — scripts/build-container.sh auto-pins\n"
+                    "    the 12.9 base image when it detects a pre-Turing GPU.\n")
+            endif()
             message(FATAL_ERROR
                 "xchplot2 (cuda-only): CUDA Toolkit ${_nvcc_major}.x dropped codegen for "
                 "sm_${_min_arch} (Pascal / Volta / pre-Turing).\n"
@@ -43,15 +71,7 @@ if(_xchplot2_nvcc)
                 "  nvcc ${_nvcc_major}.x at ${_xchplot2_nvcc}\n"
                 "  target arch: sm_${_min_arch} (from CMAKE_CUDA_ARCHITECTURES=${_arches})\n"
                 "\n"
-                "Fix one of:\n"
-                "  - Install CUDA 12.9 (last toolkit with Pascal/Volta support) and re-run cmake:\n"
-                "      sudo apt install cuda-toolkit-12-9     (Ubuntu/Debian)\n"
-                "    Then point cmake at it:\n"
-                "      cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -B build -S . [...]\n"
-                "  - Or override the target arch (only valid if you actually have a Turing+ card):\n"
-                "      cmake -DCMAKE_CUDA_ARCHITECTURES=75 -B build -S . [...]\n"
-                "  - Or use the container path — scripts/build-container.sh auto-pins\n"
-                "    the 12.9 base image when it detects a pre-Turing GPU.\n")
+                ${_fix_block})
         endif()
     endif()
 endif()

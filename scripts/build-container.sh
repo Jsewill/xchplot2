@@ -10,6 +10,7 @@
 #
 # Usage:
 #   ./scripts/build-container.sh                 # auto-detect
+#   ./scripts/build-container.sh --no-cache      # force clean rebuild
 #   ./scripts/build-container.sh --engine docker # use docker compose instead
 #
 # Override knobs (set in env before invoking):
@@ -21,10 +22,15 @@
 set -euo pipefail
 
 ENGINE=podman
+declare -a EXTRA_BUILD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --engine)  ENGINE="$2"; shift 2 ;;
+        # Force a clean rebuild (ignore podman/docker layer cache). Useful
+        # after a host upgrade (new nvcc / new CUDA toolkit / etc.) where
+        # the cached layers reference stale toolchain versions.
+        --no-cache) EXTRA_BUILD_ARGS+=("--no-cache"); shift 1 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -79,4 +85,4 @@ case "$ENGINE" in
 esac
 
 set -x
-"${COMPOSE[@]}" build cuda
+"${COMPOSE[@]}" build "${EXTRA_BUILD_ARGS[@]}" cuda
