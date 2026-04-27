@@ -1,0 +1,21 @@
+# _typos.toml — domain-specific allowlist for xchplot2.
+#
+# typos' default dictionary flags a handful of proper nouns and
+# CUDA / SYCL intrinsic names that only LOOK like misspellings. The
+# risk of one of these coincidentally being a real typo elsewhere in
+# the tree is low, so allowlist them globally rather than per-file.
+#
+# cuda-only branch only really needs `Collet` from this list, but
+# the rest are kept for parity with main so a single config moves
+# between branches without surprises.
+
+[default.extend-words]
+# AMD ROCm "Heterogeneous System Architecture" runtime.
+HSA = "HSA"
+# SYCL kernel range / index types: nd_range, nd_item.
+nd = "nd"
+# CUDA half-precision intrinsics: __hge ("greater-or-equal"),
+# __hgt, __hle, __hlt; AdaptiveCpp's libkernel/half.hpp aliases.
+hge = "hge"
+# Yann Collet, author of LZ4 / zstd, attributed in NOTICE.
+Collet = "Collet"

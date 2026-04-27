@@ -1,0 +1,21 @@
+version: 2
+
+# Dependabot bumps deps via PR. Two ecosystems:
+#   - cargo: the keygen-rs subcrate's BLS / sha2 / address-codec stack.
+#     The build.rs at repo root only references env state and has no
+#     runtime crate deps, so it doesn't need its own entry.
+#   - github-actions: action versions in .github/workflows/.
+# Weekly cadence keeps PR volume low; bump to daily if security
+# advisories pile up.
+updates:
+  - package-ecosystem: cargo
+    directory: /keygen-rs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
