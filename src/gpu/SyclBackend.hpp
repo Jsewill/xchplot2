@@ -21,6 +21,7 @@
 #include "gpu/CudaHalfShim.hpp"
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -88,6 +89,31 @@ inline int current_device_id()
     return current_device_id_ref();
 }
 
+// Mixed-vendor SYCL host filter: when this build links the CUB sort path
+// (XCHPLOT2_HAVE_CUB), drop any non-CUDA SYCL devices from the
+// enumeration. Otherwise a host with NVIDIA + AMD (e.g. user passed
+// `--gpus all` AND `--device /dev/kfd --device /dev/dri` to docker)
+// returns 2+ "GPU devices" from the SYCL view, BatchPlotter's
+// `--devices all` spawns a worker per device, and the CUB sort path
+// errors out with `cudaErrorInvalidDevice` ("invalid device ordinal")
+// when CUB is called against the AMD card. Skipping non-CUDA backends
+// here keeps the enumeration aligned with what CUB can actually use.
+//
+// Intel L0 / OCL devices are likewise filtered; HIP-only builds (the
+// rocm container) wouldn't define XCHPLOT2_HAVE_CUB and pass through.
+inline std::vector<sycl::device> usable_gpu_devices()
+{
+    auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+#ifdef XCHPLOT2_HAVE_CUB
+    devs.erase(std::remove_if(devs.begin(), devs.end(),
+        [](sycl::device const& d) {
+            return d.get_backend() != sycl::backend::cuda;
+        }),
+        devs.end());
+#endif
+    return devs;
+}
+
 // Per-thread SYCL queue. Bound to the thread's current device id (see
 // the kDefaultGpuId / kCpuDeviceId sentinels above). A unique_ptr wrapper
 // lets us defer construction until the thread has had a chance to set
@@ -109,12 +135,12 @@ inline sycl::queue& queue()
             q = std::make_unique<sycl::queue>(sycl::gpu_selector_v,
                                               async_error_handler);
         } else {
-            auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+            auto devices = usable_gpu_devices();
             if (id >= static_cast<int>(devices.size())) {
                 throw std::runtime_error(
                     "sycl_backend::queue: device id " + std::to_string(id) +
                     " out of range (found " + std::to_string(devices.size()) +
-                    " GPU device(s))");
+                    " usable GPU device(s))");
             }
             q = std::make_unique<sycl::queue>(devices[id], async_error_handler);
         }
@@ -122,12 +148,12 @@ inline sycl::queue& queue()
     return *q;
 }
 
-// Return the number of SYCL GPU devices visible to the process. Used by
-// BatchOptions::use_all_devices to expand "all" into an explicit list.
+// Return the number of SYCL GPU devices visible to the process AND
+// usable by this build. Used by BatchOptions::use_all_devices to expand
+// "all" into an explicit list. See usable_gpu_devices() for the filter.
 inline int get_gpu_device_count()
 {
-    return static_cast<int>(
-        sycl::device::get_devices(sycl::info::device_type::gpu).size());
+    return static_cast<int>(usable_gpu_devices().size());
 }
 
 // AES T-tables uploaded into a USM device buffer on first use, kept
