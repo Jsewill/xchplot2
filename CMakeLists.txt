@@ -401,6 +401,15 @@ target_compile_features(pos2_gpu PUBLIC cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
+# Marker for SyclBackend's mixed-vendor device filter. When CUB is the
+# sort path, sycl::device::get_devices(gpu) on a heterogeneous host
+# returns NVIDIA + AMD devices; CUB-on-AMD fails with cudaErrorInvalidDevice.
+# The filter in SyclBackend.hpp drops non-CUDA backends only when this
+# define is on. AMD/Intel/CPU builds leave it off so HIP / Level Zero
+# / OMP devices pass through.
+if(XCHPLOT2_BUILD_CUDA)
+    target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_HAVE_CUB=1)
+endif()
 add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
 
 # AdaptiveCpp's acpp driver doesn't auto-propagate CMake's standard
