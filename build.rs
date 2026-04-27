@@ -508,6 +508,36 @@ fn main() {
     println!("cargo:rustc-link-lib=acpp-rt");
     println!("cargo:rustc-link-lib=acpp-common");
 
+    // ---- LLVM OpenMP runtime (SYCL→OMP backend) ----
+    // AdaptiveCpp's OMP backend lowers SYCL nd_range kernels to OpenMP
+    // parallel loops. The compiled .o files reference libomp's runtime
+    // symbols (__kmpc_fork_call, __kmpc_global_thread_num, __kmpc_barrier,
+    // __kmpc_for_static_init_8u / _fini). cc / rust-lld don't auto-link
+    // libomp — pos2_gpu's SYCL TUs would then fail to link with
+    //
+    //   rust-lld: error: undefined symbol: __kmpc_fork_call
+    //
+    // Only fire on builds where ACPP_TARGETS includes "omp"; HIP and
+    // SSCP-with-CUDA backends translate to their own runtimes and don't
+    // need libomp at link time.
+    //
+    // Locations:
+    //   Ubuntu/Debian (apt libomp-18-dev): /usr/lib/llvm-18/lib/libomp.so
+    //   Arch (pacman openmp):              /usr/lib/libomp.so
+    //   AdaptiveCpp install (bundled):     $ACPP_PREFIX/lib/libomp.so
+    if acpp_targets.split(';').any(|t| t.trim() == "omp") {
+        for guess in ["/usr/lib/llvm-18/lib", "/usr/lib/llvm-19/lib",
+                      "/usr/lib/llvm-20/lib", "/usr/lib"] {
+            if std::path::Path::new(&format!("{guess}/libomp.so")).exists()
+                || std::path::Path::new(&format!("{guess}/libomp.so.5")).exists() {
+                println!("cargo:rustc-link-search=native={guess}");
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{guess}");
+                break;
+            }
+        }
+        println!("cargo:rustc-link-lib=omp");
+    }
+
     // ---- CUDA runtime ----
     // Only needed when XCHPLOT2_BUILD_CUDA=ON — then the nvcc-compiled
     // TUs (SortCuda, AesGpu, AesGpuBitsliced) pull in cudart / cudadevrt.
