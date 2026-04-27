@@ -16,7 +16,11 @@
 
 set -euo pipefail
 
-ROOT=$(git rev-parse --show-toplevel)
+# Derive ROOT from this script's own path so the harness works no
+# matter what CWD it runs from. The previous `git rev-parse` form
+# resolved against the *outer* CWD, so running this script from
+# another repo's directory wrote fixtures into the wrong tree.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 FIXTURE_DIR="$ROOT/scripts/test/install-container-deps"
 
 UPDATE=0
