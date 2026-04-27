@@ -266,7 +266,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // synchronous run_one_plot_cpu() call. Single-threaded internally;
     // multi-core utilization comes from passing `cpu` multiple times in
     // --devices (e.g. --devices cpu,cpu,cpu,cpu on a 4-core host).
-    if (device_id == kCpuDeviceId) {
+    //
+    // XCHPLOT2_SYCL_CPU_BENCH=1 routes --cpu through the SYCL pipeline on
+    // AdaptiveCpp's CPU backend instead of pos2-chip — exposed as an env
+    // var purely for benchmarking the two CPU paths against each other,
+    // not as a supported plotting mode (pos2-chip is faster + leaner).
+    bool const sycl_cpu_bench = [] {
+        char const* v = std::getenv("XCHPLOT2_SYCL_CPU_BENCH");
+        return v && v[0] == '1';
+    }();
+    if (device_id == kCpuDeviceId && !sycl_cpu_bench) {
         BatchResult res;
         if (entries.empty()) return res;
         auto const t_start = std::chrono::steady_clock::now();
