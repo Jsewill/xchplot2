@@ -50,7 +50,11 @@ if [[ -z "${CUDA_ARCH:-}" ]] && command -v nvidia-smi >/dev/null; then
     caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
             | sed 's/\.//' | sort -un)
     if [[ -n "$caps" ]]; then
-        export CUDA_ARCH=$(echo "$caps" | paste -sd';')
+        # Split assignment from export so a non-zero exit from the
+        # subshell pipeline propagates instead of being masked by
+        # `export`'s own success (shellcheck SC2155).
+        CUDA_ARCH=$(echo "$caps" | paste -sd';')
+        export CUDA_ARCH
     fi
 fi
 : "${CUDA_ARCH:=89}"
