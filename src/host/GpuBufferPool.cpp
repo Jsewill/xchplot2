@@ -338,4 +338,27 @@ size_t streaming_plain_peak_bytes(int k)
     return (size_t(anchor_mb) << 20) << shift;
 }
 
+size_t streaming_minimal_peak_bytes(int k)
+{
+    // Anchor: 3700 MB at k=28. Compact's 5200 peak minus ~1500 MB from
+    // N=8 vs N=2 T2 match staging (cap/8 ≈ 570 MB vs cap/2 ≈ 2280 MB
+    // for the meta+mi+xbits stage triple at k=28). All other compact
+    // savings (park/rehydrate of d_t1_meta / d_t1_keys_merged /
+    // d_t2_meta / d_t2_xbits / d_t2_keys_merged) carry over unchanged.
+    // Estimated, not yet measured on a real 4 GiB card; conservative
+    // by ~250 MB vs the back-of-envelope calc to leave room for
+    // CUDA-context + driver overhead. Same k-scaling as compact / plain.
+    constexpr size_t anchor_mb = 3700;
+    if (k == 28) return anchor_mb << 20;
+    if (k <  18) return size_t(16) << 20;
+    if (k >  32) return size_t(anchor_mb) << (20 + ((32 - 28) * 2));
+
+    if (k < 28) {
+        int const shift = (28 - k) * 2;
+        return (size_t(anchor_mb) << 20) >> shift;
+    }
+    int const shift = (k - 28) * 2;
+    return (size_t(anchor_mb) << 20) << shift;
+}
+
 } // namespace pos2gpu

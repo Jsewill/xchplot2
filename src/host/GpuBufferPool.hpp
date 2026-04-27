@@ -179,8 +179,13 @@ DeviceMemInfo query_device_memory();
 // streaming_plain_peak_bytes: plain tier (anchored at 7290 MB at k=28,
 // pre-park pipeline — saves ~400 ms/plot over compact via fewer PCIe
 // round-trips, at the cost of the higher peak).
+// streaming_minimal_peak_bytes: minimal tier (anchored at 3700 MB at
+// k=28). Same parks as compact plus N=8 T2 match staging (cap/8 vs
+// compact's cap/2) — targets 4 GiB cards at the cost of more PCIe
+// round-trips during T2 match.
 // Dominant terms scale with 2^k, so other k extrapolate linearly.
 size_t streaming_peak_bytes(int k);
 size_t streaming_plain_peak_bytes(int k);
+size_t streaming_minimal_peak_bytes(int k);
 
 } // namespace pos2gpu

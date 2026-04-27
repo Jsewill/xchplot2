@@ -972,25 +972,37 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t1_meta_sorted);
         s_free(stats, d_t1_keys_merged);
     } else {
-        // Compact: N=2 tiled half-cap staging with pinned-host
-        // accumulators (stages 1/2/3).
+        // Compact: N-tile cap/N staging with pinned-host accumulators.
+        // N = scratch.t2_tile_count: 2 = compact (~2.3 GB staging at
+        // k=28); 8 = minimal (~570 MB) for 4 GiB cards. Must be a power
+        // of 2 ≤ t2_num_buckets so even bucket distribution is exact.
         uint32_t const t2_num_buckets =
             (1u << t2p.num_section_bits) * (1u << t2p.num_match_key_bits);
-        uint32_t const t2_bucket_mid = t2_num_buckets / 2;
-        uint64_t const t2_half_cap   = (cap + 1) / 2;
+        int const N = scratch.t2_tile_count;
+        if (N < 2 || (N & (N - 1)) != 0) {
+            throw std::runtime_error(
+                "scratch.t2_tile_count must be a power of 2 ≥ 2 (got " +
+                std::to_string(N) + ")");
+        }
+        if (static_cast<uint32_t>(N) > t2_num_buckets) {
+            throw std::runtime_error(
+                "scratch.t2_tile_count " + std::to_string(N) +
+                " exceeds t2_num_buckets " + std::to_string(t2_num_buckets));
+        }
+        uint64_t const t2_tile_cap = (cap + uint64_t(N) - 1) / uint64_t(N);
 
         size_t t2_temp_bytes = 0;
         launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
                                 d_counter, nullptr, &t2_temp_bytes, q);
 
-        // Half-cap device staging (reused across both passes).
+        // Tile-cap device staging (reused across all N passes).
         uint64_t* d_t2_meta_stage  = nullptr;
         uint32_t* d_t2_mi_stage    = nullptr;
         uint32_t* d_t2_xbits_stage = nullptr;
         void*     d_t2_match_temp  = nullptr;
-        s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
-        s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
-        s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+        s_malloc(stats, d_t2_meta_stage,  t2_tile_cap * sizeof(uint64_t), "d_t2_meta_stage");
+        s_malloc(stats, d_t2_mi_stage,    t2_tile_cap * sizeof(uint32_t), "d_t2_mi_stage");
+        s_malloc(stats, d_t2_xbits_stage, t2_tile_cap * sizeof(uint32_t), "d_t2_xbits_stage");
         s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
 
         // Full-cap pinned host that will hold the concatenated T2 output.
@@ -1024,17 +1036,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             launch_t2_match_range(cfg.plot_id.data(), t2p,
                                   d_t1_meta_sorted, d_t1_keys_merged, t1_count,
                                   d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                                  d_counter, t2_half_cap, d_t2_match_temp,
+                                  d_counter, t2_tile_cap, d_t2_match_temp,
                                   bucket_begin, bucket_end, q);
             uint64_t pass_count = 0;
             q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
-            if (pass_count > t2_half_cap) {
+            if (pass_count > t2_tile_cap) {
                 throw std::runtime_error(
                     "T2 match pass overflow: bucket range [" +
                     std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
                     ") produced " + std::to_string(pass_count) +
-                    " pairs, staging holds " + std::to_string(t2_half_cap) +
-                    ". Lower N or widen staging.");
+                    " pairs, staging holds " + std::to_string(t2_tile_cap) +
+                    " (consider lower N or fall back to compact tier).");
             }
             q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
             q.memcpy(h_t2_mi    + host_offset, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
@@ -1045,11 +1057,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         };
 
         int p_t2 = begin_phase("T2 match");
-        uint64_t const count1 = run_pass_and_stage(0,              t2_bucket_mid,   /*host_offset=*/0);
-        uint64_t const count2 = run_pass_and_stage(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
+        // N evenly-spaced bucket ranges. host_offset accumulates so each
+        // pass appends to the pinned host buffer behind the prior pass.
+        t2_count = 0;
+        for (int pass = 0; pass < N; ++pass) {
+            uint32_t const bucket_begin =
+                uint32_t(uint64_t(pass)     * t2_num_buckets / uint64_t(N));
+            uint32_t const bucket_end =
+                uint32_t(uint64_t(pass + 1) * t2_num_buckets / uint64_t(N));
+            t2_count += run_pass_and_stage(bucket_begin, bucket_end,
+                                           /*host_offset=*/t2_count);
+        }
         end_phase(p_t2);
 
-        t2_count = count1 + count2;
         if (t2_count > cap) throw std::runtime_error("T2 overflow");
 
         // Free device staging + T1 sorted + match temp before

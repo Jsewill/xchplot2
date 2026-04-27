@@ -129,6 +129,14 @@ struct StreamingPinnedScratch {
     // but not the pool (12-14 GB cards). When true, the h_* pointers
     // above are ignored — plain mode does not park anything.
     bool plain_mode          = false;
+
+    // T2 match staging tile count (compact path only — ignored when
+    // plain_mode is true). compact uses 2 (cap/2 staging, ~2.3 GB at
+    // k=28); minimal sets it to 8 (cap/8 staging, ~570 MB) to fit 4
+    // GiB cards at the cost of more PCIe round-trips during T2 match.
+    // Must be a power of 2 in [2, t2_num_buckets] — at k=28 strength=2
+    // that's [2, 16]. BatchPlotter's tier selection sets it.
+    int t2_tile_count        = 2;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

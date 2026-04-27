@@ -374,62 +374,100 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
-        // Streaming tier dispatch: plain (~7290 MB peak at k=28, no
-        // parks, ~400 ms/plot faster) vs compact (~5200 MB peak, all
-        // parks + N=2 T2 match). Pick the larger tier that fits — use
-        // plain if it fits, otherwise compact. 128 MB margin above
-        // measured CUDA-context + driver overhead on headless cards.
+        // Streaming tier dispatch — three tiers, increasing PCIe pressure
+        // for decreasing peak VRAM:
+        //   plain   (~7290 MB at k=28): no parks, single-pass T2 match.
+        //                               Fastest, ~400 ms/plot over compact.
+        //   compact (~5200 MB at k=28): all parks + N=2 T2 match staging.
+        //                               Targets 6-8 GiB cards.
+        //   minimal (~3700 MB at k=28): compact's parks + N=8 T2 match
+        //                               staging. Targets 4 GiB cards at
+        //                               the cost of extra PCIe round-trips
+        //                               during T2 match.
+        // Auto-pick takes the largest tier that fits with the margin.
+        // 128 MB margin above measured CUDA-context + driver overhead
+        // on headless cards.
         //
-        // XCHPLOT2_STREAMING_TIER=plain|compact overrides the auto
-        // pick. Useful for benchmarking/testing.
+        // opts.streaming_tier (--tier CLI flag) > XCHPLOT2_STREAMING_TIER
+        // env var > auto. Forced plain/compact below their floor warn but
+        // proceed (caller's risk); forced minimal below its floor throws
+        // because there is no smaller tier to fall back to.
         {
-            auto const mem           = query_device_memory();
-            size_t const plain_peak  = streaming_plain_peak_bytes(pool_k);
+            auto const mem            = query_device_memory();
+            size_t const plain_peak   = streaming_plain_peak_bytes(pool_k);
             size_t const compact_peak = streaming_peak_bytes(pool_k);
-            size_t const margin      = 128ULL << 20;
+            size_t const minimal_peak = streaming_minimal_peak_bytes(pool_k);
+            size_t const margin       = 128ULL << 20;
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
-            // Tier selection precedence: opts.streaming_tier (--tier CLI
-            // flag) > XCHPLOT2_STREAMING_TIER env var > auto. Tight-VRAM
-            // cards (8 GB with ~0.7 GB free margin over plain floor) often
-            // OOM mid-plot from fragmentation / driver overhead — `--tier
-            // compact` gives ~2 GB more headroom at a small throughput cost.
             char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
-            std::string const tier =
+            std::string const tier_pref =
                 !opts.streaming_tier.empty() ? opts.streaming_tier :
                 (tier_env ? std::string(tier_env) : std::string());
-            if (tier == "plain") {
-                stream_scratch.plain_mode = true;
-            } else if (tier == "compact") {
-                stream_scratch.plain_mode = false;
+
+            enum class Tier { Plain, Compact, Minimal };
+            Tier tier;
+            if (tier_pref == "plain") {
+                tier = Tier::Plain;
+            } else if (tier_pref == "compact") {
+                tier = Tier::Compact;
+            } else if (tier_pref == "minimal") {
+                tier = Tier::Minimal;
             } else {
-                stream_scratch.plain_mode =
-                    (mem.free_bytes >= plain_peak + margin);
+                // Auto: pick the largest tier that fits with margin.
+                tier = (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
+                       (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
+                                                                   Tier::Minimal;
             }
 
+            auto tier_name = [](Tier t) -> char const* {
+                return t == Tier::Plain   ? "plain"
+                     : t == Tier::Compact ? "compact"
+                     :                      "minimal";
+            };
             size_t const required =
-                stream_scratch.plain_mode ? plain_peak : compact_peak;
-            if (mem.free_bytes < required + margin) {
+                tier == Tier::Plain   ? plain_peak   :
+                tier == Tier::Compact ? compact_peak :
+                                        minimal_peak;
+
+            // Minimal is the open-ended fallback — if even minimal won't
+            // fit, throw. Forced higher tier below its floor warns and
+            // proceeds (caller asked).
+            if (tier == Tier::Minimal && mem.free_bytes < required + margin) {
                 InsufficientVramError se(
                     "[batch] streaming pipeline needs ~" +
                     std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
-                    " (" + (stream_scratch.plain_mode ? "plain" : "compact") +
-                    " tier), device reports " +
+                    " (minimal tier, the smallest available), device reports " +
                     std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
                     " GiB free of " +
                     std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
-                    " GiB total. Use a smaller k or a GPU with more VRAM.");
+                    " GiB total. Use a smaller k or a larger GPU "
+                    "(or --cpu for pos2-chip CPU plotting).");
                 se.required_bytes = required + margin;
                 se.free_bytes     = mem.free_bytes;
                 se.total_bytes    = mem.total_bytes;
                 throw se;
             }
+            if (tier != Tier::Minimal && mem.free_bytes < required + margin) {
+                std::fprintf(stderr,
+                    "[batch] streaming tier: %s forced (%.2f GiB free < %.2f GiB "
+                    "%s floor) — proceeding, may OOM mid-plot\n",
+                    tier_name(tier),
+                    to_gib(mem.free_bytes),
+                    to_gib(required + margin),
+                    tier_name(tier));
+            }
+
+            stream_scratch.plain_mode = (tier == Tier::Plain);
+            if (tier == Tier::Minimal) {
+                stream_scratch.t2_tile_count = 8;
+            }
 
             std::fprintf(stderr,
                 "[batch] streaming tier: %s "
                 "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
-                stream_scratch.plain_mode ? "plain" : "compact",
+                tier_name(tier),
                 to_gib(mem.free_bytes),
                 to_gib(required),
                 to_gib(plain_peak + margin));
