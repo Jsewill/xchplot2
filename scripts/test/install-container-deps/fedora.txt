@@ -1,0 +1,39 @@
+=== engine=podman ===
+[install-container-deps] distro=fedora, engine=podman
++ sudo dnf install -y podman podman-compose
+[install-container-deps] Adding NVIDIA's container-toolkit dnf repo to /etc/yum.repos.d/.
++ write /etc/yum.repos.d/nvidia-container-toolkit.repo (from https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo)
++ sudo dnf install -y nvidia-container-toolkit
++ sudo install -m 0755 -d /etc/cdi
++ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+[install-container-deps] Generated CDI spec at /etc/cdi/nvidia.yaml.
+[install-container-deps] (WARNings about libnvidia-vulkan-producer / X11 configs /
+[install-container-deps]  fabric-manager / MPS / IMEX from nvidia-ctk are expected on
+[install-container-deps]  non-server hosts — those are optional features the spec
+[install-container-deps]  gracefully omits when not present.)
+
+[install-container-deps] Done.
+  Build the image:
+    ./scripts/build-container.sh --engine podman
+  After future NVIDIA driver upgrades, re-run this script (or
+  re-run nvidia-ctk cdi generate / nvidia-ctk runtime configure
+  manually) so the CDI spec / docker runtime hook stays current.
+
+=== engine=docker ===
+[install-container-deps] distro=fedora, engine=docker
++ sudo dnf install -y docker-compose-plugin docker-buildx-plugin
+[install-container-deps] Adding NVIDIA's container-toolkit dnf repo to /etc/yum.repos.d/.
++ write /etc/yum.repos.d/nvidia-container-toolkit.repo (from https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo)
++ sudo dnf install -y nvidia-container-toolkit
++ sudo systemctl enable --now docker.service
++ sudo nvidia-ctk runtime configure --runtime=docker
++ sudo systemctl restart docker
+[install-container-deps] Configured docker NVIDIA runtime + restarted dockerd.
+
+[install-container-deps] Done.
+  Build the image:
+    ./scripts/build-container.sh --engine docker
+  After future NVIDIA driver upgrades, re-run this script (or
+  re-run nvidia-ctk cdi generate / nvidia-ctk runtime configure
+  manually) so the CDI spec / docker runtime hook stays current.
+

@@ -17,7 +17,9 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts/
-        run: shellcheck scripts/*.sh
+        # Recurse so scripts/test/install-container-deps/run.sh and any
+        # future helpers under scripts/ stay covered.
+        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
 
   actions:
     name: actionlint
@@ -76,3 +78,20 @@ jobs:
         run: cmake -B build -S . -GNinja -DCMAKE_CUDA_ARCHITECTURES=75
       - name: Build
         run: cmake --build build -j$(nproc)
+
+  install-container-deps-dryrun:
+    name: install-container-deps.sh — dry-run fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Diff --dry-run output against fixtures
+        # Runs --dry-run for every engine in arch / ubuntu / fedora
+        # containers and diffs against the checked-in fixtures under
+        # scripts/test/install-container-deps/. ~60s, no sudo, no network
+        # beyond image pulls.
+        #
+        # cuda-only is NVIDIA-only, so there's no smoke job equivalent
+        # to main's: nvidia-ctk cdi generate needs a real GPU + driver
+        # to populate the spec, and the dry-run fixtures already cover
+        # the planning logic for that path.
+        run: scripts/test/install-container-deps/run.sh
