@@ -373,15 +373,33 @@ fn main() {
     if build_cuda == "ON" {
         if let (Some(nvcc_major), Some(min)) = (detect_nvcc_major(), min_arch(&cuda_arch)) {
             if nvcc_major >= 13 && min < 75 {
-                panic!(
-                    "\nxchplot2: CUDA Toolkit {nvcc_major}.x dropped codegen for sm_{min} \
-                     (Pascal / Volta / pre-Turing).\n\
-                     \n\
-                     Detected:\n  \
-                       nvcc {nvcc_major}.x\n  \
-                       target arch: sm_{min} (from CUDA_ARCHITECTURES={cuda_arch})\n\
-                     \n\
-                     Fix one of:\n  \
+                // Container detection: Docker writes /.dockerenv, Podman writes
+                // /run/.containerenv. Either presence means the host-side fixes
+                // (apt install cuda-toolkit, set CUDA_PATH) are not actionable
+                // from inside this build — the user needs to rebuild the image
+                // with a different BASE_DEVEL.
+                let in_container = std::path::Path::new("/.dockerenv").exists()
+                    || std::path::Path::new("/run/.containerenv").exists();
+                let fix_block = if in_container {
+                    format!(
+                        "You're building inside a container — the toolkit comes from the\n\
+                         base image, not the host. Rebuild the image with a CUDA 12.x base:\n  \
+                           - Recommended: rerun scripts/build-container.sh on the host;\n    \
+                             it auto-pins nvidia/cuda:12.9.1 when CUDA_ARCH < 75.\n  \
+                           - Or pass --build-arg explicitly:\n      \
+                               podman build -t xchplot2:cuda \\\n        \
+                                 --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
+                                 --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
+                                 --build-arg CUDA_ARCH={min} \\\n        \
+                                 .\n  \
+                           - Or via compose with env vars:\n      \
+                               CUDA_ARCH={min} \\\n        \
+                                 BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
+                                 BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
+                                 podman compose build cuda\n"
+                    )
+                } else {
+                    "Fix one of:\n  \
                        - Install CUDA 12.9 (last toolkit with Pascal/Volta support):\n      \
                            Ubuntu/Debian:  sudo apt install cuda-toolkit-12-9\n      \
                            Arch:           pacman -S cuda  (or pin to a 12.x channel)\n    \
@@ -392,7 +410,17 @@ fn main() {
                            CUDA_ARCHITECTURES=75 cargo install \\\n      \
                              --git https://github.com/Jsewill/xchplot2 --force\n  \
                        - Or use the container path — scripts/build-container.sh auto-pins\n    \
-                         the 12.9 base image when it detects a pre-Turing GPU.\n"
+                         the 12.9 base image when it detects a pre-Turing GPU.\n".to_string()
+                };
+                panic!(
+                    "\nxchplot2: CUDA Toolkit {nvcc_major}.x dropped codegen for sm_{min} \
+                     (Pascal / Volta / pre-Turing).\n\
+                     \n\
+                     Detected:\n  \
+                       nvcc {nvcc_major}.x\n  \
+                       target arch: sm_{min} (from CUDA_ARCHITECTURES={cuda_arch})\n\
+                     \n\
+                     {fix_block}"
                 );
             }
         }

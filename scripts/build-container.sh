@@ -12,17 +12,23 @@
 #   ./scripts/build-container.sh --gpu amd       # force AMD
 #   ./scripts/build-container.sh --gpu intel     # force Intel
 #   ./scripts/build-container.sh --gpu cpu       # CPU-only (AdaptiveCpp OpenMP)
+#   ./scripts/build-container.sh --no-cache      # force clean rebuild
 #   ./scripts/build-container.sh --engine docker # use docker compose instead
 
 set -euo pipefail
 
 ENGINE=podman
 GPU=""
+declare -a EXTRA_BUILD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpu)     GPU="$2";    shift 2 ;;
         --engine)  ENGINE="$2"; shift 2 ;;
+        # Force a clean rebuild (ignore podman/docker layer cache). Useful
+        # after a host upgrade (new nvcc / new AdaptiveCpp release / etc.)
+        # where the cached layers reference stale toolchain versions.
+        --no-cache) EXTRA_BUILD_ARGS+=("--no-cache"); shift 1 ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -199,4 +205,4 @@ case "$ENGINE" in
 esac
 
 set -x
-"${COMPOSE[@]}" build "$SERVICE"
+"${COMPOSE[@]}" build "${EXTRA_BUILD_ARGS[@]}" "$SERVICE"
