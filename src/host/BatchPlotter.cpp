@@ -312,46 +312,70 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         //   compact: peak 5200 + margin 128 = 5328 MB floor
         constexpr uint64_t kPlainFloorBytes   = 7418ULL * 1024 * 1024;
         constexpr uint64_t kCompactFloorBytes = 5328ULL * 1024 * 1024;
+        // Minimal tier: compact's pinned-host parking + N=8 T2 match
+        // staging (cap/8 vs compact's cap/2). Saves ~1.5 GiB of T2-match
+        // peak VRAM at the cost of 6 extra PCIe round-trips during T2
+        // match. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
+        // MX450). Floor is estimated, not measured on real 4 GiB
+        // hardware — please report actual fit on a 4 GiB card.
+        constexpr uint64_t kMinimalFloorBytes = 3828ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
         // > XCHPLOT2_STREAMING_TIER env var > auto-pick by free VRAM. The
         // manual overrides bypass the auto-pick threshold but still bail
-        // out cleanly if the chosen tier definitely won't fit (compact
-        // floor is a hard lower bound; forced-plain on a card with less
-        // than the plain floor warns + proceeds — caller asked).
+        // out cleanly if the chosen tier definitely won't fit (minimal
+        // floor is the hard lower bound; forced higher tier on a card
+        // below that tier's floor warns + proceeds — caller asked).
         char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
         std::string const tier_pref =
             !opts.streaming_tier.empty() ? opts.streaming_tier :
             (tier_env ? std::string(tier_env) : std::string());
-        bool want_plain;
+
+        enum class Tier { Plain, Compact, Minimal };
+        Tier tier;
         if (tier_pref == "plain") {
-            want_plain = true;
+            tier = Tier::Plain;
         } else if (tier_pref == "compact") {
-            want_plain = false;
+            tier = Tier::Compact;
+        } else if (tier_pref == "minimal") {
+            tier = Tier::Minimal;
         } else {
-            want_plain = (free_bytes >= kPlainFloorBytes);
+            // Auto: pick the largest tier that fits.
+            tier = (free_bytes >= kPlainFloorBytes)   ? Tier::Plain   :
+                   (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
+                                                        Tier::Minimal;
         }
-        if (want_plain && free_bytes < kPlainFloorBytes) {
+
+        // Forced-tier fit warnings. Forced tiers below their floor are
+        // allowed (caller's risk) — except minimal below its floor still
+        // throws because there's no smaller tier to fall back to.
+        if (tier == Tier::Plain && free_bytes < kPlainFloorBytes) {
             std::fprintf(stderr,
                 "[batch] streaming tier: plain forced (%.2f GiB free < %.2f GiB "
                 "plain floor) — proceeding, may OOM mid-plot\n",
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
+        } else if (tier == Tier::Compact && free_bytes < kCompactFloorBytes) {
+            std::fprintf(stderr,
+                "[batch] streaming tier: compact forced (%.2f GiB free < %.2f GiB "
+                "compact floor) — proceeding, may OOM mid-plot\n",
+                free_bytes / double(1ULL << 30),
+                kCompactFloorBytes / double(1ULL << 30));
         }
 
-        if (want_plain) {
-            // Plain tier: zero PCIe overhead, all parks skipped.
+        if (tier == Tier::Plain) {
+            // Plain: zero PCIe overhead, all parks skipped.
             std::fprintf(stderr,
                 "[batch] streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
-        } else if (free_bytes >= kCompactFloorBytes) {
-            // Compact tier: allocate the shared scratch buffers once
-            // per batch. At k=28 this is ~4.2 GB of pinned host:
-            //   h_meta        cap·u64 = 2.04 GB (reused t1_meta → t2_meta)
-            //   h_keys_merged cap·u32 = 1.02 GB (reused t1_keys → t2_keys)
-            //   h_t2_xbits    cap·u32 = 1.02 GB
+        } else if (tier == Tier::Compact || tier == Tier::Minimal) {
+            // Compact + Minimal share the same pinned-host scratch
+            // (h_meta / h_keys_merged / h_t2_xbits, ~4.2 GB at k=28);
+            // Minimal additionally sets t2_tile_count = 8 (vs compact's
+            // default 2) so T2 match staging shrinks from ~2.3 GB to
+            // ~570 MB — that's where the 4 GiB tier's headroom comes from.
             stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
             stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
@@ -365,23 +389,49 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
                 }
                 throw std::runtime_error(
-                    "[batch] streaming-fallback: compact-tier pinned scratch alloc failed");
+                    "[batch] streaming-fallback: compact/minimal pinned scratch alloc failed");
             }
             stream_compact = true;
-            std::fprintf(stderr,
-                "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
-                "using park/rehydrate, expect ~1-2 s/plot extra PCIe)\n",
-                free_bytes / double(1ULL << 30),
-                kPlainFloorBytes / double(1ULL << 30));
+            if (tier == Tier::Minimal) {
+                stream_scratch.t2_tile_count = 8;
+                std::fprintf(stderr,
+                    "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
+                    "park/rehydrate + N=8 T2 staging, expect ~5-15 s/plot extra PCIe)\n",
+                    free_bytes / double(1ULL << 30),
+                    kMinimalFloorBytes / double(1ULL << 30));
+            } else {
+                std::fprintf(stderr,
+                    "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
+                    "using park/rehydrate, expect ~1-2 s/plot extra PCIe)\n",
+                    free_bytes / double(1ULL << 30),
+                    kPlainFloorBytes / double(1ULL << 30));
+            }
         } else {
+            // Unreachable — the auto-pick branch above always picks one
+            // of Plain/Compact/Minimal regardless of free_bytes (Minimal
+            // is the open-ended fallback). Kept for switch-completeness.
             for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
+            throw std::runtime_error("[batch] internal: unhandled streaming tier");
+        }
+        // Forced-minimal hard floor: there's no smaller tier to fall back
+        // to, so a card below the minimal floor genuinely can't plot at
+        // this k. Bail with a clear message.
+        if (tier == Tier::Minimal && free_bytes < kMinimalFloorBytes) {
+            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+            }
+            if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+            if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
+            if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
             throw std::runtime_error(
-                "[batch] card too small for k=28 streaming at any tier: " +
+                "[batch] card too small for k=" + std::to_string(pool_k) +
+                " streaming at any tier: " +
                 std::to_string(free_bytes / (1ULL << 20)) + " MB free < " +
-                std::to_string(kCompactFloorBytes / (1ULL << 20)) +
-                " MB compact floor. Use a smaller k or a larger GPU.");
+                std::to_string(kMinimalFloorBytes / (1ULL << 20)) +
+                " MB minimal floor. Use a smaller k or a larger GPU "
+                "(or --cpu for pos2-chip CPU plotting).");
         }
     }
     if (verbose && pool_ptr) {

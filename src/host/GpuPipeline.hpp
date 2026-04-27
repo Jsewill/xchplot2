@@ -121,6 +121,13 @@ struct StreamingPinnedScratch {
     uint64_t* h_meta         = nullptr;  // parks t1_meta, then t2_meta
     uint32_t* h_keys_merged  = nullptr;  // parks t1_keys_merged, then t2_keys_merged
     uint32_t* h_t2_xbits     = nullptr;  // parks t2_xbits
+    // T2 match staging tile count. compact uses 2 (cap/2 staging, ~2.3 GB at
+    // k=28); minimal sets it to 8 (cap/8 staging, ~570 MB) to fit 4 GiB cards
+    // at the cost of more PCIe round-trips during T2 match. Must be a power
+    // of 2 in [2, t2_num_buckets] — at k=28 strength=2 that's [2, 16].
+    // BatchPlotter's tier selection (kMinimalFloorBytes constant) gates
+    // when minimal vs compact gets picked.
+    int t2_tile_count = 2;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

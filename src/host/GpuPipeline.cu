@@ -1105,26 +1105,42 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                                   scratch.h_t2_xbits != nullptr);
 
     if (t2_compact_path) {
-        // Stages 2+3: N=2 tiled T2 match into half-cap device staging,
-        // D2H each pass into pinned host accumulators. Peak during
-        // match drops from cap*(8+4+4)=4160 MB to half_cap*(8+4+4)=2080
-        // MB at k=28, at the cost of one extra round-trip PCIe + a
-        // per-plot pinned h_t2_mi allocation (freed before T2 sort).
-        // num_buckets = (1<<section_bits) * (1<<match_key_bits). For T2,
-        // num_match_key_bits = strength (≥ 2), so buckets = 16 at
-        // strength=2 regardless of k. Splitting at the midpoint gives
-        // two roughly equal-sized passes.
+        // Stages 2+3: N-tile T2 match into cap/N device staging, D2H
+        // each pass into pinned host accumulators. Peak during match
+        // drops from cap*(8+4+4) = 4160 MB at k=28 to
+        // tile_cap*(8+4+4) = 4160/N MB, at the cost of N-1 extra PCIe
+        // round-trips and a per-plot pinned h_t2_mi allocation (freed
+        // before T2 sort).
+        //
+        // N = scratch.t2_tile_count: 2 = compact (~2080 MB staging),
+        // 8 = minimal (~520 MB staging, fits 4 GiB cards).
+        //
+        // Bucket count constraint: N must divide t2_num_buckets evenly
+        // (equivalently, N ≤ t2_num_buckets and both powers of 2).
+        // num_buckets = (1<<section_bits) * (1<<match_key_bits). At
+        // strength=2 num_match_key_bits=2, so buckets = 16 regardless
+        // of k. N=2 → 8 buckets/pass; N=8 → 2 buckets/pass; N=16 → 1.
         uint32_t const t2_num_buckets = (1u << t2p.num_section_bits)
                                       * (1u << t2p.num_match_key_bits);
-        uint32_t const t2_bucket_mid  = t2_num_buckets / 2;
-        uint64_t const t2_half_cap    = (cap + 1) / 2;
+        int const N = scratch.t2_tile_count;
+        if (N < 2 || (N & (N - 1)) != 0) {
+            throw std::runtime_error(
+                "scratch.t2_tile_count must be a power of 2 ≥ 2 (got " +
+                std::to_string(N) + ")");
+        }
+        if (static_cast<uint32_t>(N) > t2_num_buckets) {
+            throw std::runtime_error(
+                "scratch.t2_tile_count " + std::to_string(N) +
+                " exceeds t2_num_buckets " + std::to_string(t2_num_buckets));
+        }
+        uint64_t const t2_tile_cap = (cap + uint64_t(N) - 1) / uint64_t(N);
 
         uint64_t* d_t2_meta_stage  = nullptr;
         uint32_t* d_t2_mi_stage    = nullptr;
         uint32_t* d_t2_xbits_stage = nullptr;
-        s_malloc(stats, d_t2_meta_stage,  t2_half_cap * sizeof(uint64_t), "d_t2_meta_stage");
-        s_malloc(stats, d_t2_mi_stage,    t2_half_cap * sizeof(uint32_t), "d_t2_mi_stage");
-        s_malloc(stats, d_t2_xbits_stage, t2_half_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+        s_malloc(stats, d_t2_meta_stage,  t2_tile_cap * sizeof(uint64_t), "d_t2_meta_stage");
+        s_malloc(stats, d_t2_mi_stage,    t2_tile_cap * sizeof(uint32_t), "d_t2_mi_stage");
+        s_malloc(stats, d_t2_xbits_stage, t2_tile_cap * sizeof(uint32_t), "d_t2_xbits_stage");
         s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
 
         // scratch.h_meta (cap * u64) doubles as the pinned accumulator
@@ -1148,19 +1164,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             CHECK(launch_t2_match_range(cfg.plot_id.data(), t2p,
                                         d_t1_meta_sorted, d_t1_keys_merged, t1_count,
                                         d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                                        d_counter, t2_half_cap,
+                                        d_counter, t2_tile_cap,
                                         d_t2_match_temp,
                                         b_begin, b_end, stream));
             uint64_t pass_count = 0;
             CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
                                   cudaMemcpyDeviceToHost, stream));
             CHECK(cudaStreamSynchronize(stream));
-            if (pass_count > t2_half_cap) {
+            if (pass_count > t2_tile_cap) {
                 throw std::runtime_error(
                     "T2 match pass overflow: bucket range [" +
                     std::to_string(b_begin) + "," + std::to_string(b_end) +
                     ") produced " + std::to_string(pass_count) +
-                    " pairs, staging holds " + std::to_string(t2_half_cap));
+                    " pairs, staging holds " + std::to_string(t2_tile_cap) +
+                    " (consider lower N or fall back to compact tier)");
             }
             CHECK(cudaMemcpyAsync(h_t2_meta + host_offset, d_t2_meta_stage,
                                   pass_count * sizeof(uint64_t),
@@ -1172,15 +1189,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                                   pass_count * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost, stream));
             // Reset counter so the next pass writes at index 0 of the
-            // half-cap staging buffers.
+            // tile-cap staging buffers.
             CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
             CHECK(cudaStreamSynchronize(stream));
             return pass_count;
         };
 
-        uint64_t const count1 = run_pass(0,              t2_bucket_mid,   /*host_offset=*/0);
-        uint64_t const count2 = run_pass(t2_bucket_mid,  t2_num_buckets,  /*host_offset=*/count1);
-        t2_count = count1 + count2;
+        // N evenly-spaced bucket ranges. host_offset accumulates so each
+        // pass appends to the pinned host buffer behind the prior pass.
+        t2_count = 0;
+        for (int pass = 0; pass < N; ++pass) {
+            uint32_t const b_begin = uint32_t(uint64_t(pass)     * t2_num_buckets / uint64_t(N));
+            uint32_t const b_end   = uint32_t(uint64_t(pass + 1) * t2_num_buckets / uint64_t(N));
+            t2_count += run_pass(b_begin, b_end, /*host_offset=*/t2_count);
+        }
         if (t2_count > cap) throw std::runtime_error("T2 overflow");
 
         s_free(stats, d_t2_match_temp);
