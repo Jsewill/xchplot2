@@ -77,7 +77,7 @@ if(_xchplot2_nvcc)
 endif()
 unset(_xchplot2_nvcc CACHE)
 
-project(pos2-gpu VERSION 0.5.2 LANGUAGES C CXX CUDA)
+project(pos2-gpu VERSION 0.6.0 LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

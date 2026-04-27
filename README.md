@@ -34,10 +34,12 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   and newer). Builds auto-detect the installed GPU's `compute_cap`
   via `nvidia-smi`; override with `$CUDA_ARCHITECTURES` for fat or
   cross-target builds (see [Build](#build)).
-- **VRAM:** 8 GB minimum. Cards with < 15 GB free transparently use
-  the streaming pipeline; 16 GB+ cards use the persistent buffer pool
-  for faster steady-state. Both paths produce byte-identical plots.
-  Detailed breakdown in [VRAM](#vram).
+- **VRAM:** 4 GiB minimum at k=28. Cards with < 15 GB free use the
+  streaming pipeline (three sub-tiers — plain ~7.4 GiB, compact
+  ~5.3 GiB, minimal ~3.8 GiB — auto-picked by free VRAM); 16 GB+
+  cards use the persistent buffer pool for faster steady-state. All
+  paths produce byte-identical plots. Detailed breakdown in
+  [VRAM](#vram).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   pool-vs-streaming path from its own GPU's free VRAM — heterogeneous
@@ -272,6 +274,7 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal` | Override the streaming-tier auto-pick. Equivalent CLI flag: `--tier`. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback.          |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `cudaMalloc` / `cudaFree`.                     |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
@@ -320,28 +323,38 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 
 ## VRAM
 
-PoS2 plots are k=28 by spec. Two code paths, dispatched automatically
+PoS2 plots are k=28 by spec. Four code paths, dispatched automatically
 based on available VRAM:
 
 - **Pool path (~15 GB, 16 GB+ cards).** The persistent buffer pool is
   sized worst-case and reused across plots in `batch` mode for
   amortised allocator cost and double-buffered D2H. Targets for
   steady-state: RTX 4080 / 4090 / 5080 / 5090, A6000, etc.
-- **Streaming path (~8 GB).** Allocates per-phase and frees between
-  phases; T1/T2 sorts are tiled (N=2 and N=4 respectively) and the
-  merge-with-gather is split into three passes so the live set stays
-  under 8 GB. Targets 8 GB cards (GTX 1070 class and up). Slower per
-  plot (~3.7 s vs ~2.1 s at k=28 on a 4090) because it pays per-phase
-  `cudaMalloc`/`cudaFree` instead of amortising.
+- **Plain streaming (~7.4 GiB floor).** Allocates per-phase and frees
+  between phases; no pinned-host parks, single-pass T2 match. Used
+  on 10-11 GB cards that can't fit the pool but have headroom above
+  compact. ~400 ms/plot faster than compact.
+- **Compact streaming (~5.3 GiB floor).** Park/rehydrate of the large
+  intermediates on pinned host across their idle windows + N=2 T2
+  match staging (cap/2 ≈ 2280 MB at k=28). T1/T2 sorts are tiled
+  (N=2 and N=4) with merge trees. Targets 6-8 GiB cards.
+- **Minimal streaming (~3.8 GiB floor).** Compact's parks plus N=8
+  T2 match staging (cap/8 ≈ 570 MB at k=28). Targets 4 GiB cards
+  (GTX 1050 Ti / 1650, RTX 3050 4GB, MX450) at the cost of extra
+  PCIe round-trips during T2 match. Floor is estimated; please
+  report actual fit on real 4 GiB hardware. There is no smaller
+  tier — a forced minimal on a card below the floor throws.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
-pool doesn't fit, it transparently falls back to the streaming
-pipeline with no flag needed. Force streaming on any card with
-`XCHPLOT2_STREAMING=1`, useful for testing or for users who want the
-smaller peak regardless.
+pool doesn't fit, the streaming-tier dispatch picks the largest
+streaming tier that fits with a 128 MB margin. Force streaming on
+any card with `XCHPLOT2_STREAMING=1`. `--tier
+plain|compact|minimal|auto` (or `XCHPLOT2_STREAMING_TIER`) overrides
+the auto-pick — useful for testing or to step down from a tight
+margin (e.g. an 8 GiB card OOMing mid-plot can `--tier compact`).
 
-Plot output is bit-identical between the two paths — the streaming
-code reorganises memory, not algorithms.
+Plot output is bit-identical across all paths — streaming
+reorganises memory, not algorithms.
 
 ## Performance
 
