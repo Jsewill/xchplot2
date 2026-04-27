@@ -51,8 +51,22 @@ services:
         INSTALL_CUDA_HEADERS: "0"
         CUDA_ARCH:            "${CUDA_ARCH:-89}"
     image: xchplot2:cuda
-    devices:
-      - nvidia.com/gpu=all
+    # GPU pass-through. Works on both engines:
+    #   - Docker (with nvidia-container-toolkit + `nvidia-ctk runtime
+    #     configure --runtime=docker && systemctl restart docker`)
+    #   - Podman 5.x (with podman-compose 1.x+; equivalent to
+    #     `--device nvidia.com/gpu=all` via CDI)
+    # The previous `devices: nvidia.com/gpu=all` shorthand worked on
+    # podman but Docker silently ignored it as an unknown device path,
+    # leaving the container without libcuda.so.1 and producing a
+    # confusing "No matching device" failure mid-plot.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - ./plots:/out
 

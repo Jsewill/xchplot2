@@ -193,8 +193,20 @@ podman compose run --rm --entrypoint /usr/local/bin/sycl_sort_parity rocm
 
 First build is ~15-30 min (AdaptiveCpp + LLVM 18 compile from source);
 subsequent rebuilds reuse the cached layers. GPU performance inside
-the container is identical to native (devices pass through via CDI on
-NVIDIA, `/dev/kfd`+`/dev/dri` on AMD; kernels run on real hardware).
+the container is identical to native — kernels run on real hardware
+via the engine's GPU pass-through:
+
+- **NVIDIA**: requires `nvidia-container-toolkit` on the host. For
+  Docker users, also run once after install:
+  ```bash
+  sudo apt install nvidia-container-toolkit
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+  ```
+  Podman 5.x with CDI works without the runtime-configure step.
+- **AMD**: `/dev/kfd` + `/dev/dri` device files. The compose `rocm`
+  service handles this automatically; for bare `podman/docker run`
+  pass `--device /dev/kfd --device /dev/dri --group-add video`.
 
 #### AMD container — sudo, `--privileged`, and `ACPP_GFX`
 
@@ -208,9 +220,11 @@ silently or in confusing ways:
    but the kernels execute as silent no-ops at runtime — sort returns
    input unchanged, AES match finds zero matches, plots look valid
    but contain non-canonical proofs that won't qualify against real
-   challenges. `compose.yaml` enforces this — an unset `ACPP_GFX`
-   errors out at compose-parse time. Common values
-   (`rocminfo | grep gfx` to confirm yours):
+   challenges. `compose.yaml` defaults `ACPP_GFX` to a placeholder
+   string that AdaptiveCpp's HIP backend rejects loudly at build
+   time, so an unset value fails fast with the placeholder visible
+   in the error rather than silently using a default like `gfx1100`.
+   Common values (`rocminfo | grep gfx` to confirm yours):
 
    - `gfx1030` — RDNA2 Navi 21 (RX 6800 / 6800 XT / 6900 XT)
    - `gfx1031` — RDNA2 Navi 22 (RX 6700 XT / 6700 / 6800M)
