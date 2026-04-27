@@ -93,7 +93,17 @@ services:
         #   gfx1101 = RDNA3 Navi 32 (RX 7800 XT/7700 XT)
         #   gfx906  = Vega 20 (Radeon VII, MI50)
         #   gfx900  = Vega 10 (RX Vega 56/64, MI25)
-        ACPP_TARGETS:         "hip:${ACPP_GFX:?set ACPP_GFX to your GPU arch (e.g. gfx1031 for RX 6700 XT) — see rocminfo | grep gfx}"
+        # Use ${VAR:-default} (NOT ${VAR:?error}) so that building cuda
+        # / intel / cpu services without ACPP_GFX set doesn't trip a
+        # parse-time error — podman-compose evaluates :? across ALL
+        # services during YAML parse, not just the one being built.
+        # The placeholder value is intentionally invalid as a gfx
+        # target so AdaptiveCpp's HIP backend fails loudly with the
+        # placeholder string in its error message — much better than
+        # silently building wrong-arch amdgcn ISA from a default like
+        # gfx1100 (kernels would then execute as runtime no-ops, see
+        # the IMPORTANT block above).
+        ACPP_TARGETS:         "hip:${ACPP_GFX:-MISSING-set-ACPP_GFX-or-use-scripts-build-container-sh}"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         # No CUDA headers on the AMD path — they conflict with HIP's
         # uchar1/etc. typedefs. CudaHalfShim.hpp's __has_include guard

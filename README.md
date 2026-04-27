@@ -116,15 +116,38 @@ Three ways to get the dependencies in place, easiest first:
 
 ### 1. Container (`podman compose` or `docker compose`)
 
-Easiest path — let the wrapper detect your GPU and pick the right
-compose service automatically:
+Easiest path — `scripts/build-container.sh` does host-side GPU
+probing and feeds the right env vars to `compose build`:
 
 ```bash
 ./scripts/build-container.sh    # auto: nvidia-smi → cuda, rocminfo → rocm
 podman compose run --rm cuda plot -k 28 -n 10 -f <farmer-pk> -c <pool-contract> -o /out
 ```
 
-[`compose.yaml`](compose.yaml) defines three vendor-specific services
+**The script handles a handful of host-side decisions that bare
+`podman compose build` can't:**
+
+- **Vendor pick** (cuda / rocm / intel / cpu) from nvidia-smi /
+  rocminfo, or `--gpu cpu` to force CPU.
+- **Multi-GPU fat binary** (e.g. `CUDA_ARCH="61;86"` on a
+  1070+3060 rig) — compose alone defaults to a single arch.
+- **Pascal/Volta auto-pin** to `nvidia/cuda:12.9.1-devel-ubuntu24.04`
+  when min arch < 75. CUDA 13 dropped sub-Turing codegen, so a Pascal
+  user without this pin hits a build-time `Unsupported gpu
+  architecture 'compute_61'` error inside the container.
+- **AMD `ACPP_GFX` extract** from rocminfo + the RDNA1 (gfx1010 →
+  gfx1013) workaround for Radeon Pro W5700.
+- **`--no-cache`** pass-through to force a clean rebuild after a
+  toolchain bump.
+
+You CAN run `podman compose build` directly — it just means setting
+those env vars yourself. The compose YAML's defaults are conservative
+(CUDA 13.0, sm_89, no AMD target without `ACPP_GFX`), so plain
+`podman compose build cuda` only "just works" on Turing-or-newer
+NVIDIA hosts. Anything else needs the script or the equivalent
+manual env:
+
+[`compose.yaml`](compose.yaml) defines four vendor-specific services
 sharing one [`Containerfile`](Containerfile); the script just runs
 `compose build` against whichever matches your hardware. Override
 manually if you prefer:
