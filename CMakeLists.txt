@@ -594,8 +594,20 @@ set_target_properties(xchplot2_cli PROPERTIES
 )
 
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
+#
+# LINK_GROUP RESCAN wraps xchplot2_cli + pos2_gpu_host so the linker
+# rescans them as a unit. xchplot2_cli holds the CUDA OBJECT files
+# (initialize_aes_tables, cub_sort_*); pos2_gpu_host's BatchPlotter.cpp
+# and SortSyclCub.cpp reference those symbols. With single-pass static-
+# archive scanning the references would land after xchplot2_cli was
+# already processed — rescan resolves the back-edge.
 add_executable(xchplot2 tools/xchplot2/main.cpp)
-target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
+target_link_libraries(xchplot2 PRIVATE
+    "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+# pos2-chip headers define non-inline soft_aesenc/soft_aesdec, which now
+# end up in two TUs (PlotFileWriterParallel.cpp and CpuPlotter.cpp) inside
+# pos2_gpu_host. Tolerate the duplicates at host link.
+target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
 
 # Parity tests are nvcc-compiled (.cu) and reference __global__ kernels
 # from the bench-specific bitsliced AES path. They build only on the CUDA
