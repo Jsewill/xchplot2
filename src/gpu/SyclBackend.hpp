@@ -13,6 +13,7 @@
 #pragma once
 
 #include "gpu/AesTables.inl"
+#include "gpu/DeviceIds.hpp"
 
 // cuda_fp16.h must precede sycl/sycl.hpp when this header is consumed
 // from an nvcc TU — AdaptiveCpp's libkernel/detail/half_representation.hpp
@@ -56,16 +57,20 @@ inline void async_error_handler(sycl::exception_list exns) noexcept
 
 // Per-thread target device id. A worker thread sets this once at startup
 // via set_current_device_id() so that its subsequent queue() call returns
-// a queue bound to the requested GPU. Value of -1 (the default) means
-// "use the default gpu_selector_v" — which is the single-device path, the
-// only path pre-multi-GPU and the zero-configuration user experience.
+// a queue bound to the requested device. Sentinel values:
+//   kDefaultGpuId (-1)  : sycl::gpu_selector_v (single-device default,
+//                         pre-multi-GPU zero-config path)
+//   kCpuDeviceId  (-2)  : sycl::cpu_selector_v (--cpu / --devices cpu;
+//                         AdaptiveCpp OMP backend on the CPU build path)
+//   0..N-1              : explicit GPU index from
+//                         sycl::device::get_devices(gpu)
 //
 // Thread-local, not global: the multi-device fan-out in BatchPlotter runs
-// N worker threads, each binding to a distinct GPU. The main thread stays
-// at -1 and sees the default selector.
+// N worker threads, each binding to a distinct device. The main thread
+// stays at kDefaultGpuId and sees the default selector.
 inline int& current_device_id_ref()
 {
-    thread_local int id = -1;
+    thread_local int id = kDefaultGpuId;
     return id;
 }
 
@@ -79,19 +84,24 @@ inline int current_device_id()
     return current_device_id_ref();
 }
 
-// Per-thread SYCL queue. Bound to the thread's current device id, or to
-// gpu_selector_v when the id is -1 (default, single-device path). A
-// unique_ptr wrapper lets us defer construction until the thread has had
-// a chance to set its device id.
+// Per-thread SYCL queue. Bound to the thread's current device id (see
+// the kDefaultGpuId / kCpuDeviceId sentinels above). A unique_ptr wrapper
+// lets us defer construction until the thread has had a chance to set
+// its device id.
 //
 // gpu_selector_v ensures the CUDA-backed GPU (or whichever AdaptiveCpp
-// was configured for) is picked over the OpenMP host device.
+// was configured for) is picked over the OpenMP host device. cpu_selector_v
+// bypasses GPU enumeration entirely and lands on AdaptiveCpp's OMP backend
+// (CPU build path, ACPP_TARGETS=omp).
 inline sycl::queue& queue()
 {
     thread_local std::unique_ptr<sycl::queue> q;
     if (!q) {
         int const id = current_device_id();
-        if (id < 0) {
+        if (id == kCpuDeviceId) {
+            q = std::make_unique<sycl::queue>(sycl::cpu_selector_v,
+                                              async_error_handler);
+        } else if (id < 0) {
             q = std::make_unique<sycl::queue>(sycl::gpu_selector_v,
                                               async_error_handler);
         } else {

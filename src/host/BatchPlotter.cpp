@@ -5,6 +5,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
+#include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
 
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
@@ -233,13 +234,19 @@ private:
 namespace {
 
 // Per-worker pipeline. Extracted from run_batch so the multi-device
-// fan-out can spawn N of these concurrently — one thread per GPU, each
-// with its own pool / channel / consumer. The outer run_batch validates
-// homogeneity and runs the disk-space preflight once; this helper
-// assumes both have already been done on `entries`.
+// fan-out can spawn N of these concurrently — one thread per device,
+// each with its own pool / channel / consumer. The outer run_batch
+// validates homogeneity and runs the disk-space preflight once; this
+// helper assumes both have already been done on `entries`.
 //
-// device_id < 0  → keep the default SYCL gpu_selector_v (single-device
-//                  default; zero-config users see unchanged behavior).
+// device_id sentinels (see src/gpu/DeviceIds.hpp):
+//   kDefaultGpuId (-1) → keep the default SYCL gpu_selector_v
+//                        (single-device default; zero-config users
+//                        see unchanged behavior).
+//   kCpuDeviceId  (-2) → CPU worker via sycl::cpu_selector_v
+//                        (--cpu / --devices cpu; AdaptiveCpp OMP
+//                        backend, much slower than GPU).
+//   0..N-1            → explicit GPU index from get_devices(gpu).
 // worker_id  < 0 → single-device path; currently unused beyond
 //                  documenting intent but reserved for a future per-
 //                  worker log prefix (see fprintf calls below — one
@@ -627,6 +634,10 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     //   use_all_devices  → enumerate at runtime, one worker per GPU
     //   device_ids       → use these explicit ids
     //   (neither)        → empty list → single-device default selector
+    //   include_cpu      → orthogonal: also append kCpuDeviceId so the
+    //                      CPU runs as one more worker. Mixes with the
+    //                      above (--cpu alone → CPU only; --cpu --devices
+    //                      all → all GPUs + CPU; etc.).
     std::vector<int> device_ids;
     if (opts.use_all_devices) {
         int const n = gpu_device_count();
@@ -640,6 +651,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         }
     } else if (!opts.device_ids.empty()) {
         device_ids = opts.device_ids;
+    }
+    if (opts.include_cpu &&
+        std::find(device_ids.begin(), device_ids.end(), kCpuDeviceId)
+            == device_ids.end()) {
+        device_ids.push_back(kCpuDeviceId);
     }
 
     auto const t_start = std::chrono::steady_clock::now();
