@@ -40,10 +40,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: keygen-rs
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
       - name: cargo check
         run: cargo check --all-targets --locked || cargo check --all-targets
       - name: cargo clippy (advisory)
@@ -51,6 +53,49 @@ jobs:
         continue-on-error: true
       - name: cargo test
         run: cargo test --all-targets
+
+  hadolint:
+    name: hadolint Containerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Containerfile
+          # CUDA / ROCm base images make version-pinning warnings (DL3008,
+          # DL3009) impractical — package versions shift between base image
+          # rolls and the toolkit pin lives in BASE_DEVEL. Same for the
+          # `set -o pipefail` warnings on RUN-with-pipe (DL4006) — those
+          # pipes are bootstrap-time noise, not runtime data paths. Filter
+          # to errors so we still catch real bugs (root, ADD vs COPY,
+          # missing && \, COPY --chown typos, etc.).
+          failure-threshold: error
+
+  compose-config:
+    name: docker compose config validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: docker compose config --quiet
+        # Catches typos in service names / build-arg keys / unresolvable
+        # ${VAR} placeholders without ever pulling a base image. ~5s.
+        run: docker compose -f compose.yaml config --quiet
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: crate-ci/typos@master
+
+  markdownlint:
+    name: markdownlint README
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DavidAnson/markdownlint-cli2-action@v18
+        with:
+          globs: README.md
 
   install-container-deps-dryrun:
     name: install-container-deps.sh — dry-run fixtures

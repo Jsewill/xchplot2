@@ -1,0 +1,12 @@
+{
+  "_comment": "README is prose-heavy and includes terminal output, wide tables, and mixed list markers. Disable rules that produce noise without catching real issues. MD051 is also disabled because markdownlint's link-fragment slug algorithm differs from GitHub's (e.g. `### Multi-GPU: --devices` slugs differently between the two).",
+  "MD004": false,
+  "MD013": false,
+  "MD026": false,
+  "MD028": false,
+  "MD031": false,
+  "MD032": false,
+  "MD040": false,
+  "MD051": false,
+  "MD060": false
+}
