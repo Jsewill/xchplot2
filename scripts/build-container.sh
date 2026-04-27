@@ -8,6 +8,9 @@
 #
 # cuda-only branch is NVIDIA-only; use the main branch for AMD/Intel.
 #
+# First-time host setup (engine + nvidia-container-toolkit + CDI spec):
+#   scripts/install-container-deps.sh
+#
 # Usage:
 #   ./scripts/build-container.sh                 # auto-detect
 #   ./scripts/build-container.sh --no-cache      # force clean rebuild

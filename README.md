@@ -117,6 +117,27 @@ Outputs:
 - `build/tools/xchplot2/xchplot2`
 - `build/tools/parity/{aes,xs,t1,t2,t3}_parity` — bit-exact CPU/GPU tests
 
+### Container (`podman compose` or `docker compose`)
+
+The CUDA Toolkit + Rust toolchain live inside the image — the host
+only needs an engine plus `nvidia-container-toolkit` for GPU
+pass-through. `scripts/install-container-deps.sh` installs both, then
+`scripts/build-container.sh` probes `nvidia-smi` for the right
+`CUDA_ARCH` and runs `compose build`:
+
+```bash
+./scripts/install-container-deps.sh    # one-time: podman + nvidia-container-toolkit + CDI
+./scripts/build-container.sh           # auto-pins CUDA 12.9 base on pre-Turing rigs
+podman compose run --rm cuda plot -k 28 -n 10 \
+    -f <farmer-pk> -c <pool-contract> -o /out
+```
+
+Plot files land in `./plots/` on the host. `compose.yaml` uses CDI
+shorthand (`devices: - nvidia.com/gpu=all`) so the runtime path is
+podman-first; bare `docker run --gpus all` still works after
+`install-container-deps.sh --engine docker`, but the `docker compose
+run` step won't see the GPU.
+
 ### Windows (experimental)
 
 This branch is CUDA-only, so a Windows build needs nothing beyond the
