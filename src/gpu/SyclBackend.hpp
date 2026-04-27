@@ -60,8 +60,12 @@ inline void async_error_handler(sycl::exception_list exns) noexcept
 // a queue bound to the requested device. Sentinel values:
 //   kDefaultGpuId (-1)  : sycl::gpu_selector_v (single-device default,
 //                         pre-multi-GPU zero-config path)
-//   kCpuDeviceId  (-2)  : sycl::cpu_selector_v (--cpu / --devices cpu;
-//                         AdaptiveCpp OMP backend on the CPU build path)
+//   kCpuDeviceId  (-2)  : sycl::cpu_selector_v (latent — kept so a future
+//                         SYCL-on-CPU benchmark path can compare against
+//                         pos2-chip's hand-tuned CPU plotter; production
+//                         --cpu / --devices cpu plotting bypasses this
+//                         and dispatches directly to run_one_plot_cpu()
+//                         in BatchPlotter, see CpuPlotter.cpp)
 //   0..N-1              : explicit GPU index from
 //                         sycl::device::get_devices(gpu)
 //
