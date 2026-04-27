@@ -297,7 +297,29 @@ set_target_properties(xchplot2_cli PROPERTIES
 
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
 add_executable(xchplot2 tools/xchplot2/main.cpp)
-target_link_libraries(xchplot2 PRIVATE xchplot2_cli)
+# Wrap the CUDA-bearing static libs in --start-group/--end-group so
+# the linker can rescan to resolve cross-archive references. Since
+# pos2_gpu became an INTERFACE library (the nvlink-dedup fix moved
+# pos2_gpu_cuda_obj's .o files into xchplot2_cli only), pos2_gpu_host
+# now references symbols (initialize_aes_tables, run_gpu_pipeline,
+# bind_current_device, ...) that live in xchplot2_cli — its own
+# consumer. CMake's default transitive link order has xchplot2_cli
+# BEFORE pos2_gpu_host on the cc line, so single-pass ld scans past
+# the resolutions before it sees the unresolved references and bails.
+# Cargo install already passes --start-group via build.rs; the cmake
+# exe needs the same treatment.
+target_link_libraries(xchplot2 PRIVATE
+    "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+# pos2-chip's soft_aesenc / soft_aesdec are defined (not just declared)
+# in headers without `inline`, so any TU that includes the chain — both
+# PlotFileWriterParallel.cpp and CpuPlotter.cpp do, transitively via
+# PlotFile.hpp / Plotter.hpp — emits its own copy. Definitions are
+# bit-identical (same source, same compile flags) so first-wins is
+# correctness-safe. cargo install already passes the same flag in
+# build.rs for an unrelated keygen-rs / libstd duplication; the cmake
+# exe needs it too once CpuPlotter joined PlotFileWriterParallel as a
+# pos2-chip-including TU.
+target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
 
 # Parity tests. Each test gets $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
 # explicitly: pos2_gpu (INTERFACE) doesn't carry the .o files, so
