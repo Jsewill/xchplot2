@@ -88,11 +88,12 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     8 GB cards (3070, 2070 Super) comfortably fit.
   - **Minimal streaming** (~3.7 GB peak + 128 MB margin): same parks
     as compact, plus N=8 T2 match staging (cap/8 ≈ 570 MB vs compact's
-    cap/2 ≈ 2280 MB). Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX
-    3050 4GB, MX450) at the cost of extra PCIe round-trips during T2
-    match. Floor is estimated, not yet measured on real 4 GiB
-    hardware — please report actual fit. Detailed breakdown in
-    [VRAM](#vram).
+    cap/2 ≈ 2280 MB). Targets 4 GiB cards — NVIDIA: GTX 1050 Ti /
+    1650, RTX 3050 4GB, MX450; AMD: RX 6500 XT / 6400 (gfx1034),
+    RX 5500 XT 4GB (gfx1012, RDNA1 spoof) — at the cost of extra
+    PCIe round-trips during T2 match. Floor is estimated, not yet
+    measured on real 4 GiB hardware — please report actual fit.
+    Detailed breakdown in [VRAM](#vram).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one

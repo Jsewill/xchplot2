@@ -158,8 +158,10 @@ case "$GPU" in
             echo "[build-container] ERROR: couldn't detect AMD gfx target." >&2
             echo "[build-container] Either install rocminfo so the host probe finds it," >&2
             echo "[build-container] or set ACPP_GFX explicitly to your card's arch:" >&2
+            echo "[build-container]   ACPP_GFX=gfx1012  $0  --gpu amd  # RX 5500 XT 4GB (RDNA1 — auto-spoofed to gfx1013)" >&2
             echo "[build-container]   ACPP_GFX=gfx1030  $0  --gpu amd  # RX 6800 / 6800 XT / 6900 XT" >&2
             echo "[build-container]   ACPP_GFX=gfx1031  $0  --gpu amd  # RX 6700 XT / 6700 / 6800M" >&2
+            echo "[build-container]   ACPP_GFX=gfx1034  $0  --gpu amd  # RX 6500 XT / 6400 (4 GiB → minimal tier)" >&2
             echo "[build-container]   ACPP_GFX=gfx1100  $0  --gpu amd  # RX 7900 XTX / XT" >&2
             echo "[build-container] (run \"rocminfo | grep gfx\" if available)" >&2
             exit 1
