@@ -112,6 +112,20 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
 
 ## Build
 
+### Which path should I use?
+
+- **"I just want to plot, Linux host"** → **container (path 1)**. Smallest
+  host install (just `podman` + `podman-compose`), all toolchain lives
+  inside the image. Auto-detects your GPU and pins the right CUDA / ROCm
+  base.
+- **"NVIDIA only, native binary, no SYCL/AdaptiveCpp"** → **`cuda-only`
+  branch (path 2)**. Three host packages — `cmake` + `build-essential`
+  + the CUDA Toolkit. No LLVM/lld/AdaptiveCpp install. Smaller dep
+  surface than main; same end result for NVIDIA users.
+- **"Full build — AMD / Intel / CPU support, parity tests on the host"**
+  → **`install-deps.sh` (path 3)**. Auto-installs cmake, lld, LLVM 18,
+  AdaptiveCpp from source. ~30-45 min first-time setup.
+
 Three ways to get the dependencies in place, easiest first:
 
 ### 1. Container (`podman compose` or `docker compose`)
