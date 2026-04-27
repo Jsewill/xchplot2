@@ -74,6 +74,14 @@ void print_usage(char const* prog)
         << "                                      works on hosts with no GPU at all.\n"
         << "                                      Plotting is 1-2 orders of magnitude\n"
         << "                                      slower than GPU.\n"
+        << "    --tier plain|compact|auto       : force streaming pipeline tier\n"
+        << "                                      when GPU pool doesn't fit. plain =\n"
+        << "                                      ~7.42 GiB floor (k=28), faster.\n"
+        << "                                      compact = ~5.33 GiB floor, fits on\n"
+        << "                                      tight 8 GiB cards. auto (default) =\n"
+        << "                                      pick plain if it fits, else compact.\n"
+        << "                                      Equivalent to XCHPLOT2_STREAMING_TIER\n"
+        << "                                      env var; CLI flag wins if both set.\n"
         << "  " << prog << " parity-check [--dir PATH]\n"
         << "    Run every *_parity binary in PATH (default: ./build/tools/parity)\n"
         << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
@@ -234,6 +242,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose") opts.verbose = true;
             else if (a == "--cpu")                  opts.include_cpu = true;
+            else if (a == "--tier" && i + 1 < argc) {
+                std::string t = argv[++i];
+                if (t != "plain" && t != "compact" && t != "auto") {
+                    std::cerr << "Error: --tier expects 'plain', 'compact', or "
+                                 "'auto' (got '" << t << "')\n";
+                    return 1;
+                }
+                opts.streaming_tier = (t == "auto") ? "" : t;
+            }
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: --devices expects 'all', 'cpu', or a "
@@ -352,6 +369,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
+        std::string plot_streaming_tier;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -376,6 +394,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--testnet"    || a == "-T") testnet = true;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
+            else if  (a == "--tier" && need(1)) {
+                std::string t = argv[++i];
+                if (t != "plain" && t != "compact" && t != "auto") {
+                    std::cerr << "Error: --tier expects 'plain', 'compact', or "
+                                 "'auto' (got '" << t << "')\n";
+                    return 1;
+                }
+                plot_streaming_tier = (t == "auto") ? "" : t;
+            }
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
                 if (!parse_devices_arg(argv[++i], tmp)) {
@@ -536,6 +563,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.device_ids      = plot_device_ids;
             opts.use_all_devices = plot_use_all_devices;
             opts.include_cpu     = plot_include_cpu;
+            opts.streaming_tier  = plot_streaming_tier;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;

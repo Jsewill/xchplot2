@@ -56,11 +56,21 @@ struct BatchResult {
 //                     through pos2-chip's Plotter directly (no CUDA
 //                     calls); 1-2 orders of magnitude slower than GPU,
 //                     useful for GPU-less hosts or as an extra worker.
+//   streaming_tier  — manual override for the streaming pipeline tier
+//                     (when the GPU pool doesn't fit). Accepted values:
+//                     "plain" (~7.4 GiB floor at k=28, ~10-15% faster),
+//                     "compact" (~5.3 GiB floor, fits on tight 8 GiB
+//                     cards). Empty string = auto: pick plain if it
+//                     fits, else compact. Equivalent to
+//                     XCHPLOT2_STREAMING_TIER env var; settable via
+//                     --tier on the CLI; the struct field takes
+//                     precedence over the env var.
 struct BatchOptions {
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;
     bool             include_cpu     = false;
+    std::string      streaming_tier;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp

@@ -314,10 +314,36 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         constexpr uint64_t kCompactFloorBytes = 5328ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
-        if (free_bytes >= kPlainFloorBytes) {
+        // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
+        // > XCHPLOT2_STREAMING_TIER env var > auto-pick by free VRAM. The
+        // manual overrides bypass the auto-pick threshold but still bail
+        // out cleanly if the chosen tier definitely won't fit (compact
+        // floor is a hard lower bound; forced-plain on a card with less
+        // than the plain floor warns + proceeds — caller asked).
+        char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
+        std::string const tier_pref =
+            !opts.streaming_tier.empty() ? opts.streaming_tier :
+            (tier_env ? std::string(tier_env) : std::string());
+        bool want_plain;
+        if (tier_pref == "plain") {
+            want_plain = true;
+        } else if (tier_pref == "compact") {
+            want_plain = false;
+        } else {
+            want_plain = (free_bytes >= kPlainFloorBytes);
+        }
+        if (want_plain && free_bytes < kPlainFloorBytes) {
+            std::fprintf(stderr,
+                "[batch] streaming tier: plain forced (%.2f GiB free < %.2f GiB "
+                "plain floor) — proceeding, may OOM mid-plot\n",
+                free_bytes / double(1ULL << 30),
+                kPlainFloorBytes / double(1ULL << 30));
+        }
+
+        if (want_plain) {
             // Plain tier: zero PCIe overhead, all parks skipped.
             std::fprintf(stderr,
-                "[batch] streaming tier: plain (%.2f GiB free ≥ %.2f GiB floor)\n",
+                "[batch] streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
         } else if (free_bytes >= kCompactFloorBytes) {
