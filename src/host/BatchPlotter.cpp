@@ -319,7 +319,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         return res;
     }
 
-    if (device_id >= 0) bind_current_device(device_id);
+    if (device_id >= 0 || device_id == kCpuDeviceId) bind_current_device(device_id);
     initialize_aes_tables();
 
     bool const verbose = opts.verbose;
