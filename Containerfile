@@ -68,13 +68,15 @@ ARG ACPP_TARGETS=
 ARG XCHPLOT2_BUILD_CUDA=ON
 ARG INSTALL_CUDA_HEADERS=0
 ARG CUDA_ARCH=89
-# LLVM/clang root used to build AdaptiveCpp. Default = Ubuntu's llvm-18.
-# AMD/ROCm overrides this to /opt/rocm/llvm so the LLVM version matches
-# ROCm's bitcode libraries (ocml.bc / ockl.bc), avoiding "Unknown
-# attribute kind (102)" bitcode-version errors when targeting HIP.
-# LLVM_CMAKE_DIR is the dir containing LLVMConfig.cmake (Ubuntu and
-# ROCm lay these out differently — Ubuntu: $LLVM_ROOT/cmake, ROCm:
-# $LLVM_ROOT/lib/cmake/llvm).
+# LLVM/clang root used to build AdaptiveCpp. Pinned to Ubuntu's llvm-18
+# for every compose service (cuda / rocm / intel / cpu) — none of them
+# override these args. The HIP-backend version match-up happens at
+# *runtime*, not build-time: ROCm 6.2's bundled clang at /opt/rocm/llvm
+# ships LLVM 18.0git, so its device bitcode (ocml.bc, ockl.bc) is
+# ABI-compatible with the libacpp-rt that AdaptiveCpp linked against
+# Ubuntu's llvm-18. ROCm 7.x dropped LLVMConfig.cmake from its rocm-llvm
+# package, which is why compose.yaml's rocm service pins BASE to 6.2.
+# LLVM_CMAKE_DIR points at the dir containing LLVMConfig.cmake.
 ARG LLVM_ROOT=/usr/lib/llvm-18
 ARG LLVM_CMAKE_DIR=/usr/lib/llvm-18/cmake
 
