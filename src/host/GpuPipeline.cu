@@ -182,6 +182,19 @@ inline void s_init_from_env(StreamingStats& s)
     }
 }
 
+// Format a byte count as both raw bytes and decimal MB. The previous
+// `bytes >> 20` form (integer right-shift = truncating divide by 1 MiB)
+// rounded any sub-MiB request down to "0 MB", which masked both the
+// real allocation size and any genuine zero-byte sizing bug at the
+// call site. Use this helper in every error path so a future
+// `requested=0` is unambiguous (raw bytes settles it).
+inline std::string s_fmt_bytes(size_t bytes) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf),
+                  "%zu bytes (%.2f MB)", bytes, bytes / 1048576.0);
+    return std::string(buf);
+}
+
 template <typename T>
 inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reason)
 {
@@ -189,9 +202,9 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
         throw std::runtime_error(
             std::string("streaming VRAM cap: phase=") + s.phase +
             " alloc=" + reason +
-            " live=" + std::to_string(s.live >> 20) +
-            " + new="  + std::to_string(bytes  >> 20) +
-            " would exceed cap=" + std::to_string(s.cap >> 20) + " MB");
+            " live=" + s_fmt_bytes(s.live) +
+            " + new=" + s_fmt_bytes(bytes) +
+            " would exceed cap=" + s_fmt_bytes(s.cap));
     }
     void* p = nullptr;
     cudaError_t err = cudaMalloc(&p, bytes);
@@ -199,9 +212,9 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
         throw std::runtime_error(
             std::string("cudaMalloc(") + reason + "): " + cudaGetErrorString(err) +
             " — phase=" + s.phase +
-            " requested=" + std::to_string(bytes >> 20) +
-            " MB live=" + std::to_string(s.live >> 20) +
-            " MB. Card likely too small for this k via the streaming "
+            " requested=" + s_fmt_bytes(bytes) +
+            " live=" + s_fmt_bytes(s.live) +
+            ". Card likely too small for this k via the streaming "
             "pipeline; try a smaller k or a card with more VRAM.");
     }
     out = static_cast<T*>(p);
