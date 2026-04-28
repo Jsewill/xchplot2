@@ -976,31 +976,123 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_t1_meta = nullptr;
     uint32_t* d_t1_mi   = nullptr;
     void*     d_t1_match_temp = nullptr;
-    s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
-    s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
-    s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
+    uint64_t  t1_count = 0;
 
-    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
-    CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          d_t1_meta, d_t1_mi, d_counter, cap,
-                          d_t1_match_temp, &t1_temp_bytes, stream));
+    // Cut #4 (minimal tier): T1 match sliced per section_l.
+    // Without slicing, T1 match peaks at d_xs (cap × 8) + d_t1_meta
+    // (cap × 8) + d_t1_mi (cap × 4) + temp ≈ 5280 MB at k=28 — the new
+    // bottleneck after cuts #1+#2+#3 brought T1 sort, T2 sort, and T3
+    // match below 4 GiB. Each section_l pass writes to cap/N device
+    // staging buffers, D2H to scratch.h_meta + a per-plot h_t1_mi
+    // accumulator. After all passes, d_xs is freed and d_t1_mi is
+    // re-hydrated full-cap for the upcoming T1 sort. Peak: 2080
+    // (d_xs) + 12 cap/N (stage) + temp ≈ 2940 MB at N=4. h_meta
+    // already holds the unsorted meta when entering T1 sort, so the
+    // existing parking step below becomes a no-op (gated on
+    // d_t1_meta != nullptr).
+    bool const tiled_t1_match = (scratch.gather_tile_count >= 2 &&
+                                 scratch.h_meta != nullptr);
+    if (tiled_t1_match) {
+        uint32_t const num_sections   = 1u << t1p.num_section_bits;
+        uint32_t const num_match_keys = 1u << t1p.num_match_key_bits;
+        uint32_t const t1_num_buckets = num_sections * num_match_keys;
+        uint64_t const tile_cap_t1    = (cap + uint64_t(num_sections) - 1)
+                                        / uint64_t(num_sections);
 
-    uint64_t t1_count = 0;
-    CHECK(cudaMemcpy(&t1_count, d_counter, sizeof(uint64_t),
-                     cudaMemcpyDeviceToHost));
-    if (t1_count > cap) throw std::runtime_error("T1 overflow");
-    validate_t1_count(t1_count, cfg.k);
+        uint64_t* d_t1_meta_stage = nullptr;
+        uint32_t* d_t1_mi_stage   = nullptr;
+        s_malloc(stats, d_t1_meta_stage,  tile_cap_t1 * sizeof(uint64_t), "d_t1_meta_stage");
+        s_malloc(stats, d_t1_mi_stage,    tile_cap_t1 * sizeof(uint32_t), "d_t1_mi_stage");
+        s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,                  "d_t1_match_temp");
 
-    s_free(stats, d_t1_match_temp);
-    // Xs fully consumed.
-    s_free(stats, d_xs);
+        // Per-plot pinned T1 mi accumulator (same shape as h_t2_mi in
+        // T2-match compact path). h_meta serves as the meta accumulator
+        // directly — its T1 unsorted-meta park lifetime starts here, so
+        // the data lands ready for cut #1's gather phase to read.
+        uint32_t* h_t1_mi = streaming_alloc_pinned_uint32(cap);
+        if (!h_t1_mi) throw std::runtime_error("pinned alloc for h_t1_mi failed");
+
+        CHECK(launch_t1_match_prepare(t1p, d_xs, total_xs, d_counter,
+                                      d_t1_match_temp, &t1_temp_bytes,
+                                      stream));
+
+        for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
+            CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+            CHECK(launch_t1_match_range(
+                cfg.plot_id.data(), t1p, d_xs, total_xs,
+                d_t1_meta_stage, d_t1_mi_stage, d_counter, tile_cap_t1,
+                d_t1_match_temp,
+                /*bucket_begin=*/section_l * num_match_keys,
+                /*bucket_end=*/(section_l + 1) * num_match_keys,
+                stream));
+
+            uint64_t pass_count = 0;
+            CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            if (pass_count > tile_cap_t1) {
+                throw std::runtime_error(
+                    "T1 match pass overflow: section_l=" +
+                    std::to_string(section_l) + " produced " +
+                    std::to_string(pass_count) + " pairs, staging holds " +
+                    std::to_string(tile_cap_t1));
+            }
+            CHECK(cudaMemcpyAsync(scratch.h_meta + t1_count, d_t1_meta_stage,
+                                  pass_count * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(h_t1_mi + t1_count, d_t1_mi_stage,
+                                  pass_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            t1_count += pass_count;
+        }
+        if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        validate_t1_count(t1_count, cfg.k);
+
+        s_free(stats, d_t1_match_temp);
+        s_free(stats, d_t1_mi_stage);
+        s_free(stats, d_t1_meta_stage);
+        // d_xs fully consumed.
+        s_free(stats, d_xs);
+
+        // Re-hydrate d_t1_mi full-cap for the upcoming T1 sort.
+        s_malloc(stats, d_t1_mi, cap * sizeof(uint32_t), "d_t1_mi");
+        CHECK(cudaMemcpyAsync(d_t1_mi, h_t1_mi,
+                              t1_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        streaming_free_pinned_uint32(h_t1_mi);
+        // d_t1_meta stays null — h_meta has the unsorted meta, the
+        // existing park step below is gated on d_t1_meta and becomes
+        // a no-op. Cut #1's gather phase H2Ds h_meta back into d_t1_meta
+        // before the gather (line ~1110).
+    } else {
+        s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
+        s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
+        s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
+
+        CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+        CHECK(launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                              d_t1_meta, d_t1_mi, d_counter, cap,
+                              d_t1_match_temp, &t1_temp_bytes, stream));
+
+        CHECK(cudaMemcpy(&t1_count, d_counter, sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost));
+        if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        validate_t1_count(t1_count, cfg.k);
+
+        s_free(stats, d_t1_match_temp);
+        // Xs fully consumed.
+        s_free(stats, d_xs);
+    }
 
     // Compact-streaming: park d_t1_meta on pinned host across T1 sort.
     // The sort only needs d_t1_mi as key; d_t1_meta is only consumed
     // by the final gather_u64 at the end of this phase. Parking drops
     // the T1 sort live set by ~2 GB at k=28. No-op when scratch.h_meta
-    // is nullptr (plain streaming).
-    if (scratch.h_meta) {
+    // is nullptr (plain streaming) OR when cut #4 (tiled_t1_match)
+    // wrote h_meta directly per-pass (d_t1_meta is null).
+    if (scratch.h_meta && d_t1_meta) {
         CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
                               t1_count * sizeof(uint64_t),
                               cudaMemcpyDeviceToHost, stream));

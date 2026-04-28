@@ -416,10 +416,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 stream_scratch.t3_input_slice_count = 1 << num_section_bits;
                 std::fprintf(stderr,
                     "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
-                    "park/rehydrate + N=8 T2 + N=4 sort gather + N=%d T3 input slicing, "
-                    "expect ~5-15 s/plot extra PCIe)\n",
+                    "park/rehydrate + N=8 T2 + N=%d T1-match + T1/T2 sort gather + "
+                    "N=%d T3 input slicing, expect ~5-15 s/plot extra PCIe)\n",
                     free_bytes / double(1ULL << 30),
                     kMinimalFloorBytes / double(1ULL << 30),
+                    stream_scratch.t3_input_slice_count,
                     stream_scratch.t3_input_slice_count);
             } else {
                 std::fprintf(stderr,
