@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -33,12 +34,46 @@ namespace {
 // throw helpers in GpuPipeline.cu are streaming-pipeline specific; the pool
 // just allocates worst-case sizes once at construction so a one-line wrap
 // suffices.
+// Format a byte count as "<N> bytes (<N.NN> MB)" for diagnostics. The
+// raw byte count surfaces sub-MiB requests that would otherwise round
+// to "0 MB"; the MB form keeps human readability for the > 1 MiB case.
+inline std::string fmt_alloc_bytes(size_t bytes)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%zu bytes (%.2f MB)",
+                  bytes, double(bytes) / (1024.0 * 1024.0));
+    return std::string(buf);
+}
+
+// AdaptiveCpp's CUDA allocator throws sycl::exception on cudaMalloc
+// failure (e.g. "cuda_allocator: cudaMalloc() failed (error code =
+// CUDA:2)" for cudaErrorMemoryAllocation). Older / non-CUDA backends
+// may instead return nullptr. Cover both paths with one diagnostic
+// shape so callers see "sycl::malloc_device(d_pair_a, 4690 MB) failed:
+// <underlying>" regardless of which branch fired. This also catches
+// the throw synchronously so the async error handler doesn't log the
+// same CUDA error a second time after caller cleanup.
 inline void* sycl_alloc_device_or_throw(size_t bytes, sycl::queue& q,
                                         char const* what)
 {
-    void* p = sycl::malloc_device(bytes, q);
+    void* p = nullptr;
+    try {
+        p = sycl::malloc_device(bytes, q);
+    } catch (sycl::exception const& e) {
+        throw std::runtime_error(
+            std::string("sycl::malloc_device(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") failed: " + e.what() +
+            ". Likely transient OOM — check `nvidia-smi` for other GPU "
+            "consumers, or set POS2GPU_MAX_VRAM_MB lower if VRAM is "
+            "shared with display/compositor.");
+    }
     if (!p) {
-        throw std::runtime_error(std::string("sycl::malloc_device(") + what + ") failed");
+        throw std::runtime_error(
+            std::string("sycl::malloc_device(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") returned null (out of device "
+            "memory). Likely transient OOM — check `nvidia-smi` for "
+            "other GPU consumers, or set POS2GPU_MAX_VRAM_MB lower if "
+            "VRAM is shared with display/compositor.");
     }
     return p;
 }
@@ -46,9 +81,18 @@ inline void* sycl_alloc_device_or_throw(size_t bytes, sycl::queue& q,
 inline void* sycl_alloc_host_or_throw(size_t bytes, sycl::queue& q,
                                       char const* what)
 {
-    void* p = sycl::malloc_host(bytes, q);
+    void* p = nullptr;
+    try {
+        p = sycl::malloc_host(bytes, q);
+    } catch (sycl::exception const& e) {
+        throw std::runtime_error(
+            std::string("sycl::malloc_host(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") failed: " + e.what());
+    }
     if (!p) {
-        throw std::runtime_error(std::string("sycl::malloc_host(") + what + ") failed");
+        throw std::runtime_error(
+            std::string("sycl::malloc_host(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") returned null (out of host pinned memory)");
     }
     return p;
 }
