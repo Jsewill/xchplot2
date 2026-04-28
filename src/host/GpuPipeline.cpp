@@ -26,6 +26,7 @@
 #include <sycl/sycl.hpp>
 
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -728,90 +730,319 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // 6176 MB to max(sort 4126 MB, pack 4096 MB) = 4126 MB.
     stats.phase = "Xs";
 
-    // Query CUB scratch size via the sort wrapper.
-    size_t xs_cub_bytes = 0;
-    launch_sort_pairs_u32_u32(
-        nullptr, xs_cub_bytes,
-        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
-
-    void*     d_xs_cub_scratch = nullptr;
-    uint32_t* d_xs_keys_a      = nullptr;
-    uint32_t* d_xs_vals_a      = nullptr;
-    s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes,                     "d_xs_cub");
-    s_malloc(stats, d_xs_keys_a,      total_xs * sizeof(uint32_t),      "d_xs_keys_a");
-    s_malloc(stats, d_xs_vals_a,      total_xs * sizeof(uint32_t),      "d_xs_vals_a");
-
     AesHashKeys const xs_keys = make_keys(cfg.plot_id.data());
     uint32_t    const xs_xor_const = cfg.testnet ? 0xA3B1C4D7u : 0u;
 
-    int p_xs = begin_phase("Xs gen+sort");
-    launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
-                  cfg.k, xs_xor_const, q);
-
-    // keys_b + vals_b appear here — minimum Xs-phase live set between
-    // gen and sort.
+    XsCandidateGpu* d_xs = nullptr;
     uint32_t* d_xs_keys_b = nullptr;
     uint32_t* d_xs_vals_b = nullptr;
-    s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
-    s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
 
-    launch_sort_pairs_u32_u32(
-        d_xs_cub_scratch, xs_cub_bytes,
-        d_xs_keys_a, d_xs_keys_b,
-        d_xs_vals_a, d_xs_vals_b,
-        total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
-    end_phase(p_xs);
+    bool const xs_sliced = !scratch.plain_mode && scratch.gather_tile_count > 1;
 
-    // sort consumed keys_a + vals_a; free them and CUB scratch before
-    // allocating d_xs so the pack phase peak stays under the sort peak.
-    s_free(stats, d_xs_cub_scratch);
-    s_free(stats, d_xs_keys_a);
-    s_free(stats, d_xs_vals_a);
+    if (!xs_sliced) {
+        // Compact / plain — full-cap gen+sort+pack (4128 MB sort peak).
+        size_t xs_cub_bytes = 0;
+        launch_sort_pairs_u32_u32(
+            nullptr, xs_cub_bytes,
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
 
-    XsCandidateGpu* d_xs = nullptr;
-    s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+        void*     d_xs_cub_scratch = nullptr;
+        uint32_t* d_xs_keys_a      = nullptr;
+        uint32_t* d_xs_vals_a      = nullptr;
+        s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes,                     "d_xs_cub");
+        s_malloc(stats, d_xs_keys_a,      total_xs * sizeof(uint32_t),      "d_xs_keys_a");
+        s_malloc(stats, d_xs_vals_a,      total_xs * sizeof(uint32_t),      "d_xs_vals_a");
 
-    int p_xs_pack = begin_phase("Xs pack");
-    launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs, q);
-    end_phase(p_xs_pack);
+        int p_xs = begin_phase("Xs gen+sort");
+        launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
+                      cfg.k, xs_xor_const, q);
 
-    s_free(stats, d_xs_keys_b);
-    s_free(stats, d_xs_vals_b);
+        s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+        s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+
+        launch_sort_pairs_u32_u32(
+            d_xs_cub_scratch, xs_cub_bytes,
+            d_xs_keys_a, d_xs_keys_b,
+            d_xs_vals_a, d_xs_vals_b,
+            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+        end_phase(p_xs);
+
+        s_free(stats, d_xs_cub_scratch);
+        s_free(stats, d_xs_keys_a);
+        s_free(stats, d_xs_vals_a);
+
+        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+
+        int p_xs_pack = begin_phase("Xs pack");
+        launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs, q);
+        end_phase(p_xs_pack);
+
+        s_free(stats, d_xs_keys_b);
+        s_free(stats, d_xs_vals_b);
+    } else {
+        // Sliced (minimal). Tile gen+sort in N=2 position halves into
+        // cap/2 device buffers, D2H per tile to USM-host. Then merge
+        // host-pinned tile outputs into device d_xs_keys_b + d_xs_vals_b
+        // (full cap). Then pack in N=2 halves with D2H per tile to a
+        // host-pinned XsCandidateGpu accumulator. Finally rehydrate
+        // d_xs from host pinned. Drops sort peak from 4128 MB → 2056 MB
+        // and pack peak from 4096 MB → 3072 MB at k=28.
+        uint64_t const xs_tile_n0  = total_xs / 2;
+        uint64_t const xs_tile_n1  = total_xs - xs_tile_n0;
+        uint64_t const xs_tile_max = (xs_tile_n0 > xs_tile_n1) ? xs_tile_n0 : xs_tile_n1;
+
+        size_t xs_cub_tile_bytes = 0;
+        launch_sort_pairs_u32_u32(
+            nullptr, xs_cub_tile_bytes,
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            xs_tile_max, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+
+        void*     d_xs_cub_scratch  = nullptr;
+        uint32_t* d_xs_keys_a_tile  = nullptr;
+        uint32_t* d_xs_vals_a_tile  = nullptr;
+        uint32_t* d_xs_keys_b_tile  = nullptr;
+        uint32_t* d_xs_vals_b_tile  = nullptr;
+        s_malloc(stats, d_xs_keys_a_tile, xs_tile_max * sizeof(uint32_t), "d_xs_keys_a_tile");
+        s_malloc(stats, d_xs_vals_a_tile, xs_tile_max * sizeof(uint32_t), "d_xs_vals_a_tile");
+        s_malloc(stats, d_xs_keys_b_tile, xs_tile_max * sizeof(uint32_t), "d_xs_keys_b_tile");
+        s_malloc(stats, d_xs_vals_b_tile, xs_tile_max * sizeof(uint32_t), "d_xs_vals_b_tile");
+        s_malloc(stats, d_xs_cub_scratch, xs_cub_tile_bytes,              "d_xs_cub");
+
+        uint32_t* h_xs_keys = static_cast<uint32_t*>(
+            sycl::malloc_host(total_xs * sizeof(uint32_t), q));
+        if (!h_xs_keys) throw std::runtime_error("sycl::malloc_host(h_xs_keys) failed");
+        uint32_t* h_xs_vals = static_cast<uint32_t*>(
+            sycl::malloc_host(total_xs * sizeof(uint32_t), q));
+        if (!h_xs_vals) throw std::runtime_error("sycl::malloc_host(h_xs_vals) failed");
+
+        int p_xs = begin_phase("Xs gen+sort");
+        auto run_tile = [&](uint64_t pos_begin, uint64_t pos_end, uint64_t out_offset) {
+            uint64_t tile_n = pos_end - pos_begin;
+            if (tile_n == 0) return;
+            launch_xs_gen_range(
+                xs_keys, d_xs_keys_a_tile, d_xs_vals_a_tile,
+                pos_begin, pos_end, cfg.k, xs_xor_const, q);
+            launch_sort_pairs_u32_u32(
+                d_xs_cub_scratch, xs_cub_tile_bytes,
+                d_xs_keys_a_tile, d_xs_keys_b_tile,
+                d_xs_vals_a_tile, d_xs_vals_b_tile,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+            q.memcpy(h_xs_keys + out_offset, d_xs_keys_b_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+            q.memcpy(h_xs_vals + out_offset, d_xs_vals_b_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+        };
+        run_tile(0,           xs_tile_n0,  0);
+        run_tile(xs_tile_n0,  total_xs,    xs_tile_n0);
+        end_phase(p_xs);
+
+        s_free(stats, d_xs_cub_scratch);
+        s_free(stats, d_xs_vals_b_tile);
+        s_free(stats, d_xs_keys_b_tile);
+        s_free(stats, d_xs_vals_a_tile);
+        s_free(stats, d_xs_keys_a_tile);
+
+        // Full-cap merge outputs on device. Merge from USM-host inputs.
+        s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+        s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+        launch_merge_pairs_stable_2way_u32_u32(
+            h_xs_keys + 0,           h_xs_vals + 0,           xs_tile_n0,
+            h_xs_keys + xs_tile_n0,  h_xs_vals + xs_tile_n0,  xs_tile_n1,
+            d_xs_keys_b, d_xs_vals_b, total_xs, q);
+        sycl::free(h_xs_keys, q);
+        sycl::free(h_xs_vals, q);
+
+        // Tiled pack. d_xs_pack_tile (cap/2 × XsCandidate = 1024 MB
+        // at k=28) reuses across tiles; the packed output collects on
+        // host pinned h_xs (cap × XsCandidate = 2048 MB host).
+        uint64_t const pack_tile_n0  = total_xs / 2;
+        uint64_t const pack_tile_n1  = total_xs - pack_tile_n0;
+        uint64_t const pack_tile_max = (pack_tile_n0 > pack_tile_n1) ? pack_tile_n0 : pack_tile_n1;
+
+        XsCandidateGpu* d_xs_pack_tile = nullptr;
+        s_malloc(stats, d_xs_pack_tile, pack_tile_max * sizeof(XsCandidateGpu), "d_xs_pack_tile");
+
+        XsCandidateGpu* h_xs = static_cast<XsCandidateGpu*>(
+            sycl::malloc_host(total_xs * sizeof(XsCandidateGpu), q));
+        if (!h_xs) throw std::runtime_error("sycl::malloc_host(h_xs) failed");
+
+        int p_xs_pack = begin_phase("Xs pack");
+        if (pack_tile_n0 > 0) {
+            launch_xs_pack_range(d_xs_keys_b + 0, d_xs_vals_b + 0,
+                                 d_xs_pack_tile, pack_tile_n0, q);
+            q.memcpy(h_xs + 0, d_xs_pack_tile,
+                     pack_tile_n0 * sizeof(XsCandidateGpu)).wait();
+        }
+        if (pack_tile_n1 > 0) {
+            launch_xs_pack_range(d_xs_keys_b + pack_tile_n0,
+                                 d_xs_vals_b + pack_tile_n0,
+                                 d_xs_pack_tile, pack_tile_n1, q);
+            q.memcpy(h_xs + pack_tile_n0, d_xs_pack_tile,
+                     pack_tile_n1 * sizeof(XsCandidateGpu)).wait();
+        }
+        end_phase(p_xs_pack);
+
+        s_free(stats, d_xs_pack_tile);
+        s_free(stats, d_xs_keys_b);
+        s_free(stats, d_xs_vals_b);
+        d_xs_keys_b = nullptr;
+        d_xs_vals_b = nullptr;
+
+        // Re-hydrate full d_xs on device from host pinned.
+        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+        q.memcpy(d_xs, h_xs, total_xs * sizeof(XsCandidateGpu)).wait();
+        sycl::free(h_xs, q);
+    }
 
     // ---------- Phase T1 match ----------
+    // SoA output: meta (uint64) + mi (uint32). Same 12 B/pair as the old
+    // AoS struct, but the two streams can be freed independently — we
+    // drop d_t1_mi as soon as CUB consumes it in the T1 sort phase.
+    //
+    // Minimal mode (gather_tile_count > 1) splits T1 match into N=
+    // num_sections passes (one per section_l) with cap/N staging
+    // outputs that are D2H'd to host pinned per pass — keeps d_xs +
+    // d_t1_meta + d_t1_mi from being co-resident at full-cap. Drops
+    // the T1 match peak from
+    //   d_xs (2048) + d_t1_meta (2080) + d_t1_mi (1040) = 5168 MB
+    // to
+    //   d_xs (2048) + d_t1_meta_stage (cap/N × 8) +
+    //   d_t1_mi_stage (cap/N × 4) = ~2870 MB at k=28 N=4.
+    //
+    // d_t1_meta + d_t1_mi (full cap) are then re-allocated on device
+    // for T1 sort, with the data H2D'd from host pinned. d_t1_meta
+    // stays parked on h_t1_meta across T1 sort exactly as in compact
+    // mode (the existing park dance is skipped — data is already on
+    // host).
+    bool const t1_match_sliced = !scratch.plain_mode && scratch.gather_tile_count > 1;
+
     stats.phase = "T1 match";
     auto t1p = make_t1_params(cfg.k, cfg.strength);
     size_t t1_temp_bytes = 0;
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           nullptr, nullptr, d_counter, cap,
                           nullptr, &t1_temp_bytes, q);
-    // SoA output: meta (uint64) + mi (uint32). Same 12 B/pair as the old
-    // AoS struct, but the two streams can be freed independently — we
-    // drop d_t1_mi as soon as CUB consumes it in the T1 sort phase.
+
     uint64_t* d_t1_meta = nullptr;
     uint32_t* d_t1_mi   = nullptr;
     void*     d_t1_match_temp = nullptr;
-    s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
-    s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
-    s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
 
-    int p_t1 = begin_phase("T1 match");
-    q.memset(d_counter, 0, sizeof(uint64_t));
-    launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          d_t1_meta, d_t1_mi, d_counter, cap,
-                          d_t1_match_temp, &t1_temp_bytes, q);
-    end_phase(p_t1);
+    // Lift h_t1_meta / h_t1_mi out of the T1 sort scope so the sliced
+    // T1 match path can populate them directly. h_t1_mi is sliced-only
+    // — it's freed in T1 sort once CUB has consumed the H2D'd copy.
+    bool      const h_meta_owned = (!scratch.plain_mode && scratch.h_meta == nullptr);
+    uint64_t* h_t1_meta = nullptr;
+    bool      h_t1_mi_owned = false;
+    uint32_t* h_t1_mi = nullptr;
 
     uint64_t t1_count = 0;
-    q.memcpy(&t1_count, d_counter, sizeof(uint64_t)).wait();
-    if (t1_count > cap) throw std::runtime_error("T1 overflow");
-    validate_t1_count(t1_count, cfg.k);
 
-    s_free(stats, d_t1_match_temp);
-    // Xs fully consumed.
-    s_free(stats, d_xs);
+    if (!t1_match_sliced) {
+        // Single-shot path (compact / plain): d_t1_meta + d_t1_mi
+        // allocated full-cap on device.
+        s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
+        s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
+        s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
+
+        int p_t1 = begin_phase("T1 match");
+        q.memset(d_counter, 0, sizeof(uint64_t));
+        launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                              d_t1_meta, d_t1_mi, d_counter, cap,
+                              d_t1_match_temp, &t1_temp_bytes, q);
+        end_phase(p_t1);
+
+        q.memcpy(&t1_count, d_counter, sizeof(uint64_t)).wait();
+        if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        validate_t1_count(t1_count, cfg.k);
+
+        s_free(stats, d_t1_match_temp);
+        s_free(stats, d_xs);
+    } else {
+        // Sliced path (minimal): N=num_sections passes with cap/N
+        // staging buffers. Output accumulates on host pinned, then
+        // d_t1_mi + h_t1_meta receive their final populations after
+        // d_xs is freed.
+        uint32_t const t1_num_sections   = 1u << t1p.num_section_bits;
+        uint32_t const t1_num_match_keys = 1u << t1p.num_match_key_bits;
+        // 25% safety over the per-section average expected output.
+        uint64_t const t1_section_cap =
+            ((cap + t1_num_sections - 1) / t1_num_sections) * 5ULL / 4ULL;
+
+        s_malloc(stats, d_t1_match_temp, t1_temp_bytes, "d_t1_match_temp");
+
+        // Compute bucket + fine-bucket offsets once; passes share them.
+        // Also zeros d_counter.
+        launch_t1_match_prepare(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                                d_counter, d_t1_match_temp, &t1_temp_bytes, q);
+
+        // Host pinned full-cap accumulators for meta + mi.
+        h_t1_meta = h_meta_owned
+            ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
+            : scratch.h_meta;
+        if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
+        h_t1_mi_owned = true;
+        h_t1_mi = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_t1_mi) throw std::runtime_error("sycl::malloc_host(h_t1_mi) failed");
+
+        // Per-pass staging device buffers (cap/N).
+        uint64_t* d_t1_meta_stage = nullptr;
+        uint32_t* d_t1_mi_stage   = nullptr;
+        s_malloc(stats, d_t1_meta_stage, t1_section_cap * sizeof(uint64_t), "d_t1_meta_stage");
+        s_malloc(stats, d_t1_mi_stage,   t1_section_cap * sizeof(uint32_t), "d_t1_mi_stage");
+
+        int p_t1 = begin_phase("T1 match");
+        uint64_t host_offset = 0;
+        for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
+            uint32_t const bucket_begin = section_l * t1_num_match_keys;
+            uint32_t const bucket_end   = (section_l + 1) * t1_num_match_keys;
+
+            launch_t1_match_range(
+                cfg.plot_id.data(), t1p, d_xs, total_xs,
+                d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_section_cap,
+                d_t1_match_temp, bucket_begin, bucket_end, q);
+
+            uint64_t pass_count = 0;
+            q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+            if (pass_count > t1_section_cap) {
+                throw std::runtime_error(
+                    "T1 match (sliced) section_l=" + std::to_string(section_l) +
+                    " produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t1_section_cap) +
+                    ". Increase t1_section_cap safety factor.");
+            }
+            q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
+                     pass_count * sizeof(uint64_t)).wait();
+            q.memcpy(h_t1_mi   + host_offset, d_t1_mi_stage,
+                     pass_count * sizeof(uint32_t)).wait();
+            host_offset += pass_count;
+            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+        }
+        end_phase(p_t1);
+
+        t1_count = host_offset;
+        if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        validate_t1_count(t1_count, cfg.k);
+
+        s_free(stats, d_t1_meta_stage);
+        s_free(stats, d_t1_mi_stage);
+        s_free(stats, d_t1_match_temp);
+
+        // Xs fully consumed.
+        s_free(stats, d_xs);
+
+        // Re-hydrate d_t1_mi full-cap on device for T1 sort (CUB
+        // sort key input). h_t1_meta stays on host across T1 sort.
+        s_malloc(stats, d_t1_mi, cap * sizeof(uint32_t), "d_t1_mi");
+        q.memcpy(d_t1_mi, h_t1_mi, t1_count * sizeof(uint32_t)).wait();
+        if (h_t1_mi_owned) sycl::free(h_t1_mi, q);
+        h_t1_mi = nullptr;
+        // d_t1_meta stays nullptr — h_t1_meta has the data; the
+        // existing T1-sort park block will see d_t1_meta == nullptr
+        // and skip the d_t1_meta → h_t1_meta memcpy.
+    }
 
     // Stage 4b (compact only): park d_t1_meta on pinned host across
     // the T1 sort phase. d_t1_meta is only needed again for
@@ -827,9 +1058,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //
     // Plain mode skips the park entirely: d_t1_meta stays live through
     // T1 sort. Costs ~2 GB peak but saves a PCIe round-trip.
-    bool      const h_meta_owned = (!scratch.plain_mode && scratch.h_meta == nullptr);
-    uint64_t* h_t1_meta = nullptr;
-    if (!scratch.plain_mode) {
+    //
+    // Sliced mode: h_t1_meta was already populated by the T1 match
+    // passes — d_t1_meta is nullptr and the park dance is skipped
+    // here. h_meta_owned + h_t1_meta were declared above (lifted out
+    // of the original T1-sort scope) so the rest of T1 sort sees the
+    // same variables in both paths.
+    if (!scratch.plain_mode && !t1_match_sliced) {
         h_t1_meta = h_meta_owned
             ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
             : scratch.h_meta;
@@ -864,36 +1099,94 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // With T1 SoA emission, d_t1_mi IS the CUB key input. We only need
     // d_keys_out (CUB sort output), d_vals_in (identity) + d_vals_out
     // (sorted vals). d_t1_mi is freed as soon as CUB consumes it.
-    uint32_t* d_keys_out     = nullptr;
-    uint32_t* d_vals_in      = nullptr;
-    uint32_t* d_vals_out     = nullptr;
-    void*     d_sort_scratch = nullptr;
-    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
-    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
-    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
-    s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
+    //
+    // Compact / plain: full-cap d_keys_out + d_vals_in + d_vals_out
+    // (1040 MB each at k=28); plus d_t1_mi (1040, full-cap input) +
+    // scratch ≈ 4176 MB peak.
+    //
+    // Minimal: per-tile cap/2 output buffers (520 each) instead of
+    // full-cap + USM-host h_keys/h_vals to collect tile outputs +
+    // launch_merge_pairs_stable_2way_u32_u32 reading USM-host inputs.
+    // Drops T1 sort CUB peak to:
+    //   d_t1_mi (1040) + 3 × cap/2 u32 (1560) + scratch ≈ 2616 MB.
+    void* d_sort_scratch = nullptr;
+    uint32_t* d_keys_out = nullptr;     // populated in compact path; minimal uses h_keys instead
+    uint32_t* d_vals_in  = nullptr;     // T2 sort below also uses this; declared at wider scope
+    uint32_t* d_vals_out = nullptr;     // populated in compact path; minimal uses h_vals instead
+    uint32_t* h_keys     = nullptr;     // USM-host, sliced path only
+    uint32_t* h_vals     = nullptr;     // USM-host, sliced path only
 
     int p_t1_sort = begin_phase("T1 sort");
-    launch_init_u32_identity(d_vals_in, t1_count, q);
-    if (t1_tile_n0 > 0) {
-        launch_sort_pairs_u32_u32(
-            d_sort_scratch, t1_sort_bytes,
-            d_t1_mi + 0, d_keys_out + 0,
-            d_vals_in + 0, d_vals_out + 0,
-            t1_tile_n0, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
-    }
-    if (t1_tile_n1 > 0) {
-        launch_sort_pairs_u32_u32(
-            d_sort_scratch, t1_sort_bytes,
-            d_t1_mi + t1_tile_n0, d_keys_out + t1_tile_n0,
-            d_vals_in + t1_tile_n0, d_vals_out + t1_tile_n0,
-            t1_tile_n1, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
-    }
 
-    // Scratch + vals_in + d_t1_mi dead after CUB.
-    s_free(stats, d_sort_scratch);
-    s_free(stats, d_vals_in);
-    s_free(stats, d_t1_mi);
+    if (!t1_match_sliced) {
+        // Compact / plain — existing full-cap path.
+        s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+        s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+        s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+        s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
+
+        launch_init_u32_identity(d_vals_in, t1_count, q);
+        if (t1_tile_n0 > 0) {
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, t1_sort_bytes,
+                d_t1_mi + 0, d_keys_out + 0,
+                d_vals_in + 0, d_vals_out + 0,
+                t1_tile_n0, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+        }
+        if (t1_tile_n1 > 0) {
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, t1_sort_bytes,
+                d_t1_mi + t1_tile_n0, d_keys_out + t1_tile_n0,
+                d_vals_in + t1_tile_n0, d_vals_out + t1_tile_n0,
+                t1_tile_n1, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+        }
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_in);
+        s_free(stats, d_t1_mi);
+    } else {
+        // Sliced — per-tile cap/2 output buffers, D2H to USM-host.
+        uint32_t* d_keys_out_tile = nullptr;
+        uint32_t* d_vals_in_tile  = nullptr;
+        uint32_t* d_vals_out_tile = nullptr;
+        s_malloc(stats, d_keys_out_tile, t1_tile_max * sizeof(uint32_t), "d_t1_keys_out_tile");
+        s_malloc(stats, d_vals_in_tile,  t1_tile_max * sizeof(uint32_t), "d_t1_vals_in_tile");
+        s_malloc(stats, d_vals_out_tile, t1_tile_max * sizeof(uint32_t), "d_t1_vals_out_tile");
+        s_malloc(stats, d_sort_scratch,  t1_sort_bytes,                  "d_sort_scratch(t1)");
+
+        h_keys = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_keys) throw std::runtime_error("sycl::malloc_host(h_keys t1) failed");
+        h_vals = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_vals) throw std::runtime_error("sycl::malloc_host(h_vals t1) failed");
+
+        auto run_tile = [&](uint64_t tile_off, uint64_t tile_n) {
+            if (tile_n == 0) return;
+            uint32_t const off32 = static_cast<uint32_t>(tile_off);
+            uint32_t* d_vals_in_tile_local = d_vals_in_tile;
+            q.parallel_for(
+                sycl::range<1>{ static_cast<size_t>(tile_n) },
+                [=](sycl::id<1> i) {
+                    d_vals_in_tile_local[i] = off32 + uint32_t(i);
+                }).wait();
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, t1_sort_bytes,
+                d_t1_mi + tile_off, d_keys_out_tile,
+                d_vals_in_tile,    d_vals_out_tile,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/cfg.k, q);
+            q.memcpy(h_keys + tile_off, d_keys_out_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+            q.memcpy(h_vals + tile_off, d_vals_out_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+        };
+        run_tile(0,            t1_tile_n0);
+        run_tile(t1_tile_n0,   t1_tile_n1);
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_out_tile);
+        s_free(stats, d_vals_in_tile);
+        s_free(stats, d_keys_out_tile);
+        s_free(stats, d_t1_mi);
+    }
 
     // 3-pass post-CUB (merge → gather meta) — same shape as T2 sort,
     // but T1 only has one gather stream (meta) so it's 2 passes here.
@@ -902,12 +1195,25 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
     s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
 
-    launch_merge_pairs_stable_2way_u32_u32(
-        d_keys_out + 0,          d_vals_out + 0,          t1_tile_n0,
-        d_keys_out + t1_tile_n0, d_vals_out + t1_tile_n0, t1_tile_n1,
-        d_t1_keys_merged, d_t1_merged_vals, t1_count, q);
-    s_free(stats, d_keys_out);
-    s_free(stats, d_vals_out);
+    if (!t1_match_sliced) {
+        launch_merge_pairs_stable_2way_u32_u32(
+            d_keys_out + 0,          d_vals_out + 0,          t1_tile_n0,
+            d_keys_out + t1_tile_n0, d_vals_out + t1_tile_n0, t1_tile_n1,
+            d_t1_keys_merged, d_t1_merged_vals, t1_count, q);
+        s_free(stats, d_keys_out);
+        s_free(stats, d_vals_out);
+    } else {
+        // Merge inputs are USM-host; the kernel reads via PCIe (sequential
+        // 2-way merge → bandwidth-bound, ~3.27 GB at k=28 / ~25 GB/s ≈
+        // 130 ms). Live device set during merge is just the two cap-sized
+        // output buffers (d_t1_keys_merged + d_t1_merged_vals = 2080 MB).
+        launch_merge_pairs_stable_2way_u32_u32(
+            h_keys + 0,            h_vals + 0,            t1_tile_n0,
+            h_keys + t1_tile_n0,   h_vals + t1_tile_n0,   t1_tile_n1,
+            d_t1_keys_merged, d_t1_merged_vals, t1_count, q);
+        sycl::free(h_keys, q); h_keys = nullptr;
+        sycl::free(h_vals, q); h_vals = nullptr;
+    }
 
     // Stage 4c (compact only): d_t1_keys_merged is not used by the
     // gather below (gather uses d_t1_merged_vals for indices); it is
@@ -937,19 +1243,60 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // overall bottleneck on its own.
     //
     // Plain mode: d_t1_meta is already live (never parked).
+    int const t1_gather_N = scratch.plain_mode ? 1 : scratch.gather_tile_count;
     if (!scratch.plain_mode) {
         s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
         q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
-        if (h_meta_owned) sycl::free(h_t1_meta, q);
-        h_t1_meta = nullptr;
+        // With gather_tile_count > 1 we reuse h_t1_meta to stage the
+        // sorted output (overwriting the unsorted data we just
+        // rehydrated from); defer the free until after the H2D rebuild.
+        if (t1_gather_N <= 1) {
+            if (h_meta_owned) sycl::free(h_t1_meta, q);
+            h_t1_meta = nullptr;
+        }
     }
 
     uint64_t* d_t1_meta_sorted = nullptr;
-    s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
-    launch_gather_u64(d_t1_meta, d_t1_merged_vals, d_t1_meta_sorted, t1_count, q);
-    end_phase(p_t1_sort);
-    s_free(stats, d_t1_meta);
-    s_free(stats, d_t1_merged_vals);
+    if (t1_gather_N <= 1) {
+        s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
+        launch_gather_u64(d_t1_meta, d_t1_merged_vals, d_t1_meta_sorted, t1_count, q);
+        end_phase(p_t1_sort);
+        s_free(stats, d_t1_meta);
+        s_free(stats, d_t1_merged_vals);
+    } else {
+        // Tiled-output gather (minimal tier). Produce the sorted output
+        // in N tiles, D2H each tile to h_t1_meta (overwriting the
+        // unsorted data we just rehydrated from), then free the inputs
+        // and rebuild the full d_t1_meta_sorted on device. Peak during
+        // gather drops from
+        //   d_t1_meta (2080) + d_t1_merged_vals (1040)
+        //   + d_t1_meta_sorted (2080) = 5200 MB
+        // to
+        //   d_t1_meta (2080) + d_t1_merged_vals (1040)
+        //   + d_tile (cap/N × u64 = 520 at N=4) = ~3640 MB.
+        uint64_t const tile_max =
+            (t1_count + uint64_t(t1_gather_N) - 1) / uint64_t(t1_gather_N);
+        uint64_t* d_tile = nullptr;
+        s_malloc(stats, d_tile, tile_max * sizeof(uint64_t), "d_t1_meta_sorted_tile");
+        for (int n = 0; n < t1_gather_N; ++n) {
+            uint64_t const tile_off = uint64_t(n) * tile_max;
+            if (tile_off >= t1_count) break;
+            uint64_t const tile_n = std::min(tile_max, t1_count - tile_off);
+            launch_gather_u64(
+                d_t1_meta, d_t1_merged_vals + tile_off,
+                d_tile, tile_n, q);
+            q.memcpy(h_t1_meta + tile_off, d_tile,
+                     tile_n * sizeof(uint64_t)).wait();
+        }
+        s_free(stats, d_tile);
+        s_free(stats, d_t1_meta);
+        s_free(stats, d_t1_merged_vals);
+        s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
+        q.memcpy(d_t1_meta_sorted, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
+        end_phase(p_t1_sort);
+        if (h_meta_owned) sycl::free(h_t1_meta, q);
+        h_t1_meta = nullptr;
+    }
 
     // Stage 4c (compact only): H2D d_t1_keys_merged back now that T2
     // match (its consumer) is about to start. Pinned host freed after
@@ -1178,73 +1525,192 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // needed, so d_keys_in only needs to hold the merged sorted-MI output
     // that downstream T3 match will consume. Allocate it AFTER the CUB
     // tile-sort has freed d_t2_mi to keep peak narrow.
-    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
-    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
-    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
-    s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
+    //
+    // Compact / plain: full-cap d_keys_out + d_vals_in + d_vals_out
+    // (~4168 MB peak with d_t2_mi during tile sort).
+    //
+    // Sliced (minimal): per-tile cap/N output buffers + USM-host
+    // accumulators, then USM-host parking of AB / CD between merge
+    // tree steps so the final merge sees only its own outputs +
+    // USM-host inputs (live device ~2080 MB at k=28). Peaks under
+    // 4 GiB at every step.
 
-    int p_t2_sort = begin_phase("T2 sort");
-    launch_init_u32_identity(d_vals_in, t2_count, q);
-    for (int t = 0; t < kNumT2Tiles; ++t) {
-        if (t2_tile_n[t] == 0) continue;
-        uint64_t off = t2_tile_off[t];
-        launch_sort_pairs_u32_u32(
-            d_sort_scratch, t2_sort_bytes,
-            d_t2_mi    + off, d_keys_out + off,
-            d_vals_in  + off, d_vals_out + off,
-            t2_tile_n[t], 0, cfg.k, q);
-    }
-
-    s_free(stats, d_sort_scratch);
-    s_free(stats, d_vals_in);
-    s_free(stats, d_t2_mi);
-
-    // Tree-of-2-way-merges: (tile 0 + tile 1) → AB, (tile 2 + tile 3) → CD,
-    // then (AB + CD) → final merged stream. AB and CD buffers hold half
-    // of the total output each, so their combined footprint (2080 MB at
-    // k=28) fits under the budget freed by shrinking the CUB scratch.
     uint64_t const ab_count = t2_tile_n[0] + t2_tile_n[1];
     uint64_t const cd_count = t2_tile_n[2] + t2_tile_n[3];
+
+    int p_t2_sort = begin_phase("T2 sort");
+
+    if (!t1_match_sliced) {
+        // Compact / plain — existing full-cap CUB tile sort.
+        s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+        s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+        s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+        s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
+
+        launch_init_u32_identity(d_vals_in, t2_count, q);
+        for (int t = 0; t < kNumT2Tiles; ++t) {
+            if (t2_tile_n[t] == 0) continue;
+            uint64_t off = t2_tile_off[t];
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, t2_sort_bytes,
+                d_t2_mi    + off, d_keys_out + off,
+                d_vals_in  + off, d_vals_out + off,
+                t2_tile_n[t], 0, cfg.k, q);
+        }
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_in);
+        s_free(stats, d_t2_mi);
+    } else {
+        // Sliced — per-tile cap/N output, D2H to USM-host h_keys/h_vals.
+        uint32_t* d_keys_out_tile = nullptr;
+        uint32_t* d_vals_in_tile  = nullptr;
+        uint32_t* d_vals_out_tile = nullptr;
+        s_malloc(stats, d_keys_out_tile, t2_tile_max * sizeof(uint32_t), "d_t2_keys_out_tile");
+        s_malloc(stats, d_vals_in_tile,  t2_tile_max * sizeof(uint32_t), "d_t2_vals_in_tile");
+        s_malloc(stats, d_vals_out_tile, t2_tile_max * sizeof(uint32_t), "d_t2_vals_out_tile");
+        s_malloc(stats, d_sort_scratch,  t2_sort_bytes,                  "d_sort_scratch(t2)");
+
+        h_keys = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_keys) throw std::runtime_error("sycl::malloc_host(h_keys t2) failed");
+        h_vals = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_vals) throw std::runtime_error("sycl::malloc_host(h_vals t2) failed");
+
+        for (int t = 0; t < kNumT2Tiles; ++t) {
+            uint64_t const tile_n = t2_tile_n[t];
+            if (tile_n == 0) continue;
+            uint64_t const tile_off = t2_tile_off[t];
+            uint32_t const off32    = static_cast<uint32_t>(tile_off);
+            uint32_t* d_vals_in_tile_local = d_vals_in_tile;
+            q.parallel_for(
+                sycl::range<1>{ static_cast<size_t>(tile_n) },
+                [=](sycl::id<1> i) {
+                    d_vals_in_tile_local[i] = off32 + uint32_t(i);
+                }).wait();
+            launch_sort_pairs_u32_u32(
+                d_sort_scratch, t2_sort_bytes,
+                d_t2_mi + tile_off, d_keys_out_tile,
+                d_vals_in_tile,    d_vals_out_tile,
+                tile_n, 0, cfg.k, q);
+            q.memcpy(h_keys + tile_off, d_keys_out_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+            q.memcpy(h_vals + tile_off, d_vals_out_tile,
+                     tile_n * sizeof(uint32_t)).wait();
+        }
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_out_tile);
+        s_free(stats, d_vals_in_tile);
+        s_free(stats, d_keys_out_tile);
+        s_free(stats, d_t2_mi);
+    }
+
+    // Tree-of-2-way-merges: (tile 0 + tile 1) → AB, (tile 2 + tile 3) → CD,
+    // then (AB + CD) → final merged stream.
+    //
+    // Compact: AB + CD live across the final merge → peak ~4160 MB.
+    // Sliced: AB and CD parked to USM-host between tree steps so the
+    // final merge sees only itself + USM-host inputs (~2080 MB peak).
     uint32_t* d_AB_keys = nullptr;
     uint32_t* d_AB_vals = nullptr;
     uint32_t* d_CD_keys = nullptr;
     uint32_t* d_CD_vals = nullptr;
-    s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
-    s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
-    s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
-    s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
+    uint32_t* h_AB_keys = nullptr;
+    uint32_t* h_AB_vals = nullptr;
+    uint32_t* h_CD_keys = nullptr;
+    uint32_t* h_CD_vals = nullptr;
 
-    if (ab_count > 0) {
-        launch_merge_pairs_stable_2way_u32_u32(
-            d_keys_out + t2_tile_off[0], d_vals_out + t2_tile_off[0], t2_tile_n[0],
-            d_keys_out + t2_tile_off[1], d_vals_out + t2_tile_off[1], t2_tile_n[1],
-            d_AB_keys, d_AB_vals, ab_count, q);
-    }
-    if (cd_count > 0) {
-        launch_merge_pairs_stable_2way_u32_u32(
-            d_keys_out + t2_tile_off[2], d_vals_out + t2_tile_off[2], t2_tile_n[2],
-            d_keys_out + t2_tile_off[3], d_vals_out + t2_tile_off[3], t2_tile_n[3],
-            d_CD_keys, d_CD_vals, cd_count, q);
-    }
+    if (!t1_match_sliced) {
+        s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
+        s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
+        s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
+        s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
 
-    // Per-tile CUB outputs are consumed; free before alloc'ing the
-    // final merged buffers.
-    s_free(stats, d_keys_out);
-    s_free(stats, d_vals_out);
+        if (ab_count > 0) {
+            launch_merge_pairs_stable_2way_u32_u32(
+                d_keys_out + t2_tile_off[0], d_vals_out + t2_tile_off[0], t2_tile_n[0],
+                d_keys_out + t2_tile_off[1], d_vals_out + t2_tile_off[1], t2_tile_n[1],
+                d_AB_keys, d_AB_vals, ab_count, q);
+        }
+        if (cd_count > 0) {
+            launch_merge_pairs_stable_2way_u32_u32(
+                d_keys_out + t2_tile_off[2], d_vals_out + t2_tile_off[2], t2_tile_n[2],
+                d_keys_out + t2_tile_off[3], d_vals_out + t2_tile_off[3], t2_tile_n[3],
+                d_CD_keys, d_CD_vals, cd_count, q);
+        }
+
+        s_free(stats, d_keys_out);
+        s_free(stats, d_vals_out);
+    } else {
+        // AB merge: read USM-host slices, write device d_AB. Then D2H
+        // to USM-host and free device.
+        s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
+        s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
+        if (ab_count > 0) {
+            launch_merge_pairs_stable_2way_u32_u32(
+                h_keys + t2_tile_off[0], h_vals + t2_tile_off[0], t2_tile_n[0],
+                h_keys + t2_tile_off[1], h_vals + t2_tile_off[1], t2_tile_n[1],
+                d_AB_keys, d_AB_vals, ab_count, q);
+        }
+        h_AB_keys = static_cast<uint32_t*>(sycl::malloc_host(ab_count * sizeof(uint32_t), q));
+        h_AB_vals = static_cast<uint32_t*>(sycl::malloc_host(ab_count * sizeof(uint32_t), q));
+        if (!h_AB_keys || !h_AB_vals) throw std::runtime_error("sycl::malloc_host(h_AB) failed");
+        if (ab_count > 0) {
+            q.memcpy(h_AB_keys, d_AB_keys, ab_count * sizeof(uint32_t));
+            q.memcpy(h_AB_vals, d_AB_vals, ab_count * sizeof(uint32_t)).wait();
+        }
+        s_free(stats, d_AB_vals);
+        s_free(stats, d_AB_keys);
+
+        // CD merge: same shape.
+        s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
+        s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
+        if (cd_count > 0) {
+            launch_merge_pairs_stable_2way_u32_u32(
+                h_keys + t2_tile_off[2], h_vals + t2_tile_off[2], t2_tile_n[2],
+                h_keys + t2_tile_off[3], h_vals + t2_tile_off[3], t2_tile_n[3],
+                d_CD_keys, d_CD_vals, cd_count, q);
+        }
+        h_CD_keys = static_cast<uint32_t*>(sycl::malloc_host(cd_count * sizeof(uint32_t), q));
+        h_CD_vals = static_cast<uint32_t*>(sycl::malloc_host(cd_count * sizeof(uint32_t), q));
+        if (!h_CD_keys || !h_CD_vals) throw std::runtime_error("sycl::malloc_host(h_CD) failed");
+        if (cd_count > 0) {
+            q.memcpy(h_CD_keys, d_CD_keys, cd_count * sizeof(uint32_t));
+            q.memcpy(h_CD_vals, d_CD_vals, cd_count * sizeof(uint32_t)).wait();
+        }
+        s_free(stats, d_CD_vals);
+        s_free(stats, d_CD_keys);
+
+        // h_keys + h_vals consumed by AB/CD merges — free.
+        sycl::free(h_keys, q); h_keys = nullptr;
+        sycl::free(h_vals, q); h_vals = nullptr;
+    }
 
     uint32_t* d_t2_keys_merged = nullptr;   // merged sorted MI for T3.
     uint32_t* d_merged_vals    = nullptr;   // merged sorted src indices.
     s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
     s_malloc(stats, d_merged_vals,    cap * sizeof(uint32_t), "d_merged_vals");
 
-    launch_merge_pairs_stable_2way_u32_u32(
-        d_AB_keys, d_AB_vals, ab_count,
-        d_CD_keys, d_CD_vals, cd_count,
-        d_t2_keys_merged, d_merged_vals, t2_count, q);
-    s_free(stats, d_AB_keys);
-    s_free(stats, d_AB_vals);
-    s_free(stats, d_CD_keys);
-    s_free(stats, d_CD_vals);
+    if (!t1_match_sliced) {
+        launch_merge_pairs_stable_2way_u32_u32(
+            d_AB_keys, d_AB_vals, ab_count,
+            d_CD_keys, d_CD_vals, cd_count,
+            d_t2_keys_merged, d_merged_vals, t2_count, q);
+        s_free(stats, d_AB_keys);
+        s_free(stats, d_AB_vals);
+        s_free(stats, d_CD_keys);
+        s_free(stats, d_CD_vals);
+    } else {
+        // Final merge from USM-host inputs into device outputs.
+        launch_merge_pairs_stable_2way_u32_u32(
+            h_AB_keys, h_AB_vals, ab_count,
+            h_CD_keys, h_CD_vals, cd_count,
+            d_t2_keys_merged, d_merged_vals, t2_count, q);
+        sycl::free(h_AB_keys, q); h_AB_keys = nullptr;
+        sycl::free(h_AB_vals, q); h_AB_vals = nullptr;
+        sycl::free(h_CD_keys, q); h_CD_keys = nullptr;
+        sycl::free(h_CD_vals, q); h_CD_vals = nullptr;
+    }
 
     // Stage 4c (compact only): d_t2_keys_merged is not consumed by the
     // gather calls below (they use d_merged_vals for indices) — it's
@@ -1273,34 +1739,121 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //
     // Plain mode: d_t2_meta and d_t2_xbits are already live from T2
     // match (never parked). Gather reads them directly and frees after.
-    if (!scratch.plain_mode) {
+    int const t2_gather_N = scratch.plain_mode ? 1 : scratch.gather_tile_count;
+    uint64_t* d_t2_meta_sorted  = nullptr;
+    uint32_t* d_t2_xbits_sorted = nullptr;
+
+    if (t2_gather_N <= 1) {
+        // Single-shot path (compact / plain).
+        if (!scratch.plain_mode) {
+            s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
+            q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
+            q.wait();
+            if (h_meta_owned) sycl::free(h_t2_meta, q);
+            h_t2_meta = nullptr;
+        }
+
+        s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
+        launch_gather_u64(d_t2_meta, d_merged_vals, d_t2_meta_sorted, t2_count, q);
+        q.wait();
+        s_free(stats, d_t2_meta);
+
+        if (!scratch.plain_mode) {
+            s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+            q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+            q.wait();
+            if (h_xbits_owned) sycl::free(h_t2_xbits, q);
+            h_t2_xbits = nullptr;
+        }
+
+        s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
+        launch_gather_u32(d_t2_xbits, d_merged_vals, d_t2_xbits_sorted, t2_count, q);
+        end_phase(p_t2_sort);
+        s_free(stats, d_t2_xbits);
+        s_free(stats, d_merged_vals);
+    } else {
+        // Tiled-output gather (minimal tier). Both gathers stage their
+        // sorted outputs to host pinned (reusing h_t2_meta and
+        // h_t2_xbits — same buffers that just held the parked unsorted
+        // data) one tile at a time. Crucially, d_t2_meta_sorted is NOT
+        // re-allocated on device until BOTH gathers and d_merged_vals
+        // are done — otherwise the xbits gather peak (d_t2_meta_sorted
+        // 2080 + d_merged_vals 1040 + d_t2_xbits 1040 + tile 260) would
+        // still hit ~4420 MB. Deferring the rehydrate keeps the xbits
+        // gather peak at d_merged_vals (1040) + d_t2_xbits (1040) +
+        // tile (260 at N=4) = ~2340 MB. Final rehydrate peak:
+        // d_t2_meta_sorted (2080) + d_t2_xbits_sorted (1040) = 3120 MB.
+        uint64_t const tile_max =
+            (t2_count + uint64_t(t2_gather_N) - 1) / uint64_t(t2_gather_N);
+
+        // --- Meta gather (tiled output → h_t2_meta) ---
         s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
-        q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t));
-        q.wait();
-        if (h_meta_owned) sycl::free(h_t2_meta, q);
-        h_t2_meta = nullptr;
-    }
+        q.memcpy(d_t2_meta, h_t2_meta, t2_count * sizeof(uint64_t)).wait();
+        {
+            uint64_t* d_meta_tile = nullptr;
+            s_malloc(stats, d_meta_tile, tile_max * sizeof(uint64_t), "d_t2_meta_sorted_tile");
+            for (int n = 0; n < t2_gather_N; ++n) {
+                uint64_t const tile_off = uint64_t(n) * tile_max;
+                if (tile_off >= t2_count) break;
+                uint64_t const tile_n = std::min(tile_max, t2_count - tile_off);
+                launch_gather_u64(
+                    d_t2_meta, d_merged_vals + tile_off,
+                    d_meta_tile, tile_n, q);
+                q.memcpy(h_t2_meta + tile_off, d_meta_tile,
+                         tile_n * sizeof(uint64_t)).wait();
+            }
+            s_free(stats, d_meta_tile);
+        }
+        s_free(stats, d_t2_meta);
 
-    uint64_t* d_t2_meta_sorted = nullptr;
-    s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
-    launch_gather_u64(d_t2_meta, d_merged_vals, d_t2_meta_sorted, t2_count, q);
-    q.wait();
-    s_free(stats, d_t2_meta);
-
-    if (!scratch.plain_mode) {
+        // --- Xbits gather (tiled output → h_t2_xbits) ---
         s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
-        q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
-        q.wait();
+        q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
+        {
+            uint32_t* d_xbits_tile = nullptr;
+            s_malloc(stats, d_xbits_tile, tile_max * sizeof(uint32_t), "d_t2_xbits_sorted_tile");
+            for (int n = 0; n < t2_gather_N; ++n) {
+                uint64_t const tile_off = uint64_t(n) * tile_max;
+                if (tile_off >= t2_count) break;
+                uint64_t const tile_n = std::min(tile_max, t2_count - tile_off);
+                launch_gather_u32(
+                    d_t2_xbits, d_merged_vals + tile_off,
+                    d_xbits_tile, tile_n, q);
+                q.memcpy(h_t2_xbits + tile_off, d_xbits_tile,
+                         tile_n * sizeof(uint32_t)).wait();
+            }
+            s_free(stats, d_xbits_tile);
+        }
+        s_free(stats, d_t2_xbits);
+
+        // d_merged_vals dead now that both gathers have produced their
+        // sorted outputs on host.
+        s_free(stats, d_merged_vals);
+
+        // Rehydrate d_t2_xbits_sorted to device (1040 MB at k=28). The
+        // T3 match kernel reads d_sorted_xbits[l] / d_sorted_xbits[r]
+        // by index and the random-access pattern would be too slow via
+        // PCIe with USM-host.
+        s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
+        q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
         if (h_xbits_owned) sycl::free(h_t2_xbits, q);
         h_t2_xbits = nullptr;
-    }
 
-    uint32_t* d_t2_xbits_sorted = nullptr;
-    s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
-    launch_gather_u32(d_t2_xbits, d_merged_vals, d_t2_xbits_sorted, t2_count, q);
-    end_phase(p_t2_sort);
-    s_free(stats, d_t2_xbits);
-    s_free(stats, d_merged_vals);
+        // Site 4: do NOT rehydrate d_t2_meta_sorted to device. h_t2_meta
+        // (now containing the sorted meta) stays alive across T3 match;
+        // the sliced T3 match path H2Ds a section_l + section_r pair of
+        // slices per pass, dropping T3 match peak from
+        //   d_t2_meta_sorted (2080) + d_t2_xbits_sorted (1040) +
+        //   d_t2_keys_merged (1040) + d_t3_stage (1040) = 5200 MB
+        // to
+        //   d_meta_l (cap/N_sections × u64 = 520) + d_meta_r (520) +
+        //   d_t2_xbits_sorted (1040) + d_t2_keys_merged (1040) +
+        //   d_t3_stage (cap/N_sections × u64 = 520) = ~3640 MB at k=28.
+        // h_t2_meta is freed inside the T3 match block once all
+        // section-pair passes complete.
+
+        end_phase(p_t2_sort);
+    }
 
     // ---------- Phase T3 match ----------
     // Plain mode: one-shot launch_t3_match writing directly into
@@ -1356,6 +1909,134 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t2_meta_sorted);
         s_free(stats, d_t2_xbits_sorted);
         s_free(stats, d_t2_keys_merged);
+    } else if (scratch.gather_tile_count > 1) {
+        // Minimal (sliced T3 match — site 4). d_t2_meta_sorted is NOT
+        // on device in this path; the sorted meta is parked on
+        // h_t2_meta (from the T2 sort tiled gather). For each section_l
+        // we H2D the matching pair of sections (l + r) into small
+        // device slices, run the kernel against those slices, D2H the
+        // stage output to h_t3, then free the slices. Drops T3 match
+        // peak from ~5200 MB (compact) to ~3665 MB at k=28.
+        uint32_t const num_sections   = 1u << t3p.num_section_bits;
+        uint32_t const num_match_keys = 1u << t3p.num_match_key_bits;
+        uint32_t const num_buckets_t3 = num_sections * num_match_keys;
+        // Per-pass output capacity sized at cap/N × 1.25 (25% safety
+        // margin over the expected uniform-distribution average).
+        uint64_t const t3_section_cap =
+            ((cap + num_sections - 1) / num_sections) * 5ULL / 4ULL;
+
+        T3PairingGpu* d_t3_stage      = nullptr;
+        void*         d_t3_match_temp = nullptr;
+        s_malloc(stats, d_t3_stage,      t3_section_cap * sizeof(T3PairingGpu), "d_t3_stage");
+        s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                          "d_t3_match_temp");
+
+        bool const h_t3_owned = (scratch.h_t3 == nullptr);
+        T3PairingGpu* h_t3 = h_t3_owned
+            ? static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q))
+            : reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
+        if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
+
+        // Compute bucket + fine-bucket offsets in d_t3_match_temp; also
+        // zero d_counter. Same call shape as compact path.
+        launch_t3_match_prepare(cfg.plot_id.data(), t3p,
+                                d_t2_keys_merged, t2_count,
+                                d_counter, d_t3_match_temp, &t3_temp_bytes, q);
+
+        // D2H the bucket-offsets table (small: 17 × u64 at k=28
+        // strength=2) so we can compute each section's global row range
+        // host-side.
+        std::vector<uint64_t> h_t3_offsets(num_buckets_t3 + 1);
+        q.memcpy(h_t3_offsets.data(), d_t3_match_temp,
+                 (num_buckets_t3 + 1) * sizeof(uint64_t)).wait();
+
+        auto compute_section_r = [&](uint32_t section_l) -> uint32_t {
+            // Mirror the kernel's section_l → section_r permutation.
+            uint32_t const mask = num_sections - 1u;
+            uint32_t const rl   = ((section_l << 1) |
+                                   (section_l >> (t3p.num_section_bits - 1))) & mask;
+            uint32_t const rl1  = (rl + 1u) & mask;
+            return ((rl1 >> 1) |
+                    (rl1 << (t3p.num_section_bits - 1))) & mask;
+        };
+
+        int p_t3 = begin_phase("T3 match + Feistel");
+        uint64_t host_offset = 0;
+        for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
+            uint32_t const section_r = compute_section_r(section_l);
+            uint64_t const section_l_row_start = h_t3_offsets[section_l * num_match_keys];
+            uint64_t const section_l_row_end   = h_t3_offsets[(section_l + 1) * num_match_keys];
+            uint64_t const section_l_count     = section_l_row_end - section_l_row_start;
+            uint64_t const section_r_row_start = h_t3_offsets[section_r * num_match_keys];
+            uint64_t const section_r_row_end   = h_t3_offsets[(section_r + 1) * num_match_keys];
+            uint64_t const section_r_count     = section_r_row_end - section_r_row_start;
+
+            // Skip empty sections — happens for tiny test plots where
+            // a section has zero rows. The kernel would early-return
+            // anyway but the slice malloc rejects bytes==0 since f1d3c67.
+            if (section_l_count == 0) continue;
+
+            uint64_t* d_meta_l_slice = nullptr;
+            uint64_t* d_meta_r_slice = nullptr;
+            s_malloc(stats, d_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
+            if (section_r_count > 0) {
+                s_malloc(stats, d_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t3_meta_r_slice");
+            }
+
+            q.memcpy(d_meta_l_slice, h_t2_meta + section_l_row_start,
+                     section_l_count * sizeof(uint64_t)).wait();
+            if (section_r_count > 0) {
+                q.memcpy(d_meta_r_slice, h_t2_meta + section_r_row_start,
+                         section_r_count * sizeof(uint64_t)).wait();
+            }
+
+            uint32_t const bucket_begin = section_l * num_match_keys;
+            uint32_t const bucket_end   = (section_l + 1) * num_match_keys;
+            launch_t3_match_section_pair_range(
+                cfg.plot_id.data(), t3p,
+                d_meta_l_slice, section_l_row_start,
+                d_meta_r_slice, section_r_row_start,
+                d_t2_xbits_sorted, d_t2_keys_merged, t2_count,
+                d_t3_stage, d_counter, t3_section_cap,
+                d_t3_match_temp, bucket_begin, bucket_end, q);
+
+            uint64_t pass_count = 0;
+            q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+            if (pass_count > t3_section_cap) {
+                throw std::runtime_error(
+                    "T3 match (sliced) section_l=" + std::to_string(section_l) +
+                    " produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t3_section_cap) +
+                    ". Lower N or widen t3_section_cap safety factor.");
+            }
+            q.memcpy(h_t3 + host_offset, d_t3_stage,
+                     pass_count * sizeof(T3PairingGpu)).wait();
+            host_offset += pass_count;
+            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+
+            if (section_r_count > 0) s_free(stats, d_meta_r_slice);
+            s_free(stats, d_meta_l_slice);
+        }
+        end_phase(p_t3);
+
+        t3_count = host_offset;
+        if (t3_count > cap) throw std::runtime_error("T3 overflow");
+
+        // d_t2_meta_sorted is null in this path (never allocated) — skip
+        // its s_free. Free everything else that was alive across T3 match.
+        s_free(stats, d_t3_match_temp);
+        s_free(stats, d_t3_stage);
+        s_free(stats, d_t2_xbits_sorted);
+        s_free(stats, d_t2_keys_merged);
+
+        // h_t2_meta was kept alive across T3 match for slicing; free now
+        // that all section pairs have been H2D'd.
+        if (h_meta_owned) sycl::free(h_t2_meta, q);
+        h_t2_meta = nullptr;
+
+        // Re-hydrate full-cap d_t3 on device for T3 sort.
+        s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
+        q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
+        if (h_t3_owned) sycl::free(h_t3, q);
     } else {
         // Compact: N=2 half-cap staging with pinned-host h_t3 accumulator.
         uint64_t const t3_half_cap = (cap + 1) / 2;
@@ -1433,27 +2114,95 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     }
 
     // ---------- Phase T3 sort ----------
-    size_t t3_sort_bytes = 0;
-    launch_sort_keys_u64(
-        nullptr, t3_sort_bytes,
-        static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
-        cap, 0, 2 * cfg.k, q);
-
+    // Compact / plain: full-cap CUB sort_keys with separate keys_in
+    // (= d_t3) and keys_out (= d_frags_out) buffers — peaks at
+    // 2 × cap × u64 + scratch ≈ 4228 MB at k=28.
+    //
+    // Minimal: tile the sort in halves with a single cap/2 output
+    // buffer, D2H each tile to host pinned, std::inplace_merge on
+    // host, then H2D the merged result back into the full-cap
+    // d_frags_out the D2H phase below expects. Drops T3 sort peak to
+    // ~3152 MB at k=28 (d_t3 2080 + tile output 1040 + sort scratch
+    // sized for cap/2 ≈ 32). Adds one cap-sized PCIe round-trip per
+    // plot.
     stats.phase = "T3 sort";
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
     uint64_t* d_frags_out = nullptr;
-    s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
-    s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
 
-    int p_t3_sort = begin_phase("T3 sort");
-    launch_sort_keys_u64(
-        d_sort_scratch, t3_sort_bytes,
-        d_frags_in, d_frags_out,
-        t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
-    end_phase(p_t3_sort);
+    if (!t1_match_sliced) {
+        size_t t3_sort_bytes = 0;
+        launch_sort_keys_u64(
+            nullptr, t3_sort_bytes,
+            static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
+            cap, 0, 2 * cfg.k, q);
 
-    s_free(stats, d_t3);
-    s_free(stats, d_sort_scratch);
+        s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
+        s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
+
+        int p_t3_sort = begin_phase("T3 sort");
+        launch_sort_keys_u64(
+            d_sort_scratch, t3_sort_bytes,
+            d_frags_in, d_frags_out,
+            t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
+        end_phase(p_t3_sort);
+
+        s_free(stats, d_t3);
+        s_free(stats, d_sort_scratch);
+    } else {
+        // Tiled sort + host merge.
+        uint64_t const tile_max = (cap + 1) / 2;
+        uint64_t const tile_n0  = t3_count / 2;
+        uint64_t const tile_n1  = t3_count - tile_n0;
+
+        size_t t3_tile_sort_bytes = 0;
+        launch_sort_keys_u64(
+            nullptr, t3_tile_sort_bytes,
+            static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
+            tile_max, 0, 2 * cfg.k, q);
+
+        uint64_t* d_frags_out_tile     = nullptr;
+        void*     d_sort_scratch_tile  = nullptr;
+        s_malloc(stats, d_frags_out_tile,    tile_max * sizeof(uint64_t), "d_frags_out_tile");
+        s_malloc(stats, d_sort_scratch_tile, t3_tile_sort_bytes,          "d_sort_scratch(t3_tile)");
+
+        uint64_t* h_frags = static_cast<uint64_t*>(
+            sycl::malloc_host(cap * sizeof(uint64_t), q));
+        if (!h_frags) throw std::runtime_error("sycl::malloc_host(h_frags) failed");
+
+        int p_t3_sort = begin_phase("T3 sort");
+        if (tile_n0 > 0) {
+            launch_sort_keys_u64(
+                d_sort_scratch_tile, t3_tile_sort_bytes,
+                d_frags_in, d_frags_out_tile,
+                tile_n0, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
+            q.memcpy(h_frags, d_frags_out_tile,
+                     tile_n0 * sizeof(uint64_t)).wait();
+        }
+        if (tile_n1 > 0) {
+            launch_sort_keys_u64(
+                d_sort_scratch_tile, t3_tile_sort_bytes,
+                d_frags_in + tile_n0, d_frags_out_tile,
+                tile_n1, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
+            q.memcpy(h_frags + tile_n0, d_frags_out_tile,
+                     tile_n1 * sizeof(uint64_t)).wait();
+        }
+        end_phase(p_t3_sort);
+
+        s_free(stats, d_frags_out_tile);
+        s_free(stats, d_sort_scratch_tile);
+        s_free(stats, d_t3);
+
+        // Stable in-place merge of [0, tile_n0) and [tile_n0, t3_count)
+        // — both halves are individually sorted by launch_sort_keys_u64.
+        std::inplace_merge(h_frags, h_frags + tile_n0, h_frags + t3_count);
+
+        // Re-hydrate full-cap d_frags_out for the existing D2H phase.
+        s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
+        if (t3_count > 0) {
+            q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
+        }
+        sycl::free(h_frags, q);
+    }
 
     // ---------- D2H ----------
     // Two destination modes:

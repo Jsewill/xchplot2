@@ -137,6 +137,20 @@ struct StreamingPinnedScratch {
     // Must be a power of 2 in [2, t2_num_buckets] — at k=28 strength=2
     // that's [2, 16]. BatchPlotter's tier selection sets it.
     int t2_tile_count        = 2;
+
+    // Sort-gather tile count (compact path only — ignored when
+    // plain_mode is true). Each of T1-sort gather, T2-sort meta gather,
+    // and T2-sort xbits gather peaks at ~5200 MB at k=28 because the
+    // input meta + indices + output buffer are all cap-sized and live
+    // simultaneously. With gather_tile_count = N > 1, the gather runs
+    // in N tiles, D2H'ing each tile to a host pinned staging buffer
+    // (reusing the parking scratch h_meta / h_t2_xbits) and
+    // re-allocating the full sorted output afterward via H2D. Drops
+    // each gather peak from 5200 to ~3640 MB at N=4 (peak = full input
+    // 2080 + indices 1040 + tile output 520). Default 1 = no tiling
+    // (compact / plain). Minimal tier sets it to 4. Adds ~3 PCIe round
+    // trips of cap-sized data per plot.
+    int gather_tile_count    = 1;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

@@ -43,6 +43,134 @@ T1MatchParams make_t1_params(int k, int strength)
 // match_all_buckets) and the previously-unused matching_section helper
 // have moved to T1Offsets.cuh / T1OffsetsSycl.cpp on the cross-backend path.
 
+namespace {
+
+constexpr int kT1FineBits = 8;
+
+struct T1Derived {
+    uint32_t num_sections;
+    uint32_t num_match_keys;
+    uint32_t num_buckets;
+    uint64_t fine_entries;
+    size_t   bucket_bytes;
+    size_t   fine_bytes;
+    size_t   temp_needed;
+    uint32_t target_mask;
+    uint64_t l_count_max;
+};
+
+T1Derived derive_t1(T1MatchParams const& params)
+{
+    T1Derived d{};
+    d.num_sections    = 1u << params.num_section_bits;
+    d.num_match_keys  = 1u << params.num_match_key_bits;
+    d.num_buckets     = d.num_sections * d.num_match_keys;
+    uint64_t const fine_count = 1ull << kT1FineBits;
+    d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
+    d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
+    d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
+    d.temp_needed     = d.bucket_bytes + d.fine_bytes;
+    d.target_mask     = (params.num_match_target_bits >= 32)
+                          ? 0xFFFFFFFFu
+                          : ((1u << params.num_match_target_bits) - 1u);
+    d.l_count_max =
+        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
+    return d;
+}
+
+} // namespace
+
+void launch_t1_match_prepare(
+    uint8_t const* plot_id_bytes,
+    T1MatchParams const& params,
+    XsCandidateGpu const* d_sorted_xs,
+    uint64_t total,
+    uint64_t* d_out_count,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    sycl::queue& q)
+{
+    if (!plot_id_bytes || !temp_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
+
+    T1Derived const d = derive_t1(params);
+
+    if (d_temp_storage == nullptr) {
+        *temp_bytes = d.temp_needed;
+        return;
+    }
+    if (*temp_bytes < d.temp_needed) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (!d_sorted_xs || !d_out_count)  throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.num_match_target_bits <= kT1FineBits) throw std::invalid_argument("invalid argument to launch wrapper");
+
+    auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
+    auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    launch_compute_bucket_offsets(
+        d_sorted_xs, total,
+        params.num_match_target_bits,
+        d.num_buckets, d_offsets, q);
+    launch_compute_fine_bucket_offsets(
+        d_sorted_xs, d_offsets,
+        params.num_match_target_bits, kT1FineBits,
+        d.num_buckets, d_fine_offsets, q);
+    q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
+}
+
+void launch_t1_match_range(
+    uint8_t const* plot_id_bytes,
+    T1MatchParams const& params,
+    XsCandidateGpu const* d_sorted_xs,
+    uint64_t total,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    (void)total;
+    if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
+    if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
+    if (!d_sorted_xs || !d_out_meta || !d_out_mi || !d_out_count)
+        throw std::invalid_argument("invalid argument to launch wrapper");
+
+    T1Derived const d = derive_t1(params);
+    if (bucket_end > d.num_buckets) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (bucket_end <= bucket_begin) return;
+
+    constexpr int kThreads = 256;
+    uint64_t const blocks_x_u64 = (d.l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
+
+    auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
+    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+
+    int const extra_rounds_bits = params.strength - 2;
+    int const num_test_bits     = params.num_match_key_bits;
+    int const num_info_bits     = params.k;
+
+    launch_t1_match_all_buckets(
+        keys, d_sorted_xs,
+        const_cast<uint64_t const*>(d_offsets),
+        const_cast<uint64_t const*>(d_fine_offsets),
+        d.num_match_keys, d.num_buckets,
+        params.k, params.num_section_bits,
+        params.num_match_target_bits, kT1FineBits,
+        extra_rounds_bits, d.target_mask,
+        num_test_bits, num_info_bits,
+        d_out_meta, d_out_mi, d_out_count,
+        capacity, d.l_count_max,
+        bucket_begin, bucket_end, q);
+}
+
 void launch_t1_match(
     uint8_t const* plot_id_bytes,
     T1MatchParams const& params,
@@ -56,81 +184,19 @@ void launch_t1_match(
     size_t* temp_bytes,
     sycl::queue& q)
 {
-    if (!plot_id_bytes || !temp_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
+    // Single-shot wrapper: prepare + one full-range match. Preserves
+    // the original API for pool path, test mode, and parity tests.
+    launch_t1_match_prepare(
+        plot_id_bytes, params, d_sorted_xs, total,
+        d_out_count, d_temp_storage, temp_bytes, q);
+    if (d_temp_storage == nullptr) return;  // size-query path
 
-    uint32_t num_sections    = 1u << params.num_section_bits;
-    uint32_t num_match_keys  = 1u << params.num_match_key_bits;
-    uint32_t num_buckets     = num_sections * num_match_keys;
-
-    // temp layout: offsets[num_buckets + 1] uint64 || fine_offsets[num_buckets * 2^FINE_BITS + 1]
-    constexpr int FINE_BITS = 8;
-    uint64_t const fine_count    = 1ull << FINE_BITS;
-    uint64_t const fine_entries  = uint64_t(num_buckets) * fine_count + 1;
-
-    size_t const bucket_bytes = sizeof(uint64_t) * (num_buckets + 1);
-    size_t const fine_bytes   = sizeof(uint64_t) * fine_entries;
-    size_t const needed       = bucket_bytes + fine_bytes;
-
-    if (d_temp_storage == nullptr) {
-        *temp_bytes = needed;
-
-        return;
-    }
-    if (*temp_bytes < needed)        throw std::invalid_argument("invalid argument to launch wrapper");
-    if (!d_sorted_xs || !d_out_meta || !d_out_mi || !d_out_count)
-        throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.num_match_target_bits <= FINE_BITS) throw std::invalid_argument("invalid argument to launch wrapper");
-
-    auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
-    auto* d_fine_offsets = d_offsets + (num_buckets + 1);
-
-    AesHashKeys keys = make_keys(plot_id_bytes);
-
-    // 1) Bucket offsets — backend-dispatched (CUDA or SYCL) via T1Offsets.cuh.
-    launch_compute_bucket_offsets(
-        d_sorted_xs, total,
-        params.num_match_target_bits,
-        num_buckets,
-        d_offsets, q);
-    // 1b) Fine-bucket offsets — backend-dispatched via T1Offsets.cuh.
-    launch_compute_fine_bucket_offsets(
-        d_sorted_xs, d_offsets,
-        params.num_match_target_bits, FINE_BITS,
-        num_buckets, d_fine_offsets, q);
-    // Reset out_count to 0.
-    q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
-
-    // Use the static per-section capacity as the over-launch upper
-    // bound for blocks_x. Avoids a D2H copy + stream sync that the
-    // actual-max computation would need; excess threads early-exit on
-    // `l >= l_end` inside match_all_buckets. Saves ~50–150 µs of host
-    // fence per plot (× 3 phases) and unblocks stream-level overlap.
-    uint64_t l_count_max =
-        static_cast<uint64_t>(max_pairs_per_section(params.k, params.num_section_bits));
-
-    uint32_t target_mask = (params.num_match_target_bits >= 32)
-                            ? 0xFFFFFFFFu
-                            : ((1u << params.num_match_target_bits) - 1u);
-    int extra_rounds_bits = params.strength - 2;
-    int num_test_bits     = params.num_match_key_bits;
-    int num_info_bits     = params.k;
-
-    constexpr int kThreads = 256;
-    uint64_t blocks_x_u64 = (l_count_max + kThreads - 1) / kThreads;
-    if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
-
-    // Match — backend-dispatched (CUDA or SYCL) via T1Offsets.cuh.
-    launch_t1_match_all_buckets(
-        keys, d_sorted_xs, d_offsets, d_fine_offsets,
-        num_match_keys, num_buckets,
-        params.k, params.num_section_bits,
-        params.num_match_target_bits, FINE_BITS,
-        extra_rounds_bits, target_mask,
-        num_test_bits, num_info_bits,
+    T1Derived const d = derive_t1(params);
+    launch_t1_match_range(
+        plot_id_bytes, params, d_sorted_xs, total,
         d_out_meta, d_out_mi, d_out_count,
-        capacity, l_count_max, q);
+        capacity, d_temp_storage,
+        /*bucket_begin=*/0, /*bucket_end=*/d.num_buckets, q);
 }
 
 } // namespace pos2gpu

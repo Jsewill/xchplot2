@@ -64,4 +64,40 @@ void launch_t1_match(
     size_t* temp_bytes,
     sycl::queue& q);
 
+// Two-step entry point for callers that want to run T1 match in
+// multiple bucket-range passes (parallel to T3's prepare/range plumbing).
+//
+// launch_t1_match_prepare: computes bucket + fine-bucket offsets into
+//   d_temp_storage and zeroes d_out_count. Same sizing protocol as
+//   launch_t1_match (d_temp_storage==nullptr fills *temp_bytes).
+//
+// launch_t1_match_range: runs the match kernel for bucket range
+//   [bucket_begin, bucket_end). Multiple calls sharing the same
+//   d_out_meta / d_out_mi / d_out_count produce a concatenated output
+//   via atomic append, byte-equivalent to a single full-range call
+//   after the subsequent T1 sort.
+void launch_t1_match_prepare(
+    uint8_t const* plot_id_bytes,
+    T1MatchParams const& params,
+    XsCandidateGpu const* d_sorted_xs,
+    uint64_t total,
+    uint64_t* d_out_count,
+    void* d_temp_storage,
+    size_t* temp_bytes,
+    sycl::queue& q);
+
+void launch_t1_match_range(
+    uint8_t const* plot_id_bytes,
+    T1MatchParams const& params,
+    XsCandidateGpu const* d_sorted_xs,
+    uint64_t total,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu

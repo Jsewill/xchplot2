@@ -470,7 +470,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
             stream_scratch.plain_mode = (tier == Tier::Plain);
             if (tier == Tier::Minimal) {
-                stream_scratch.t2_tile_count = 8;
+                stream_scratch.t2_tile_count     = 8;
+                stream_scratch.gather_tile_count = 4;
             }
 
             std::fprintf(stderr,

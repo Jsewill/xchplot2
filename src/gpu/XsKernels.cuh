@@ -30,11 +30,37 @@ void launch_xs_gen(
     uint32_t xor_const,
     sycl::queue& q);
 
+// Position-range variant of launch_xs_gen. Generates Xs candidates for
+// positions x ∈ [pos_begin, pos_end) and writes to keys_out[i] /
+// vals_out[i] where i = x - pos_begin (relative indexing). keys_out /
+// vals_out must be sized for at least (pos_end - pos_begin) elements.
+// Used by minimal tier to tile the Xs gen + sort phase below the
+// 4 GiB-cap peak.
+void launch_xs_gen_range(
+    AesHashKeys keys,
+    uint32_t* keys_out,
+    uint32_t* vals_out,
+    uint64_t pos_begin,
+    uint64_t pos_end,
+    int k,
+    uint32_t xor_const,
+    sycl::queue& q);
+
 void launch_xs_pack(
     uint32_t const* keys_in,
     uint32_t const* vals_in,
     XsCandidateGpu* d_out,
     uint64_t total,
+    sycl::queue& q);
+
+// Position-range variant of launch_xs_pack. Reads keys_in[i] / vals_in[i]
+// for i ∈ [0, count) and writes XsCandidateGpu{keys_in[i], vals_in[i]}
+// to d_out[i + dst_begin]. Lets the caller pack incrementally.
+void launch_xs_pack_range(
+    uint32_t const* keys_in,
+    uint32_t const* vals_in,
+    XsCandidateGpu* d_out,
+    uint64_t count,
     sycl::queue& q);
 
 } // namespace pos2gpu

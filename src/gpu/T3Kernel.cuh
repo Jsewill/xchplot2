@@ -90,4 +90,30 @@ void launch_t3_match_range(
     uint32_t bucket_end,
     sycl::queue& q);
 
+// Sliced-meta variant of launch_t3_match_range (minimal tier). Caller
+// must ensure that all bucket ids in [bucket_begin, bucket_end) share
+// the same section_l so that l reads always fall within section_l's
+// row range and r reads always fall within section_r's row range. The
+// caller pre-computes the row starts for each section (from the
+// d_offsets table sitting in d_temp_storage) and H2Ds the relevant
+// section slices of d_sorted_meta into d_meta_l_slice / d_meta_r_slice.
+// d_sorted_xbits and d_sorted_mi are still full-cap on device.
+void launch_t3_match_section_pair_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint64_t section_r_row_start,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
+    uint64_t t2_count,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu

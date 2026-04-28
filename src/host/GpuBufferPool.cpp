@@ -395,15 +395,29 @@ size_t streaming_plain_peak_bytes(int k)
 
 size_t streaming_minimal_peak_bytes(int k)
 {
-    // Anchor: 3700 MB at k=28. Compact's 5200 peak minus ~1500 MB from
-    // N=8 vs N=2 T2 match staging (cap/8 ≈ 570 MB vs cap/2 ≈ 2280 MB
-    // for the meta+mi+xbits stage triple at k=28). All other compact
-    // savings (park/rehydrate of d_t1_meta / d_t1_keys_merged /
-    // d_t2_meta / d_t2_xbits / d_t2_keys_merged) carry over unchanged.
-    // Estimated, not yet measured on a real 4 GiB card; conservative
-    // by ~250 MB vs the back-of-envelope calc to leave room for
-    // CUDA-context + driver overhead. Same k-scaling as compact / plain.
-    constexpr size_t anchor_mb = 3700;
+    // Anchor: 3760 MB at k=28 (measured 3754 MB on sm_89 + the
+    // streaming-stats trace; rounded up for safety). Bottleneck is T3
+    // match where d_t2_keys_merged + d_t2_xbits_sorted + meta-l/r
+    // slices + d_t3_stage are co-resident.
+    //
+    // Minimal layers cumulative cuts on top of compact:
+    //   1. N=8 T2 match staging (cap/8 ≈ 570 MB vs compact's cap/2).
+    //   2. T1 sort gather, T2 sort meta+xbits gathers — tiled output,
+    //      D2H per tile to host pinned, rebuild on device after free.
+    //   3. T3 match — d_t2_meta_sorted parked on host pinned, sliced
+    //      device buffers H2D'd per (section_l, section_r) pass.
+    //   4. T1 match — sliced into N passes per section_l, output
+    //      accumulated to host pinned.
+    //   5. T1, T2, T3 sort CUB sub-phases — per-tile cap/N output
+    //      buffers, USM-host accumulation, merges with USM-host inputs.
+    //   6. Xs phase — gen+sort tiled in N=2 position halves with
+    //      USM-host accumulators; pack tiled with D2H per tile.
+    //
+    // Cumulative effect at k=28: peak drops from 5200 MB (compact) →
+    // 3754 MB (minimal). Trade-off: ~6 extra cap-sized PCIe round-
+    // trips per plot (~2.5× wall on NVIDIA — 13 s/plot → 34 s/plot
+    // at k=28). Same k-scaling as compact / plain.
+    constexpr size_t anchor_mb = 3760;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

@@ -55,4 +55,44 @@ void launch_t3_match_all_buckets(
     uint32_t bucket_end,
     sycl::queue& q);
 
+// Sliced variant: same algorithm as launch_t3_match_all_buckets but with
+// d_sorted_meta accessed via two per-section slices instead of a full
+// cap-sized device buffer. The kernel reads:
+//   meta_l = d_meta_l_slice[l - section_l_row_start]
+//   meta_r = d_meta_r_slice[r - section_r_row_start]
+// Caller MUST ensure that all bucket ids in [bucket_begin, bucket_end)
+// share the same section_l (i.e., the range is contained in
+// [section_l*num_match_keys, (section_l+1)*num_match_keys)) so that
+// every l read falls in section_l's row range and every r read falls in
+// the (uniquely-determined) section_r's row range. d_sorted_xbits and
+// d_sorted_mi remain full-cap on device (no slicing). Used by minimal
+// tier to keep d_t2_meta_sorted parked on host pinned across T3 match;
+// drops T3 match peak from ~5200 MB to ~3380 MB at k=28.
+void launch_t3_match_section_pair(
+    AesHashKeys keys,
+    FeistelKey fk,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint64_t section_r_row_start,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    uint32_t num_buckets,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu
