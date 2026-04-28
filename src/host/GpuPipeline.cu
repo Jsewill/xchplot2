@@ -198,6 +198,19 @@ inline std::string s_fmt_bytes(size_t bytes) {
 template <typename T>
 inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reason)
 {
+    // Zero-byte requests come from sizing queries that returned 0,
+    // which downstream callers honour as "skip this alloc" only by
+    // accident — cudaMalloc(0) is implementation-defined and on some
+    // driver versions returns cudaErrorInvalidValue rather than a
+    // valid empty pointer. Surface the actual upstream cause instead
+    // of triggering the misleading "Card likely too small" path.
+    if (bytes == 0) {
+        throw std::runtime_error(
+            std::string("internal: s_malloc('") + reason + "') called with "
+            "bytes=0 — an upstream sizing query returned 0 (count=0). "
+            "Run the parity tests on this device to localise the kernel "
+            "that produced no output.");
+    }
     if (s.cap && s.live + bytes > s.cap) {
         throw std::runtime_error(
             std::string("streaming VRAM cap: phase=") + s.phase +
@@ -247,6 +260,28 @@ inline void s_free(StreamingStats& s, T*& ptr)
     }
     cudaFree(raw);
     ptr = nullptr;
+}
+
+// Sanity-check t1_count after T1 match. Healthy plots produce ~2^k
+// entries; anything below total_xs/64 (= 2^(k-6)) — let alone literal
+// zero — points at kernel correctness on the device, not a VRAM
+// shortfall. Surfaces a clear diagnostic instead of letting downstream
+// sort-scratch alloc fail with the misleading "Card likely too small"
+// message — the same defensive check carried by main's GpuPipeline.cpp
+// for parity across branches.
+inline void validate_t1_count(uint64_t t1_count, int k)
+{
+    uint64_t const min_plausible = (1ULL << k) >> 6;
+    if (t1_count >= min_plausible) return;
+
+    throw std::runtime_error(
+        "T1 match produced " + std::to_string(t1_count) + " entries "
+        "(expected ~2^" + std::to_string(k) + " = " +
+        std::to_string(1ULL << k) + " for k=" + std::to_string(k) +
+        "). This indicates a kernel correctness issue on the device, "
+        "not a VRAM shortfall. Build the parity tests via cmake and "
+        "verify on this device: aes_parity, xs_parity, t1_parity, "
+        "t2_parity, t3_parity.");
 }
 
 // =====================================================================
@@ -556,6 +591,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     CHECK(cudaMemcpy(&t1_count, d_count, sizeof(uint64_t),
                      cudaMemcpyDeviceToHost));
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
+    validate_t1_count(t1_count, cfg.k);
 
 
     // Sort T1 by match_info (low k bits). d_storage is now repurposed
@@ -953,6 +989,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     CHECK(cudaMemcpy(&t1_count, d_counter, sizeof(uint64_t),
                      cudaMemcpyDeviceToHost));
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
+    validate_t1_count(t1_count, cfg.k);
 
     s_free(stats, d_t1_match_temp);
     // Xs fully consumed.
