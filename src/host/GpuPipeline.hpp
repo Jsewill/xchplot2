@@ -118,7 +118,7 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
 // Lifetime-disjoint sharing: h_meta (cap*u64) is reused for t1_meta
 // then t2_meta; h_keys_merged (cap*u32) is reused for t1 then t2.
 struct StreamingPinnedScratch {
-    uint64_t* h_meta         = nullptr;  // parks t1_meta, then t2_meta
+    uint64_t* h_meta         = nullptr;  // parks t1_meta, then t2_meta, then t3 accumulator
     uint32_t* h_keys_merged  = nullptr;  // parks t1_keys_merged, then t2_keys_merged
     uint32_t* h_t2_xbits     = nullptr;  // parks t2_xbits
     // T2 match staging tile count. compact uses 2 (cap/2 staging, ~2.3 GB at
@@ -128,6 +128,17 @@ struct StreamingPinnedScratch {
     // BatchPlotter's tier selection (kMinimalFloorBytes constant) gates
     // when minimal vs compact gets picked.
     int t2_tile_count = 2;
+    // T3 match staging tile count. After T2-match got tiled, T3 match
+    // became the new overall pipeline peak (d_t2_meta_sorted +
+    // d_t2_xbits_sorted + d_t2_keys_merged + d_t3 ≈ 6240 MiB at k=28).
+    // Setting t3_tile_count >= 2 emits T3 into a cap/N device staging
+    // buffer and accumulates into h_meta (reused as the T3 host
+    // accumulator — its T2 meta park lifetime ended at the gather phase
+    // above, so the buffer is dead by T3 match entry). Default 1 = no
+    // tiling (original single-shot kernel call). Must be a power of 2
+    // in [1, t3_num_buckets] — at k=28 strength=2 that's [1, 16]; the
+    // staging path (>= 2) requires h_meta to be non-null.
+    int t3_tile_count = 1;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

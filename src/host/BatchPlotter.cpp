@@ -372,10 +372,15 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 kPlainFloorBytes / double(1ULL << 30));
         } else if (tier == Tier::Compact || tier == Tier::Minimal) {
             // Compact + Minimal share the same pinned-host scratch
-            // (h_meta / h_keys_merged / h_t2_xbits, ~4.2 GB at k=28);
-            // Minimal additionally sets t2_tile_count = 8 (vs compact's
-            // default 2) so T2 match staging shrinks from ~2.3 GB to
-            // ~570 MB — that's where the 4 GiB tier's headroom comes from.
+            // (h_meta / h_keys_merged / h_t2_xbits, ~4.2 GB at k=28).
+            // Both also set t3_tile_count = 2: T3 match emits into a
+            // half-cap d_t3 staging buffer and accumulates into h_meta
+            // (its T2-meta park lifetime ends at the meta gather above),
+            // dropping the T3-match peak from 6240 MiB → 5200 MiB at
+            // k=28 so compact gets back under its sub-6 GiB design
+            // target. Minimal additionally sets t2_tile_count = 8 (vs
+            // compact's default 2) so T2 match staging shrinks from
+            // ~2.3 GB to ~570 MB.
             stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
             stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
@@ -392,17 +397,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     "[batch] streaming-fallback: compact/minimal pinned scratch alloc failed");
             }
             stream_compact = true;
+            stream_scratch.t3_tile_count = 2;
             if (tier == Tier::Minimal) {
                 stream_scratch.t2_tile_count = 8;
                 std::fprintf(stderr,
                     "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
-                    "park/rehydrate + N=8 T2 staging, expect ~5-15 s/plot extra PCIe)\n",
+                    "park/rehydrate + N=8 T2 + N=2 T3 staging, expect ~5-15 s/plot extra PCIe)\n",
                     free_bytes / double(1ULL << 30),
                     kMinimalFloorBytes / double(1ULL << 30));
             } else {
                 std::fprintf(stderr,
                     "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
-                    "using park/rehydrate, expect ~1-2 s/plot extra PCIe)\n",
+                    "park/rehydrate + N=2 T3 staging, expect ~1-2 s/plot extra PCIe)\n",
                     free_bytes / double(1ULL << 30),
                     kPlainFloorBytes / double(1ULL << 30));
             }

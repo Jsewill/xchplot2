@@ -1476,25 +1476,124 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     T3PairingGpu* d_t3 = nullptr;
     void*         d_t3_match_temp = nullptr;
-    s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
-    s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
+    uint64_t      t3_count        = 0;
 
-    CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
-    CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          d_t2_keys_merged, t2_count,
-                          d_t3, d_counter, cap,
-                          d_t3_match_temp, &t3_temp_bytes, stream));
+    bool const t3_stage_path =
+        scratch.t3_tile_count >= 2 && scratch.h_meta != nullptr;
 
-    uint64_t t3_count = 0;
-    CHECK(cudaMemcpy(&t3_count, d_counter, sizeof(uint64_t),
-                     cudaMemcpyDeviceToHost));
-    if (t3_count > cap) throw std::runtime_error("T3 overflow");
+    if (t3_stage_path) {
+        // Compact/minimal-streaming T3 staging. The four T3-match input
+        // buffers (d_t2_meta_sorted 2080 MB + d_t2_xbits_sorted 1040 MB
+        // + d_t2_keys_merged 1040 MB at k=28) plus a full-cap d_t3
+        // (2080 MB) is the new overall pipeline peak after T2-match was
+        // tiled out — 6240 MiB at k=28, breaking compact's sub-6 GiB
+        // target. Tiling T3 match output into cap/N device staging and
+        // accumulating into h_meta (its T2-meta park lifetime ended at
+        // the gather above) drops the d_t3 contribution from cap*8 to
+        // cap*8/N: peak becomes 4160 + 2080/N MB. N=2 → 5200 MB at k=28.
+        //
+        // After the tile loop, the staging buffers and d_t2_* are freed
+        // before allocating the full-cap d_t3 needed for T3 sort, so
+        // T3 sort itself sees a clean peak (~4160 MB) without the
+        // d_t2_* baseline weighing on it.
+        uint32_t const t3_num_buckets = (1u << t3p.num_section_bits)
+                                      * (1u << t3p.num_match_key_bits);
+        int const N = scratch.t3_tile_count;
+        if ((N & (N - 1)) != 0) {
+            throw std::runtime_error(
+                "scratch.t3_tile_count must be a power of 2 (got " +
+                std::to_string(N) + ")");
+        }
+        if (static_cast<uint32_t>(N) > t3_num_buckets) {
+            throw std::runtime_error(
+                "scratch.t3_tile_count " + std::to_string(N) +
+                " exceeds t3_num_buckets " + std::to_string(t3_num_buckets));
+        }
+        uint64_t const t3_tile_cap = (cap + uint64_t(N) - 1) / uint64_t(N);
 
-    s_free(stats, d_t3_match_temp);
-    s_free(stats, d_t2_meta_sorted);
-    s_free(stats, d_t2_xbits_sorted);
-    s_free(stats, d_t2_keys_merged);
+        T3PairingGpu* d_t3_stage = nullptr;
+        s_malloc(stats, d_t3_stage,      t3_tile_cap * sizeof(T3PairingGpu), "d_t3_stage");
+        s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                      "d_t3_match_temp");
+
+        // h_meta (cap × u64) doubles as the pinned accumulator for T3
+        // pairings — same size in bytes (T3PairingGpu == 8) and its T2
+        // park lifetime ended at the meta gather above. Reinterpret-cast
+        // is safe under [basic.lval]/11.5: byte arrays are valid storage
+        // for any trivially-copyable POD of compatible alignment.
+        T3PairingGpu* const h_t3 =
+            reinterpret_cast<T3PairingGpu*>(scratch.h_meta);
+
+        CHECK(launch_t3_match_prepare(cfg.plot_id.data(), t3p,
+                                      d_t2_keys_merged, t2_count,
+                                      d_counter,
+                                      d_t3_match_temp, &t3_temp_bytes,
+                                      stream));
+
+        for (int pass = 0; pass < N; ++pass) {
+            uint32_t const b_begin = uint32_t(uint64_t(pass)     * t3_num_buckets / uint64_t(N));
+            uint32_t const b_end   = uint32_t(uint64_t(pass + 1) * t3_num_buckets / uint64_t(N));
+
+            CHECK(launch_t3_match_range(cfg.plot_id.data(), t3p,
+                                        d_t2_meta_sorted, d_t2_xbits_sorted,
+                                        d_t2_keys_merged, t2_count,
+                                        d_t3_stage, d_counter, t3_tile_cap,
+                                        d_t3_match_temp,
+                                        b_begin, b_end, stream));
+
+            uint64_t pass_count = 0;
+            CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            if (pass_count > t3_tile_cap) {
+                throw std::runtime_error(
+                    "T3 match pass overflow: bucket range [" +
+                    std::to_string(b_begin) + "," + std::to_string(b_end) +
+                    ") produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t3_tile_cap) +
+                    " (consider lower t3_tile_count)");
+            }
+            CHECK(cudaMemcpyAsync(h_t3 + t3_count, d_t3_stage,
+                                  pass_count * sizeof(T3PairingGpu),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+            CHECK(cudaStreamSynchronize(stream));
+            t3_count += pass_count;
+        }
+        if (t3_count > cap) throw std::runtime_error("T3 overflow");
+
+        // Free staging + match temp + the T3-match inputs before the
+        // full-cap d_t3 alloc, so the H2D-back peak is just d_t3 alone.
+        s_free(stats, d_t3_match_temp);
+        s_free(stats, d_t3_stage);
+        s_free(stats, d_t2_meta_sorted);
+        s_free(stats, d_t2_xbits_sorted);
+        s_free(stats, d_t2_keys_merged);
+
+        s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
+        CHECK(cudaMemcpyAsync(d_t3, h_t3,
+                              t3_count * sizeof(T3PairingGpu),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+    } else {
+        s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
+        s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
+
+        CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+        CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
+                              d_t2_meta_sorted, d_t2_xbits_sorted,
+                              d_t2_keys_merged, t2_count,
+                              d_t3, d_counter, cap,
+                              d_t3_match_temp, &t3_temp_bytes, stream));
+
+        CHECK(cudaMemcpy(&t3_count, d_counter, sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost));
+        if (t3_count > cap) throw std::runtime_error("T3 overflow");
+
+        s_free(stats, d_t3_match_temp);
+        s_free(stats, d_t2_meta_sorted);
+        s_free(stats, d_t2_xbits_sorted);
+        s_free(stats, d_t2_keys_merged);
+    }
 
     // ---------- Phase T3 sort ----------
     size_t t3_sort_bytes = 0;
