@@ -911,69 +911,212 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // extra PCIe cost (purely a lifetime rearrangement of on-device
     // buffers).
     stats.phase = "Xs";
-
-    uint32_t* d_xs_keys_a = nullptr;
-    uint32_t* d_xs_vals_a = nullptr;
-    s_malloc(stats, d_xs_keys_a, total_xs * sizeof(uint32_t), "d_xs_keys_a");
-    s_malloc(stats, d_xs_vals_a, total_xs * sizeof(uint32_t), "d_xs_vals_a");
-
-    CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                        d_xs_keys_a, d_xs_vals_a));
-
-    // CUB DoubleBuffer mode: ping-pongs between keys_a/keys_b so the
-    // internal scratch shrinks from ~2 GB at k=28 down to ~MB of
-    // histograms (matches launch_construct_xs and the streaming
-    // T1/T2/T3 sorts). Caller canonicalises to keys_b/vals_b via a
-    // conditional D2D copy if CUB landed in the a side.
-    uint32_t* d_xs_keys_b = nullptr;
-    uint32_t* d_xs_vals_b = nullptr;
-    s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
-    s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
-
-    size_t xs_cub_bytes = 0;
-    {
-        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
-        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            nullptr, xs_cub_bytes,
-            probe_keys, probe_vals,
-            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
-    }
-    void* d_xs_cub_scratch = nullptr;
-    s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes, "d_xs_cub");
-
-    {
-        cub::DoubleBuffer<uint32_t> dk(d_xs_keys_a, d_xs_keys_b);
-        cub::DoubleBuffer<uint32_t> dv(d_xs_vals_a, d_xs_vals_b);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            d_xs_cub_scratch, xs_cub_bytes,
-            dk, dv,
-            total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
-        // Canonicalise sorted result into keys_b/vals_b so downstream
-        // free-before-pack treats keys_a/vals_a as the disposable pair.
-        if (dk.Current() != d_xs_keys_b) {
-            CHECK(cudaMemcpyAsync(d_xs_keys_b, dk.Current(),
-                total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-        }
-        if (dv.Current() != d_xs_vals_b) {
-            CHECK(cudaMemcpyAsync(d_xs_vals_b, dv.Current(),
-                total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-        }
-    }
-
-    // Sort consumed keys_a + vals_a; free them + CUB scratch before
-    // allocating d_xs so the pack phase peak stays under the sort peak.
-    s_free(stats, d_xs_cub_scratch);
-    s_free(stats, d_xs_keys_a);
-    s_free(stats, d_xs_vals_a);
-
     XsCandidateGpu* d_xs = nullptr;
-    s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
 
-    CHECK(launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs));
+    // Cut #6 (minimal tier): tile Xs gen+sort+pack with N=gather_tile_
+    // count. The non-tiled path peaks at four cap-sized uint32 buffers
+    // during the CUB DoubleBuffer sort (~4136 MB at k=28 incl. CUB
+    // scratch); cut #6 generates once into 2 cap × u32, then sorts in
+    // N tiles using cap/N alternate buffers, D2H'ing each sorted tile
+    // to a 2-cap u32 host accumulator (carved out of scratch.h_meta —
+    // its T1-meta-park lifetime starts later in T1 match cut #4, so
+    // it's dead through Xs). After all tiles, free the device buffers,
+    // host-merge with the cut #5-style paired merge, and pack the
+    // (keys, vals) host pair directly into d_xs's match_info / x
+    // fields via two strided cudaMemcpy2DAsync calls. Drops Xs phase
+    // peak from 4136 → ~2600 MB at k=28 (2 cap gen + 2 cap/N sort alt
+    // + scratch ≈ 2.5 cap at N=4). Final d_xs alloc is the post-merge
+    // peak at ~2 cap = 2080 MB.
+    bool const tiled_xs = (scratch.gather_tile_count >= 2 &&
+                           scratch.h_meta != nullptr);
 
-    s_free(stats, d_xs_keys_b);
-    s_free(stats, d_xs_vals_b);
+    if (tiled_xs) {
+        int const N_xs = scratch.gather_tile_count;
+        uint64_t const tile_cap_xs =
+            (total_xs + uint64_t(N_xs) - 1) / uint64_t(N_xs);
+
+        // Reuse scratch.h_meta (cap × u64 = 2 cap × u32) as the
+        // h_xs_keys + h_xs_vals accumulators. h_xs_keys covers the
+        // first cap u32 entries; h_xs_vals the next cap. total_xs <=
+        // cap so both fit. h_meta gets overwritten by T1 match's cut
+        // #4 D2H later — we don't preserve Xs data past this phase.
+        uint32_t* h_xs_keys = reinterpret_cast<uint32_t*>(scratch.h_meta);
+        uint32_t* h_xs_vals = h_xs_keys + cap;
+
+        uint32_t* d_xs_keys_full = nullptr;
+        uint32_t* d_xs_vals_full = nullptr;
+        s_malloc(stats, d_xs_keys_full, total_xs * sizeof(uint32_t), "d_xs_keys_full");
+        s_malloc(stats, d_xs_vals_full, total_xs * sizeof(uint32_t), "d_xs_vals_full");
+
+        CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                            d_xs_keys_full, d_xs_vals_full));
+
+        size_t xs_cub_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, xs_cub_bytes,
+                probe_keys, probe_vals,
+                tile_cap_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+        }
+
+        uint32_t* d_xs_keys_alt    = nullptr;
+        uint32_t* d_xs_vals_alt    = nullptr;
+        void*     d_xs_cub_scratch = nullptr;
+        s_malloc(stats, d_xs_keys_alt,    tile_cap_xs * sizeof(uint32_t), "d_xs_keys_alt");
+        s_malloc(stats, d_xs_vals_alt,    tile_cap_xs * sizeof(uint32_t), "d_xs_vals_alt");
+        s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes,                   "d_xs_cub");
+
+        std::vector<uint64_t> tile_ends_xs(N_xs + 1);
+        tile_ends_xs[0] = 0;
+        for (int t = 0; t < N_xs; ++t) {
+            uint64_t const tile_start = uint64_t(t) * tile_cap_xs;
+            uint64_t const tile_end   = (tile_start + tile_cap_xs < total_xs)
+                                          ? tile_start + tile_cap_xs : total_xs;
+            tile_ends_xs[t + 1] = tile_end;
+            uint64_t const tile_n = tile_end - tile_start;
+            if (tile_n == 0) continue;
+
+            cub::DoubleBuffer<uint32_t> dk(d_xs_keys_full + tile_start, d_xs_keys_alt);
+            cub::DoubleBuffer<uint32_t> dv(d_xs_vals_full + tile_start, d_xs_vals_alt);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_xs_cub_scratch, xs_cub_bytes,
+                dk, dv,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+
+            CHECK(cudaMemcpyAsync(h_xs_keys + tile_start, dk.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost));
+            CHECK(cudaMemcpyAsync(h_xs_vals + tile_start, dv.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost));
+        }
+        CHECK(cudaStreamSynchronize(0));
+
+        s_free(stats, d_xs_cub_scratch);
+        s_free(stats, d_xs_vals_alt);
+        s_free(stats, d_xs_keys_alt);
+        s_free(stats, d_xs_vals_full);
+        s_free(stats, d_xs_keys_full);
+
+        // Host paired merge — same shape as cut #5.
+        std::vector<uint32_t> tmp_keys(total_xs);
+        std::vector<uint32_t> tmp_vals(total_xs);
+        auto paired_merge_xs = [&](uint64_t left, uint64_t mid, uint64_t right) {
+            uint64_t i = left, j = mid, k = 0;
+            while (i < mid && j < right) {
+                if (h_xs_keys[i] <= h_xs_keys[j]) {
+                    tmp_keys[k] = h_xs_keys[i];
+                    tmp_vals[k] = h_xs_vals[i];
+                    ++i; ++k;
+                } else {
+                    tmp_keys[k] = h_xs_keys[j];
+                    tmp_vals[k] = h_xs_vals[j];
+                    ++j; ++k;
+                }
+            }
+            while (i < mid) {
+                tmp_keys[k] = h_xs_keys[i];
+                tmp_vals[k] = h_xs_vals[i];
+                ++i; ++k;
+            }
+            while (j < right) {
+                tmp_keys[k] = h_xs_keys[j];
+                tmp_vals[k] = h_xs_vals[j];
+                ++j; ++k;
+            }
+            std::memcpy(h_xs_keys + left, tmp_keys.data(), k * sizeof(uint32_t));
+            std::memcpy(h_xs_vals + left, tmp_vals.data(), k * sizeof(uint32_t));
+        };
+        for (int width = 1; width < N_xs; width *= 2) {
+            for (int i = 0; i + width < N_xs; i += 2 * width) {
+                int const left  = i;
+                int const mid   = i + width;
+                int const right = (i + 2 * width <= N_xs) ? (i + 2 * width) : N_xs;
+                paired_merge_xs(tile_ends_xs[left], tile_ends_xs[mid], tile_ends_xs[right]);
+            }
+        }
+
+        // Pack (h_xs_keys, h_xs_vals) → d_xs via two strided H2D
+        // copies. d_xs[i] = {match_info, x} (8 B), so each field gets
+        // a stride-8 destination. cudaMemcpy2D handles the strided
+        // write efficiently — no separate pack kernel + 2 cap × u32
+        // d_xs_keys_b / d_xs_vals_b alive on device during pack.
+        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+        XsCandidateGpu sentinel{};
+        size_t const struct_stride = sizeof(XsCandidateGpu);
+        size_t const field_bytes   = sizeof(uint32_t);
+        // match_info field (offset 0)
+        CHECK(cudaMemcpy2DAsync(
+            reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, match_info),
+            struct_stride,
+            h_xs_keys, field_bytes,
+            field_bytes, total_xs,
+            cudaMemcpyHostToDevice, /*stream=*/0));
+        // x field (offset offsetof(.,x))
+        CHECK(cudaMemcpy2DAsync(
+            reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, x),
+            struct_stride,
+            h_xs_vals, field_bytes,
+            field_bytes, total_xs,
+            cudaMemcpyHostToDevice, /*stream=*/0));
+        CHECK(cudaStreamSynchronize(0));
+        (void)sentinel;
+    } else {
+        uint32_t* d_xs_keys_a = nullptr;
+        uint32_t* d_xs_vals_a = nullptr;
+        s_malloc(stats, d_xs_keys_a, total_xs * sizeof(uint32_t), "d_xs_keys_a");
+        s_malloc(stats, d_xs_vals_a, total_xs * sizeof(uint32_t), "d_xs_vals_a");
+
+        CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                            d_xs_keys_a, d_xs_vals_a));
+
+        uint32_t* d_xs_keys_b = nullptr;
+        uint32_t* d_xs_vals_b = nullptr;
+        s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+        s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+
+        size_t xs_cub_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, xs_cub_bytes,
+                probe_keys, probe_vals,
+                total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+        }
+        void* d_xs_cub_scratch = nullptr;
+        s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes, "d_xs_cub");
+
+        {
+            cub::DoubleBuffer<uint32_t> dk(d_xs_keys_a, d_xs_keys_b);
+            cub::DoubleBuffer<uint32_t> dv(d_xs_vals_a, d_xs_vals_b);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_xs_cub_scratch, xs_cub_bytes,
+                dk, dv,
+                total_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
+            if (dk.Current() != d_xs_keys_b) {
+                CHECK(cudaMemcpyAsync(d_xs_keys_b, dk.Current(),
+                    total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            }
+            if (dv.Current() != d_xs_vals_b) {
+                CHECK(cudaMemcpyAsync(d_xs_vals_b, dv.Current(),
+                    total_xs * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            }
+        }
+
+        s_free(stats, d_xs_cub_scratch);
+        s_free(stats, d_xs_keys_a);
+        s_free(stats, d_xs_vals_a);
+
+        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+
+        CHECK(launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs));
+
+        s_free(stats, d_xs_keys_b);
+        s_free(stats, d_xs_vals_b);
+    }
 
     // ---------- Phase T1 match ----------
     stats.phase = "T1 match";

@@ -318,7 +318,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // match. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
         // MX450). Floor is estimated, not measured on real 4 GiB
         // hardware — please report actual fit on a 4 GiB card.
-        constexpr uint64_t kMinimalFloorBytes = 4356ULL * 1024 * 1024;
+        constexpr uint64_t kMinimalFloorBytes = 3768ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
