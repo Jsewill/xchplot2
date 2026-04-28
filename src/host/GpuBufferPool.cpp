@@ -314,10 +314,11 @@ namespace {
 //
 // Baseline set at 256 MB at k=28 (a touch over CUB's typical scratch
 // on sm_89 to keep headroom on NVIDIA cards near the threshold) and
-// scaled 4× per +k step so it tracks the anchors' own scaling. The
-// returned adjustment is `max(0, runtime_sort_scratch - baseline)`,
-// so NVIDIA hosts whose runtime scratch is at or below the baseline
-// see no change in predicted peak.
+// scaled 2× per +k step (linear in cap, matching how CUB's actual
+// DeviceRadixSort scratch grows). The returned adjustment is
+// `max(0, runtime_sort_scratch - baseline)`, so NVIDIA hosts whose
+// runtime scratch is at or below the baseline see no change in
+// predicted peak.
 inline size_t streaming_sort_scratch_adjustment(int k)
 {
     constexpr size_t cub_baseline_at_k28_bytes = 256ULL << 20;
@@ -342,8 +343,8 @@ inline size_t streaming_sort_scratch_adjustment(int k)
 
     int const dk = k - 28;
     size_t baseline = cub_baseline_at_k28_bytes;
-    if (dk > 0)      baseline <<= (dk * 2);
-    else if (dk < 0) baseline >>= (-dk * 2);
+    if (dk > 0)      baseline <<= dk;
+    else if (dk < 0) baseline >>= -dk;
 
     return (actual > baseline) ? (actual - baseline) : 0;
 }
@@ -361,13 +362,13 @@ size_t streaming_peak_bytes(int k)
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;       // floor for tiny test plots
-    if (k >  32) return (size_t(anchor_mb) << (20 + ((32 - 28) * 2))) + adj;
+    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
 
     if (k < 28) {
-        int const shift = (28 - k) * 2;  // k drops by 2 → 4× smaller
+        int const shift = 28 - k;  // cap halves per −1 in k → 2× smaller
         return ((size_t(anchor_mb) << 20) >> shift) + adj;
     }
-    int const shift = (k - 28) * 2;
+    int const shift = k - 28;
     return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
@@ -382,13 +383,13 @@ size_t streaming_plain_peak_bytes(int k)
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + ((32 - 28) * 2))) + adj;
+    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
 
     if (k < 28) {
-        int const shift = (28 - k) * 2;
+        int const shift = 28 - k;
         return ((size_t(anchor_mb) << 20) >> shift) + adj;
     }
-    int const shift = (k - 28) * 2;
+    int const shift = k - 28;
     return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
@@ -406,13 +407,13 @@ size_t streaming_minimal_peak_bytes(int k)
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + ((32 - 28) * 2))) + adj;
+    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
 
     if (k < 28) {
-        int const shift = (28 - k) * 2;
+        int const shift = 28 - k;
         return ((size_t(anchor_mb) << 20) >> shift) + adj;
     }
-    int const shift = (k - 28) * 2;
+    int const shift = k - 28;
     return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
