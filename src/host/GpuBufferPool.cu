@@ -31,6 +31,55 @@ namespace {
     }                                                                    \
 } while (0)
 
+// Format a byte count as "<N> bytes (<N.NN> MB)" for diagnostics. The
+// raw byte count surfaces sub-MiB requests that would otherwise round
+// to "0 MB"; the MB form keeps human readability for the > 1 MiB case.
+inline std::string fmt_alloc_bytes(size_t bytes)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%zu bytes (%.2f MB)",
+                  bytes, double(bytes) / (1024.0 * 1024.0));
+    return std::string(buf);
+}
+
+// cudaMalloc wrapper that includes the requested byte count + the
+// underlying CUDA error name/string in the diagnostic. The pool's
+// preflight cudaMemGetInfo check fails most attempts cleanly with
+// the "needs ~X.X GiB, only Y.Y GiB free" InsufficientVramError
+// shape, but a later cudaMalloc can race with another GPU consumer
+// (compositor spike, transient driver activity) and surface CUDA:2
+// (cudaErrorMemoryAllocation) — without this wrapper the caller saw
+// only "GpuBufferPool CUDA: out of memory" with no clue which alloc
+// or how big. Mirrors main's d7d2748 sycl_alloc_device_or_throw fix.
+template <typename T>
+inline void pool_alloc(T*& out, size_t bytes, char const* what)
+{
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&out), bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaMalloc(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") failed: " +
+            cudaGetErrorName(err) + " (" + cudaGetErrorString(err) +
+            "). Likely transient OOM — check `nvidia-smi` for other "
+            "GPU consumers, or set POS2GPU_MAX_VRAM_MB lower if VRAM "
+            "is shared with display/compositor.");
+    }
+}
+
+inline void pool_alloc_host(void** out, size_t bytes, char const* what)
+{
+    cudaError_t err = cudaMallocHost(out, bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaMallocHost(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") failed: " +
+            cudaGetErrorName(err) + " (" + cudaGetErrorString(err) +
+            "). Pinned-host alloc failed — system RAM exhausted, or "
+            "the pinned-memory cgroup/ulimit is below the requested "
+            "size.");
+    }
+}
+
 } // namespace
 
 GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
@@ -147,13 +196,15 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         }
     };
     try {
-        POOL_CHECK(cudaMalloc(&d_storage,      storage_bytes));
-        POOL_CHECK(cudaMalloc(&d_pair_a,       pair_a_bytes));
-        POOL_CHECK(cudaMalloc(&d_pair_b,       pair_b_bytes));
-        POOL_CHECK(cudaMalloc(&d_sort_scratch, sort_scratch_bytes));
-        POOL_CHECK(cudaMalloc(&d_counter,      sizeof(uint64_t)));
+        pool_alloc(d_storage,      storage_bytes,      "d_storage");
+        pool_alloc(d_pair_a,       pair_a_bytes,       "d_pair_a");
+        pool_alloc(d_pair_b,       pair_b_bytes,       "d_pair_b");
+        pool_alloc(d_sort_scratch, sort_scratch_bytes, "d_sort_scratch");
+        pool_alloc(d_counter,      sizeof(uint64_t),   "d_counter");
         for (int i = 0; i < kNumPinnedBuffers; ++i) {
-            POOL_CHECK(cudaMallocHost(&h_pinned_t3[i], pinned_bytes));
+            pool_alloc_host(reinterpret_cast<void**>(&h_pinned_t3[i]),
+                            pinned_bytes,
+                            ("h_pinned_t3[" + std::to_string(i) + "]").c_str());
         }
     } catch (...) {
         cleanup_partial();
