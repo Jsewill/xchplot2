@@ -114,6 +114,18 @@ __global__ void init_u32_identity(uint32_t* __restrict__ vals, uint64_t count)
     vals[idx] = uint32_t(idx);
 }
 
+// Variant for cut #5 tile-sort: writes vals[i] = uint32_t(offset + i).
+// Used to seed CUB SortPairs vals with global (not tile-relative)
+// positions per tile, so the vals stream coming out of sort indexes
+// directly into the cap-sized d_t1_meta / d_t2_meta for the gather.
+__global__ void init_u32_identity_offset(uint32_t* __restrict__ vals,
+                                          uint64_t count, uint32_t offset)
+{
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= count) return;
+    vals[idx] = uint32_t(offset + uint32_t(idx));
+}
+
 // Gather-by-index helpers. Used to split the fused merge-permute into
 // merge + per-column gather, letting the streaming path free the source
 // column between gather passes and shrink the peak VRAM window.
@@ -1100,102 +1112,213 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         d_t1_meta = nullptr;
     }
 
-    // ---------- Phase T1 sort (tiled, N=2) ----------
-    // Partition T1 into two halves by index, CUB-sort each with scratch
-    // sized for the larger half, then stable 2-way merge the sorted runs
-    // back into the extract-input slot (d_keys_in / d_vals_in) — that
-    // slot is free because the CUB sort has already consumed it.
-    //
-    // N=2 is the minimal case that exercises the tile + merge path; a
-    // larger N shrinks per-tile CUB scratch further but needs a multi-
-    // way merge or a tree of pairwise merges. Phase 6 can bump N once
-    // Phase 4's k=28 VRAM measurement shows how tight the budget is.
-    uint64_t const t1_tile_n0  = t1_count / 2;
-    uint64_t const t1_tile_n1  = t1_count - t1_tile_n0;
-    uint64_t const t1_tile_max = (t1_tile_n0 > t1_tile_n1) ? t1_tile_n0 : t1_tile_n1;
-
-    // CUB DoubleBuffer mode: caller's two buffers act as the radix
-    // ping-pong, so CUB's internal scratch shrinks from ~2 GB at k=28
-    // down to ~MB of histograms. Frees enough VRAM to fit on 8 GB cards.
-    size_t t1_sort_bytes = 0;
-    {
-        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
-        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            nullptr, t1_sort_bytes,
-            probe_keys, probe_vals,
-            t1_tile_max, 0, cfg.k, stream));
-    }
-
+    // ---------- Phase T1 sort ----------
     stats.phase = "T1 sort";
-    // With T1 SoA emission, d_t1_mi IS the CUB key input. With DoubleBuffer
-    // mode CUB ping-pongs between d_t1_mi and d_keys_out, so the result
-    // may land in either; we cudaMemcpyAsync to d_keys_out when it lands
-    // in d_t1_mi to keep downstream code unchanged.
-    uint32_t* d_keys_out     = nullptr;
-    uint32_t* d_vals_in      = nullptr;
-    uint32_t* d_vals_out     = nullptr;
-    void*     d_sort_scratch = nullptr;
-    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
-    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
-    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
-    s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
-
-    init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
-        d_vals_in, t1_count);
-    CHECK(cudaGetLastError());
-
-    auto sort_t1_tile = [&](uint64_t off, uint64_t n) {
-        if (n == 0) return;
-        cub::DoubleBuffer<uint32_t> dk(d_t1_mi + off, d_keys_out + off);
-        cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            d_sort_scratch, t1_sort_bytes,
-            dk, dv,
-            n, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
-        if (dk.Current() != d_keys_out + off) {
-            CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
-                n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-        }
-        if (dv.Current() != d_vals_out + off) {
-            CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
-                n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-        }
-    };
-    sort_t1_tile(0, t1_tile_n0);
-    sort_t1_tile(t1_tile_n0, t1_tile_n1);
-
-    // Scratch + vals_in + d_t1_mi dead after CUB.
-    s_free(stats, d_sort_scratch);
-    s_free(stats, d_vals_in);
-    s_free(stats, d_t1_mi);
-
-    // 3-pass post-CUB (merge → gather meta) — same shape as T2 sort,
-    // but T1 only has one gather stream (meta) so it's 2 passes here.
     uint32_t* d_t1_keys_merged  = nullptr;
     uint32_t* d_t1_merged_vals  = nullptr;
-    s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
-    s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
 
-    merge_pairs_stable_2way<<<blocks(t1_count), kThreads, 0, stream>>>(
-        d_keys_out + 0,          d_vals_out + 0,          t1_tile_n0,
-        d_keys_out + t1_tile_n0, d_vals_out + t1_tile_n0, t1_tile_n1,
-        d_t1_keys_merged, d_t1_merged_vals, t1_count);
-    CHECK(cudaGetLastError());
+    // Cut #5 (minimal tier): tile T1 sort with N=gather_tile_count and
+    // accumulate sorted (keys, vals) runs into scratch.h_keys_merged
+    // and scratch.h_t2_xbits on host. h_keys_merged's "park" lifetime
+    // starts here directly (no D2H from a cap-sized device buffer
+    // first). h_t2_xbits is dead until T2 sort gather (cut #2) so it
+    // doubles as a temporary T1-vals accumulator across T1 sort and
+    // gather. After all tiles, free per-tile + d_t1_mi, host-merge
+    // (paired keys+vals, stable on key with vals tiebreak), allocate
+    // d_t1_merged_vals + H2D from h_t2_xbits. d_t1_keys_merged stays
+    // null — the existing T2-match rehydrate (h_keys_merged → device)
+    // already covers the T2-match-side need. Drops the cap × u32 ×
+    // 4 = 4180 MB peak to cap × u32 + 3 × cap/N × u32 = 1820 MB at
+    // N=4 during the sort phase.
+    bool const tiled_t1_sort = (scratch.gather_tile_count >= 2 &&
+                                scratch.h_keys_merged != nullptr &&
+                                scratch.h_t2_xbits != nullptr);
 
-    s_free(stats, d_keys_out);
-    s_free(stats, d_vals_out);
+    if (tiled_t1_sort) {
+        int const N_t1 = scratch.gather_tile_count;
+        uint64_t const tile_cap_t1_sort =
+            (t1_count + uint64_t(N_t1) - 1) / uint64_t(N_t1);
 
-    // Compact-streaming: park d_t1_keys_merged across the remainder of
-    // T1 sort. It's only needed again at T2 match entry as the
-    // d_sorted_mi input; freeing it here drops the gather-time and
-    // T2-match-setup live set by 1 GB at k=28.
-    if (scratch.h_keys_merged) {
-        CHECK(cudaMemcpyAsync(scratch.h_keys_merged, d_t1_keys_merged,
+        size_t t1_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, t1_sort_bytes,
+                probe_keys, probe_vals,
+                tile_cap_t1_sort, 0, cfg.k, stream));
+        }
+
+        uint32_t* d_keys_tile     = nullptr;
+        uint32_t* d_vals_in_tile  = nullptr;
+        uint32_t* d_vals_out_tile = nullptr;
+        void*     d_sort_scratch  = nullptr;
+        s_malloc(stats, d_keys_tile,     tile_cap_t1_sort * sizeof(uint32_t), "d_keys_tile_t1");
+        s_malloc(stats, d_vals_in_tile,  tile_cap_t1_sort * sizeof(uint32_t), "d_vals_in_tile_t1");
+        s_malloc(stats, d_vals_out_tile, tile_cap_t1_sort * sizeof(uint32_t), "d_vals_out_tile_t1");
+        s_malloc(stats, d_sort_scratch,  t1_sort_bytes,                       "d_sort_scratch(t1)");
+
+        std::vector<uint64_t> tile_ends_t1(N_t1 + 1);
+        tile_ends_t1[0] = 0;
+        for (int t = 0; t < N_t1; ++t) {
+            uint64_t const tile_start = uint64_t(t) * tile_cap_t1_sort;
+            uint64_t const tile_end   = (tile_start + tile_cap_t1_sort < t1_count)
+                                          ? tile_start + tile_cap_t1_sort : t1_count;
+            tile_ends_t1[t + 1] = tile_end;
+            uint64_t const tile_n = tile_end - tile_start;
+            if (tile_n == 0) continue;
+
+            init_u32_identity_offset<<<blocks(tile_n), kThreads, 0, stream>>>(
+                d_vals_in_tile, tile_n, uint32_t(tile_start));
+            CHECK(cudaGetLastError());
+
+            cub::DoubleBuffer<uint32_t> dk(d_t1_mi + tile_start, d_keys_tile);
+            cub::DoubleBuffer<uint32_t> dv(d_vals_in_tile, d_vals_out_tile);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_sort_scratch, t1_sort_bytes,
+                dk, dv,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+
+            CHECK(cudaMemcpyAsync(scratch.h_keys_merged + tile_start, dk.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(scratch.h_t2_xbits + tile_start, dv.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+        }
+        CHECK(cudaStreamSynchronize(stream));
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_out_tile);
+        s_free(stats, d_vals_in_tile);
+        s_free(stats, d_keys_tile);
+        s_free(stats, d_t1_mi);
+
+        // Host paired merge: tree of pairwise merges with cap-sized
+        // temp buffers (allocated once, reused across levels). Stable
+        // on key — when keys are equal, the entry from the earlier
+        // tile wins (its vals are smaller positions in the unsorted
+        // input, matching CUB's stable sort behaviour). Result is
+        // byte-identical to a single-shot CUB SortPairs.
+        std::vector<uint32_t> tmp_keys(t1_count);
+        std::vector<uint32_t> tmp_vals(t1_count);
+        auto paired_merge_t1 = [&](uint64_t left, uint64_t mid, uint64_t right) {
+            uint64_t i = left, j = mid, k = 0;
+            while (i < mid && j < right) {
+                if (scratch.h_keys_merged[i] <= scratch.h_keys_merged[j]) {
+                    tmp_keys[k] = scratch.h_keys_merged[i];
+                    tmp_vals[k] = scratch.h_t2_xbits[i];
+                    ++i; ++k;
+                } else {
+                    tmp_keys[k] = scratch.h_keys_merged[j];
+                    tmp_vals[k] = scratch.h_t2_xbits[j];
+                    ++j; ++k;
+                }
+            }
+            while (i < mid) {
+                tmp_keys[k] = scratch.h_keys_merged[i];
+                tmp_vals[k] = scratch.h_t2_xbits[i];
+                ++i; ++k;
+            }
+            while (j < right) {
+                tmp_keys[k] = scratch.h_keys_merged[j];
+                tmp_vals[k] = scratch.h_t2_xbits[j];
+                ++j; ++k;
+            }
+            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data(),
+                        k * sizeof(uint32_t));
+            std::memcpy(scratch.h_t2_xbits + left, tmp_vals.data(),
+                        k * sizeof(uint32_t));
+        };
+        for (int width = 1; width < N_t1; width *= 2) {
+            for (int i = 0; i + width < N_t1; i += 2 * width) {
+                int const left  = i;
+                int const mid   = i + width;
+                int const right = (i + 2 * width <= N_t1) ? (i + 2 * width) : N_t1;
+                paired_merge_t1(tile_ends_t1[left], tile_ends_t1[mid], tile_ends_t1[right]);
+            }
+        }
+
+        s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
+        CHECK(cudaMemcpyAsync(d_t1_merged_vals, scratch.h_t2_xbits,
                               t1_count * sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost, stream));
-        s_free(stats, d_t1_keys_merged);
-        d_t1_keys_merged = nullptr;
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        // d_t1_keys_merged stays null — h_keys_merged already has the
+        // sorted T1 mi stream. The existing T2 match rehydrate path
+        // (further below) reads from h_keys_merged unchanged.
+    } else {
+        // Existing N=2 tile + 2-way merger path for compact / plain.
+        uint64_t const t1_tile_n0  = t1_count / 2;
+        uint64_t const t1_tile_n1  = t1_count - t1_tile_n0;
+        uint64_t const t1_tile_max = (t1_tile_n0 > t1_tile_n1) ? t1_tile_n0 : t1_tile_n1;
+
+        size_t t1_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, t1_sort_bytes,
+                probe_keys, probe_vals,
+                t1_tile_max, 0, cfg.k, stream));
+        }
+
+        uint32_t* d_keys_out     = nullptr;
+        uint32_t* d_vals_in      = nullptr;
+        uint32_t* d_vals_out     = nullptr;
+        void*     d_sort_scratch = nullptr;
+        s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+        s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+        s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+        s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
+
+        init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_vals_in, t1_count);
+        CHECK(cudaGetLastError());
+
+        auto sort_t1_tile = [&](uint64_t off, uint64_t n) {
+            if (n == 0) return;
+            cub::DoubleBuffer<uint32_t> dk(d_t1_mi + off, d_keys_out + off);
+            cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_sort_scratch, t1_sort_bytes,
+                dk, dv,
+                n, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+            if (dk.Current() != d_keys_out + off) {
+                CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
+                    n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+            }
+            if (dv.Current() != d_vals_out + off) {
+                CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
+                    n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+            }
+        };
+        sort_t1_tile(0, t1_tile_n0);
+        sort_t1_tile(t1_tile_n0, t1_tile_n1);
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_in);
+        s_free(stats, d_t1_mi);
+
+        s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
+        s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
+
+        merge_pairs_stable_2way<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_keys_out + 0,          d_vals_out + 0,          t1_tile_n0,
+            d_keys_out + t1_tile_n0, d_vals_out + t1_tile_n0, t1_tile_n1,
+            d_t1_keys_merged, d_t1_merged_vals, t1_count);
+        CHECK(cudaGetLastError());
+
+        s_free(stats, d_keys_out);
+        s_free(stats, d_vals_out);
+
+        if (scratch.h_keys_merged) {
+            CHECK(cudaMemcpyAsync(scratch.h_keys_merged, d_t1_keys_merged,
+                                  t1_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            s_free(stats, d_t1_keys_merged);
+            d_t1_keys_merged = nullptr;
+        }
     }
 
     // Compact-streaming: JIT H2D d_t1_meta back before gather.
@@ -1424,13 +1547,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t1_keys_merged);
     }
 
-    // ---------- Phase T2 sort (tiled, N=2) ----------
-    // Mirror of T1 sort above — same tile-and-merge shape, but permute
-    // writes a meta-xbits pair (T2 match output is 16 B, split SoA for
-    // T3's L1-bound read pattern) instead of plain meta.
-    // N=4 tiling halves the CUB scratch peak (~1044 MB → ~522 MB at
-    // k=28), bringing the T2 CUB-alloc peak under 8 GB. Merge is done
-    // as a tree of three 2-way merges: (0+1)→AB, (2+3)→CD, (AB+CD)→final.
+    // ---------- Phase T2 sort ----------
+    stats.phase = "T2 sort";
     constexpr int kNumT2Tiles = 4;
     uint64_t t2_tile_n  [kNumT2Tiles];
     uint64_t t2_tile_off[kNumT2Tiles + 1];
@@ -1446,107 +1564,235 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     for (int t = 0; t < kNumT2Tiles; ++t)
         if (t2_tile_n[t] > t2_tile_max) t2_tile_max = t2_tile_n[t];
 
-    size_t t2_sort_bytes = 0;
-    {
-        cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
-        cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            nullptr, t2_sort_bytes,
-            probe_keys, probe_vals,
-            t2_tile_max, 0, cfg.k, stream));
-    }
-
-    stats.phase = "T2 sort";
-    // DoubleBuffer mode: ping-pong over d_t2_mi/d_keys_out (and
-    // d_vals_in/d_vals_out). Internal scratch shrinks ~2 GB → ~MB.
-    s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
-    s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
-    s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
-    s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
-
-    init_u32_identity<<<blocks(t2_count), kThreads, 0, stream>>>(
-        d_vals_in, t2_count);
-    CHECK(cudaGetLastError());
-
-    for (int t = 0; t < kNumT2Tiles; ++t) {
-        if (t2_tile_n[t] == 0) continue;
-        uint64_t off = t2_tile_off[t];
-        cub::DoubleBuffer<uint32_t> dk(d_t2_mi + off, d_keys_out + off);
-        cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
-        CHECK(cub::DeviceRadixSort::SortPairs(
-            d_sort_scratch, t2_sort_bytes,
-            dk, dv,
-            t2_tile_n[t], 0, cfg.k, stream));
-        if (dk.Current() != d_keys_out + off) {
-            CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
-                t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-        }
-        if (dv.Current() != d_vals_out + off) {
-            CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
-                t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-        }
-    }
-
-    s_free(stats, d_sort_scratch);
-    s_free(stats, d_vals_in);
-    s_free(stats, d_t2_mi);
-
-    // Tree-of-2-way-merges: (tile 0 + tile 1) → AB, (tile 2 + tile 3) → CD,
-    // then (AB + CD) → final merged stream. AB and CD buffers hold half
-    // of the total output each, so their combined footprint (2080 MB at
-    // k=28) fits under the budget freed by shrinking the CUB scratch.
-    uint64_t const ab_count = t2_tile_n[0] + t2_tile_n[1];
-    uint64_t const cd_count = t2_tile_n[2] + t2_tile_n[3];
-    uint32_t* d_AB_keys = nullptr;
-    uint32_t* d_AB_vals = nullptr;
-    uint32_t* d_CD_keys = nullptr;
-    uint32_t* d_CD_vals = nullptr;
-    s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
-    s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
-    s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
-    s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
-
-    if (ab_count > 0) {
-        merge_pairs_stable_2way<<<blocks(ab_count), kThreads, 0, stream>>>(
-            d_keys_out + t2_tile_off[0], d_vals_out + t2_tile_off[0], t2_tile_n[0],
-            d_keys_out + t2_tile_off[1], d_vals_out + t2_tile_off[1], t2_tile_n[1],
-            d_AB_keys, d_AB_vals, ab_count);
-        CHECK(cudaGetLastError());
-    }
-    if (cd_count > 0) {
-        merge_pairs_stable_2way<<<blocks(cd_count), kThreads, 0, stream>>>(
-            d_keys_out + t2_tile_off[2], d_vals_out + t2_tile_off[2], t2_tile_n[2],
-            d_keys_out + t2_tile_off[3], d_vals_out + t2_tile_off[3], t2_tile_n[3],
-            d_CD_keys, d_CD_vals, cd_count);
-        CHECK(cudaGetLastError());
-    }
-
-    // Per-tile CUB outputs are consumed; free before alloc'ing the
-    // final merged buffers.
-    s_free(stats, d_keys_out);
-    s_free(stats, d_vals_out);
-
     uint32_t* d_t2_keys_merged = nullptr;   // merged sorted MI for T3.
     uint32_t* d_merged_vals    = nullptr;   // merged sorted src indices.
-    s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
-    s_malloc(stats, d_merged_vals,    cap * sizeof(uint32_t), "d_merged_vals");
 
-    merge_pairs_stable_2way<<<blocks(t2_count), kThreads, 0, stream>>>(
-        d_AB_keys, d_AB_vals, ab_count,
-        d_CD_keys, d_CD_vals, cd_count,
-        d_t2_keys_merged, d_merged_vals, t2_count);
-    CHECK(cudaGetLastError());
+    // Cut #5 (minimal tier): mirror of T1 sort cut #5 — tile T2 sort
+    // with N=gather_tile_count, accumulate (sorted_keys, vals_perm)
+    // into scratch.h_keys_merged and scratch.h_t2_xbits on host, host
+    // paired merge, H2D vals back to d_merged_vals. d_t2_keys_merged
+    // stays null (h_keys_merged has the data — existing T3-match
+    // rehydrate path picks it up). Drops the cap × u32 × 4 = 4170 MB
+    // sort peak to cap × u32 + 3 × cap/N × u32 = 1820 MB at N=4.
+    bool const tiled_t2_sort = (scratch.gather_tile_count >= 2 &&
+                                scratch.h_keys_merged != nullptr &&
+                                scratch.h_t2_xbits != nullptr);
 
-    s_free(stats, d_AB_keys);
-    s_free(stats, d_AB_vals);
-    s_free(stats, d_CD_keys);
-    s_free(stats, d_CD_vals);
+    if (tiled_t2_sort) {
+        int const N_t2 = scratch.gather_tile_count;
+        uint64_t const tile_cap_t2_sort =
+            (t2_count + uint64_t(N_t2) - 1) / uint64_t(N_t2);
 
-    // Compact-streaming: park d_t2_keys_merged across the gather peak.
-    // It's not used by the gather (that reads d_merged_vals as indices)
-    // and only needed again at T3 match entry. Frees 1 GB at k=28
-    // during the gather phase.
-    if (scratch.h_keys_merged) {
+        size_t t2_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, t2_sort_bytes,
+                probe_keys, probe_vals,
+                tile_cap_t2_sort, 0, cfg.k, stream));
+        }
+
+        uint32_t* d_keys_tile     = nullptr;
+        uint32_t* d_vals_in_tile  = nullptr;
+        uint32_t* d_vals_out_tile = nullptr;
+        void*     d_sort_scratch  = nullptr;
+        s_malloc(stats, d_keys_tile,     tile_cap_t2_sort * sizeof(uint32_t), "d_keys_tile_t2");
+        s_malloc(stats, d_vals_in_tile,  tile_cap_t2_sort * sizeof(uint32_t), "d_vals_in_tile_t2");
+        s_malloc(stats, d_vals_out_tile, tile_cap_t2_sort * sizeof(uint32_t), "d_vals_out_tile_t2");
+        s_malloc(stats, d_sort_scratch,  t2_sort_bytes,                       "d_sort_scratch(t2)");
+
+        // Per-plot pinned T2-sort vals accumulator. Can't reuse
+        // scratch.h_t2_xbits the way T1 sort cut #5 does — h_t2_xbits
+        // holds the parked T2 unsorted xbits stream that cut #2's
+        // xbits gather (further below) still needs to read.
+        // h_keys_merged IS reusable as the keys accumulator: T1's
+        // parked sorted-mi was already consumed by T2 match's
+        // rehydrate, so by T2 sort entry it's dead.
+        uint32_t* h_t2_sort_vals = streaming_alloc_pinned_uint32(cap);
+        if (!h_t2_sort_vals) {
+            throw std::runtime_error("pinned alloc for h_t2_sort_vals failed");
+        }
+
+        std::vector<uint64_t> tile_ends_t2(N_t2 + 1);
+        tile_ends_t2[0] = 0;
+        for (int t = 0; t < N_t2; ++t) {
+            uint64_t const tile_start = uint64_t(t) * tile_cap_t2_sort;
+            uint64_t const tile_end   = (tile_start + tile_cap_t2_sort < t2_count)
+                                          ? tile_start + tile_cap_t2_sort : t2_count;
+            tile_ends_t2[t + 1] = tile_end;
+            uint64_t const tile_n = tile_end - tile_start;
+            if (tile_n == 0) continue;
+
+            init_u32_identity_offset<<<blocks(tile_n), kThreads, 0, stream>>>(
+                d_vals_in_tile, tile_n, uint32_t(tile_start));
+            CHECK(cudaGetLastError());
+
+            cub::DoubleBuffer<uint32_t> dk(d_t2_mi + tile_start, d_keys_tile);
+            cub::DoubleBuffer<uint32_t> dv(d_vals_in_tile, d_vals_out_tile);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_sort_scratch, t2_sort_bytes,
+                dk, dv,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
+
+            CHECK(cudaMemcpyAsync(scratch.h_keys_merged + tile_start, dk.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(h_t2_sort_vals + tile_start, dv.Current(),
+                                  tile_n * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+        }
+        CHECK(cudaStreamSynchronize(stream));
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_out_tile);
+        s_free(stats, d_vals_in_tile);
+        s_free(stats, d_keys_tile);
+        s_free(stats, d_t2_mi);
+
+        std::vector<uint32_t> tmp_keys(t2_count);
+        std::vector<uint32_t> tmp_vals(t2_count);
+        auto paired_merge_t2 = [&](uint64_t left, uint64_t mid, uint64_t right) {
+            uint64_t i = left, j = mid, k = 0;
+            while (i < mid && j < right) {
+                if (scratch.h_keys_merged[i] <= scratch.h_keys_merged[j]) {
+                    tmp_keys[k] = scratch.h_keys_merged[i];
+                    tmp_vals[k] = h_t2_sort_vals[i];
+                    ++i; ++k;
+                } else {
+                    tmp_keys[k] = scratch.h_keys_merged[j];
+                    tmp_vals[k] = h_t2_sort_vals[j];
+                    ++j; ++k;
+                }
+            }
+            while (i < mid) {
+                tmp_keys[k] = scratch.h_keys_merged[i];
+                tmp_vals[k] = h_t2_sort_vals[i];
+                ++i; ++k;
+            }
+            while (j < right) {
+                tmp_keys[k] = scratch.h_keys_merged[j];
+                tmp_vals[k] = h_t2_sort_vals[j];
+                ++j; ++k;
+            }
+            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data(),
+                        k * sizeof(uint32_t));
+            std::memcpy(h_t2_sort_vals + left, tmp_vals.data(),
+                        k * sizeof(uint32_t));
+        };
+        for (int width = 1; width < N_t2; width *= 2) {
+            for (int i = 0; i + width < N_t2; i += 2 * width) {
+                int const left  = i;
+                int const mid   = i + width;
+                int const right = (i + 2 * width <= N_t2) ? (i + 2 * width) : N_t2;
+                paired_merge_t2(tile_ends_t2[left], tile_ends_t2[mid], tile_ends_t2[right]);
+            }
+        }
+
+        s_malloc(stats, d_merged_vals, cap * sizeof(uint32_t), "d_merged_vals");
+        CHECK(cudaMemcpyAsync(d_merged_vals, h_t2_sort_vals,
+                              t2_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        streaming_free_pinned_uint32(h_t2_sort_vals);
+        // d_t2_keys_merged stays null — h_keys_merged has the sorted
+        // T2 mi stream. Existing T3-match rehydrate reads h_keys_merged.
+    } else {
+        // Existing N=4 tiles + 4-way device merge tree path.
+        size_t t2_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint32_t> probe_keys(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> probe_vals(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, t2_sort_bytes,
+                probe_keys, probe_vals,
+                t2_tile_max, 0, cfg.k, stream));
+        }
+
+        uint32_t* d_keys_out     = nullptr;
+        uint32_t* d_vals_in      = nullptr;
+        uint32_t* d_vals_out     = nullptr;
+        void*     d_sort_scratch = nullptr;
+        s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
+        s_malloc(stats, d_vals_in,      cap * sizeof(uint32_t), "d_vals_in");
+        s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
+        s_malloc(stats, d_sort_scratch, t2_sort_bytes,          "d_sort_scratch(t2)");
+
+        init_u32_identity<<<blocks(t2_count), kThreads, 0, stream>>>(
+            d_vals_in, t2_count);
+        CHECK(cudaGetLastError());
+
+        for (int t = 0; t < kNumT2Tiles; ++t) {
+            if (t2_tile_n[t] == 0) continue;
+            uint64_t off = t2_tile_off[t];
+            cub::DoubleBuffer<uint32_t> dk(d_t2_mi + off, d_keys_out + off);
+            cub::DoubleBuffer<uint32_t> dv(d_vals_in + off, d_vals_out + off);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_sort_scratch, t2_sort_bytes,
+                dk, dv,
+                t2_tile_n[t], 0, cfg.k, stream));
+            if (dk.Current() != d_keys_out + off) {
+                CHECK(cudaMemcpyAsync(d_keys_out + off, dk.Current(),
+                    t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+            }
+            if (dv.Current() != d_vals_out + off) {
+                CHECK(cudaMemcpyAsync(d_vals_out + off, dv.Current(),
+                    t2_tile_n[t] * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_vals_in);
+        s_free(stats, d_t2_mi);
+
+        uint64_t const ab_count = t2_tile_n[0] + t2_tile_n[1];
+        uint64_t const cd_count = t2_tile_n[2] + t2_tile_n[3];
+        uint32_t* d_AB_keys = nullptr;
+        uint32_t* d_AB_vals = nullptr;
+        uint32_t* d_CD_keys = nullptr;
+        uint32_t* d_CD_vals = nullptr;
+        s_malloc(stats, d_AB_keys, ab_count * sizeof(uint32_t), "d_t2_AB_keys");
+        s_malloc(stats, d_AB_vals, ab_count * sizeof(uint32_t), "d_t2_AB_vals");
+        s_malloc(stats, d_CD_keys, cd_count * sizeof(uint32_t), "d_t2_CD_keys");
+        s_malloc(stats, d_CD_vals, cd_count * sizeof(uint32_t), "d_t2_CD_vals");
+
+        if (ab_count > 0) {
+            merge_pairs_stable_2way<<<blocks(ab_count), kThreads, 0, stream>>>(
+                d_keys_out + t2_tile_off[0], d_vals_out + t2_tile_off[0], t2_tile_n[0],
+                d_keys_out + t2_tile_off[1], d_vals_out + t2_tile_off[1], t2_tile_n[1],
+                d_AB_keys, d_AB_vals, ab_count);
+            CHECK(cudaGetLastError());
+        }
+        if (cd_count > 0) {
+            merge_pairs_stable_2way<<<blocks(cd_count), kThreads, 0, stream>>>(
+                d_keys_out + t2_tile_off[2], d_vals_out + t2_tile_off[2], t2_tile_n[2],
+                d_keys_out + t2_tile_off[3], d_vals_out + t2_tile_off[3], t2_tile_n[3],
+                d_CD_keys, d_CD_vals, cd_count);
+            CHECK(cudaGetLastError());
+        }
+
+        s_free(stats, d_keys_out);
+        s_free(stats, d_vals_out);
+
+        s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
+        s_malloc(stats, d_merged_vals,    cap * sizeof(uint32_t), "d_merged_vals");
+
+        merge_pairs_stable_2way<<<blocks(t2_count), kThreads, 0, stream>>>(
+            d_AB_keys, d_AB_vals, ab_count,
+            d_CD_keys, d_CD_vals, cd_count,
+            d_t2_keys_merged, d_merged_vals, t2_count);
+        CHECK(cudaGetLastError());
+
+        s_free(stats, d_AB_keys);
+        s_free(stats, d_AB_vals);
+        s_free(stats, d_CD_keys);
+        s_free(stats, d_CD_vals);
+    }
+
+    // Compact-streaming: park d_t2_keys_merged across the gather peak
+    // (no-op when cut #5 already wrote h_keys_merged directly — gated
+    // on d_t2_keys_merged != nullptr).
+    if (scratch.h_keys_merged && d_t2_keys_merged) {
         CHECK(cudaMemcpyAsync(scratch.h_keys_merged, d_t2_keys_merged,
                               t2_count * sizeof(uint32_t),
                               cudaMemcpyDeviceToHost, stream));
@@ -1980,35 +2226,134 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     }
 
     // ---------- Phase T3 sort ----------
-    size_t t3_sort_bytes = 0;
-    {
-        cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
-        CHECK(cub::DeviceRadixSort::SortKeys(
-            nullptr, t3_sort_bytes,
-            probe,
-            cap, 0, 2 * cfg.k, stream));
-    }
-
     stats.phase = "T3 sort";
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
     uint64_t* d_frags_out = nullptr;
-    s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
-    s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
 
-    {
-        cub::DoubleBuffer<uint64_t> dk(d_frags_in, d_frags_out);
-        CHECK(cub::DeviceRadixSort::SortKeys(
-            d_sort_scratch, t3_sort_bytes,
-            dk,
-            t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
-        if (dk.Current() != d_frags_out) {
-            CHECK(cudaMemcpyAsync(d_frags_out, dk.Current(),
-                t3_count * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
+    // Cut #5 (minimal tier): tile T3 sort with N=gather_tile_count and
+    // accumulate sorted runs into scratch.h_meta on host (its T2-meta /
+    // T3-input lifetime ended at cut #3's h_t3_acc free, so the buffer
+    // is dead by T3 sort entry). Per tile: sort cap/N entries in-place
+    // in d_t3 using a small DoubleBuffer alternate buffer. After all
+    // tiles, D2H the tile-sorted runs to host, free d_t3 + alternate,
+    // do an N-way merge on host (sequential 2-way std::inplace_merge),
+    // then H2D the globally sorted result into d_frags_out. Drops T3
+    // sort peak from cap × u64 (in) + cap × u64 (out) + scratch ≈
+    // 4228 MB at k=28 down to cap × u64 (in) + cap/N × u64 (alt) +
+    // scratch ≈ 2400 MB at N=4.
+    bool const tiled_t3_sort = (scratch.gather_tile_count >= 2 &&
+                                scratch.h_meta != nullptr);
+
+    if (tiled_t3_sort) {
+        int const N_t3 = scratch.gather_tile_count;
+        uint64_t const tile_cap_t3 = (t3_count + uint64_t(N_t3) - 1) / uint64_t(N_t3);
+
+        // CUB scratch sized for the largest tile (last tile may be
+        // shorter, but DeviceRadixSort scratch is monotonic in the
+        // input length so this is a safe upper bound).
+        size_t t3_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                nullptr, t3_sort_bytes,
+                probe,
+                tile_cap_t3, 0, 2 * cfg.k, stream));
         }
-    }
 
-    s_free(stats, d_t3);
-    s_free(stats, d_sort_scratch);
+        uint64_t* d_t3_alt      = nullptr;
+        void*     d_sort_scratch = nullptr;
+        s_malloc(stats, d_t3_alt,       tile_cap_t3 * sizeof(uint64_t), "d_t3_alt");
+        s_malloc(stats, d_sort_scratch, t3_sort_bytes,                  "d_sort_scratch(t3)");
+
+        std::vector<uint64_t> tile_ends(N_t3 + 1);
+        tile_ends[0] = 0;
+        for (int t = 0; t < N_t3; ++t) {
+            uint64_t const tile_start = uint64_t(t) * tile_cap_t3;
+            uint64_t const tile_end   = (tile_start + tile_cap_t3 < t3_count)
+                                          ? tile_start + tile_cap_t3 : t3_count;
+            tile_ends[t + 1] = tile_end;
+            uint64_t const tile_n = tile_end - tile_start;
+            if (tile_n == 0) continue;
+
+            cub::DoubleBuffer<uint64_t> dk(d_frags_in + tile_start, d_t3_alt);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                d_sort_scratch, t3_sort_bytes,
+                dk,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+            if (dk.Current() != d_frags_in + tile_start) {
+                CHECK(cudaMemcpyAsync(d_frags_in + tile_start, dk.Current(),
+                    tile_n * sizeof(uint64_t),
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        // D2H all tile-sorted runs back to host pinned (scratch.h_meta
+        // is dead by now — see comment above). Free device buffers
+        // before the host-side merge so the next phase's allocs see a
+        // clean slate.
+        CHECK(cudaMemcpyAsync(scratch.h_meta, d_frags_in,
+                              t3_count * sizeof(uint64_t),
+                              cudaMemcpyDeviceToHost, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        s_free(stats, d_t3);
+        s_free(stats, d_t3_alt);
+        s_free(stats, d_sort_scratch);
+
+        // Host-side N-way merge over scratch.h_meta. For N=4 this is
+        // three sequential in-place merges:
+        //   1. merge runs 0+1 → [tile_ends[0], tile_ends[2])
+        //   2. merge runs 2+3 → [tile_ends[2], tile_ends[N])
+        //   3. merge halves    → [tile_ends[0], tile_ends[N])
+        // Generalises to any power-of-2 N via repeated halving. CUB's
+        // SortKeys is stable; std::inplace_merge is stable; sources
+        // come in ascending tile-index order so equal keys preserve
+        // their original (pre-sort) position the same way a single-
+        // shot CUB sort would. Result is byte-identical to non-tiled.
+        for (int width = 1; width < N_t3; width *= 2) {
+            for (int i = 0; i + width < N_t3; i += 2 * width) {
+                int const left  = i;
+                int const mid   = i + width;
+                int const right = (i + 2 * width <= N_t3) ? (i + 2 * width) : N_t3;
+                std::inplace_merge(scratch.h_meta + tile_ends[left],
+                                   scratch.h_meta + tile_ends[mid],
+                                   scratch.h_meta + tile_ends[right]);
+            }
+        }
+
+        s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
+        CHECK(cudaMemcpyAsync(d_frags_out, scratch.h_meta,
+                              t3_count * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+    } else {
+        size_t t3_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                nullptr, t3_sort_bytes,
+                probe,
+                cap, 0, 2 * cfg.k, stream));
+        }
+
+        void* d_sort_scratch = nullptr;
+        s_malloc(stats, d_frags_out,    cap * sizeof(uint64_t), "d_frags_out");
+        s_malloc(stats, d_sort_scratch, t3_sort_bytes,          "d_sort_scratch(t3)");
+
+        {
+            cub::DoubleBuffer<uint64_t> dk(d_frags_in, d_frags_out);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                d_sort_scratch, t3_sort_bytes,
+                dk,
+                t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+            if (dk.Current() != d_frags_out) {
+                CHECK(cudaMemcpyAsync(d_frags_out, dk.Current(),
+                    t3_count * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        s_free(stats, d_t3);
+        s_free(stats, d_sort_scratch);
+    }
 
     // ---------- D2H ----------
     // Two destination modes:
