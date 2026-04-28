@@ -129,7 +129,23 @@ inline sycl::queue& queue()
     if (!q) {
         int const id = current_device_id();
         if (id == kCpuDeviceId) {
-            q = std::make_unique<sycl::queue>(sycl::cpu_selector_v,
+            // AdaptiveCpp's OpenMP backend exposes its host device as
+            // `info::device_type::host`, which SYCL 2020's
+            // `cpu_selector_v` *can* reject (host-device is deprecated
+            // in 2020). And a custom selector lambda does too on the
+            // 25.10 headers. Bypass selectors and take the first device
+            // visible under whatever ACPP_VISIBILITY_MASK is in effect —
+            // when limited to omp, that's the OMP host device by
+            // construction. When CPU + GPU are both visible, set the
+            // mask to "omp" before invoking to disambiguate.
+            auto devs = sycl::device::get_devices();
+            if (devs.empty()) {
+                throw std::runtime_error(
+                    "sycl_backend::queue (CPU): no SYCL devices visible. "
+                    "Set ACPP_VISIBILITY_MASK=omp to expose AdaptiveCpp's "
+                    "OpenMP backend.");
+            }
+            q = std::make_unique<sycl::queue>(devs.front(),
                                               async_error_handler);
         } else if (id < 0) {
             q = std::make_unique<sycl::queue>(sycl::gpu_selector_v,
