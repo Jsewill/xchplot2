@@ -359,11 +359,24 @@ based on available VRAM:
   intermediates on pinned host across their idle windows + N=2 T2
   match staging (cap/2 ≈ 2280 MB at k=28). T1/T2 sorts are tiled
   (N=2 and N=4) with merge trees. Targets 6-8 GiB cards.
-- **Minimal streaming (~3.8 GiB floor).** Compact's parks plus N=8
-  T2 match staging (cap/8 ≈ 570 MB at k=28). Targets 4 GiB cards
-  (GTX 1050 Ti / 1650, RTX 3050 4GB, MX450) at the cost of extra
-  PCIe round-trips during T2 match. Floor is estimated; please
-  report actual fit on real 4 GiB hardware. There is no smaller
+- **Minimal streaming (~3.8 GiB floor).** Compact's parks plus three
+  layered cuts that knock T1 sort, T2 sort, and T3 match below the
+  4 GiB cliff: (1) N=8 T2 match staging (cap/8 ≈ 570 MB at k=28),
+  (2) N=4 T1/T2 sort gather tiling — the merged-key + permuted-meta
+  gather output is D2H'd per tile to pinned host instead of landing
+  full-cap on device, and (3) T3 match section-pair input slicing —
+  d_t2_meta_sorted is parked on pinned host across T3 match, with
+  the section_l + section_r row slices H2D'd per pass to a cap/2
+  device buffer (d_t2_xbits_sorted + d_t2_keys_merged stay full-cap
+  for binary-search reads). T3 output accumulates through a per-plot
+  pinned `h_t3_acc` buffer and rehydrates full-cap once the T2
+  inputs are freed. Bottleneck moves from compact's tied 5200 MB at
+  T1/T2 sort + T3 match down to ~3700 MB at T3 match.
+  Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB, MX450) and
+  comfortably fits 5 GiB+ cards at the cost of ~5-15 s/plot extra
+  PCIe round-trips. Floor still aspirational on real 4 GiB hardware
+  (post-CUDA-context free VRAM is ~3.5 GiB on those parts, leaving
+  little margin) — please report actual fit. There is no smaller
   tier — a forced minimal on a card below the floor throws.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the

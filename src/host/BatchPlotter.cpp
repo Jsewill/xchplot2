@@ -400,11 +400,27 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             stream_scratch.t3_tile_count = 2;
             if (tier == Tier::Minimal) {
                 stream_scratch.t2_tile_count = 8;
+                // Cuts #1+#2: tile T1/T2 sort gathers through pinned host so
+                // the cap-sized sorted_meta / sorted_xbits never co-reside
+                // with the unsorted-meta + merged_vals on device. N=4 = one
+                // tile per section_l at k=28 strength=2; tile size cap/4 ≈
+                // 520 MB at k=28 — same envelope as the t2 stage tile.
+                stream_scratch.gather_tile_count = 4;
+                // Cut #3: T3 match section-pair input slicing. Equals
+                // num_sections (= (1<<2) at k=28 strength=2 = 4); the T3
+                // match phase iterates section_l ∈ [0, num_sections) and
+                // H2Ds the section_l + section_r row slices per pass
+                // instead of holding the cap-sized d_t2_meta_sorted on
+                // device. Drops T3 match peak from ~5200 → ~3700 MB.
+                int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
+                stream_scratch.t3_input_slice_count = 1 << num_section_bits;
                 std::fprintf(stderr,
                     "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
-                    "park/rehydrate + N=8 T2 + N=2 T3 staging, expect ~5-15 s/plot extra PCIe)\n",
+                    "park/rehydrate + N=8 T2 + N=4 sort gather + N=%d T3 input slicing, "
+                    "expect ~5-15 s/plot extra PCIe)\n",
                     free_bytes / double(1ULL << 30),
-                    kMinimalFloorBytes / double(1ULL << 30));
+                    kMinimalFloorBytes / double(1ULL << 30),
+                    stream_scratch.t3_input_slice_count);
             } else {
                 std::fprintf(stderr,
                     "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
