@@ -107,6 +107,19 @@ inline std::string s_fmt_bytes(size_t bytes) {
 template <typename T>
 inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reason)
 {
+    // Zero-byte requests come from sizing queries that returned 0,
+    // which downstream callers honour as "skip this alloc" only by
+    // accident (sycl::malloc_device(0) returns null on HIP). Surface
+    // the actual upstream cause instead of triggering the misleading
+    // "Card likely too small" path below.
+    if (bytes == 0) {
+        throw std::runtime_error(
+            std::string("internal: s_malloc('") + reason + "') called with "
+            "bytes=0 — an upstream sizing query returned 0 (count=0). On "
+            "AMD/HIP this most often indicates a kernel correctness issue "
+            "on an unvalidated device (e.g. gfx1013/RDNA1 community spoof). "
+            "Run the parity tests on this device to localise.");
+    }
     if (s.cap && s.live + bytes > s.cap) {
         throw std::runtime_error(
             std::string("streaming VRAM cap: phase=") + s.phase +
@@ -154,6 +167,32 @@ inline void s_free(StreamingStats& s, T*& ptr)
     }
     sycl::free(raw, sycl_backend::queue());
     ptr = nullptr;
+}
+
+// Sanity-check t1_count after T1 match. Healthy plots produce ~2^k
+// entries; anything below total_xs/64 (= 2^(k-6)) — let alone literal
+// zero — points at kernel correctness on the device, not a VRAM
+// shortfall. Catching this here surfaces a clear diagnostic instead of
+// letting downstream sort-scratch alloc fail with the misleading
+// "Card likely too small" message (an 8 GiB W5700 on the
+// gfx1013/RDNA1 community spoof currently produces 0 T1 matches at
+// k=28; only the OOM further down was visible before this check).
+inline void validate_t1_count(uint64_t t1_count, int k)
+{
+    uint64_t const min_plausible = (1ULL << k) >> 6;
+    if (t1_count >= min_plausible) return;
+
+    throw std::runtime_error(
+        "T1 match produced " + std::to_string(t1_count) + " entries "
+        "(expected ~2^" + std::to_string(k) + " = " +
+        std::to_string(1ULL << k) + " for k=" + std::to_string(k) +
+        "). This indicates a kernel correctness issue on this device, "
+        "not a VRAM shortfall. On AMD/HIP this most often means an "
+        "AdaptiveCpp target like the gfx1013/RDNA1 community spoof "
+        "produced wrong output. Build the parity tests via cmake and "
+        "verify on this device: sycl_g_x_parity, sycl_sort_parity, "
+        "sycl_bucket_offsets_parity, plot_file_parity. README's "
+        "'Community-tested, not parity-validated' caveat applies.");
 }
 
 } // namespace
@@ -357,6 +396,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     uint64_t t1_count = 0;
     q.memcpy(&t1_count, d_count, sizeof(uint64_t)).wait();
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
+    validate_t1_count(t1_count, cfg.k);
 
 
     // Sort T1 by match_info (low k bits). d_storage is now repurposed
@@ -767,6 +807,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t t1_count = 0;
     q.memcpy(&t1_count, d_counter, sizeof(uint64_t)).wait();
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
+    validate_t1_count(t1_count, cfg.k);
 
     s_free(stats, d_t1_match_temp);
     // Xs fully consumed.
