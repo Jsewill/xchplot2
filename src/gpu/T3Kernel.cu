@@ -123,6 +123,23 @@ __global__ void compute_fine_bucket_offsets(
     }
 }
 
+// Biases for section-pair input slicing (cut #3). When the streaming
+// minimal tier slices d_sorted_meta to just the section_l + section_r
+// rows for each pass, the kernel still receives global l/r indices
+// (l_start/l_end and r/lo/hi all derive from the full d_offsets +
+// d_fine_offsets, which are built once across the full pipeline). The
+// biases shift `l` and `r` to the corresponding offset inside the
+// sliced buffer:
+//
+//   meta_l = sorted_meta[ l + meta_l_index_bias ]
+//   meta_r = sorted_meta[ r + meta_r_index_bias ]
+//
+// Full-cap callers pass biases = 0 so indexing is unchanged. Sliced
+// callers pass:
+//   meta_l_index_bias = section_l_slice_start - section_l_row_start
+//   meta_r_index_bias = section_r_slice_start - section_r_row_start
+// which are negative when the slice is concatenated tightly. The
+// kernel uses int64_t arithmetic to handle the negative case.
 __global__ __launch_bounds__(256, 4) void match_all_buckets(
     AesHashKeys keys,
     uint64_t const* __restrict__ sorted_meta,
@@ -140,7 +157,9 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     T3PairingGpu* __restrict__ out,
     unsigned long long* __restrict__ out_count,
     uint64_t out_capacity,
-    uint32_t bucket_begin)
+    uint32_t bucket_begin,
+    int64_t meta_l_index_bias,
+    int64_t meta_r_index_bias)
 {
     __shared__ uint32_t sT[4 * 256];
     load_aes_tables_smem(sT);
@@ -165,7 +184,9 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (l >= l_end) return;
 
-    uint64_t meta_l = sorted_meta[l];
+    uint64_t const meta_l_idx = static_cast<uint64_t>(
+        static_cast<int64_t>(l) + meta_l_index_bias);
+    uint64_t meta_l = sorted_meta[meta_l_idx];
     uint32_t xb_l   = sorted_xbits[l];
 
     uint32_t target_l = matching_target_smem(keys, 3u, match_key_r, meta_l, sT, 0)
@@ -196,7 +217,9 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
         uint32_t target_r = sorted_mi[r] & target_mask;
         if (target_r != target_l) break;
 
-        uint64_t meta_r = sorted_meta[r];
+        uint64_t const meta_r_idx = static_cast<uint64_t>(
+            static_cast<int64_t>(r) + meta_r_index_bias);
+        uint64_t meta_r = sorted_meta[meta_r_idx];
         uint32_t xb_r   = sorted_xbits[r];
 
         Result128 res = pairing_smem(keys, meta_l, meta_r, sT, 0);
@@ -376,7 +399,74 @@ cudaError_t launch_t3_match_range(
         d_out_pairings,
         reinterpret_cast<unsigned long long*>(d_out_count),
         capacity,
-        bucket_begin);
+        bucket_begin,
+        /*meta_l_index_bias=*/0, /*meta_r_index_bias=*/0);
+    return cudaGetLastError();
+}
+
+// Cut #3: section-pair input-slicing variant. d_sorted_meta points to
+// a buffer holding the section_l row + section_r row (concatenated)
+// rather than the full-cap sorted meta. d_sorted_xbits and d_sorted_mi
+// stay full-cap (cheaper to keep on device than to slice). The biases
+// remap kernel-internal global indices into the slice's positions.
+//
+// Caller computes: section_l = bucket_begin / num_match_keys (must
+// equal (bucket_end-1) / num_match_keys, i.e. one section_l per call),
+// section_r = matching_section(section_l), and looks up the row
+// boundaries from the SAME d_offsets the prepare phase built. The
+// slice contains [section_l_row | section_r_row] tightly packed at
+// indices 0 and section_l_row_count.
+cudaError_t launch_t3_match_section_pair_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_sorted_meta_slice,    // section_l + section_r rows, packed
+    uint32_t const* d_sorted_xbits,         // full cap
+    uint32_t const* d_sorted_mi,            // full cap
+    uint64_t /*t2_count*/,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    int64_t meta_l_index_bias,
+    int64_t meta_r_index_bias,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.strength < 2)                return cudaErrorInvalidValue;
+    if (!d_sorted_meta_slice || !d_sorted_xbits || !d_sorted_mi
+        || !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+
+    T3Derived const d = derive_t3(params);
+    if (bucket_end > d.num_buckets) return cudaErrorInvalidValue;
+    if (bucket_end <= bucket_begin) return cudaSuccess;
+
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    constexpr int kThreads = 256;
+    uint64_t blocks_x_u64 = (d.l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets_in_range, 1);
+
+    auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
+    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+
+    match_all_buckets<<<grid, kThreads, 0, stream>>>(
+        keys, d_sorted_meta_slice, d_sorted_xbits, d_sorted_mi,
+        d_offsets, d_fine_offsets,
+        d.num_match_keys,
+        params.k, params.num_section_bits,
+        params.num_match_target_bits, kT3FineBits,
+        d.target_mask, d.num_test_bits,
+        d_out_pairings,
+        reinterpret_cast<unsigned long long*>(d_out_count),
+        capacity,
+        bucket_begin,
+        meta_l_index_bias, meta_r_index_bias);
     return cudaGetLastError();
 }
 
@@ -409,6 +499,18 @@ cudaError_t launch_t3_match(
         d_out_pairings, d_out_count,
         capacity, d_temp_storage,
         /*bucket_begin=*/0, /*bucket_end=*/d.num_buckets, stream);
+}
+
+uint32_t matching_section_host(uint32_t section_l, int num_section_bits)
+{
+    // Same math as the anonymous matching_section helper above, but
+    // exposed for host-side computation (streaming pipeline needs to
+    // know section_r before launching the per-section_l T3 pass).
+    uint32_t const num_sections = 1u << num_section_bits;
+    uint32_t const mask         = num_sections - 1u;
+    uint32_t const rl  = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
+    uint32_t const rl1 = (rl + 1) & mask;
+    return ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
 }
 
 } // namespace pos2gpu

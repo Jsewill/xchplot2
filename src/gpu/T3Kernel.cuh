@@ -85,4 +85,37 @@ cudaError_t launch_t3_match_range(
     uint32_t bucket_end,
     cudaStream_t stream = nullptr);
 
+// Cut #3: section-pair input-slicing variant of launch_t3_match_range.
+// d_sorted_meta_slice holds the section_l row + section_r row, packed
+// (section_l first at index 0, section_r second at index = section_l
+// row count). d_sorted_xbits + d_sorted_mi stay full-cap on device.
+//
+// The biases shift the kernel's global l/r indices into slice
+// positions. Each call covers exactly one section_l (one
+// matching_section pair); the streaming caller iterates section_l ∈
+// [0, num_sections) and re-uses the same d_temp_storage from
+// launch_t3_match_prepare.
+cudaError_t launch_t3_match_section_pair_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_sorted_meta_slice,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
+    uint64_t t2_count,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    int64_t meta_l_index_bias,
+    int64_t meta_r_index_bias,
+    cudaStream_t stream = nullptr);
+
+// Mirrors pos2-chip/src/pos/ProofCore.hpp matching_section. Exposed for
+// the streaming caller to compute section_r from section_l on the host
+// side (the kernel already does this internally; this helper avoids
+// duplicating the rotation math at the wiring site).
+uint32_t matching_section_host(uint32_t section_l, int num_section_bits);
+
 } // namespace pos2gpu

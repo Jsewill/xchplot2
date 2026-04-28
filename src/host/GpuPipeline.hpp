@@ -139,6 +139,27 @@ struct StreamingPinnedScratch {
     // in [1, t3_num_buckets] — at k=28 strength=2 that's [1, 16]; the
     // staging path (>= 2) requires h_meta to be non-null.
     int t3_tile_count = 1;
+    // T1 / T2 sort gather tile count. When >= 2 the sort phase emits
+    // the merged-key + permuted-meta gather output in N tiles, D2H'ing
+    // each tile to host pinned (h_meta / h_keys_merged) so the cap-sized
+    // sorted_meta never has to be alive on device in full. Re-hydrated
+    // before the next match phase via H2D from the host accumulator.
+    // Drops T1-sort and T2-sort phase peaks from 5200 → ~3640 MB at
+    // k=28. Default 1 = no tiling. Used by the minimal tier (set to 4
+    // by BatchPlotter); requires h_meta + h_keys_merged populated.
+    int gather_tile_count = 1;
+    // T3 match input-slice count. When >= 2 d_t2_meta_sorted is parked
+    // on h_meta across T3 match; each pass H2Ds the section_l +
+    // section_r row slices onto cap/N device buffers. d_t2_xbits_sorted
+    // and d_t2_keys_merged stay full-cap on device for binary-search /
+    // target reads. Caller iterates section_l ∈ [0, num_sections) using
+    // bucket_begin = section_l × num_match_keys, bucket_end =
+    // (section_l+1) × num_match_keys. Must equal num_sections (= 4 at
+    // k=28 strength=2) when active. Default 1 = no slicing. Requires
+    // h_meta populated and orthogonal to t3_tile_count (input slicing
+    // already gives one D2H accumulator pass per section, no separate
+    // output staging needed when input slicing is on).
+    int t3_input_slice_count = 1;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
