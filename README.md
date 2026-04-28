@@ -86,14 +86,19 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     park/rehydrate + N=2 T2 match tiling. Used on 6-8 GB cards where
     plain won't fit. 6 GB cards (RTX 2060, RX 6600) are on the edge;
     8 GB cards (3070, 2070 Super) comfortably fit.
-  - **Minimal streaming** (~3.7 GB peak + 128 MB margin): same parks
-    as compact, plus N=8 T2 match staging (cap/8 ≈ 570 MB vs compact's
-    cap/2 ≈ 2280 MB). Targets 4 GiB cards — NVIDIA: GTX 1050 Ti /
-    1650, RTX 3050 4GB, MX450; AMD: RX 6500 XT / 6400 (gfx1034),
-    RX 5500 XT 4GB (gfx1012, RDNA1 spoof) — at the cost of extra
-    PCIe round-trips during T2 match. Floor is estimated, not yet
-    measured on real 4 GiB hardware — please report actual fit.
-    Detailed breakdown in [VRAM](#vram).
+  - **Minimal streaming** (~3.76 GB peak + 128 MB margin): six layered
+    cuts on top of compact — N=8 T2 match staging, tiled gathers in
+    T1/T2 sort, sliced T1 match (per section_l), sliced T3 match
+    (T2 inputs parked on host, slice H2D'd per section pair),
+    per-tile CUB outputs in T1/T2/T3 sort with USM-host merges, and
+    tiled Xs gen+sort+pack with host-pinned accumulation. Bottleneck
+    moves from compact's T1 sort (5200 MB) to T3 match (3754 MB).
+    Targets 5 GiB+ cards (RTX 2060, RX 6600 XT, RX 7600) comfortably;
+    4 GiB cards (GTX 1050 Ti, RTX 3050 4GB, MX450) are an edge case
+    since real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context.
+    Trade-off: ~6 extra cap-sized PCIe round-trips per plot. k=28
+    wall on sm_89: ~34 s/plot vs ~13 s for compact. Detailed
+    breakdown in [VRAM](#vram).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
@@ -696,7 +701,7 @@ binaries first.
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
-| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks; minimal = ~3.7 GB peak, parks + N=8 T2 staging for 4 GiB cards). Equivalent CLI flag: `--tier`. |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.76 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards). Equivalent CLI flag: `--tier`. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
@@ -797,17 +802,47 @@ based on available VRAM at batch start:
   typically has ~5.5 GiB free which has ~170 MB slack over the
   5328 MB requirement), 8 GB cards comfortable, 10 GB and up ample.
   Log the full alloc trace with `POS2GPU_STREAMING_STATS=1`.
-- **Minimal streaming (~3.7 GB peak + 128 MB margin; ≥ 3.83 GiB free
-  at k=28).** Same parks as compact; T2 match staging is N=8
-  (cap/8 ≈ 570 MB) instead of compact's N=2 (cap/2 ≈ 2280 MB) — that's
-  where the ~1.5 GB peak savings come from. Pays 6 extra PCIe
-  round-trips per T2 match relative to compact, so steady-state is
-  slower. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
-  MX450). The 3700 MB anchor is conservative by ~250 MB vs the
-  back-of-envelope buffer math, leaving room for CUDA-context +
-  driver overhead. Floor is estimated; please report actual fit on
-  real 4 GiB hardware. There is no smaller tier — a forced minimal
-  on a card below the floor throws rather than falling further.
+- **Minimal streaming (~3.76 GB peak + 128 MB margin; ≥ 3.80 GiB free
+  at k=28).** Layered cuts on top of compact:
+  - **N=8 T2 match staging.** cap/8 ≈ 570 MB vs compact's cap/2
+    ≈ 2280 MB — saves ~1.5 GB on the T2-match peak.
+  - **Tiled gathers in T1 sort + T2 sort meta + T2 sort xbits.**
+    Each gather output produced in N=4 tiles, D2H'd to host pinned
+    (reusing the existing parking buffers) one tile at a time, then
+    rebuilt on device after the cap-sized inputs are freed. Drops
+    each gather peak from 5200 MB → ~3640 MB.
+  - **Sliced T1 match.** N passes (one per section_l) emit to a
+    cap/N device staging pair, D2H per pass to host pinned. d_xs
+    (2048 MB at k=28) no longer co-resides with full-cap d_t1_meta +
+    d_t1_mi → T1-match peak drops from 5168 MB → 3023 MB.
+  - **Sliced T3 match.** d_t2_meta_sorted parked on host across
+    T3 match; per pass H2Ds the (section_l, section_r) row slices
+    onto a small device buffer pair. d_t2_xbits_sorted +
+    d_t2_keys_merged remain full-cap on device for binary-search /
+    target reads. T3-match peak: 5200 MB → 3754 MB.
+  - **Per-tile CUB outputs in T1/T2/T3 sort sub-phases.** T1 and T2
+    sort use cap/2 / cap/4 device output buffers respectively, D2H
+    per tile to USM-host accumulators, with the existing 2-way merge
+    kernel reading USM-host inputs. T2 additionally parks AB / CD
+    intermediates to host between tree steps so the final merge
+    sees only its own outputs. T3 sort uses cap/2 tile + host-side
+    `std::inplace_merge`. CUB sub-phase peaks: 4170-4228 MB →
+    3155-3640 MB.
+  - **Tiled Xs gen+sort+pack.** N=2 position halves through cap/2
+    ping-pong buffers + USM-host accumulator + 2-way merge, then
+    pack runs in cap/2 halves with D2H per tile to a host-pinned
+    `XsCandidateGpu` accumulator (final d_xs rehydrated H2D).
+    Xs phase peak: 4128 MB → 3072 MB.
+
+  Bottleneck after all six cuts is the T3 match phase at 3754 MB.
+  Targets 5 GiB+ cards comfortably (RTX 2060, RX 6600 XT, RX 7600
+  with ~1.7+ GiB headroom). 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050
+  4GB, MX450) are an edge case — real 4 GiB physical hardware
+  reports ~3.5 GiB free post-CUDA-context, just under the 3.80 GiB
+  required floor. Trade-off: ~6 extra cap-sized PCIe round-trips per
+  plot push k=28 wall on sm_89 from ~13 s/plot (compact) to ~34
+  s/plot (minimal). There is no smaller tier — a forced minimal on a
+  card below the floor throws rather than falling further.
 
 At pool construction `xchplot2` queries `cudaMemGetInfo` on the
 CUDA-only build, or `global_mem_size` (device total) on the SYCL

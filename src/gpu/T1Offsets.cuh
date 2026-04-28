@@ -52,14 +52,22 @@ void launch_compute_fine_bucket_offsets(
     uint64_t* d_fine_offsets,
     sycl::queue& q);
 
-// Fused T1 match: for each (section_l, match_key_r) bucket, walk the L
-// candidates against the matching R bucket with AES-derived target_l, and
-// emit T1Pairings into out_meta[] / out_mi[] via an atomic cursor.
+// Fused T1 match: for each (section_l, match_key_r) bucket in the
+// half-open range [bucket_begin, bucket_end), walk the L candidates
+// against the matching R bucket with AES-derived target_l, and emit
+// T1Pairings into out_meta[] / out_mi[] via an atomic cursor.
 //
-// Grid arrangement (CUDA): grid.y = num_buckets, grid.x slices L; the SYCL
-// path uses an analogous 2D nd_range. l_count_max is the per-section L
-// upper bound used to size grid.x without a host fence on the actual L
-// count — excess threads early-exit on `l >= l_end`.
+// Grid arrangement (CUDA): grid.y = bucket_end - bucket_begin,
+// grid.x slices L; the SYCL path uses an analogous 2D nd_range.
+// l_count_max is the per-section L upper bound used to size grid.x
+// without a host fence on the actual L count — excess threads
+// early-exit on `l >= l_end`.
+//
+// Across multiple calls sharing the same d_out_meta / d_out_mi /
+// d_out_count, results append via the atomic counter — same pattern
+// as T3 match's bucket-range plumbing. Used by minimal tier to split
+// T1 match into N passes with smaller per-pass staging output, keeping
+// d_t1_meta + d_t1_mi off-device until after T1 match completes.
 void launch_t1_match_all_buckets(
     AesHashKeys keys,
     XsCandidateGpu const* d_sorted_xs,
@@ -80,6 +88,8 @@ void launch_t1_match_all_buckets(
     uint64_t* d_out_count,
     uint64_t out_capacity,
     uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
     sycl::queue& q);
 
 } // namespace pos2gpu
