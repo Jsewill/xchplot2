@@ -36,7 +36,7 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   cross-target builds (see [Build](#build)).
 - **VRAM:** 4 GiB minimum at k=28. Cards with < 15 GB free use the
   streaming pipeline (three sub-tiers — plain ~7.4 GiB, compact
-  ~5.3 GiB, minimal ~3.8 GiB — auto-picked by free VRAM); 16 GB+
+  ~5.3 GiB, minimal ~4.25 GiB — auto-picked by free VRAM); 16 GB+
   cards use the persistent buffer pool for faster steady-state. All
   paths produce byte-identical plots. Detailed breakdown in
   [VRAM](#vram).
@@ -359,28 +359,34 @@ based on available VRAM:
   intermediates on pinned host across their idle windows + N=2 T2
   match staging (cap/2 ≈ 2280 MB at k=28). T1/T2 sorts are tiled
   (N=2 and N=4) with merge trees. Targets 6-8 GiB cards.
-- **Minimal streaming (~3.8 GiB floor).** Compact's parks plus four
-  layered cuts that knock T1 match, T1 sort, T2 sort, and T3 match
-  below the 4 GiB cliff: (1) N=8 T2 match staging (cap/8 ≈ 570 MB
-  at k=28), (2) N=4 T1/T2 sort gather tiling — the merged-key +
+- **Minimal streaming (~4.25 GiB floor).** Compact's parks plus
+  four layered cuts that knock the T1-match / T2-match / T3-match
+  peaks below the 4 GiB cliff and the T1/T2 sort gather peaks
+  alongside: (1) N=8 T2 match staging (cap/8 ≈ 570 MB at k=28),
+  (2) N=4 T1/T2 sort gather tiling — the merged-key +
   permuted-meta gather output is D2H'd per tile to pinned host
   instead of landing full-cap on device, (3) T3 match section-pair
   input slicing — d_t2_meta_sorted is parked on pinned host across
   T3 match, with the section_l + section_r row slices H2D'd per
   pass to a cap/2 device buffer (d_t2_xbits_sorted +
-  d_t2_keys_merged stay full-cap for binary-search reads), and (4)
-  N=4 T1 match slicing — each section_l pass writes to cap/4 device
-  staging, D2H to pinned host. T3 output accumulates through a
-  per-plot pinned `h_t3_acc` buffer and rehydrates full-cap once
-  the T2 inputs are freed; T1 mi accumulates through a per-plot
-  pinned `h_t1_mi` and rehydrates before T1 sort. Bottleneck moves
-  from compact's tied 5200 MB at T1 match / T1 sort / T2 sort / T3
-  match down to ~3700 MB at T3 match.
-  Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB, MX450) and
-  comfortably fits 5 GiB+ cards at the cost of ~5-15 s/plot extra
-  PCIe round-trips. Floor still aspirational on real 4 GiB hardware
-  (post-CUDA-context free VRAM is ~3.5 GiB on those parts, leaving
-  little margin) — please report actual fit. There is no smaller
+  d_t2_keys_merged stay full-cap for binary-search reads), and
+  (4) N=4 T1 match slicing — each section_l pass writes to cap/4
+  device staging, D2H to pinned host. T3 output accumulates
+  through a per-plot pinned `h_t3_acc` buffer and rehydrates
+  full-cap once the T2 inputs are freed; T1 mi accumulates through
+  a per-plot pinned `h_t1_mi` and rehydrates before T1 sort.
+  Measured overall peak at k=28 strength=2 on RTX 4090 (compact
+  → minimal): 5200 → 4228 MB; the new bottleneck is T3 sort
+  (d_t3 2080 + d_frags_out 2080 + CUB scratch 68). Targets 5 GiB+
+  cards (RTX 2060, RX 6600 / 6600 XT, RX 7600) comfortably with
+  ~1 GiB headroom at the cost of ~5-15 s/plot extra PCIe round-
+  trips. **4 GiB cards still don't fit** — the CUB sort and Xs
+  gen+sort+pack phases still allocate four cap-sized
+  uint32 buffers (~4 cap = ~4160 MB), pushing total above the
+  ~3.5 GiB free a 4 GiB card reports post-CUDA-context. Closing
+  that gap requires the SYCL-branch's remaining cuts (CUB sort
+  output tiling with host accumulators across T1/T2/T3 sort + Xs
+  gen+sort+pack tiling) — not yet ported. There is no smaller
   tier — a forced minimal on a card below the floor throws.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
