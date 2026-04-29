@@ -121,7 +121,7 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             "AMD/HIP this most often indicates a kernel correctness issue "
             "on an unvalidated device — either an AOT target outside the "
             "validated set (the gfx1013/RDNA1 community spoof is the known "
-            "case) or AdaptiveCpp's generic SSCP JIT mis-lowering a kernel "
+            "case) or AdaptiveCpp's generic SSCP JIT miscompiling a kernel "
             "for the actual gfx ISA. Run the parity tests on this device "
             "to localise: sycl_g_x_parity, sycl_sort_parity, "
             "sycl_bucket_offsets_parity, sycl_t1_parity.");
@@ -184,7 +184,7 @@ inline void s_free(StreamingStats& s, T*& ptr)
 // matches at k=28: the gfx1013/RDNA1 community spoof on a W5700, and
 // AdaptiveCpp's generic SSCP JIT on the same RDNA1 silicon (the JIT
 // path is theoretically more compatible than the AOT spoof but has
-// been observed to mis-lower the matcher). Only the OOM further down
+// been observed to miscompile the matcher). Only the OOM further down
 // was visible before this check.
 inline void validate_t1_count(uint64_t t1_count, int k)
 {
