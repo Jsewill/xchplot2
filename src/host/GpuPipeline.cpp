@@ -119,8 +119,12 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             std::string("internal: s_malloc('") + reason + "') called with "
             "bytes=0 — an upstream sizing query returned 0 (count=0). On "
             "AMD/HIP this most often indicates a kernel correctness issue "
-            "on an unvalidated device (e.g. gfx1013/RDNA1 community spoof). "
-            "Run the parity tests on this device to localise.");
+            "on an unvalidated device — either an AOT target outside the "
+            "validated set (the gfx1013/RDNA1 community spoof is the known "
+            "case) or AdaptiveCpp's generic SSCP JIT mis-lowering a kernel "
+            "for the actual gfx ISA. Run the parity tests on this device "
+            "to localise: sycl_g_x_parity, sycl_sort_parity, "
+            "sycl_bucket_offsets_parity, sycl_t1_parity.");
     }
     if (s.cap && s.live + bytes > s.cap) {
         throw std::runtime_error(
@@ -176,9 +180,12 @@ inline void s_free(StreamingStats& s, T*& ptr)
 // zero — points at kernel correctness on the device, not a VRAM
 // shortfall. Catching this here surfaces a clear diagnostic instead of
 // letting downstream sort-scratch alloc fail with the misleading
-// "Card likely too small" message (an 8 GiB W5700 on the
-// gfx1013/RDNA1 community spoof currently produces 0 T1 matches at
-// k=28; only the OOM further down was visible before this check).
+// "Card likely too small" message. Two AMD/HIP cases produce 0 T1
+// matches at k=28: the gfx1013/RDNA1 community spoof on a W5700, and
+// AdaptiveCpp's generic SSCP JIT on the same RDNA1 silicon (the JIT
+// path is theoretically more compatible than the AOT spoof but has
+// been observed to mis-lower the matcher). Only the OOM further down
+// was visible before this check.
 inline void validate_t1_count(uint64_t t1_count, int k)
 {
     uint64_t const min_plausible = (1ULL << k) >> 6;
@@ -189,12 +196,17 @@ inline void validate_t1_count(uint64_t t1_count, int k)
         "(expected ~2^" + std::to_string(k) + " = " +
         std::to_string(1ULL << k) + " for k=" + std::to_string(k) +
         "). This indicates a kernel correctness issue on this device, "
-        "not a VRAM shortfall. On AMD/HIP this most often means an "
-        "AdaptiveCpp target like the gfx1013/RDNA1 community spoof "
-        "produced wrong output. Build the parity tests via cmake and "
-        "verify on this device: sycl_g_x_parity, sycl_sort_parity, "
-        "sycl_bucket_offsets_parity, plot_file_parity. README's "
-        "'Community-tested, not parity-validated' caveat applies.");
+        "not a VRAM shortfall. On AMD/HIP this most often means the "
+        "AdaptiveCpp target produced wrong output for the actual gfx "
+        "ISA — either the gfx1013/RDNA1 community AOT spoof or the "
+        "generic SSCP JIT path on an unvalidated card. Build the "
+        "parity tests via cmake and verify on this device: "
+        "sycl_g_x_parity, sycl_sort_parity, sycl_bucket_offsets_parity, "
+        "sycl_t1_parity. The first three exercise individual kernels at "
+        "small N; sycl_t1_parity runs the full T1 matcher against the "
+        "pos2-chip CPU reference and is the closest reproducer of the "
+        "k=28 failure. README's 'Community-tested, not parity-validated' "
+        "caveat applies.");
 }
 
 } // namespace

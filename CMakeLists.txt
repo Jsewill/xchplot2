@@ -697,3 +697,28 @@ target_include_directories(sycl_sort_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# SYCL-native sibling of t1_parity.cu. The .cu version is nvcc-only, so on
+# AMD/Intel hosts the T1 matcher had no end-to-end CPU-vs-GPU coverage —
+# this binary closes that gap. Same comparison semantics as t1_parity.cu
+# (sorted-set equality of T1Pairings against pos2-chip's Table1Constructor),
+# but uses sycl::malloc_device + q.memcpy in place of cudaMalloc /
+# cudaMemcpy so it builds on the SYCL-only path too.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(sycl_t1_parity tools/parity/sycl_t1_parity.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(sycl_t1_parity tools/parity/sycl_t1_parity.cpp)
+endif()
+add_sycl_to_target(TARGET sycl_t1_parity
+                   SOURCES tools/parity/sycl_t1_parity.cpp)
+target_link_libraries(sycl_t1_parity PRIVATE pos2_gpu_host)
+target_include_directories(sycl_t1_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_t1_parity PRIVATE cxx_std_20)
+# pos2-chip's plot/PlotLayout.hpp + plot/TableConstructorGeneric.hpp pull
+# in non-inline soft_aesenc/soft_aesdec, which already exist in pos2_gpu_host
+# via PlotFileWriterParallel.cpp + CpuPlotter.cpp. Same mitigation as the
+# xchplot2 CLI link line — see the --allow-multiple-definition note above.
+target_link_options(sycl_t1_parity PRIVATE LINKER:--allow-multiple-definition)
+set_target_properties(sycl_t1_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
