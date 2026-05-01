@@ -767,6 +767,23 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_xs_keys_a,      total_xs * sizeof(uint32_t),      "d_xs_keys_a");
         s_malloc(stats, d_xs_vals_a,      total_xs * sizeof(uint32_t),      "d_xs_vals_a");
 
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            // Pre-fill keys_a / vals_a head/mid/tail with a sentinel
+            // (0xCD bytes → 0xCDCDCDCD u32) so the post-launch dump
+            // discriminates "kernel didn't write" (sees 0xCD) from
+            // "kernel ran but wrote 0xBE" (sees 0xBE) — distinct from
+            // the HIP allocator's fresh-allocation poison fill which
+            // is also 0xBE.
+            uint64_t const off_mid  = total_xs / 2;
+            uint64_t const off_tail = (total_xs >= 16ULL) ? total_xs - 16ULL : 0ULL;
+            q.memset(d_xs_keys_a,            0xCD, 64).wait();
+            q.memset(d_xs_keys_a + off_mid,  0xCD, 64).wait();
+            q.memset(d_xs_keys_a + off_tail, 0xCD, 64).wait();
+            q.memset(d_xs_vals_a,            0xCD, 64).wait();
+            q.memset(d_xs_vals_a + off_mid,  0xCD, 64).wait();
+            q.memset(d_xs_vals_a + off_tail, 0xCD, 64).wait();
+        }
+
         int p_xs = begin_phase("Xs gen+sort");
         launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
                       cfg.k, xs_xor_const, q);

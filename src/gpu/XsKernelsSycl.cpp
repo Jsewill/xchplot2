@@ -19,15 +19,15 @@ void launch_xs_gen(
     sycl::queue& q)
 {
     // Tile via launch_xs_gen_range. AdaptiveCpp's HIP backend on
-    // gfx1010 / gfx1013-spoof silently drops a 1D parallel_for at
-    // 1M-workgroup scale (single-shot k=28: total=2^28 / 256 = 2^20
-    // workgroups — every output stays at the HIP allocator's 0xBE
-    // poison fill, with no host-visible error). 4 M-item tiles
-    // dispatch 16 k workgroups each; sycl_t1_parity at k=22 already
-    // exercises the matcher at this workgroup count on W5700, and
-    // the cost on NVIDIA is a few tens of microseconds of extra
-    // launch overhead vs the AES work.
-    constexpr uint64_t kTileItems = 1ULL << 22;
+    // gfx1010 / gfx1013-spoof silently drops a 1D parallel_for above
+    // some workgroup-count threshold (every output stays at the HIP
+    // allocator's 0xBE poison fill, with no host-visible error). At
+    // 16 k workgroups per tile (1ULL << 22) we still hit it; at 1 k
+    // workgroups (the parity-validated k=18 single-shot dispatch on
+    // W5700) we don't. Pick 256 k items / 1 k workgroups per tile.
+    // Cost on NVIDIA: ~1024 dispatches at k=28 ≈ 5 ms launch overhead
+    // total — negligible vs the per-plot AES work.
+    constexpr uint64_t kTileItems = 1ULL << 18;
     for (uint64_t off = 0; off < total; off += kTileItems) {
         uint64_t const end = (off + kTileItems < total)
                                 ? (off + kTileItems) : total;
@@ -88,7 +88,7 @@ void launch_xs_pack(
 {
     // Tile via launch_xs_pack_range — same amdgcn dispatch-scale
     // workaround as launch_xs_gen above.
-    constexpr uint64_t kTileItems = 1ULL << 22;
+    constexpr uint64_t kTileItems = 1ULL << 18;
     for (uint64_t off = 0; off < total; off += kTileItems) {
         uint64_t const end = (off + kTileItems < total)
                                 ? (off + kTileItems) : total;
