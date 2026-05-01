@@ -164,14 +164,41 @@ fn detect_amd_gfx() -> Option<String> {
                 // gfx1010 silicon. Not parity-validated — flagged via
                 // cargo:warning so users know they're on the workaround
                 // path.
+                //
+                // Opt out with XCHPLOT2_NO_GFX_SPOOF=1 to AOT-target the
+                // actual ISA. The spoof has been observed to silently
+                // produce no-op kernels on at least one W5700 / ROCm 6 /
+                // AdaptiveCpp 25.10 setup, where building for gfx1010
+                // natively or falling back to ACPP_TARGETS=generic was
+                // the only working path. Setting the variable doesn't
+                // promise the native target compiles — if AdaptiveCpp
+                // doesn't accept gfx1010 as a HIP target on the user's
+                // toolchain version, the build will fail clearly rather
+                // than silently producing broken kernels.
                 let spoofed = match name {
                     "gfx1010" | "gfx1011" | "gfx1012" => {
-                        println!(
-                            "cargo:warning=xchplot2: RDNA1 {name} detected — \
-                             building for gfx1013 (community workaround, \
-                             not parity-validated; verify plots with \
-                             `xchplot2 verify` before farming)");
-                        "gfx1013".to_string()
+                        let no_spoof = env::var("XCHPLOT2_NO_GFX_SPOOF")
+                            .map(|v| !v.is_empty() && v != "0")
+                            .unwrap_or(false);
+                        if no_spoof {
+                            println!(
+                                "cargo:warning=xchplot2: RDNA1 {name} detected, \
+                                 XCHPLOT2_NO_GFX_SPOOF set — AOT-targeting {name} \
+                                 natively (no community workaround). If AdaptiveCpp \
+                                 can't compile for {name}, unset XCHPLOT2_NO_GFX_SPOOF \
+                                 or pass ACPP_TARGETS=generic to fall back to SSCP JIT.");
+                            name.to_string()
+                        } else {
+                            println!(
+                                "cargo:warning=xchplot2: RDNA1 {name} detected — \
+                                 building for gfx1013 (community workaround, \
+                                 not parity-validated; verify plots with \
+                                 `xchplot2 verify` before farming). To opt out: \
+                                 set XCHPLOT2_NO_GFX_SPOOF=1 (build native {name}) \
+                                 or ACPP_TARGETS=generic (SSCP JIT, slower but \
+                                 compiles for any gfx ISA).");
+                            "gfx1013".to_string()
+                        }
                     }
                     other => other.to_string(),
                 };
