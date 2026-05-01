@@ -123,6 +123,82 @@ inline std::vector<sycl::device> usable_gpu_devices()
 // was configured for) is picked over the OpenMP host device. cpu_selector_v
 // bypasses GPU enumeration entirely and lands on AdaptiveCpp's OMP backend
 // (CPU build path, ACPP_TARGETS=omp).
+//
+// Runs a one-shot dispatch sanity check on first construction (see
+// validate_kernel_dispatch below). If AdaptiveCpp's HIP / CUDA backend
+// on this host produces a no-op kernel stub at JIT/AOT time, the throw
+// surfaces here — at the first GPU work request — instead of much later
+// as a confusing "T1 match produced 0 entries" / streaming-tier error.
+// Set POS2GPU_SKIP_SELFTEST=1 to bypass; useful when you've already
+// validated the device this session and want lower startup overhead
+// across many short-lived processes.
+inline void validate_kernel_dispatch(sycl::queue& q)
+{
+    if (char const* v = std::getenv("POS2GPU_SKIP_SELFTEST"); v && v[0] == '1') {
+        return;
+    }
+
+    constexpr std::size_t   N        = 16;
+    constexpr std::uint32_t kPattern = 0xDEADBEEFu;
+
+    std::uint32_t* d = sycl::malloc_device<std::uint32_t>(N, q);
+    if (!d) {
+        throw std::runtime_error(
+            "[selftest] sycl::malloc_device(16 * u32) returned null. "
+            "The SYCL runtime can't allocate even tiny device buffers — "
+            "device discovery probably failed (check rocminfo / nvidia-smi, "
+            "ACPP_VISIBILITY_MASK).");
+    }
+
+    // Sentinel-fill: a "no kernel writes landed" outcome shows the
+    // sentinel, not random uninitialised bytes that might happen to
+    // match the expected pattern by coincidence.
+    q.memset(d, 0xCD, N * sizeof(std::uint32_t)).wait();
+    q.parallel_for(sycl::nd_range<1>{N, N}, [=](sycl::nd_item<1> it) {
+        std::size_t idx = it.get_global_id(0);
+        d[idx] = kPattern + static_cast<std::uint32_t>(idx);
+    }).wait();
+
+    std::uint32_t host[N] = {};
+    q.memcpy(host, d, N * sizeof(std::uint32_t)).wait();
+    sycl::free(d, q);
+
+    int fails = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        if (host[i] != kPattern + static_cast<std::uint32_t>(i)) ++fails;
+    }
+    if (fails == 0) return;
+
+    char head[64];
+    std::snprintf(head, sizeof(head), "0x%08x (expected 0x%08x)",
+                  host[0], kPattern);
+    std::string msg =
+        "[selftest] SYCL kernel writes are not landing on the device. "
+        "A trivial parallel_for(16) writing a known pattern produced "
+        "host[0]=";
+    msg += head;
+    msg += ".\n  ";
+    if (host[0] == 0xCDCDCDCDu) {
+        msg += "The pre-launch sentinel (0xCDCDCDCD) is intact, so the "
+               "kernel completed without writing anything. ";
+    } else {
+        msg += "The sentinel was overwritten but with a wrong value — "
+               "the kernel is dispatching but its output is corrupted. ";
+    }
+    msg += "Most likely AdaptiveCpp's HIP / CUDA backend on this host is "
+           "producing a no-op or miscompiled kernel stub at JIT/AOT time. "
+           "Diagnose with:\n"
+           "  - ACPP_DEBUG_LEVEL=2 ./xchplot2 ...   (shows the JIT log)\n"
+           "  - rocminfo / nvidia-smi              (confirm the actual ISA "
+           "matches the AOT target — see cargo:warning lines from your "
+           "last `cargo install`)\n"
+           "  - try ACPP_TARGETS=generic           (forces SSCP JIT instead "
+           "of an AOT spoof)\n"
+           "Bypass the self-test with POS2GPU_SKIP_SELFTEST=1 if you've "
+           "already validated this device this session.";
+    throw std::runtime_error(msg);
+}
+
 inline sycl::queue& queue()
 {
     thread_local std::unique_ptr<sycl::queue> q;
@@ -160,6 +236,7 @@ inline sycl::queue& queue()
             }
             q = std::make_unique<sycl::queue>(devices[id], async_error_handler);
         }
+        validate_kernel_dispatch(*q);
     }
     return *q;
 }
