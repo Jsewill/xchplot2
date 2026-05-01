@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #if !defined(XCHPLOT2_SKIP_CUDA_RUNTIME) && __has_include(<cuda_runtime.h>)
   #include <cuda_runtime.h>
 #else
@@ -38,6 +40,20 @@
   #endif
 #endif
 
+// __half / __half2: AdaptiveCpp's libkernel/half_representation can
+// reference these by name even when the codegen target is HIP, not CUDA.
+// Earlier the SKIP path simply didn't include cuda_fp16.h and provided
+// nothing in its place — silent on most hosts, but on at least one
+// W5700 / gfx1010 / gfx1013-spoof + ROCm + AdaptiveCpp combination, the
+// missing types caused JIT to emit no-op kernel stubs (every kernel
+// dispatch completed cleanly with zero device-side writes). Fall back
+// to ROCm's <hip/hip_fp16.h> when available, then to opaque struct
+// stubs as a last resort.
 #if !defined(XCHPLOT2_SKIP_CUDA_FP16) && __has_include(<cuda_fp16.h>)
   #include <cuda_fp16.h>
+#elif __has_include(<hip/hip_fp16.h>)
+  #include <hip/hip_fp16.h>
+#else
+  struct __half  { uint16_t x; };
+  struct __half2 { uint16_t x; uint16_t y; };
 #endif
