@@ -35,6 +35,26 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # NOT required when XCHPLOT2_BUILD_CUDA=OFF — only the headers.
 option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ON)
 
+# On dual-toolchain hosts (CUDA Toolkit + ROCm both installed), the SYCL
+# TUs pull in CUDA's <cuda_runtime.h> via CudaHalfShim.hpp AND ROCm's
+# <hip/hip_runtime.h> via AdaptiveCpp's HIP backend. Their vector_types
+# headers declare conflicting typedefs for char1 / int2 / etc., which
+# breaks the compile. CudaHalfShim respects XCHPLOT2_SKIP_CUDA_RUNTIME /
+# _FP16 — turn them on when we're (a) NOT building CUDA TUs and (b) ROCm
+# is present, so the shim falls back to its opaque stubs instead.
+if(NOT XCHPLOT2_BUILD_CUDA)
+    find_path(XCHPLOT2_HIP_RUNTIME_H hip/hip_runtime.h
+              PATHS /opt/rocm/include /usr/include /usr/local/include
+              NO_DEFAULT_PATH)
+    if(XCHPLOT2_HIP_RUNTIME_H)
+        add_compile_definitions(
+            XCHPLOT2_SKIP_CUDA_RUNTIME
+            XCHPLOT2_SKIP_CUDA_FP16)
+        message(STATUS "xchplot2: ROCm at ${XCHPLOT2_HIP_RUNTIME_H} — "
+                       "skipping CUDA runtime/fp16 includes (CudaHalfShim stubs)")
+    endif()
+endif()
+
 if(XCHPLOT2_BUILD_CUDA)
     # Default arch: sm_89 (RTX 4090). Override via -DCMAKE_CUDA_ARCHITECTURES=...
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
