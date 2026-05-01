@@ -959,6 +959,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
         s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
 
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            uint64_t const sample_n = (total_xs < 16ULL) ? total_xs : 16ULL;
+            XsCandidateGpu sample[16] = {};
+            q.memcpy(sample, d_xs, sample_n * sizeof(XsCandidateGpu)).wait();
+            std::fprintf(stderr,
+                "[t1-debug] plain pre-launch  k=%d total_xs=%llu cap=%llu  d_xs[0..%llu]:\n",
+                cfg.k, (unsigned long long)total_xs,
+                (unsigned long long)cap, (unsigned long long)sample_n);
+            for (uint64_t i = 0; i < sample_n; ++i) {
+                std::fprintf(stderr,
+                    "  [%2llu] match_info=0x%08x x=0x%08x\n",
+                    (unsigned long long)i, sample[i].match_info, sample[i].x);
+            }
+        }
+
         int p_t1 = begin_phase("T1 match");
         q.memset(d_counter, 0, sizeof(uint64_t));
         launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
@@ -968,6 +983,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         q.memcpy(&t1_count, d_counter, sizeof(uint64_t)).wait();
         if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            std::fprintf(stderr,
+                "[t1-debug] plain post-launch t1_count=%llu\n",
+                (unsigned long long)t1_count);
+        }
         validate_t1_count(t1_count, cfg.k);
 
         s_free(stats, d_t1_match_temp);
@@ -1005,6 +1025,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_t1_meta_stage, t1_section_cap * sizeof(uint64_t), "d_t1_meta_stage");
         s_malloc(stats, d_t1_mi_stage,   t1_section_cap * sizeof(uint32_t), "d_t1_mi_stage");
 
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            uint64_t const sample_n = (total_xs < 16ULL) ? total_xs : 16ULL;
+            XsCandidateGpu sample[16] = {};
+            q.memcpy(sample, d_xs, sample_n * sizeof(XsCandidateGpu)).wait();
+            std::fprintf(stderr,
+                "[t1-debug] sliced pre-launch k=%d total_xs=%llu cap=%llu  d_xs[0..%llu]:\n",
+                cfg.k, (unsigned long long)total_xs,
+                (unsigned long long)cap, (unsigned long long)sample_n);
+            for (uint64_t i = 0; i < sample_n; ++i) {
+                std::fprintf(stderr,
+                    "  [%2llu] match_info=0x%08x x=0x%08x\n",
+                    (unsigned long long)i, sample[i].match_info, sample[i].x);
+            }
+        }
+
         int p_t1 = begin_phase("T1 match");
         uint64_t host_offset = 0;
         for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
@@ -1036,6 +1071,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         t1_count = host_offset;
         if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            std::fprintf(stderr,
+                "[t1-debug] sliced post-launch t1_count=%llu (sum across %u sections)\n",
+                (unsigned long long)t1_count, t1_num_sections);
+        }
         validate_t1_count(t1_count, cfg.k);
 
         s_free(stats, d_t1_meta_stage);
