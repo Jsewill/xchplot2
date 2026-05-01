@@ -773,17 +773,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
             uint64_t const sn = (total_xs < 16ULL) ? total_xs : 16ULL;
-            uint32_t ka[16] = {};
-            uint32_t va[16] = {};
-            q.memcpy(ka, d_xs_keys_a, sn * sizeof(uint32_t)).wait();
-            q.memcpy(va, d_xs_vals_a, sn * sizeof(uint32_t)).wait();
+            uint64_t const off_mid  = total_xs / 2;
+            uint64_t const off_tail = (total_xs >= 16ULL) ? total_xs - 16ULL : 0ULL;
+            uint32_t ka_h[16] = {}, va_h[16] = {};
+            uint32_t ka_m[16] = {}, va_m[16] = {};
+            uint32_t ka_t[16] = {}, va_t[16] = {};
+            q.memcpy(ka_h, d_xs_keys_a,            sn * sizeof(uint32_t)).wait();
+            q.memcpy(va_h, d_xs_vals_a,            sn * sizeof(uint32_t)).wait();
+            q.memcpy(ka_m, d_xs_keys_a + off_mid,  sn * sizeof(uint32_t)).wait();
+            q.memcpy(va_m, d_xs_vals_a + off_mid,  sn * sizeof(uint32_t)).wait();
+            q.memcpy(ka_t, d_xs_keys_a + off_tail, sn * sizeof(uint32_t)).wait();
+            q.memcpy(va_t, d_xs_vals_a + off_tail, sn * sizeof(uint32_t)).wait();
             std::fprintf(stderr,
-                "[t1-debug] post-xs_gen   total_xs=%llu keys_a/vals_a[0..%llu]:\n",
-                (unsigned long long)total_xs, (unsigned long long)sn);
+                "[t1-debug] post-xs_gen   total_xs=%llu (head idx=0, mid idx=%llu, tail idx=%llu):\n",
+                (unsigned long long)total_xs,
+                (unsigned long long)off_mid, (unsigned long long)off_tail);
             for (uint64_t i = 0; i < sn; ++i) {
                 std::fprintf(stderr,
-                    "  [%2llu] keys_a=0x%08x vals_a=0x%08x\n",
-                    (unsigned long long)i, ka[i], va[i]);
+                    "  H[%2llu] ka=0x%08x va=0x%08x  M[%2llu] ka=0x%08x va=0x%08x  T[%2llu] ka=0x%08x va=0x%08x\n",
+                    (unsigned long long)i,            ka_h[i], va_h[i],
+                    (unsigned long long)(off_mid + i),  ka_m[i], va_m[i],
+                    (unsigned long long)(off_tail + i), ka_t[i], va_t[i]);
             }
         }
 
@@ -805,17 +815,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
             uint64_t const sn = (total_xs < 16ULL) ? total_xs : 16ULL;
-            uint32_t kb[16] = {};
-            uint32_t vb[16] = {};
-            q.memcpy(kb, d_xs_keys_b, sn * sizeof(uint32_t)).wait();
-            q.memcpy(vb, d_xs_vals_b, sn * sizeof(uint32_t)).wait();
+            uint64_t const off_mid  = total_xs / 2;
+            uint64_t const off_tail = (total_xs >= 16ULL) ? total_xs - 16ULL : 0ULL;
+            uint32_t kb_h[16] = {}, vb_h[16] = {};
+            uint32_t kb_m[16] = {}, vb_m[16] = {};
+            uint32_t kb_t[16] = {}, vb_t[16] = {};
+            q.memcpy(kb_h, d_xs_keys_b,            sn * sizeof(uint32_t)).wait();
+            q.memcpy(vb_h, d_xs_vals_b,            sn * sizeof(uint32_t)).wait();
+            q.memcpy(kb_m, d_xs_keys_b + off_mid,  sn * sizeof(uint32_t)).wait();
+            q.memcpy(vb_m, d_xs_vals_b + off_mid,  sn * sizeof(uint32_t)).wait();
+            q.memcpy(kb_t, d_xs_keys_b + off_tail, sn * sizeof(uint32_t)).wait();
+            q.memcpy(vb_t, d_xs_vals_b + off_tail, sn * sizeof(uint32_t)).wait();
             std::fprintf(stderr,
-                "[t1-debug] post-xs_sort  total_xs=%llu keys_b/vals_b[0..%llu]:\n",
-                (unsigned long long)total_xs, (unsigned long long)sn);
+                "[t1-debug] post-xs_sort  total_xs=%llu (head idx=0, mid idx=%llu, tail idx=%llu):\n",
+                (unsigned long long)total_xs,
+                (unsigned long long)off_mid, (unsigned long long)off_tail);
             for (uint64_t i = 0; i < sn; ++i) {
                 std::fprintf(stderr,
-                    "  [%2llu] keys_b=0x%08x vals_b=0x%08x\n",
-                    (unsigned long long)i, kb[i], vb[i]);
+                    "  H[%2llu] kb=0x%08x vb=0x%08x  M[%2llu] kb=0x%08x vb=0x%08x  T[%2llu] kb=0x%08x vb=0x%08x\n",
+                    (unsigned long long)i,            kb_h[i], vb_h[i],
+                    (unsigned long long)(off_mid + i),  kb_m[i], vb_m[i],
+                    (unsigned long long)(off_tail + i), kb_t[i], vb_t[i]);
             }
         }
 
