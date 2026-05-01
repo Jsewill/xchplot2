@@ -771,6 +771,22 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
                       cfg.k, xs_xor_const, q);
 
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            uint64_t const sn = (total_xs < 16ULL) ? total_xs : 16ULL;
+            uint32_t ka[16] = {};
+            uint32_t va[16] = {};
+            q.memcpy(ka, d_xs_keys_a, sn * sizeof(uint32_t)).wait();
+            q.memcpy(va, d_xs_vals_a, sn * sizeof(uint32_t)).wait();
+            std::fprintf(stderr,
+                "[t1-debug] post-xs_gen   total_xs=%llu keys_a/vals_a[0..%llu]:\n",
+                (unsigned long long)total_xs, (unsigned long long)sn);
+            for (uint64_t i = 0; i < sn; ++i) {
+                std::fprintf(stderr,
+                    "  [%2llu] keys_a=0x%08x vals_a=0x%08x\n",
+                    (unsigned long long)i, ka[i], va[i]);
+            }
+        }
+
         s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
         s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
 
@@ -786,6 +802,22 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_xs_vals_a);
 
         s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            uint64_t const sn = (total_xs < 16ULL) ? total_xs : 16ULL;
+            uint32_t kb[16] = {};
+            uint32_t vb[16] = {};
+            q.memcpy(kb, d_xs_keys_b, sn * sizeof(uint32_t)).wait();
+            q.memcpy(vb, d_xs_vals_b, sn * sizeof(uint32_t)).wait();
+            std::fprintf(stderr,
+                "[t1-debug] post-xs_sort  total_xs=%llu keys_b/vals_b[0..%llu]:\n",
+                (unsigned long long)total_xs, (unsigned long long)sn);
+            for (uint64_t i = 0; i < sn; ++i) {
+                std::fprintf(stderr,
+                    "  [%2llu] keys_b=0x%08x vals_b=0x%08x\n",
+                    (unsigned long long)i, kb[i], vb[i]);
+            }
+        }
 
         int p_xs_pack = begin_phase("Xs pack");
         launch_xs_pack(d_xs_keys_b, d_xs_vals_b, d_xs, total_xs, q);
