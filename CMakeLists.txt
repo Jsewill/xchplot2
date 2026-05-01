@@ -290,6 +290,31 @@ if(_xchplot2_acpp_lib_dir)
     message(STATUS "xchplot2: AdaptiveCpp lib dir = ${_xchplot2_acpp_lib_dir}")
 endif()
 
+# Embed runtime library paths so binaries built via plain `cmake` (parity
+# tests, dev rebuilds, anything not invoked through cargo+build.rs) can
+# locate AdaptiveCpp's runtime lib + ROCm's libamdhip64.so without an
+# external LD_LIBRARY_PATH. build.rs sets the same rpaths via
+# rustc-link-arg for the cargo path, so this is idempotent for the
+# production binary. Without this, a fresh `cmake -B build && cmake
+# --build build --target sycl_t1_parity` produces a binary that throws
+# "No matching device" at SYCL queue construction because
+# librt-backend-hip.so can't dynamically link libamdhip64.so.
+#
+# The FetchContent path leaves _xchplot2_acpp_lib_dir as a generator
+# expression ("$<TARGET_FILE_DIR:acpp-rt>") which can't go into the
+# RPATH variables at config time — CMake's BUILD_WITH_INSTALL_RPATH=OFF
+# default already handles in-tree targets in that case.
+if(_xchplot2_acpp_lib_dir AND NOT _xchplot2_acpp_lib_dir MATCHES "\\$<")
+    list(APPEND CMAKE_BUILD_RPATH   "${_xchplot2_acpp_lib_dir}")
+    list(APPEND CMAKE_INSTALL_RPATH "${_xchplot2_acpp_lib_dir}")
+endif()
+if(XCHPLOT2_HIP_RUNTIME_H)
+    get_filename_component(_xchplot2_rocm_root "${XCHPLOT2_HIP_RUNTIME_H}/.." ABSOLUTE)
+    list(APPEND CMAKE_BUILD_RPATH   "${_xchplot2_rocm_root}/lib")
+    list(APPEND CMAKE_INSTALL_RPATH "${_xchplot2_rocm_root}/lib")
+    message(STATUS "xchplot2: embedded rpath includes ${_xchplot2_rocm_root}/lib")
+endif()
+
 # pos2-chip dependency.
 #
 # Default behavior: FetchContent auto-clones Chia-Network/pos2-chip into
