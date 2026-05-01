@@ -767,6 +767,61 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_xs_keys_a,      total_xs * sizeof(uint32_t),      "d_xs_keys_a");
         s_malloc(stats, d_xs_vals_a,      total_xs * sizeof(uint32_t),      "d_xs_vals_a");
 
+        if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
+            // Sentinel-fill keys_a / vals_a head/mid/tail with 0xCD.
+            uint64_t const off_mid  = total_xs / 2;
+            uint64_t const off_tail = (total_xs >= 16ULL) ? total_xs - 16ULL : 0ULL;
+            q.memset(d_xs_keys_a,            0xCD, 64).wait();
+            q.memset(d_xs_keys_a + off_mid,  0xCD, 64).wait();
+            q.memset(d_xs_keys_a + off_tail, 0xCD, 64).wait();
+            q.memset(d_xs_vals_a,            0xCD, 64).wait();
+            q.memset(d_xs_vals_a + off_mid,  0xCD, 64).wait();
+            q.memset(d_xs_vals_a + off_tail, 0xCD, 64).wait();
+
+            // Trivial-kernel sanity: writes 0xDEADBEEF to keys_a[0..16]
+            // with no LDS / no captured struct / no AES. If this
+            // produces 0xCDCDCDCD post-launch, AdaptiveCpp's HIP
+            // submission path is producing no-op stubs for ANY kernel
+            // — the problem is below our level. If it produces
+            // 0xDEADBEEF, simple kernels work and the issue is
+            // specific to the cooperative-LDS / AES kernel pattern.
+            {
+                uint32_t* p = d_xs_keys_a;
+                q.parallel_for(
+                    sycl::nd_range<1>{256, 256},
+                    [=](sycl::nd_item<1> it) {
+                        size_t idx = it.get_global_id(0);
+                        if (idx < 16) p[idx] = 0xDEADBEEFu;
+                    }).wait();
+                uint32_t check[16] = {};
+                q.memcpy(check, d_xs_keys_a, 16 * sizeof(uint32_t)).wait();
+                bool const ok = (check[0] == 0xDEADBEEFu);
+                std::fprintf(stderr,
+                    "[t1-debug] trivial kernel test: %s  (keys_a[0]=0x%08x)\n",
+                    ok ? "PASS — simple kernels can write"
+                       : "FAIL — kernel writes are not landing",
+                    check[0]);
+                // Restore sentinel since the trivial kernel overwrote
+                // the head region.
+                q.memset(d_xs_keys_a, 0xCD, 64).wait();
+            }
+
+            // Dump d_aes_tables[0..16]. Standard AES T0[0] = 0xC66363A5.
+            // If we see 0xBE / 0xCD here, the T-table USM buffer was
+            // never populated by aes_tables_device's q.memcpy — kernels
+            // would then read garbage and produce nothing useful.
+            {
+                uint32_t* d_tables = sycl_backend::aes_tables_device(q);
+                uint32_t aes_check[16] = {};
+                q.memcpy(aes_check, d_tables, 16 * sizeof(uint32_t)).wait();
+                std::fprintf(stderr,
+                    "[t1-debug] d_aes_tables[0..16] (T0[0] should be 0xC66363A5):\n");
+                for (int i = 0; i < 16; ++i) {
+                    std::fprintf(stderr, "  [%2d] 0x%08x\n", i, aes_check[i]);
+                }
+            }
+        }
+
         int p_xs = begin_phase("Xs gen+sort");
         launch_xs_gen(xs_keys, d_xs_keys_a, d_xs_vals_a, total_xs,
                       cfg.k, xs_xor_const, q);
