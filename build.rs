@@ -669,13 +669,21 @@ fn main() {
         println!("cargo:rustc-link-search=native={rocm_root}/hip/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{rocm_root}/lib");
         if std::path::Path::new(&amdhip_lib).exists() {
+            // Wrap with --no-as-needed/--as-needed: even a positional
+            // .so path gets dropped from NEEDED by ld's --as-needed
+            // when no symbol references it (true for the SSCP path
+            // that has zero host-side HIP symbol refs). The library
+            // itself must end up in DT_NEEDED so AdaptiveCpp's runtime
+            // dlopen finds it already loaded; otherwise HIP backend
+            // never initialises and we throw "No matching device".
+            println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
             println!("cargo:rustc-link-arg={amdhip_lib}");
+            println!("cargo:rustc-link-arg=-Wl,--as-needed");
         } else {
             // Fallback: ROCm not at /opt/rocm/lib but the user set
-            // ACPP_TARGETS=hip:* explicitly, so trust that the linker
-            // will resolve via the search-path above. AOT HIP fat
-            // binaries DO reference HIP symbols, so --as-needed keeps
-            // -lamdhip64 in NEEDED in that path.
+            // ACPP_TARGETS=hip:* explicitly. AOT HIP fat binaries
+            // reference HIP symbols directly, so --as-needed keeps
+            // -lamdhip64 in NEEDED on that path.
             println!("cargo:rustc-link-lib=amdhip64");
         }
     }
