@@ -158,46 +158,67 @@ fn detect_amd_gfx() -> Option<String> {
         if let Some(rest) = line.trim().strip_prefix("Name:") {
             let name = rest.trim();
             if name.starts_with("gfx") {
-                // RDNA1 workaround: gfx1010/1011/1012 aren't direct
-                // AdaptiveCpp HIP targets. Community-tested (Radeon Pro
-                // W5700) that gfx1013 is ISA-close enough to run on
-                // gfx1010 silicon. Not parity-validated — flagged via
-                // cargo:warning so users know they're on the workaround
-                // path.
+                // RDNA1 (gfx1010/1011/1012) isn't a direct AdaptiveCpp
+                // HIP AOT target. We previously defaulted to a community
+                // workaround that AOT-compiled for gfx1013 (close-ISA),
+                // but it has been observed to silently produce no-op
+                // kernels on at least one W5700 / ROCm 6 / AdaptiveCpp
+                // 25.10 setup — every kernel dispatch completes without
+                // writing, surfacing far downstream as "T1 match
+                // produced 0 entries". A separate-build experiment on
+                // the same host with ACPP_TARGETS=generic (SSCP JIT)
+                // dispatched and produced correct output through k=24.
                 //
-                // Opt out with XCHPLOT2_NO_GFX_SPOOF=1 to AOT-target the
-                // actual ISA. The spoof has been observed to silently
-                // produce no-op kernels on at least one W5700 / ROCm 6 /
-                // AdaptiveCpp 25.10 setup, where building for gfx1010
-                // natively or falling back to ACPP_TARGETS=generic was
-                // the only working path. Setting the variable doesn't
-                // promise the native target compiles — if AdaptiveCpp
-                // doesn't accept gfx1010 as a HIP target on the user's
-                // toolchain version, the build will fail clearly rather
-                // than silently producing broken kernels.
+                // Default for RDNA1 is now ACPP_TARGETS=generic (signal
+                // by returning None — caller's None branch picks
+                // generic). Two opt-in escape hatches preserved for
+                // users who've validated their stack on the legacy
+                // path:
+                //   XCHPLOT2_FORCE_GFX_SPOOF=1 — gfx1013 AOT spoof
+                //   XCHPLOT2_NO_GFX_SPOOF=1    — native gfx1010 AOT
+                //                                (may fail to compile
+                //                                if AdaptiveCpp doesn't
+                //                                advertise it as a HIP
+                //                                target).
                 let spoofed = match name {
                     "gfx1010" | "gfx1011" | "gfx1012" => {
+                        let force_spoof = env::var("XCHPLOT2_FORCE_GFX_SPOOF")
+                            .map(|v| !v.is_empty() && v != "0")
+                            .unwrap_or(false);
                         let no_spoof = env::var("XCHPLOT2_NO_GFX_SPOOF")
                             .map(|v| !v.is_empty() && v != "0")
                             .unwrap_or(false);
-                        if no_spoof {
+                        if force_spoof {
+                            println!(
+                                "cargo:warning=xchplot2: RDNA1 {name} detected, \
+                                 XCHPLOT2_FORCE_GFX_SPOOF set — building for \
+                                 gfx1013 (legacy community workaround). The \
+                                 default switched to ACPP_TARGETS=generic (SSCP \
+                                 JIT) after the spoof was observed to silently \
+                                 produce no-op kernels on some W5700 setups; \
+                                 unset XCHPLOT2_FORCE_GFX_SPOOF if your plots \
+                                 fail with 'T1 match produced 0 entries'.");
+                            "gfx1013".to_string()
+                        } else if no_spoof {
                             println!(
                                 "cargo:warning=xchplot2: RDNA1 {name} detected, \
                                  XCHPLOT2_NO_GFX_SPOOF set — AOT-targeting {name} \
-                                 natively (no community workaround). If AdaptiveCpp \
-                                 can't compile for {name}, unset XCHPLOT2_NO_GFX_SPOOF \
-                                 or pass ACPP_TARGETS=generic to fall back to SSCP JIT.");
+                                 natively. If AdaptiveCpp doesn't advertise {name} \
+                                 as a HIP target on your toolchain, the build will \
+                                 fail; unset XCHPLOT2_NO_GFX_SPOOF to fall back to \
+                                 the (working-on-most-cards) generic SSCP JIT.");
                             name.to_string()
                         } else {
                             println!(
                                 "cargo:warning=xchplot2: RDNA1 {name} detected — \
-                                 building for gfx1013 (community workaround, \
-                                 not parity-validated; verify plots with \
-                                 `xchplot2 verify` before farming). To opt out: \
-                                 set XCHPLOT2_NO_GFX_SPOOF=1 (build native {name}) \
-                                 or ACPP_TARGETS=generic (SSCP JIT, slower but \
-                                 compiles for any gfx ISA).");
-                            "gfx1013".to_string()
+                                 defaulting to ACPP_TARGETS=generic (SSCP JIT). \
+                                 The previous gfx1013 community workaround was \
+                                 observed to silently produce no-op kernels on \
+                                 at least one W5700 / ROCm 6 setup. Override: \
+                                 XCHPLOT2_FORCE_GFX_SPOOF=1 (back to gfx1013 AOT) \
+                                 or XCHPLOT2_NO_GFX_SPOOF=1 (try native {name})."
+                            );
+                            return None;
                         }
                     }
                     other => other.to_string(),
