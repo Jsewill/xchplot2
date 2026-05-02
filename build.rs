@@ -643,9 +643,21 @@ fn main() {
     // -lamdhip64 rust-lld fails with "undefined symbol: __hip*".
     // Honour $ROCM_PATH if set, else fall back to /opt/rocm (standard
     // bare-metal + all official ROCm container images).
-    if acpp_targets.starts_with("hip:") {
-        let rocm_root = env::var("ROCM_PATH")
-            .unwrap_or_else(|_| "/opt/rocm".to_string());
+    // Link libamdhip64 whenever ROCm is reachable, not just when
+    // ACPP_TARGETS is hip-prefixed. ACPP_TARGETS=generic (SSCP JIT) on
+    // an AMD host still needs the HIP runtime at load time —
+    // librt-backend-hip.so dlopens libamdhip64, but glibc doesn't walk
+    // the binary's RUNPATH for transitive backend deps. By making
+    // libamdhip64 a direct dependency of the binary, the loader pulls
+    // it in at startup via RUNPATH, and AdaptiveCpp's runtime dlopen
+    // finds the already-loaded handle. Without this, an AMD-host
+    // build with the new RDNA1 default (generic instead of the
+    // gfx1013 spoof) fails at first queue construction with
+    // "No matching device" because HIP can't initialise.
+    let rocm_root = env::var("ROCM_PATH")
+        .unwrap_or_else(|_| "/opt/rocm".to_string());
+    let amdhip_lib = format!("{rocm_root}/lib/libamdhip64.so");
+    if acpp_targets.starts_with("hip:") || std::path::Path::new(&amdhip_lib).exists() {
         println!("cargo:rustc-link-search=native={rocm_root}/lib");
         println!("cargo:rustc-link-search=native={rocm_root}/hip/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{rocm_root}/lib");
