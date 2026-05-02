@@ -654,6 +654,13 @@ fn main() {
     // build with the new RDNA1 default (generic instead of the
     // gfx1013 spoof) fails at first queue construction with
     // "No matching device" because HIP can't initialise.
+    //
+    // We pass the full .so path (rather than `cargo:rustc-link-lib=amdhip64`
+    // which becomes `-lamdhip64`) because the SSCP path emits no host-
+    // side HIP symbol references, and the linker's default --as-needed
+    // would drop a name-only -l flag from NEEDED. A positional path
+    // argument bypasses --as-needed and keeps the library in the link.
+    // Same approach as CMakeLists.txt's `link_libraries(.../libamdhip64.so)`.
     let rocm_root = env::var("ROCM_PATH")
         .unwrap_or_else(|_| "/opt/rocm".to_string());
     let amdhip_lib = format!("{rocm_root}/lib/libamdhip64.so");
@@ -661,7 +668,16 @@ fn main() {
         println!("cargo:rustc-link-search=native={rocm_root}/lib");
         println!("cargo:rustc-link-search=native={rocm_root}/hip/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{rocm_root}/lib");
-        println!("cargo:rustc-link-lib=amdhip64");
+        if std::path::Path::new(&amdhip_lib).exists() {
+            println!("cargo:rustc-link-arg={amdhip_lib}");
+        } else {
+            // Fallback: ROCm not at /opt/rocm/lib but the user set
+            // ACPP_TARGETS=hip:* explicitly, so trust that the linker
+            // will resolve via the search-path above. AOT HIP fat
+            // binaries DO reference HIP symbols, so --as-needed keeps
+            // -lamdhip64 in NEEDED in that path.
+            println!("cargo:rustc-link-lib=amdhip64");
+        }
     }
 
     // C++ stdlib + POSIX bits the static libs (Rust std + pthread inside
