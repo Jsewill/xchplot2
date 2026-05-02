@@ -313,6 +313,22 @@ if(XCHPLOT2_HIP_RUNTIME_H)
     list(APPEND CMAKE_BUILD_RPATH   "${_xchplot2_rocm_root}/lib")
     list(APPEND CMAKE_INSTALL_RPATH "${_xchplot2_rocm_root}/lib")
     message(STATUS "xchplot2: embedded rpath includes ${_xchplot2_rocm_root}/lib")
+
+    # Direct-link libamdhip64 so AdaptiveCpp's runtime-dlopen'd HIP
+    # backend (librt-backend-hip.so) finds the library already loaded
+    # in the process address space. dlopen of a backend's transitive
+    # deps doesn't consult the calling binary's RUNPATH on glibc —
+    # without this explicit link, ROCm silently fails to initialise
+    # and AdaptiveCpp's default selector falls through to its OpenMP
+    # host device. The fall-through makes hellosycl / sycl_t1_parity
+    # report "ALL OK" while having executed entirely on CPU. Mirrors
+    # build.rs:631 (cargo:rustc-link-lib=amdhip64) for the cargo
+    # build path.
+    if(EXISTS "${_xchplot2_rocm_root}/lib/libamdhip64.so")
+        link_libraries("${_xchplot2_rocm_root}/lib/libamdhip64.so")
+        message(STATUS "xchplot2: link_libraries(libamdhip64.so) — "
+                       "AdaptiveCpp HIP backend will find ROCm at runtime")
+    endif()
 endif()
 
 # pos2-chip dependency.
