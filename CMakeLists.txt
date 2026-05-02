@@ -767,3 +767,16 @@ target_compile_features(sycl_t1_parity PRIVATE cxx_std_20)
 target_link_options(sycl_t1_parity PRIVATE LINKER:--allow-multiple-definition)
 set_target_properties(sycl_t1_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Lowest-level diagnostic: a hello-world SYCL kernel that proves
+# AdaptiveCpp's HIP / CUDA backend can dispatch *anything* on the
+# detected device. No pos2_gpu / pos2_gpu_host link — purely the SYCL
+# runtime + a 16-element parallel_for. Use it as the first step when
+# sycl_t1_parity or the production CLI silently produces no output: if
+# hellosycl FAILs, no xchplot2-level fix can recover and the issue is
+# below our level (driver mismatch, JIT no-op stubs, etc.).
+add_executable(hellosycl tools/sanity/hellosycl.cpp)
+add_sycl_to_target(TARGET hellosycl SOURCES tools/sanity/hellosycl.cpp)
+target_compile_features(hellosycl PRIVATE cxx_std_20)
+set_target_properties(hellosycl PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
