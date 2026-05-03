@@ -729,7 +729,10 @@ pulled in transitively):
 - **`CUB memcpy keys_out: invalid argument`** mid-pipeline (after T1
   match starts), no CUDA device on the host. Same root cause: CUB sort
   was compiled in and is being dispatched against AMD silicon. Same
-  fix.
+  fix. Builds past `4394c66` catch this at queue construction with a
+  `[selftest] this build links CUDA/CUB ... but the SYCL queue landed
+  on a non-CUDA device` exception that names the device and the rebuild
+  command, instead of the bare CUB error 30s in.
 
 - **`[AdaptiveCpp Warning] [backend_loader] Could not load library:
   /opt/adaptivecpp/lib/hipSYCL/librt-backend-cuda.so (libcudart.so.11.0:
