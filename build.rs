@@ -37,16 +37,17 @@ fn detect_cuda_arch() -> Option<String> {
 }
 
 /// Same probe as `detect_cuda_arch`, but filters out NVIDIA GPUs
-/// below our README-documented minimum compute capability (sm_61,
-/// Pascal / GTX 10-series). Below sm_53 the GPU also lacks native
-/// FP16 intrinsics (`__hadd` / `__hsub` / `__hmul` / `__hdiv` /
-/// `__hlt` / `__hle` / `__hgt` / `__hge`) that AdaptiveCpp's
-/// `half.hpp` emits unconditionally in any nvcc device pass —
-/// `cuda_fp16.h` guards those behind `__CUDA_ARCH__ >= 530`. Users
-/// with an ancient secondary NVIDIA card (e.g. a GTX 750 Ti sitting
-/// next to a real AMD / NVIDIA workhorse) otherwise get routed onto
-/// the CUB fast path via vendor-precedence and fail to compile
-/// SortCuda.cu with a cascade of "identifier `__hXXX` is undefined".
+/// below our README-documented minimum compute capability (sm_50,
+/// Maxwell first-gen / GTX 750-class). The floor used to be sm_61 on
+/// the assumption that AdaptiveCpp's `half.hpp` referenced FP16
+/// intrinsics (`__hadd` / `__hsub` / `__hmul` / `__hdiv` / `__hlt` /
+/// `__hgt`) only available on sm_53+ — but those intrinsics are
+/// *implemented* in `cuda_fp16.hpp` via `NV_IF_ELSE_TARGET(NV_PROVIDES_SM_53, …)`
+/// with a fp32 emulation fallback for pre-sm_53 cards. CUDA 12.x
+/// toolkits compile cleanly for sm_50/52/53. The real floor is the
+/// toolkit's own codegen support: CUDA 12.x supports sm_50-90+,
+/// CUDA 13.x dropped sm_50-72 (CMakeLists' nvcc-vs-arch preflight
+/// catches that pairing with a FATAL_ERROR + fix block).
 ///
 /// Returns Some(arch) only when nvidia-smi reports a card at or
 /// above our minimum; emits a cargo:warning and returns None
@@ -54,14 +55,27 @@ fn detect_cuda_arch() -> Option<String> {
 fn usable_nvidia_arch() -> Option<String> {
     let arch = detect_cuda_arch()?;
     let n: u32 = arch.parse().ok()?;
-    if n < 61 {
+    if n < 50 {
         println!(
             "cargo:warning=xchplot2: nvidia-smi detected sm_{arch} — below our \
-             minimum supported compute capability (sm_61 / Pascal). Ignoring \
-             NVIDIA for default targeting; set CUDA_ARCHITECTURES={arch} + \
-             XCHPLOT2_BUILD_CUDA=ON to force-build the CUB path anyway (not \
-             recommended — AdaptiveCpp half.hpp references sm_53+ FP16 \
-             intrinsics that your card's headers don't provide).");
+             minimum supported compute capability (sm_50 / Maxwell). CUDA 11.x \
+             was the last toolkit to compile for Kepler (sm_30-37); we don't \
+             support that path. Ignoring NVIDIA for default targeting; if \
+             this card is your only GPU, force the build with \
+             CUDA_ARCHITECTURES={arch} + XCHPLOT2_BUILD_CUDA=ON and an \
+             appropriately-old CUDA toolkit, or fall back to \
+             ACPP_TARGETS=omp for AdaptiveCpp's CPU OpenMP backend.");
+        return None;
+    }
+    if n < 75 && detect_nvcc_major().map(|m| m >= 13).unwrap_or(false) {
+        println!(
+            "cargo:warning=xchplot2: nvidia-smi detected sm_{arch} (Maxwell / \
+             Pascal / Volta) but nvcc is CUDA 13.x, which dropped codegen \
+             for sm_50-72. Ignoring NVIDIA for default targeting; install \
+             CUDA 12.9 (last toolkit with Maxwell-Volta support) and re-run, \
+             or use scripts/build-container.sh which auto-pins the right \
+             base image. CMakeLists' preflight will FATAL_ERROR with the \
+             exact remediation if you force-build anyway.");
         return None;
     }
     Some(arch)
