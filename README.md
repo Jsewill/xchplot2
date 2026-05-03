@@ -259,13 +259,14 @@ will expect.
 #### Multi-GPU: `--devices`
 
 `xchplot2 devices` prints id, name, VRAM, SM count, and compute
-capability for every visible CUDA device — use the printed `[N]`
-index with `--devices N`:
+capability for every visible CUDA device, plus the host CPU plotter
+row. Use the printed `[N]` / `[cpu]` index with `--devices`:
 
 ```
 $ xchplot2 devices
-Visible CUDA devices (1):
-  [0] NVIDIA GeForce RTX 4090          vram=24076 MB  SMs=128  CC=8.9
+Visible devices (1 GPU + 1 CPU):
+  [0]   NVIDIA GeForce RTX 4090          vram=24076 MB  SMs=128  CC=8.9
+  [cpu] Host CPU plotter                 threads=32                       (1-2 orders slower than GPU)
 ```
 
 Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
