@@ -708,6 +708,57 @@ agreement is still bit-exact across `aes` / `xs` / `t1` / `t2` / `t3` /
 `plot_file`. Requires `cmake --build` to have produced the parity
 binaries first.
 
+## Troubleshooting
+
+Symptoms most commonly seen when running `xchplot2 plot` on AMD hosts
+that also have CUDA Toolkit headers installed (a fairly common state
+after a previous NVIDIA install or the `cuda` distro package being
+pulled in transitively):
+
+- **`sycl_backend::queue: device id 0 out of range (found 0 usable GPU
+  device(s))`** when invoking with `--devices N`, while plain
+  `xchplot2 plot ...` (no flag) finds the GPU. Means your build picked
+  `XCHPLOT2_BUILD_CUDA=ON` and the device list is being filtered to
+  CUDA-backend devices only — your AMD card is present but filtered
+  out. The new error message will spell this out and point at the
+  rebuild incantation; older builds give the bare "0 usable" line.
+  Fix: `git pull && XCHPLOT2_BUILD_CUDA=OFF cargo install --path . --force`,
+  or just `cargo install --path . --force` on a build past
+  `amd_gpu_present()` — the autodetect now catches RDNA1 too.
+
+- **`CUB memcpy keys_out: invalid argument`** mid-pipeline (after T1
+  match starts), no CUDA device on the host. Same root cause: CUB sort
+  was compiled in and is being dispatched against AMD silicon. Same
+  fix.
+
+- **`[AdaptiveCpp Warning] [backend_loader] Could not load library:
+  /opt/adaptivecpp/lib/hipSYCL/librt-backend-cuda.so (libcudart.so.11.0:
+  cannot open shared object file)`**: cosmetic only — AdaptiveCpp
+  built with CUDA backend support but no CUDA runtime to load. Happens
+  when AdaptiveCpp was installed out-of-band rather than via
+  `scripts/install-deps.sh --gpu amd` (which sets
+  `-DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE`). To suppress without a
+  rebuild: `export ACPP_VISIBILITY_MASK=hip;omp` so AdaptiveCpp skips
+  the CUDA backend probe entirely.
+
+- **`T1 match produced 0 entries`** on RDNA1 (`gfx1010` / `gfx1011` /
+  `gfx1012`, including the Radeon Pro W5700 / RX 5700 XT). The
+  community `gfx1013` AOT-spoof default was observed to silently
+  compile no-op kernel stubs on at least one W5700 + ROCm 6 +
+  AdaptiveCpp 25.10 host. Default flipped to `ACPP_TARGETS=generic`
+  (SSCP JIT) in recent main; `cargo install --force` past commit
+  `d939ee8` (or the SHA-1 mirror equivalent) restores correct
+  behavior. To restore the old spoof, `XCHPLOT2_FORCE_GFX_SPOOF=1
+  cargo install ...`. The startup self-test in `SyclBackend::queue()`
+  catches the no-op-kernel case at queue construction with a clear
+  exception, so this should now surface immediately rather than as
+  empty pipeline output minutes in.
+
+- **Deep-pipeline diagnostics**: set `POS2GPU_T1_DEBUG=1` for verbose
+  per-stage dumps (Xs gen / sort intermediates, T1 match input/output
+  samples, AES T-table sanity). Useful when the symptom isn't on the
+  list above and you want to localize where the data goes wrong.
+
 ## Environment variables
 
 | Variable                      | Effect                                                                  |
