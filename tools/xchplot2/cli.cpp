@@ -6,6 +6,10 @@
 //           BLS keys via the keygen-rs Rust shim, then dispatches through
 //           batch internally. The "real" entrypoint for users.
 
+#include "gpu/SyclDeviceList.hpp" // list_gpu_devices() — backs the
+                                  // `devices` subcommand below. Plain
+                                  // types only; the SYCL include lives
+                                  // in SyclDeviceList.cpp (acpp-built).
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
 #include "host/Cancel.hpp"
@@ -24,6 +28,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -102,6 +107,12 @@ void print_usage(char const* prog)
         << "    Default PATH is ./build/tools/parity. Build the tests with\n"
         << "    `cmake --build <build-dir>` first. Useful for post-refactor\n"
         << "    regression screening.\n"
+        << "  " << prog << " devices\n"
+        << "    List every visible SYCL GPU device + the host CPU plotter\n"
+        << "    with id, name, backend, capacity, and which sort path the\n"
+        << "    runtime dispatcher will route a worker to (CUB on cuda-\n"
+        << "    backend devices when this build links CUB, otherwise SortSycl).\n"
+        << "    Use the printed [N] / [cpu] index with --devices in plot/batch.\n"
         << "\n"
         << "  test-mode positional args:\n"
         << "    <k>            : even integer in [18, 32]\n"
@@ -262,6 +273,51 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     std::string mode = argv[1];
+
+    if (mode == "devices") {
+        // Enumerate every visible SYCL GPU device + the CPU plotter
+        // (always available via AdaptiveCpp's OpenMP host backend).
+        // Reports id, name, backend, capacity, and which sort path
+        // the runtime dispatcher will route a worker on this device
+        // to (CUB on cuda-backend queues when this build links the
+        // CUB sort path; SortSycl otherwise — see SortDispatch.cpp).
+        // Use the printed `[N]` / `[cpu]` index with `--devices`.
+        auto devices = pos2gpu::list_gpu_devices();
+        std::printf("Visible devices (%zu GPU + 1 CPU):\n", devices.size());
+        for (auto const& d : devices) {
+            std::size_t vram_mb =
+                static_cast<std::size_t>(d.vram_bytes / (1024ull * 1024ull));
+#ifdef XCHPLOT2_HAVE_CUB
+            char const* sort_hint = d.is_cuda_backend ? "CUB" : "SYCL";
+#else
+            char const* sort_hint = "SYCL";
+#endif
+            std::printf("  [%zu]   %-32s backend=%-10s vram=%5zu MB  CUs=%-4u  sort:%s\n",
+                        d.id, d.name.c_str(), d.backend.c_str(),
+                        vram_mb, d.cu_count, sort_hint);
+        }
+        // CPU row. hardware_concurrency() returns 0 when it can't
+        // figure out the count (rare), in which case print "?".
+        unsigned threads = std::thread::hardware_concurrency();
+        if (threads == 0) {
+            std::printf("  [cpu] %-32s backend=%-10s threads=  ?            sort:SYCL  (1-2 orders slower than GPU)\n",
+                        "Host CPU plotter", "omp");
+        } else {
+            std::printf("  [cpu] %-32s backend=%-10s threads=%-4u           sort:SYCL  (1-2 orders slower than GPU)\n",
+                        "Host CPU plotter", "omp", threads);
+        }
+        if (devices.empty()) {
+            std::printf("\nNo GPU devices visible to AdaptiveCpp / SYCL.\n"
+                        "Check rocminfo / nvidia-smi, ACPP_VISIBILITY_MASK, and that the\n"
+                        "relevant SYCL backend was built into AdaptiveCpp.\n"
+                        "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
+        } else {
+            std::printf("\nUse `--devices N` (id) for a specific GPU, `--devices cpu`\n"
+                        "for the host CPU, `--devices all` for one worker per GPU,\n"
+                        "or any comma combination (e.g. `all,cpu`).\n");
+        }
+        return 0;
+    }
 
     if (mode == "batch") {
         if (argc < 3) { print_usage(argv[0]); return 1; }
