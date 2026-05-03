@@ -409,7 +409,8 @@ set(POS2_GPU_SYCL_SRC
 # compiled out and reduces to a single tail call into SortSycl.cpp.
 list(APPEND POS2_GPU_SYCL_SRC
     src/gpu/SortSycl.cpp
-    src/gpu/SortDispatch.cpp)
+    src/gpu/SortDispatch.cpp
+    src/gpu/SyclDeviceList.cpp)
 
 if(XCHPLOT2_BUILD_CUDA)
     set(POS2_GPU_CUDA_SRC

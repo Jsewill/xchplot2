@@ -635,6 +635,23 @@ will expect.
 
 #### Multi-device: `--devices` and `--cpu`
 
+`xchplot2 devices` prints id, name, backend, VRAM, compute-unit count,
+and which sort path each device will use (CUB on cuda-backend devices
+when this build links CUB, SortSycl otherwise) — the printed `[N]`
+index is the value `--devices N` accepts:
+
+```
+$ xchplot2 devices
+Visible devices (2 GPU + 1 CPU):
+  [0]   NVIDIA GeForce RTX 4090          backend=cuda       vram=24076 MB  CUs=128   sort:CUB
+  [1]   AMD Radeon Pro W5700             backend=hip        vram= 8176 MB  CUs=36    sort:SYCL
+  [cpu] Host CPU plotter                 backend=omp        threads=32             sort:SYCL  (1-2 orders slower than GPU)
+
+Use `--devices N` (id) for a specific GPU, `--devices cpu`
+for the host CPU, `--devices all` for one worker per GPU,
+or any comma combination (e.g. `all,cpu`).
+```
+
 Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
 across multiple devices — one worker thread per device, each with its
 own buffer pool and writer channel. Plots are partitioned round-robin,
@@ -709,6 +726,12 @@ agreement is still bit-exact across `aes` / `xs` / `t1` / `t2` / `t3` /
 binaries first.
 
 ## Troubleshooting
+
+- **Listing visible GPUs**: `xchplot2 devices` prints id, name, backend,
+  VRAM, compute-unit count, and which sort path each device will use
+  (CUB on cuda-backend devices when this build links CUB; SortSycl
+  otherwise). Use the printed `[N]` index with `--devices N` for
+  `plot` / `batch`.
 
 - **Hybrid hosts (NVIDIA + AMD/Intel on the same box)**: a single
   binary handles all visible GPUs. `xchplot2 plot --devices all`
