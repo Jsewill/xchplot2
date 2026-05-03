@@ -185,6 +185,7 @@ add_library(pos2_gpu_cuda_obj OBJECT
     src/gpu/T1Kernel.cu
     src/gpu/T2Kernel.cu
     src/gpu/T3Kernel.cu
+    src/gpu/CudaDeviceList.cu
     src/host/GpuBufferPool.cu
     src/host/GpuPipeline.cu
 )

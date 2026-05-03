@@ -6,6 +6,13 @@
 //           BLS keys via the keygen-rs Rust shim, then dispatches through
 //           batch internally. The "real" entrypoint for users.
 
+#include "gpu/CudaDeviceList.hpp"  // list_cuda_devices() — backs the
+                                   // `devices` subcommand below.
+                                   // Plain-types header; the
+                                   // cuda_runtime.h call lives in
+                                   // CudaDeviceList.cu so cli.cpp
+                                   // (compiled by g++) doesn't need
+                                   // the CUDA include path.
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
@@ -89,6 +96,10 @@ void print_usage(char const* prog)
         << "    Run every *_parity binary in PATH (default: ./build/tools/parity)\n"
         << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
         << "    <build-dir>` first. Useful for post-refactor regression screening.\n"
+        << "  " << prog << " devices\n"
+        << "    List every visible CUDA device with id, name, VRAM, SM count,\n"
+        << "    and compute capability. Use the printed [N] index with\n"
+        << "    --devices N in plot/batch.\n"
         << "\n"
         << "  test-mode positional args:\n"
         << "    <k>            : even integer in [18, 32]\n"
@@ -236,6 +247,34 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     std::string mode = argv[1];
+
+    if (mode == "devices") {
+        // Enumerate every visible CUDA device and report id, name,
+        // VRAM, SM count, compute capability. Use the printed `[N]`
+        // index with `--devices N` for `plot` / `batch`.
+        auto query = pos2gpu::list_cuda_devices();
+        if (!query.error.empty()) {
+            std::printf("CUDA error: %s\n", query.error.c_str());
+            std::printf("(no driver / no NVIDIA GPU / mismatched libcuda?)\n");
+            return 1;
+        }
+        std::printf("Visible CUDA devices (%zu):\n", query.devices.size());
+        for (auto const& d : query.devices) {
+            std::size_t vram_mb =
+                static_cast<std::size_t>(d.vram_bytes / (1024ull * 1024ull));
+            std::printf("  [%d] %-32s vram=%5zu MB  SMs=%d  CC=%d.%d\n",
+                        d.id, d.name.c_str(), vram_mb,
+                        d.sm_count, d.cc_major, d.cc_minor);
+        }
+        if (query.devices.empty()) {
+            std::printf("\nNo CUDA devices visible.\n"
+                        "Check `nvidia-smi -L` and that the driver is loaded.\n");
+        } else {
+            std::printf("\nUse `--devices N` (id) in `plot` / `batch` to pick a specific\n"
+                        "device, or `--devices all` for one worker per device.\n");
+        }
+        return 0;
+    }
 
     if (mode == "batch") {
         if (argc < 3) { print_usage(argv[0]); return 1; }
