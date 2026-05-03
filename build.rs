@@ -163,20 +163,50 @@ fn detect_intel_gpu() -> bool {
 /// return None for AMD cards we choose to route through SSCP (RDNA1
 /// default), but the GPU is still present and BUILD_CUDA detection
 /// should still see it as "AMD host, skip CUDA TUs".
+///
+/// Falls back to /sys/class/drm vendor-ID probe (0x1002) when rocminfo
+/// isn't on $PATH at build time. That happens reliably when users
+/// install ROCm via /opt/rocm/bin without sourcing /etc/profile.d/rocm.sh
+/// in the shell that runs `cargo install`, or run `cargo install` under
+/// systemd / sudo / chroot where the parent shell's PATH is stripped.
+/// Without the fallback the BUILD_CUDA selector falls through to the
+/// `nvcc present → ON, "CI fallback"` arm, the build links CUB, and the
+/// streaming pipeline dies on first sort dispatch against the AMD card.
 fn amd_gpu_present() -> bool {
-    let out = match Command::new("rocminfo").output() {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-    let s = match std::str::from_utf8(&out.stdout) {
-        Ok(s) => s,
+    if let Ok(out) = Command::new("rocminfo").output() {
+        if out.status.success() {
+            if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                if s.lines().any(|l| {
+                    l.trim().strip_prefix("Name:")
+                        .map(|rest| rest.trim().starts_with("gfx"))
+                        .unwrap_or(false)
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+    // PCI fallback — same pattern as detect_intel_gpu(). Doesn't need any
+    // user-space tools, only readable sysfs (true on every Linux host
+    // with the amdgpu / radeon kernel module loaded).
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
         Err(_) => return false,
     };
-    s.lines().any(|l| {
-        l.trim().strip_prefix("Name:")
-            .map(|rest| rest.trim().starts_with("gfx"))
-            .unwrap_or(false)
-    })
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let vendor = entry.path().join("device/vendor");
+        if let Ok(v) = std::fs::read_to_string(&vendor) {
+            if v.trim() == "0x1002" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
