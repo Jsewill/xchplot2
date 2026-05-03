@@ -30,10 +30,15 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
 
 ## Hardware compatibility
 
-- **GPU:** NVIDIA, compute capability ≥ 6.1 (Pascal / GTX 10-series
+- **GPU:** NVIDIA, compute capability ≥ 5.0 (Maxwell / GTX 750-class
   and newer). Builds auto-detect the installed GPU's `compute_cap`
   via `nvidia-smi`; override with `$CUDA_ARCHITECTURES` for fat or
-  cross-target builds (see [Build](#build)).
+  cross-target builds (see [Build](#build)). Pre-sm_53 cards lack
+  native FP16 ALUs, but `cuda_fp16.h` falls back to fp32 emulation
+  for the half-precision intrinsics — any kernel paths touching
+  FP16 still work correctly, with the emulation cost. The AES + match
+  kernels at the heart of plotting are integer-only and see no FP16
+  penalty.
 - **VRAM:** 4 GiB minimum at k=28. Cards with < 15 GB free use the
   streaming pipeline (three sub-tiers — plain ~7.4 GiB, compact
   ~5.3 GiB, minimal ~3.7 GiB — auto-picked by free VRAM); 16 GB+
@@ -51,9 +56,16 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   under load if throughput looks off.
 - **Host RAM:** ≥ 16 GB recommended; `batch` mode pins ~4 GB of host
   memory for D2H double-buffering (pool or streaming).
-- **CUDA Toolkit:** 12+ required to build (tested on 13.x). Runtime
-  users on RTX 50-series (Blackwell, `sm_120`) need a driver bundle
-  that ships Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
+- **CUDA Toolkit:** 12+ required to build (tested on 13.x). The
+  toolkit-vs-arch matrix:
+  - `sm_50` – `sm_72` (Maxwell / Pascal / Volta): need CUDA **12.9**
+    (last toolkit with codegen for these arches — 13.x dropped them
+    entirely). `build.rs` catches the 13.x + old-arch pairing in a
+    preflight and points at the fix path.
+  - `sm_75` – `sm_90` (Turing / Ampere / Hopper): 12.x or 13.x both
+    work.
+  - `sm_120` (RTX 50-series Blackwell): need 12.8+; earlier toolkits
+    lack Blackwell codegen.
 - **CPU architecture:** `x86_64` is the tested path. `aarch64` is also
   supported for NVIDIA ARM platforms — Jetson Orin (`sm_87`), IGX
   Orin, and Grace Hopper / GH200 (`sm_90`, SBSA). `build.rs` picks
@@ -99,8 +111,9 @@ CUDA_ARCHITECTURES="89;120" cargo install --git https://github.com/Jsewill/xchpl
 CUDA_ARCHITECTURES=75 cargo install --git https://github.com/Jsewill/xchplot2
 ```
 
-Common values: `61` GTX 10-series, `70` Volta, `75` Turing, `80` A100,
-`86` RTX 30-series, `89` RTX 40-series, `90` H100, `120` RTX 50-series.
+Common values: `52` GTX 9-series (Maxwell, needs CUDA 12.9 toolkit),
+`61` GTX 10-series, `70` Volta, `75` Turing, `80` A100, `86` RTX 30-
+series, `89` RTX 40-series, `90` H100, `120` RTX 50-series.
 
 ### CMake (also builds the parity tests)
 
