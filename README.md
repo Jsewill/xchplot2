@@ -42,29 +42,36 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
 ## Hardware compatibility
 
 - **GPU:**
-  - **NVIDIA**, compute capability ≥ 6.1 (Pascal / GTX 10-series and
-    newer) via the CUDA fast path. Builds auto-detect the installed
-    GPU's `compute_cap` via `nvidia-smi`; override with
+  - **NVIDIA**, compute capability ≥ 5.0 (Maxwell / GTX 750-class
+    and newer) via the CUDA fast path. Builds auto-detect the
+    installed GPU's `compute_cap` via `nvidia-smi`; override with
     `$CUDA_ARCHITECTURES` for fat or cross-target builds (see
-    [Build](#build)). On dual-vendor hosts (e.g. AMD primary +
-    secondary NVIDIA), `build.rs` prefers AMD/Intel auto-targeting
-    when the detected NVIDIA arch is below this floor — old or
-    legacy NVIDIA cards no longer steal the CUB path from a real
-    AMD/Intel workhorse.
+    [Build](#build)). Pre-sm_53 cards lack native FP16 ALUs, but
+    `cuda_fp16.h` falls back to fp32 emulation for the half-precision
+    intrinsics — kernels work correctly with the emulation cost.
+    On dual-vendor hosts (e.g. AMD primary + secondary NVIDIA),
+    `build.rs` also routes around CUDA 13.x + sm < 75 (the toolkit
+    dropped Maxwell-Volta codegen) so an old NVIDIA card next to a
+    working AMD GPU no longer derails the build.
   - **AMD ROCm** via the SYCL / AdaptiveCpp path. Validated on RDNA2
     (`gfx1031`, RX 6700 XT, 12 GB) — bit-exact parity with the CUDA
     backend across the sort / bucket-offsets / g_x kernels, and
     farmable plots end-to-end. ROCm 6.2 required (newer ROCm versions
     have LLVM packaging breakage — see [`compose.yaml`](compose.yaml)
     rocm-service comments). Build picks `ACPP_TARGETS=hip:gfxXXXX`
-    from `rocminfo` automatically. Other gfx targets (`gfx1030` /
-    `gfx1100`) build cleanly but are untested on real hardware.
-    RDNA1 cards (`gfx1010`/`gfx1011`/`gfx1012`) aren't a direct
-    AdaptiveCpp target, but a **Radeon Pro W5700 (`gfx1010`)** has
-    been reported to work end-to-end by spoofing as `gfx1013` at
-    build time: `ACPP_GFX=gfx1013 ./scripts/build-container.sh`.
-    Community-tested, not parity-validated — smoke-test any batch
-    with `xchplot2 verify` before committing.
+    from `rocminfo` automatically for RDNA2+. Other gfx targets
+    (`gfx1030` / `gfx1100`) build cleanly but are untested on real
+    hardware. **RDNA1 cards (`gfx1010`/`gfx1011`/`gfx1012`, e.g.
+    Radeon Pro W5700, RX 5700 / 5700 XT)** default to
+    `ACPP_TARGETS=generic` (SSCP JIT) — a previous community
+    workaround AOT-spoofed them as `gfx1013`, but that has been
+    observed to silently produce no-op kernel stubs on at least one
+    W5700 + ROCm 6 + AdaptiveCpp 25.10 setup. Generic SSCP works
+    end-to-end through k=24 parity tests. Two opt-in escape hatches
+    preserved: `XCHPLOT2_FORCE_GFX_SPOOF=1` to restore the legacy
+    AOT spoof, `XCHPLOT2_NO_GFX_SPOOF=1` to AOT-target the actual
+    ISA natively (build will fail clearly if AdaptiveCpp doesn't
+    accept it).
   - **Intel oneAPI** is wired up but untested.
   - **CPU** (no GPU) via AdaptiveCpp's OpenMP backend. Opt-in with
     `--cpu` (or `--devices cpu`) — never the default. Plotting is
@@ -113,9 +120,15 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
 - **CUDA Toolkit:** 12+ required for the NVIDIA build path (tested on
   13.x). Skipped automatically on AMD/Intel builds where `nvcc` isn't
   available — `build.rs` runs `nvcc --version` and flips
-  `XCHPLOT2_BUILD_CUDA=OFF` when missing. Runtime users on RTX
-  50-series (Blackwell, `sm_120`) need a driver bundle that ships
-  Toolkit 12.8+; earlier toolkits lack Blackwell codegen.
+  `XCHPLOT2_BUILD_CUDA=OFF` when missing. The toolkit-vs-arch matrix:
+  - `sm_50` – `sm_72` (Maxwell / Pascal / Volta): need CUDA **12.9**
+    (last toolkit with codegen for these arches — 13.x dropped them
+    entirely). `build.rs` catches the 13.x + old-arch pairing in a
+    preflight and points at the fix path.
+  - `sm_75` – `sm_90` (Turing / Ampere / Hopper): 12.x or 13.x both
+    work.
+  - `sm_120` (RTX 50-series Blackwell): need 12.8+; earlier toolkits
+    lack Blackwell codegen.
 - **OS:** Linux (tested on modern glibc distributions) is the supported
   path. Windows users route through either the `cuda-only` branch
   natively (NVIDIA + MSVC + CUDA) or WSL2 (any vendor WSL2 supports)
