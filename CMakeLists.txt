@@ -400,6 +400,17 @@ set(POS2_GPU_SYCL_SRC
     src/host/GpuBufferPool.cpp
     src/host/GpuPipeline.cpp)
 
+# Sort path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) is now
+# always compiled — it's the runtime fallback for non-CUDA backends on
+# dual-toolchain builds, and the only path on AMD-only / Intel-only /
+# CPU builds. SortDispatch.cpp picks at runtime based on the queue's
+# device backend (sycl::backend::cuda → _cub variant; everything else →
+# _sycl variant). When BUILD_CUDA=OFF, the dispatcher's CUB branch is
+# compiled out and reduces to a single tail call into SortSycl.cpp.
+list(APPEND POS2_GPU_SYCL_SRC
+    src/gpu/SortSycl.cpp
+    src/gpu/SortDispatch.cpp)
+
 if(XCHPLOT2_BUILD_CUDA)
     set(POS2_GPU_CUDA_SRC
         src/gpu/AesGpu.cu
@@ -417,12 +428,13 @@ if(XCHPLOT2_BUILD_CUDA)
     list(APPEND POS2_GPU_SYCL_SRC
         src/gpu/SortSyclCub.cpp)
 else()
-    # Non-CUDA path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) +
-    # AesStub.cpp no-op for initialize_aes_tables. Both compiled by acpp
-    # via add_sycl_to_target.
+    # AesStub.cpp: no-op initialize_aes_tables on builds without the
+    # CUDA AOT path. AesGpu.cu provides the real implementation when
+    # BUILD_CUDA=ON; SYCL workers ignore initialize_aes_tables anyway
+    # (they upload AES T-tables lazily via SyclBackend.hpp's
+    # aes_tables_device(q)).
     set(POS2_GPU_CUDA_SRC)
     list(APPEND POS2_GPU_SYCL_SRC
-        src/gpu/SortSycl.cpp
         src/gpu/AesStub.cpp)
 endif()
 
@@ -462,12 +474,11 @@ target_compile_features(pos2_gpu PUBLIC cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
-# Marker for SyclBackend's mixed-vendor device filter. When CUB is the
-# sort path, sycl::device::get_devices(gpu) on a heterogeneous host
-# returns NVIDIA + AMD devices; CUB-on-AMD fails with cudaErrorInvalidDevice.
-# The filter in SyclBackend.hpp drops non-CUDA backends only when this
-# define is on. AMD/Intel/CPU builds leave it off so HIP / Level Zero
-# / OMP devices pass through.
+# Marker for SortDispatch.cpp: gates whether the runtime backend
+# dispatcher includes the CUB branch. Defined when SortSyclCub.cpp +
+# SortCuda.cu are linked (BUILD_CUDA=ON); undefined on AMD-only /
+# Intel-only / CPU builds, in which case the dispatcher reduces to a
+# single tail call into SortSycl.cpp.
 if(XCHPLOT2_BUILD_CUDA)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_HAVE_CUB=1)
 endif()

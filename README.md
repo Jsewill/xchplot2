@@ -710,29 +710,12 @@ binaries first.
 
 ## Troubleshooting
 
-Symptoms most commonly seen when running `xchplot2 plot` on AMD hosts
-that also have CUDA Toolkit headers installed (a fairly common state
-after a previous NVIDIA install or the `cuda` distro package being
-pulled in transitively):
-
-- **`sycl_backend::queue: device id 0 out of range (found 0 usable GPU
-  device(s))`** when invoking with `--devices N`, while plain
-  `xchplot2 plot ...` (no flag) finds the GPU. Means your build picked
-  `XCHPLOT2_BUILD_CUDA=ON` and the device list is being filtered to
-  CUDA-backend devices only — your AMD card is present but filtered
-  out. The new error message will spell this out and point at the
-  rebuild incantation; older builds give the bare "0 usable" line.
-  Fix: `git pull && XCHPLOT2_BUILD_CUDA=OFF cargo install --path . --force`,
-  or just `cargo install --path . --force` on a build past
-  `amd_gpu_present()` — the autodetect now catches RDNA1 too.
-
-- **`CUB memcpy keys_out: invalid argument`** mid-pipeline (after T1
-  match starts), no CUDA device on the host. Same root cause: CUB sort
-  was compiled in and is being dispatched against AMD silicon. Same
-  fix. Builds past `4394c66` catch this at queue construction with a
-  `[selftest] this build links CUDA/CUB ... but the SYCL queue landed
-  on a non-CUDA device` exception that names the device and the rebuild
-  command, instead of the bare CUB error 30s in.
+- **Hybrid hosts (NVIDIA + AMD/Intel on the same box)**: a single
+  binary handles all visible GPUs. `xchplot2 plot --devices all`
+  spawns a worker per GPU; each worker picks the right sort backend
+  at queue construction (CUB on NVIDIA, hand-rolled SYCL radix on
+  AMD/Intel) via the runtime dispatcher in `SortDispatch.cpp`. No
+  rebuild required to add a second-vendor card.
 
 - **`[AdaptiveCpp Warning] [backend_loader] Could not load library:
   /opt/adaptivecpp/lib/hipSYCL/librt-backend-cuda.so (libcudart.so.11.0:
@@ -750,12 +733,19 @@ pulled in transitively):
   compile no-op kernel stubs on at least one W5700 + ROCm 6 +
   AdaptiveCpp 25.10 host. Default flipped to `ACPP_TARGETS=generic`
   (SSCP JIT) in recent main; `cargo install --force` past commit
-  `d939ee8` (or the SHA-1 mirror equivalent) restores correct
-  behavior. To restore the old spoof, `XCHPLOT2_FORCE_GFX_SPOOF=1
-  cargo install ...`. The startup self-test in `SyclBackend::queue()`
-  catches the no-op-kernel case at queue construction with a clear
-  exception, so this should now surface immediately rather than as
-  empty pipeline output minutes in.
+  `d939ee8` restores correct behavior. To restore the old spoof,
+  `XCHPLOT2_FORCE_GFX_SPOOF=1 cargo install ...`. The startup self-
+  test in `SyclBackend::queue()` catches the no-op-kernel case at
+  queue construction with a clear exception, so this surfaces
+  immediately rather than as empty pipeline output minutes in.
+
+- **`CUB ... invalid argument`** mid-pipeline, or
+  **`sycl_backend::queue: device id 0 out of range (found 0 usable
+  GPU device(s))`** with `--devices N` while the default selector
+  finds a GPU: pre-`762fde2` symptoms of CUB-only sort being
+  dispatched against an AMD/Intel device (or being filtered out of
+  the device list). The runtime sort dispatcher fixes both — `git
+  pull && cargo install --path . --force` to upgrade.
 
 - **Deep-pipeline diagnostics**: set `POS2GPU_T1_DEBUG=1` for verbose
   per-stage dumps (Xs gen / sort intermediates, T1 match input/output

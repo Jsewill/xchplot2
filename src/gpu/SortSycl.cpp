@@ -306,7 +306,10 @@ void radix_pass_keys_u64(
 // vs the ~6 GB the old keys_alt/vals_alt cost there). The result lands
 // in keys_out; if the pass count is odd we do one final memcpy from
 // keys_in (which holds the result after the last swap).
-void launch_sort_pairs_u32_u32(
+// Renamed _sycl in 2026-05; the canonical launch_sort_pairs_u32_u32 lives
+// in SortDispatch.cpp and routes to this implementation for non-CUDA
+// devices (and for everything when XCHPLOT2_HAVE_CUB isn't defined).
+void launch_sort_pairs_u32_u32_sycl(
     void* d_temp_storage,
     size_t& temp_bytes,
     uint32_t* keys_in, uint32_t* keys_out,
@@ -352,7 +355,7 @@ void launch_sort_pairs_u32_u32(
     }
 }
 
-void launch_sort_keys_u64(
+void launch_sort_keys_u64_sycl(
     void* d_temp_storage,
     size_t& temp_bytes,
     uint64_t* keys_in, uint64_t* keys_out,
