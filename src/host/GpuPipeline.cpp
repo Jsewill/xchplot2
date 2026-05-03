@@ -815,7 +815,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 uint32_t aes_check[16] = {};
                 q.memcpy(aes_check, d_tables, 16 * sizeof(uint32_t)).wait();
                 std::fprintf(stderr,
-                    "[t1-debug] d_aes_tables[0..16] (T0[0] should be 0xC66363A5):\n");
+                    "[t1-debug] d_aes_tables[0..16] (T0[a] = (2S[a],S[a],S[a],3S[a]) packed LE; T0[0] = 0xa56363c6):\n");
                 for (int i = 0; i < 16; ++i) {
                     std::fprintf(stderr, "  [%2d] 0x%08x\n", i, aes_check[i]);
                 }
