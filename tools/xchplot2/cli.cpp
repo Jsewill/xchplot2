@@ -29,6 +29,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -97,9 +98,9 @@ void print_usage(char const* prog)
         << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
         << "    <build-dir>` first. Useful for post-refactor regression screening.\n"
         << "  " << prog << " devices\n"
-        << "    List every visible CUDA device with id, name, VRAM, SM count,\n"
-        << "    and compute capability. Use the printed [N] index with\n"
-        << "    --devices N in plot/batch.\n"
+        << "    List every visible CUDA device + the host CPU plotter,\n"
+        << "    with id, name, VRAM/threads, and per-GPU SM count + compute\n"
+        << "    capability. Use the printed [N] / [cpu] index with --devices.\n"
         << "\n"
         << "  test-mode positional args:\n"
         << "    <k>            : even integer in [18, 32]\n"
@@ -249,29 +250,41 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     std::string mode = argv[1];
 
     if (mode == "devices") {
-        // Enumerate every visible CUDA device and report id, name,
-        // VRAM, SM count, compute capability. Use the printed `[N]`
-        // index with `--devices N` for `plot` / `batch`.
+        // Enumerate every visible CUDA device + the host CPU plotter
+        // (always available via --cpu / --devices cpu). Reports id,
+        // name, VRAM/threads, and per-GPU SM count + compute capability.
+        // Use the printed `[N]` / `[cpu]` index with `--devices`.
         auto query = pos2gpu::list_cuda_devices();
         if (!query.error.empty()) {
             std::printf("CUDA error: %s\n", query.error.c_str());
             std::printf("(no driver / no NVIDIA GPU / mismatched libcuda?)\n");
+            std::printf("The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
             return 1;
         }
-        std::printf("Visible CUDA devices (%zu):\n", query.devices.size());
+        std::printf("Visible devices (%zu GPU + 1 CPU):\n", query.devices.size());
         for (auto const& d : query.devices) {
             std::size_t vram_mb =
                 static_cast<std::size_t>(d.vram_bytes / (1024ull * 1024ull));
-            std::printf("  [%d] %-32s vram=%5zu MB  SMs=%d  CC=%d.%d\n",
+            std::printf("  [%d]   %-32s vram=%5zu MB  SMs=%-3d  CC=%d.%d\n",
                         d.id, d.name.c_str(), vram_mb,
                         d.sm_count, d.cc_major, d.cc_minor);
         }
+        unsigned threads = std::thread::hardware_concurrency();
+        if (threads == 0) {
+            std::printf("  [cpu] %-32s threads=  ?                          (1-2 orders slower than GPU)\n",
+                        "Host CPU plotter");
+        } else {
+            std::printf("  [cpu] %-32s threads=%-4u                       (1-2 orders slower than GPU)\n",
+                        "Host CPU plotter", threads);
+        }
         if (query.devices.empty()) {
             std::printf("\nNo CUDA devices visible.\n"
-                        "Check `nvidia-smi -L` and that the driver is loaded.\n");
+                        "Check `nvidia-smi -L` and that the driver is loaded.\n"
+                        "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
         } else {
-            std::printf("\nUse `--devices N` (id) in `plot` / `batch` to pick a specific\n"
-                        "device, or `--devices all` for one worker per device.\n");
+            std::printf("\nUse `--devices N` (id) for a specific GPU, `--devices cpu`\n"
+                        "for the host CPU, `--devices all` for one worker per GPU,\n"
+                        "or any comma combination (e.g. `all,cpu`).\n");
         }
         return 0;
     }
