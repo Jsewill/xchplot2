@@ -13,16 +13,18 @@
 //   cub_sort_*(...)                      — pure-CUDA CUB kernel +
 //                                          internal cudaStreamSync.
 //
-// This file is only built when XCHPLOT2_BUILD_CUDA=ON. The
-// non-CUDA path provides launch_sort_* via SortSycl.cpp instead
-// (hand-rolled SYCL radix sort, no CUB / nvcc involvement).
+// This file is only built when XCHPLOT2_BUILD_CUDA=ON. The dispatcher
+// in SortDispatch.cpp routes here for CUDA-backend queues; non-CUDA
+// queues (HIP / Level Zero / OpenMP host) flow to SortSycl.cpp's
+// launch_sort_*_sycl variants instead. AMD-only / Intel-only / CPU
+// builds skip this file entirely (BUILD_CUDA=OFF).
 
 #include "gpu/Sort.cuh"
 #include "gpu/SortCubInternal.cuh"
 
 namespace pos2gpu {
 
-void launch_sort_pairs_u32_u32(
+void launch_sort_pairs_u32_u32_cub(
     void* d_temp_storage,
     size_t& temp_bytes,
     uint32_t* keys_in, uint32_t* keys_out,
@@ -41,7 +43,7 @@ void launch_sort_pairs_u32_u32(
         count, begin_bit, end_bit);
 }
 
-void launch_sort_keys_u64(
+void launch_sort_keys_u64_cub(
     void* d_temp_storage,
     size_t& temp_bytes,
     uint64_t* keys_in, uint64_t* keys_out,

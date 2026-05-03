@@ -89,28 +89,19 @@ inline int current_device_id()
     return current_device_id_ref();
 }
 
-// Mixed-vendor SYCL host filter: when this build links the CUB sort path
-// (XCHPLOT2_HAVE_CUB), drop any non-CUDA SYCL devices from the
-// enumeration. Otherwise a host with NVIDIA + AMD (e.g. user passed
-// `--gpus all` AND `--device /dev/kfd --device /dev/dri` to docker)
-// returns 2+ "GPU devices" from the SYCL view, BatchPlotter's
-// `--devices all` spawns a worker per device, and the CUB sort path
-// errors out with `cudaErrorInvalidDevice` ("invalid device ordinal")
-// when CUB is called against the AMD card. Skipping non-CUDA backends
-// here keeps the enumeration aligned with what CUB can actually use.
+// Every SYCL GPU device this process can see. Used by --devices N to
+// translate the user's index into a sycl::device, and by --devices all
+// to spawn a worker per device.
 //
-// Intel L0 / OCL devices are likewise filtered; HIP-only builds (the
-// rocm container) wouldn't define XCHPLOT2_HAVE_CUB and pass through.
+// Used to filter non-CUDA backends out when the CUB sort path was
+// linked, on the theory that a worker landing on an AMD device with
+// CUB-only sort would just die mid-pipeline. The runtime backend
+// dispatch in SortDispatch.cpp made that filter unnecessary — a hybrid
+// host (NVIDIA + AMD) can now run a worker per device, with each
+// worker picking the right sort backend at queue construction time.
 inline std::vector<sycl::device> usable_gpu_devices()
 {
     auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-#ifdef XCHPLOT2_HAVE_CUB
-    devs.erase(std::remove_if(devs.begin(), devs.end(),
-        [](sycl::device const& d) {
-            return d.get_backend() != sycl::backend::cuda;
-        }),
-        devs.end());
-#endif
     return devs;
 }
 
