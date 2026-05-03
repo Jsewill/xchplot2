@@ -144,10 +144,33 @@ fn detect_intel_gpu() -> bool {
     false
 }
 
+/// Does the host have any AMD GPU detectable by rocminfo? Independent
+/// of which ACPP_TARGETS string we'd pick for it — `detect_amd_gfx` may
+/// return None for AMD cards we choose to route through SSCP (RDNA1
+/// default), but the GPU is still present and BUILD_CUDA detection
+/// should still see it as "AMD host, skip CUDA TUs".
+fn amd_gpu_present() -> bool {
+    let out = match Command::new("rocminfo").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let s = match std::str::from_utf8(&out.stdout) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    s.lines().any(|l| {
+        l.trim().strip_prefix("Name:")
+            .map(|rest| rest.trim().starts_with("gfx"))
+            .unwrap_or(false)
+    })
+}
+
 /// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
 /// an RX 7900 XTX. Returns None when rocminfo is missing or there's no AMD
-/// GPU. Used to set ACPP_TARGETS=hip:gfxXXXX so AdaptiveCpp can AOT-compile
-/// the kernels for the actual hardware.
+/// GPU, AND ALSO when we deliberately want the caller to fall through to
+/// ACPP_TARGETS=generic (currently for RDNA1 gfx1010/1011/1012). Use
+/// amd_gpu_present() to distinguish "no AMD GPU at all" from "AMD GPU
+/// present but routed through generic SSCP".
 fn detect_amd_gfx() -> Option<String> {
     let out = Command::new("rocminfo").output().ok()?;
     if !out.status.success() {
@@ -380,7 +403,12 @@ fn main() {
             // AdaptiveCpp half.hpp references sm_53+ FP16 intrinsics
             // that the old card's cuda_fp16.h guards out.
             let nvidia_gpu = usable_nvidia_arch().is_some();
-            let amd_gpu    = detect_amd_gfx().is_some();
+            // amd_gpu_present, NOT detect_amd_gfx().is_some() — the
+            // latter returns None for RDNA1 (we route those through
+            // SSCP instead of an AOT hip:* target), but the GPU is
+            // there and we MUST skip CUDA TUs to avoid running
+            // SortCuda.cu's CUB calls against AMD silicon.
+            let amd_gpu    = amd_gpu_present();
             let intel_gpu  = detect_intel_gpu();
             if nvidia_gpu {
                 ("ON".to_string(), "NVIDIA GPU detected")
