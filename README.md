@@ -17,8 +17,9 @@ xchplot2 plot -k 28 -n 10 \
     -c <pool-contract-xch1-or-txch1> \
     -o /mnt/plots
 
-# Multi-GPU — one worker per device, round-robin partition.
-xchplot2 plot ... --devices all
+# Multi-GPU — one worker per GPU, round-robin partition.
+# (`--devices all` adds a CPU worker too; `--devices gpu` sticks to GPUs.)
+xchplot2 plot ... --devices gpu
 ```
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM /
@@ -277,15 +278,22 @@ channel. Plots are partitioned round-robin, so a batch of 10 plots on
 second.
 
 ```bash
-# Every visible CUDA device — enumerated at runtime.
+# Every visible CUDA device — enumerated at runtime. No CPU worker.
 xchplot2 plot --k 28 --num 10 -f <farmer-pk> -c <pool-contract> \
-    --out /mnt/plots --devices all
+    --out /mnt/plots --devices gpu
+
+# Every CUDA device PLUS a CPU worker on the same batch.
+xchplot2 plot ... --devices all
 
 # Only these specific device ids (sorted, deduplicated).
 xchplot2 plot ... --devices 0,2,3
 
 # Explicit single id (same as omitting the flag on a single-GPU host).
 xchplot2 plot ... --devices 0
+
+# CPU only, or specific GPUs + CPU as a list.
+xchplot2 plot ... --devices cpu
+xchplot2 plot ... --devices 0,1,cpu
 ```
 
 Omitted flag = single device on the CUDA-default device — identical
