@@ -254,10 +254,18 @@ namespace {
 //                  line per call means ordering is already atomic
 //                  per-line, so interleaving across workers is
 //                  acceptable for v1 without prefix disambiguation).
+// shared_idx (default null) lets multiple workers race for the next plot
+// out of a single shared `entries` list. When set, every worker calls
+// shared_idx->fetch_add(1) and exits when the result >= entries.size() —
+// dynamic load balancing, so a fast GPU worker keeps pulling plots while
+// a slow CPU worker handles only what it can finish in the same wall.
+// When null (single-device path), the worker iterates 0..entries.size()-1
+// in order — original behaviour.
 BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             BatchOptions const& opts,
                             int                 device_id,
-                            int                 worker_id)
+                            int                 worker_id,
+                            std::atomic<std::size_t>* shared_idx = nullptr)
 {
     (void)worker_id;
 
@@ -279,7 +287,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         BatchResult res;
         if (entries.empty()) return res;
         auto const t_start = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < entries.size(); ++i) {
+        std::size_t local_idx = 0;
+        while (true) {
+            std::size_t const i = shared_idx
+                ? shared_idx->fetch_add(1, std::memory_order_relaxed)
+                : local_idx++;
+            if (i >= entries.size()) break;
             if (opts.skip_existing) {
                 auto out_path = std::filesystem::path(entries[i].out_dir)
                                 / entries[i].out_name;
@@ -298,9 +311,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 ++res.plots_written;
                 if (opts.verbose) {
                     std::fprintf(stderr,
-                        "[batch:cpu] plot %zu/%zu done: %s\n",
-                        i + 1, entries.size(),
-                        entries[i].out_name.c_str());
+                        "[batch:cpu] plot %zu done: %s\n",
+                        i, entries[i].out_name.c_str());
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
@@ -609,15 +621,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     size_t producer_failed = 0;
 
     // Producer (this thread): drives the GPU pipeline, hands off to consumer.
+    // local_count rotates this worker's own pinned-buffer slots (channel
+    // depth = kNumPinnedBuffers); it must NOT use the global plot index
+    // when shared_idx is in play, because peer workers also hold slots in
+    // their own pools.
     try {
-        for (size_t i = 0; i < entries.size(); ++i) {
+        std::size_t local_idx = 0;
+        std::size_t local_count = 0;
+        while (true) {
             if (consumer_failed) break;
+
+            std::size_t const i = shared_idx
+                ? shared_idx->fetch_add(1, std::memory_order_relaxed)
+                : local_idx++;
+            if (i >= entries.size()) break;
 
             if (cancel_requested()) {
                 std::fprintf(stderr,
-                    "[batch] cancel received — stopping before plot %zu "
-                    "(%zu plot(s) not started)\n",
-                    i, entries.size() - i);
+                    "[batch] cancel received — stopping before plot %zu\n", i);
                 break;
             }
 
@@ -647,7 +668,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             WorkItem item;
             item.entry  = entries[i];
             item.index  = i;
-            int const slot = static_cast<int>(i % GpuBufferPool::kNumPinnedBuffers);
+            int const slot = static_cast<int>(
+                local_count % GpuBufferPool::kNumPinnedBuffers);
             try {
                 if (pool_ptr) {
                     // Pool path: rotate pinned slot per plot. The channel's
@@ -683,6 +705,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
 
             chan.push(std::move(item));
+            ++local_count;
         }
     } catch (...) {
         chan.close();
@@ -779,26 +802,23 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         return r;
     }
 
-    // Multi-device: round-robin-partition the entries and spawn one
-    // worker thread per GPU. Each worker constructs its own
-    // GpuBufferPool, producer/consumer channel, and writer thread on
-    // its target device — zero cross-worker shared state beyond stderr
-    // and the filesystem. Plot output names come from the manifest, so
-    // distinct plots already land in distinct files.
+    // Multi-device: workers race to pull plots from a single shared
+    // queue (atomic counter into `entries`) so a fast GPU keeps pulling
+    // work while a slow CPU only handles what it can finish in the same
+    // wall. Each worker still constructs its own GpuBufferPool /
+    // producer-consumer channel / writer thread on its target device —
+    // zero cross-worker shared state beyond `next_idx`, stderr, and
+    // the filesystem.
     size_t const N = device_ids.size();
-    std::vector<std::vector<BatchEntry>> buckets(N);
-    for (size_t i = 0; i < entries.size(); ++i) {
-        buckets[i % N].push_back(entries[i]);
-    }
-
     std::fprintf(stderr,
-        "[batch] multi-device: %zu plots across %zu workers — devices:",
+        "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
         entries.size(), N);
     for (size_t i = 0; i < N; ++i) {
         std::fprintf(stderr, " %d", device_ids[i]);
     }
     std::fprintf(stderr, "\n");
 
+    std::atomic<std::size_t> next_idx{0};
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -807,7 +827,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         workers.emplace_back([&, i]() {
             try {
                 per_worker[i] = run_batch_slice(
-                    buckets[i], opts, device_ids[i], static_cast<int>(i));
+                    entries, opts, device_ids[i],
+                    static_cast<int>(i), &next_idx);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
             }
