@@ -75,10 +75,11 @@ void print_usage(char const* prog)
         << "                                      instead of aborting the batch.\n"
         << "    --devices SPEC                  : multi-device. SPEC is a comma\n"
         << "                                      list mixing any of:\n"
-        << "                                        all       — every visible GPU\n"
-        << "                                        cpu       — CPU worker (slow)\n"
+        << "                                        all       — every GPU + CPU\n"
+        << "                                        gpu       — every visible GPU\n"
+        << "                                        cpu       — CPU worker only (slow)\n"
         << "                                        0,1,3     — explicit GPU ids\n"
-        << "                                      e.g. all,cpu = every GPU + CPU.\n"
+        << "                                      e.g. gpu,cpu == all.\n"
         << "                                      Omitted = single device via default\n"
         << "                                      SYCL selector (zero-config).\n"
         << "    --cpu                           : add a CPU worker alongside the\n"
@@ -207,8 +208,9 @@ void read_urandom(uint8_t* out, size_t n)
 bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
     // Accept comma-separated mix of:
-    //   "all"      → opts.use_all_devices = true
-    //   "cpu"      → opts.include_cpu     = true
+    //   "all"      → every GPU + the CPU worker
+    //   "gpu"      → every visible GPU only
+    //   "cpu"      → the CPU worker only
     //   "<int>"    → opts.device_ids.push_back(int)  (real GPU index)
     // "cpu" alone is OK; otherwise at least one GPU token is required.
     opts.device_ids.clear();
@@ -222,6 +224,10 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
         if (tok.empty()) return false;
         any_token = true;
         if (tok == "all") {
+            opts.use_all_devices = true;
+            opts.include_cpu = true;
+            any_gpu_token = true;
+        } else if (tok == "gpu") {
             opts.use_all_devices = true;
             any_gpu_token = true;
         } else if (tok == "cpu") {
@@ -312,9 +318,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         "relevant SYCL backend was built into AdaptiveCpp.\n"
                         "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
         } else {
-            std::printf("\nUse `--devices N` (id) for a specific GPU, `--devices cpu`\n"
-                        "for the host CPU, `--devices all` for one worker per GPU,\n"
-                        "or any comma combination (e.g. `all,cpu`).\n");
+            std::printf("\nUse `--devices N` (id) for a specific GPU,\n"
+                        "     `--devices gpu` for every GPU,\n"
+                        "     `--devices cpu` for the host CPU only,\n"
+                        "     `--devices all` for every GPU + CPU,\n"
+                        "  or any comma combination (e.g. `0,2,cpu`).\n");
         }
         return 0;
     }

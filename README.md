@@ -29,8 +29,9 @@ xchplot2 plot -k 28 -n 10 \
     -c <pool-contract-xch1-or-txch1> \
     -o /mnt/plots
 
-# Multi-GPU — one worker per device, round-robin partition.
-xchplot2 plot ... --devices all
+# Multi-GPU — one worker per GPU, round-robin partition.
+# (`--devices all` adds a CPU worker too; `--devices gpu` sticks to GPUs.)
+xchplot2 plot ... --devices gpu
 ```
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM
@@ -77,8 +78,8 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     `--cpu` (or `--devices cpu`) — never the default. Plotting is
     1-2 orders of magnitude slower than a real GPU; intended for
     headless CI, GPU-less dev machines, or as an extra worker
-    alongside GPUs (`--cpu --devices all` runs every visible GPU
-    plus a CPU worker on the same batch). Build the container with
+    alongside GPUs (`--devices all` runs every visible GPU plus a
+    CPU worker on the same batch; `--devices gpu` sticks to GPUs). Build the container with
     `scripts/build-container.sh --gpu cpu` for the standalone CPU
     image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
 - **VRAM:** four tiers, picked automatically based on free device
@@ -647,9 +648,11 @@ Visible devices (2 GPU + 1 CPU):
   [1]   AMD Radeon Pro W5700             backend=hip        vram= 8176 MB  CUs=36    sort:SYCL
   [cpu] Host CPU plotter                 backend=omp        threads=32             sort:SYCL  (1-2 orders slower than GPU)
 
-Use `--devices N` (id) for a specific GPU, `--devices cpu`
-for the host CPU, `--devices all` for one worker per GPU,
-or any comma combination (e.g. `all,cpu`).
+Use `--devices N` (id) for a specific GPU,
+     `--devices gpu` for every GPU,
+     `--devices cpu` for the host CPU only,
+     `--devices all` for every GPU + CPU,
+  or any comma combination (e.g. `0,2,cpu`).
 ```
 
 Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
@@ -659,9 +662,12 @@ so a batch of 10 plots on 2 GPUs sends plots 0/2/4/6/8 to the first
 GPU and 1/3/5/7/9 to the second.
 
 ```bash
-# Every visible GPU — enumerated at runtime.
+# Every visible GPU — enumerated at runtime. No CPU worker.
 xchplot2 plot --k 28 --num 10 -f <farmer-pk> -c <pool-contract> \
-    --out /mnt/plots --devices all
+    --out /mnt/plots --devices gpu
+
+# Every visible GPU PLUS a CPU worker on the same batch.
+xchplot2 plot ... --devices all
 
 # Only these specific GPU ids (sorted, deduplicated).
 xchplot2 plot ... --devices 0,2,3
@@ -674,10 +680,8 @@ xchplot2 plot ... --devices 0
 xchplot2 plot ... --devices cpu
 xchplot2 plot ... --cpu
 
-# Heterogeneous: every GPU PLUS a CPU worker on the same batch.
-# --cpu is orthogonal to --devices and appends a CPU worker.
-xchplot2 plot ... --devices all --cpu
-xchplot2 plot ... --devices 0,1,cpu     # same effect, written as a list
+# Mix tokens: specific GPUs + CPU.
+xchplot2 plot ... --devices 0,1,cpu
 ```
 
 CPU plotting is **1-2 orders of magnitude slower than GPU** — meant for
@@ -734,11 +738,12 @@ binaries first.
   `plot` / `batch`.
 
 - **Hybrid hosts (NVIDIA + AMD/Intel on the same box)**: a single
-  binary handles all visible GPUs. `xchplot2 plot --devices all`
-  spawns a worker per GPU; each worker picks the right sort backend
-  at queue construction (CUB on NVIDIA, hand-rolled SYCL radix on
-  AMD/Intel) via the runtime dispatcher in `SortDispatch.cpp`. No
-  rebuild required to add a second-vendor card.
+  binary handles all visible GPUs. `xchplot2 plot --devices gpu`
+  spawns a worker per GPU (use `--devices all` to also add a CPU
+  worker); each worker picks the right sort backend at queue
+  construction (CUB on NVIDIA, hand-rolled SYCL radix on AMD/Intel)
+  via the runtime dispatcher in `SortDispatch.cpp`. No rebuild
+  required to add a second-vendor card.
 
 - **`[AdaptiveCpp Warning] [backend_loader] Could not load library:
   /opt/adaptivecpp/lib/hipSYCL/librt-backend-cuda.so (libcudart.so.11.0:
