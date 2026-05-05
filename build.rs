@@ -53,7 +53,36 @@ fn detect_cuda_arch() -> Option<String> {
 /// above our minimum; emits a cargo:warning and returns None
 /// otherwise so callers fall through to the AMD / Intel detection.
 fn usable_nvidia_arch() -> Option<String> {
-    let arch = detect_cuda_arch()?;
+    let arch = match detect_cuda_arch() {
+        Some(a) => a,
+        None => {
+            // nvidia-smi missing or its `--query-gpu=compute_cap` query
+            // failed. Fall back to a sysfs PCI probe so hosts with old
+            // drivers or partial enumeration still get NVIDIA-aware
+            // build flags. We can't know the real compute_cap from
+            // sysfs, so honor $CUDA_ARCHITECTURES if set; otherwise
+            // default to sm_75 (Turing — works on every CUDA toolkit
+            // 12.x or 13.x without the Maxwell/Pascal/Volta drop).
+            if !nvidia_gpu_present() {
+                return None;
+            }
+            let (fallback_arch, source) = match env::var("CUDA_ARCHITECTURES")
+                .ok()
+                .and_then(|s| min_arch(&s))
+            {
+                Some(a) => (a.to_string(), "$CUDA_ARCHITECTURES"),
+                None => ("75".to_string(), "default (Turing)"),
+            };
+            println!(
+                "cargo:warning=xchplot2: nvidia-smi --query-gpu=compute_cap \
+                 failed, but /sys/class/drm reports an NVIDIA GPU (vendor \
+                 0x10de). Falling back to sm_{fallback_arch} ({source}). If \
+                 your card is older or newer, set $CUDA_ARCHITECTURES \
+                 explicitly (e.g. CUDA_ARCHITECTURES=89 for an RTX 4090) \
+                 — autodetect can't read the compute_cap from sysfs alone.");
+            fallback_arch
+        }
+    };
     let n: u32 = arch.parse().ok()?;
     if n < 50 {
         println!(
@@ -151,6 +180,34 @@ fn detect_intel_gpu() -> bool {
         let vendor = entry.path().join("device/vendor");
         if let Ok(v) = std::fs::read_to_string(&vendor) {
             if v.trim() == "0x8086" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does the host have any NVIDIA GPU? Sysfs PCI vendor-ID probe (0x10de)
+/// — same fallback shape as `amd_gpu_present()`. Used by
+/// `usable_nvidia_arch()` to recover when `nvidia-smi --query-gpu=
+/// compute_cap` fails (older driver, partial enumeration, container
+/// missing nvidia-smi binary, etc.) but the host clearly has an NVIDIA
+/// card. Doesn't tell us the compute_cap; callers fall back to
+/// `$CUDA_ARCHITECTURES` or a sensible default if this returns true.
+fn nvidia_gpu_present() -> bool {
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let vendor = entry.path().join("device/vendor");
+        if let Ok(v) = std::fs::read_to_string(&vendor) {
+            if v.trim() == "0x10de" {
                 return true;
             }
         }
