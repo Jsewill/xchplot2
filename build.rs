@@ -36,6 +36,35 @@ fn detect_cuda_arch() -> Option<String> {
     Some(arch.to_string())
 }
 
+/// Does the host have any NVIDIA GPU? Sysfs PCI vendor-ID probe
+/// (0x10de) — independent of `nvidia-smi`, which can fail on older
+/// drivers, partial enumeration, container / chroot / sudo invocation
+/// where the binary isn't on PATH, etc. Used to differentiate "no
+/// NVIDIA card on this host" (CI / cross-compile) from "NVIDIA card
+/// present but nvidia-smi probe failed" (use the default arch with a
+/// pointed warning so the user knows they should set $CUDA_ARCHITECTURES
+/// if their card differs from the default).
+fn nvidia_gpu_present() -> bool {
+    let entries = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let vendor = entry.path().join("device/vendor");
+        if let Ok(v) = std::fs::read_to_string(&vendor) {
+            if v.trim() == "0x10de" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Probe whether `cmd` is on PATH and runnable. Used by preflight()
 /// to detect missing toolchain pieces before cmake gets to fail with
 /// a cryptic message.
@@ -137,7 +166,28 @@ fn main() {
         Ok(v) => (v, "$CUDA_ARCHITECTURES"),
         Err(_) => match detect_cuda_arch() {
             Some(v) => (v, "nvidia-smi probe"),
-            None    => (fallback_arch.to_string(), "fallback (no nvidia-smi)"),
+            None    => {
+                // nvidia-smi probe failed. Distinguish two sub-cases via
+                // sysfs so the warning tells the user what's actually
+                // happening on their host:
+                //
+                //   sysfs sees an NVIDIA card → nvidia-smi is broken /
+                //     missing / on a different PATH; we still target this
+                //     host, just with the default arch. User should set
+                //     $CUDA_ARCHITECTURES if it isn't sm_${fallback_arch}.
+                //
+                //   sysfs sees no NVIDIA card → assume CI / headless /
+                //     cross-compile. Build for the default arch; the user
+                //     who actually has a card on a different host can
+                //     override.
+                if nvidia_gpu_present() {
+                    (fallback_arch.to_string(),
+                     "fallback (NVIDIA in sysfs, nvidia-smi probe failed)")
+                } else {
+                    (fallback_arch.to_string(),
+                     "fallback (no NVIDIA detected — CI / cross-compile)")
+                }
+            }
         },
     };
     println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({source})");
