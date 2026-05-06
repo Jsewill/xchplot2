@@ -237,11 +237,13 @@ std::vector<std::uint64_t> single_gpu_fragments(
 
 std::vector<std::uint64_t> sharded_fragments(
     pos2gpu::BatchEntry const& entry,
-    double w0 = 1.0, double w1 = 1.0)
+    double w0 = 1.0, double w1 = 1.0,
+    bool prefer_peer = false)
 {
     auto& q = pos2gpu::sycl_backend::queue();
     pos2gpu::BatchOptions opts{};
-    opts.shard_plot = true;
+    opts.shard_plot       = true;
+    opts.prefer_peer_copy = prefer_peer;
 
     std::vector<pos2gpu::MultiGpuShardContext> shards(2);
     shards[0] = {&q, 0, w0};
@@ -255,7 +257,8 @@ std::vector<std::uint64_t> sharded_fragments(
 }
 
 bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
-             double w0 = 1.0, double w1 = 1.0)
+             double w0 = 1.0, double w1 = 1.0,
+             bool prefer_peer = false)
 {
     pos2gpu::BatchEntry entry{};
     entry.k          = k;
@@ -269,7 +272,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
     }
 
     auto ref     = single_gpu_fragments(entry);
-    auto sharded = sharded_fragments  (entry, w0, w1);
+    auto sharded = sharded_fragments  (entry, w0, w1, prefer_peer);
 
     std::sort(ref.begin(),     ref.end());
     std::sort(sharded.begin(), sharded.end());
@@ -281,10 +284,11 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
     bool const ok = size_ok && bytes_ok;
 
     std::printf(
-        "%s fragment-phase k=%d testnet=%d seed=%u w=[%g,%g]  "
+        "%s fragment-phase k=%d testnet=%d seed=%u w=[%g,%g] xport=%s  "
         "[count=%llu vs %llu  size=%d bytes=%d]\n",
         ok ? "PASS" : "FAIL", k, testnet ? 1 : 0,
         static_cast<unsigned>(plot_id_seed), w0, w1,
+        prefer_peer ? "peer" : "host",
         static_cast<unsigned long long>(ref.size()),
         static_cast<unsigned long long>(sharded.size()),
         size_ok ? 1 : 0, bytes_ok ? 1 : 0);
@@ -296,7 +300,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
 int main()
 {
     bool all_ok = true;
-    // Uniform weights — same coverage as before.
+    // HostBounce + uniform weights — Phase 2.3d coverage.
     for (int k : {18, 20, 22}) {
         for (bool testnet : {false, true}) {
             for (std::uint8_t seed : {7u, 31u}) {
@@ -304,12 +308,7 @@ int main()
             }
         }
     }
-    // Weighted partition (Phase 2.4a). Skewed [3.0, 1.0] gives shard 0
-    // 12 of 16 buckets at strength=2; [1.0, 3.0] flips the skew so the
-    // last-shard partition path is also exercised. Same multiset
-    // equivalence holds because match-phase replicates full input on
-    // every shard — the weighted bucket assignment only changes which
-    // shard emits which match, never the union.
+    // HostBounce + weighted (Phase 2.4a).
     for (int k : {18, 22}) {
         for (bool testnet : {false}) {
             for (std::uint8_t seed : {7u}) {
@@ -317,6 +316,24 @@ int main()
                 all_ok = run_one(k, testnet, seed, /*w0=*/1.0, /*w1=*/3.0) && all_ok;
             }
         }
+    }
+    // Peer transport (Phase 2.4b). Default weights and the [3,1] skew.
+    // Atomic-scatter on GPU produces non-deterministic tie order, so
+    // multiset equivalence is the only correctness invariant — already
+    // what this test checks (sort + memcmp).
+    for (int k : {18, 20, 22}) {
+        for (bool testnet : {false, true}) {
+            for (std::uint8_t seed : {7u, 31u}) {
+                all_ok = run_one(k, testnet, seed,
+                                 /*w0=*/1.0, /*w1=*/1.0,
+                                 /*prefer_peer=*/true) && all_ok;
+            }
+        }
+    }
+    for (int k : {18, 22}) {
+        all_ok = run_one(k, /*testnet=*/false, /*seed=*/7u,
+                         /*w0=*/3.0, /*w1=*/1.0,
+                         /*prefer_peer=*/true) && all_ok;
     }
     return all_ok ? 0 : 1;
 }

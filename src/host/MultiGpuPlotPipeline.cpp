@@ -238,13 +238,13 @@ void MultiGpuPlotPipeline::run_xs_phase()
     }
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u32_distributed(
-        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     void* d_scratch = scratch_bytes
         ? sycl::malloc_device(scratch_bytes, *shards_[0].queue)
         : nullptr;
     launch_sort_pairs_u32_u32_distributed(
         d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
-        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
 
     // Step 3 — per-shard launch_xs_pack into a packed XsCandidateGpu
@@ -468,12 +468,12 @@ void MultiGpuPlotPipeline::run_t1_phase()
 
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u64_distributed(
-        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     void* d_scratch = scratch_bytes
         ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
     launch_sort_pairs_u32_u64_distributed(
         d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
-        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
 
     for (std::size_t s = 0; s < N; ++s) {
@@ -685,12 +685,12 @@ void MultiGpuPlotPipeline::run_t2_phase()
 
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u64u32_distributed(
-        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     void* d_scratch = scratch_bytes
         ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
     launch_sort_pairs_u32_u64u32_distributed(
         d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
-        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
 
     for (std::size_t s = 0; s < N; ++s) {
@@ -909,13 +909,13 @@ void MultiGpuPlotPipeline::run_t3_phase()
     std::size_t scratch_bytes = 0;
     launch_sort_keys_u64_distributed(
         nullptr, scratch_bytes, sort_shards,
-        /*begin_bit=*/0, /*end_bit=*/t3_end_bit);
+        /*begin_bit=*/0, /*end_bit=*/t3_end_bit, transport());
     void* d_scratch = scratch_bytes
         ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
     launch_sort_keys_u64_distributed(
         d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
         scratch_bytes, sort_shards,
-        /*begin_bit=*/0, /*end_bit=*/t3_end_bit);
+        /*begin_bit=*/0, /*end_bit=*/t3_end_bit, transport());
     if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
 
     for (std::size_t s = 0; s < N; ++s) {

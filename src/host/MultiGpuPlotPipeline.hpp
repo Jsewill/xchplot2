@@ -14,6 +14,7 @@
 #pragma once
 
 #include "host/BatchPlotter.hpp"
+#include "gpu/SortDistributed.hpp"
 
 #include <cstdint>
 #include <span>
@@ -152,6 +153,13 @@ private:
     // queue works; pinned host memory is process-wide).
     std::uint64_t* h_fragments_     = nullptr;
     std::uint64_t  fragments_count_ = 0;
+
+    DistributedSortTransport transport() const noexcept
+    {
+        return opts_.prefer_peer_copy
+            ? DistributedSortTransport::Peer
+            : DistributedSortTransport::HostBounce;
+    }
 
     void run_t1_phase();
     void run_t2_phase();

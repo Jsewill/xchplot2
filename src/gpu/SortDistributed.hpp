@@ -24,6 +24,31 @@
 
 namespace pos2gpu {
 
+// Selects how the distributed sort moves data across shards.
+//
+//   HostBounce — (default, Phase 2.1+) D2H every source's input into
+//     pinned host buffers, host-side scatter walk to bin items by
+//     destination, H2D into receivers, per-receiver local sort.
+//     Two PCIe traversals + a host walk. Topology-agnostic: works on
+//     any (src, dst) queue pair regardless of peer access.
+//
+//   Peer — (Phase 2.4b) per-source GPU scatter into per-destination
+//     contiguous staging on the source device, then direct D2D memcpy
+//     per (src, dst) pair. On NVLink-capable topologies this skips
+//     the host-bounce PCIe round-trip entirely; on PCIe-only hosts
+//     CUDA's driver typically still routes through host but with
+//     fewer copies. Atomic-scatter on GPU produces non-deterministic
+//     tie order — output is multiset-equivalent to HostBounce, not
+//     byte-identical at same-key tie boundaries.
+//
+// Both transports are correct; the choice is purely performance.
+// Falls back automatically: shards.size() <= 1 always uses the
+// single-shard fast path regardless of the requested transport.
+enum class DistributedSortTransport {
+    HostBounce,
+    Peer,
+};
+
 // Per-shard handles for the distributed sort. The caller owns the
 // queue and the input/output buffers; the wrapper coordinates the
 // cross-shard exchange (Phase 2.1+) without taking ownership.
@@ -113,14 +138,16 @@ void launch_sort_pairs_u32_u32_distributed(
     void* d_temp_storage,
     std::size_t& temp_bytes,
     std::vector<DistributedSortPairsShard>& shards,
-    int begin_bit, int end_bit);
+    int begin_bit, int end_bit,
+    DistributedSortTransport transport = DistributedSortTransport::HostBounce);
 
 // Distributed analogue of launch_sort_keys_u64.
 void launch_sort_keys_u64_distributed(
     void* d_temp_storage,
     std::size_t& temp_bytes,
     std::vector<DistributedSortKeysU64Shard>& shards,
-    int begin_bit, int end_bit);
+    int begin_bit, int end_bit,
+    DistributedSortTransport transport = DistributedSortTransport::HostBounce);
 
 // Sort (uint32 key, uint64 value) pairs by uint32 key over
 // [begin_bit, end_bit) bits, distributed across the shards. Same
@@ -139,7 +166,8 @@ void launch_sort_pairs_u32_u64_distributed(
     void* d_temp_storage,
     std::size_t& temp_bytes,
     std::vector<DistributedSortPairsU32U64Shard>& shards,
-    int begin_bit, int end_bit);
+    int begin_bit, int end_bit,
+    DistributedSortTransport transport = DistributedSortTransport::HostBounce);
 
 // Sort (uint32 key, uint64 value_a, uint32 value_b) triples by uint32
 // key over [begin_bit, end_bit) bits, distributed across the shards.
@@ -160,6 +188,7 @@ void launch_sort_pairs_u32_u64u32_distributed(
     void* d_temp_storage,
     std::size_t& temp_bytes,
     std::vector<DistributedSortPairsU32U64U32Shard>& shards,
-    int begin_bit, int end_bit);
+    int begin_bit, int end_bit,
+    DistributedSortTransport transport = DistributedSortTransport::HostBounce);
 
 } // namespace pos2gpu

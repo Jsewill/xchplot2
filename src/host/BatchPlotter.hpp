@@ -102,6 +102,13 @@ struct BatchOptions {
     std::string streaming_tier;
     bool shard_plot        = false;
     std::string shard_strategy = "bucket";
+    // Phase 2.4b: when true and shard_plot is on, the distributed sorts
+    // route data via direct device-to-device memcpy (Peer transport)
+    // instead of the default host-pinned bounce. Equivalent on a
+    // single-GPU dev box (peer-on-same-context = ordinary device
+    // memcpy); the win lands on real multi-GPU hosts where the SYCL
+    // backend can route through NVLink/peer-PCIe.
+    bool prefer_peer_copy  = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
