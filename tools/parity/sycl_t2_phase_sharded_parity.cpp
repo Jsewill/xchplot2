@@ -12,17 +12,11 @@
 // tie order isn't deterministic; comparison sorts both arrays by the
 // full (mi, meta, xbits) tuple before memcmp.
 
-#include "gpu/AesHashGpu.cuh"
-#include "gpu/PipelineKernels.cuh"
-#include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
-#include "gpu/T1Kernel.cuh"
-#include "gpu/T2Kernel.cuh"
-#include "gpu/XsCandidateGpu.hpp"
-#include "gpu/XsKernels.cuh"
 #include "host/BatchPlotter.hpp"
 #include "host/MultiGpuPlotPipeline.hpp"
-#include "host/PoolSizing.hpp"
+
+#include "sycl_sharded_reference.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -35,7 +29,10 @@
 
 namespace {
 
-struct T2Sorted {
+using pos2gpu::parity::T2Sorted;
+
+#if 0
+struct T2Sorted_unused_legacy {
     std::vector<std::uint32_t> mi;
     std::vector<std::uint64_t> meta;
     std::vector<std::uint32_t> xbits;
@@ -214,6 +211,7 @@ T2Sorted single_gpu_t2_phase(pos2gpu::BatchEntry const& entry)
     sycl::free(d_t2_xbits_out, q);
     return out;
 }
+#endif
 
 T2Sorted sharded_t2_phase(pos2gpu::BatchEntry const& entry)
 {
@@ -267,7 +265,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
             static_cast<std::uint8_t>(plot_id_seed * 17u + i * 19u);
     }
 
-    auto ref     = single_gpu_t2_phase(entry);
+    auto ref     = pos2gpu::parity::single_gpu_t2(entry);
     auto sharded = sharded_t2_phase  (entry);
 
     // SET comparison: sort both by the full (mi, meta, xbits) tuple

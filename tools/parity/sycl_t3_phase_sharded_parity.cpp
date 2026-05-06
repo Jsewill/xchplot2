@@ -7,18 +7,11 @@
 // post-sort tie order isn't deterministic between the reference and
 // sharded paths, so the comparison sorts both arrays before memcmp.
 
-#include "gpu/AesHashGpu.cuh"
-#include "gpu/PipelineKernels.cuh"
-#include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
-#include "gpu/T1Kernel.cuh"
-#include "gpu/T2Kernel.cuh"
-#include "gpu/T3Kernel.cuh"
-#include "gpu/XsCandidateGpu.hpp"
-#include "gpu/XsKernels.cuh"
 #include "host/BatchPlotter.hpp"
 #include "host/MultiGpuPlotPipeline.hpp"
-#include "host/PoolSizing.hpp"
+
+#include "sycl_sharded_reference.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -31,9 +24,11 @@
 
 namespace {
 
-// Reference: full single-GPU pipeline through Xs + T1 + T1-sort + T2 +
-// T2-sort + T3 + T3-sort, returning the sorted proof_fragment stream.
-std::vector<std::uint64_t> single_gpu_t3_phase(pos2gpu::BatchEntry const& entry)
+#if 0
+// Inline single-GPU reference replaced by pos2gpu::parity::single_gpu_fragments
+// from sycl_sharded_reference.hpp. Kept under #if 0 for one revision so the
+// previous chain is auditable; remove on the next cleanup pass.
+std::vector<std::uint64_t> single_gpu_t3_phase_LEGACY(pos2gpu::BatchEntry const& entry)
 {
     auto& q = pos2gpu::sycl_backend::queue();
     int const k = entry.k;
@@ -243,6 +238,7 @@ std::vector<std::uint64_t> single_gpu_t3_phase(pos2gpu::BatchEntry const& entry)
     sycl::free(d_frags_out, q);
     return out;
 }
+#endif
 
 std::vector<std::uint64_t> sharded_t3_phase(pos2gpu::BatchEntry const& entry)
 {
@@ -288,7 +284,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
             static_cast<std::uint8_t>(plot_id_seed * 17u + i * 19u);
     }
 
-    auto ref     = single_gpu_t3_phase(entry);
+    auto ref     = pos2gpu::parity::single_gpu_fragments(entry);
     auto sharded = sharded_t3_phase  (entry);
 
     // SET comparison. T3 emits via atomic cursor; the radix sort by

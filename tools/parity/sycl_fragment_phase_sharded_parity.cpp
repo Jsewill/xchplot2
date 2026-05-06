@@ -13,18 +13,11 @@
 // reasoning as the T3 phase parity test (radix sort over only the
 // low 2k bits leaves the high bits arbitrary).
 
-#include "gpu/AesHashGpu.cuh"
-#include "gpu/PipelineKernels.cuh"
-#include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
-#include "gpu/T1Kernel.cuh"
-#include "gpu/T2Kernel.cuh"
-#include "gpu/T3Kernel.cuh"
-#include "gpu/XsCandidateGpu.hpp"
-#include "gpu/XsKernels.cuh"
 #include "host/BatchPlotter.hpp"
 #include "host/MultiGpuPlotPipeline.hpp"
-#include "host/PoolSizing.hpp"
+
+#include "sycl_sharded_reference.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -37,10 +30,10 @@
 
 namespace {
 
-// Reuse the single-GPU T3 phase code from sycl_t3_phase_sharded_parity
-// (kept minimal copy here to keep this TU self-contained — the chain
-// is mechanical and cheap to repeat at small k).
-std::vector<std::uint64_t> single_gpu_fragments(
+#if 0
+// Inline single-GPU reference replaced by pos2gpu::parity::single_gpu_fragments
+// from sycl_sharded_reference.hpp.
+std::vector<std::uint64_t> single_gpu_fragments_LEGACY(
     pos2gpu::BatchEntry const& entry)
 {
     auto& q = pos2gpu::sycl_backend::queue();
@@ -228,6 +221,7 @@ std::vector<std::uint64_t> single_gpu_fragments(
     sycl::free(d_frags_out, q);
     return out;
 }
+#endif
 
 std::vector<std::uint64_t> sharded_fragments(
     pos2gpu::BatchEntry const& entry,
@@ -265,7 +259,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
             static_cast<std::uint8_t>(plot_id_seed * 17u + i * 19u);
     }
 
-    auto ref     = single_gpu_fragments(entry);
+    auto ref     = pos2gpu::parity::single_gpu_fragments(entry);
     auto sharded = sharded_fragments  (entry, w0, w1, prefer_peer);
 
     std::sort(ref.begin(),     ref.end());
