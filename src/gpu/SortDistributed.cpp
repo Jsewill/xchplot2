@@ -35,6 +35,7 @@
 #include "gpu/SortDistributed.hpp"
 #include "gpu/PipelineKernels.cuh"
 #include "gpu/Sort.cuh"
+#include "gpu/SortDistributedPeer.hpp"  // peer-path scatter kernels (Phase 2.4b)
 
 #include <sycl/sycl.hpp>
 
@@ -110,254 +111,24 @@ T* pinned_alloc(std::size_t n, sycl::queue& q)
 } // namespace
 
 // ---------------------------------------------------------------------
-// Phase 2.4b: GPU-side scatter helpers used by the peer-copy paths.
-//
-// Atomic-scatter design: pass 1 counts items per destination via
-// atomic increments; host computes per-destination start offsets;
-// pass 2 atomically allocates a slot inside each destination's range
-// and writes the item there. Tie order within a destination is
-// non-deterministic (atomic completion order) but the multiset is
-// preserved.
-//
-// Implication for parity-test design: any consumer that compares
-// Peer-transport output byte-for-byte against single-GPU output will
-// see mismatches at same-key tie boundaries. Compare as a SET (sort
-// by full tuple before memcmp) — that's what the sycl_*_sharded
-// parity tests do.
-//
-// Each kernel is type-specific so the compiler emits direct memory
-// writes rather than going through templated indirection.
+// Phase 2.4b: peer-path scatter kernels live in SortDistributedPeer.{hpp,cpp}
+// in the pos2gpu::detail namespace. The entry points below pull them in
+// via the using-decls at namespace scope — the names are unambiguous.
 // ---------------------------------------------------------------------
+using detail::launch_count_per_dest_u32;
+using detail::launch_count_per_dest_u64;
+using detail::launch_scatter_u32_u32;
+using detail::launch_scatter_u32_u64;
+using detail::launch_scatter_u32_u64u32;
+using detail::launch_scatter_u64_keys;
+using detail::exclusive_scan_u32;
 
 namespace {
 
-// Device-side bucket-of for u32 keys; mirrors the host bucket_of_u32
-// formula bit-for-bit so a key routed to dest d on host produces the
-// same d on device.
-inline std::size_t bucket_of_u32_dev(std::uint32_t key, std::uint32_t N,
-                                     int begin_bit, int end_bit)
-{
-    int const bits = end_bit - begin_bit;
-    if (bits >= 32) {
-        return (static_cast<std::uint64_t>(key) *
-                static_cast<std::uint64_t>(N)) >> 32;
-    }
-    std::uint32_t const mask  = (1u << bits) - 1u;
-    std::uint32_t const value = (key >> begin_bit) & mask;
-    return (static_cast<std::uint64_t>(value) *
-            static_cast<std::uint64_t>(N)) >> bits;
-}
-
-// Same shape for u64 keys (used by the keys-only sort).
-inline std::size_t bucket_of_u64_dev(std::uint64_t key, std::uint32_t N,
-                                     int begin_bit, int end_bit)
-{
-    int const bits = end_bit - begin_bit;
-    if (bits >= 64) {
-        std::uint32_t const hi = static_cast<std::uint32_t>(key >> 32);
-        return (static_cast<std::uint64_t>(hi) *
-                static_cast<std::uint64_t>(N)) >> 32;
-    }
-    if (bits > 32) {
-        int const shift = begin_bit + (bits - 32);
-        std::uint64_t const hi_mask = (1ull << (bits - 32)) - 1ull;
-        std::uint64_t const value = (key >> shift) & hi_mask;
-        return (value * static_cast<std::uint64_t>(N)) >> (bits - 32);
-    }
-    std::uint64_t const mask  = (1ull << bits) - 1ull;
-    std::uint64_t const value = (key >> begin_bit) & mask;
-    return (value * static_cast<std::uint64_t>(N)) >> bits;
-}
-
-// Pass 1: count how many items in d_keys[0..count) hash to each of the
-// N destination buckets. d_dst_count is N entries on the same device
-// as the queue; caller pre-zeroes it.
-void launch_count_per_dest_u32(
-    std::uint32_t const* d_keys, std::uint64_t count,
-    std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t* d_dst_count, sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint32_t k = d_keys[i];
-            std::size_t d = bucket_of_u32_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cnt(d_dst_count[d]);
-            cnt.fetch_add(1u);
-        }).wait();
-}
-
-void launch_count_per_dest_u64(
-    std::uint64_t const* d_keys, std::uint64_t count,
-    std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t* d_dst_count, sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint64_t k = d_keys[i];
-            std::size_t d = bucket_of_u64_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cnt(d_dst_count[d]);
-            cnt.fetch_add(1u);
-        }).wait();
-}
-
-// Pass 2 variants: scatter inputs into per-destination contiguous
-// regions of the source-device staging buffers. d_dst_offsets[d] is
-// the start offset of destination d's region within staging. d_dst_cur
-// is the per-destination atomic write index, pre-zeroed by caller.
-void launch_scatter_u32_u32(
-    std::uint32_t const* d_keys_in, std::uint32_t const* d_vals_in,
-    std::uint64_t count, std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t const* d_dst_offsets, std::uint32_t* d_dst_cur,
-    std::uint32_t* d_staging_keys, std::uint32_t* d_staging_vals,
-    sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint32_t const k = d_keys_in[i];
-            std::uint32_t const v = d_vals_in[i];
-            std::size_t const d = bucket_of_u32_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cur(d_dst_cur[d]);
-            std::uint32_t const slot = cur.fetch_add(1u);
-            std::uint32_t const idx  = d_dst_offsets[d] + slot;
-            d_staging_keys[idx] = k;
-            d_staging_vals[idx] = v;
-        }).wait();
-}
-
-void launch_scatter_u32_u64(
-    std::uint32_t const* d_keys_in, std::uint64_t const* d_vals_in,
-    std::uint64_t count, std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t const* d_dst_offsets, std::uint32_t* d_dst_cur,
-    std::uint32_t* d_staging_keys, std::uint64_t* d_staging_vals,
-    sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint32_t const k = d_keys_in[i];
-            std::uint64_t const v = d_vals_in[i];
-            std::size_t const d = bucket_of_u32_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cur(d_dst_cur[d]);
-            std::uint32_t const slot = cur.fetch_add(1u);
-            std::uint32_t const idx  = d_dst_offsets[d] + slot;
-            d_staging_keys[idx] = k;
-            d_staging_vals[idx] = v;
-        }).wait();
-}
-
-void launch_scatter_u32_u64u32(
-    std::uint32_t const* d_keys_in,
-    std::uint64_t const* d_va_in, std::uint32_t const* d_vb_in,
-    std::uint64_t count, std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t const* d_dst_offsets, std::uint32_t* d_dst_cur,
-    std::uint32_t* d_staging_keys,
-    std::uint64_t* d_staging_va, std::uint32_t* d_staging_vb,
-    sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint32_t const k  = d_keys_in[i];
-            std::uint64_t const va = d_va_in[i];
-            std::uint32_t const vb = d_vb_in[i];
-            std::size_t const d = bucket_of_u32_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cur(d_dst_cur[d]);
-            std::uint32_t const slot = cur.fetch_add(1u);
-            std::uint32_t const idx  = d_dst_offsets[d] + slot;
-            d_staging_keys[idx] = k;
-            d_staging_va[idx]   = va;
-            d_staging_vb[idx]   = vb;
-        }).wait();
-}
-
-void launch_scatter_u64_keys(
-    std::uint64_t const* d_keys_in,
-    std::uint64_t count, std::uint32_t N, int begin_bit, int end_bit,
-    std::uint32_t const* d_dst_offsets, std::uint32_t* d_dst_cur,
-    std::uint64_t* d_staging_keys,
-    sycl::queue& q)
-{
-    if (count == 0) return;
-    constexpr std::size_t threads = 256;
-    std::size_t const groups = (count + threads - 1) / threads;
-    q.parallel_for(
-        sycl::nd_range<1>{ groups * threads, threads },
-        [=](sycl::nd_item<1> it) {
-            std::uint64_t i = it.get_global_id(0);
-            if (i >= count) return;
-            std::uint64_t const k = d_keys_in[i];
-            std::size_t const d = bucket_of_u64_dev(k, N, begin_bit, end_bit);
-            sycl::atomic_ref<std::uint32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::device,
-                sycl::access::address_space::global_space>
-                cur(d_dst_cur[d]);
-            std::uint32_t const slot = cur.fetch_add(1u);
-            std::uint32_t const idx  = d_dst_offsets[d] + slot;
-            d_staging_keys[idx] = k;
-        }).wait();
-}
-
-// Compute prefix-sum offsets[N] from counts[N] on host. Returns total.
-std::uint32_t exclusive_scan_u32(
-    std::uint32_t const* counts, std::uint32_t* offsets, std::size_t N)
-{
-    std::uint32_t cum = 0;
-    for (std::size_t i = 0; i < N; ++i) {
-        offsets[i] = cum;
-        cum += counts[i];
-    }
-    return cum;
-}
-
+// (Peer-path bucket_of_u32_dev / bucket_of_u64_dev / count + scatter
+// kernels live in SortDistributedPeer.cpp; the using-decls above
+// expose them in this namespace.)
+[[maybe_unused]] inline void _peer_split_marker() {}
 } // namespace
 
 void launch_sort_pairs_u32_u32_distributed(

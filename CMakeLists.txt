@@ -411,6 +411,7 @@ list(APPEND POS2_GPU_SYCL_SRC
     src/gpu/SortSycl.cpp
     src/gpu/SortDispatch.cpp
     src/gpu/SortDistributed.cpp
+    src/gpu/SortDistributedPeer.cpp
     src/gpu/SyclDeviceList.cpp)
 
 if(XCHPLOT2_BUILD_CUDA)
