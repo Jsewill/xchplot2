@@ -129,6 +129,48 @@ std::vector<std::uint32_t> compute_bucket_partition(
     return partition;
 }
 
+// u64 sibling: partition a `total` count of items (positions, not
+// buckets) across the shards proportional to their weights. Used by
+// the Xs gen step where each shard generates Xs for an interval
+// [pos_begin, pos_end) of the 2^k position space — fast shards take
+// proportionally larger intervals so Xs gen runtime tracks match
+// runtime.
+std::vector<std::uint64_t> compute_position_partition(
+    std::vector<MultiGpuShardContext> const& shards,
+    std::uint64_t total)
+{
+    std::size_t const N = shards.size();
+    if (N == 0) {
+        throw std::runtime_error(
+            "compute_position_partition: shards.empty()");
+    }
+
+    double total_weight = 0.0;
+    for (auto const& s : shards) {
+        if (!(s.weight > 0.0)) {
+            throw std::runtime_error(
+                "compute_position_partition: every shard must have a "
+                "positive weight (got " + std::to_string(s.weight) + ").");
+        }
+        total_weight += s.weight;
+    }
+
+    std::vector<std::uint64_t> partition(N + 1, 0);
+    double cum = 0.0;
+    for (std::size_t i = 0; i < N; ++i) {
+        cum += shards[i].weight;
+        // Monotonic non-decreasing; not clamped to "at least one
+        // position per shard" because the Xs gen kernel handles c==0
+        // gracefully (no work; subsequent steps see shard_in_count=0).
+        partition[i + 1] = static_cast<std::uint64_t>(
+            std::round(cum / total_weight * static_cast<double>(total)));
+        if (partition[i + 1] < partition[i]) partition[i + 1] = partition[i];
+        if (partition[i + 1] > total)        partition[i + 1] = total;
+    }
+    partition[N] = total;
+    return partition;
+}
+
 } // namespace
 
 MultiGpuPlotPipeline::MultiGpuPlotPipeline(
@@ -247,9 +289,11 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
     // contract is "out_capacity ≥ max possible inflow").
     std::uint64_t const out_cap = total_xs;
 
+    auto const xs_partition = compute_position_partition(shards_, total_xs);
+
     for (std::size_t s = 0; s < N; ++s) {
-        std::uint64_t const pos_begin = (s * total_xs) / N;
-        std::uint64_t const pos_end   = ((s + 1) * total_xs) / N;
+        std::uint64_t const pos_begin = xs_partition[s];
+        std::uint64_t const pos_end   = xs_partition[s + 1];
         std::uint64_t const c         = pos_end - pos_begin;
         shard_in_count[s] = c;
 
