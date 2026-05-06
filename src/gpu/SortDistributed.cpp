@@ -601,4 +601,214 @@ void launch_sort_pairs_u32_u64_distributed(
     }
 }
 
+namespace {
+
+// Local sort-by-mi + dual-stream gather (u64 + u32) using
+// launch_permute_t2's fused two-stream kernel. Mirrors the T2-sort
+// pattern in GpuPipeline.cpp.
+void local_sort_pairs_u32_u64u32(
+    std::uint32_t* keys_in,    std::uint32_t* keys_out,
+    std::uint64_t* vals_a_in,  std::uint64_t* vals_a_out,
+    std::uint32_t* vals_b_in,  std::uint32_t* vals_b_out,
+    std::uint32_t* d_idx_in,   std::uint32_t* d_idx_out,
+    void* d_sort_scratch, std::size_t sort_scratch_bytes,
+    std::uint64_t count, int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+    if (count == 0) return;
+    launch_init_u32_identity(d_idx_in, count, q);
+    launch_sort_pairs_u32_u32(
+        d_sort_scratch ? d_sort_scratch
+                       : reinterpret_cast<void*>(std::uintptr_t{1}),
+        sort_scratch_bytes,
+        keys_in, keys_out, d_idx_in, d_idx_out,
+        count, begin_bit, end_bit, q);
+    launch_permute_t2(vals_a_in, vals_b_in, d_idx_out,
+                      vals_a_out, vals_b_out, count, q);
+}
+
+} // namespace
+
+void launch_sort_pairs_u32_u64u32_distributed(
+    void* d_temp_storage,
+    std::size_t& temp_bytes,
+    std::vector<DistributedSortPairsU32U64U32Shard>& shards,
+    int begin_bit, int end_bit)
+{
+    if (shards.empty()) {
+        throw std::runtime_error(
+            "launch_sort_pairs_u32_u64u32_distributed: shards.empty() — "
+            "callers must pass at least one shard.");
+    }
+
+    if (shards.size() == 1) {
+        DistributedSortPairsU32U64U32Shard& s = shards[0];
+        sycl::queue& q = *s.queue;
+
+        std::size_t sort_scratch_bytes = 0;
+        launch_sort_pairs_u32_u32(
+            nullptr, sort_scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            s.count, begin_bit, end_bit, q);
+
+        std::size_t const idx_bytes = static_cast<std::size_t>(s.count)
+                                    * sizeof(std::uint32_t);
+        std::size_t const total = sort_scratch_bytes + 2 * idx_bytes;
+
+        if (d_temp_storage == nullptr) {
+            temp_bytes = total;
+            return;
+        }
+        if (temp_bytes < total) {
+            throw std::runtime_error(
+                "launch_sort_pairs_u32_u64u32_distributed: temp_bytes ("
+                + std::to_string(temp_bytes) + ") < required ("
+                + std::to_string(total) + ").");
+        }
+
+        auto* d_bytes = static_cast<std::uint8_t*>(d_temp_storage);
+        auto* d_idx_in  = reinterpret_cast<std::uint32_t*>(d_bytes);
+        auto* d_idx_out = reinterpret_cast<std::uint32_t*>(d_bytes + idx_bytes);
+        void* d_sort_sc = static_cast<void*>(d_bytes + 2 * idx_bytes);
+
+        local_sort_pairs_u32_u64u32(
+            s.keys_in,   s.keys_out,
+            s.vals_a_in, s.vals_a_out,
+            s.vals_b_in, s.vals_b_out,
+            d_idx_in, d_idx_out, d_sort_sc, sort_scratch_bytes,
+            s.count, begin_bit, end_bit, q);
+        q.wait();
+        s.out_count = s.count;
+        return;
+    }
+
+    if (d_temp_storage == nullptr) {
+        temp_bytes = 0;
+        return;
+    }
+
+    std::size_t const N = shards.size();
+    sycl::queue& alloc_q = *shards[0].queue;
+
+    // Step 1: D2H every source shard's three input streams into pinned
+    // host buffers.
+    std::vector<std::uint32_t*> host_keys (N, nullptr);
+    std::vector<std::uint64_t*> host_va   (N, nullptr);
+    std::vector<std::uint32_t*> host_vb   (N, nullptr);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::size_t const c = static_cast<std::size_t>(shards[s].count);
+        host_keys[s] = pinned_alloc<std::uint32_t>(c, alloc_q);
+        host_va  [s] = pinned_alloc<std::uint64_t>(c, alloc_q);
+        host_vb  [s] = pinned_alloc<std::uint32_t>(c, alloc_q);
+        if (c == 0) continue;
+        shards[s].queue->memcpy(host_keys[s], shards[s].keys_in,
+                                c * sizeof(std::uint32_t));
+        shards[s].queue->memcpy(host_va  [s], shards[s].vals_a_in,
+                                c * sizeof(std::uint64_t));
+        shards[s].queue->memcpy(host_vb  [s], shards[s].vals_b_in,
+                                c * sizeof(std::uint32_t));
+    }
+    for (std::size_t s = 0; s < N; ++s) shards[s].queue->wait();
+
+    // Step 2: count + scatter walk.
+    std::vector<std::size_t> recv_count(N, 0);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::size_t const c = static_cast<std::size_t>(shards[s].count);
+        for (std::size_t i = 0; i < c; ++i) {
+            std::size_t const d = bucket_of_u32(host_keys[s][i], N,
+                                                begin_bit, end_bit);
+            ++recv_count[d];
+        }
+    }
+
+    std::vector<std::uint32_t*> recv_keys(N, nullptr);
+    std::vector<std::uint64_t*> recv_va  (N, nullptr);
+    std::vector<std::uint32_t*> recv_vb  (N, nullptr);
+    for (std::size_t d = 0; d < N; ++d) {
+        recv_keys[d] = pinned_alloc<std::uint32_t>(recv_count[d], alloc_q);
+        recv_va  [d] = pinned_alloc<std::uint64_t>(recv_count[d], alloc_q);
+        recv_vb  [d] = pinned_alloc<std::uint32_t>(recv_count[d], alloc_q);
+    }
+
+    std::vector<std::size_t> recv_pos(N, 0);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::size_t const c = static_cast<std::size_t>(shards[s].count);
+        for (std::size_t i = 0; i < c; ++i) {
+            std::uint32_t const k  = host_keys[s][i];
+            std::uint64_t const va = host_va  [s][i];
+            std::uint32_t const vb = host_vb  [s][i];
+            std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
+            recv_keys[d][recv_pos[d]] = k;
+            recv_va  [d][recv_pos[d]] = va;
+            recv_vb  [d][recv_pos[d]] = vb;
+            ++recv_pos[d];
+        }
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_pos[d] != recv_count[d]) {
+            throw std::runtime_error(
+                "launch_sort_pairs_u32_u64u32_distributed: scatter walk "
+                "produced inconsistent counts (internal bug)");
+        }
+    }
+
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::free(host_keys[s], alloc_q);
+        sycl::free(host_va  [s], alloc_q);
+        sycl::free(host_vb  [s], alloc_q);
+    }
+
+    // Step 3 & 4: H2D + per-receiver local sort + permute.
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsU32U64U32Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd > sd.out_capacity) {
+            throw std::runtime_error(std::string(
+                "launch_sort_pairs_u32_u64u32_distributed: shard ")
+                + std::to_string(d) + " received " + std::to_string(cd)
+                + " elements but its out_capacity is only "
+                + std::to_string(sd.out_capacity)
+                + ". Sizing must allow each shard to receive up to the "
+                "total input count in the worst case.");
+        }
+        sd.out_count = cd;
+        if (cd == 0) continue;
+
+        sd.queue->memcpy(sd.keys_in,   recv_keys[d],
+                         cd * sizeof(std::uint32_t));
+        sd.queue->memcpy(sd.vals_a_in, recv_va  [d],
+                         cd * sizeof(std::uint64_t));
+        sd.queue->memcpy(sd.vals_b_in, recv_vb  [d],
+                         cd * sizeof(std::uint32_t));
+        sd.queue->wait();
+
+        std::size_t scratch_bytes = 0;
+        launch_sort_pairs_u32_u32(
+            nullptr, scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            cd, begin_bit, end_bit, *sd.queue);
+        void* scratch = scratch_bytes
+            ? sycl::malloc_device(scratch_bytes, *sd.queue) : nullptr;
+
+        auto* d_idx_in  = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
+        auto* d_idx_out = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
+
+        local_sort_pairs_u32_u64u32(
+            sd.keys_in,   sd.keys_out,
+            sd.vals_a_in, sd.vals_a_out,
+            sd.vals_b_in, sd.vals_b_out,
+            d_idx_in, d_idx_out, scratch, scratch_bytes,
+            cd, begin_bit, end_bit, *sd.queue);
+        sd.queue->wait();
+
+        if (scratch) sycl::free(scratch, *sd.queue);
+        sycl::free(d_idx_in,  *sd.queue);
+        sycl::free(d_idx_out, *sd.queue);
+    }
+
+    for (std::size_t d = 0; d < N; ++d) {
+        sycl::free(recv_keys[d], alloc_q);
+        sycl::free(recv_va  [d], alloc_q);
+        sycl::free(recv_vb  [d], alloc_q);
+    }
+}
+
 } // namespace pos2gpu

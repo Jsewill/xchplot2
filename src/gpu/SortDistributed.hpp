@@ -77,6 +77,26 @@ struct DistributedSortPairsU32U64Shard {
     std::uint64_t  out_count;
 };
 
+// Pairs sort with uint32 key and (uint64, uint32) value pair. Used by
+// T2's distributed post-match sort: the key is match_info, the values
+// are the T2 meta (u64) and x_bits (u32) streams. Same ping-pong
+// contract: every keys_in / vals_*_in buffer is scratch on input.
+struct DistributedSortPairsU32U64U32Shard {
+    sycl::queue* queue;
+
+    std::uint32_t* keys_in;
+    std::uint64_t* vals_a_in;     // meta
+    std::uint32_t* vals_b_in;     // x_bits
+    std::uint64_t  count;
+
+    std::uint32_t* keys_out;
+    std::uint64_t* vals_a_out;
+    std::uint32_t* vals_b_out;
+    std::uint64_t  out_capacity;
+
+    std::uint64_t  out_count;
+};
+
 // Sort (key, value) pairs by uint32 key over [begin_bit, end_bit) bits,
 // distributed across the shards.
 //
@@ -119,6 +139,27 @@ void launch_sort_pairs_u32_u64_distributed(
     void* d_temp_storage,
     std::size_t& temp_bytes,
     std::vector<DistributedSortPairsU32U64Shard>& shards,
+    int begin_bit, int end_bit);
+
+// Sort (uint32 key, uint64 value_a, uint32 value_b) triples by uint32
+// key over [begin_bit, end_bit) bits, distributed across the shards.
+// Same sizing-then-sort contract as the u32/u32 form.
+//
+// N=1 fast path: identity-index radix sort + launch_permute_t2 to gather
+// both vals streams in one fused kernel (mirrors GpuPipeline.cpp's T2
+// sort). Caller-owned temp_bytes covers the underlying u32/u32 sort
+// scratch + 2 * count * sizeof(uint32) for the identity / sorted-index
+// buffers.
+//
+// N>=2: same host-pinned bounce as the u32/u32 form, with the u64 + u32
+// vals carried alongside the key on the scatter walk; each receiver
+// runs a local identity-index sort + launch_permute_t2 to reconstruct
+// vals_a_out / vals_b_out. Per-receiver scratch is allocated internally
+// (temp_bytes = 0).
+void launch_sort_pairs_u32_u64u32_distributed(
+    void* d_temp_storage,
+    std::size_t& temp_bytes,
+    std::vector<DistributedSortPairsU32U64U32Shard>& shards,
     int begin_bit, int end_bit);
 
 } // namespace pos2gpu
