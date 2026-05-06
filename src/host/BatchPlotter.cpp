@@ -6,6 +6,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/MultiGpuPlotPipeline.hpp"  // --shard-plot path (Phase 2.2+)
+#include "host/MultiGpuShardBufferPool.hpp"  // batch-amortised buffer reuse
 #include "host/PlotFileWriterParallel.hpp"
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
 #include "gpu/SyclBackend.hpp"  // sycl_backend::queue, set_current_device_id
@@ -767,10 +768,24 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
         sycl_backend::set_current_device_id(dev_id);
         shard_queues.push_back(&sycl_backend::queue());
     }
+    // Per-shard buffer pools: persist across plots in this batch so
+    // the largest replicated allocations (full Xs, full T1/T2/T3
+    // streams) avoid the malloc/free round-trip per plot. Pools live
+    // on the stack here; their dtor frees device memory at function
+    // return.
+    std::vector<ShardBufferPool> shard_pools(device_ids.size());
+    for (std::size_t k = 0; k < device_ids.size(); ++k) {
+        shard_pools[k].attach(shard_queues[k]);
+    }
+
     std::vector<MultiGpuShardContext> shard_ctx;
     shard_ctx.reserve(device_ids.size());
     for (std::size_t k = 0; k < device_ids.size(); ++k) {
-        shard_ctx.push_back({shard_queues[k], device_ids[k]});
+        MultiGpuShardContext c{};
+        c.queue     = shard_queues[k];
+        c.device_id = device_ids[k];
+        c.pool      = &shard_pools[k];
+        shard_ctx.push_back(c);
     }
 
     for (BatchEntry const& entry : entries) {

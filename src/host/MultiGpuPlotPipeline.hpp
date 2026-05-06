@@ -14,6 +14,7 @@
 #pragma once
 
 #include "host/BatchPlotter.hpp"
+#include "host/MultiGpuShardBufferPool.hpp"
 #include "gpu/SortDistributed.hpp"
 
 #include <cstdint>
@@ -47,9 +48,16 @@ enum class Phase {
 // the uniform partition behaviour from before Phase 2.4a; pass
 // non-uniform values to skew the work toward the faster cards.
 struct MultiGpuShardContext {
-    sycl::queue* queue     = nullptr;
-    int          device_id = -1;
-    double       weight    = 1.0;
+    sycl::queue*     queue     = nullptr;
+    int              device_id = -1;
+    double           weight    = 1.0;
+    // Optional buffer pool that persists across plots in a batch.
+    // When non-null, the pipeline routes its largest allocations
+    // (d_full_xs, full T1 / T2 replicas, sort-output staging) through
+    // the pool so consecutive plots reuse the buffers. When null, the
+    // pipeline falls back to per-plot malloc + free (matching the
+    // pre-pool behaviour and the parity-test setup).
+    ShardBufferPool* pool      = nullptr;
 };
 
 class MultiGpuPlotPipeline {

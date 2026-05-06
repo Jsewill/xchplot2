@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace pos2gpu {
@@ -147,6 +148,24 @@ template <class T>
 SyclHostPtr<T> sycl_alloc_host_owned(std::size_t n, sycl::queue& q)
 {
     return SyclHostPtr<T>(&q, sycl::malloc_host<T>(n, q));
+}
+
+// Pool-or-malloc helper. When the shard has a buffer pool attached
+// (run_batch_sharded sets one up per shard at batch start), the large
+// per-phase allocations are routed through the pool so consecutive
+// plots reuse the buffers — same VRAM footprint, no per-plot malloc
+// cost. The returned SyclDevicePtr is non-owning when from the pool
+// (q == nullptr makes reset()/dtor a no-op); the pool's destructor
+// frees on its own schedule.
+template <class T>
+SyclDevicePtr<T> pool_or_alloc(
+    ShardBufferPool* pool, std::string_view label,
+    std::uint64_t n, sycl::queue& q)
+{
+    if (pool) {
+        return SyclDevicePtr<T>(nullptr, pool->ensure<T>(label, n));
+    }
+    return sycl_alloc_device_owned<T>(n, q);
 }
 
 // Partition `num_buckets` across the shards proportional to their
@@ -529,7 +548,8 @@ void MultiGpuPlotPipeline::run_t1_phase()
     std::vector<SyclDevicePtr<XsCandidateGpu>> d_full_xs(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_xs[s] = sycl_alloc_device_owned<XsCandidateGpu>(total_xs, q);
+        d_full_xs[s] = pool_or_alloc<XsCandidateGpu>(
+            shards_[s].pool, "full_xs", total_xs, q);
         q.memcpy(d_full_xs[s].get(), h_full.get(),
                  sizeof(XsCandidateGpu) * total_xs).wait();
     }
@@ -735,8 +755,10 @@ void MultiGpuPlotPipeline::run_t2_phase()
     std::vector<SyclDevicePtr<std::uint64_t>> d_full_meta(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_mi  [s] = sycl_alloc_device_owned<std::uint32_t>(t1_total, q);
-        d_full_meta[s] = sycl_alloc_device_owned<std::uint64_t>(t1_total, q);
+        d_full_mi  [s] = pool_or_alloc<std::uint32_t>(
+            shards_[s].pool, "t2_full_mi",   t1_total, q);
+        d_full_meta[s] = pool_or_alloc<std::uint64_t>(
+            shards_[s].pool, "t2_full_meta", t1_total, q);
         q.memcpy(d_full_mi  [s].get(), h_mi.get(),
                  t1_total * sizeof(std::uint32_t)).wait();
         q.memcpy(d_full_meta[s].get(), h_meta.get(),
@@ -949,9 +971,12 @@ void MultiGpuPlotPipeline::run_t3_phase()
     std::vector<SyclDevicePtr<std::uint32_t>> d_full_xbits(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_mi   [s] = sycl_alloc_device_owned<std::uint32_t>(t2_total, q);
-        d_full_meta [s] = sycl_alloc_device_owned<std::uint64_t>(t2_total, q);
-        d_full_xbits[s] = sycl_alloc_device_owned<std::uint32_t>(t2_total, q);
+        d_full_mi   [s] = pool_or_alloc<std::uint32_t>(
+            shards_[s].pool, "t3_full_mi",    t2_total, q);
+        d_full_meta [s] = pool_or_alloc<std::uint64_t>(
+            shards_[s].pool, "t3_full_meta",  t2_total, q);
+        d_full_xbits[s] = pool_or_alloc<std::uint32_t>(
+            shards_[s].pool, "t3_full_xbits", t2_total, q);
         q.memcpy(d_full_mi   [s].get(), h_mi.get(),
                  t2_total * sizeof(std::uint32_t)).wait();
         q.memcpy(d_full_meta [s].get(), h_meta.get(),
