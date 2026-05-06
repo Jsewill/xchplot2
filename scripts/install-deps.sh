@@ -14,6 +14,10 @@
 #   scripts/install-deps.sh --no-acpp      # skip AdaptiveCpp build (use FetchContent)
 #   scripts/install-deps.sh --gpu amd      # force AMD path (CUDA headers only)
 #   scripts/install-deps.sh --gpu nvidia   # force NVIDIA path (full CUDA Toolkit)
+#   scripts/install-deps.sh --rebuild-acpp # wipe + rebuild AdaptiveCpp even if
+#                                          # $ACPP_PREFIX already has an install
+#                                          # (use after a driver / toolchain
+#                                          # change, or to re-pin $ACPP_REF).
 #
 # Supported distros: Arch family, Ubuntu/Debian, Fedora/RHEL.
 # For anything else, install the equivalents listed at the bottom and
@@ -24,13 +28,15 @@ set -euo pipefail
 ACPP_REF=${ACPP_REF:-v25.10.0}
 ACPP_PREFIX=${ACPP_PREFIX:-/opt/adaptivecpp}
 SKIP_ACPP=0
+REBUILD_ACPP=0
 GPU=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-acpp)   SKIP_ACPP=1; shift ;;
-        --gpu)       GPU="$2"; shift 2 ;;
-        -h|--help)   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --no-acpp)      SKIP_ACPP=1; shift ;;
+        --rebuild-acpp) REBUILD_ACPP=1; shift ;;
+        --gpu)          GPU="$2"; shift 2 ;;
+        -h|--help)      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -200,8 +206,17 @@ if [[ $SKIP_ACPP -eq 1 ]]; then
 fi
 
 if [[ -d "$ACPP_PREFIX" ]] && [[ -f "$ACPP_PREFIX/lib/cmake/AdaptiveCpp/AdaptiveCppConfig.cmake" ]]; then
-    echo "[install-deps] AdaptiveCpp already installed at $ACPP_PREFIX. Skipping."
-    exit 0
+    if [[ $REBUILD_ACPP -eq 1 ]]; then
+        echo "[install-deps] --rebuild-acpp: wiping existing $ACPP_PREFIX and rebuilding."
+        # $ACPP_PREFIX usually lives under /opt or another root-owned tree, so
+        # the wipe needs sudo. The build + install step further down already
+        # uses sudo for cmake --install; reusing it here is consistent.
+        sudo rm -rf "$ACPP_PREFIX"
+    else
+        echo "[install-deps] AdaptiveCpp already installed at $ACPP_PREFIX. Skipping."
+        echo "[install-deps] Pass --rebuild-acpp to wipe + rebuild (e.g. after a driver change)."
+        exit 0
+    fi
 fi
 
 ACPP_BUILD_DIR=$(mktemp -d -t xchplot2-acpp-XXXXXX)
