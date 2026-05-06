@@ -410,6 +410,7 @@ set(POS2_GPU_SYCL_SRC
 list(APPEND POS2_GPU_SYCL_SRC
     src/gpu/SortSycl.cpp
     src/gpu/SortDispatch.cpp
+    src/gpu/SortDistributed.cpp
     src/gpu/SyclDeviceList.cpp)
 
 if(XCHPLOT2_BUILD_CUDA)
@@ -769,6 +770,26 @@ endif()
 target_include_directories(sycl_sort_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Phase 2.0b — distributed sort fast-path regression test. Confirms
+# launch_sort_*_distributed with shards.size() == 1 produces byte-
+# identical output to the single-shard sort, and that N>1 throws the
+# expected "not yet implemented" message. See
+# docs/multi-gpu-single-plot-alt-bucket-partition.md.
+add_executable(sycl_distributed_sort_parity
+    tools/parity/sycl_distributed_sort_parity.cpp)
+add_sycl_to_target(TARGET sycl_distributed_sort_parity
+                   SOURCES tools/parity/sycl_distributed_sort_parity.cpp)
+target_link_libraries(sycl_distributed_sort_parity PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_distributed_sort_parity
+                   PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_distributed_sort_parity
+                           PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_distributed_sort_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_distributed_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # SYCL-native sibling of t1_parity.cu. The .cu version is nvcc-only, so on
