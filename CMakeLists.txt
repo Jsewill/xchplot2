@@ -795,6 +795,28 @@ target_compile_features(sycl_xs_phase_sharded_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_xs_phase_sharded_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Phase 2.3a — sharded T1-phase parity test. Confirms
+# MultiGpuPlotPipeline's run_t1_phase produces a union of per-shard
+# sorted (mi, meta) outputs that's byte-identical to single-GPU
+# launch_t1_match + identity-index radix sort by mi + meta gather.
+# Uses N=2 virtual shards on the same physical queue so it runs on
+# the dev box without real multi-GPU hardware.
+add_executable(sycl_t1_phase_sharded_parity
+    tools/parity/sycl_t1_phase_sharded_parity.cpp)
+add_sycl_to_target(TARGET sycl_t1_phase_sharded_parity
+                   SOURCES tools/parity/sycl_t1_phase_sharded_parity.cpp)
+target_link_libraries(sycl_t1_phase_sharded_parity
+    PRIVATE pos2_gpu pos2_gpu_host)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_t1_phase_sharded_parity
+                   PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_t1_phase_sharded_parity
+                           PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_t1_phase_sharded_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_t1_phase_sharded_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 2.0b — distributed sort fast-path regression test. Confirms
 # launch_sort_*_distributed with shards.size() == 1 produces byte-
 # identical output to the single-shard sort, and that N>1 throws the

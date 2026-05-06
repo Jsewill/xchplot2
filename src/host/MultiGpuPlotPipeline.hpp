@@ -49,6 +49,10 @@ public:
     // callers should use run() — the multi-step pipeline.
     void run_xs_phase();
 
+    // Run the Xs phase followed by the T1 phase (Phase 2.3a). Public
+    // for the T1-phase parity test; production callers go through run().
+    void run_xs_then_t1_phase();
+
     // Per-shard Xs phase outputs. shard k's d_xs holds a packed
     // XsCandidateGpu array sized xs_phase_count(k). Concatenating in
     // shard-id order reproduces the single-GPU sorted XsCandidateGpu
@@ -57,6 +61,19 @@ public:
     { return xs_phase_d_xs_[shard]; }
     std::uint64_t xs_phase_count(std::size_t shard) const
     { return xs_phase_count_[shard]; }
+
+    // Per-shard T1 phase outputs (sorted by match_info). shard k holds
+    // matches whose match_info falls in the [k/N, (k+1)/N) bucket of
+    // the k-bit value-space. Concatenating in shard-id order reproduces
+    // the single-GPU T1-sort output (same SoA layout as GpuPipeline:
+    // d_keys_out / d_t1_meta_sorted).
+    std::uint32_t* t1_phase_d_mi(std::size_t shard) const
+    { return t1_phase_d_mi_[shard]; }
+    std::uint64_t* t1_phase_d_meta(std::size_t shard) const
+    { return t1_phase_d_meta_[shard]; }
+    std::uint64_t  t1_phase_count(std::size_t shard) const
+    { return t1_phase_count_[shard]; }
+
     std::size_t shard_count() const { return shards_.size(); }
     sycl::queue& shard_queue(std::size_t shard) const
     { return *shards_[shard].queue; }
@@ -66,8 +83,12 @@ private:
     BatchOptions                        opts_;
     std::vector<MultiGpuShardContext>   shards_;
 
-    std::vector<XsCandidateGpu*> xs_phase_d_xs_;
-    std::vector<std::uint64_t>   xs_phase_count_;
+    std::vector<XsCandidateGpu*>  xs_phase_d_xs_;
+    std::vector<std::uint64_t>    xs_phase_count_;
+
+    std::vector<std::uint32_t*>   t1_phase_d_mi_;
+    std::vector<std::uint64_t*>   t1_phase_d_meta_;
+    std::vector<std::uint64_t>    t1_phase_count_;
 
     void run_t1_phase();
     void run_t2_phase();

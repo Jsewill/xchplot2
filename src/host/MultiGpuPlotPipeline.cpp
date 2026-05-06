@@ -1,12 +1,14 @@
-// MultiGpuPlotPipeline.cpp — Phase 2.2 implementation: Xs phase only.
+// MultiGpuPlotPipeline.cpp — Phase 2.2 (Xs) + Phase 2.3a (T1) implementation.
 
 #include "host/MultiGpuPlotPipeline.hpp"
 
 #include "gpu/AesHashGpu.cuh"
 #include "gpu/Sort.cuh"
 #include "gpu/SortDistributed.hpp"
+#include "gpu/T1Kernel.cuh"
 #include "gpu/XsCandidateGpu.hpp"
 #include "gpu/XsKernels.cuh"
+#include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -38,6 +40,9 @@ MultiGpuPlotPipeline::MultiGpuPlotPipeline(
     }
     xs_phase_d_xs_.assign(shards_.size(), nullptr);
     xs_phase_count_.assign(shards_.size(), 0);
+    t1_phase_d_mi_.assign(shards_.size(), nullptr);
+    t1_phase_d_meta_.assign(shards_.size(), nullptr);
+    t1_phase_count_.assign(shards_.size(), 0);
 }
 
 MultiGpuPlotPipeline::~MultiGpuPlotPipeline()
@@ -51,6 +56,14 @@ void MultiGpuPlotPipeline::free_phase_outputs()
         if (xs_phase_d_xs_[k]) {
             sycl::free(xs_phase_d_xs_[k], *shards_[k].queue);
             xs_phase_d_xs_[k] = nullptr;
+        }
+        if (t1_phase_d_mi_[k]) {
+            sycl::free(t1_phase_d_mi_[k], *shards_[k].queue);
+            t1_phase_d_mi_[k] = nullptr;
+        }
+        if (t1_phase_d_meta_[k]) {
+            sycl::free(t1_phase_d_meta_[k], *shards_[k].queue);
+            t1_phase_d_meta_[k] = nullptr;
         }
     }
 }
@@ -173,19 +186,238 @@ void MultiGpuPlotPipeline::run_xs_phase()
     }
 }
 
-void MultiGpuPlotPipeline::run_t1_phase()
+void MultiGpuPlotPipeline::run_xs_then_t1_phase()
 {
-    throw std::runtime_error(
-        "MultiGpuPlotPipeline: T1 match is not yet implemented for the "
-        "sharded path (Phase 2.3 in the plan). Phase 2.2 ships the Xs "
-        "phase end-to-end (gen + sort + pack across shards) and the "
-        "distributed sort primitive; the per-shard T1/T2/T3 matches "
-        "with their cross-shard boundary fixups land next. See "
-        "docs/multi-gpu-single-plot-alt-bucket-partition.md.");
+    run_xs_phase();
+    run_t1_phase();
 }
 
-void MultiGpuPlotPipeline::run_t2_phase() { /* unreachable past T1's throw */ }
-void MultiGpuPlotPipeline::run_t3_phase() { /* unreachable */ }
+void MultiGpuPlotPipeline::run_t1_phase()
+{
+    // Phase 2.3a — sharded T1 match.
+    //
+    // Algorithm:
+    //   1. Replicate sorted Xs onto every shard via host-pinned bounce.
+    //      The Xs phase's bucket-partition by match_info means each shard
+    //      already holds a contiguous bucket range; concatenating in
+    //      shard-id order yields the single-GPU sorted-Xs layout
+    //      byte-for-byte (Phase 2.2 already validated this).
+    //   2. Each shard runs launch_t1_match_prepare (full-input bucket
+    //      offsets) + launch_t1_match_range over its assigned bucket
+    //      subset. The atomic-cursor append plumbing inside the kernel
+    //      means each shard fills a local (mi, meta) stream containing
+    //      exactly the matches whose bucket falls in its range.
+    //   3. Distributed sort the per-shard (mi, meta) streams by mi using
+    //      launch_sort_pairs_u32_u64_distributed. After the sort, shard k
+    //      holds matches whose mi falls in [k * 2^k / N, (k+1) * 2^k / N),
+    //      sorted within that range — the layout T2 will consume.
+    //
+    // Replication is the right tradeoff at this slice: T1 needs both
+    // section_l data and section_r = matching_section(section_l) data,
+    // and matching_section is a non-trivial permutation (rotate-left +1
+    // rotate-right) that doesn't admit a section partition where every
+    // match stays intra-shard. Replicating sorted Xs (k=28: 2 GB per
+    // shard) is cheap on 12+ GiB cards; the multi-GPU memory savings
+    // come in T2/T3, not Xs.
+
+    std::size_t const N = shards_.size();
+    int const k = entry_.k;
+    std::uint64_t const total_xs = std::uint64_t{1} << k;
+    auto const t1p = make_t1_params(k, entry_.strength);
+
+    // Mirror derive_t1: num_buckets = num_sections * num_match_keys.
+    std::uint32_t const num_buckets =
+        (std::uint32_t{1} << t1p.num_section_bits) *
+        (std::uint32_t{1} << t1p.num_match_key_bits);
+
+    if (num_buckets % N != 0) {
+        throw std::runtime_error(
+            "MultiGpuPlotPipeline::run_t1_phase: T1 num_buckets ("
+            + std::to_string(num_buckets) + ") not divisible by shard "
+            "count (" + std::to_string(N) + "). Phase 2.3a requires a "
+            "clean bucket-aligned partition; Phase 2.4 will relax this "
+            "via uneven bucket assignment for heterogeneous rigs.");
+    }
+
+    // ---------- Step 1 — replicate sorted Xs across shards. ----------
+    sycl::queue& alloc_q = *shards_[0].queue;
+    XsCandidateGpu* h_full = sycl::malloc_host<XsCandidateGpu>(total_xs, alloc_q);
+
+    std::uint64_t off = 0;
+    for (std::size_t s = 0; s < N; ++s) {
+        std::uint64_t const c = xs_phase_count_[s];
+        if (c > 0) {
+            shards_[s].queue->memcpy(
+                h_full + off, xs_phase_d_xs_[s],
+                sizeof(XsCandidateGpu) * c).wait();
+        }
+        off += c;
+    }
+    if (off != total_xs) {
+        sycl::free(h_full, alloc_q);
+        throw std::runtime_error(
+            "MultiGpuPlotPipeline::run_t1_phase: Xs phase outputs sum to "
+            + std::to_string(off) + " entries but total_xs = "
+            + std::to_string(total_xs)
+            + ". run_xs_phase() must complete before run_t1_phase().");
+    }
+
+    std::vector<XsCandidateGpu*> d_full_xs(N, nullptr);
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        d_full_xs[s] = sycl::malloc_device<XsCandidateGpu>(total_xs, q);
+        q.memcpy(d_full_xs[s], h_full,
+                 sizeof(XsCandidateGpu) * total_xs).wait();
+    }
+    sycl::free(h_full, alloc_q);
+
+    // The bucket-partitioned Xs phase outputs are no longer needed —
+    // d_full_xs holds the same data on every shard. Free them now to
+    // recover memory before T1 staging allocations.
+    for (std::size_t s = 0; s < N; ++s) {
+        if (xs_phase_d_xs_[s]) {
+            sycl::free(xs_phase_d_xs_[s], *shards_[s].queue);
+            xs_phase_d_xs_[s] = nullptr;
+        }
+    }
+
+    // ---------- Step 2 — per-shard T1 match over assigned buckets. ----
+    // Capacity: max_pairs_per_section * num_sections — the standard
+    // pos2-chip pool sizing for T1 output, which adds an extra-margin-
+    // bits term over the naive 2^k count to absorb expected skew. Same
+    // formula GpuBufferPool uses for the single-GPU T1 cap, giving each
+    // shard the same per-bucket safety as the production single-GPU
+    // path. Each shard sees the FULL input + emits only its bucket
+    // subset, so per-shard count <= full t1 cap on the worst case.
+    std::uint32_t const num_sections = std::uint32_t{1} << t1p.num_section_bits;
+    std::uint64_t const t1_cap =
+        static_cast<std::uint64_t>(
+            max_pairs_per_section(k, t1p.num_section_bits)) * num_sections;
+
+    std::vector<std::uint64_t*> d_t1_meta_unsorted(N, nullptr);
+    std::vector<std::uint32_t*> d_t1_mi_unsorted  (N, nullptr);
+    std::vector<std::uint64_t*> d_t1_count        (N, nullptr);
+    std::vector<void*>          d_t1_temp         (N, nullptr);
+
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        d_t1_meta_unsorted[s] = sycl::malloc_device<std::uint64_t>(t1_cap, q);
+        d_t1_mi_unsorted  [s] = sycl::malloc_device<std::uint32_t>(t1_cap, q);
+        d_t1_count        [s] = sycl::malloc_device<std::uint64_t>(1, q);
+
+        std::size_t tb = 0;
+        launch_t1_match_prepare(entry_.plot_id.data(), t1p,
+            d_full_xs[s], total_xs,
+            d_t1_count[s], nullptr, &tb, q);
+        d_t1_temp[s] = sycl::malloc_device(tb, q);
+        launch_t1_match_prepare(entry_.plot_id.data(), t1p,
+            d_full_xs[s], total_xs,
+            d_t1_count[s], d_t1_temp[s], &tb, q);
+
+        std::uint32_t const bucket_begin =
+            static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(s)     * num_buckets) / N);
+        std::uint32_t const bucket_end =
+            static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(s + 1) * num_buckets) / N);
+
+        launch_t1_match_range(entry_.plot_id.data(), t1p,
+            d_full_xs[s], total_xs,
+            d_t1_meta_unsorted[s], d_t1_mi_unsorted[s], d_t1_count[s],
+            t1_cap, d_t1_temp[s],
+            bucket_begin, bucket_end, q);
+    }
+    for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
+
+    std::vector<std::uint64_t> shard_count(N, 0);
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        q.memcpy(&shard_count[s], d_t1_count[s], sizeof(std::uint64_t)).wait();
+        if (shard_count[s] > t1_cap) {
+            throw std::runtime_error(
+                "MultiGpuPlotPipeline::run_t1_phase: shard "
+                + std::to_string(s) + " T1 produced "
+                + std::to_string(shard_count[s])
+                + " entries, exceeds capacity " + std::to_string(t1_cap)
+                + ". Bucket-skew worse than expected; raise t1_cap.");
+        }
+    }
+
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        sycl::free(d_t1_temp [s], q);
+        sycl::free(d_t1_count[s], q);
+        sycl::free(d_full_xs [s], q);
+    }
+
+    // ---------- Step 3 — distributed sort by mi. -------------------
+    // Worst-case per-shard receive: the union total (skewed input case).
+    std::uint64_t t1_total = 0;
+    for (auto c : shard_count) t1_total += c;
+
+    std::uint64_t const sort_cap = t1_total;
+    std::vector<std::uint32_t*> d_t1_mi_sorted  (N, nullptr);
+    std::vector<std::uint64_t*> d_t1_meta_sorted(N, nullptr);
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        d_t1_mi_sorted  [s] = sycl::malloc_device<std::uint32_t>(sort_cap, q);
+        d_t1_meta_sorted[s] = sycl::malloc_device<std::uint64_t>(sort_cap, q);
+    }
+
+    std::vector<DistributedSortPairsU32U64Shard> sort_shards(N);
+    for (std::size_t s = 0; s < N; ++s) {
+        sort_shards[s].queue        = shards_[s].queue;
+        sort_shards[s].keys_in      = d_t1_mi_unsorted[s];
+        sort_shards[s].vals_in      = d_t1_meta_unsorted[s];
+        sort_shards[s].count        = shard_count[s];
+        sort_shards[s].keys_out     = d_t1_mi_sorted[s];
+        sort_shards[s].vals_out     = d_t1_meta_sorted[s];
+        sort_shards[s].out_capacity = sort_cap;
+        sort_shards[s].out_count    = 0;
+    }
+
+    std::size_t scratch_bytes = 0;
+    launch_sort_pairs_u32_u64_distributed(
+        nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+    void* d_scratch = scratch_bytes
+        ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
+    launch_sort_pairs_u32_u64_distributed(
+        d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
+        scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k);
+    if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
+
+    for (std::size_t s = 0; s < N; ++s) {
+        sycl::queue& q = *shards_[s].queue;
+        sycl::free(d_t1_mi_unsorted  [s], q);
+        sycl::free(d_t1_meta_unsorted[s], q);
+    }
+
+    for (std::size_t s = 0; s < N; ++s) {
+        t1_phase_d_mi_  [s] = d_t1_mi_sorted  [s];
+        t1_phase_d_meta_[s] = d_t1_meta_sorted[s];
+        t1_phase_count_ [s] = sort_shards[s].out_count;
+    }
+
+    std::uint64_t out_total = 0;
+    for (auto c : t1_phase_count_) out_total += c;
+    if (out_total != t1_total) {
+        throw std::runtime_error(
+            "MultiGpuPlotPipeline::run_t1_phase: post-sort count mismatch "
+            "(expected " + std::to_string(t1_total) + ", got "
+            + std::to_string(out_total) + ")");
+    }
+}
+
+void MultiGpuPlotPipeline::run_t2_phase()
+{
+    throw std::runtime_error(
+        "MultiGpuPlotPipeline: T2 match is not yet implemented for the "
+        "sharded path (Phase 2.3b in the plan). Phase 2.3a ships the T1 "
+        "phase end-to-end (replicate Xs + per-shard match + distributed "
+        "u32/u64 sort by mi); per-shard T2 with the same shape is next. "
+        "See docs/multi-gpu-single-plot-alt-bucket-partition.md.");
+}
+void MultiGpuPlotPipeline::run_t3_phase()       { /* unreachable past T2's throw */ }
 void MultiGpuPlotPipeline::run_fragment_phase() { /* unreachable */ }
 
 } // namespace pos2gpu
