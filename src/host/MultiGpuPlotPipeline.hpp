@@ -26,6 +26,17 @@ namespace pos2gpu {
 
 struct XsCandidateGpu;  // forward-declared; full def in gpu/XsCandidateGpu.hpp
 
+// Pipeline phase identifier — used by run_through() and any caller
+// that wants to reason about phase ordering. Strictly ordered: each
+// phase requires the previous one's output.
+enum class Phase {
+    Xs,
+    T1,
+    T2,
+    T3,
+    Fragment,
+};
+
 // Per-shard runtime context. The caller (run_batch_sharded) constructs
 // these — one per device id passed via --devices.
 //
@@ -53,21 +64,16 @@ public:
     // throw a clear "Phase 2.3 not yet implemented" until they land.
     void run();
 
-    // Run only the Xs phase (gen + sort + pack across shards). Public
-    // for parity tests that need to inspect intermediate state without
-    // hitting the T1 phase's "not yet implemented" throw. Production
-    // callers should use run() — the multi-step pipeline.
-    void run_xs_phase();
+    // Run the pipeline up to and including the named phase. Each phase
+    // requires the previous one's output, so passing Phase::T2 runs
+    // Xs + T1 + T2. Public for parity tests that need to inspect the
+    // intermediate per-shard state of a specific phase without driving
+    // the rest of the chain. Production callers use run() (=
+    // run_through(Phase::Fragment)).
+    void run_through(Phase phase);
 
-    // Run the Xs phase followed by the T1 phase (Phase 2.3a). Public
-    // for the T1-phase parity test; production callers go through run().
-    void run_xs_then_t1_phase();
-
-    // Run Xs + T1 + T2 (Phase 2.3b). Public for the T2-phase parity test.
-    void run_xs_then_t1_then_t2_phase();
-
-    // Run Xs + T1 + T2 + T3 (Phase 2.3c). Public for the T3-phase parity test.
-    void run_xs_then_t1_then_t2_then_t3_phase();
+    // Convenience alias kept for the Xs-only parity test.
+    void run_xs_phase() { run_through(Phase::Xs); }
 
     // After run() completes, returns a span over the concatenated host
     // buffer of sorted T3 proof_fragments — same shape as
@@ -161,6 +167,7 @@ private:
             : DistributedSortTransport::HostBounce;
     }
 
+    void run_xs_phase_impl();
     void run_t1_phase();
     void run_t2_phase();
     void run_t3_phase();

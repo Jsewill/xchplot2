@@ -84,9 +84,7 @@ T1Sorted single_gpu_t1_phase(pos2gpu::BatchEntry const& entry)
     // ----- T1 match. -----
     auto t1p = pos2gpu::make_t1_params(k, entry.strength);
     std::uint64_t const cap =
-        static_cast<std::uint64_t>(
-            pos2gpu::max_pairs_per_section(k, t1p.num_section_bits))
-        * (std::uint64_t{1} << t1p.num_section_bits);
+        pos2gpu::match_phase_capacity(k, t1p.num_section_bits);
     auto* d_t1_meta  = sycl::malloc_device<std::uint64_t>(cap, q);
     auto* d_t1_mi    = sycl::malloc_device<std::uint32_t>(cap, q);
     auto* d_t1_count = sycl::malloc_device<std::uint64_t>(1, q);
@@ -154,7 +152,7 @@ T1Sorted single_gpu_t1_phase(pos2gpu::BatchEntry const& entry)
     return out;
 }
 
-// Sharded: 2 virtual shards on the same queue, drive run_xs_then_t1_phase
+// Sharded: 2 virtual shards on the same queue, drive run_through(T1)
 // and concatenate the per-shard sorted (mi, meta) outputs in shard-id
 // order. By construction (distributed sort partitions by mi value-space)
 // the concatenation reproduces a globally sorted-by-mi stream — i.e. the
@@ -170,7 +168,7 @@ T1Sorted sharded_t1_phase(pos2gpu::BatchEntry const& entry)
     shards[1] = {&q, 0};
 
     pos2gpu::MultiGpuPlotPipeline pipeline(entry, opts, std::move(shards));
-    pipeline.run_xs_then_t1_phase();
+    pipeline.run_through(pos2gpu::Phase::T1);
 
     std::uint64_t total = 0;
     for (std::size_t s = 0; s < pipeline.shard_count(); ++s) {

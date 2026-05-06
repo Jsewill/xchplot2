@@ -72,9 +72,7 @@ std::vector<std::uint64_t> single_gpu_t3_phase(pos2gpu::BatchEntry const& entry)
     // ----- T1 match + sort. -----
     auto t1p = pos2gpu::make_t1_params(k, entry.strength);
     std::uint64_t const t1_cap =
-        static_cast<std::uint64_t>(
-            pos2gpu::max_pairs_per_section(k, t1p.num_section_bits))
-        * (std::uint64_t{1} << t1p.num_section_bits);
+        pos2gpu::match_phase_capacity(k, t1p.num_section_bits);
     auto* d_t1_meta  = sycl::malloc_device<std::uint64_t>(t1_cap, q);
     auto* d_t1_mi    = sycl::malloc_device<std::uint32_t>(t1_cap, q);
     auto* d_t1_count = sycl::malloc_device<std::uint64_t>(1, q);
@@ -129,9 +127,7 @@ std::vector<std::uint64_t> single_gpu_t3_phase(pos2gpu::BatchEntry const& entry)
     // ----- T2 match + sort. -----
     auto t2p = pos2gpu::make_t2_params(k, entry.strength);
     std::uint64_t const t2_cap =
-        static_cast<std::uint64_t>(
-            pos2gpu::max_pairs_per_section(k, t2p.num_section_bits))
-        * (std::uint64_t{1} << t2p.num_section_bits);
+        pos2gpu::match_phase_capacity(k, t2p.num_section_bits);
     auto* d_t2_meta  = sycl::malloc_device<std::uint64_t>(t2_cap, q);
     auto* d_t2_mi    = sycl::malloc_device<std::uint32_t>(t2_cap, q);
     auto* d_t2_xbits = sycl::malloc_device<std::uint32_t>(t2_cap, q);
@@ -192,9 +188,7 @@ std::vector<std::uint64_t> single_gpu_t3_phase(pos2gpu::BatchEntry const& entry)
     // ----- T3 match. -----
     auto t3p = pos2gpu::make_t3_params(k, entry.strength);
     std::uint64_t const t3_cap =
-        static_cast<std::uint64_t>(
-            pos2gpu::max_pairs_per_section(k, t3p.num_section_bits))
-        * (std::uint64_t{1} << t3p.num_section_bits);
+        pos2gpu::match_phase_capacity(k, t3p.num_section_bits);
     auto* d_t3       = sycl::malloc_device<pos2gpu::T3PairingGpu>(t3_cap, q);
     auto* d_t3_count = sycl::malloc_device<std::uint64_t>(1, q);
 
@@ -261,7 +255,7 @@ std::vector<std::uint64_t> sharded_t3_phase(pos2gpu::BatchEntry const& entry)
     shards[1] = {&q, 0};
 
     pos2gpu::MultiGpuPlotPipeline pipeline(entry, opts, std::move(shards));
-    pipeline.run_xs_then_t1_then_t2_then_t3_phase();
+    pipeline.run_through(pos2gpu::Phase::T3);
 
     std::uint64_t total = 0;
     for (std::size_t s = 0; s < pipeline.shard_count(); ++s) {

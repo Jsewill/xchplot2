@@ -208,14 +208,23 @@ void MultiGpuPlotPipeline::free_phase_outputs()
 
 void MultiGpuPlotPipeline::run()
 {
-    run_xs_phase();
+    run_through(Phase::Fragment);
+}
+
+void MultiGpuPlotPipeline::run_through(Phase phase)
+{
+    run_xs_phase_impl();
+    if (phase == Phase::Xs) return;
     run_t1_phase();
+    if (phase == Phase::T1) return;
     run_t2_phase();
+    if (phase == Phase::T2) return;
     run_t3_phase();
+    if (phase == Phase::T3) return;
     run_fragment_phase();
 }
 
-void MultiGpuPlotPipeline::run_xs_phase()
+void MultiGpuPlotPipeline::run_xs_phase_impl()
 {
     std::size_t const N = shards_.size();
     int const k = entry_.k;
@@ -324,12 +333,6 @@ void MultiGpuPlotPipeline::run_xs_phase()
     }
 }
 
-void MultiGpuPlotPipeline::run_xs_then_t1_phase()
-{
-    run_xs_phase();
-    run_t1_phase();
-}
-
 void MultiGpuPlotPipeline::run_t1_phase()
 {
     // Phase 2.3a — sharded T1 match.
@@ -420,10 +423,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
     // shard the same per-bucket safety as the production single-GPU
     // path. Each shard sees the FULL input + emits only its bucket
     // subset, so per-shard count <= full t1 cap on the worst case.
-    std::uint32_t const num_sections = std::uint32_t{1} << t1p.num_section_bits;
-    std::uint64_t const t1_cap =
-        static_cast<std::uint64_t>(
-            max_pairs_per_section(k, t1p.num_section_bits)) * num_sections;
+    std::uint64_t const t1_cap = match_phase_capacity(k, t1p.num_section_bits);
 
     std::vector<std::uint64_t*> d_t1_meta_unsorted(N, nullptr);
     std::vector<std::uint32_t*> d_t1_mi_unsorted  (N, nullptr);
@@ -535,13 +535,6 @@ void MultiGpuPlotPipeline::run_t1_phase()
     }
 }
 
-void MultiGpuPlotPipeline::run_xs_then_t1_then_t2_phase()
-{
-    run_xs_phase();
-    run_t1_phase();
-    run_t2_phase();
-}
-
 void MultiGpuPlotPipeline::run_t2_phase()
 {
     // Phase 2.3b — sharded T2 match.
@@ -630,11 +623,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
     // ---------- Step 2 — per-shard T2 match. ----------
     // Same pos2-chip pool sizing as the single-GPU path: T2 emits at
     // most max_pairs_per_section * num_sections matches.
-    std::uint32_t const num_sections_t2 =
-        std::uint32_t{1} << t2p.num_section_bits;
-    std::uint64_t const t2_cap =
-        static_cast<std::uint64_t>(
-            max_pairs_per_section(k, t2p.num_section_bits)) * num_sections_t2;
+    std::uint64_t const t2_cap = match_phase_capacity(k, t2p.num_section_bits);
 
     std::vector<std::uint64_t*> d_t2_meta_unsorted (N, nullptr);
     std::vector<std::uint32_t*> d_t2_mi_unsorted   (N, nullptr);
@@ -754,14 +743,6 @@ void MultiGpuPlotPipeline::run_t2_phase()
     }
 }
 
-void MultiGpuPlotPipeline::run_xs_then_t1_then_t2_then_t3_phase()
-{
-    run_xs_phase();
-    run_t1_phase();
-    run_t2_phase();
-    run_t3_phase();
-}
-
 void MultiGpuPlotPipeline::run_t3_phase()
 {
     // Phase 2.3c — sharded T3 match.
@@ -860,11 +841,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
     }
 
     // ---------- Step 2 — per-shard T3 match. ----------
-    std::uint32_t const num_sections_t3 =
-        std::uint32_t{1} << t3p.num_section_bits;
-    std::uint64_t const t3_cap =
-        static_cast<std::uint64_t>(
-            max_pairs_per_section(k, t3p.num_section_bits)) * num_sections_t3;
+    std::uint64_t const t3_cap = match_phase_capacity(k, t3p.num_section_bits);
 
     std::vector<T3PairingGpu*>  d_t3_unsorted(N, nullptr);
     std::vector<std::uint64_t*> d_t3_count   (N, nullptr);
