@@ -56,6 +56,9 @@ public:
     // Run Xs + T1 + T2 (Phase 2.3b). Public for the T2-phase parity test.
     void run_xs_then_t1_then_t2_phase();
 
+    // Run Xs + T1 + T2 + T3 (Phase 2.3c). Public for the T3-phase parity test.
+    void run_xs_then_t1_then_t2_then_t3_phase();
+
     // Per-shard Xs phase outputs. shard k's d_xs holds a packed
     // XsCandidateGpu array sized xs_phase_count(k). Concatenating in
     // shard-id order reproduces the single-GPU sorted XsCandidateGpu
@@ -91,6 +94,15 @@ public:
     std::uint64_t  t2_phase_count(std::size_t shard) const
     { return t2_phase_count_[shard]; }
 
+    // Per-shard T3 phase outputs (sorted by proof_fragment low 2k bits).
+    // shard k holds fragments in [k * 2^(2k) / N, (k+1) * 2^(2k) / N).
+    // Concatenating in shard-id order reproduces the single-GPU T3-sort
+    // output (GpuPipeline.cpp's d_frags_out).
+    std::uint64_t* t3_phase_d_frags(std::size_t shard) const
+    { return t3_phase_d_frags_[shard]; }
+    std::uint64_t  t3_phase_count(std::size_t shard) const
+    { return t3_phase_count_[shard]; }
+
     std::size_t shard_count() const { return shards_.size(); }
     sycl::queue& shard_queue(std::size_t shard) const
     { return *shards_[shard].queue; }
@@ -111,6 +123,9 @@ private:
     std::vector<std::uint64_t*>   t2_phase_d_meta_;
     std::vector<std::uint32_t*>   t2_phase_d_xbits_;
     std::vector<std::uint64_t>    t2_phase_count_;
+
+    std::vector<std::uint64_t*>   t3_phase_d_frags_;
+    std::vector<std::uint64_t>    t3_phase_count_;
 
     void run_t1_phase();
     void run_t2_phase();
