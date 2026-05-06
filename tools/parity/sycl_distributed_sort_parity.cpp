@@ -212,32 +212,241 @@ bool run_keys(uint32_t seed, uint64_t count)
     return ok;
 }
 
-// Smoke-test that N>1 throws a clear error (Phase 2.0b contract).
-bool run_n_gt_1_throws()
+// Phase 2.1 — pairs sort with N=2 virtual shards (both pointing at the
+// same physical queue on the dev box). Splits the input arbitrarily
+// across the two shards, then verifies the union of distributed
+// outputs equals what a single-shard sort over the concatenated input
+// would produce. Validates correctness of the host-pinned bounce
+// algorithm on hardware accessible to a 1-GPU dev box; real multi-
+// physical-GPU runs are downstream once a multi-GPU rig is reachable.
+bool run_pairs_n2(uint32_t seed, uint64_t total)
 {
     auto& q = pos2gpu::sycl_backend::queue();
-    std::vector<pos2gpu::DistributedSortPairsShard> shards(2);
-    for (auto& s : shards) {
-        s.queue = &q;
-        s.keys_in = s.vals_in = s.keys_out = s.vals_out = nullptr;
-        s.count = 0;
-        s.out_capacity = 0;
-        s.out_count = 0;
+
+    std::mt19937_64 rng(seed);
+    std::vector<uint32_t> h_keys(total), h_vals(total);
+    for (uint64_t i = 0; i < total; ++i) {
+        h_keys[i] = static_cast<uint32_t>(i);
+        h_vals[i] = static_cast<uint32_t>(i);
     }
-    std::size_t temp_bytes = 0;
-    try {
+    std::shuffle(h_keys.begin(), h_keys.end(), rng);
+
+    // Reference: single-shard sort over the FULL concatenated input.
+    std::vector<uint32_t> ref_keys(total), ref_vals(total);
+    {
+        uint32_t* d_keys_in  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_keys_out = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_in  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_out = sycl::malloc_device<uint32_t>(total, q);
+        q.memcpy(d_keys_in, h_keys.data(), sizeof(uint32_t) * total);
+        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * total).wait();
+
+        size_t scratch_bytes = 0;
+        pos2gpu::launch_sort_pairs_u32_u32(
+            nullptr, scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            total, 0, 32, q);
+        void* d_scratch = scratch_bytes
+            ? sycl::malloc_device(scratch_bytes, q) : nullptr;
+        pos2gpu::launch_sort_pairs_u32_u32(
+            d_scratch ? d_scratch : reinterpret_cast<void*>(uintptr_t{1}),
+            scratch_bytes,
+            d_keys_in, d_keys_out, d_vals_in, d_vals_out,
+            total, 0, 32, q);
+        q.wait();
+        q.memcpy(ref_keys.data(), d_keys_out, sizeof(uint32_t) * total);
+        q.memcpy(ref_vals.data(), d_vals_out, sizeof(uint32_t) * total).wait();
+        if (d_scratch) sycl::free(d_scratch, q);
+        sycl::free(d_keys_in,  q);
+        sycl::free(d_keys_out, q);
+        sycl::free(d_vals_in,  q);
+        sycl::free(d_vals_out, q);
+    }
+
+    // Distributed N=2: split input into [0, total/2) on shard 0,
+    // [total/2, total) on shard 1. Each shard's out_capacity is `total`
+    // because in the worst skew case all items could land in one shard's
+    // bucket.
+    uint64_t const split = total / 2;
+    uint64_t const c0 = split;
+    uint64_t const c1 = total - split;
+
+    std::vector<uint32_t> dist_combined_keys, dist_combined_vals;
+    dist_combined_keys.reserve(total);
+    dist_combined_vals.reserve(total);
+
+    {
+        uint32_t* d_keys_in_0  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_keys_in_1  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_keys_out_0 = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_keys_out_1 = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_in_0  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_in_1  = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_out_0 = sycl::malloc_device<uint32_t>(total, q);
+        uint32_t* d_vals_out_1 = sycl::malloc_device<uint32_t>(total, q);
+
+        q.memcpy(d_keys_in_0, h_keys.data(),      sizeof(uint32_t) * c0);
+        q.memcpy(d_keys_in_1, h_keys.data() + c0, sizeof(uint32_t) * c1);
+        q.memcpy(d_vals_in_0, h_vals.data(),      sizeof(uint32_t) * c0);
+        q.memcpy(d_vals_in_1, h_vals.data() + c0, sizeof(uint32_t) * c1).wait();
+
+        std::vector<pos2gpu::DistributedSortPairsShard> shards(2);
+        shards[0].queue = &q;
+        shards[0].keys_in = d_keys_in_0;
+        shards[0].vals_in = d_vals_in_0;
+        shards[0].count = c0;
+        shards[0].keys_out = d_keys_out_0;
+        shards[0].vals_out = d_vals_out_0;
+        shards[0].out_capacity = total;
+        shards[0].out_count = 0;
+
+        shards[1].queue = &q;
+        shards[1].keys_in = d_keys_in_1;
+        shards[1].vals_in = d_vals_in_1;
+        shards[1].count = c1;
+        shards[1].keys_out = d_keys_out_1;
+        shards[1].vals_out = d_vals_out_1;
+        shards[1].out_capacity = total;
+        shards[1].out_count = 0;
+
+        size_t scratch_bytes = 0;
         pos2gpu::launch_sort_pairs_u32_u32_distributed(
-            nullptr, temp_bytes, shards, 0, 32);
-    } catch (std::exception const& e) {
-        std::string msg = e.what();
-        bool const ok = msg.find("not yet implemented") != std::string::npos
-                     && msg.find("Phase 2.1") != std::string::npos;
-        std::printf("%s pairs N=2 throws Phase-2.1-pending error\n",
-                    ok ? "PASS" : "FAIL");
-        return ok;
+            nullptr, scratch_bytes, shards, 0, 32);
+        void* d_scratch = scratch_bytes
+            ? sycl::malloc_device(scratch_bytes, q) : nullptr;
+        pos2gpu::launch_sort_pairs_u32_u32_distributed(
+            d_scratch ? d_scratch : reinterpret_cast<void*>(uintptr_t{1}),
+            scratch_bytes, shards, 0, 32);
+        q.wait();
+
+        // Pull each shard's bucket-range output back to host and
+        // concatenate in shard order — this is the union expected to
+        // match the single-shard reference.
+        std::vector<uint32_t> sk0(shards[0].out_count), sk1(shards[1].out_count);
+        std::vector<uint32_t> sv0(shards[0].out_count), sv1(shards[1].out_count);
+        if (shards[0].out_count > 0) {
+            q.memcpy(sk0.data(), d_keys_out_0,
+                     sizeof(uint32_t) * shards[0].out_count);
+            q.memcpy(sv0.data(), d_vals_out_0,
+                     sizeof(uint32_t) * shards[0].out_count);
+        }
+        if (shards[1].out_count > 0) {
+            q.memcpy(sk1.data(), d_keys_out_1,
+                     sizeof(uint32_t) * shards[1].out_count);
+            q.memcpy(sv1.data(), d_vals_out_1,
+                     sizeof(uint32_t) * shards[1].out_count);
+        }
+        q.wait();
+        dist_combined_keys.insert(dist_combined_keys.end(), sk0.begin(), sk0.end());
+        dist_combined_keys.insert(dist_combined_keys.end(), sk1.begin(), sk1.end());
+        dist_combined_vals.insert(dist_combined_vals.end(), sv0.begin(), sv0.end());
+        dist_combined_vals.insert(dist_combined_vals.end(), sv1.begin(), sv1.end());
+
+        if (d_scratch) sycl::free(d_scratch, q);
+        sycl::free(d_keys_in_0,  q); sycl::free(d_keys_in_1,  q);
+        sycl::free(d_keys_out_0, q); sycl::free(d_keys_out_1, q);
+        sycl::free(d_vals_in_0,  q); sycl::free(d_vals_in_1,  q);
+        sycl::free(d_vals_out_0, q); sycl::free(d_vals_out_1, q);
     }
-    std::printf("FAIL pairs N=2 did not throw\n");
-    return false;
+
+    bool const total_ok = (dist_combined_keys.size() == ref_keys.size());
+    bool const keys_ok = total_ok && std::memcmp(
+        ref_keys.data(), dist_combined_keys.data(),
+        sizeof(uint32_t) * total) == 0;
+    bool const vals_ok = total_ok && std::memcmp(
+        ref_vals.data(), dist_combined_vals.data(),
+        sizeof(uint32_t) * total) == 0;
+    bool const ok = total_ok && keys_ok && vals_ok;
+    std::printf("%s pairs N=2 seed=%u total=%lu  [size=%d keys=%d vals=%d]\n",
+                ok ? "PASS" : "FAIL", seed, (unsigned long)total,
+                total_ok ? 1 : 0, keys_ok ? 1 : 0, vals_ok ? 1 : 0);
+    return ok;
+}
+
+// Same shape but for u64 keys (no values).
+bool run_keys_n2(uint32_t seed, uint64_t total)
+{
+    auto& q = pos2gpu::sycl_backend::queue();
+
+    std::mt19937_64 rng(seed);
+    std::vector<uint64_t> h_keys(total);
+    for (uint64_t i = 0; i < total; ++i) h_keys[i] = i * 37u + 1u;
+    std::shuffle(h_keys.begin(), h_keys.end(), rng);
+
+    std::vector<uint64_t> ref_keys(total);
+    {
+        uint64_t* d_in  = sycl::malloc_device<uint64_t>(total, q);
+        uint64_t* d_out = sycl::malloc_device<uint64_t>(total, q);
+        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * total).wait();
+        size_t scratch_bytes = 0;
+        pos2gpu::launch_sort_keys_u64(
+            nullptr, scratch_bytes, nullptr, nullptr, total, 0, 64, q);
+        void* d_scratch = scratch_bytes
+            ? sycl::malloc_device(scratch_bytes, q) : nullptr;
+        pos2gpu::launch_sort_keys_u64(
+            d_scratch ? d_scratch : reinterpret_cast<void*>(uintptr_t{1}),
+            scratch_bytes, d_in, d_out, total, 0, 64, q);
+        q.wait();
+        q.memcpy(ref_keys.data(), d_out, sizeof(uint64_t) * total).wait();
+        if (d_scratch) sycl::free(d_scratch, q);
+        sycl::free(d_in,  q); sycl::free(d_out, q);
+    }
+
+    uint64_t const split = total / 2;
+    uint64_t const c0 = split, c1 = total - split;
+
+    std::vector<uint64_t> dist_combined;
+    dist_combined.reserve(total);
+    {
+        uint64_t* d_in_0  = sycl::malloc_device<uint64_t>(total, q);
+        uint64_t* d_in_1  = sycl::malloc_device<uint64_t>(total, q);
+        uint64_t* d_out_0 = sycl::malloc_device<uint64_t>(total, q);
+        uint64_t* d_out_1 = sycl::malloc_device<uint64_t>(total, q);
+        q.memcpy(d_in_0, h_keys.data(),      sizeof(uint64_t) * c0);
+        q.memcpy(d_in_1, h_keys.data() + c0, sizeof(uint64_t) * c1).wait();
+
+        std::vector<pos2gpu::DistributedSortKeysU64Shard> shards(2);
+        shards[0].queue = &q;
+        shards[0].keys_in = d_in_0; shards[0].count = c0;
+        shards[0].keys_out = d_out_0; shards[0].out_capacity = total;
+        shards[0].out_count = 0;
+        shards[1].queue = &q;
+        shards[1].keys_in = d_in_1; shards[1].count = c1;
+        shards[1].keys_out = d_out_1; shards[1].out_capacity = total;
+        shards[1].out_count = 0;
+
+        size_t scratch_bytes = 0;
+        pos2gpu::launch_sort_keys_u64_distributed(
+            nullptr, scratch_bytes, shards, 0, 64);
+        void* d_scratch = scratch_bytes
+            ? sycl::malloc_device(scratch_bytes, q) : nullptr;
+        pos2gpu::launch_sort_keys_u64_distributed(
+            d_scratch ? d_scratch : reinterpret_cast<void*>(uintptr_t{1}),
+            scratch_bytes, shards, 0, 64);
+        q.wait();
+
+        std::vector<uint64_t> s0(shards[0].out_count), s1(shards[1].out_count);
+        if (shards[0].out_count > 0)
+            q.memcpy(s0.data(), d_out_0, sizeof(uint64_t) * shards[0].out_count);
+        if (shards[1].out_count > 0)
+            q.memcpy(s1.data(), d_out_1, sizeof(uint64_t) * shards[1].out_count);
+        q.wait();
+        dist_combined.insert(dist_combined.end(), s0.begin(), s0.end());
+        dist_combined.insert(dist_combined.end(), s1.begin(), s1.end());
+
+        if (d_scratch) sycl::free(d_scratch, q);
+        sycl::free(d_in_0,  q); sycl::free(d_in_1,  q);
+        sycl::free(d_out_0, q); sycl::free(d_out_1, q);
+    }
+
+    bool const total_ok = (dist_combined.size() == total);
+    bool const keys_ok = total_ok && std::memcmp(
+        ref_keys.data(), dist_combined.data(),
+        sizeof(uint64_t) * total) == 0;
+    bool const ok = total_ok && keys_ok;
+    std::printf("%s keys  N=2 seed=%u total=%lu  [size=%d match=%d]\n",
+                ok ? "PASS" : "FAIL", seed, (unsigned long)total,
+                total_ok ? 1 : 0, keys_ok ? 1 : 0);
+    return ok;
 }
 
 } // namespace
@@ -245,12 +454,22 @@ bool run_n_gt_1_throws()
 int main()
 {
     bool all_ok = true;
+    // N=1 fast-path regression — must continue to match single-shard.
     for (uint32_t seed : {7u, 31u}) {
         for (uint64_t count : {16ull, 16384ull, 262144ull, 1048576ull}) {
             all_ok = run_pairs(seed, count) && all_ok;
             all_ok = run_keys (seed, count) && all_ok;
         }
     }
-    all_ok = run_n_gt_1_throws() && all_ok;
+    // N=2 distributed (2 virtual shards on the same physical device on
+    // single-GPU dev boxes) — validates the host-pinned bounce
+    // algorithm without needing real multi-GPU hardware. Real multi-
+    // physical-GPU validation lands once a multi-GPU rig is reachable.
+    for (uint32_t seed : {7u, 31u}) {
+        for (uint64_t total : {16ull, 16384ull, 262144ull, 1048576ull}) {
+            all_ok = run_pairs_n2(seed, total) && all_ok;
+            all_ok = run_keys_n2 (seed, total) && all_ok;
+        }
+    }
     return all_ok ? 0 : 1;
 }
