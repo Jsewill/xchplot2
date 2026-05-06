@@ -63,6 +63,92 @@ namespace pos2gpu {
 
 namespace {
 
+// Move-only RAII for sycl::malloc_device / malloc_host allocations.
+// Holds (queue*, ptr); frees in dtor unless release() was called.
+// Used to keep per-phase intermediate scratch from leaking when a
+// downstream launch throws mid-loop.
+template <class T>
+struct SyclDevicePtr {
+    sycl::queue* q = nullptr;
+    T* p = nullptr;
+
+    SyclDevicePtr() = default;
+    SyclDevicePtr(sycl::queue* q_, T* p_) : q(q_), p(p_) {}
+    SyclDevicePtr(SyclDevicePtr const&) = delete;
+    SyclDevicePtr& operator=(SyclDevicePtr const&) = delete;
+    SyclDevicePtr(SyclDevicePtr&& o) noexcept : q(o.q), p(o.p) { o.p = nullptr; }
+    SyclDevicePtr& operator=(SyclDevicePtr&& o) noexcept {
+        if (this != &o) { reset(); q = o.q; p = o.p; o.p = nullptr; }
+        return *this;
+    }
+    ~SyclDevicePtr() { reset(); }
+
+    void reset() noexcept {
+        if (p && q) { sycl::free(p, *q); p = nullptr; }
+    }
+    T* release() noexcept { T* tmp = p; p = nullptr; return tmp; }
+    T* get() const noexcept { return p; }
+};
+
+template <class T>
+SyclDevicePtr<T> sycl_alloc_device_owned(std::size_t n, sycl::queue& q)
+{
+    return SyclDevicePtr<T>(&q, sycl::malloc_device<T>(n, q));
+}
+
+// Untyped variant — distributed sort scratch + match-prepare temp
+// arrive as void* so we can't directly use SyclDevicePtr<void>
+// (sycl::free on void* still needs a queue). Functionally identical.
+struct SyclDeviceVoid {
+    sycl::queue* q = nullptr;
+    void* p = nullptr;
+
+    SyclDeviceVoid() = default;
+    SyclDeviceVoid(sycl::queue* q_, void* p_) : q(q_), p(p_) {}
+    SyclDeviceVoid(SyclDeviceVoid const&) = delete;
+    SyclDeviceVoid& operator=(SyclDeviceVoid const&) = delete;
+    SyclDeviceVoid(SyclDeviceVoid&& o) noexcept : q(o.q), p(o.p) { o.p = nullptr; }
+    SyclDeviceVoid& operator=(SyclDeviceVoid&& o) noexcept {
+        if (this != &o) { reset(); q = o.q; p = o.p; o.p = nullptr; }
+        return *this;
+    }
+    ~SyclDeviceVoid() { reset(); }
+
+    void reset() noexcept {
+        if (p && q) { sycl::free(p, *q); p = nullptr; }
+    }
+    void* get() const noexcept { return p; }
+};
+
+// Pinned host: same lifetime story but allocated via malloc_host.
+template <class T>
+struct SyclHostPtr {
+    sycl::queue* q = nullptr;
+    T* p = nullptr;
+
+    SyclHostPtr() = default;
+    SyclHostPtr(sycl::queue* q_, T* p_) : q(q_), p(p_) {}
+    SyclHostPtr(SyclHostPtr const&) = delete;
+    SyclHostPtr& operator=(SyclHostPtr const&) = delete;
+    SyclHostPtr(SyclHostPtr&& o) noexcept : q(o.q), p(o.p) { o.p = nullptr; }
+    SyclHostPtr& operator=(SyclHostPtr&& o) noexcept {
+        if (this != &o) { reset(); q = o.q; p = o.p; o.p = nullptr; }
+        return *this;
+    }
+    ~SyclHostPtr() { reset(); }
+
+    void reset() noexcept {
+        if (p && q) { sycl::free(p, *q); p = nullptr; }
+    }
+    T* get() const noexcept { return p; }
+};
+
+template <class T>
+SyclHostPtr<T> sycl_alloc_host_owned(std::size_t n, sycl::queue& q)
+{
+    return SyclHostPtr<T>(&q, sycl::malloc_host<T>(n, q));
+}
+
 // Partition `num_buckets` across the shards proportional to their
 // weights. Returns a vector of size N+1 where shard s owns the range
 // [partition[s], partition[s+1]). Boundary rounding is to the nearest
@@ -419,20 +505,20 @@ void MultiGpuPlotPipeline::run_t1_phase()
 
     // ---------- Step 1 — replicate sorted Xs across shards. ----------
     sycl::queue& alloc_q = *shards_[0].queue;
-    XsCandidateGpu* h_full = sycl::malloc_host<XsCandidateGpu>(total_xs, alloc_q);
+    auto h_full = sycl_alloc_host_owned<XsCandidateGpu>(total_xs, alloc_q);
 
     std::uint64_t off = 0;
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const c = xs_phase_count_[s];
         if (c > 0) {
             shards_[s].queue->memcpy(
-                h_full + off, xs_phase_d_xs_[s],
+                h_full.get() + off, xs_phase_d_xs_[s],
                 sizeof(XsCandidateGpu) * c).wait();
         }
         off += c;
     }
     if (off != total_xs) {
-        sycl::free(h_full, alloc_q);
+        // h_full RAII-frees on throw.
         throw std::runtime_error(
             "MultiGpuPlotPipeline::run_t1_phase: Xs phase outputs sum to "
             + std::to_string(off) + " entries but total_xs = "
@@ -440,14 +526,14 @@ void MultiGpuPlotPipeline::run_t1_phase()
             + ". run_xs_phase() must complete before run_t1_phase().");
     }
 
-    std::vector<XsCandidateGpu*> d_full_xs(N, nullptr);
+    std::vector<SyclDevicePtr<XsCandidateGpu>> d_full_xs(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_xs[s] = sycl::malloc_device<XsCandidateGpu>(total_xs, q);
-        q.memcpy(d_full_xs[s], h_full,
+        d_full_xs[s] = sycl_alloc_device_owned<XsCandidateGpu>(total_xs, q);
+        q.memcpy(d_full_xs[s].get(), h_full.get(),
                  sizeof(XsCandidateGpu) * total_xs).wait();
     }
-    sycl::free(h_full, alloc_q);
+    h_full.reset();
 
     // The bucket-partitioned Xs phase outputs are no longer needed —
     // d_full_xs holds the same data on every shard. Free them now to
@@ -469,33 +555,34 @@ void MultiGpuPlotPipeline::run_t1_phase()
     // subset, so per-shard count <= full t1 cap on the worst case.
     std::uint64_t const t1_cap = match_phase_capacity(k, t1p.num_section_bits);
 
-    std::vector<std::uint64_t*> d_t1_meta_unsorted(N, nullptr);
-    std::vector<std::uint32_t*> d_t1_mi_unsorted  (N, nullptr);
-    std::vector<std::uint64_t*> d_t1_count        (N, nullptr);
-    std::vector<void*>          d_t1_temp         (N, nullptr);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t1_meta_unsorted(N);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t1_mi_unsorted  (N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t1_count        (N);
+    std::vector<SyclDeviceVoid>               d_t1_temp         (N);
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t1_meta_unsorted[s] = sycl::malloc_device<std::uint64_t>(t1_cap, q);
-        d_t1_mi_unsorted  [s] = sycl::malloc_device<std::uint32_t>(t1_cap, q);
-        d_t1_count        [s] = sycl::malloc_device<std::uint64_t>(1, q);
+        d_t1_meta_unsorted[s] = sycl_alloc_device_owned<std::uint64_t>(t1_cap, q);
+        d_t1_mi_unsorted  [s] = sycl_alloc_device_owned<std::uint32_t>(t1_cap, q);
+        d_t1_count        [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
         launch_t1_match_prepare(entry_.plot_id.data(), t1p,
-            d_full_xs[s], total_xs,
-            d_t1_count[s], nullptr, &tb, q);
-        d_t1_temp[s] = sycl::malloc_device(tb, q);
+            d_full_xs[s].get(), total_xs,
+            d_t1_count[s].get(), nullptr, &tb, q);
+        d_t1_temp[s] = SyclDeviceVoid(&q, sycl::malloc_device(tb, q));
         launch_t1_match_prepare(entry_.plot_id.data(), t1p,
-            d_full_xs[s], total_xs,
-            d_t1_count[s], d_t1_temp[s], &tb, q);
+            d_full_xs[s].get(), total_xs,
+            d_t1_count[s].get(), d_t1_temp[s].get(), &tb, q);
 
         std::uint32_t const bucket_begin = t1_partition[s];
         std::uint32_t const bucket_end   = t1_partition[s + 1];
 
         launch_t1_match_range(entry_.plot_id.data(), t1p,
-            d_full_xs[s], total_xs,
-            d_t1_meta_unsorted[s], d_t1_mi_unsorted[s], d_t1_count[s],
-            t1_cap, d_t1_temp[s],
+            d_full_xs[s].get(), total_xs,
+            d_t1_meta_unsorted[s].get(), d_t1_mi_unsorted[s].get(),
+            d_t1_count[s].get(),
+            t1_cap, d_t1_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -503,7 +590,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
     std::vector<std::uint64_t> shard_count(N, 0);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t1_count[s], sizeof(std::uint64_t)).wait();
+        q.memcpy(&shard_count[s], d_t1_count[s].get(), sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t1_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t1_phase: shard "
@@ -514,11 +601,12 @@ void MultiGpuPlotPipeline::run_t1_phase()
         }
     }
 
+    // Early-release the heavy intermediates before allocating the sort
+    // outputs — d_full_xs is the largest (full Xs replica per shard).
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        sycl::free(d_t1_temp [s], q);
-        sycl::free(d_t1_count[s], q);
-        sycl::free(d_full_xs [s], q);
+        d_t1_temp [s].reset();
+        d_t1_count[s].reset();
+        d_full_xs [s].reset();
     }
 
     // ---------- Step 3 — distributed sort by mi. -------------------
@@ -527,22 +615,22 @@ void MultiGpuPlotPipeline::run_t1_phase()
     for (auto c : shard_count) t1_total += c;
 
     std::uint64_t const sort_cap = t1_total;
-    std::vector<std::uint32_t*> d_t1_mi_sorted  (N, nullptr);
-    std::vector<std::uint64_t*> d_t1_meta_sorted(N, nullptr);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t1_mi_sorted  (N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t1_meta_sorted(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t1_mi_sorted  [s] = sycl::malloc_device<std::uint32_t>(sort_cap, q);
-        d_t1_meta_sorted[s] = sycl::malloc_device<std::uint64_t>(sort_cap, q);
+        d_t1_mi_sorted  [s] = sycl_alloc_device_owned<std::uint32_t>(sort_cap, q);
+        d_t1_meta_sorted[s] = sycl_alloc_device_owned<std::uint64_t>(sort_cap, q);
     }
 
     std::vector<DistributedSortPairsU32U64Shard> sort_shards(N);
     for (std::size_t s = 0; s < N; ++s) {
         sort_shards[s].queue        = shards_[s].queue;
-        sort_shards[s].keys_in      = d_t1_mi_unsorted[s];
-        sort_shards[s].vals_in      = d_t1_meta_unsorted[s];
+        sort_shards[s].keys_in      = d_t1_mi_unsorted[s].get();
+        sort_shards[s].vals_in      = d_t1_meta_unsorted[s].get();
         sort_shards[s].count        = shard_count[s];
-        sort_shards[s].keys_out     = d_t1_mi_sorted[s];
-        sort_shards[s].vals_out     = d_t1_meta_sorted[s];
+        sort_shards[s].keys_out     = d_t1_mi_sorted[s].get();
+        sort_shards[s].vals_out     = d_t1_meta_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
     }
@@ -550,22 +638,28 @@ void MultiGpuPlotPipeline::run_t1_phase()
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u64_distributed(
         nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
-    void* d_scratch = scratch_bytes
-        ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
+    SyclDeviceVoid d_scratch;
+    if (scratch_bytes) {
+        d_scratch = SyclDeviceVoid(shards_[0].queue,
+            sycl::malloc_device(scratch_bytes, *shards_[0].queue));
+    }
     launch_sort_pairs_u32_u64_distributed(
-        d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
+        d_scratch.get() ? d_scratch.get() : reinterpret_cast<void*>(std::uintptr_t{1}),
         scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
-    if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
+    d_scratch.reset();
 
+    // Early-free the unsorted scratch — the distributed sort already
+    // wrote the result into d_t1_*_sorted.
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        sycl::free(d_t1_mi_unsorted  [s], q);
-        sycl::free(d_t1_meta_unsorted[s], q);
+        d_t1_mi_unsorted  [s].reset();
+        d_t1_meta_unsorted[s].reset();
     }
 
+    // Hand off ownership of the sorted buffers to the phase-output
+    // member vectors (managed by free_phase_outputs from now on).
     for (std::size_t s = 0; s < N; ++s) {
-        t1_phase_d_mi_  [s] = d_t1_mi_sorted  [s];
-        t1_phase_d_meta_[s] = d_t1_meta_sorted[s];
+        t1_phase_d_mi_  [s] = d_t1_mi_sorted  [s].release();
+        t1_phase_d_meta_[s] = d_t1_meta_sorted[s].release();
         t1_phase_count_ [s] = sort_shards[s].out_count;
     }
 
@@ -613,44 +707,43 @@ void MultiGpuPlotPipeline::run_t2_phase()
     for (auto c : t1_phase_count_) t1_total += c;
 
     sycl::queue& alloc_q = *shards_[0].queue;
-    std::uint32_t* h_mi   = sycl::malloc_host<std::uint32_t>(t1_total, alloc_q);
-    std::uint64_t* h_meta = sycl::malloc_host<std::uint64_t>(t1_total, alloc_q);
+    auto h_mi   = sycl_alloc_host_owned<std::uint32_t>(t1_total, alloc_q);
+    auto h_meta = sycl_alloc_host_owned<std::uint64_t>(t1_total, alloc_q);
 
     std::uint64_t off = 0;
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const c = t1_phase_count_[s];
         if (c > 0) {
             shards_[s].queue->memcpy(
-                h_mi + off,   t1_phase_d_mi_[s],
+                h_mi.get() + off,   t1_phase_d_mi_[s],
                 c * sizeof(std::uint32_t)).wait();
             shards_[s].queue->memcpy(
-                h_meta + off, t1_phase_d_meta_[s],
+                h_meta.get() + off, t1_phase_d_meta_[s],
                 c * sizeof(std::uint64_t)).wait();
         }
         off += c;
     }
     if (off != t1_total) {
-        sycl::free(h_mi,   alloc_q);
-        sycl::free(h_meta, alloc_q);
+        // h_mi / h_meta RAII-free on throw.
         throw std::runtime_error(
             "MultiGpuPlotPipeline::run_t2_phase: T1 outputs sum to "
             + std::to_string(off) + " entries but t1_total = "
             + std::to_string(t1_total));
     }
 
-    std::vector<std::uint32_t*> d_full_mi  (N, nullptr);
-    std::vector<std::uint64_t*> d_full_meta(N, nullptr);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_full_mi  (N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_full_meta(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_mi  [s] = sycl::malloc_device<std::uint32_t>(t1_total, q);
-        d_full_meta[s] = sycl::malloc_device<std::uint64_t>(t1_total, q);
-        q.memcpy(d_full_mi  [s], h_mi,
+        d_full_mi  [s] = sycl_alloc_device_owned<std::uint32_t>(t1_total, q);
+        d_full_meta[s] = sycl_alloc_device_owned<std::uint64_t>(t1_total, q);
+        q.memcpy(d_full_mi  [s].get(), h_mi.get(),
                  t1_total * sizeof(std::uint32_t)).wait();
-        q.memcpy(d_full_meta[s], h_meta,
+        q.memcpy(d_full_meta[s].get(), h_meta.get(),
                  t1_total * sizeof(std::uint64_t)).wait();
     }
-    sycl::free(h_mi,   alloc_q);
-    sycl::free(h_meta, alloc_q);
+    h_mi.reset();
+    h_meta.reset();
 
     // The bucket-partitioned T1 outputs are no longer needed.
     for (std::size_t s = 0; s < N; ++s) {
@@ -669,36 +762,36 @@ void MultiGpuPlotPipeline::run_t2_phase()
     // most max_pairs_per_section * num_sections matches.
     std::uint64_t const t2_cap = match_phase_capacity(k, t2p.num_section_bits);
 
-    std::vector<std::uint64_t*> d_t2_meta_unsorted (N, nullptr);
-    std::vector<std::uint32_t*> d_t2_mi_unsorted   (N, nullptr);
-    std::vector<std::uint32_t*> d_t2_xbits_unsorted(N, nullptr);
-    std::vector<std::uint64_t*> d_t2_count         (N, nullptr);
-    std::vector<void*>          d_t2_temp          (N, nullptr);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t2_meta_unsorted (N);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t2_mi_unsorted   (N);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t2_xbits_unsorted(N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t2_count         (N);
+    std::vector<SyclDeviceVoid>               d_t2_temp          (N);
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t2_meta_unsorted [s] = sycl::malloc_device<std::uint64_t>(t2_cap, q);
-        d_t2_mi_unsorted   [s] = sycl::malloc_device<std::uint32_t>(t2_cap, q);
-        d_t2_xbits_unsorted[s] = sycl::malloc_device<std::uint32_t>(t2_cap, q);
-        d_t2_count         [s] = sycl::malloc_device<std::uint64_t>(1, q);
+        d_t2_meta_unsorted [s] = sycl_alloc_device_owned<std::uint64_t>(t2_cap, q);
+        d_t2_mi_unsorted   [s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap, q);
+        d_t2_xbits_unsorted[s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap, q);
+        d_t2_count         [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
         launch_t2_match_prepare(entry_.plot_id.data(), t2p,
-            d_full_mi[s], t1_total,
-            d_t2_count[s], nullptr, &tb, q);
-        d_t2_temp[s] = sycl::malloc_device(tb, q);
+            d_full_mi[s].get(), t1_total,
+            d_t2_count[s].get(), nullptr, &tb, q);
+        d_t2_temp[s] = SyclDeviceVoid(&q, sycl::malloc_device(tb, q));
         launch_t2_match_prepare(entry_.plot_id.data(), t2p,
-            d_full_mi[s], t1_total,
-            d_t2_count[s], d_t2_temp[s], &tb, q);
+            d_full_mi[s].get(), t1_total,
+            d_t2_count[s].get(), d_t2_temp[s].get(), &tb, q);
 
         std::uint32_t const bucket_begin = t2_partition[s];
         std::uint32_t const bucket_end   = t2_partition[s + 1];
 
         launch_t2_match_range(entry_.plot_id.data(), t2p,
-            d_full_meta[s], d_full_mi[s], t1_total,
-            d_t2_meta_unsorted[s], d_t2_mi_unsorted[s],
-            d_t2_xbits_unsorted[s], d_t2_count[s],
-            t2_cap, d_t2_temp[s],
+            d_full_meta[s].get(), d_full_mi[s].get(), t1_total,
+            d_t2_meta_unsorted[s].get(), d_t2_mi_unsorted[s].get(),
+            d_t2_xbits_unsorted[s].get(), d_t2_count[s].get(),
+            t2_cap, d_t2_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -706,7 +799,8 @@ void MultiGpuPlotPipeline::run_t2_phase()
     std::vector<std::uint64_t> shard_count(N, 0);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t2_count[s], sizeof(std::uint64_t)).wait();
+        q.memcpy(&shard_count[s], d_t2_count[s].get(),
+                 sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t2_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t2_phase: shard "
@@ -716,12 +810,13 @@ void MultiGpuPlotPipeline::run_t2_phase()
         }
     }
 
+    // Early-release the heavy intermediates (full T1 replicas + match
+    // scratch + count) before allocating sort outputs.
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        sycl::free(d_t2_temp  [s], q);
-        sycl::free(d_t2_count [s], q);
-        sycl::free(d_full_mi  [s], q);
-        sycl::free(d_full_meta[s], q);
+        d_t2_temp  [s].reset();
+        d_t2_count [s].reset();
+        d_full_mi  [s].reset();
+        d_full_meta[s].reset();
     }
 
     // ---------- Step 3 — distributed sort by mi. ----------
@@ -729,26 +824,26 @@ void MultiGpuPlotPipeline::run_t2_phase()
     for (auto c : shard_count) t2_total += c;
 
     std::uint64_t const sort_cap = t2_total;
-    std::vector<std::uint32_t*> d_t2_mi_sorted   (N, nullptr);
-    std::vector<std::uint64_t*> d_t2_meta_sorted (N, nullptr);
-    std::vector<std::uint32_t*> d_t2_xbits_sorted(N, nullptr);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t2_mi_sorted   (N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t2_meta_sorted (N);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_t2_xbits_sorted(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t2_mi_sorted   [s] = sycl::malloc_device<std::uint32_t>(sort_cap, q);
-        d_t2_meta_sorted [s] = sycl::malloc_device<std::uint64_t>(sort_cap, q);
-        d_t2_xbits_sorted[s] = sycl::malloc_device<std::uint32_t>(sort_cap, q);
+        d_t2_mi_sorted   [s] = sycl_alloc_device_owned<std::uint32_t>(sort_cap, q);
+        d_t2_meta_sorted [s] = sycl_alloc_device_owned<std::uint64_t>(sort_cap, q);
+        d_t2_xbits_sorted[s] = sycl_alloc_device_owned<std::uint32_t>(sort_cap, q);
     }
 
     std::vector<DistributedSortPairsU32U64U32Shard> sort_shards(N);
     for (std::size_t s = 0; s < N; ++s) {
         sort_shards[s].queue        = shards_[s].queue;
-        sort_shards[s].keys_in      = d_t2_mi_unsorted[s];
-        sort_shards[s].vals_a_in    = d_t2_meta_unsorted[s];
-        sort_shards[s].vals_b_in    = d_t2_xbits_unsorted[s];
+        sort_shards[s].keys_in      = d_t2_mi_unsorted[s].get();
+        sort_shards[s].vals_a_in    = d_t2_meta_unsorted[s].get();
+        sort_shards[s].vals_b_in    = d_t2_xbits_unsorted[s].get();
         sort_shards[s].count        = shard_count[s];
-        sort_shards[s].keys_out     = d_t2_mi_sorted[s];
-        sort_shards[s].vals_a_out   = d_t2_meta_sorted[s];
-        sort_shards[s].vals_b_out   = d_t2_xbits_sorted[s];
+        sort_shards[s].keys_out     = d_t2_mi_sorted[s].get();
+        sort_shards[s].vals_a_out   = d_t2_meta_sorted[s].get();
+        sort_shards[s].vals_b_out   = d_t2_xbits_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
     }
@@ -756,24 +851,26 @@ void MultiGpuPlotPipeline::run_t2_phase()
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u64u32_distributed(
         nullptr, scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
-    void* d_scratch = scratch_bytes
-        ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
+    SyclDeviceVoid d_scratch;
+    if (scratch_bytes) {
+        d_scratch = SyclDeviceVoid(shards_[0].queue,
+            sycl::malloc_device(scratch_bytes, *shards_[0].queue));
+    }
     launch_sort_pairs_u32_u64u32_distributed(
-        d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
+        d_scratch.get() ? d_scratch.get() : reinterpret_cast<void*>(std::uintptr_t{1}),
         scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
-    if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
+    d_scratch.reset();
 
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        sycl::free(d_t2_mi_unsorted   [s], q);
-        sycl::free(d_t2_meta_unsorted [s], q);
-        sycl::free(d_t2_xbits_unsorted[s], q);
+        d_t2_mi_unsorted   [s].reset();
+        d_t2_meta_unsorted [s].reset();
+        d_t2_xbits_unsorted[s].reset();
     }
 
     for (std::size_t s = 0; s < N; ++s) {
-        t2_phase_d_mi_   [s] = d_t2_mi_sorted   [s];
-        t2_phase_d_meta_ [s] = d_t2_meta_sorted [s];
-        t2_phase_d_xbits_[s] = d_t2_xbits_sorted[s];
+        t2_phase_d_mi_   [s] = d_t2_mi_sorted   [s].release();
+        t2_phase_d_meta_ [s] = d_t2_meta_sorted [s].release();
+        t2_phase_d_xbits_[s] = d_t2_xbits_sorted[s].release();
         t2_phase_count_  [s] = sort_shards[s].out_count;
     }
 
@@ -819,54 +916,52 @@ void MultiGpuPlotPipeline::run_t3_phase()
     for (auto c : t2_phase_count_) t2_total += c;
 
     sycl::queue& alloc_q = *shards_[0].queue;
-    std::uint32_t* h_mi    = sycl::malloc_host<std::uint32_t>(t2_total, alloc_q);
-    std::uint64_t* h_meta  = sycl::malloc_host<std::uint64_t>(t2_total, alloc_q);
-    std::uint32_t* h_xbits = sycl::malloc_host<std::uint32_t>(t2_total, alloc_q);
+    auto h_mi    = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
+    auto h_meta  = sycl_alloc_host_owned<std::uint64_t>(t2_total, alloc_q);
+    auto h_xbits = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
 
     std::uint64_t off = 0;
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const c = t2_phase_count_[s];
         if (c > 0) {
             shards_[s].queue->memcpy(
-                h_mi + off,    t2_phase_d_mi_[s],
+                h_mi.get() + off,    t2_phase_d_mi_[s],
                 c * sizeof(std::uint32_t)).wait();
             shards_[s].queue->memcpy(
-                h_meta + off,  t2_phase_d_meta_[s],
+                h_meta.get() + off,  t2_phase_d_meta_[s],
                 c * sizeof(std::uint64_t)).wait();
             shards_[s].queue->memcpy(
-                h_xbits + off, t2_phase_d_xbits_[s],
+                h_xbits.get() + off, t2_phase_d_xbits_[s],
                 c * sizeof(std::uint32_t)).wait();
         }
         off += c;
     }
     if (off != t2_total) {
-        sycl::free(h_mi,    alloc_q);
-        sycl::free(h_meta,  alloc_q);
-        sycl::free(h_xbits, alloc_q);
+        // h_mi / h_meta / h_xbits RAII-free on throw.
         throw std::runtime_error(
             "MultiGpuPlotPipeline::run_t3_phase: T2 outputs sum to "
             + std::to_string(off) + " entries but t2_total = "
             + std::to_string(t2_total));
     }
 
-    std::vector<std::uint32_t*> d_full_mi   (N, nullptr);
-    std::vector<std::uint64_t*> d_full_meta (N, nullptr);
-    std::vector<std::uint32_t*> d_full_xbits(N, nullptr);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_full_mi   (N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_full_meta (N);
+    std::vector<SyclDevicePtr<std::uint32_t>> d_full_xbits(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_full_mi   [s] = sycl::malloc_device<std::uint32_t>(t2_total, q);
-        d_full_meta [s] = sycl::malloc_device<std::uint64_t>(t2_total, q);
-        d_full_xbits[s] = sycl::malloc_device<std::uint32_t>(t2_total, q);
-        q.memcpy(d_full_mi   [s], h_mi,
+        d_full_mi   [s] = sycl_alloc_device_owned<std::uint32_t>(t2_total, q);
+        d_full_meta [s] = sycl_alloc_device_owned<std::uint64_t>(t2_total, q);
+        d_full_xbits[s] = sycl_alloc_device_owned<std::uint32_t>(t2_total, q);
+        q.memcpy(d_full_mi   [s].get(), h_mi.get(),
                  t2_total * sizeof(std::uint32_t)).wait();
-        q.memcpy(d_full_meta [s], h_meta,
+        q.memcpy(d_full_meta [s].get(), h_meta.get(),
                  t2_total * sizeof(std::uint64_t)).wait();
-        q.memcpy(d_full_xbits[s], h_xbits,
+        q.memcpy(d_full_xbits[s].get(), h_xbits.get(),
                  t2_total * sizeof(std::uint32_t)).wait();
     }
-    sycl::free(h_mi,    alloc_q);
-    sycl::free(h_meta,  alloc_q);
-    sycl::free(h_xbits, alloc_q);
+    h_mi.reset();
+    h_meta.reset();
+    h_xbits.reset();
 
     // The bucket-partitioned T2 outputs are no longer needed.
     for (std::size_t s = 0; s < N; ++s) {
@@ -887,31 +982,32 @@ void MultiGpuPlotPipeline::run_t3_phase()
     // ---------- Step 2 — per-shard T3 match. ----------
     std::uint64_t const t3_cap = match_phase_capacity(k, t3p.num_section_bits);
 
-    std::vector<T3PairingGpu*>  d_t3_unsorted(N, nullptr);
-    std::vector<std::uint64_t*> d_t3_count   (N, nullptr);
-    std::vector<void*>          d_t3_temp    (N, nullptr);
+    std::vector<SyclDevicePtr<T3PairingGpu>>  d_t3_unsorted(N);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t3_count   (N);
+    std::vector<SyclDeviceVoid>               d_t3_temp    (N);
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t3_unsorted[s] = sycl::malloc_device<T3PairingGpu>(t3_cap, q);
-        d_t3_count   [s] = sycl::malloc_device<std::uint64_t>(1, q);
+        d_t3_unsorted[s] = sycl_alloc_device_owned<T3PairingGpu>(t3_cap, q);
+        d_t3_count   [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
         launch_t3_match_prepare(entry_.plot_id.data(), t3p,
-            d_full_mi[s], t2_total,
-            d_t3_count[s], nullptr, &tb, q);
-        d_t3_temp[s] = sycl::malloc_device(tb, q);
+            d_full_mi[s].get(), t2_total,
+            d_t3_count[s].get(), nullptr, &tb, q);
+        d_t3_temp[s] = SyclDeviceVoid(&q, sycl::malloc_device(tb, q));
         launch_t3_match_prepare(entry_.plot_id.data(), t3p,
-            d_full_mi[s], t2_total,
-            d_t3_count[s], d_t3_temp[s], &tb, q);
+            d_full_mi[s].get(), t2_total,
+            d_t3_count[s].get(), d_t3_temp[s].get(), &tb, q);
 
         std::uint32_t const bucket_begin = t3_partition[s];
         std::uint32_t const bucket_end   = t3_partition[s + 1];
 
         launch_t3_match_range(entry_.plot_id.data(), t3p,
-            d_full_meta[s], d_full_xbits[s], d_full_mi[s], t2_total,
-            d_t3_unsorted[s], d_t3_count[s],
-            t3_cap, d_t3_temp[s],
+            d_full_meta[s].get(), d_full_xbits[s].get(), d_full_mi[s].get(),
+            t2_total,
+            d_t3_unsorted[s].get(), d_t3_count[s].get(),
+            t3_cap, d_t3_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -919,7 +1015,8 @@ void MultiGpuPlotPipeline::run_t3_phase()
     std::vector<std::uint64_t> shard_count(N, 0);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t3_count[s], sizeof(std::uint64_t)).wait();
+        q.memcpy(&shard_count[s], d_t3_count[s].get(),
+                 sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t3_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t3_phase: shard "
@@ -929,13 +1026,13 @@ void MultiGpuPlotPipeline::run_t3_phase()
         }
     }
 
+    // Early-release the heavy intermediates.
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        sycl::free(d_t3_temp   [s], q);
-        sycl::free(d_t3_count  [s], q);
-        sycl::free(d_full_mi   [s], q);
-        sycl::free(d_full_meta [s], q);
-        sycl::free(d_full_xbits[s], q);
+        d_t3_temp   [s].reset();
+        d_t3_count  [s].reset();
+        d_full_mi   [s].reset();
+        d_full_meta [s].reset();
+        d_full_xbits[s].reset();
     }
 
     // ---------- Step 3 — distributed sort by proof_fragment. ----------
@@ -946,19 +1043,19 @@ void MultiGpuPlotPipeline::run_t3_phase()
     for (auto c : shard_count) t3_total += c;
 
     std::uint64_t const sort_cap = t3_total;
-    std::vector<std::uint64_t*> d_t3_frags_sorted(N, nullptr);
+    std::vector<SyclDevicePtr<std::uint64_t>> d_t3_frags_sorted(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t3_frags_sorted[s] = sycl::malloc_device<std::uint64_t>(sort_cap, q);
+        d_t3_frags_sorted[s] = sycl_alloc_device_owned<std::uint64_t>(sort_cap, q);
     }
 
     std::vector<DistributedSortKeysU64Shard> sort_shards(N);
     for (std::size_t s = 0; s < N; ++s) {
         sort_shards[s].queue        = shards_[s].queue;
         sort_shards[s].keys_in      =
-            reinterpret_cast<std::uint64_t*>(d_t3_unsorted[s]);
+            reinterpret_cast<std::uint64_t*>(d_t3_unsorted[s].get());
         sort_shards[s].count        = shard_count[s];
-        sort_shards[s].keys_out     = d_t3_frags_sorted[s];
+        sort_shards[s].keys_out     = d_t3_frags_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
     }
@@ -968,20 +1065,22 @@ void MultiGpuPlotPipeline::run_t3_phase()
     launch_sort_keys_u64_distributed(
         nullptr, scratch_bytes, sort_shards,
         /*begin_bit=*/0, /*end_bit=*/t3_end_bit, transport());
-    void* d_scratch = scratch_bytes
-        ? sycl::malloc_device(scratch_bytes, *shards_[0].queue) : nullptr;
+    SyclDeviceVoid d_scratch;
+    if (scratch_bytes) {
+        d_scratch = SyclDeviceVoid(shards_[0].queue,
+            sycl::malloc_device(scratch_bytes, *shards_[0].queue));
+    }
     launch_sort_keys_u64_distributed(
-        d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
+        d_scratch.get() ? d_scratch.get() : reinterpret_cast<void*>(std::uintptr_t{1}),
         scratch_bytes, sort_shards,
         /*begin_bit=*/0, /*end_bit=*/t3_end_bit, transport());
-    if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
+    d_scratch.reset();
+
+    // Free unsorted T3 (sort already wrote into d_t3_frags_sorted).
+    for (std::size_t s = 0; s < N; ++s) d_t3_unsorted[s].reset();
 
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::free(d_t3_unsorted[s], *shards_[s].queue);
-    }
-
-    for (std::size_t s = 0; s < N; ++s) {
-        t3_phase_d_frags_[s] = d_t3_frags_sorted[s];
+        t3_phase_d_frags_[s] = d_t3_frags_sorted[s].release();
         t3_phase_count_  [s] = sort_shards[s].out_count;
     }
 
