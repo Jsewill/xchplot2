@@ -735,6 +735,36 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     return res;
 }
 
+// Phase 1 scaffold: opt-in single-plot multi-GPU dispatch. The
+// design proper lives in docs/multi-gpu-single-plot-*.md; this entry
+// point reserves the API and errors clearly for N > 1 until the
+// partition + multi-GPU sort machinery lands in Phase 2.
+//
+// Caller invariants (enforced in run_batch before this is called):
+//   - opts.shard_plot is true
+//   - device_ids.size() > 1
+//   - entries is non-empty
+BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
+                              BatchOptions const& opts,
+                              std::vector<int> const& device_ids)
+{
+    (void)entries;
+    (void)opts;
+    char const* strategy = opts.shard_strategy.empty()
+        ? "bucket"
+        : opts.shard_strategy.c_str();
+    throw std::runtime_error(std::string(
+        "--shard-plot is currently a scaffold (Phase 1): the dispatch "
+        "wiring is in place but the multi-GPU sharded pipeline "
+        "(strategy='") + strategy + "', " +
+        std::to_string(device_ids.size()) +
+        " devices) hasn't been implemented yet. To run the existing "
+        "multi-plot work-queue (one plot per device, round-robin), "
+        "drop the --shard-plot flag — `--devices all` or `--devices "
+        "0,1,...` keep working as before. "
+        "See docs/multi-gpu-single-plot-*.md for the planned design.");
+}
+
 } // namespace
 
 BatchResult run_batch(std::vector<BatchEntry> const& entries,
@@ -789,6 +819,20 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     }
 
     auto const t_start = std::chrono::steady_clock::now();
+
+    // Single-plot-multi-GPU dispatch (opt in via --shard-plot). Each
+    // plot runs across all selected devices as a "team" instead of
+    // distributing plots between independent workers. Phase 1 ships
+    // the surface area only — N=1 falls through to the existing
+    // single-GPU path (a no-op equivalent), N > 1 throws a clear
+    // error until Phase 2 lands the spatial / bucket partition.
+    // See docs/multi-gpu-single-plot-*.md.
+    if (opts.shard_plot && device_ids.size() > 1) {
+        BatchResult r = run_batch_sharded(entries, opts, device_ids);
+        r.total_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        return r;
+    }
 
     // Fast path: zero-config default or one explicit id. Runs on the
     // caller thread — identical control flow to pre-multi-GPU except

@@ -88,6 +88,16 @@ void print_usage(char const* prog)
         << "                                      is 1-2 orders of magnitude slower\n"
         << "                                      than GPU; intended for GPU-less\n"
         << "                                      hosts or as an extra worker.\n"
+        << "    --shard-plot                    : EXPERIMENTAL — opt in to single-plot\n"
+        << "                                      multi-GPU. Each plot is processed by\n"
+        << "                                      ALL --devices cooperatively (one plot\n"
+        << "                                      at a time, sharded across GPUs)\n"
+        << "                                      instead of the default work-queue\n"
+        << "                                      (one plot per GPU). Phase 1 ships\n"
+        << "                                      the surface area only; N>1 throws\n"
+        << "                                      until the partition + multi-GPU sort\n"
+        << "                                      land. Drop the flag for the existing\n"
+        << "                                      multi-plot behaviour.\n"
         << "    --tier plain|compact|minimal|auto : force streaming pipeline tier\n"
         << "                                      when GPU pool doesn't fit. plain =\n"
         << "                                      ~7.24 GB floor (k=28), faster.\n"
@@ -337,6 +347,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--skip-existing")               opts.skip_existing = true;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
             else if (a == "--cpu")                         opts.include_cpu = true;
+            else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
@@ -509,6 +520,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
+        bool plot_shard_plot      = false;
         std::string plot_streaming_tier;
 
         for (int i = 2; i < argc; ++i) {
@@ -536,6 +548,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--skip-existing")           skip_existing = true;
             else if  (a == "--continue-on-error")       continue_on_error = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
+            else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
@@ -712,6 +725,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.device_ids        = plot_device_ids;
             opts.use_all_devices   = plot_use_all_devices;
             opts.include_cpu       = plot_include_cpu;
+            opts.shard_plot        = plot_shard_plot;
             opts.streaming_tier    = plot_streaming_tier;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written

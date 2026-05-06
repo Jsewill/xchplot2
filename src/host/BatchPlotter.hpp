@@ -75,6 +75,23 @@ struct BatchResult {
 //                       else compact). Equivalent to XCHPLOT2_STREAMING_TIER
 //                       env var but settable via --tier on the CLI; the
 //                       struct field takes precedence over the env var.
+//   shard_plot        — opt in to single-plot multi-GPU mode. Default
+//                       (false) keeps the existing work-queue dispatch:
+//                       N workers, one plot each, round-robin. With
+//                       shard_plot=true, the workers form a "team" and
+//                       run plots one at a time, each owning a shard
+//                       of every plot. Phase 1 scaffold lands the
+//                       option but only supports N=1 (no-op fall-through
+//                       to single-GPU); N > 1 throws a clear error
+//                       until later phases implement the real sharding.
+//                       See docs/multi-gpu-single-plot-*.md for the
+//                       design.
+//   shard_strategy    — partition strategy when shard_plot is on.
+//                       Reserved for the multi-GPU work; "bucket" is
+//                       the planned default (output-bucket partition
+//                       with distributed radix sort). "section_l" is
+//                       the alternative (input-section partition with
+//                       gather-sort-scatter). Ignored when N=1.
 struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
@@ -83,6 +100,8 @@ struct BatchOptions {
     bool use_all_devices   = false;
     bool include_cpu       = false;
     std::string streaming_tier;
+    bool shard_plot        = false;
+    std::string shard_strategy = "bucket";
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
