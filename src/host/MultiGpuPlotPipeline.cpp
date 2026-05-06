@@ -16,12 +16,83 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace pos2gpu {
+
+namespace {
+
+// Partition `num_buckets` across the shards proportional to their
+// weights. Returns a vector of size N+1 where shard s owns the range
+// [partition[s], partition[s+1]). Boundary rounding is to the nearest
+// integer with a clamp to ensure each shard has at least one bucket
+// (otherwise a near-zero weight would produce an empty range and the
+// kernel launch would early-exit, leaving that shard idle but the
+// distributed sort still expecting non-zero data — a wedge). The last
+// boundary is always exactly num_buckets.
+std::vector<std::uint32_t> compute_bucket_partition(
+    std::vector<MultiGpuShardContext> const& shards,
+    std::uint32_t num_buckets)
+{
+    std::size_t const N = shards.size();
+    if (N == 0) {
+        throw std::runtime_error(
+            "compute_bucket_partition: shards.empty()");
+    }
+    if (num_buckets < N) {
+        throw std::runtime_error(
+            "compute_bucket_partition: num_buckets ("
+            + std::to_string(num_buckets) + ") < shard count ("
+            + std::to_string(N) + "). Cannot give every shard at "
+            "least one bucket; either reduce shard count or use a "
+            "(k, strength) producing more buckets.");
+    }
+
+    double total = 0.0;
+    for (auto const& s : shards) {
+        if (!(s.weight > 0.0)) {
+            throw std::runtime_error(
+                "compute_bucket_partition: every shard must have a "
+                "positive weight (got " + std::to_string(s.weight)
+                + ").");
+        }
+        total += s.weight;
+    }
+
+    std::vector<std::uint32_t> partition(N + 1, 0);
+    double cum = 0.0;
+    for (std::size_t i = 0; i < N; ++i) {
+        cum += shards[i].weight;
+        std::uint32_t b = static_cast<std::uint32_t>(
+            std::round(cum / total * static_cast<double>(num_buckets)));
+        // Monotonic + at least one bucket per shard. The arithmetic
+        // above is monotonic but rounding can collide — clamp.
+        std::uint32_t const min_b = partition[i] + 1u;
+        if (b < min_b) b = min_b;
+        if (b > num_buckets) b = num_buckets;
+        partition[i + 1] = b;
+    }
+    // Force the last boundary exactly even after the clamp dance so
+    // every bucket is owned (no off-by-one in the last shard's range).
+    partition[N] = num_buckets;
+    if (partition[N] < partition[N - 1] + 1u) {
+        // The clamp earlier should have prevented this, but if it
+        // didn't (e.g. extreme weights with num_buckets == N), surface
+        // a clear error rather than launching with an empty range.
+        throw std::runtime_error(
+            "compute_bucket_partition: unable to give shard "
+            + std::to_string(N - 1) + " at least one bucket "
+            "(num_buckets=" + std::to_string(num_buckets)
+            + ", N=" + std::to_string(N) + ").");
+    }
+    return partition;
+}
+
+} // namespace
 
 MultiGpuPlotPipeline::MultiGpuPlotPipeline(
         BatchEntry const& entry,
@@ -260,14 +331,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
         (std::uint32_t{1} << t1p.num_section_bits) *
         (std::uint32_t{1} << t1p.num_match_key_bits);
 
-    if (num_buckets % N != 0) {
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t1_phase: T1 num_buckets ("
-            + std::to_string(num_buckets) + ") not divisible by shard "
-            "count (" + std::to_string(N) + "). Phase 2.3a requires a "
-            "clean bucket-aligned partition; Phase 2.4 will relax this "
-            "via uneven bucket assignment for heterogeneous rigs.");
-    }
+    auto const t1_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate sorted Xs across shards. ----------
     sycl::queue& alloc_q = *shards_[0].queue;
@@ -344,12 +408,8 @@ void MultiGpuPlotPipeline::run_t1_phase()
             d_full_xs[s], total_xs,
             d_t1_count[s], d_t1_temp[s], &tb, q);
 
-        std::uint32_t const bucket_begin =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s)     * num_buckets) / N);
-        std::uint32_t const bucket_end =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s + 1) * num_buckets) / N);
+        std::uint32_t const bucket_begin = t1_partition[s];
+        std::uint32_t const bucket_end   = t1_partition[s + 1];
 
         launch_t1_match_range(entry_.plot_id.data(), t1p,
             d_full_xs[s], total_xs,
@@ -472,13 +532,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
         (std::uint32_t{1} << t2p.num_section_bits) *
         (std::uint32_t{1} << t2p.num_match_key_bits);
 
-    if (num_buckets % N != 0) {
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t2_phase: T2 num_buckets ("
-            + std::to_string(num_buckets) + ") not divisible by shard "
-            "count (" + std::to_string(N) + "). Phase 2.3b requires a "
-            "clean bucket-aligned partition.");
-    }
+    auto const t2_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate T1 sorted streams. ----------
     std::uint64_t t1_total = 0;
@@ -567,12 +621,8 @@ void MultiGpuPlotPipeline::run_t2_phase()
             d_full_mi[s], t1_total,
             d_t2_count[s], d_t2_temp[s], &tb, q);
 
-        std::uint32_t const bucket_begin =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s)     * num_buckets) / N);
-        std::uint32_t const bucket_end =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s + 1) * num_buckets) / N);
+        std::uint32_t const bucket_begin = t2_partition[s];
+        std::uint32_t const bucket_end   = t2_partition[s + 1];
 
         launch_t2_match_range(entry_.plot_id.data(), t2p,
             d_full_meta[s], d_full_mi[s], t1_total,
@@ -700,13 +750,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
         (std::uint32_t{1} << t3p.num_section_bits) *
         (std::uint32_t{1} << t3p.num_match_key_bits);
 
-    if (num_buckets % N != 0) {
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t3_phase: T3 num_buckets ("
-            + std::to_string(num_buckets) + ") not divisible by shard "
-            "count (" + std::to_string(N) + "). Phase 2.3c requires a "
-            "clean bucket-aligned partition.");
-    }
+    auto const t3_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate T2 sorted streams. ----------
     std::uint64_t t2_total = 0;
@@ -803,12 +847,8 @@ void MultiGpuPlotPipeline::run_t3_phase()
             d_full_mi[s], t2_total,
             d_t3_count[s], d_t3_temp[s], &tb, q);
 
-        std::uint32_t const bucket_begin =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s)     * num_buckets) / N);
-        std::uint32_t const bucket_end =
-            static_cast<std::uint32_t>(
-                (static_cast<std::uint64_t>(s + 1) * num_buckets) / N);
+        std::uint32_t const bucket_begin = t3_partition[s];
+        std::uint32_t const bucket_end   = t3_partition[s + 1];
 
         launch_t3_match_range(entry_.plot_id.data(), t3p,
             d_full_meta[s], d_full_xbits[s], d_full_mi[s], t2_total,

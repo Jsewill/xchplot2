@@ -27,9 +27,17 @@ struct XsCandidateGpu;  // forward-declared; full def in gpu/XsCandidateGpu.hpp
 
 // Per-shard runtime context. The caller (run_batch_sharded) constructs
 // these — one per device id passed via --devices.
+//
+// `weight` is the relative throughput of this shard for load-balancing
+// the per-phase match work across asymmetric rigs (e.g. a 4090 + a
+// 3060 host). Each match phase's bucket range for shard s is
+// proportional to weight[s] / sum(weights). Default 1.0 reproduces
+// the uniform partition behaviour from before Phase 2.4a; pass
+// non-uniform values to skew the work toward the faster cards.
 struct MultiGpuShardContext {
     sycl::queue* queue     = nullptr;
     int          device_id = -1;
+    double       weight    = 1.0;
 };
 
 class MultiGpuPlotPipeline {

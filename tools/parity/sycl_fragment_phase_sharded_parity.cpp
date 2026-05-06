@@ -235,15 +235,17 @@ std::vector<std::uint64_t> single_gpu_fragments(
     return out;
 }
 
-std::vector<std::uint64_t> sharded_fragments(pos2gpu::BatchEntry const& entry)
+std::vector<std::uint64_t> sharded_fragments(
+    pos2gpu::BatchEntry const& entry,
+    double w0 = 1.0, double w1 = 1.0)
 {
     auto& q = pos2gpu::sycl_backend::queue();
     pos2gpu::BatchOptions opts{};
     opts.shard_plot = true;
 
     std::vector<pos2gpu::MultiGpuShardContext> shards(2);
-    shards[0] = {&q, 0};
-    shards[1] = {&q, 0};
+    shards[0] = {&q, 0, w0};
+    shards[1] = {&q, 0, w1};
 
     pos2gpu::MultiGpuPlotPipeline pipeline(entry, opts, std::move(shards));
     pipeline.run();  // through fragment phase
@@ -252,7 +254,8 @@ std::vector<std::uint64_t> sharded_fragments(pos2gpu::BatchEntry const& entry)
     return std::vector<std::uint64_t>(span.begin(), span.end());
 }
 
-bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
+bool run_one(int k, bool testnet, std::uint8_t plot_id_seed,
+             double w0 = 1.0, double w1 = 1.0)
 {
     pos2gpu::BatchEntry entry{};
     entry.k          = k;
@@ -266,7 +269,7 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
     }
 
     auto ref     = single_gpu_fragments(entry);
-    auto sharded = sharded_fragments  (entry);
+    auto sharded = sharded_fragments  (entry, w0, w1);
 
     std::sort(ref.begin(),     ref.end());
     std::sort(sharded.begin(), sharded.end());
@@ -278,10 +281,10 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
     bool const ok = size_ok && bytes_ok;
 
     std::printf(
-        "%s fragment-phase k=%d testnet=%d seed=%u  "
+        "%s fragment-phase k=%d testnet=%d seed=%u w=[%g,%g]  "
         "[count=%llu vs %llu  size=%d bytes=%d]\n",
         ok ? "PASS" : "FAIL", k, testnet ? 1 : 0,
-        static_cast<unsigned>(plot_id_seed),
+        static_cast<unsigned>(plot_id_seed), w0, w1,
         static_cast<unsigned long long>(ref.size()),
         static_cast<unsigned long long>(sharded.size()),
         size_ok ? 1 : 0, bytes_ok ? 1 : 0);
@@ -293,10 +296,25 @@ bool run_one(int k, bool testnet, std::uint8_t plot_id_seed)
 int main()
 {
     bool all_ok = true;
+    // Uniform weights — same coverage as before.
     for (int k : {18, 20, 22}) {
         for (bool testnet : {false, true}) {
             for (std::uint8_t seed : {7u, 31u}) {
                 all_ok = run_one(k, testnet, seed) && all_ok;
+            }
+        }
+    }
+    // Weighted partition (Phase 2.4a). Skewed [3.0, 1.0] gives shard 0
+    // 12 of 16 buckets at strength=2; [1.0, 3.0] flips the skew so the
+    // last-shard partition path is also exercised. Same multiset
+    // equivalence holds because match-phase replicates full input on
+    // every shard — the weighted bucket assignment only changes which
+    // shard emits which match, never the union.
+    for (int k : {18, 22}) {
+        for (bool testnet : {false}) {
+            for (std::uint8_t seed : {7u}) {
+                all_ok = run_one(k, testnet, seed, /*w0=*/3.0, /*w1=*/1.0) && all_ok;
+                all_ok = run_one(k, testnet, seed, /*w0=*/1.0, /*w1=*/3.0) && all_ok;
             }
         }
     }
