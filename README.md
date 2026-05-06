@@ -32,6 +32,14 @@ xchplot2 plot -k 28 -n 10 \
 # Multi-GPU — one worker per GPU, round-robin partition.
 # (`--devices all` adds a CPU worker too; `--devices gpu` sticks to GPUs.)
 xchplot2 plot ... --devices gpu
+
+# Single-plot multi-GPU (--shard-plot) — every selected device works
+# on the same plot in parallel instead of plotting independent files.
+# Use this for k > 32 working sets that don't fit a single card, or
+# rigs where one card is too small to plot solo. Per-shard weights
+# load-balance asymmetric pairs (e.g. 4090 + 3060). Phase 2.4b lands
+# the peer-copy fast path; opt-in via the SDK's BatchOptions.
+xchplot2 plot ... --devices 0,1 --shard-plot
 ```
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM

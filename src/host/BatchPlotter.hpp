@@ -108,6 +108,13 @@ struct BatchOptions {
     // single-GPU dev box (peer-on-same-context = ordinary device
     // memcpy); the win lands on real multi-GPU hosts where the SYCL
     // backend can route through NVLink/peer-PCIe.
+    //
+    // VRAM tradeoff: the Peer transport allocates per-source staging
+    // sized to the source shard's full input count (~1.6 GB/shard for
+    // u32_u32 at k=28; up to ~3.2 GB/shard for u32_u64+u32 in T2's
+    // sort). HostBounce keeps the same data on host-pinned memory
+    // instead — slower but easier on VRAM. Stay on HostBounce on
+    // tight-VRAM (<10 GB) cards at large k.
     bool prefer_peer_copy  = false;
 };
 

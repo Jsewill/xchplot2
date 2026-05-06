@@ -119,6 +119,12 @@ T* pinned_alloc(std::size_t n, sycl::queue& q)
 // non-deterministic (atomic completion order) but the multiset is
 // preserved.
 //
+// Implication for parity-test design: any consumer that compares
+// Peer-transport output byte-for-byte against single-GPU output will
+// see mismatches at same-key tie boundaries. Compare as a SET (sort
+// by full tuple before memcmp) — that's what the sycl_*_sharded
+// parity tests do.
+//
 // Each kernel is type-specific so the compiler emits direct memory
 // writes rather than going through templated indirection.
 // ---------------------------------------------------------------------

@@ -1,5 +1,42 @@
 // MultiGpuPlotPipeline.cpp — Phase 2.2 (Xs) + Phase 2.3a (T1) +
 // Phase 2.3b (T2) + Phase 2.3c (T3) + Phase 2.3d (fragment) impl.
+//
+// ---------------------------------------------------------------------
+// Architecture notes
+//
+// Replicate-full strategy. Every match phase (T1, T2, T3) currently
+// host-bounces the FULL output of the previous phase to every shard,
+// then runs match over the shard's assigned bucket subset. This is
+// simple and correct but uses ~N × phase_output bytes of VRAM total
+// (N = shard count). At k=28 with N=2 that's roughly 4 GB Xs +
+// 3.2 GB T1 + 3.2 GB T2 of replicated input, on top of the per-shard
+// match scratch. Tight on 12 GB cards once T2/T3 staging is also
+// live.
+//
+// Two ways to reduce, both significant work and tracked here so the
+// next pass at sharded perf knows where to look:
+//   (a) Section-pair fetch — a shard processing buckets in section_l
+//       only needs section_l's rows + matching_section(section_l)'s
+//       rows, not the full input. At num_sections=4 that's a 2x
+//       reduction in replicated data.
+//   (b) Shared-context single-pointer reads — on backends that share
+//       a primary context across devices (AdaptiveCpp's CUDA backend
+//       on a single host fits this), every shard could read the same
+//       device pointer instead of allocating its own copy. CUDA's
+//       peer access handles the cross-device fetch transparently.
+//       Trade-off: the source-device's VRAM bandwidth is shared by
+//       all consumers.
+//
+// Distributed sort destination assignment stays uniform (the
+// `bucket_of_u32` formula in SortDistributed.cpp). Phase 2.4a
+// introduced weighted bucket assignment for the match phases but did
+// NOT propagate to the sort destination — that's deliberate, because
+// the host-bounce replication makes the match input the same on
+// every shard regardless of which shard "received" it from the sort.
+// Only the emit-side weighting matters for load balancing. If the
+// replicate-full strategy ever changes (see (a)/(b) above), the sort
+// destination would need to follow the weight too.
+// ---------------------------------------------------------------------
 
 #include "host/MultiGpuPlotPipeline.hpp"
 
