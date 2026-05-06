@@ -581,6 +581,7 @@ add_library(pos2_gpu_host STATIC
     src/host/BatchPlotter.cpp
     src/host/CpuPlotter.cpp
     src/host/Cancel.cpp
+    src/host/MultiGpuPlotPipeline.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -770,6 +771,28 @@ endif()
 target_include_directories(sycl_sort_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Phase 2.2 — sharded Xs-phase parity test. Confirms
+# MultiGpuPlotPipeline's run_xs_phase produces a union of per-shard
+# packed XsCandidateGpu outputs that's byte-identical to single-GPU
+# launch_xs_gen + sort + launch_xs_pack. Uses N=2 virtual shards on
+# the same physical queue so it runs on the dev box without real
+# multi-GPU hardware.
+add_executable(sycl_xs_phase_sharded_parity
+    tools/parity/sycl_xs_phase_sharded_parity.cpp)
+add_sycl_to_target(TARGET sycl_xs_phase_sharded_parity
+                   SOURCES tools/parity/sycl_xs_phase_sharded_parity.cpp)
+target_link_libraries(sycl_xs_phase_sharded_parity
+    PRIVATE pos2_gpu pos2_gpu_host)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_xs_phase_sharded_parity
+                   PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_xs_phase_sharded_parity
+                           PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_xs_phase_sharded_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_xs_phase_sharded_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Phase 2.0b — distributed sort fast-path regression test. Confirms

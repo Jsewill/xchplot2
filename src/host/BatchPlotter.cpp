@@ -5,8 +5,10 @@
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
+#include "host/MultiGpuPlotPipeline.hpp"  // --shard-plot path (Phase 2.2+)
 #include "host/PlotFileWriterParallel.hpp"
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
+#include "gpu/SyclBackend.hpp"  // sycl_backend::queue, set_current_device_id
 
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
@@ -735,10 +737,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     return res;
 }
 
-// Phase 1 scaffold: opt-in single-plot multi-GPU dispatch. The
-// design proper lives in docs/multi-gpu-single-plot-*.md; this entry
-// point reserves the API and errors clearly for N > 1 until the
-// partition + multi-GPU sort machinery lands in Phase 2.
+// Single-plot multi-GPU dispatch. Each plot in `entries` runs through
+// the sharded pipeline using all of `device_ids` cooperatively.
+// Phase 2.2 implements the Xs phase end-to-end; Phase 2.3+ wires
+// up T1/T2/T3 matches and fragment serialize. The pipeline class
+// throws a clear "Phase 2.3 not yet implemented" message when run()
+// reaches the T1 match step until that phase lands.
 //
 // Caller invariants (enforced in run_batch before this is called):
 //   - opts.shard_plot is true
@@ -748,21 +752,47 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
                               BatchOptions const& opts,
                               std::vector<int> const& device_ids)
 {
-    (void)entries;
-    (void)opts;
-    char const* strategy = opts.shard_strategy.empty()
-        ? "bucket"
-        : opts.shard_strategy.c_str();
-    throw std::runtime_error(std::string(
-        "--shard-plot is currently a scaffold (Phase 1): the dispatch "
-        "wiring is in place but the multi-GPU sharded pipeline "
-        "(strategy='") + strategy + "', " +
-        std::to_string(device_ids.size()) +
-        " devices) hasn't been implemented yet. To run the existing "
-        "multi-plot work-queue (one plot per device, round-robin), "
-        "drop the --shard-plot flag — `--devices all` or `--devices "
-        "0,1,...` keep working as before. "
-        "See docs/multi-gpu-single-plot-*.md for the planned design.");
+    BatchResult res;
+    auto const t_start = std::chrono::steady_clock::now();
+
+    // Per-shard SYCL queues. Phase 2.2 + 2.3 use the sycl_backend
+    // queue() factory; in real multi-GPU runs each shard's thread sets
+    // its current_device_id before calling queue() so each ends up
+    // with a queue bound to its target device. For the dev-box
+    // single-GPU case (where the same device id is used N times for
+    // testing) all shards point at the same physical queue.
+    std::vector<sycl::queue*> shard_queues;
+    shard_queues.reserve(device_ids.size());
+    for (int dev_id : device_ids) {
+        sycl_backend::set_current_device_id(dev_id);
+        shard_queues.push_back(&sycl_backend::queue());
+    }
+    std::vector<MultiGpuShardContext> shard_ctx;
+    shard_ctx.reserve(device_ids.size());
+    for (std::size_t k = 0; k < device_ids.size(); ++k) {
+        shard_ctx.push_back({shard_queues[k], device_ids[k]});
+    }
+
+    for (BatchEntry const& entry : entries) {
+        try {
+            MultiGpuPlotPipeline pipeline(entry, opts, shard_ctx);
+            pipeline.run();
+            ++res.plots_written;
+        } catch (std::exception const& e) {
+            std::fprintf(stderr,
+                "[shard-plot] FAILED for plot '%s': %s\n",
+                entry.out_name.c_str(), e.what());
+            ++res.plots_failed;
+            if (!opts.continue_on_error) {
+                res.total_wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                return res;
+            }
+        }
+    }
+    res.total_wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+    return res;
 }
 
 } // namespace
