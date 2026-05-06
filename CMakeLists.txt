@@ -859,6 +859,27 @@ target_compile_features(sycl_t3_phase_sharded_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_t3_phase_sharded_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Phase 2.3d — sharded fragment-phase parity test. Drives the full
+# pipeline.run() (Xs through fragment phase) and verifies the host-
+# bounced concatenated fragment span is multiset-equivalent to single-
+# GPU. Validates the D2H + concat in run_fragment_phase on top of the
+# T3 phase parity.
+add_executable(sycl_fragment_phase_sharded_parity
+    tools/parity/sycl_fragment_phase_sharded_parity.cpp)
+add_sycl_to_target(TARGET sycl_fragment_phase_sharded_parity
+                   SOURCES tools/parity/sycl_fragment_phase_sharded_parity.cpp)
+target_link_libraries(sycl_fragment_phase_sharded_parity
+    PRIVATE pos2_gpu pos2_gpu_host)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_fragment_phase_sharded_parity
+                   PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_fragment_phase_sharded_parity
+                           PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_fragment_phase_sharded_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_fragment_phase_sharded_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 2.0b — distributed sort fast-path regression test. Confirms
 # launch_sort_*_distributed with shards.size() == 1 produces byte-
 # identical output to the single-shard sort, and that N>1 throws the

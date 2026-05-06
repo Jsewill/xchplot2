@@ -1,5 +1,5 @@
 // MultiGpuPlotPipeline.cpp — Phase 2.2 (Xs) + Phase 2.3a (T1) +
-// Phase 2.3b (T2) + Phase 2.3c (T3) implementation.
+// Phase 2.3b (T2) + Phase 2.3c (T3) + Phase 2.3d (fragment) impl.
 
 #include "host/MultiGpuPlotPipeline.hpp"
 
@@ -90,6 +90,11 @@ void MultiGpuPlotPipeline::free_phase_outputs()
             sycl::free(t3_phase_d_frags_[k], *shards_[k].queue);
             t3_phase_d_frags_[k] = nullptr;
         }
+    }
+    if (h_fragments_) {
+        sycl::free(h_fragments_, *shards_[0].queue);
+        h_fragments_     = nullptr;
+        fragments_count_ = 0;
     }
 }
 
@@ -893,13 +898,63 @@ void MultiGpuPlotPipeline::run_t3_phase()
 }
 void MultiGpuPlotPipeline::run_fragment_phase()
 {
-    throw std::runtime_error(
-        "MultiGpuPlotPipeline: fragment phase is not yet implemented "
-        "for the sharded path (Phase 2.3d). Phase 2.3c ships T3 "
-        "end-to-end (replicate T2 + per-shard match + distributed u64 "
-        "fragment sort); the fragment serialize fan-out + file write "
-        "concat are next. See "
-        "docs/multi-gpu-single-plot-alt-bucket-partition.md.");
+    // Phase 2.3d — D2H fan-in + concatenate.
+    //
+    // Each shard's t3_phase_d_frags_[s] holds proof_fragments whose low
+    // 2*k bits fall in [s/N, (s+1)/N) of the 2k-bit value-space, sorted
+    // within that range. Concatenating per-shard outputs in shard-id
+    // order reproduces the single-GPU low-2k-bit-sorted layout —
+    // byte-for-byte modulo the same-low-2k-bits tie order, which is
+    // already non-deterministic between runs (the radix sort is stable
+    // but the upstream T3 match emits via atomic cursor).
+    //
+    // Lands in a single pinned-host buffer h_fragments_ that survives
+    // until run() returns; caller (BatchPlotter) feeds it straight to
+    // write_plot_file_parallel, then the pipeline destructor frees it.
+
+    std::size_t const N = shards_.size();
+    sycl::queue& alloc_q = *shards_[0].queue;
+
+    std::uint64_t total = 0;
+    for (auto c : t3_phase_count_) total += c;
+
+    if (h_fragments_) {
+        sycl::free(h_fragments_, alloc_q);
+        h_fragments_     = nullptr;
+        fragments_count_ = 0;
+    }
+    if (total == 0) return;
+
+    h_fragments_ = sycl::malloc_host<std::uint64_t>(total, alloc_q);
+
+    std::uint64_t off = 0;
+    for (std::size_t s = 0; s < N; ++s) {
+        std::uint64_t const c = t3_phase_count_[s];
+        if (c > 0) {
+            shards_[s].queue->memcpy(
+                h_fragments_ + off, t3_phase_d_frags_[s],
+                c * sizeof(std::uint64_t)).wait();
+        }
+        off += c;
+    }
+    if (off != total) {
+        sycl::free(h_fragments_, alloc_q);
+        h_fragments_     = nullptr;
+        fragments_count_ = 0;
+        throw std::runtime_error(
+            "MultiGpuPlotPipeline::run_fragment_phase: per-shard counts "
+            "sum to " + std::to_string(off) + " but expected "
+            + std::to_string(total));
+    }
+    fragments_count_ = total;
+
+    // Per-shard device fragments are no longer needed.
+    for (std::size_t s = 0; s < N; ++s) {
+        if (t3_phase_d_frags_[s]) {
+            sycl::free(t3_phase_d_frags_[s], *shards_[s].queue);
+            t3_phase_d_frags_[s] = nullptr;
+        }
+    }
 }
 
 } // namespace pos2gpu

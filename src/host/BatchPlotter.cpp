@@ -775,8 +775,28 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
 
     for (BatchEntry const& entry : entries) {
         try {
+            // Resolve target path before running so an out_dir failure
+            // surfaces before the (~minutes) plot work.
+            auto full_path = std::filesystem::path(entry.out_dir) / entry.out_name;
+            std::filesystem::create_directories(entry.out_dir);
+
             MultiGpuPlotPipeline pipeline(entry, opts, shard_ctx);
             pipeline.run();
+
+            std::vector<uint8_t> memo_bytes = entry.memo;
+            if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+
+            write_plot_file_parallel(
+                full_path.string(),
+                pipeline.fragments(),
+                entry.plot_id.data(),
+                static_cast<uint8_t>(entry.k),
+                static_cast<uint8_t>(entry.strength),
+                entry.testnet ? uint8_t{1} : uint8_t{0},
+                static_cast<uint16_t>(entry.plot_index),
+                static_cast<uint8_t>(entry.meta_group),
+                std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+
             ++res.plots_written;
         } catch (std::exception const& e) {
             std::fprintf(stderr,

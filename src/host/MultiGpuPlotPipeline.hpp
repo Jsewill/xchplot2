@@ -16,6 +16,7 @@
 #include "host/BatchPlotter.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include <sycl/sycl.hpp>
@@ -58,6 +59,17 @@ public:
 
     // Run Xs + T1 + T2 + T3 (Phase 2.3c). Public for the T3-phase parity test.
     void run_xs_then_t1_then_t2_then_t3_phase();
+
+    // After run() completes, returns a span over the concatenated host
+    // buffer of sorted T3 proof_fragments — same shape as
+    // GpuPipelineResult::fragments(), suitable to feed straight into
+    // write_plot_file_parallel. Buffer lifetime is tied to the pipeline
+    // object; freed by the destructor.
+    std::span<std::uint64_t const> fragments() const noexcept
+    {
+        return {h_fragments_, fragments_count_};
+    }
+    std::uint64_t fragments_count() const noexcept { return fragments_count_; }
 
     // Per-shard Xs phase outputs. shard k's d_xs holds a packed
     // XsCandidateGpu array sized xs_phase_count(k). Concatenating in
@@ -126,6 +138,12 @@ private:
 
     std::vector<std::uint64_t*>   t3_phase_d_frags_;
     std::vector<std::uint64_t>    t3_phase_count_;
+
+    // Pinned-host concatenated fragment buffer produced by
+    // run_fragment_phase. The pinning queue is shards_[0].queue (any
+    // queue works; pinned host memory is process-wide).
+    std::uint64_t* h_fragments_     = nullptr;
+    std::uint64_t  fragments_count_ = 0;
 
     void run_t1_phase();
     void run_t2_phase();
