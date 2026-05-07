@@ -667,9 +667,18 @@ void MultiGpuPlotPipeline::run_t1_phase()
         for (auto& e : evts) e.wait();
     } else {
         // Host-bounce path: parallel D2H into a single pinned-host
-        // bounce buffer, parallel H2D fan-out. The pinned buffer is
-        // pooled when shards_[0].pool is attached so consecutive plots
-        // (and the next match phase) reuse the page-locked range.
+        // bounce buffer, then per-(receiver, source) H2D copies that
+        // each chain on the matching D2H event. The fan-out is N×N
+        // small copies (each is one source's slice into one receiver's
+        // d_full_xs), but each copy waits only on its own source's D2H
+        // — so a receiver starts pulling source 0's slice the moment
+        // source 0 lands on host while source 1's D2H is still in
+        // flight. Total bytes moved is identical to the single-large-
+        // H2D-per-receiver shape; the gain is pipelining D2H against
+        // H2D instead of draining one before the other.
+        // The pinned buffer is pooled when shards_[0].pool is attached
+        // so consecutive plots (and the next match phase) reuse the
+        // page-locked range.
         XsCandidateGpu* h_full_ptr = nullptr;
         SyclHostPtr<XsCandidateGpu> h_full_owned;
         if (shards_[0].pool) {
@@ -689,15 +698,20 @@ void MultiGpuPlotPipeline::run_t1_phase()
                 h_full_ptr + shard_off[s], xs_phase_d_xs_[s],
                 sizeof(XsCandidateGpu) * c);
         }
-        for (std::size_t s = 0; s < N; ++s) {
-            if (xs_phase_count_[s] > 0) d2h[s].wait();
-        }
 
-        std::vector<sycl::event> h2d(N);
-        for (std::size_t s = 0; s < N; ++s) {
-            sycl::queue& q = *shards_[s].queue;
-            h2d[s] = q.memcpy(d_full_xs[s].get(), h_full_ptr,
-                              sizeof(XsCandidateGpu) * total_xs);
+        std::vector<sycl::event> h2d;
+        h2d.reserve(N * N);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = xs_phase_count_[s];
+                if (c == 0) continue;
+                h2d.push_back(q.memcpy(
+                    d_full_xs[r].get() + shard_off[s],
+                    h_full_ptr        + shard_off[s],
+                    sizeof(XsCandidateGpu) * c,
+                    d2h[s]));
+            }
         }
         for (auto& e : h2d) e.wait();
         // h_full_owned RAII-frees if pool was unavailable.
@@ -978,7 +992,8 @@ void MultiGpuPlotPipeline::run_t2_phase()
             h_meta = h_meta_owned.get();
         }
 
-        // D2H — submit per-shard pulls concurrently, then wait.
+        // D2H — submit per-source pulls concurrently. No drain;
+        // per-(receiver, source) H2Ds below chain on each d2h_*[s].
         std::vector<sycl::event> d2h_mi(N);
         std::vector<sycl::event> d2h_meta(N);
         for (std::size_t s = 0; s < N; ++s) {
@@ -991,24 +1006,33 @@ void MultiGpuPlotPipeline::run_t2_phase()
                 h_meta + shard_off[s], t1_phase_d_meta_[s],
                 c * sizeof(std::uint64_t));
         }
-        for (std::size_t s = 0; s < N; ++s) {
-            if (t1_phase_count_[s] == 0) continue;
-            d2h_mi  [s].wait();
-            d2h_meta[s].wait();
-        }
 
-        // H2D fan-out — submit per-shard, then wait.
-        std::vector<sycl::event> h2d_mi(N);
-        std::vector<sycl::event> h2d_meta(N);
-        for (std::size_t s = 0; s < N; ++s) {
-            sycl::queue& q = *shards_[s].queue;
-            h2d_mi  [s] = q.memcpy(d_full_mi  [s].get(), h_mi,
-                                   t1_total * sizeof(std::uint32_t));
-            h2d_meta[s] = q.memcpy(d_full_meta[s].get(), h_meta,
-                                   t1_total * sizeof(std::uint64_t));
+        // H2D fan-out — per-(receiver, source) slice copies that wait
+        // only on the matching source's D2H. Receiver r starts pulling
+        // source 0's slice the moment source 0 lands on host while
+        // other sources are still in flight. Total bytes moved is
+        // identical to the single-large-H2D-per-receiver shape; the
+        // gain is pipelining D2H against H2D.
+        std::vector<sycl::event> h2d;
+        h2d.reserve(N * N * 2);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = t1_phase_count_[s];
+                if (c == 0) continue;
+                h2d.push_back(q.memcpy(
+                    d_full_mi  [r].get() + shard_off[s],
+                    h_mi                 + shard_off[s],
+                    c * sizeof(std::uint32_t),
+                    d2h_mi  [s]));
+                h2d.push_back(q.memcpy(
+                    d_full_meta[r].get() + shard_off[s],
+                    h_meta               + shard_off[s],
+                    c * sizeof(std::uint64_t),
+                    d2h_meta[s]));
+            }
         }
-        for (auto& e : h2d_mi)   e.wait();
-        for (auto& e : h2d_meta) e.wait();
+        for (auto& e : h2d) e.wait();
     }
 
     // The bucket-partitioned T1 outputs are no longer needed.
@@ -1289,6 +1313,8 @@ void MultiGpuPlotPipeline::run_t3_phase()
             h_xbits = h_xbits_owned.get();
         }
 
+        // D2H — submit per-source pulls concurrently. No drain;
+        // per-(receiver, source) H2Ds below chain on each d2h_*[s].
         std::vector<sycl::event> d2h_mi(N);
         std::vector<sycl::event> d2h_meta(N);
         std::vector<sycl::event> d2h_xbits(N);
@@ -1305,28 +1331,35 @@ void MultiGpuPlotPipeline::run_t3_phase()
                 h_xbits + shard_off[s], t2_phase_d_xbits_[s],
                 c * sizeof(std::uint32_t));
         }
-        for (std::size_t s = 0; s < N; ++s) {
-            if (t2_phase_count_[s] == 0) continue;
-            d2h_mi   [s].wait();
-            d2h_meta [s].wait();
-            d2h_xbits[s].wait();
-        }
 
-        std::vector<sycl::event> h2d_mi(N);
-        std::vector<sycl::event> h2d_meta(N);
-        std::vector<sycl::event> h2d_xbits(N);
-        for (std::size_t s = 0; s < N; ++s) {
-            sycl::queue& q = *shards_[s].queue;
-            h2d_mi   [s] = q.memcpy(d_full_mi   [s].get(), h_mi,
-                                    t2_total * sizeof(std::uint32_t));
-            h2d_meta [s] = q.memcpy(d_full_meta [s].get(), h_meta,
-                                    t2_total * sizeof(std::uint64_t));
-            h2d_xbits[s] = q.memcpy(d_full_xbits[s].get(), h_xbits,
-                                    t2_total * sizeof(std::uint32_t));
+        // H2D fan-out — per-(receiver, source) slice copies that wait
+        // only on the matching source's D2H. See run_t1_phase for the
+        // pipelining rationale.
+        std::vector<sycl::event> h2d;
+        h2d.reserve(N * N * 3);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = t2_phase_count_[s];
+                if (c == 0) continue;
+                h2d.push_back(q.memcpy(
+                    d_full_mi   [r].get() + shard_off[s],
+                    h_mi                  + shard_off[s],
+                    c * sizeof(std::uint32_t),
+                    d2h_mi   [s]));
+                h2d.push_back(q.memcpy(
+                    d_full_meta [r].get() + shard_off[s],
+                    h_meta                + shard_off[s],
+                    c * sizeof(std::uint64_t),
+                    d2h_meta [s]));
+                h2d.push_back(q.memcpy(
+                    d_full_xbits[r].get() + shard_off[s],
+                    h_xbits               + shard_off[s],
+                    c * sizeof(std::uint32_t),
+                    d2h_xbits[s]));
+            }
         }
-        for (auto& e : h2d_mi)    e.wait();
-        for (auto& e : h2d_meta)  e.wait();
-        for (auto& e : h2d_xbits) e.wait();
+        for (auto& e : h2d) e.wait();
     }
 
     // The bucket-partitioned T2 outputs are no longer needed.
