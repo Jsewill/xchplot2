@@ -1453,23 +1453,57 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // to
         //   d_t1_meta (2080) + d_t1_merged_vals (1040)
         //   + d_tile (cap/N × u64 = 520 at N=4) = ~3640 MB.
+        //
+        // Tiny tier: park d_t1_merged_vals on host before the gather
+        // loop, then H2D each tile's index slice into a small device
+        // buffer. Drops the merged_vals contribution from cap × u32
+        // (1040 MB at k=28) to cap/N × u32 (260 MB at N=4 / 130 MB at
+        // N=8). Combined with all other tiny chunks the gather peak
+        // approaches d_t1_meta's floor (~2080 MB at k=28).
         uint64_t const tile_max =
             (t1_count + uint64_t(t1_gather_N) - 1) / uint64_t(t1_gather_N);
         uint64_t* d_tile = nullptr;
+        uint32_t* h_t1_merged_vals = nullptr;
+        uint32_t* d_idx_tile       = nullptr;
+        if (scratch.tiny_mode) {
+            // D2H merged_vals to host pinned, free device, allocate
+            // small per-tile device staging for indices.
+            h_t1_merged_vals = static_cast<uint32_t*>(
+                sycl::malloc_host(t1_count * sizeof(uint32_t), q));
+            if (!h_t1_merged_vals)
+                throw std::runtime_error("sycl::malloc_host(h_t1_merged_vals) failed");
+            q.memcpy(h_t1_merged_vals, d_t1_merged_vals,
+                     t1_count * sizeof(uint32_t)).wait();
+            s_free(stats, d_t1_merged_vals);
+            d_t1_merged_vals = nullptr;
+            s_malloc(stats, d_idx_tile, tile_max * sizeof(uint32_t), "d_t1_merged_vals_tile");
+        }
         s_malloc(stats, d_tile, tile_max * sizeof(uint64_t), "d_t1_meta_sorted_tile");
         for (int n = 0; n < t1_gather_N; ++n) {
             uint64_t const tile_off = uint64_t(n) * tile_max;
             if (tile_off >= t1_count) break;
             uint64_t const tile_n = std::min(tile_max, t1_count - tile_off);
+            uint32_t const* src_idx = nullptr;
+            if (scratch.tiny_mode) {
+                q.memcpy(d_idx_tile, h_t1_merged_vals + tile_off,
+                         tile_n * sizeof(uint32_t)).wait();
+                src_idx = d_idx_tile;
+            } else {
+                src_idx = d_t1_merged_vals + tile_off;
+            }
             launch_gather_u64(
-                d_t1_meta, d_t1_merged_vals + tile_off,
+                d_t1_meta, src_idx,
                 d_tile, tile_n, q);
             q.memcpy(h_t1_meta + tile_off, d_tile,
                      tile_n * sizeof(uint64_t)).wait();
         }
         s_free(stats, d_tile);
+        if (scratch.tiny_mode) {
+            s_free(stats, d_idx_tile);
+            sycl::free(h_t1_merged_vals, q);
+        }
         s_free(stats, d_t1_meta);
-        s_free(stats, d_t1_merged_vals);
+        if (d_t1_merged_vals) s_free(stats, d_t1_merged_vals);
         // Tiny tier: skip the full-cap d_t1_meta_sorted rehydration. The
         // sliced T2 match path (per-section meta_l/meta_r H2D) reads
         // section-sized slices from h_t1_meta directly. Saves 2080 MB of
@@ -2134,8 +2168,29 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // gather peak at d_merged_vals (1040) + d_t2_xbits (1040) +
         // tile (260 at N=4) = ~2340 MB. Final rehydrate peak:
         // d_t2_meta_sorted (2080) + d_t2_xbits_sorted (1040) = 3120 MB.
+        //
+        // Tiny tier: also park d_merged_vals on host before the
+        // gathers, then H2D each tile's index slice into a small
+        // device buffer (reused across both gather passes). Drops the
+        // merged_vals contribution from cap × u32 (1040 MB at k=28) to
+        // tile cap × u32 (260 MB at N=4 / 130 MB at N=8) for the
+        // duration of each pass.
         uint64_t const tile_max =
             (t2_count + uint64_t(t2_gather_N) - 1) / uint64_t(t2_gather_N);
+
+        uint32_t* h_t2_merged_vals = nullptr;
+        uint32_t* d_t2_idx_tile    = nullptr;
+        if (scratch.tiny_mode) {
+            h_t2_merged_vals = static_cast<uint32_t*>(
+                sycl::malloc_host(t2_count * sizeof(uint32_t), q));
+            if (!h_t2_merged_vals)
+                throw std::runtime_error("sycl::malloc_host(h_t2_merged_vals) failed");
+            q.memcpy(h_t2_merged_vals, d_merged_vals,
+                     t2_count * sizeof(uint32_t)).wait();
+            s_free(stats, d_merged_vals);
+            d_merged_vals = nullptr;
+            s_malloc(stats, d_t2_idx_tile, tile_max * sizeof(uint32_t), "d_t2_merged_vals_tile");
+        }
 
         // --- Meta gather (tiled output → h_t2_meta) ---
         s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
@@ -2147,8 +2202,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 uint64_t const tile_off = uint64_t(n) * tile_max;
                 if (tile_off >= t2_count) break;
                 uint64_t const tile_n = std::min(tile_max, t2_count - tile_off);
+                uint32_t const* idx_src = nullptr;
+                if (scratch.tiny_mode) {
+                    q.memcpy(d_t2_idx_tile, h_t2_merged_vals + tile_off,
+                             tile_n * sizeof(uint32_t)).wait();
+                    idx_src = d_t2_idx_tile;
+                } else {
+                    idx_src = d_merged_vals + tile_off;
+                }
                 launch_gather_u64(
-                    d_t2_meta, d_merged_vals + tile_off,
+                    d_t2_meta, idx_src,
                     d_meta_tile, tile_n, q);
                 q.memcpy(h_t2_meta + tile_off, d_meta_tile,
                          tile_n * sizeof(uint64_t)).wait();
@@ -2167,8 +2230,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 uint64_t const tile_off = uint64_t(n) * tile_max;
                 if (tile_off >= t2_count) break;
                 uint64_t const tile_n = std::min(tile_max, t2_count - tile_off);
+                uint32_t const* idx_src = nullptr;
+                if (scratch.tiny_mode) {
+                    q.memcpy(d_t2_idx_tile, h_t2_merged_vals + tile_off,
+                             tile_n * sizeof(uint32_t)).wait();
+                    idx_src = d_t2_idx_tile;
+                } else {
+                    idx_src = d_merged_vals + tile_off;
+                }
                 launch_gather_u32(
-                    d_t2_xbits, d_merged_vals + tile_off,
+                    d_t2_xbits, idx_src,
                     d_xbits_tile, tile_n, q);
                 q.memcpy(h_t2_xbits + tile_off, d_xbits_tile,
                          tile_n * sizeof(uint32_t)).wait();
@@ -2179,7 +2250,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // d_merged_vals dead now that both gathers have produced their
         // sorted outputs on host.
-        s_free(stats, d_merged_vals);
+        if (scratch.tiny_mode) {
+            s_free(stats, d_t2_idx_tile);
+            sycl::free(h_t2_merged_vals, q);
+        }
+        if (d_merged_vals) s_free(stats, d_merged_vals);
 
         // Rehydrate d_t2_xbits_sorted to device (1040 MB at k=28). The
         // T3 match kernel reads d_sorted_xbits[l] / d_sorted_xbits[r]
