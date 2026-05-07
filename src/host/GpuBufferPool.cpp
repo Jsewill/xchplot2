@@ -477,35 +477,32 @@ size_t streaming_minimal_peak_bytes(int k)
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Target anchor: 1500 MB at k=28. Lets ~2 GB cards (which report
-    // ~1.7-1.8 GB free under the desktop driver) plot k=28 with a
-    // ~200-300 MB margin for driver / OS overhead. Layers further
-    // cuts on top of minimal:
-    //   - Tighter T1/T2/T3 match staging (target N=16 or N=32 vs
-    //     minimal's N=8) — output cap/N grows smaller per slice.
-    //   - Aggressive park-to-host: full Xs and intermediate T1/T2
-    //     sorted streams kept on pinned host, swapped in per phase.
-    //   - Smaller per-tile CUB sort scratch.
+    // Anchor: 3200 MB at k=28 (measured 3120 MB; +80 MB headroom).
+    // Tiny is the smallest streaming tier. Compared to minimal's
+    // ~3760 MB peak, tiny lands ~640 MB lower (17% reduction) by
+    // parking additional cap-sized buffers on host pinned across
+    // their consumer phase:
+    //   - T2 match: d_t1_meta_sorted + d_t1_keys_merged parked, T2
+    //     match runs per-section with sliced meta/mi reads
+    //   - T3 match: d_t2_xbits_sorted + d_t2_keys_merged parked,
+    //     T3 match runs per-section with sliced xbits/mi reads
+    //   - T1/T2 sort gather: merged_vals parked across the gather
+    //     loops, H2D'd per tile into a small device buffer
+    //   - T3 sort: d_t3 parked, tile sort H2D's input from h_t3
     //
-    // Cost: more PCIe round-trips than minimal (sliced finer + more
-    // park/rehydrate cycles). Expected ~12-20 s/plot at k=28 vs
-    // minimal's ~34 s/plot — wait, actually minimal is 34 s, so tiny
-    // will be slower; the tradeoff is "able to plot at all on 2 GB
-    // cards" vs "cannot plot". Caller must opt into either an
-    // explicit `--tier tiny` or have free VRAM that fits ONLY this
-    // peak. When host pinning fails to grow enough, the pipeline
-    // throws InsufficientHostMemoryError naming `--temp-dir` as the
-    // opt-in disk-fallback (added in a later commit, not yet wired).
+    // Cost: ~3 cap-sized PCIe round-trips per plot on top of
+    // minimal's already-elevated PCIe traffic. Expected per-plot
+    // wall time slightly higher than minimal's 34 s/plot at k=28;
+    // empirically measured TBD.
     //
-    // Scaffolding-only as of this commit: the constant lands here
-    // and the auto-pick / `--tier tiny` branches resolve to it, but
-    // the additional staging cuts that actually reduce peak below
-    // minimal's 3760 MB ship in subsequent commits. Until those
-    // land, requesting `tier=tiny` runs the minimal-tier path
-    // unchanged (peak still ~3760 MB) — the user gets a clear "tier
-    // pinned to tiny but device can't fit it" error if the device
-    // VRAM is below this budget.
-    constexpr size_t anchor_mb = 1500;
+    // Floor for further reduction (sub-2-GB cards): T1 sort gather
+    // still pins a full-cap d_t1_meta on device because the gather
+    // kernel does random-access reads. Slicing it would require
+    // either a kernel-level scatter-by-source-tile rewrite or a
+    // disk-fallback layer (chunk 4 in the project plan). Either
+    // change is independently scoped — it is NOT a correctness
+    // issue, just a peak-VRAM ceiling.
+    constexpr size_t anchor_mb = 3200;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

@@ -100,8 +100,8 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     CPU worker on the same batch; `--devices gpu` sticks to GPUs). Build the container with
     `scripts/build-container.sh --gpu cpu` for the standalone CPU
     image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
-- **VRAM:** four tiers, picked automatically based on free device
-  VRAM at k=28. All four produce byte-identical plots.
+- **VRAM:** five tiers, picked automatically based on free device
+  VRAM at k=28. All five produce byte-identical plots.
   - **Pool** (~11 GB device + ~4 GB pinned host): fastest steady-state,
     used on 12 GB+ cards.
   - **Plain streaming** (~7.3 GB peak + 128 MB margin): per-plot
@@ -125,6 +125,20 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     Trade-off: ~6 extra cap-sized PCIe round-trips per plot. k=28
     wall on sm_89: ~34 s/plot vs ~13 s for compact. Detailed
     breakdown in [VRAM](#vram).
+  - **Tiny streaming** (~3.2 GB peak + 128 MB margin, k=28 measured
+    3120 MB): the smallest tier. Layers four further park-on-host
+    cuts on top of minimal — d_t1_meta_sorted + d_t1_keys_merged
+    parked across T2 match (T2 match runs section-pair-sliced),
+    d_t2_xbits_sorted + d_t2_keys_merged parked across T3 match
+    (T3 match also section-pair-sliced), merged_vals parked across
+    T1/T2 sort gather (H2D per tile), and d_t3 parked across T3
+    sort (tile sort H2Ds input from h_t3). Targets 4 GB cards
+    where minimal is on the edge. Trade-off: another ~4 cap-sized
+    PCIe round-trips per plot beyond minimal; expect somewhat
+    higher per-plot wall time. Bottleneck: T1 sort gather (full
+    d_t1_meta on device for the random-access gather kernel).
+    Cards under ~4 GB free need a kernel-level d_t1_meta scatter
+    rewrite or an opt-in disk-fallback layer (neither shipped yet).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
@@ -804,7 +818,7 @@ binaries first.
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
-| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.76 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards). Equivalent CLI flag: `--tier`. |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.76 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards; tiny = ~3.2 GB peak, layers further park-on-host cuts across T2 match, T3 match, sort gathers, and T3 sort — targets 4 GB cards where minimal is on the edge). Equivalent CLI flag: `--tier`. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
@@ -961,9 +975,9 @@ auto-pick. Forced plain or compact below their floor warns and
 proceeds (caller's risk); forced minimal below its floor throws
 because there is no smaller tier to fall back to.
 
-Plot output is bit-identical across all four paths — streaming
-reorganises memory, not algorithms. Verified at k=22 with md5sum
-across pool / plain / compact / minimal.
+Plot output is bit-identical across all five paths — streaming
+reorganises memory, not algorithms. Verified at k=22 (and k=28
+for tiny vs minimal) by byte comparison.
 
 ## Performance
 
@@ -978,7 +992,8 @@ wall from `xchplot2 batch` (10-plot manifest, mean):
 | `main`, `XCHPLOT2_BUILD_CUDA=OFF` (hand-rolled SYCL radix) | 3.79 s | cross-vendor fallback (AMD/Intel) on AdaptiveCpp |
 | plain streaming tier (10-11 GB cards) | ~5.7 s | no parks, single-pass T2 match; ~400 ms/plot faster than compact |
 | compact streaming tier (6-8 GB cards) | ~7.3 s | full parks + N=2 T2 match |
-| minimal streaming tier (4 GiB cards) | TBD | full parks + N=8 T2 match; smallest peak (~3.7 GB) |
+| minimal streaming tier (5 GiB cards) | TBD | full parks + N=8 T2 match; ~3.7 GB peak |
+| tiny streaming tier (4 GB cards)     | TBD | minimal + park d_t1_meta_sorted/d_t1_keys_merged across T2 match, d_t2_xbits/d_t2_keys across T3 match, merged_vals across sort gathers, d_t3 across T3 sort; ~3.2 GB peak |
 | `main` on RX 6700 XT (gfx1031 / ROCm 6.2 / AdaptiveCpp HIP) | **9.97 s** | AMD batch steady-state at k=28; T-table AES near-optimal on RDNA2 via this compiler stack |
 
 The `main`/CUB row is +12% over `cuda-only` from extra AdaptiveCpp
