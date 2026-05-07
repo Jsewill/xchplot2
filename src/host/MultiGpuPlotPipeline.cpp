@@ -572,8 +572,16 @@ void MultiGpuPlotPipeline::run_t1_phase()
     // formula GpuBufferPool uses for the single-GPU T1 cap, giving each
     // shard the same per-bucket safety as the production single-GPU
     // path. Each shard sees the FULL input + emits only its bucket
-    // subset, so per-shard count <= full t1 cap on the worst case.
-    std::uint64_t const t1_cap = match_phase_capacity(k, t1p.num_section_bits);
+    // Each shard processes its bucket-range subset of inputs and
+    // produces ~match_phase_capacity/N matches (uniform distribution).
+    // Sizing the unsorted buffers to the full t1_cap allocates N×
+    // more than the shard needs and OOMs at k>=28 on 20 GB cards.
+    // 25% slack covers any partition imbalance; the
+    // shard_count[s] > t1_cap check below throws cleanly if a
+    // pathological input ever exceeds it.
+    std::uint64_t const t1_cap_full = match_phase_capacity(k, t1p.num_section_bits);
+    std::uint64_t const t1_cap_share = (t1_cap_full + N - 1) / N;
+    std::uint64_t const t1_cap = t1_cap_share + t1_cap_share / 4 + 1024;
 
     std::vector<SyclDevicePtr<std::uint64_t>> d_t1_meta_unsorted(N);
     std::vector<SyclDevicePtr<std::uint32_t>> d_t1_mi_unsorted  (N);
@@ -787,9 +795,14 @@ void MultiGpuPlotPipeline::run_t2_phase()
     }
 
     // ---------- Step 2 — per-shard T2 match. ----------
-    // Same pos2-chip pool sizing as the single-GPU path: T2 emits at
-    // most max_pairs_per_section * num_sections matches.
-    std::uint64_t const t2_cap = match_phase_capacity(k, t2p.num_section_bits);
+    // Per-shard share of the full T2 capacity; see run_t1_phase for
+    // the rationale. T2 has the largest per-item footprint of the
+    // three phases (mi+meta+xbits = 16 B/item), so the saving from
+    // shrinking these unsorted buffers is the biggest of any single
+    // change.
+    std::uint64_t const t2_cap_full = match_phase_capacity(k, t2p.num_section_bits);
+    std::uint64_t const t2_cap_share = (t2_cap_full + N - 1) / N;
+    std::uint64_t const t2_cap = t2_cap_share + t2_cap_share / 4 + 1024;
 
     std::vector<SyclDevicePtr<std::uint64_t>> d_t2_meta_unsorted (N);
     std::vector<SyclDevicePtr<std::uint32_t>> d_t2_mi_unsorted   (N);
@@ -1018,7 +1031,10 @@ void MultiGpuPlotPipeline::run_t3_phase()
     }
 
     // ---------- Step 2 — per-shard T3 match. ----------
-    std::uint64_t const t3_cap = match_phase_capacity(k, t3p.num_section_bits);
+    // Per-shard share of the full T3 capacity; see run_t1_phase.
+    std::uint64_t const t3_cap_full = match_phase_capacity(k, t3p.num_section_bits);
+    std::uint64_t const t3_cap_share = (t3_cap_full + N - 1) / N;
+    std::uint64_t const t3_cap = t3_cap_share + t3_cap_share / 4 + 1024;
 
     std::vector<SyclDevicePtr<T3PairingGpu>>  d_t3_unsorted(N);
     std::vector<SyclDevicePtr<std::uint64_t>> d_t3_count   (N);
