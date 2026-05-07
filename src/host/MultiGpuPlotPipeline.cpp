@@ -466,20 +466,33 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
     std::vector<std::uint32_t*> d_vals_out(N, nullptr);
     std::vector<std::uint64_t>  shard_in_count(N, 0);
 
-    // Per-shard receive capacity. g_x's value-range bucket function
-    // produces a near-uniform distribution across the N receivers, so
-    // each shard gets ~total_xs/N items in steady state. We size to
-    // the per-shard share + 25 % slack, mirroring the T1/T2/T3 sort
-    // capacity formulas. Distributed-sort's `cd > out_capacity` check
-    // throws cleanly on the (very unlikely) skewed input that exceeds
-    // the bound. Sizing to the full total_xs would multiply per-shard
-    // VRAM by N for buffers that are essentially write-by-1/N — at
-    // k=28, total_xs is 1 GiB / stream and there are 4 streams, so
-    // the old worst-case sizing wasted ~1.5 GiB per shard.
+    // Per-shard scratch capacity. The d_keys_in/d_vals_in (and matching
+    // _out) buffers double as both the pre-sort input (where xs_gen
+    // writes shard_in_count[s] items) AND the post-distribution input
+    // (where the distributed sort lands recv_count items). Sizing must
+    // cover BOTH peaks:
+    //
+    //   - Pre-sort write: shard_in_count[s] = position partition share
+    //     for this shard's weight. With uniform weights this equals
+    //     total_xs/N; with skewed weights (e.g. --shard-weights 3,1)
+    //     the heavy shard's partition can exceed total_xs/N.
+    //   - Post-sort distribution: ~total_xs/N in expected case, plus
+    //     25% slack for non-uniform value distribution. The
+    //     distributed-sort `cd > out_capacity` check throws cleanly on
+    //     pathological inputs that exceed this bound.
+    //
+    // Use the larger of the two with their respective slack. This
+    // preserves the small-VRAM win of the post-sort sizing for the
+    // uniform-weight common case while correctly handling weighted
+    // partitions (which used to OOB-write d_keys_in during gen and
+    // either segfault or — under driver/runtime softness — corrupt the
+    // recv_count[] computation later, surfacing as the "received N
+    // elements but out_capacity is M" exception in distributed sort).
     std::uint64_t const out_cap_share = (total_xs + N - 1) / N;
     std::uint64_t const out_cap       = out_cap_share + out_cap_share / 4 + 1024;
 
     auto const xs_partition = compute_position_partition(shards_, total_xs);
+    std::vector<std::uint64_t> shard_caps(N, 0);
 
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const pos_begin = xs_partition[s];
@@ -487,11 +500,14 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         std::uint64_t const c         = pos_end - pos_begin;
         shard_in_count[s] = c;
 
+        std::uint64_t const in_cap_with_slack = c + c / 4 + 1024;
+        shard_caps[s] = std::max(out_cap, in_cap_with_slack);
+
         sycl::queue& q = *shards_[s].queue;
-        d_keys_in [s] = sycl::malloc_device<std::uint32_t>(out_cap, q);
-        d_vals_in [s] = sycl::malloc_device<std::uint32_t>(out_cap, q);
-        d_keys_out[s] = sycl::malloc_device<std::uint32_t>(out_cap, q);
-        d_vals_out[s] = sycl::malloc_device<std::uint32_t>(out_cap, q);
+        d_keys_in [s] = sycl::malloc_device<std::uint32_t>(shard_caps[s], q);
+        d_vals_in [s] = sycl::malloc_device<std::uint32_t>(shard_caps[s], q);
+        d_keys_out[s] = sycl::malloc_device<std::uint32_t>(shard_caps[s], q);
+        d_vals_out[s] = sycl::malloc_device<std::uint32_t>(shard_caps[s], q);
 
         if (c > 0) {
             launch_xs_gen_range(
@@ -515,7 +531,7 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         sort_shards[s].count        = shard_in_count[s];
         sort_shards[s].keys_out     = d_keys_out[s];
         sort_shards[s].vals_out     = d_vals_out[s];
-        sort_shards[s].out_capacity = out_cap;
+        sort_shards[s].out_capacity = shard_caps[s];
         sort_shards[s].out_count    = 0;
         sort_shards[s].pool         = shards_[s].pool;
     }
@@ -744,9 +760,29 @@ void MultiGpuPlotPipeline::run_t1_phase()
     // 25% slack covers any partition imbalance; the
     // shard_count[s] > t1_cap check below throws cleanly if a
     // pathological input ever exceeds it.
+    // Per-shard capacity must hold BOTH peaks for d_t1_mi_unsorted /
+    // d_t1_meta_unsorted: the pre-sort match write (this shard's
+    // bucket-range emit) AND the post-distribution receive (where the
+    // distributed sort lands ~t1_total/N items into the same buffer
+    // before the final radix-sort tile, see SortDistributed.cpp).
+    //   - match_share   : (t1_cap_full * buckets_per_shard / num_buckets) + 25%
+    //   - sort_share    : t1_cap_full / N + 25%  (uniform post-sort)
+    // The heavy shard's match output exceeds sort_share; the light
+    // shard's match output is smaller than sort_share. Use max so both
+    // fit. The over-cap-output check below throws cleanly if observed
+    // counts exceed even this conservative bound.
     std::uint64_t const t1_cap_full = match_phase_capacity(k, t1p.num_section_bits);
-    std::uint64_t const t1_cap_share = (t1_cap_full + N - 1) / N;
-    std::uint64_t const t1_cap = t1_cap_share + t1_cap_share / 4 + 1024;
+    std::uint64_t const t1_uniform_share =
+        (t1_cap_full + N - 1) / N + (t1_cap_full + N - 1) / N / 4 + 1024;
+    std::vector<std::uint64_t> t1_cap(N);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::uint64_t const buckets = std::uint64_t(t1_partition[s + 1])
+                                    - std::uint64_t(t1_partition[s]);
+        std::uint64_t const match_share =
+            (t1_cap_full * buckets + num_buckets - 1) / num_buckets;
+        std::uint64_t const match_cap = match_share + match_share / 4 + 1024;
+        t1_cap[s] = std::max(match_cap, t1_uniform_share);
+    }
 
     std::vector<SyclDevicePtr<std::uint64_t>> d_t1_meta_unsorted(N);
     std::vector<SyclDevicePtr<std::uint32_t>> d_t1_mi_unsorted  (N);
@@ -755,8 +791,8 @@ void MultiGpuPlotPipeline::run_t1_phase()
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t1_meta_unsorted[s] = sycl_alloc_device_owned<std::uint64_t>(t1_cap, q);
-        d_t1_mi_unsorted  [s] = sycl_alloc_device_owned<std::uint32_t>(t1_cap, q);
+        d_t1_meta_unsorted[s] = sycl_alloc_device_owned<std::uint64_t>(t1_cap[s], q);
+        d_t1_mi_unsorted  [s] = sycl_alloc_device_owned<std::uint32_t>(t1_cap[s], q);
         d_t1_count        [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
@@ -775,7 +811,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
             d_full_xs[s].get(), total_xs,
             d_t1_meta_unsorted[s].get(), d_t1_mi_unsorted[s].get(),
             d_t1_count[s].get(),
-            t1_cap, d_t1_temp[s].get(),
+            t1_cap[s], d_t1_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -791,12 +827,12 @@ void MultiGpuPlotPipeline::run_t1_phase()
         for (auto& e : cnt_evts) e.wait();
     }
     for (std::size_t s = 0; s < N; ++s) {
-        if (shard_count[s] > t1_cap) {
+        if (shard_count[s] > t1_cap[s]) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t1_phase: shard "
                 + std::to_string(s) + " T1 produced "
                 + std::to_string(shard_count[s])
-                + " entries, exceeds capacity " + std::to_string(t1_cap)
+                + " entries, exceeds capacity " + std::to_string(t1_cap[s])
                 + ". Bucket-skew worse than expected; raise t1_cap.");
         }
     }
@@ -1056,9 +1092,20 @@ void MultiGpuPlotPipeline::run_t2_phase()
     // three phases (mi+meta+xbits = 16 B/item), so the saving from
     // shrinking these unsorted buffers is the biggest of any single
     // change.
+    // Per-shard cap mirrors run_t1_phase (max of the bucket-share match
+    // output and the post-distribution sort share).
     std::uint64_t const t2_cap_full = match_phase_capacity(k, t2p.num_section_bits);
-    std::uint64_t const t2_cap_share = (t2_cap_full + N - 1) / N;
-    std::uint64_t const t2_cap = t2_cap_share + t2_cap_share / 4 + 1024;
+    std::uint64_t const t2_uniform_share =
+        (t2_cap_full + N - 1) / N + (t2_cap_full + N - 1) / N / 4 + 1024;
+    std::vector<std::uint64_t> t2_cap(N);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::uint64_t const buckets = std::uint64_t(t2_partition[s + 1])
+                                    - std::uint64_t(t2_partition[s]);
+        std::uint64_t const match_share =
+            (t2_cap_full * buckets + num_buckets - 1) / num_buckets;
+        std::uint64_t const match_cap = match_share + match_share / 4 + 1024;
+        t2_cap[s] = std::max(match_cap, t2_uniform_share);
+    }
 
     std::vector<SyclDevicePtr<std::uint64_t>> d_t2_meta_unsorted (N);
     std::vector<SyclDevicePtr<std::uint32_t>> d_t2_mi_unsorted   (N);
@@ -1068,9 +1115,9 @@ void MultiGpuPlotPipeline::run_t2_phase()
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t2_meta_unsorted [s] = sycl_alloc_device_owned<std::uint64_t>(t2_cap, q);
-        d_t2_mi_unsorted   [s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap, q);
-        d_t2_xbits_unsorted[s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap, q);
+        d_t2_meta_unsorted [s] = sycl_alloc_device_owned<std::uint64_t>(t2_cap[s], q);
+        d_t2_mi_unsorted   [s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap[s], q);
+        d_t2_xbits_unsorted[s] = sycl_alloc_device_owned<std::uint32_t>(t2_cap[s], q);
         d_t2_count         [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
@@ -1089,7 +1136,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
             d_full_meta[s].get(), d_full_mi[s].get(), t1_total,
             d_t2_meta_unsorted[s].get(), d_t2_mi_unsorted[s].get(),
             d_t2_xbits_unsorted[s].get(), d_t2_count[s].get(),
-            t2_cap, d_t2_temp[s].get(),
+            t2_cap[s], d_t2_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -1104,12 +1151,12 @@ void MultiGpuPlotPipeline::run_t2_phase()
         for (auto& e : cnt_evts) e.wait();
     }
     for (std::size_t s = 0; s < N; ++s) {
-        if (shard_count[s] > t2_cap) {
+        if (shard_count[s] > t2_cap[s]) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t2_phase: shard "
                 + std::to_string(s) + " T2 produced "
                 + std::to_string(shard_count[s])
-                + " entries, exceeds capacity " + std::to_string(t2_cap));
+                + " entries, exceeds capacity " + std::to_string(t2_cap[s]));
         }
     }
 
@@ -1383,9 +1430,23 @@ void MultiGpuPlotPipeline::run_t3_phase()
     // ---------- Step 2 — per-shard T3 match. ----------
     auto const t_t3_match = sub_begin();
     // Per-shard share of the full T3 capacity; see run_t1_phase.
+    // Per-shard cap mirrors run_t1_phase / run_t2_phase. d_t3_unsorted
+    // doubles as both the match output and the distributed-sort
+    // keys_in (which the sort overwrites with received items at line
+    // 647 of SortDistributed.cpp), so it must hold max(match_share,
+    // post_sort_share).
     std::uint64_t const t3_cap_full = match_phase_capacity(k, t3p.num_section_bits);
-    std::uint64_t const t3_cap_share = (t3_cap_full + N - 1) / N;
-    std::uint64_t const t3_cap = t3_cap_share + t3_cap_share / 4 + 1024;
+    std::uint64_t const t3_uniform_share =
+        (t3_cap_full + N - 1) / N + (t3_cap_full + N - 1) / N / 4 + 1024;
+    std::vector<std::uint64_t> t3_cap(N);
+    for (std::size_t s = 0; s < N; ++s) {
+        std::uint64_t const buckets = std::uint64_t(t3_partition[s + 1])
+                                    - std::uint64_t(t3_partition[s]);
+        std::uint64_t const match_share =
+            (t3_cap_full * buckets + num_buckets - 1) / num_buckets;
+        std::uint64_t const match_cap = match_share + match_share / 4 + 1024;
+        t3_cap[s] = std::max(match_cap, t3_uniform_share);
+    }
 
     std::vector<SyclDevicePtr<T3PairingGpu>>  d_t3_unsorted(N);
     std::vector<SyclDevicePtr<std::uint64_t>> d_t3_count   (N);
@@ -1393,7 +1454,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
 
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
-        d_t3_unsorted[s] = sycl_alloc_device_owned<T3PairingGpu>(t3_cap, q);
+        d_t3_unsorted[s] = sycl_alloc_device_owned<T3PairingGpu>(t3_cap[s], q);
         d_t3_count   [s] = sycl_alloc_device_owned<std::uint64_t>(1, q);
 
         std::size_t tb = 0;
@@ -1412,7 +1473,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
             d_full_meta[s].get(), d_full_xbits[s].get(), d_full_mi[s].get(),
             t2_total,
             d_t3_unsorted[s].get(), d_t3_count[s].get(),
-            t3_cap, d_t3_temp[s].get(),
+            t3_cap[s], d_t3_temp[s].get(),
             bucket_begin, bucket_end, q);
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
@@ -1427,12 +1488,12 @@ void MultiGpuPlotPipeline::run_t3_phase()
         for (auto& e : cnt_evts) e.wait();
     }
     for (std::size_t s = 0; s < N; ++s) {
-        if (shard_count[s] > t3_cap) {
+        if (shard_count[s] > t3_cap[s]) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t3_phase: shard "
                 + std::to_string(s) + " T3 produced "
                 + std::to_string(shard_count[s])
-                + " entries, exceeds capacity " + std::to_string(t3_cap));
+                + " entries, exceeds capacity " + std::to_string(t3_cap[s]));
         }
     }
 
