@@ -818,43 +818,149 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
         shard_ctx.push_back(c);
     }
 
+    // Producer/consumer overlap between the GPU pipeline and the plot
+    // file writer. The producer (this thread) drives MultiGpuPlotPipeline
+    // through every phase including the fragment D2H, then hands the
+    // pipeline + target path off to the consumer thread, which calls
+    // write_plot_file_parallel. While the consumer is FSE-encoding +
+    // writing plot N, the producer is already running the GPU pipeline
+    // for plot N+1 on the same shards. The pipeline pointer is moved
+    // into the WriteJob so the pinned-host fragments buffer (h_fragments_)
+    // stays alive until write_plot_file_parallel returns; the pipeline's
+    // destructor then frees it on the consumer thread, off the producer's
+    // critical path.
+    //
+    // Channel depth=1: the queue holds at most one waiting job, plus
+    // one in-flight at the consumer. Producer blocks on push when the
+    // queue is full so we never accumulate finished plots in pinned
+    // host memory. With sharded GPU compute ~10 s/plot at k=28 and
+    // file write ~1 s/plot, the producer is the slow side and never
+    // sees the back-pressure path in practice.
+    struct WriteJob {
+        std::unique_ptr<MultiGpuPlotPipeline> pipeline;
+        std::filesystem::path                 full_path;
+        BatchEntry                            entry;
+        std::vector<std::uint8_t>             memo_bytes;
+    };
+
+    std::mutex                   q_mu;
+    std::condition_variable      cv_not_empty;
+    std::condition_variable      cv_not_full;
+    std::queue<WriteJob>         q;
+    bool                         producer_done   = false;
+    std::atomic<bool>            consumer_failed{false};
+    std::exception_ptr           consumer_err;
+    std::atomic<std::size_t>     plots_written_consumer{0};
+    std::atomic<std::size_t>     plots_failed_consumer{0};
+
+    std::thread consumer([&] {
+        for (;;) {
+            WriteJob job;
+            {
+                std::unique_lock<std::mutex> lock(q_mu);
+                cv_not_empty.wait(lock, [&] {
+                    return !q.empty() || producer_done;
+                });
+                if (q.empty()) return;  // drained + producer_done
+                job = std::move(q.front());
+                q.pop();
+                cv_not_full.notify_one();
+            }
+            try {
+                write_plot_file_parallel(
+                    job.full_path.string(),
+                    job.pipeline->fragments(),
+                    job.entry.plot_id.data(),
+                    static_cast<std::uint8_t>(job.entry.k),
+                    static_cast<std::uint8_t>(job.entry.strength),
+                    job.entry.testnet ? std::uint8_t{1} : std::uint8_t{0},
+                    static_cast<std::uint16_t>(job.entry.plot_index),
+                    static_cast<std::uint8_t>(job.entry.meta_group),
+                    std::span<std::uint8_t const>(
+                        job.memo_bytes.data(), job.memo_bytes.size()));
+                ++plots_written_consumer;
+            } catch (std::exception const& e) {
+                std::fprintf(stderr,
+                    "[shard-plot] FAILED writing '%s': %s\n",
+                    job.entry.out_name.c_str(), e.what());
+                ++plots_failed_consumer;
+                if (!opts.continue_on_error) {
+                    consumer_err = std::current_exception();
+                    consumer_failed.store(true, std::memory_order_release);
+                    // Wake a producer that may be blocked on cv_not_full
+                    // so it can observe consumer_failed and exit cleanly.
+                    cv_not_full.notify_all();
+                    return;
+                }
+            }
+            // job (incl. pipeline) destructs here; h_fragments_ is freed
+            // off the producer's critical path.
+        }
+    });
+
+    std::size_t plots_failed_producer = 0;
+    bool        early_stop            = false;
     for (BatchEntry const& entry : entries) {
+        if (consumer_failed.load(std::memory_order_acquire)) {
+            early_stop = true;
+            break;
+        }
         try {
             // Resolve target path before running so an out_dir failure
             // surfaces before the (~minutes) plot work.
             auto full_path = std::filesystem::path(entry.out_dir) / entry.out_name;
             std::filesystem::create_directories(entry.out_dir);
 
-            MultiGpuPlotPipeline pipeline(entry, opts, shard_ctx);
-            pipeline.run();
+            auto pipeline = std::make_unique<MultiGpuPlotPipeline>(
+                entry, opts, shard_ctx);
+            pipeline->run();
 
-            std::vector<uint8_t> memo_bytes = entry.memo;
-            if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+            WriteJob job;
+            job.pipeline   = std::move(pipeline);
+            job.full_path  = std::move(full_path);
+            job.entry      = entry;
+            job.memo_bytes = entry.memo;
+            if (job.memo_bytes.empty()) job.memo_bytes.assign(32 + 48 + 32, 0);
 
-            write_plot_file_parallel(
-                full_path.string(),
-                pipeline.fragments(),
-                entry.plot_id.data(),
-                static_cast<uint8_t>(entry.k),
-                static_cast<uint8_t>(entry.strength),
-                entry.testnet ? uint8_t{1} : uint8_t{0},
-                static_cast<uint16_t>(entry.plot_index),
-                static_cast<uint8_t>(entry.meta_group),
-                std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
-
-            ++res.plots_written;
+            {
+                std::unique_lock<std::mutex> lock(q_mu);
+                cv_not_full.wait(lock, [&] {
+                    return q.size() < 1
+                        || consumer_failed.load(std::memory_order_acquire);
+                });
+                if (consumer_failed.load(std::memory_order_acquire)) {
+                    early_stop = true;
+                    break;
+                }
+                q.push(std::move(job));
+                cv_not_empty.notify_one();
+            }
         } catch (std::exception const& e) {
             std::fprintf(stderr,
                 "[shard-plot] FAILED for plot '%s': %s\n",
                 entry.out_name.c_str(), e.what());
-            ++res.plots_failed;
+            ++plots_failed_producer;
             if (!opts.continue_on_error) {
-                res.total_wall_seconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - t_start).count();
-                return res;
+                early_stop = true;
+                break;
             }
         }
     }
+
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        producer_done = true;
+        cv_not_empty.notify_all();
+    }
+    consumer.join();
+
+    if (consumer_failed.load(std::memory_order_acquire) && consumer_err) {
+        std::rethrow_exception(consumer_err);
+    }
+
+    res.plots_written = plots_written_consumer.load();
+    res.plots_failed  = plots_failed_producer + plots_failed_consumer.load();
+    (void)early_stop;
     res.total_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
     return res;
