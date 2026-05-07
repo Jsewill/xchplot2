@@ -109,4 +109,34 @@ void launch_t2_match_range(
     uint32_t bucket_end,
     sycl::queue& q);
 
+// Fully-sliced T2 match range (tiny tier). Same range constraint as
+// launch_t2_match_range but the input streams are read via per-section
+// slices instead of full-cap device pointers. Caller MUST guarantee
+// [bucket_begin, bucket_end) fits inside one section_l.
+//
+//   d_meta_l_slice  : section_l's meta rows (size = section_l_count)
+//   d_meta_r_slice  : section_r's meta rows (size = section_r_count)
+//   d_mi_r_slice    : section_r's mi rows  (size = section_r_count)
+//   section_l_row_start, section_r_row_start : global row indices
+//
+// Used by tiny tier so d_t1_meta_sorted and d_t1_keys_merged stay
+// parked on host pinned memory across T2 match.
+void launch_t2_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu

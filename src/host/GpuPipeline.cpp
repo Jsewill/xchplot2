@@ -1470,17 +1470,32 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_tile);
         s_free(stats, d_t1_meta);
         s_free(stats, d_t1_merged_vals);
-        s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
-        q.memcpy(d_t1_meta_sorted, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
+        // Tiny tier: skip the full-cap d_t1_meta_sorted rehydration. The
+        // sliced T2 match path (per-section meta_l/meta_r H2D) reads
+        // section-sized slices from h_t1_meta directly. Saves 2080 MB of
+        // device VRAM at k=28 across T2 match.
+        if (!scratch.tiny_mode) {
+            s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
+            q.memcpy(d_t1_meta_sorted, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
+        }
         end_phase(p_t1_sort);
-        if (h_meta_owned) sycl::free(h_t1_meta, q);
-        h_t1_meta = nullptr;
+        // Tiny: keep h_t1_meta alive across T2 match for slicing. Free
+        // happens inside the tiny T2 match block.
+        if (!scratch.tiny_mode) {
+            if (h_meta_owned) sycl::free(h_t1_meta, q);
+            h_t1_meta = nullptr;
+        }
     }
 
     // Stage 4c (compact only): H2D d_t1_keys_merged back now that T2
     // match (its consumer) is about to start. Pinned host freed after
     // H2D. Plain mode: d_t1_keys_merged is already live.
-    if (!scratch.plain_mode) {
+    //
+    // Tiny tier: skip the rehydration. h_t1_keys_merged stays alive
+    // across T2 match; the split kernel reads section_r's mi slice each
+    // pass. The T2 prepare step needs mi on device for histogram counts;
+    // the tiny T2 match block briefly rehydrates for prepare and frees.
+    if (!scratch.plain_mode && !scratch.tiny_mode) {
         s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
         q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
         if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
@@ -1606,18 +1621,129 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // Compute bucket + fine-bucket offsets once; both passes share
         // them. Also zeroes d_counter.
+        //
+        // Tiny mode: d_t1_keys_merged is parked on host. The prepare
+        // kernel needs the sorted mi stream on device for its histogram
+        // counts. Briefly rehydrate, run prepare, then free.
+        uint32_t* d_t1_keys_for_prepare = nullptr;
+        if (scratch.tiny_mode) {
+            s_malloc(stats, d_t1_keys_for_prepare, cap * sizeof(uint32_t), "d_t1_keys_merged_prep");
+            q.memcpy(d_t1_keys_for_prepare, h_t1_keys_merged,
+                     t1_count * sizeof(uint32_t)).wait();
+        }
         launch_t2_match_prepare(cfg.plot_id.data(), t2p,
-                                d_t1_keys_merged, t1_count,
+                                scratch.tiny_mode ? d_t1_keys_for_prepare
+                                                   : d_t1_keys_merged,
+                                t1_count,
                                 d_counter, d_t2_match_temp, &t2_temp_bytes, q);
+        if (scratch.tiny_mode) {
+            s_free(stats, d_t1_keys_for_prepare);
+            d_t1_keys_for_prepare = nullptr;
+        }
+
+        // Tiny mode: D2H the bucket-offsets table so we can compute each
+        // section's row range host-side. Only the bucket-offsets prefix
+        // is needed (fine-offsets stay on device for the kernel's binary
+        // search).
+        uint32_t const num_sections_t2   = 1u << t2p.num_section_bits;
+        uint32_t const num_match_keys_t2 = 1u << t2p.num_match_key_bits;
+        uint32_t const num_buckets_t2    = num_sections_t2 * num_match_keys_t2;
+        std::vector<uint64_t> h_t2_bucket_offsets;
+        if (scratch.tiny_mode) {
+            h_t2_bucket_offsets.resize(num_buckets_t2 + 1);
+            q.memcpy(h_t2_bucket_offsets.data(), d_t2_match_temp,
+                     (num_buckets_t2 + 1) * sizeof(uint64_t)).wait();
+        }
+
+        auto compute_section_r_t2 = [&](uint32_t section_l) -> uint32_t {
+            uint32_t const mask = num_sections_t2 - 1u;
+            uint32_t const rl   = ((section_l << 1) |
+                                   (section_l >> (t2p.num_section_bits - 1))) & mask;
+            uint32_t const rl1  = (rl + 1u) & mask;
+            return ((rl1 >> 1) |
+                    (rl1 << (t2p.num_section_bits - 1))) & mask;
+        };
+
+        // Per-section state (tiny only): re-allocate slices when the
+        // pass crosses into a new section_l. Slices stay on device for
+        // all passes within a section.
+        int32_t  cur_section_l = -1;
+        uint64_t cur_section_l_row_start = 0;
+        uint64_t cur_section_r_row_start = 0;
+        uint64_t* d_t2_meta_l_slice = nullptr;
+        uint64_t* d_t2_meta_r_slice = nullptr;
+        uint32_t* d_t2_mi_r_slice   = nullptr;
+
+        auto release_t2_slices = [&]() {
+            if (d_t2_mi_r_slice)   { s_free(stats, d_t2_mi_r_slice);   d_t2_mi_r_slice   = nullptr; }
+            if (d_t2_meta_r_slice) { s_free(stats, d_t2_meta_r_slice); d_t2_meta_r_slice = nullptr; }
+            if (d_t2_meta_l_slice) { s_free(stats, d_t2_meta_l_slice); d_t2_meta_l_slice = nullptr; }
+            cur_section_l = -1;
+        };
+
+        auto ensure_t2_slices = [&](uint32_t section_l) {
+            if (static_cast<int32_t>(section_l) == cur_section_l) return;
+            release_t2_slices();
+
+            uint32_t const section_r = compute_section_r_t2(section_l);
+            cur_section_l_row_start = h_t2_bucket_offsets[section_l * num_match_keys_t2];
+            uint64_t section_l_row_end =
+                h_t2_bucket_offsets[(section_l + 1) * num_match_keys_t2];
+            uint64_t section_l_count = section_l_row_end - cur_section_l_row_start;
+            cur_section_r_row_start = h_t2_bucket_offsets[section_r * num_match_keys_t2];
+            uint64_t section_r_row_end =
+                h_t2_bucket_offsets[(section_r + 1) * num_match_keys_t2];
+            uint64_t section_r_count = section_r_row_end - cur_section_r_row_start;
+
+            if (section_l_count > 0) {
+                s_malloc(stats, d_t2_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t2_meta_l_slice");
+                q.memcpy(d_t2_meta_l_slice, h_t1_meta + cur_section_l_row_start,
+                         section_l_count * sizeof(uint64_t)).wait();
+            }
+            if (section_r_count > 0) {
+                s_malloc(stats, d_t2_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t2_meta_r_slice");
+                s_malloc(stats, d_t2_mi_r_slice,   section_r_count * sizeof(uint32_t), "d_t2_mi_r_slice");
+                q.memcpy(d_t2_meta_r_slice, h_t1_meta + cur_section_r_row_start,
+                         section_r_count * sizeof(uint64_t)).wait();
+                q.memcpy(d_t2_mi_r_slice, h_t1_keys_merged + cur_section_r_row_start,
+                         section_r_count * sizeof(uint32_t)).wait();
+            }
+            cur_section_l = static_cast<int32_t>(section_l);
+        };
 
         auto run_pass_and_stage = [&](uint32_t bucket_begin, uint32_t bucket_end,
                                       uint64_t host_offset) -> uint64_t
         {
-            launch_t2_match_range(cfg.plot_id.data(), t2p,
-                                  d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                                  d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                                  d_counter, t2_tile_cap, d_t2_match_temp,
-                                  bucket_begin, bucket_end, q);
+            if (scratch.tiny_mode) {
+                // Tiny: every pass must fit entirely in one section_l,
+                // so caller (the loop below) is responsible for chunking
+                // at section boundaries.
+                uint32_t const section_l = bucket_begin / num_match_keys_t2;
+                if (bucket_end > 0 && (bucket_end - 1) / num_match_keys_t2 != section_l) {
+                    throw std::runtime_error(
+                        "tiny T2 match: pass [" + std::to_string(bucket_begin) +
+                        "," + std::to_string(bucket_end) +
+                        ") crosses section_l boundary (num_match_keys=" +
+                        std::to_string(num_match_keys_t2) + ")");
+                }
+                ensure_t2_slices(section_l);
+                if (d_t2_meta_l_slice && d_t2_meta_r_slice && d_t2_mi_r_slice) {
+                    launch_t2_match_section_pair_split_range(
+                        cfg.plot_id.data(), t2p,
+                        d_t2_meta_l_slice, cur_section_l_row_start,
+                        d_t2_meta_r_slice, d_t2_mi_r_slice, cur_section_r_row_start,
+                        d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                        d_counter, t2_tile_cap, d_t2_match_temp,
+                        bucket_begin, bucket_end, q);
+                }
+                // Empty section pair → no pairings, fall through to drain.
+            } else {
+                launch_t2_match_range(cfg.plot_id.data(), t2p,
+                                      d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                                      d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                                      d_counter, t2_tile_cap, d_t2_match_temp,
+                                      bucket_begin, bucket_end, q);
+            }
             uint64_t pass_count = 0;
             q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
             if (pass_count > t2_tile_cap) {
@@ -1637,16 +1763,52 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         };
 
         int p_t2 = begin_phase("T2 match");
-        // N evenly-spaced bucket ranges. host_offset accumulates so each
-        // pass appends to the pinned host buffer behind the prior pass.
         t2_count = 0;
-        for (int pass = 0; pass < N; ++pass) {
-            uint32_t const bucket_begin =
-                uint32_t(uint64_t(pass)     * t2_num_buckets / uint64_t(N));
-            uint32_t const bucket_end =
-                uint32_t(uint64_t(pass + 1) * t2_num_buckets / uint64_t(N));
-            t2_count += run_pass_and_stage(bucket_begin, bucket_end,
-                                           /*host_offset=*/t2_count);
+        if (scratch.tiny_mode) {
+            // Section-aware iteration: for each section_l, run all
+            // passes whose [bucket_begin, bucket_end) range falls in
+            // that section's bucket range. With t2_tile_count=N and
+            // num_match_keys_t2 per section, alignment requires
+            // num_buckets/N to divide num_match_keys_t2 evenly OR
+            // num_match_keys_t2 to divide num_buckets/N evenly. The
+            // latter would put multiple sections in one pass (which
+            // would cross slice boundaries) — guard against it.
+            uint32_t const pass_size = num_buckets_t2 / uint32_t(N);
+            if (pass_size > num_match_keys_t2) {
+                throw std::runtime_error(
+                    "tiny T2 match: pass spans multiple sections "
+                    "(pass_size=" + std::to_string(pass_size) +
+                    ", num_match_keys=" + std::to_string(num_match_keys_t2) +
+                    "). Increase t2_tile_count.");
+            }
+            if (num_match_keys_t2 % pass_size != 0) {
+                throw std::runtime_error(
+                    "tiny T2 match: pass_size " + std::to_string(pass_size) +
+                    " does not evenly divide num_match_keys " +
+                    std::to_string(num_match_keys_t2) +
+                    ". Use t2_tile_count = power-of-2 multiple of num_sections.");
+            }
+            for (int pass = 0; pass < N; ++pass) {
+                uint32_t const bucket_begin =
+                    uint32_t(uint64_t(pass)     * num_buckets_t2 / uint64_t(N));
+                uint32_t const bucket_end =
+                    uint32_t(uint64_t(pass + 1) * num_buckets_t2 / uint64_t(N));
+                t2_count += run_pass_and_stage(bucket_begin, bucket_end,
+                                               /*host_offset=*/t2_count);
+            }
+            release_t2_slices();
+        } else {
+            // N evenly-spaced bucket ranges. host_offset accumulates so
+            // each pass appends to the pinned host buffer behind the
+            // prior pass.
+            for (int pass = 0; pass < N; ++pass) {
+                uint32_t const bucket_begin =
+                    uint32_t(uint64_t(pass)     * num_buckets_t2 / uint64_t(N));
+                uint32_t const bucket_end =
+                    uint32_t(uint64_t(pass + 1) * num_buckets_t2 / uint64_t(N));
+                t2_count += run_pass_and_stage(bucket_begin, bucket_end,
+                                               /*host_offset=*/t2_count);
+            }
         }
         end_phase(p_t2);
 
@@ -1658,8 +1820,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t2_meta_stage);
         s_free(stats, d_t2_mi_stage);
         s_free(stats, d_t2_xbits_stage);
-        s_free(stats, d_t1_meta_sorted);
-        s_free(stats, d_t1_keys_merged);
+        // Tiny: d_t1_meta_sorted and d_t1_keys_merged are null (parked
+        // on host pinned). Free the host buffers; T2 sort below will
+        // build its inputs from h_t2_meta/h_t2_mi/h_t2_xbits.
+        if (scratch.tiny_mode) {
+            if (h_meta_owned) sycl::free(h_t1_meta, q);
+            h_t1_meta = nullptr;
+            if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
+            h_t1_keys_merged = nullptr;
+        } else {
+            s_free(stats, d_t1_meta_sorted);
+            s_free(stats, d_t1_keys_merged);
+        }
 
         // Stage 4a: hydrate full-cap d_t2_mi from h_t2_mi. d_t2_meta
         // and d_t2_xbits are NOT hydrated yet — they stay on pinned
