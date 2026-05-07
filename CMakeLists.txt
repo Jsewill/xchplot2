@@ -388,6 +388,7 @@ endif()
 # All backend-dispatched wrapper TUs (T*OffsetsSycl.cpp, PipelineKernelsSycl.cpp)
 # go through AdaptiveCpp via add_sycl_to_target below.
 set(POS2_GPU_SYCL_SRC
+    src/gpu/SyclBackend.cpp
     src/gpu/T1OffsetsSycl.cpp
     src/gpu/T2OffsetsSycl.cpp
     src/gpu/T3OffsetsSycl.cpp
