@@ -116,4 +116,31 @@ void launch_t3_match_section_pair_range(
     uint32_t bucket_end,
     sycl::queue& q);
 
+// Fully-sliced variant (tiny tier). Same range constraint as
+// launch_t3_match_section_pair_range but every per-row stream is also
+// sliced — the kernel never touches a full-cap device buffer for
+// meta/xbits/mi. Caller H2Ds:
+//   d_meta_l_slice, d_xbits_l_slice : section_l's rows (size = section_l_count)
+//   d_meta_r_slice, d_xbits_r_slice,
+//   d_mi_r_slice                    : section_r's rows (size = section_r_count)
+// Used by tiny tier so d_t2_meta_sorted, d_t2_xbits_sorted, and
+// d_t2_keys_merged stay parked on host pinned memory across T3 match.
+void launch_t3_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint32_t const* d_xbits_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_xbits_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q);
+
 } // namespace pos2gpu

@@ -235,6 +235,63 @@ void launch_t3_match_section_pair_range(
         q);
 }
 
+void launch_t3_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint32_t const* d_xbits_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_xbits_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    sycl::queue& q)
+{
+    if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
+    if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
+    if (!d_meta_l_slice || !d_xbits_l_slice
+        || !d_meta_r_slice || !d_xbits_r_slice || !d_mi_r_slice
+        || !d_out_pairings || !d_out_count) throw std::invalid_argument("invalid argument to launch wrapper");
+
+    T3Derived const d = derive_t3(params);
+
+    if (bucket_end > d.num_buckets) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (bucket_end <= bucket_begin) return;
+
+    constexpr int kThreads = 256;
+    uint64_t const blocks_x_u64 = (d.l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) throw std::invalid_argument("invalid argument to launch wrapper");
+
+    auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
+    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+
+    launch_t3_match_section_pair_split(
+        keys, fk,
+        d_meta_l_slice, d_xbits_l_slice, section_l_row_start,
+        d_meta_r_slice, d_xbits_r_slice, d_mi_r_slice, section_r_row_start,
+        const_cast<uint64_t*>(d_offsets),
+        const_cast<uint64_t*>(d_fine_offsets),
+        d.num_match_keys, d.num_buckets,
+        params.k, params.num_section_bits,
+        params.num_match_target_bits, kT3FineBits,
+        d.target_mask, d.num_test_bits,
+        d_out_pairings, d_out_count,
+        capacity, d.l_count_max,
+        bucket_begin, bucket_end,
+        q);
+}
+
 void launch_t3_match(
     uint8_t const* plot_id_bytes,
     T3MatchParams const& params,

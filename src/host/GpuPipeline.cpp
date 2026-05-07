@@ -616,9 +616,29 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg)
 {
 
     sycl::queue& q = sycl_backend::queue();
+    StreamingPinnedScratch scratch{};
+    // Honor XCHPLOT2_STREAMING_TIER in the no-arg path so test mode and
+    // standalone callers can exercise non-default tiers without going
+    // through BatchPlotter. Mirrors BatchPlotter's tier selection.
+    if (char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER")) {
+        std::string t = tier_env;
+        if (t == "plain") {
+            scratch.plain_mode = true;
+        } else if (t == "compact") {
+            // compact = default (no flags set). Explicitly leave both off.
+        } else if (t == "minimal") {
+            scratch.t2_tile_count     = 8;
+            scratch.gather_tile_count = 4;
+        } else if (t == "tiny") {
+            scratch.t2_tile_count     = 8;
+            scratch.gather_tile_count = 4;
+            scratch.tiny_mode         = true;
+        }
+        // Unrecognized values fall through to default (compact).
+    }
     return run_gpu_pipeline_streaming_impl(cfg, /*pinned_dst=*/nullptr,
                                                 /*pinned_capacity=*/0,
-                                                StreamingPinnedScratch{});
+                                                scratch);
 }
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
@@ -1993,10 +2013,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // T3 match kernel reads d_sorted_xbits[l] / d_sorted_xbits[r]
         // by index and the random-access pattern would be too slow via
         // PCIe with USM-host.
-        s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
-        q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
-        if (h_xbits_owned) sycl::free(h_t2_xbits, q);
-        h_t2_xbits = nullptr;
+        //
+        // Tiny tier: skip the rehydration. h_t2_xbits stays alive across
+        // T3 match, and the per-section split kernel H2Ds the section-l
+        // + section-r slices into small device buffers each pass. d_t2_
+        // xbits_sorted remains nullptr in this path; the T3 match block
+        // skips its s_free below.
+        if (!scratch.tiny_mode) {
+            s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
+            q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
+            if (h_xbits_owned) sycl::free(h_t2_xbits, q);
+            h_t2_xbits = nullptr;
+        }
 
         // Site 4: do NOT rehydrate d_t2_meta_sorted to device. h_t2_meta
         // (now containing the sorted meta) stays alive across T3 match;
@@ -2036,7 +2064,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // host now that we're about to enter T3 match (its consumer).
     // Pinned host freed after H2D. Plain mode: d_t2_keys_merged is
     // already live (never parked).
-    if (!scratch.plain_mode) {
+    //
+    // Tiny tier: skip the rehydration. h_t2_keys_merged stays alive
+    // across T3 match; the split kernel reads section_r's mi slice
+    // each pass (d_t2_keys_merged is only used as the binary-search
+    // and r-stream input, both indexed within section_r's row range).
+    if (!scratch.plain_mode && !scratch.tiny_mode) {
         s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
         q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
         if (h_keys_owned) sycl::free(h_t2_keys_merged, q);
@@ -2076,6 +2109,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // device slices, run the kernel against those slices, D2H the
         // stage output to h_t3, then free the slices. Drops T3 match
         // peak from ~5200 MB (compact) to ~3665 MB at k=28.
+        //
+        // Tiny mode: also park d_t2_xbits_sorted and d_t2_keys_merged
+        // on host pinned (they were never rehydrated above). Per
+        // section, allocate xbits + mi slices alongside meta slices and
+        // call the fully-sliced split kernel. Drops T3 match peak by
+        // an additional ~2080 MB at k=28.
         uint32_t const num_sections   = 1u << t3p.num_section_bits;
         uint32_t const num_match_keys = 1u << t3p.num_match_key_bits;
         uint32_t const num_buckets_t3 = num_sections * num_match_keys;
@@ -2097,9 +2136,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // Compute bucket + fine-bucket offsets in d_t3_match_temp; also
         // zero d_counter. Same call shape as compact path.
+        //
+        // Tiny mode: d_t2_keys_merged is parked. The prepare kernel
+        // needs the sorted mi stream on device for its histogram
+        // counts. Briefly rehydrate, run prepare, then free again. The
+        // 1040 MB spike is bounded to this prepare phase; the subsequent
+        // per-section loop reads only sliced mi.
+        uint32_t* d_t2_keys_for_prepare = nullptr;
+        if (scratch.tiny_mode) {
+            s_malloc(stats, d_t2_keys_for_prepare, cap * sizeof(uint32_t), "d_t2_keys_merged_prep");
+            q.memcpy(d_t2_keys_for_prepare, h_t2_keys_merged,
+                     t2_count * sizeof(uint32_t)).wait();
+        }
         launch_t3_match_prepare(cfg.plot_id.data(), t3p,
-                                d_t2_keys_merged, t2_count,
+                                scratch.tiny_mode ? d_t2_keys_for_prepare
+                                                   : d_t2_keys_merged,
+                                t2_count,
                                 d_counter, d_t3_match_temp, &t3_temp_bytes, q);
+        if (scratch.tiny_mode) {
+            s_free(stats, d_t2_keys_for_prepare);
+            d_t2_keys_for_prepare = nullptr;
+        }
 
         // D2H the bucket-offsets table (small: 17 × u64 at k=28
         // strength=2) so we can compute each section's global row range
@@ -2134,11 +2191,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // anyway but the slice malloc rejects bytes==0 since f1d3c67.
             if (section_l_count == 0) continue;
 
-            uint64_t* d_meta_l_slice = nullptr;
-            uint64_t* d_meta_r_slice = nullptr;
+            uint64_t* d_meta_l_slice  = nullptr;
+            uint64_t* d_meta_r_slice  = nullptr;
+            uint32_t* d_xbits_l_slice = nullptr;
+            uint32_t* d_xbits_r_slice = nullptr;
+            uint32_t* d_mi_r_slice    = nullptr;
             s_malloc(stats, d_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
             if (section_r_count > 0) {
                 s_malloc(stats, d_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t3_meta_r_slice");
+            }
+            if (scratch.tiny_mode) {
+                s_malloc(stats, d_xbits_l_slice, section_l_count * sizeof(uint32_t), "d_t3_xbits_l_slice");
+                if (section_r_count > 0) {
+                    s_malloc(stats, d_xbits_r_slice, section_r_count * sizeof(uint32_t), "d_t3_xbits_r_slice");
+                    s_malloc(stats, d_mi_r_slice,    section_r_count * sizeof(uint32_t), "d_t3_mi_r_slice");
+                }
             }
 
             q.memcpy(d_meta_l_slice, h_t2_meta + section_l_row_start,
@@ -2147,16 +2214,39 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 q.memcpy(d_meta_r_slice, h_t2_meta + section_r_row_start,
                          section_r_count * sizeof(uint64_t)).wait();
             }
+            if (scratch.tiny_mode) {
+                q.memcpy(d_xbits_l_slice, h_t2_xbits + section_l_row_start,
+                         section_l_count * sizeof(uint32_t)).wait();
+                if (section_r_count > 0) {
+                    q.memcpy(d_xbits_r_slice, h_t2_xbits + section_r_row_start,
+                             section_r_count * sizeof(uint32_t)).wait();
+                    q.memcpy(d_mi_r_slice, h_t2_keys_merged + section_r_row_start,
+                             section_r_count * sizeof(uint32_t)).wait();
+                }
+            }
 
             uint32_t const bucket_begin = section_l * num_match_keys;
             uint32_t const bucket_end   = (section_l + 1) * num_match_keys;
-            launch_t3_match_section_pair_range(
-                cfg.plot_id.data(), t3p,
-                d_meta_l_slice, section_l_row_start,
-                d_meta_r_slice, section_r_row_start,
-                d_t2_xbits_sorted, d_t2_keys_merged, t2_count,
-                d_t3_stage, d_counter, t3_section_cap,
-                d_t3_match_temp, bucket_begin, bucket_end, q);
+            if (scratch.tiny_mode) {
+                if (section_r_count > 0) {
+                    launch_t3_match_section_pair_split_range(
+                        cfg.plot_id.data(), t3p,
+                        d_meta_l_slice, d_xbits_l_slice, section_l_row_start,
+                        d_meta_r_slice, d_xbits_r_slice, d_mi_r_slice, section_r_row_start,
+                        d_t3_stage, d_counter, t3_section_cap,
+                        d_t3_match_temp, bucket_begin, bucket_end, q);
+                }
+                // section_r_count == 0 → no pairings can form; skip kernel
+                // (output count for this section is 0).
+            } else {
+                launch_t3_match_section_pair_range(
+                    cfg.plot_id.data(), t3p,
+                    d_meta_l_slice, section_l_row_start,
+                    d_meta_r_slice, section_r_row_start,
+                    d_t2_xbits_sorted, d_t2_keys_merged, t2_count,
+                    d_t3_stage, d_counter, t3_section_cap,
+                    d_t3_match_temp, bucket_begin, bucket_end, q);
+            }
 
             uint64_t pass_count = 0;
             q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
@@ -2172,6 +2262,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             host_offset += pass_count;
             q.memset(d_counter, 0, sizeof(uint64_t)).wait();
 
+            if (scratch.tiny_mode) {
+                if (d_mi_r_slice)    s_free(stats, d_mi_r_slice);
+                if (d_xbits_r_slice) s_free(stats, d_xbits_r_slice);
+                s_free(stats, d_xbits_l_slice);
+            }
             if (section_r_count > 0) s_free(stats, d_meta_r_slice);
             s_free(stats, d_meta_l_slice);
         }
@@ -2184,8 +2279,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // its s_free. Free everything else that was alive across T3 match.
         s_free(stats, d_t3_match_temp);
         s_free(stats, d_t3_stage);
-        s_free(stats, d_t2_xbits_sorted);
-        s_free(stats, d_t2_keys_merged);
+        // Tiny: d_t2_xbits_sorted and d_t2_keys_merged are null (parked
+        // on host pinned). Free the host buffers instead.
+        if (scratch.tiny_mode) {
+            if (h_xbits_owned) sycl::free(h_t2_xbits, q);
+            h_t2_xbits = nullptr;
+            if (h_keys_owned)  sycl::free(h_t2_keys_merged, q);
+            h_t2_keys_merged = nullptr;
+        } else {
+            s_free(stats, d_t2_xbits_sorted);
+            s_free(stats, d_t2_keys_merged);
+        }
 
         // h_t2_meta was kept alive across T3 match for slicing; free now
         // that all section pairs have been H2D'd.

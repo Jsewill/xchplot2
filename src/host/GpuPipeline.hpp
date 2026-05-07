@@ -151,6 +151,20 @@ struct StreamingPinnedScratch {
     // (compact / plain). Minimal tier sets it to 4. Adds ~3 PCIe round
     // trips of cap-sized data per plot.
     int gather_tile_count    = 1;
+
+    // Tiny tier (host-park-everything-across-T3-match). Builds on
+    // minimal: same N=4 sort-gather tiling and N=8 T2-match staging,
+    // PLUS d_t2_xbits_sorted and d_t2_keys_merged stay parked on host
+    // pinned memory across T3 match. T3 match runs per-section with
+    // fully-sliced reads (meta + xbits + mi all sliced) via
+    // launch_t3_match_section_pair_split_range. Drops T3 match peak
+    // from minimal's ~3380 MB to ~1300 MB at k=28 — fits 2 GB cards.
+    // Cost: two extra cap-sized PCIe round-trips (D2H xbits/keys after
+    // sort, and per-section H2D slices into T3 match) on top of
+    // minimal's already-elevated PCIe traffic. Requires plain_mode==
+    // false and gather_tile_count > 1 (i.e., the minimal-path
+    // prerequisites). BatchPlotter sets this when tier==Tiny.
+    bool tiny_mode           = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

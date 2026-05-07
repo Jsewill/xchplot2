@@ -460,56 +460,27 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 tier == Tier::Minimal ? minimal_peak :
                                         tiny_peak;
 
-            // Tiny is currently a scaffolding stub: the constant lands
-            // here and routes through the dispatcher, but the actual
-            // VRAM-reducing implementation (tighter match slicing,
-            // park-to-host of full Xs, smaller sort scratch) ships in
-            // subsequent commits. Until then, tier=tiny falls back to
-            // running the minimal-tier path internally — so its real
-            // peak is still ~minimal_peak. Warn loudly and require the
-            // device to fit minimal's peak even when the user asks for
-            // tiny, so a 2 GB card asking for tiny gets a clear
-            // "implementation pending" error instead of an opaque OOM
-            // mid-plot.
-            bool const tiny_falls_back = (tier == Tier::Tiny);
-            size_t const required_actual =
-                tiny_falls_back ? minimal_peak : required;
-
-            if (tier == Tier::Tiny) {
-                std::fprintf(stderr,
-                    "[batch] tier=tiny: scaffolding only — runs the "
-                    "minimal-tier path (~%.2f GiB peak) until tighter "
-                    "slicing lands. Cards reporting < %.2f GiB free "
-                    "will throw below.\n",
-                    to_gib(minimal_peak),
-                    to_gib(minimal_peak + margin));
-            }
-
-            // Open-ended fallback: if even the smallest *implemented*
-            // tier (currently minimal) won't fit, throw. Forced higher
-            // tier below its floor warns and proceeds.
-            if ((tier == Tier::Minimal || tier == Tier::Tiny)
-                && mem.free_bytes < required_actual + margin) {
+            // Open-ended fallback: if even the smallest tier (tiny)
+            // won't fit, throw. Forced higher tier below its floor
+            // warns and proceeds.
+            if (tier == Tier::Tiny
+                && mem.free_bytes < required + margin) {
                 InsufficientVramError se(
                     "[batch] streaming pipeline needs ~" +
-                    std::to_string(to_gib(required_actual + margin)).substr(0, 5) +
+                    std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
-                    (tiny_falls_back
-                        ? " (tiny tier requested but currently runs the "
-                          "minimal path until tighter slicing ships), device reports "
-                        : " (minimal tier, the smallest available), device reports "
-                    ) +
+                    " (tiny tier, the smallest available), device reports " +
                     std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
                     " GiB free of " +
                     std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
                     " GiB total. Use a smaller k or a larger GPU "
                     "(or --cpu for pos2-chip CPU plotting).");
-                se.required_bytes = required_actual + margin;
+                se.required_bytes = required + margin;
                 se.free_bytes     = mem.free_bytes;
                 se.total_bytes    = mem.total_bytes;
                 throw se;
             }
-            if (tier != Tier::Minimal && tier != Tier::Tiny
+            if (tier != Tier::Tiny
                 && mem.free_bytes < required + margin) {
                 std::fprintf(stderr,
                     "[batch] streaming tier: %s forced (%.2f GiB free < %.2f GiB "
@@ -521,8 +492,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
 
             stream_scratch.plain_mode = (tier == Tier::Plain);
-            // Tiny falls back to minimal's tile counts until the
-            // tighter-slicing implementation lands.
+            stream_scratch.tiny_mode  = (tier == Tier::Tiny);
+            // Tiny shares minimal's tile counts (gather_tile_count > 1
+            // is the trigger for the host-pinned T2 sort path that
+            // tiny extends across T3 match).
             if (tier == Tier::Minimal || tier == Tier::Tiny) {
                 stream_scratch.t2_tile_count     = 8;
                 stream_scratch.gather_tile_count = 4;
@@ -533,7 +506,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
                 tier_name(tier),
                 to_gib(mem.free_bytes),
-                to_gib(required_actual),
+                to_gib(required),
                 to_gib(plain_peak + margin));
         }
         // Size the pinned buffers using the same cap formula as the pool.
