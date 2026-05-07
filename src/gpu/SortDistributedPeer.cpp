@@ -46,7 +46,11 @@ inline std::size_t bucket_of_u64_dev(std::uint64_t key, std::uint32_t N,
                 static_cast<std::uint64_t>(N)) >> 32;
     }
     if (bits > 32) {
-        int const shift = begin_bit + (bits - 32);
+        // Top (bits - 32) bits relative to begin_bit. Mirrors
+        // bucket_of_u64 in SortDistributed.cpp; both must agree on
+        // the value-range partition or the fragment-phase concat
+        // produces an unsorted stream.
+        int const shift = begin_bit + 32;
         std::uint64_t const hi_mask = (1ull << (bits - 32)) - 1ull;
         std::uint64_t const value = (key >> shift) & hi_mask;
         return (value * static_cast<std::uint64_t>(N)) >> (bits - 32);

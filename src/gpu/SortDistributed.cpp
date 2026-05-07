@@ -89,7 +89,13 @@ std::size_t bucket_of_u64(std::uint64_t key, std::size_t N,
     if (bits > 32) {
         // Active range straddles the 32-bit boundary; use the top
         // (bits - 32) bits relative to begin_bit as the discriminator.
-        int const shift = begin_bit + (bits - 32);
+        // Those bits live at positions [begin_bit + 32, end_bit), so the
+        // right shift is begin_bit + 32 — NOT begin_bit + (bits-32),
+        // which would extract a slice from the middle of the value range
+        // and break the value-range-partition invariant the fragment
+        // phase relies on (concatenating shards in shard-id order has
+        // to produce a globally non-decreasing stream).
+        int const shift = begin_bit + 32;
         std::uint64_t const hi_mask = (1ull << (bits - 32)) - 1ull;
         std::uint64_t const value = (key >> shift) & hi_mask;
         return (value * static_cast<std::uint64_t>(N)) >> (bits - 32);
