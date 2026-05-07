@@ -756,17 +756,47 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
     BatchResult res;
     auto const t_start = std::chrono::steady_clock::now();
 
-    // Per-shard SYCL queues. Phase 2.2 + 2.3 use the sycl_backend
-    // queue() factory; in real multi-GPU runs each shard's thread sets
-    // its current_device_id before calling queue() so each ends up
-    // with a queue bound to its target device. For the dev-box
-    // single-GPU case (where the same device id is used N times for
-    // testing) all shards point at the same physical queue.
+    // Per-shard SYCL queues — one sycl::queue per target device.
+    //
+    // Earlier this loop went through the sycl_backend::queue() factory
+    // which is a thread_local unique_ptr. From a single thread (which
+    // is how the pipeline drives all shards today), the first call
+    // wins: every shard pointer aliased the same queue, all bound to
+    // whichever device the first call landed on. On the dev box that
+    // looked fine because there was only one GPU; on real multi-GPU
+    // hosts every shard's work piled onto device 0, OOMing the T2
+    // phase at k>=28 even though the second card was idle.
+    //
+    // Construct the queues directly here, one owned by this function
+    // (storage keeps them alive across pipeline.run() calls). Each
+    // queue runs the SyclBackend selftest before pipeline use so a
+    // miscompiled kernel on any of the shards surfaces here, not deep
+    // in the streaming pipeline.
+    auto const& gpu_devs = sycl_backend::usable_gpu_devices();
+    std::vector<std::unique_ptr<sycl::queue>> shard_queue_storage;
+    shard_queue_storage.reserve(device_ids.size());
     std::vector<sycl::queue*> shard_queues;
     shard_queues.reserve(device_ids.size());
     for (int dev_id : device_ids) {
-        sycl_backend::set_current_device_id(dev_id);
-        shard_queues.push_back(&sycl_backend::queue());
+        if (dev_id == kCpuDeviceId) {
+            throw std::runtime_error(
+                "run_batch_sharded: --cpu in --shard-plot is not "
+                "supported (CPU device can't host the per-shard SYCL "
+                "queues used by MultiGpuPlotPipeline).");
+        }
+        if (dev_id < 0 || dev_id >= static_cast<int>(gpu_devs.size())) {
+            throw std::runtime_error(
+                "run_batch_sharded: device id "
+                + std::to_string(dev_id) + " out of range (found "
+                + std::to_string(gpu_devs.size())
+                + " usable GPU device(s))");
+        }
+        auto q = std::make_unique<sycl::queue>(
+            gpu_devs[static_cast<std::size_t>(dev_id)],
+            sycl_backend::async_error_handler);
+        sycl_backend::validate_kernel_dispatch(*q);
+        shard_queues.push_back(q.get());
+        shard_queue_storage.push_back(std::move(q));
     }
     // Per-shard buffer pools: persist across plots in this batch so
     // the largest replicated allocations (full Xs, full T1/T2/T3
