@@ -44,6 +44,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pos2gpu {
@@ -369,25 +370,46 @@ void launch_sort_pairs_u32_u32_distributed(
     for (std::size_t s = 0; s < N; ++s) shards[s].queue->wait();
 
     // Step 2: Host-side scatter into per-receiver pinned buffers.
-    // First pass counts items per (source, receiver). Second pass
-    // copies. Walking sources in ascending shard-id preserves the
-    // cross-shard concatenation order that a single stable sort over
-    // [shard 0 input | … | shard N-1 input] would see.
+    // Walked in parallel — one thread per source — with pre-computed
+    // per-(source, dest) starting offsets so threads write to disjoint
+    // slices of recv_*[d]. Sources still occupy ascending shard-id
+    // ranges within each recv_*[d] so a single stable sort over
+    // [shard 0 input | … | shard N-1 input] still produces the same
+    // cross-shard concatenation order. This is the slow path of the
+    // HostBounce sort at k=28: a single-threaded walk over multi-GB
+    // pinned-host buffers takes seconds of wall while every GPU
+    // is idle. Parallelising by source (typically N=2-4) keeps the
+    // CPU saturated and shaves several hundred ms per sort.
     std::vector<std::vector<std::size_t>> counts_src_dst(
         N, std::vector<std::size_t>(N, 0));
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::size_t const d = bucket_of_u32(host_keys[s][i], N,
-                                                begin_bit, end_bit);
-            ++counts_src_dst[s][d];
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                auto* counts_s = counts_src_dst[s].data();
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::size_t const d = bucket_of_u32(
+                        host_keys[s][i], N, begin_bit, end_bit);
+                    ++counts_s[d];
+                }
+            });
         }
+        for (auto& t : threads) t.join();
     }
 
     std::vector<std::size_t> recv_count(N, 0);
-    for (std::size_t s = 0; s < N; ++s)
-        for (std::size_t d = 0; d < N; ++d)
-            recv_count[d] += counts_src_dst[s][d];
+    std::vector<std::vector<std::size_t>> dest_offset(
+        N, std::vector<std::size_t>(N, 0));
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            dest_offset[s][d] = off;
+            off += counts_src_dst[s][d];
+        }
+        recv_count[d] = off;
+    }
 
     // Allocate per-receiver pinned recv buffers (worst case is the
     // total input, but recv_count[d] is exact — no over-alloc).
@@ -401,26 +423,28 @@ void launch_sort_pairs_u32_u32_distributed(
             shards[d].pool, "ds_recv_vals_a", c, alloc_q);
     }
 
-    // Scatter walk.
-    std::vector<std::size_t> recv_pos(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::uint32_t const k = host_keys[s][i];
-            std::uint32_t const v = host_vals[s][i];
-            std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
-            recv_keys[d][recv_pos[d]] = k;
-            recv_vals[d][recv_pos[d]] = v;
-            ++recv_pos[d];
+    // Scatter walk — parallel by source. Threads write to disjoint
+    // [dest_offset[s][d], dest_offset[s][d] + counts_src_dst[s][d])
+    // slices of recv_*[d], so no atomics needed.
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                std::vector<std::size_t> local_pos(N, 0);
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::uint32_t const k = host_keys[s][i];
+                    std::uint32_t const v = host_vals[s][i];
+                    std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
+                    std::size_t const idx = dest_offset[s][d] + local_pos[d];
+                    recv_keys[d][idx] = k;
+                    recv_vals[d][idx] = v;
+                    ++local_pos[d];
+                }
+            });
         }
-    }
-    for (std::size_t d = 0; d < N; ++d) {
-        // sanity (defensive): recv_pos[d] must equal recv_count[d]
-        if (recv_pos[d] != recv_count[d]) {
-            throw std::runtime_error(
-                "launch_sort_pairs_u32_u32_distributed: scatter walk "
-                "produced inconsistent counts (internal bug)");
-        }
+        for (auto& t : threads) t.join();
     }
 
     // Free source pinned buffers — no-op when pooled (pool retains).
@@ -672,20 +696,38 @@ void launch_sort_keys_u64_distributed(
     }
     for (std::size_t s = 0; s < N; ++s) shards[s].queue->wait();
 
+    // Parallel-by-source count + scatter; see u32_u32 variant for the
+    // pattern. Threads write to disjoint slices of recv_keys[d].
     std::vector<std::vector<std::size_t>> counts_src_dst(
         N, std::vector<std::size_t>(N, 0));
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::size_t const d = bucket_of_u64(host_keys[s][i], N,
-                                                begin_bit, end_bit);
-            ++counts_src_dst[s][d];
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                auto* counts_s = counts_src_dst[s].data();
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::size_t const d = bucket_of_u64(
+                        host_keys[s][i], N, begin_bit, end_bit);
+                    ++counts_s[d];
+                }
+            });
         }
+        for (auto& t : threads) t.join();
     }
+
     std::vector<std::size_t> recv_count(N, 0);
-    for (std::size_t s = 0; s < N; ++s)
-        for (std::size_t d = 0; d < N; ++d)
-            recv_count[d] += counts_src_dst[s][d];
+    std::vector<std::vector<std::size_t>> dest_offset(
+        N, std::vector<std::size_t>(N, 0));
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            dest_offset[s][d] = off;
+            off += counts_src_dst[s][d];
+        }
+        recv_count[d] = off;
+    }
 
     std::vector<std::uint64_t*> recv_keys(N, nullptr);
     for (std::size_t d = 0; d < N; ++d) {
@@ -694,22 +736,22 @@ void launch_sort_keys_u64_distributed(
             shards[d].pool, "ds_recv_keys", c, alloc_q);
     }
 
-    std::vector<std::size_t> recv_pos(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::uint64_t const k = host_keys[s][i];
-            std::size_t const d = bucket_of_u64(k, N, begin_bit, end_bit);
-            recv_keys[d][recv_pos[d]] = k;
-            ++recv_pos[d];
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                std::vector<std::size_t> local_pos(N, 0);
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::uint64_t const k = host_keys[s][i];
+                    std::size_t const d = bucket_of_u64(k, N, begin_bit, end_bit);
+                    recv_keys[d][dest_offset[s][d] + local_pos[d]] = k;
+                    ++local_pos[d];
+                }
+            });
         }
-    }
-    for (std::size_t d = 0; d < N; ++d) {
-        if (recv_pos[d] != recv_count[d]) {
-            throw std::runtime_error(
-                "launch_sort_keys_u64_distributed: scatter walk produced "
-                "inconsistent counts (internal bug)");
-        }
+        for (auto& t : threads) t.join();
     }
 
     for (std::size_t s = 0; s < N; ++s) {
@@ -1017,17 +1059,38 @@ void launch_sort_pairs_u32_u64_distributed(
     }
     for (std::size_t s = 0; s < N; ++s) shards[s].queue->wait();
 
-    // Step 2: per-receiver count, then scatter walk. Iterating sources in
-    // ascending shard-id order preserves the cross-shard concatenation
-    // order so the per-receiver stable sort is deterministic.
-    std::vector<std::size_t> recv_count(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::size_t const d = bucket_of_u32(host_keys[s][i], N,
-                                                begin_bit, end_bit);
-            ++recv_count[d];
+    // Parallel-by-source count + scatter (see u32_u32 variant comment).
+    // Iterating sources in ascending shard-id order via per-(s, d)
+    // offsets still preserves the cross-shard concatenation order.
+    std::vector<std::vector<std::size_t>> counts_src_dst(
+        N, std::vector<std::size_t>(N, 0));
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                auto* counts_s = counts_src_dst[s].data();
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::size_t const d = bucket_of_u32(
+                        host_keys[s][i], N, begin_bit, end_bit);
+                    ++counts_s[d];
+                }
+            });
         }
+        for (auto& t : threads) t.join();
+    }
+
+    std::vector<std::size_t> recv_count(N, 0);
+    std::vector<std::vector<std::size_t>> dest_offset(
+        N, std::vector<std::size_t>(N, 0));
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            dest_offset[s][d] = off;
+            off += counts_src_dst[s][d];
+        }
+        recv_count[d] = off;
     }
 
     std::vector<std::uint32_t*> recv_keys(N, nullptr);
@@ -1040,24 +1103,25 @@ void launch_sort_pairs_u32_u64_distributed(
             shards[d].pool, "ds_recv_vals_a", c, alloc_q);
     }
 
-    std::vector<std::size_t> recv_pos(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::uint32_t const k = host_keys[s][i];
-            std::uint64_t const v = host_vals[s][i];
-            std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
-            recv_keys[d][recv_pos[d]] = k;
-            recv_vals[d][recv_pos[d]] = v;
-            ++recv_pos[d];
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                std::vector<std::size_t> local_pos(N, 0);
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::uint32_t const k = host_keys[s][i];
+                    std::uint64_t const v = host_vals[s][i];
+                    std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
+                    std::size_t const idx = dest_offset[s][d] + local_pos[d];
+                    recv_keys[d][idx] = k;
+                    recv_vals[d][idx] = v;
+                    ++local_pos[d];
+                }
+            });
         }
-    }
-    for (std::size_t d = 0; d < N; ++d) {
-        if (recv_pos[d] != recv_count[d]) {
-            throw std::runtime_error(
-                "launch_sort_pairs_u32_u64_distributed: scatter walk "
-                "produced inconsistent counts (internal bug)");
-        }
+        for (auto& t : threads) t.join();
     }
 
     for (std::size_t s = 0; s < N; ++s) {
@@ -1401,15 +1465,36 @@ void launch_sort_pairs_u32_u64u32_distributed(
     }
     for (std::size_t s = 0; s < N; ++s) shards[s].queue->wait();
 
-    // Step 2: count + scatter walk.
-    std::vector<std::size_t> recv_count(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::size_t const d = bucket_of_u32(host_keys[s][i], N,
-                                                begin_bit, end_bit);
-            ++recv_count[d];
+    // Parallel-by-source count + scatter (see u32_u32 variant comment).
+    std::vector<std::vector<std::size_t>> counts_src_dst(
+        N, std::vector<std::size_t>(N, 0));
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                auto* counts_s = counts_src_dst[s].data();
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::size_t const d = bucket_of_u32(
+                        host_keys[s][i], N, begin_bit, end_bit);
+                    ++counts_s[d];
+                }
+            });
         }
+        for (auto& t : threads) t.join();
+    }
+
+    std::vector<std::size_t> recv_count(N, 0);
+    std::vector<std::vector<std::size_t>> dest_offset(
+        N, std::vector<std::size_t>(N, 0));
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            dest_offset[s][d] = off;
+            off += counts_src_dst[s][d];
+        }
+        recv_count[d] = off;
     }
 
     std::vector<std::uint32_t*> recv_keys(N, nullptr);
@@ -1425,26 +1510,27 @@ void launch_sort_pairs_u32_u64u32_distributed(
             shards[d].pool, "ds_recv_vals_b",   c, alloc_q);
     }
 
-    std::vector<std::size_t> recv_pos(N, 0);
-    for (std::size_t s = 0; s < N; ++s) {
-        std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        for (std::size_t i = 0; i < c; ++i) {
-            std::uint32_t const k  = host_keys[s][i];
-            std::uint64_t const va = host_va  [s][i];
-            std::uint32_t const vb = host_vb  [s][i];
-            std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
-            recv_keys[d][recv_pos[d]] = k;
-            recv_va  [d][recv_pos[d]] = va;
-            recv_vb  [d][recv_pos[d]] = vb;
-            ++recv_pos[d];
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            threads.emplace_back([&, s] {
+                std::size_t const c = static_cast<std::size_t>(shards[s].count);
+                std::vector<std::size_t> local_pos(N, 0);
+                for (std::size_t i = 0; i < c; ++i) {
+                    std::uint32_t const k  = host_keys[s][i];
+                    std::uint64_t const va = host_va  [s][i];
+                    std::uint32_t const vb = host_vb  [s][i];
+                    std::size_t const d = bucket_of_u32(k, N, begin_bit, end_bit);
+                    std::size_t const idx = dest_offset[s][d] + local_pos[d];
+                    recv_keys[d][idx] = k;
+                    recv_va  [d][idx] = va;
+                    recv_vb  [d][idx] = vb;
+                    ++local_pos[d];
+                }
+            });
         }
-    }
-    for (std::size_t d = 0; d < N; ++d) {
-        if (recv_pos[d] != recv_count[d]) {
-            throw std::runtime_error(
-                "launch_sort_pairs_u32_u64u32_distributed: scatter walk "
-                "produced inconsistent counts (internal bug)");
-        }
+        for (auto& t : threads) t.join();
     }
 
     for (std::size_t s = 0; s < N; ++s) {
