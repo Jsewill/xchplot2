@@ -37,9 +37,11 @@ xchplot2 plot ... --devices gpu
 # on the same plot in parallel instead of plotting independent files.
 # Use this for k > 32 working sets that don't fit a single card, or
 # rigs where one card is too small to plot solo. Per-shard weights
-# load-balance asymmetric pairs (e.g. 4090 + 3060). Phase 2.4b lands
-# the peer-copy fast path; opt-in via the SDK's BatchOptions.
+# load-balance asymmetric pairs (e.g. 4090 + 3060). Add
+# `--prefer-peer-copy` for direct device-to-device transport on NVLink
+# hosts; the default host-pinned bounce works on any topology.
 xchplot2 plot ... --devices 0,1 --shard-plot
+xchplot2 plot ... --devices 0,1 --shard-plot --prefer-peer-copy
 ```
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM
@@ -986,6 +988,18 @@ wall-clock throughput is bounded by the slowest device's slice —
 Live multi-GPU plots were confirmed end-to-end on NVIDIA; per-device
 numbers will vary with PCIe bandwidth sharing on the host root
 complex.
+
+`--shard-plot` is a separate mode that splits one plot across every
+selected GPU instead of running independent plots in parallel. On
+PCIe-only multi-GPU rigs (no NVLink) it's slower per-plot than
+work-queue mode because each shard still does full reads of the
+replicated streams between phases — measured at ~1.5× single-GPU on
+the peer-copy fast path and ~2.2× on the default host-pinned bounce
+on 2× RTX 4000 Ada. It's worth using only when (a) the plot's working
+set doesn't fit on any single card (k > 32 or asymmetric small-card
+pairs) or (b) the host has NVLink. For ordinary throughput plotting
+on PCIe-only multi-GPU, prefer the work-queue path (`--devices` alone,
+no `--shard-plot`).
 
 ## License
 
