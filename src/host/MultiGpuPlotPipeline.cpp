@@ -716,10 +716,17 @@ void MultiGpuPlotPipeline::run_t1_phase()
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
 
+    // Pull the N shard counts in one batch — submit all then drain.
     std::vector<std::uint64_t> shard_count(N, 0);
+    {
+        std::vector<sycl::event> cnt_evts(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            cnt_evts[s] = shards_[s].queue->memcpy(
+                &shard_count[s], d_t1_count[s].get(), sizeof(std::uint64_t));
+        }
+        for (auto& e : cnt_evts) e.wait();
+    }
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t1_count[s].get(), sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t1_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t1_phase: shard "
@@ -994,10 +1001,15 @@ void MultiGpuPlotPipeline::run_t2_phase()
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
 
     std::vector<std::uint64_t> shard_count(N, 0);
+    {
+        std::vector<sycl::event> cnt_evts(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            cnt_evts[s] = shards_[s].queue->memcpy(
+                &shard_count[s], d_t2_count[s].get(), sizeof(std::uint64_t));
+        }
+        for (auto& e : cnt_evts) e.wait();
+    }
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t2_count[s].get(),
-                 sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t2_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t2_phase: shard "
@@ -1284,10 +1296,15 @@ void MultiGpuPlotPipeline::run_t3_phase()
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
 
     std::vector<std::uint64_t> shard_count(N, 0);
+    {
+        std::vector<sycl::event> cnt_evts(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            cnt_evts[s] = shards_[s].queue->memcpy(
+                &shard_count[s], d_t3_count[s].get(), sizeof(std::uint64_t));
+        }
+        for (auto& e : cnt_evts) e.wait();
+    }
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::queue& q = *shards_[s].queue;
-        q.memcpy(&shard_count[s], d_t3_count[s].get(),
-                 sizeof(std::uint64_t)).wait();
         if (shard_count[s] > t3_cap) {
             throw std::runtime_error(
                 "MultiGpuPlotPipeline::run_t3_phase: shard "
@@ -1408,24 +1425,28 @@ void MultiGpuPlotPipeline::run_fragment_phase()
 
     h_fragments_ = sycl::malloc_host<std::uint64_t>(total, alloc_q);
 
-    std::uint64_t off = 0;
+    // Submit all per-shard D2H copies concurrently into the right host
+    // offset, then drain. Each shard's queue is on a different physical
+    // GPU, so serializing per-shard with .wait() forces the transfers
+    // onto a single PCIe lane at a time.
+    std::vector<std::uint64_t> shard_off(N, 0);
+    {
+        std::uint64_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            shard_off[s] = off;
+            off += t3_phase_count_[s];
+        }
+    }
+    std::vector<sycl::event> evts(N);
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const c = t3_phase_count_[s];
-        if (c > 0) {
-            shards_[s].queue->memcpy(
-                h_fragments_ + off, t3_phase_d_frags_[s],
-                c * sizeof(std::uint64_t)).wait();
-        }
-        off += c;
+        if (c == 0) continue;
+        evts[s] = shards_[s].queue->memcpy(
+            h_fragments_ + shard_off[s], t3_phase_d_frags_[s],
+            c * sizeof(std::uint64_t));
     }
-    if (off != total) {
-        sycl::free(h_fragments_, alloc_q);
-        h_fragments_     = nullptr;
-        fragments_count_ = 0;
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_fragment_phase: per-shard counts "
-            "sum to " + std::to_string(off) + " but expected "
-            + std::to_string(total));
+    for (std::size_t s = 0; s < N; ++s) {
+        if (t3_phase_count_[s] > 0) evts[s].wait();
     }
     fragments_count_ = total;
 
