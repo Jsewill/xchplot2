@@ -36,6 +36,7 @@
 #include "gpu/PipelineKernels.cuh"
 #include "gpu/Sort.cuh"
 #include "gpu/SortDistributedPeer.hpp"  // peer-path scatter kernels (Phase 2.4b)
+#include "host/MultiGpuShardBufferPool.hpp"  // optional pinned-bounce pool
 
 #include <sycl/sycl.hpp>
 
@@ -112,6 +113,30 @@ template <class T>
 T* pinned_alloc(std::size_t n, sycl::queue& q)
 {
     return sycl::malloc_host<T>(n, q);
+}
+
+// Acquire a pinned host buffer of capacity n elements of type T. When
+// `pool` is non-null the buffer comes from the pool's per-label slot
+// (page-locking is paid once and amortised across plots + across the
+// three distributed-sort phases per plot). Without a pool the buffer
+// is freshly malloc_host'd on `alloc_q` and the caller must call
+// pinned_release to free it.
+template <class T>
+T* pinned_acquire(ShardBufferPool* pool, char const* label,
+                  std::size_t n, sycl::queue& alloc_q)
+{
+    std::size_t const safe_n = n == 0 ? 1 : n;
+    if (pool) return pool->ensure_host<T>(label, safe_n);
+    return pinned_alloc<T>(safe_n, alloc_q);
+}
+
+// Release a buffer obtained via pinned_acquire. No-op if pooled (the
+// pool retains ownership).
+template <class T>
+void pinned_release(ShardBufferPool* pool, T* ptr, sycl::queue& alloc_q)
+{
+    if (pool || !ptr) return;
+    sycl::free(ptr, alloc_q);
 }
 
 } // namespace
@@ -321,14 +346,19 @@ void launch_sort_pairs_u32_u32_distributed(
     // -----------------------------------------------------------------
 
     // Step 1: D2H every source shard's inputs into per-source pinned
-    // host buffers. Use shards[0]'s queue as the alloc context.
+    // host buffers. Use shards[0]'s queue as the alloc context for the
+    // unpooled fallback. Pinned-host slots are routed through each
+    // shard's pool (when present) so the page-locked range is reused
+    // across the three distributed-sort calls per plot.
     sycl::queue& alloc_q = *shards[0].queue;
     std::vector<std::uint32_t*> host_keys(N, nullptr);
     std::vector<std::uint32_t*> host_vals(N, nullptr);
     for (std::size_t s = 0; s < N; ++s) {
         std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        host_keys[s] = pinned_alloc<std::uint32_t>(c == 0 ? 1 : c, alloc_q);
-        host_vals[s] = pinned_alloc<std::uint32_t>(c == 0 ? 1 : c, alloc_q);
+        host_keys[s] = pinned_acquire<std::uint32_t>(
+            shards[s].pool, "ds_u32u32_host_keys", c, alloc_q);
+        host_vals[s] = pinned_acquire<std::uint32_t>(
+            shards[s].pool, "ds_u32u32_host_vals", c, alloc_q);
         if (c > 0) {
             shards[s].queue->memcpy(host_keys[s], shards[s].keys_in,
                                     c * sizeof(std::uint32_t));
@@ -365,8 +395,10 @@ void launch_sort_pairs_u32_u32_distributed(
     std::vector<std::uint32_t*> recv_vals(N, nullptr);
     for (std::size_t d = 0; d < N; ++d) {
         std::size_t const c = recv_count[d] == 0 ? 1 : recv_count[d];
-        recv_keys[d] = pinned_alloc<std::uint32_t>(c, alloc_q);
-        recv_vals[d] = pinned_alloc<std::uint32_t>(c, alloc_q);
+        recv_keys[d] = pinned_acquire<std::uint32_t>(
+            shards[d].pool, "ds_u32u32_recv_keys", c, alloc_q);
+        recv_vals[d] = pinned_acquire<std::uint32_t>(
+            shards[d].pool, "ds_u32u32_recv_vals", c, alloc_q);
     }
 
     // Scatter walk.
@@ -391,16 +423,21 @@ void launch_sort_pairs_u32_u32_distributed(
         }
     }
 
-    // Free source pinned buffers — no longer needed.
+    // Free source pinned buffers — no-op when pooled (pool retains).
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::free(host_keys[s], alloc_q);
-        sycl::free(host_vals[s], alloc_q);
+        pinned_release(shards[s].pool, host_keys[s], alloc_q);
+        pinned_release(shards[s].pool, host_vals[s], alloc_q);
     }
 
-    // Step 3 & 4: H2D and per-receiver local sort. Each receiver's
-    // keys_in / vals_in serve as the H2D landing zone (they're scratch
-    // per the public ping-pong contract); keys_out / vals_out hold the
-    // sorted result.
+    // ---- Steps 3 & 4 (parallelised across receivers) -----------------
+    // Old: for d=0..N-1 { H2D; wait; sort; wait; free }
+    //   → only one GPU active at a time during the slowest step (sort).
+    // New: capacity check + scratch sizing (CPU); then parallel H2D
+    //   submission + global drain; then parallel sort submission +
+    //   global drain; then per-shard scratch free.
+    // The two global drains preserve the H2D-before-sort ordering on
+    // out-of-order queues without serialising across receivers.
+    std::vector<std::size_t> scratch_bytes(N, 0);
     for (std::size_t d = 0; d < N; ++d) {
         DistributedSortPairsShard& sd = shards[d];
         std::size_t const cd = recv_count[d];
@@ -416,35 +453,71 @@ void launch_sort_pairs_u32_u32_distributed(
         }
         sd.out_count = cd;
         if (cd == 0) continue;
-
-        sd.queue->memcpy(sd.keys_in, recv_keys[d],
-                         cd * sizeof(std::uint32_t));
-        sd.queue->memcpy(sd.vals_in, recv_vals[d],
-                         cd * sizeof(std::uint32_t));
-        sd.queue->wait();
-
-        // Per-receiver sort scratch sizing query, then alloc, then sort.
-        std::size_t scratch_bytes = 0;
         launch_sort_pairs_u32_u32(
-            nullptr, scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            nullptr, scratch_bytes[d], nullptr, nullptr, nullptr, nullptr,
             cd, begin_bit, end_bit, *sd.queue);
-        void* scratch = scratch_bytes
-            ? sycl::malloc_device(scratch_bytes, *sd.queue) : nullptr;
-
-        launch_sort_pairs_u32_u32(
-            scratch ? scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
-            scratch_bytes,
-            sd.keys_in, sd.keys_out, sd.vals_in, sd.vals_out,
-            cd, begin_bit, end_bit, *sd.queue);
-        sd.queue->wait();
-
-        if (scratch) sycl::free(scratch, *sd.queue);
     }
 
-    // Free recv pinned buffers.
+    // Per-receiver sort scratch — pooled when the receiver attached a
+    // pool, else fresh malloc that is freed below.
+    std::vector<void*> sort_scratch(N, nullptr);
+    std::vector<bool>  scratch_pooled(N, false);
     for (std::size_t d = 0; d < N; ++d) {
-        sycl::free(recv_keys[d], alloc_q);
-        sycl::free(recv_vals[d], alloc_q);
+        if (recv_count[d] == 0 || scratch_bytes[d] == 0) continue;
+        if (shards[d].pool) {
+            sort_scratch[d] = shards[d].pool->ensure_bytes(
+                "ds_u32u32_sort_scratch", scratch_bytes[d]);
+            scratch_pooled[d] = true;
+        } else {
+            sort_scratch[d] = sycl::malloc_device(
+                scratch_bytes[d], *shards[d].queue);
+        }
+    }
+
+    // Parallel H2D submit + global drain.
+    std::vector<sycl::event> h2d_keys(N), h2d_vals(N);
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsShard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        h2d_keys[d] = sd.queue->memcpy(sd.keys_in, recv_keys[d],
+                                       cd * sizeof(std::uint32_t));
+        h2d_vals[d] = sd.queue->memcpy(sd.vals_in, recv_vals[d],
+                                       cd * sizeof(std::uint32_t));
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] == 0) continue;
+        h2d_keys[d].wait();
+        h2d_vals[d].wait();
+    }
+
+    // Parallel sort submit + global drain.
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsShard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        launch_sort_pairs_u32_u32(
+            sort_scratch[d] ? sort_scratch[d]
+                            : reinterpret_cast<void*>(std::uintptr_t{1}),
+            scratch_bytes[d],
+            sd.keys_in, sd.keys_out, sd.vals_in, sd.vals_out,
+            cd, begin_bit, end_bit, *sd.queue);
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] > 0) shards[d].queue->wait();
+    }
+
+    // Free non-pooled sort scratch.
+    for (std::size_t d = 0; d < N; ++d) {
+        if (sort_scratch[d] && !scratch_pooled[d]) {
+            sycl::free(sort_scratch[d], *shards[d].queue);
+        }
+    }
+
+    // Free recv pinned buffers — no-op when pooled.
+    for (std::size_t d = 0; d < N; ++d) {
+        pinned_release(shards[d].pool, recv_keys[d], alloc_q);
+        pinned_release(shards[d].pool, recv_vals[d], alloc_q);
     }
 }
 
@@ -590,7 +663,8 @@ void launch_sort_keys_u64_distributed(
     std::vector<std::uint64_t*> host_keys(N, nullptr);
     for (std::size_t s = 0; s < N; ++s) {
         std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        host_keys[s] = pinned_alloc<std::uint64_t>(c == 0 ? 1 : c, alloc_q);
+        host_keys[s] = pinned_acquire<std::uint64_t>(
+            shards[s].pool, "ds_u64_host_keys", c, alloc_q);
         if (c > 0) {
             shards[s].queue->memcpy(host_keys[s], shards[s].keys_in,
                                     c * sizeof(std::uint64_t));
@@ -616,7 +690,8 @@ void launch_sort_keys_u64_distributed(
     std::vector<std::uint64_t*> recv_keys(N, nullptr);
     for (std::size_t d = 0; d < N; ++d) {
         std::size_t const c = recv_count[d] == 0 ? 1 : recv_count[d];
-        recv_keys[d] = pinned_alloc<std::uint64_t>(c, alloc_q);
+        recv_keys[d] = pinned_acquire<std::uint64_t>(
+            shards[d].pool, "ds_u64_recv_keys", c, alloc_q);
     }
 
     std::vector<std::size_t> recv_pos(N, 0);
@@ -637,8 +712,12 @@ void launch_sort_keys_u64_distributed(
         }
     }
 
-    for (std::size_t s = 0; s < N; ++s) sycl::free(host_keys[s], alloc_q);
+    for (std::size_t s = 0; s < N; ++s) {
+        pinned_release(shards[s].pool, host_keys[s], alloc_q);
+    }
 
+    // Steps 3 & 4 — parallelised across receivers.
+    std::vector<std::size_t> scratch_bytes(N, 0);
     for (std::size_t d = 0; d < N; ++d) {
         DistributedSortKeysU64Shard& sd = shards[d];
         std::size_t const cd = recv_count[d];
@@ -651,29 +730,60 @@ void launch_sort_keys_u64_distributed(
         }
         sd.out_count = cd;
         if (cd == 0) continue;
-
-        sd.queue->memcpy(sd.keys_in, recv_keys[d],
-                         cd * sizeof(std::uint64_t));
-        sd.queue->wait();
-
-        std::size_t scratch_bytes = 0;
         launch_sort_keys_u64(
-            nullptr, scratch_bytes, nullptr, nullptr,
+            nullptr, scratch_bytes[d], nullptr, nullptr,
             cd, begin_bit, end_bit, *sd.queue);
-        void* scratch = scratch_bytes
-            ? sycl::malloc_device(scratch_bytes, *sd.queue) : nullptr;
-
-        launch_sort_keys_u64(
-            scratch ? scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
-            scratch_bytes,
-            sd.keys_in, sd.keys_out,
-            cd, begin_bit, end_bit, *sd.queue);
-        sd.queue->wait();
-
-        if (scratch) sycl::free(scratch, *sd.queue);
     }
 
-    for (std::size_t d = 0; d < N; ++d) sycl::free(recv_keys[d], alloc_q);
+    std::vector<void*> sort_scratch(N, nullptr);
+    std::vector<bool>  scratch_pooled(N, false);
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] == 0 || scratch_bytes[d] == 0) continue;
+        if (shards[d].pool) {
+            sort_scratch[d] = shards[d].pool->ensure_bytes(
+                "ds_u64_sort_scratch", scratch_bytes[d]);
+            scratch_pooled[d] = true;
+        } else {
+            sort_scratch[d] = sycl::malloc_device(
+                scratch_bytes[d], *shards[d].queue);
+        }
+    }
+
+    std::vector<sycl::event> h2d_keys(N);
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortKeysU64Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        h2d_keys[d] = sd.queue->memcpy(sd.keys_in, recv_keys[d],
+                                       cd * sizeof(std::uint64_t));
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] > 0) h2d_keys[d].wait();
+    }
+
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortKeysU64Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        launch_sort_keys_u64(
+            sort_scratch[d] ? sort_scratch[d]
+                            : reinterpret_cast<void*>(std::uintptr_t{1}),
+            scratch_bytes[d],
+            sd.keys_in, sd.keys_out,
+            cd, begin_bit, end_bit, *sd.queue);
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] > 0) shards[d].queue->wait();
+    }
+
+    for (std::size_t d = 0; d < N; ++d) {
+        if (sort_scratch[d] && !scratch_pooled[d]) {
+            sycl::free(sort_scratch[d], *shards[d].queue);
+        }
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        pinned_release(shards[d].pool, recv_keys[d], alloc_q);
+    }
 }
 
 namespace {
@@ -895,8 +1005,10 @@ void launch_sort_pairs_u32_u64_distributed(
     std::vector<std::uint64_t*> host_vals(N, nullptr);
     for (std::size_t s = 0; s < N; ++s) {
         std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        host_keys[s] = pinned_alloc<std::uint32_t>(c, alloc_q);
-        host_vals[s] = pinned_alloc<std::uint64_t>(c, alloc_q);
+        host_keys[s] = pinned_acquire<std::uint32_t>(
+            shards[s].pool, "ds_u32u64_host_keys", c, alloc_q);
+        host_vals[s] = pinned_acquire<std::uint64_t>(
+            shards[s].pool, "ds_u32u64_host_vals", c, alloc_q);
         if (c == 0) continue;
         shards[s].queue->memcpy(host_keys[s], shards[s].keys_in,
                                 c * sizeof(std::uint32_t));
@@ -921,8 +1033,11 @@ void launch_sort_pairs_u32_u64_distributed(
     std::vector<std::uint32_t*> recv_keys(N, nullptr);
     std::vector<std::uint64_t*> recv_vals(N, nullptr);
     for (std::size_t d = 0; d < N; ++d) {
-        recv_keys[d] = pinned_alloc<std::uint32_t>(recv_count[d], alloc_q);
-        recv_vals[d] = pinned_alloc<std::uint64_t>(recv_count[d], alloc_q);
+        std::size_t const c = recv_count[d] == 0 ? 1 : recv_count[d];
+        recv_keys[d] = pinned_acquire<std::uint32_t>(
+            shards[d].pool, "ds_u32u64_recv_keys", c, alloc_q);
+        recv_vals[d] = pinned_acquire<std::uint64_t>(
+            shards[d].pool, "ds_u32u64_recv_vals", c, alloc_q);
     }
 
     std::vector<std::size_t> recv_pos(N, 0);
@@ -946,11 +1061,14 @@ void launch_sort_pairs_u32_u64_distributed(
     }
 
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::free(host_keys[s], alloc_q);
-        sycl::free(host_vals[s], alloc_q);
+        pinned_release(shards[s].pool, host_keys[s], alloc_q);
+        pinned_release(shards[s].pool, host_vals[s], alloc_q);
     }
 
-    // Step 3 & 4: H2D + per-receiver local sort (identity sort + gather).
+    // Step 3 & 4 — parallelised across receivers (capacity check + scratch
+    // sizing first; parallel scratch alloc; parallel H2D submit + global
+    // drain; parallel local-sort submit + global drain).
+    std::vector<std::size_t> scratch_bytes(N, 0);
     for (std::size_t d = 0; d < N; ++d) {
         DistributedSortPairsU32U64Shard& sd = shards[d];
         std::size_t const cd = recv_count[d];
@@ -965,37 +1083,85 @@ void launch_sort_pairs_u32_u64_distributed(
         }
         sd.out_count = cd;
         if (cd == 0) continue;
-
-        sd.queue->memcpy(sd.keys_in, recv_keys[d],
-                         cd * sizeof(std::uint32_t));
-        sd.queue->memcpy(sd.vals_in, recv_vals[d],
-                         cd * sizeof(std::uint64_t));
-        sd.queue->wait();
-
-        std::size_t scratch_bytes = 0;
         launch_sort_pairs_u32_u32(
-            nullptr, scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            nullptr, scratch_bytes[d],
+            nullptr, nullptr, nullptr, nullptr,
             cd, begin_bit, end_bit, *sd.queue);
-        void* scratch = scratch_bytes
-            ? sycl::malloc_device(scratch_bytes, *sd.queue) : nullptr;
+    }
 
-        auto* d_idx_in  = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
-        auto* d_idx_out = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
+    std::vector<void*>          sort_scratch(N, nullptr);
+    std::vector<bool>           scratch_pooled(N, false);
+    std::vector<std::uint32_t*> d_idx_in (N, nullptr);
+    std::vector<std::uint32_t*> d_idx_out(N, nullptr);
+    std::vector<bool>           idx_pooled(N, false);
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        if (shards[d].pool) {
+            if (scratch_bytes[d]) {
+                sort_scratch[d] = shards[d].pool->ensure_bytes(
+                    "ds_u32u64_sort_scratch", scratch_bytes[d]);
+                scratch_pooled[d] = true;
+            }
+            d_idx_in [d] = shards[d].pool->ensure<std::uint32_t>(
+                "ds_u32u64_idx_in",  cd);
+            d_idx_out[d] = shards[d].pool->ensure<std::uint32_t>(
+                "ds_u32u64_idx_out", cd);
+            idx_pooled[d] = true;
+        } else {
+            if (scratch_bytes[d]) {
+                sort_scratch[d] = sycl::malloc_device(
+                    scratch_bytes[d], *shards[d].queue);
+            }
+            d_idx_in [d] = sycl::malloc_device<std::uint32_t>(
+                cd, *shards[d].queue);
+            d_idx_out[d] = sycl::malloc_device<std::uint32_t>(
+                cd, *shards[d].queue);
+        }
+    }
 
-        local_sort_pairs_u32_u64(
-            sd.keys_in, sd.keys_out, sd.vals_in, sd.vals_out,
-            d_idx_in, d_idx_out, scratch, scratch_bytes,
-            cd, begin_bit, end_bit, *sd.queue);
-        sd.queue->wait();
-
-        if (scratch) sycl::free(scratch, *sd.queue);
-        sycl::free(d_idx_in,  *sd.queue);
-        sycl::free(d_idx_out, *sd.queue);
+    std::vector<sycl::event> h2d_keys(N), h2d_vals(N);
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsU32U64Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        h2d_keys[d] = sd.queue->memcpy(sd.keys_in, recv_keys[d],
+                                       cd * sizeof(std::uint32_t));
+        h2d_vals[d] = sd.queue->memcpy(sd.vals_in, recv_vals[d],
+                                       cd * sizeof(std::uint64_t));
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] == 0) continue;
+        h2d_keys[d].wait();
+        h2d_vals[d].wait();
     }
 
     for (std::size_t d = 0; d < N; ++d) {
-        sycl::free(recv_keys[d], alloc_q);
-        sycl::free(recv_vals[d], alloc_q);
+        DistributedSortPairsU32U64Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        local_sort_pairs_u32_u64(
+            sd.keys_in, sd.keys_out, sd.vals_in, sd.vals_out,
+            d_idx_in[d], d_idx_out[d],
+            sort_scratch[d], scratch_bytes[d],
+            cd, begin_bit, end_bit, *sd.queue);
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] > 0) shards[d].queue->wait();
+    }
+
+    for (std::size_t d = 0; d < N; ++d) {
+        if (sort_scratch[d] && !scratch_pooled[d]) {
+            sycl::free(sort_scratch[d], *shards[d].queue);
+        }
+        if (!idx_pooled[d]) {
+            if (d_idx_in [d]) sycl::free(d_idx_in [d], *shards[d].queue);
+            if (d_idx_out[d]) sycl::free(d_idx_out[d], *shards[d].queue);
+        }
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        pinned_release(shards[d].pool, recv_keys[d], alloc_q);
+        pinned_release(shards[d].pool, recv_vals[d], alloc_q);
     }
 }
 
@@ -1219,9 +1385,12 @@ void launch_sort_pairs_u32_u64u32_distributed(
     std::vector<std::uint32_t*> host_vb   (N, nullptr);
     for (std::size_t s = 0; s < N; ++s) {
         std::size_t const c = static_cast<std::size_t>(shards[s].count);
-        host_keys[s] = pinned_alloc<std::uint32_t>(c, alloc_q);
-        host_va  [s] = pinned_alloc<std::uint64_t>(c, alloc_q);
-        host_vb  [s] = pinned_alloc<std::uint32_t>(c, alloc_q);
+        host_keys[s] = pinned_acquire<std::uint32_t>(
+            shards[s].pool, "ds_u32u64u32_host_keys", c, alloc_q);
+        host_va  [s] = pinned_acquire<std::uint64_t>(
+            shards[s].pool, "ds_u32u64u32_host_va",   c, alloc_q);
+        host_vb  [s] = pinned_acquire<std::uint32_t>(
+            shards[s].pool, "ds_u32u64u32_host_vb",   c, alloc_q);
         if (c == 0) continue;
         shards[s].queue->memcpy(host_keys[s], shards[s].keys_in,
                                 c * sizeof(std::uint32_t));
@@ -1247,9 +1416,13 @@ void launch_sort_pairs_u32_u64u32_distributed(
     std::vector<std::uint64_t*> recv_va  (N, nullptr);
     std::vector<std::uint32_t*> recv_vb  (N, nullptr);
     for (std::size_t d = 0; d < N; ++d) {
-        recv_keys[d] = pinned_alloc<std::uint32_t>(recv_count[d], alloc_q);
-        recv_va  [d] = pinned_alloc<std::uint64_t>(recv_count[d], alloc_q);
-        recv_vb  [d] = pinned_alloc<std::uint32_t>(recv_count[d], alloc_q);
+        std::size_t const c = recv_count[d] == 0 ? 1 : recv_count[d];
+        recv_keys[d] = pinned_acquire<std::uint32_t>(
+            shards[d].pool, "ds_u32u64u32_recv_keys", c, alloc_q);
+        recv_va  [d] = pinned_acquire<std::uint64_t>(
+            shards[d].pool, "ds_u32u64u32_recv_va",   c, alloc_q);
+        recv_vb  [d] = pinned_acquire<std::uint32_t>(
+            shards[d].pool, "ds_u32u64u32_recv_vb",   c, alloc_q);
     }
 
     std::vector<std::size_t> recv_pos(N, 0);
@@ -1275,12 +1448,13 @@ void launch_sort_pairs_u32_u64u32_distributed(
     }
 
     for (std::size_t s = 0; s < N; ++s) {
-        sycl::free(host_keys[s], alloc_q);
-        sycl::free(host_va  [s], alloc_q);
-        sycl::free(host_vb  [s], alloc_q);
+        pinned_release(shards[s].pool, host_keys[s], alloc_q);
+        pinned_release(shards[s].pool, host_va  [s], alloc_q);
+        pinned_release(shards[s].pool, host_vb  [s], alloc_q);
     }
 
-    // Step 3 & 4: H2D + per-receiver local sort + permute.
+    // Step 3 & 4 — parallelised across receivers.
+    std::vector<std::size_t> scratch_bytes(N, 0);
     for (std::size_t d = 0; d < N; ++d) {
         DistributedSortPairsU32U64U32Shard& sd = shards[d];
         std::size_t const cd = recv_count[d];
@@ -1295,42 +1469,91 @@ void launch_sort_pairs_u32_u64u32_distributed(
         }
         sd.out_count = cd;
         if (cd == 0) continue;
-
-        sd.queue->memcpy(sd.keys_in,   recv_keys[d],
-                         cd * sizeof(std::uint32_t));
-        sd.queue->memcpy(sd.vals_a_in, recv_va  [d],
-                         cd * sizeof(std::uint64_t));
-        sd.queue->memcpy(sd.vals_b_in, recv_vb  [d],
-                         cd * sizeof(std::uint32_t));
-        sd.queue->wait();
-
-        std::size_t scratch_bytes = 0;
         launch_sort_pairs_u32_u32(
-            nullptr, scratch_bytes, nullptr, nullptr, nullptr, nullptr,
+            nullptr, scratch_bytes[d],
+            nullptr, nullptr, nullptr, nullptr,
             cd, begin_bit, end_bit, *sd.queue);
-        void* scratch = scratch_bytes
-            ? sycl::malloc_device(scratch_bytes, *sd.queue) : nullptr;
+    }
 
-        auto* d_idx_in  = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
-        auto* d_idx_out = sycl::malloc_device<std::uint32_t>(cd, *sd.queue);
+    std::vector<void*>          sort_scratch(N, nullptr);
+    std::vector<bool>           scratch_pooled(N, false);
+    std::vector<std::uint32_t*> d_idx_in (N, nullptr);
+    std::vector<std::uint32_t*> d_idx_out(N, nullptr);
+    std::vector<bool>           idx_pooled(N, false);
+    for (std::size_t d = 0; d < N; ++d) {
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        if (shards[d].pool) {
+            if (scratch_bytes[d]) {
+                sort_scratch[d] = shards[d].pool->ensure_bytes(
+                    "ds_u32u64u32_sort_scratch", scratch_bytes[d]);
+                scratch_pooled[d] = true;
+            }
+            d_idx_in [d] = shards[d].pool->ensure<std::uint32_t>(
+                "ds_u32u64u32_idx_in",  cd);
+            d_idx_out[d] = shards[d].pool->ensure<std::uint32_t>(
+                "ds_u32u64u32_idx_out", cd);
+            idx_pooled[d] = true;
+        } else {
+            if (scratch_bytes[d]) {
+                sort_scratch[d] = sycl::malloc_device(
+                    scratch_bytes[d], *shards[d].queue);
+            }
+            d_idx_in [d] = sycl::malloc_device<std::uint32_t>(
+                cd, *shards[d].queue);
+            d_idx_out[d] = sycl::malloc_device<std::uint32_t>(
+                cd, *shards[d].queue);
+        }
+    }
 
+    std::vector<sycl::event> h2d_keys(N), h2d_va(N), h2d_vb(N);
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsU32U64U32Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
+        h2d_keys[d] = sd.queue->memcpy(sd.keys_in,   recv_keys[d],
+                                       cd * sizeof(std::uint32_t));
+        h2d_va  [d] = sd.queue->memcpy(sd.vals_a_in, recv_va  [d],
+                                       cd * sizeof(std::uint64_t));
+        h2d_vb  [d] = sd.queue->memcpy(sd.vals_b_in, recv_vb  [d],
+                                       cd * sizeof(std::uint32_t));
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] == 0) continue;
+        h2d_keys[d].wait();
+        h2d_va  [d].wait();
+        h2d_vb  [d].wait();
+    }
+
+    for (std::size_t d = 0; d < N; ++d) {
+        DistributedSortPairsU32U64U32Shard& sd = shards[d];
+        std::size_t const cd = recv_count[d];
+        if (cd == 0) continue;
         local_sort_pairs_u32_u64u32(
             sd.keys_in,   sd.keys_out,
             sd.vals_a_in, sd.vals_a_out,
             sd.vals_b_in, sd.vals_b_out,
-            d_idx_in, d_idx_out, scratch, scratch_bytes,
+            d_idx_in[d], d_idx_out[d],
+            sort_scratch[d], scratch_bytes[d],
             cd, begin_bit, end_bit, *sd.queue);
-        sd.queue->wait();
-
-        if (scratch) sycl::free(scratch, *sd.queue);
-        sycl::free(d_idx_in,  *sd.queue);
-        sycl::free(d_idx_out, *sd.queue);
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        if (recv_count[d] > 0) shards[d].queue->wait();
     }
 
     for (std::size_t d = 0; d < N; ++d) {
-        sycl::free(recv_keys[d], alloc_q);
-        sycl::free(recv_va  [d], alloc_q);
-        sycl::free(recv_vb  [d], alloc_q);
+        if (sort_scratch[d] && !scratch_pooled[d]) {
+            sycl::free(sort_scratch[d], *shards[d].queue);
+        }
+        if (!idx_pooled[d]) {
+            if (d_idx_in [d]) sycl::free(d_idx_in [d], *shards[d].queue);
+            if (d_idx_out[d]) sycl::free(d_idx_out[d], *shards[d].queue);
+        }
+    }
+    for (std::size_t d = 0; d < N; ++d) {
+        pinned_release(shards[d].pool, recv_keys[d], alloc_q);
+        pinned_release(shards[d].pool, recv_va  [d], alloc_q);
+        pinned_release(shards[d].pool, recv_vb  [d], alloc_q);
     }
 }
 

@@ -24,6 +24,12 @@
 
 namespace pos2gpu {
 
+// Optional per-shard pool used to keep multi-GB pinned host bounces
+// resident across the three distributed-sort calls per plot. Forward-
+// declared here to avoid pulling host/MultiGpuShardBufferPool.hpp into
+// every gpu-layer translation unit.
+class ShardBufferPool;
+
 // Selects how the distributed sort moves data across shards.
 //
 //   HostBounce — (default, Phase 2.1+) D2H every source's input into
@@ -69,6 +75,13 @@ struct DistributedSortPairsShard {
 
     // Filled by the implementation post-sort:
     std::uint64_t  out_count;      // actual elements placed in this shard's output
+
+    // Optional. When non-null, the host-bounce pinned buffers and the
+    // per-receiver sort scratch are routed through this pool's
+    // ensure_host / ensure_bytes slots so consecutive distributed-sort
+    // calls (T1 → T2 → T3 in a single plot) and consecutive plots reuse
+    // the same page-locked / device allocations.
+    ShardBufferPool* pool = nullptr;
 };
 
 struct DistributedSortKeysU64Shard {
@@ -81,6 +94,8 @@ struct DistributedSortKeysU64Shard {
     std::uint64_t  out_capacity;
 
     std::uint64_t  out_count;
+
+    ShardBufferPool* pool = nullptr;
 };
 
 // Pairs sort with uint32 key and uint64 value. Used by T1's distributed
@@ -100,6 +115,8 @@ struct DistributedSortPairsU32U64Shard {
     std::uint64_t  out_capacity;
 
     std::uint64_t  out_count;
+
+    ShardBufferPool* pool = nullptr;
 };
 
 // Pairs sort with uint32 key and (uint64, uint32) value pair. Used by
@@ -120,6 +137,8 @@ struct DistributedSortPairsU32U64U32Shard {
     std::uint64_t  out_capacity;
 
     std::uint64_t  out_count;
+
+    ShardBufferPool* pool = nullptr;
 };
 
 // Sort (key, value) pairs by uint32 key over [begin_bit, end_bit) bits,

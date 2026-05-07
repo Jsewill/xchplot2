@@ -475,6 +475,7 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         sort_shards[s].vals_out     = d_vals_out[s];
         sort_shards[s].out_capacity = out_cap;
         sort_shards[s].out_count    = 0;
+        sort_shards[s].pool         = shards_[s].pool;
     }
     std::size_t scratch_bytes = 0;
     launch_sort_pairs_u32_u32_distributed(
@@ -776,6 +777,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
         sort_shards[s].vals_out     = d_t1_meta_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
+        sort_shards[s].pool         = shards_[s].pool;
     }
 
     std::size_t scratch_bytes = 0;
@@ -1061,6 +1063,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
         sort_shards[s].vals_b_out   = d_t2_xbits_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
+        sort_shards[s].pool         = shards_[s].pool;
     }
 
     std::size_t scratch_bytes = 0;
@@ -1359,6 +1362,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
         sort_shards[s].keys_out     = d_t3_frags_sorted[s].get();
         sort_shards[s].out_capacity = sort_cap;
         sort_shards[s].out_count    = 0;
+        sort_shards[s].pool         = shards_[s].pool;
     }
 
     int const t3_end_bit = 2 * k;
