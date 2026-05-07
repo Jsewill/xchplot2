@@ -475,4 +475,48 @@ size_t streaming_minimal_peak_bytes(int k)
     return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
+size_t streaming_tiny_peak_bytes(int k)
+{
+    // Target anchor: 1500 MB at k=28. Lets ~2 GB cards (which report
+    // ~1.7-1.8 GB free under the desktop driver) plot k=28 with a
+    // ~200-300 MB margin for driver / OS overhead. Layers further
+    // cuts on top of minimal:
+    //   - Tighter T1/T2/T3 match staging (target N=16 or N=32 vs
+    //     minimal's N=8) — output cap/N grows smaller per slice.
+    //   - Aggressive park-to-host: full Xs and intermediate T1/T2
+    //     sorted streams kept on pinned host, swapped in per phase.
+    //   - Smaller per-tile CUB sort scratch.
+    //
+    // Cost: more PCIe round-trips than minimal (sliced finer + more
+    // park/rehydrate cycles). Expected ~12-20 s/plot at k=28 vs
+    // minimal's ~34 s/plot — wait, actually minimal is 34 s, so tiny
+    // will be slower; the tradeoff is "able to plot at all on 2 GB
+    // cards" vs "cannot plot". Caller must opt into either an
+    // explicit `--tier tiny` or have free VRAM that fits ONLY this
+    // peak. When host pinning fails to grow enough, the pipeline
+    // throws InsufficientHostMemoryError naming `--temp-dir` as the
+    // opt-in disk-fallback (added in a later commit, not yet wired).
+    //
+    // Scaffolding-only as of this commit: the constant lands here
+    // and the auto-pick / `--tier tiny` branches resolve to it, but
+    // the additional staging cuts that actually reduce peak below
+    // minimal's 3760 MB ship in subsequent commits. Until those
+    // land, requesting `tier=tiny` runs the minimal-tier path
+    // unchanged (peak still ~3760 MB) — the user gets a clear "tier
+    // pinned to tiny but device can't fit it" error if the device
+    // VRAM is below this budget.
+    constexpr size_t anchor_mb = 1500;
+    size_t const adj = streaming_sort_scratch_adjustment(k);
+    if (k == 28) return (anchor_mb << 20) + adj;
+    if (k <  18) return (size_t(16) << 20) + adj;
+    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
+
+    if (k < 28) {
+        int const shift = 28 - k;
+        return ((size_t(anchor_mb) << 20) >> shift) + adj;
+    }
+    int const shift = k - 28;
+    return ((size_t(anchor_mb) << 20) << shift) + adj;
+}
+
 } // namespace pos2gpu

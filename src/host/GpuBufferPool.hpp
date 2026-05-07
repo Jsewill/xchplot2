@@ -183,9 +183,16 @@ DeviceMemInfo query_device_memory();
 // k=28). Same parks as compact plus N=8 T2 match staging (cap/8 vs
 // compact's cap/2) — targets 4 GiB cards at the cost of more PCIe
 // round-trips during T2 match.
+// streaming_tiny_peak_bytes: tiny tier (anchored at 1500 MB at k=28).
+// Layers further cuts on top of minimal — tighter match staging,
+// aggressive park-to-host of full Xs and intermediate streams, smaller
+// per-tile sort scratch — to fit ~2 GB cards. Costs more PCIe round-
+// trips than minimal. Scaffolding lands first; the actual peak-
+// reducing implementation ships in subsequent commits.
 // Dominant terms scale with 2^k, so other k extrapolate linearly.
 size_t streaming_peak_bytes(int k);
 size_t streaming_plain_peak_bytes(int k);
 size_t streaming_minimal_peak_bytes(int k);
+size_t streaming_tiny_peak_bytes(int k);
 
 } // namespace pos2gpu

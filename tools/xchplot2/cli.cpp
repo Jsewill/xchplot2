@@ -111,13 +111,17 @@ void print_usage(char const* prog)
         << "    --prefer-peer-copy              : deprecated alias; Peer is the default\n"
         << "                                      now, this flag is a no-op kept for\n"
         << "                                      backward-compat with existing scripts.\n"
-        << "    --tier plain|compact|minimal|auto : force streaming pipeline tier\n"
+        << "    --tier plain|compact|minimal|tiny|auto : force streaming pipeline tier\n"
         << "                                      when GPU pool doesn't fit. plain =\n"
         << "                                      ~7.24 GB floor (k=28), faster.\n"
         << "                                      compact = ~5.33 GB floor, fits on\n"
         << "                                      tight 8 GB cards. minimal = ~3.83 GB\n"
         << "                                      floor, fits on 4 GiB cards (extra\n"
         << "                                      PCIe round-trips during T2 match).\n"
+        << "                                      tiny = ~1.5 GB target floor for sub-\n"
+        << "                                      4 GB cards. SCAFFOLDING ONLY in this\n"
+        << "                                      build: routes to the minimal-tier\n"
+        << "                                      path until tighter slicing lands.\n"
         << "                                      auto (default) = pick the largest\n"
         << "                                      tier that fits. Equivalent to\n"
         << "                                      XCHPLOT2_STREAMING_TIER env var;\n"
@@ -365,9 +369,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--prefer-peer-copy")            { /* now the default, kept as a no-op alias */ }
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                if (t != "plain" && t != "compact" && t != "minimal"
+                    && t != "tiny" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', or 'auto' (got '" << t << "')\n";
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
@@ -569,9 +574,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--prefer-peer-copy")        { /* now the default, kept as a no-op alias */ }
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                if (t != "plain" && t != "compact" && t != "minimal"
+                    && t != "tiny" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', or 'auto' (got '" << t << "')\n";
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;

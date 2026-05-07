@@ -70,11 +70,15 @@ struct BatchResult {
 //                       pipeline tier (when the GPU pool doesn't fit).
 //                       Accepted values: "plain" (~7.24 GB floor at k=28,
 //                       ~10-15% faster), "compact" (~5.33 GB floor, fits
-//                       on tight 8 GB cards). Empty string = auto (the
-//                       pre-existing behavior: pick plain if it fits,
-//                       else compact). Equivalent to XCHPLOT2_STREAMING_TIER
-//                       env var but settable via --tier on the CLI; the
-//                       struct field takes precedence over the env var.
+//                       on tight 8 GB cards), "minimal" (~3.76 GB floor,
+//                       4 GB cards), "tiny" (~1.5 GB floor target, sub-
+//                       4 GB cards — scaffolding only as of this commit;
+//                       runs the minimal-tier path until tighter slicing
+//                       lands). Empty string = auto (pick the largest
+//                       tier that fits free VRAM). Equivalent to
+//                       XCHPLOT2_STREAMING_TIER env var but settable via
+//                       --tier on the CLI; the struct field takes
+//                       precedence over the env var.
 //   shard_plot        — opt in to single-plot multi-GPU mode. Default
 //                       (false) keeps the existing work-queue dispatch:
 //                       N workers, one plot each, round-robin. With
