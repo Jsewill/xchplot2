@@ -630,11 +630,18 @@ void MultiGpuPlotPipeline::run_t1_phase()
     }
 
     // ---------- Step 3 — distributed sort by mi. -------------------
-    // Worst-case per-shard receive: the union total (skewed input case).
+    // Each shard receives ~t1_total/N items after the value-range
+    // redistribution; sizing each output buffer to t1_total
+    // over-allocates by N× and OOMs at k>=28 on 20 GB cards. 25% slack
+    // on the expected share is plenty for uniform mi (the
+    // recv_count > out_capacity check in the sort still throws cleanly
+    // on pathological inputs). See run_t3_phase below for the same
+    // pattern.
     std::uint64_t t1_total = 0;
     for (auto c : shard_count) t1_total += c;
 
-    std::uint64_t const sort_cap = t1_total;
+    std::uint64_t const t1_per_shard_share = (t1_total + N - 1) / N;
+    std::uint64_t const sort_cap = t1_per_shard_share + t1_per_shard_share / 4 + 1024;
     std::vector<SyclDevicePtr<std::uint32_t>> d_t1_mi_sorted  (N);
     std::vector<SyclDevicePtr<std::uint64_t>> d_t1_meta_sorted(N);
     for (std::size_t s = 0; s < N; ++s) {
@@ -842,10 +849,16 @@ void MultiGpuPlotPipeline::run_t2_phase()
     }
 
     // ---------- Step 3 — distributed sort by mi. ----------
+    // Each shard receives ~t2_total/N items; t2_total over-allocates by
+    // N×. T2 has the largest per-item footprint of the three sorts
+    // (u32 + u64 + u32 = 16 bytes/item), so this is where the OOM
+    // bites hardest at high k. See run_t1_phase / run_t3_phase for the
+    // same pattern.
     std::uint64_t t2_total = 0;
     for (auto c : shard_count) t2_total += c;
 
-    std::uint64_t const sort_cap = t2_total;
+    std::uint64_t const t2_per_shard_share = (t2_total + N - 1) / N;
+    std::uint64_t const sort_cap = t2_per_shard_share + t2_per_shard_share / 4 + 1024;
     std::vector<SyclDevicePtr<std::uint32_t>> d_t2_mi_sorted   (N);
     std::vector<SyclDevicePtr<std::uint64_t>> d_t2_meta_sorted (N);
     std::vector<SyclDevicePtr<std::uint32_t>> d_t2_xbits_sorted(N);
@@ -1067,7 +1080,20 @@ void MultiGpuPlotPipeline::run_t3_phase()
     std::uint64_t t3_total = 0;
     for (auto c : shard_count) t3_total += c;
 
-    std::uint64_t const sort_cap = t3_total;
+    // out_capacity must hold this shard's bucket share after the
+    // distributed sort redistributes by value range. With N shards and
+    // a well-distributed bucket function (top log2(N) bits of
+    // [begin_bit, end_bit)), each shard receives ~t3_total/N items —
+    // proof_fragments are derived hashes, the standard deviation is
+    // O(sqrt(t3_total/N)) and lands well under 1% by k=22. Sizing each
+    // output buffer to t3_total (the previous setting) over-allocates
+    // by N×: at k=28 with N=2 that's ~22 GB per shard, past the 20 GB
+    // RTX 4000 Ada VRAM budget. 25% slack covers any bucket imbalance
+    // we'd realistically see; the Peer / HostBounce path's
+    // recv_count > out_capacity check still throws cleanly on
+    // pathological inputs.
+    std::uint64_t const per_shard_share = (t3_total + N - 1) / N;
+    std::uint64_t const sort_cap = per_shard_share + per_shard_share / 4 + 1024;
     std::vector<SyclDevicePtr<std::uint64_t>> d_t3_frags_sorted(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
