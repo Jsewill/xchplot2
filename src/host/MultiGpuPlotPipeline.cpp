@@ -53,9 +53,14 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -360,15 +365,55 @@ void MultiGpuPlotPipeline::run()
 
 void MultiGpuPlotPipeline::run_through(Phase phase)
 {
-    run_xs_phase_impl();
-    if (phase == Phase::Xs) return;
-    run_t1_phase();
-    if (phase == Phase::T1) return;
-    run_t2_phase();
-    if (phase == Phase::T2) return;
-    run_t3_phase();
-    if (phase == Phase::T3) return;
-    run_fragment_phase();
+    // Phase-wall timing — POS2GPU_PHASE_TIMING=1 mirrors GpuPipeline's
+    // single-GPU breakdown so users can compare sharded vs single
+    // costs side by side. Each begin/end waits on every shard queue
+    // so the sample brackets actual GPU work; when disabled, the
+    // lambdas early-out and add ~zero cost. Phase names match the
+    // single-GPU labels where they map cleanly (Xs / T1 / T2 / T3 /
+    // fragment) so a user grepping `[phase-timing]` can correlate.
+    bool const phase_timing = [] {
+        char const* v = std::getenv("POS2GPU_PHASE_TIMING");
+        return v && v[0] == '1';
+    }();
+    using phase_clock = std::chrono::steady_clock;
+    std::vector<std::pair<char const*, double>> phase_records;
+    auto wait_all = [&] {
+        for (auto& shard : shards_) shard.queue->wait();
+    };
+    auto run_timed = [&](char const* label, auto&& fn) {
+        if (!phase_timing) { fn(); return; }
+        wait_all();
+        auto const t0 = phase_clock::now();
+        fn();
+        wait_all();
+        auto const t1 = phase_clock::now();
+        phase_records.emplace_back(
+            label,
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    };
+    auto report = [&] {
+        if (!phase_timing || phase_records.empty()) return;
+        double total = 0.0;
+        for (auto const& [_n, ms] : phase_records) total += ms;
+        std::fprintf(stderr, "[phase-timing][shard]");
+        for (auto const& [name, ms] : phase_records) {
+            std::fprintf(stderr, " %s=%.1fms(%.0f%%)",
+                name, ms, total > 0.0 ? 100.0 * ms / total : 0.0);
+        }
+        std::fprintf(stderr, " total=%.1fms\n", total);
+    };
+
+    run_timed("Xs",       [&] { run_xs_phase_impl(); });
+    if (phase == Phase::Xs) { report(); return; }
+    run_timed("T1",       [&] { run_t1_phase(); });
+    if (phase == Phase::T1) { report(); return; }
+    run_timed("T2",       [&] { run_t2_phase(); });
+    if (phase == Phase::T2) { report(); return; }
+    run_timed("T3",       [&] { run_t3_phase(); });
+    if (phase == Phase::T3) { report(); return; }
+    run_timed("Fragment", [&] { run_fragment_phase(); });
+    report();
 }
 
 void MultiGpuPlotPipeline::run_xs_phase_impl()
