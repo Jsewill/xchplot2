@@ -466,11 +466,18 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
     std::vector<std::uint32_t*> d_vals_out(N, nullptr);
     std::vector<std::uint64_t>  shard_in_count(N, 0);
 
-    // Worst-case per-shard receive count for the distributed sort:
-    // total_xs (if all items happened to land in one bucket — highly
-    // unlikely with g_x's near-uniform distribution, but the API
-    // contract is "out_capacity ≥ max possible inflow").
-    std::uint64_t const out_cap = total_xs;
+    // Per-shard receive capacity. g_x's value-range bucket function
+    // produces a near-uniform distribution across the N receivers, so
+    // each shard gets ~total_xs/N items in steady state. We size to
+    // the per-shard share + 25 % slack, mirroring the T1/T2/T3 sort
+    // capacity formulas. Distributed-sort's `cd > out_capacity` check
+    // throws cleanly on the (very unlikely) skewed input that exceeds
+    // the bound. Sizing to the full total_xs would multiply per-shard
+    // VRAM by N for buffers that are essentially write-by-1/N — at
+    // k=28, total_xs is 1 GiB / stream and there are 4 streams, so
+    // the old worst-case sizing wasted ~1.5 GiB per shard.
+    std::uint64_t const out_cap_share = (total_xs + N - 1) / N;
+    std::uint64_t const out_cap       = out_cap_share + out_cap_share / 4 + 1024;
 
     auto const xs_partition = compute_position_partition(shards_, total_xs);
 
@@ -862,6 +869,17 @@ void MultiGpuPlotPipeline::run_t1_phase()
             "(expected " + std::to_string(t1_total) + ", got "
             + std::to_string(out_total) + ")");
     }
+
+    // The replicated Xs buffer is dead for the remainder of the plot
+    // (T2/T3 work from the per-shard sorted T1 output). Drop the pool
+    // slot on every shard so its ~3 GB at k=28 doesn't sit alongside
+    // T2/T3's working set. The next plot will re-allocate via ensure().
+    for (std::size_t s = 0; s < N; ++s) {
+        if (shards_[s].pool) {
+            shards_[s].pool->clear_slot("full_xs");
+            shards_[s].pool->clear_host_slot("h_bounce_xs");
+        }
+    }
 }
 
 void MultiGpuPlotPipeline::run_t2_phase()
@@ -1145,6 +1163,16 @@ void MultiGpuPlotPipeline::run_t2_phase()
         t2_phase_count_  [s] = sort_shards[s].out_count;
     }
     sub_end("t2.sort", t_t2_sort);
+
+    // Drop the T2 input replication slots — T3 reads from
+    // t2_phase_d_mi_/meta_/xbits_ (the per-shard sorted T2 output),
+    // not from t2_full_*. Saves ~3 GB at k=28 during T3.
+    for (std::size_t s = 0; s < N; ++s) {
+        if (shards_[s].pool) {
+            shards_[s].pool->clear_slot("t2_full_mi");
+            shards_[s].pool->clear_slot("t2_full_meta");
+        }
+    }
 
     std::uint64_t out_total = 0;
     for (auto c : t2_phase_count_) out_total += c;
@@ -1450,6 +1478,18 @@ void MultiGpuPlotPipeline::run_t3_phase()
         t3_phase_count_  [s] = sort_shards[s].out_count;
     }
     sub_end("t3.sort", t_t3_sort);
+
+    // Drop the T3 input replication slots — Fragment phase only needs
+    // t3_phase_d_frags_ (the sorted output). Saves ~4 GB at k=28
+    // during the fragment-phase D2H, and across plots until the next
+    // plot's T3 phase re-grows them.
+    for (std::size_t s = 0; s < N; ++s) {
+        if (shards_[s].pool) {
+            shards_[s].pool->clear_slot("t3_full_mi");
+            shards_[s].pool->clear_slot("t3_full_meta");
+            shards_[s].pool->clear_slot("t3_full_xbits");
+        }
+    }
 
     std::uint64_t out_total = 0;
     for (auto c : t3_phase_count_) out_total += c;

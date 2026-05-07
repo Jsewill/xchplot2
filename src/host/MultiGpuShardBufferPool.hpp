@@ -103,6 +103,31 @@ public:
         return slot.ptr;
     }
 
+    // Drop a single device slot, freeing its allocation. Called by
+    // the orchestrator at phase boundaries to release replicated-input
+    // buffers that are dead for the rest of the plot — the next
+    // ensure() under the same label will re-allocate. Without this,
+    // every slot lives for the whole plot and the peak VRAM at T3 has
+    // to fit `full_xs` (T1 input) + `t2_full_mi/meta` (T2 input) +
+    // `t3_full_*` (T3 input) all at once even though only the last is
+    // in use; clearing the stale slots between phases drops the peak
+    // by ~6 GB at k=28.
+    void clear_slot(std::string_view name) noexcept
+    {
+        auto it = slots_.find(std::string(name));
+        if (it == slots_.end()) return;
+        if (it->second.ptr && q_) sycl::free(it->second.ptr, *q_);
+        slots_.erase(it);
+    }
+
+    void clear_host_slot(std::string_view name) noexcept
+    {
+        auto it = host_slots_.find(std::string(name));
+        if (it == host_slots_.end()) return;
+        if (it->second.ptr && q_) sycl::free(it->second.ptr, *q_);
+        host_slots_.erase(it);
+    }
+
     // Free every cached slot. Called from the destructor; useful
     // explicitly when the caller wants to reclaim VRAM between
     // batches without destroying the pool object.
