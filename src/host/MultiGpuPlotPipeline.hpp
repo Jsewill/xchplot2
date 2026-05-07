@@ -17,8 +17,10 @@
 #include "host/MultiGpuShardBufferPool.hpp"
 #include "gpu/SortDistributed.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <sycl/sycl.hpp>
@@ -184,6 +186,34 @@ private:
     // Free all per-phase device allocations. Called from dtor on the
     // happy path and the unwind path so partial pipelines don't leak.
     void free_phase_outputs();
+
+    // Sub-phase profiling. Populated by sub_begin/sub_end when
+    // run_through() sees POS2GPU_PHASE_TIMING_VERBOSE=1; otherwise
+    // nullptr and the helpers degenerate to no-ops. Each entry is a
+    // (sub-phase label, milliseconds) pair grouped within the parent
+    // phase. Cleared between phase reports so the vector stays small.
+    std::vector<std::pair<char const*, double>>* subphase_records_ = nullptr;
+
+    // Begin a sub-phase sample: drains every shard queue then captures
+    // the wall clock. No-op (returns default time_point) when
+    // subphase_records_ is null. Pair with sub_end(label, t0).
+    std::chrono::steady_clock::time_point sub_begin()
+    {
+        if (!subphase_records_) return {};
+        for (auto& s : shards_) s.queue->wait();
+        return std::chrono::steady_clock::now();
+    }
+
+    void sub_end(char const* label,
+                 std::chrono::steady_clock::time_point t0)
+    {
+        if (!subphase_records_) return;
+        for (auto& s : shards_) s.queue->wait();
+        auto const t1 = std::chrono::steady_clock::now();
+        subphase_records_->emplace_back(
+            label,
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
 };
 
 } // namespace pos2gpu

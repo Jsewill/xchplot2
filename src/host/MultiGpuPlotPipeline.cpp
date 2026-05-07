@@ -372,12 +372,26 @@ void MultiGpuPlotPipeline::run_through(Phase phase)
     // lambdas early-out and add ~zero cost. Phase names match the
     // single-GPU labels where they map cleanly (Xs / T1 / T2 / T3 /
     // fragment) so a user grepping `[phase-timing]` can correlate.
+    //
+    // POS2GPU_PHASE_TIMING_VERBOSE=1 also enables sub-phase tracing
+    // via time_sub() inside run_xs / run_t1 / run_t2 / run_t3 /
+    // run_fragment. Each parent phase emits a second
+    // `[phase-timing][shard][verbose]` line afterwards listing its
+    // sub-steps (replicate D2H/H2D, match, distributed sort, etc.).
+    // Adds wait_all() calls inside the phase, which serialises the
+    // parallel-submission pattern; only enable when measuring.
     bool const phase_timing = [] {
         char const* v = std::getenv("POS2GPU_PHASE_TIMING");
         return v && v[0] == '1';
     }();
+    bool const subphase_verbose = phase_timing && [] {
+        char const* v = std::getenv("POS2GPU_PHASE_TIMING_VERBOSE");
+        return v && v[0] == '1';
+    }();
     using phase_clock = std::chrono::steady_clock;
     std::vector<std::pair<char const*, double>> phase_records;
+    std::vector<std::pair<char const*, double>> sub_records;
+    if (subphase_verbose) subphase_records_ = &sub_records;
     auto wait_all = [&] {
         for (auto& shard : shards_) shard.queue->wait();
     };
@@ -392,6 +406,18 @@ void MultiGpuPlotPipeline::run_through(Phase phase)
             label,
             std::chrono::duration<double, std::milli>(t1 - t0).count());
     };
+    auto report_subphase = [&](char const* phase_name) {
+        if (!subphase_verbose || sub_records.empty()) return;
+        double total = 0.0;
+        for (auto const& [_n, ms] : sub_records) total += ms;
+        std::fprintf(stderr, "[phase-timing][shard][verbose] %s:", phase_name);
+        for (auto const& [name, ms] : sub_records) {
+            std::fprintf(stderr, " %s=%.1fms(%.0f%%)",
+                name, ms, total > 0.0 ? 100.0 * ms / total : 0.0);
+        }
+        std::fprintf(stderr, " sum=%.1fms\n", total);
+        sub_records.clear();
+    };
     auto report = [&] {
         if (!phase_timing || phase_records.empty()) return;
         double total = 0.0;
@@ -405,15 +431,21 @@ void MultiGpuPlotPipeline::run_through(Phase phase)
     };
 
     run_timed("Xs",       [&] { run_xs_phase_impl(); });
-    if (phase == Phase::Xs) { report(); return; }
+    report_subphase("Xs");
+    if (phase == Phase::Xs) { report(); subphase_records_ = nullptr; return; }
     run_timed("T1",       [&] { run_t1_phase(); });
-    if (phase == Phase::T1) { report(); return; }
+    report_subphase("T1");
+    if (phase == Phase::T1) { report(); subphase_records_ = nullptr; return; }
     run_timed("T2",       [&] { run_t2_phase(); });
-    if (phase == Phase::T2) { report(); return; }
+    report_subphase("T2");
+    if (phase == Phase::T2) { report(); subphase_records_ = nullptr; return; }
     run_timed("T3",       [&] { run_t3_phase(); });
-    if (phase == Phase::T3) { report(); return; }
+    report_subphase("T3");
+    if (phase == Phase::T3) { report(); subphase_records_ = nullptr; return; }
     run_timed("Fragment", [&] { run_fragment_phase(); });
+    report_subphase("Fragment");
     report();
+    subphase_records_ = nullptr;
 }
 
 void MultiGpuPlotPipeline::run_xs_phase_impl()
@@ -427,6 +459,7 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
     // Step 1 — per-shard Xs gen via launch_xs_gen_range. Shard k owns
     // the position range [k*total_xs/N, (k+1)*total_xs/N). Outputs
     // land in per-shard u32 keys/vals scratch on the shard's device.
+    auto const t_xs_gen = sub_begin();
     std::vector<std::uint32_t*> d_keys_in (N, nullptr);
     std::vector<std::uint32_t*> d_vals_in (N, nullptr);
     std::vector<std::uint32_t*> d_keys_out(N, nullptr);
@@ -460,11 +493,13 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         }
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
+    sub_end("xs.gen", t_xs_gen);
 
     // Step 2 — distributed sort. Each shard becomes a
     // DistributedSortPairsShard. After the call, shard k's keys_out /
     // vals_out hold its bucket range of sorted (key, val) pairs;
     // shards[k].out_count is the actual count.
+    auto const t_xs_sort = sub_begin();
     std::vector<DistributedSortPairsShard> sort_shards(N);
     for (std::size_t s = 0; s < N; ++s) {
         sort_shards[s].queue        = shards_[s].queue;
@@ -487,10 +522,12 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         d_scratch ? d_scratch : reinterpret_cast<void*>(std::uintptr_t{1}),
         scratch_bytes, sort_shards, /*begin_bit=*/0, /*end_bit=*/k, transport());
     if (d_scratch) sycl::free(d_scratch, *shards_[0].queue);
+    sub_end("xs.sort", t_xs_sort);
 
     // Step 3 — per-shard launch_xs_pack into a packed XsCandidateGpu
     // output sized for the shard's bucket range. The packed output is
     // what T1 match consumes in Phase 2.3.
+    auto const t_xs_pack = sub_begin();
     for (std::size_t s = 0; s < N; ++s) {
         std::uint64_t const c = sort_shards[s].out_count;
         xs_phase_count_[s] = c;
@@ -505,6 +542,7 @@ void MultiGpuPlotPipeline::run_xs_phase_impl()
         }
     }
     for (std::size_t s = 0; s < N; ++s) shards_[s].queue->wait();
+    sub_end("xs.pack", t_xs_pack);
 
     // Free intermediate u32 keys/vals — only the packed XsCandidateGpu
     // output survives into Phase 2.3.
@@ -569,6 +607,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
     auto const t1_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate sorted Xs across shards. ----------
+    auto const t_t1_replicate = sub_begin();
     // Per-shard offsets in the concatenated layout. Computed once so
     // both the D2H pull and the receiver-side scatter can index without
     // re-walking the count array.
@@ -667,7 +706,10 @@ void MultiGpuPlotPipeline::run_t1_phase()
         }
     }
 
+    sub_end("t1.replicate", t_t1_replicate);
+
     // ---------- Step 2 — per-shard T1 match over assigned buckets. ----
+    auto const t_t1_match = sub_begin();
     // Capacity: max_pairs_per_section * num_sections — the standard
     // pos2-chip pool sizing for T1 output, which adds an extra-margin-
     // bits term over the naive 2^k count to absorb expected skew. Same
@@ -746,7 +788,10 @@ void MultiGpuPlotPipeline::run_t1_phase()
         d_full_xs [s].reset();
     }
 
+    sub_end("t1.match", t_t1_match);
+
     // ---------- Step 3 — distributed sort by mi. -------------------
+    auto const t_t1_sort = sub_begin();
     // Each shard receives ~t1_total/N items after the value-range
     // redistribution; sizing each output buffer to t1_total
     // over-allocates by N× and OOMs at k>=28 on 20 GB cards. 25% slack
@@ -807,6 +852,7 @@ void MultiGpuPlotPipeline::run_t1_phase()
         t1_phase_d_meta_[s] = d_t1_meta_sorted[s].release();
         t1_phase_count_ [s] = sort_shards[s].out_count;
     }
+    sub_end("t1.sort", t_t1_sort);
 
     std::uint64_t out_total = 0;
     for (auto c : t1_phase_count_) out_total += c;
@@ -848,6 +894,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
     auto const t2_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate T1 sorted streams. ----------
+    auto const t_t2_replicate = sub_begin();
     std::uint64_t t1_total = 0;
     for (auto c : t1_phase_count_) t1_total += c;
 
@@ -958,7 +1005,10 @@ void MultiGpuPlotPipeline::run_t2_phase()
         }
     }
 
+    sub_end("t2.replicate", t_t2_replicate);
+
     // ---------- Step 2 — per-shard T2 match. ----------
+    auto const t_t2_match = sub_begin();
     // Per-shard share of the full T2 capacity; see run_t1_phase for
     // the rationale. T2 has the largest per-item footprint of the
     // three phases (mi+meta+xbits = 16 B/item), so the saving from
@@ -1030,7 +1080,10 @@ void MultiGpuPlotPipeline::run_t2_phase()
         d_full_meta[s].reset();
     }
 
+    sub_end("t2.match", t_t2_match);
+
     // ---------- Step 3 — distributed sort by mi. ----------
+    auto const t_t2_sort = sub_begin();
     // Each shard receives ~t2_total/N items; t2_total over-allocates by
     // N×. T2 has the largest per-item footprint of the three sorts
     // (u32 + u64 + u32 = 16 bytes/item), so this is where the OOM
@@ -1091,6 +1144,7 @@ void MultiGpuPlotPipeline::run_t2_phase()
         t2_phase_d_xbits_[s] = d_t2_xbits_sorted[s].release();
         t2_phase_count_  [s] = sort_shards[s].out_count;
     }
+    sub_end("t2.sort", t_t2_sort);
 
     std::uint64_t out_total = 0;
     for (auto c : t2_phase_count_) out_total += c;
@@ -1130,6 +1184,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
     auto const t3_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate T2 sorted streams. ----------
+    auto const t_t3_replicate = sub_begin();
     std::uint64_t t2_total = 0;
     for (auto c : t2_phase_count_) t2_total += c;
 
@@ -1262,7 +1317,10 @@ void MultiGpuPlotPipeline::run_t3_phase()
         }
     }
 
+    sub_end("t3.replicate", t_t3_replicate);
+
     // ---------- Step 2 — per-shard T3 match. ----------
+    auto const t_t3_match = sub_begin();
     // Per-shard share of the full T3 capacity; see run_t1_phase.
     std::uint64_t const t3_cap_full = match_phase_capacity(k, t3p.num_section_bits);
     std::uint64_t const t3_cap_share = (t3_cap_full + N - 1) / N;
@@ -1326,7 +1384,10 @@ void MultiGpuPlotPipeline::run_t3_phase()
         d_full_xbits[s].reset();
     }
 
+    sub_end("t3.match", t_t3_match);
+
     // ---------- Step 3 — distributed sort by proof_fragment. ----------
+    auto const t_t3_sort = sub_begin();
     // T3PairingGpu is just a uint64_t; reinterpret in place. Sort over
     // the low 2*k bits to match GpuPipeline.cpp's launch_sort_keys_u64
     // call.
@@ -1388,6 +1449,7 @@ void MultiGpuPlotPipeline::run_t3_phase()
         t3_phase_d_frags_[s] = d_t3_frags_sorted[s].release();
         t3_phase_count_  [s] = sort_shards[s].out_count;
     }
+    sub_end("t3.sort", t_t3_sort);
 
     std::uint64_t out_total = 0;
     for (auto c : t3_phase_count_) out_total += c;
@@ -1427,12 +1489,15 @@ void MultiGpuPlotPipeline::run_fragment_phase()
     }
     if (total == 0) return;
 
+    auto const t_frag_alloc = sub_begin();
     h_fragments_ = sycl::malloc_host<std::uint64_t>(total, alloc_q);
+    sub_end("fragment.host_alloc", t_frag_alloc);
 
     // Submit all per-shard D2H copies concurrently into the right host
     // offset, then drain. Each shard's queue is on a different physical
     // GPU, so serializing per-shard with .wait() forces the transfers
     // onto a single PCIe lane at a time.
+    auto const t_frag_d2h = sub_begin();
     std::vector<std::uint64_t> shard_off(N, 0);
     {
         std::uint64_t off = 0;
@@ -1453,6 +1518,7 @@ void MultiGpuPlotPipeline::run_fragment_phase()
         if (t3_phase_count_[s] > 0) evts[s].wait();
     }
     fragments_count_ = total;
+    sub_end("fragment.d2h", t_frag_d2h);
 
     // Per-shard device fragments are no longer needed.
     for (std::size_t s = 0; s < N; ++s) {
