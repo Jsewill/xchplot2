@@ -117,9 +117,12 @@ echo "[install-deps] distro=$DISTRO, gpu=$GPU, acpp=${ACPP_REF}, prefix=${ACPP_P
 
 # ── Per-distro packages ─────────────────────────────────────────────────────
 install_arch() {
+    # `openmp` is clang's libomp runtime — required by AdaptiveCpp's
+    # OpenMP backend find_package check, even on the NVIDIA path.
     local pkgs=(cmake git base-devel python ninja
                 llvm clang lld
-                boost numactl curl)
+                boost numactl curl
+                openmp)
     case "$GPU" in
         nvidia) pkgs+=(cuda) ;;
         # rocminfo: needed by build-container.sh + scripts/install-deps.sh
@@ -130,6 +133,19 @@ install_arch() {
         amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo) ;;
     esac
     sudo pacman -S --needed --noconfirm "${pkgs[@]}"
+
+    # On rolling Arch, `llvm`/`clang` are often >20 — above AdaptiveCpp's
+    # 16-20 cap. Pull the official side-by-side `llvm20`/`clang20`/`lld20`
+    # from `extra`; they install under /usr/lib/llvm20, the first path
+    # the LLVM probe further down checks.
+    local sys_llvm_major
+    sys_llvm_major=$(pacman -Q llvm 2>/dev/null \
+                     | awk '{print $2}' | grep -oE '^[0-9]+')
+    if [[ -n "$sys_llvm_major" ]] && (( sys_llvm_major > 20 )); then
+        echo "[install-deps] System llvm is $sys_llvm_major (> AdaptiveCpp's 20 cap)."
+        echo "[install-deps] Installing side-by-side llvm20/clang20/lld20 from extra."
+        sudo pacman -S --needed --noconfirm llvm20 llvm20-libs clang20 lld20
+    fi
 }
 
 install_apt() {
@@ -289,19 +305,43 @@ echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
 git clone --depth 1 --branch "$ACPP_REF" \
     https://github.com/AdaptiveCpp/AdaptiveCpp.git "$ACPP_BUILD_DIR/src"
 
-# AMD-only builds don't need AdaptiveCpp's CUDA backend. Skip the
-# `find_package(CUDA)` probe that AdaptiveCpp's CMakeLists runs at
-# line ~122: on hosts where a CUDA headers subset is installed (distro
-# `cuda` package, JetPack fragments, /usr/lib from some wrappers), the
-# probe finds a partial install and AdaptiveCpp's own `FindCUDA.cmake`
-# emits `CUDAToolkit_LIBRARY_ROOT /usr/lib does not point to the
-# correct directory, try setting it manually`. The warning is cosmetic
-# (AdaptiveCpp continues without CUDA), but it looks like an error to
-# users skimming the install log.
-ACPP_CUDA_DISABLE=()
-if [[ "$GPU" == "amd" ]]; then
-    ACPP_CUDA_DISABLE+=(-DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE)
-fi
+# GPU-specific knobs for AdaptiveCpp's `find_package(CUDA)` probe.
+#
+# The probe drives WITH_CUDA_BACKEND (CMakeLists.txt:237 —
+# `set(WITH_CUDA_BACKEND ${CUDA_FOUND} CACHE BOOL ...)`), so its outcome
+# decides whether `librt-backend-cuda.so` ships in the install. We
+# deliberately don't force WITH_CUDA_BACKEND=ON: lines 224-228 turn that
+# into `SEND_ERROR` when CUDA can't be found, which is worse than the
+# silent off we'd get from an honest auto-detect miss. Just feed the
+# probe a toolkit root when we know one — auto-detect handles the rest.
+#
+# Arch: `cuda` installs to /opt/cuda, which isn't on the default PATH
+# and isn't a location FindCUDA scans on its own — so without a hint
+# the backend silently turns off and `acpp-info` lists only OpenMP/OCL,
+# even with two NVIDIA cards in the box. Override the default with
+# ACPP_CUDA_TOOLKIT_ROOT=... if your toolkit lives elsewhere.
+#
+# AMD: same probe, opposite problem — on hosts where a CUDA *headers*
+# subset is installed (distro cuda, JetPack fragments, /usr/lib from
+# some wrappers), AdaptiveCpp's FindCUDA emits
+# `CUDAToolkit_LIBRARY_ROOT /usr/lib does not point to the correct
+# directory, try setting it manually`. AdaptiveCpp continues fine, but
+# the warning looks like an error in the log. Disable the probe.
+ACPP_CUDA_FLAGS=()
+case "$GPU" in
+    nvidia)
+        ACPP_CUDA_TOOLKIT_ROOT=${ACPP_CUDA_TOOLKIT_ROOT:-/opt/cuda}
+        if [[ -d "$ACPP_CUDA_TOOLKIT_ROOT" ]]; then
+            ACPP_CUDA_FLAGS+=(
+                -DCUDA_TOOLKIT_ROOT_DIR="$ACPP_CUDA_TOOLKIT_ROOT"
+                -DCUDAToolkit_ROOT="$ACPP_CUDA_TOOLKIT_ROOT"
+            )
+        fi
+        ;;
+    amd)
+        ACPP_CUDA_FLAGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE)
+        ;;
+esac
 
 cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -310,7 +350,7 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_CXX_COMPILER="$LLVM_ROOT/bin/clang++" \
     -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" \
     -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
-    "${ACPP_CUDA_DISABLE[@]}" \
+    "${ACPP_CUDA_FLAGS[@]}" \
     "${ACPP_ROCM_FLAGS[@]}"
 cmake --build "$ACPP_BUILD_DIR/build" --parallel
 sudo cmake --install "$ACPP_BUILD_DIR/build"
@@ -322,3 +362,29 @@ echo "  Build xchplot2:"
 echo "    export CMAKE_PREFIX_PATH=$ACPP_PREFIX:\$CMAKE_PREFIX_PATH"
 echo "    cargo install --path .                  # or:"
 echo "    cmake -B build -S . && cmake --build build -j"
+
+# Tell users about the nvcc/host-compiler dance when the system gcc is
+# newer than what the installed nvcc supports. nvcc 12.8's default ccbin
+# (/usr/bin/cc → system gcc) chokes on gcc 15+'s libstdc++ <type_traits>.
+# Two ccbins work around it: (a) the side-by-side gcc-14 we install when
+# pinning cuda 12.8 from the Arch archive (cleanest — nvcc's canonical
+# Linux host), or (b) the clang we picked for AdaptiveCpp's build (works
+# for the simple compiler-id test, but on some cuda 12.x point releases
+# crt/math_functions.hpp's rsqrt definition trips clang's exception-spec
+# check). Print whichever is available so non-Arch hosts (where g++-14
+# isn't auto-installed) still get a usable hint.
+if [[ "$GPU" == "nvidia" ]] && command -v gcc >/dev/null; then
+    sys_gcc_major=$(gcc -dumpversion 2>/dev/null | grep -oE '^[0-9]+')
+    if [[ -n "$sys_gcc_major" ]] && (( sys_gcc_major > 14 )); then
+        echo
+        echo "[install-deps] Note: system gcc is $sys_gcc_major; nvcc 12.8's default host"
+        echo "[install-deps] compiler can't parse its libstdc++ headers. Use one of these"
+        echo "[install-deps] as nvcc's ccbin via CMAKE_CUDA_HOST_COMPILER:"
+        if command -v g++-14 >/dev/null; then
+            echo "    -DCMAKE_CUDA_HOST_COMPILER=$(command -v g++-14)   # preferred — nvcc's canonical Linux host"
+        fi
+        if [[ -n "${LLVM_ROOT:-}" ]] && [[ -x "$LLVM_ROOT/bin/clang++" ]]; then
+            echo "    -DCMAKE_CUDA_HOST_COMPILER=$LLVM_ROOT/bin/clang++   # works on most cuda 12.x point releases"
+        fi
+    fi
+fi
