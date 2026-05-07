@@ -78,6 +78,31 @@ public:
         return slot.ptr;
     }
 
+    // Pinned-host equivalent. The replicate-full step in each match
+    // phase needs a multi-GB pinned host bounce buffer; without
+    // pooling, every phase pays a fresh malloc_host (which page-locks
+    // the range — non-trivial cost, especially on Linux). Pinned host
+    // memory is process-wide regardless of which device queue did the
+    // alloc, so a single per-pool host slot is sufficient.
+    template <class T>
+    T* ensure_host(std::string_view name, std::uint64_t n)
+    {
+        return static_cast<T*>(
+            ensure_host_bytes(name, static_cast<std::size_t>(n) * sizeof(T)));
+    }
+
+    void* ensure_host_bytes(std::string_view name, std::size_t bytes)
+    {
+        Slot& slot = host_slots_[std::string(name)];
+        if (slot.bytes < bytes) {
+            if (slot.ptr) sycl::free(slot.ptr, *q_);
+            slot.ptr   = bytes == 0 ? nullptr
+                                    : sycl::malloc_host(bytes, *q_);
+            slot.bytes = bytes;
+        }
+        return slot.ptr;
+    }
+
     // Free every cached slot. Called from the destructor; useful
     // explicitly when the caller wants to reclaim VRAM between
     // batches without destroying the pool object.
@@ -88,14 +113,19 @@ public:
             if (slot.ptr) sycl::free(slot.ptr, *q_);
         }
         slots_.clear();
+        for (auto& [name, slot] : host_slots_) {
+            if (slot.ptr) sycl::free(slot.ptr, *q_);
+        }
+        host_slots_.clear();
     }
 
     // Total bytes currently held by all cached slots — useful for
-    // debug/log reporting.
+    // debug/log reporting. Includes both device and pinned-host slots.
     std::size_t total_bytes() const noexcept
     {
         std::size_t total = 0;
-        for (auto const& [name, slot] : slots_) total += slot.bytes;
+        for (auto const& [name, slot] : slots_)      total += slot.bytes;
+        for (auto const& [name, slot] : host_slots_) total += slot.bytes;
         return total;
     }
 
@@ -105,8 +135,9 @@ private:
         std::size_t bytes = 0;
     };
 
-    sycl::queue*               q_ = nullptr;
+    sycl::queue*                q_ = nullptr;
     std::map<std::string, Slot> slots_;
+    std::map<std::string, Slot> host_slots_;
 };
 
 } // namespace pos2gpu

@@ -568,37 +568,93 @@ void MultiGpuPlotPipeline::run_t1_phase()
     auto const t1_partition = compute_bucket_partition(shards_, num_buckets);
 
     // ---------- Step 1 — replicate sorted Xs across shards. ----------
-    sycl::queue& alloc_q = *shards_[0].queue;
-    auto h_full = sycl_alloc_host_owned<XsCandidateGpu>(total_xs, alloc_q);
-
-    std::uint64_t off = 0;
-    for (std::size_t s = 0; s < N; ++s) {
-        std::uint64_t const c = xs_phase_count_[s];
-        if (c > 0) {
-            shards_[s].queue->memcpy(
-                h_full.get() + off, xs_phase_d_xs_[s],
-                sizeof(XsCandidateGpu) * c).wait();
+    // Per-shard offsets in the concatenated layout. Computed once so
+    // both the D2H pull and the receiver-side scatter can index without
+    // re-walking the count array.
+    std::vector<std::uint64_t> shard_off(N, 0);
+    {
+        std::uint64_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            shard_off[s] = off;
+            off += xs_phase_count_[s];
         }
-        off += c;
-    }
-    if (off != total_xs) {
-        // h_full RAII-frees on throw.
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t1_phase: Xs phase outputs sum to "
-            + std::to_string(off) + " entries but total_xs = "
-            + std::to_string(total_xs)
-            + ". run_xs_phase() must complete before run_t1_phase().");
+        if (off != total_xs) {
+            throw std::runtime_error(
+                "MultiGpuPlotPipeline::run_t1_phase: Xs phase outputs sum to "
+                + std::to_string(off) + " entries but total_xs = "
+                + std::to_string(total_xs)
+                + ". run_xs_phase() must complete before run_t1_phase().");
+        }
     }
 
+    // Allocate destination buffers (one full-Xs replica per shard) up
+    // front so we can stream into them in parallel below.
     std::vector<SyclDevicePtr<XsCandidateGpu>> d_full_xs(N);
     for (std::size_t s = 0; s < N; ++s) {
         sycl::queue& q = *shards_[s].queue;
         d_full_xs[s] = pool_or_alloc<XsCandidateGpu>(
             shards_[s].pool, "full_xs", total_xs, q);
-        q.memcpy(d_full_xs[s].get(), h_full.get(),
-                 sizeof(XsCandidateGpu) * total_xs).wait();
     }
-    h_full.reset();
+
+    sycl::queue& alloc_q = *shards_[0].queue;
+
+    if (opts_.prefer_peer_copy) {
+        // Peer-copy fast path: each receiver issues N independent D2D
+        // memcpys directly from each source's per-shard d_xs buffer into
+        // its own d_full_xs at the correct offset. AdaptiveCpp's CUDA
+        // backend resolves cross-device pointers via cudaMemcpyPeerAsync;
+        // single-context (e.g. all-shards-on-one-device parity tests)
+        // collapses to a same-device copy. Skips the host bounce entirely.
+        std::vector<sycl::event> evts;
+        evts.reserve(N * N);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = xs_phase_count_[s];
+                if (c == 0) continue;
+                evts.push_back(q.memcpy(
+                    d_full_xs[r].get() + shard_off[s], xs_phase_d_xs_[s],
+                    sizeof(XsCandidateGpu) * c));
+            }
+        }
+        for (auto& e : evts) e.wait();
+    } else {
+        // Host-bounce path: parallel D2H into a single pinned-host
+        // bounce buffer, parallel H2D fan-out. The pinned buffer is
+        // pooled when shards_[0].pool is attached so consecutive plots
+        // (and the next match phase) reuse the page-locked range.
+        XsCandidateGpu* h_full_ptr = nullptr;
+        SyclHostPtr<XsCandidateGpu> h_full_owned;
+        if (shards_[0].pool) {
+            h_full_ptr = shards_[0].pool->ensure_host<XsCandidateGpu>(
+                "h_bounce_xs", total_xs);
+        } else {
+            h_full_owned = sycl_alloc_host_owned<XsCandidateGpu>(
+                total_xs, alloc_q);
+            h_full_ptr = h_full_owned.get();
+        }
+
+        std::vector<sycl::event> d2h(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            std::uint64_t const c = xs_phase_count_[s];
+            if (c == 0) continue;
+            d2h[s] = shards_[s].queue->memcpy(
+                h_full_ptr + shard_off[s], xs_phase_d_xs_[s],
+                sizeof(XsCandidateGpu) * c);
+        }
+        for (std::size_t s = 0; s < N; ++s) {
+            if (xs_phase_count_[s] > 0) d2h[s].wait();
+        }
+
+        std::vector<sycl::event> h2d(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            sycl::queue& q = *shards_[s].queue;
+            h2d[s] = q.memcpy(d_full_xs[s].get(), h_full_ptr,
+                              sizeof(XsCandidateGpu) * total_xs);
+        }
+        for (auto& e : h2d) e.wait();
+        // h_full_owned RAII-frees if pool was unavailable.
+    }
 
     // The bucket-partitioned Xs phase outputs are no longer needed —
     // d_full_xs holds the same data on every shard. Free them now to
@@ -786,29 +842,19 @@ void MultiGpuPlotPipeline::run_t2_phase()
     std::uint64_t t1_total = 0;
     for (auto c : t1_phase_count_) t1_total += c;
 
-    sycl::queue& alloc_q = *shards_[0].queue;
-    auto h_mi   = sycl_alloc_host_owned<std::uint32_t>(t1_total, alloc_q);
-    auto h_meta = sycl_alloc_host_owned<std::uint64_t>(t1_total, alloc_q);
-
-    std::uint64_t off = 0;
-    for (std::size_t s = 0; s < N; ++s) {
-        std::uint64_t const c = t1_phase_count_[s];
-        if (c > 0) {
-            shards_[s].queue->memcpy(
-                h_mi.get() + off,   t1_phase_d_mi_[s],
-                c * sizeof(std::uint32_t)).wait();
-            shards_[s].queue->memcpy(
-                h_meta.get() + off, t1_phase_d_meta_[s],
-                c * sizeof(std::uint64_t)).wait();
+    std::vector<std::uint64_t> shard_off(N, 0);
+    {
+        std::uint64_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            shard_off[s] = off;
+            off += t1_phase_count_[s];
         }
-        off += c;
-    }
-    if (off != t1_total) {
-        // h_mi / h_meta RAII-free on throw.
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t2_phase: T1 outputs sum to "
-            + std::to_string(off) + " entries but t1_total = "
-            + std::to_string(t1_total));
+        if (off != t1_total) {
+            throw std::runtime_error(
+                "MultiGpuPlotPipeline::run_t2_phase: T1 outputs sum to "
+                + std::to_string(off) + " entries but t1_total = "
+                + std::to_string(t1_total));
+        }
     }
 
     std::vector<SyclDevicePtr<std::uint32_t>> d_full_mi  (N);
@@ -819,13 +865,77 @@ void MultiGpuPlotPipeline::run_t2_phase()
             shards_[s].pool, "t2_full_mi",   t1_total, q);
         d_full_meta[s] = pool_or_alloc<std::uint64_t>(
             shards_[s].pool, "t2_full_meta", t1_total, q);
-        q.memcpy(d_full_mi  [s].get(), h_mi.get(),
-                 t1_total * sizeof(std::uint32_t)).wait();
-        q.memcpy(d_full_meta[s].get(), h_meta.get(),
-                 t1_total * sizeof(std::uint64_t)).wait();
     }
-    h_mi.reset();
-    h_meta.reset();
+
+    sycl::queue& alloc_q = *shards_[0].queue;
+
+    if (opts_.prefer_peer_copy) {
+        // Peer-copy: per receiver, fan-in N D2D memcpys per stream.
+        std::vector<sycl::event> evts;
+        evts.reserve(N * N * 2);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = t1_phase_count_[s];
+                if (c == 0) continue;
+                evts.push_back(q.memcpy(
+                    d_full_mi  [r].get() + shard_off[s], t1_phase_d_mi_[s],
+                    c * sizeof(std::uint32_t)));
+                evts.push_back(q.memcpy(
+                    d_full_meta[r].get() + shard_off[s], t1_phase_d_meta_[s],
+                    c * sizeof(std::uint64_t)));
+            }
+        }
+        for (auto& e : evts) e.wait();
+    } else {
+        std::uint32_t* h_mi   = nullptr;
+        std::uint64_t* h_meta = nullptr;
+        SyclHostPtr<std::uint32_t> h_mi_owned;
+        SyclHostPtr<std::uint64_t> h_meta_owned;
+        if (shards_[0].pool) {
+            h_mi   = shards_[0].pool->ensure_host<std::uint32_t>(
+                "h_bounce_mi",   t1_total);
+            h_meta = shards_[0].pool->ensure_host<std::uint64_t>(
+                "h_bounce_meta", t1_total);
+        } else {
+            h_mi_owned   = sycl_alloc_host_owned<std::uint32_t>(t1_total, alloc_q);
+            h_meta_owned = sycl_alloc_host_owned<std::uint64_t>(t1_total, alloc_q);
+            h_mi   = h_mi_owned.get();
+            h_meta = h_meta_owned.get();
+        }
+
+        // D2H — submit per-shard pulls concurrently, then wait.
+        std::vector<sycl::event> d2h_mi(N);
+        std::vector<sycl::event> d2h_meta(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            std::uint64_t const c = t1_phase_count_[s];
+            if (c == 0) continue;
+            d2h_mi  [s] = shards_[s].queue->memcpy(
+                h_mi   + shard_off[s], t1_phase_d_mi_[s],
+                c * sizeof(std::uint32_t));
+            d2h_meta[s] = shards_[s].queue->memcpy(
+                h_meta + shard_off[s], t1_phase_d_meta_[s],
+                c * sizeof(std::uint64_t));
+        }
+        for (std::size_t s = 0; s < N; ++s) {
+            if (t1_phase_count_[s] == 0) continue;
+            d2h_mi  [s].wait();
+            d2h_meta[s].wait();
+        }
+
+        // H2D fan-out — submit per-shard, then wait.
+        std::vector<sycl::event> h2d_mi(N);
+        std::vector<sycl::event> h2d_meta(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            sycl::queue& q = *shards_[s].queue;
+            h2d_mi  [s] = q.memcpy(d_full_mi  [s].get(), h_mi,
+                                   t1_total * sizeof(std::uint32_t));
+            h2d_meta[s] = q.memcpy(d_full_meta[s].get(), h_meta,
+                                   t1_total * sizeof(std::uint64_t));
+        }
+        for (auto& e : h2d_mi)   e.wait();
+        for (auto& e : h2d_meta) e.wait();
+    }
 
     // The bucket-partitioned T1 outputs are no longer needed.
     for (std::size_t s = 0; s < N; ++s) {
@@ -1008,33 +1118,19 @@ void MultiGpuPlotPipeline::run_t3_phase()
     std::uint64_t t2_total = 0;
     for (auto c : t2_phase_count_) t2_total += c;
 
-    sycl::queue& alloc_q = *shards_[0].queue;
-    auto h_mi    = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
-    auto h_meta  = sycl_alloc_host_owned<std::uint64_t>(t2_total, alloc_q);
-    auto h_xbits = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
-
-    std::uint64_t off = 0;
-    for (std::size_t s = 0; s < N; ++s) {
-        std::uint64_t const c = t2_phase_count_[s];
-        if (c > 0) {
-            shards_[s].queue->memcpy(
-                h_mi.get() + off,    t2_phase_d_mi_[s],
-                c * sizeof(std::uint32_t)).wait();
-            shards_[s].queue->memcpy(
-                h_meta.get() + off,  t2_phase_d_meta_[s],
-                c * sizeof(std::uint64_t)).wait();
-            shards_[s].queue->memcpy(
-                h_xbits.get() + off, t2_phase_d_xbits_[s],
-                c * sizeof(std::uint32_t)).wait();
+    std::vector<std::uint64_t> shard_off(N, 0);
+    {
+        std::uint64_t off = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            shard_off[s] = off;
+            off += t2_phase_count_[s];
         }
-        off += c;
-    }
-    if (off != t2_total) {
-        // h_mi / h_meta / h_xbits RAII-free on throw.
-        throw std::runtime_error(
-            "MultiGpuPlotPipeline::run_t3_phase: T2 outputs sum to "
-            + std::to_string(off) + " entries but t2_total = "
-            + std::to_string(t2_total));
+        if (off != t2_total) {
+            throw std::runtime_error(
+                "MultiGpuPlotPipeline::run_t3_phase: T2 outputs sum to "
+                + std::to_string(off) + " entries but t2_total = "
+                + std::to_string(t2_total));
+        }
     }
 
     std::vector<SyclDevicePtr<std::uint32_t>> d_full_mi   (N);
@@ -1048,16 +1144,92 @@ void MultiGpuPlotPipeline::run_t3_phase()
             shards_[s].pool, "t3_full_meta",  t2_total, q);
         d_full_xbits[s] = pool_or_alloc<std::uint32_t>(
             shards_[s].pool, "t3_full_xbits", t2_total, q);
-        q.memcpy(d_full_mi   [s].get(), h_mi.get(),
-                 t2_total * sizeof(std::uint32_t)).wait();
-        q.memcpy(d_full_meta [s].get(), h_meta.get(),
-                 t2_total * sizeof(std::uint64_t)).wait();
-        q.memcpy(d_full_xbits[s].get(), h_xbits.get(),
-                 t2_total * sizeof(std::uint32_t)).wait();
     }
-    h_mi.reset();
-    h_meta.reset();
-    h_xbits.reset();
+
+    sycl::queue& alloc_q = *shards_[0].queue;
+
+    if (opts_.prefer_peer_copy) {
+        std::vector<sycl::event> evts;
+        evts.reserve(N * N * 3);
+        for (std::size_t r = 0; r < N; ++r) {
+            sycl::queue& q = *shards_[r].queue;
+            for (std::size_t s = 0; s < N; ++s) {
+                std::uint64_t const c = t2_phase_count_[s];
+                if (c == 0) continue;
+                evts.push_back(q.memcpy(
+                    d_full_mi   [r].get() + shard_off[s], t2_phase_d_mi_[s],
+                    c * sizeof(std::uint32_t)));
+                evts.push_back(q.memcpy(
+                    d_full_meta [r].get() + shard_off[s], t2_phase_d_meta_[s],
+                    c * sizeof(std::uint64_t)));
+                evts.push_back(q.memcpy(
+                    d_full_xbits[r].get() + shard_off[s], t2_phase_d_xbits_[s],
+                    c * sizeof(std::uint32_t)));
+            }
+        }
+        for (auto& e : evts) e.wait();
+    } else {
+        std::uint32_t* h_mi    = nullptr;
+        std::uint64_t* h_meta  = nullptr;
+        std::uint32_t* h_xbits = nullptr;
+        SyclHostPtr<std::uint32_t> h_mi_owned;
+        SyclHostPtr<std::uint64_t> h_meta_owned;
+        SyclHostPtr<std::uint32_t> h_xbits_owned;
+        if (shards_[0].pool) {
+            h_mi    = shards_[0].pool->ensure_host<std::uint32_t>(
+                "h_bounce_mi",    t2_total);
+            h_meta  = shards_[0].pool->ensure_host<std::uint64_t>(
+                "h_bounce_meta",  t2_total);
+            h_xbits = shards_[0].pool->ensure_host<std::uint32_t>(
+                "h_bounce_xbits", t2_total);
+        } else {
+            h_mi_owned    = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
+            h_meta_owned  = sycl_alloc_host_owned<std::uint64_t>(t2_total, alloc_q);
+            h_xbits_owned = sycl_alloc_host_owned<std::uint32_t>(t2_total, alloc_q);
+            h_mi    = h_mi_owned.get();
+            h_meta  = h_meta_owned.get();
+            h_xbits = h_xbits_owned.get();
+        }
+
+        std::vector<sycl::event> d2h_mi(N);
+        std::vector<sycl::event> d2h_meta(N);
+        std::vector<sycl::event> d2h_xbits(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            std::uint64_t const c = t2_phase_count_[s];
+            if (c == 0) continue;
+            d2h_mi   [s] = shards_[s].queue->memcpy(
+                h_mi    + shard_off[s], t2_phase_d_mi_[s],
+                c * sizeof(std::uint32_t));
+            d2h_meta [s] = shards_[s].queue->memcpy(
+                h_meta  + shard_off[s], t2_phase_d_meta_[s],
+                c * sizeof(std::uint64_t));
+            d2h_xbits[s] = shards_[s].queue->memcpy(
+                h_xbits + shard_off[s], t2_phase_d_xbits_[s],
+                c * sizeof(std::uint32_t));
+        }
+        for (std::size_t s = 0; s < N; ++s) {
+            if (t2_phase_count_[s] == 0) continue;
+            d2h_mi   [s].wait();
+            d2h_meta [s].wait();
+            d2h_xbits[s].wait();
+        }
+
+        std::vector<sycl::event> h2d_mi(N);
+        std::vector<sycl::event> h2d_meta(N);
+        std::vector<sycl::event> h2d_xbits(N);
+        for (std::size_t s = 0; s < N; ++s) {
+            sycl::queue& q = *shards_[s].queue;
+            h2d_mi   [s] = q.memcpy(d_full_mi   [s].get(), h_mi,
+                                    t2_total * sizeof(std::uint32_t));
+            h2d_meta [s] = q.memcpy(d_full_meta [s].get(), h_meta,
+                                    t2_total * sizeof(std::uint64_t));
+            h2d_xbits[s] = q.memcpy(d_full_xbits[s].get(), h_xbits,
+                                    t2_total * sizeof(std::uint32_t));
+        }
+        for (auto& e : h2d_mi)    e.wait();
+        for (auto& e : h2d_meta)  e.wait();
+        for (auto& e : h2d_xbits) e.wait();
+    }
 
     // The bucket-partitioned T2 outputs are no longer needed.
     for (std::size_t s = 0; s < N; ++s) {
