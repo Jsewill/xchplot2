@@ -2325,6 +2325,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     T3PairingGpu* d_t3    = nullptr;
     uint64_t      t3_count = 0;
+    // Tiny mode plumbing: when the minimal/tiny T3 match block parks
+    // its concatenated output on host pinned, tiny additionally keeps
+    // h_t3 alive across T3 sort instead of rehydrating d_t3 to full
+    // cap (saves 2080 MB at k=28). The T3 sort phase below reads the
+    // input directly from this host buffer.
+    T3PairingGpu* scratch_tiny_h_t3        = nullptr;
+    bool          scratch_tiny_h_t3_owned  = false;
 
     if (scratch.plain_mode) {
         // Plain: one-shot full-cap T3 match.
@@ -2544,9 +2551,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         h_t2_meta = nullptr;
 
         // Re-hydrate full-cap d_t3 on device for T3 sort.
-        s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
-        q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
-        if (h_t3_owned) sycl::free(h_t3, q);
+        //
+        // Tiny mode: skip the rehydration. h_t3 stays alive across T3
+        // sort; the tiled-sort path below H2D's each tile directly from
+        // h_t3 into a small device buffer instead of reading from a
+        // full-cap d_t3. Saves 2080 MB of device VRAM at k=28 across
+        // T3 sort.
+        if (!scratch.tiny_mode) {
+            s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
+            q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
+            if (h_t3_owned) sycl::free(h_t3, q);
+        }
+        // Stash h_t3 ownership for T3 sort cleanup. d_t3 stays nullptr
+        // in tiny mode; the T3 sort phase reads h_t3 directly.
+        scratch_tiny_h_t3        = scratch.tiny_mode ? h_t3 : nullptr;
+        scratch_tiny_h_t3_owned  = scratch.tiny_mode ? h_t3_owned : false;
     } else {
         // Compact: N=2 half-cap staging with pinned-host h_t3 accumulator.
         uint64_t const t3_half_cap = (cap + 1) / 2;
@@ -2660,6 +2679,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_sort_scratch);
     } else {
         // Tiled sort + host merge.
+        //
+        // Minimal: input lives on device (d_t3 full cap). Tile sort
+        // reads from d_frags_in (= d_t3) + offset.
+        //
+        // Tiny: input lives on host (scratch_tiny_h_t3, set by the
+        // earlier minimal/tiny T3 match block when tiny_mode is true).
+        // d_t3 is nullptr. Each tile sort H2Ds the input slice from
+        // host into the same d_frags_out_tile buffer (reused as both
+        // sort input and sort output via in-place CUB), removing the
+        // ~2080 MB d_t3 pin from the T3 sort phase.
         uint64_t const tile_max = (cap + 1) / 2;
         uint64_t const tile_n0  = t3_count / 2;
         uint64_t const tile_n1  = t3_count - tile_n0;
@@ -2671,27 +2700,58 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             tile_max, 0, 2 * cfg.k, q);
 
         uint64_t* d_frags_out_tile     = nullptr;
+        uint64_t* d_frags_in_tile      = nullptr;  // tiny only
         void*     d_sort_scratch_tile  = nullptr;
         s_malloc(stats, d_frags_out_tile,    tile_max * sizeof(uint64_t), "d_frags_out_tile");
+        if (scratch.tiny_mode) {
+            // Separate input buffer for tiny since launch_sort_keys_u64
+            // requires distinct in/out buffers for CUB radix sort.
+            s_malloc(stats, d_frags_in_tile, tile_max * sizeof(uint64_t), "d_frags_in_tile");
+        }
         s_malloc(stats, d_sort_scratch_tile, t3_tile_sort_bytes,          "d_sort_scratch(t3_tile)");
 
         uint64_t* h_frags = static_cast<uint64_t*>(
             sycl::malloc_host(cap * sizeof(uint64_t), q));
         if (!h_frags) throw std::runtime_error("sycl::malloc_host(h_frags) failed");
 
+        // Tiny mode: source pointer is the parked host buffer; the
+        // staging variant H2Ds before each tile sort. In minimal mode
+        // d_frags_in is the device-resident d_t3 and the tile sort
+        // reads from it directly.
+        uint64_t const* h_t3_src =
+            scratch.tiny_mode
+                ? reinterpret_cast<uint64_t const*>(scratch_tiny_h_t3)
+                : nullptr;
+
         int p_t3_sort = begin_phase("T3 sort");
         if (tile_n0 > 0) {
+            uint64_t const* sort_in = nullptr;
+            if (scratch.tiny_mode) {
+                q.memcpy(d_frags_in_tile, h_t3_src,
+                         tile_n0 * sizeof(uint64_t)).wait();
+                sort_in = d_frags_in_tile;
+            } else {
+                sort_in = d_frags_in;
+            }
             launch_sort_keys_u64(
                 d_sort_scratch_tile, t3_tile_sort_bytes,
-                d_frags_in, d_frags_out_tile,
+                const_cast<uint64_t*>(sort_in), d_frags_out_tile,
                 tile_n0, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
             q.memcpy(h_frags, d_frags_out_tile,
                      tile_n0 * sizeof(uint64_t)).wait();
         }
         if (tile_n1 > 0) {
+            uint64_t const* sort_in = nullptr;
+            if (scratch.tiny_mode) {
+                q.memcpy(d_frags_in_tile, h_t3_src + tile_n0,
+                         tile_n1 * sizeof(uint64_t)).wait();
+                sort_in = d_frags_in_tile;
+            } else {
+                sort_in = d_frags_in + tile_n0;
+            }
             launch_sort_keys_u64(
                 d_sort_scratch_tile, t3_tile_sort_bytes,
-                d_frags_in + tile_n0, d_frags_out_tile,
+                const_cast<uint64_t*>(sort_in), d_frags_out_tile,
                 tile_n1, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
             q.memcpy(h_frags + tile_n0, d_frags_out_tile,
                      tile_n1 * sizeof(uint64_t)).wait();
@@ -2699,8 +2759,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         end_phase(p_t3_sort);
 
         s_free(stats, d_frags_out_tile);
+        if (scratch.tiny_mode) s_free(stats, d_frags_in_tile);
         s_free(stats, d_sort_scratch_tile);
-        s_free(stats, d_t3);
+        if (scratch.tiny_mode) {
+            // h_t3 was kept alive into T3 sort; free now that all tiles
+            // have been sorted + D2H'd.
+            if (scratch_tiny_h_t3_owned) sycl::free(scratch_tiny_h_t3, q);
+            scratch_tiny_h_t3 = nullptr;
+        } else {
+            s_free(stats, d_t3);
+        }
 
         // Stable in-place merge of [0, tile_n0) and [tile_n0, t3_count)
         // — both halves are individually sorted by launch_sort_keys_u64.
