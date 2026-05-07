@@ -117,6 +117,21 @@ bool run_one(int k, bool testnet, uint8_t plot_id_seed)
     auto ref      = single_gpu_xs_phase(entry);
     auto sharded  = sharded_xs_phase  (entry);
 
+    // Multiset comparison: canonicalise both sides by full-record
+    // lexicographic order before comparing. Single-GPU + HostBounce
+    // produce byte-stable tie order; Peer's atomic scatter randomises
+    // within-tie order. Both are correctness-equivalent (the upstream
+    // T3 match's atomic cursor already breaks tie-order determinism
+    // between runs at the next phase), so the parity check we want
+    // here is multiset, not byte-stable. Matches the canonicalise-
+    // then-memcmp pattern in sycl_t{1,2,3}_phase_sharded_parity.
+    auto canonical_lt = [](pos2gpu::XsCandidateGpu const& a,
+                           pos2gpu::XsCandidateGpu const& b) {
+        return std::memcmp(&a, &b, sizeof(pos2gpu::XsCandidateGpu)) < 0;
+    };
+    std::sort(ref.begin(),     ref.end(),     canonical_lt);
+    std::sort(sharded.begin(), sharded.end(), canonical_lt);
+
     bool const size_ok = (ref.size() == sharded.size());
     bool const bytes_ok = size_ok && std::memcmp(
         ref.data(), sharded.data(),

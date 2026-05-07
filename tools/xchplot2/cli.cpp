@@ -95,16 +95,22 @@ void print_usage(char const* prog)
         << "                                      instead of the default work-queue\n"
         << "                                      (one plot per GPU). Drop the flag for\n"
         << "                                      the default work-queue behaviour.\n"
-        << "    --prefer-peer-copy              : with --shard-plot, route the distributed\n"
-        << "                                      sort traffic through direct device-to-\n"
-        << "                                      device memcpy (Peer transport) instead\n"
-        << "                                      of the default host-pinned bounce.\n"
-        << "                                      Faster when the SYCL/CUDA backend can\n"
-        << "                                      use NVLink or peer-PCIe; allocates\n"
-        << "                                      per-source staging sized to each\n"
-        << "                                      shard's full input (~1.6 GB at k=28),\n"
-        << "                                      so prefer the default bounce on tight\n"
-        << "                                      VRAM (<10 GB) cards.\n"
+        << "    --host-bounce                   : with --shard-plot, force the distributed\n"
+        << "                                      sort traffic through host-pinned bounce\n"
+        << "                                      instead of the default Peer transport.\n"
+        << "                                      Use on tight-VRAM (<10 GB) cards at\n"
+        << "                                      large k where the Peer path's per-\n"
+        << "                                      source staging (~1.6 GB/shard for u32\n"
+        << "                                      pairs at k=28; up to ~3.2 GB/shard\n"
+        << "                                      for T2's u32_u64+u32) doesn't fit.\n"
+        << "                                      The Peer default is faster on every\n"
+        << "                                      tested topology — NVLink hosts route\n"
+        << "                                      direct, PCIe-only hosts get implicit\n"
+        << "                                      single-bounce via SYCL/CUDA D2D, still\n"
+        << "                                      one copy fewer than HostBounce.\n"
+        << "    --prefer-peer-copy              : deprecated alias; Peer is the default\n"
+        << "                                      now, this flag is a no-op kept for\n"
+        << "                                      backward-compat with existing scripts.\n"
         << "    --tier plain|compact|minimal|auto : force streaming pipeline tier\n"
         << "                                      when GPU pool doesn't fit. plain =\n"
         << "                                      ~7.24 GB floor (k=28), faster.\n"
@@ -355,7 +361,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
-            else if (a == "--prefer-peer-copy")            opts.prefer_peer_copy = true;
+            else if (a == "--host-bounce")                 opts.prefer_peer_copy = false;
+            else if (a == "--prefer-peer-copy")            { /* now the default, kept as a no-op alias */ }
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
@@ -529,7 +536,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
-        bool plot_prefer_peer_copy = false;
+        bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
 
         for (int i = 2; i < argc; ++i) {
@@ -558,7 +565,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--continue-on-error")       continue_on_error = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
-            else if  (a == "--prefer-peer-copy")        plot_prefer_peer_copy = true;
+            else if  (a == "--host-bounce")             plot_prefer_peer_copy = false;
+            else if  (a == "--prefer-peer-copy")        { /* now the default, kept as a no-op alias */ }
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {

@@ -37,11 +37,15 @@ xchplot2 plot ... --devices gpu
 # on the same plot in parallel instead of plotting independent files.
 # Use this for k > 32 working sets that don't fit a single card, or
 # rigs where one card is too small to plot solo. Per-shard weights
-# load-balance asymmetric pairs (e.g. 4090 + 3060). Add
-# `--prefer-peer-copy` for direct device-to-device transport on NVLink
-# hosts; the default host-pinned bounce works on any topology.
+# load-balance asymmetric pairs (e.g. 4090 + 3060). Distributed-sort
+# traffic now defaults to direct device-to-device (Peer transport) —
+# routes via NVLink where available, implicit single host-bounce on
+# PCIe-only (still one copy fewer than the explicit two-bounce
+# fallback). Add `--host-bounce` to opt into the explicit two-bounce
+# path on tight-VRAM cards where the Peer per-source staging
+# (~1.6 GB/shard at k=28) doesn't fit.
 xchplot2 plot ... --devices 0,1 --shard-plot
-xchplot2 plot ... --devices 0,1 --shard-plot --prefer-peer-copy
+xchplot2 plot ... --devices 0,1 --shard-plot --host-bounce
 ```
 
 See [Hardware compatibility](#hardware-compatibility) for GPU / VRAM
@@ -994,7 +998,7 @@ selected GPU instead of running independent plots in parallel. On
 PCIe-only multi-GPU rigs (no NVLink) it's slower per-plot than
 work-queue mode because each shard still does full reads of the
 replicated streams between phases — measured at ~1.5× single-GPU on
-the peer-copy fast path and ~2.2× on the default host-pinned bounce
+the default Peer transport and ~2.2× when forced to `--host-bounce`
 on 2× RTX 4000 Ada. It's worth using only when (a) the plot's working
 set doesn't fit on any single card (k > 32 or asymmetric small-card
 pairs) or (b) the host has NVLink. For ordinary throughput plotting
