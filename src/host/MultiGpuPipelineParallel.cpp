@@ -1,4 +1,4 @@
-// MultiGpuPipelineParallel.cpp — Phase 2.1c orchestrator. See header.
+// MultiGpuPipelineParallel.cpp — Phase 2.1c/d orchestrator. See header.
 
 #include "host/MultiGpuPipelineParallel.hpp"
 
@@ -7,6 +7,10 @@
 
 #include <sycl/sycl.hpp>
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
 #include <thread>
 
@@ -167,6 +171,199 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
 
     free_boundary(buf);
     return result;
+}
+
+namespace {
+
+// Bounded slot channel for handoff between stage 1 and stage 2.
+// stage1 sends `slot_index` after writing into bufs[slot]. stage2
+// receives slot_index and reads from bufs[slot]. After stage2
+// finishes with bufs[slot], it releases the slot back via
+// free_slot.send(slot).
+class SlotChannel {
+public:
+    void send(int slot)
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        q_.push(slot);
+        cv_.notify_one();
+    }
+    void close()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        closed_ = true;
+        cv_.notify_all();
+    }
+    // Returns -1 when channel is closed and empty.
+    int recv()
+    {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return closed_ || !q_.empty(); });
+        if (q_.empty()) return -1;
+        int s = q_.front();
+        q_.pop();
+        return s;
+    }
+
+private:
+    std::mutex              m_;
+    std::condition_variable cv_;
+    std::queue<int>         q_;
+    bool                    closed_ = false;
+};
+
+} // namespace
+
+std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
+    std::vector<GpuPipelineConfig> const& cfgs,
+    int                                   device_first,
+    int                                   device_second,
+    int                                   depth)
+{
+    if (cfgs.empty()) return {};
+    if (depth < 1) depth = 1;
+    if (depth > static_cast<int>(cfgs.size())) {
+        depth = static_cast<int>(cfgs.size());
+    }
+    if (device_first < 0 || device_second < 0) {
+        throw std::runtime_error(
+            "run_pipeline_parallel_batch: device ids must be non-negative");
+    }
+
+    // Validate cfgs are uniform on cap-relevant fields. Each plot
+    // re-uses the same boundary slots; cap must be the same.
+    int const k0 = cfgs[0].k;
+    for (auto const& c : cfgs) {
+        if (c.k != k0) {
+            throw std::runtime_error(
+                "run_pipeline_parallel_batch: heterogeneous k across "
+                "entries is not supported (would require per-slot caps)");
+        }
+        if (c.k < 18 || c.k > 32 || (c.k & 1) != 0) {
+            throw std::runtime_error("k must be even in [18, 32]");
+        }
+        if (c.strength < 2) {
+            throw std::runtime_error("strength must be >= 2");
+        }
+    }
+
+    int const num_section_bits = (k0 < 28) ? 2 : (k0 - 26);
+    std::uint64_t const cap =
+        max_pairs_per_section(k0, num_section_bits) *
+        (std::uint64_t{1} << num_section_bits);
+
+    // Allocate `depth` boundary buffer sets on dev_first's queue.
+    bind_current_device(device_first);
+    sycl::queue& alloc_q = sycl_backend::queue();
+    std::vector<BoundaryBuffers> bufs(depth);
+    for (int i = 0; i < depth; ++i) {
+        bufs[i].alloc_queue = &alloc_q;
+        bufs[i].pinned_dst    = static_cast<std::uint64_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
+        bufs[i].h_meta        = static_cast<std::uint64_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
+        bufs[i].h_t2_meta     = static_cast<std::uint64_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
+        bufs[i].h_t2_xbits    = static_cast<std::uint32_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint32_t), alloc_q));
+        bufs[i].h_keys_merged = static_cast<std::uint32_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint32_t), alloc_q));
+        if (!bufs[i].pinned_dst || !bufs[i].h_meta || !bufs[i].h_t2_meta ||
+            !bufs[i].h_t2_xbits || !bufs[i].h_keys_merged)
+        {
+            for (auto& b : bufs) free_boundary(b);
+            throw std::runtime_error(
+                "run_pipeline_parallel_batch: boundary alloc failed");
+        }
+    }
+
+    // Per-slot state shared between stage 1 and stage 2.
+    struct SlotState {
+        std::uint64_t t1_count = 0;
+        std::uint64_t t2_count = 0;
+        int           cfg_idx  = -1;
+    };
+    std::vector<SlotState> slot_state(depth);
+
+    // free_slots: slots ready for stage 1 to fill. Pre-fill with all.
+    // ready_slots: slots that stage 1 has filled, awaiting stage 2.
+    SlotChannel free_slots;
+    SlotChannel ready_slots;
+    for (int i = 0; i < depth; ++i) free_slots.send(i);
+
+    std::vector<PipelineParallelSplitResult> results(cfgs.size());
+    std::exception_ptr stage1_exc;
+    std::exception_ptr stage2_exc;
+
+    std::thread stage1([&] {
+        try {
+            bind_current_device(device_first);
+            for (std::size_t idx = 0; idx < cfgs.size(); ++idx) {
+                int const slot = free_slots.recv();
+                if (slot < 0) break;
+                StreamingPinnedScratch s{};
+                s.tiny_mode          = true;
+                s.t2_tile_count      = 8;
+                s.gather_tile_count  = 4;
+                s.h_meta             = bufs[slot].h_meta;
+                s.h_t2_meta          = bufs[slot].h_t2_meta;
+                s.h_t2_xbits         = bufs[slot].h_t2_xbits;
+                s.h_keys_merged      = bufs[slot].h_keys_merged;
+                s.stop_after_t2_sort = true;
+                auto r = run_gpu_pipeline_streaming(
+                    cfgs[idx], bufs[slot].pinned_dst, cap, s);
+                slot_state[slot].t1_count = r.t1_count;
+                slot_state[slot].t2_count = r.t2_count;
+                slot_state[slot].cfg_idx  = static_cast<int>(idx);
+                ready_slots.send(slot);
+            }
+        } catch (...) {
+            stage1_exc = std::current_exception();
+        }
+        ready_slots.close();
+    });
+
+    std::thread stage2([&] {
+        try {
+            bind_current_device(device_second);
+            for (;;) {
+                int const slot = ready_slots.recv();
+                if (slot < 0) break;
+                int const idx = slot_state[slot].cfg_idx;
+                StreamingPinnedScratch s{};
+                s.tiny_mode         = true;
+                s.t2_tile_count     = 8;
+                s.gather_tile_count = 4;
+                s.h_meta            = bufs[slot].h_meta;
+                s.h_t2_meta         = bufs[slot].h_t2_meta;
+                s.h_t2_xbits        = bufs[slot].h_t2_xbits;
+                s.h_keys_merged     = bufs[slot].h_keys_merged;
+                s.start_at_t3_match = true;
+                s.t1_count_in       = slot_state[slot].t1_count;
+                s.t2_count_in       = slot_state[slot].t2_count;
+                auto r = run_gpu_pipeline_streaming(
+                    cfgs[idx], bufs[slot].pinned_dst, cap, s);
+                auto frags = r.fragments();
+                results[idx].fragments_storage.assign(
+                    frags.begin(), frags.end());
+                results[idx].t1_count = r.t1_count;
+                results[idx].t2_count = r.t2_count;
+                results[idx].t3_count = r.t3_count;
+                free_slots.send(slot);
+            }
+        } catch (...) {
+            stage2_exc = std::current_exception();
+        }
+    });
+
+    stage1.join();
+    stage2.join();
+
+    for (auto& b : bufs) free_boundary(b);
+
+    if (stage1_exc) std::rethrow_exception(stage1_exc);
+    if (stage2_exc) std::rethrow_exception(stage2_exc);
+    return results;
 }
 
 } // namespace pos2gpu

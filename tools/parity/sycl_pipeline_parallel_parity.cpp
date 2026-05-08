@@ -100,24 +100,68 @@ bool run_one(int k, std::uint8_t seed, int dev_first, int dev_second)
 
 } // namespace
 
+// Run a 4-plot batch through the pipelined orchestrator and verify
+// each output matches the single-call reference. Validates the
+// depth=2 buffer-slot recycling and the inter-stage handoff over
+// multiple plots.
+bool run_batch(int k, int dev_first, int dev_second)
+{
+    std::vector<pos2gpu::GpuPipelineConfig> cfgs(4);
+    std::vector<std::vector<std::uint64_t>> refs(4);
+    for (std::size_t i = 0; i < cfgs.size(); ++i) {
+        cfgs[i].k = k;
+        cfgs[i].strength = 2;
+        derive_plot_id(cfgs[i].plot_id, static_cast<std::uint8_t>(7 + i));
+        refs[i] = run_full(k, static_cast<std::uint8_t>(7 + i));
+        std::sort(refs[i].begin(), refs[i].end());
+    }
+
+    auto batch = pos2gpu::run_pipeline_parallel_batch(cfgs, dev_first, dev_second, /*depth=*/2);
+
+    bool all_ok = true;
+    for (std::size_t i = 0; i < cfgs.size(); ++i) {
+        auto frags = batch[i].fragments();
+        std::vector<std::uint64_t> got(frags.begin(), frags.end());
+        std::sort(got.begin(), got.end());
+        bool const ok = (got.size() == refs[i].size()) &&
+            std::memcmp(got.data(), refs[i].data(),
+                        sizeof(std::uint64_t) * got.size()) == 0;
+        std::printf(
+            "%s pipeline-batch k=%d entry=%zu dev=[%d,%d] [count=%llu vs %llu]\n",
+            ok ? "PASS" : "FAIL", k, i, dev_first, dev_second,
+            static_cast<unsigned long long>(refs[i].size()),
+            static_cast<unsigned long long>(got.size()));
+        if (!ok) all_ok = false;
+    }
+    return all_ok;
+}
+
 int main(int argc, char** argv)
 {
     int single_k = -1;
     int dev_first = 0;
     int dev_second = 0;
-    for (int i = 1; i + 1 < argc; ++i) {
+    bool batch_only = false;
+    for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
-        if (arg == "--k") {
+        if (arg == "--batch") {
+            batch_only = true;
+        } else if (arg == "--k" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), single_k);
-        } else if (arg == "--dev-first") {
+            ++i;
+        } else if (arg == "--dev-first" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), dev_first);
-        } else if (arg == "--dev-second") {
+            ++i;
+        } else if (arg == "--dev-second" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), dev_second);
+            ++i;
         }
     }
 
     bool all_ok = true;
-    if (single_k >= 0) {
+    if (batch_only) {
+        all_ok = run_batch(single_k >= 0 ? single_k : 22, dev_first, dev_second) && all_ok;
+    } else if (single_k >= 0) {
         all_ok = run_one(single_k, 7, dev_first, dev_second) && all_ok;
     } else {
         for (int k : {18, 20, 22}) {
@@ -125,6 +169,8 @@ int main(int argc, char** argv)
                 all_ok = run_one(k, seed, dev_first, dev_second) && all_ok;
             }
         }
+        // Also validate the pipelined-batch path at k=22.
+        all_ok = run_batch(22, dev_first, dev_second) && all_ok;
     }
     return all_ok ? 0 : 1;
 }

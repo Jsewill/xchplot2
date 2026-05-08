@@ -46,4 +46,23 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
     int                      device_first,
     int                      device_second);
 
+// Pipelined batch entry point. Runs a sequence of plots through the
+// two-stage split with depth in-flight at the boundary — while plot
+// N is on device_second (T3 + Frag), plot N+1 starts on device_first
+// (Xs + T1 + T2). Steady-state throughput per plot ≈
+// max(stage1_wall, stage2_wall) instead of (stage1+stage2).
+//
+// `depth` controls the number of pre-allocated boundary buffer sets.
+// 2 is enough to overlap one plot per stage; higher depth helps when
+// stage variance is high. Each set is cap-sized: ~6.2 GB pinned host
+// at k=28 (4 buffers × 2 GB + 1 × 2 GB pinned_dst). depth × that is
+// the host-pinned cost; default is 2.
+//
+// Returns one fragments vector per entry, in input order.
+std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
+    std::vector<GpuPipelineConfig> const& cfgs,
+    int                                   device_first,
+    int                                   device_second,
+    int                                   depth = 2);
+
 } // namespace pos2gpu
