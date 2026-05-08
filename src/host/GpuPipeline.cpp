@@ -745,6 +745,57 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_counter = nullptr;
     s_malloc(stats, d_counter, sizeof(uint64_t), "d_counter");
 
+    // Phase 2 (pipeline-parallel) function-scope state. Originally
+    // declared inside the Xs / T1 / T2 phase blocks; lifted here so
+    // the start_at_t3_match entry can populate them and goto past the
+    // first half. The first-half phase code below assigns to these as
+    // it runs; the second-half (T3 match → end) code reads them.
+    bool t1_match_sliced = !scratch.plain_mode && scratch.gather_tile_count > 1;
+    bool h_meta_owned    = (!scratch.plain_mode && scratch.h_meta == nullptr);
+    bool h_keys_owned    = (!scratch.plain_mode && scratch.h_keys_merged == nullptr);
+    bool h_xbits_owned   = false;
+
+    uint64_t t1_count = 0;
+    uint64_t t2_count = 0;
+
+    uint64_t* h_t2_meta        = nullptr;
+    uint32_t* h_t2_xbits       = nullptr;
+    uint32_t* h_t2_keys_merged = nullptr;
+
+    uint32_t* d_t2_keys_merged  = nullptr;
+    uint64_t* d_t2_meta_sorted  = nullptr;
+    uint32_t* d_t2_xbits_sorted = nullptr;
+    uint64_t* d_t2_meta         = nullptr;
+    uint32_t* d_t2_mi           = nullptr;
+    uint32_t* d_t2_xbits        = nullptr;
+    void*     d_sort_scratch    = nullptr;
+
+    if (scratch.start_at_t3_match) {
+        if (!scratch.tiny_mode) {
+            throw std::runtime_error(
+                "start_at_t3_match currently requires tiny_mode "
+                "(T3 match expects h_t2_* on host pinned)");
+        }
+        if (!scratch.h_meta || !scratch.h_t2_xbits || !scratch.h_keys_merged) {
+            throw std::runtime_error(
+                "start_at_t3_match requires h_meta, h_t2_xbits, and "
+                "h_keys_merged populated by the caller");
+        }
+        t1_count         = scratch.t1_count_in;
+        t2_count         = scratch.t2_count_in;
+        h_t2_meta        = scratch.h_meta;
+        h_t2_xbits       = scratch.h_t2_xbits;
+        h_t2_keys_merged = scratch.h_keys_merged;
+        h_meta_owned     = false;
+        h_xbits_owned    = false;
+        h_keys_owned     = false;
+        goto t3_match_entry;
+    }
+
+    // Open a scope for the entire first-half (Xs+T1+T2) phase code so
+    // the start_at_t3_match goto above can legally bypass any inner
+    // declarations — only function-top state is in scope at the label.
+    {
     // ---------- Phase Xs (stage 4e: inlined gen+sort+pack) ----------
     // launch_construct_xs lumps keys_a/keys_b/vals_a/vals_b into a single
     // d_xs_temp blob (~4 GB at k=28). keys_a+vals_a are dead after the
@@ -1056,7 +1107,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // stays parked on h_t1_meta across T1 sort exactly as in compact
     // mode (the existing park dance is skipped — data is already on
     // host).
-    bool const t1_match_sliced = !scratch.plain_mode && scratch.gather_tile_count > 1;
+    // t1_match_sliced: declared at function top.
 
     stats.phase = "T1 match";
     auto t1p = make_t1_params(cfg.k, cfg.strength);
@@ -1072,12 +1123,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Lift h_t1_meta / h_t1_mi out of the T1 sort scope so the sliced
     // T1 match path can populate them directly. h_t1_mi is sliced-only
     // — it's freed in T1 sort once CUB has consumed the H2D'd copy.
-    bool      const h_meta_owned = (!scratch.plain_mode && scratch.h_meta == nullptr);
+    // h_meta_owned: declared at function top.
     uint64_t* h_t1_meta = nullptr;
     bool      h_t1_mi_owned = false;
     uint32_t* h_t1_mi = nullptr;
 
-    uint64_t t1_count = 0;
+    // t1_count: declared at function top.
 
     if (!t1_match_sliced) {
         // Single-shot path (compact / plain): d_t1_meta + d_t1_mi
@@ -1288,7 +1339,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // launch_merge_pairs_stable_2way_u32_u32 reading USM-host inputs.
     // Drops T1 sort CUB peak to:
     //   d_t1_mi (1040) + 3 × cap/2 u32 (1560) + scratch ≈ 2616 MB.
-    void* d_sort_scratch = nullptr;
+    // d_sort_scratch: declared at function top for cross-phase reuse.
     uint32_t* d_keys_out = nullptr;     // populated in compact path; minimal uses h_keys instead
     uint32_t* d_vals_in  = nullptr;     // T2 sort below also uses this; declared at wider scope
     uint32_t* d_vals_out = nullptr;     // populated in compact path; minimal uses h_vals instead
@@ -1402,7 +1453,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // at T2 match entry.
     //
     // Plain mode keeps d_t1_keys_merged live across the gather peak.
-    bool      const h_keys_owned = (!scratch.plain_mode && scratch.h_keys_merged == nullptr);
+    // h_keys_owned: declared at function top (non-const so start_at_t3_match can override).
     uint32_t* h_t1_keys_merged = nullptr;
     if (!scratch.plain_mode) {
         h_t1_keys_merged = h_keys_owned
@@ -1564,14 +1615,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // only d_t2_mi is live here (hydrated from the per-plot h_t2_mi),
     // and h_t2_meta / h_t2_xbits hold the concatenated outputs on
     // pinned host until JIT H2D at the gather site.
-    uint64_t* d_t2_meta  = nullptr;
-    uint32_t* d_t2_mi    = nullptr;
-    uint32_t* d_t2_xbits = nullptr;
-    uint64_t t2_count    = 0;
-    uint64_t* h_t2_meta  = nullptr;
-    uint32_t* h_t2_xbits = nullptr;
-    bool      h_xbits_owned = false;
-
+    // d_t2_meta / d_t2_mi / d_t2_xbits / t2_count / h_t2_meta /
+    // h_t2_xbits / h_xbits_owned are declared at function top so the
+    // start_at_t3_match entry can populate them and skip this phase.
     if (scratch.plain_mode) {
         // Plain: one-shot launch_t2_match into full-cap device buffers.
         size_t t2_temp_bytes = 0;
@@ -2071,7 +2117,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         sycl::free(h_vals, q); h_vals = nullptr;
     }
 
-    uint32_t* d_t2_keys_merged = nullptr;   // merged sorted MI for T3.
+    // d_t2_keys_merged: merged sorted MI for T3 (declared at function top).
     uint32_t* d_merged_vals    = nullptr;   // merged sorted src indices.
     s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
     s_malloc(stats, d_merged_vals,    cap * sizeof(uint32_t), "d_merged_vals");
@@ -2105,7 +2151,6 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // before T3 match.
     //
     // Plain mode keeps d_t2_keys_merged live across the gather peak.
-    uint32_t* h_t2_keys_merged = nullptr;
     if (!scratch.plain_mode) {
         h_t2_keys_merged = h_keys_owned  // reuse t1_keys flag: same scratch
             ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
@@ -2125,8 +2170,6 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Plain mode: d_t2_meta and d_t2_xbits are already live from T2
     // match (never parked). Gather reads them directly and frees after.
     int const t2_gather_N = scratch.plain_mode ? 1 : scratch.gather_tile_count;
-    uint64_t* d_t2_meta_sorted  = nullptr;
-    uint32_t* d_t2_xbits_sorted = nullptr;
 
     if (t2_gather_N <= 1) {
         // Single-shot path (compact / plain).
@@ -2289,6 +2332,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         end_phase(p_t2_sort);
     }
 
+    }  // end of first-half (Xs+T1+T2) scope.
+
     // Phase 2 (pipeline-parallel) first-half cut: when
     // stop_after_t2_sort is set, return immediately. The sorted T2
     // outputs are in h_t2_meta / h_t2_xbits / h_t2_keys_merged on host
@@ -2329,6 +2374,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         return result;
     }
 
+t3_match_entry:
     // ---------- Phase T3 match ----------
     // Plain mode: one-shot launch_t3_match writing directly into
     // full-cap d_t3. No pinned-host staging, no round-trips — saves
