@@ -927,6 +927,26 @@ target_link_options(sycl_t1_parity PRIVATE LINKER:--allow-multiple-definition)
 set_target_properties(sycl_t1_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Phase 2.1 — pipeline-parallel split parity. Drives the
+# stop_after_t2_sort + start_at_t3_match entry points on the same
+# physical queue and confirms the resulting plot fragments match a
+# single-call run. Validates the T2-sort boundary handoff with the
+# distinct-h_t2_meta buffer-reuse fix.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(sycl_phase_split_parity tools/parity/sycl_phase_split_parity.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(sycl_phase_split_parity tools/parity/sycl_phase_split_parity.cpp)
+endif()
+add_sycl_to_target(TARGET sycl_phase_split_parity
+                   SOURCES tools/parity/sycl_phase_split_parity.cpp)
+target_link_libraries(sycl_phase_split_parity PRIVATE pos2_gpu_host)
+target_include_directories(sycl_phase_split_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_phase_split_parity PRIVATE cxx_std_20)
+target_link_options(sycl_phase_split_parity PRIVATE LINKER:--allow-multiple-definition)
+set_target_properties(sycl_phase_split_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Lowest-level diagnostic: a hello-world SYCL kernel that proves
 # AdaptiveCpp's HIP / CUDA backend can dispatch *anything* on the
 # detected device. No pos2_gpu / pos2_gpu_host link — purely the SYCL

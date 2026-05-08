@@ -121,6 +121,20 @@ struct StreamingPinnedScratch {
     uint32_t* h_t2_xbits     = nullptr;
     uint64_t* h_t3           = nullptr;  // reinterpreted as T3PairingGpu*
 
+    // Optional T2-sorted-meta buffer (distinct from h_meta). When the
+    // caller provides h_meta as a single buffer, the streaming pipeline
+    // historically reused it for both T1 sorted meta (input) and T2
+    // sorted meta (output). In tiny mode, T2 match's per-pass loop
+    // reads h_t1_meta WHILE D2H'ing T2 output to the same buffer; at
+    // small k the cumulative D2H extent reaches the next section's
+    // input range and corrupts the read. h_t2_meta lets the caller
+    // provide a separate destination so T1 input and T2 output never
+    // alias. nullptr falls back to a per-plot allocation in tiny mode
+    // (so the bug is fixed for all callers, with the per-plot alloc
+    // overhead avoidable by setting this field). Compact / plain
+    // modes are unaffected — they don't read h_t1_meta during T2 match.
+    uint64_t* h_t2_meta      = nullptr;
+
     // Plain mode: skip all parks and use single-pass T2 match. Higher
     // peak (~7.3 GB at k=28) than compact (~5.2 GB) but ~400 ms/plot
     // faster because there are no PCIe round-trips for T1 meta / T1

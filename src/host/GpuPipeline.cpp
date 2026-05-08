@@ -754,6 +754,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     bool h_meta_owned    = (!scratch.plain_mode && scratch.h_meta == nullptr);
     bool h_keys_owned    = (!scratch.plain_mode && scratch.h_keys_merged == nullptr);
     bool h_xbits_owned   = false;
+    // h_t2_meta_owned tracks ownership of the (possibly distinct) T2
+    // meta buffer. In tiny mode this is decoupled from h_meta_owned to
+    // prevent the T1-input / T2-output buffer-reuse race; see
+    // feedback_h_meta_buffer_reuse_bug memo.
+    bool h_t2_meta_owned = false;
 
     uint64_t t1_count = 0;
     uint64_t t2_count = 0;
@@ -776,17 +781,24 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "start_at_t3_match currently requires tiny_mode "
                 "(T3 match expects h_t2_* on host pinned)");
         }
-        if (!scratch.h_meta || !scratch.h_t2_xbits || !scratch.h_keys_merged) {
+        // Caller must provide the T2 boundary buffers. Prefer the
+        // dedicated h_t2_meta field; fall back to h_meta for callers
+        // that pre-date the buffer-reuse fix.
+        uint64_t* const t2_meta_in = scratch.h_t2_meta
+            ? scratch.h_t2_meta
+            : scratch.h_meta;
+        if (!t2_meta_in || !scratch.h_t2_xbits || !scratch.h_keys_merged) {
             throw std::runtime_error(
-                "start_at_t3_match requires h_meta, h_t2_xbits, and "
-                "h_keys_merged populated by the caller");
+                "start_at_t3_match requires h_t2_meta (or h_meta), "
+                "h_t2_xbits, and h_keys_merged populated by the caller");
         }
         t1_count         = scratch.t1_count_in;
         t2_count         = scratch.t2_count_in;
-        h_t2_meta        = scratch.h_meta;
+        h_t2_meta        = t2_meta_in;
         h_t2_xbits       = scratch.h_t2_xbits;
         h_t2_keys_merged = scratch.h_keys_merged;
         h_meta_owned     = false;
+        h_t2_meta_owned  = false;
         h_xbits_owned    = false;
         h_keys_owned     = false;
         goto t3_match_entry;
@@ -1689,9 +1701,29 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                                              + what + ") failed");
             return p;
         };
-        h_t2_meta  = h_meta_owned
-            ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
-            : scratch.h_meta;
+        // In tiny mode, h_t2_meta MUST be distinct from h_t1_meta (=
+        // scratch.h_meta when caller provides). Otherwise the per-pass
+        // T2 match D2H corrupts unread h_t1_meta sections at small k.
+        // Caller can pre-provide scratch.h_t2_meta to avoid the per-
+        // plot malloc; otherwise we allocate fresh per plot.
+        if (scratch.tiny_mode) {
+            if (scratch.h_t2_meta) {
+                h_t2_meta = scratch.h_t2_meta;
+                h_t2_meta_owned = false;
+            } else {
+                h_t2_meta = static_cast<uint64_t*>(
+                    alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta(tiny)"));
+                h_t2_meta_owned = true;
+            }
+        } else {
+            // Compact mode: T2 match reads d_t1_meta_sorted on device,
+            // not h_t1_meta on host — sharing scratch.h_meta with the
+            // T2 output buffer is safe.
+            h_t2_meta = h_meta_owned
+                ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
+                : scratch.h_meta;
+            h_t2_meta_owned = h_meta_owned;
+        }
         uint32_t* h_t2_mi = static_cast<uint32_t*>(
             alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
         h_xbits_owned = (scratch.h_t2_xbits == nullptr);
@@ -2633,7 +2665,7 @@ t3_match_entry:
 
         // h_t2_meta was kept alive across T3 match for slicing; free now
         // that all section pairs have been H2D'd.
-        if (h_meta_owned) sycl::free(h_t2_meta, q);
+        if (h_t2_meta_owned) sycl::free(h_t2_meta, q);
         h_t2_meta = nullptr;
 
         // Re-hydrate full-cap d_t3 on device for T3 sort.
