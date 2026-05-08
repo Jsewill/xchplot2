@@ -370,6 +370,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
+            else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
             else if (a == "--host-bounce")                 opts.prefer_peer_copy = false;
             else if (a == "--prefer-peer-copy")            { /* now the default, kept as a no-op alias */ }
             else if (a == "--tier" && i + 1 < argc) {
@@ -546,6 +547,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
+        bool plot_pipeline_plot   = false;
         bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
 
@@ -575,6 +577,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--continue-on-error")       continue_on_error = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
+            else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
             else if  (a == "--host-bounce")             plot_prefer_peer_copy = false;
             else if  (a == "--prefer-peer-copy")        { /* now the default, kept as a no-op alias */ }
             else if  (a == "--tier" && need(1)) {
@@ -755,6 +758,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.use_all_devices   = plot_use_all_devices;
             opts.include_cpu       = plot_include_cpu;
             opts.shard_plot        = plot_shard_plot;
+            opts.pipeline_plot     = plot_pipeline_plot;
             opts.prefer_peer_copy  = plot_prefer_peer_copy;
             opts.streaming_tier    = plot_streaming_tier;
             auto res = pos2gpu::run_batch(entries, opts);

@@ -5,7 +5,8 @@
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
-#include "host/MultiGpuPlotPipeline.hpp"  // --shard-plot path (Phase 2.2+)
+#include "host/MultiGpuPlotPipeline.hpp"        // --shard-plot path (Phase 2.2+)
+#include "host/MultiGpuPipelineParallel.hpp"   // --pipeline-plot path (Phase 2.1d)
 #include "host/MultiGpuShardBufferPool.hpp"  // batch-amortised buffer reuse
 #include "host/PlotFileWriterParallel.hpp"
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
@@ -990,6 +991,90 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
     return res;
 }
 
+BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
+                                    BatchOptions const& opts,
+                                    std::vector<int> const& device_ids)
+{
+    BatchResult res{};
+    if (device_ids.size() != 2) {
+        throw std::runtime_error(
+            "run_batch_pipeline_plot: --pipeline-plot requires exactly 2 device "
+            "ids (got " + std::to_string(device_ids.size()) + ")");
+    }
+    int const dev_first  = device_ids[0];
+    int const dev_second = device_ids[1];
+    if (dev_first < 0 || dev_second < 0) {
+        throw std::runtime_error(
+            "run_batch_pipeline_plot: device ids must be non-negative");
+    }
+
+    if (opts.verbose) {
+        std::fprintf(stderr,
+            "[pipeline-plot] %zu plots: stage1 on dev %d, stage2 on dev %d "
+            "(depth=2)\n",
+            entries.size(), dev_first, dev_second);
+    }
+
+    // Convert BatchEntry sequence to GpuPipelineConfig sequence.
+    std::vector<GpuPipelineConfig> cfgs;
+    cfgs.reserve(entries.size());
+    for (auto const& e : entries) {
+        GpuPipelineConfig cfg;
+        cfg.k        = e.k;
+        cfg.strength = e.strength;
+        cfg.testnet  = e.testnet;
+        cfg.plot_id  = e.plot_id;
+        cfgs.push_back(cfg);
+    }
+
+    // Run the pipelined orchestrator. depth=2 overlaps one plot per
+    // stage; for tiny-mode tier on PCIe-only the stages contend on
+    // host PCIe and depth>2 doesn't recover much.
+    auto results = run_pipeline_parallel_batch(
+        cfgs, dev_first, dev_second, /*depth=*/2);
+
+    // Write plot files sequentially. CPU-bound FSE compression doesn't
+    // overlap with GPU work in this MVP — Phase 2.1f could add a
+    // writer thread that takes results as the orchestrator emits them.
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto const& entry = entries[i];
+        try {
+            auto full_path = std::filesystem::path(entry.out_dir) / entry.out_name;
+            std::filesystem::create_directories(entry.out_dir);
+
+            std::vector<uint8_t> memo_bytes = entry.memo;
+            if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+
+            auto frags = results[i].fragments();
+            write_plot_file_parallel(
+                full_path.string(),
+                frags,
+                entry.plot_id.data(),
+                static_cast<uint8_t>(entry.k),
+                static_cast<uint8_t>(entry.strength),
+                entry.testnet ? uint8_t{1} : uint8_t{0},
+                static_cast<uint16_t>(entry.plot_index),
+                static_cast<uint8_t>(entry.meta_group),
+                std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()),
+                /*thread_count=*/0);
+            ++res.plots_written;
+            if (opts.verbose) {
+                std::fprintf(stderr,
+                    "[pipeline-plot] wrote %s (%llu fragments)\n",
+                    full_path.c_str(),
+                    static_cast<unsigned long long>(frags.size()));
+            }
+        } catch (std::exception const& e) {
+            std::fprintf(stderr,
+                "[pipeline-plot] FAILED for plot '%s': %s\n",
+                entry.out_name.c_str(), e.what());
+            ++res.plots_failed;
+            if (!opts.continue_on_error) break;
+        }
+    }
+    return res;
+}
+
 } // namespace
 
 BatchResult run_batch(std::vector<BatchEntry> const& entries,
@@ -1054,6 +1139,13 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // See docs/multi-gpu-single-plot-*.md.
     if (opts.shard_plot && device_ids.size() > 1) {
         BatchResult r = run_batch_sharded(entries, opts, device_ids);
+        r.total_wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        return r;
+    }
+
+    if (opts.pipeline_plot) {
+        BatchResult r = run_batch_pipeline_plot(entries, opts, device_ids);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
         return r;

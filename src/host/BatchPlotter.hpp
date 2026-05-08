@@ -106,6 +106,15 @@ struct BatchOptions {
     std::string streaming_tier;
     bool shard_plot        = false;
     std::string shard_strategy = "bucket";
+    // Pipeline-parallel mode (Phase 2.1d): split each plot at the T2-
+    // sort boundary across exactly two devices. device_ids[0] runs
+    // Xs / T1 / T2; device_ids[1] runs T3 / Frag. Plots are pipelined
+    // (depth=2) so plot N's stage 2 overlaps plot N+1's stage 1. On
+    // PCIe-only hosts the two stages contend for host bandwidth and
+    // throughput is below work-queue; the value is correctness on
+    // heterogeneous rigs and per-plot latency on NVLink-equipped
+    // hosts. Mutually exclusive with shard_plot.
+    bool pipeline_plot     = false;
     // When true and shard_plot is on, the distributed sorts route data
     // via direct device-to-device memcpy (Peer transport). On NVLink
     // hosts this stays on the fabric; on PCIe-only hosts the SYCL/CUDA
