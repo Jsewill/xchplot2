@@ -584,6 +584,7 @@ add_library(pos2_gpu_host STATIC
     src/host/CpuPlotter.cpp
     src/host/Cancel.cpp
     src/host/MultiGpuPlotPipeline.cpp
+    src/host/MultiGpuPipelineParallel.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -945,6 +946,25 @@ target_include_directories(sycl_phase_split_parity PRIVATE ${_xchplot2_cuda_incl
 target_compile_features(sycl_phase_split_parity PRIVATE cxx_std_20)
 target_link_options(sycl_phase_split_parity PRIVATE LINKER:--allow-multiple-definition)
 set_target_properties(sycl_phase_split_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Phase 2.1c — pipeline-parallel orchestrator parity. Drives
+# run_pipeline_parallel_split with both halves pointing at device 0
+# (single-GPU virtual two-device test). Real two-GPU validation runs
+# on the VPS via --dev-first 0 --dev-second 1.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(sycl_pipeline_parallel_parity tools/parity/sycl_pipeline_parallel_parity.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(sycl_pipeline_parallel_parity tools/parity/sycl_pipeline_parallel_parity.cpp)
+endif()
+add_sycl_to_target(TARGET sycl_pipeline_parallel_parity
+                   SOURCES tools/parity/sycl_pipeline_parallel_parity.cpp)
+target_link_libraries(sycl_pipeline_parallel_parity PRIVATE pos2_gpu_host)
+target_include_directories(sycl_pipeline_parallel_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_pipeline_parallel_parity PRIVATE cxx_std_20)
+target_link_options(sycl_pipeline_parallel_parity PRIVATE LINKER:--allow-multiple-definition)
+set_target_properties(sycl_pipeline_parallel_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Lowest-level diagnostic: a hello-world SYCL kernel that proves
