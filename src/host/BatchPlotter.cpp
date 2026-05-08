@@ -545,13 +545,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
             stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
             stream_scratch.h_t3          = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            // Tiny tier needs a separate h_t2_meta to avoid the
+            // h_t1_meta/h_t2_meta buffer-reuse race in T2 match's
+            // per-pass loop. Compact / minimal modes don't trip the
+            // race (they read d_t1_meta_sorted on device, not h_t1_meta
+            // on host) so leave h_t2_meta null and the streaming
+            // pipeline reuses h_meta as before.
+            if (stream_scratch.tiny_mode) {
+                stream_scratch.h_t2_meta = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            }
             if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
-                !stream_scratch.h_t2_xbits || !stream_scratch.h_t3)
+                !stream_scratch.h_t2_xbits || !stream_scratch.h_t3 ||
+                (stream_scratch.tiny_mode && !stream_scratch.h_t2_meta))
             {
                 if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
                 if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
                 if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
                 if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
+                if (stream_scratch.h_t2_meta)     streaming_free_pinned_uint64(stream_scratch.h_t2_meta);
                 for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                     if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
                 }
@@ -741,6 +752,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
     if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
     if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+    if (stream_scratch.h_t2_meta)     streaming_free_pinned_uint64(stream_scratch.h_t2_meta);
     if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
 
     res.plots_written = plots_done.load();
