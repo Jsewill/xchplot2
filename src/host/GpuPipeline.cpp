@@ -776,10 +776,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     void*     d_sort_scratch    = nullptr;
 
     if (scratch.start_at_t3_match) {
-        if (!scratch.tiny_mode) {
+        // Minimal and tiny modes both work for the second-half handoff:
+        // - Tiny: T3 match reads all per-section streams (meta+xbits+
+        //   mi) from host pinned. No device-side T2 buffers needed.
+        // - Minimal: T3 match reads meta from host pinned slices but
+        //   xbits + mi from full-cap device buffers. We rehydrate
+        //   those from the caller-provided host buffers below.
+        // Plain / compact don't support the split — they consume T2
+        // outputs from device buffers that the first half doesn't
+        // surface to host.
+        if (scratch.gather_tile_count <= 1) {
             throw std::runtime_error(
-                "start_at_t3_match currently requires tiny_mode "
-                "(T3 match expects h_t2_* on host pinned)");
+                "start_at_t3_match requires minimal or tiny tier "
+                "(gather_tile_count > 1); plain/compact don't surface "
+                "T2 sorted outputs to host pinned.");
         }
         // Caller must provide the T2 boundary buffers. Prefer the
         // dedicated h_t2_meta field; fall back to h_meta for callers
@@ -801,6 +811,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         h_t2_meta_owned  = false;
         h_xbits_owned    = false;
         h_keys_owned     = false;
+
+        // Minimal mode: T3 match reads d_t2_xbits_sorted on device
+        // for its full-cap random-access reads (it only slices the
+        // meta side). Allocate and rehydrate from h_t2_xbits before
+        // jumping to T3 match. d_t2_keys_merged is rehydrated by the
+        // existing T3 match prep-stage code at line ~2360.
+        if (!scratch.tiny_mode) {
+            s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t),
+                     "d_t2_xbits_sorted(start_at_t3)");
+            q.memcpy(d_t2_xbits_sorted, h_t2_xbits,
+                     t2_count * sizeof(uint32_t)).wait();
+        }
         goto t3_match_entry;
     }
 
@@ -2341,7 +2363,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // + section-r slices into small device buffers each pass. d_t2_
         // xbits_sorted remains nullptr in this path; the T3 match block
         // skips its s_free below.
-        if (!scratch.tiny_mode) {
+        //
+        // Phase 2 split (stop_after_t2_sort): also skip — h_t2_xbits
+        // is what the second-half receiver reads. The second-half
+        // start_at_t3_match path rehydrates d_t2_xbits_sorted there
+        // when running in minimal mode.
+        if (!scratch.tiny_mode && !scratch.stop_after_t2_sort) {
             s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
             q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
             if (h_xbits_owned) sycl::free(h_t2_xbits, q);
