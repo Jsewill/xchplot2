@@ -165,6 +165,39 @@ struct StreamingPinnedScratch {
     // false and gather_tile_count > 1 (i.e., the minimal-path
     // prerequisites). BatchPlotter sets this when tier==Tiny.
     bool tiny_mode           = false;
+
+    // Phase 2 (pipeline-parallel pooled VRAM) split fields. The
+    // streaming pipeline normally runs Xs → T1 → T2 → T3 → write end-
+    // to-end. To split the work across two GPUs, the first GPU runs
+    // through T2 sort and parks the sorted T2 output on host pinned;
+    // the second GPU starts at T3 match using those host buffers as
+    // input.
+    //
+    // stop_after_t2_sort: when true, the streaming pipeline runs the
+    //   first half (Xs / T1 / T2) and returns immediately after T2
+    //   sort completes. The result struct's t2_count is the surviving
+    //   count of T2 entries; t1_count is also populated. t3_count is
+    //   0 and result.fragments() returns an empty span. The caller
+    //   takes ownership of h_meta / h_t2_xbits / h_keys_merged (they
+    //   hold the sorted T2 outputs). The h_t3 scratch is unused in
+    //   this mode. Implies plain_mode==false (the first-half/second-
+    //   half handoff requires the host-pinned park machinery).
+    //
+    // start_at_t3_match: when true, the streaming pipeline skips the
+    //   Xs / T1 / T2 phases entirely and starts at T3 match. The
+    //   caller MUST populate t2_count_in (count of valid entries in
+    //   the T2 buffers) and provide h_meta / h_t2_xbits /
+    //   h_keys_merged with that many sorted T2 entries. The caller
+    //   retains ownership of those buffers; this entry point will not
+    //   free them.
+    //
+    // The two flags are mutually exclusive — set exactly one for
+    // Phase 2 splits, or leave both false for the existing
+    // single-GPU full-pipeline behaviour.
+    bool     stop_after_t2_sort = false;
+    bool     start_at_t3_match  = false;
+    uint64_t t2_count_in        = 0;
+    uint64_t t1_count_in        = 0;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

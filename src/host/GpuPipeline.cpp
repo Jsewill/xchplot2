@@ -2289,6 +2289,46 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         end_phase(p_t2_sort);
     }
 
+    // Phase 2 (pipeline-parallel) first-half cut: when
+    // stop_after_t2_sort is set, return immediately. The sorted T2
+    // outputs are in h_t2_meta / h_t2_xbits / h_t2_keys_merged on host
+    // pinned; the caller owns those buffers and must hand them to the
+    // second-half entry point on the receiving GPU. Requires
+    // gather_tile_count > 1 (minimal/tiny path), since the compact
+    // path frees h_t2_meta during T2 sort gather.
+    if (scratch.stop_after_t2_sort) {
+        if (scratch.gather_tile_count <= 1) {
+            throw std::runtime_error(
+                "StreamingPinnedScratch::stop_after_t2_sort requires "
+                "gather_tile_count > 1 (minimal or tiny tier); "
+                "compact path frees h_t2_meta during T2 sort gather.");
+        }
+        // d_t2_keys_merged was parked on host already (line ~2055)
+        // for non-plain modes. Verify h_t2_meta and h_t2_xbits are
+        // also alive — they should be in minimal/tiny mode.
+        if (!h_t2_meta || !h_t2_xbits || !h_t2_keys_merged) {
+            throw std::runtime_error(
+                "stop_after_t2_sort: T2 boundary buffers not populated "
+                "(h_t2_meta / h_t2_xbits / h_t2_keys_merged). Internal "
+                "logic error.");
+        }
+        s_free(stats, d_counter);
+        report_phases();
+        if (stats.verbose) {
+            std::fprintf(stderr,
+                "[streaming first-half] k=%d strength=%d  peak device VRAM = %.2f MB\n",
+                cfg.k, cfg.strength, stats.peak / (1024.0 * 1024.0));
+        }
+
+        GpuPipelineResult result;
+        result.t1_count = t1_count;
+        result.t2_count = t2_count;
+        result.t3_count = 0;  // T3 not run in first half
+        // Caller takes ownership of h_t2_meta / h_t2_xbits /
+        // h_t2_keys_merged; we do NOT free them here.
+        return result;
+    }
+
     // ---------- Phase T3 match ----------
     // Plain mode: one-shot launch_t3_match writing directly into
     // full-cap d_t3. No pinned-host staging, no round-trips — saves
