@@ -153,7 +153,32 @@ install_apt() {
                 llvm-18 llvm-18-dev clang-18 lld-18 libclang-18-dev libclang-cpp18-dev
                 libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
     case "$GPU" in
-        nvidia) pkgs+=(nvidia-cuda-toolkit) ;;
+        nvidia)
+            # Detect a pre-existing /usr/local/cuda-X.Y install (RunPod /
+            # NGC / NVIDIA-supplied container images all ship CUDA at
+            # /usr/local/cuda-X.Y from the official `cuda-toolkit-X-Y`
+            # package or NVIDIA's runfile installer). Ubuntu's apt
+            # `nvidia-cuda-toolkit` is a separate (often older) packaging
+            # that drops nvcc at /usr/bin/nvcc; installing it on top of
+            # an already-present /usr/local/cuda-X.Y shadows the newer
+            # toolkit and triggers nvcc-vs-host-compiler incompatibilities
+            # (e.g. CUDA 12.0's cudafe++ choking on glibc's _Float32).
+            # Skip the apt install when a newer /usr/local/cuda-X.Y is
+            # already on the box; the existing install plus the
+            # /etc/profile.d/cuda.sh below covers our needs.
+            local existing_cuda=""
+            for d in /usr/local/cuda /usr/local/cuda-*; do
+                if [[ -x "$d/bin/nvcc" ]]; then
+                    existing_cuda="$d"
+                    break
+                fi
+            done
+            if [[ -n "$existing_cuda" ]]; then
+                echo "[install-deps] Found existing CUDA at $existing_cuda — skipping apt nvidia-cuda-toolkit"
+            else
+                pkgs+=(nvidia-cuda-toolkit)
+            fi
+            ;;
         amd)    pkgs+=(rocm-hip-sdk rocm-libs rocminfo)
                 # rocminfo is the discovery tool build-container.sh probes;
                 # not pulled in transitively by rocm-hip-sdk.
@@ -165,6 +190,18 @@ install_apt() {
     esac
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+
+    # Front-load /usr/local/cuda/bin on PATH for non-login shells (e.g.
+    # `ssh host "cmd"` build invocations) so nvcc is found without the
+    # caller having to source ~/.bashrc. NVIDIA's official install
+    # documentation tells users to do this themselves; doing it here
+    # makes the post-install build "just work" on container/CI hosts.
+    if [[ "$GPU" == "nvidia" ]] && [[ -x /usr/local/cuda/bin/nvcc ]] \
+       && [[ ! -f /etc/profile.d/cuda.sh ]]; then
+        echo "[install-deps] Writing /etc/profile.d/cuda.sh (PATH front-load /usr/local/cuda/bin)"
+        echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh >/dev/null
+        sudo chmod +x /etc/profile.d/cuda.sh
+    fi
 }
 
 install_dnf() {
@@ -330,12 +367,29 @@ git clone --depth 1 --branch "$ACPP_REF" \
 ACPP_CUDA_FLAGS=()
 case "$GPU" in
     nvidia)
-        ACPP_CUDA_TOOLKIT_ROOT=${ACPP_CUDA_TOOLKIT_ROOT:-/opt/cuda}
-        if [[ -d "$ACPP_CUDA_TOOLKIT_ROOT" ]]; then
+        # Probe candidate CUDA toolkit roots in order. Without an
+        # explicit hint here, AdaptiveCpp's cmake silently builds
+        # without the CUDA backend on hosts where CUDA isn't at the
+        # standard cmake-default path (e.g. Ubuntu RunPod / NGC images
+        # where CUDA lives under /usr/local/cuda-X.Y rather than
+        # /opt/cuda). Caller can still override via ACPP_CUDA_TOOLKIT_
+        # ROOT for non-standard installs.
+        if [[ -z "${ACPP_CUDA_TOOLKIT_ROOT:-}" ]]; then
+            for cand in /opt/cuda /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-13 /usr/local/cuda-12.9 /usr/local/cuda-12.8; do
+                if [[ -x "$cand/bin/nvcc" ]]; then
+                    ACPP_CUDA_TOOLKIT_ROOT="$cand"
+                    break
+                fi
+            done
+        fi
+        if [[ -n "${ACPP_CUDA_TOOLKIT_ROOT:-}" ]] && [[ -d "$ACPP_CUDA_TOOLKIT_ROOT" ]]; then
+            echo "[install-deps] AdaptiveCpp CUDA backend → $ACPP_CUDA_TOOLKIT_ROOT"
             ACPP_CUDA_FLAGS+=(
                 -DCUDA_TOOLKIT_ROOT_DIR="$ACPP_CUDA_TOOLKIT_ROOT"
                 -DCUDAToolkit_ROOT="$ACPP_CUDA_TOOLKIT_ROOT"
             )
+        else
+            echo "[install-deps] WARNING: no CUDA toolkit found at /opt/cuda or /usr/local/cuda* — AdaptiveCpp will build without the CUDA backend"
         fi
         ;;
     amd)
