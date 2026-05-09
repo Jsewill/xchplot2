@@ -56,9 +56,27 @@ if(NOT XCHPLOT2_BUILD_CUDA)
 endif()
 
 if(XCHPLOT2_BUILD_CUDA)
-    # Default arch: sm_89 (RTX 4090). Override via -DCMAKE_CUDA_ARCHITECTURES=...
+    # Default arch: `native` — CMake 3.24+ probes the locally-visible
+    # GPUs and emits SASS only for those compute capabilities. Falls
+    # back to sm_89 (RTX 4090) when no GPU is visible at configure
+    # time (e.g., container builds, headless CI). Override either via
+    # -DCMAKE_CUDA_ARCHITECTURES=89;86 (multi-arch fatbin) or a
+    # specific value when cross-compiling for hardware that's not
+    # plugged into the build host.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 89)
+        # Probe whether `native` resolves to anything; if no GPU is
+        # visible CMake will error out cryptically. Fall back to sm_89
+        # in that case.
+        execute_process(
+            COMMAND nvidia-smi -L
+            OUTPUT_VARIABLE _xchplot2_nvsmi_out
+            ERROR_QUIET
+            RESULT_VARIABLE _xchplot2_nvsmi_rc)
+        if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_nvsmi_out MATCHES "GPU")
+            set(CMAKE_CUDA_ARCHITECTURES native)
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES 89)
+        endif()
     endif()
 
     # Preflight nvcc-vs-arch compatibility BEFORE enable_language(CUDA),
@@ -602,6 +620,26 @@ set(POS2_KEYGEN_CRATE_DIR "${CMAKE_SOURCE_DIR}/keygen-rs")
 set(POS2_KEYGEN_TARGET_DIR "${CMAKE_BINARY_DIR}/keygen-rs-target")
 set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/libpos2_keygen.a")
 
+# Resolve `cargo` once, with HINTS for the rustup default install
+# location ($HOME/.cargo/bin). rustup writes its PATH entry to
+# ~/.bashrc / ~/.profile / ~/.cargo/env at install time, but a non-
+# login `ssh host "cmd"` shell doesn't source any of those — so a
+# CI-style invocation that ran `install-deps.sh` and then immediately
+# tried `cmake --build` from the same ssh session would otherwise
+# fail to find cargo on PATH. Using find_program with HINTS makes
+# the build pick up rustup's cargo regardless of shell login state.
+find_program(POS2_CARGO_EXECUTABLE cargo
+    HINTS "$ENV{HOME}/.cargo/bin"
+          "$ENV{CARGO_HOME}/bin"
+          "/root/.cargo/bin"
+    DOC "Path to the rustup-installed cargo")
+if(NOT POS2_CARGO_EXECUTABLE)
+    message(FATAL_ERROR
+        "xchplot2: cargo not found. Install Rust via rustup "
+        "(scripts/install-deps.sh handles this) and re-run cmake. "
+        "rustup's default install drops cargo at ~/.cargo/bin/cargo.")
+endif()
+
 # Collect the sources so CMake knows when to rebuild.
 file(GLOB_RECURSE POS2_KEYGEN_SRCS
     "${POS2_KEYGEN_CRATE_DIR}/src/*.rs"
@@ -613,7 +651,7 @@ add_custom_command(
     OUTPUT "${POS2_KEYGEN_STATIC_LIB}"
     COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${POS2_KEYGEN_TARGET_DIR}
-            cargo build --release --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
+            ${POS2_CARGO_EXECUTABLE} build --release --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
     DEPENDS ${POS2_KEYGEN_SRCS}
     WORKING_DIRECTORY "${POS2_KEYGEN_CRATE_DIR}"
     COMMENT "cargo build --release (pos2_keygen Rust shim)"
