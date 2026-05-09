@@ -2590,9 +2590,14 @@ t3_match_entry:
         s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                          "d_t3_match_temp");
 
         bool const h_t3_owned = (scratch.h_t3 == nullptr);
-        T3PairingGpu* h_t3 = h_t3_owned
-            ? static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q))
-            : reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
+        T3PairingGpu* h_t3 = nullptr;
+        if (h_t3_owned) {
+            h_t3 = scratch.pool
+                ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
+                : static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q));
+        } else {
+            h_t3 = reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
+        }
         if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
         // Compute bucket + fine-bucket offsets in d_t3_match_temp; also
@@ -2767,12 +2772,12 @@ t3_match_entry:
         if (!scratch.tiny_mode) {
             s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
             q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
-            if (h_t3_owned) sycl::free(h_t3, q);
+            if (h_t3_owned && !scratch.pool) sycl::free(h_t3, q);
         }
         // Stash h_t3 ownership for T3 sort cleanup. d_t3 stays nullptr
         // in tiny mode; the T3 sort phase reads h_t3 directly.
         scratch_tiny_h_t3        = scratch.tiny_mode ? h_t3 : nullptr;
-        scratch_tiny_h_t3_owned  = scratch.tiny_mode ? h_t3_owned : false;
+        scratch_tiny_h_t3_owned  = (scratch.tiny_mode && h_t3_owned && !scratch.pool);
     } else {
         // Compact: N=2 half-cap staging with pinned-host h_t3 accumulator.
         uint64_t const t3_half_cap = (cap + 1) / 2;
@@ -2787,9 +2792,14 @@ t3_match_entry:
         // batch). T3PairingGpu is just a uint64 proof_fragment, so the
         // scratch buffer is declared as uint64_t* and reinterpret-cast.
         bool const h_t3_owned = (scratch.h_t3 == nullptr);
-        T3PairingGpu* h_t3 = h_t3_owned
-            ? static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q))
-            : reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
+        T3PairingGpu* h_t3 = nullptr;
+        if (h_t3_owned) {
+            h_t3 = scratch.pool
+                ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
+                : static_cast<T3PairingGpu*>(sycl::malloc_host(cap * sizeof(T3PairingGpu), q));
+        } else {
+            h_t3 = reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
+        }
         if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
         // Compute bucket + fine-bucket offsets once; both match passes
