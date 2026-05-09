@@ -1041,7 +1041,8 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // stage; for tiny-mode tier on PCIe-only the stages contend on
     // host PCIe and depth>2 doesn't recover much.
     auto results = run_pipeline_parallel_batch(
-        cfgs, dev_first, dev_second, /*depth=*/2);
+        cfgs, dev_first, dev_second, /*depth=*/2,
+        opts.pipeline_tier_first, opts.pipeline_tier_second);
 
     // Write plot files sequentially. CPU-bound FSE compression doesn't
     // overlap with GPU work in this MVP — Phase 2.1f could add a

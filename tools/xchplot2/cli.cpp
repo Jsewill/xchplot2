@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -371,6 +372,32 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
+            else if (a == "--pipeline-stage-tiers" && i + 1 < argc) {
+                std::string spec = argv[++i];
+                auto parse_tier = [](std::string const& t)
+                    -> std::optional<pos2gpu::PipelineStageTier> {
+                    if (t == "tiny" || t == "Tiny")
+                        return pos2gpu::PipelineStageTier::Tiny;
+                    if (t == "minimal" || t == "Minimal" || t == "min")
+                        return pos2gpu::PipelineStageTier::Minimal;
+                    return std::nullopt;
+                };
+                auto colon = spec.find(':');
+                if (colon == std::string::npos) {
+                    std::cerr << "Error: --pipeline-stage-tiers expects "
+                                 "'STAGE1:STAGE2' (each tiny|minimal)\n";
+                    return 1;
+                }
+                auto t1 = parse_tier(spec.substr(0, colon));
+                auto t2 = parse_tier(spec.substr(colon + 1));
+                if (!t1 || !t2) {
+                    std::cerr << "Error: --pipeline-stage-tiers tiers must be "
+                                 "'tiny' or 'minimal' (got '" << spec << "')\n";
+                    return 1;
+                }
+                opts.pipeline_tier_first  = *t1;
+                opts.pipeline_tier_second = *t2;
+            }
             else if (a == "--host-bounce")                 opts.prefer_peer_copy = false;
             else if (a == "--prefer-peer-copy")            { /* now the default, kept as a no-op alias */ }
             else if (a == "--tier" && i + 1 < argc) {
@@ -550,6 +577,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_pipeline_plot   = false;
         bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
+        pos2gpu::PipelineStageTier plot_pipeline_tier_first  = pos2gpu::PipelineStageTier::Tiny;
+        pos2gpu::PipelineStageTier plot_pipeline_tier_second = pos2gpu::PipelineStageTier::Tiny;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -578,6 +607,32 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
+            else if  (a == "--pipeline-stage-tiers" && need(1)) {
+                std::string spec = argv[++i];
+                auto parse_tier = [](std::string const& t)
+                    -> std::optional<pos2gpu::PipelineStageTier> {
+                    if (t == "tiny" || t == "Tiny")
+                        return pos2gpu::PipelineStageTier::Tiny;
+                    if (t == "minimal" || t == "Minimal" || t == "min")
+                        return pos2gpu::PipelineStageTier::Minimal;
+                    return std::nullopt;
+                };
+                auto colon = spec.find(':');
+                if (colon == std::string::npos) {
+                    std::cerr << "Error: --pipeline-stage-tiers expects "
+                                 "'STAGE1:STAGE2' (each tiny|minimal)\n";
+                    return 1;
+                }
+                auto t1 = parse_tier(spec.substr(0, colon));
+                auto t2 = parse_tier(spec.substr(colon + 1));
+                if (!t1 || !t2) {
+                    std::cerr << "Error: --pipeline-stage-tiers tiers must be "
+                                 "'tiny' or 'minimal' (got '" << spec << "')\n";
+                    return 1;
+                }
+                plot_pipeline_tier_first  = *t1;
+                plot_pipeline_tier_second = *t2;
+            }
             else if  (a == "--host-bounce")             plot_prefer_peer_copy = false;
             else if  (a == "--prefer-peer-copy")        { /* now the default, kept as a no-op alias */ }
             else if  (a == "--tier" && need(1)) {
@@ -758,7 +813,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.use_all_devices   = plot_use_all_devices;
             opts.include_cpu       = plot_include_cpu;
             opts.shard_plot        = plot_shard_plot;
-            opts.pipeline_plot     = plot_pipeline_plot;
+            opts.pipeline_plot          = plot_pipeline_plot;
+            opts.pipeline_tier_first    = plot_pipeline_tier_first;
+            opts.pipeline_tier_second   = plot_pipeline_tier_second;
             opts.prefer_peer_copy  = plot_prefer_peer_copy;
             opts.streaming_tier    = plot_streaming_tier;
             auto res = pos2gpu::run_batch(entries, opts);
