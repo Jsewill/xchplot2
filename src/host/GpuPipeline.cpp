@@ -1737,10 +1737,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta(tiny)"));
                 h_t2_meta_owned = true;
             }
+        } else if (scratch.h_t2_meta && scratch.h_t2_meta != scratch.h_meta) {
+            // Caller provided a distinct h_t2_meta buffer. Honour that —
+            // required by the pipeline-parallel orchestrator's T2-boundary
+            // protocol so the start_at_t3_match consumer can read T2 meta
+            // from its dedicated buffer (the consumer prefers h_t2_meta
+            // over h_meta). Without this, minimal-mode producers wrote
+            // T2 meta into h_meta and left h_t2_meta untouched, causing
+            // start_at_t3_match to read uninitialized memory and the
+            // T3-match kernel to wedge or produce garbage.
+            h_t2_meta = scratch.h_t2_meta;
+            h_t2_meta_owned = false;
         } else {
-            // Compact mode: T2 match reads d_t1_meta_sorted on device,
-            // not h_t1_meta on host — sharing scratch.h_meta with the
-            // T2 output buffer is safe.
+            // Compact mode without a dedicated h_t2_meta buffer: T2 match
+            // reads d_t1_meta_sorted on device, not h_t1_meta on host —
+            // sharing scratch.h_meta with the T2 output buffer is safe.
             h_t2_meta = h_meta_owned
                 ? static_cast<uint64_t*>(alloc_pinned_or_throw(cap * sizeof(uint64_t), "h_t2_meta"))
                 : scratch.h_meta;
