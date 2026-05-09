@@ -11,6 +11,7 @@
 
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 
 #include "gpu/AesGpu.cuh"
@@ -1227,9 +1228,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             ? static_cast<uint64_t*>(sycl::malloc_host(cap * sizeof(uint64_t), q))
             : scratch.h_meta;
         if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
-        h_t1_mi_owned = true;
-        h_t1_mi = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
-        if (!h_t1_mi) throw std::runtime_error("sycl::malloc_host(h_t1_mi) failed");
+        if (scratch.pool) {
+            // Pool path: amortise across plots in a batch. The pool
+            // owns the buffer and frees it on its own destruction; the
+            // streaming pipeline must NOT free it here.
+            h_t1_mi = scratch.pool->acquire_as<uint32_t>("h_t1_mi", cap, q);
+            h_t1_mi_owned = false;
+        } else {
+            h_t1_mi_owned = true;
+            h_t1_mi = static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+            if (!h_t1_mi) throw std::runtime_error("sycl::malloc_host(h_t1_mi) failed");
+        }
 
         // Per-pass staging device buffers (cap/N).
         uint64_t* d_t1_meta_stage = nullptr;

@@ -26,6 +26,7 @@
 namespace pos2gpu {
 
 struct GpuBufferPool;
+class  HostPinnedPool;
 
 struct GpuPipelineConfig {
     std::array<uint8_t, 32> plot_id{};
@@ -212,6 +213,15 @@ struct StreamingPinnedScratch {
     bool     start_at_t3_match  = false;
     uint64_t t2_count_in        = 0;
     uint64_t t1_count_in        = 0;
+
+    // Optional host-pinned pool for amortising per-plot malloc_host
+    // calls across a batch. When non-null, the streaming pipeline
+    // routes its per-plot pinned-host allocations (currently h_t1_mi)
+    // through pool->acquire(name, ...) instead of sycl::malloc_host.
+    // The pool keeps the buffers alive across plots; the pipeline
+    // does NOT free pool-owned buffers at function exit. nullptr
+    // preserves the historical per-plot malloc_host + free behaviour.
+    HostPinnedPool* pool = nullptr;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

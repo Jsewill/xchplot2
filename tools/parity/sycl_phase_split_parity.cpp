@@ -4,6 +4,7 @@
 
 #include "gpu/SyclBackend.hpp"
 #include "host/GpuPipeline.hpp"
+#include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
@@ -216,6 +217,68 @@ RunResult run_split_minimal_producer(int k, std::uint8_t seed)
     return out;
 }
 
+// HostPinnedPool integration test: run 2 plots through the same pool
+// and verify byte-identical output to the no-pool reference. Pool is
+// shared across plots so the second plot's h_t1_mi alloc is amortised
+// (the slot is sized correctly on plot 1 and reused on plot 2).
+bool run_pool_two_plots(int k, std::uint8_t seed_a, std::uint8_t seed_b)
+{
+    pos2gpu::HostPinnedPool pool;
+    auto run_one_through_pool = [&](std::uint8_t seed) {
+        pos2gpu::GpuPipelineConfig cfg;
+        cfg.k        = k;
+        cfg.strength = 2;
+        derive_plot_id(cfg.plot_id, seed);
+
+        auto& q = pos2gpu::sycl_backend::queue();
+        int const num_section_bits = (k < 28) ? 2 : (k - 26);
+        std::uint64_t const cap =
+            pos2gpu::max_pairs_per_section(k, num_section_bits) *
+            (1ULL << num_section_bits);
+        auto* pinned_dst = static_cast<std::uint64_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+        if (!pinned_dst) std::exit(2);
+
+        pos2gpu::StreamingPinnedScratch s{};
+        s.tiny_mode         = true;
+        s.t2_tile_count     = 8;
+        s.gather_tile_count = 4;
+        s.pool              = &pool;
+        auto r = pos2gpu::run_gpu_pipeline_streaming(cfg, pinned_dst, cap, s);
+        auto frags = r.fragments();
+        std::vector<std::uint64_t> out(frags.begin(), frags.end());
+        sycl::free(pinned_dst, q);
+        return out;
+    };
+
+    auto ref_a  = run_full(k, seed_a);
+    auto ref_b  = run_full(k, seed_b);
+    auto pool_a = run_one_through_pool(seed_a);
+    auto pool_b = run_one_through_pool(seed_b);
+
+    std::sort(ref_a.fragments.begin(),  ref_a.fragments.end());
+    std::sort(ref_b.fragments.begin(),  ref_b.fragments.end());
+    std::sort(pool_a.begin(),           pool_a.end());
+    std::sort(pool_b.begin(),           pool_b.end());
+
+    bool const a_match = ref_a.fragments.size() == pool_a.size() &&
+        std::memcmp(ref_a.fragments.data(), pool_a.data(),
+                    sizeof(std::uint64_t) * pool_a.size()) == 0;
+    bool const b_match = ref_b.fragments.size() == pool_b.size() &&
+        std::memcmp(ref_b.fragments.data(), pool_b.data(),
+                    sizeof(std::uint64_t) * pool_b.size()) == 0;
+    // After 2 plots, pool should have exactly 1 slot (h_t1_mi) live.
+    bool const slot_ok = (pool.slot_count() == 1);
+
+    bool const ok = a_match && b_match && slot_ok;
+    std::printf(
+        "%s pool-two-plots k=%d seeds=[%u,%u] a_bytes=%d b_bytes=%d slots=%zu\n",
+        ok ? "PASS" : "FAIL", k,
+        static_cast<unsigned>(seed_a), static_cast<unsigned>(seed_b),
+        a_match ? 1 : 0, b_match ? 1 : 0, pool.slot_count());
+    return ok;
+}
+
 bool run_one_minimal_producer(int k, std::uint8_t seed)
 {
     auto ref   = run_full(k, seed);
@@ -257,12 +320,14 @@ int main(int argc, char** argv)
     if (single_k >= 0) {
         all_ok = run_one(single_k, 7) && all_ok;
         all_ok = run_one_minimal_producer(single_k, 7) && all_ok;
+        all_ok = run_pool_two_plots(single_k, 7, 31) && all_ok;
     } else {
         for (int k : {18, 20, 22}) {
             for (std::uint8_t seed : {7u, 31u}) {
                 all_ok = run_one(k, seed) && all_ok;
                 all_ok = run_one_minimal_producer(k, seed) && all_ok;
             }
+            all_ok = run_pool_two_plots(k, 7, 31) && all_ok;
         }
     }
     return all_ok ? 0 : 1;

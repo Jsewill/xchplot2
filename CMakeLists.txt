@@ -417,7 +417,8 @@ set(POS2_GPU_SYCL_SRC
     src/gpu/T2Kernel.cpp
     src/gpu/T3Kernel.cpp
     src/host/GpuBufferPool.cpp
-    src/host/GpuPipeline.cpp)
+    src/host/GpuPipeline.cpp
+    src/host/HostPinnedPool.cpp)
 
 # Sort path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) is now
 # always compiled — it's the runtime fallback for non-CUDA backends on
@@ -603,7 +604,6 @@ add_library(pos2_gpu_host STATIC
     src/host/Cancel.cpp
     src/host/MultiGpuPlotPipeline.cpp
     src/host/MultiGpuPipelineParallel.cpp
-    src/host/HostPinnedPool.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
