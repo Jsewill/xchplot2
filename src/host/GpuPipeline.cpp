@@ -2517,10 +2517,16 @@ t3_match_entry:
         uint32_t const num_sections   = 1u << t3p.num_section_bits;
         uint32_t const num_match_keys = 1u << t3p.num_match_key_bits;
         uint32_t const num_buckets_t3 = num_sections * num_match_keys;
-        // Per-pass output capacity sized at cap/N × 1.25 (25% safety
+        // Per-pass output capacity sized at cap/N × 1.5 (50% safety
         // margin over the expected uniform-distribution average).
+        // T3 input is already plot-id-shaped meta — its per-section
+        // populations skew further from uniform than T1's xbit-derived
+        // sections, so it gets the larger margin (T1 stays at 25%).
+        // The +20% bump in d_t3_stage VRAM is the price of letting the
+        // sliced/minimal path tolerate skewed plot_id seeds at small k
+        // and unblocks pipeline-parallel + minimal-tier composition.
         uint64_t const t3_section_cap =
-            ((cap + num_sections - 1) / num_sections) * 5ULL / 4ULL;
+            ((cap + num_sections - 1) / num_sections) * 3ULL / 2ULL;
 
         T3PairingGpu* d_t3_stage      = nullptr;
         void*         d_t3_match_temp = nullptr;
@@ -2654,7 +2660,7 @@ t3_match_entry:
                     "T3 match (sliced) section_l=" + std::to_string(section_l) +
                     " produced " + std::to_string(pass_count) +
                     " pairs, staging holds " + std::to_string(t3_section_cap) +
-                    ". Lower N or widen t3_section_cap safety factor.");
+                    " (50% over uniform avg). Lower N or widen t3_section_cap safety factor.");
             }
             q.memcpy(h_t3 + host_offset, d_t3_stage,
                      pass_count * sizeof(T3PairingGpu)).wait();
