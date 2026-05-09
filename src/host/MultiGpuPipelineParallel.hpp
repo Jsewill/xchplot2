@@ -17,6 +17,7 @@
 #include "host/GpuPipeline.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -64,5 +65,37 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     int                                   device_first,
     int                                   device_second,
     int                                   depth = 2);
+
+// Phase 2-C: device-VRAM-aware stage assignment.
+//
+// Stage 1 (Xs + T1 + T2 sort) is the heavier VRAM consumer in every
+// tier — it has to hold the Xs candidate stream + CUB radix-sort
+// scratch on device. Stage 2 (T3 match + frag) is meaningfully
+// smaller, especially in the sliced minimal/tiny tiers.
+//
+// On a heterogeneous rig (e.g. 24 GB + 8 GB) the right policy is to
+// put stage 1 on the larger card so the small card can auto-pick a
+// smaller streaming tier (compact / minimal / tiny) without forcing
+// the large card down. select_pipeline_devices() applies that policy.
+//
+// On a uniform rig the function is a no-op (input order preserved
+// when VRAM ties).
+struct PipelineDeviceAssignment {
+    int           dev_first              = 0;
+    int           dev_second             = 0;
+    std::uint64_t dev_first_vram_bytes   = 0;
+    std::uint64_t dev_second_vram_bytes  = 0;
+    bool          reordered              = false;
+};
+
+// Default form — looks up VRAM via
+//   sycl_backend::usable_gpu_devices()[id].get_info<global_mem_size>()
+PipelineDeviceAssignment select_pipeline_devices(int dev_a, int dev_b);
+
+// Test seam — caller supplies the VRAM lookup. Used by parity tests
+// to exercise the swap without real heterogeneous hardware.
+PipelineDeviceAssignment select_pipeline_devices(
+    int dev_a, int dev_b,
+    std::function<std::uint64_t(int)> const& vram_for_device);
 
 } // namespace pos2gpu

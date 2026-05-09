@@ -171,6 +171,38 @@ int main(int argc, char** argv)
         }
         // Also validate the pipelined-batch path at k=22.
         all_ok = run_batch(22, dev_first, dev_second) && all_ok;
+
+        // Phase 2-C: select_pipeline_devices unit tests via injected
+        // VRAM lookup. Doesn't touch the GPUs — pure policy logic.
+        auto check_select = [&](int a, int b,
+                                std::uint64_t va, std::uint64_t vb,
+                                int want_first, int want_second,
+                                bool want_reordered, char const* label)
+        {
+            auto vram = [&](int id) -> std::uint64_t {
+                if (id == a) return va;
+                if (id == b) return vb;
+                std::abort();
+            };
+            auto r = pos2gpu::select_pipeline_devices(a, b, vram);
+            bool ok = r.dev_first == want_first
+                   && r.dev_second == want_second
+                   && r.reordered == want_reordered
+                   && r.dev_first_vram_bytes  == (want_first  == a ? va : vb)
+                   && r.dev_second_vram_bytes == (want_second == a ? va : vb);
+            std::printf("%s select-pipeline-devices %s: in=(%d,%d) "
+                        "vram=(%llu,%llu) -> out=(%d,%d) reordered=%d\n",
+                        ok ? "PASS" : "FAIL", label, a, b,
+                        (unsigned long long)va, (unsigned long long)vb,
+                        r.dev_first, r.dev_second, r.reordered ? 1 : 0);
+            return ok;
+        };
+        // Already in big-VRAM-first order: no swap.
+        all_ok = check_select(0, 1, 24ULL<<30, 12ULL<<30, 0, 1, false, "uniform-order") && all_ok;
+        // Reverse order: swap to put big card on stage 1.
+        all_ok = check_select(0, 1, 12ULL<<30, 24ULL<<30, 1, 0, true,  "swap-needed")  && all_ok;
+        // Equal VRAM (uniform rig): keep input order.
+        all_ok = check_select(2, 3, 16ULL<<30, 16ULL<<30, 2, 3, false, "tie-keeps-order") && all_ok;
     }
     return all_ok ? 0 : 1;
 }

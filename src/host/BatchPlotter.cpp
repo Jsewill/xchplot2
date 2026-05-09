@@ -1001,18 +1001,28 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
             "run_batch_pipeline_plot: --pipeline-plot requires exactly 2 device "
             "ids (got " + std::to_string(device_ids.size()) + ")");
     }
-    int const dev_first  = device_ids[0];
-    int const dev_second = device_ids[1];
-    if (dev_first < 0 || dev_second < 0) {
+    if (device_ids[0] < 0 || device_ids[1] < 0) {
         throw std::runtime_error(
             "run_batch_pipeline_plot: device ids must be non-negative");
     }
 
+    // Phase 2-C: device-VRAM-aware stage assignment. Stage 1 is the
+    // heavier VRAM consumer (Xs candidate stream + CUB sort scratch),
+    // so the larger-VRAM card runs it. On a uniform rig this is a
+    // no-op; on a heterogeneous rig it lets the small card auto-pick a
+    // smaller streaming tier without forcing the large card down.
+    auto const assign  = select_pipeline_devices(device_ids[0], device_ids[1]);
+    int const dev_first  = assign.dev_first;
+    int const dev_second = assign.dev_second;
+
     if (opts.verbose) {
+        double const gb1 = static_cast<double>(assign.dev_first_vram_bytes)  / 1.0e9;
+        double const gb2 = static_cast<double>(assign.dev_second_vram_bytes) / 1.0e9;
         std::fprintf(stderr,
-            "[pipeline-plot] %zu plots: stage1 on dev %d, stage2 on dev %d "
-            "(depth=2)\n",
-            entries.size(), dev_first, dev_second);
+            "[pipeline-plot] %zu plots: stage1 on dev %d (%.1f GB) → "
+            "stage2 on dev %d (%.1f GB)%s (depth=2)\n",
+            entries.size(), dev_first, gb1, dev_second, gb2,
+            assign.reordered ? " [reordered by VRAM]" : "");
     }
 
     // Convert BatchEntry sequence to GpuPipelineConfig sequence.

@@ -9,12 +9,61 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace pos2gpu {
+
+namespace {
+
+std::uint64_t default_vram_for_device(int id)
+{
+    auto const& devs = sycl_backend::usable_gpu_devices();
+    if (id < 0 || static_cast<std::size_t>(id) >= devs.size()) {
+        throw std::runtime_error(
+            "select_pipeline_devices: device id " + std::to_string(id) +
+            " out of range (have " + std::to_string(devs.size()) + " GPUs)");
+    }
+    return devs[id].get_info<sycl::info::device::global_mem_size>();
+}
+
+} // namespace
+
+PipelineDeviceAssignment select_pipeline_devices(
+    int dev_a, int dev_b,
+    std::function<std::uint64_t(int)> const& vram_for_device)
+{
+    if (dev_a < 0 || dev_b < 0) {
+        throw std::runtime_error(
+            "select_pipeline_devices: device ids must be non-negative");
+    }
+    auto const a_vram = vram_for_device(dev_a);
+    auto const b_vram = vram_for_device(dev_b);
+    PipelineDeviceAssignment out;
+    if (a_vram >= b_vram) {
+        out.dev_first             = dev_a;
+        out.dev_second            = dev_b;
+        out.dev_first_vram_bytes  = a_vram;
+        out.dev_second_vram_bytes = b_vram;
+        out.reordered             = false;
+    } else {
+        out.dev_first             = dev_b;
+        out.dev_second            = dev_a;
+        out.dev_first_vram_bytes  = b_vram;
+        out.dev_second_vram_bytes = a_vram;
+        out.reordered             = true;
+    }
+    return out;
+}
+
+PipelineDeviceAssignment select_pipeline_devices(int dev_a, int dev_b)
+{
+    return select_pipeline_devices(dev_a, dev_b, default_vram_for_device);
+}
 
 namespace {
 
