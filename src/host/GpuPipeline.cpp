@@ -1497,12 +1497,25 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //
     // Plain mode keeps d_t1_keys_merged live across the gather peak.
     // h_keys_owned: declared at function top (non-const so start_at_t3_match can override).
+    // h_keys_owned governs BOTH h_t1_keys_merged and h_t2_keys_merged
+    // (they share scratch.h_keys_merged when caller provides; they're
+    // also never live concurrently — h_t1 is freed before h_t2 is
+    // allocated). Pool integration must NOT modify h_keys_owned, since
+    // doing so breaks the downstream h_t2_keys_merged allocation logic
+    // at the `h_t2_keys_merged = h_keys_owned ? malloc_host : scratch`
+    // site. Instead, frees of both buffers are additionally gated on
+    // scratch.pool == nullptr.
     uint32_t* h_t1_keys_merged = nullptr;
     if (!scratch.plain_mode) {
-        h_t1_keys_merged = h_keys_owned
-            ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
-            : scratch.h_keys_merged;
-        if (!h_t1_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t1_keys_merged) failed");
+        if (h_keys_owned) {
+            h_t1_keys_merged = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_keys_merged", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+            if (!h_t1_keys_merged) throw std::runtime_error(
+                "sycl::malloc_host(h_t1_keys_merged) failed");
+        } else {
+            h_t1_keys_merged = scratch.h_keys_merged;
+        }
         q.memcpy(h_t1_keys_merged, d_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
         s_free(stats, d_t1_keys_merged);
         d_t1_keys_merged = nullptr;
@@ -1626,7 +1639,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     if (!scratch.plain_mode && !scratch.tiny_mode) {
         s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
         q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
-        if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
+        if (h_keys_owned && !scratch.pool) sycl::free(h_t1_keys_merged, q);
         h_t1_keys_merged = nullptr;
     }
 
@@ -1985,7 +1998,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         if (scratch.tiny_mode) {
             if (h_meta_owned) sycl::free(h_t1_meta, q);
             h_t1_meta = nullptr;
-            if (h_keys_owned) sycl::free(h_t1_keys_merged, q);
+            if (h_keys_owned && !scratch.pool) sycl::free(h_t1_keys_merged, q);
             h_t1_keys_merged = nullptr;
         } else {
             s_free(stats, d_t1_meta_sorted);
@@ -2231,9 +2244,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //
     // Plain mode keeps d_t2_keys_merged live across the gather peak.
     if (!scratch.plain_mode) {
-        h_t2_keys_merged = h_keys_owned  // reuse t1_keys flag: same scratch
-            ? static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q))
-            : scratch.h_keys_merged;
+        if (h_keys_owned) {
+            // Pool path reuses the "h_keys_merged" slot — h_t1_keys_merged
+            // was freed before this point, so the buffer is available.
+            h_t2_keys_merged = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_keys_merged", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+        } else {
+            h_t2_keys_merged = scratch.h_keys_merged;
+        }
         if (!h_t2_keys_merged) throw std::runtime_error("sycl::malloc_host(h_t2_keys_merged) failed");
         q.memcpy(h_t2_keys_merged, d_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
         s_free(stats, d_t2_keys_merged);
@@ -2501,7 +2520,7 @@ t3_match_entry:
     if (!scratch.plain_mode && !scratch.tiny_mode) {
         s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
         q.memcpy(d_t2_keys_merged, h_t2_keys_merged, t2_count * sizeof(uint32_t)).wait();
-        if (h_keys_owned) sycl::free(h_t2_keys_merged, q);
+        if (h_keys_owned && !scratch.pool) sycl::free(h_t2_keys_merged, q);
         h_t2_keys_merged = nullptr;
     }
 
@@ -2726,7 +2745,7 @@ t3_match_entry:
         if (scratch.tiny_mode) {
             if (h_xbits_owned) sycl::free(h_t2_xbits, q);
             h_t2_xbits = nullptr;
-            if (h_keys_owned)  sycl::free(h_t2_keys_merged, q);
+            if (h_keys_owned && !scratch.pool) sycl::free(h_t2_keys_merged, q);
             h_t2_keys_merged = nullptr;
         } else {
             s_free(stats, d_t2_xbits_sorted);
