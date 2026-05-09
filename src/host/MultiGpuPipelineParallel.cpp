@@ -72,6 +72,18 @@ namespace {
 // first device's queue is used for the malloc_host so the buffers
 // land in a shared pinned-host pool — on CUDA that's portable across
 // all devices in the same process by default.
+//
+// Portability caveat (Phase 2-A hypothesis): AdaptiveCpp's CUDA
+// backend is *expected* to allocate with cudaHostAllocPortable so the
+// host pages are mapped into every device context. Validated on Ada
+// Lovelace (RTX 4000 Ada). Observed once on Ampere (2× A4000) the
+// first plot segfaulted and left GPU 0 in nvidia-smi ERR! state — if
+// future investigation confirms the cause is non-portable pinned
+// memory on Ampere drivers, the fix is to either (a) interop with the
+// CUDA backend to call cudaHostRegister with cudaHostRegisterPortable
+// after allocation, or (b) allocate one buffer set per device and add
+// a host-staging copy at the boundary. Neither is needed if the
+// upstream allocator already passes the portable flag.
 struct BoundaryBuffers {
     std::uint64_t* pinned_dst        = nullptr;
     std::uint64_t* h_meta            = nullptr;

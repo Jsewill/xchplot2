@@ -2417,6 +2417,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "logic error.");
         }
         s_free(stats, d_counter);
+
+        // Phase 2-A defense: drain the queue before handing the boundary
+        // buffers to the receiver. The T2-sort gather phase issues D2H
+        // copies into h_t2_meta / h_t2_xbits / h_t2_keys_merged with
+        // intermediate q.wait()s inside, but a final wait here is a
+        // cheap, explicit guarantee that *every* host-pinned write is
+        // drained before the orchestrator's SlotChannel.send() makes the
+        // slot visible to the second-half thread on dev_second. Without
+        // this, any straggling async copy could race the receiver's
+        // first H2D / read on the same buffer.
+        q.wait();
+
         report_phases();
         if (stats.verbose) {
             std::fprintf(stderr,
