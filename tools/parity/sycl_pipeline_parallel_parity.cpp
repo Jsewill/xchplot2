@@ -62,16 +62,51 @@ std::vector<std::uint64_t> run_full(int k, std::uint8_t seed)
 }
 
 std::vector<std::uint64_t> run_orchestrator(
-    int k, std::uint8_t seed, int dev_first, int dev_second)
+    int k, std::uint8_t seed, int dev_first, int dev_second,
+    pos2gpu::PipelineStageTier tier_first  = pos2gpu::PipelineStageTier::Tiny,
+    pos2gpu::PipelineStageTier tier_second = pos2gpu::PipelineStageTier::Tiny)
 {
     pos2gpu::GpuPipelineConfig cfg;
     cfg.k        = k;
     cfg.strength = 2;
     derive_plot_id(cfg.plot_id, seed);
 
-    auto r = pos2gpu::run_pipeline_parallel_split(cfg, dev_first, dev_second);
+    auto r = pos2gpu::run_pipeline_parallel_split(
+        cfg, dev_first, dev_second, tier_first, tier_second);
     auto frags = r.fragments();
     return std::vector<std::uint64_t>(frags.begin(), frags.end());
+}
+
+char const* tier_name(pos2gpu::PipelineStageTier t)
+{
+    return t == pos2gpu::PipelineStageTier::Tiny ? "tiny" : "min";
+}
+
+bool run_one_tiers(int k, std::uint8_t seed, int dev_first, int dev_second,
+                   pos2gpu::PipelineStageTier tier_first,
+                   pos2gpu::PipelineStageTier tier_second)
+{
+    auto ref = run_full(k, seed);
+    auto pp  = run_orchestrator(k, seed, dev_first, dev_second, tier_first, tier_second);
+
+    std::sort(ref.begin(), ref.end());
+    std::sort(pp.begin(),  pp.end());
+
+    bool const size_ok  = (ref.size() == pp.size());
+    bool const bytes_ok = size_ok && std::memcmp(
+        ref.data(), pp.data(),
+        sizeof(std::uint64_t) * ref.size()) == 0;
+    bool const ok = size_ok && bytes_ok;
+
+    std::printf(
+        "%s pipeline-parallel k=%d seed=%u dev=[%d,%d] tiers=[%s+%s] [count=%llu vs %llu size=%d bytes=%d]\n",
+        ok ? "PASS" : "FAIL", k, static_cast<unsigned>(seed),
+        dev_first, dev_second,
+        tier_name(tier_first), tier_name(tier_second),
+        static_cast<unsigned long long>(ref.size()),
+        static_cast<unsigned long long>(pp.size()),
+        size_ok ? 1 : 0, bytes_ok ? 1 : 0);
+    return ok;
 }
 
 bool run_one(int k, std::uint8_t seed, int dev_first, int dev_second)
@@ -171,6 +206,18 @@ int main(int argc, char** argv)
         }
         // Also validate the pipelined-batch path at k=22.
         all_ok = run_batch(22, dev_first, dev_second) && all_ok;
+
+        // Phase 2-E: validate all 4 (tiny|minimal) × (tiny|minimal)
+        // tier combos at the boundary handoff. Default tiny+tiny is
+        // already covered above; the other 3 combos exercise the
+        // h_t2_meta producer/consumer agreement post Phase 2-D fix.
+        using T = pos2gpu::PipelineStageTier;
+        for (auto combo : {std::pair{T::Tiny,    T::Minimal},
+                           std::pair{T::Minimal, T::Tiny},
+                           std::pair{T::Minimal, T::Minimal}}) {
+            all_ok = run_one_tiers(20, 7, dev_first, dev_second,
+                                   combo.first, combo.second) && all_ok;
+        }
 
         // Phase 2-C: select_pipeline_devices unit tests via injected
         // VRAM lookup. Doesn't touch the GPUs — pure policy logic.

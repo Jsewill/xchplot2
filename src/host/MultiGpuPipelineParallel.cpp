@@ -112,7 +112,9 @@ void free_boundary(BoundaryBuffers& b)
 PipelineParallelSplitResult run_pipeline_parallel_split(
     GpuPipelineConfig const& cfg,
     int                      device_first,
-    int                      device_second)
+    int                      device_second,
+    PipelineStageTier        tier_first,
+    PipelineStageTier        tier_second)
 {
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
@@ -171,14 +173,7 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
             try {
                 bind_current_device(device_first);
                 StreamingPinnedScratch scratch{};
-                // Minimal tier: less PCIe traffic than tiny because
-                // T2 match reads d_t1_meta_sorted on device. Both
-                // tiers leave T2 sorted outputs on host pinned at
-                // T2 sort exit, so the boundary handoff is the same.
-                // Pipeline-plot opts into minimal by default;
-                // heterogeneous rigs that need tiny on the small
-                // card will eventually pick per-device tier.
-                scratch.tiny_mode          = true;
+                scratch.tiny_mode          = (tier_first == PipelineStageTier::Tiny);
                 scratch.t2_tile_count      = 8;
                 scratch.gather_tile_count  = 4;
                 scratch.h_meta             = buf.h_meta;
@@ -209,7 +204,7 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
             try {
                 bind_current_device(device_second);
                 StreamingPinnedScratch scratch{};
-                scratch.tiny_mode          = true;
+                scratch.tiny_mode          = (tier_second == PipelineStageTier::Tiny);
                 scratch.t2_tile_count     = 8;
                 scratch.gather_tile_count = 4;
                 scratch.h_meta            = buf.h_meta;
@@ -286,7 +281,9 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
     int                                   device_first,
     int                                   device_second,
-    int                                   depth)
+    int                                   depth,
+    PipelineStageTier                     tier_first,
+    PipelineStageTier                     tier_second)
 {
     if (cfgs.empty()) return {};
     if (depth < 1) depth = 1;
@@ -370,7 +367,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 int const slot = free_slots.recv();
                 if (slot < 0) break;
                 StreamingPinnedScratch s{};
-                s.tiny_mode          = true;
+                s.tiny_mode          = (tier_first == PipelineStageTier::Tiny);
                 s.t2_tile_count      = 8;
                 s.gather_tile_count  = 4;
                 s.h_meta             = bufs[slot].h_meta;
@@ -399,7 +396,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 if (slot < 0) break;
                 int const idx = slot_state[slot].cfg_idx;
                 StreamingPinnedScratch s{};
-                s.tiny_mode          = true;
+                s.tiny_mode          = (tier_second == PipelineStageTier::Tiny);
                 s.t2_tile_count     = 8;
                 s.gather_tile_count = 4;
                 s.h_meta            = bufs[slot].h_meta;

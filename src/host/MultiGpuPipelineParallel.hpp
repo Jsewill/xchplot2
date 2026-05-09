@@ -35,9 +35,21 @@ struct PipelineParallelSplitResult {
     }
 };
 
+// Per-stage streaming tier. Only Tiny and Minimal are valid in the
+// pipeline-parallel boundary handoff — the upper tiers (Plain /
+// Compact) don't surface T2 sorted outputs to host pinned memory.
+//
+// Tiny is the smaller-VRAM default; Minimal trades device VRAM for
+// (typically) lower wall-clock per stage. On a heterogeneous rig you
+// can pick Minimal on the larger-VRAM card and Tiny on the smaller.
+enum class PipelineStageTier {
+    Tiny,
+    Minimal,
+};
+
 // Run a single plot across two GPUs by splitting at the T2-sort
-// boundary. Requires tier=tiny on both halves (the boundary handoff
-// uses the host-pinned T2 buffers that tiny mode populates).
+// boundary. tier_first / tier_second select per-stage streaming tier
+// (default Tiny+Tiny matches pre-Phase-2-E behaviour).
 //
 // device_first runs Xs / T1 / T2; device_second runs T3 / Frag.
 // Setting them equal runs both halves on the same device sequentially
@@ -45,7 +57,9 @@ struct PipelineParallelSplitResult {
 PipelineParallelSplitResult run_pipeline_parallel_split(
     GpuPipelineConfig const& cfg,
     int                      device_first,
-    int                      device_second);
+    int                      device_second,
+    PipelineStageTier        tier_first  = PipelineStageTier::Tiny,
+    PipelineStageTier        tier_second = PipelineStageTier::Tiny);
 
 // Pipelined batch entry point. Runs a sequence of plots through the
 // two-stage split with depth in-flight at the boundary — while plot
@@ -60,11 +74,14 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
 // the host-pinned cost; default is 2.
 //
 // Returns one fragments vector per entry, in input order.
+// tier_first / tier_second default to Tiny+Tiny.
 std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
     int                                   device_first,
     int                                   device_second,
-    int                                   depth = 2);
+    int                                   depth = 2,
+    PipelineStageTier                     tier_first  = PipelineStageTier::Tiny,
+    PipelineStageTier                     tier_second = PipelineStageTier::Tiny);
 
 // Phase 2-C: device-VRAM-aware stage assignment.
 //
