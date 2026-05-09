@@ -254,7 +254,9 @@ bool run_pool_two_plots(int k, std::uint8_t seed_a, std::uint8_t seed_b)
     auto ref_a  = run_full(k, seed_a);
     auto ref_b  = run_full(k, seed_b);
     auto pool_a = run_one_through_pool(seed_a);
+    std::size_t const slots_after_a = pool.slot_count();
     auto pool_b = run_one_through_pool(seed_b);
+    std::size_t const slots_after_b = pool.slot_count();
 
     std::sort(ref_a.fragments.begin(),  ref_a.fragments.end());
     std::sort(ref_b.fragments.begin(),  ref_b.fragments.end());
@@ -267,15 +269,16 @@ bool run_pool_two_plots(int k, std::uint8_t seed_a, std::uint8_t seed_b)
     bool const b_match = ref_b.fragments.size() == pool_b.size() &&
         std::memcmp(ref_b.fragments.data(), pool_b.data(),
                     sizeof(std::uint64_t) * pool_b.size()) == 0;
-    // After 2 plots, pool should have exactly 1 slot (h_t1_mi) live.
-    bool const slot_ok = (pool.slot_count() == 1);
+    // Pool should keep its slots stable between plots — plot 2 must
+    // reuse the slots created by plot 1, not allocate new ones.
+    bool const slots_stable = (slots_after_a > 0) && (slots_after_a == slots_after_b);
 
-    bool const ok = a_match && b_match && slot_ok;
+    bool const ok = a_match && b_match && slots_stable;
     std::printf(
-        "%s pool-two-plots k=%d seeds=[%u,%u] a_bytes=%d b_bytes=%d slots=%zu\n",
+        "%s pool-two-plots k=%d seeds=[%u,%u] a_bytes=%d b_bytes=%d slots=%zu->%zu\n",
         ok ? "PASS" : "FAIL", k,
         static_cast<unsigned>(seed_a), static_cast<unsigned>(seed_b),
-        a_match ? 1 : 0, b_match ? 1 : 0, pool.slot_count());
+        a_match ? 1 : 0, b_match ? 1 : 0, slots_after_a, slots_after_b);
     return ok;
 }
 

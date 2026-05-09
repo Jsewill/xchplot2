@@ -1766,8 +1766,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 : scratch.h_meta;
             h_t2_meta_owned = h_meta_owned;
         }
-        uint32_t* h_t2_mi = static_cast<uint32_t*>(
-            alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
+        // h_t2_mi: per-plot full-cap host pinned. Pool path amortises
+        // across plots when scratch.pool is set; otherwise per-plot
+        // malloc + free at line ~1996 (gated on h_t2_mi_owned).
+        bool      h_t2_mi_owned = (scratch.pool == nullptr);
+        uint32_t* h_t2_mi = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t2_mi", cap, q)
+            : static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
         h_xbits_owned = (scratch.h_t2_xbits == nullptr);
         h_t2_xbits = h_xbits_owned
             ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
@@ -1993,7 +1998,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
         q.memcpy(d_t2_mi, h_t2_mi, t2_count * sizeof(uint32_t));
         q.wait();
-        sycl::free(h_t2_mi, q);
+        if (h_t2_mi_owned) sycl::free(h_t2_mi, q);
     }
 
     // ---------- Phase T2 sort (tiled, N=2) ----------
