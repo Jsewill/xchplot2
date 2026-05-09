@@ -5,6 +5,7 @@
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
+#include "host/HostPinnedPool.hpp"
 #include "host/MultiGpuPlotPipeline.hpp"        // --shard-plot path (Phase 2.2+)
 #include "host/MultiGpuPipelineParallel.hpp"   // --pipeline-plot path (Phase 2.1d)
 #include "host/MultiGpuShardBufferPool.hpp"  // batch-amortised buffer reuse
@@ -372,6 +373,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // in the streaming-fallback branch below; nullptr fields when the
     // pool path is active (pool_ptr != null).
     StreamingPinnedScratch stream_scratch{};
+    // Phase 2-26: per-batch host-pinned pool for the per-plot allocs
+    // that stream_scratch fields don't already amortise (h_t1_mi,
+    // h_t2_mi, and h_keys_merged when stream_scratch.h_keys_merged is
+    // null). Wired into stream_scratch.pool below in the streaming-
+    // fallback branch only — the GpuBufferPool path doesn't hit the
+    // streaming code at all.
+    HostPinnedPool stream_pool;
 
     // Force-streaming override (matches the one-shot run_gpu_pipeline
     // dispatch). Useful for testing the streaming path on a high-VRAM
@@ -541,6 +549,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         //
         // Plain tier does not park anything, so these pinned-host
         // scratch buffers are not needed.
+        // Wire the per-batch pool so per-plot allocs not covered by
+        // stream_scratch fields (h_t1_mi, h_t2_mi, h_keys_merged when
+        // not pre-allocated below) amortise across the batch instead
+        // of round-tripping malloc_host on every plot.
+        stream_scratch.pool = &stream_pool;
         if (!stream_scratch.plain_mode) {
             stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
