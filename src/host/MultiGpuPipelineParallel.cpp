@@ -3,6 +3,7 @@
 #include "host/MultiGpuPipelineParallel.hpp"
 
 #include "gpu/SyclBackend.hpp"
+#include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
@@ -363,6 +364,9 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::thread stage1([&] {
         try {
             bind_current_device(device_first);
+            // Per-thread host-pinned pool: amortises per-plot allocs
+            // (h_t1_mi, h_t2_mi) across all plots this thread handles.
+            HostPinnedPool stage1_pool;
             for (std::size_t idx = 0; idx < cfgs.size(); ++idx) {
                 int const slot = free_slots.recv();
                 if (slot < 0) break;
@@ -375,6 +379,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 s.h_t2_xbits         = bufs[slot].h_t2_xbits;
                 s.h_keys_merged      = bufs[slot].h_keys_merged;
                 s.stop_after_t2_sort = true;
+                s.pool               = &stage1_pool;
                 auto r = run_gpu_pipeline_streaming(
                     cfgs[idx], bufs[slot].pinned_dst, cap, s);
                 slot_state[slot].t1_count = r.t1_count;
@@ -391,6 +396,8 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::thread stage2([&] {
         try {
             bind_current_device(device_second);
+            // Per-thread host-pinned pool: amortises h_t3 across plots.
+            HostPinnedPool stage2_pool;
             for (;;) {
                 int const slot = ready_slots.recv();
                 if (slot < 0) break;
@@ -406,6 +413,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 s.start_at_t3_match = true;
                 s.t1_count_in       = slot_state[slot].t1_count;
                 s.t2_count_in       = slot_state[slot].t2_count;
+                s.pool              = &stage2_pool;
                 auto r = run_gpu_pipeline_streaming(
                     cfgs[idx], bufs[slot].pinned_dst, cap, s);
                 auto frags = r.fragments();
