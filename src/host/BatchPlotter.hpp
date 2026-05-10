@@ -116,13 +116,14 @@ struct BatchOptions {
     // heterogeneous rigs and per-plot latency on NVLink-equipped
     // hosts. Mutually exclusive with shard_plot.
     bool pipeline_plot     = false;
-    // Phase 2-E: per-stage streaming tier for the pipeline-plot path.
-    // Tiny is the safe default; Minimal trades device VRAM for fewer
-    // PCIe round-trips per stage. Heterogeneous-rig benchmarks can pick
-    // Minimal on the larger card and Tiny on the smaller. Ignored when
-    // pipeline_plot is false.
-    PipelineStageTier pipeline_tier_first  = PipelineStageTier::Tiny;
-    PipelineStageTier pipeline_tier_second = PipelineStageTier::Tiny;
+    // Per-stage streaming tier for the pipeline-plot path. Empty
+    // defaults to Tiny per stage. When non-empty, size must match
+    // device_ids.size() (currently 2 or 3). Tiny is the safe default;
+    // Minimal trades device VRAM for fewer PCIe round-trips per
+    // stage. Heterogeneous-rig benchmarks can pick Minimal on the
+    // larger card and Tiny on the smaller. Ignored when pipeline_plot
+    // is false.
+    std::vector<PipelineStageTier> pipeline_tiers;
     // When true and shard_plot is on, the distributed sorts route data
     // via direct device-to-device memcpy (Peer transport). On NVLink
     // hosts this stays on the fabric; on PCIe-only hosts the SYCL/CUDA

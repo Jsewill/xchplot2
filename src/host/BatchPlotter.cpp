@@ -1009,33 +1009,61 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                                     std::vector<int> const& device_ids)
 {
     BatchResult res{};
-    if (device_ids.size() != 2) {
+    if (device_ids.size() != 2 && device_ids.size() != 3) {
         throw std::runtime_error(
-            "run_batch_pipeline_plot: --pipeline-plot requires exactly 2 device "
+            "run_batch_pipeline_plot: --pipeline-plot requires 2 or 3 device "
             "ids (got " + std::to_string(device_ids.size()) + ")");
     }
-    if (device_ids[0] < 0 || device_ids[1] < 0) {
-        throw std::runtime_error(
+    for (int id : device_ids) {
+        if (id < 0) throw std::runtime_error(
             "run_batch_pipeline_plot: device ids must be non-negative");
     }
+    if (!opts.pipeline_tiers.empty() &&
+        opts.pipeline_tiers.size() != device_ids.size())
+    {
+        throw std::runtime_error(
+            "run_batch_pipeline_plot: pipeline_tiers must be empty or match "
+            "device_ids size (got " +
+            std::to_string(opts.pipeline_tiers.size()) + " tiers vs " +
+            std::to_string(device_ids.size()) + " devices)");
+    }
 
-    // Phase 2-C: device-VRAM-aware stage assignment. Stage 1 is the
-    // heavier VRAM consumer (Xs candidate stream + CUB sort scratch),
-    // so the larger-VRAM card runs it. On a uniform rig this is a
-    // no-op; on a heterogeneous rig it lets the small card auto-pick a
-    // smaller streaming tier without forcing the large card down.
-    auto const assign  = select_pipeline_devices(device_ids);
-    int const dev_first  = assign.dev_first;
-    int const dev_second = assign.dev_second;
+    // For N=2: keep the existing VRAM-aware reorder (heaviest stage
+    // on largest-VRAM card). For N=3: select_pipeline_devices doesn't
+    // yet generalise — pass device_ids in caller order and let the
+    // N-stage VRAM-aware assignment land in a follow-up.
+    std::vector<int> staged_devices;
+    bool reordered = false;
+    std::vector<std::uint64_t> stage_vram_bytes;
+    if (device_ids.size() == 2) {
+        auto const assign = select_pipeline_devices(device_ids);
+        staged_devices    = {assign.dev_first, assign.dev_second};
+        stage_vram_bytes  = {assign.dev_first_vram_bytes,
+                             assign.dev_second_vram_bytes};
+        reordered         = assign.reordered;
+    } else {
+        staged_devices = device_ids;
+        // VRAM lookup for verbose printout (best-effort).
+        auto const& devs = sycl_backend::usable_gpu_devices();
+        stage_vram_bytes.reserve(staged_devices.size());
+        for (int id : staged_devices) {
+            stage_vram_bytes.push_back(
+                (id >= 0 && static_cast<std::size_t>(id) < devs.size())
+                ? devs[id].get_info<sycl::info::device::global_mem_size>()
+                : 0);
+        }
+    }
 
     if (opts.verbose) {
-        double const gb1 = static_cast<double>(assign.dev_first_vram_bytes)  / 1.0e9;
-        double const gb2 = static_cast<double>(assign.dev_second_vram_bytes) / 1.0e9;
-        std::fprintf(stderr,
-            "[pipeline-plot] %zu plots: stage1 on dev %d (%.1f GB) → "
-            "stage2 on dev %d (%.1f GB)%s (depth=2)\n",
-            entries.size(), dev_first, gb1, dev_second, gb2,
-            assign.reordered ? " [reordered by VRAM]" : "");
+        std::fprintf(stderr, "[pipeline-plot] %zu plots:", entries.size());
+        for (std::size_t s = 0; s < staged_devices.size(); ++s) {
+            double const gb = static_cast<double>(stage_vram_bytes[s]) / 1.0e9;
+            std::fprintf(stderr, " stage%zu on dev %d (%.1f GB)%s",
+                         s + 1, staged_devices[s], gb,
+                         (s + 1 == staged_devices.size()) ? "" : " →");
+        }
+        std::fprintf(stderr, "%s (depth=2)\n",
+                     reordered ? " [reordered by VRAM]" : "");
     }
 
     // Convert BatchEntry sequence to GpuPipelineConfig sequence.
@@ -1054,11 +1082,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // stage; for tiny-mode tier on PCIe-only the stages contend on
     // host PCIe and depth>2 doesn't recover much.
     auto results = run_pipeline_parallel_batch(
-        cfgs,
-        std::vector<int>{dev_first, dev_second},
-        /*depth=*/2,
-        std::vector<PipelineStageTier>{opts.pipeline_tier_first,
-                                       opts.pipeline_tier_second});
+        cfgs, staged_devices, /*depth=*/2, opts.pipeline_tiers);
 
     // Write plot files sequentially. CPU-bound FSE compression doesn't
     // overlap with GPU work in this MVP — Phase 2.1f could add a
