@@ -1024,7 +1024,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // so the larger-VRAM card runs it. On a uniform rig this is a
     // no-op; on a heterogeneous rig it lets the small card auto-pick a
     // smaller streaming tier without forcing the large card down.
-    auto const assign  = select_pipeline_devices(device_ids[0], device_ids[1]);
+    auto const assign  = select_pipeline_devices(device_ids);
     int const dev_first  = assign.dev_first;
     int const dev_second = assign.dev_second;
 
@@ -1054,8 +1054,11 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // stage; for tiny-mode tier on PCIe-only the stages contend on
     // host PCIe and depth>2 doesn't recover much.
     auto results = run_pipeline_parallel_batch(
-        cfgs, dev_first, dev_second, /*depth=*/2,
-        opts.pipeline_tier_first, opts.pipeline_tier_second);
+        cfgs,
+        std::vector<int>{dev_first, dev_second},
+        /*depth=*/2,
+        std::vector<PipelineStageTier>{opts.pipeline_tier_first,
+                                       opts.pipeline_tier_second});
 
     // Write plot files sequentially. CPU-bound FSE compression doesn't
     // overlap with GPU work in this MVP — Phase 2.1f could add a

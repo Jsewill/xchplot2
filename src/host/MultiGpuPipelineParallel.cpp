@@ -35,9 +35,16 @@ std::uint64_t default_vram_for_device(int id)
 } // namespace
 
 PipelineDeviceAssignment select_pipeline_devices(
-    int dev_a, int dev_b,
+    std::vector<int> const&                  device_ids,
     std::function<std::uint64_t(int)> const& vram_for_device)
 {
+    if (device_ids.size() != 2) {
+        throw std::runtime_error(
+            "select_pipeline_devices: exactly 2 device ids required (got " +
+            std::to_string(device_ids.size()) + "); N-stage in progress");
+    }
+    int const dev_a = device_ids[0];
+    int const dev_b = device_ids[1];
     if (dev_a < 0 || dev_b < 0) {
         throw std::runtime_error(
             "select_pipeline_devices: device ids must be non-negative");
@@ -61,9 +68,9 @@ PipelineDeviceAssignment select_pipeline_devices(
     return out;
 }
 
-PipelineDeviceAssignment select_pipeline_devices(int dev_a, int dev_b)
+PipelineDeviceAssignment select_pipeline_devices(std::vector<int> const& device_ids)
 {
-    return select_pipeline_devices(dev_a, dev_b, default_vram_for_device);
+    return select_pipeline_devices(device_ids, default_vram_for_device);
 }
 
 namespace {
@@ -111,11 +118,9 @@ void free_boundary(BoundaryBuffers& b)
 } // namespace
 
 PipelineParallelSplitResult run_pipeline_parallel_split(
-    GpuPipelineConfig const& cfg,
-    int                      device_first,
-    int                      device_second,
-    PipelineStageTier        tier_first,
-    PipelineStageTier        tier_second)
+    GpuPipelineConfig const&              cfg,
+    std::vector<int> const&               device_ids,
+    std::vector<PipelineStageTier> const& tiers)
 {
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
@@ -123,6 +128,22 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
     }
+    if (device_ids.size() != 2) {
+        throw std::runtime_error(
+            "run_pipeline_parallel_split: exactly 2 device ids required (got " +
+            std::to_string(device_ids.size()) + "); N-stage in progress");
+    }
+    if (!tiers.empty() && tiers.size() != device_ids.size()) {
+        throw std::runtime_error(
+            "run_pipeline_parallel_split: tiers must be empty or match "
+            "device_ids size");
+    }
+    int const device_first  = device_ids[0];
+    int const device_second = device_ids[1];
+    PipelineStageTier const tier_first =
+        tiers.empty() ? PipelineStageTier::Tiny : tiers[0];
+    PipelineStageTier const tier_second =
+        tiers.empty() ? PipelineStageTier::Tiny : tiers[1];
     if (device_first < 0 || device_second < 0) {
         throw std::runtime_error(
             "run_pipeline_parallel_split: device ids must be non-negative");
@@ -280,17 +301,31 @@ private:
 
 std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
-    int                                   device_first,
-    int                                   device_second,
+    std::vector<int> const&               device_ids,
     int                                   depth,
-    PipelineStageTier                     tier_first,
-    PipelineStageTier                     tier_second)
+    std::vector<PipelineStageTier> const& tiers)
 {
     if (cfgs.empty()) return {};
     if (depth < 1) depth = 1;
     if (depth > static_cast<int>(cfgs.size())) {
         depth = static_cast<int>(cfgs.size());
     }
+    if (device_ids.size() != 2) {
+        throw std::runtime_error(
+            "run_pipeline_parallel_batch: exactly 2 device ids required (got " +
+            std::to_string(device_ids.size()) + "); N-stage in progress");
+    }
+    if (!tiers.empty() && tiers.size() != device_ids.size()) {
+        throw std::runtime_error(
+            "run_pipeline_parallel_batch: tiers must be empty or match "
+            "device_ids size");
+    }
+    int const device_first  = device_ids[0];
+    int const device_second = device_ids[1];
+    PipelineStageTier const tier_first =
+        tiers.empty() ? PipelineStageTier::Tiny : tiers[0];
+    PipelineStageTier const tier_second =
+        tiers.empty() ? PipelineStageTier::Tiny : tiers[1];
     if (device_first < 0 || device_second < 0) {
         throw std::runtime_error(
             "run_pipeline_parallel_batch: device ids must be non-negative");

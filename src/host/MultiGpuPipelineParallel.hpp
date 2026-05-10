@@ -47,41 +47,41 @@ enum class PipelineStageTier {
     Minimal,
 };
 
-// Run a single plot across two GPUs by splitting at the T2-sort
-// boundary. tier_first / tier_second select per-stage streaming tier
-// (default Tiny+Tiny matches pre-Phase-2-E behaviour).
+// Run a single plot across N GPUs by splitting the streaming pipeline
+// at one or more phase boundaries. Today only the T2-sort boundary is
+// implemented, so device_ids.size() must be 2: device_ids[0] runs
+// Xs / T1 / T2; device_ids[1] runs T3 / Frag. Setting both equal runs
+// both halves on the same device sequentially (validation path).
 //
-// device_first runs Xs / T1 / T2; device_second runs T3 / Frag.
-// Setting them equal runs both halves on the same device sequentially
-// (validation path).
+// `tiers[i]` selects per-stage streaming tier; empty (default) means
+// Tiny for every stage. When non-empty, tiers.size() must equal
+// device_ids.size().
 PipelineParallelSplitResult run_pipeline_parallel_split(
-    GpuPipelineConfig const& cfg,
-    int                      device_first,
-    int                      device_second,
-    PipelineStageTier        tier_first  = PipelineStageTier::Tiny,
-    PipelineStageTier        tier_second = PipelineStageTier::Tiny);
+    GpuPipelineConfig const&              cfg,
+    std::vector<int> const&               device_ids,
+    std::vector<PipelineStageTier> const& tiers = {});
 
 // Pipelined batch entry point. Runs a sequence of plots through the
-// two-stage split with depth in-flight at the boundary — while plot
-// N is on device_second (T3 + Frag), plot N+1 starts on device_first
-// (Xs + T1 + T2). Steady-state throughput per plot ≈
-// max(stage1_wall, stage2_wall) instead of (stage1+stage2).
+// N-stage split with `depth` plots in-flight at each boundary — while
+// plot N is on the last stage, plot N+1 starts on the first. Steady-
+// state throughput per plot ≈ max(stage_i_wall) once depth ≥ N.
 //
-// `depth` controls the number of pre-allocated boundary buffer sets.
-// 2 is enough to overlap one plot per stage; higher depth helps when
-// stage variance is high. Each set is cap-sized: ~6.2 GB pinned host
-// at k=28 (4 buffers × 2 GB + 1 × 2 GB pinned_dst). depth × that is
-// the host-pinned cost; default is 2.
+// `depth` controls the number of pre-allocated boundary buffer sets
+// per boundary. 2 is enough to overlap one plot per stage; higher
+// depth helps when stage variance is high. Each set is cap-sized
+// (~6.2 GB pinned host at k=28 for the T2-sort boundary).
+// depth × num_boundaries × per-set cost is the host-pinned total;
+// default depth is 2.
+//
+// `device_ids[i]` runs stage i; today device_ids.size() must be 2.
+// `tiers` is parallel to device_ids; empty defaults to Tiny per stage.
 //
 // Returns one fragments vector per entry, in input order.
-// tier_first / tier_second default to Tiny+Tiny.
 std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
-    int                                   device_first,
-    int                                   device_second,
+    std::vector<int> const&               device_ids,
     int                                   depth = 2,
-    PipelineStageTier                     tier_first  = PipelineStageTier::Tiny,
-    PipelineStageTier                     tier_second = PipelineStageTier::Tiny);
+    std::vector<PipelineStageTier> const& tiers = {});
 
 // Phase 2-C: device-VRAM-aware stage assignment.
 //
@@ -107,12 +107,14 @@ struct PipelineDeviceAssignment {
 
 // Default form — looks up VRAM via
 //   sycl_backend::usable_gpu_devices()[id].get_info<global_mem_size>()
-PipelineDeviceAssignment select_pipeline_devices(int dev_a, int dev_b);
+// device_ids.size() must equal 2 until N-stage assignment lands.
+PipelineDeviceAssignment select_pipeline_devices(
+    std::vector<int> const& device_ids);
 
 // Test seam — caller supplies the VRAM lookup. Used by parity tests
 // to exercise the swap without real heterogeneous hardware.
 PipelineDeviceAssignment select_pipeline_devices(
-    int dev_a, int dev_b,
+    std::vector<int> const&                  device_ids,
     std::function<std::uint64_t(int)> const& vram_for_device);
 
 } // namespace pos2gpu

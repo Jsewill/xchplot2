@@ -72,7 +72,9 @@ std::vector<std::uint64_t> run_orchestrator(
     derive_plot_id(cfg.plot_id, seed);
 
     auto r = pos2gpu::run_pipeline_parallel_split(
-        cfg, dev_first, dev_second, tier_first, tier_second);
+        cfg,
+        std::vector<int>{dev_first, dev_second},
+        std::vector<pos2gpu::PipelineStageTier>{tier_first, tier_second});
     auto frags = r.fragments();
     return std::vector<std::uint64_t>(frags.begin(), frags.end());
 }
@@ -151,7 +153,8 @@ bool run_batch(int k, int dev_first, int dev_second)
         std::sort(refs[i].begin(), refs[i].end());
     }
 
-    auto batch = pos2gpu::run_pipeline_parallel_batch(cfgs, dev_first, dev_second, /*depth=*/2);
+    auto batch = pos2gpu::run_pipeline_parallel_batch(
+        cfgs, std::vector<int>{dev_first, dev_second}, /*depth=*/2);
 
     bool all_ok = true;
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
@@ -231,7 +234,7 @@ int main(int argc, char** argv)
                 if (id == b) return vb;
                 std::abort();
             };
-            auto r = pos2gpu::select_pipeline_devices(a, b, vram);
+            auto r = pos2gpu::select_pipeline_devices(std::vector<int>{a, b}, vram);
             bool ok = r.dev_first == want_first
                    && r.dev_second == want_second
                    && r.reordered == want_reordered
