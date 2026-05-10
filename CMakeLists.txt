@@ -604,6 +604,7 @@ add_library(pos2_gpu_host STATIC
     src/host/Cancel.cpp
     src/host/MultiGpuPlotPipeline.cpp
     src/host/MultiGpuPipelineParallel.cpp
+    src/host/TempFile.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -779,6 +780,10 @@ add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
 add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
+
+add_executable(temp_file_test tools/parity/temp_file_test.cpp)
+target_link_libraries(temp_file_test PRIVATE pos2_gpu_host)
+target_compile_features(temp_file_test PRIVATE cxx_std_20)
 target_compile_features(sycl_bucket_offsets_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_bucket_offsets_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
