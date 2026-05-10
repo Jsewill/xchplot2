@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -137,14 +138,14 @@ bool run_one(int k, std::uint8_t seed, int dev_first, int dev_second)
 
 } // namespace
 
-// Run a 4-plot batch through the pipelined orchestrator and verify
-// each output matches the single-call reference. Validates the
-// depth=2 buffer-slot recycling and the inter-stage handoff over
-// multiple plots.
-bool run_batch(int k, int dev_first, int dev_second)
+// Run a multi-plot batch through the pipelined orchestrator and
+// verify each output matches the single-call reference. Validates
+// depth-N buffer-slot recycling and the inter-stage handoff.
+bool run_batch(int k, int dev_first, int dev_second,
+               std::size_t plot_count = 4, int depth = 2)
 {
-    std::vector<pos2gpu::GpuPipelineConfig> cfgs(4);
-    std::vector<std::vector<std::uint64_t>> refs(4);
+    std::vector<pos2gpu::GpuPipelineConfig> cfgs(plot_count);
+    std::vector<std::vector<std::uint64_t>> refs(plot_count);
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
         cfgs[i].k = k;
         cfgs[i].strength = 2;
@@ -153,8 +154,11 @@ bool run_batch(int k, int dev_first, int dev_second)
         std::sort(refs[i].begin(), refs[i].end());
     }
 
+    auto const t0 = std::chrono::steady_clock::now();
     auto batch = pos2gpu::run_pipeline_parallel_batch(
-        cfgs, std::vector<int>{dev_first, dev_second}, /*depth=*/2);
+        cfgs, std::vector<int>{dev_first, dev_second}, depth);
+    auto const t1 = std::chrono::steady_clock::now();
+    double const wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     bool all_ok = true;
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
@@ -171,6 +175,8 @@ bool run_batch(int k, int dev_first, int dev_second)
             static_cast<unsigned long long>(got.size()));
         if (!ok) all_ok = false;
     }
+    std::printf("[wall] pipeline-batch-2stage k=%d N=%zu plots depth=%d wall=%.1fms (%.1fms/plot)\n",
+                k, cfgs.size(), depth, wall_ms, wall_ms / cfgs.size());
     return all_ok;
 }
 
@@ -215,12 +221,12 @@ bool run_one_3stage(int k, std::uint8_t seed,
 }
 
 // Pipelined 3-stage batch — multiple plots in flight at each
-// boundary, depth=2. Validates the depth-N slot recycling holds for
-// the new generic orchestrator.
-bool run_batch_3stage(int k, int dev0, int dev1, int dev2)
+// boundary. Validates depth-N slot recycling and outputs wall time.
+bool run_batch_3stage(int k, int dev0, int dev1, int dev2,
+                      std::size_t plot_count = 4, int depth = 2)
 {
-    std::vector<pos2gpu::GpuPipelineConfig> cfgs(4);
-    std::vector<std::vector<std::uint64_t>> refs(4);
+    std::vector<pos2gpu::GpuPipelineConfig> cfgs(plot_count);
+    std::vector<std::vector<std::uint64_t>> refs(plot_count);
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
         cfgs[i].k = k;
         cfgs[i].strength = 2;
@@ -229,8 +235,11 @@ bool run_batch_3stage(int k, int dev0, int dev1, int dev2)
         std::sort(refs[i].begin(), refs[i].end());
     }
 
+    auto const t0 = std::chrono::steady_clock::now();
     auto batch = pos2gpu::run_pipeline_parallel_batch(
-        cfgs, std::vector<int>{dev0, dev1, dev2}, /*depth=*/2);
+        cfgs, std::vector<int>{dev0, dev1, dev2}, depth);
+    auto const t1 = std::chrono::steady_clock::now();
+    double const wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     bool all_ok = true;
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
@@ -247,6 +256,8 @@ bool run_batch_3stage(int k, int dev0, int dev1, int dev2)
             static_cast<unsigned long long>(got.size()));
         if (!ok) all_ok = false;
     }
+    std::printf("[wall] pipeline-batch-3stage k=%d N=%zu plots depth=%d wall=%.1fms (%.1fms/plot)\n",
+                k, cfgs.size(), depth, wall_ms, wall_ms / cfgs.size());
     return all_ok;
 }
 
@@ -257,10 +268,15 @@ int main(int argc, char** argv)
     int dev_second = 0;
     int dev_third = 0;
     bool batch_only = false;
+    bool three_stage = false;
+    int plot_count = 4;
+    int depth = 2;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
         if (arg == "--batch") {
             batch_only = true;
+        } else if (arg == "--3stage") {
+            three_stage = true;
         } else if (arg == "--k" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), single_k);
             ++i;
@@ -273,12 +289,28 @@ int main(int argc, char** argv)
         } else if (arg == "--dev-third" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), dev_third);
             ++i;
+        } else if (arg == "--plots" && i + 1 < argc) {
+            std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), plot_count);
+            ++i;
+        } else if (arg == "--depth" && i + 1 < argc) {
+            std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), depth);
+            ++i;
         }
     }
 
     bool all_ok = true;
     if (batch_only) {
-        all_ok = run_batch(single_k >= 0 ? single_k : 22, dev_first, dev_second) && all_ok;
+        if (three_stage) {
+            all_ok = run_batch_3stage(single_k >= 0 ? single_k : 22,
+                                       dev_first, dev_second, dev_third,
+                                       static_cast<std::size_t>(plot_count),
+                                       depth) && all_ok;
+        } else {
+            all_ok = run_batch(single_k >= 0 ? single_k : 22,
+                               dev_first, dev_second,
+                               static_cast<std::size_t>(plot_count),
+                               depth) && all_ok;
+        }
     } else if (single_k >= 0) {
         all_ok = run_one(single_k, 7, dev_first, dev_second) && all_ok;
     } else {
