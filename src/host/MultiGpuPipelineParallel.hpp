@@ -98,11 +98,19 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
 // On a uniform rig the function is a no-op (input order preserved
 // when VRAM ties).
 struct PipelineDeviceAssignment {
+    // N-stage canonical view (always populated). dev_ids[i] is the
+    // device assigned to stage i; dev_vram_bytes[i] is its VRAM.
+    std::vector<int>           dev_ids;
+    std::vector<std::uint64_t> dev_vram_bytes;
+    bool                       reordered = false;
+
+    // 2-stage scalar view (only populated when dev_ids.size() == 2).
+    // Pre-N-stage callers and existing parity tests read these; new
+    // code should prefer dev_ids / dev_vram_bytes.
     int           dev_first              = 0;
     int           dev_second             = 0;
     std::uint64_t dev_first_vram_bytes   = 0;
     std::uint64_t dev_second_vram_bytes  = 0;
-    bool          reordered              = false;
 };
 
 // Default form — looks up VRAM via

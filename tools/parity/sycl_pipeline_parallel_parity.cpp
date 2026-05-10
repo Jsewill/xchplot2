@@ -366,6 +366,44 @@ int main(int argc, char** argv)
         // Equal VRAM (uniform rig): keep input order.
         all_ok = check_select(2, 3, 16ULL<<30, 16ULL<<30, 2, 3, false, "tie-keeps-order") && all_ok;
 
+        // Phase 2.2e: N=3 VRAM-aware assignment. Heaviness order
+        // [stage1, stage0, stage2] — biggest VRAM → stage 1 (T2),
+        // next → stage 0 (Xs+T1), smallest → stage 2 (T3+Frag).
+        auto check_select3 = [&](std::vector<int> in,
+                                 std::vector<std::uint64_t> vrams,
+                                 std::vector<int> want_stages,
+                                 bool want_reordered, char const* label)
+        {
+            auto vram = [&](int id) -> std::uint64_t {
+                for (std::size_t i = 0; i < in.size(); ++i)
+                    if (in[i] == id) return vrams[i];
+                std::abort();
+            };
+            auto r = pos2gpu::select_pipeline_devices(in, vram);
+            bool ok = (r.dev_ids == want_stages) && (r.reordered == want_reordered);
+            std::printf("%s select-pipeline-devices-3stage %s: in=(%d,%d,%d) "
+                        "vram=(%llu,%llu,%llu) -> out=(%d,%d,%d) reordered=%d\n",
+                        ok ? "PASS" : "FAIL", label,
+                        in[0], in[1], in[2],
+                        (unsigned long long)vrams[0], (unsigned long long)vrams[1], (unsigned long long)vrams[2],
+                        r.dev_ids[0], r.dev_ids[1], r.dev_ids[2],
+                        r.reordered ? 1 : 0);
+            return ok;
+        };
+        // Uniform 3 cards: keep input order (no reorder).
+        all_ok = check_select3({0,1,2}, {16ULL<<30, 16ULL<<30, 16ULL<<30},
+                               {0,1,2}, false, "uniform-order-3") && all_ok;
+        // Heterogeneous: dev0=24GB, dev1=16GB, dev2=8GB. Heaviness
+        // [stage1, stage0, stage2] → stage1=dev0 (biggest), stage0=dev1,
+        // stage2=dev2. So out should be (dev_for_stage0, dev_for_stage1,
+        // dev_for_stage2) = (1, 0, 2). reordered=true.
+        all_ok = check_select3({0,1,2}, {24ULL<<30, 16ULL<<30, 8ULL<<30},
+                               {1,0,2}, true, "heterogeneous-3") && all_ok;
+        // Reverse VRAM order: dev0=8, dev1=16, dev2=24. Stage1 gets dev2,
+        // stage0 gets dev1, stage2 gets dev0 → (1, 2, 0). reordered=true.
+        all_ok = check_select3({0,1,2}, {8ULL<<30, 16ULL<<30, 24ULL<<30},
+                               {1,2,0}, true, "reverse-vram-3") && all_ok;
+
         // Phase 2.2c: 3-stage orchestrator. N=3 splits Xs+T1 / T2 /
         // T3+Frag using the new T1-sort boundary alongside the
         // existing T2-sort boundary. Run on the same physical device

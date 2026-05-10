@@ -1028,31 +1028,14 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
             std::to_string(device_ids.size()) + " devices)");
     }
 
-    // For N=2: keep the existing VRAM-aware reorder (heaviest stage
-    // on largest-VRAM card). For N=3: select_pipeline_devices doesn't
-    // yet generalise — pass device_ids in caller order and let the
-    // N-stage VRAM-aware assignment land in a follow-up.
-    std::vector<int> staged_devices;
-    bool reordered = false;
-    std::vector<std::uint64_t> stage_vram_bytes;
-    if (device_ids.size() == 2) {
-        auto const assign = select_pipeline_devices(device_ids);
-        staged_devices    = {assign.dev_first, assign.dev_second};
-        stage_vram_bytes  = {assign.dev_first_vram_bytes,
-                             assign.dev_second_vram_bytes};
-        reordered         = assign.reordered;
-    } else {
-        staged_devices = device_ids;
-        // VRAM lookup for verbose printout (best-effort).
-        auto const& devs = sycl_backend::usable_gpu_devices();
-        stage_vram_bytes.reserve(staged_devices.size());
-        for (int id : staged_devices) {
-            stage_vram_bytes.push_back(
-                (id >= 0 && static_cast<std::size_t>(id) < devs.size())
-                ? devs[id].get_info<sycl::info::device::global_mem_size>()
-                : 0);
-        }
-    }
+    // VRAM-aware assignment: heaviest stage on largest-VRAM card.
+    // Generalised for N=2 (T2-sort split) and N=3 (T1-sort + T2-sort
+    // split). The heaviness order is encoded in select_pipeline_devices;
+    // see stage_heaviness_order() in MultiGpuPipelineParallel.cpp.
+    auto const assign      = select_pipeline_devices(device_ids);
+    auto const& staged_devices    = assign.dev_ids;
+    auto const& stage_vram_bytes  = assign.dev_vram_bytes;
+    bool const reordered          = assign.reordered;
 
     if (opts.verbose) {
         std::fprintf(stderr, "[pipeline-plot] %zu plots:", entries.size());
