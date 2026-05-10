@@ -768,6 +768,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint32_t* h_t2_xbits       = nullptr;
     uint32_t* h_t2_keys_merged = nullptr;
 
+    // Phase 2.2 split: lifted from inside the first-half scope so
+    // start_at_t2_match can populate them and skip the Xs / T1 phases,
+    // and stop_after_t1_sort can hand them back to the caller.
+    uint64_t* h_t1_meta        = nullptr;
+    uint32_t* h_t1_keys_merged = nullptr;
+
     uint32_t* d_t2_keys_merged  = nullptr;
     uint64_t* d_t2_meta_sorted  = nullptr;
     uint32_t* d_t2_xbits_sorted = nullptr;
@@ -1155,11 +1161,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint32_t* d_t1_mi   = nullptr;
     void*     d_t1_match_temp = nullptr;
 
-    // Lift h_t1_meta / h_t1_mi out of the T1 sort scope so the sliced
-    // T1 match path can populate them directly. h_t1_mi is sliced-only
-    // — it's freed in T1 sort once CUB has consumed the H2D'd copy.
-    // h_meta_owned: declared at function top.
-    uint64_t* h_t1_meta = nullptr;
+    // h_t1_meta is now declared at function top (Phase 2.2 split prep)
+    // so start_at_t2_match can populate it before this code runs.
+    // h_t1_mi is sliced-only — freed in T1 sort once CUB has consumed
+    // the H2D'd copy. h_meta_owned: declared at function top.
     bool      h_t1_mi_owned = false;
     uint32_t* h_t1_mi = nullptr;
 
@@ -1505,7 +1510,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // at the `h_t2_keys_merged = h_keys_owned ? malloc_host : scratch`
     // site. Instead, frees of both buffers are additionally gated on
     // scratch.pool == nullptr.
-    uint32_t* h_t1_keys_merged = nullptr;
+    // h_t1_keys_merged is now declared at function top (Phase 2.2 split
+    // prep) so start_at_t2_match can populate it before this code runs.
     if (!scratch.plain_mode) {
         if (h_keys_owned) {
             h_t1_keys_merged = scratch.pool
