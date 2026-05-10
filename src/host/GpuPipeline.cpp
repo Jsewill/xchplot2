@@ -1575,8 +1575,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         if (scratch.tiny_mode) {
             // D2H merged_vals to host pinned, free device, allocate
             // small per-tile device staging for indices.
-            h_t1_merged_vals = static_cast<uint32_t*>(
-                sycl::malloc_host(t1_count * sizeof(uint32_t), q));
+            // Pool path requests cap-sized so the slot doesn't oscillate
+            // across plots with variable t1_count. Only first plot pays
+            // the realloc; subsequent plots reuse the same buffer.
+            h_t1_merged_vals = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(t1_count * sizeof(uint32_t), q));
             if (!h_t1_merged_vals)
                 throw std::runtime_error("sycl::malloc_host(h_t1_merged_vals) failed");
             q.memcpy(h_t1_merged_vals, d_t1_merged_vals,
@@ -1607,7 +1611,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_tile);
         if (scratch.tiny_mode) {
             s_free(stats, d_idx_tile);
-            sycl::free(h_t1_merged_vals, q);
+            if (!scratch.pool) sycl::free(h_t1_merged_vals, q);
         }
         s_free(stats, d_t1_meta);
         if (d_t1_merged_vals) s_free(stats, d_t1_merged_vals);
@@ -2322,8 +2326,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         uint32_t* h_t2_merged_vals = nullptr;
         uint32_t* d_t2_idx_tile    = nullptr;
         if (scratch.tiny_mode) {
-            h_t2_merged_vals = static_cast<uint32_t*>(
-                sycl::malloc_host(t2_count * sizeof(uint32_t), q));
+            // Reuse the "h_merged_vals" pool slot — h_t1_merged_vals
+            // freed/returned before this point; never live concurrently.
+            h_t2_merged_vals = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(t2_count * sizeof(uint32_t), q));
             if (!h_t2_merged_vals)
                 throw std::runtime_error("sycl::malloc_host(h_t2_merged_vals) failed");
             q.memcpy(h_t2_merged_vals, d_merged_vals,
@@ -2393,7 +2400,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // sorted outputs on host.
         if (scratch.tiny_mode) {
             s_free(stats, d_t2_idx_tile);
-            sycl::free(h_t2_merged_vals, q);
+            if (!scratch.pool) sycl::free(h_t2_merged_vals, q);
         }
         if (d_merged_vals) s_free(stats, d_merged_vals);
 
