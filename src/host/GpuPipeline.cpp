@@ -774,6 +774,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* h_t1_meta        = nullptr;
     uint32_t* h_t1_keys_merged = nullptr;
 
+    // Phase 2.2 split: device buffers that cross the Xs+T1 / T2-match
+    // scope boundary. Lifted from inner phase blocks so the if-skip
+    // wrapping Xs+T1 (when start_at_t2_match is set) doesn't break
+    // their references in T2 match / T2 sort code below. All six are
+    // trivially init'd to nullptr; non-skip paths assign as before.
+    uint32_t* d_keys_out        = nullptr;
+    uint32_t* d_vals_in         = nullptr;
+    uint32_t* d_vals_out        = nullptr;
+    uint32_t* h_keys            = nullptr;
+    uint32_t* h_vals            = nullptr;
+    uint32_t* d_t1_keys_merged  = nullptr;
+    uint64_t* d_t1_meta_sorted  = nullptr;
+
     uint32_t* d_t2_keys_merged  = nullptr;
     uint64_t* d_t2_meta_sorted  = nullptr;
     uint32_t* d_t2_xbits_sorted = nullptr;
@@ -833,10 +846,44 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         goto t3_match_entry;
     }
 
+    // Phase 2.2 split BEFORE T2 match: when start_at_t2_match is set,
+    // skip the Xs / T1 work and feed T2 match from the caller's
+    // h_meta + h_keys_merged. Variables that cross the Xs+T1 / T2 match
+    // boundary (h_t1_meta, h_t1_keys_merged, d_t1_meta_sorted,
+    // d_t1_keys_merged, d_keys_out, d_vals_in, d_vals_out, h_keys,
+    // h_vals) are lifted to function top so the if-skip below can
+    // bypass their declarations without breaking T2 match references.
+    if (scratch.start_at_t2_match) {
+        if (scratch.start_at_t3_match) {
+            throw std::runtime_error(
+                "start_at_t2_match and start_at_t3_match are mutually exclusive");
+        }
+        if (!scratch.tiny_mode) {
+            throw std::runtime_error(
+                "start_at_t2_match requires tiny tier (gather_tile_count == 4); "
+                "minimal/compact would need device-side d_t1_meta_sorted "
+                "rehydration that this initial cut doesn't implement.");
+        }
+        if (!scratch.h_meta || !scratch.h_keys_merged) {
+            throw std::runtime_error(
+                "start_at_t2_match requires h_meta and h_keys_merged "
+                "populated by the caller with sorted T1 outputs");
+        }
+        t1_count         = scratch.t1_count_in;
+        h_t1_meta        = scratch.h_meta;
+        h_t1_keys_merged = scratch.h_keys_merged;
+        h_meta_owned     = false;
+        h_keys_owned     = false;
+    }
+
     // Open a scope for the entire first-half (Xs+T1+T2) phase code so
     // the start_at_t3_match goto above can legally bypass any inner
     // declarations — only function-top state is in scope at the label.
     {
+    // Phase 2.2 split: skip Xs / T1 / T1 sort when start_at_t2_match
+    // is set. Closing brace lands just before T2 match phase, where
+    // stop_after_t1_sort also exits if requested.
+    if (!scratch.start_at_t2_match) {
     // ---------- Phase Xs (stage 4e: inlined gen+sort+pack) ----------
     // launch_construct_xs lumps keys_a/keys_b/vals_a/vals_b into a single
     // d_xs_temp blob (~4 GB at k=28). keys_a+vals_a are dead after the
@@ -1388,11 +1435,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Drops T1 sort CUB peak to:
     //   d_t1_mi (1040) + 3 × cap/2 u32 (1560) + scratch ≈ 2616 MB.
     // d_sort_scratch: declared at function top for cross-phase reuse.
-    uint32_t* d_keys_out = nullptr;     // populated in compact path; minimal uses h_keys instead
-    uint32_t* d_vals_in  = nullptr;     // T2 sort below also uses this; declared at wider scope
-    uint32_t* d_vals_out = nullptr;     // populated in compact path; minimal uses h_vals instead
-    uint32_t* h_keys     = nullptr;     // USM-host, sliced path only
-    uint32_t* h_vals     = nullptr;     // USM-host, sliced path only
+    // d_keys_out / d_vals_in / d_vals_out / h_keys: lifted to function
+    // top (Phase 2.2 split prep) so they survive past the Xs+T1
+    // if-skip. Comment summary of original sites preserved for context:
+    //   d_keys_out — populated in compact path; minimal uses h_keys instead
+    //   d_vals_in  — T2 sort below also uses this; wider-scope intent kept
+    //   d_vals_out — populated in compact path; minimal uses h_vals instead
+    //   h_keys     — USM-host, sliced path only
+    // h_vals lifted to function top (Phase 2.2 split prep). USM-host, sliced path only.
 
     int p_t1_sort = begin_phase("T1 sort");
 
@@ -1468,7 +1518,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     // 3-pass post-CUB (merge → gather meta) — same shape as T2 sort,
     // but T1 only has one gather stream (meta) so it's 2 passes here.
-    uint32_t* d_t1_keys_merged  = nullptr;
+    // d_t1_keys_merged is now declared at function top (Phase 2.2 split prep).
     uint32_t* d_t1_merged_vals  = nullptr;
     s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
     s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
@@ -1548,7 +1598,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
     }
 
-    uint64_t* d_t1_meta_sorted = nullptr;
+    // d_t1_meta_sorted is now declared at function top (Phase 2.2 split prep).
     if (t1_gather_N <= 1) {
         s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
         launch_gather_u64(d_t1_meta, d_t1_merged_vals, d_t1_meta_sorted, t1_count, q);
@@ -1651,6 +1701,36 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
         if (h_keys_owned && !scratch.pool) sycl::free(h_t1_keys_merged, q);
         h_t1_keys_merged = nullptr;
+    }
+    }  // end of Xs+T1 if-skip (when start_at_t2_match is set, skip to here)
+
+    // Phase 2.2 split first-half cut: when stop_after_t1_sort is set,
+    // return immediately. Sorted T1 metadata + match_info are in the
+    // caller-provided h_meta and h_keys_merged on host pinned;
+    // result.t1_count is set. Only tiny tier is supported by this
+    // initial cut.
+    if (scratch.stop_after_t1_sort) {
+        if (!scratch.tiny_mode) {
+            throw std::runtime_error(
+                "stop_after_t1_sort requires tiny tier (gather_tile_count == 4); "
+                "minimal/compact frees host pinned T1 buffers before this point "
+                "or never parks them — extending requires a separate code path.");
+        }
+        if (!scratch.h_meta || !scratch.h_keys_merged) {
+            throw std::runtime_error(
+                "stop_after_t1_sort requires caller-provided h_meta and "
+                "h_keys_merged so the sorted T1 outputs survive return");
+        }
+        if (!h_t1_meta || !h_t1_keys_merged) {
+            throw std::runtime_error(
+                "stop_after_t1_sort: T1 boundary buffers not populated "
+                "(internal pipeline error)");
+        }
+        GpuPipelineResult result;
+        result.t1_count = t1_count;
+        result.t2_count = 0;
+        result.t3_count = 0;
+        return result;
     }
 
     // ---------- Phase T2 match ----------

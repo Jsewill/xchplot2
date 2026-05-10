@@ -214,6 +214,28 @@ struct StreamingPinnedScratch {
     uint64_t t2_count_in        = 0;
     uint64_t t1_count_in        = 0;
 
+    // Phase 2.2 split BEFORE T2 match (in addition to the existing
+    // T2-sort pair around the T2 boundary).
+    //
+    // stop_after_t1_sort: when true, run Xs / T1 / T1 sort, then return
+    //   immediately. result.t1_count is set; t2_count and t3_count are
+    //   0. Caller-provided h_meta and h_keys_merged hold sorted T1
+    //   metadata and match_info; caller retains ownership.
+    //
+    // start_at_t2_match: when true, skip Xs / T1 entirely and start at
+    //   T2 match. Caller MUST populate t1_count_in plus h_meta (sorted
+    //   T1 meta) and h_keys_merged (sorted T1 match_info). Caller
+    //   retains ownership of those buffers.
+    //
+    // Both flags require the tiny tier (tiny_mode == true). Minimal /
+    // compact would need device-side d_t1_meta_sorted rehydration the
+    // initial cut doesn't implement.
+    //
+    // Mutual exclusion: at most one stop_after_* and one start_at_*
+    // per call. start_at_t2_match cannot combine with start_at_t3_match.
+    bool     stop_after_t1_sort = false;
+    bool     start_at_t2_match  = false;
+
     // Optional host-pinned pool for amortising per-plot malloc_host
     // calls across a batch. When non-null, the streaming pipeline
     // routes its per-plot pinned-host allocations (currently h_t1_mi)
