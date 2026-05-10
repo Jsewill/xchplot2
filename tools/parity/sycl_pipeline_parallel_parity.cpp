@@ -174,11 +174,88 @@ bool run_batch(int k, int dev_first, int dev_second)
     return all_ok;
 }
 
+// Phase 2.2c: 3-stage orchestrator parity. N=3 splits Xs+T1 / T2 /
+// T3+Frag across three devices. Validates byte-identical fragments
+// vs the single-GPU full-pipeline reference at k = 18, 20, 22.
+bool run_one_3stage(int k, std::uint8_t seed,
+                    int dev0, int dev1, int dev2)
+{
+    auto ref = run_full(k, seed);
+
+    pos2gpu::GpuPipelineConfig cfg;
+    cfg.k        = k;
+    cfg.strength = 2;
+    derive_plot_id(cfg.plot_id, seed);
+
+    auto results = pos2gpu::run_pipeline_parallel_batch(
+        std::vector<pos2gpu::GpuPipelineConfig>{cfg},
+        std::vector<int>{dev0, dev1, dev2},
+        /*depth=*/2);
+
+    auto frags = results[0].fragments();
+    std::vector<std::uint64_t> got(frags.begin(), frags.end());
+    std::sort(ref.begin(), ref.end());
+    std::sort(got.begin(), got.end());
+
+    bool const size_ok  = (ref.size() == got.size());
+    bool const bytes_ok = size_ok && std::memcmp(
+        ref.data(), got.data(),
+        sizeof(std::uint64_t) * ref.size()) == 0;
+    bool const ok = size_ok && bytes_ok;
+
+    std::printf(
+        "%s pipeline-parallel-3stage k=%d seed=%u dev=[%d,%d,%d] "
+        "[count=%llu vs %llu size=%d bytes=%d]\n",
+        ok ? "PASS" : "FAIL", k, static_cast<unsigned>(seed),
+        dev0, dev1, dev2,
+        static_cast<unsigned long long>(ref.size()),
+        static_cast<unsigned long long>(got.size()),
+        size_ok ? 1 : 0, bytes_ok ? 1 : 0);
+    return ok;
+}
+
+// Pipelined 3-stage batch — multiple plots in flight at each
+// boundary, depth=2. Validates the depth-N slot recycling holds for
+// the new generic orchestrator.
+bool run_batch_3stage(int k, int dev0, int dev1, int dev2)
+{
+    std::vector<pos2gpu::GpuPipelineConfig> cfgs(4);
+    std::vector<std::vector<std::uint64_t>> refs(4);
+    for (std::size_t i = 0; i < cfgs.size(); ++i) {
+        cfgs[i].k = k;
+        cfgs[i].strength = 2;
+        derive_plot_id(cfgs[i].plot_id, static_cast<std::uint8_t>(7 + i));
+        refs[i] = run_full(k, static_cast<std::uint8_t>(7 + i));
+        std::sort(refs[i].begin(), refs[i].end());
+    }
+
+    auto batch = pos2gpu::run_pipeline_parallel_batch(
+        cfgs, std::vector<int>{dev0, dev1, dev2}, /*depth=*/2);
+
+    bool all_ok = true;
+    for (std::size_t i = 0; i < cfgs.size(); ++i) {
+        auto frags = batch[i].fragments();
+        std::vector<std::uint64_t> got(frags.begin(), frags.end());
+        std::sort(got.begin(), got.end());
+        bool const ok = (got.size() == refs[i].size()) &&
+            std::memcmp(got.data(), refs[i].data(),
+                        sizeof(std::uint64_t) * got.size()) == 0;
+        std::printf(
+            "%s pipeline-batch-3stage k=%d entry=%zu dev=[%d,%d,%d] [count=%llu vs %llu]\n",
+            ok ? "PASS" : "FAIL", k, i, dev0, dev1, dev2,
+            static_cast<unsigned long long>(refs[i].size()),
+            static_cast<unsigned long long>(got.size()));
+        if (!ok) all_ok = false;
+    }
+    return all_ok;
+}
+
 int main(int argc, char** argv)
 {
     int single_k = -1;
     int dev_first = 0;
     int dev_second = 0;
+    int dev_third = 0;
     bool batch_only = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -192,6 +269,9 @@ int main(int argc, char** argv)
             ++i;
         } else if (arg == "--dev-second" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), dev_second);
+            ++i;
+        } else if (arg == "--dev-third" && i + 1 < argc) {
+            std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), dev_third);
             ++i;
         }
     }
@@ -253,6 +333,19 @@ int main(int argc, char** argv)
         all_ok = check_select(0, 1, 12ULL<<30, 24ULL<<30, 1, 0, true,  "swap-needed")  && all_ok;
         // Equal VRAM (uniform rig): keep input order.
         all_ok = check_select(2, 3, 16ULL<<30, 16ULL<<30, 2, 3, false, "tie-keeps-order") && all_ok;
+
+        // Phase 2.2c: 3-stage orchestrator. N=3 splits Xs+T1 / T2 /
+        // T3+Frag using the new T1-sort boundary alongside the
+        // existing T2-sort boundary. Run on the same physical device
+        // (dev=[0,0,0]) for the validation matrix; multi-GPU
+        // configurations (dev=[0,1,2]) need to be invoked via CLI
+        // args on a 3-GPU host.
+        for (int k : {18, 20, 22}) {
+            for (std::uint8_t seed : {7u, 31u}) {
+                all_ok = run_one_3stage(k, seed, dev_first, dev_second, dev_third) && all_ok;
+            }
+        }
+        all_ok = run_batch_3stage(22, dev_first, dev_second, dev_third) && all_ok;
     }
     return all_ok ? 0 : 1;
 }

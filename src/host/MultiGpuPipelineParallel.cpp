@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -310,24 +311,19 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     if (depth > static_cast<int>(cfgs.size())) {
         depth = static_cast<int>(cfgs.size());
     }
-    if (device_ids.size() != 2) {
+    int const N = static_cast<int>(device_ids.size());
+    if (N != 2 && N != 3) {
         throw std::runtime_error(
-            "run_pipeline_parallel_batch: exactly 2 device ids required (got " +
-            std::to_string(device_ids.size()) + "); N-stage in progress");
+            "run_pipeline_parallel_batch: device_ids.size() must be 2 (T2-sort "
+            "split) or 3 (T1-sort + T2-sort split); got " + std::to_string(N));
     }
     if (!tiers.empty() && tiers.size() != device_ids.size()) {
         throw std::runtime_error(
             "run_pipeline_parallel_batch: tiers must be empty or match "
             "device_ids size");
     }
-    int const device_first  = device_ids[0];
-    int const device_second = device_ids[1];
-    PipelineStageTier const tier_first =
-        tiers.empty() ? PipelineStageTier::Tiny : tiers[0];
-    PipelineStageTier const tier_second =
-        tiers.empty() ? PipelineStageTier::Tiny : tiers[1];
-    if (device_first < 0 || device_second < 0) {
-        throw std::runtime_error(
+    for (int id : device_ids) {
+        if (id < 0) throw std::runtime_error(
             "run_pipeline_parallel_batch: device ids must be non-negative");
     }
 
@@ -353,8 +349,41 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         max_pairs_per_section(k0, num_section_bits) *
         (std::uint64_t{1} << num_section_bits);
 
-    // Allocate `depth` boundary buffer sets on dev_first's queue.
-    bind_current_device(device_first);
+    // Per-stage role (which streaming-pipeline phase boundary to use).
+    // N=2 (one boundary, T2-sort): stage 0 = Xs+T1+T2, stage 1 = T3+Frag.
+    // N=3 (two boundaries): stage 0 = Xs+T1, stage 1 = T2 match+sort,
+    //                       stage 2 = T3+Frag.
+    struct StageRole {
+        int               device_id          = -1;
+        PipelineStageTier tier               = PipelineStageTier::Tiny;
+        bool              stop_after_t1_sort = false;
+        bool              stop_after_t2_sort = false;
+        bool              start_at_t2_match  = false;
+        bool              start_at_t3_match  = false;
+    };
+    std::vector<StageRole> roles(N);
+    for (int i = 0; i < N; ++i) {
+        roles[i].device_id = device_ids[i];
+        roles[i].tier      = tiers.empty() ? PipelineStageTier::Tiny : tiers[i];
+    }
+    if (N == 2) {
+        roles[0].stop_after_t2_sort = true;
+        roles[1].start_at_t3_match  = true;
+    } else { // N == 3
+        roles[0].stop_after_t1_sort = true;
+        roles[1].start_at_t2_match  = true;
+        roles[1].stop_after_t2_sort = true;
+        roles[2].start_at_t3_match  = true;
+    }
+
+    // Allocate `depth` boundary buffer sets on stage-0's queue. The
+    // single BoundaryBuffers shape covers both T1-sort and T2-sort
+    // boundaries — T1-sort uses h_meta + h_keys_merged only, T2-sort
+    // uses all four host pinned buffers; pinned_dst is the final-stage
+    // output. Each slot is exclusively owned by one plot at a time as
+    // it flows through the stages, so reusing buffers across boundaries
+    // within a slot is safe.
+    bind_current_device(roles[0].device_id);
     sycl::queue& alloc_q = sycl_backend::queue();
     std::vector<BoundaryBuffers> bufs(depth);
     for (int i = 0; i < depth; ++i) {
@@ -378,7 +407,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         }
     }
 
-    // Per-slot state shared between stage 1 and stage 2.
+    // Per-slot counts that downstream stages need (echoed forward).
     struct SlotState {
         std::uint64_t t1_count = 0;
         std::uint64_t t2_count = 0;
@@ -386,91 +415,101 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     };
     std::vector<SlotState> slot_state(depth);
 
-    // free_slots: slots ready for stage 1 to fill. Pre-fill with all.
-    // ready_slots: slots that stage 1 has filled, awaiting stage 2.
-    SlotChannel free_slots;
-    SlotChannel ready_slots;
-    for (int i = 0; i < depth; ++i) free_slots.send(i);
+    // Channel topology: channels[0] = free slots (recycled by the last
+    // stage). channels[i] for 1 <= i <= N-1 = ready slots between stage
+    // i-1 and stage i. SlotChannel has std::mutex so it's non-movable;
+    // store via unique_ptr to keep references stable.
+    std::vector<std::unique_ptr<SlotChannel>> channels(N);
+    for (int i = 0; i < N; ++i) channels[i] = std::make_unique<SlotChannel>();
+    for (int i = 0; i < depth; ++i) channels[0]->send(i);
 
     std::vector<PipelineParallelSplitResult> results(cfgs.size());
-    std::exception_ptr stage1_exc;
-    std::exception_ptr stage2_exc;
+    std::vector<std::exception_ptr> excs(N);
 
-    std::thread stage1([&] {
-        try {
-            bind_current_device(device_first);
-            // Per-thread host-pinned pool: amortises per-plot allocs
-            // (h_t1_mi, h_t2_mi) across all plots this thread handles.
-            HostPinnedPool stage1_pool;
-            for (std::size_t idx = 0; idx < cfgs.size(); ++idx) {
-                int const slot = free_slots.recv();
-                if (slot < 0) break;
-                StreamingPinnedScratch s{};
-                s.tiny_mode          = (tier_first == PipelineStageTier::Tiny);
-                s.t2_tile_count      = 8;
-                s.gather_tile_count  = 4;
-                s.h_meta             = bufs[slot].h_meta;
-                s.h_t2_meta          = bufs[slot].h_t2_meta;
-                s.h_t2_xbits         = bufs[slot].h_t2_xbits;
-                s.h_keys_merged      = bufs[slot].h_keys_merged;
-                s.stop_after_t2_sort = true;
-                s.pool               = &stage1_pool;
-                auto r = run_gpu_pipeline_streaming(
-                    cfgs[idx], bufs[slot].pinned_dst, cap, s);
-                slot_state[slot].t1_count = r.t1_count;
-                slot_state[slot].t2_count = r.t2_count;
-                slot_state[slot].cfg_idx  = static_cast<int>(idx);
-                ready_slots.send(slot);
+    std::vector<std::thread> stage_threads;
+    stage_threads.reserve(N);
+    for (int s = 0; s < N; ++s) {
+        stage_threads.emplace_back([&, s] {
+            try {
+                bind_current_device(roles[s].device_id);
+                // Per-thread host-pinned pool: amortises per-plot allocs
+                // (h_t1_mi, h_t2_mi, h_t3, h_keys_merged, h_merged_vals)
+                // across all plots this thread handles.
+                HostPinnedPool stage_pool;
+
+                bool const is_first = (s == 0);
+                bool const is_last  = (s == N - 1);
+                std::size_t plot_idx = 0;
+
+                for (;;) {
+                    int const slot = channels[s]->recv();
+                    if (slot < 0) break;
+
+                    int cfg_idx;
+                    if (is_first) {
+                        if (plot_idx >= cfgs.size()) break;
+                        cfg_idx = static_cast<int>(plot_idx++);
+                    } else {
+                        cfg_idx = slot_state[slot].cfg_idx;
+                    }
+
+                    StreamingPinnedScratch sc{};
+                    sc.tiny_mode          = (roles[s].tier == PipelineStageTier::Tiny);
+                    sc.t2_tile_count      = 8;
+                    sc.gather_tile_count  = 4;
+                    sc.h_meta             = bufs[slot].h_meta;
+                    sc.h_t2_meta          = bufs[slot].h_t2_meta;
+                    sc.h_t2_xbits         = bufs[slot].h_t2_xbits;
+                    sc.h_keys_merged      = bufs[slot].h_keys_merged;
+                    sc.stop_after_t1_sort = roles[s].stop_after_t1_sort;
+                    sc.stop_after_t2_sort = roles[s].stop_after_t2_sort;
+                    sc.start_at_t2_match  = roles[s].start_at_t2_match;
+                    sc.start_at_t3_match  = roles[s].start_at_t3_match;
+                    sc.t1_count_in        = slot_state[slot].t1_count;
+                    sc.t2_count_in        = slot_state[slot].t2_count;
+                    sc.pool               = &stage_pool;
+
+                    auto r = run_gpu_pipeline_streaming(
+                        cfgs[cfg_idx], bufs[slot].pinned_dst, cap, sc);
+
+                    if (is_first) {
+                        slot_state[slot].cfg_idx = cfg_idx;
+                    }
+                    if (!is_last) {
+                        // Echo forward — the streaming pipeline copies
+                        // input counts back into result when relevant
+                        // (start_at_*) and writes new counts otherwise.
+                        slot_state[slot].t1_count = r.t1_count;
+                        slot_state[slot].t2_count = r.t2_count;
+                        channels[s + 1]->send(slot);
+                    } else {
+                        // Final stage: capture fragments + recycle slot.
+                        auto frags = r.fragments();
+                        results[cfg_idx].fragments_storage.assign(
+                            frags.begin(), frags.end());
+                        results[cfg_idx].t1_count = r.t1_count;
+                        results[cfg_idx].t2_count = r.t2_count;
+                        results[cfg_idx].t3_count = r.t3_count;
+                        channels[0]->send(slot);
+                    }
+                }
+            } catch (...) {
+                excs[s] = std::current_exception();
             }
-        } catch (...) {
-            stage1_exc = std::current_exception();
-        }
-        ready_slots.close();
-    });
-
-    std::thread stage2([&] {
-        try {
-            bind_current_device(device_second);
-            // Per-thread host-pinned pool: amortises h_t3 across plots.
-            HostPinnedPool stage2_pool;
-            for (;;) {
-                int const slot = ready_slots.recv();
-                if (slot < 0) break;
-                int const idx = slot_state[slot].cfg_idx;
-                StreamingPinnedScratch s{};
-                s.tiny_mode          = (tier_second == PipelineStageTier::Tiny);
-                s.t2_tile_count     = 8;
-                s.gather_tile_count = 4;
-                s.h_meta            = bufs[slot].h_meta;
-                s.h_t2_meta         = bufs[slot].h_t2_meta;
-                s.h_t2_xbits        = bufs[slot].h_t2_xbits;
-                s.h_keys_merged     = bufs[slot].h_keys_merged;
-                s.start_at_t3_match = true;
-                s.t1_count_in       = slot_state[slot].t1_count;
-                s.t2_count_in       = slot_state[slot].t2_count;
-                s.pool              = &stage2_pool;
-                auto r = run_gpu_pipeline_streaming(
-                    cfgs[idx], bufs[slot].pinned_dst, cap, s);
-                auto frags = r.fragments();
-                results[idx].fragments_storage.assign(
-                    frags.begin(), frags.end());
-                results[idx].t1_count = r.t1_count;
-                results[idx].t2_count = r.t2_count;
-                results[idx].t3_count = r.t3_count;
-                free_slots.send(slot);
+            // Close downstream so the next stage can drain and exit.
+            // Last stage doesn't close channels[0] — channels[0] just
+            // becomes unreferenced when its thread exits.
+            if (s + 1 < N) {
+                channels[s + 1]->close();
             }
-        } catch (...) {
-            stage2_exc = std::current_exception();
-        }
-    });
+        });
+    }
 
-    stage1.join();
-    stage2.join();
+    for (auto& t : stage_threads) t.join();
 
     for (auto& b : bufs) free_boundary(b);
 
-    if (stage1_exc) std::rethrow_exception(stage1_exc);
-    if (stage2_exc) std::rethrow_exception(stage2_exc);
+    for (auto& e : excs) if (e) std::rethrow_exception(e);
     return results;
 }
 
