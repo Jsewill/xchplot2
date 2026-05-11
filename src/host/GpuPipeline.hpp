@@ -227,9 +227,14 @@ struct StreamingPinnedScratch {
     //   T1 meta) and h_keys_merged (sorted T1 match_info). Caller
     //   retains ownership of those buffers.
     //
-    // Both flags require the tiny tier (tiny_mode == true). Minimal /
-    // compact would need device-side d_t1_meta_sorted rehydration the
-    // initial cut doesn't implement.
+    // Both flags require minimal or tiny tier (gather_tile_count > 1).
+    // Tiny: T2 match reads h_t1_meta + h_t1_keys_merged directly per
+    //   section, no device-side rehydration needed.
+    // Minimal: T2 match consumes d_t1_meta_sorted + d_t1_keys_merged
+    //   on device. The start_at_t2_match prelude allocates and H2Ds
+    //   them from caller's h_meta + h_keys_merged.
+    // Plain/compact don't surface T1 sorted outputs to host pinned in
+    // a state the caller can hand off; not supported by this boundary.
     //
     // Mutual exclusion: at most one stop_after_* and one start_at_*
     // per call. start_at_t2_match cannot combine with start_at_t3_match.

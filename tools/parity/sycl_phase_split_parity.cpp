@@ -249,6 +249,92 @@ bool run_one_t1_split(int k, std::uint8_t seed)
     return ok;
 }
 
+// Phase 2.2f: T1-sort split with minimal tier on either or both
+// halves. Validates that the new minimal-mode start_at_t2_match
+// rehydration (d_t1_meta_sorted + d_t1_keys_merged H2D) and the
+// stop_after_t1_sort hand-off in non-tiny mode work end-to-end.
+RunResult run_t1_split_tiers(int k, std::uint8_t seed,
+                             bool first_tiny, bool second_tiny)
+{
+    pos2gpu::GpuPipelineConfig cfg;
+    cfg.k        = k;
+    cfg.strength = 2;
+    derive_plot_id(cfg.plot_id, seed);
+
+    auto& q = pos2gpu::sycl_backend::queue();
+    int const num_section_bits = (k < 28) ? 2 : (k - 26);
+    std::uint64_t const cap =
+        pos2gpu::max_pairs_per_section(k, num_section_bits) *
+        (1ULL << num_section_bits);
+
+    auto* h_meta        = static_cast<std::uint64_t*>(sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+    auto* h_t2_meta     = static_cast<std::uint64_t*>(sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+    auto* h_t2_xbits    = static_cast<std::uint32_t*>(sycl::malloc_host(cap * sizeof(std::uint32_t), q));
+    auto* h_keys_merged = static_cast<std::uint32_t*>(sycl::malloc_host(cap * sizeof(std::uint32_t), q));
+    auto* pinned_dst    = static_cast<std::uint64_t*>(sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+    if (!h_meta || !h_t2_meta || !h_t2_xbits || !h_keys_merged || !pinned_dst) std::exit(2);
+
+    pos2gpu::StreamingPinnedScratch first{};
+    first.tiny_mode          = first_tiny;
+    first.t2_tile_count      = 8;
+    first.gather_tile_count  = 4;
+    first.h_meta             = h_meta;
+    first.h_t2_meta          = h_t2_meta;
+    first.h_t2_xbits         = h_t2_xbits;
+    first.h_keys_merged      = h_keys_merged;
+    first.stop_after_t1_sort = true;
+    auto r1 = pos2gpu::run_gpu_pipeline_streaming(cfg, pinned_dst, cap, first);
+
+    pos2gpu::StreamingPinnedScratch second{};
+    second.tiny_mode         = second_tiny;
+    second.t2_tile_count     = 8;
+    second.gather_tile_count = 4;
+    second.h_meta            = h_meta;
+    second.h_t2_meta         = h_t2_meta;
+    second.h_t2_xbits        = h_t2_xbits;
+    second.h_keys_merged     = h_keys_merged;
+    second.start_at_t2_match = true;
+    second.t1_count_in       = r1.t1_count;
+    auto r2 = pos2gpu::run_gpu_pipeline_streaming(cfg, pinned_dst, cap, second);
+
+    auto frags = r2.fragments();
+    RunResult out;
+    out.fragments.assign(frags.begin(), frags.end());
+    out.t2_count = r2.t2_count;
+
+    sycl::free(h_meta,        q);
+    sycl::free(h_t2_meta,     q);
+    sycl::free(h_t2_xbits,    q);
+    sycl::free(h_keys_merged, q);
+    sycl::free(pinned_dst,    q);
+    return out;
+}
+
+bool run_one_t1_split_tiers(int k, std::uint8_t seed,
+                            bool first_tiny, bool second_tiny)
+{
+    auto ref   = run_full(k, seed);
+    auto split = run_t1_split_tiers(k, seed, first_tiny, second_tiny);
+
+    std::sort(ref.fragments.begin(),   ref.fragments.end());
+    std::sort(split.fragments.begin(), split.fragments.end());
+
+    bool const size_ok  = (ref.fragments.size() == split.fragments.size());
+    bool const bytes_ok = size_ok && std::memcmp(
+        ref.fragments.data(), split.fragments.data(),
+        sizeof(std::uint64_t) * ref.fragments.size()) == 0;
+    bool const ok = size_ok && bytes_ok;
+
+    std::printf(
+        "%s phase-split-t1-tiers k=%d seed=%u tiers=[%s+%s] [t3=%llu vs %llu size=%d bytes=%d]\n",
+        ok ? "PASS" : "FAIL", k, static_cast<unsigned>(seed),
+        first_tiny ? "tiny" : "min", second_tiny ? "tiny" : "min",
+        static_cast<unsigned long long>(ref.fragments.size()),
+        static_cast<unsigned long long>(split.fragments.size()),
+        size_ok ? 1 : 0, bytes_ok ? 1 : 0);
+    return ok;
+}
+
 // Phase 2-D probe: invoke run_split with tiny_mode=false on the
 // producer half. Validates that the GpuPipeline h_t2_meta fix lets
 // minimal-mode producers populate the boundary buffers in the format
@@ -418,6 +504,7 @@ int main(int argc, char** argv)
         all_ok = run_one_minimal_producer(single_k, 7) && all_ok;
         all_ok = run_pool_two_plots(single_k, 7, 31) && all_ok;
         all_ok = run_one_t1_split(single_k, 7) && all_ok;
+        all_ok = run_one_t1_split_tiers(single_k, 7, false, false) && all_ok;
     } else {
         for (int k : {18, 20, 22}) {
             for (std::uint8_t seed : {7u, 31u}) {
@@ -426,6 +513,14 @@ int main(int argc, char** argv)
                 all_ok = run_one_t1_split(k, seed) && all_ok;
             }
             all_ok = run_pool_two_plots(k, 7, 31) && all_ok;
+        }
+        // Phase 2.2f: T1-sort split with all 4 tier combos at the
+        // boundary handoff. (tiny+tiny is already covered above by
+        // run_one_t1_split — repeated here only via the other 3.)
+        for (auto combo : {std::pair{false, false},   // min+min
+                           std::pair{true,  false},   // tiny+min
+                           std::pair{false, true}}) { // min+tiny
+            all_ok = run_one_t1_split_tiers(20, 7, combo.first, combo.second) && all_ok;
         }
     }
     return all_ok ? 0 : 1;

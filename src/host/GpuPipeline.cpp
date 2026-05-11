@@ -858,11 +858,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             throw std::runtime_error(
                 "start_at_t2_match and start_at_t3_match are mutually exclusive");
         }
-        if (!scratch.tiny_mode) {
+        if (scratch.gather_tile_count <= 1) {
             throw std::runtime_error(
-                "start_at_t2_match requires tiny tier (gather_tile_count == 4); "
-                "minimal/compact would need device-side d_t1_meta_sorted "
-                "rehydration that this initial cut doesn't implement.");
+                "start_at_t2_match requires minimal or tiny tier "
+                "(gather_tile_count > 1); plain/compact path doesn't surface "
+                "T1 sorted outputs to host pinned in a state the caller can "
+                "hand off.");
         }
         if (!scratch.h_meta || !scratch.h_keys_merged) {
             throw std::runtime_error(
@@ -874,6 +875,23 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         h_t1_keys_merged = scratch.h_keys_merged;
         h_meta_owned     = false;
         h_keys_owned     = false;
+
+        // Minimal mode: T2 match consumes d_t1_meta_sorted and
+        // d_t1_keys_merged on device (full-cap), populated by T1 sort
+        // in the normal flow. Skipping Xs+T1 means we must rehydrate
+        // them here from the caller-provided host pinned buffers.
+        // Tiny mode reads h_t1_meta + h_t1_keys_merged directly per
+        // section inside T2 match and doesn't need the device buffers.
+        if (!scratch.tiny_mode) {
+            s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t),
+                     "d_t1_meta_sorted(start_at_t2)");
+            q.memcpy(d_t1_meta_sorted, scratch.h_meta,
+                     t1_count * sizeof(uint64_t)).wait();
+            s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t),
+                     "d_t1_keys_merged(start_at_t2)");
+            q.memcpy(d_t1_keys_merged, scratch.h_keys_merged,
+                     t1_count * sizeof(uint32_t)).wait();
+        }
     }
 
     // Open a scope for the entire first-half (Xs+T1+T2) phase code so
@@ -1682,7 +1700,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         end_phase(p_t1_sort);
         // Tiny: keep h_t1_meta alive across T2 match for slicing. Free
         // happens inside the tiny T2 match block.
-        if (!scratch.tiny_mode) {
+        // stop_after_t1_sort (Phase 2.2): keep h_t1_meta alive so the
+        // caller can read sorted T1 metadata. h_meta_owned is already
+        // false for the stop_after_t1_sort path (caller provides the
+        // buffer), so the free below is a no-op — but the unconditional
+        // h_t1_meta = nullptr would still disconnect it from the
+        // caller's pointer, hence the explicit guard.
+        if (!scratch.tiny_mode && !scratch.stop_after_t1_sort) {
             if (h_meta_owned) sycl::free(h_t1_meta, q);
             h_t1_meta = nullptr;
         }
@@ -1696,7 +1720,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // across T2 match; the split kernel reads section_r's mi slice each
     // pass. The T2 prepare step needs mi on device for histogram counts;
     // the tiny T2 match block briefly rehydrates for prepare and frees.
-    if (!scratch.plain_mode && !scratch.tiny_mode) {
+    //
+    // stop_after_t1_sort: also skip — sorted T1 match_info is the
+    // caller's return state, host pinned must survive.
+    if (!scratch.plain_mode && !scratch.tiny_mode && !scratch.stop_after_t1_sort) {
         s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
         q.memcpy(d_t1_keys_merged, h_t1_keys_merged, t1_count * sizeof(uint32_t)).wait();
         if (h_keys_owned && !scratch.pool) sycl::free(h_t1_keys_merged, q);
@@ -1710,11 +1737,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // result.t1_count is set. Only tiny tier is supported by this
     // initial cut.
     if (scratch.stop_after_t1_sort) {
-        if (!scratch.tiny_mode) {
+        if (scratch.gather_tile_count <= 1) {
             throw std::runtime_error(
-                "stop_after_t1_sort requires tiny tier (gather_tile_count == 4); "
-                "minimal/compact frees host pinned T1 buffers before this point "
-                "or never parks them — extending requires a separate code path.");
+                "stop_after_t1_sort requires minimal or tiny tier "
+                "(gather_tile_count > 1); plain/compact path never parks "
+                "T1 sorted outputs to host pinned.");
         }
         if (!scratch.h_meta || !scratch.h_keys_merged) {
             throw std::runtime_error(
