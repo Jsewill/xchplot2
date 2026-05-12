@@ -1106,48 +1106,114 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // memory per slot per boundary (~6 GB at k=28 for the T2-sort
     // boundary, less for the T1-sort boundary).
     int const depth = (opts.pipeline_depth > 0) ? opts.pipeline_depth : 2;
-    auto results = run_pipeline_parallel_batch(
-        cfgs, staged_devices, depth, resolved_tiers);
 
-    // Write plot files sequentially. CPU-bound FSE compression doesn't
-    // overlap with GPU work in this MVP — Phase 2.1f could add a
-    // writer thread that takes results as the orchestrator emits them.
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        auto const& entry = entries[i];
-        try {
-            auto full_path = std::filesystem::path(entry.out_dir) / entry.out_name;
-            std::filesystem::create_directories(entry.out_dir);
+    // Phase 2.1f: concurrent plot writer. The orchestrator fires
+    // on_plot_complete from the final-stage worker thread as soon as
+    // each plot's fragments are ready. We push (idx, result) onto a
+    // queue; a writer thread drains the queue and runs FSE+disk
+    // write in parallel with subsequent plots' GPU pipelines.
+    //
+    // Steady-state effect: per-plot wall = max(GPU pipeline, FSE+disk)
+    // instead of sum(GPU, FSE+disk). For k=28 the post-batch sequential
+    // writes were ~8 s/plot; overlapping cuts the 10-plot total by a
+    // similar amount.
+    struct WriteJob {
+        int                                idx;
+        PipelineParallelSplitResult        result;
+    };
+    std::mutex              q_mtx;
+    std::condition_variable q_cv;
+    std::queue<WriteJob>    q;
+    std::atomic<bool>       q_done{false};
+    std::atomic<bool>       writer_abort{false};
 
-            std::vector<uint8_t> memo_bytes = entry.memo;
-            if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+    std::atomic<std::size_t> plots_written_ct{0};
+    std::atomic<std::size_t> plots_failed_ct{0};
 
-            auto frags = results[i].fragments();
-            write_plot_file_parallel(
-                full_path.string(),
-                frags,
-                entry.plot_id.data(),
-                static_cast<uint8_t>(entry.k),
-                static_cast<uint8_t>(entry.strength),
-                entry.testnet ? uint8_t{1} : uint8_t{0},
-                static_cast<uint16_t>(entry.plot_index),
-                static_cast<uint8_t>(entry.meta_group),
-                std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()),
-                /*thread_count=*/0);
-            ++res.plots_written;
-            if (opts.verbose) {
-                std::fprintf(stderr,
-                    "[pipeline-plot] wrote %s (%llu fragments)\n",
-                    full_path.c_str(),
-                    static_cast<unsigned long long>(frags.size()));
+    auto writer_fn = [&]() {
+        while (true) {
+            WriteJob job;
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_cv.wait(lk, [&] {
+                    return !q.empty() || q_done.load();
+                });
+                if (q.empty()) return;  // q_done && drained → exit
+                job = std::move(q.front());
+                q.pop();
             }
-        } catch (std::exception const& e) {
-            std::fprintf(stderr,
-                "[pipeline-plot] FAILED for plot '%s': %s\n",
-                entry.out_name.c_str(), e.what());
-            ++res.plots_failed;
-            if (!opts.continue_on_error) break;
+            // Drop pending work if a prior write failed and the
+            // batch is in "stop on first failure" mode.
+            if (writer_abort.load()) continue;
+
+            auto const& entry = entries[static_cast<std::size_t>(job.idx)];
+            try {
+                auto full_path = std::filesystem::path(entry.out_dir)
+                                 / entry.out_name;
+                std::filesystem::create_directories(entry.out_dir);
+
+                std::vector<uint8_t> memo_bytes = entry.memo;
+                if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
+
+                auto frags = job.result.fragments();
+                write_plot_file_parallel(
+                    full_path.string(),
+                    frags,
+                    entry.plot_id.data(),
+                    static_cast<uint8_t>(entry.k),
+                    static_cast<uint8_t>(entry.strength),
+                    entry.testnet ? uint8_t{1} : uint8_t{0},
+                    static_cast<uint16_t>(entry.plot_index),
+                    static_cast<uint8_t>(entry.meta_group),
+                    std::span<uint8_t const>(memo_bytes.data(),
+                                             memo_bytes.size()),
+                    /*thread_count=*/0);
+                ++plots_written_ct;
+                if (opts.verbose) {
+                    std::fprintf(stderr,
+                        "[pipeline-plot] wrote %s (%llu fragments)\n",
+                        full_path.c_str(),
+                        static_cast<unsigned long long>(frags.size()));
+                }
+            } catch (std::exception const& e) {
+                std::fprintf(stderr,
+                    "[pipeline-plot] FAILED for plot '%s': %s\n",
+                    entry.out_name.c_str(), e.what());
+                ++plots_failed_ct;
+                if (!opts.continue_on_error) writer_abort.store(true);
+            }
         }
+    };
+
+    std::thread writer(writer_fn);
+
+    auto on_plot_complete =
+        [&](int cfg_idx, PipelineParallelSplitResult result) {
+            {
+                std::lock_guard<std::mutex> lk(q_mtx);
+                q.push(WriteJob{cfg_idx, std::move(result)});
+            }
+            q_cv.notify_one();
+        };
+
+    try {
+        run_pipeline_parallel_batch(
+            cfgs, staged_devices, depth, resolved_tiers, on_plot_complete);
+    } catch (...) {
+        // Make sure the writer thread can exit even if the
+        // orchestrator throws — otherwise we leak the std::thread.
+        q_done.store(true);
+        q_cv.notify_all();
+        writer.join();
+        throw;
     }
+
+    q_done.store(true);
+    q_cv.notify_all();
+    writer.join();
+
+    res.plots_written = plots_written_ct.load();
+    res.plots_failed  = plots_failed_ct.load();
     return res;
 }
 

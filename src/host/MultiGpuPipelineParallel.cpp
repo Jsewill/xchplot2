@@ -360,7 +360,8 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
     std::vector<int> const&               device_ids,
     int                                   depth,
-    std::vector<PipelineStageTier> const& tiers)
+    std::vector<PipelineStageTier> const& tiers,
+    PipelineBatchPlotCallback             on_plot_complete)
 {
     if (cfgs.empty()) return {};
     if (depth < 1) depth = 1;
@@ -572,6 +573,18 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                         results[cfg_idx].t1_count = r.t1_count;
                         results[cfg_idx].t2_count = r.t2_count;
                         results[cfg_idx].t3_count = r.t3_count;
+                        // Phase 2.1f: signal completion so the caller's
+                        // writer thread (if any) can overlap FSE+disk
+                        // with subsequent plots' GPU work. Move the
+                        // result into the callback to avoid a ~240 MB
+                        // fragments copy at k=28 — the orchestrator's
+                        // returned results[cfg_idx] is left hollow,
+                        // which is documented contract for callers
+                        // that wire a callback.
+                        if (on_plot_complete) {
+                            on_plot_complete(cfg_idx,
+                                             std::move(results[cfg_idx]));
+                        }
                         channels[0]->send(slot);
                     }
                 }

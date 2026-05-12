@@ -77,11 +77,28 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
 // `tiers` is parallel to device_ids; empty defaults to Tiny per stage.
 //
 // Returns one fragments vector per entry, in input order.
+// Optional plot-completion callback. Phase 2.1f: fires from the
+// final-stage worker thread immediately after plot N's result is
+// captured. Lets BatchPlotter hand the completed fragments to a
+// writer thread without waiting for the whole batch to finish
+// (overlaps FSE+disk with subsequent plots' GPU work). Runs on
+// the worker thread — keep it short + thread-safe; typically just
+// pushes (idx, result) onto a queue.
+//
+// When the callback is set the orchestrator MOVES result[cfg_idx]
+// into the callback parameter (avoids a ~240 MB copy at k=28); the
+// returned results vector has hollow fragments_storage for those
+// slots. Callers using the callback should consume the result via
+// the callback and not the return value.
+using PipelineBatchPlotCallback =
+    std::function<void(int cfg_idx, PipelineParallelSplitResult result)>;
+
 std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
     std::vector<int> const&               device_ids,
     int                                   depth = 2,
-    std::vector<PipelineStageTier> const& tiers = {});
+    std::vector<PipelineStageTier> const& tiers = {},
+    PipelineBatchPlotCallback             on_plot_complete = {});
 
 // Phase 2-C: device-VRAM-aware stage assignment.
 //
