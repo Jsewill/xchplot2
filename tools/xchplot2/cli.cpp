@@ -373,9 +373,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
             else if (a == "--pipeline-depth" && i + 1 < argc) {
-                int d = 2;
-                std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), d);
-                ++i;
+                int const d = std::atoi(argv[++i]);
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
                 opts.pipeline_depth = d;
             }
@@ -639,9 +637,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
             else if  (a == "--pipeline-depth" && need(1)) {
-                int d = 2;
-                std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), d);
-                ++i;
+                int const d = std::atoi(argv[++i]);
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
                 plot_pipeline_depth = d;
             }
