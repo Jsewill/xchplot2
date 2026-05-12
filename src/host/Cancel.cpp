@@ -1,4 +1,4 @@
-// Cancel.cpp — implementation of the SIGINT/SIGTERM cancel flag.
+// Cancel.cpp — implementation of the SIGINT/SIGTERM/SIGHUP cancel flag.
 
 #include "host/Cancel.hpp"
 
@@ -53,6 +53,21 @@ void install_cancel_signal_handlers()
 {
     std::signal(SIGINT,  cancel_handler);
     std::signal(SIGTERM, cancel_handler);
+    // SIGHUP — sent when the controlling terminal disappears (SSH
+    // disconnect, terminal closed). Without explicit handling, the
+    // default disposition kills the process immediately, leaving any
+    // in-flight CUDA contexts and kernels improperly torn down.
+    // That path is a *suspected* cause of host-wide CUDA driver-
+    // state corruption observed across runpod containers in 2026-05:
+    // NVML still reports healthy GPUs but cuInit returns
+    // cudaErrorInitializationError in every subsequent process.
+    // Routing SIGHUP through the same cooperative cancel flag lets
+    // the batch loop finish its current plot and drain CUDA cleanly
+    // before exit. Hypothesis to verify: does this stop the wedge
+    // from recurring after SSH-backgrounded plot runs?
+#if defined(SIGHUP)
+    std::signal(SIGHUP, cancel_handler);
+#endif
 }
 
 bool cancel_requested() noexcept
