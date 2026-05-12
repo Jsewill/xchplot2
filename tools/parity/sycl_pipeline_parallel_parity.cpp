@@ -18,10 +18,8 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <charconv>
 #include <chrono>
-#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -265,76 +263,6 @@ bool run_batch_3stage(int k, int dev0, int dev1, int dev2,
     return all_ok;
 }
 
-// Work-queue baseline: each device runs a worker thread that pulls
-// plots round-robin and runs the full streaming pipeline locally.
-// Same streaming tier (tiny) and no file writes — apples-to-apples
-// vs pipeline-batch[-3stage]. Real BatchPlotter work-queue uses the
-// GpuBufferPool path when it fits (24 GB cards do at k=28), which
-// would be ~30% faster — this benchmark gives the streaming-mode
-// floor that pipeline-plot must beat to matter on equal-VRAM rigs.
-bool run_workqueue(int k, std::vector<int> const& dev_ids, std::size_t plot_count)
-{
-    std::vector<pos2gpu::GpuPipelineConfig> cfgs(plot_count);
-    for (std::size_t i = 0; i < cfgs.size(); ++i) {
-        cfgs[i].k = k;
-        cfgs[i].strength = 2;
-        derive_plot_id(cfgs[i].plot_id, static_cast<std::uint8_t>(7 + i));
-    }
-    int const N = static_cast<int>(dev_ids.size());
-    std::atomic<int> next_plot{0};
-
-    auto const t0 = std::chrono::steady_clock::now();
-
-    std::vector<std::thread> workers;
-    std::vector<std::exception_ptr> excs(N);
-    workers.reserve(N);
-    for (int w = 0; w < N; ++w) {
-        workers.emplace_back([&, w] {
-            try {
-                int const dev = dev_ids[w];
-                pos2gpu::bind_current_device(dev);
-                auto& q = pos2gpu::sycl_backend::queue();
-                int const num_section_bits = (k < 28) ? 2 : (k - 26);
-                std::uint64_t const cap =
-                    pos2gpu::max_pairs_per_section(k, num_section_bits) *
-                    (1ULL << num_section_bits);
-                auto* pinned_dst = static_cast<std::uint64_t*>(
-                    sycl::malloc_host(cap * sizeof(std::uint64_t), q));
-                if (!pinned_dst) throw std::runtime_error("malloc_host pinned_dst failed");
-                pos2gpu::HostPinnedPool worker_pool;
-                for (;;) {
-                    int const idx = next_plot.fetch_add(1);
-                    if (idx >= static_cast<int>(plot_count)) break;
-                    pos2gpu::StreamingPinnedScratch s{};
-                    s.tiny_mode         = true;
-                    s.t2_tile_count     = 8;
-                    s.gather_tile_count = 4;
-                    s.pool              = &worker_pool;
-                    pos2gpu::run_gpu_pipeline_streaming(cfgs[idx], pinned_dst, cap, s);
-                }
-                sycl::free(pinned_dst, q);
-            } catch (...) {
-                excs[w] = std::current_exception();
-            }
-        });
-    }
-    for (auto& t : workers) t.join();
-
-    auto const t1 = std::chrono::steady_clock::now();
-    double const wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    for (int w = 0; w < N; ++w) {
-        if (excs[w]) {
-            try { std::rethrow_exception(excs[w]); }
-            catch (std::exception const& e) {
-                std::fprintf(stderr, "[workqueue] worker %d threw: %s\n", w, e.what());
-            }
-        }
-    }
-    std::printf("[wall] workqueue k=%d N=%zu plots devs=%d wall=%.1fms (%.1fms/plot)\n",
-                k, plot_count, N, wall_ms, wall_ms / plot_count);
-    return true;
-}
-
 int main(int argc, char** argv)
 {
     int single_k = -1;
@@ -343,7 +271,6 @@ int main(int argc, char** argv)
     int dev_third = 0;
     bool batch_only = false;
     bool three_stage = false;
-    bool workqueue_mode = false;
     int plot_count = 4;
     int depth = 2;
     for (int i = 1; i < argc; ++i) {
@@ -352,8 +279,6 @@ int main(int argc, char** argv)
             batch_only = true;
         } else if (arg == "--3stage") {
             three_stage = true;
-        } else if (arg == "--workqueue") {
-            workqueue_mode = true;
         } else if (arg == "--picker-only") {
             // Run only the select_strategy unit tests — no GPU init.
             auto check_strategy = [](std::vector<int> devs,
@@ -413,16 +338,7 @@ int main(int argc, char** argv)
     }
 
     bool all_ok = true;
-    if (workqueue_mode) {
-        // Use --dev-third != --dev-first to opt into 3-device work-queue.
-        // Default 2-device when --dev-third was left at its 0 default.
-        std::vector<int> devs;
-        devs.push_back(dev_first);
-        if (dev_second != dev_first) devs.push_back(dev_second);
-        if (dev_third != dev_first && dev_third != dev_second) devs.push_back(dev_third);
-        all_ok = run_workqueue(single_k >= 0 ? single_k : 22, devs,
-                               static_cast<std::size_t>(plot_count)) && all_ok;
-    } else if (batch_only) {
+    if (batch_only) {
         if (three_stage) {
             all_ok = run_batch_3stage(single_k >= 0 ? single_k : 22,
                                        dev_first, dev_second, dev_third,
