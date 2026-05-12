@@ -241,6 +241,27 @@ struct StreamingPinnedScratch {
     bool     stop_after_t1_sort = false;
     bool     start_at_t2_match  = false;
 
+    // Phase 2.5a: skip the minimal-tier T3 sort tile-merge when the
+    // device has VRAM headroom. The default minimal/tiny T3 sort
+    // splits the cap-sized fragment array into two half-cap tiles,
+    // sorts each on device, D2H's both to host pinned, std::inplace_
+    // merges on CPU (single-threaded, 1-3 s for 268M u64 at k=28),
+    // then H2D's the merged result back to d_frags_out. This bounds
+    // T3 sort peak to ~3.15 GB at k=28 — good for sub-5 GB cards,
+    // bad for everyone else.
+    //
+    // When this flag is set, T3 sort takes the !t1_match_sliced
+    // "fast path" instead: full-cap d_t3 input + full-cap d_frags_out
+    // output + CUB sort scratch (peak ~4.2 GB at k=28), single CUB
+    // launch, no host merge. Drops T3 sort wall from ~3-6 s back to
+    // ~200-500 ms in pipelined-batch mode (the host merge was the
+    // dominant overhead under PCIe contention).
+    //
+    // Only honoured when the caller has confirmed the device fits;
+    // the streaming pipeline does not auto-detect — set it from
+    // BatchPlotter / orchestrator based on per-device VRAM.
+    bool     t3_sort_full_cap   = false;
+
     // Optional host-pinned pool for amortising per-plot malloc_host
     // calls across a batch. When non-null, the streaming pipeline
     // routes its per-plot pinned-host allocations (currently h_t1_mi)

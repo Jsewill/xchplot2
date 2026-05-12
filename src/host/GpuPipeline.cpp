@@ -2995,7 +2995,15 @@ t3_match_entry:
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
     uint64_t* d_frags_out = nullptr;
 
-    if (!t1_match_sliced) {
+    // Phase 2.5a: t3_sort_full_cap opt-in skips the tile-merge path
+    // when caller has confirmed VRAM headroom. Forces the fast path
+    // even in minimal mode where t1_match_sliced is true. Tiny mode
+    // (input lives on host) can't take this branch — full-cap fast
+    // path needs d_t3 on device.
+    bool const t3_use_full_cap = !t1_match_sliced ||
+        (scratch.t3_sort_full_cap && !scratch.tiny_mode);
+
+    if (t3_use_full_cap) {
         size_t t3_sort_bytes = 0;
         launch_sort_keys_u64(
             nullptr, t3_sort_bytes,

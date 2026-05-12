@@ -411,16 +411,26 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     //                       stage 2 = T3+Frag.
     struct StageRole {
         int               device_id          = -1;
+        std::uint64_t     vram_bytes         = 0;
         PipelineStageTier tier               = PipelineStageTier::Tiny;
         bool              stop_after_t1_sort = false;
         bool              stop_after_t2_sort = false;
         bool              start_at_t2_match  = false;
         bool              start_at_t3_match  = false;
+        bool              t3_sort_full_cap   = false;
     };
     std::vector<StageRole> roles(N);
+    // Look up each staged device's VRAM up-front. Used to gate the
+    // Phase 2.5a t3_sort_full_cap optimisation on the final stage.
+    auto const& sycl_devs = sycl_backend::usable_gpu_devices();
     for (int i = 0; i < N; ++i) {
         roles[i].device_id = device_ids[i];
         roles[i].tier      = tiers.empty() ? PipelineStageTier::Tiny : tiers[i];
+        roles[i].vram_bytes =
+            (device_ids[i] >= 0 &&
+             static_cast<std::size_t>(device_ids[i]) < sycl_devs.size())
+            ? sycl_devs[device_ids[i]].get_info<sycl::info::device::global_mem_size>()
+            : 0;
     }
     if (N == 2) {
         roles[0].stop_after_t2_sort = true;
@@ -430,6 +440,21 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         roles[1].start_at_t2_match  = true;
         roles[1].stop_after_t2_sort = true;
         roles[2].start_at_t3_match  = true;
+    }
+
+    // Phase 2.5a: enable the full-cap on-device T3 sort for the final
+    // stage when its device has VRAM headroom. The minimal-tier tile-
+    // merge path (host std::inplace_merge) bloats T3 sort wall by 15-
+    // 30× in pipelined-batch mode under PCIe contention. Threshold is
+    // 6 GB (full-cap T3 sort peaks at ~4.2 GB at k=28; +40% safety).
+    // Tiny stages can't use this — their input is host-pinned, no
+    // device-resident d_t3.
+    constexpr std::uint64_t kT3FullCapVramFloor = 6ULL << 30; // 6 GB
+    int const final_stage = N - 1;
+    if (roles[final_stage].tier == PipelineStageTier::Minimal &&
+        roles[final_stage].vram_bytes >= kT3FullCapVramFloor)
+    {
+        roles[final_stage].t3_sort_full_cap = true;
     }
 
     // Allocate `depth` boundary buffer sets on stage-0's queue. The
@@ -521,6 +546,7 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                     sc.stop_after_t2_sort = roles[s].stop_after_t2_sort;
                     sc.start_at_t2_match  = roles[s].start_at_t2_match;
                     sc.start_at_t3_match  = roles[s].start_at_t3_match;
+                    sc.t3_sort_full_cap   = roles[s].t3_sort_full_cap;
                     sc.t1_count_in        = slot_state[slot].t1_count;
                     sc.t2_count_in        = slot_state[slot].t2_count;
                     sc.pool               = &stage_pool;
