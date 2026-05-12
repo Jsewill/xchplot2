@@ -8,6 +8,7 @@
 // runs on the VPS via `--devices 0,1`.
 
 #include "gpu/SyclBackend.hpp"
+#include "host/BatchPlotter.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/MultiGpuPipelineParallel.hpp"
@@ -353,6 +354,43 @@ int main(int argc, char** argv)
             three_stage = true;
         } else if (arg == "--workqueue") {
             workqueue_mode = true;
+        } else if (arg == "--picker-only") {
+            // Run only the select_strategy unit tests — no GPU init.
+            auto check_strategy = [](std::vector<int> devs,
+                                     std::vector<std::uint64_t> vrams,
+                                     int k,
+                                     pos2gpu::BatchStrategy want,
+                                     char const* label) -> bool {
+                auto vram = [&](int id) -> std::uint64_t {
+                    for (std::size_t i = 0; i < devs.size(); ++i)
+                        if (devs[i] == id) return vrams[i];
+                    return 0;
+                };
+                std::string reason;
+                auto got = pos2gpu::select_strategy({devs, k}, vram, &reason);
+                bool ok = (got == want);
+                char const* gn = "?";
+                switch (got) {
+                    case pos2gpu::BatchStrategy::Auto:         gn = "auto"; break;
+                    case pos2gpu::BatchStrategy::WorkQueue:    gn = "work-queue"; break;
+                    case pos2gpu::BatchStrategy::PipelinePlot: gn = "pipeline-plot"; break;
+                    case pos2gpu::BatchStrategy::ShardPlot:    gn = "shard-plot"; break;
+                }
+                std::printf("%s strategy-picker %s: k=%d N=%zu -> %s (%s)\n",
+                            ok ? "PASS" : "FAIL", label, k, devs.size(),
+                            gn, reason.c_str());
+                return ok;
+            };
+            using S = pos2gpu::BatchStrategy;
+            bool ok = true;
+            ok = check_strategy({0}, {24ULL<<30}, 28, S::WorkQueue, "n1") && ok;
+            ok = check_strategy({0,1,2}, {24ULL<<30, 24ULL<<30, 24ULL<<30}, 28,
+                                S::WorkQueue, "uniform-big-3") && ok;
+            ok = check_strategy({0,1}, {24ULL<<30, 8ULL<<30}, 28,
+                                S::WorkQueue, "het-fits-2") && ok;
+            ok = check_strategy({0,1}, {24ULL<<30, 1ULL<<30}, 28,
+                                S::PipelinePlot, "sub-tiny-2") && ok;
+            return ok ? 0 : 1;
         } else if (arg == "--k" && i + 1 < argc) {
             std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), single_k);
             ++i;
@@ -488,6 +526,46 @@ int main(int argc, char** argv)
         // stage0 gets dev1, stage2 gets dev0 → (1, 2, 0). reordered=true.
         all_ok = check_select3({0,1,2}, {8ULL<<30, 16ULL<<30, 24ULL<<30},
                                {1,2,0}, true, "reverse-vram-3") && all_ok;
+
+        // Phase 2.4: select_strategy picker. Pure logic, no GPU needed.
+        auto check_strategy = [&](std::vector<int> devs,
+                                  std::vector<std::uint64_t> vrams,
+                                  int k,
+                                  pos2gpu::BatchStrategy want,
+                                  char const* label)
+        {
+            auto vram = [&](int id) -> std::uint64_t {
+                for (std::size_t i = 0; i < devs.size(); ++i)
+                    if (devs[i] == id) return vrams[i];
+                return 0;
+            };
+            std::string reason;
+            auto got = pos2gpu::select_strategy({devs, k}, vram, &reason);
+            bool const ok = (got == want);
+            char const* got_name = "?";
+            switch (got) {
+                case pos2gpu::BatchStrategy::Auto:         got_name = "auto"; break;
+                case pos2gpu::BatchStrategy::WorkQueue:    got_name = "work-queue"; break;
+                case pos2gpu::BatchStrategy::PipelinePlot: got_name = "pipeline-plot"; break;
+                case pos2gpu::BatchStrategy::ShardPlot:    got_name = "shard-plot"; break;
+            }
+            std::printf("%s strategy-picker %s: k=%d N=%zu -> %s (%s)\n",
+                        ok ? "PASS" : "FAIL", label, k, devs.size(),
+                        got_name, reason.c_str());
+            return ok;
+        };
+        using S = pos2gpu::BatchStrategy;
+        // N=1 → WorkQueue (only option)
+        all_ok = check_strategy({0}, {24ULL<<30}, 28, S::WorkQueue, "n1") && all_ok;
+        // 3× big cards → WorkQueue (all fit pool)
+        all_ok = check_strategy({0,1,2}, {24ULL<<30, 24ULL<<30, 24ULL<<30}, 28,
+                                S::WorkQueue, "uniform-big-3") && all_ok;
+        // Mixed but all fit tiny → WorkQueue (per-device tier picks handle it)
+        all_ok = check_strategy({0,1}, {24ULL<<30, 8ULL<<30}, 28,
+                                S::WorkQueue, "het-fits-2") && all_ok;
+        // Small card below tiny peak at k=28 → PipelinePlot
+        all_ok = check_strategy({0,1}, {24ULL<<30, 1ULL<<30}, 28,
+                                S::PipelinePlot, "sub-tiny-2") && all_ok;
 
         // Phase 2.2c: 3-stage orchestrator. N=3 splits Xs+T1 / T2 /
         // T3+Frag using the new T1-sort boundary alongside the

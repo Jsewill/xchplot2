@@ -372,6 +372,21 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
+            else if (a == "--strategy" && i + 1 < argc) {
+                std::string const s = argv[++i];
+                if      (s == "auto")          opts.strategy = pos2gpu::BatchStrategy::Auto;
+                else if (s == "work-queue" ||
+                         s == "workqueue")     opts.strategy = pos2gpu::BatchStrategy::WorkQueue;
+                else if (s == "pipeline" ||
+                         s == "pipeline-plot") opts.strategy = pos2gpu::BatchStrategy::PipelinePlot;
+                else if (s == "shard" ||
+                         s == "shard-plot")    opts.strategy = pos2gpu::BatchStrategy::ShardPlot;
+                else {
+                    std::cerr << "Error: --strategy expects auto|work-queue|"
+                                 "pipeline|shard (got '" << s << "')\n";
+                    return 1;
+                }
+            }
             else if (a == "--pipeline-stage-tiers" && i + 1 < argc) {
                 std::string const spec = argv[++i];
                 auto parse_tier = [](std::string const& t)
@@ -583,6 +598,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
         bool plot_pipeline_plot   = false;
+        pos2gpu::BatchStrategy plot_strategy = pos2gpu::BatchStrategy::Auto;
         bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
         std::vector<pos2gpu::PipelineStageTier> plot_pipeline_tiers;
@@ -614,6 +630,21 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
+            else if  (a == "--strategy" && need(1)) {
+                std::string const s = argv[++i];
+                if      (s == "auto")          plot_strategy = pos2gpu::BatchStrategy::Auto;
+                else if (s == "work-queue" ||
+                         s == "workqueue")     plot_strategy = pos2gpu::BatchStrategy::WorkQueue;
+                else if (s == "pipeline" ||
+                         s == "pipeline-plot") plot_strategy = pos2gpu::BatchStrategy::PipelinePlot;
+                else if (s == "shard" ||
+                         s == "shard-plot")    plot_strategy = pos2gpu::BatchStrategy::ShardPlot;
+                else {
+                    std::cerr << "Error: --strategy expects auto|work-queue|"
+                                 "pipeline|shard (got '" << s << "')\n";
+                    return 1;
+                }
+            }
             else if  (a == "--pipeline-stage-tiers" && need(1)) {
                 std::string const spec = argv[++i];
                 auto parse_tier = [](std::string const& t)
@@ -829,6 +860,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.include_cpu       = plot_include_cpu;
             opts.shard_plot        = plot_shard_plot;
             opts.pipeline_plot          = plot_pipeline_plot;
+            opts.strategy               = plot_strategy;
             opts.pipeline_tiers         = plot_pipeline_tiers;
             opts.prefer_peer_copy  = plot_prefer_peer_copy;
             opts.streaming_tier    = plot_streaming_tier;

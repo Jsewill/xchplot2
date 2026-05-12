@@ -1111,6 +1111,85 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
 
 } // namespace
 
+// Phase 2.4 auto-strategy picker. Decides at runtime which multi-GPU
+// strategy fits the rig + k. Pure function — testable via the
+// injected `vram_for_device` lookup. Heuristic:
+//   - N <= 1                                 → WorkQueue (only option)
+//   - smallest dev's VRAM < tiny streaming   → PipelinePlot (work-queue
+//                                              can't fit on smallest card;
+//                                              pipeline gives it the
+//                                              lightest stage)
+//   - else                                   → WorkQueue (proven
+//                                              throughput winner on
+//                                              equal-VRAM PCIe rigs;
+//                                              pool path on 24 GB cards
+//                                              wins by ~40× over
+//                                              pipeline-plot at k=28)
+// shard-plot is never auto-selected — it's a niche opt-in with worse
+// PCIe-only throughput than work-queue (see README).
+BatchStrategy select_strategy(
+    StrategyPickInputs const&                inputs,
+    std::function<std::uint64_t(int)> const& vram_for_device,
+    std::string*                             reason_out)
+{
+    std::size_t const N = inputs.device_ids.size();
+    if (N <= 1) {
+        if (reason_out) *reason_out =
+            "N=" + std::to_string(N) +
+            " device(s); work-queue is the only multi-GPU strategy";
+        return BatchStrategy::WorkQueue;
+    }
+
+    std::uint64_t const tiny_peak  = streaming_tiny_peak_bytes(inputs.k);
+    std::uint64_t       min_vram   = UINT64_MAX;
+    int                 min_dev    = -1;
+    for (int id : inputs.device_ids) {
+        if (id < 0) continue;  // CPU worker — skip in VRAM heuristic
+        std::uint64_t const v = vram_for_device(id);
+        if (v < min_vram) { min_vram = v; min_dev = id; }
+    }
+
+    // If we couldn't sample any GPU (all-CPU device list): WorkQueue.
+    if (min_dev < 0) {
+        if (reason_out) *reason_out =
+            "no GPU in device list; work-queue handles CPU";
+        return BatchStrategy::WorkQueue;
+    }
+
+    if (min_vram < tiny_peak) {
+        if (reason_out) {
+            *reason_out =
+                "smallest GPU (dev " + std::to_string(min_dev) + ", " +
+                std::to_string(min_vram / (1ULL << 30)) + " GB) below tiny "
+                "streaming peak (" +
+                std::to_string(tiny_peak / (1ULL << 30)) +
+                " GB) at k=" + std::to_string(inputs.k) +
+                "; pipeline-plot puts the small card on the lightest stage";
+        }
+        return BatchStrategy::PipelinePlot;
+    }
+
+    if (reason_out) {
+        *reason_out =
+            "all " + std::to_string(N) + " GPU(s) fit at k=" +
+            std::to_string(inputs.k) + " (smallest = " +
+            std::to_string(min_vram / (1ULL << 30)) +
+            " GB ≥ tiny peak); work-queue is the throughput winner";
+    }
+    return BatchStrategy::WorkQueue;
+}
+
+BatchStrategy select_strategy(StrategyPickInputs const& inputs,
+                              std::string*              reason_out)
+{
+    auto vram = [](int id) -> std::uint64_t {
+        auto const& devs = sycl_backend::usable_gpu_devices();
+        if (id < 0 || static_cast<std::size_t>(id) >= devs.size()) return 0;
+        return devs[id].get_info<sycl::info::device::global_mem_size>();
+    };
+    return select_strategy(inputs, vram, reason_out);
+}
+
 BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts)
 {
@@ -1164,21 +1243,51 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
 
     auto const t_start = std::chrono::steady_clock::now();
 
-    // Single-plot-multi-GPU dispatch (opt in via --shard-plot). Each
-    // plot runs across all selected devices as a "team" instead of
-    // distributing plots between independent workers. Phase 1 ships
-    // the surface area only — N=1 falls through to the existing
-    // single-GPU path (a no-op equivalent), N > 1 throws a clear
-    // error until Phase 2 lands the spatial / bucket partition.
-    // See docs/multi-gpu-single-plot-*.md.
-    if (opts.shard_plot && device_ids.size() > 1) {
+    // Phase 2.4: resolve the multi-GPU strategy. The user can set
+    // opts.strategy explicitly, OR keep the legacy bool fields
+    // (shard_plot / pipeline_plot) which are honoured when
+    // strategy == Auto. When strategy == Auto and neither legacy bool
+    // is set, the picker runs the heuristic.
+    BatchStrategy resolved_strategy = opts.strategy;
+    std::string   resolved_reason;
+    if (resolved_strategy == BatchStrategy::Auto) {
+        if (opts.shard_plot) {
+            resolved_strategy = BatchStrategy::ShardPlot;
+            resolved_reason   = "legacy --shard-plot opt-in";
+        } else if (opts.pipeline_plot) {
+            resolved_strategy = BatchStrategy::PipelinePlot;
+            resolved_reason   = "legacy --pipeline-plot opt-in";
+        } else {
+            StrategyPickInputs inputs{device_ids, pool_k};
+            resolved_strategy = select_strategy(inputs, &resolved_reason);
+        }
+    } else {
+        resolved_reason = "explicit --strategy override";
+    }
+    if (opts.verbose) {
+        char const* name = "work-queue";
+        switch (resolved_strategy) {
+            case BatchStrategy::Auto:         name = "auto(?)"; break;
+            case BatchStrategy::WorkQueue:    name = "work-queue"; break;
+            case BatchStrategy::PipelinePlot: name = "pipeline-plot"; break;
+            case BatchStrategy::ShardPlot:    name = "shard-plot"; break;
+        }
+        std::fprintf(stderr, "[strategy] picked %s — %s\n",
+                     name, resolved_reason.c_str());
+    }
+
+    // Single-plot-multi-GPU dispatch (shard-plot strategy). Each plot
+    // runs across all selected devices as a "team" instead of
+    // distributing plots between independent workers. Niche on
+    // PCIe-only — see README. N=1 falls through to single-GPU path.
+    if (resolved_strategy == BatchStrategy::ShardPlot && device_ids.size() > 1) {
         BatchResult r = run_batch_sharded(entries, opts, device_ids);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
         return r;
     }
 
-    if (opts.pipeline_plot) {
+    if (resolved_strategy == BatchStrategy::PipelinePlot) {
         BatchResult r = run_batch_pipeline_plot(entries, opts, device_ids);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();

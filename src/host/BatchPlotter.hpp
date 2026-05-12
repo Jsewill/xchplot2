@@ -14,6 +14,8 @@
 #include "host/GpuPlotter.hpp"
 #include "host/MultiGpuPipelineParallel.hpp"
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,18 @@ struct BatchResult {
 //                       with distributed radix sort). "section_l" is
 //                       the alternative (input-section partition with
 //                       gather-sort-scatter). Ignored when N=1.
+// Phase 2.4 batch-strategy picker. Auto = pick at runtime based on
+// device VRAM and k. WorkQueue = N independent plotters round-robin
+// (default for equal-VRAM PCIe-only rigs where each card fits the
+// pool). PipelinePlot = N-stage split (--pipeline-plot semantics).
+// ShardPlot = single-plot multi-GPU (--shard-plot semantics).
+enum class BatchStrategy {
+    Auto,
+    WorkQueue,
+    PipelinePlot,
+    ShardPlot,
+};
+
 struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
@@ -105,6 +119,11 @@ struct BatchOptions {
     bool use_all_devices   = false;
     bool include_cpu       = false;
     std::string streaming_tier;
+    // Phase 2.4: explicit strategy (Auto = picker decides). Legacy
+    // shard_plot / pipeline_plot bool fields below are still honoured
+    // for backward compatibility and act as explicit overrides if
+    // strategy == Auto.
+    BatchStrategy strategy = BatchStrategy::Auto;
     bool shard_plot        = false;
     std::string shard_strategy = "bucket";
     // Pipeline-parallel mode (Phase 2.1d): split each plot at the T2-
@@ -159,5 +178,29 @@ inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
     opts.verbose = verbose;
     return run_batch(entries, opts);
 }
+
+// Phase 2.4 auto-strategy picker. Heuristic:
+//   N == 1                              → WorkQueue
+//   smallest device VRAM < tiny peak    → PipelinePlot (work-queue won't fit)
+//   else                                → WorkQueue
+// shard_plot is never auto-selected (niche; remains explicit opt-in).
+//
+// `reason_out`, if non-null, gets a short human-readable string for
+// `[strategy] auto-picked X because Y` verbose printout.
+//
+// `vram_for_device` is the injectable VRAM lookup (test seam). The
+// default-form overload uses sycl_backend's usable_gpu_devices.
+struct StrategyPickInputs {
+    std::vector<int> device_ids;
+    int              k;
+};
+BatchStrategy select_strategy(
+    StrategyPickInputs const&                inputs,
+    std::function<std::uint64_t(int)> const& vram_for_device,
+    std::string*                             reason_out = nullptr);
+
+BatchStrategy select_strategy(
+    StrategyPickInputs const& inputs,
+    std::string*              reason_out = nullptr);
 
 } // namespace pos2gpu
