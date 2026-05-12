@@ -1049,6 +1049,45 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                      reordered ? " [reordered by VRAM]" : "");
     }
 
+    // Phase 2.2g: per-stage tier auto-pick. When the user doesn't
+    // pin tiers explicitly, default each stage to Minimal if its
+    // device has the VRAM (with safety headroom), else Tiny. Big
+    // cards get the faster tier — fewer PCIe round-trips — without
+    // forcing the user to spell it out.
+    int const k_for_tiers = entries[0].k;
+    std::vector<PipelineStageTier> resolved_tiers = opts.pipeline_tiers;
+    if (resolved_tiers.empty()) {
+        std::uint64_t const minimal_peak =
+            streaming_minimal_peak_bytes(k_for_tiers);
+        // Leave ~25% headroom on top of the predicted peak so we
+        // don't slam right up to the cap — accounts for pinned-host
+        // allocations and any sort-scratch oscillation.
+        std::uint64_t const minimal_threshold =
+            minimal_peak + (minimal_peak / 4);
+        resolved_tiers.reserve(staged_devices.size());
+        for (std::size_t s = 0; s < staged_devices.size(); ++s) {
+            bool const fits_minimal =
+                stage_vram_bytes[s] >= minimal_threshold;
+            resolved_tiers.push_back(fits_minimal
+                ? PipelineStageTier::Minimal
+                : PipelineStageTier::Tiny);
+        }
+        if (opts.verbose) {
+            std::fprintf(stderr,
+                "[pipeline-plot] auto-tier (k=%d, minimal_peak=%.1f GB +25%% headroom):",
+                k_for_tiers,
+                static_cast<double>(minimal_peak) / 1.0e9);
+            for (std::size_t s = 0; s < resolved_tiers.size(); ++s) {
+                char const* tname =
+                    (resolved_tiers[s] == PipelineStageTier::Minimal)
+                        ? "minimal" : "tiny";
+                std::fprintf(stderr, " stage%zu=%s",
+                             s + 1, tname);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     // Convert BatchEntry sequence to GpuPipelineConfig sequence.
     std::vector<GpuPipelineConfig> cfgs;
     cfgs.reserve(entries.size());
@@ -1061,11 +1100,14 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
         cfgs.push_back(cfg);
     }
 
-    // Run the pipelined orchestrator. depth=2 overlaps one plot per
-    // stage; for tiny-mode tier on PCIe-only the stages contend on
-    // host PCIe and depth>2 doesn't recover much.
+    // Phase 2.2h: pipeline_depth from BatchOptions (default 2,
+    // override via --pipeline-depth). Higher depth amortises fill/
+    // drain over more in-flight plots; trade-off is host-pinned
+    // memory per slot per boundary (~6 GB at k=28 for the T2-sort
+    // boundary, less for the T1-sort boundary).
+    int const depth = (opts.pipeline_depth > 0) ? opts.pipeline_depth : 2;
     auto results = run_pipeline_parallel_batch(
-        cfgs, staged_devices, /*depth=*/2, opts.pipeline_tiers);
+        cfgs, staged_devices, depth, resolved_tiers);
 
     // Write plot files sequentially. CPU-bound FSE compression doesn't
     // overlap with GPU work in this MVP — Phase 2.1f could add a

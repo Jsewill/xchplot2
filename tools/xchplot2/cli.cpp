@@ -372,6 +372,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--cpu")                         opts.include_cpu = true;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
+            else if (a == "--pipeline-depth" && i + 1 < argc) {
+                int d = 2;
+                std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), d);
+                ++i;
+                if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
+                opts.pipeline_depth = d;
+            }
             else if (a == "--strategy" && i + 1 < argc) {
                 std::string const s = argv[++i];
                 if      (s == "auto")          opts.strategy = pos2gpu::BatchStrategy::Auto;
@@ -598,6 +605,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
         bool plot_pipeline_plot   = false;
+        int  plot_pipeline_depth  = 2;
         pos2gpu::BatchStrategy plot_strategy = pos2gpu::BatchStrategy::Auto;
         bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
@@ -630,6 +638,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
+            else if  (a == "--pipeline-depth" && need(1)) {
+                int d = 2;
+                std::from_chars(argv[i+1], argv[i+1] + std::strlen(argv[i+1]), d);
+                ++i;
+                if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
+                plot_pipeline_depth = d;
+            }
             else if  (a == "--strategy" && need(1)) {
                 std::string const s = argv[++i];
                 if      (s == "auto")          plot_strategy = pos2gpu::BatchStrategy::Auto;
@@ -860,6 +875,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.include_cpu       = plot_include_cpu;
             opts.shard_plot        = plot_shard_plot;
             opts.pipeline_plot          = plot_pipeline_plot;
+            opts.pipeline_depth         = plot_pipeline_depth;
             opts.strategy               = plot_strategy;
             opts.pipeline_tiers         = plot_pipeline_tiers;
             opts.prefer_peer_copy  = plot_prefer_peer_copy;
