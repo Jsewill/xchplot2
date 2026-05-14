@@ -23,10 +23,14 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
+#include <mutex>
+#include <queue>
 #include <random>
 #include <stdexcept>
 #include <system_error>
@@ -36,6 +40,82 @@
 namespace pos2gpu {
 
 namespace {
+
+// Process-global worker pool for plot-file FSE compression.
+//
+// Every write_plot_file_parallel() call routes its per-chunk tasks
+// through this single pool. In a multi-GPU work-queue batch each GPU
+// worker runs its own consumer thread, and each consumer used to call
+// std::async with hardware_concurrency() tasks — so N concurrent
+// writers spawned N × core_count OS threads, destructively
+// oversubscribing the host. With the shared pool the total number of
+// compression threads is fixed at hardware_concurrency() regardless of
+// N; concurrent writers' tasks simply queue and drain through the same
+// workers (work-conserving — a lone writer still gets every core).
+//
+// Re-entrancy is safe: the BatchPlotter consumer threads that call
+// write_plot_file_parallel() are not pool workers, and a single
+// write_plot_file_parallel() call's two parallel regions (chunkify,
+// then compress) run sequentially, never nested.
+class WriterThreadPool {
+public:
+    static WriterThreadPool& instance() {
+        static WriterThreadPool pool;
+        return pool;
+    }
+
+    std::size_t size() const noexcept { return workers_.size(); }
+
+    std::future<void> submit(std::function<void()> fn) {
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(fn));
+        std::future<void> fut = task->get_future();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queue_.emplace([task] { (*task)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    WriterThreadPool() {
+        unsigned n = std::thread::hardware_concurrency();
+        if (n == 0) n = 4;
+        workers_.reserve(n);
+        for (unsigned i = 0; i < n; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~WriterThreadPool() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+
+    void worker_loop() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                job = std::move(queue_.front());
+                queue_.pop();
+            }
+            job();
+        }
+    }
+
+    std::mutex                        mu_;
+    std::condition_variable           cv_;
+    std::queue<std::function<void()>> queue_;
+    std::vector<std::thread>          workers_;
+    bool                              stop_ = false;
+};
 
 // Inline equivalent of pos2-chip's
 // ChunkedProofFragments::convertToChunkedProofFragments, but operating on
@@ -71,17 +151,18 @@ ChunkedProofFragments chunkify_proof_fragments_span(
     }
     for (std::size_t c = ci + 1; c <= num_spans; ++c) boundaries[c] = N;
 
-    // Step 2: parallel copy, one async task per contiguous range of chunks.
-    // We spawn thread_count tasks total (not one per chunk), amortising
-    // std::async thread-creation cost across many chunks per task.
+    // Step 2: parallel copy, one task per contiguous range of chunks.
+    // Tasks route through the shared WriterThreadPool — thread_count is
+    // the split granularity, not a thread count.
     std::size_t const tasks_n       = std::min<std::size_t>(thread_count, num_spans);
     std::size_t const chunks_per_tk = (num_spans + tasks_n - 1) / tasks_n;
 
+    auto& pool = WriterThreadPool::instance();
     std::vector<std::future<void>> tasks;
     tasks.reserve(tasks_n);
     for (std::size_t tstart = 0; tstart < num_spans; tstart += chunks_per_tk) {
         std::size_t const tend = std::min<std::size_t>(tstart + chunks_per_tk, num_spans);
-        tasks.emplace_back(std::async(std::launch::async,
+        tasks.emplace_back(pool.submit(
             [&, tstart, tend]() {
                 for (std::size_t c = tstart; c < tend; ++c) {
                     std::size_t const a = boundaries[c];
@@ -112,9 +193,14 @@ size_t write_plot_file_parallel(
 {
     ProofParams params(plot_id_32, k, strength, testnet);
 
+    // thread_count is the task-split granularity, not a thread count:
+    // every task routes through the shared WriterThreadPool, whose
+    // worker count is fixed at hardware_concurrency(). 0 ⇒ split into
+    // one task per pool worker. See WriterThreadPool above for why this
+    // matters in a multi-GPU work-queue batch.
     if (thread_count == 0) {
-        thread_count = std::thread::hardware_concurrency();
-        if (thread_count == 0) thread_count = 4;
+        thread_count =
+            static_cast<unsigned>(WriterThreadPool::instance().size());
     }
 
     // Build chunked representation (cheap; single pass over fragments)
@@ -125,18 +211,19 @@ size_t write_plot_file_parallel(
     uint64_t const num_chunks = static_cast<uint64_t>(chunked.proof_fragments_chunks.size());
     int const stub_bits = params.get_k() - PlotFile::MINUS_STUB_BITS;
 
-    // Parallel chunk compression. Static partitioning: thread_count tasks,
-    // each loops over a contiguous range of chunks. Avoids the O(num_chunks)
-    // std::async thread-creation overhead of one-task-per-chunk.
+    // Parallel chunk compression. Static partitioning: tasks_n tasks,
+    // each loops over a contiguous range of chunks, all routed through
+    // the shared WriterThreadPool.
     std::vector<std::vector<uint8_t>> compressed(num_chunks);
     if (num_chunks > 0) {
         uint64_t const tasks_n       = std::min<uint64_t>(thread_count, num_chunks);
         uint64_t const chunks_per_tk = (num_chunks + tasks_n - 1) / tasks_n;
+        auto& pool = WriterThreadPool::instance();
         std::vector<std::future<void>> tasks;
         tasks.reserve(tasks_n);
         for (uint64_t tstart = 0; tstart < num_chunks; tstart += chunks_per_tk) {
             uint64_t const tend = std::min<uint64_t>(tstart + chunks_per_tk, num_chunks);
-            tasks.emplace_back(std::async(std::launch::async,
+            tasks.emplace_back(pool.submit(
                 [&, tstart, tend]() {
                     for (uint64_t i = tstart; i < tend; ++i) {
                         uint64_t start_range = i * range_per_chunk;
