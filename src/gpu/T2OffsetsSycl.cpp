@@ -163,11 +163,25 @@ void run_t2_match_twophase(
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
 
+    // Production v2: per-bucket ops chain through SYCL event deps —
+    // memset → Phase A → Phase B → next bucket — with zero host sync per
+    // bucket. See run_t3_match_twophase for the full rationale; this
+    // mirrors that design.
+    size_t const b_blocks_max = static_cast<size_t>(
+        (cand_cap + threads - 1) / threads);
+
+    sycl::event prev_event;
+    bool have_prev = false;
+
     for (uint32_t b = bucket_begin; b < bucket_end; ++b) {
-        q.memset(d_cand_count, 0, sizeof(uint64_t)).wait();
+        auto e_memset = q.submit([&](sycl::handler& h) {
+            if (have_prev) h.depends_on(prev_event);
+            h.memset(d_cand_count, 0, sizeof(uint64_t));
+        });
 
         // ---- Phase A: enumerate candidate (l, r) index pairs ----
-        q.submit([&](sycl::handler& h) {
+        auto e_phase_a = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_memset);
             sycl::local_accessor<uint32_t, 1> sT_local{
                 sycl::range<1>{4 * 256}, h};
             h.parallel_for(
@@ -221,28 +235,17 @@ void run_t2_match_twophase(
                         d_cand_r[ci] = static_cast<uint32_t>(r);
                     }
                 });
-        }).wait();
-
-        uint64_t cand_n = 0;
-        q.memcpy(&cand_n, d_cand_count, sizeof(uint64_t)).wait();
-        if (dbg) {
-            std::fprintf(stderr,
-                "[t2-twophase] bucket %u: %llu candidates (cap %llu)%s\n",
-                b, static_cast<unsigned long long>(cand_n),
-                static_cast<unsigned long long>(cand_cap),
-                cand_n > cand_cap ? "  *** OVERFLOW ***" : "");
-        }
-        if (cand_n > cand_cap) cand_n = cand_cap;
-        if (cand_n == 0) continue;
+        });
 
         // ---- Phase B: process this bucket's candidates convergently ----
-        size_t const b_blocks = static_cast<size_t>(
-            (cand_n + threads - 1) / threads);
-        q.submit([&](sycl::handler& h) {
+        // cand_cap-sized grid; threads read the actual cand_n from the
+        // device counter (Phase A's writes are visible via e_phase_a).
+        auto e_phase_b = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_phase_a);
             sycl::local_accessor<uint32_t, 1> sT_local{
                 sycl::range<1>{4 * 256}, h};
             h.parallel_for(
-                sycl::nd_range<1>{ b_blocks * threads, threads },
+                sycl::nd_range<1>{ b_blocks_max * threads, threads },
                 [=, keys_copy = keys](sycl::nd_item<1> it) {
                     uint32_t* sT = &sT_local[0];
                     size_t local_id = it.get_local_id(0);
@@ -253,6 +256,8 @@ void run_t2_match_twophase(
                     it.barrier(sycl::access::fence_space::local_space);
 
                     uint64_t idx = it.get_global_id(0);
+                    uint64_t cand_n = *d_cand_count;
+                    if (cand_n > cand_cap) cand_n = cand_cap;
                     if (idx >= cand_n) return;
 
                     uint32_t l = d_cand_l[idx];
@@ -294,8 +299,28 @@ void run_t2_match_twophase(
                     d_out_mi   [out_idx] = match_info_result;
                     d_out_xbits[out_idx] = x_bits;
                 });
-        }).wait();
+        });
+
+        // Optional debug print — adds one host sync per bucket.
+        if (dbg) {
+            uint64_t cand_n_dbg = 0;
+            q.submit([&](sycl::handler& h) {
+                h.depends_on(e_phase_a);
+                h.memcpy(&cand_n_dbg, d_cand_count, sizeof(uint64_t));
+            }).wait();
+            std::fprintf(stderr,
+                "[t2-twophase] bucket %u: %llu candidates (cap %llu)%s\n",
+                b, static_cast<unsigned long long>(cand_n_dbg),
+                static_cast<unsigned long long>(cand_cap),
+                cand_n_dbg > cand_cap ? "  *** OVERFLOW ***" : "");
+        }
+
+        prev_event = e_phase_b;
+        have_prev  = true;
     }
+
+    // Single drain — the caller expects synchronous completion.
+    q.wait();
 
     sycl::free(d_cand_l, q);
     sycl::free(d_cand_r, q);

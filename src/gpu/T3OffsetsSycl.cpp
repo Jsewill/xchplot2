@@ -99,11 +99,38 @@ void run_t3_match_twophase(
 
     // Process one bucket per iteration: Phase A enumerates that bucket's
     // candidate pairs, Phase B drains them into the shared output.
+    //
+    // Production v2: all per-bucket ops chain through SYCL event deps —
+    // memset → Phase A → Phase B → next bucket's memset — with zero host
+    // sync per bucket. The previous prototype wrapped each op in
+    // .wait() (4 host syncs × 16 buckets = 64/table/plot), which on a
+    // multi-GPU host-bound pipeline added enough host overhead to flip
+    // two-phase from a single-GPU win to a multi-GPU regression. With
+    // event deps the only sync is one q.wait() at the end of the call
+    // (or, in debug mode, a per-bucket readback for the candidate-count
+    // print).
+    //
+    // Phase B is launched with a cand_cap-sized grid; each thread reads
+    // the bucket's actual cand_n from the device counter and early-
+    // returns if idx >= cand_n. That removes the need for a host
+    // readback of cand_n to size Phase B's launch. Cost: ~2× over-
+    // launching (cand_cap is ~2× the expected per-bucket candidate
+    // count). The wasted threads do one comparison + return — cheap.
+    size_t const b_blocks_max = static_cast<size_t>(
+        (cand_cap + threads - 1) / threads);
+
+    sycl::event prev_event;
+    bool have_prev = false;
+
     for (uint32_t b = bucket_begin; b < bucket_end; ++b) {
-        q.memset(d_cand_count, 0, sizeof(uint64_t)).wait();
+        auto e_memset = q.submit([&](sycl::handler& h) {
+            if (have_prev) h.depends_on(prev_event);
+            h.memset(d_cand_count, 0, sizeof(uint64_t));
+        });
 
         // ---- Phase A: enumerate candidate (l, r) index pairs ----
-        q.submit([&](sycl::handler& h) {
+        auto e_phase_a = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_memset);
             sycl::local_accessor<uint32_t, 1> sT_local{
                 sycl::range<1>{4 * 256}, h};
             h.parallel_for(
@@ -157,28 +184,15 @@ void run_t3_match_twophase(
                         d_cand_r[ci] = static_cast<uint32_t>(r);
                     }
                 });
-        }).wait();
-
-        uint64_t cand_n = 0;
-        q.memcpy(&cand_n, d_cand_count, sizeof(uint64_t)).wait();
-        if (dbg) {
-            std::fprintf(stderr,
-                "[t3-twophase] bucket %u: %llu candidates (cap %llu)%s\n",
-                b, static_cast<unsigned long long>(cand_n),
-                static_cast<unsigned long long>(cand_cap),
-                cand_n > cand_cap ? "  *** OVERFLOW ***" : "");
-        }
-        if (cand_n > cand_cap) cand_n = cand_cap;
-        if (cand_n == 0) continue;
+        });
 
         // ---- Phase B: process this bucket's candidates convergently ----
-        size_t const b_blocks = static_cast<size_t>(
-            (cand_n + threads - 1) / threads);
-        q.submit([&](sycl::handler& h) {
+        auto e_phase_b = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_phase_a);
             sycl::local_accessor<uint32_t, 1> sT_local{
                 sycl::range<1>{4 * 256}, h};
             h.parallel_for(
-                sycl::nd_range<1>{ b_blocks * threads, threads },
+                sycl::nd_range<1>{ b_blocks_max * threads, threads },
                 [=, keys_copy = keys, fk_copy = fk](sycl::nd_item<1> it) {
                     uint32_t* sT = &sT_local[0];
                     size_t local_id = it.get_local_id(0);
@@ -189,6 +203,11 @@ void run_t3_match_twophase(
                     it.barrier(sycl::access::fence_space::local_space);
 
                     uint64_t idx = it.get_global_id(0);
+                    // Read this bucket's candidate count from the device
+                    // counter. Phase A's writes are visible because Phase
+                    // B depends on e_phase_a.
+                    uint64_t cand_n = *d_cand_count;
+                    if (cand_n > cand_cap) cand_n = cand_cap;
                     if (idx >= cand_n) return;
 
                     uint32_t l = d_cand_l[idx];
@@ -221,8 +240,32 @@ void run_t3_match_twophase(
                     p.proof_fragment = fragment;
                     d_out_pairings[out_idx] = p;
                 });
-        }).wait();
+        });
+
+        // Optional debug print — adds one host sync per bucket. Off by
+        // default; only useful for prototyping.
+        if (dbg) {
+            uint64_t cand_n_dbg = 0;
+            q.submit([&](sycl::handler& h) {
+                h.depends_on(e_phase_a);
+                h.memcpy(&cand_n_dbg, d_cand_count, sizeof(uint64_t));
+            }).wait();
+            std::fprintf(stderr,
+                "[t3-twophase] bucket %u: %llu candidates (cap %llu)%s\n",
+                b, static_cast<unsigned long long>(cand_n_dbg),
+                static_cast<unsigned long long>(cand_cap),
+                cand_n_dbg > cand_cap ? "  *** OVERFLOW ***" : "");
+        }
+
+        prev_event = e_phase_b;
+        have_prev  = true;
     }
+
+    // Single drain at the end — replaces the prototype's 64 per-table
+    // q.wait()s with one. The caller of launch_t3_match_all_buckets
+    // expected synchronous completion (no event return), so we still
+    // wait here before returning.
+    q.wait();
 
     sycl::free(d_cand_l, q);
     sycl::free(d_cand_r, q);
