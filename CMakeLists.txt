@@ -420,6 +420,7 @@ set(POS2_GPU_SYCL_SRC
     src/gpu/T3OffsetsSycl.cpp
     src/gpu/PipelineKernelsSycl.cpp
     src/gpu/TwoLevelSortSycl.cpp
+    src/gpu/StreamingPartitionSycl.cpp
     src/gpu/XsKernel.cpp
     src/gpu/XsKernelsSycl.cpp
     src/gpu/T1Kernel.cpp
@@ -887,6 +888,24 @@ endif()
 target_include_directories(sycl_sort_u32_u64_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_sort_u32_u64_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_u32_u64_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Phase 1.3b of the StreamingPinned/StreamingDisk tier plan. Validates
+# launch_streaming_partition_u32_u64 by per-bucket multiset compare
+# against a CPU reference. Exercises kernel zero-copy writes through
+# USM-host pointers (the partition output lives on host-pinned and
+# is written directly by the kernel).
+add_executable(sycl_streaming_partition_parity
+    tools/parity/sycl_streaming_partition_parity.cpp)
+add_sycl_to_target(TARGET sycl_streaming_partition_parity
+                   SOURCES tools/parity/sycl_streaming_partition_parity.cpp)
+target_link_libraries(sycl_streaming_partition_parity PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_streaming_partition_parity PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_streaming_partition_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_streaming_partition_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_streaming_partition_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Phase 2.2 — sharded Xs-phase parity test. Confirms
