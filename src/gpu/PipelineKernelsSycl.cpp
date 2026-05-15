@@ -77,6 +77,72 @@ void launch_permute_t2(
         }).wait();
 }
 
+// Scatter family — see PipelineKernels.cuh for the design rationale.
+// Each kernel walks the source sequentially; the write target is
+// d_dst[d_inv_indices[i]], which is random but VRAM-cache-friendly.
+// No atomics needed: inv_indices is a permutation, so every dst slot
+// is written exactly once.
+
+void launch_compute_inverse_u32(
+    uint32_t const* d_indices, uint32_t* d_inv,
+    uint64_t count, sycl::queue& q)
+{
+    q.parallel_for(
+        sycl::nd_range<1>{ global_for(count), kThreads },
+        [=](sycl::nd_item<1> it) {
+            uint64_t p = it.get_global_id(0);
+            if (p >= count) return;
+            // indices[p] is the original position of the element that
+            // landed at sorted position p; the inverse maps the other
+            // way. Cast p down to u32 — inputs to this primitive are
+            // bounded by k=32 cap (≪ 2^32).
+            d_inv[d_indices[p]] = static_cast<uint32_t>(p);
+        }).wait();
+}
+
+void launch_scatter_u64(
+    uint64_t const* d_src, uint32_t const* d_inv_indices,
+    uint64_t* d_dst, uint64_t count, sycl::queue& q)
+{
+    q.parallel_for(
+        sycl::nd_range<1>{ global_for(count), kThreads },
+        [=](sycl::nd_item<1> it) {
+            uint64_t i = it.get_global_id(0);
+            if (i >= count) return;
+            d_dst[d_inv_indices[i]] = d_src[i];
+        }).wait();
+}
+
+void launch_scatter_u32(
+    uint32_t const* d_src, uint32_t const* d_inv_indices,
+    uint32_t* d_dst, uint64_t count, sycl::queue& q)
+{
+    q.parallel_for(
+        sycl::nd_range<1>{ global_for(count), kThreads },
+        [=](sycl::nd_item<1> it) {
+            uint64_t i = it.get_global_id(0);
+            if (i >= count) return;
+            d_dst[d_inv_indices[i]] = d_src[i];
+        }).wait();
+}
+
+void launch_permute_t2_scatter(
+    uint64_t const* d_src_meta, uint32_t const* d_src_xbits,
+    uint32_t const* d_inv_indices,
+    uint64_t* d_dst_meta, uint32_t* d_dst_xbits,
+    uint64_t count, sycl::queue& q)
+{
+    q.parallel_for(
+        sycl::nd_range<1>{ global_for(count), kThreads },
+        [=](sycl::nd_item<1> it) {
+            uint64_t i = it.get_global_id(0);
+            if (i >= count) return;
+            uint32_t const dst = d_inv_indices[i];
+            d_dst_meta[dst]  = d_src_meta[i];
+            d_dst_xbits[dst] = d_src_xbits[i];
+        }).wait();
+}
+
 void launch_merge_pairs_stable_2way_u32_u32(
     uint32_t const* d_A_keys, uint32_t const* d_A_vals, uint64_t nA,
     uint32_t const* d_B_keys, uint32_t const* d_B_vals, uint64_t nB,

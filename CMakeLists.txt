@@ -833,6 +833,25 @@ target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Phase 0 of the StreamingPinned/StreamingDisk tier plan
+# (project_streaming_pinned_disk_spec). Exercises the new scatter
+# family (launch_compute_inverse_u32 + launch_scatter_{u64,u32} +
+# launch_permute_t2_scatter) against the existing gather family.
+# Pure SYCL — same wiring as sycl_sort_parity (CUDA-obj pull-in is
+# only needed because pos2_gpu's SortSyclCub.cpp transitively calls
+# CUB symbols, not because scatter itself needs CUB).
+add_executable(sycl_scatter_parity tools/parity/sycl_scatter_parity.cpp)
+add_sycl_to_target(TARGET sycl_scatter_parity
+                   SOURCES tools/parity/sycl_scatter_parity.cpp)
+target_link_libraries(sycl_scatter_parity PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_scatter_parity PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_scatter_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_scatter_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_scatter_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 2.2 — sharded Xs-phase parity test. Confirms
 # MultiGpuPlotPipeline's run_xs_phase produces a union of per-shard
 # packed XsCandidateGpu outputs that's byte-identical to single-GPU
