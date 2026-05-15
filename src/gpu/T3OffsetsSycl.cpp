@@ -5,6 +5,7 @@
 // fine at this size — if local-memory spills ever bite, switch to a USM
 // upload analogous to the CUDA cudaMemcpyToSymbolAsync path.
 
+#include "gpu/MatchKernelCommon.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T3Offsets.cuh"
 
@@ -120,13 +121,7 @@ void run_t3_match_twophase(
                     uint32_t section_l   = bucket_id / num_match_keys;
                     uint32_t match_key_r = bucket_id % num_match_keys;
 
-                    uint32_t section_r;
-                    {
-                        uint32_t mask = (1u << num_section_bits) - 1u;
-                        uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
-                        uint32_t rl1  = (rl + 1) & mask;
-                        section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
-                    }
+                    uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
 
                     uint64_t l_start = d_offsets[section_l * num_match_keys];
                     uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
@@ -143,16 +138,10 @@ void run_t3_match_twophase(
                     uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                     uint32_t fine_key   = target_l >> fine_shift;
                     uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                    uint64_t lo         = d_fine_offsets[fine_idx];
                     uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
-                    uint64_t hi         = fine_hi;
-
-                    while (lo < hi) {
-                        uint64_t mid = lo + ((hi - lo) >> 1);
-                        uint32_t target_mid = d_sorted_mi[mid] & target_mask;
-                        if (target_mid < target_l) lo = mid + 1;
-                        else                       hi = mid;
-                    }
+                    uint64_t lo         = pos2gpu::fine_bucket_lower_bound(
+                        d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                        target_l, target_mask);
 
                     for (uint64_t r = lo; r < fine_hi; ++r) {
                         uint32_t target_r = d_sorted_mi[r] & target_mask;
@@ -323,13 +312,7 @@ void launch_t3_match_all_buckets(
                 uint32_t section_l   = bucket_id / num_match_keys;
                 uint32_t match_key_r = bucket_id % num_match_keys;
 
-                uint32_t section_r;
-                {
-                    uint32_t mask = (1u << num_section_bits) - 1u;
-                    uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
-                    uint32_t rl1  = (rl + 1) & mask;
-                    section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
-                }
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
 
                 uint64_t l_start = d_offsets[section_l * num_match_keys];
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
@@ -350,16 +333,10 @@ void launch_t3_match_all_buckets(
                 uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                 uint32_t fine_key   = target_l >> fine_shift;
                 uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                uint64_t lo         = d_fine_offsets[fine_idx];
                 uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
-                uint64_t hi         = fine_hi;
-
-                while (lo < hi) {
-                    uint64_t mid = lo + ((hi - lo) >> 1);
-                    uint32_t target_mid = d_sorted_mi[mid] & target_mask;
-                    if (target_mid < target_l) lo = mid + 1;
-                    else                       hi = mid;
-                }
+                uint64_t lo         = pos2gpu::fine_bucket_lower_bound(
+                    d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                    target_l, target_mask);
 
                 uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
                                                             : ((1u << num_test_bits) - 1u);
@@ -457,13 +434,7 @@ void launch_t3_match_section_pair(
                 uint32_t section_l   = bucket_id / num_match_keys;
                 uint32_t match_key_r = bucket_id % num_match_keys;
 
-                uint32_t section_r;
-                {
-                    uint32_t mask = (1u << num_section_bits) - 1u;
-                    uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
-                    uint32_t rl1  = (rl + 1) & mask;
-                    section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
-                }
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
 
                 uint64_t l_start = d_offsets[section_l * num_match_keys];
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
@@ -485,16 +456,10 @@ void launch_t3_match_section_pair(
                 uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
                 uint32_t fine_key   = target_l >> fine_shift;
                 uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
-                uint64_t lo         = d_fine_offsets[fine_idx];
                 uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
-                uint64_t hi         = fine_hi;
-
-                while (lo < hi) {
-                    uint64_t mid = lo + ((hi - lo) >> 1);
-                    uint32_t target_mid = d_sorted_mi[mid] & target_mask;
-                    if (target_mid < target_l) lo = mid + 1;
-                    else                       hi = mid;
-                }
+                uint64_t lo         = pos2gpu::fine_bucket_lower_bound(
+                    d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                    target_l, target_mask);
 
                 uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
                                                             : ((1u << num_test_bits) - 1u);
@@ -594,13 +559,7 @@ void launch_t3_match_section_pair_split(
                 uint32_t section_l   = bucket_id / num_match_keys;
                 uint32_t match_key_r = bucket_id % num_match_keys;
 
-                uint32_t section_r;
-                {
-                    uint32_t mask = (1u << num_section_bits) - 1u;
-                    uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
-                    uint32_t rl1  = (rl + 1) & mask;
-                    section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
-                }
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
 
                 uint64_t l_start = d_offsets[section_l * num_match_keys];
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];

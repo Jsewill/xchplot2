@@ -14,6 +14,7 @@
 // SYCL writes). Two extra host syncs vs. the pure-CUDA path; not
 // perf-relevant for slice 2.
 
+#include "gpu/MatchKernelCommon.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T1Offsets.cuh"
 
@@ -160,13 +161,7 @@ void launch_t1_match_all_buckets(
                 uint32_t section_l   = bucket_id / num_match_keys;
                 uint32_t match_key_r = bucket_id % num_match_keys;
 
-                uint32_t section_r;
-                {
-                    uint32_t mask = (1u << num_section_bits) - 1u;
-                    uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
-                    uint32_t rl1  = (rl + 1) & mask;
-                    section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
-                }
+                uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
 
                 uint64_t l_start = d_offsets[section_l * num_match_keys];
                 uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
