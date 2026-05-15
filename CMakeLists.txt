@@ -419,6 +419,7 @@ set(POS2_GPU_SYCL_SRC
     src/gpu/T2OffsetsSycl.cpp
     src/gpu/T3OffsetsSycl.cpp
     src/gpu/PipelineKernelsSycl.cpp
+    src/gpu/TwoLevelSortSycl.cpp
     src/gpu/XsKernel.cpp
     src/gpu/XsKernelsSycl.cpp
     src/gpu/T1Kernel.cpp
@@ -850,6 +851,24 @@ endif()
 target_include_directories(sycl_scatter_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_scatter_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_scatter_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# Phase 1 of the StreamingPinned/StreamingDisk tier plan. Wraps
+# launch_sort_pairs_u32_u32 in a top-bits partition pass so the
+# output is segmented into 2^num_top_bits contiguous buckets. The
+# parity test compares byte-identical output to a single-level
+# sort over the same inputs, plus structural checks on the
+# d_bucket_starts output array.
+add_executable(sycl_two_level_sort_parity tools/parity/sycl_two_level_sort_parity.cpp)
+add_sycl_to_target(TARGET sycl_two_level_sort_parity
+                   SOURCES tools/parity/sycl_two_level_sort_parity.cpp)
+target_link_libraries(sycl_two_level_sort_parity PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_two_level_sort_parity PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_two_level_sort_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_two_level_sort_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_two_level_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Phase 2.2 — sharded Xs-phase parity test. Confirms
