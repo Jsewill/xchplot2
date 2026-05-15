@@ -518,16 +518,36 @@ size_t streaming_tiny_peak_bytes(int k)
 
 size_t streaming_pinned_peak_bytes(int k)
 {
-    // Phase 1.3c-i: scaffolding only. The pinned tier currently
-    // shares Tiny's algorithm (and therefore its peak) because the
-    // actual GpuPipeline-side streaming-partition wiring lives in
-    // Phase 1.3c-ii. Once that lands, the anchor below drops to
-    // ~1500 MB at k=28 (the spec target — streaming partition +
-    // per-bucket sort removes the full-cap d_t1_meta-on-device
-    // requirement that's Tiny's floor today). Until then this
-    // mirrors Tiny exactly so a forced --tier pinned run validates
-    // the picker plumbing without changing observed behaviour.
-    return streaming_tiny_peak_bytes(k);
+    // Anchor: 2900 MB at k=28. After Phase 1.3c-ii + 1.4a/b/c the
+    // Pinned tier eliminates the T1-sort-gather floor (d_t1_meta
+    // full-cap on device, ~2 GB at k=28) AND the Xs phase floor
+    // (d_xs_keys_b + d_xs_vals_b + d_xs_pack_tile, ~3 GB at k=28,
+    // plus the d_xs rehydrate ~2 GB). What remains is the T2 sort /
+    // T3 match phase peak. Measured at k=26: Pinned 720 MB / Tiny
+    // 792 MB → ~91% of Tiny. Extrapolated to k=28 (which scales
+    // ~4× from k=26 for the dominant terms): Pinned ≈ 2900 MB.
+    //
+    // The spec's original 1500 MB-at-k=28 target is unreachable
+    // without also streaming T2 sort and T3 match phases — those
+    // are now the floor (project_streaming_pinned_disk_spec
+    // memory documents the analysis). Phase 1.5+ would attack
+    // those; not currently scoped.
+    //
+    // Auto-picker window for k=28: free VRAM in [2900, 3200) MB
+    // picks Pinned instead of Tiny. Outside that window the picker
+    // behaves as before (Tiny for >= 3200, throw below 2900 - margin).
+    constexpr size_t anchor_mb = 2900;
+    size_t const adj = streaming_sort_scratch_adjustment(k);
+    if (k == 28) return (anchor_mb << 20) + adj;
+    if (k <  18) return (size_t(16) << 20) + adj;
+    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
+
+    if (k < 28) {
+        int const shift = 28 - k;
+        return ((size_t(anchor_mb) << 20) >> shift) + adj;
+    }
+    int const shift = k - 28;
+    return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
 } // namespace pos2gpu
