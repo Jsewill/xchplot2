@@ -89,20 +89,23 @@ void launch_partition(
         }).wait();
 }
 
-// Inner-scratch byte size: the worst case is one bucket consuming
-// the entire count (skewed input). We allocate for full N so any
-// per-bucket sort fits. This matches the single-level sort's
-// scratch magnitude — the savings from this primitive are in
-// output layout, not in working-set size during the sort phase.
-size_t inner_sort_scratch_bytes(uint64_t count, int begin_bit, int end_bit_inner)
+// Inner-scratch byte size: querying the segmented sort, which on
+// the CUDA backend yields cub::DeviceSegmentedRadixSort's scratch
+// (small — proportional to num_segments) and on other backends
+// falls back to a per-segment scratch sized for the worst-case
+// segment (= num_items).
+size_t inner_sort_scratch_bytes(
+    uint64_t count, int num_segments,
+    int begin_bit, int end_bit_inner, sycl::queue& q)
 {
     size_t s = 0;
-    auto& q = sycl_backend::queue();
-    launch_sort_pairs_u32_u32(
+    launch_segmented_sort_pairs_u32_u32(
         nullptr, s,
-        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        count, begin_bit, end_bit_inner, q);
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
+        count, num_segments,
+        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t const*>(nullptr),
+        begin_bit, end_bit_inner, q);
     return s;
 }
 
@@ -142,7 +145,8 @@ void launch_two_level_sort_pairs_u32_u32(
     //   [inner_bytes, inner_bytes + N*4)                 — d_keys_part
     //   [..,         + 2*N*4)                            — d_vals_part
     //   [..,         + 2*N*4 + num_buckets*4)            — d_cursors
-    size_t const inner_bytes   = inner_sort_scratch_bytes(count, begin_bit, top_bit_offset);
+    size_t const inner_bytes   = inner_sort_scratch_bytes(
+        count, static_cast<int>(num_buckets), begin_bit, top_bit_offset, q);
     size_t const inner_aligned = align8(inner_bytes);
     size_t const part_bytes    = count * sizeof(uint32_t);
     size_t const cursor_bytes  = num_buckets * sizeof(uint32_t);
@@ -206,33 +210,30 @@ void launch_two_level_sort_pairs_u32_u32(
                      d_cursors, count, top_bit_offset, num_top_bits, q);
 
     // ---- Pass 4: per-bucket sort.
-    // We reuse one scratch arena across buckets. Each bucket's
-    // sort is independent — no cross-bucket data dependencies.
-    // Result lands in (keys_out, vals_out) at the partition's
-    // contiguous positions, so the concatenation is implicit.
-    for (size_t b = 0; b < num_buckets; ++b) {
-        uint64_t const start  = h_starts[b];
-        uint64_t const stop   = h_starts[b + 1];
-        uint64_t const bsize  = stop - start;
-        if (bsize == 0) continue;
-
-        // Special case: when there are no inner bits to sort
-        // (begin_bit == top_bit_offset), bucket data is already
-        // in final order. Copy partition → output.
-        if (begin_bit == top_bit_offset) {
-            q.memcpy(keys_out + start, d_keys_part + start, bsize * sizeof(uint32_t));
-            q.memcpy(vals_out + start, d_vals_part + start, bsize * sizeof(uint32_t)).wait();
-            continue;
-        }
-
+    // Single segmented-sort call (one CUB launch on NVIDIA; a
+    // per-segment loop on other backends — see SortSycl.cpp's
+    // launch_segmented_sort_pairs_u32_u32_sycl). Result lands in
+    // (keys_out, vals_out) at the partition's contiguous positions.
+    //
+    // Special case: if there are no inner bits to sort
+    // (begin_bit == top_bit_offset), the partition output is
+    // already in final order — just copy.
+    if (begin_bit == top_bit_offset) {
+        q.memcpy(keys_out, d_keys_part, count * sizeof(uint32_t));
+        q.memcpy(vals_out, d_vals_part, count * sizeof(uint32_t)).wait();
+    } else {
         size_t inner_bytes_actual = inner_bytes;
-        launch_sort_pairs_u32_u32(
+        // d_bucket_starts holds num_buckets+1 entries; segment i
+        // occupies [d_bucket_starts[i], d_bucket_starts[i+1]).
+        // Pass d_bucket_starts (begin) and d_bucket_starts + 1
+        // (end) — both are valid for the first num_buckets entries.
+        launch_segmented_sort_pairs_u32_u32(
             d_inner_scratch, inner_bytes_actual,
-            /* keys_in (clobberable scratch): */ d_keys_part + start,
-            /* keys_out: */                      keys_out + start,
-            /* vals_in (clobberable scratch): */ d_vals_part + start,
-            /* vals_out: */                      vals_out + start,
-            bsize, begin_bit, top_bit_offset, q);
+            d_keys_part, keys_out,
+            d_vals_part, vals_out,
+            count, static_cast<int>(num_buckets),
+            d_bucket_starts, d_bucket_starts + 1,
+            begin_bit, top_bit_offset, q);
     }
     q.wait();
 

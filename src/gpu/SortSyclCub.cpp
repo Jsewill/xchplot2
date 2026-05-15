@@ -58,4 +58,26 @@ void launch_sort_keys_u64_cub(
         keys_in, keys_out, count, begin_bit, end_bit);
 }
 
+void launch_segmented_sort_pairs_u32_u32_cub(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t const* keys_in, uint32_t* keys_out,
+    uint32_t const* vals_in, uint32_t* vals_out,
+    uint64_t num_items,
+    int num_segments,
+    uint32_t const* d_begin_offsets,
+    uint32_t const* d_end_offsets,
+    int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+    if (d_temp_storage != nullptr) {
+        q.wait();
+    }
+    cub_segmented_sort_pairs_u32_u32(d_temp_storage, temp_bytes,
+        keys_in, keys_out, vals_in, vals_out,
+        num_items, num_segments,
+        d_begin_offsets, d_end_offsets,
+        begin_bit, end_bit);
+}
+
 } // namespace pos2gpu

@@ -127,4 +127,54 @@ void cub_sort_keys_u64(
         "cudaStreamSynchronize after SortKeys");
 }
 
+// CUB segmented radix sort. Sorts `num_segments` independent
+// segments of the (keys_in, vals_in) arrays in a single launch.
+// d_begin_offsets[i] / d_end_offsets[i] are the inclusive/exclusive
+// segment bounds; for contiguous segments the caller can pass
+// d_begin_offsets and d_begin_offsets + 1 (since segment i ends
+// where segment i+1 begins).
+//
+// We don't use the DoubleBuffer variant here: segmented sort with
+// uint32_t offsets has narrower template instantiations and the
+// non-DoubleBuffer signature lands the result directly in
+// (keys_out, vals_out) without the post-hoc memcpy dance the
+// regular sort needs.
+void cub_segmented_sort_pairs_u32_u32(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t const* keys_in, uint32_t* keys_out,
+    uint32_t const* vals_in, uint32_t* vals_out,
+    uint64_t num_items,
+    int num_segments,
+    uint32_t const* d_begin_offsets,
+    uint32_t const* d_end_offsets,
+    int begin_bit, int end_bit)
+{
+    if (d_temp_storage == nullptr) {
+        cuda_check_or_throw(cub::DeviceSegmentedRadixSort::SortPairs(
+            nullptr, temp_bytes,
+            keys_in, keys_out,
+            vals_in, vals_out,
+            static_cast<int>(num_items),
+            num_segments,
+            d_begin_offsets, d_end_offsets,
+            begin_bit, end_bit, /*stream=*/nullptr),
+            "SegmentedSortPairs (sizing)");
+        return;
+    }
+
+    cuda_check_or_throw(cub::DeviceSegmentedRadixSort::SortPairs(
+        d_temp_storage, temp_bytes,
+        keys_in, keys_out,
+        vals_in, vals_out,
+        static_cast<int>(num_items),
+        num_segments,
+        d_begin_offsets, d_end_offsets,
+        begin_bit, end_bit, /*stream=*/nullptr),
+        "SegmentedSortPairs");
+
+    cuda_check_or_throw(cudaStreamSynchronize(nullptr),
+        "cudaStreamSynchronize after SegmentedSortPairs");
+}
+
 } // namespace pos2gpu

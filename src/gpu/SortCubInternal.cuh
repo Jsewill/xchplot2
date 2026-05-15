@@ -54,4 +54,32 @@ void cub_sort_keys_u64(
     uint64_t count,
     int begin_bit, int end_bit);
 
+// CUB segmented radix sort of (key, value) pairs. Sorts each of
+// num_segments contiguous ranges of the (keys_in, vals_in) arrays
+// independently, in a single CUB launch — significantly cheaper
+// than a sequential loop of cub_sort_pairs_u32_u32 calls when the
+// segments are small (~1M entries) because per-launch overhead
+// dominates a tiny sort.
+//
+// Segments are described by d_begin_offsets[num_segments] and
+// d_end_offsets[num_segments]. For contiguous segments (which is
+// the two-level-sort caller's case) pass d_begin_offsets and
+// d_begin_offsets + 1; segment i then runs from offsets[i] to
+// offsets[i+1].
+//
+// Inputs are const here (CUB does not clobber them in this mode,
+// since the result lands in d_keys_out / d_vals_out without a
+// ping-pong via the inputs). Same internal-sync contract as the
+// non-segmented wrapper above.
+void cub_segmented_sort_pairs_u32_u32(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t const* keys_in, uint32_t* keys_out,
+    uint32_t const* vals_in, uint32_t* vals_out,
+    uint64_t num_items,
+    int num_segments,
+    uint32_t const* d_begin_offsets,
+    uint32_t const* d_end_offsets,
+    int begin_bit, int end_bit);
+
 } // namespace pos2gpu

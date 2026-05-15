@@ -388,4 +388,90 @@ void launch_sort_keys_u64_sycl(
     }
 }
 
+// Pure-SYCL fallback for segmented sort. The hand-rolled radix
+// doesn't have a segmented variant, so we simply loop the
+// single-segment sort over each range. This is the same shape as
+// the caller-side loop that lived inside TwoLevelSortSycl before
+// the unified API; it stays here so the public
+// launch_segmented_sort_pairs_u32_u32 has the same dispatch shape
+// as the rest of the sort family.
+//
+// On NVIDIA the CUB-backed variant in SortSyclCub.cpp does the
+// real work in a single launch — see SortCuda.cu's
+// cub_segmented_sort_pairs_u32_u32. This fallback is only chosen
+// for non-CUDA queues.
+//
+// Scratch sizing strategy: we need enough scratch to fit the
+// largest segment's single-sort scratch. Caller doesn't know
+// max-segment-size at query time, so we conservatively query at
+// num_items (full count). That makes this fallback's scratch
+// requirement match the single-level sort's, which is the worst
+// case anyway.
+void launch_segmented_sort_pairs_u32_u32_sycl(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t const* keys_in, uint32_t* keys_out,
+    uint32_t const* vals_in, uint32_t* vals_out,
+    uint64_t num_items,
+    int num_segments,
+    uint32_t const* d_begin_offsets,
+    uint32_t const* d_end_offsets,
+    int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+    // Conservative query: ask the single-level sort for scratch at
+    // the full num_items count.
+    if (d_temp_storage == nullptr) {
+        size_t s = 0;
+        launch_sort_pairs_u32_u32_sycl(
+            nullptr, s,
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            num_items, begin_bit, end_bit, q);
+        temp_bytes = s;
+        return;
+    }
+
+    // Pull offsets to host once — num_segments is small (≤65536
+    // in practice) so D2H is sub-millisecond.
+    std::vector<uint32_t> h_begin(num_segments), h_end(num_segments);
+    q.memcpy(h_begin.data(), d_begin_offsets, num_segments * sizeof(uint32_t));
+    q.memcpy(h_end.data(),   d_end_offsets,   num_segments * sizeof(uint32_t)).wait();
+
+    // The single-level fallback's input is clobbered as scratch.
+    // For segmented mode we copy each segment's slice from keys_in
+    // into keys_out first, then sort in place using keys_out as
+    // both input and scratch via the (keys_out, keys_out) call. The
+    // hand-rolled radix can't safely take the same buffer for both
+    // — it ping-pongs internally — so allocate per-call scratch
+    // copies of the segment's data instead.
+    for (int s = 0; s < num_segments; ++s) {
+        uint64_t const start = h_begin[s];
+        uint64_t const stop  = h_end[s];
+        uint64_t const n     = stop - start;
+        if (n == 0) continue;
+
+        // Use the supplied keys_out / vals_out as the final dest;
+        // route the input through a per-segment scratch slice
+        // allocated up-front from d_temp_storage's tail. (Simpler
+        // option: malloc/free per segment. SYCL's malloc_device on
+        // the fallback path runs on non-NVIDIA queues which often
+        // route through OCL — malloc per call is fine perf-wise.)
+        uint32_t* scratch_keys = sycl::malloc_device<uint32_t>(n, q);
+        uint32_t* scratch_vals = sycl::malloc_device<uint32_t>(n, q);
+        q.memcpy(scratch_keys, keys_in + start, n * sizeof(uint32_t));
+        q.memcpy(scratch_vals, vals_in + start, n * sizeof(uint32_t)).wait();
+
+        size_t scratch_bytes = temp_bytes;
+        launch_sort_pairs_u32_u32_sycl(
+            d_temp_storage, scratch_bytes,
+            scratch_keys, keys_out + start,
+            scratch_vals, vals_out + start,
+            n, begin_bit, end_bit, q);
+
+        sycl::free(scratch_keys, q);
+        sycl::free(scratch_vals, q);
+    }
+}
+
 } // namespace pos2gpu
