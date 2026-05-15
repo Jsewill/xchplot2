@@ -1490,10 +1490,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Pick partition geometry. num_top_bits must satisfy
         //   begin_bit=0 + num_top_bits <= end_bit=cfg.k
         // with at least 1 lower bit left to sort within each bucket
-        // (so num_top_bits <= cfg.k - 1). Default 8 → 256 buckets;
-        // at k=28 that's ~1M entries per bucket on average. At
-        // very small k we shrink it so the math holds.
-        int  const num_top_bits   = std::min(8, std::max(1, cfg.k - 1));
+        // (so num_top_bits <= cfg.k - 1).
+        //
+        // num_top_bits scales with k so the per-bucket entry count
+        // stays in CUB's efficient range without exploding the per-
+        // bucket launch count. The previous flat `min(8, k-1)` made
+        // smaller k pay 256 sequential per-bucket sort launches on
+        // tiny buckets — at k=24 (~5K entries/bucket × 256 launches
+        // × ~500 µs each) that was ~128 ms of pure launch overhead,
+        // a 50% wall regression vs Tiny.
+        //
+        // Heuristic:  max(4, min(8, k - 18))
+        //   k=18..22 →  4 → 16 buckets   (k=22: ~22K/bucket)
+        //   k=24     →  6 → 64 buckets   (~22K/bucket)
+        //   k=26     →  8 → 256 buckets  (~22K/bucket)
+        //   k=28+    →  8 → 256 buckets  (~1M/bucket at k=28)
+        //
+        // Target: ~20K-1M entries per bucket — small enough that the
+        // per-bucket CUB sort fits comfortably in scratch, large enough
+        // that launch overhead is a fraction of sort time.
+        int  const num_top_bits   = std::max(4, std::min(8, cfg.k - 18));
         int  const top_bit_offset = cfg.k - num_top_bits;
         size_t const num_buckets  = size_t{1} << num_top_bits;
 
