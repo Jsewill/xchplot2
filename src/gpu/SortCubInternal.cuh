@@ -54,6 +54,16 @@ void cub_sort_keys_u64(
     uint64_t count,
     int begin_bit, int end_bit);
 
+// CUB radix sort of (uint32 key, uint64 value) pairs. Same contract
+// as cub_sort_pairs_u32_u32 except for the value width.
+void cub_sort_pairs_u32_u64(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit);
+
 // CUB segmented radix sort of (key, value) pairs. Sorts each of
 // num_segments contiguous ranges of the (keys_in, vals_in) arrays
 // independently, in a single CUB launch — significantly cheaper

@@ -31,6 +31,7 @@
 // wrong.
 
 #include "gpu/Sort.cuh"
+#include "gpu/PipelineKernels.cuh"  // launch_init_u32_identity, launch_gather_u64
 
 #include <sycl/sycl.hpp>
 
@@ -38,7 +39,9 @@
 #include "hipSYCL/algorithms/util/allocation_cache.hpp"
 
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace pos2gpu {
 
@@ -386,6 +389,63 @@ void launch_sort_keys_u64_sycl(
     if (cur != keys_out) {
         q.memcpy(keys_out, cur, sizeof(uint64_t) * count).wait();
     }
+}
+
+// Pure-SYCL fallback for u32_u64 sort. The hand-rolled radix in
+// this file is u32-key/u32-value only, and templating it for u64
+// values is non-trivial (RADIX, scan widths, atomic types all bake
+// the value type into the kernels). Sidestep that by sorting
+// (keys, identity_idx) with the existing u32_u32 path, then gather
+// the u64 values through the resulting permutation. Correct on any
+// backend; slower than a native u32_u64 radix by ~1 extra full-cap
+// u32 traversal, which is acceptable for the non-NVIDIA fallback.
+void launch_sort_pairs_u32_u64_sycl(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+    // Layout of d_temp_storage:
+    //   [0, u32_sort_bytes)      — u32_u32 sort scratch
+    //   [..,  + count*4)         — identity index input
+    //   [..,  + 2*count*4)       — permuted index output
+    size_t u32_sort_bytes = 0;
+    launch_sort_pairs_u32_u32_sycl(
+        nullptr, u32_sort_bytes,
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        count, begin_bit, end_bit, q);
+
+    size_t const idx_bytes   = count * sizeof(uint32_t);
+    size_t const total_bytes = u32_sort_bytes + 2 * idx_bytes;
+    if (d_temp_storage == nullptr) {
+        temp_bytes = total_bytes;
+        return;
+    }
+    if (temp_bytes < total_bytes) {
+        throw std::invalid_argument(
+            "launch_sort_pairs_u32_u64_sycl: temp_bytes too small");
+    }
+
+    auto* base = static_cast<unsigned char*>(d_temp_storage);
+    void*     d_inner_scratch = base;
+    auto*     d_idx_in        = reinterpret_cast<uint32_t*>(base + u32_sort_bytes);
+    auto*     d_idx_out       = reinterpret_cast<uint32_t*>(base + u32_sort_bytes + idx_bytes);
+
+    launch_init_u32_identity(d_idx_in, count, q);
+
+    launch_sort_pairs_u32_u32_sycl(
+        d_inner_scratch, u32_sort_bytes,
+        keys_in, keys_out,
+        d_idx_in, d_idx_out,
+        count, begin_bit, end_bit, q);
+
+    // Permute vals through d_idx_out (the sorted-position-to-original
+    // index permutation). vals_out[i] = vals_in[d_idx_out[i]].
+    launch_gather_u64(vals_in, d_idx_out, vals_out, count, q);
 }
 
 // Pure-SYCL fallback for segmented sort. The hand-rolled radix

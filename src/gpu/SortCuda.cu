@@ -127,6 +127,48 @@ void cub_sort_keys_u64(
         "cudaStreamSynchronize after SortKeys");
 }
 
+void cub_sort_pairs_u32_u64(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit)
+{
+    if (d_temp_storage == nullptr) {
+        cub::DoubleBuffer<uint32_t> d_keys(keys_in, keys_out);
+        cub::DoubleBuffer<uint64_t> d_vals(vals_in, vals_out);
+        cuda_check_or_throw(cub::DeviceRadixSort::SortPairs(
+            nullptr, temp_bytes,
+            d_keys, d_vals,
+            static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
+            "SortPairs u32_u64 (sizing)");
+        return;
+    }
+
+    cub::DoubleBuffer<uint32_t> d_keys(keys_in, keys_out);
+    cub::DoubleBuffer<uint64_t> d_vals(vals_in, vals_out);
+    cuda_check_or_throw(cub::DeviceRadixSort::SortPairs(
+        d_temp_storage, temp_bytes,
+        d_keys, d_vals,
+        static_cast<int>(count), begin_bit, end_bit, /*stream=*/nullptr),
+        "SortPairs u32_u64");
+
+    if (d_keys.Current() != keys_out) {
+        cuda_check_or_throw(cudaMemcpyAsync(keys_out, d_keys.Current(),
+            count * sizeof(uint32_t), cudaMemcpyDeviceToDevice, nullptr),
+            "memcpy keys_out u32_u64");
+    }
+    if (d_vals.Current() != vals_out) {
+        cuda_check_or_throw(cudaMemcpyAsync(vals_out, d_vals.Current(),
+            count * sizeof(uint64_t), cudaMemcpyDeviceToDevice, nullptr),
+            "memcpy vals_out u32_u64");
+    }
+
+    cuda_check_or_throw(cudaStreamSynchronize(nullptr),
+        "cudaStreamSynchronize after SortPairs u32_u64");
+}
+
 // CUB segmented radix sort. Sorts `num_segments` independent
 // segments of the (keys_in, vals_in) arrays in a single launch.
 // d_begin_offsets[i] / d_end_offsets[i] are the inclusive/exclusive

@@ -56,6 +56,24 @@ void launch_sort_keys_u64(
     int begin_bit, int end_bit,
     sycl::queue& q);
 
+// Sort (uint32 key, uint64 value) pairs by key over [begin_bit, end_bit).
+// Used by the StreamingPinned-tier T1 sort: each per-bucket arena holds
+// (match_info_u32, meta_u64) pairs and is sorted in-place after a
+// streaming partition stage carries both fields through together. This
+// avoids a separate random-access meta gather after the sort.
+//
+// Same in/out ping-pong contract as launch_sort_pairs_u32_u32: caller
+// treats keys_in/vals_in as clobberable scratch; result lands in
+// keys_out/vals_out.
+void launch_sort_pairs_u32_u64(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q);
+
 // Segmented radix sort: sorts num_segments contiguous ranges
 // (defined by d_begin_offsets[i] / d_end_offsets[i]) of the (keys,
 // vals) arrays independently in a single backend call. On NVIDIA

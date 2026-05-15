@@ -58,6 +58,23 @@ void launch_sort_keys_u64_cub(
         keys_in, keys_out, count, begin_bit, end_bit);
 }
 
+void launch_sort_pairs_u32_u64_cub(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+    if (d_temp_storage != nullptr) {
+        q.wait();
+    }
+    cub_sort_pairs_u32_u64(d_temp_storage, temp_bytes,
+        keys_in, keys_out, vals_in, vals_out,
+        count, begin_bit, end_bit);
+}
+
 void launch_segmented_sort_pairs_u32_u32_cub(
     void* d_temp_storage,
     size_t& temp_bytes,

@@ -36,6 +36,15 @@ void launch_sort_keys_u64_cub(
     int begin_bit, int end_bit,
     sycl::queue& q);
 
+void launch_sort_pairs_u32_u64_cub(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q);
+
 void launch_segmented_sort_pairs_u32_u32_cub(
     void* d_temp_storage,
     size_t& temp_bytes,
@@ -62,6 +71,15 @@ void launch_sort_keys_u64_sycl(
     void* d_temp_storage,
     size_t& temp_bytes,
     uint64_t* keys_in, uint64_t* keys_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q);
+
+void launch_sort_pairs_u32_u64_sycl(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
     uint64_t count,
     int begin_bit, int end_bit,
     sycl::queue& q);
@@ -122,6 +140,30 @@ void launch_sort_keys_u64(
     launch_sort_keys_u64_sycl(
         d_temp_storage, temp_bytes,
         keys_in, keys_out,
+        count, begin_bit, end_bit, q);
+}
+
+void launch_sort_pairs_u32_u64(
+    void* d_temp_storage,
+    size_t& temp_bytes,
+    uint32_t* keys_in, uint32_t* keys_out,
+    uint64_t* vals_in, uint64_t* vals_out,
+    uint64_t count,
+    int begin_bit, int end_bit,
+    sycl::queue& q)
+{
+#if defined(XCHPLOT2_HAVE_CUB)
+    if (q.get_device().get_backend() == sycl::backend::cuda) {
+        launch_sort_pairs_u32_u64_cub(
+            d_temp_storage, temp_bytes,
+            keys_in, keys_out, vals_in, vals_out,
+            count, begin_bit, end_bit, q);
+        return;
+    }
+#endif
+    launch_sort_pairs_u32_u64_sycl(
+        d_temp_storage, temp_bytes,
+        keys_in, keys_out, vals_in, vals_out,
         count, begin_bit, end_bit, q);
 }
 
