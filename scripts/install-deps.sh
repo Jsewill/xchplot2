@@ -198,7 +198,12 @@ install_apt() {
     # makes the post-install build "just work" on container/CI hosts.
     if [[ "$GPU" == "nvidia" ]] && [[ -x /usr/local/cuda/bin/nvcc ]] \
        && [[ ! -f /etc/profile.d/cuda.sh ]]; then
+        # The single quotes below are intentional: we want the *file* to
+        # contain a literal $PATH that expands when each new shell sources
+        # /etc/profile.d, not the script-author's PATH baked in at install
+        # time. shellcheck flags this as SC2016 — silence it on the next line.
         echo "[install-deps] Writing /etc/profile.d/cuda.sh (PATH front-load /usr/local/cuda/bin)"
+        # shellcheck disable=SC2016
         echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh >/dev/null
         sudo chmod +x /etc/profile.d/cuda.sh
     fi
