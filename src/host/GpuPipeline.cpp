@@ -796,6 +796,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint32_t* d_t2_xbits        = nullptr;
     void*     d_sort_scratch    = nullptr;
 
+    // Phase 1.4c — Pinned tier only. h_xs survives the Xs phase
+    // and is consumed by T1 match's per-section-pair tile flow.
+    // h_xs_section_starts: (num_sections+1) prefix-sum offsets giving
+    // each section's begin position in h_xs. For non-Pinned paths,
+    // both stay null / empty.
+    XsCandidateGpu*       h_xs_pinned          = nullptr;
+    std::vector<uint64_t> h_xs_section_starts;
+
     if (scratch.start_at_t3_match) {
         // Minimal and tiny modes both work for the second-half handoff:
         // - Tiny: T3 match reads all per-section streams (meta+xbits+
@@ -1189,6 +1197,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             if (!h_xs) throw std::runtime_error(
                 "sycl::malloc_host(h_xs, pinned) failed");
 
+            // Phase 1.4c also needs section-start offsets so T1 match
+            // can find each section's range in h_xs without re-scanning.
+            // Sections are top num_section_bits of match_info; h_xs is
+            // sorted by match_info so each section is contiguous.
+            int      const xs_num_section_bits =
+                (cfg.k < 28) ? 2 : (cfg.k - 26);
+            uint32_t const xs_num_sections     = 1u << xs_num_section_bits;
+            int      const xs_section_shift    = cfg.k - xs_num_section_bits;
+            std::vector<uint64_t> section_count(xs_num_sections, 0);
+
             int p_xs_pack = begin_phase("Xs pack");
             {
                 uint32_t const* a_k = h_xs_keys + 0;
@@ -1201,22 +1219,32 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 while (i < nA && j < nB) {
                     if (a_k[i] <= b_k[j]) {
                         h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
+                        ++section_count[a_k[i] >> xs_section_shift];
                         ++i; ++k;
                     } else {
                         h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
+                        ++section_count[b_k[j] >> xs_section_shift];
                         ++j; ++k;
                     }
                 }
                 while (i < nA) {
                     h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
+                    ++section_count[a_k[i] >> xs_section_shift];
                     ++i; ++k;
                 }
                 while (j < nB) {
                     h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
+                    ++section_count[b_k[j] >> xs_section_shift];
                     ++j; ++k;
                 }
             }
             end_phase(p_xs_pack);
+
+            // Prefix-sum into the function-scope offsets array.
+            h_xs_section_starts.assign(xs_num_sections + 1, 0);
+            for (uint32_t s = 0; s < xs_num_sections; ++s) {
+                h_xs_section_starts[s + 1] = h_xs_section_starts[s] + section_count[s];
+            }
 
             sycl::free(h_xs_keys, q);
             sycl::free(h_xs_vals, q);
@@ -1270,11 +1298,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             d_xs_vals_b = nullptr;
         }
 
-        // Re-hydrate full d_xs on device from host pinned. Common to
-        // Minimal/Tiny/Pinned (Phase 1.4c will eliminate this for Pinned).
-        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
-        q.memcpy(d_xs, h_xs, total_xs * sizeof(XsCandidateGpu)).wait();
-        sycl::free(h_xs, q);
+        // Re-hydrate full d_xs on device from host pinned (Minimal/Tiny).
+        // Pinned (Phase 1.4c): skip — h_xs survives to T1 match, which
+        // consumes it via per-section-pair tile H2D.
+        if (scratch.pinned_mode) {
+            h_xs_pinned = h_xs;
+        } else {
+            s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+            q.memcpy(d_xs, h_xs, total_xs * sizeof(XsCandidateGpu)).wait();
+            sycl::free(h_xs, q);
+        }
     }
 
     // ---------- Phase T1 match ----------
@@ -1372,10 +1405,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         s_malloc(stats, d_t1_match_temp, t1_temp_bytes, "d_t1_match_temp");
 
-        // Compute bucket + fine-bucket offsets once; passes share them.
-        // Also zeros d_counter.
-        launch_t1_match_prepare(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                                d_counter, d_t1_match_temp, &t1_temp_bytes, q);
+        // Pinned (Phase 1.4c) defers the prepare to per-pass on each
+        // section-pair tile; Minimal/Tiny do it once on full d_xs as
+        // before.
+        if (!scratch.pinned_mode) {
+            // Compute bucket + fine-bucket offsets once; passes share them.
+            // Also zeros d_counter.
+            launch_t1_match_prepare(cfg.plot_id.data(), t1p, d_xs, total_xs,
+                                    d_counter, d_t1_match_temp, &t1_temp_bytes, q);
+        }
 
         // Host pinned full-cap accumulators for meta + mi.
         h_t1_meta = h_meta_owned
@@ -1415,14 +1453,77 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             }
         }
 
+        // Phase 1.4c — Pinned per-pair-tile setup. matching_section is
+        // pos2-chip ProofCore::matching_section, used internally by
+        // launch_t1_match_all_buckets to find each L bucket's matching
+        // R bucket. We compute it ourselves to know which two sections
+        // need to be co-resident in d_xs_tile for each pass.
+        //
+        // CRITICAL: the tile MUST be sorted by bucket number — the
+        // prepare's bucket-offset construction does binary search on
+        // d_sorted[mid].match_info >> bucket_shift and ASSUMES the
+        // sequence is monotonically increasing. Always H2D the
+        // numerically-smaller section first, regardless of which side
+        // (L or R) it is semantically. The kernel's d_offsets lookups
+        // are by absolute section number, so semantic L/R order is
+        // irrelevant to correctness.
+        int      const ns_bits  = t1p.num_section_bits;
+        uint32_t const num_secs = t1_num_sections;
+        auto matching_section = [ns_bits, num_secs](uint32_t s) -> uint32_t {
+            uint32_t const rl  = ((s << 1) | (s >> (ns_bits - 1))) & (num_secs - 1);
+            uint32_t const rl1 = (rl + 1) & (num_secs - 1);
+            return ((rl1 >> 1) | (rl1 << (ns_bits - 1))) & (num_secs - 1);
+        };
+
+        XsCandidateGpu* d_xs_tile = nullptr;
+        uint64_t        max_pair  = 0;
+        if (scratch.pinned_mode) {
+            for (uint32_t s = 0; s < num_secs; ++s) {
+                uint64_t const sl = h_xs_section_starts[s + 1] -
+                                    h_xs_section_starts[s];
+                uint32_t const sr = matching_section(s);
+                uint64_t const sr_size = h_xs_section_starts[sr + 1] -
+                                         h_xs_section_starts[sr];
+                uint64_t const pair = sl + sr_size;
+                if (pair > max_pair) max_pair = pair;
+            }
+            s_malloc(stats, d_xs_tile,
+                     max_pair * sizeof(XsCandidateGpu), "d_xs_tile_pinned");
+        }
+
         int p_t1 = begin_phase("T1 match");
         uint64_t host_offset = 0;
         for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
             uint32_t const bucket_begin = section_l * t1_num_match_keys;
             uint32_t const bucket_end   = (section_l + 1) * t1_num_match_keys;
 
+            XsCandidateGpu const* d_xs_for_pass = d_xs;
+            uint64_t              total_for_pass = total_xs;
+            if (scratch.pinned_mode) {
+                uint32_t const section_r  = matching_section(section_l);
+                uint32_t const section_lo = std::min(section_l, section_r);
+                uint32_t const section_hi = std::max(section_l, section_r);
+                uint64_t const lo_off = h_xs_section_starts[section_lo];
+                uint64_t const lo_n   = h_xs_section_starts[section_lo + 1] - lo_off;
+                uint64_t const hi_off = h_xs_section_starts[section_hi];
+                uint64_t const hi_n   = h_xs_section_starts[section_hi + 1] - hi_off;
+                total_for_pass = lo_n + hi_n;
+
+                // Smaller section first (kernel's bucket-offset binary
+                // search demands a tile sorted by bucket number).
+                q.memcpy(d_xs_tile,         h_xs_pinned + lo_off,
+                         lo_n * sizeof(XsCandidateGpu));
+                q.memcpy(d_xs_tile + lo_n,  h_xs_pinned + hi_off,
+                         hi_n * sizeof(XsCandidateGpu)).wait();
+
+                launch_t1_match_prepare(
+                    cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
+                    d_counter, d_t1_match_temp, &t1_temp_bytes, q);
+                d_xs_for_pass = d_xs_tile;
+            }
+
             launch_t1_match_range(
-                cfg.plot_id.data(), t1p, d_xs, total_xs,
+                cfg.plot_id.data(), t1p, d_xs_for_pass, total_for_pass,
                 d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_section_cap,
                 d_t1_match_temp, bucket_begin, bucket_end, q);
 
@@ -1444,6 +1545,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
         end_phase(p_t1);
 
+        if (scratch.pinned_mode && d_xs_tile) {
+            s_free(stats, d_xs_tile);
+        }
+        if (scratch.pinned_mode && h_xs_pinned) {
+            sycl::free(h_xs_pinned, q);
+            h_xs_pinned = nullptr;
+        }
+
         t1_count = host_offset;
         if (t1_count > cap) throw std::runtime_error("T1 overflow");
         if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
@@ -1457,8 +1566,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t1_mi_stage);
         s_free(stats, d_t1_match_temp);
 
-        // Xs fully consumed.
-        s_free(stats, d_xs);
+        // Xs fully consumed. Pinned never allocates d_xs (h_xs feeds
+        // T1 match via per-pair tiles); Minimal/Tiny did so it must
+        // be freed.
+        if (d_xs) {
+            s_free(stats, d_xs);
+        }
 
         // Re-hydrate d_t1_mi full-cap on device for T1 sort (CUB
         // sort key input). h_t1_meta stays on host across T1 sort.
