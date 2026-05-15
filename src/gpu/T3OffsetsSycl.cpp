@@ -314,6 +314,205 @@ void run_t3_match_twophase(
     q.wait();
 }
 
+// Two-phase variant of launch_t3_match_section_pair (streaming-tier
+// Minimal). Same structure as run_t3_match_twophase but reads meta_l
+// from a section-sliced buffer (caller guarantees bucket range fits in
+// one section_l). xbits and mi remain full-cap (per the section_pair
+// contract). Shares the same acquire_t3_cand_scratch per-queue cache.
+void run_t3_match_section_pair_twophase(
+    AesHashKeys const& keys,
+    FeistelKey const& fk,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint64_t section_r_row_start,
+    uint32_t const* d_sorted_xbits,
+    uint32_t const* d_sorted_mi,
+    uint64_t const* d_offsets,
+    uint64_t const* d_fine_offsets,
+    uint32_t num_match_keys,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t out_capacity,
+    uint64_t l_count_max,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    uint32_t* d_aes_tables,
+    sycl::queue& q)
+{
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+    constexpr size_t threads = 256;
+    size_t const blocks_x = static_cast<size_t>(
+        (l_count_max + threads - 1) / threads);
+
+    bool const dbg = [] {
+        char const* v = std::getenv("POS2GPU_T3_TWOPHASE_DEBUG");
+        return v && v[0] == '1';
+    }();
+
+    uint64_t const cand_cap =
+        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 8
+        + 4096;
+    auto& scratch = acquire_t3_cand_scratch(q, cand_cap);
+    uint32_t* d_cand_l     = scratch.d_cand_l;
+    uint32_t* d_cand_r     = scratch.d_cand_r;
+    uint64_t* d_cand_count = scratch.d_cand_count;
+    auto* d_cand_count_ull =
+        reinterpret_cast<unsigned long long*>(d_cand_count);
+    auto* d_out_count_ull =
+        reinterpret_cast<unsigned long long*>(d_out_count);
+
+    size_t const b_blocks_max = static_cast<size_t>(
+        (cand_cap + threads - 1) / threads);
+
+    sycl::event prev_event;
+    bool have_prev = false;
+
+    for (uint32_t b = bucket_begin; b < bucket_end; ++b) {
+        auto e_memset = q.submit([&](sycl::handler& h) {
+            if (have_prev) h.depends_on(prev_event);
+            h.memset(d_cand_count, 0, sizeof(uint64_t));
+        });
+
+        // ---- Phase A: enumerate candidate (l, r) index pairs ----
+        auto e_phase_a = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_memset);
+            sycl::local_accessor<uint32_t, 1> sT_local{
+                sycl::range<1>{4 * 256}, h};
+            h.parallel_for(
+                sycl::nd_range<1>{ blocks_x * threads, threads },
+                [=, keys_copy = keys](sycl::nd_item<1> it) {
+                    uint32_t* sT = &sT_local[0];
+                    size_t local_id = it.get_local_id(0);
+                    #pragma unroll 1
+                    for (size_t i = local_id; i < 4 * 256; i += threads) {
+                        sT[i] = d_aes_tables[i];
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    uint32_t bucket_id   = b;
+                    uint32_t section_l   = bucket_id / num_match_keys;
+                    uint32_t match_key_r = bucket_id % num_match_keys;
+
+                    uint32_t section_r = pos2gpu::matching_section_r(section_l, num_section_bits);
+
+                    uint64_t l_start = d_offsets[section_l * num_match_keys];
+                    uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+                    uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+                    uint64_t l = l_start + it.get_global_id(0);
+                    if (l >= l_end) return;
+
+                    // Sliced l-side meta read.
+                    uint64_t meta_l = d_meta_l_slice[l - section_l_row_start];
+                    uint32_t target_l = pos2gpu::matching_target_smem(
+                                            keys_copy, 3u, match_key_r, meta_l, sT, 0)
+                                      & target_mask;
+
+                    uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
+                    uint32_t fine_key   = target_l >> fine_shift;
+                    uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
+                    uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
+                    uint64_t lo         = pos2gpu::fine_bucket_lower_bound(
+                        d_sorted_mi, d_fine_offsets[fine_idx], fine_hi,
+                        target_l, target_mask);
+
+                    for (uint64_t r = lo; r < fine_hi; ++r) {
+                        uint32_t target_r = d_sorted_mi[r] & target_mask;
+                        if (target_r != target_l) break;
+
+                        sycl::atomic_ref<unsigned long long,
+                                         sycl::memory_order::relaxed,
+                                         sycl::memory_scope::device>
+                            cand_atomic{ *d_cand_count_ull };
+                        unsigned long long ci = cand_atomic.fetch_add(1ULL);
+                        if (ci >= cand_cap) return;
+                        d_cand_l[ci] = static_cast<uint32_t>(l);
+                        d_cand_r[ci] = static_cast<uint32_t>(r);
+                    }
+                });
+        });
+
+        // ---- Phase B: process this bucket's candidates convergently ----
+        auto e_phase_b = q.submit([&](sycl::handler& h) {
+            h.depends_on(e_phase_a);
+            sycl::local_accessor<uint32_t, 1> sT_local{
+                sycl::range<1>{4 * 256}, h};
+            h.parallel_for(
+                sycl::nd_range<1>{ b_blocks_max * threads, threads },
+                [=, keys_copy = keys, fk_copy = fk](sycl::nd_item<1> it) {
+                    uint32_t* sT = &sT_local[0];
+                    size_t local_id = it.get_local_id(0);
+                    #pragma unroll 1
+                    for (size_t i = local_id; i < 4 * 256; i += threads) {
+                        sT[i] = d_aes_tables[i];
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    uint64_t idx = it.get_global_id(0);
+                    uint64_t cand_n = *d_cand_count;
+                    if (cand_n > cand_cap) cand_n = cand_cap;
+                    if (idx >= cand_n) return;
+
+                    uint32_t l = d_cand_l[idx];
+                    uint32_t r = d_cand_r[idx];
+
+                    // Sliced reads on both sides; xbits stays full-cap.
+                    uint64_t meta_l = d_meta_l_slice[l - section_l_row_start];
+                    uint32_t xb_l   = d_sorted_xbits[l];
+                    uint64_t meta_r = d_meta_r_slice[r - section_r_row_start];
+                    uint32_t xb_r   = d_sorted_xbits[r];
+
+                    uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                                                                : ((1u << num_test_bits) - 1u);
+
+                    pos2gpu::Result128 res = pos2gpu::pairing_smem(
+                        keys_copy, meta_l, meta_r, sT, 0);
+                    uint32_t test_result = res.r[3] & test_mask;
+                    if (test_result != 0) return;
+
+                    uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
+                    uint64_t fragment   = pos2gpu::feistel_encrypt(fk_copy, all_x_bits);
+
+                    sycl::atomic_ref<unsigned long long,
+                                     sycl::memory_order::relaxed,
+                                     sycl::memory_scope::device>
+                        out_count_atomic{ *d_out_count_ull };
+                    unsigned long long out_idx = out_count_atomic.fetch_add(1ULL);
+                    if (out_idx >= out_capacity) return;
+
+                    T3PairingGpu p;
+                    p.proof_fragment = fragment;
+                    d_out_pairings[out_idx] = p;
+                });
+        });
+
+        if (dbg) {
+            uint64_t cand_n_dbg = 0;
+            q.submit([&](sycl::handler& h) {
+                h.depends_on(e_phase_a);
+                h.memcpy(&cand_n_dbg, d_cand_count, sizeof(uint64_t));
+            }).wait();
+            std::fprintf(stderr,
+                "[t3-twophase-sp] bucket %u: %llu candidates (cap %llu)%s\n",
+                b, static_cast<unsigned long long>(cand_n_dbg),
+                static_cast<unsigned long long>(cand_cap),
+                cand_n_dbg > cand_cap ? "  *** OVERFLOW ***" : "");
+        }
+
+        prev_event = e_phase_b;
+        have_prev  = true;
+    }
+
+    q.wait();
+}
+
 bool t3_twophase_enabled()
 {
     static bool const enabled = [] {
@@ -488,6 +687,19 @@ void launch_t3_match_section_pair(
     uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
 
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
+
+    // Phase 2 prototype: env-gated two-phase split (Minimal-tier path).
+    if (t3_twophase_enabled()) {
+        run_t3_match_section_pair_twophase(
+            keys, fk, d_meta_l_slice, section_l_row_start,
+            d_meta_r_slice, section_r_row_start,
+            d_sorted_xbits, d_sorted_mi, d_offsets, d_fine_offsets,
+            num_match_keys, k, num_section_bits, num_match_target_bits,
+            fine_bits, target_mask, num_test_bits,
+            d_out_pairings, d_out_count, out_capacity, l_count_max,
+            bucket_begin, bucket_end, d_aes_tables, q);
+        return;
+    }
 
     constexpr size_t threads = 256;
     uint64_t blocks_x_u64    = (l_count_max + threads - 1) / threads;
