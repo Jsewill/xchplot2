@@ -360,8 +360,16 @@ endif()
 # Devs hacking on pos2-chip locally can override the default by passing
 # -DPOS2_CHIP_DIR=/abs/path/to/pos2-chip on the cmake command line; the
 # fetch is then skipped entirely.
-set(POS2_CHIP_GIT_TAG "0a69995b21a30ee201408300043336c8415e0b81"
-    CACHE STRING "pos2-chip commit / tag to fetch")
+# In-tree default. Override on the command line with
+# -DPOS2_CHIP_GIT_TAG=<sha> (the cache entry created by -D sticks across
+# reconfigures). We deliberately do NOT use `set(... CACHE STRING)` here:
+# CACHE STRING is no-op when the cache already has a value, so editing this
+# line and reconfiguring an existing build/ dir would silently keep the OLD
+# pin. The `if(NOT DEFINED ...)` guard lets a plain edit take effect on
+# reconfigure while still honouring user -D overrides.
+if(NOT DEFINED POS2_CHIP_GIT_TAG)
+    set(POS2_CHIP_GIT_TAG "b0da7aa7bec3974833d651173a6d9953c21eb808")
+endif()
 
 if(NOT DEFINED POS2_CHIP_DIR)
     include(FetchContent)
