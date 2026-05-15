@@ -1079,13 +1079,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_xs_keys_b);
         s_free(stats, d_xs_vals_b);
     } else {
-        // Sliced (minimal). Tile gen+sort in N=2 position halves into
-        // cap/2 device buffers, D2H per tile to USM-host. Then merge
-        // host-pinned tile outputs into device d_xs_keys_b + d_xs_vals_b
-        // (full cap). Then pack in N=2 halves with D2H per tile to a
-        // host-pinned XsCandidateGpu accumulator. Finally rehydrate
-        // d_xs from host pinned. Drops sort peak from 4128 MB → 2056 MB
-        // and pack peak from 4096 MB → 3072 MB at k=28.
+        // Sliced (minimal/tiny/pinned). Tile gen+sort in N=2 position
+        // halves into cap/2 device buffers, D2H per tile to USM-host.
+        //
+        // From here, two sub-paths:
+        //   - Minimal/Tiny: merge host-pinned tile outputs into device
+        //     d_xs_keys_b + d_xs_vals_b (full cap). Pack in N=2 halves
+        //     with D2H per tile to a host-pinned XsCandidateGpu
+        //     accumulator. Drops sort peak from 4128 MB → 2056 MB and
+        //     pack peak from 4096 MB → 3072 MB at k=28. (Existing.)
+        //   - Pinned (Phase 1.4a+b): merge on host (CPU std::merge-style
+        //     loop — the GPU merge kernel does per-thread binary search
+        //     with random reads, pathological on USM-host source). Then
+        //     pack reads/writes with all-host USM pointers — pack's
+        //     access is sequential per thread so PCIe bursts are
+        //     efficient. Eliminates d_xs_keys_b / d_xs_vals_b /
+        //     d_xs_pack_tile from device entirely (~3 GB saving at
+        //     k=28). The d_xs rehydrate at the bottom of this block
+        //     still happens; eliminating it is Phase 1.4c.
+        //
+        // The Pinned sub-path is gated on scratch.pinned_mode below;
+        // Minimal/Tiny stay on the existing flow unchanged.
         uint64_t const xs_tile_n0  = total_xs / 2;
         uint64_t const xs_tile_n1  = total_xs - xs_tile_n0;
         uint64_t const xs_tile_max = (xs_tile_n0 > xs_tile_n1) ? xs_tile_n0 : xs_tile_n1;
@@ -1142,53 +1156,122 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_xs_vals_a_tile);
         s_free(stats, d_xs_keys_a_tile);
 
-        // Full-cap merge outputs on device. Merge from USM-host inputs.
-        s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
-        s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
-        launch_merge_pairs_stable_2way_u32_u32(
-            h_xs_keys + 0,           h_xs_vals + 0,           xs_tile_n0,
-            h_xs_keys + xs_tile_n0,  h_xs_vals + xs_tile_n0,  xs_tile_n1,
-            d_xs_keys_b, d_xs_vals_b, total_xs, q);
-        sycl::free(h_xs_keys, q);
-        sycl::free(h_xs_vals, q);
+        XsCandidateGpu* h_xs = nullptr;
 
-        // Tiled pack. d_xs_pack_tile (cap/2 × XsCandidate = 1024 MB
-        // at k=28) reuses across tiles; the packed output collects on
-        // host pinned h_xs (cap × XsCandidate = 2048 MB host).
-        uint64_t const pack_tile_n0  = total_xs / 2;
-        uint64_t const pack_tile_n1  = total_xs - pack_tile_n0;
-        uint64_t const pack_tile_max = (pack_tile_n0 > pack_tile_n1) ? pack_tile_n0 : pack_tile_n1;
+        if (scratch.pinned_mode) {
+            // Phase 1.4a + 1.4b — Pinned tier only.
+            //
+            // Both merge AND pack run on the CPU as a single fused
+            // loop that writes directly to the host-pinned h_xs output.
+            //
+            // Why CPU rather than GPU-on-host-pointers: AdaptiveCpp's
+            // CUDA backend doesn't issue burst PCIe transfers when a
+            // SYCL kernel dereferences malloc_host pointers — each
+            // thread's read becomes an individual transaction, ~1 µs
+            // latency. Measured: kernel pack on all-USM-host pointers
+            // at k=26 ran 4434 ms (vs 27 ms for the device-input
+            // tiled-pack of the existing path). A CPU loop that
+            // streams the same data hits ~30 GB/s memory bandwidth,
+            // which works out to ~30 ms at k=26 / ~134 ms at k=28.
+            //
+            // Why fuse merge + pack: pack is trivially
+            // `out[i] = {keys[i], vals[i]}` — combining it with the
+            // merge's "pick lower of two heads" loop adds no work but
+            // saves the intermediate h_xs_keys_merged + h_xs_vals_merged
+            // arrays (~2 GB host at k=28).
+            //
+            // Net device-peak saving: skips d_xs_keys_b + d_xs_vals_b +
+            // d_xs_pack_tile entirely (~3 GB device at k=28). The
+            // d_xs rehydrate at the bottom of the block is unchanged —
+            // that's Phase 1.4c's lever.
+            h_xs = static_cast<XsCandidateGpu*>(
+                sycl::malloc_host(total_xs * sizeof(XsCandidateGpu), q));
+            if (!h_xs) throw std::runtime_error(
+                "sycl::malloc_host(h_xs, pinned) failed");
 
-        XsCandidateGpu* d_xs_pack_tile = nullptr;
-        s_malloc(stats, d_xs_pack_tile, pack_tile_max * sizeof(XsCandidateGpu), "d_xs_pack_tile");
+            int p_xs_pack = begin_phase("Xs pack");
+            {
+                uint32_t const* a_k = h_xs_keys + 0;
+                uint32_t const* a_v = h_xs_vals + 0;
+                uint32_t const* b_k = h_xs_keys + xs_tile_n0;
+                uint32_t const* b_v = h_xs_vals + xs_tile_n0;
+                uint64_t const nA = xs_tile_n0;
+                uint64_t const nB = xs_tile_n1;
+                uint64_t i = 0, j = 0, k = 0;
+                while (i < nA && j < nB) {
+                    if (a_k[i] <= b_k[j]) {
+                        h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
+                        ++i; ++k;
+                    } else {
+                        h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
+                        ++j; ++k;
+                    }
+                }
+                while (i < nA) {
+                    h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
+                    ++i; ++k;
+                }
+                while (j < nB) {
+                    h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
+                    ++j; ++k;
+                }
+            }
+            end_phase(p_xs_pack);
 
-        XsCandidateGpu* h_xs = static_cast<XsCandidateGpu*>(
-            sycl::malloc_host(total_xs * sizeof(XsCandidateGpu), q));
-        if (!h_xs) throw std::runtime_error("sycl::malloc_host(h_xs) failed");
+            sycl::free(h_xs_keys, q);
+            sycl::free(h_xs_vals, q);
+        } else {
+            // Minimal/Tiny path — unchanged from before Phase 1.4.
 
-        int p_xs_pack = begin_phase("Xs pack");
-        if (pack_tile_n0 > 0) {
-            launch_xs_pack_range(d_xs_keys_b + 0, d_xs_vals_b + 0,
-                                 d_xs_pack_tile, pack_tile_n0, q);
-            q.memcpy(h_xs + 0, d_xs_pack_tile,
-                     pack_tile_n0 * sizeof(XsCandidateGpu)).wait();
+            // Full-cap merge outputs on device. Merge from USM-host inputs.
+            s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
+            s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
+            launch_merge_pairs_stable_2way_u32_u32(
+                h_xs_keys + 0,           h_xs_vals + 0,           xs_tile_n0,
+                h_xs_keys + xs_tile_n0,  h_xs_vals + xs_tile_n0,  xs_tile_n1,
+                d_xs_keys_b, d_xs_vals_b, total_xs, q);
+            sycl::free(h_xs_keys, q);
+            sycl::free(h_xs_vals, q);
+
+            // Tiled pack. d_xs_pack_tile (cap/2 × XsCandidate = 1024 MB
+            // at k=28) reuses across tiles; the packed output collects on
+            // host pinned h_xs (cap × XsCandidate = 2048 MB host).
+            uint64_t const pack_tile_n0  = total_xs / 2;
+            uint64_t const pack_tile_n1  = total_xs - pack_tile_n0;
+            uint64_t const pack_tile_max = (pack_tile_n0 > pack_tile_n1) ? pack_tile_n0 : pack_tile_n1;
+
+            XsCandidateGpu* d_xs_pack_tile = nullptr;
+            s_malloc(stats, d_xs_pack_tile, pack_tile_max * sizeof(XsCandidateGpu), "d_xs_pack_tile");
+
+            h_xs = static_cast<XsCandidateGpu*>(
+                sycl::malloc_host(total_xs * sizeof(XsCandidateGpu), q));
+            if (!h_xs) throw std::runtime_error("sycl::malloc_host(h_xs) failed");
+
+            int p_xs_pack = begin_phase("Xs pack");
+            if (pack_tile_n0 > 0) {
+                launch_xs_pack_range(d_xs_keys_b + 0, d_xs_vals_b + 0,
+                                     d_xs_pack_tile, pack_tile_n0, q);
+                q.memcpy(h_xs + 0, d_xs_pack_tile,
+                         pack_tile_n0 * sizeof(XsCandidateGpu)).wait();
+            }
+            if (pack_tile_n1 > 0) {
+                launch_xs_pack_range(d_xs_keys_b + pack_tile_n0,
+                                     d_xs_vals_b + pack_tile_n0,
+                                     d_xs_pack_tile, pack_tile_n1, q);
+                q.memcpy(h_xs + pack_tile_n0, d_xs_pack_tile,
+                         pack_tile_n1 * sizeof(XsCandidateGpu)).wait();
+            }
+            end_phase(p_xs_pack);
+
+            s_free(stats, d_xs_pack_tile);
+            s_free(stats, d_xs_keys_b);
+            s_free(stats, d_xs_vals_b);
+            d_xs_keys_b = nullptr;
+            d_xs_vals_b = nullptr;
         }
-        if (pack_tile_n1 > 0) {
-            launch_xs_pack_range(d_xs_keys_b + pack_tile_n0,
-                                 d_xs_vals_b + pack_tile_n0,
-                                 d_xs_pack_tile, pack_tile_n1, q);
-            q.memcpy(h_xs + pack_tile_n0, d_xs_pack_tile,
-                     pack_tile_n1 * sizeof(XsCandidateGpu)).wait();
-        }
-        end_phase(p_xs_pack);
 
-        s_free(stats, d_xs_pack_tile);
-        s_free(stats, d_xs_keys_b);
-        s_free(stats, d_xs_vals_b);
-        d_xs_keys_b = nullptr;
-        d_xs_vals_b = nullptr;
-
-        // Re-hydrate full d_xs on device from host pinned.
+        // Re-hydrate full d_xs on device from host pinned. Common to
+        // Minimal/Tiny/Pinned (Phase 1.4c will eliminate this for Pinned).
         s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
         q.memcpy(d_xs, h_xs, total_xs * sizeof(XsCandidateGpu)).wait();
         sycl::free(h_xs, q);
