@@ -431,6 +431,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const compact_peak = streaming_peak_bytes(pool_k);
             size_t const minimal_peak = streaming_minimal_peak_bytes(pool_k);
             size_t const tiny_peak    = streaming_tiny_peak_bytes(pool_k);
+            size_t const pinned_peak  = streaming_pinned_peak_bytes(pool_k);
             size_t const margin       = 128ULL << 20;
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
@@ -439,7 +440,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 !opts.streaming_tier.empty() ? opts.streaming_tier :
                 (tier_env ? std::string(tier_env) : std::string());
 
-            enum class Tier { Plain, Compact, Minimal, Tiny };
+            enum class Tier { Plain, Compact, Minimal, Tiny, Pinned };
             Tier tier;
             if (tier_pref == "plain") {
                 tier = Tier::Plain;
@@ -449,36 +450,46 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 tier = Tier::Minimal;
             } else if (tier_pref == "tiny") {
                 tier = Tier::Tiny;
+            } else if (tier_pref == "pinned") {
+                tier = Tier::Pinned;
             } else {
                 // Auto: pick the largest tier that fits with margin.
+                // Pinned slots in below Tiny — it serves sub-Tiny-peak
+                // cards. With Pinned's peak math currently equal to
+                // Tiny's (Phase 1.3c-i scaffolding), the auto-picker
+                // never reaches the Pinned branch; once 1.3c-ii lowers
+                // the Pinned anchor it becomes the new floor.
                 tier = (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
                        (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
                        (mem.free_bytes >= minimal_peak + margin) ? Tier::Minimal :
-                                                                   Tier::Tiny;
+                       (mem.free_bytes >= tiny_peak    + margin) ? Tier::Tiny    :
+                                                                   Tier::Pinned;
             }
 
             auto tier_name = [](Tier t) -> char const* {
                 return t == Tier::Plain   ? "plain"
                      : t == Tier::Compact ? "compact"
                      : t == Tier::Minimal ? "minimal"
-                     :                      "tiny";
+                     : t == Tier::Tiny    ? "tiny"
+                     :                      "pinned";
             };
             size_t const required =
                 tier == Tier::Plain   ? plain_peak   :
                 tier == Tier::Compact ? compact_peak :
                 tier == Tier::Minimal ? minimal_peak :
-                                        tiny_peak;
+                tier == Tier::Tiny    ? tiny_peak    :
+                                        pinned_peak;
 
-            // Open-ended fallback: if even the smallest tier (tiny)
-            // won't fit, throw. Forced higher tier below its floor
-            // warns and proceeds.
-            if (tier == Tier::Tiny
+            // Open-ended fallback: if even the smallest tier (now
+            // pinned) won't fit, throw. Forced higher tier below its
+            // floor warns and proceeds.
+            if (tier == Tier::Pinned
                 && mem.free_bytes < required + margin) {
                 InsufficientVramError se(
                     "[batch] streaming pipeline needs ~" +
                     std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
-                    " (tiny tier, the smallest available), device reports " +
+                    " (pinned tier, the smallest available), device reports " +
                     std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
                     " GiB free of " +
                     std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
@@ -489,7 +500,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 se.total_bytes    = mem.total_bytes;
                 throw se;
             }
-            if (tier != Tier::Tiny
+            if (tier != Tier::Pinned
                 && mem.free_bytes < required + margin) {
                 std::fprintf(stderr,
                     "[batch] streaming tier: %s forced (%.2f GiB free < %.2f GiB "
@@ -500,12 +511,17 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     tier_name(tier));
             }
 
-            stream_scratch.plain_mode = (tier == Tier::Plain);
-            stream_scratch.tiny_mode  = (tier == Tier::Tiny);
-            // Tiny shares minimal's tile counts (gather_tile_count > 1
+            stream_scratch.plain_mode  = (tier == Tier::Plain);
+            // Pinned inherits Tiny's host-park behaviour as the
+            // baseline; the streaming-partition algorithm change
+            // ships in Phase 1.3c-ii and is then gated by an
+            // additional pinned_mode flag on the scratch struct.
+            stream_scratch.tiny_mode   = (tier == Tier::Tiny || tier == Tier::Pinned);
+            stream_scratch.pinned_mode = (tier == Tier::Pinned);
+            // Tiny / Pinned share minimal's tile counts (gather_tile_count > 1
             // is the trigger for the host-pinned T2 sort path that
             // tiny extends across T3 match).
-            if (tier == Tier::Minimal || tier == Tier::Tiny) {
+            if (tier == Tier::Minimal || tier == Tier::Tiny || tier == Tier::Pinned) {
                 stream_scratch.t2_tile_count     = 8;
                 stream_scratch.gather_tile_count = 4;
             }

@@ -181,6 +181,20 @@ struct StreamingPinnedScratch {
     // prerequisites). BatchPlotter sets this when tier==Tiny.
     bool tiny_mode           = false;
 
+    // Pinned tier (streaming-partition T1 sort, sub-Tiny VRAM peak).
+    // Strict superset of tiny_mode: when pinned_mode is true,
+    // tiny_mode is also set, all Tiny-mode parks apply, AND T1 sort
+    // additionally goes through launch_streaming_partition_u32_u64
+    // + per-bucket launch_sort_pairs_u32_u64 instead of the in-VRAM
+    // gather. Targets 2-3 GB cards by keeping d_t1_meta fully host-
+    // resident (no temporary full-cap d_t1_meta on device during
+    // T1 sort gather, which is Tiny's floor).
+    //
+    // Phase 1.3c-i ships the flag without the algorithm change —
+    // setting pinned_mode=true today is a no-op vs tiny_mode=true.
+    // Phase 1.3c-ii flips the T1 sort dispatch in GpuPipeline.cpp.
+    bool pinned_mode         = false;
+
     // Phase 2 (pipeline-parallel pooled VRAM) split fields. The
     // streaming pipeline normally runs Xs → T1 → T2 → T3 → write end-
     // to-end. To split the work across two GPUs, the first GPU runs

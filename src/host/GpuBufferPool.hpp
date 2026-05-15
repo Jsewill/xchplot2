@@ -194,5 +194,12 @@ size_t streaming_peak_bytes(int k);
 size_t streaming_plain_peak_bytes(int k);
 size_t streaming_minimal_peak_bytes(int k);
 size_t streaming_tiny_peak_bytes(int k);
+// streaming_pinned_peak_bytes: pinned tier — replaces the in-VRAM
+// T1 sort gather (Tiny's floor) with a streaming-partition + per-
+// bucket-sort flow that keeps d_t1_meta host-resident. Targets
+// 2-3 GB cards. Phase 1.3c-i ships scaffolding only (peak math
+// identical to Tiny); Phase 1.3c-ii lowers the anchor once the
+// algorithm change in GpuPipeline.cpp is in place.
+size_t streaming_pinned_peak_bytes(int k);
 
 } // namespace pos2gpu

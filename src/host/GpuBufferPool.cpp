@@ -516,4 +516,18 @@ size_t streaming_tiny_peak_bytes(int k)
     return ((size_t(anchor_mb) << 20) << shift) + adj;
 }
 
+size_t streaming_pinned_peak_bytes(int k)
+{
+    // Phase 1.3c-i: scaffolding only. The pinned tier currently
+    // shares Tiny's algorithm (and therefore its peak) because the
+    // actual GpuPipeline-side streaming-partition wiring lives in
+    // Phase 1.3c-ii. Once that lands, the anchor below drops to
+    // ~1500 MB at k=28 (the spec target — streaming partition +
+    // per-bucket sort removes the full-cap d_t1_meta-on-device
+    // requirement that's Tiny's floor today). Until then this
+    // mirrors Tiny exactly so a forced --tier pinned run validates
+    // the picker plumbing without changing observed behaviour.
+    return streaming_tiny_peak_bytes(k);
+}
+
 } // namespace pos2gpu
