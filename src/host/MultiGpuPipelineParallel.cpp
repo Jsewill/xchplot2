@@ -156,6 +156,13 @@ struct BoundaryBuffers {
     std::uint32_t* h_t2_xbits        = nullptr;
     std::uint32_t* h_keys_merged     = nullptr;
     sycl::queue*   alloc_queue       = nullptr;
+    // When true, the buffers were allocated as device memory on the
+    // *consumer* (stage 2) GPU via sycl::malloc_device, not as host
+    // pinned. Stage 1's gather q.memcpy to these pointers becomes a
+    // cross-device D2D — AdaptiveCpp's CUDA backend routes it via
+    // cudaMemcpyPeerAsync, eliminating the H2D leg of the boundary
+    // handoff. Same sycl::free path works for both allocation kinds.
+    bool peer_copy_active = false;
 };
 
 void free_boundary(BoundaryBuffers& b)
@@ -170,6 +177,15 @@ void free_boundary(BoundaryBuffers& b)
     b.h_meta = b.h_t2_meta = nullptr;
     b.h_t2_xbits = nullptr;
     b.h_keys_merged = nullptr;
+}
+
+bool pipeline_peer_copy_enabled()
+{
+    static bool const enabled = [] {
+        char const* v = std::getenv("POS2GPU_PIPELINE_PEER_COPY");
+        return v && v[0] == '1';
+    }();
+    return enabled;
 }
 
 } // namespace
@@ -211,32 +227,65 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
         max_pairs_per_section(cfg.k, num_section_bits) *
         (std::uint64_t{1} << num_section_bits);
 
-    // Allocate the boundary buffers on a queue bound to device_first.
-    // bind_current_device(device_first) makes sycl_backend::queue() lazily
-    // construct (in this thread) a queue rooted at that device. The
-    // buffers land in that queue's host-pinned pool; on CUDA they're
-    // portable to other devices in the same process.
+    // Allocate the boundary buffers.
+    //
+    // Default path (POS2GPU_PIPELINE_PEER_COPY unset): host-pinned on a
+    // queue bound to device_first. bind_current_device(device_first)
+    // makes sycl_backend::queue() lazily construct a queue rooted at
+    // that device; the buffers land in its host-pinned pool, portable
+    // to every device in the same process on CUDA.
+    //
+    // Peer-copy path (POS2GPU_PIPELINE_PEER_COPY=1): device memory on
+    // device_second's queue. Stage 1's gather q.memcpy to these
+    // pointers becomes cross-device D2D — AdaptiveCpp's CUDA backend
+    // routes it through cudaMemcpyPeerAsync, eliminating the H2D leg
+    // of the boundary handoff. Targets the T2-sort PCIe contention
+    // that bloats stage 1's wall in pipelined batch.
+    bool const peer_copy = pipeline_peer_copy_enabled();
     BoundaryBuffers buf;
+    buf.peer_copy_active = peer_copy;
     {
-        bind_current_device(device_first);
+        // When peer-copy is on, allocate everything via stage 2's queue
+        // — host-pinned is portable across devices, so pinned_dst +
+        // h_meta still work for host-side use, AND the T2-boundary
+        // buffers become device memory on stage 2 (cross-device D2D
+        // via AdaptiveCpp's peer-copy routing).
+        int const alloc_dev = peer_copy ? device_second : device_first;
+        bind_current_device(alloc_dev);
         sycl::queue& q = sycl_backend::queue();
         buf.alloc_queue = &q;
-        buf.pinned_dst    = static_cast<std::uint64_t*>(
+
+        // pinned_dst + h_meta stay host-pinned regardless — host-side
+        // code touches them (T1 sort tile-merge for h_meta; T3 final
+        // frag output for pinned_dst).
+        buf.pinned_dst = static_cast<std::uint64_t*>(
             sycl::malloc_host(cap * sizeof(std::uint64_t), q));
-        buf.h_meta        = static_cast<std::uint64_t*>(
+        buf.h_meta     = static_cast<std::uint64_t*>(
             sycl::malloc_host(cap * sizeof(std::uint64_t), q));
-        buf.h_t2_meta     = static_cast<std::uint64_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint64_t), q));
-        buf.h_t2_xbits    = static_cast<std::uint32_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint32_t), q));
-        buf.h_keys_merged = static_cast<std::uint32_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint32_t), q));
+
+        if (peer_copy) {
+            buf.h_t2_meta     = static_cast<std::uint64_t*>(
+                sycl::malloc_device(cap * sizeof(std::uint64_t), q));
+            buf.h_t2_xbits    = static_cast<std::uint32_t*>(
+                sycl::malloc_device(cap * sizeof(std::uint32_t), q));
+            buf.h_keys_merged = static_cast<std::uint32_t*>(
+                sycl::malloc_device(cap * sizeof(std::uint32_t), q));
+        } else {
+            buf.h_t2_meta     = static_cast<std::uint64_t*>(
+                sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+            buf.h_t2_xbits    = static_cast<std::uint32_t*>(
+                sycl::malloc_host(cap * sizeof(std::uint32_t), q));
+            buf.h_keys_merged = static_cast<std::uint32_t*>(
+                sycl::malloc_host(cap * sizeof(std::uint32_t), q));
+        }
         if (!buf.pinned_dst || !buf.h_meta || !buf.h_t2_meta ||
             !buf.h_t2_xbits || !buf.h_keys_merged)
         {
             free_boundary(buf);
             throw std::runtime_error(
-                "run_pipeline_parallel_split: boundary pinned-host alloc failed");
+                peer_copy
+                ? "run_pipeline_parallel_split: boundary device alloc failed"
+                : "run_pipeline_parallel_split: boundary pinned-host alloc failed");
         }
     }
 
@@ -458,28 +507,46 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         roles[final_stage].t3_sort_full_cap = true;
     }
 
-    // Allocate `depth` boundary buffer sets on stage-0's queue. The
-    // single BoundaryBuffers shape covers both T1-sort and T2-sort
-    // boundaries — T1-sort uses h_meta + h_keys_merged only, T2-sort
-    // uses all four host pinned buffers; pinned_dst is the final-stage
-    // output. Each slot is exclusively owned by one plot at a time as
-    // it flows through the stages, so reusing buffers across boundaries
-    // within a slot is safe.
-    bind_current_device(roles[0].device_id);
+    // Allocate `depth` boundary buffer sets. Default path: host-pinned
+    // on stage-0's queue (portable on CUDA). Peer-copy path
+    // (POS2GPU_PIPELINE_PEER_COPY=1, N=2 only for now): device memory
+    // on the *consumer* stage's queue — stage 1's gather q.memcpy to
+    // these pointers becomes cross-device D2D via AdaptiveCpp's
+    // cudaMemcpyPeerAsync routing. N=3+ stays on host-pinned (each
+    // boundary's consumer differs; per-boundary allocation is a
+    // follow-up).
+    bool const peer_copy = pipeline_peer_copy_enabled() && (N == 2);
+    int const alloc_stage = peer_copy ? (N - 1) : 0;
+    bind_current_device(roles[alloc_stage].device_id);
     sycl::queue& alloc_q = sycl_backend::queue();
     std::vector<BoundaryBuffers> bufs(depth);
+    // pinned_dst + h_meta always host-pinned (host-side use). The 3
+    // T2-boundary buffers become device-on-consumer when peer_copy is
+    // on (cross-device D2D via AdaptiveCpp's peer-copy routing).
+    auto alloc_u64_host = [&](std::size_t n) -> std::uint64_t* {
+        return static_cast<std::uint64_t*>(
+            sycl::malloc_host(n * sizeof(std::uint64_t), alloc_q));
+    };
+    auto alloc_u64_boundary = [&](std::size_t n) -> std::uint64_t* {
+        void* p = peer_copy
+            ? sycl::malloc_device(n * sizeof(std::uint64_t), alloc_q)
+            : sycl::malloc_host(  n * sizeof(std::uint64_t), alloc_q);
+        return static_cast<std::uint64_t*>(p);
+    };
+    auto alloc_u32_boundary = [&](std::size_t n) -> std::uint32_t* {
+        void* p = peer_copy
+            ? sycl::malloc_device(n * sizeof(std::uint32_t), alloc_q)
+            : sycl::malloc_host(  n * sizeof(std::uint32_t), alloc_q);
+        return static_cast<std::uint32_t*>(p);
+    };
     for (int i = 0; i < depth; ++i) {
-        bufs[i].alloc_queue = &alloc_q;
-        bufs[i].pinned_dst    = static_cast<std::uint64_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
-        bufs[i].h_meta        = static_cast<std::uint64_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
-        bufs[i].h_t2_meta     = static_cast<std::uint64_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint64_t), alloc_q));
-        bufs[i].h_t2_xbits    = static_cast<std::uint32_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint32_t), alloc_q));
-        bufs[i].h_keys_merged = static_cast<std::uint32_t*>(
-            sycl::malloc_host(cap * sizeof(std::uint32_t), alloc_q));
+        bufs[i].alloc_queue       = &alloc_q;
+        bufs[i].peer_copy_active  = peer_copy;
+        bufs[i].pinned_dst    = alloc_u64_host(cap);
+        bufs[i].h_meta        = alloc_u64_host(cap);
+        bufs[i].h_t2_meta     = alloc_u64_boundary(cap);
+        bufs[i].h_t2_xbits    = alloc_u32_boundary(cap);
+        bufs[i].h_keys_merged = alloc_u32_boundary(cap);
         if (!bufs[i].pinned_dst || !bufs[i].h_meta || !bufs[i].h_t2_meta ||
             !bufs[i].h_t2_xbits || !bufs[i].h_keys_merged)
         {
