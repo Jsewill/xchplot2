@@ -1533,16 +1533,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             h_t1_keys_merged, h_part_vals, h_bucket_starts,
             t1_count, top_bit_offset, num_top_bits,
             /*tile_count=*/0, q);
-        void* d_partition_scratch = partition_scratch_bytes
-            ? sycl::malloc_device(partition_scratch_bytes, q)
-            : nullptr;
+        void* d_partition_scratch = nullptr;
+        if (partition_scratch_bytes) {
+            s_malloc(stats, d_partition_scratch,
+                     partition_scratch_bytes, "d_t1_partition_scratch");
+        }
         launch_streaming_partition_u32_u64(
             d_partition_scratch, partition_scratch_bytes,
             d_t1_mi, h_t1_meta,
             h_t1_keys_merged, h_part_vals, h_bucket_starts,
             t1_count, top_bit_offset, num_top_bits,
             /*tile_count=*/0, q);
-        if (d_partition_scratch) sycl::free(d_partition_scratch, q);
+        if (d_partition_scratch) s_free(stats, d_partition_scratch);
 
         // d_t1_mi is no longer needed after partition.
         s_free(stats, d_t1_mi);
@@ -1557,10 +1559,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // Per-bucket device scratch, sized at max bucket. Reused
         // across all buckets — the per-bucket sort is sequential.
-        uint32_t* d_bk_in  = sycl::malloc_device<uint32_t>(max_bucket, q);
-        uint32_t* d_bk_out = sycl::malloc_device<uint32_t>(max_bucket, q);
-        uint64_t* d_bv_in  = sycl::malloc_device<uint64_t>(max_bucket, q);
-        uint64_t* d_bv_out = sycl::malloc_device<uint64_t>(max_bucket, q);
+        uint32_t* d_bk_in  = nullptr;
+        uint32_t* d_bk_out = nullptr;
+        uint64_t* d_bv_in  = nullptr;
+        uint64_t* d_bv_out = nullptr;
+        s_malloc(stats, d_bk_in,  max_bucket * sizeof(uint32_t), "d_t1_bk_in");
+        s_malloc(stats, d_bk_out, max_bucket * sizeof(uint32_t), "d_t1_bk_out");
+        s_malloc(stats, d_bv_in,  max_bucket * sizeof(uint64_t), "d_t1_bv_in");
+        s_malloc(stats, d_bv_out, max_bucket * sizeof(uint64_t), "d_t1_bv_out");
 
         // Query sort scratch at the max bucket size.
         size_t bucket_sort_bytes = 0;
@@ -1568,9 +1574,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             nullptr, bucket_sort_bytes,
             d_bk_in, d_bk_out, d_bv_in, d_bv_out,
             max_bucket, 0, top_bit_offset, q);
-        void* d_bucket_sort_scratch = bucket_sort_bytes
-            ? sycl::malloc_device(bucket_sort_bytes, q)
-            : nullptr;
+        void* d_bucket_sort_scratch = nullptr;
+        if (bucket_sort_bytes) {
+            s_malloc(stats, d_bucket_sort_scratch,
+                     bucket_sort_bytes, "d_t1_bucket_sort_scratch");
+        }
 
         for (size_t b = 0; b < num_buckets; ++b) {
             uint32_t const bstart = h_bucket_starts[b];
@@ -1600,11 +1608,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                      bsz * sizeof(uint64_t)).wait();
         }
 
-        if (d_bucket_sort_scratch) sycl::free(d_bucket_sort_scratch, q);
-        sycl::free(d_bk_in, q);
-        sycl::free(d_bk_out, q);
-        sycl::free(d_bv_in, q);
-        sycl::free(d_bv_out, q);
+        if (d_bucket_sort_scratch) s_free(stats, d_bucket_sort_scratch);
+        s_free(stats, d_bk_in);
+        s_free(stats, d_bk_out);
+        s_free(stats, d_bv_in);
+        s_free(stats, d_bv_out);
         sycl::free(h_part_vals, q);
         sycl::free(h_bucket_starts, q);
 
