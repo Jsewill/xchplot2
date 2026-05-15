@@ -22,6 +22,7 @@
 #include "gpu/T3Kernel.cuh"
 #include "gpu/PipelineKernels.cuh"
 #include "gpu/Sort.cuh"
+#include "gpu/StreamingPartition.cuh"
 #include "gpu/SyclBackend.hpp"
 
 #include <sycl/sycl.hpp>
@@ -1464,6 +1465,161 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     int p_t1_sort = begin_phase("T1 sort");
 
+    // ------------------------------------------------------------
+    // Phase 1.3c-ii Pinned T1 sort: streaming partition + per-bucket sort.
+    //
+    // Today's Tiny-mode T1 sort gather (~2080 MB d_t1_meta on device
+    // at k=28) is the streaming-pipeline floor — it's why we can't
+    // fit on 2-3 GB GPUs even after every other host park. Pinned
+    // replaces that gather with the streaming-partition primitive
+    // (Phase 1.3b) + per-bucket launch_sort_pairs_u32_u64 (Phase 1.3a):
+    // h_t1_meta is read tile-by-tile, partitioned to host-pinned
+    // bucket arenas, and each bucket sorted in turn on a small per-
+    // bucket-sized device buffer. d_t1_meta never lives at full cap
+    // on device.
+    //
+    // Outputs match Tiny's contract:
+    //   h_t1_meta:        sorted in place
+    //   h_t1_keys_merged: sorted on host-pinned (downstream T2 match
+    //                     reads section slices from it; tiny path
+    //                     already parks d_t1_keys_merged on host)
+    //   d_t1_mi:          freed (no longer needed)
+    //   d_t1_keys_merged: nullptr (parked on host as h_t1_keys_merged,
+    //                     matching tiny's behaviour after this phase)
+    if (scratch.pinned_mode) {
+        // Pick partition geometry. num_top_bits must satisfy
+        //   begin_bit=0 + num_top_bits <= end_bit=cfg.k
+        // with at least 1 lower bit left to sort within each bucket
+        // (so num_top_bits <= cfg.k - 1). Default 8 → 256 buckets;
+        // at k=28 that's ~1M entries per bucket on average. At
+        // very small k we shrink it so the math holds.
+        int  const num_top_bits   = std::min(8, std::max(1, cfg.k - 1));
+        int  const top_bit_offset = cfg.k - num_top_bits;
+        size_t const num_buckets  = size_t{1} << num_top_bits;
+
+        // Allocate h_t1_keys_merged using the same pool/scratch/
+        // malloc_host pattern the merge phase uses below (so the
+        // ownership flag h_keys_owned remains accurate). Streaming
+        // partition writes its bucketed key output directly into
+        // this buffer, and the per-bucket sort overwrites it with
+        // sorted output — no extra copy.
+        if (h_keys_owned) {
+            h_t1_keys_merged = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_keys_merged", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+            if (!h_t1_keys_merged) throw std::runtime_error(
+                "sycl::malloc_host(h_t1_keys_merged, pinned mode) failed");
+        } else {
+            h_t1_keys_merged = scratch.h_keys_merged;
+        }
+
+        // Temp host arenas for partition output vals and bucket starts.
+        uint64_t* h_part_vals = static_cast<uint64_t*>(
+            sycl::malloc_host(cap * sizeof(uint64_t), q));
+        if (!h_part_vals) throw std::runtime_error(
+            "sycl::malloc_host(h_part_vals, pinned mode) failed");
+        uint32_t* h_bucket_starts = static_cast<uint32_t*>(
+            sycl::malloc_host((num_buckets + 1) * sizeof(uint32_t), q));
+        if (!h_bucket_starts) throw std::runtime_error(
+            "sycl::malloc_host(h_bucket_starts, pinned mode) failed");
+
+        // Run streaming partition. Output: (h_t1_keys_merged,
+        // h_part_vals) bucketed by top_num_top_bits of mi, with
+        // h_bucket_starts giving the exclusive-scan offsets.
+        size_t partition_scratch_bytes = 0;
+        launch_streaming_partition_u32_u64(
+            nullptr, partition_scratch_bytes,
+            d_t1_mi, h_t1_meta,
+            h_t1_keys_merged, h_part_vals, h_bucket_starts,
+            t1_count, top_bit_offset, num_top_bits,
+            /*tile_count=*/0, q);
+        void* d_partition_scratch = partition_scratch_bytes
+            ? sycl::malloc_device(partition_scratch_bytes, q)
+            : nullptr;
+        launch_streaming_partition_u32_u64(
+            d_partition_scratch, partition_scratch_bytes,
+            d_t1_mi, h_t1_meta,
+            h_t1_keys_merged, h_part_vals, h_bucket_starts,
+            t1_count, top_bit_offset, num_top_bits,
+            /*tile_count=*/0, q);
+        if (d_partition_scratch) sycl::free(d_partition_scratch, q);
+
+        // d_t1_mi is no longer needed after partition.
+        s_free(stats, d_t1_mi);
+        d_t1_mi = nullptr;
+
+        // Find max bucket size for per-bucket device buffer sizing.
+        uint32_t max_bucket = 0;
+        for (size_t b = 0; b < num_buckets; ++b) {
+            uint32_t const bsz = h_bucket_starts[b + 1] - h_bucket_starts[b];
+            if (bsz > max_bucket) max_bucket = bsz;
+        }
+
+        // Per-bucket device scratch, sized at max bucket. Reused
+        // across all buckets — the per-bucket sort is sequential.
+        uint32_t* d_bk_in  = sycl::malloc_device<uint32_t>(max_bucket, q);
+        uint32_t* d_bk_out = sycl::malloc_device<uint32_t>(max_bucket, q);
+        uint64_t* d_bv_in  = sycl::malloc_device<uint64_t>(max_bucket, q);
+        uint64_t* d_bv_out = sycl::malloc_device<uint64_t>(max_bucket, q);
+
+        // Query sort scratch at the max bucket size.
+        size_t bucket_sort_bytes = 0;
+        launch_sort_pairs_u32_u64(
+            nullptr, bucket_sort_bytes,
+            d_bk_in, d_bk_out, d_bv_in, d_bv_out,
+            max_bucket, 0, top_bit_offset, q);
+        void* d_bucket_sort_scratch = bucket_sort_bytes
+            ? sycl::malloc_device(bucket_sort_bytes, q)
+            : nullptr;
+
+        for (size_t b = 0; b < num_buckets; ++b) {
+            uint32_t const bstart = h_bucket_starts[b];
+            uint32_t const bsz    = h_bucket_starts[b + 1] - bstart;
+            if (bsz == 0) continue;
+
+            q.memcpy(d_bk_in, h_t1_keys_merged + bstart,
+                     bsz * sizeof(uint32_t));
+            q.memcpy(d_bv_in, h_part_vals + bstart,
+                     bsz * sizeof(uint64_t)).wait();
+
+            size_t bsb = bucket_sort_bytes;
+            launch_sort_pairs_u32_u64(
+                d_bucket_sort_scratch, bsb,
+                d_bk_in, d_bk_out, d_bv_in, d_bv_out,
+                bsz, 0, top_bit_offset, q);
+
+            // Overwrite the bucketed-but-unsorted ranges with sorted
+            // data. h_t1_keys_merged was the partition output target
+            // for keys; sorted keys go back to the same slot. h_t1_meta
+            // was the SOURCE of streaming_partition — its unsorted
+            // contents are no longer needed, so we use it as the final
+            // sorted-meta destination directly (in place overwrite).
+            q.memcpy(h_t1_keys_merged + bstart, d_bk_out,
+                     bsz * sizeof(uint32_t));
+            q.memcpy(h_t1_meta + bstart, d_bv_out,
+                     bsz * sizeof(uint64_t)).wait();
+        }
+
+        if (d_bucket_sort_scratch) sycl::free(d_bucket_sort_scratch, q);
+        sycl::free(d_bk_in, q);
+        sycl::free(d_bk_out, q);
+        sycl::free(d_bv_in, q);
+        sycl::free(d_bv_out, q);
+        sycl::free(h_part_vals, q);
+        sycl::free(h_bucket_starts, q);
+
+        end_phase(p_t1_sort);
+        // h_t1_keys_merged and h_t1_meta are both sorted on host-pinned.
+        // d_t1_keys_merged stays nullptr (parked on host) — same shape
+        // tiny mode reaches after the 2-way merge + D2H park.
+        goto t1_sort_done;
+    }
+
+    {  // Block-scope wrapper for non-pinned T1 sort path. The goto in
+       // the pinned branch above lands at t1_sort_done; this block
+       // contains the existing CUB-sort + 2-way-merge + gather code
+       // (with its own local variable declarations) which goto must
+       // not appear to "skip past" at function scope.
     if (!t1_match_sliced) {
         // Compact / plain — existing full-cap path.
         s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
@@ -1711,6 +1867,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             h_t1_meta = nullptr;
         }
     }
+
+    }  // end block-scope wrapper for non-pinned T1 sort path.
+
+    // Pinned-mode T1 sort joins back here. h_t1_keys_merged and
+    // h_t1_meta are both sorted on host-pinned at this point; the
+    // d_t1_keys_merged rehydration below is a no-op for tiny / pinned
+    // (the consumer-side T2 match block does its own brief rehydrate
+    // and free).
+    t1_sort_done:;
 
     // Stage 4c (compact only): H2D d_t1_keys_merged back now that T2
     // match (its consumer) is about to start. Pinned host freed after
