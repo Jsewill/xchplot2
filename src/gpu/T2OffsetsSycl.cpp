@@ -10,7 +10,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace pos2gpu {
 
@@ -93,6 +95,42 @@ void launch_t2_compute_fine_bucket_offsets(
 
 namespace {
 
+// Per-queue cached candidate scratch for run_t2_match_twophase. See
+// the equivalent in T3OffsetsSycl.cpp for the full rationale; T2 uses
+// its own cache (16× per-bucket-output sizing vs T3's 8×, so they
+// grow independently).
+struct T2CandScratch {
+    uint32_t* d_cand_l     = nullptr;
+    uint32_t* d_cand_r     = nullptr;
+    uint64_t* d_cand_count = nullptr;
+    uint64_t  cap          = 0;
+};
+
+T2CandScratch& acquire_t2_cand_scratch(sycl::queue& q, uint64_t cand_cap)
+{
+    static std::mutex mu;
+    static std::unordered_map<sycl::queue*, T2CandScratch> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& s = cache[&q];
+    if (s.cap < cand_cap) {
+        if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
+        if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
+        if (s.d_cand_count) sycl::free(s.d_cand_count, q);
+        s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
+        s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
+        s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
+        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count) {
+            if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
+            if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
+            if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
+            s.cap = 0;
+            throw std::runtime_error("T2 two-phase: candidate buffer alloc failed");
+        }
+        s.cap = cand_cap;
+    }
+    return s;
+}
+
 // ---- Phase 2 prototype: two-phase T2 match ----------------------------
 //
 // Mirrors run_t3_match_twophase (T3OffsetsSycl.cpp). The single-kernel
@@ -145,19 +183,16 @@ void run_t2_match_twophase(
     // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at 16× the
     // average per-bucket output count — generous headroom over the
     // expected candidate:output ratio (~4× for the T3 test filter; T2's
-    // is measured via the debug print). Allocated once, reused per bucket.
+    // is measured via the debug print). Allocated once, reused per bucket
+    // — and now also reused across calls on the same queue via the
+    // per-queue cache (acquire_t2_cand_scratch above).
     uint64_t const cand_cap =
         (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 16
         + 4096;
-    uint32_t* d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
-    uint32_t* d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
-    uint64_t* d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-    if (!d_cand_l || !d_cand_r || !d_cand_count) {
-        if (d_cand_l)     sycl::free(d_cand_l, q);
-        if (d_cand_r)     sycl::free(d_cand_r, q);
-        if (d_cand_count) sycl::free(d_cand_count, q);
-        throw std::runtime_error("T2 two-phase: candidate buffer alloc failed");
-    }
+    auto& scratch = acquire_t2_cand_scratch(q, cand_cap);
+    uint32_t* d_cand_l     = scratch.d_cand_l;
+    uint32_t* d_cand_r     = scratch.d_cand_r;
+    uint64_t* d_cand_count = scratch.d_cand_count;
     auto* d_cand_count_ull =
         reinterpret_cast<unsigned long long*>(d_cand_count);
     auto* d_out_count_ull =
@@ -319,12 +354,10 @@ void run_t2_match_twophase(
         have_prev  = true;
     }
 
-    // Single drain — the caller expects synchronous completion.
+    // Single drain — the caller expects synchronous completion. After
+    // the wait the cached scratch is fully drained for the next call;
+    // no free — the per-queue cache owns the buffers.
     q.wait();
-
-    sycl::free(d_cand_l, q);
-    sycl::free(d_cand_r, q);
-    sycl::free(d_cand_count, q);
 }
 
 bool t2_twophase_enabled()

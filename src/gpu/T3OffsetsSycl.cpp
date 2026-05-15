@@ -13,11 +13,57 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace pos2gpu {
 
 namespace {
+
+// Per-queue cached candidate scratch for run_t3_match_twophase.
+// Allocated on first use, grown on demand, and reused across every
+// subsequent call on the same queue — drops the ~500–1000 MB device
+// malloc/free that the prototype paid per plot. Multiple work-queue
+// worker threads each call into this with their own queue; the mutex
+// only protects the map, the per-queue buffers themselves are reused
+// serially within one queue (run_t3_match_twophase ends with q.wait()
+// so the buffer is fully drained before the next call sees it).
+//
+// No process-exit teardown — explicit sycl::free at static destruction
+// races the SYCL runtime's own shutdown on AdaptiveCpp; OS reclaims
+// the GPU memory when the process exits.
+struct T3CandScratch {
+    uint32_t* d_cand_l     = nullptr;
+    uint32_t* d_cand_r     = nullptr;
+    uint64_t* d_cand_count = nullptr;
+    uint64_t  cap          = 0;
+};
+
+T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
+{
+    static std::mutex mu;
+    static std::unordered_map<sycl::queue*, T3CandScratch> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& s = cache[&q];
+    if (s.cap < cand_cap) {
+        if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
+        if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
+        if (s.d_cand_count) sycl::free(s.d_cand_count, q);
+        s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
+        s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
+        s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
+        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count) {
+            if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
+            if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
+            if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
+            s.cap = 0;
+            throw std::runtime_error("T3 two-phase: candidate buffer alloc failed");
+        }
+        s.cap = cand_cap;
+    }
+    return s;
+}
 
 // ---- Phase 2 prototype: two-phase T3 match ----------------------------
 //
@@ -79,19 +125,17 @@ void run_t3_match_twophase(
     // filter passes ~1/4, so total candidates ≈ 4× outputs. Sized at 8×
     // the average per-bucket output count → ~2× headroom over the
     // expected per-bucket candidate count, absorbing inter-bucket
-    // variance. Allocated once, reused across all buckets in the range.
+    // variance. Allocated once, reused across all buckets in the range
+    // — and now also reused across calls on the same queue via the
+    // per-queue cache (acquire_t3_cand_scratch above), so the per-plot
+    // ~500 MB device malloc/free is gone.
     uint64_t const cand_cap =
         (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 8
         + 4096;
-    uint32_t* d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
-    uint32_t* d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
-    uint64_t* d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-    if (!d_cand_l || !d_cand_r || !d_cand_count) {
-        if (d_cand_l)     sycl::free(d_cand_l, q);
-        if (d_cand_r)     sycl::free(d_cand_r, q);
-        if (d_cand_count) sycl::free(d_cand_count, q);
-        throw std::runtime_error("T3 two-phase: candidate buffer alloc failed");
-    }
+    auto& scratch = acquire_t3_cand_scratch(q, cand_cap);
+    uint32_t* d_cand_l     = scratch.d_cand_l;
+    uint32_t* d_cand_r     = scratch.d_cand_r;
+    uint64_t* d_cand_count = scratch.d_cand_count;
     auto* d_cand_count_ull =
         reinterpret_cast<unsigned long long*>(d_cand_count);
     auto* d_out_count_ull =
@@ -263,13 +307,11 @@ void run_t3_match_twophase(
 
     // Single drain at the end — replaces the prototype's 64 per-table
     // q.wait()s with one. The caller of launch_t3_match_all_buckets
-    // expected synchronous completion (no event return), so we still
-    // wait here before returning.
+    // expects synchronous completion (no event return), so we still
+    // wait here before returning. After the wait the cached scratch is
+    // fully drained and ready for the next call on this queue; no free
+    // — the per-queue cache owns the buffers for the process lifetime.
     q.wait();
-
-    sycl::free(d_cand_l, q);
-    sycl::free(d_cand_r, q);
-    sycl::free(d_cand_count, q);
 }
 
 bool t3_twophase_enabled()
