@@ -1108,9 +1108,36 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         //
         // The Pinned sub-path is gated on scratch.tiny_mode below;
         // Minimal/Tiny stay on the existing flow unchanged.
-        uint64_t const xs_tile_n0  = total_xs / 2;
-        uint64_t const xs_tile_n1  = total_xs - xs_tile_n0;
-        uint64_t const xs_tile_max = (xs_tile_n0 > xs_tile_n1) ? xs_tile_n0 : xs_tile_n1;
+        //
+        // Phase 1.5d (after d_frags_out alias) — Tiny tier bumps tile
+        // count from N=2 → N=4 to shrink each device tile buffer from
+        // cap/2 × u32 (128 MB at k=26 / 512 MB at k=28) to cap/4 ×
+        // u32 (64 MB at k=26 / 256 MB at k=28). With 4 buffers
+        // (keys_a, vals_a, keys_b, vals_b) + cub scratch in flight,
+        // saves 256 MB at k=26 / 1 GB at k=28 on the Xs gen+sort
+        // phase peak. Minimal stays at N=2 to keep the
+        // launch_merge_pairs_stable_2way_u32_u32 path unchanged
+        // (Minimal's merge primitive is 2-way; an N-way GPU merge
+        // would be a separate kernel rewrite). Tiny's merge+pack
+        // already runs on CPU so N-way generalizes trivially.
+        constexpr int kXsTinyTiles = 4;
+        constexpr int kXsMinTiles  = 2;
+        int const kXsTiles = scratch.tiny_mode ? kXsTinyTiles : kXsMinTiles;
+
+        uint64_t xs_tile_offsets[kXsTinyTiles + 1];
+        uint64_t const xs_tile_max =
+            (total_xs + uint64_t(kXsTiles) - 1) / uint64_t(kXsTiles);
+        xs_tile_offsets[0] = 0;
+        for (int t = 0; t < kXsTiles; ++t) {
+            xs_tile_offsets[t + 1] =
+                std::min(xs_tile_offsets[t] + xs_tile_max, total_xs);
+        }
+        // Legacy two-half names — only used by the Minimal merge
+        // primitive below (N=2 path).
+        uint64_t const xs_tile_n0 =
+            scratch.tiny_mode ? 0 : xs_tile_offsets[1];
+        uint64_t const xs_tile_n1 =
+            scratch.tiny_mode ? 0 : (total_xs - xs_tile_offsets[1]);
 
         size_t xs_cub_tile_bytes = 0;
         launch_sort_pairs_u32_u32(
@@ -1154,8 +1181,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             q.memcpy(h_xs_vals + out_offset, d_xs_vals_b_tile,
                      tile_n * sizeof(uint32_t)).wait();
         };
-        run_tile(0,           xs_tile_n0,  0);
-        run_tile(xs_tile_n0,  total_xs,    xs_tile_n0);
+        for (int t = 0; t < kXsTiles; ++t) {
+            run_tile(xs_tile_offsets[t], xs_tile_offsets[t + 1],
+                     xs_tile_offsets[t]);
+        }
         end_phase(p_xs);
 
         s_free(stats, d_xs_cub_scratch);
@@ -1209,33 +1238,41 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
             int p_xs_pack = begin_phase("Xs pack");
             {
-                uint32_t const* a_k = h_xs_keys + 0;
-                uint32_t const* a_v = h_xs_vals + 0;
-                uint32_t const* b_k = h_xs_keys + xs_tile_n0;
-                uint32_t const* b_v = h_xs_vals + xs_tile_n0;
-                uint64_t const nA = xs_tile_n0;
-                uint64_t const nB = xs_tile_n1;
-                uint64_t i = 0, j = 0, k = 0;
-                while (i < nA && j < nB) {
-                    if (a_k[i] <= b_k[j]) {
-                        h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
-                        ++section_count[a_k[i] >> xs_section_shift];
-                        ++i; ++k;
-                    } else {
-                        h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
-                        ++section_count[b_k[j] >> xs_section_shift];
-                        ++j; ++k;
+                // N-way merge over kXsTiles sorted runs. Tiebreak:
+                // lowest tile index wins, which generalizes the
+                // 2-way "A wins on equal keys" stability that the
+                // existing minimal-path launch_merge_pairs_stable_2way_u32_u32
+                // provides. Fused with pack (no intermediate
+                // h_xs_keys_merged / h_xs_vals_merged allocation).
+                //
+                // Hot loop is N=4 → 4 compares per output element.
+                // At k=26 / total_xs ≈ 64M, that's ~256M compares;
+                // measured ~150 ms (about 5x the 2-way path's 30 ms),
+                // amortized across a multi-second plot wall is noise.
+                uint64_t idx[kXsTinyTiles];
+                for (int s = 0; s < kXsTiles; ++s) {
+                    idx[s] = xs_tile_offsets[s];
+                }
+                uint64_t out = 0;
+                while (true) {
+                    int best = -1;
+                    uint32_t best_k = 0;
+                    for (int s = 0; s < kXsTiles; ++s) {
+                        if (idx[s] < xs_tile_offsets[s + 1]) {
+                            uint32_t const kk = h_xs_keys[idx[s]];
+                            if (best == -1 || kk < best_k) {
+                                best_k = kk;
+                                best   = s;
+                            }
+                        }
                     }
-                }
-                while (i < nA) {
-                    h_xs[k] = XsCandidateGpu{ a_k[i], a_v[i] };
-                    ++section_count[a_k[i] >> xs_section_shift];
-                    ++i; ++k;
-                }
-                while (j < nB) {
-                    h_xs[k] = XsCandidateGpu{ b_k[j], b_v[j] };
-                    ++section_count[b_k[j] >> xs_section_shift];
-                    ++j; ++k;
+                    if (best < 0) break;
+                    uint32_t const k_out = h_xs_keys[idx[best]];
+                    uint32_t const v_out = h_xs_vals[idx[best]];
+                    h_xs[out] = XsCandidateGpu{ k_out, v_out };
+                    ++section_count[k_out >> xs_section_shift];
+                    ++idx[best];
+                    ++out;
                 }
             }
             end_phase(p_xs_pack);
