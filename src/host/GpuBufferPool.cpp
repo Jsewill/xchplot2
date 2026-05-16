@@ -536,7 +536,12 @@ size_t streaming_pinned_peak_bytes(int k)
     // Auto-picker window for k=28: free VRAM in [2900, 3200) MB
     // picks Pinned instead of Tiny. Outside that window the picker
     // behaves as before (Tiny for >= 3200, throw below 2900 - margin).
-    constexpr size_t anchor_mb = 2900;
+    // Post-1.5c-a measurement: Pinned is ~68% of Tiny at k=22/24/26
+    // on RTX 4090. Lower the anchor from 2900 to 2200 MB at k=28
+    // (= 3200 * 0.68 ≈ 2176, round up to 2200 for safety margin).
+    // This widens the auto-picker's Pinned-only window from
+    // [2900, 3200) MB to [2200, 3200) MB.
+    constexpr size_t anchor_mb = 2200;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

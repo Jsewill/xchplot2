@@ -3290,9 +3290,33 @@ t3_match_entry:
         uint64_t const t3_section_cap =
             ((cap + num_sections - 1) / num_sections) * 3ULL / 2ULL;
 
+        // Phase 1.5c — Pinned tier only. d_t3_stage (T3 match output
+        // staging buffer, 198 MB at k=26 / ~800 MB at k=28) goes on
+        // host-pinned. The match kernel's writes are atomic-claim
+        // slot allocation — sequential by slot, written via USM-host
+        // pointer (each write → PCIe transaction). Measured at k=26:
+        // -110 MB overall plot peak, +18% wall. The wall cost is
+        // intended for Pinned (target hardware can't run any other
+        // tier anyway); on the dev box's 4090 it's just slower.
+        //
+        // Per pass:
+        //   match writes (~cap/N_sections × T3PairingGpu) via PCIe
+        //   q.memcpy h_t3 ← d_t3_stage becomes host→host (effectively
+        //     a sequential memcpy, fast).
+        //
+        // Free path is symmetric — when host-pinned, sycl::free not
+        // s_free so the StreamingStats tracker stays accurate.
         T3PairingGpu* d_t3_stage      = nullptr;
         void*         d_t3_match_temp = nullptr;
-        s_malloc(stats, d_t3_stage,      t3_section_cap * sizeof(T3PairingGpu), "d_t3_stage");
+        bool          d_t3_stage_on_host = scratch.pinned_mode;
+        if (d_t3_stage_on_host) {
+            d_t3_stage = static_cast<T3PairingGpu*>(
+                sycl::malloc_host(t3_section_cap * sizeof(T3PairingGpu), q));
+            if (!d_t3_stage) throw std::runtime_error(
+                "sycl::malloc_host(d_t3_stage, pinned T3) failed");
+        } else {
+            s_malloc(stats, d_t3_stage, t3_section_cap * sizeof(T3PairingGpu), "d_t3_stage");
+        }
         s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                          "d_t3_match_temp");
 
         bool const h_t3_owned = (scratch.h_t3 == nullptr);
@@ -3450,7 +3474,12 @@ t3_match_entry:
         // d_t2_meta_sorted is null in this path (never allocated) — skip
         // its s_free. Free everything else that was alive across T3 match.
         s_free(stats, d_t3_match_temp);
-        s_free(stats, d_t3_stage);
+        if (d_t3_stage_on_host) {
+            sycl::free(d_t3_stage, q);
+            d_t3_stage = nullptr;
+        } else {
+            s_free(stats, d_t3_stage);
+        }
         // Tiny: d_t2_xbits_sorted and d_t2_keys_merged are null (parked
         // on host pinned). Free the host buffers instead.
         if (scratch.tiny_mode) {
