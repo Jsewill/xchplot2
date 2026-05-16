@@ -2473,23 +2473,75 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Compute bucket + fine-bucket offsets once; both passes share
         // them. Also zeroes d_counter.
         //
-        // Tiny mode: d_t1_keys_merged is parked on host. The prepare
-        // kernel needs the sorted mi stream on device for its histogram
-        // counts. Briefly rehydrate, run prepare, then free.
-        uint32_t* d_t1_keys_for_prepare = nullptr;
+        // Phase 1.6d — Tiny path computes offsets on host via binary
+        // search on h_t1_keys_merged (sorted by mi), then H2Ds the
+        // small offsets arrays (~33 KB total at k=26) directly to
+        // d_t2_match_temp. Eliminates the 264 MB d_t1_keys_merged_prep
+        // device spike that previously set the T2 match floor.
+        uint32_t const num_buckets_t2_early =
+            (1u << t2p.num_section_bits) * (1u << t2p.num_match_key_bits);
         if (scratch.tiny_mode) {
-            s_malloc(stats, d_t1_keys_for_prepare, cap * sizeof(uint32_t), "d_t1_keys_merged_prep");
-            q.memcpy(d_t1_keys_for_prepare, h_t1_keys_merged,
-                     t1_count * sizeof(uint32_t)).wait();
-        }
-        launch_t2_match_prepare(cfg.plot_id.data(), t2p,
-                                scratch.tiny_mode ? d_t1_keys_for_prepare
-                                                   : d_t1_keys_merged,
-                                t1_count,
-                                d_counter, d_t2_match_temp, &t2_temp_bytes, q);
-        if (scratch.tiny_mode) {
-            s_free(stats, d_t1_keys_for_prepare);
-            d_t1_keys_for_prepare = nullptr;
+            // d_t2_match_temp layout (matches launch_t2_match_prepare):
+            //   [0 .. num_buckets]      = bucket offsets (u64)
+            //   [num_buckets+1 .. + fine_count + 1] = fine offsets (u64)
+            // fine_count = num_buckets * 2^kT2FineBits with kT2FineBits=8.
+            constexpr int kT2FineBitsLocal = 8;
+            uint32_t const num_buckets_t2 = num_buckets_t2_early;
+            uint32_t const fine_count =
+                num_buckets_t2 * (1u << kT2FineBitsLocal);
+            int const bucket_shift = t2p.num_match_target_bits;
+            int const fine_shift   = t2p.num_match_target_bits - kT2FineBitsLocal;
+
+            std::vector<uint64_t> h_bucket_off(num_buckets_t2 + 1);
+            std::vector<uint64_t> h_fine_off  (fine_count + 1);
+
+            // Bucket offsets: for each bucket b in [0, num_buckets],
+            // find first i where (h_t1_keys_merged[i] >> bucket_shift) >= b.
+            h_bucket_off[0] = 0;
+            for (uint32_t b = 1; b <= num_buckets_t2; ++b) {
+                uint64_t lo = h_bucket_off[b - 1], hi = t1_count;
+                while (lo < hi) {
+                    uint64_t mid = lo + (hi - lo) / 2;
+                    uint32_t const bm = h_t1_keys_merged[mid] >> bucket_shift;
+                    if (bm < b) lo = mid + 1;
+                    else        hi = mid;
+                }
+                h_bucket_off[b] = lo;
+            }
+            // Fine offsets: for each (b, f) in [0, num_buckets) x [0, 2^fine_bits],
+            // find first i in [h_bucket_off[b], h_bucket_off[b+1]) where
+            // (h_t1_keys_merged[i] >> fine_shift) >= (b << fine_bits) | f.
+            for (uint32_t b = 0; b < num_buckets_t2; ++b) {
+                uint64_t const b_start = h_bucket_off[b];
+                uint64_t const b_end   = h_bucket_off[b + 1];
+                uint64_t cursor = b_start;
+                for (uint32_t f = 0; f < (1u << kT2FineBitsLocal); ++f) {
+                    uint64_t const fine_idx = (uint64_t(b) << kT2FineBitsLocal) | f;
+                    uint32_t const target_fine = (b << kT2FineBitsLocal) | f;
+                    uint64_t lo = cursor, hi = b_end;
+                    while (lo < hi) {
+                        uint64_t mid = lo + (hi - lo) / 2;
+                        uint32_t const fm = h_t1_keys_merged[mid] >> fine_shift;
+                        if (fm < target_fine) lo = mid + 1;
+                        else                  hi = mid;
+                    }
+                    h_fine_off[fine_idx] = lo;
+                    cursor = lo;
+                }
+            }
+            h_fine_off[fine_count] = h_bucket_off[num_buckets_t2];
+
+            q.memcpy(d_t2_match_temp, h_bucket_off.data(),
+                     (num_buckets_t2 + 1) * sizeof(uint64_t)).wait();
+            q.memcpy(static_cast<uint64_t*>(d_t2_match_temp) + (num_buckets_t2 + 1),
+                     h_fine_off.data(),
+                     (fine_count + 1) * sizeof(uint64_t)).wait();
+            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+        } else {
+            launch_t2_match_prepare(cfg.plot_id.data(), t2p,
+                                    d_t1_keys_merged,
+                                    t1_count,
+                                    d_counter, d_t2_match_temp, &t2_temp_bytes, q);
         }
 
         // Tiny mode: D2H the bucket-offsets table so we can compute each
@@ -3532,20 +3584,65 @@ t3_match_entry:
         // counts. Briefly rehydrate, run prepare, then free again. The
         // 1040 MB spike is bounded to this prepare phase; the subsequent
         // per-section loop reads only sliced mi.
-        uint32_t* d_t2_keys_for_prepare = nullptr;
+        // Phase 1.6d (T3) — Tiny path computes T3 prepare offsets on
+        // host via binary search on h_t2_keys_merged (sorted by mi).
+        // Eliminates the cap-sized d_t2_keys_merged_prep device spike
+        // (264 MB at k=26 / 1 GB at k=28) that previously bounded
+        // T3 match phase from above.
         if (scratch.tiny_mode) {
-            s_malloc(stats, d_t2_keys_for_prepare, cap * sizeof(uint32_t), "d_t2_keys_merged_prep");
-            q.memcpy(d_t2_keys_for_prepare, h_t2_keys_merged,
-                     t2_count * sizeof(uint32_t)).wait();
-        }
-        launch_t3_match_prepare(cfg.plot_id.data(), t3p,
-                                scratch.tiny_mode ? d_t2_keys_for_prepare
-                                                   : d_t2_keys_merged,
-                                t2_count,
-                                d_counter, d_t3_match_temp, &t3_temp_bytes, q);
-        if (scratch.tiny_mode) {
-            s_free(stats, d_t2_keys_for_prepare);
-            d_t2_keys_for_prepare = nullptr;
+            constexpr int kT3FineBitsLocal = 8;
+            uint32_t const num_buckets_t3_p =
+                (1u << t3p.num_section_bits) * (1u << t3p.num_match_key_bits);
+            uint32_t const fine_count =
+                num_buckets_t3_p * (1u << kT3FineBitsLocal);
+            int const bucket_shift = t3p.num_match_target_bits;
+            int const fine_shift   = t3p.num_match_target_bits - kT3FineBitsLocal;
+
+            std::vector<uint64_t> h_bucket_off(num_buckets_t3_p + 1);
+            std::vector<uint64_t> h_fine_off  (fine_count + 1);
+
+            h_bucket_off[0] = 0;
+            for (uint32_t b = 1; b <= num_buckets_t3_p; ++b) {
+                uint64_t lo = h_bucket_off[b - 1], hi = t2_count;
+                while (lo < hi) {
+                    uint64_t mid = lo + (hi - lo) / 2;
+                    uint32_t const bm = h_t2_keys_merged[mid] >> bucket_shift;
+                    if (bm < b) lo = mid + 1;
+                    else        hi = mid;
+                }
+                h_bucket_off[b] = lo;
+            }
+            for (uint32_t b = 0; b < num_buckets_t3_p; ++b) {
+                uint64_t const b_start = h_bucket_off[b];
+                uint64_t const b_end   = h_bucket_off[b + 1];
+                uint64_t cursor = b_start;
+                for (uint32_t f = 0; f < (1u << kT3FineBitsLocal); ++f) {
+                    uint64_t const fine_idx = (uint64_t(b) << kT3FineBitsLocal) | f;
+                    uint32_t const target_fine = (b << kT3FineBitsLocal) | f;
+                    uint64_t lo = cursor, hi = b_end;
+                    while (lo < hi) {
+                        uint64_t mid = lo + (hi - lo) / 2;
+                        uint32_t const fm = h_t2_keys_merged[mid] >> fine_shift;
+                        if (fm < target_fine) lo = mid + 1;
+                        else                  hi = mid;
+                    }
+                    h_fine_off[fine_idx] = lo;
+                    cursor = lo;
+                }
+            }
+            h_fine_off[fine_count] = h_bucket_off[num_buckets_t3_p];
+
+            q.memcpy(d_t3_match_temp, h_bucket_off.data(),
+                     (num_buckets_t3_p + 1) * sizeof(uint64_t)).wait();
+            q.memcpy(static_cast<uint64_t*>(d_t3_match_temp) + (num_buckets_t3_p + 1),
+                     h_fine_off.data(),
+                     (fine_count + 1) * sizeof(uint64_t)).wait();
+            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+        } else {
+            launch_t3_match_prepare(cfg.plot_id.data(), t3p,
+                                    d_t2_keys_merged,
+                                    t2_count,
+                                    d_counter, d_t3_match_temp, &t3_temp_bytes, q);
         }
 
         // D2H the bucket-offsets table (small: 17 × u64 at k=28
@@ -3567,68 +3664,136 @@ t3_match_entry:
 
         int p_t3 = begin_phase("T3 match + Feistel");
         uint64_t host_offset = 0;
-        for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
-            uint32_t const section_r = compute_section_r(section_l);
-            uint64_t const section_l_row_start = h_t3_offsets[section_l * num_match_keys];
-            uint64_t const section_l_row_end   = h_t3_offsets[(section_l + 1) * num_match_keys];
-            uint64_t const section_l_count     = section_l_row_end - section_l_row_start;
-            uint64_t const section_r_row_start = h_t3_offsets[section_r * num_match_keys];
-            uint64_t const section_r_row_end   = h_t3_offsets[(section_r + 1) * num_match_keys];
-            uint64_t const section_r_count     = section_r_row_end - section_r_row_start;
 
-            // Skip empty sections — happens for tiny test plots where
-            // a section has zero rows. The kernel would early-return
-            // anyway but the slice malloc rejects bytes==0 since f1d3c67.
-            if (section_l_count == 0) continue;
-
+        // Phase 1.6c — Tiny T3 sub-section attack: iterate one
+        // bucket_id = (section_l, match_key_r) at a time. L slices
+        // (meta_l + xbits_l) are cached per section_l, R slices
+        // (meta_r + xbits_r + mi_r) are re-loaded per pass at
+        // R-bucket granularity. Saves R-section co-resident bytes:
+        //   meta_r:    128 → 32 MB at k=26 (-96 MB)
+        //   xbits_r:    64 → 16 MB at k=26 (-48 MB)
+        //   mi_r:       64 → 16 MB at k=26 (-48 MB)
+        // T3 match phase live drops 448 → ~256 MB at k=26.
+        if (scratch.tiny_mode) {
+            // Per-section_l L cache.
+            int32_t cur_section_l = -1;
+            uint64_t  cur_l_row_start = 0;
             uint64_t* d_meta_l_slice  = nullptr;
-            uint64_t* d_meta_r_slice  = nullptr;
             uint32_t* d_xbits_l_slice = nullptr;
-            uint32_t* d_xbits_r_slice = nullptr;
-            uint32_t* d_mi_r_slice    = nullptr;
-            s_malloc(stats, d_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
-            if (section_r_count > 0) {
-                s_malloc(stats, d_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t3_meta_r_slice");
-            }
-            if (scratch.tiny_mode) {
-                s_malloc(stats, d_xbits_l_slice, section_l_count * sizeof(uint32_t), "d_t3_xbits_l_slice");
-                if (section_r_count > 0) {
-                    s_malloc(stats, d_xbits_r_slice, section_r_count * sizeof(uint32_t), "d_t3_xbits_r_slice");
-                    s_malloc(stats, d_mi_r_slice,    section_r_count * sizeof(uint32_t), "d_t3_mi_r_slice");
+            auto release_l = [&]() {
+                if (d_xbits_l_slice) { s_free(stats, d_xbits_l_slice); d_xbits_l_slice = nullptr; }
+                if (d_meta_l_slice)  { s_free(stats, d_meta_l_slice);  d_meta_l_slice  = nullptr; }
+                cur_section_l = -1;
+            };
+            auto ensure_l = [&](uint32_t section_l) {
+                if (static_cast<int32_t>(section_l) == cur_section_l) return;
+                release_l();
+                cur_l_row_start = h_t3_offsets[section_l * num_match_keys];
+                uint64_t const l_end = h_t3_offsets[(section_l + 1) * num_match_keys];
+                uint64_t const l_count = l_end - cur_l_row_start;
+                if (l_count > 0) {
+                    s_malloc(stats, d_meta_l_slice,
+                             l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
+                    s_malloc(stats, d_xbits_l_slice,
+                             l_count * sizeof(uint32_t), "d_t3_xbits_l_slice");
+                    q.memcpy(d_meta_l_slice, h_t2_meta + cur_l_row_start,
+                             l_count * sizeof(uint64_t)).wait();
+                    q.memcpy(d_xbits_l_slice, h_t2_xbits + cur_l_row_start,
+                             l_count * sizeof(uint32_t)).wait();
                 }
-            }
+                cur_section_l = static_cast<int32_t>(section_l);
+            };
 
-            q.memcpy(d_meta_l_slice, h_t2_meta + section_l_row_start,
-                     section_l_count * sizeof(uint64_t)).wait();
-            if (section_r_count > 0) {
-                q.memcpy(d_meta_r_slice, h_t2_meta + section_r_row_start,
-                         section_r_count * sizeof(uint64_t)).wait();
-            }
-            if (scratch.tiny_mode) {
-                q.memcpy(d_xbits_l_slice, h_t2_xbits + section_l_row_start,
-                         section_l_count * sizeof(uint32_t)).wait();
-                if (section_r_count > 0) {
-                    q.memcpy(d_xbits_r_slice, h_t2_xbits + section_r_row_start,
-                             section_r_count * sizeof(uint32_t)).wait();
-                    q.memcpy(d_mi_r_slice, h_t2_keys_merged + section_r_row_start,
-                             section_r_count * sizeof(uint32_t)).wait();
-                }
-            }
+            for (uint32_t bucket_id = 0; bucket_id < num_buckets_t3; ++bucket_id) {
+                uint32_t const section_l   = bucket_id / num_match_keys;
+                uint32_t const section_r   = compute_section_r(section_l);
+                uint32_t const mk          = bucket_id % num_match_keys;
+                uint32_t const r_bucket_id = section_r * num_match_keys + mk;
 
-            uint32_t const bucket_begin = section_l * num_match_keys;
-            uint32_t const bucket_end   = (section_l + 1) * num_match_keys;
-            if (scratch.tiny_mode) {
-                if (section_r_count > 0) {
+                uint64_t const l_count =
+                    h_t3_offsets[section_l * num_match_keys + num_match_keys] -
+                    h_t3_offsets[section_l * num_match_keys];
+                if (l_count == 0) continue;
+                ensure_l(section_l);
+
+                uint64_t const r_row_start = h_t3_offsets[r_bucket_id];
+                uint64_t const r_row_end   = h_t3_offsets[r_bucket_id + 1];
+                uint64_t const r_count     = r_row_end - r_row_start;
+
+                uint64_t* d_meta_r_slice  = nullptr;
+                uint32_t* d_xbits_r_slice = nullptr;
+                uint32_t* d_mi_r_slice    = nullptr;
+                if (r_count > 0) {
+                    s_malloc(stats, d_meta_r_slice,
+                             r_count * sizeof(uint64_t), "d_t3_meta_r_bucket");
+                    s_malloc(stats, d_xbits_r_slice,
+                             r_count * sizeof(uint32_t), "d_t3_xbits_r_bucket");
+                    s_malloc(stats, d_mi_r_slice,
+                             r_count * sizeof(uint32_t), "d_t3_mi_r_bucket");
+                    q.memcpy(d_meta_r_slice, h_t2_meta + r_row_start,
+                             r_count * sizeof(uint64_t)).wait();
+                    q.memcpy(d_xbits_r_slice, h_t2_xbits + r_row_start,
+                             r_count * sizeof(uint32_t)).wait();
+                    q.memcpy(d_mi_r_slice, h_t2_keys_merged + r_row_start,
+                             r_count * sizeof(uint32_t)).wait();
+
                     launch_t3_match_section_pair_split_range(
                         cfg.plot_id.data(), t3p,
-                        d_meta_l_slice, d_xbits_l_slice, section_l_row_start,
-                        d_meta_r_slice, d_xbits_r_slice, d_mi_r_slice, section_r_row_start,
+                        d_meta_l_slice, d_xbits_l_slice, cur_l_row_start,
+                        d_meta_r_slice, d_xbits_r_slice, d_mi_r_slice, r_row_start,
                         d_t3_stage, d_counter, t3_section_cap,
-                        d_t3_match_temp, bucket_begin, bucket_end, q);
+                        d_t3_match_temp, bucket_id, bucket_id + 1, q);
+
+                    uint64_t pass_count = 0;
+                    q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+                    if (pass_count > t3_section_cap) {
+                        throw std::runtime_error(
+                            "T3 match (sub-section) bucket_id=" +
+                            std::to_string(bucket_id) +
+                            " produced " + std::to_string(pass_count) +
+                            " pairs, staging holds " + std::to_string(t3_section_cap));
+                    }
+                    q.memcpy(h_t3 + host_offset, d_t3_stage,
+                             pass_count * sizeof(T3PairingGpu)).wait();
+                    host_offset += pass_count;
+                    q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+
+                    s_free(stats, d_mi_r_slice);
+                    s_free(stats, d_xbits_r_slice);
+                    s_free(stats, d_meta_r_slice);
                 }
-                // section_r_count == 0 → no pairings can form; skip kernel
-                // (output count for this section is 0).
-            } else {
+            }
+            release_l();
+        } else {
+            // Non-tiny (minimal): existing per-section loop preserved.
+            for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
+                uint32_t const section_r = compute_section_r(section_l);
+                uint64_t const section_l_row_start = h_t3_offsets[section_l * num_match_keys];
+                uint64_t const section_l_row_end   = h_t3_offsets[(section_l + 1) * num_match_keys];
+                uint64_t const section_l_count     = section_l_row_end - section_l_row_start;
+                uint64_t const section_r_row_start = h_t3_offsets[section_r * num_match_keys];
+                uint64_t const section_r_row_end   = h_t3_offsets[(section_r + 1) * num_match_keys];
+                uint64_t const section_r_count     = section_r_row_end - section_r_row_start;
+
+                if (section_l_count == 0) continue;
+
+                uint64_t* d_meta_l_slice = nullptr;
+                uint64_t* d_meta_r_slice = nullptr;
+                s_malloc(stats, d_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
+                if (section_r_count > 0) {
+                    s_malloc(stats, d_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t3_meta_r_slice");
+                }
+
+                q.memcpy(d_meta_l_slice, h_t2_meta + section_l_row_start,
+                         section_l_count * sizeof(uint64_t)).wait();
+                if (section_r_count > 0) {
+                    q.memcpy(d_meta_r_slice, h_t2_meta + section_r_row_start,
+                             section_r_count * sizeof(uint64_t)).wait();
+                }
+
+                uint32_t const bucket_begin = section_l * num_match_keys;
+                uint32_t const bucket_end   = (section_l + 1) * num_match_keys;
+
                 launch_t3_match_section_pair_range(
                     cfg.plot_id.data(), t3p,
                     d_meta_l_slice, section_l_row_start,
@@ -3636,29 +3801,24 @@ t3_match_entry:
                     d_t2_xbits_sorted, d_t2_keys_merged, t2_count,
                     d_t3_stage, d_counter, t3_section_cap,
                     d_t3_match_temp, bucket_begin, bucket_end, q);
-            }
 
-            uint64_t pass_count = 0;
-            q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
-            if (pass_count > t3_section_cap) {
-                throw std::runtime_error(
-                    "T3 match (sliced) section_l=" + std::to_string(section_l) +
-                    " produced " + std::to_string(pass_count) +
-                    " pairs, staging holds " + std::to_string(t3_section_cap) +
-                    " (50% over uniform avg). Lower N or widen t3_section_cap safety factor.");
-            }
-            q.memcpy(h_t3 + host_offset, d_t3_stage,
-                     pass_count * sizeof(T3PairingGpu)).wait();
-            host_offset += pass_count;
-            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+                uint64_t pass_count = 0;
+                q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+                if (pass_count > t3_section_cap) {
+                    throw std::runtime_error(
+                        "T3 match (sliced) section_l=" + std::to_string(section_l) +
+                        " produced " + std::to_string(pass_count) +
+                        " pairs, staging holds " + std::to_string(t3_section_cap) +
+                        " (50% over uniform avg). Lower N or widen t3_section_cap safety factor.");
+                }
+                q.memcpy(h_t3 + host_offset, d_t3_stage,
+                         pass_count * sizeof(T3PairingGpu)).wait();
+                host_offset += pass_count;
+                q.memset(d_counter, 0, sizeof(uint64_t)).wait();
 
-            if (scratch.tiny_mode) {
-                if (d_mi_r_slice)    s_free(stats, d_mi_r_slice);
-                if (d_xbits_r_slice) s_free(stats, d_xbits_r_slice);
-                s_free(stats, d_xbits_l_slice);
+                if (section_r_count > 0) s_free(stats, d_meta_r_slice);
+                s_free(stats, d_meta_l_slice);
             }
-            if (section_r_count > 0) s_free(stats, d_meta_r_slice);
-            s_free(stats, d_meta_l_slice);
         }
         end_phase(p_t3);
 
