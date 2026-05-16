@@ -1441,9 +1441,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // d_xs is freed.
         uint32_t const t1_num_sections   = 1u << t1p.num_section_bits;
         uint32_t const t1_num_match_keys = 1u << t1p.num_match_key_bits;
+        uint32_t const t1_num_buckets    = t1_num_sections * t1_num_match_keys;
         // 25% safety over the per-section average expected output.
         uint64_t const t1_section_cap =
             ((cap + t1_num_sections - 1) / t1_num_sections) * 5ULL / 4ULL;
+        // Phase 1.6a — Tiny per-(section_l, match_key_r) sub-pass cap:
+        // staging only needs to hold one bucket's match output, not the
+        // full section's. Same 25% safety. Drops staging from ~247 MB
+        // (165 d_t1_meta_stage + 82 d_t1_mi_stage) to ~62 MB at k=26.
+        uint64_t const t1_bucket_pair_cap =
+            ((cap + t1_num_buckets - 1) / t1_num_buckets) * 5ULL / 4ULL;
+        uint64_t const t1_stage_cap =
+            scratch.tiny_mode ? t1_bucket_pair_cap : t1_section_cap;
 
         s_malloc(stats, d_t1_match_temp, t1_temp_bytes, "d_t1_match_temp");
 
@@ -1477,8 +1486,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Per-pass staging device buffers (cap/N).
         uint64_t* d_t1_meta_stage = nullptr;
         uint32_t* d_t1_mi_stage   = nullptr;
-        s_malloc(stats, d_t1_meta_stage, t1_section_cap * sizeof(uint64_t), "d_t1_meta_stage");
-        s_malloc(stats, d_t1_mi_stage,   t1_section_cap * sizeof(uint32_t), "d_t1_mi_stage");
+        s_malloc(stats, d_t1_meta_stage, t1_stage_cap * sizeof(uint64_t), "d_t1_meta_stage");
+        s_malloc(stats, d_t1_mi_stage,   t1_stage_cap * sizeof(uint32_t), "d_t1_mi_stage");
 
         if (char const* v = std::getenv("POS2GPU_T1_DEBUG"); v && v[0] == '1') {
             uint64_t const sample_n = (total_xs < 16ULL) ? total_xs : 16ULL;
@@ -1517,17 +1526,58 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             return ((rl1 >> 1) | (rl1 << (ns_bits - 1))) & (num_secs - 1);
         };
 
+        // Phase 1.6a — Tiny sub-section attack: process each (section_l,
+        // match_key_r) bucket-pair independently. The kernel reads L
+        // from d_offsets[section_l*nmk..(section_l+1)*nmk] (full
+        // section_l) but only ONE r_bucket per bucket_id. So we can
+        // fetch L_full + R_one_bucket per pass and shrink the tile
+        // from L+R (256 MB at k=26) to L+R/N where N=num_match_keys
+        // (160 MB at k=26 / 1280 MB at k=28).
+        //
+        // Pre-compute per-section per-bucket entry boundaries in
+        // h_xs_pinned (sorted by match_info, so within section_s the
+        // buckets are contiguous; binary search the boundaries).
+        std::vector<std::vector<uint64_t>> section_bucket_starts;
         XsCandidateGpu* d_xs_tile = nullptr;
         uint64_t        max_pair  = 0;
         if (scratch.tiny_mode) {
+            int const t1_bucket_shift = t1p.num_match_target_bits;
+            section_bucket_starts.assign(
+                num_secs, std::vector<uint64_t>(t1_num_match_keys + 1));
             for (uint32_t s = 0; s < num_secs; ++s) {
-                uint64_t const sl = h_xs_section_starts[s + 1] -
-                                    h_xs_section_starts[s];
+                uint64_t const s_off  = h_xs_section_starts[s];
+                uint64_t const s_size = h_xs_section_starts[s + 1] - s_off;
+                section_bucket_starts[s][0] = 0;
+                section_bucket_starts[s][t1_num_match_keys] = s_size;
+                for (uint32_t b = 1; b < t1_num_match_keys; ++b) {
+                    uint32_t const target_bucket = s * t1_num_match_keys + b;
+                    uint64_t lo = 0, hi = s_size;
+                    while (lo < hi) {
+                        uint64_t mid = lo + (hi - lo) / 2;
+                        uint32_t const bm =
+                            h_xs_pinned[s_off + mid].match_info >> t1_bucket_shift;
+                        if (bm < target_bucket) lo = mid + 1;
+                        else                    hi = mid;
+                    }
+                    section_bucket_starts[s][b] = lo;
+                }
+            }
+
+            // Sub-tile size = max over all section pairs of
+            // (L_section_size + max R bucket in matching R section).
+            for (uint32_t s = 0; s < num_secs; ++s) {
+                uint64_t const sl_size =
+                    h_xs_section_starts[s + 1] - h_xs_section_starts[s];
                 uint32_t const sr = matching_section(s);
-                uint64_t const sr_size = h_xs_section_starts[sr + 1] -
-                                         h_xs_section_starts[sr];
-                uint64_t const pair = sl + sr_size;
-                if (pair > max_pair) max_pair = pair;
+                uint64_t r_max_bucket = 0;
+                for (uint32_t b = 0; b < t1_num_match_keys; ++b) {
+                    uint64_t const b_size =
+                        section_bucket_starts[sr][b + 1] -
+                        section_bucket_starts[sr][b];
+                    if (b_size > r_max_bucket) r_max_bucket = b_size;
+                }
+                uint64_t const sub_pair = sl_size + r_max_bucket;
+                if (sub_pair > max_pair) max_pair = sub_pair;
             }
             s_malloc(stats, d_xs_tile,
                      max_pair * sizeof(XsCandidateGpu), "d_xs_tile_pinned");
@@ -1536,54 +1586,102 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         int p_t1 = begin_phase("T1 match");
         uint64_t host_offset = 0;
         for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
-            uint32_t const bucket_begin = section_l * t1_num_match_keys;
-            uint32_t const bucket_end   = (section_l + 1) * t1_num_match_keys;
-
-            XsCandidateGpu const* d_xs_for_pass = d_xs;
-            uint64_t              total_for_pass = total_xs;
             if (scratch.tiny_mode) {
-                uint32_t const section_r  = matching_section(section_l);
-                uint32_t const section_lo = std::min(section_l, section_r);
-                uint32_t const section_hi = std::max(section_l, section_r);
-                uint64_t const lo_off = h_xs_section_starts[section_lo];
-                uint64_t const lo_n   = h_xs_section_starts[section_lo + 1] - lo_off;
-                uint64_t const hi_off = h_xs_section_starts[section_hi];
-                uint64_t const hi_n   = h_xs_section_starts[section_hi + 1] - hi_off;
-                total_for_pass = lo_n + hi_n;
+                // N = num_match_keys sub-passes per section_l. Each
+                // pass: L (full section_l) + R (one bucket of
+                // section_r), processing the one bucket_id =
+                // section_l*nmk + mk that hits that R bucket.
+                uint32_t const section_r = matching_section(section_l);
+                uint64_t const l_off = h_xs_section_starts[section_l];
+                uint64_t const l_n   = h_xs_section_starts[section_l + 1] - l_off;
+                uint64_t const r_sec_off = h_xs_section_starts[section_r];
 
-                // Smaller section first (kernel's bucket-offset binary
-                // search demands a tile sorted by bucket number).
-                q.memcpy(d_xs_tile,         h_xs_pinned + lo_off,
-                         lo_n * sizeof(XsCandidateGpu));
-                q.memcpy(d_xs_tile + lo_n,  h_xs_pinned + hi_off,
-                         hi_n * sizeof(XsCandidateGpu)).wait();
+                for (uint32_t mk = 0; mk < t1_num_match_keys; ++mk) {
+                    uint64_t const r_buck_off_in_sec =
+                        section_bucket_starts[section_r][mk];
+                    uint64_t const r_buck_n =
+                        section_bucket_starts[section_r][mk + 1] -
+                        r_buck_off_in_sec;
+                    uint64_t const r_buck_abs_off = r_sec_off + r_buck_off_in_sec;
+                    uint64_t const total_for_pass = l_n + r_buck_n;
+                    uint32_t const bucket_begin =
+                        section_l * t1_num_match_keys + mk;
+                    uint32_t const bucket_end   = bucket_begin + 1;
 
-                launch_t1_match_prepare(
-                    cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
-                    d_counter, d_t1_match_temp, &t1_temp_bytes, q);
-                d_xs_for_pass = d_xs_tile;
+                    // Smaller section first — L section has bucket_ids
+                    // [section_l*nmk, (section_l+1)*nmk); R bucket has
+                    // bucket_id section_r*nmk + mk. The single-R-bucket
+                    // bucket_id is uniformly above or below all L
+                    // bucket_ids based on section_l vs section_r.
+                    if (section_l < section_r) {
+                        q.memcpy(d_xs_tile,
+                                 h_xs_pinned + l_off,
+                                 l_n * sizeof(XsCandidateGpu));
+                        q.memcpy(d_xs_tile + l_n,
+                                 h_xs_pinned + r_buck_abs_off,
+                                 r_buck_n * sizeof(XsCandidateGpu)).wait();
+                    } else {
+                        q.memcpy(d_xs_tile,
+                                 h_xs_pinned + r_buck_abs_off,
+                                 r_buck_n * sizeof(XsCandidateGpu));
+                        q.memcpy(d_xs_tile + r_buck_n,
+                                 h_xs_pinned + l_off,
+                                 l_n * sizeof(XsCandidateGpu)).wait();
+                    }
+
+                    launch_t1_match_prepare(
+                        cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
+                        d_counter, d_t1_match_temp, &t1_temp_bytes, q);
+
+                    launch_t1_match_range(
+                        cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
+                        d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_stage_cap,
+                        d_t1_match_temp, bucket_begin, bucket_end, q);
+
+                    uint64_t pass_count = 0;
+                    q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+                    if (pass_count > t1_stage_cap) {
+                        throw std::runtime_error(
+                            "T1 match (sub-section) section_l=" +
+                            std::to_string(section_l) +
+                            " mk=" + std::to_string(mk) +
+                            " produced " + std::to_string(pass_count) +
+                            " pairs, staging holds " + std::to_string(t1_stage_cap) +
+                            ". Increase t1_bucket_pair_cap safety factor.");
+                    }
+                    q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
+                             pass_count * sizeof(uint64_t)).wait();
+                    q.memcpy(h_t1_mi   + host_offset, d_t1_mi_stage,
+                             pass_count * sizeof(uint32_t)).wait();
+                    host_offset += pass_count;
+                    q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+                }
+            } else {
+                // Non-tiny: existing per-section pass (no sub-bucket).
+                uint32_t const bucket_begin = section_l * t1_num_match_keys;
+                uint32_t const bucket_end   = (section_l + 1) * t1_num_match_keys;
+
+                launch_t1_match_range(
+                    cfg.plot_id.data(), t1p, d_xs, total_xs,
+                    d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_stage_cap,
+                    d_t1_match_temp, bucket_begin, bucket_end, q);
+
+                uint64_t pass_count = 0;
+                q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+                if (pass_count > t1_stage_cap) {
+                    throw std::runtime_error(
+                        "T1 match (sliced) section_l=" + std::to_string(section_l) +
+                        " produced " + std::to_string(pass_count) +
+                        " pairs, staging holds " + std::to_string(t1_stage_cap) +
+                        ". Increase t1_section_cap safety factor.");
+                }
+                q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
+                         pass_count * sizeof(uint64_t)).wait();
+                q.memcpy(h_t1_mi   + host_offset, d_t1_mi_stage,
+                         pass_count * sizeof(uint32_t)).wait();
+                host_offset += pass_count;
+                q.memset(d_counter, 0, sizeof(uint64_t)).wait();
             }
-
-            launch_t1_match_range(
-                cfg.plot_id.data(), t1p, d_xs_for_pass, total_for_pass,
-                d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_section_cap,
-                d_t1_match_temp, bucket_begin, bucket_end, q);
-
-            uint64_t pass_count = 0;
-            q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
-            if (pass_count > t1_section_cap) {
-                throw std::runtime_error(
-                    "T1 match (sliced) section_l=" + std::to_string(section_l) +
-                    " produced " + std::to_string(pass_count) +
-                    " pairs, staging holds " + std::to_string(t1_section_cap) +
-                    ". Increase t1_section_cap safety factor.");
-            }
-            q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
-                     pass_count * sizeof(uint64_t)).wait();
-            q.memcpy(h_t1_mi   + host_offset, d_t1_mi_stage,
-                     pass_count * sizeof(uint32_t)).wait();
-            host_offset += pass_count;
-            q.memset(d_counter, 0, sizeof(uint64_t)).wait();
         }
         end_phase(p_t1);
 
