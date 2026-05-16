@@ -2393,19 +2393,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 " exceeds t2_num_buckets " + std::to_string(t2_num_buckets));
         }
         uint64_t const t2_tile_cap = (cap + uint64_t(N) - 1) / uint64_t(N);
+        // Phase 1.6b — Tiny per-bucket-pair cap: one bucket_id per pass.
+        // Halves staging vs the t2_tile_cap that the t2_tile_count=8
+        // Tiny default produced.
+        uint64_t const t2_bucket_pair_cap =
+            ((cap + uint64_t(t2_num_buckets) - 1) / uint64_t(t2_num_buckets)) * 5ULL / 4ULL;
+        uint64_t const t2_stage_cap =
+            scratch.tiny_mode ? t2_bucket_pair_cap : t2_tile_cap;
 
         size_t t2_temp_bytes = 0;
         launch_t2_match_prepare(cfg.plot_id.data(), t2p, nullptr, t1_count,
                                 d_counter, nullptr, &t2_temp_bytes, q);
 
-        // Tile-cap device staging (reused across all N passes).
+        // Tile-cap device staging (reused across all passes).
         uint64_t* d_t2_meta_stage  = nullptr;
         uint32_t* d_t2_mi_stage    = nullptr;
         uint32_t* d_t2_xbits_stage = nullptr;
         void*     d_t2_match_temp  = nullptr;
-        s_malloc(stats, d_t2_meta_stage,  t2_tile_cap * sizeof(uint64_t), "d_t2_meta_stage");
-        s_malloc(stats, d_t2_mi_stage,    t2_tile_cap * sizeof(uint32_t), "d_t2_mi_stage");
-        s_malloc(stats, d_t2_xbits_stage, t2_tile_cap * sizeof(uint32_t), "d_t2_xbits_stage");
+        s_malloc(stats, d_t2_meta_stage,  t2_stage_cap * sizeof(uint64_t), "d_t2_meta_stage");
+        s_malloc(stats, d_t2_mi_stage,    t2_stage_cap * sizeof(uint32_t), "d_t2_mi_stage");
+        s_malloc(stats, d_t2_xbits_stage, t2_stage_cap * sizeof(uint32_t), "d_t2_xbits_stage");
         s_malloc(stats, d_t2_match_temp,  t2_temp_bytes,                  "d_t2_match_temp");
 
         // Full-cap pinned host that will hold the concatenated T2 output.
@@ -2511,12 +2518,22 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Per-section state (tiny only): re-allocate slices when the
         // pass crosses into a new section_l. Slices stay on device for
         // all passes within a section.
+        //
+        // Phase 1.6b — Tiny sub-section attack on T2: only L slice is
+        // cached per section_l now. R is loaded per (section_l, mk)
+        // bucket-pair sub-pass since the kernel iterates one bucket_id
+        // at a time. Saves R-section co-resident bytes:
+        //   meta_r:  128 → 32 MB at k=26 (-96 MB)
+        //   mi_r:     64 → 16 MB at k=26 (-48 MB)
+        // Combined with smaller per-bucket-pair staging cap below,
+        // T2 match phase live drops ~452 → ~264 MB at k=26.
         int32_t  cur_section_l = -1;
         uint64_t cur_section_l_row_start = 0;
-        uint64_t cur_section_r_row_start = 0;
         uint64_t* d_t2_meta_l_slice = nullptr;
+        // Per-pass R bucket slices (Tiny only) — re-allocated per pass.
         uint64_t* d_t2_meta_r_slice = nullptr;
         uint32_t* d_t2_mi_r_slice   = nullptr;
+        uint64_t cur_r_slice_row_start = 0;
 
         auto release_t2_slices = [&]() {
             if (d_t2_mi_r_slice)   { s_free(stats, d_t2_mi_r_slice);   d_t2_mi_r_slice   = nullptr; }
@@ -2525,77 +2542,72 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             cur_section_l = -1;
         };
 
-        auto ensure_t2_slices = [&](uint32_t section_l) {
+        // Tiny: ensure L is loaded for the section_l of the bucket about
+        // to be processed. L stays on device until section_l changes.
+        // R is NOT loaded here — load_t2_r_bucket handles each pass's R.
+        auto ensure_t2_l_slice = [&](uint32_t section_l) {
             if (static_cast<int32_t>(section_l) == cur_section_l) return;
-            release_t2_slices();
+            if (d_t2_meta_l_slice) { s_free(stats, d_t2_meta_l_slice); d_t2_meta_l_slice = nullptr; }
 
-            uint32_t const section_r = compute_section_r_t2(section_l);
             cur_section_l_row_start = h_t2_bucket_offsets[section_l * num_match_keys_t2];
             uint64_t section_l_row_end =
                 h_t2_bucket_offsets[(section_l + 1) * num_match_keys_t2];
             uint64_t section_l_count = section_l_row_end - cur_section_l_row_start;
-            cur_section_r_row_start = h_t2_bucket_offsets[section_r * num_match_keys_t2];
-            uint64_t section_r_row_end =
-                h_t2_bucket_offsets[(section_r + 1) * num_match_keys_t2];
-            uint64_t section_r_count = section_r_row_end - cur_section_r_row_start;
 
             if (section_l_count > 0) {
                 s_malloc(stats, d_t2_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t2_meta_l_slice");
                 q.memcpy(d_t2_meta_l_slice, h_t1_meta + cur_section_l_row_start,
                          section_l_count * sizeof(uint64_t)).wait();
             }
-            if (section_r_count > 0) {
-                s_malloc(stats, d_t2_meta_r_slice, section_r_count * sizeof(uint64_t), "d_t2_meta_r_slice");
-                s_malloc(stats, d_t2_mi_r_slice,   section_r_count * sizeof(uint32_t), "d_t2_mi_r_slice");
-                q.memcpy(d_t2_meta_r_slice, h_t1_meta + cur_section_r_row_start,
-                         section_r_count * sizeof(uint64_t)).wait();
-                q.memcpy(d_t2_mi_r_slice, h_t1_keys_merged + cur_section_r_row_start,
-                         section_r_count * sizeof(uint32_t)).wait();
-            }
             cur_section_l = static_cast<int32_t>(section_l);
+        };
+
+        // Tiny: load one R bucket's worth of meta+mi from host pinned.
+        // r_bucket_id = section_r * num_match_keys_t2 + match_key_r.
+        // Returns the row start in the original t1 stream (used as the
+        // kernel's section_r_row_start = base offset for r-index math).
+        // Caller frees via release_r_bucket below.
+        auto load_t2_r_bucket = [&](uint32_t r_bucket_id) -> uint64_t {
+            uint64_t const r_start = h_t2_bucket_offsets[r_bucket_id];
+            uint64_t const r_end   = h_t2_bucket_offsets[r_bucket_id + 1];
+            uint64_t const r_count = r_end - r_start;
+            if (r_count == 0) {
+                cur_r_slice_row_start = r_start;
+                return r_start;
+            }
+            s_malloc(stats, d_t2_meta_r_slice, r_count * sizeof(uint64_t), "d_t2_meta_r_bucket");
+            s_malloc(stats, d_t2_mi_r_slice,   r_count * sizeof(uint32_t), "d_t2_mi_r_bucket");
+            q.memcpy(d_t2_meta_r_slice, h_t1_meta + r_start,
+                     r_count * sizeof(uint64_t)).wait();
+            q.memcpy(d_t2_mi_r_slice, h_t1_keys_merged + r_start,
+                     r_count * sizeof(uint32_t)).wait();
+            cur_r_slice_row_start = r_start;
+            return r_start;
+        };
+        auto release_r_bucket = [&]() {
+            if (d_t2_mi_r_slice)   { s_free(stats, d_t2_mi_r_slice);   d_t2_mi_r_slice   = nullptr; }
+            if (d_t2_meta_r_slice) { s_free(stats, d_t2_meta_r_slice); d_t2_meta_r_slice = nullptr; }
         };
 
         auto run_pass_and_stage = [&](uint32_t bucket_begin, uint32_t bucket_end,
                                       uint64_t host_offset) -> uint64_t
         {
-            if (scratch.tiny_mode) {
-                // Tiny: every pass must fit entirely in one section_l,
-                // so caller (the loop below) is responsible for chunking
-                // at section boundaries.
-                uint32_t const section_l = bucket_begin / num_match_keys_t2;
-                if (bucket_end > 0 && (bucket_end - 1) / num_match_keys_t2 != section_l) {
-                    throw std::runtime_error(
-                        "tiny T2 match: pass [" + std::to_string(bucket_begin) +
-                        "," + std::to_string(bucket_end) +
-                        ") crosses section_l boundary (num_match_keys=" +
-                        std::to_string(num_match_keys_t2) + ")");
-                }
-                ensure_t2_slices(section_l);
-                if (d_t2_meta_l_slice && d_t2_meta_r_slice && d_t2_mi_r_slice) {
-                    launch_t2_match_section_pair_split_range(
-                        cfg.plot_id.data(), t2p,
-                        d_t2_meta_l_slice, cur_section_l_row_start,
-                        d_t2_meta_r_slice, d_t2_mi_r_slice, cur_section_r_row_start,
-                        d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                        d_counter, t2_tile_cap, d_t2_match_temp,
-                        bucket_begin, bucket_end, q);
-                }
-                // Empty section pair → no pairings, fall through to drain.
-            } else {
-                launch_t2_match_range(cfg.plot_id.data(), t2p,
-                                      d_t1_meta_sorted, d_t1_keys_merged, t1_count,
-                                      d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
-                                      d_counter, t2_tile_cap, d_t2_match_temp,
-                                      bucket_begin, bucket_end, q);
-            }
+            // Phase 1.6b — Tiny path is now per-bucket-pair, see the
+            // dedicated loop below. This lambda is only called from the
+            // non-tiny path.
+            launch_t2_match_range(cfg.plot_id.data(), t2p,
+                                  d_t1_meta_sorted, d_t1_keys_merged, t1_count,
+                                  d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                                  d_counter, t2_stage_cap, d_t2_match_temp,
+                                  bucket_begin, bucket_end, q);
             uint64_t pass_count = 0;
             q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
-            if (pass_count > t2_tile_cap) {
+            if (pass_count > t2_stage_cap) {
                 throw std::runtime_error(
                     "T2 match pass overflow: bucket range [" +
                     std::to_string(bucket_begin) + "," + std::to_string(bucket_end) +
                     ") produced " + std::to_string(pass_count) +
-                    " pairs, staging holds " + std::to_string(t2_tile_cap) +
+                    " pairs, staging holds " + std::to_string(t2_stage_cap) +
                     " (consider lower N or fall back to compact tier).");
             }
             q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
@@ -2609,36 +2621,48 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         int p_t2 = begin_phase("T2 match");
         t2_count = 0;
         if (scratch.tiny_mode) {
-            // Section-aware iteration: for each section_l, run all
-            // passes whose [bucket_begin, bucket_end) range falls in
-            // that section's bucket range. With t2_tile_count=N and
-            // num_match_keys_t2 per section, alignment requires
-            // num_buckets/N to divide num_match_keys_t2 evenly OR
-            // num_match_keys_t2 to divide num_buckets/N evenly. The
-            // latter would put multiple sections in one pass (which
-            // would cross slice boundaries) — guard against it.
-            uint32_t const pass_size = num_buckets_t2 / uint32_t(N);
-            if (pass_size > num_match_keys_t2) {
-                throw std::runtime_error(
-                    "tiny T2 match: pass spans multiple sections "
-                    "(pass_size=" + std::to_string(pass_size) +
-                    ", num_match_keys=" + std::to_string(num_match_keys_t2) +
-                    "). Increase t2_tile_count.");
-            }
-            if (num_match_keys_t2 % pass_size != 0) {
-                throw std::runtime_error(
-                    "tiny T2 match: pass_size " + std::to_string(pass_size) +
-                    " does not evenly divide num_match_keys " +
-                    std::to_string(num_match_keys_t2) +
-                    ". Use t2_tile_count = power-of-2 multiple of num_sections.");
-            }
-            for (int pass = 0; pass < N; ++pass) {
-                uint32_t const bucket_begin =
-                    uint32_t(uint64_t(pass)     * num_buckets_t2 / uint64_t(N));
-                uint32_t const bucket_end =
-                    uint32_t(uint64_t(pass + 1) * num_buckets_t2 / uint64_t(N));
-                t2_count += run_pass_and_stage(bucket_begin, bucket_end,
-                                               /*host_offset=*/t2_count);
+            // Per-bucket-pair sub-section attack. For each bucket_id,
+            // ensure L is loaded for its section_l (cached across the
+            // section's num_match_keys_t2 passes), load only the matching
+            // R bucket, run the kernel for just this one bucket_id,
+            // accumulate, free R, repeat.
+            for (uint32_t bucket_id = 0; bucket_id < num_buckets_t2; ++bucket_id) {
+                uint32_t const section_l = bucket_id / num_match_keys_t2;
+                uint32_t const section_r = compute_section_r_t2(section_l);
+                uint32_t const mk        = bucket_id % num_match_keys_t2;
+                uint32_t const r_bucket_id = section_r * num_match_keys_t2 + mk;
+
+                ensure_t2_l_slice(section_l);
+                uint64_t const r_row_start = load_t2_r_bucket(r_bucket_id);
+
+                if (d_t2_meta_l_slice &&
+                    (d_t2_meta_r_slice || h_t2_bucket_offsets[r_bucket_id + 1] ==
+                                          h_t2_bucket_offsets[r_bucket_id]))
+                {
+                    launch_t2_match_section_pair_split_range(
+                        cfg.plot_id.data(), t2p,
+                        d_t2_meta_l_slice, cur_section_l_row_start,
+                        d_t2_meta_r_slice, d_t2_mi_r_slice, r_row_start,
+                        d_t2_meta_stage, d_t2_mi_stage, d_t2_xbits_stage,
+                        d_counter, t2_stage_cap, d_t2_match_temp,
+                        bucket_id, bucket_id + 1, q);
+
+                    uint64_t pass_count = 0;
+                    q.memcpy(&pass_count, d_counter, sizeof(uint64_t)).wait();
+                    if (pass_count > t2_stage_cap) {
+                        throw std::runtime_error(
+                            "tiny T2 match bucket " + std::to_string(bucket_id) +
+                            " produced " + std::to_string(pass_count) +
+                            " pairs, staging holds " + std::to_string(t2_stage_cap));
+                    }
+                    q.memcpy(h_t2_meta  + t2_count, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
+                    q.memcpy(h_t2_mi    + t2_count, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
+                    q.memcpy(h_t2_xbits + t2_count, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
+                    q.wait();
+                    q.memset(d_counter, 0, sizeof(uint64_t)).wait();
+                    t2_count += pass_count;
+                }
+                release_r_bucket();
             }
             release_t2_slices();
         } else {
