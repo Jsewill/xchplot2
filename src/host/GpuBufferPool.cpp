@@ -477,19 +477,20 @@ size_t streaming_minimal_peak_bytes(int k)
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Anchor: 1250 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
+    // Anchor: 1100 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
     // algorithms that were originally developed under the "Pinned"
     // tier name. After Phase 1.6 sub-section attacks (per-bucket-pair
-    // T1/T2/T3 match + host-side T2/T3 prepare offsets), measured on
-    // RTX 4090:
-    //   k=22:  ~22 MB →  ~352 MB extrapolated at k=28
-    //   k=24:   92 MB → ~1472 MB extrapolated at k=28
-    //   k=26:  288 MB → ~1152 MB extrapolated at k=28
-    // The k=24 → k=28 extrapolation is the conservative one; set
-    // anchor to 1250 MB — ~8% safety margin above the k=26 → k=28
-    // line. The current floor is T2 sort scratch (CUB tile_max-sized
-    // workspace at 288 MB at k=26 / ~1152 MB at k=28); the match
-    // phases are all at ~256 MB.
+    // T1/T2/T3 match + host-side T2/T3 prepare offsets), measured
+    // direct on RTX 4090:
+    //   k=22:  ~22 MB
+    //   k=24:   92 MB
+    //   k=26:  288 MB
+    //   k=28: 1064 MB (direct measurement, not extrapolated)
+    // Set anchor to 1100 MB — 3.4% safety margin above the measured
+    // k=28 peak. The k=28 scaling came in 8% under the linear
+    // k=26→k=28 extrapolation because fixed-size CUB scratch and
+    // staging caps don't fully 4× with cap. The current floor is
+    // T2 sort scratch (CUB tile_max-sized workspace).
     //
     // What Tiny now does (all the host-park + streaming techniques):
     //   - Xs: CPU merge+pack to host h_xs, no device d_xs_keys_b/vals_b
@@ -516,7 +517,7 @@ size_t streaming_tiny_peak_bytes(int k)
     // k=28). Options: (a) finer per-bucket sort with smaller cub
     // scratch, (b) host-side merge of pre-sorted partition tiles,
     // (c) Phase 2 Disk tier for spill.
-    constexpr size_t anchor_mb = 1250;
+    constexpr size_t anchor_mb = 1100;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;
