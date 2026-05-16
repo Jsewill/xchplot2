@@ -477,17 +477,19 @@ size_t streaming_minimal_peak_bytes(int k)
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Anchor: 2100 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
+    // Anchor: 1250 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
     // algorithms that were originally developed under the "Pinned"
-    // tier name. After the d_frags_out → host alias (Phase 1.5c-b
-    // revival) and Xs gen+sort N=2 → N=4 tile bump, measured on
+    // tier name. After Phase 1.6 sub-section attacks (per-bucket-pair
+    // T1/T2/T3 match + host-side T2/T3 prepare offsets), measured on
     // RTX 4090:
-    //   k=22:  35 MB → ~560 MB extrapolated at k=28
-    //   k=24: 128 MB → ~2.05 GB extrapolated at k=28
-    //   k=26: 504 MB → ~2.02 GB extrapolated at k=28
-    // Set anchor to 2100 MB — 4% safety margin above the k=26 → k=28
-    // linear extrapolation (the floor is now T1 match's
-    // d_xs_tile_pinned which scales 4× with k).
+    //   k=22:  ~22 MB →  ~352 MB extrapolated at k=28
+    //   k=24:   92 MB → ~1472 MB extrapolated at k=28
+    //   k=26:  288 MB → ~1152 MB extrapolated at k=28
+    // The k=24 → k=28 extrapolation is the conservative one; set
+    // anchor to 1250 MB — ~8% safety margin above the k=26 → k=28
+    // line. The current floor is T2 sort scratch (CUB tile_max-sized
+    // workspace at 288 MB at k=26 / ~1152 MB at k=28); the match
+    // phases are all at ~256 MB.
     //
     // What Tiny now does (all the host-park + streaming techniques):
     //   - Xs: CPU merge+pack to host h_xs, no device d_xs_keys_b/vals_b
@@ -509,14 +511,12 @@ size_t streaming_tiny_peak_bytes(int k)
     // all. Larger cards should use Plain/Compact/Minimal which are
     // unchanged.
     //
-    // Going below ~2.0 GB at k=28 requires: (a) attacking T1/T2/T3
-    // match's per-section slice floors via sub-section bucket tiles
-    // (kernel-level work — d_xs_tile_pinned at 256 MB k=26 sets the
-    // current T1 match floor; T2/T3 match's per-section slices are
-    // co-equal near 450 MB), or (b) temp-device-backed bucketing for
-    // the largest intermediate arrays (Phase 2 Disk tier in the
-    // original spec).
-    constexpr size_t anchor_mb = 2100;
+    // Going below ~1.1 GB at k=28 requires attacking the T2 sort
+    // CUB scratch (the new floor — 288 MB at k=26 / ~1152 MB at
+    // k=28). Options: (a) finer per-bucket sort with smaller cub
+    // scratch, (b) host-side merge of pre-sorted partition tiles,
+    // (c) Phase 2 Disk tier for spill.
+    constexpr size_t anchor_mb = 1250;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;
