@@ -477,13 +477,17 @@ size_t streaming_minimal_peak_bytes(int k)
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Anchor: 2200 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
+    // Anchor: 2100 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
     // algorithms that were originally developed under the "Pinned"
-    // tier name. Measured at RTX 4090 post-promotion:
-    //   k=22: 36 MB  → ~580 MB extrapolated at k=28
-    //   k=24: 136 MB → ~2.2 GB extrapolated at k=28
-    //   k=26: 528 MB → ~2.1 GB extrapolated at k=28
-    // Set anchor to 2200 MB for margin.
+    // tier name. After the d_frags_out → host alias (Phase 1.5c-b
+    // revival) and Xs gen+sort N=2 → N=4 tile bump, measured on
+    // RTX 4090:
+    //   k=22:  35 MB → ~560 MB extrapolated at k=28
+    //   k=24: 128 MB → ~2.05 GB extrapolated at k=28
+    //   k=26: 504 MB → ~2.02 GB extrapolated at k=28
+    // Set anchor to 2100 MB — 4% safety margin above the k=26 → k=28
+    // linear extrapolation (the floor is now T1 match's
+    // d_xs_tile_pinned which scales 4× with k).
     //
     // What Tiny now does (all the host-park + streaming techniques):
     //   - Xs: CPU merge+pack to host h_xs, no device d_xs_keys_b/vals_b
@@ -505,11 +509,14 @@ size_t streaming_tiny_peak_bytes(int k)
     // all. Larger cards should use Plain/Compact/Minimal which are
     // unchanged.
     //
-    // Going below ~2.1 GB at k=28 requires: (a) attacking the T2/T3
-    // match per-section slice floors (kernel-level work), or (b)
-    // temp-device-backed bucketing for the largest intermediate
-    // arrays (Phase 2 Disk tier in the original spec).
-    constexpr size_t anchor_mb = 2200;
+    // Going below ~2.0 GB at k=28 requires: (a) attacking T1/T2/T3
+    // match's per-section slice floors via sub-section bucket tiles
+    // (kernel-level work — d_xs_tile_pinned at 256 MB k=26 sets the
+    // current T1 match floor; T2/T3 match's per-section slices are
+    // co-equal near 450 MB), or (b) temp-device-backed bucketing for
+    // the largest intermediate arrays (Phase 2 Disk tier in the
+    // original spec).
+    constexpr size_t anchor_mb = 2100;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;
