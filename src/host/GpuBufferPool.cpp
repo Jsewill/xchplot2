@@ -477,32 +477,39 @@ size_t streaming_minimal_peak_bytes(int k)
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Anchor: 3200 MB at k=28 (measured 3120 MB; +80 MB headroom).
-    // Tiny is the smallest streaming tier. Compared to minimal's
-    // ~3760 MB peak, tiny lands ~640 MB lower (17% reduction) by
-    // parking additional cap-sized buffers on host pinned across
-    // their consumer phase:
-    //   - T2 match: d_t1_meta_sorted + d_t1_keys_merged parked, T2
-    //     match runs per-section with sliced meta/mi reads
-    //   - T3 match: d_t2_xbits_sorted + d_t2_keys_merged parked,
-    //     T3 match runs per-section with sliced xbits/mi reads
-    //   - T1/T2 sort gather: merged_vals parked across the gather
-    //     loops, H2D'd per tile into a small device buffer
-    //   - T3 sort: d_t3 parked, tile sort H2D's input from h_t3
+    // Anchor: 2200 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
+    // algorithms that were originally developed under the "Pinned"
+    // tier name. Measured at RTX 4090 post-promotion:
+    //   k=22: 36 MB  → ~580 MB extrapolated at k=28
+    //   k=24: 136 MB → ~2.2 GB extrapolated at k=28
+    //   k=26: 528 MB → ~2.1 GB extrapolated at k=28
+    // Set anchor to 2200 MB for margin.
     //
-    // Cost: ~3 cap-sized PCIe round-trips per plot on top of
-    // minimal's already-elevated PCIe traffic. Expected per-plot
-    // wall time slightly higher than minimal's 34 s/plot at k=28;
-    // empirically measured TBD.
+    // What Tiny now does (all the host-park + streaming techniques):
+    //   - Xs: CPU merge+pack to host h_xs, no device d_xs_keys_b/vals_b
+    //     intermediate (Phase 1.4a+b)
+    //   - T1 match: per-section-pair tile H2D from h_xs, no full-cap
+    //     d_xs on device (Phase 1.4c)
+    //   - T1 sort: streaming partition (top-bits bucket) + per-bucket
+    //     u32_u64 sort, no full-cap d_t1_meta on device (Phase 1.3c-ii)
+    //   - T2 sort: streaming partition with triple-val (key/meta/xbits
+    //     paired through duplicate keys) + per-bucket sort, no
+    //     full-cap d_t2_meta on device (Phase 1.5b)
+    //   - T3 match: d_t3_stage allocated as USM-host so device peak
+    //     drops by ~200 MB at k=26 / ~800 MB at k=28 (Phase 1.5c-a)
+    //   - T3 sort: N=4 tile + multi-way host merge (vs N=2 before)
     //
-    // Floor for further reduction (sub-2-GB cards): T1 sort gather
-    // still pins a full-cap d_t1_meta on device because the gather
-    // kernel does random-access reads. Slicing it would require
-    // either a kernel-level scatter-by-source-tile rewrite or a
-    // disk-fallback layer (chunk 4 in the project plan). Either
-    // change is independently scoped — it is NOT a correctness
-    // issue, just a peak-VRAM ceiling.
-    constexpr size_t anchor_mb = 3200;
+    // Wall trade vs the original (pre-promotion) Tiny implementation:
+    // approximately +16% at k=26 on RTX 4090. Acceptable on target
+    // hardware (2-3 GB GPUs) which couldn't run the original Tiny at
+    // all. Larger cards should use Plain/Compact/Minimal which are
+    // unchanged.
+    //
+    // Going below ~2.1 GB at k=28 requires: (a) attacking the T2/T3
+    // match per-section slice floors (kernel-level work), or (b)
+    // temp-device-backed bucketing for the largest intermediate
+    // arrays (Phase 2 Disk tier in the original spec).
+    constexpr size_t anchor_mb = 2200;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

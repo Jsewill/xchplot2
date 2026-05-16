@@ -1106,7 +1106,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         //     k=28). The d_xs rehydrate at the bottom of this block
         //     still happens; eliminating it is Phase 1.4c.
         //
-        // The Pinned sub-path is gated on scratch.pinned_mode below;
+        // The Pinned sub-path is gated on scratch.tiny_mode below;
         // Minimal/Tiny stay on the existing flow unchanged.
         uint64_t const xs_tile_n0  = total_xs / 2;
         uint64_t const xs_tile_n1  = total_xs - xs_tile_n0;
@@ -1166,7 +1166,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         XsCandidateGpu* h_xs = nullptr;
 
-        if (scratch.pinned_mode) {
+        if (scratch.tiny_mode) {
             // Phase 1.4a + 1.4b — Pinned tier only.
             //
             // Both merge AND pack run on the CPU as a single fused
@@ -1306,7 +1306,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Re-hydrate full d_xs on device from host pinned (Minimal/Tiny).
         // Pinned (Phase 1.4c): skip — h_xs survives to T1 match, which
         // consumes it via per-section-pair tile H2D.
-        if (scratch.pinned_mode) {
+        if (scratch.tiny_mode) {
             h_xs_pinned = h_xs;
         } else {
             s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
@@ -1413,7 +1413,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Pinned (Phase 1.4c) defers the prepare to per-pass on each
         // section-pair tile; Minimal/Tiny do it once on full d_xs as
         // before.
-        if (!scratch.pinned_mode) {
+        if (!scratch.tiny_mode) {
             // Compute bucket + fine-bucket offsets once; passes share them.
             // Also zeros d_counter.
             launch_t1_match_prepare(cfg.plot_id.data(), t1p, d_xs, total_xs,
@@ -1482,7 +1482,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         XsCandidateGpu* d_xs_tile = nullptr;
         uint64_t        max_pair  = 0;
-        if (scratch.pinned_mode) {
+        if (scratch.tiny_mode) {
             for (uint32_t s = 0; s < num_secs; ++s) {
                 uint64_t const sl = h_xs_section_starts[s + 1] -
                                     h_xs_section_starts[s];
@@ -1504,7 +1504,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
             XsCandidateGpu const* d_xs_for_pass = d_xs;
             uint64_t              total_for_pass = total_xs;
-            if (scratch.pinned_mode) {
+            if (scratch.tiny_mode) {
                 uint32_t const section_r  = matching_section(section_l);
                 uint32_t const section_lo = std::min(section_l, section_r);
                 uint32_t const section_hi = std::max(section_l, section_r);
@@ -1550,10 +1550,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
         end_phase(p_t1);
 
-        if (scratch.pinned_mode && d_xs_tile) {
+        if (scratch.tiny_mode && d_xs_tile) {
             s_free(stats, d_xs_tile);
         }
-        if (scratch.pinned_mode && h_xs_pinned) {
+        if (scratch.tiny_mode && h_xs_pinned) {
             sycl::free(h_xs_pinned, q);
             h_xs_pinned = nullptr;
         }
@@ -1687,7 +1687,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //   d_t1_mi:          freed (no longer needed)
     //   d_t1_keys_merged: nullptr (parked on host as h_t1_keys_merged,
     //                     matching tiny's behaviour after this phase)
-    if (scratch.pinned_mode) {
+    if (scratch.tiny_mode) {
         // Pick partition geometry. num_top_bits must satisfy
         //   begin_bit=0 + num_top_bits <= end_bit=cfg.k
         // with at least 1 lower bit left to sort within each bucket
@@ -2635,7 +2635,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Per-bucket device peak: small (~30-50 MB at k=26 — sort
     // scratch + 4 small per-bucket scratches). Replaces 528 MB
     // d_t2_meta floor entirely.
-    if (scratch.pinned_mode) {
+    if (scratch.tiny_mode) {
         int  const t2p_num_top_bits =
             std::max(4, std::min(8, cfg.k - 18));
         int  const t2p_top_bit_offset = cfg.k - t2p_num_top_bits;
@@ -3343,7 +3343,7 @@ t3_match_entry:
         // s_free so the StreamingStats tracker stays accurate.
         T3PairingGpu* d_t3_stage      = nullptr;
         void*         d_t3_match_temp = nullptr;
-        bool          d_t3_stage_on_host = scratch.pinned_mode;
+        bool          d_t3_stage_on_host = scratch.tiny_mode;
         if (d_t3_stage_on_host) {
             d_t3_stage = static_cast<T3PairingGpu*>(
                 sycl::malloc_host(t3_section_cap * sizeof(T3PairingGpu), q));
