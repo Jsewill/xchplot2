@@ -3684,9 +3684,19 @@ t3_match_entry:
         // host into the same d_frags_out_tile buffer (reused as both
         // sort input and sort output via in-place CUB), removing the
         // ~2080 MB d_t3 pin from the T3 sort phase.
-        uint64_t const tile_max = (cap + 1) / 2;
-        uint64_t const tile_n0  = t3_count / 2;
-        uint64_t const tile_n1  = t3_count - tile_n0;
+        // Cheap-win bump from N=2 to N=4: shrinks tile_max from cap/2
+        // to cap/4 → d_frags_out_tile (+ d_frags_in_tile in tiny mode)
+        // each drop by half. T3 sort phase peak drops from 2*(cap/2)
+        // + scratch ≈ 537 MB at k=26 to 2*(cap/4) + scratch ≈ 269 MB
+        // at k=26. Host-side merge becomes a 3-merge tree for N=4.
+        constexpr int kT3SortTiles = 4;
+        uint64_t const tile_max = (cap + uint64_t(kT3SortTiles) - 1) / uint64_t(kT3SortTiles);
+        uint64_t t3_offsets[kT3SortTiles + 1];
+        t3_offsets[0] = 0;
+        for (int i = 0; i < kT3SortTiles; ++i) {
+            uint64_t const next = std::min(t3_offsets[i] + tile_max, t3_count);
+            t3_offsets[i + 1] = next;
+        }
 
         size_t t3_tile_sort_bytes = 0;
         launch_sort_keys_u64(
@@ -3719,37 +3729,25 @@ t3_match_entry:
                 : nullptr;
 
         int p_t3_sort = begin_phase("T3 sort");
-        if (tile_n0 > 0) {
+        for (int t = 0; t < kT3SortTiles; ++t) {
+            uint64_t const tile_off = t3_offsets[t];
+            uint64_t const tile_n   = t3_offsets[t + 1] - tile_off;
+            if (tile_n == 0) continue;
+
             uint64_t const* sort_in = nullptr;
             if (scratch.tiny_mode) {
-                q.memcpy(d_frags_in_tile, h_t3_src,
-                         tile_n0 * sizeof(uint64_t)).wait();
+                q.memcpy(d_frags_in_tile, h_t3_src + tile_off,
+                         tile_n * sizeof(uint64_t)).wait();
                 sort_in = d_frags_in_tile;
             } else {
-                sort_in = d_frags_in;
+                sort_in = d_frags_in + tile_off;
             }
             launch_sort_keys_u64(
                 d_sort_scratch_tile, t3_tile_sort_bytes,
                 const_cast<uint64_t*>(sort_in), d_frags_out_tile,
-                tile_n0, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
-            q.memcpy(h_frags, d_frags_out_tile,
-                     tile_n0 * sizeof(uint64_t)).wait();
-        }
-        if (tile_n1 > 0) {
-            uint64_t const* sort_in = nullptr;
-            if (scratch.tiny_mode) {
-                q.memcpy(d_frags_in_tile, h_t3_src + tile_n0,
-                         tile_n1 * sizeof(uint64_t)).wait();
-                sort_in = d_frags_in_tile;
-            } else {
-                sort_in = d_frags_in + tile_n0;
-            }
-            launch_sort_keys_u64(
-                d_sort_scratch_tile, t3_tile_sort_bytes,
-                const_cast<uint64_t*>(sort_in), d_frags_out_tile,
-                tile_n1, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
-            q.memcpy(h_frags + tile_n0, d_frags_out_tile,
-                     tile_n1 * sizeof(uint64_t)).wait();
+                tile_n, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
+            q.memcpy(h_frags + tile_off, d_frags_out_tile,
+                     tile_n * sizeof(uint64_t)).wait();
         }
         end_phase(p_t3_sort);
 
@@ -3765,9 +3763,28 @@ t3_match_entry:
             s_free(stats, d_t3);
         }
 
-        // Stable in-place merge of [0, tile_n0) and [tile_n0, t3_count)
-        // — both halves are individually sorted by launch_sort_keys_u64.
-        std::inplace_merge(h_frags, h_frags + tile_n0, h_frags + t3_count);
+        // Multi-way stable merge of the N=4 sorted runs. Tree shape
+        // for N=4: (0+1)→A, (2+3)→B, (A+B)→final. 3 binary
+        // std::inplace_merges, depth 2. Stable, matches the original
+        // 2-way merge's byte-parity contract for downstream consumers.
+        if constexpr (kT3SortTiles == 4) {
+            std::inplace_merge(h_frags + t3_offsets[0],
+                               h_frags + t3_offsets[1],
+                               h_frags + t3_offsets[2]);
+            std::inplace_merge(h_frags + t3_offsets[2],
+                               h_frags + t3_offsets[3],
+                               h_frags + t3_offsets[4]);
+            std::inplace_merge(h_frags + t3_offsets[0],
+                               h_frags + t3_offsets[2],
+                               h_frags + t3_offsets[4]);
+        } else {
+            // Generic sequential fallback for other N.
+            for (int t = 1; t < kT3SortTiles; ++t) {
+                std::inplace_merge(h_frags + t3_offsets[0],
+                                   h_frags + t3_offsets[t],
+                                   h_frags + t3_offsets[t + 1]);
+            }
+        }
 
         // Re-hydrate full-cap d_frags_out for the existing D2H phase.
         s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
