@@ -2565,6 +2565,205 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     int p_t2_sort = begin_phase("T2 sort");
 
+    // ------------------------------------------------------------
+    // Phase 1.5b — Pinned-only T2 sort via streaming partition.
+    //
+    // Today's tiled T2 sort gather (Tiny path, line ~2842) re-
+    // allocates d_t2_meta at full cap on device (528 MB at k=26 /
+    // ~2 GB at k=28) to support random-access gather. That's the
+    // T2-sort phase peak and, after Phase 1.4 eliminated Xs+T1
+    // contributors, the overall plot peak.
+    //
+    // Pinned replaces the entire CUB-tile-sort + tree-merge +
+    // d_t2_meta-gather + d_t2_xbits-gather flow with:
+    //   1. launch_streaming_partition_u32_u64_u32 (Phase 1.5a)
+    //      reads d_t2_mi tile-by-tile and h_t2_meta + h_t2_xbits
+    //      paired (so the meta+xbits pairing survives duplicate
+    //      mi keys), producing bucketed host-resident output.
+    //   2. Per-bucket: H2D bucket → sort (key, identity_idx)
+    //      with launch_sort_pairs_u32_u32 → gather meta with
+    //      launch_gather_u64 + xbits with launch_gather_u32 →
+    //      D2H sorted output back into h_t2_meta + h_t2_xbits +
+    //      h_t2_keys_merged at the bucket's contiguous range.
+    //
+    // Output contract matches Tiny exactly:
+    //   h_t2_meta:        sorted in place
+    //   h_t2_xbits:       sorted in place
+    //   h_t2_keys_merged: sorted on host-pinned (T3 match's
+    //                     tiny/pinned path consumes from here)
+    //   d_t2_keys_merged: nullptr (parked on host)
+    //   d_t2_meta:        nullptr (never allocated)
+    //   d_t2_xbits:       nullptr (never allocated)
+    //   d_merged_vals:    nullptr (never allocated; per-bucket
+    //                     idx serves the same role internally)
+    //
+    // Per-bucket device peak: small (~30-50 MB at k=26 — sort
+    // scratch + 4 small per-bucket scratches). Replaces 528 MB
+    // d_t2_meta floor entirely.
+    if (scratch.pinned_mode) {
+        int  const t2p_num_top_bits =
+            std::max(4, std::min(8, cfg.k - 18));
+        int  const t2p_top_bit_offset = cfg.k - t2p_num_top_bits;
+        size_t const t2p_num_buckets  = size_t{1} << t2p_num_top_bits;
+
+        // Allocate h_t2_keys_merged via the same pool/scratch/
+        // malloc_host pattern the existing code uses below — sorted
+        // keys land here directly via streaming partition + per-
+        // bucket sort.
+        if (h_keys_owned) {
+            h_t2_keys_merged = scratch.pool
+                ? scratch.pool->acquire_as<uint32_t>("h_keys_merged", cap, q)
+                : static_cast<uint32_t*>(sycl::malloc_host(cap * sizeof(uint32_t), q));
+            if (!h_t2_keys_merged) throw std::runtime_error(
+                "sycl::malloc_host(h_t2_keys_merged, pinned) failed");
+        } else {
+            h_t2_keys_merged = scratch.h_keys_merged;
+        }
+
+        // Temp host arenas for partition output (meta + xbits will
+        // be re-emitted into h_t2_meta + h_t2_xbits during per-
+        // bucket sort, overwriting the original unsorted contents).
+        uint64_t* h_part_meta = static_cast<uint64_t*>(
+            sycl::malloc_host(cap * sizeof(uint64_t), q));
+        if (!h_part_meta) throw std::runtime_error(
+            "sycl::malloc_host(h_part_meta, pinned T2) failed");
+        uint32_t* h_part_xbits = static_cast<uint32_t*>(
+            sycl::malloc_host(cap * sizeof(uint32_t), q));
+        if (!h_part_xbits) throw std::runtime_error(
+            "sycl::malloc_host(h_part_xbits, pinned T2) failed");
+        uint32_t* h_bucket_starts = static_cast<uint32_t*>(
+            sycl::malloc_host((t2p_num_buckets + 1) * sizeof(uint32_t), q));
+        if (!h_bucket_starts) throw std::runtime_error(
+            "sycl::malloc_host(h_bucket_starts, pinned T2) failed");
+
+        // d_t2_mi is on device at full cap here (rehydrated from
+        // h_t2_mi just before this block). Use it as the partition
+        // source key. Triple-val partition keeps (meta, xbits)
+        // paired across duplicate mi values.
+        size_t partition_scratch_bytes = 0;
+        launch_streaming_partition_u32_u64_u32(
+            nullptr, partition_scratch_bytes,
+            d_t2_mi, h_t2_meta, h_t2_xbits,
+            h_t2_keys_merged, h_part_meta, h_part_xbits, h_bucket_starts,
+            t2_count, t2p_top_bit_offset, t2p_num_top_bits,
+            /*tile_count=*/0, q);
+        void* d_partition_scratch = nullptr;
+        if (partition_scratch_bytes) {
+            s_malloc(stats, d_partition_scratch,
+                     partition_scratch_bytes, "d_t2_partition_scratch");
+        }
+        launch_streaming_partition_u32_u64_u32(
+            d_partition_scratch, partition_scratch_bytes,
+            d_t2_mi, h_t2_meta, h_t2_xbits,
+            h_t2_keys_merged, h_part_meta, h_part_xbits, h_bucket_starts,
+            t2_count, t2p_top_bit_offset, t2p_num_top_bits,
+            /*tile_count=*/0, q);
+        if (d_partition_scratch) s_free(stats, d_partition_scratch);
+
+        // d_t2_mi consumed.
+        s_free(stats, d_t2_mi);
+        d_t2_mi = nullptr;
+
+        // Max bucket size for per-bucket scratch sizing.
+        uint32_t max_bucket = 0;
+        for (size_t b = 0; b < t2p_num_buckets; ++b) {
+            uint32_t const bsz = h_bucket_starts[b + 1] - h_bucket_starts[b];
+            if (bsz > max_bucket) max_bucket = bsz;
+        }
+
+        // Per-bucket device scratch (reused across buckets).
+        uint32_t* d_bk_in       = nullptr;
+        uint32_t* d_bk_out      = nullptr;
+        uint32_t* d_bidx_in     = nullptr;
+        uint32_t* d_bidx_out    = nullptr;
+        uint64_t* d_bmeta       = nullptr;
+        uint64_t* d_bmeta_out   = nullptr;
+        uint32_t* d_bxbits      = nullptr;
+        uint32_t* d_bxbits_out  = nullptr;
+        s_malloc(stats, d_bk_in,      max_bucket * sizeof(uint32_t), "d_t2_bk_in");
+        s_malloc(stats, d_bk_out,     max_bucket * sizeof(uint32_t), "d_t2_bk_out");
+        s_malloc(stats, d_bidx_in,    max_bucket * sizeof(uint32_t), "d_t2_bidx_in");
+        s_malloc(stats, d_bidx_out,   max_bucket * sizeof(uint32_t), "d_t2_bidx_out");
+        s_malloc(stats, d_bmeta,      max_bucket * sizeof(uint64_t), "d_t2_bmeta");
+        s_malloc(stats, d_bmeta_out,  max_bucket * sizeof(uint64_t), "d_t2_bmeta_out");
+        s_malloc(stats, d_bxbits,     max_bucket * sizeof(uint32_t), "d_t2_bxbits");
+        s_malloc(stats, d_bxbits_out, max_bucket * sizeof(uint32_t), "d_t2_bxbits_out");
+
+        size_t bucket_sort_bytes = 0;
+        launch_sort_pairs_u32_u32(
+            nullptr, bucket_sort_bytes,
+            d_bk_in, d_bk_out, d_bidx_in, d_bidx_out,
+            max_bucket, 0, t2p_top_bit_offset, q);
+        void* d_bucket_sort_scratch = nullptr;
+        if (bucket_sort_bytes) {
+            s_malloc(stats, d_bucket_sort_scratch,
+                     bucket_sort_bytes, "d_t2_bucket_sort_scratch");
+        }
+
+        for (size_t b = 0; b < t2p_num_buckets; ++b) {
+            uint32_t const bstart = h_bucket_starts[b];
+            uint32_t const bsz    = h_bucket_starts[b + 1] - bstart;
+            if (bsz == 0) continue;
+
+            // H2D bucket's triple (keys, meta, xbits) — bucketed,
+            // not yet sorted within bucket.
+            q.memcpy(d_bk_in,  h_t2_keys_merged + bstart,
+                     bsz * sizeof(uint32_t));
+            q.memcpy(d_bmeta,  h_part_meta + bstart,
+                     bsz * sizeof(uint64_t));
+            q.memcpy(d_bxbits, h_part_xbits + bstart,
+                     bsz * sizeof(uint32_t)).wait();
+
+            // Init identity idx so we can recover the sort
+            // permutation as d_bidx_out after sorting (keys, idx).
+            launch_init_u32_identity(d_bidx_in, bsz, q);
+
+            size_t bsb = bucket_sort_bytes;
+            launch_sort_pairs_u32_u32(
+                d_bucket_sort_scratch, bsb,
+                d_bk_in, d_bk_out, d_bidx_in, d_bidx_out,
+                bsz, 0, t2p_top_bit_offset, q);
+
+            // Gather meta + xbits using the sort permutation.
+            // d_bmeta / d_bxbits are bucket-sized on device →
+            // random reads are L2-cached and fast.
+            launch_gather_u64(d_bmeta,  d_bidx_out, d_bmeta_out,  bsz, q);
+            launch_gather_u32(d_bxbits, d_bidx_out, d_bxbits_out, bsz, q);
+
+            // D2H sorted triple. h_t2_keys_merged + h_t2_meta +
+            // h_t2_xbits are overwritten in place — the unsorted
+            // contents at [bstart..bend) are no longer needed.
+            q.memcpy(h_t2_keys_merged + bstart, d_bk_out,
+                     bsz * sizeof(uint32_t));
+            q.memcpy(h_t2_meta        + bstart, d_bmeta_out,
+                     bsz * sizeof(uint64_t));
+            q.memcpy(h_t2_xbits       + bstart, d_bxbits_out,
+                     bsz * sizeof(uint32_t)).wait();
+        }
+
+        if (d_bucket_sort_scratch) s_free(stats, d_bucket_sort_scratch);
+        s_free(stats, d_bk_in);
+        s_free(stats, d_bk_out);
+        s_free(stats, d_bidx_in);
+        s_free(stats, d_bidx_out);
+        s_free(stats, d_bmeta);
+        s_free(stats, d_bmeta_out);
+        s_free(stats, d_bxbits);
+        s_free(stats, d_bxbits_out);
+        sycl::free(h_part_meta, q);
+        sycl::free(h_part_xbits, q);
+        sycl::free(h_bucket_starts, q);
+
+        end_phase(p_t2_sort);
+        goto t2_sort_done;
+    }
+
+    {  // Block-scope wrapper for the non-Pinned T2 sort body.
+       // Goto from the Pinned branch above lands at t2_sort_done
+       // below; this scope contains all the existing local
+       // declarations (d_AB_keys, d_t2_meta_sorted_tile, etc.)
+       // so the goto does not appear to cross any function-scope
+       // variable declaration (C++ rule).
     if (!t1_match_sliced) {
         // Compact / plain — existing full-cap CUB tile sort.
         s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
@@ -2939,7 +3138,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         end_phase(p_t2_sort);
     }
+    }  // close non-pinned T2 sort scope-wrapper.
 
+    t2_sort_done:;
     }  // end of first-half (Xs+T1+T2) scope.
 
     // Phase 2 (pipeline-parallel) first-half cut: when
