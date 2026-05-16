@@ -1261,12 +1261,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             sycl::free(h_xs_keys, q);
             sycl::free(h_xs_vals, q);
 
-            // Tiled pack. d_xs_pack_tile (cap/2 × XsCandidate = 1024 MB
-            // at k=28) reuses across tiles; the packed output collects on
-            // host pinned h_xs (cap × XsCandidate = 2048 MB host).
-            uint64_t const pack_tile_n0  = total_xs / 2;
-            uint64_t const pack_tile_n1  = total_xs - pack_tile_n0;
-            uint64_t const pack_tile_max = (pack_tile_n0 > pack_tile_n1) ? pack_tile_n0 : pack_tile_n1;
+            // Tiled pack. d_xs_pack_tile reuses across tiles; the
+            // packed output collects on host pinned h_xs (cap ×
+            // XsCandidate = 2048 MB host at k=28).
+            //
+            // Cheap-win bump from N=2 to N=4: shrinks d_xs_pack_tile
+            // from cap/2 × XsCandidate (1024 MB at k=28) to cap/4
+            // × XsCandidate (512 MB at k=28). Saves 512 MB at k=28
+            // / 128 MB at k=26 on the Xs pack phase peak.
+            // The d_xs_keys_b + d_xs_vals_b co-residency (the bigger
+            // pack contributors) is unchanged — that requires
+            // Pinned-style algorithm to attack.
+            constexpr int kXsPackTiles = 4;
+            uint64_t const pack_tile_max =
+                (total_xs + uint64_t(kXsPackTiles) - 1) / uint64_t(kXsPackTiles);
 
             XsCandidateGpu* d_xs_pack_tile = nullptr;
             s_malloc(stats, d_xs_pack_tile, pack_tile_max * sizeof(XsCandidateGpu), "d_xs_pack_tile");
@@ -1276,18 +1284,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             if (!h_xs) throw std::runtime_error("sycl::malloc_host(h_xs) failed");
 
             int p_xs_pack = begin_phase("Xs pack");
-            if (pack_tile_n0 > 0) {
-                launch_xs_pack_range(d_xs_keys_b + 0, d_xs_vals_b + 0,
-                                     d_xs_pack_tile, pack_tile_n0, q);
-                q.memcpy(h_xs + 0, d_xs_pack_tile,
-                         pack_tile_n0 * sizeof(XsCandidateGpu)).wait();
-            }
-            if (pack_tile_n1 > 0) {
-                launch_xs_pack_range(d_xs_keys_b + pack_tile_n0,
-                                     d_xs_vals_b + pack_tile_n0,
-                                     d_xs_pack_tile, pack_tile_n1, q);
-                q.memcpy(h_xs + pack_tile_n0, d_xs_pack_tile,
-                         pack_tile_n1 * sizeof(XsCandidateGpu)).wait();
+            for (int n = 0; n < kXsPackTiles; ++n) {
+                uint64_t const tile_off = uint64_t(n) * pack_tile_max;
+                if (tile_off >= total_xs) break;
+                uint64_t const tile_n = std::min(pack_tile_max, total_xs - tile_off);
+                launch_xs_pack_range(d_xs_keys_b + tile_off,
+                                     d_xs_vals_b + tile_off,
+                                     d_xs_pack_tile, tile_n, q);
+                q.memcpy(h_xs + tile_off, d_xs_pack_tile,
+                         tile_n * sizeof(XsCandidateGpu)).wait();
             }
             end_phase(p_xs_pack);
 
@@ -1980,6 +1985,34 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     //
     // Plain mode: d_t1_meta is already live (never parked).
     int const t1_gather_N = scratch.plain_mode ? 1 : scratch.gather_tile_count;
+
+    // Cheap-win reorder (k=26 saves ~72 MB / k=28 ~288 MB): for tiny
+    // (and pinned-mode which inherits tiny=true), park d_t1_merged_vals
+    // to host BEFORE allocating d_t1_meta. The previous order had both
+    // co-resident at the H2D moment, contributing 264 + 528 = 792 MB
+    // to the T1 sort phase peak at k=26 (this was the dominant Tiny
+    // floor). After the reorder, d_t1_merged_vals is gone when
+    // d_t1_meta is allocated, so the peak drops to d_t1_meta (528 MB)
+    // + per-tile staging (~192 MB). Saves ~264 MB at k=26.
+    //
+    // The park is duplicated below (inside the multi-tile gather
+    // branch) for backward-compat-without-this-reorder code paths;
+    // the duplicated branch is guarded so it's a no-op when we've
+    // already parked here.
+    uint32_t* h_t1_merged_vals_pre = nullptr;  // populated by the early-park
+    if (!scratch.plain_mode && t1_gather_N > 1 && scratch.tiny_mode
+        && d_t1_merged_vals != nullptr) {
+        h_t1_merged_vals_pre = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
+            : static_cast<uint32_t*>(sycl::malloc_host(t1_count * sizeof(uint32_t), q));
+        if (!h_t1_merged_vals_pre) throw std::runtime_error(
+            "sycl::malloc_host(h_t1_merged_vals_pre) failed");
+        q.memcpy(h_t1_merged_vals_pre, d_t1_merged_vals,
+                 t1_count * sizeof(uint32_t)).wait();
+        s_free(stats, d_t1_merged_vals);
+        d_t1_merged_vals = nullptr;
+    }
+
     if (!scratch.plain_mode) {
         s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
         q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
@@ -2020,23 +2053,25 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         uint64_t const tile_max =
             (t1_count + uint64_t(t1_gather_N) - 1) / uint64_t(t1_gather_N);
         uint64_t* d_tile = nullptr;
-        uint32_t* h_t1_merged_vals = nullptr;
+        uint32_t* h_t1_merged_vals = h_t1_merged_vals_pre;  // from early park
         uint32_t* d_idx_tile       = nullptr;
         if (scratch.tiny_mode) {
-            // D2H merged_vals to host pinned, free device, allocate
-            // small per-tile device staging for indices.
-            // Pool path requests cap-sized so the slot doesn't oscillate
-            // across plots with variable t1_count. Only first plot pays
-            // the realloc; subsequent plots reuse the same buffer.
-            h_t1_merged_vals = scratch.pool
-                ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
-                : static_cast<uint32_t*>(sycl::malloc_host(t1_count * sizeof(uint32_t), q));
-            if (!h_t1_merged_vals)
-                throw std::runtime_error("sycl::malloc_host(h_t1_merged_vals) failed");
-            q.memcpy(h_t1_merged_vals, d_t1_merged_vals,
-                     t1_count * sizeof(uint32_t)).wait();
-            s_free(stats, d_t1_merged_vals);
-            d_t1_merged_vals = nullptr;
+            // Cheap-win reorder: the early-park above (before d_t1_meta
+            // alloc) handled the host park. If we got here without one
+            // (e.g., the early-park branch was skipped because
+            // d_t1_merged_vals was already nullptr), fall back to the
+            // original park-here logic.
+            if (h_t1_merged_vals == nullptr) {
+                h_t1_merged_vals = scratch.pool
+                    ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
+                    : static_cast<uint32_t*>(sycl::malloc_host(t1_count * sizeof(uint32_t), q));
+                if (!h_t1_merged_vals)
+                    throw std::runtime_error("sycl::malloc_host(h_t1_merged_vals) failed");
+                q.memcpy(h_t1_merged_vals, d_t1_merged_vals,
+                         t1_count * sizeof(uint32_t)).wait();
+                s_free(stats, d_t1_merged_vals);
+                d_t1_merged_vals = nullptr;
+            }
             s_malloc(stats, d_idx_tile, tile_max * sizeof(uint32_t), "d_t1_merged_vals_tile");
         }
         s_malloc(stats, d_tile, tile_max * sizeof(uint64_t), "d_t1_meta_sorted_tile");
