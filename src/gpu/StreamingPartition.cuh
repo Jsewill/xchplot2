@@ -76,4 +76,36 @@ void launch_streaming_partition_u32_u64(
     uint64_t tile_count,
     sycl::queue& q);
 
+// Triple-val variant: same shape as launch_streaming_partition_u32_u64
+// but also carries a u32 second-value array alongside the u64 first
+// value. Used by Phase 1.5 (T2 sort streaming) where each entry has
+// a u64 meta AND a u32 xbits that must stay paired through the sort.
+//
+// Why two outputs in ONE pass rather than two separate partition
+// calls: each call's atomic-claim ordering is non-deterministic, so
+// running launch_streaming_partition_u32_u64 twice (once with meta as
+// val, once with xbits) would produce DIFFERENT slot orderings for
+// duplicate keys → meta[i] and xbits[i] would belong to different
+// original entries. Carrying both vals through a single partition
+// preserves the meta-xbits pairing.
+//
+// API mirrors u32_u64 with an extra (h_vals2_in, h_part_vals2) pair.
+// Both vals are written at the same atomic-claim slot, so the i-th
+// output triple always corresponds to a single input position.
+void launch_streaming_partition_u32_u64_u32(
+    void* d_scratch,
+    size_t& scratch_bytes,
+    uint32_t const* d_keys_in,
+    uint64_t const* h_vals_in,
+    uint32_t const* h_vals2_in,
+    uint32_t* h_part_keys,
+    uint64_t* h_part_vals,
+    uint32_t* h_part_vals2,
+    uint32_t* h_bucket_starts,
+    uint64_t count,
+    int top_bit_offset,
+    int num_top_bits,
+    uint64_t tile_count,
+    sycl::queue& q);
+
 } // namespace pos2gpu

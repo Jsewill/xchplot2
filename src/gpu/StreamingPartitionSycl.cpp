@@ -205,4 +205,135 @@ void launch_streaming_partition_u32_u64(
     scratch_bytes = total_bytes;
 }
 
+// Triple-val variant. See StreamingPartition.cuh for the why.
+// Layout-wise this is u32_u64 with an extra (d_vals2_tile, vals2)
+// pair carried alongside. Both per-tile H2Ds happen back-to-back
+// (single wait at end), and the partition kernel writes both
+// outputs at the same atomic-claim slot.
+void launch_streaming_partition_u32_u64_u32(
+    void* d_scratch,
+    size_t& scratch_bytes,
+    uint32_t const* d_keys_in,
+    uint64_t const* h_vals_in,
+    uint32_t const* h_vals2_in,
+    uint32_t* h_part_keys,
+    uint64_t* h_part_vals,
+    uint32_t* h_part_vals2,
+    uint32_t* h_bucket_starts,
+    uint64_t count,
+    int top_bit_offset,
+    int num_top_bits,
+    uint64_t tile_count,
+    sycl::queue& q)
+{
+    if (num_top_bits < 1 || num_top_bits > 16) {
+        throw std::invalid_argument(
+            "launch_streaming_partition_u32_u64_u32: num_top_bits out of range");
+    }
+    if (top_bit_offset < 0 || top_bit_offset + num_top_bits > 32) {
+        throw std::invalid_argument(
+            "launch_streaming_partition_u32_u64_u32: top_bit_offset + num_top_bits out of range");
+    }
+
+    size_t const num_buckets   = size_t{1} << num_top_bits;
+    uint64_t const tiles       = pick_tile_n(count, tile_count);
+    uint64_t const tile_size   = (count + tiles - 1) / tiles;
+
+    // Layout of d_scratch:
+    //   d_hist_cursors        (num_buckets × u32)
+    //   d_vals_tile           (tile_size × u64)
+    //   d_vals2_tile          (tile_size × u32)
+    size_t const hist_bytes        = num_buckets * sizeof(uint32_t);
+    size_t const hist_aligned      = align8(hist_bytes);
+    size_t const vals_tile_bytes   = tile_size * sizeof(uint64_t);
+    size_t const vals2_tile_bytes  = tile_size * sizeof(uint32_t);
+    size_t const vals2_aligned     = align8(vals2_tile_bytes);
+    size_t const total_bytes       = hist_aligned + vals_tile_bytes + vals2_aligned;
+
+    if (d_scratch == nullptr) {
+        scratch_bytes = total_bytes;
+        return;
+    }
+    if (scratch_bytes < total_bytes) {
+        throw std::invalid_argument(
+            "launch_streaming_partition_u32_u64_u32: scratch_bytes too small");
+    }
+
+    auto* base = static_cast<unsigned char*>(d_scratch);
+    auto* d_hist_cursors = reinterpret_cast<uint32_t*>(base);
+    auto* d_vals_tile    = reinterpret_cast<uint64_t*>(base + hist_aligned);
+    auto* d_vals2_tile   = reinterpret_cast<uint32_t*>(base + hist_aligned + vals_tile_bytes);
+
+    q.memset(h_bucket_starts, 0, (num_buckets + 1) * sizeof(uint32_t)).wait();
+    if (count == 0) return;
+
+    // Pass 1: histogram (identical to u32_u64).
+    q.memset(d_hist_cursors, 0, hist_bytes).wait();
+    q.parallel_for(
+        sycl::nd_range<1>{ global_for(count), kThreads },
+        [=](sycl::nd_item<1> it) {
+            uint64_t const i = it.get_global_id(0);
+            if (i >= count) return;
+            uint32_t const b = bucket_of(d_keys_in[i], top_bit_offset, num_top_bits);
+            sycl::atomic_ref<uint32_t,
+                sycl::memory_order::relaxed,
+                sycl::memory_scope::device,
+                sycl::access::address_space::global_space>
+                slot(d_hist_cursors[b]);
+            slot.fetch_add(1u);
+        }).wait();
+
+    std::vector<uint32_t> h_hist(num_buckets);
+    q.memcpy(h_hist.data(), d_hist_cursors, num_buckets * sizeof(uint32_t)).wait();
+    uint32_t cum = 0;
+    for (size_t b = 0; b < num_buckets; ++b) {
+        h_bucket_starts[b] = cum;
+        cum += h_hist[b];
+    }
+    h_bucket_starts[num_buckets] = cum;
+    if (static_cast<uint64_t>(cum) != count) {
+        throw std::runtime_error(
+            "launch_streaming_partition_u32_u64_u32: histogram total mismatch");
+    }
+    q.memcpy(d_hist_cursors, h_bucket_starts, num_buckets * sizeof(uint32_t)).wait();
+
+    // Pass 2: per-tile partition with two parallel val streams.
+    for (uint64_t t = 0; t < tiles; ++t) {
+        uint64_t const tile_off = t * tile_size;
+        if (tile_off >= count) break;
+        uint64_t const tile_n   = std::min(tile_size, count - tile_off);
+
+        q.memcpy(d_vals_tile,  h_vals_in  + tile_off,
+                 tile_n * sizeof(uint64_t));
+        q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
+                 tile_n * sizeof(uint32_t)).wait();
+
+        uint32_t* const part_keys  = h_part_keys;
+        uint64_t* const part_vals  = h_part_vals;
+        uint32_t* const part_vals2 = h_part_vals2;
+        uint32_t const* const keys_tile = d_keys_in + tile_off;
+        q.parallel_for(
+            sycl::nd_range<1>{ global_for(tile_n), kThreads },
+            [=](sycl::nd_item<1> it) {
+                uint64_t const i = it.get_global_id(0);
+                if (i >= tile_n) return;
+                uint32_t const k  = keys_tile[i];
+                uint64_t const v  = d_vals_tile[i];
+                uint32_t const v2 = d_vals2_tile[i];
+                uint32_t const b  = bucket_of(k, top_bit_offset, num_top_bits);
+                sycl::atomic_ref<uint32_t,
+                    sycl::memory_order::relaxed,
+                    sycl::memory_scope::device,
+                    sycl::access::address_space::global_space>
+                    cur(d_hist_cursors[b]);
+                uint32_t const pos = cur.fetch_add(1u);
+                part_keys[pos]  = k;
+                part_vals[pos]  = v;
+                part_vals2[pos] = v2;
+            }).wait();
+    }
+
+    scratch_bytes = total_bytes;
+}
+
 } // namespace pos2gpu

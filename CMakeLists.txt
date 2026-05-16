@@ -908,6 +908,23 @@ target_compile_features(sycl_streaming_partition_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_streaming_partition_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Phase 1.5a of the StreamingPinned tier plan. Validates the
+# triple-val streaming_partition (u32 key, u64 val_a, u32 val_b)
+# needed by Phase 1.5b (T2 sort streaming) where meta + xbits
+# must travel paired through the partition.
+add_executable(sycl_streaming_partition_u32_u64_u32_parity
+    tools/parity/sycl_streaming_partition_u32_u64_u32_parity.cpp)
+add_sycl_to_target(TARGET sycl_streaming_partition_u32_u64_u32_parity
+                   SOURCES tools/parity/sycl_streaming_partition_u32_u64_u32_parity.cpp)
+target_link_libraries(sycl_streaming_partition_u32_u64_u32_parity PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_streaming_partition_u32_u64_u32_parity PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_streaming_partition_u32_u64_u32_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_streaming_partition_u32_u64_u32_parity PRIVATE cxx_std_20)
+set_target_properties(sycl_streaming_partition_u32_u64_u32_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 2.2 — sharded Xs-phase parity test. Confirms
 # MultiGpuPlotPipeline's run_xs_phase produces a union of per-shard
 # packed XsCandidateGpu outputs that's byte-identical to single-GPU
