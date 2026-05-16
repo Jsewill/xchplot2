@@ -3645,6 +3645,26 @@ t3_match_entry:
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
     uint64_t* d_frags_out = nullptr;
 
+    // Phase 1.5c-b (revived): in Tiny tier the tile-sort + host-merge
+    // already lands the final sorted output in a host-pinned buffer
+    // (h_frags below). The original code then H2D-re-hydrates a
+    // cap-sized d_frags_out on device just so the D2H phase has
+    // something to memcpy out of. That re-hydrate sets Tiny's k=26
+    // device-peak (528 MB) — by far the largest single contributor.
+    //
+    // When the caller has supplied pinned_dst with cap-class capacity
+    // (batch mode), we can alias h_frags = pinned_dst directly: the
+    // tile sort writes its D2H'd output into pinned_dst, std::inplace_merge
+    // runs in-place there, and the D2H phase becomes a no-op (the
+    // sorted fragments already live in the caller's buffer).
+    //
+    // For the one-shot path (no pinned_dst) we still alias the temp
+    // pinned region by pre-allocating it before the tile sort and
+    // letting D2H emit it into the OWNING result vector with a host
+    // std::memcpy. Either way: no device-side d_frags_out re-hydrate.
+    bool d_frags_out_on_host = false;
+    uint64_t* h_frags_owned_oneshot = nullptr;  // freed in D2H after copy
+
     // Phase 2.5a: t3_sort_full_cap opt-in skips the tile-merge path
     // when caller has confirmed VRAM headroom. Forces the fast path
     // even in minimal mode where t1_match_sliced is true. Tiny mode
@@ -3715,9 +3735,28 @@ t3_match_entry:
         }
         s_malloc(stats, d_sort_scratch_tile, t3_tile_sort_bytes,          "d_sort_scratch(t3_tile)");
 
-        uint64_t* h_frags = static_cast<uint64_t*>(
-            sycl::malloc_host(cap * sizeof(uint64_t), q));
-        if (!h_frags) throw std::runtime_error("sycl::malloc_host(h_frags) failed");
+        // Tiny tier: alias h_frags onto the caller's pinned_dst when
+        // available, else pre-allocate the one-shot temp and let D2H
+        // free it after the std::memcpy to the OWNING result. Saves
+        // the d_frags_out re-hydrate AND avoids double-allocating
+        // cap-sized host pinned (one for h_frags + one for h_pinned
+        // in D2H).
+        uint64_t* h_frags = nullptr;
+        if (scratch.tiny_mode && pinned_dst && pinned_capacity >= cap) {
+            h_frags = pinned_dst;
+            d_frags_out_on_host = true;
+        } else if (scratch.tiny_mode) {
+            h_frags_owned_oneshot = static_cast<uint64_t*>(
+                sycl::malloc_host(cap * sizeof(uint64_t), q));
+            if (!h_frags_owned_oneshot)
+                throw std::runtime_error("sycl::malloc_host(h_frags_oneshot) failed");
+            h_frags = h_frags_owned_oneshot;
+            d_frags_out_on_host = true;
+        } else {
+            h_frags = static_cast<uint64_t*>(
+                sycl::malloc_host(cap * sizeof(uint64_t), q));
+            if (!h_frags) throw std::runtime_error("sycl::malloc_host(h_frags) failed");
+        }
 
         // Tiny mode: source pointer is the parked host buffer; the
         // staging variant H2Ds before each tile sort. In minimal mode
@@ -3786,12 +3825,28 @@ t3_match_entry:
             }
         }
 
-        // Re-hydrate full-cap d_frags_out for the existing D2H phase.
-        s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
-        if (t3_count > 0) {
-            q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
+        if (d_frags_out_on_host) {
+            // Tiny: h_frags already holds the sorted output in caller's
+            // pinned_dst (or in h_frags_owned_oneshot for the no-pinned
+            // path). D2H below detects d_frags_out_on_host and either
+            // no-ops or std::memcpys to the OWNING vector — no device
+            // re-hydrate, no q.memcpy roundtrip. Saves cap × u64 device
+            // bytes (= 528 MB at k=26 / ~2 GB at k=28) on the T3 sort
+            // phase peak — the dominant Tiny-tier device floor.
+            //
+            // Set d_frags_out to h_frags so the unconditional s_free
+            // below knows it's a host pointer (the alias case marks the
+            // pointer in a side-flag the s_free path checks).
+            d_frags_out = h_frags;
+        } else {
+            // Minimal/Compact/Plain: re-hydrate full-cap d_frags_out for
+            // the existing D2H phase.
+            s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
+            if (t3_count > 0) {
+                q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
+            }
+            sycl::free(h_frags, q);
         }
-        sycl::free(h_frags, q);
     }
 
     // ---------- D2H ----------
@@ -3809,7 +3864,30 @@ t3_match_entry:
 
     int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
     if (t3_count > 0) {
-        if (pinned_dst) {
+        if (d_frags_out_on_host) {
+            // Tiny: sorted output already lives in pinned_dst (or in
+            // h_frags_owned_oneshot). No device-to-host transfer needed.
+            if (pinned_dst) {
+                // Result aliases pinned_dst — caller owns.
+                if (pinned_capacity < t3_count) {
+                    throw std::runtime_error(
+                        "run_gpu_pipeline_streaming: pinned_capacity " +
+                        std::to_string(pinned_capacity) +
+                        " < t3_count " + std::to_string(t3_count));
+                }
+                result.external_fragments_ptr   = pinned_dst;
+                result.external_fragments_count = t3_count;
+            } else {
+                // One-shot path — copy from our temp pinned to OWNING
+                // vector using a host std::memcpy (q.memcpy would
+                // serialize through the SYCL queue, which an earlier
+                // attempt this session showed adds 1-2s wall at k=26).
+                result.t3_fragments_storage.resize(t3_count);
+                std::memcpy(result.t3_fragments_storage.data(),
+                            h_frags_owned_oneshot,
+                            sizeof(uint64_t) * t3_count);
+            }
+        } else if (pinned_dst) {
             if (pinned_capacity < t3_count) {
                 throw std::runtime_error(
                     "run_gpu_pipeline_streaming: pinned_capacity " +
@@ -3835,7 +3913,15 @@ t3_match_entry:
     }
     end_phase(p_d2h);
 
-    s_free(stats, d_frags_out);
+    if (d_frags_out_on_host) {
+        // Free the one-shot pinned (alias-to-pinned_dst path leaves the
+        // buffer for the caller). d_frags_out is a host pointer in this
+        // branch — must NOT route through s_free's device tracking.
+        if (h_frags_owned_oneshot) sycl::free(h_frags_owned_oneshot, q);
+        d_frags_out = nullptr;
+    } else {
+        s_free(stats, d_frags_out);
+    }
     s_free(stats, d_counter);
 
     if (stats.verbose) {
