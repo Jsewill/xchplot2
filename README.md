@@ -41,11 +41,11 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   kernels at the heart of plotting are integer-only and see no FP16
   penalty.
 - **VRAM:** 4 GiB minimum at k=28. Cards with < 15 GB free use the
-  streaming pipeline (three sub-tiers — plain ~7.4 GiB, compact
-  ~5.3 GiB, minimal ~3.7 GiB — auto-picked by free VRAM); 16 GB+
-  cards use the persistent buffer pool for faster steady-state. All
-  paths produce byte-identical plots. Detailed breakdown in
-  [VRAM](#vram).
+  streaming pipeline (four sub-tiers — plain ~7.4 GiB, compact
+  ~5.3 GiB, minimal ~3.7 GiB, tiny ~3.7 GiB pending sub-2GiB
+  reduction — auto-picked by free VRAM); 16 GB+ cards use the
+  persistent buffer pool for faster steady-state. All paths produce
+  byte-identical plots. Detailed breakdown in [VRAM](#vram).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   pool-vs-streaming path from its own GPU's free VRAM — heterogeneous
@@ -419,16 +419,39 @@ based on available VRAM:
   host-CPU merge work — k=28 wall on sm_89: ~31 s/plot vs ~12 s
   for compact (~2.6×). 4 GiB cards remain an edge case since
   real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context;
-  please report actual fit. There is no smaller tier — a forced
-  minimal on a card below the floor throws.
+  please report actual fit.
+- **Tiny streaming (~3.7 GiB floor at this commit, ~1.1 GiB
+  target).** Mirrors the SYCL Tiny tier algorithm. On top of
+  Minimal's six cuts, adds: per-section-pair T1 match tile (Xs
+  data parks on pinned host h_xs_pinned; T1 reads via per-(L,R)
+  section H2D), per-(section_l, match_key_r) bucket-pair
+  sub-section for T1/T2/T3 match (per-pass tile is L section +
+  one R bucket instead of full L+R), streaming-partition T1 sort
+  (eliminates the cap-sized d_t1_meta on device by partitioning
+  to per-bucket arenas + per-bucket CUB sort), host-side T2/T3
+  prepare offsets (binary search on the already-sorted
+  h_keys_merged, skipping the cap-sized GPU prepare-keys H2D),
+  and d_frags_out → host alias (T3 sort lands sorted fragments
+  directly in pinned_dst, eliminating the cap-sized re-hydrate).
+  Targets sub-2 GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB,
+  older laptop dGPUs). **In-progress note**: at this commit the
+  Tiny T2 sort still uses Minimal's path because the
+  byte-parity-preserving Tiny T2 sort (quad-val streaming
+  partition with global_idx tiebreak) is deferred to a follow-up.
+  Until that lands, Tiny's plot peak equals Minimal's 3640 MB —
+  the floor here matches Minimal's. `--tier tiny` produces a
+  fully farmable, byte-identical plot (validated at k=22/24/26/28)
+  but doesn't yet deliver the targeted peak reduction. There is
+  no smaller tier — a forced tiny on a card below the floor throws.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
 pool doesn't fit, the streaming-tier dispatch picks the largest
 streaming tier that fits with a 128 MB margin. Force streaming on
 any card with `XCHPLOT2_STREAMING=1`. `--tier
-plain|compact|minimal|auto` (or `XCHPLOT2_STREAMING_TIER`) overrides
-the auto-pick — useful for testing or to step down from a tight
-margin (e.g. an 8 GiB card OOMing mid-plot can `--tier compact`).
+plain|compact|minimal|tiny|auto` (or `XCHPLOT2_STREAMING_TIER`)
+overrides the auto-pick — useful for testing or to step down from
+a tight margin (e.g. an 8 GiB card OOMing mid-plot can
+`--tier compact`).
 
 Plot output is bit-identical across all paths — streaming
 reorganises memory, not algorithms.

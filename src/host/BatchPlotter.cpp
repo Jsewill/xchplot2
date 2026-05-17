@@ -331,14 +331,23 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // MX450). Floor is estimated, not measured on real 4 GiB
         // hardware — please report actual fit on a 4 GiB card.
         constexpr uint64_t kMinimalFloorBytes = 3768ULL * 1024 * 1024;
-        // Tiny tier: mirrors the SYCL Tiny tier (measured 1064 MB at
-        // k=28 on RTX 4090, anchor 1100 MB for ~3.4% safety). Targets
-        // sub-2 GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB,
-        // older laptop dGPUs). At time of scaffold landing the Tiny
-        // code path is identical to Minimal — full Tiny algorithm
-        // wiring lands in subsequent commits (see
-        // [project_cuda_only_tiny_port]).
-        constexpr uint64_t kTinyFloorBytes    = 1100ULL * 1024 * 1024;
+        // Tiny tier: algorithm wiring (per-bucket-pair T1/T2/T3 match,
+        // streaming-partition T1 sort, d_t3_stage + d_frags_out host
+        // aliases, host-prepare T2/T3 offsets) shipped through commit
+        // 1d494b3. At this commit Tiny's plot peak at k=28 measures
+        // 3640 MB on RTX 4090 — IDENTICAL to Minimal because T2 sort
+        // gather (the current peak driver) still uses the Minimal
+        // path. Honest floor here matches Minimal's; auto-picker
+        // therefore treats Tiny ≡ Minimal in selection.
+        //
+        // The Tiny T2 sort streaming partition (project task #49) is
+        // the last lever to unlock sub-2 GB cards on cuda-only. Until
+        // it lands, --tier tiny is functionally correct (byte-parity
+        // verified at k=22/24/26/28 vs SYCL Plain reference) but
+        // doesn't give the targeted peak reduction. After #49 ships,
+        // lower kTinyFloorBytes to ~1100 MB to match the SYCL Tiny
+        // tier's measured 1064 MB peak.
+        constexpr uint64_t kTinyFloorBytes    = 3768ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
@@ -451,8 +460,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (tier == Tier::Tiny) {
                     std::fprintf(stderr,
                         "[batch] streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
-                        "scaffold-only, sharing minimal code path until Tiny "
-                        "sub-section algorithm wiring lands)\n",
+                        "per-bucket-pair T1/T2/T3 match + streaming-partition T1 sort + "
+                        "d_t3_stage/d_frags_out host alias + host-prepare T2/T3 offsets, "
+                        "current peak ≈ minimal because Tiny T2 sort streaming partition "
+                        "(project task #49) hasn't landed yet)\n",
                         free_bytes / double(1ULL << 30),
                         kTinyFloorBytes / double(1ULL << 30));
                 } else {
