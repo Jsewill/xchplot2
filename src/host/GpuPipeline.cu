@@ -2985,14 +2985,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         s_malloc(stats, d_t3_match_temp, t3_temp_bytes, "d_t3_match_temp");
 
-        // d_t3_stage on device for initial wiring — defer host-pinned
-        // d_t3_stage (Phase 1.5c-a) to a follow-up commit to isolate
-        // any byte-parity bugs in the host-pinned path. Per-bucket-pair
-        // cap is small (~bucket-pair cap × 8 B) so device alloc cost
-        // is negligible.
-        T3PairingGpu* d_t3_stage = nullptr;
-        s_malloc(stats, d_t3_stage,
-                 t3_bucket_pair_cap * sizeof(T3PairingGpu), "d_t3_stage");
+        // d_t3_stage on host-pinned (Phase 1.5c-a). T3 match kernel
+        // writes via atomic-claim slot allocation = sequential-by-slot
+        // write pattern (unique out_idx per claim, no contention on
+        // adjacent addresses) — well-suited for UVA-mapped writes to
+        // host pinned memory. cudaMallocHost allocation is
+        // device-accessible via UVA on Kepler+ (cuda-only's sm_50
+        // floor). Saves ~200 MB at k=28 on T3 match phase peak.
+        // Initially deferred from #45 to isolate byte-parity bugs;
+        // re-applied here after #50 (T3 sort streaming) shifted T3
+        // match to the new floor.
+        T3PairingGpu* d_t3_stage = reinterpret_cast<T3PairingGpu*>(
+            streaming_alloc_pinned_uint64(t3_bucket_pair_cap));
+        if (!d_t3_stage) throw std::runtime_error("pinned alloc d_t3_stage failed");
 
         // Phase 1.6d (T3) — host-side prepare offsets over
         // scratch.h_keys_merged (sorted by mi from T2 sort). Eliminates
@@ -3155,10 +3160,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                         " produced " + std::to_string(pass_count) +
                         " pairs, staging holds " + std::to_string(t3_bucket_pair_cap));
                 }
-                // d_t3_stage is on device; D2H to host accumulator.
-                CHECK(cudaMemcpyAsync(h_t3_acc + t3_count, d_t3_stage,
-                                      pass_count * sizeof(T3PairingGpu),
-                                      cudaMemcpyDeviceToHost, stream));
+                // d_t3_stage is host-pinned (UVA-mapped); kernel
+                // writes are already host-visible after stream sync.
+                // Use host-to-host std::memcpy (q.memcpy would
+                // serialize through the stream).
+                std::memcpy(h_t3_acc + t3_count, d_t3_stage,
+                            pass_count * sizeof(T3PairingGpu));
                 t3_count += pass_count;
                 CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
                 CHECK(cudaStreamSynchronize(stream));
@@ -3172,7 +3179,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         if (t3_count > cap) throw std::runtime_error("T3 overflow");
 
         s_free(stats, d_t3_match_temp);
-        s_free(stats, d_t3_stage);
+        // d_t3_stage is host-pinned (not device); free via cudaFreeHost.
+        streaming_free_pinned_uint64(reinterpret_cast<uint64_t*>(d_t3_stage));
 
         // d_t2_xbits_sorted may be still alive from the (Tiny-mode) T2
         // sort gather hydration above. Free it now (T3 match doesn't
