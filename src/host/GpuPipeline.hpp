@@ -160,6 +160,16 @@ struct StreamingPinnedScratch {
     // already gives one D2H accumulator pass per section, no separate
     // output staging needed when input slicing is on).
     int t3_input_slice_count = 1;
+    // Tiny tier: most-aggressive streaming. Mirrors the SYCL Tiny tier
+    // (k=28 measured peak 1064 MB) for sub-2GB NVIDIA cards. When set,
+    // GpuPipeline.cu activates per-section-pair T1 match + per-bucket-pair
+    // T1/T2/T3 match sub-section + streaming-partition per-bucket sorts +
+    // CPU merge+pack Xs + host-pinned d_t3_stage + d_frags_out host
+    // alias + host-side T2/T3 prepare offsets. See [project_cuda_only_tiny_port].
+    // Initially scaffolding-only (Tier::Tiny picker entry exists, but
+    // GpuPipeline still routes Tiny through the Minimal code path until
+    // the per-Phase wiring lands).
+    bool tiny_mode = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

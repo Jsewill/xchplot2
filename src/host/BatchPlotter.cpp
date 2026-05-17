@@ -331,6 +331,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // MX450). Floor is estimated, not measured on real 4 GiB
         // hardware — please report actual fit on a 4 GiB card.
         constexpr uint64_t kMinimalFloorBytes = 3768ULL * 1024 * 1024;
+        // Tiny tier: mirrors the SYCL Tiny tier (measured 1064 MB at
+        // k=28 on RTX 4090, anchor 1100 MB for ~3.4% safety). Targets
+        // sub-2 GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB,
+        // older laptop dGPUs). At time of scaffold landing the Tiny
+        // code path is identical to Minimal — full Tiny algorithm
+        // wiring lands in subsequent commits (see
+        // [project_cuda_only_tiny_port]).
+        constexpr uint64_t kTinyFloorBytes    = 1100ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
@@ -344,7 +352,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             !opts.streaming_tier.empty() ? opts.streaming_tier :
             (tier_env ? std::string(tier_env) : std::string());
 
-        enum class Tier { Plain, Compact, Minimal };
+        enum class Tier { Plain, Compact, Minimal, Tiny };
         Tier tier;
         if (tier_pref == "plain") {
             tier = Tier::Plain;
@@ -352,11 +360,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             tier = Tier::Compact;
         } else if (tier_pref == "minimal") {
             tier = Tier::Minimal;
+        } else if (tier_pref == "tiny") {
+            tier = Tier::Tiny;
         } else {
             // Auto: pick the largest tier that fits.
             tier = (free_bytes >= kPlainFloorBytes)   ? Tier::Plain   :
                    (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
-                                                        Tier::Minimal;
+                   (free_bytes >= kMinimalFloorBytes) ? Tier::Minimal :
+                                                        Tier::Tiny;
         }
 
         // Forced-tier fit warnings. Forced tiers below their floor are
@@ -382,7 +393,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 "[batch] streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
-        } else if (tier == Tier::Compact || tier == Tier::Minimal) {
+        } else if (tier == Tier::Compact || tier == Tier::Minimal ||
+                   tier == Tier::Tiny) {
             // Compact + Minimal share the same pinned-host scratch
             // (h_meta / h_keys_merged / h_t2_xbits, ~4.2 GB at k=28).
             // Both also set t3_tile_count = 2: T3 match emits into a
@@ -410,7 +422,17 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
             stream_compact = true;
             stream_scratch.t3_tile_count = 2;
-            if (tier == Tier::Minimal) {
+            // Tiny tier: scaffolding only. Currently sets all Minimal
+            // flags + tiny_mode (consumed by GpuPipeline.cu when the
+            // per-Phase wiring lands — see [project_cuda_only_tiny_port]).
+            // Until then, Tiny produces byte-identical output to Minimal
+            // since the tiny_mode flag isn't yet acted on. Lets the
+            // tier-picker scaffolding land + validate the workflow
+            // before the algorithm changes.
+            if (tier == Tier::Tiny) {
+                stream_scratch.tiny_mode = true;
+            }
+            if (tier == Tier::Minimal || tier == Tier::Tiny) {
                 stream_scratch.t2_tile_count = 8;
                 // Cuts #1+#2: tile T1/T2 sort gathers through pinned host so
                 // the cap-sized sorted_meta / sorted_xbits never co-reside
@@ -426,14 +448,23 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // device. Drops T3 match peak from ~5200 → ~3700 MB.
                 int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
                 stream_scratch.t3_input_slice_count = 1 << num_section_bits;
-                std::fprintf(stderr,
-                    "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
-                    "park/rehydrate + N=8 T2 + N=%d T1-match + T1/T2 sort gather + "
-                    "N=%d T3 input slicing, expect ~5-15 s/plot extra PCIe)\n",
-                    free_bytes / double(1ULL << 30),
-                    kMinimalFloorBytes / double(1ULL << 30),
-                    stream_scratch.t3_input_slice_count,
-                    stream_scratch.t3_input_slice_count);
+                if (tier == Tier::Tiny) {
+                    std::fprintf(stderr,
+                        "[batch] streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
+                        "scaffold-only, sharing minimal code path until Tiny "
+                        "sub-section algorithm wiring lands)\n",
+                        free_bytes / double(1ULL << 30),
+                        kTinyFloorBytes / double(1ULL << 30));
+                } else {
+                    std::fprintf(stderr,
+                        "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
+                        "park/rehydrate + N=8 T2 + N=%d T1-match + T1/T2 sort gather + "
+                        "N=%d T3 input slicing, expect ~5-15 s/plot extra PCIe)\n",
+                        free_bytes / double(1ULL << 30),
+                        kMinimalFloorBytes / double(1ULL << 30),
+                        stream_scratch.t3_input_slice_count,
+                        stream_scratch.t3_input_slice_count);
+                }
             } else {
                 std::fprintf(stderr,
                     "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
@@ -450,10 +481,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
             throw std::runtime_error("[batch] internal: unhandled streaming tier");
         }
-        // Forced-minimal hard floor: there's no smaller tier to fall back
-        // to, so a card below the minimal floor genuinely can't plot at
+        // Forced-tiny hard floor: there's no smaller tier to fall back
+        // to, so a card below the tiny floor genuinely can't plot at
         // this k. Bail with a clear message.
-        if (tier == Tier::Minimal && free_bytes < kMinimalFloorBytes) {
+        if (tier == Tier::Tiny && free_bytes < kTinyFloorBytes) {
             for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
@@ -464,8 +495,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 "[batch] card too small for k=" + std::to_string(pool_k) +
                 " streaming at any tier: " +
                 std::to_string(free_bytes / (1ULL << 20)) + " MB free < " +
-                std::to_string(kMinimalFloorBytes / (1ULL << 20)) +
-                " MB minimal floor. Use a smaller k or a larger GPU "
+                std::to_string(kTinyFloorBytes / (1ULL << 20)) +
+                " MB tiny floor. Use a smaller k or a larger GPU "
                 "(or --cpu for pos2-chip CPU plotting).");
         }
     }
