@@ -2306,6 +2306,202 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     // ---------- Phase T2 sort ----------
     stats.phase = "T2 sort";
+
+    // Tiny T2 sort (Phase 1.5b): triple-val streaming partition
+    // (key, meta_u64, global_idx_u32) + per-bucket sort with packed
+    // (key << 32 | global_idx) u64 keys.
+    //
+    // Why packed u64 keys: per-bucket-local identity_idx tiebreak
+    // (the simpler approach we tried in #44) produces different
+    // equal-key ordering than Minimal/Plain's full-array sort
+    // (which tiebreaks by global identity_idx). With global_idx
+    // carried through partition + packed into the sort key, the
+    // per-bucket sort tiebreaks by ORIGINAL position — matching the
+    // global sort and preserving byte-parity.
+    //
+    // Why partition carries global_idx instead of xbits: xbits would
+    // need to stay PAIRED with meta across duplicate keys (atomic-
+    // claim partition shuffles bucket-local order). With global_idx
+    // partitioned alongside meta, sorted_global_idx after the
+    // per-bucket sort lets us gather xbits from the ORIGINAL
+    // scratch.h_t2_xbits at the right positions.
+    //
+    // Output: scratch.h_keys_merged + scratch.h_meta + scratch.h_t2_xbits
+    // hold sorted (mi, meta, xbits) on host pinned. Downstream T3
+    // match consumes these from host pinned. d_merged_vals /
+    // d_t2_keys_merged stay nullptr — no permutation needed.
+    //
+    // Peak win at k=28: -2 GB (d_t2_mi freed after partition;
+    // T2 sort gather hydration of d_t2_meta + d_t2_meta_tile
+    // eliminated; downstream T3 match reads slices from host).
+    if (scratch.tiny_mode) {
+        int const num_top_bits_t2   = std::max(4, std::min(8, cfg.k - 18));
+        int const top_bit_offset_t2 = cfg.k - num_top_bits_t2;
+        size_t const num_buckets_t2 = size_t{1} << num_top_bits_t2;
+
+        // Pre-compute global_idx [0..t2_count) on host pinned.
+        uint32_t* h_global_idx_in = streaming_alloc_pinned_uint32(t2_count);
+        if (!h_global_idx_in) throw std::runtime_error("pinned alloc h_global_idx failed");
+        for (uint64_t i = 0; i < t2_count; ++i) {
+            h_global_idx_in[i] = static_cast<uint32_t>(i);
+        }
+
+        // Partition output arenas. Reuse scratch.h_keys_merged as
+        // bucketed-keys arena (T1's sorted mi parked there is no
+        // longer needed after Tiny T2 match's host prepare consumed
+        // it). h_part_meta + h_part_global_idx need fresh pinned.
+        uint64_t* h_part_meta = streaming_alloc_pinned_uint64(cap);
+        if (!h_part_meta) throw std::runtime_error("pinned alloc h_part_meta failed");
+        uint32_t* h_part_global_idx = streaming_alloc_pinned_uint32(cap);
+        if (!h_part_global_idx) throw std::runtime_error("pinned alloc h_part_global_idx failed");
+        uint32_t* h_bucket_starts_t2s = streaming_alloc_pinned_uint32(num_buckets_t2 + 1);
+        if (!h_bucket_starts_t2s) throw std::runtime_error("pinned alloc h_bucket_starts_t2s failed");
+
+        // Triple-val partition with global_idx as val2.
+        size_t partition_scratch_bytes = 0;
+        CHECK(launch_streaming_partition_u32_u64_u32(
+            nullptr, partition_scratch_bytes,
+            d_t2_mi, scratch.h_meta, h_global_idx_in,
+            scratch.h_keys_merged, h_part_meta, h_part_global_idx,
+            h_bucket_starts_t2s,
+            t2_count, top_bit_offset_t2, num_top_bits_t2,
+            /*tile_count=*/0, stream));
+        void* d_partition_scratch_t2s = nullptr;
+        if (partition_scratch_bytes) {
+            s_malloc(stats, d_partition_scratch_t2s,
+                     partition_scratch_bytes, "d_t2_sort_partition_scratch");
+        }
+        CHECK(launch_streaming_partition_u32_u64_u32(
+            d_partition_scratch_t2s, partition_scratch_bytes,
+            d_t2_mi, scratch.h_meta, h_global_idx_in,
+            scratch.h_keys_merged, h_part_meta, h_part_global_idx,
+            h_bucket_starts_t2s,
+            t2_count, top_bit_offset_t2, num_top_bits_t2,
+            /*tile_count=*/0, stream));
+        if (d_partition_scratch_t2s) s_free(stats, d_partition_scratch_t2s);
+
+        // d_t2_mi no longer needed.
+        s_free(stats, d_t2_mi);
+        d_t2_mi = nullptr;
+
+        // global_idx input array no longer needed (carried through partition).
+        streaming_free_pinned_uint32(h_global_idx_in);
+
+        // Find max bucket size.
+        uint32_t max_bucket_t2s = 0;
+        for (size_t b = 0; b < num_buckets_t2; ++b) {
+            uint32_t const bsz =
+                h_bucket_starts_t2s[b + 1] - h_bucket_starts_t2s[b];
+            if (bsz > max_bucket_t2s) max_bucket_t2s = bsz;
+        }
+
+        // Per-bucket device buffers — packed u64 keys for stable sort.
+        uint64_t* d_bk_packed_in  = nullptr;
+        uint64_t* d_bk_packed_out = nullptr;
+        uint64_t* d_bv_meta_in    = nullptr;
+        uint64_t* d_bv_meta_out   = nullptr;
+        s_malloc(stats, d_bk_packed_in,  max_bucket_t2s * sizeof(uint64_t), "d_t2s_bk_packed_in");
+        s_malloc(stats, d_bk_packed_out, max_bucket_t2s * sizeof(uint64_t), "d_t2s_bk_packed_out");
+        s_malloc(stats, d_bv_meta_in,    max_bucket_t2s * sizeof(uint64_t), "d_t2s_bv_meta_in");
+        s_malloc(stats, d_bv_meta_out,   max_bucket_t2s * sizeof(uint64_t), "d_t2s_bv_meta_out");
+
+        // CUB scratch sized at max bucket. end_bit = 32 + k covers
+        // global_idx (low 32 bits) + key (high 32 bits, of which
+        // bits k..31 are zero and bits 0..k are the key) so that
+        // sort tiebreaks by global_idx within equal keys.
+        size_t bucket_sort_bytes_t2s = 0;
+        CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, bucket_sort_bytes_t2s,
+            d_bk_packed_in, d_bk_packed_out,
+            d_bv_meta_in, d_bv_meta_out,
+            max_bucket_t2s,
+            /*begin_bit=*/0, /*end_bit=*/32 + cfg.k, stream));
+        void* d_bucket_sort_scratch_t2s = nullptr;
+        if (bucket_sort_bytes_t2s) {
+            s_malloc(stats, d_bucket_sort_scratch_t2s,
+                     bucket_sort_bytes_t2s, "d_t2s_bucket_sort_scratch");
+        }
+
+        // Separate output buffer for sorted xbits — the gather pattern
+        // reads h_t2_xbits[sorted_global_idx[i]] which can hit any
+        // global position, so in-place writes to scratch.h_t2_xbits
+        // would clobber data still needed by later buckets. Memcpy
+        // back to scratch.h_t2_xbits at end.
+        uint32_t* h_t2_xbits_sorted_out = streaming_alloc_pinned_uint32(cap);
+        if (!h_t2_xbits_sorted_out) throw std::runtime_error("pinned alloc h_t2_xbits_sorted_out failed");
+
+        std::vector<uint64_t> h_packed_bucket(max_bucket_t2s);
+
+        for (size_t b = 0; b < num_buckets_t2; ++b) {
+            uint32_t const bstart = h_bucket_starts_t2s[b];
+            uint32_t const bsz    = h_bucket_starts_t2s[b + 1] - bstart;
+            if (bsz == 0) continue;
+
+            // Host: pack (key, global_idx) into u64.
+            for (uint32_t i = 0; i < bsz; ++i) {
+                h_packed_bucket[i] =
+                    (uint64_t(scratch.h_keys_merged[bstart + i]) << 32) |
+                    uint64_t(h_part_global_idx[bstart + i]);
+            }
+
+            CHECK(cudaMemcpyAsync(d_bk_packed_in, h_packed_bucket.data(),
+                                  bsz * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream));
+            CHECK(cudaMemcpyAsync(d_bv_meta_in, h_part_meta + bstart,
+                                  bsz * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream));
+
+            size_t bsb = bucket_sort_bytes_t2s;
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_bucket_sort_scratch_t2s, bsb,
+                d_bk_packed_in, d_bk_packed_out,
+                d_bv_meta_in, d_bv_meta_out,
+                bsz, /*begin_bit=*/0, /*end_bit=*/32 + cfg.k, stream));
+
+            // D2H sorted packed keys + meta.
+            CHECK(cudaMemcpyAsync(h_packed_bucket.data(), d_bk_packed_out,
+                                  bsz * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaMemcpyAsync(scratch.h_meta + bstart, d_bv_meta_out,
+                                  bsz * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+
+            // Unpack: sorted keys → scratch.h_keys_merged (in place),
+            // sorted global_idx → gather xbits from original
+            // scratch.h_t2_xbits into h_t2_xbits_sorted_out.
+            for (uint32_t i = 0; i < bsz; ++i) {
+                uint64_t const packed = h_packed_bucket[i];
+                scratch.h_keys_merged[bstart + i] =
+                    static_cast<uint32_t>(packed >> 32);
+                uint32_t const orig_idx = static_cast<uint32_t>(packed & 0xFFFFFFFFu);
+                h_t2_xbits_sorted_out[bstart + i] = scratch.h_t2_xbits[orig_idx];
+            }
+        }
+
+        if (d_bucket_sort_scratch_t2s) s_free(stats, d_bucket_sort_scratch_t2s);
+        s_free(stats, d_bv_meta_out);
+        s_free(stats, d_bv_meta_in);
+        s_free(stats, d_bk_packed_out);
+        s_free(stats, d_bk_packed_in);
+        streaming_free_pinned_uint64(h_part_meta);
+        streaming_free_pinned_uint32(h_part_global_idx);
+        streaming_free_pinned_uint32(h_bucket_starts_t2s);
+
+        // Copy sorted xbits back to scratch.h_t2_xbits. After this
+        // point, scratch.h_meta + scratch.h_keys_merged + scratch.h_t2_xbits
+        // hold sorted (meta, mi, xbits). Downstream T3 match (Tiny
+        // path, which uses host prepare + per-bucket slice loads)
+        // reads from these.
+        std::memcpy(scratch.h_t2_xbits, h_t2_xbits_sorted_out,
+                    t2_count * sizeof(uint32_t));
+        streaming_free_pinned_uint32(h_t2_xbits_sorted_out);
+
+        // Tiny T2 sort done. Skip the rest of the T2 sort phase
+        // (tiled_t2_sort + Minimal gather Cut #2) via the
+        // !scratch.tiny_mode gates added below.
+    }
+
     constexpr int kNumT2Tiles = 4;
     uint64_t t2_tile_n  [kNumT2Tiles];
     uint64_t t2_tile_off[kNumT2Tiles + 1];
@@ -2351,7 +2547,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     bool const tiled_t2_sort = (scratch.gather_tile_count >= 2 &&
                                 scratch.h_keys_merged != nullptr &&
-                                scratch.h_t2_xbits != nullptr);
+                                scratch.h_t2_xbits != nullptr &&
+                                !scratch.tiny_mode);
 
     if (tiled_t2_sort) {
         int const N_t2 = scratch.gather_tile_count;
@@ -2585,7 +2782,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // (12 cap = 8 + 4 cap for d_t2_meta_sorted + d_t2_xbits_sorted).
     bool const tiled_gather_t2 = (gather_n >= 2 &&
                                   scratch.h_meta != nullptr &&
-                                  scratch.h_t2_xbits != nullptr);
+                                  scratch.h_t2_xbits != nullptr &&
+                                  !scratch.tiny_mode);
 
     uint64_t* d_t2_meta_sorted  = nullptr;
     uint32_t* d_t2_xbits_sorted = nullptr;
@@ -2660,7 +2858,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         CHECK(cudaMemcpyAsync(d_t2_xbits_sorted, scratch.h_t2_xbits,
                               t2_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
-    } else {
+    } else if (!scratch.tiny_mode) {
         // Compact-streaming: JIT H2D d_t2_meta back for gather_u64.
         if (scratch.h_meta) {
             s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
