@@ -2703,7 +2703,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Compact-streaming: H2D d_t2_keys_merged back for T3 match (its
     // consumer). Allocated here so d_t3 + d_t3_match_temp can pick the
     // freed region left by d_t2_meta during the meta gather above.
-    if (scratch.h_keys_merged) {
+    // Tiny skips this — host prepare + per-bucket R slice carry mi
+    // information without the full-cap device hydration.
+    if (scratch.h_keys_merged && !scratch.tiny_mode) {
         s_malloc(stats, d_t2_keys_merged, cap * sizeof(uint32_t), "d_t2_keys_merged");
         CHECK(cudaMemcpyAsync(d_t2_keys_merged, scratch.h_keys_merged,
                               t2_count * sizeof(uint32_t),
@@ -2714,14 +2716,240 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     void*         d_t3_match_temp = nullptr;
     uint64_t      t3_count        = 0;
 
+    // Tiny T3 match (Phase 1.6c + 1.6d + 1.5c-a):
+    //   - L (meta_l + xbits_l) cached per section_l on device.
+    //   - R (meta_r + xbits_r + mi_r) per (section_l, mk) bucket slice.
+    //   - Host-side prepare offsets from scratch.h_keys_merged (no
+    //     d_t2_keys_merged GPU hydration).
+    //   - d_t3_stage allocated as host-pinned (UVA-mapped writes from
+    //     the match kernel). Eliminates d_t3_stage from device peak.
+    //   - Uses launch_t3_match_section_pair_split_range (kernel from
+    //     commit cca9287).
+    bool const tiny_t3_match = scratch.tiny_mode;
+
     bool const t3_input_slice_path =
+        !tiny_t3_match &&
         scratch.t3_input_slice_count >= 2 && scratch.h_meta != nullptr;
 
     bool const t3_stage_path =
-        !t3_input_slice_path &&
+        !tiny_t3_match && !t3_input_slice_path &&
         scratch.t3_tile_count >= 2 && scratch.h_meta != nullptr;
 
-    if (t3_input_slice_path) {
+    if (tiny_t3_match) {
+        uint32_t const num_sections_t3   = 1u << t3p.num_section_bits;
+        uint32_t const num_match_keys_t3 = 1u << t3p.num_match_key_bits;
+        uint32_t const t3_num_buckets    = num_sections_t3 * num_match_keys_t3;
+        uint64_t const t3_bucket_pair_cap =
+            ((cap + uint64_t(t3_num_buckets) - 1) / uint64_t(t3_num_buckets))
+            * 3ULL / 2ULL;  // 50% safety margin (T3 skews more than T2 from uniform avg)
+
+        s_malloc(stats, d_t3_match_temp, t3_temp_bytes, "d_t3_match_temp");
+
+        // d_t3_stage on device for initial wiring — defer host-pinned
+        // d_t3_stage (Phase 1.5c-a) to a follow-up commit to isolate
+        // any byte-parity bugs in the host-pinned path. Per-bucket-pair
+        // cap is small (~bucket-pair cap × 8 B) so device alloc cost
+        // is negligible.
+        T3PairingGpu* d_t3_stage = nullptr;
+        s_malloc(stats, d_t3_stage,
+                 t3_bucket_pair_cap * sizeof(T3PairingGpu), "d_t3_stage");
+
+        // Phase 1.6d (T3) — host-side prepare offsets over
+        // scratch.h_keys_merged (sorted by mi from T2 sort). Eliminates
+        // the 1 GB d_t2_keys_merged GPU H2D.
+        constexpr int kT3FineBitsLocal = 8;
+        uint32_t const t3_fine_count =
+            t3_num_buckets * (1u << kT3FineBitsLocal);
+        int const t3_bucket_shift = t3p.num_match_target_bits;
+        int const t3_fine_shift   = t3p.num_match_target_bits - kT3FineBitsLocal;
+
+        std::vector<uint64_t> h_t3_bucket_off(t3_num_buckets + 1);
+        std::vector<uint64_t> h_t3_fine_off  (t3_fine_count + 1);
+        h_t3_bucket_off[0] = 0;
+        for (uint32_t b = 1; b <= t3_num_buckets; ++b) {
+            uint64_t lo = h_t3_bucket_off[b - 1], hi = t2_count;
+            while (lo < hi) {
+                uint64_t mid = lo + (hi - lo) / 2;
+                uint32_t const bm = scratch.h_keys_merged[mid] >> t3_bucket_shift;
+                if (bm < b) lo = mid + 1;
+                else        hi = mid;
+            }
+            h_t3_bucket_off[b] = lo;
+        }
+        for (uint32_t b = 0; b < t3_num_buckets; ++b) {
+            uint64_t const b_start = h_t3_bucket_off[b];
+            uint64_t const b_end   = h_t3_bucket_off[b + 1];
+            uint64_t cursor = b_start;
+            for (uint32_t f = 0; f < (1u << kT3FineBitsLocal); ++f) {
+                uint64_t const fine_idx = (uint64_t(b) << kT3FineBitsLocal) | f;
+                uint32_t const target_fine = (b << kT3FineBitsLocal) | f;
+                uint64_t lo = cursor, hi = b_end;
+                while (lo < hi) {
+                    uint64_t mid = lo + (hi - lo) / 2;
+                    uint32_t const fm = scratch.h_keys_merged[mid] >> t3_fine_shift;
+                    if (fm < target_fine) lo = mid + 1;
+                    else                  hi = mid;
+                }
+                h_t3_fine_off[fine_idx] = lo;
+                cursor = lo;
+            }
+        }
+        h_t3_fine_off[t3_fine_count] = h_t3_bucket_off[t3_num_buckets];
+
+        CHECK(cudaMemcpyAsync(d_t3_match_temp, h_t3_bucket_off.data(),
+                              (t3_num_buckets + 1) * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaMemcpyAsync(static_cast<uint64_t*>(d_t3_match_temp) + (t3_num_buckets + 1),
+                              h_t3_fine_off.data(),
+                              (t3_fine_count + 1) * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream));
+        // CRITICAL: host prepare bypasses launch_t3_match_prepare, which
+        // is where the GPU prepare would upload g_t3_fk (the __constant__
+        // Feistel key used by feistel_encrypt inside the match kernel).
+        // Without this upload, fragments are computed with stale/zero
+        // Feistel key → wrong plot bytes. Took several rounds of
+        // debugging to find — t3_count matched Minimal exactly (same
+        // match SET), but fragment VALUES were wrong because of the
+        // missing key upload.
+        CHECK(launch_t3_upload_feistel_key(cfg.plot_id.data(), t3p, stream));
+        CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+        CHECK(cudaStreamSynchronize(stream));
+
+        // Per-plot T3 accumulator on host pinned. h_meta is in use as
+        // T2 meta input source across the loop, so we need a separate
+        // accumulator.
+        uint64_t* h_t3_acc_raw = streaming_alloc_pinned_uint64(cap);
+        if (!h_t3_acc_raw) throw std::runtime_error("pinned alloc for h_t3_acc failed");
+        T3PairingGpu* const h_t3_acc = reinterpret_cast<T3PairingGpu*>(h_t3_acc_raw);
+
+        // Per-section L cache: meta_l + xbits_l.
+        int32_t cur_section_l = -1;
+        uint64_t cur_l_row_start = 0;
+        uint64_t* d_t3_meta_l_slice = nullptr;
+        uint32_t* d_t3_xbits_l_slice = nullptr;
+        auto release_l = [&]() {
+            if (d_t3_xbits_l_slice) { s_free(stats, d_t3_xbits_l_slice); d_t3_xbits_l_slice = nullptr; }
+            if (d_t3_meta_l_slice)  { s_free(stats, d_t3_meta_l_slice);  d_t3_meta_l_slice  = nullptr; }
+            cur_section_l = -1;
+        };
+        auto ensure_l = [&](uint32_t section_l) {
+            if (static_cast<int32_t>(section_l) == cur_section_l) return;
+            release_l();
+            cur_l_row_start = h_t3_bucket_off[section_l * num_match_keys_t3];
+            uint64_t const l_end = h_t3_bucket_off[(section_l + 1) * num_match_keys_t3];
+            uint64_t const l_count = l_end - cur_l_row_start;
+            if (l_count > 0) {
+                s_malloc(stats, d_t3_meta_l_slice,
+                         l_count * sizeof(uint64_t), "d_t3_meta_l_slice");
+                s_malloc(stats, d_t3_xbits_l_slice,
+                         l_count * sizeof(uint32_t), "d_t3_xbits_l_slice");
+                CHECK(cudaMemcpyAsync(d_t3_meta_l_slice,
+                                      scratch.h_meta + cur_l_row_start,
+                                      l_count * sizeof(uint64_t),
+                                      cudaMemcpyHostToDevice, stream));
+                CHECK(cudaMemcpyAsync(d_t3_xbits_l_slice,
+                                      scratch.h_t2_xbits + cur_l_row_start,
+                                      l_count * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice, stream));
+                CHECK(cudaStreamSynchronize(stream));
+            }
+            cur_section_l = static_cast<int32_t>(section_l);
+        };
+
+        // Per (section_l, mk) iteration. For each bucket_id, the kernel
+        // reads L (full section) + R (one bucket) and writes matches
+        // via UVA to d_t3_stage host pinned.
+        for (uint32_t bucket_id = 0; bucket_id < t3_num_buckets; ++bucket_id) {
+            uint32_t const section_l = bucket_id / num_match_keys_t3;
+            uint32_t const section_r =
+                matching_section_host(section_l, t3p.num_section_bits);
+            uint32_t const mk        = bucket_id % num_match_keys_t3;
+            uint32_t const r_bucket_id = section_r * num_match_keys_t3 + mk;
+
+            ensure_l(section_l);
+
+            uint64_t const r_row_start = h_t3_bucket_off[r_bucket_id];
+            uint64_t const r_row_end   = h_t3_bucket_off[r_bucket_id + 1];
+            uint64_t const r_count     = r_row_end - r_row_start;
+
+            uint64_t* d_t3_meta_r_bucket  = nullptr;
+            uint32_t* d_t3_xbits_r_bucket = nullptr;
+            uint32_t* d_t3_mi_r_bucket    = nullptr;
+            if (r_count > 0 && d_t3_meta_l_slice) {
+                s_malloc(stats, d_t3_meta_r_bucket,
+                         r_count * sizeof(uint64_t), "d_t3_meta_r_bucket");
+                s_malloc(stats, d_t3_xbits_r_bucket,
+                         r_count * sizeof(uint32_t), "d_t3_xbits_r_bucket");
+                s_malloc(stats, d_t3_mi_r_bucket,
+                         r_count * sizeof(uint32_t), "d_t3_mi_r_bucket");
+                CHECK(cudaMemcpyAsync(d_t3_meta_r_bucket,
+                                      scratch.h_meta + r_row_start,
+                                      r_count * sizeof(uint64_t),
+                                      cudaMemcpyHostToDevice, stream));
+                CHECK(cudaMemcpyAsync(d_t3_xbits_r_bucket,
+                                      scratch.h_t2_xbits + r_row_start,
+                                      r_count * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice, stream));
+                CHECK(cudaMemcpyAsync(d_t3_mi_r_bucket,
+                                      scratch.h_keys_merged + r_row_start,
+                                      r_count * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice, stream));
+                CHECK(cudaStreamSynchronize(stream));
+
+                CHECK(launch_t3_match_section_pair_split_range(
+                    cfg.plot_id.data(), t3p,
+                    d_t3_meta_l_slice, d_t3_xbits_l_slice, cur_l_row_start,
+                    d_t3_meta_r_bucket, d_t3_xbits_r_bucket, d_t3_mi_r_bucket,
+                    r_row_start,
+                    d_t3_stage, d_counter, t3_bucket_pair_cap,
+                    d_t3_match_temp,
+                    bucket_id, bucket_id + 1, stream));
+
+                uint64_t pass_count = 0;
+                CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, stream));
+                CHECK(cudaStreamSynchronize(stream));
+                if (pass_count > t3_bucket_pair_cap) {
+                    throw std::runtime_error(
+                        "tiny T3 match bucket " + std::to_string(bucket_id) +
+                        " produced " + std::to_string(pass_count) +
+                        " pairs, staging holds " + std::to_string(t3_bucket_pair_cap));
+                }
+                // d_t3_stage is on device; D2H to host accumulator.
+                CHECK(cudaMemcpyAsync(h_t3_acc + t3_count, d_t3_stage,
+                                      pass_count * sizeof(T3PairingGpu),
+                                      cudaMemcpyDeviceToHost, stream));
+                t3_count += pass_count;
+                CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+                CHECK(cudaStreamSynchronize(stream));
+
+                s_free(stats, d_t3_mi_r_bucket);
+                s_free(stats, d_t3_xbits_r_bucket);
+                s_free(stats, d_t3_meta_r_bucket);
+            }
+        }
+        release_l();
+        if (t3_count > cap) throw std::runtime_error("T3 overflow");
+
+        s_free(stats, d_t3_match_temp);
+        s_free(stats, d_t3_stage);
+
+        // d_t2_xbits_sorted may be still alive from the (Tiny-mode) T2
+        // sort gather hydration above. Free it now (T3 match doesn't
+        // need it).
+        if (d_t2_xbits_sorted) {
+            s_free(stats, d_t2_xbits_sorted);
+            d_t2_xbits_sorted = nullptr;
+        }
+
+        // Hydrate d_t3 full-cap for downstream T3 sort.
+        s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
+        CHECK(cudaMemcpyAsync(d_t3, h_t3_acc,
+                              t3_count * sizeof(T3PairingGpu),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        streaming_free_pinned_uint64(h_t3_acc_raw);
+    } else if (t3_input_slice_path) {
         // Cut #3 (minimal tier): T3 match section-pair input slicing.
         // d_t2_meta_sorted is parked on scratch.h_meta from cut #2's
         // deferred re-hydrate (skipped when t3_input_slice_count >= 2);
@@ -2979,7 +3207,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               t3_count * sizeof(T3PairingGpu),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-    } else {
+    } else if (!tiny_t3_match) {
         s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
         s_malloc(stats, d_t3_match_temp, t3_temp_bytes,              "d_t3_match_temp");
 

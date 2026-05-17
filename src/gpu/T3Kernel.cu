@@ -652,6 +652,25 @@ cudaError_t launch_t3_match_section_pair_split_range(
     return cudaGetLastError();
 }
 
+// Tiny tier (sub-section) helper: upload the Feistel key without
+// running the full prepare. The host-side T3 prepare (computes
+// bucket + fine offsets via binary search on the parked h_keys_merged)
+// bypasses launch_t3_match_prepare to avoid the cap-sized
+// d_t2_keys_merged GPU hydration, but the kernel still needs
+// g_t3_fk uploaded. Caller invokes this once after the host prepare
+// finishes and before the per-bucket-pair match loop starts.
+cudaError_t launch_t3_upload_feistel_key(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes)             return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
+    FeistelKey fk = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    return cudaMemcpyToSymbolAsync(
+        g_t3_fk, &fk, sizeof(fk), 0, cudaMemcpyHostToDevice, stream);
+}
+
 cudaError_t launch_t3_match(
     uint8_t const* plot_id_bytes,
     T3MatchParams const& params,

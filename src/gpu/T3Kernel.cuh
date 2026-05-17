@@ -145,6 +145,19 @@ cudaError_t launch_t3_match_section_pair_split_range(
     uint32_t bucket_end,
     cudaStream_t stream = nullptr);
 
+// Tiny tier helper: upload the T3 Feistel key (__constant__ g_t3_fk)
+// without running launch_t3_match_prepare. The host-side T3 prepare
+// (Phase 1.6d) computes bucket + fine offsets on host via binary
+// search to avoid the cap-sized d_t2_keys_merged GPU hydration that
+// the GPU prepare would require. Since the GPU prepare normally
+// uploads g_t3_fk alongside the offsets, host-prepare callers must
+// invoke this separately or the match kernel will see stale Feistel
+// key data → wrong fragment values.
+cudaError_t launch_t3_upload_feistel_key(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    cudaStream_t stream = nullptr);
+
 // Mirrors pos2-chip/src/pos/ProofCore.hpp matching_section. Exposed for
 // the streaming caller to compute section_r from section_l on the host
 // side (the kernel already does this internally; this helper avoids
