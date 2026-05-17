@@ -327,7 +327,7 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
-| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal` | Override the streaming-tier auto-pick. Equivalent CLI flag: `--tier`. |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain ~7.4 GiB peak, compact ~5.3 GiB, minimal ~3.7 GiB, tiny ~1.1 GiB — k=28 measured). Equivalent CLI flag: `--tier`. Either form forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback.          |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `cudaMalloc` / `cudaFree`.                     |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
