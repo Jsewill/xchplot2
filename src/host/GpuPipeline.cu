@@ -952,13 +952,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         uint32_t* h_xs_keys = reinterpret_cast<uint32_t*>(scratch.h_meta);
         uint32_t* h_xs_vals = h_xs_keys + cap;
 
+        // Tiny tier (task #52): skip the cap × 2 × u32 = 1 GB at k=28
+        // full-cap gen output. Per tile: launch_xs_gen_range writes
+        // (keys_a, vals_a) for [tile_start, tile_end), CUB sort to
+        // (keys_b, vals_b), D2H to host pinned. Buffers stay
+        // tile-sized — Xs phase peak drops from 2566 MB to ~256 MB
+        // at k=28, N=4 (4 × tile_cap_xs × u32 + CUB scratch).
+        //
+        // Higher tiers (Minimal, etc.) use the existing full-cap gen
+        // path: launch_xs_gen produces 2 cap × u32 device buffers
+        // once, then tiles only the sort. They have the VRAM headroom.
+        bool const tiny_xs_gen = scratch.tiny_mode;
+
         uint32_t* d_xs_keys_full = nullptr;
         uint32_t* d_xs_vals_full = nullptr;
-        s_malloc(stats, d_xs_keys_full, total_xs * sizeof(uint32_t), "d_xs_keys_full");
-        s_malloc(stats, d_xs_vals_full, total_xs * sizeof(uint32_t), "d_xs_vals_full");
+        if (!tiny_xs_gen) {
+            s_malloc(stats, d_xs_keys_full, total_xs * sizeof(uint32_t), "d_xs_keys_full");
+            s_malloc(stats, d_xs_vals_full, total_xs * sizeof(uint32_t), "d_xs_vals_full");
 
-        CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
-                            d_xs_keys_full, d_xs_vals_full));
+            CHECK(launch_xs_gen(cfg.plot_id.data(), cfg.k, cfg.testnet,
+                                d_xs_keys_full, d_xs_vals_full));
+        }
 
         size_t xs_cub_bytes = 0;
         {
@@ -970,9 +984,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 tile_cap_xs, /*begin_bit=*/0, /*end_bit=*/cfg.k));
         }
 
+        // For Tiny we need TWO sort buffers per side (a + b) since CUB
+        // DoubleBuffer needs distinct ping-pong buffers; the existing
+        // non-tiny path uses (d_xs_keys_full + tile_start) as the "A"
+        // side and d_xs_keys_alt as the "B" side.
+        uint32_t* d_xs_keys_a      = nullptr;  // tiny: per-tile gen output
+        uint32_t* d_xs_vals_a      = nullptr;
         uint32_t* d_xs_keys_alt    = nullptr;
         uint32_t* d_xs_vals_alt    = nullptr;
         void*     d_xs_cub_scratch = nullptr;
+        if (tiny_xs_gen) {
+            s_malloc(stats, d_xs_keys_a, tile_cap_xs * sizeof(uint32_t), "d_xs_keys_a_tile");
+            s_malloc(stats, d_xs_vals_a, tile_cap_xs * sizeof(uint32_t), "d_xs_vals_a_tile");
+        }
         s_malloc(stats, d_xs_keys_alt,    tile_cap_xs * sizeof(uint32_t), "d_xs_keys_alt");
         s_malloc(stats, d_xs_vals_alt,    tile_cap_xs * sizeof(uint32_t), "d_xs_vals_alt");
         s_malloc(stats, d_xs_cub_scratch, xs_cub_bytes,                   "d_xs_cub");
@@ -987,8 +1011,20 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             uint64_t const tile_n = tile_end - tile_start;
             if (tile_n == 0) continue;
 
-            cub::DoubleBuffer<uint32_t> dk(d_xs_keys_full + tile_start, d_xs_keys_alt);
-            cub::DoubleBuffer<uint32_t> dv(d_xs_vals_full + tile_start, d_xs_vals_alt);
+            uint32_t* keys_src = tiny_xs_gen ? d_xs_keys_a : (d_xs_keys_full + tile_start);
+            uint32_t* vals_src = tiny_xs_gen ? d_xs_vals_a : (d_xs_vals_full + tile_start);
+
+            if (tiny_xs_gen) {
+                // Generate just this tile's range into the small
+                // tile-sized a-buffers.
+                CHECK(launch_xs_gen_range(
+                    cfg.plot_id.data(), cfg.k, cfg.testnet,
+                    tile_start, tile_end,
+                    d_xs_keys_a, d_xs_vals_a));
+            }
+
+            cub::DoubleBuffer<uint32_t> dk(keys_src, d_xs_keys_alt);
+            cub::DoubleBuffer<uint32_t> dv(vals_src, d_xs_vals_alt);
             CHECK(cub::DeviceRadixSort::SortPairs(
                 d_xs_cub_scratch, xs_cub_bytes,
                 dk, dv,
@@ -1003,11 +1039,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
         CHECK(cudaStreamSynchronize(0));
 
+        if (tiny_xs_gen) {
+            s_free(stats, d_xs_vals_a);
+            s_free(stats, d_xs_keys_a);
+        }
         s_free(stats, d_xs_cub_scratch);
         s_free(stats, d_xs_vals_alt);
         s_free(stats, d_xs_keys_alt);
-        s_free(stats, d_xs_vals_full);
-        s_free(stats, d_xs_keys_full);
+        if (!tiny_xs_gen) {
+            s_free(stats, d_xs_vals_full);
+            s_free(stats, d_xs_keys_full);
+        }
 
         // Host paired merge — same shape as cut #5.
         std::vector<uint32_t> tmp_keys(total_xs);

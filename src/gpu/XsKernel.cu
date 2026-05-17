@@ -47,6 +47,33 @@ __global__ void gen_kernel(
     vals_out[idx] = x;
 }
 
+// Range variant: generates Xs entries for x ∈ [pos_begin, pos_end).
+// Output buffers hold (pos_end - pos_begin) entries indexed from 0.
+// Used by Tiny tier's tiled Xs gen+sort: each tile generates only
+// its slice, avoiding the cap-sized full-cap gen output that the
+// non-range path produces.
+__global__ void gen_kernel_range(
+    AesHashKeys keys,
+    uint32_t* __restrict__ keys_out, // match_info, tile_n entries
+    uint32_t* __restrict__ vals_out, // x, tile_n entries
+    uint64_t pos_begin,
+    uint64_t pos_end,
+    int k,
+    uint32_t xor_const)
+{
+    __shared__ uint32_t sT[4 * 256];
+    load_aes_tables_smem(sT);
+    __syncthreads();
+
+    uint64_t local_idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    uint64_t global_idx = pos_begin + local_idx;
+    if (global_idx >= pos_end) return;
+    uint32_t x = static_cast<uint32_t>(global_idx);
+    uint32_t mixed = x ^ xor_const;
+    keys_out[local_idx] = g_x_smem(keys, mixed, k, sT, kAesGRounds);
+    vals_out[local_idx] = x;
+}
+
 __global__ void pack_kernel(
     uint32_t const* __restrict__ keys_in,
     uint32_t const* __restrict__ vals_in,
@@ -128,6 +155,39 @@ cudaError_t launch_xs_gen(
 
     gen_kernel<<<blocks, kThreads, 0, stream>>>(
         keys, d_keys_out, d_vals_out, total, k, xor_const);
+    return cudaGetLastError();
+}
+
+// Range variant of launch_xs_gen: generates Xs entries for x in
+// [pos_begin, pos_end). Output buffers (caller-allocated) hold
+// (pos_end - pos_begin) entries, indexed from 0. Used by Tiny tier's
+// tiled Xs gen+sort+pack — each tile generates only its slice into
+// a small device buffer (vs the full-cap allocation the non-range
+// path requires). Drops the Xs phase peak from 2 cap × u32 ≈ 1 GB
+// at k=28 to 2 cap/N × u32 ≈ 256 MB at N=4.
+cudaError_t launch_xs_gen_range(
+    uint8_t const* plot_id_bytes, int k, bool testnet,
+    uint64_t pos_begin, uint64_t pos_end,
+    uint32_t* d_keys_out, uint32_t* d_vals_out,
+    cudaStream_t stream)
+{
+    if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
+    if (!plot_id_bytes || !d_keys_out || !d_vals_out) return cudaErrorInvalidValue;
+    if (pos_end <= pos_begin) return cudaSuccess;
+    uint64_t const total = 1ULL << k;
+    if (pos_end > total) return cudaErrorInvalidValue;
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+    uint32_t xor_const = testnet ? kTestnetGXorConst : 0u;
+
+    uint64_t const tile_n = pos_end - pos_begin;
+    constexpr int kThreads = 256;
+    uint64_t blocks_u64 = (tile_n + kThreads - 1) / kThreads;
+    if (blocks_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    unsigned blocks = static_cast<unsigned>(blocks_u64);
+
+    gen_kernel_range<<<blocks, kThreads, 0, stream>>>(
+        keys, d_keys_out, d_vals_out, pos_begin, pos_end, k, xor_const);
     return cudaGetLastError();
 }
 

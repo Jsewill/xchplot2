@@ -78,6 +78,21 @@ cudaError_t launch_xs_gen(
     uint32_t* d_vals_out,
     cudaStream_t stream = nullptr);
 
+// Range variant: generates Xs entries for x ∈ [pos_begin, pos_end).
+// Output buffers hold (pos_end - pos_begin) entries indexed from 0.
+// Used by Tiny tier's tiled Xs path — each tile generates only its
+// slice, avoiding the cap-sized full-cap gen output. See XsKernel.cu
+// for the rationale + peak savings.
+cudaError_t launch_xs_gen_range(
+    uint8_t const* plot_id_bytes,
+    int k,
+    bool testnet,
+    uint64_t pos_begin,
+    uint64_t pos_end,
+    uint32_t* d_keys_out,
+    uint32_t* d_vals_out,
+    cudaStream_t stream = nullptr);
+
 cudaError_t launch_xs_pack(
     uint32_t const* d_keys_in,
     uint32_t const* d_vals_in,
