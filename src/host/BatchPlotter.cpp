@@ -384,20 +384,33 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // Force-streaming override (matches the one-shot run_gpu_pipeline
     // dispatch). Useful for testing the streaming path on a high-VRAM
     // card and for users who want the smaller peak even when the pool
-    // would fit.
-    bool const force_streaming = [] {
+    // would fit. Also triggered by an explicit `--tier <non-auto>` or
+    // `XCHPLOT2_STREAMING_TIER` selection — without this the tier
+    // selector below is unreachable on cards where the pool fits, so
+    // `--tier tiny` on a 24 GB card was silently ignored.
+    char const* tier_env_pre = std::getenv("XCHPLOT2_STREAMING_TIER");
+    bool const tier_forced =
+        !opts.streaming_tier.empty() ||
+        (tier_env_pre && tier_env_pre[0] != '\0');
+    bool const force_streaming = [tier_forced] {
         char const* v = std::getenv("XCHPLOT2_STREAMING");
-        return v && v[0] == '1';
+        if (v && v[0] == '1') return true;
+        return tier_forced;
     }();
 
     try {
         if (force_streaming) {
-            throw InsufficientVramError("XCHPLOT2_STREAMING=1 forced");
+            throw InsufficientVramError(
+                tier_forced ? "--tier override forced streaming"
+                            : "XCHPLOT2_STREAMING=1 forced");
         }
         pool_ptr = std::make_unique<GpuBufferPool>(
             pool_k, pool_strength, pool_testnet);
     } catch (InsufficientVramError const& e) {
-        if (force_streaming) {
+        if (tier_forced) {
+            std::fprintf(stderr, "[batch] --tier override — using "
+                                 "streaming pipeline per plot\n");
+        } else if (force_streaming) {
             std::fprintf(stderr, "[batch] XCHPLOT2_STREAMING=1 — using "
                                  "streaming pipeline per plot\n");
         } else {
