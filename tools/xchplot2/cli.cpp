@@ -93,7 +93,7 @@ void print_usage(char const* prog)
         << "                                      until the partition + multi-GPU sort\n"
         << "                                      land. Drop the flag for the existing\n"
         << "                                      multi-plot behaviour.\n"
-        << "    --tier plain|compact|minimal|auto\n"
+        << "    --tier plain|compact|minimal|tiny|auto\n"
         << "                                    : force streaming pipeline tier when\n"
         << "                                      GPU pool doesn't fit.\n"
         << "                                        plain   = ~7.42 GiB floor, fastest\n"
@@ -101,6 +101,8 @@ void print_usage(char const* prog)
         << "                                        minimal = ~3.7 GiB floor, fits 4 GiB\n"
         << "                                                  (estimated; please report\n"
         << "                                                   actual fit on real 4 GiB)\n"
+        << "                                        tiny    = ~1.1 GiB floor, sub-2 GiB\n"
+        << "                                                  cards (P620 2GB, GTX 1050 2GB)\n"
         << "                                        auto    = pick largest that fits\n"
         << "                                      Equivalent to XCHPLOT2_STREAMING_TIER\n"
         << "                                      env var; CLI flag wins if both set.\n"
@@ -317,9 +319,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--shard-plot")           opts.shard_plot = true;
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                if (t != "plain" && t != "compact" && t != "minimal" &&
+                    t != "tiny" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', or 'auto' (got '"
+                              << t << "')\n";
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
@@ -471,9 +475,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
-                if (t != "plain" && t != "compact" && t != "minimal" && t != "auto") {
+                if (t != "plain" && t != "compact" && t != "minimal" &&
+                    t != "tiny" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', or 'auto' (got '"
+                              << t << "')\n";
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;
