@@ -1909,8 +1909,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                           nullptr, &t2_temp_bytes));
 
     // Compact-streaming: H2D d_t1_keys_merged back from pinned host
-    // (we parked it across T1 sort's gather peak).
-    if (scratch.h_keys_merged) {
+    // (we parked it across T1 sort's gather peak). Tiny T2 match below
+    // uses host prepare + per-bucket-pair slices, doesn't need the
+    // full-cap d_t1_keys_merged on device.
+    if (scratch.h_keys_merged && !scratch.tiny_mode) {
         s_malloc(stats, d_t1_keys_merged, cap * sizeof(uint32_t), "d_t1_keys_merged");
         CHECK(cudaMemcpyAsync(d_t1_keys_merged, scratch.h_keys_merged,
                               t1_count * sizeof(uint32_t),
