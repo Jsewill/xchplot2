@@ -119,26 +119,26 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     per-tile CUB outputs in T1/T2/T3 sort with USM-host merges, and
     tiled Xs gen+sort+pack with host-pinned accumulation. Bottleneck
     moves from compact's T1 sort (5200 MB) to T3 match (3754 MB).
-    Targets 5 GiB+ cards (RTX 2060, RX 6600 XT, RX 7600) comfortably;
-    4 GiB cards (GTX 1050 Ti, RTX 3050 4GB, MX450) are an edge case
-    since real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context.
-    Trade-off: ~6 extra cap-sized PCIe round-trips per plot. k=28
-    wall on sm_89: ~34 s/plot vs ~13 s for compact. Detailed
-    breakdown in [VRAM](#vram).
-  - **Tiny streaming** (~3.2 GB peak + 128 MB margin, k=28 measured
-    3120 MB): the smallest tier. Layers four further park-on-host
-    cuts on top of minimal — d_t1_meta_sorted + d_t1_keys_merged
-    parked across T2 match (T2 match runs section-pair-sliced),
-    d_t2_xbits_sorted + d_t2_keys_merged parked across T3 match
-    (T3 match also section-pair-sliced), merged_vals parked across
-    T1/T2 sort gather (H2D per tile), and d_t3 parked across T3
-    sort (tile sort H2Ds input from h_t3). Targets 4 GB cards
-    where minimal is on the edge. Trade-off: another ~4 cap-sized
-    PCIe round-trips per plot beyond minimal; expect somewhat
-    higher per-plot wall time. Bottleneck: T1 sort gather (full
-    d_t1_meta on device for the random-access gather kernel).
-    Cards under ~4 GB free need a kernel-level d_t1_meta scatter
-    rewrite or an opt-in disk-fallback layer (neither shipped yet).
+    Targets 5 GiB+ cards (RTX 2060, RX 6600 XT, RX 7600). Trade-off:
+    ~6 extra cap-sized PCIe round-trips per plot. k=28 wall on sm_89:
+    ~34 s/plot vs ~13 s for compact. Detailed breakdown in
+    [VRAM](#vram).
+  - **Tiny streaming** (~1.07 GiB peak + 36 MB margin, k=28 measured
+    **1064 MB**): the smallest tier. Builds on minimal with full Phase
+    1.4 + 1.5 + 1.6 algorithm work — per-section-pair T1/T2/T3 match
+    with host-prepare offsets, streaming-partition T1/T2 sort
+    (atomic-claim per-bucket + global_idx stable tiebreak), tile-and-
+    merge T3 sort from host, Xs gen+sort tiling, and host-pinned
+    d_t3_stage + d_frags_out aliases. Per-phase peaks at k=28 ≤ 1064
+    MB (Xs 1030, T1 match 1040, T1 sort 1056, T2 match 1040, T2 sort
+    1064, T3 match 1024, T3 sort 1047). Targets sub-2 GiB NVIDIA
+    cards (Quadro P620 2 GB, GTX 1050 2 GB, GT 1030 2 GB, older
+    laptop dGPUs); 4 GiB cards (GTX 1050 Ti, RTX 3050 4GB, MX450)
+    auto-select Tiny too since real 4 GiB hardware reports ~3.5 GiB
+    free post-CUDA-context, just under minimal's 3.68 GiB floor.
+    Trade-off: ~17 s/plot extra PCIe vs minimal at k=28 (sm_89
+    ~50 s/plot). There is no smaller tier — a forced tiny on a card
+    below the 1.07 GiB floor throws.
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
@@ -818,7 +818,7 @@ binaries first.
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
-| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.76 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards; tiny = ~3.2 GB peak, layers further park-on-host cuts across T2 match, T3 match, sort gathers, and T3 sort — targets 4 GB cards where minimal is on the edge). Equivalent CLI flag: `--tier`. |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.76 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards; tiny = ~1.07 GiB peak, k=28 measured 1064 MB, layers Phase 1.4/1.5/1.6 streaming-partition + per-bucket-pair match + host-prepare offsets on top of minimal — targets sub-2 GiB cards like Quadro P620 / GTX 1050 2 GB). Equivalent CLI flag: `--tier`. Either form now forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
