@@ -1,6 +1,7 @@
 // BatchPlotter.cu — implementation of staggered multi-plot pipeline.
 
 #include "host/BatchPlotter.hpp"
+#include "host/Cancel.hpp"
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
@@ -195,6 +196,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 ? shared_idx->fetch_add(1, std::memory_order_relaxed)
                 : local_idx++;
             if (i >= entries.size()) break;
+            if (cancel_requested()) {
+                std::fprintf(stderr,
+                    "[batch:cpu] cancel received — stopping before plot %zu\n", i);
+                break;
+            }
             try {
                 run_one_plot_cpu(entries[i], opts);
                 ++res.plots_written;
@@ -581,6 +587,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 ? shared_idx->fetch_add(1, std::memory_order_relaxed)
                 : local_idx++;
             if (i >= entries.size()) break;
+            if (cancel_requested()) {
+                std::fprintf(stderr,
+                    "[batch] cancel received — stopping before plot %zu\n", i);
+                break;
+            }
 
             auto t_plot = std::chrono::steady_clock::now();
 

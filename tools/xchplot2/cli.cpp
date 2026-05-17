@@ -13,6 +13,7 @@
                                    // CudaDeviceList.cu so cli.cpp
                                    // (compiled by g++) doesn't need
                                    // the CUDA include path.
+#include "host/Cancel.hpp"
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
@@ -259,6 +260,8 @@ std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
+    pos2gpu::install_cancel_signal_handlers();
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
