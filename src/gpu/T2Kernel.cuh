@@ -104,4 +104,37 @@ cudaError_t launch_t2_match_range(
     uint32_t bucket_end,
     cudaStream_t stream = nullptr);
 
+// Tiny tier (sub-section): T2 match where meta_l is a per-section L
+// slice and meta_r + mi_r are per-bucket R slices. Used by the
+// per-bucket-pair sub-section loop where each pass holds only the L
+// section's meta + ONE R bucket's meta+mi co-resident on device —
+// drops T2 match phase peak from ~452 MB (full per-section L+R) to
+// ~264 MB at k=26.
+//
+// Caller passes section_l_row_start = h_t2_bucket_offsets[section_l*nmk]
+// and section_r_row_start = h_t2_bucket_offsets[r_bucket_id]. The
+// kernel converts global l/r indices (still derived from
+// d_temp_storage's offsets table) into slice-local indices via
+// subtraction. bucket_begin..bucket_end is restricted to bucket_ids
+// that hit the (section_l, r_bucket) pair.
+//
+// Mirrors SYCL's launch_t2_match_section_pair_split (Phase 1.6b).
+cudaError_t launch_t2_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T2MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    uint64_t* d_out_meta,
+    uint32_t* d_out_mi,
+    uint32_t* d_out_xbits,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    cudaStream_t stream = nullptr);
+
 } // namespace pos2gpu
