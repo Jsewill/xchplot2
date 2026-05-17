@@ -913,6 +913,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     stats.phase = "Xs";
     XsCandidateGpu* d_xs = nullptr;
 
+    // Tiny tier (Phase 1.4a/b/c): h_xs_pinned + h_xs_section_starts
+    // replace device d_xs as the Xs-phase output. Consumed by the
+    // Tiny T1 match per-section-pair + per-bucket-pair sub-section
+    // path below. Lifetime: allocated in Xs pack (tiny_mode only),
+    // freed at end of T1 match. Mirrors SYCL Phase 1.4a/b.
+    XsCandidateGpu*       h_xs_pinned        = nullptr;
+    std::vector<uint64_t> h_xs_section_starts;
+
     // Cut #6 (minimal tier): tile Xs gen+sort+pack with N=gather_tile_
     // count. The non-tiled path peaks at four cap-sized uint32 buffers
     // during the CUB DoubleBuffer sort (~4136 MB at k=28 incl. CUB
@@ -1038,31 +1046,71 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             }
         }
 
-        // Pack (h_xs_keys, h_xs_vals) → d_xs via two strided H2D
-        // copies. d_xs[i] = {match_info, x} (8 B), so each field gets
-        // a stride-8 destination. cudaMemcpy2D handles the strided
-        // write efficiently — no separate pack kernel + 2 cap × u32
-        // d_xs_keys_b / d_xs_vals_b alive on device during pack.
-        s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
-        XsCandidateGpu sentinel{};
-        size_t const struct_stride = sizeof(XsCandidateGpu);
-        size_t const field_bytes   = sizeof(uint32_t);
-        // match_info field (offset 0)
-        CHECK(cudaMemcpy2DAsync(
-            reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, match_info),
-            struct_stride,
-            h_xs_keys, field_bytes,
-            field_bytes, total_xs,
-            cudaMemcpyHostToDevice, /*stream=*/0));
-        // x field (offset offsetof(.,x))
-        CHECK(cudaMemcpy2DAsync(
-            reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, x),
-            struct_stride,
-            h_xs_vals, field_bytes,
-            field_bytes, total_xs,
-            cudaMemcpyHostToDevice, /*stream=*/0));
-        CHECK(cudaStreamSynchronize(0));
-        (void)sentinel;
+        // Pack (h_xs_keys, h_xs_vals) → d_xs.
+        //
+        // Two paths:
+        //   tiny_mode:  CPU pack into host-pinned h_xs_pinned + build
+        //               h_xs_section_starts. No d_xs allocation. The
+        //               Tiny T1 match below H2Ds per-section-pair tiles
+        //               from h_xs_pinned, avoiding the 2 GB d_xs pin
+        //               across T1 match. (Phase 1.4a/b.)
+        //   non-tiny:   existing cudaMemcpy2D pack into device d_xs.
+        if (scratch.tiny_mode) {
+            // Allocate h_xs_pinned (cap × XsCandidateGpu = total_xs × 8 B)
+            // via cudaMallocHost — the T1 match per-section-pair path needs
+            // device-accessible host memory for the H2D into d_xs_tile.
+            cudaError_t err = cudaMallocHost(&h_xs_pinned,
+                                             total_xs * sizeof(XsCandidateGpu));
+            if (err != cudaSuccess || !h_xs_pinned) {
+                throw std::runtime_error(
+                    "cudaMallocHost(h_xs_pinned) failed: " +
+                    std::string(cudaGetErrorString(err)));
+            }
+
+            uint32_t const xs_num_sections = 1u << num_section_bits;
+            int      const xs_section_shift = cfg.k - num_section_bits;
+            std::vector<uint64_t> section_count(xs_num_sections, 0);
+
+            // CPU pack + section count in one pass over the already-
+            // merged (h_xs_keys, h_xs_vals) host arrays.
+            for (uint64_t i = 0; i < total_xs; ++i) {
+                XsCandidateGpu c{};
+                c.match_info = h_xs_keys[i];
+                c.x          = h_xs_vals[i];
+                h_xs_pinned[i] = c;
+                ++section_count[h_xs_keys[i] >> xs_section_shift];
+            }
+
+            // Prefix-sum into h_xs_section_starts (size num_sections + 1).
+            h_xs_section_starts.assign(xs_num_sections + 1, 0);
+            for (uint32_t s = 0; s < xs_num_sections; ++s) {
+                h_xs_section_starts[s + 1] =
+                    h_xs_section_starts[s] + section_count[s];
+            }
+            // d_xs stays nullptr. T1 match path below routes Tiny
+            // through the new h_xs_pinned-driven sub-section loop.
+        } else {
+            s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
+            XsCandidateGpu sentinel{};
+            size_t const struct_stride = sizeof(XsCandidateGpu);
+            size_t const field_bytes   = sizeof(uint32_t);
+            // match_info field (offset 0)
+            CHECK(cudaMemcpy2DAsync(
+                reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, match_info),
+                struct_stride,
+                h_xs_keys, field_bytes,
+                field_bytes, total_xs,
+                cudaMemcpyHostToDevice, /*stream=*/0));
+            // x field (offset offsetof(.,x))
+            CHECK(cudaMemcpy2DAsync(
+                reinterpret_cast<char*>(d_xs) + offsetof(XsCandidateGpu, x),
+                struct_stride,
+                h_xs_vals, field_bytes,
+                field_bytes, total_xs,
+                cudaMemcpyHostToDevice, /*stream=*/0));
+            CHECK(cudaStreamSynchronize(0));
+            (void)sentinel;
+        }
     } else {
         uint32_t* d_xs_keys_a = nullptr;
         uint32_t* d_xs_vals_a = nullptr;
@@ -1145,9 +1193,198 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // already holds the unsorted meta when entering T1 sort, so the
     // existing parking step below becomes a no-op (gated on
     // d_t1_meta != nullptr).
+    // Tiny tier T1 match (Phase 1.4c + 1.6a): per-section-pair tile +
+    // per-bucket-pair sub-section. Reads h_xs_pinned (built in Xs
+    // pack above) and H2Ds one section's L data + ONE R bucket per
+    // sub-pass into d_xs_tile. Drops T1 match phase peak from
+    // 2080 (d_xs) + staging ≈ 2.4 GB at k=28 down to ~1 GB (L+R/4
+    // bucket tile + per-bucket-pair staging). After all sub-passes,
+    // h_meta + h_t1_mi hold the full T1 output and we hydrate d_t1_mi
+    // for the unchanged downstream T1 sort path. Mirrors SYCL's
+    // Tiny T1 match (Phase 1.4c + 1.6a).
+    bool const tiny_t1_match = (scratch.tiny_mode && h_xs_pinned != nullptr);
+
+    if (tiny_t1_match) {
+        uint32_t const num_sections   = 1u << t1p.num_section_bits;
+        uint32_t const num_match_keys = 1u << t1p.num_match_key_bits;
+        uint32_t const t1_num_buckets = num_sections * num_match_keys;
+        // Per-bucket-pair staging cap = ceil(cap / num_buckets) × 5/4.
+        // Saves the per-section-cap allocation (4× smaller staging).
+        uint64_t const t1_bucket_pair_cap =
+            ((cap + uint64_t(t1_num_buckets) - 1) / uint64_t(t1_num_buckets))
+            * 5ULL / 4ULL;
+
+        // matching_section mirrors pos2-chip / SYCL's rotation math.
+        int      const ns_bits  = t1p.num_section_bits;
+        uint32_t const num_secs = num_sections;
+        auto matching_section = [ns_bits, num_secs](uint32_t s) -> uint32_t {
+            uint32_t const rl  = ((s << 1) | (s >> (ns_bits - 1))) & (num_secs - 1);
+            uint32_t const rl1 = (rl + 1) & (num_secs - 1);
+            return ((rl1 >> 1) | (rl1 << (ns_bits - 1))) & (num_secs - 1);
+        };
+
+        // Pre-compute per-section per-bucket entry boundaries in
+        // h_xs_pinned. h_xs_pinned is sorted by match_info, so within
+        // section s the bucket-ids are contiguous; binary-search the
+        // boundary between bucket b-1 and bucket b. Offsets are
+        // RELATIVE to h_xs_section_starts[s].
+        int const t1_bucket_shift = t1p.num_match_target_bits;
+        std::vector<std::vector<uint64_t>> section_bucket_starts(
+            num_secs, std::vector<uint64_t>(num_match_keys + 1));
+        for (uint32_t s = 0; s < num_secs; ++s) {
+            uint64_t const s_off  = h_xs_section_starts[s];
+            uint64_t const s_size = h_xs_section_starts[s + 1] - s_off;
+            section_bucket_starts[s][0] = 0;
+            section_bucket_starts[s][num_match_keys] = s_size;
+            for (uint32_t b = 1; b < num_match_keys; ++b) {
+                uint32_t const target_bucket = s * num_match_keys + b;
+                uint64_t lo = 0, hi = s_size;
+                while (lo < hi) {
+                    uint64_t mid = lo + (hi - lo) / 2;
+                    uint32_t const bm =
+                        h_xs_pinned[s_off + mid].match_info >> t1_bucket_shift;
+                    if (bm < target_bucket) lo = mid + 1;
+                    else                    hi = mid;
+                }
+                section_bucket_starts[s][b] = lo;
+            }
+        }
+
+        // Sub-tile size = max over all section pairs of
+        // (L_section_size + max R bucket in matching R section).
+        uint64_t max_pair = 0;
+        for (uint32_t s = 0; s < num_secs; ++s) {
+            uint64_t const sl_size =
+                h_xs_section_starts[s + 1] - h_xs_section_starts[s];
+            uint32_t const sr = matching_section(s);
+            uint64_t r_max_bucket = 0;
+            for (uint32_t b = 0; b < num_match_keys; ++b) {
+                uint64_t const b_size =
+                    section_bucket_starts[sr][b + 1] -
+                    section_bucket_starts[sr][b];
+                if (b_size > r_max_bucket) r_max_bucket = b_size;
+            }
+            uint64_t const sub_pair = sl_size + r_max_bucket;
+            if (sub_pair > max_pair) max_pair = sub_pair;
+        }
+
+        XsCandidateGpu* d_xs_tile = nullptr;
+        uint64_t* d_t1_meta_stage = nullptr;
+        uint32_t* d_t1_mi_stage   = nullptr;
+        s_malloc(stats, d_xs_tile, max_pair * sizeof(XsCandidateGpu), "d_xs_tile_pinned");
+        s_malloc(stats, d_t1_meta_stage, t1_bucket_pair_cap * sizeof(uint64_t), "d_t1_meta_stage");
+        s_malloc(stats, d_t1_mi_stage,   t1_bucket_pair_cap * sizeof(uint32_t), "d_t1_mi_stage");
+        s_malloc(stats, d_t1_match_temp, t1_temp_bytes,                          "d_t1_match_temp");
+
+        uint32_t* h_t1_mi = streaming_alloc_pinned_uint32(cap);
+        if (!h_t1_mi) throw std::runtime_error("pinned alloc for h_t1_mi failed");
+
+        // Iterate (section_l, mk) bucket-pairs. Each pass H2Ds L
+        // (full section_l) + R (one bucket of section_r) into
+        // d_xs_tile, runs prepare on the tile, runs match for the
+        // single bucket_id, then D2Hs the staging output.
+        uint64_t host_offset = 0;
+        for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
+            uint32_t const section_r = matching_section(section_l);
+            uint64_t const l_off = h_xs_section_starts[section_l];
+            uint64_t const l_n   = h_xs_section_starts[section_l + 1] - l_off;
+            uint64_t const r_sec_off = h_xs_section_starts[section_r];
+
+            for (uint32_t mk = 0; mk < num_match_keys; ++mk) {
+                uint64_t const r_buck_off_in_sec = section_bucket_starts[section_r][mk];
+                uint64_t const r_buck_n =
+                    section_bucket_starts[section_r][mk + 1] - r_buck_off_in_sec;
+                uint64_t const r_buck_abs_off = r_sec_off + r_buck_off_in_sec;
+                uint64_t const total_for_pass = l_n + r_buck_n;
+                uint32_t const bucket_begin = section_l * num_match_keys + mk;
+                uint32_t const bucket_end   = bucket_begin + 1;
+
+                // Sorted-bucket layout: smaller section first (kernel's
+                // bucket-offset binary search demands monotone bucket-id
+                // ordering across the tile).
+                if (section_l < section_r) {
+                    CHECK(cudaMemcpyAsync(d_xs_tile, h_xs_pinned + l_off,
+                                          l_n * sizeof(XsCandidateGpu),
+                                          cudaMemcpyHostToDevice, stream));
+                    CHECK(cudaMemcpyAsync(d_xs_tile + l_n,
+                                          h_xs_pinned + r_buck_abs_off,
+                                          r_buck_n * sizeof(XsCandidateGpu),
+                                          cudaMemcpyHostToDevice, stream));
+                } else {
+                    CHECK(cudaMemcpyAsync(d_xs_tile, h_xs_pinned + r_buck_abs_off,
+                                          r_buck_n * sizeof(XsCandidateGpu),
+                                          cudaMemcpyHostToDevice, stream));
+                    CHECK(cudaMemcpyAsync(d_xs_tile + r_buck_n,
+                                          h_xs_pinned + l_off,
+                                          l_n * sizeof(XsCandidateGpu),
+                                          cudaMemcpyHostToDevice, stream));
+                }
+                CHECK(cudaStreamSynchronize(stream));
+
+                CHECK(launch_t1_match_prepare(t1p, d_xs_tile, total_for_pass,
+                                              d_counter, d_t1_match_temp,
+                                              &t1_temp_bytes, stream));
+                CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
+
+                CHECK(launch_t1_match_range(
+                    cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
+                    d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_bucket_pair_cap,
+                    d_t1_match_temp, bucket_begin, bucket_end, stream));
+
+                uint64_t pass_count = 0;
+                CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, stream));
+                CHECK(cudaStreamSynchronize(stream));
+                if (pass_count > t1_bucket_pair_cap) {
+                    throw std::runtime_error(
+                        "T1 match (Tiny sub-section) section_l=" +
+                        std::to_string(section_l) + " mk=" + std::to_string(mk) +
+                        " produced " + std::to_string(pass_count) +
+                        " pairs, staging holds " + std::to_string(t1_bucket_pair_cap));
+                }
+                CHECK(cudaMemcpyAsync(scratch.h_meta + host_offset, d_t1_meta_stage,
+                                      pass_count * sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, stream));
+                CHECK(cudaMemcpyAsync(h_t1_mi + host_offset, d_t1_mi_stage,
+                                      pass_count * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToHost, stream));
+                CHECK(cudaStreamSynchronize(stream));
+                host_offset += pass_count;
+            }
+        }
+        t1_count = host_offset;
+        if (t1_count > cap) throw std::runtime_error("T1 overflow");
+        validate_t1_count(t1_count, cfg.k);
+
+        s_free(stats, d_t1_match_temp);
+        s_free(stats, d_t1_mi_stage);
+        s_free(stats, d_t1_meta_stage);
+        s_free(stats, d_xs_tile);
+        // h_xs_pinned consumed.
+        cudaFreeHost(h_xs_pinned);
+        h_xs_pinned = nullptr;
+
+        // Re-hydrate d_t1_mi full-cap for the upcoming T1 sort
+        // (downstream Tiny T1 sort + match phases still use the
+        // existing Minimal code path in this commit).
+        s_malloc(stats, d_t1_mi, cap * sizeof(uint32_t), "d_t1_mi");
+        CHECK(cudaMemcpyAsync(d_t1_mi, h_t1_mi, t1_count * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+        streaming_free_pinned_uint32(h_t1_mi);
+        // d_t1_meta stays null — h_meta has the unsorted meta, the
+        // existing park step below is gated on d_t1_meta and becomes
+        // a no-op. Cut #1's gather phase H2Ds h_meta back into d_t1_meta
+        // before the gather.
+    }
+
+    // Minimal/Compact tier paths follow. tiled_t1_match is gated to
+    // exclude Tiny (which took the path above and produced d_t1_mi
+    // + h_meta directly).
     bool const tiled_t1_match = (scratch.gather_tile_count >= 2 &&
-                                 scratch.h_meta != nullptr);
-    if (tiled_t1_match) {
+                                 scratch.h_meta != nullptr &&
+                                 !scratch.tiny_mode);
+    if (!tiny_t1_match && tiled_t1_match) {
         uint32_t const num_sections   = 1u << t1p.num_section_bits;
         uint32_t const num_match_keys = 1u << t1p.num_match_key_bits;
         uint32_t const t1_num_buckets = num_sections * num_match_keys;
@@ -1221,7 +1458,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // existing park step below is gated on d_t1_meta and becomes
         // a no-op. Cut #1's gather phase H2Ds h_meta back into d_t1_meta
         // before the gather (line ~1110).
-    } else {
+    } else if (!tiny_t1_match) {
+        // Plain / Compact non-tiled path. Tiny already handled above.
         s_malloc(stats, d_t1_meta,        cap * sizeof(uint64_t), "d_t1_meta");
         s_malloc(stats, d_t1_mi,          cap * sizeof(uint32_t), "d_t1_mi");
         s_malloc(stats, d_t1_match_temp,  t1_temp_bytes,          "d_t1_match_temp");
