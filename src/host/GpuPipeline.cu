@@ -3140,13 +3140,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             d_t2_xbits_sorted = nullptr;
         }
 
-        // Hydrate d_t3 full-cap for downstream T3 sort.
-        s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
-        CHECK(cudaMemcpyAsync(d_t3, h_t3_acc,
-                              t3_count * sizeof(T3PairingGpu),
-                              cudaMemcpyHostToDevice, stream));
-        CHECK(cudaStreamSynchronize(stream));
+        // Tiny T3 sort streaming (task #50): KEEP T3 fragments on host
+        // instead of hydrating d_t3 full-cap (saves cap × 8 = 2 GB at
+        // k=28). Copy h_t3_acc → scratch.h_meta (its T2-meta input
+        // park lifetime ended when Tiny T3 match consumed the last
+        // section's meta data). scratch.h_meta is the function-scope
+        // pinned slot that downstream Tiny T3 sort tile-sort reads
+        // from + merges in place. d_t3 stays nullptr.
+        std::memcpy(scratch.h_meta, h_t3_acc, t3_count * sizeof(T3PairingGpu));
         streaming_free_pinned_uint64(h_t3_acc_raw);
+        // d_t3 left null — Tiny T3 sort branch below uses scratch.h_meta
+        // as input. Downstream T3 sort phase detects via scratch.tiny_mode.
     } else if (t3_input_slice_path) {
         // Cut #3 (minimal tier): T3 match section-pair input slicing.
         // d_t2_meta_sorted is parked on scratch.h_meta from cut #2's
@@ -3439,6 +3443,92 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // floor in the Minimal T3 sort phase.
     bool d_frags_out_on_host = false;
 
+    // Tiny T3 sort streaming (task #50): d_t3 is null on entry (Tiny
+    // T3 match parked fragments in scratch.h_meta instead of
+    // hydrating d_t3 full-cap). Tile-sort reads tiles from
+    // scratch.h_meta into small d_t3_tile, CUB SortKeys per tile,
+    // D2H sorted tile back into scratch.h_meta (in place — tiles
+    // don't overlap). After all tiles, std::inplace_merge on host.
+    // d_frags_out aliases scratch.h_meta — no device d_t3 ever
+    // allocated for this phase. Eliminates the 2 GB d_t3 device
+    // footprint that the Minimal/Compact paths require.
+    if (scratch.tiny_mode) {
+        constexpr int kNumT3TilesTiny = 4;
+        uint64_t const tile_cap_tiny =
+            (t3_count + uint64_t(kNumT3TilesTiny) - 1) / uint64_t(kNumT3TilesTiny);
+
+        size_t t3_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                nullptr, t3_sort_bytes,
+                probe,
+                tile_cap_tiny, 0, 2 * cfg.k, stream));
+        }
+
+        uint64_t* d_t3_tile      = nullptr;
+        uint64_t* d_t3_tile_alt  = nullptr;
+        void*     d_sort_scratch = nullptr;
+        s_malloc(stats, d_t3_tile,      tile_cap_tiny * sizeof(uint64_t), "d_t3_tile_tiny");
+        s_malloc(stats, d_t3_tile_alt,  tile_cap_tiny * sizeof(uint64_t), "d_t3_tile_tiny_alt");
+        s_malloc(stats, d_sort_scratch, t3_sort_bytes,                    "d_sort_scratch(t3_tiny)");
+
+        std::vector<uint64_t> tile_ends_tiny(kNumT3TilesTiny + 1);
+        tile_ends_tiny[0] = 0;
+        for (int t = 0; t < kNumT3TilesTiny; ++t) {
+            uint64_t const tile_start = uint64_t(t) * tile_cap_tiny;
+            uint64_t const tile_end   = (tile_start + tile_cap_tiny < t3_count)
+                                          ? tile_start + tile_cap_tiny : t3_count;
+            tile_ends_tiny[t + 1] = tile_end;
+            uint64_t const tile_n = tile_end - tile_start;
+            if (tile_n == 0) continue;
+
+            // H2D tile from scratch.h_meta into d_t3_tile.
+            CHECK(cudaMemcpyAsync(d_t3_tile, scratch.h_meta + tile_start,
+                                  tile_n * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream));
+
+            cub::DoubleBuffer<uint64_t> dk(d_t3_tile, d_t3_tile_alt);
+            CHECK(cub::DeviceRadixSort::SortKeys(
+                d_sort_scratch, t3_sort_bytes,
+                dk,
+                tile_n, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+
+            // D2H sorted tile back into scratch.h_meta (in place).
+            CHECK(cudaMemcpyAsync(scratch.h_meta + tile_start, dk.Current(),
+                                  tile_n * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+        }
+        CHECK(cudaStreamSynchronize(stream));
+
+        s_free(stats, d_sort_scratch);
+        s_free(stats, d_t3_tile_alt);
+        s_free(stats, d_t3_tile);
+
+        // Host-side N-way stable merge of the kNumT3TilesTiny sorted
+        // runs. T3PairingGpu is u64; CUB SortKeys is unstable but
+        // determines a unique order for distinct u64 fragments (which
+        // Feistel guarantees), so the merge produces a canonical
+        // sorted sequence identical to the full-array sort.
+        for (int width = 1; width < kNumT3TilesTiny; width *= 2) {
+            for (int i = 0; i + width < kNumT3TilesTiny; i += 2 * width) {
+                int const left  = i;
+                int const mid   = i + width;
+                int const right = (i + 2 * width <= kNumT3TilesTiny) ? (i + 2 * width) : kNumT3TilesTiny;
+                std::inplace_merge(scratch.h_meta + tile_ends_tiny[left],
+                                   scratch.h_meta + tile_ends_tiny[mid],
+                                   scratch.h_meta + tile_ends_tiny[right]);
+            }
+        }
+
+        // d_frags_out aliases scratch.h_meta. D2H phase below detects
+        // d_frags_out_on_host=true and emits via std::memcpy.
+        d_frags_out = scratch.h_meta;
+        d_frags_out_on_host = true;
+        // Skip the Minimal/Compact tiled_t3_sort below via the
+        // `if (tiled_t3_sort && !d_frags_out_on_host)` gate.
+    }
+
     // Cut #5 (minimal tier): tile T3 sort with N=gather_tile_count and
     // accumulate sorted runs into scratch.h_meta on host (its T2-meta /
     // T3-input lifetime ended at cut #3's h_t3_acc free, so the buffer
@@ -3451,7 +3541,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // 4228 MB at k=28 down to cap × u64 (in) + cap/N × u64 (alt) +
     // scratch ≈ 2400 MB at N=4.
     bool const tiled_t3_sort = (scratch.gather_tile_count >= 2 &&
-                                scratch.h_meta != nullptr);
+                                scratch.h_meta != nullptr &&
+                                !scratch.tiny_mode);
 
     if (tiled_t3_sort) {
         int const N_t3 = scratch.gather_tile_count;
@@ -3544,7 +3635,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                                   cudaMemcpyHostToDevice, stream));
             CHECK(cudaStreamSynchronize(stream));
         }
-    } else {
+    } else if (!scratch.tiny_mode) {
         size_t t3_sort_bytes = 0;
         {
             cub::DoubleBuffer<uint64_t> probe(nullptr, nullptr);
