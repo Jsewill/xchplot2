@@ -331,23 +331,25 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // MX450). Floor is estimated, not measured on real 4 GiB
         // hardware — please report actual fit on a 4 GiB card.
         constexpr uint64_t kMinimalFloorBytes = 3768ULL * 1024 * 1024;
-        // Tiny tier: algorithm wiring (per-bucket-pair T1/T2/T3 match,
-        // streaming-partition T1 sort, d_t3_stage + d_frags_out host
-        // aliases, host-prepare T2/T3 offsets) shipped through commit
-        // 1d494b3. At this commit Tiny's plot peak at k=28 measures
-        // 3640 MB on RTX 4090 — IDENTICAL to Minimal because T2 sort
-        // gather (the current peak driver) still uses the Minimal
-        // path. Honest floor here matches Minimal's; auto-picker
-        // therefore treats Tiny ≡ Minimal in selection.
+        // Tiny tier: full Phase 1.4 + 1.5 + 1.6 algorithm port
+        // shipped through commit 6a5a6c0. At k=28 on RTX 4090 the
+        // measured plot peak is 2615 MB (T3 sort phase floor: d_t3
+        // full-cap + sort scratch + tile gather). Other phases all
+        // sit at ≤ 2080 MB (T3 match), 1064 MB (T2 sort), ~1 GB
+        // (T1 match / T1 sort / T2 match), 2566 MB (Xs).
         //
-        // The Tiny T2 sort streaming partition (project task #49) is
-        // the last lever to unlock sub-2 GB cards on cuda-only. Until
-        // it lands, --tier tiny is functionally correct (byte-parity
-        // verified at k=22/24/26/28 vs SYCL Plain reference) but
-        // doesn't give the targeted peak reduction. After #49 ships,
-        // lower kTinyFloorBytes to ~1100 MB to match the SYCL Tiny
-        // tier's measured 1064 MB peak.
-        constexpr uint64_t kTinyFloorBytes    = 3768ULL * 1024 * 1024;
+        // Anchor set to 2700 MB (+3% safety margin over the 2615 MB
+        // measured) so the auto-picker selects Tiny on cards from
+        // ~2.7 GB free up to Minimal's 3.7 GB floor. Below 2.7 GB
+        // the plot won't fit at any tier (Tiny floor is the lower
+        // bound for cuda-only's streaming pipeline).
+        //
+        // Further peak reductions toward SYCL Tiny's measured 1064 MB
+        // at k=28 require: (a) T3 sort streaming partition (drops
+        // d_t3 full-cap), (b) T3 match per-bucket xbits (drops
+        // d_t2_xbits_sorted hydration), (c) Xs gen+sort tiling
+        // (drops Xs phase to ~1 GB). Tracked as follow-ups.
+        constexpr uint64_t kTinyFloorBytes    = 2700ULL * 1024 * 1024;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection precedence: opts.streaming_tier (--tier CLI flag)
@@ -460,10 +462,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (tier == Tier::Tiny) {
                     std::fprintf(stderr,
                         "[batch] streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
-                        "per-bucket-pair T1/T2/T3 match + streaming-partition T1 sort + "
-                        "d_t3_stage/d_frags_out host alias + host-prepare T2/T3 offsets, "
-                        "current peak ≈ minimal because Tiny T2 sort streaming partition "
-                        "(project task #49) hasn't landed yet)\n",
+                        "per-bucket-pair T1/T2/T3 match + streaming-partition T1/T2 sort "
+                        "+ host-prepare T2/T3 offsets + d_frags_out host alias, "
+                        "expect ~20-25 s/plot extra PCIe vs minimal at k=28)\n",
                         free_bytes / double(1ULL << 30),
                         kTinyFloorBytes / double(1ULL << 30));
                 } else {

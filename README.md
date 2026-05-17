@@ -420,29 +420,32 @@ based on available VRAM:
   for compact (~2.6×). 4 GiB cards remain an edge case since
   real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context;
   please report actual fit.
-- **Tiny streaming (~3.7 GiB floor at this commit, ~1.1 GiB
-  target).** Mirrors the SYCL Tiny tier algorithm. On top of
-  Minimal's six cuts, adds: per-section-pair T1 match tile (Xs
-  data parks on pinned host h_xs_pinned; T1 reads via per-(L,R)
-  section H2D), per-(section_l, match_key_r) bucket-pair
-  sub-section for T1/T2/T3 match (per-pass tile is L section +
-  one R bucket instead of full L+R), streaming-partition T1 sort
-  (eliminates the cap-sized d_t1_meta on device by partitioning
-  to per-bucket arenas + per-bucket CUB sort), host-side T2/T3
-  prepare offsets (binary search on the already-sorted
-  h_keys_merged, skipping the cap-sized GPU prepare-keys H2D),
-  and d_frags_out → host alias (T3 sort lands sorted fragments
-  directly in pinned_dst, eliminating the cap-sized re-hydrate).
-  Targets sub-2 GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB,
-  older laptop dGPUs). **In-progress note**: at this commit the
-  Tiny T2 sort still uses Minimal's path because the
-  byte-parity-preserving Tiny T2 sort (quad-val streaming
-  partition with global_idx tiebreak) is deferred to a follow-up.
-  Until that lands, Tiny's plot peak equals Minimal's 3640 MB —
-  the floor here matches Minimal's. `--tier tiny` produces a
-  fully farmable, byte-identical plot (validated at k=22/24/26/28)
-  but doesn't yet deliver the targeted peak reduction. There is
-  no smaller tier — a forced tiny on a card below the floor throws.
+- **Tiny streaming (~2.7 GiB floor).** Mirrors the SYCL Tiny tier
+  algorithm. On top of Minimal's six cuts, adds: per-section-pair
+  T1 match tile (Xs data parks on pinned host h_xs_pinned; T1
+  reads via per-(L,R) section H2D), per-(section_l, match_key_r)
+  bucket-pair sub-section for T1/T2/T3 match (per-pass tile is L
+  section + one R bucket instead of full L+R), streaming-partition
+  T1 sort + streaming-partition T2 sort with global_idx tiebreak
+  (eliminates the cap-sized d_t1_meta and d_t2_mi on device by
+  partitioning to per-bucket arenas + per-bucket CUB sort),
+  host-side T2/T3 prepare offsets (binary search on the
+  already-sorted h_keys_merged, skipping the cap-sized GPU
+  prepare-keys H2D), and d_frags_out → host alias (T3 sort lands
+  sorted fragments directly in pinned_dst, eliminating the
+  cap-sized re-hydrate). Targets 3-4 GiB cards (and the sub-3 GiB
+  bracket via the follow-ups noted below). Measured at k=28
+  strength=2 on RTX 4090: 2615 MB plot peak; per-phase peaks: Xs
+  2566, T1 match 1040, T1 sort 1056, T2 match 1040, T2 sort 1064,
+  T3 match 2080, T3 sort 2615. Trade-off: ~17 s/plot extra wall
+  vs minimal (per-bucket sequential pack + sort + gather +
+  host-side meta merge) — k=28 wall on sm_89 ~49 s/plot.
+  Byte-identical to other tiers at k=22/24/26/28 (validated).
+  There is no smaller tier — a forced tiny on a card below the
+  floor throws. Further peak reductions toward the SYCL Tiny
+  measured 1064 MB target require: T3 sort streaming partition
+  (drops d_t3 full-cap), T3 match per-bucket xbits (drops
+  d_t2_xbits_sorted hydration), and Xs gen+sort tiling.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
 pool doesn't fit, the streaming-tier dispatch picks the largest
