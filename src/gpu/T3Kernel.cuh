@@ -112,6 +112,39 @@ cudaError_t launch_t3_match_section_pair_range(
     int64_t meta_r_index_bias,
     cudaStream_t stream = nullptr);
 
+// Tiny tier (sub-section): T3 match where ALL five inputs are
+// per-section / per-bucket slices. Used by the per-bucket-pair
+// sub-section loop where each pass holds only the L section's
+// meta+xbits + ONE R bucket's meta+xbits+mi co-resident on device —
+// drops T3 match phase peak from ~448 MB (full per-section L+R) to
+// ~256 MB (full L + one R bucket) at k=26.
+//
+// Caller passes section_l_row_start = h_t3_offsets[section_l*nmk]
+// and section_r_row_start = h_t3_offsets[r_bucket_id]. The kernel
+// converts global l/r indices (still derived from d_temp_storage's
+// offsets table, built once on the full t2 stream) into slice-local
+// indices via subtraction. bucket_begin..bucket_end is restricted to
+// bucket_ids that hit the (section_l, r_bucket) pair.
+//
+// Mirrors SYCL's launch_t3_match_section_pair_split (Phase 1.6c).
+cudaError_t launch_t3_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint32_t const* d_xbits_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_xbits_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    cudaStream_t stream = nullptr);
+
 // Mirrors pos2-chip/src/pos/ProofCore.hpp matching_section. Exposed for
 // the streaming caller to compute section_r from section_l on the host
 // side (the kernel already does this internally; this helper avoids

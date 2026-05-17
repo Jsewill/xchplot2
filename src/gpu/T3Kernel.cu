@@ -238,6 +238,117 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     }
 }
 
+// match_all_buckets_split: Tiny tier variant of match_all_buckets that
+// reads ALL five inputs (meta_l, xbits_l, meta_r, xbits_r, mi_r) from
+// per-section slices instead of full-cap device arrays. Each side has
+// its own row-start offset so the kernel can convert global l/r
+// indices (still derived from d_offsets / d_fine_offsets built once
+// across the full pipeline) into slice-local indices.
+//
+//   l_off = l - section_l_row_start
+//   r_off = r - section_r_row_start
+//
+// Caller guarantees that every l in [l_start, l_end) maps to a valid
+// l_off in the L slice, and every r in [lo, fine_hi) maps to a valid
+// r_off in the R slice — which is true when bucket_begin..bucket_end
+// is restricted to bucket_ids that hit the section_l + section_r pair.
+//
+// Direct CUDA translation of SYCL's launch_t3_match_section_pair_split
+// (T3OffsetsSycl.cpp). Same algorithm, same per-thread loop body.
+__global__ __launch_bounds__(256, 4) void match_all_buckets_split(
+    AesHashKeys keys,
+    uint64_t const* __restrict__ meta_l_slice,
+    uint32_t const* __restrict__ xbits_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* __restrict__ meta_r_slice,
+    uint32_t const* __restrict__ xbits_r_slice,
+    uint32_t const* __restrict__ mi_r_slice,
+    uint64_t section_r_row_start,
+    uint64_t const* __restrict__ d_offsets,
+    uint64_t const* __restrict__ d_fine_offsets,
+    uint32_t num_match_keys,
+    int k,
+    int num_section_bits,
+    int num_match_target_bits,
+    int fine_bits,
+    uint32_t target_mask,
+    int num_test_bits,
+    T3PairingGpu* __restrict__ out,
+    unsigned long long* __restrict__ out_count,
+    uint64_t out_capacity,
+    uint32_t bucket_begin)
+{
+    __shared__ uint32_t sT[4 * 256];
+    load_aes_tables_smem(sT);
+    __syncthreads();
+
+    uint32_t bucket_id   = bucket_begin + blockIdx.y;
+    uint32_t section_l   = bucket_id / num_match_keys;
+    uint32_t match_key_r = bucket_id % num_match_keys;
+
+    uint32_t section_r;
+    {
+        uint32_t mask = (1u << num_section_bits) - 1u;
+        uint32_t rl   = ((section_l << 1) | (section_l >> (num_section_bits - 1))) & mask;
+        uint32_t rl1  = (rl + 1) & mask;
+        section_r = ((rl1 >> 1) | (rl1 << (num_section_bits - 1))) & mask;
+    }
+
+    uint64_t l_start = d_offsets[section_l * num_match_keys];
+    uint64_t l_end   = d_offsets[(section_l + 1) * num_match_keys];
+    uint32_t r_bucket = section_r * num_match_keys + match_key_r;
+
+    uint64_t l = l_start + blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (l >= l_end) return;
+
+    uint64_t const l_off = l - section_l_row_start;
+    uint64_t meta_l = meta_l_slice[l_off];
+    uint32_t xb_l   = xbits_l_slice[l_off];
+
+    uint32_t target_l = matching_target_smem(keys, 3u, match_key_r, meta_l, sT, 0)
+                      & target_mask;
+
+    uint32_t fine_shift = static_cast<uint32_t>(num_match_target_bits - fine_bits);
+    uint32_t fine_key   = target_l >> fine_shift;
+    uint64_t fine_idx   = (uint64_t(r_bucket) << fine_bits) | fine_key;
+    uint64_t lo         = d_fine_offsets[fine_idx];
+    uint64_t fine_hi    = d_fine_offsets[fine_idx + 1];
+    uint64_t hi         = fine_hi;
+
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) >> 1);
+        uint32_t target_mid = mi_r_slice[mid - section_r_row_start] & target_mask;
+        if (target_mid < target_l) lo = mid + 1;
+        else                       hi = mid;
+    }
+
+    uint32_t test_mask = (num_test_bits >= 32) ? 0xFFFFFFFFu
+                                                : ((1u << num_test_bits) - 1u);
+
+    for (uint64_t r = lo; r < fine_hi; ++r) {
+        uint64_t const r_off = r - section_r_row_start;
+        uint32_t target_r = mi_r_slice[r_off] & target_mask;
+        if (target_r != target_l) break;
+
+        uint64_t meta_r = meta_r_slice[r_off];
+        uint32_t xb_r   = xbits_r_slice[r_off];
+
+        Result128 res = pairing_smem(keys, meta_l, meta_r, sT, 0);
+        uint32_t test_result = res.r[3] & test_mask;
+        if (test_result != 0) continue;
+
+        uint64_t all_x_bits = (uint64_t(xb_l) << k) | uint64_t(xb_r);
+        uint64_t fragment   = feistel_encrypt(g_t3_fk, all_x_bits);
+
+        unsigned long long out_idx = atomicAdd(out_count, 1ULL);
+        if (out_idx >= out_capacity) return;
+
+        T3PairingGpu p;
+        p.proof_fragment = fragment;
+        out[out_idx] = p;
+    }
+}
+
 } // namespace
 
 namespace {
@@ -467,6 +578,77 @@ cudaError_t launch_t3_match_section_pair_range(
         capacity,
         bucket_begin,
         meta_l_index_bias, meta_r_index_bias);
+    return cudaGetLastError();
+}
+
+// Tiny tier T3 match: ALL five inputs (meta_l, xbits_l, meta_r,
+// xbits_r, mi_r) are per-section slices. Used by the per-bucket-pair
+// sub-section loop where each pass holds only the L section's
+// meta+xbits + ONE R bucket's meta+xbits+mi co-resident on device.
+//
+// Caller pre-computes section_l_row_start and section_r_row_start
+// from h_t3_offsets[section_l*nmk] and h_t3_offsets[r_bucket_id]
+// respectively (the latter for sub-bucket R slices). The kernel
+// converts global l/r → slice-local indices via subtraction.
+//
+// Mirrors SYCL's launch_t3_match_section_pair_split. d_offsets +
+// d_fine_offsets in d_temp_storage are built once on the full t2
+// stream (host-side, via prepare's bucket-offset computation) and
+// shared across all section-pair sub-passes.
+cudaError_t launch_t3_match_section_pair_split_range(
+    uint8_t const* plot_id_bytes,
+    T3MatchParams const& params,
+    uint64_t const* d_meta_l_slice,
+    uint32_t const* d_xbits_l_slice,
+    uint64_t section_l_row_start,
+    uint64_t const* d_meta_r_slice,
+    uint32_t const* d_xbits_r_slice,
+    uint32_t const* d_mi_r_slice,
+    uint64_t section_r_row_start,
+    T3PairingGpu* d_out_pairings,
+    uint64_t* d_out_count,
+    uint64_t capacity,
+    void const* d_temp_storage,
+    uint32_t bucket_begin,
+    uint32_t bucket_end,
+    cudaStream_t stream)
+{
+    if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.strength < 2)                return cudaErrorInvalidValue;
+    if (!d_meta_l_slice || !d_xbits_l_slice ||
+        !d_meta_r_slice || !d_xbits_r_slice || !d_mi_r_slice ||
+        !d_out_pairings || !d_out_count) return cudaErrorInvalidValue;
+
+    T3Derived const d = derive_t3(params);
+    if (bucket_end > d.num_buckets) return cudaErrorInvalidValue;
+    if (bucket_end <= bucket_begin) return cudaSuccess;
+
+    uint32_t const num_buckets_in_range = bucket_end - bucket_begin;
+
+    constexpr int kThreads = 256;
+    uint64_t blocks_x_u64 = (d.l_count_max + kThreads - 1) / kThreads;
+    if (blocks_x_u64 > UINT_MAX) return cudaErrorInvalidValue;
+    dim3 grid(static_cast<unsigned>(blocks_x_u64), num_buckets_in_range, 1);
+
+    auto const* d_offsets      = reinterpret_cast<uint64_t const*>(d_temp_storage);
+    auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
+
+    AesHashKeys keys = make_keys(plot_id_bytes);
+
+    match_all_buckets_split<<<grid, kThreads, 0, stream>>>(
+        keys,
+        d_meta_l_slice, d_xbits_l_slice, section_l_row_start,
+        d_meta_r_slice, d_xbits_r_slice, d_mi_r_slice, section_r_row_start,
+        d_offsets, d_fine_offsets,
+        d.num_match_keys,
+        params.k, params.num_section_bits,
+        params.num_match_target_bits, kT3FineBits,
+        d.target_mask, d.num_test_bits,
+        d_out_pairings,
+        reinterpret_cast<unsigned long long*>(d_out_count),
+        capacity,
+        bucket_begin);
     return cudaGetLastError();
 }
 
