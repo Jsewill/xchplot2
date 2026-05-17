@@ -3233,6 +3233,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint64_t* d_frags_in  = reinterpret_cast<uint64_t*>(d_t3);
     uint64_t* d_frags_out = nullptr;
 
+    // Phase 1.5c-b (Tiny): d_frags_out aliased onto host pinned. After
+    // the tile-sort + host-merge produces sorted fragments in
+    // scratch.h_meta, point d_frags_out at scratch.h_meta directly
+    // (or pinned_dst when caller supplied). Skips the cap-sized
+    // d_frags_out re-hydrate (-2 GB at k=28) — the dominant device
+    // floor in the Minimal T3 sort phase.
+    bool d_frags_out_on_host = false;
+
     // Cut #5 (minimal tier): tile T3 sort with N=gather_tile_count and
     // accumulate sorted runs into scratch.h_meta on host (its T2-meta /
     // T3-input lifetime ended at cut #3's h_t3_acc free, so the buffer
@@ -3323,11 +3331,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             }
         }
 
-        s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
-        CHECK(cudaMemcpyAsync(d_frags_out, scratch.h_meta,
-                              t3_count * sizeof(uint64_t),
-                              cudaMemcpyHostToDevice, stream));
-        CHECK(cudaStreamSynchronize(stream));
+        if (scratch.tiny_mode) {
+            // Tiny: skip the d_frags_out re-hydrate. scratch.h_meta
+            // already holds the sorted fragments; the D2H phase below
+            // sees d_frags_out_on_host=true and reads from host
+            // directly (host→host std::memcpy or alias to pinned_dst).
+            // Saves cap × u64 = 2 GB at k=28 device peak.
+            d_frags_out = scratch.h_meta;  // alias — NOT device memory
+            d_frags_out_on_host = true;
+        } else {
+            s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
+            CHECK(cudaMemcpyAsync(d_frags_out, scratch.h_meta,
+                                  t3_count * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream));
+            CHECK(cudaStreamSynchronize(stream));
+        }
     } else {
         size_t t3_sort_bytes = 0;
         {
@@ -3372,7 +3390,29 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     result.t3_count = t3_count;
 
     if (t3_count > 0) {
-        if (pinned_dst) {
+        if (d_frags_out_on_host) {
+            // Tiny: d_frags_out aliases scratch.h_meta (sorted on
+            // host). Copy via std::memcpy (host→host); q.memcpy from
+            // host-pinned source would serialize through the SYCL
+            // queue / CUDA stream and is slower than a host memcpy on
+            // the same NUMA node.
+            if (pinned_dst) {
+                if (pinned_capacity < t3_count) {
+                    throw std::runtime_error(
+                        "run_gpu_pipeline_streaming: pinned_capacity " +
+                        std::to_string(pinned_capacity) +
+                        " < t3_count " + std::to_string(t3_count));
+                }
+                std::memcpy(pinned_dst, d_frags_out,
+                            sizeof(uint64_t) * t3_count);
+                result.external_fragments_ptr   = pinned_dst;
+                result.external_fragments_count = t3_count;
+            } else {
+                result.t3_fragments_storage.resize(t3_count);
+                std::memcpy(result.t3_fragments_storage.data(), d_frags_out,
+                            sizeof(uint64_t) * t3_count);
+            }
+        } else if (pinned_dst) {
             if (pinned_capacity < t3_count) {
                 throw std::runtime_error(
                     "run_gpu_pipeline_streaming: pinned_capacity " +
@@ -3399,7 +3439,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
     }
 
-    s_free(stats, d_frags_out);
+    if (d_frags_out_on_host) {
+        // d_frags_out is a host pointer (alias to scratch.h_meta) —
+        // must NOT route through s_free's device-memory tracker.
+        d_frags_out = nullptr;
+    } else {
+        s_free(stats, d_frags_out);
+    }
     s_free(stats, d_counter);
 
     if (stats.verbose) {
