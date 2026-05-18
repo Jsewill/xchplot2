@@ -394,9 +394,55 @@ For non-NVIDIA targets, the build also probes:
 
 ### `cargo install`
 
+Toolchain prerequisites for the NVIDIA build:
+
+- **CUDA Toolkit 12.0+** — 12.0 is the floor (the `_v2` runtime ABI we
+  link, plus C++20 CUDA dialect, both require 12.0).
+- **CMake ≥ 3.26** for nvcc 12.5+ (Debian 12's stock 3.25 doesn't know
+  the dialect flags; install Kitware's repo).
+- **rustc ≥ 1.85** (rustup `stable`). Distro-packaged Rust (Ubuntu
+  24.04 apt cargo is 1.75) is too old for the `edition2024` feature
+  required by `chia-client` 0.42.
+
+#### Verified install matrix (NVIDIA path)
+
+| Distro                | CUDA source                         | CMake source            | Rust source       |
+|-----------------------|-------------------------------------|-------------------------|-------------------|
+| Ubuntu 24.04          | apt `nvidia-cuda-toolkit` (12.0)    | apt `cmake` (3.28)      | rustup `stable`   |
+| Ubuntu 24.04          | NVIDIA apt `cuda-toolkit-12-9`      | apt `cmake` (3.28)      | rustup `stable`   |
+| Ubuntu 22.04          | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
+| Debian 12 (Bookworm)  | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
+| Fedora 41             | NVIDIA dnf `cuda-toolkit-12-9`      | dnf `cmake` (3.30)      | rustup `stable`   |
+| Rocky / Alma 9        | NVIDIA dnf `cuda-toolkit-12-9`      | dnf `cmake` (3.26)      | rustup `stable`   |
+| Arch / CachyOS        | pacman `cuda` (12.x)                | pacman `cmake`          | pacman `rust` or rustup |
+
+Combinations that **don't** work on a stock install:
+- **Ubuntu 22.04 + apt CUDA**: ships CUDA 11.5 — nvcc too old for the
+  C++20 dialect, and `libcudart` predates the `_v2` ABI. Use NVIDIA's
+  apt repo instead.
+- **Debian 12 + stock CMake**: 3.25 doesn't know how to drive nvcc
+  12.5+. Use Kitware's CMake apt repo.
+- **Ubuntu 22.04/24.04 + apt cargo**: 1.75 can't parse `edition2024`.
+  Install rustup.
+- **WSL**: works the same as native — install toolkit + rustup inside
+  the WSL distro. WSL's `/usr/lib/wsl/lib` only provides the driver
+  (`libcuda.so`), not the runtime.
+
 ```bash
+# rustup, if not already installed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
 cargo install --git https://github.com/Jsewill/xchplot2
 ```
+
+The CUDA runtime is statically linked into the installed binary
+(`libcudart_static.a` + `libculibos.a`), so users don't need any
+`libcudart.so` version pinning at runtime, and there's no class of
+"wrong libcudart on linker path" install failures regardless of how
+mixed the user's previous CUDA installs are. Costs ~1 MB of binary
+size; bought us the user-reported `cudaGetDeviceProperties_v2`
+undefined-symbol class entirely.
 
 `build.rs` auto-detects the local GPU's compute capability by querying
 `nvidia-smi --query-gpu=compute_cap` and builds for only that

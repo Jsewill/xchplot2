@@ -760,23 +760,45 @@ fn main() {
             });
         println!("cargo:rustc-link-search=native={cuda_root}/lib64");
         println!("cargo:rustc-link-search=native={cuda_root}/lib");
+        // Per-host-triple library layout used by recent NVIDIA toolkits
+        // (apt repo cuda-toolkit-12-5+ reorganised x86_64 too, not just
+        // ARM). Also covers Jetson JetPack/L4T (aarch64-linux) and
+        // GH200/SBSA servers. Harmless when the dir doesn't exist.
+        println!("cargo:rustc-link-search=native={cuda_root}/targets/x86_64-linux/lib");
+        println!("cargo:rustc-link-search=native={cuda_root}/targets/aarch64-linux/lib");
+        println!("cargo:rustc-link-search=native={cuda_root}/targets/sbsa-linux/lib");
         // Distro-packaged CUDA fallbacks. Debian/Ubuntu's
-        // `apt install nvidia-cuda-toolkit` ships libcudart.so /
+        // `apt install nvidia-cuda-toolkit` ships libcudart_static.a /
         // libcudadevrt.a at the multi-arch path /usr/lib/x86_64-linux-gnu,
         // not the /usr/local/cuda layout the NVIDIA apt repo / runfile
         // installer uses. Fedora/RHEL parks them at /usr/lib64. Emit
         // both as additional search paths so cargo install works on
-        // stock distro packages too — without this, rust-lld fails at
-        // the final link with `undefined symbol: cudaGetDeviceProperties_v2`
-        // even though nvcc compiled the TUs fine. Gated on dir existence
-        // so we don't pollute the search list on non-Linux hosts.
+        // stock distro packages too. Gated on dir existence so we don't
+        // pollute the search list on non-Linux hosts.
         for extra in ["/usr/lib/x86_64-linux-gnu", "/usr/lib64"] {
             if std::path::Path::new(extra).is_dir() {
                 println!("cargo:rustc-link-search=native={extra}");
             }
         }
-        println!("cargo:rustc-link-lib=cudart");
-        println!("cargo:rustc-link-lib=cudadevrt");
+        // Static-link the CUDA runtime so we don't depend on whatever
+        // libcudart.so happens to be earliest on the user's link path.
+        // Reported failure was `undefined symbol: cudaGetDeviceProperties_v2`
+        // — that symbol was added in CUDA 12.0; users with a stale
+        // pre-12 libcudart.so somewhere on the linker path (mixed
+        // installs, post-upgrade leftovers, certain WSL setups) saw
+        // the linker resolve against the old lib even though nvcc
+        // compiled against 12-era headers. libcudart_static.a is the
+        // toolkit's own runtime, so it always matches our headers and
+        // there's nothing to mismatch against. Costs ~600 KB of binary
+        // size; eliminates a whole class of distro-install bugs.
+        //
+        // cudart_static drags in libculibos (CUDA's internal OS shim)
+        // plus pthread/dl/rt (already linked below). cudadevrt is
+        // .a-only (no .so) — separable-compilation device-code linker,
+        // always static.
+        println!("cargo:rustc-link-lib=static=cudart_static");
+        println!("cargo:rustc-link-lib=static=culibos");
+        println!("cargo:rustc-link-lib=static=cudadevrt");
     }
 
     // ---- HIP runtime ----
