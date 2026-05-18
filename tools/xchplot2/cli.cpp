@@ -380,6 +380,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose") opts.verbose = true;
+            else if (a == "--progress")             opts.progress = true;
             else if (a == "--cpu")                  opts.include_cpu = true;
             else if (a == "--shard-plot")           opts.shard_plot = true;
             else if (a == "--tier" && i + 1 < argc) {
@@ -512,6 +513,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
+        bool plot_progress        = false;
         std::string plot_streaming_tier;
         std::map<int, std::string> plot_per_device_tier;
         std::string plot_all_gpus_tier;
@@ -538,6 +540,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
+            else if  (a == "--progress")                plot_progress = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--tier" && need(1)) {
@@ -710,6 +713,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
             pos2gpu::BatchOptions opts{};
             opts.verbose          = verbose;
+            opts.progress         = plot_progress;
             opts.device_ids       = plot_device_ids;
             opts.use_all_devices  = plot_use_all_devices;
             opts.include_cpu      = plot_include_cpu;

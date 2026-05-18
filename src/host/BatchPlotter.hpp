@@ -101,6 +101,13 @@ struct BatchOptions {
 
     bool             shard_plot      = false;
     std::string      shard_strategy  = "bucket";
+
+    // Opt-in aggregate progress: prints a one-liner after each plot
+    // completes showing "N/M done (%, avg s/plot, ETA)". Independent
+    // of verbose (which is finer-grained per-phase noise) and useful
+    // for long batches where the user wants a single watch-line
+    // without enabling the full verbose stream.
+    bool             progress        = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
