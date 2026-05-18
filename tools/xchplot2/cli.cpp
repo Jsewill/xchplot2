@@ -426,6 +426,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose")        opts.verbose = true;
+            else if (a == "--progress")                    opts.progress = true;
             else if (a == "--skip-existing")               opts.skip_existing = true;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
             else if (a == "--cpu")                         opts.include_cpu = true;
@@ -661,6 +662,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
+        bool plot_progress        = false;
         bool plot_pipeline_plot   = false;
         int  plot_pipeline_depth  = 2;
         pos2gpu::BatchStrategy plot_strategy = pos2gpu::BatchStrategy::Auto;
@@ -692,6 +694,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
+            else if  (a == "--progress")                plot_progress = true;
             else if  (a == "--skip-existing")           skip_existing = true;
             else if  (a == "--continue-on-error")       continue_on_error = true;
             else if  (a == "--cpu")                     plot_include_cpu = true;
@@ -941,6 +944,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.streaming_tier    = plot_streaming_tier;
             opts.per_device_tier   = plot_per_device_tier;
             opts.all_gpus_tier     = plot_all_gpus_tier;
+            opts.progress          = plot_progress;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;

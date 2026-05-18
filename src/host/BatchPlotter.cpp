@@ -707,11 +707,30 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         static_cast<uint8_t>(item.entry.meta_group),
                         std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
-                    ++plots_done;
+                    size_t const done_now = ++plots_done;
                     if (verbose) {
                         std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
                                      log_prefix.c_str(),
                                      item.index, full_path.string().c_str());
+                    }
+                    if (opts.progress && shared_idx == nullptr) {
+                        // Single-worker path only — see cuda-only branch
+                        // commit for rationale. Multi-device aggregate
+                        // progress is on FEATURES.md.
+                        auto const elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count();
+                        double const avg = elapsed / double(done_now);
+                        size_t const total = entries.size();
+                        double const eta_s = avg * double(total - done_now);
+                        int const eta_m = int(eta_s) / 60;
+                        int const eta_r = int(eta_s) % 60;
+                        std::fprintf(stderr,
+                            "%s progress: plot %zu/%zu done "
+                            "(%.1f%%, %.2f s/plot avg, ~%dm%02ds left)\n",
+                            log_prefix.c_str(),
+                            done_now, total,
+                            100.0 * double(done_now) / double(total),
+                            avg, eta_m, eta_r);
                     }
                 } catch (std::exception const& e) {
                     if (!opts.continue_on_error) throw;
