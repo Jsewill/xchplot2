@@ -438,6 +438,29 @@ fn main() {
     println!("cargo:rustc-link-lib=static=culibos");
     println!("cargo:rustc-link-lib=static=cudadevrt");
 
+    // WSL defensive rpath. The statically-linked libcudart code calls
+    // dlopen("libcuda.so.1") at first GPU touch — that driver lib lives
+    // at /usr/lib/wsl/lib on WSL2 (injected from the Windows side, not
+    // owned by the Linux distro). WSL distros are *supposed* to register
+    // that dir via /etc/ld.so.conf.d/ld.wsl.conf, but on non-wslg setups,
+    // custom WSL images, or pre-injection-era distros the entry can be
+    // missing — then the binary installs fine but fails at first GPU
+    // call with `libcuda.so.1: cannot open shared object file`.
+    //
+    // Bake /usr/lib/wsl/lib into the binary's runtime search path so
+    // we don't depend on the loader's system-wide config being right.
+    // --disable-new-dtags is the meaningful bit: it emits DT_RPATH
+    // (legacy) instead of DT_RUNPATH. DT_RUNPATH only helps DT_NEEDED
+    // entries declared by *us* — we don't declare libcuda directly,
+    // libcudart_static does it via dlopen, so RUNPATH wouldn't apply.
+    // DT_RPATH propagates to dlopen calls made from within the same
+    // module (our binary, into which libcudart was linked).
+    //
+    // No cost on non-WSL: the loader hits the missing dir, skips it,
+    // moves on through the usual search.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/wsl/lib");
+    println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+
     // C++ stdlib + POSIX bits the static libs (Rust std + pthread inside
     // pos2_keygen, std::async + std::thread in pos2_gpu_host) reach for.
     println!("cargo:rustc-link-lib=stdc++");
