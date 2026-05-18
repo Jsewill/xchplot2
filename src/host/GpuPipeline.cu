@@ -23,6 +23,7 @@
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

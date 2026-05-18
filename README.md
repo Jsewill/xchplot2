@@ -81,14 +81,53 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
 
 ## Build
 
-Requires CUDA Toolkit 12+ (tested on 13.x), C++20 host compiler, CMake
-≥ 3.24, and a Rust toolchain (for `keygen-rs`).
+Requires CUDA Toolkit **12.0+** (12.0 is the floor — `cudaGetDeviceProperties_v2`,
+the v2 ABI we link, and CUDA C++20 dialect all need 12.0; 12.9 is the
+newest tested), **C++20** host compiler, **CMake ≥ 3.26** (3.26+ knows
+how to drive nvcc 12.5+; lower works for older nvcc), and a Rust
+toolchain new enough to parse `edition2024` (**rustc ≥ 1.85**, i.e.
+rustup `stable`; most distro-packaged Rust is too old).
+
+### Verified install matrix
+
+| Distro              | CUDA source                                    | CMake source            | Rust source   |
+|---------------------|------------------------------------------------|-------------------------|---------------|
+| Ubuntu 24.04        | apt `nvidia-cuda-toolkit` (12.0)               | apt `cmake` (3.28)      | rustup `stable` |
+| Ubuntu 24.04        | NVIDIA apt repo `cuda-toolkit-12-9`            | apt `cmake` (3.28)      | rustup `stable` |
+| Ubuntu 22.04        | NVIDIA apt repo `cuda-toolkit-12-9`            | Kitware apt `cmake`     | rustup `stable` |
+| Debian 12 (Bookworm)| NVIDIA apt repo `cuda-toolkit-12-9`            | Kitware apt `cmake`     | rustup `stable` |
+| Fedora 41           | NVIDIA dnf repo `cuda-toolkit-12-9`            | dnf `cmake` (3.30)      | rustup `stable` |
+| Rocky / Alma / RHEL 9 | NVIDIA dnf repo `cuda-toolkit-12-9`          | dnf `cmake` (3.26)      | rustup `stable` |
+| Arch / CachyOS      | pacman `cuda` (12.x)                           | pacman `cmake`          | pacman `rust` or rustup |
+
+Combinations that **don't** work on a stock install:
+- **Ubuntu 22.04 + apt CUDA**: ships CUDA 11.5 — nvcc too old for the
+  C++20 dialect we use, and the v1-ABI `libcudart` lacks
+  `cudaGetDeviceProperties_v2`. Use NVIDIA's apt repo instead.
+- **Debian 12 + apt CUDA + apt CMake**: stock CMake 3.25 doesn't know
+  how to drive nvcc 12.5+. Use Kitware's CMake apt repo.
+- **Ubuntu 22.04/24.04 + apt cargo**: distro-packaged Rust (1.75) can't
+  parse `edition2024` required by the `chia-client` 0.42 dep tree.
+  Install rustup instead.
+- **WSL**: works the same as native — the only WSL-specific bits are
+  the `libcuda.so` injection at `/usr/lib/wsl/lib` (driver, not
+  runtime). Install the toolkit + rustup inside the WSL distro.
 
 ### `cargo install`
 
 ```bash
+# rustup, if not already installed (apt/dnf cargo is too old)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
 cargo install --git https://github.com/Jsewill/xchplot2
 ```
+
+The CUDA runtime is statically linked into the binary, so users don't
+need any `libcudart.so` version pinning at runtime, and there's no
+class of "wrong libcudart on linker path" install failures regardless
+of how mixed the user's previous CUDA installs are. The binary is ~1 MB
+larger (3.8 MB vs 2.8 MB) for that property.
 
 `build.rs` auto-detects the local GPU's compute capability by querying
 `nvidia-smi --query-gpu=compute_cap` and builds for only that
