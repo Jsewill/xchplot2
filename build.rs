@@ -375,6 +375,21 @@ fn main() {
     // Harmless on x86_64 — just silences "no such dir" search misses.
     println!("cargo:rustc-link-search=native={cuda_root}/targets/aarch64-linux/lib");
     println!("cargo:rustc-link-search=native={cuda_root}/targets/sbsa-linux/lib");
+    // Distro-packaged CUDA fallbacks. Debian/Ubuntu's
+    // `apt install nvidia-cuda-toolkit` ships libcudart.so /
+    // libcudadevrt.a at the multi-arch path /usr/lib/x86_64-linux-gnu,
+    // not the /usr/local/cuda layout the NVIDIA apt repo / runfile
+    // installer uses. Fedora/RHEL parks them at /usr/lib64. Emit both
+    // as additional search paths so cargo install works on stock
+    // distro packages too — without this, rust-lld fails at the final
+    // link with `undefined symbol: cudaGetDeviceProperties_v2` even
+    // though nvcc compiled the TUs fine. Gated on dir existence so
+    // we don't pollute the search list on non-Linux hosts.
+    for extra in ["/usr/lib/x86_64-linux-gnu", "/usr/lib64"] {
+        if std::path::Path::new(extra).is_dir() {
+            println!("cargo:rustc-link-search=native={extra}");
+        }
+    }
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cudadevrt");
 
