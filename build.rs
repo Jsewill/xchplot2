@@ -357,16 +357,45 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     // ---- CUDA runtime ----
-    // Honour $CUDA_PATH / $CUDA_HOME if set, else fall back to /opt/cuda
-    // (Arch / CachyOS) then /usr/local/cuda (Debian-ish).
+    //
+    // Order matters: the *first* libcudart_static.a the linker finds on
+    // `-L` paths is what gets statically linked. If the user has more
+    // than one toolkit installed (an old CUDA 11.x leftover plus the
+    // CUDA 12.x they actually compiled with), trusting `/usr/local/cuda`
+    // or `$CUDA_PATH` can pick the wrong one — exactly the failure
+    // mode behind the 0.7.2 user report (linker found a CUDA 11
+    // libcudart_static.a, the static archive lacked
+    // `cudaGetDeviceProperties_v2`, link died).
+    //
+    // The reliable source of truth is the nvcc that CMake actually
+    // invoked to compile the .o files — its sibling lib dirs hold the
+    // matching libcudart_static.a. We canonicalize `which nvcc` to
+    // resolve the `/usr/local/cuda` → `cuda-12.x` symlink chain and
+    // put *that* toolkit's lib dir first on the search list. The
+    // legacy /opt/cuda + /usr/local/cuda + /usr/lib/* fallbacks stay
+    // as later entries so plain setups still work without nvcc on PATH.
+    let nvcc_toolkit_root = nvcc_canonical_toolkit_root();
     let cuda_root = env::var("CUDA_PATH")
         .or_else(|_| env::var("CUDA_HOME"))
-        .unwrap_or_else(|_| {
+        .ok()
+        .or_else(|| nvcc_toolkit_root.clone())
+        .unwrap_or_else(|| {
             for guess in ["/opt/cuda", "/usr/local/cuda"] {
                 if std::path::Path::new(guess).exists() { return guess.to_string(); }
             }
             "/opt/cuda".to_string()
         });
+
+    // Emit nvcc's own toolkit dirs FIRST (when distinct from cuda_root),
+    // so the linker resolves libcudart_static.a from there ahead of
+    // any stale lookalikes under /usr/local/cuda or /opt/cuda.
+    if let Some(ref root) = nvcc_toolkit_root {
+        if root != &cuda_root {
+            println!("cargo:rustc-link-search=native={root}/targets/x86_64-linux/lib");
+            println!("cargo:rustc-link-search=native={root}/lib64");
+            println!("cargo:rustc-link-search=native={root}/lib");
+        }
+    }
     println!("cargo:rustc-link-search=native={cuda_root}/lib64");
     println!("cargo:rustc-link-search=native={cuda_root}/lib");
     // Per-host-triple library layout used by recent NVIDIA toolkits
@@ -427,4 +456,43 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+}
+
+/// Locate nvcc on PATH (or under $CUDA_PATH/bin, $CUDA_HOME/bin) and
+/// return the canonical (symlink-resolved) parent-of-bin directory.
+/// That dir is the toolkit root whose lib subdirs hold the
+/// libcudart_static.a that matches what nvcc compiled the .o against.
+///
+/// Returns None if no nvcc is reachable — caller falls back to the
+/// legacy /opt/cuda / /usr/local/cuda probe.
+fn nvcc_canonical_toolkit_root() -> Option<String> {
+    // Candidate nvcc locations in priority order:
+    //   1. $CUDA_PATH/bin/nvcc, $CUDA_HOME/bin/nvcc (explicit user pick)
+    //   2. PATH (mirrors CMake's default CUDA-compiler search)
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for var in &["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(p) = env::var(var) {
+            candidates.push(std::path::PathBuf::from(p).join("bin").join("nvcc"));
+        }
+    }
+    if let Ok(path) = env::var("PATH") {
+        for dir in env::split_paths(&path) {
+            candidates.push(dir.join("nvcc"));
+        }
+    }
+    for cand in candidates {
+        if !cand.is_file() { continue; }
+        // canonicalize() resolves symlinks — that's exactly what we
+        // want: /usr/local/cuda/bin/nvcc → /usr/local/cuda-12.9/bin/nvcc
+        // collapses the wrong-symlink scenario the user hit.
+        let real = match std::fs::canonicalize(&cand) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Toolkit root = parent of bin = parent of nvcc's parent.
+        if let Some(toolkit) = real.parent().and_then(|bin| bin.parent()) {
+            return toolkit.to_str().map(String::from);
+        }
+    }
+    None
 }
