@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -81,6 +82,18 @@ void print_usage(char const* prog)
         << "                                        cpu       — CPU worker only (slow)\n"
         << "                                        0,1,3     — explicit GPU ids\n"
         << "                                      e.g. gpu,cpu == all.\n"
+        << "                                      Any GPU selector accepts a `:tier`\n"
+        << "                                      suffix to pin the streaming tier for\n"
+        << "                                      that device(s). Tier ∈ plain | compact\n"
+        << "                                      | minimal | tiny | pinned | auto.\n"
+        << "                                      Per-GPU override wins over gpu:<tier>\n"
+        << "                                      wins over global --tier. Examples:\n"
+        << "                                        gpu,2:tiny      all GPUs auto, 2 = tiny\n"
+        << "                                        all,2:tiny      all GPUs + CPU; 2 = tiny\n"
+        << "                                        gpu:tiny,2:plain    all tiny, 2 = plain\n"
+        << "                                        gpu:tiny,2:auto     all tiny, 2 auto\n"
+        << "                                      `cpu:<tier>` is rejected (no tier on\n"
+        << "                                      CPU worker).\n"
         << "                                      Omitted = single device via default\n"
         << "                                      SYCL selector (zero-config).\n"
         << "    --cpu                           : add a CPU worker alongside the\n"
@@ -241,12 +254,35 @@ void read_urandom(uint8_t* out, size_t n)
 bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
     // Accept comma-separated mix of:
-    //   "all"      → every GPU + the CPU worker
-    //   "gpu"      → every visible GPU only
-    //   "cpu"      → the CPU worker only
-    //   "<int>"    → opts.device_ids.push_back(int)  (real GPU index)
-    // "cpu" alone is OK; otherwise at least one GPU token is required.
+    //   "all"             → all GPUs + CPU worker
+    //   "gpu"             → all GPUs
+    //   "cpu"             → CPU worker
+    //   "<int>"           → explicit GPU id
+    //   "gpu:<tier>"      → all GPUs default to <tier>
+    //   "all:<tier>"      → all GPUs default to <tier>, plus CPU worker
+    //   "<int>:<tier>"    → explicit GPU id + per-GPU tier override
+    //
+    // <tier> is one of plain/compact/minimal/tiny/auto. The "auto"
+    // sentinel explicitly opts back into auto-pick — useful for
+    // overriding `gpu:<tier>` or global `--tier` on one specific GPU.
+    //
+    // Compose freely: `gpu,2:tiny` = all GPUs auto-pick except GPU 2
+    // which uses tiny. `gpu:tiny,2:plain` = all GPUs tiny except GPU 2
+    // which uses plain. `cpu:<tier>` is rejected — CPU worker has no
+    // streaming tier.
+    auto is_valid_tier = [](std::string const& t) {
+        return t == "plain" || t == "compact" || t == "minimal" ||
+               t == "tiny"  || t == "pinned"  || t == "auto";
+    };
+    auto bad = [&](char const* why) {
+        std::cerr << "Error: --devices: " << why
+                  << " (token list: \"" << s << "\")\n";
+        return false;
+    };
+
     opts.device_ids.clear();
+    opts.per_device_tier.clear();
+    opts.all_gpus_tier.clear();
     bool any_token = false;
     bool any_gpu_token = false;
     size_t start = 0;
@@ -256,23 +292,46 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             start, end == std::string::npos ? std::string::npos : end - start);
         if (tok.empty()) return false;
         any_token = true;
-        if (tok == "all") {
+
+        std::string selector = tok;
+        std::string tier_suffix;
+        if (size_t const colon = tok.find(':'); colon != std::string::npos) {
+            selector    = tok.substr(0, colon);
+            tier_suffix = tok.substr(colon + 1);
+            if (tier_suffix.empty())  return bad("empty tier after `:`");
+            if (!is_valid_tier(tier_suffix)) {
+                return bad("invalid tier (expect plain|compact|minimal|tiny|auto)");
+            }
+        }
+
+        if (selector == "all") {
             opts.use_all_devices = true;
             opts.include_cpu = true;
             any_gpu_token = true;
-        } else if (tok == "gpu") {
+            if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
+        } else if (selector == "gpu") {
             opts.use_all_devices = true;
             any_gpu_token = true;
-        } else if (tok == "cpu") {
+            if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
+        } else if (selector == "cpu") {
+            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
             opts.include_cpu = true;
         } else {
             char* endp = nullptr;
-            long const v = std::strtol(tok.c_str(), &endp, 10);
-            if (endp == tok.c_str() || *endp != '\0' || v < 0 || v > 1023) {
-                return false;
+            long const v = std::strtol(selector.c_str(), &endp, 10);
+            if (endp == selector.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+                return bad("unrecognised device token (expect all|gpu|cpu|<id>)");
             }
-            opts.device_ids.push_back(static_cast<int>(v));
+            int const id = static_cast<int>(v);
+            opts.device_ids.push_back(id);
             any_gpu_token = true;
+            if (!tier_suffix.empty()) {
+                auto const it = opts.per_device_tier.find(id);
+                if (it != opts.per_device_tier.end() && it->second != tier_suffix) {
+                    return bad("same GPU id given two different :tier overrides");
+                }
+                opts.per_device_tier[id] = tier_suffix;
+            }
         }
         if (end == std::string::npos) break;
         start = end + 1;
@@ -607,6 +666,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         pos2gpu::BatchStrategy plot_strategy = pos2gpu::BatchStrategy::Auto;
         bool plot_prefer_peer_copy = true;  // default flipped — Peer is faster on every tested topology; --host-bounce opts back to the explicit two-bounce path.
         std::string plot_streaming_tier;
+        std::map<int, std::string> plot_per_device_tier;
+        std::string plot_all_gpus_tier;
         std::vector<pos2gpu::PipelineStageTier> plot_pipeline_tiers;
 
         for (int i = 2; i < argc; ++i) {
@@ -710,9 +771,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                                  "(got '" << argv[i] << "')\n";
                     return 1;
                 }
-                plot_device_ids      = std::move(tmp.device_ids);
-                plot_use_all_devices = tmp.use_all_devices;
+                plot_device_ids       = std::move(tmp.device_ids);
+                plot_use_all_devices  = tmp.use_all_devices;
                 if (tmp.include_cpu) plot_include_cpu = true;
+                plot_per_device_tier  = std::move(tmp.per_device_tier);
+                plot_all_gpus_tier    = std::move(tmp.all_gpus_tier);
             }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
@@ -876,6 +939,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.pipeline_tiers         = plot_pipeline_tiers;
             opts.prefer_peer_copy  = plot_prefer_peer_copy;
             opts.streaming_tier    = plot_streaming_tier;
+            opts.per_device_tier   = plot_per_device_tier;
+            opts.all_gpus_tier     = plot_all_gpus_tier;
             auto res = pos2gpu::run_batch(entries, opts);
             double per = res.plots_written
                 ? res.total_wall_seconds / double(res.plots_written) : 0;

@@ -389,9 +389,29 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // selector below is unreachable on cards where the pool fits, so
     // `--tier tiny` on a 24 GB card was silently ignored.
     char const* tier_env_pre = std::getenv("XCHPLOT2_STREAMING_TIER");
-    bool const tier_forced =
-        !opts.streaming_tier.empty() ||
-        (tier_env_pre && tier_env_pre[0] != '\0');
+
+    // Resolve the effective tier for THIS worker. Precedence (highest
+    // wins):
+    //   1. --devices `<id>:<tier>` override for this device_id
+    //   2. --devices `gpu:<tier>` / `all:<tier>` shorthand
+    //   3. global --tier / XCHPLOT2_STREAMING_TIER
+    //   4. (empty) → auto-pick from free VRAM
+    // The `auto` value is a sentinel that explicitly opts back into
+    // auto-pick — used to override a higher-level default for one GPU.
+    std::string effective_tier;
+    if (auto it = opts.per_device_tier.find(device_id);
+        it != opts.per_device_tier.end())
+    {
+        effective_tier = (it->second == "auto") ? std::string() : it->second;
+    } else if (!opts.all_gpus_tier.empty()) {
+        effective_tier = opts.all_gpus_tier;
+    } else if (!opts.streaming_tier.empty()) {
+        effective_tier = opts.streaming_tier;
+    } else if (tier_env_pre && tier_env_pre[0] != '\0') {
+        effective_tier = tier_env_pre;
+    }
+
+    bool const tier_forced = !effective_tier.empty();
     bool const force_streaming = [tier_forced] {
         char const* v = std::getenv("XCHPLOT2_STREAMING");
         if (v && v[0] == '1') return true;
@@ -448,10 +468,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const margin       = 128ULL << 20;
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
-            char const* tier_env = std::getenv("XCHPLOT2_STREAMING_TIER");
-            std::string const tier_pref =
-                !opts.streaming_tier.empty() ? opts.streaming_tier :
-                (tier_env ? std::string(tier_env) : std::string());
+            // Use effective_tier resolved at the top of run_batch_slice
+            // (per-device override > gpu:tier shorthand > global --tier
+            // > env), falling back to auto-pick by free VRAM when no
+            // override is in effect.
+            std::string const& tier_pref = effective_tier;
 
             enum class Tier { Plain, Compact, Minimal, Tiny, Pinned };
             Tier tier;
