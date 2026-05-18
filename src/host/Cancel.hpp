@@ -24,6 +24,13 @@ void install_cancel_signal_handlers();
 // (or since reset_cancel_for_tests()).
 bool cancel_requested() noexcept;
 
+// Programmatic cancel — sets the same flag the signal handler does,
+// without the user-facing "Press Ctrl-C again" message. Intended for
+// in-process triggers like a worker hitting ENOSPC and wanting its
+// peers to drain and stop instead of writing more plots that will
+// also fail.
+void request_cancel() noexcept;
+
 // Testing hook — clear the flag. Not intended for production code.
 void reset_cancel_for_tests() noexcept;
 

@@ -75,6 +75,14 @@ bool cancel_requested() noexcept
     return g_cancel_count > 0;
 }
 
+void request_cancel() noexcept
+{
+    // Same flag the signal handler uses, but no async-signal-safety
+    // constraints here — called from a normal C++ thread context
+    // (e.g. a worker catching ENOSPC and asking peers to drain).
+    if (g_cancel_count < 1) g_cancel_count = 1;
+}
+
 void reset_cancel_for_tests() noexcept
 {
     g_cancel_count = 0;
