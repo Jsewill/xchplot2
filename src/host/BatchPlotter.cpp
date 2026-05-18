@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -26,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace pos2gpu {
 
@@ -104,6 +106,68 @@ struct WorkItem {
     GpuPipelineResult result;
     size_t            index = 0;
 };
+
+// Rough per-plot upper-bound estimate for the disk preflight. The
+// actual compressed .plot2 is smaller (FSE over proof-fragment stubs);
+// this uncompressed ceiling is deliberately pessimistic so we only
+// WARN when the disk is genuinely too small, not for boundary cases.
+//
+// Formula: 2^k fragments × proof_fragment_bits/8, where
+// proof_fragment_bits ≈ k stub + (k - 2) xbits + overhead ≈ 2k bits.
+uint64_t approx_plot_bytes_upper_bound(int k)
+{
+    if (k <= 0 || k > 32) return 0;
+    uint64_t const fragments = uint64_t(1) << k;
+    uint64_t const bits_per  = uint64_t(2 * k);
+    return (fragments * bits_per) / 8;
+}
+
+// Group the batch by output directory, statvfs each, and WARN (don't
+// throw) when free space is below the upper-bound need. Advisory only:
+// the writer's ENOSPC handling is the real safety net; this just gives
+// the user a chance to free space before a long run dies mid-write.
+void preflight_disk_space(std::vector<BatchEntry> const& entries,
+                          BatchOptions const& opts)
+{
+    if (entries.empty()) return;
+
+    std::map<std::string, std::pair<size_t, uint64_t>> per_dir;
+    for (auto const& e : entries) {
+        uint64_t const est = approx_plot_bytes_upper_bound(e.k);
+        auto& slot = per_dir[e.out_dir.empty() ? std::string(".") : e.out_dir];
+        slot.first  += 1;
+        slot.second += est;
+    }
+
+    constexpr double GB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+    for (auto const& [dir, tally] : per_dir) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);  // space() needs it to exist
+        auto const info = std::filesystem::space(dir, ec);
+        if (ec) {
+            if (opts.verbose) {
+                std::fprintf(stderr,
+                    "[batch] preflight: cannot stat free space on %s (%s) — "
+                    "skipping check\n", dir.c_str(), ec.message().c_str());
+            }
+            continue;
+        }
+        double const need_gb = tally.second * GB;
+        double const free_gb = info.available * GB;
+        if (info.available < tally.second) {
+            std::fprintf(stderr,
+                "[batch] WARNING: %s has %.1f GB free but %zu plot(s) may need "
+                "up to ~%.1f GB (uncompressed upper bound). The batch will "
+                "still run; consider freeing space or reducing count.\n",
+                dir.c_str(), free_gb, tally.first, need_gb);
+        } else if (opts.verbose) {
+            std::fprintf(stderr,
+                "[batch] preflight: %s has %.1f GB free, %zu plot(s) need "
+                "up to ~%.1f GB\n",
+                dir.c_str(), free_gb, tally.first, need_gb);
+        }
+    }
+}
 
 // Bounded SPSC queue + end-of-stream signal.
 //
@@ -770,6 +834,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 "run_batch: all entries must share (k, strength, testnet)");
         }
     }
+
+    // Disk-space preflight (advisory, never throws). Runs once before
+    // any worker dispatch so the user sees the warning up front instead
+    // of N minutes into a doomed batch.
+    preflight_disk_space(entries, opts);
 
     // Resolve the target device list:
     //   use_all_devices  → enumerate at runtime, one worker per GPU
