@@ -13,6 +13,7 @@
 
 #include "host/GpuPlotter.hpp"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,21 @@ struct BatchOptions {
     bool             use_all_devices = false;
     bool             include_cpu     = false;
     std::string      streaming_tier;
+
+    // Per-GPU tier override populated by the --devices `<id>:<tier>`
+    // suffix syntax. Keyed by CUDA device id; value is "plain" /
+    // "compact" / "minimal" / "tiny" / "auto". A "auto" entry means
+    // "explicitly opt back to auto-pick" — wins over both
+    // `all_gpus_tier` and the global `streaming_tier`. Wins over the
+    // global `streaming_tier` for the listed device.
+    std::map<int, std::string> per_device_tier;
+
+    // Tier set via the `gpu:<tier>` / `all:<tier>` shorthand on
+    // --devices. Applies to every GPU that wasn't given an explicit
+    // `<id>:<tier>` override above. Wins over the global
+    // `streaming_tier` for those devices.
+    std::string      all_gpus_tier;
+
     bool             shard_plot      = false;
     std::string      shard_strategy  = "bucket";
 };

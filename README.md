@@ -335,6 +335,41 @@ xchplot2 plot ... --devices cpu
 xchplot2 plot ... --devices 0,1,cpu
 ```
 
+##### Per-GPU streaming tier
+
+Any GPU selector in `--devices` accepts a `:tier` suffix to pin the
+streaming tier for that device. Tier ∈ `plain|compact|minimal|tiny|auto`.
+Useful when GPUs differ in VRAM, or when one card is also serving
+the desktop and you want to leave it more headroom:
+
+```bash
+# All GPUs auto-pick from free VRAM, except GPU 2 which uses tiny.
+xchplot2 plot ... --devices gpu,2:tiny
+
+# All GPUs + CPU worker; GPU 2 = tiny.
+xchplot2 plot ... --devices all,2:tiny
+
+# All GPUs pinned to tiny, except GPU 2 which uses plain.
+xchplot2 plot ... --devices gpu:tiny,2:plain
+
+# All GPUs pinned to tiny, except GPU 2 which auto-picks (the `:auto`
+# sentinel explicitly re-enables auto-pick for a single GPU).
+xchplot2 plot ... --devices gpu:tiny,2:auto
+
+# All-explicit form (still works).
+xchplot2 plot ... --devices 0:tiny,1:minimal,2:plain
+```
+
+Precedence (highest wins):
+1. Per-GPU `<id>:<tier>` token
+2. `gpu:<tier>` / `all:<tier>` shorthand
+3. Global `--tier <name>` / `XCHPLOT2_STREAMING_TIER`
+4. Auto-pick from free VRAM
+
+`cpu:<tier>` is rejected (the CPU worker doesn't use streaming
+tiers). Duplicate IDs with conflicting tiers (`0:tiny,0:plain`) and
+unknown tier names are also rejected at parse time.
+
 Omitted flag = single device on the CUDA-default device — identical
 to pre-multi-GPU behavior, zero regression risk.
 
