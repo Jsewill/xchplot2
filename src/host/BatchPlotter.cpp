@@ -107,6 +107,23 @@ struct WorkItem {
     size_t            index = 0;
 };
 
+// Check `.plot2` is present at path AND looks like a valid plot file
+// (magic bytes "pos2" + nonzero size). Used for skip_existing so we
+// don't silently skip a zero-byte or crash-truncated leftover.
+bool looks_like_complete_plot(std::filesystem::path const& path)
+{
+    std::error_code ec;
+    auto const sz = std::filesystem::file_size(path, ec);
+    if (ec || sz < 64) return false;  // header alone is >64 B
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char magic[4]{};
+    in.read(magic, 4);
+    return in.good() && magic[0] == 'p' && magic[1] == 'o'
+                     && magic[2] == 's' && magic[3] == '2';
+}
+
 // Rough per-plot upper-bound estimate for the disk preflight. The
 // actual compressed .plot2 is smaller (FSE over proof-fragment stubs);
 // this uncompressed ceiling is deliberately pessimistic so we only
@@ -275,6 +292,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     "%s cancel received — stopping before plot %zu\n",
                     log_prefix.c_str(), i);
                 break;
+            }
+            if (opts.skip_existing) {
+                auto out_path = std::filesystem::path(entries[i].out_dir)
+                                / entries[i].out_name;
+                if (looks_like_complete_plot(out_path)) {
+                    if (opts.verbose) {
+                        std::fprintf(stderr,
+                            "%s skipping plot %zu: %s (already exists)\n",
+                            log_prefix.c_str(), i, out_path.string().c_str());
+                    }
+                    ++res.plots_skipped;
+                    continue;
+                }
             }
             try {
                 run_one_plot_cpu(entries[i], opts);
@@ -738,6 +768,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     "%s cancel received — stopping before plot %zu\n",
                     log_prefix.c_str(), i);
                 break;
+            }
+            if (opts.skip_existing) {
+                auto out_path = std::filesystem::path(entries[i].out_dir)
+                                / entries[i].out_name;
+                if (looks_like_complete_plot(out_path)) {
+                    if (opts.verbose) {
+                        std::fprintf(stderr,
+                            "%s skipping plot %zu: %s (already exists)\n",
+                            log_prefix.c_str(), i, out_path.string().c_str());
+                    }
+                    ++res.plots_skipped;
+                    continue;
+                }
             }
 
             auto t_plot = std::chrono::steady_clock::now();

@@ -33,6 +33,7 @@ struct BatchEntry {
 
 struct BatchResult {
     size_t plots_written = 0;
+    size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
     double total_wall_seconds = 0.0;
 };
 
@@ -108,6 +109,14 @@ struct BatchOptions {
     // for long batches where the user wants a single watch-line
     // without enabling the full verbose stream.
     bool             progress        = false;
+
+    // Resume support: if an output .plot2 already exists at the
+    // target path AND passes a quick "looks like a complete plot"
+    // check (pos2 magic header), skip the entry. Lets a long batch
+    // resume after partial completion without re-plotting finished
+    // entries. Doubles as a manifest-level idempotency knob — re-
+    // running the same manifest is a no-op once every plot is on disk.
+    bool             skip_existing   = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
