@@ -725,6 +725,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         } catch (...) {
             consumer_err = std::current_exception();
             consumer_failed = true;
+            // ENOSPC from the writer, or any other consumer-side I/O
+            // failure, means peer workers will hit the same problem.
+            // Cooperative-cancel them so they stop pulling new plots
+            // off the queue instead of writing more partials that the
+            // RAII guard then has to clean up.
+            request_cancel();
         }
     });
 
@@ -1515,6 +1521,13 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                     static_cast<int>(i), &next_idx);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
+                // Tell peer workers to drain after their current plot
+                // and stop pulling new ones. Without this, an ENOSPC
+                // on one disk (or any other worker-side failure) keeps
+                // peers plotting until the manifest is exhausted, only
+                // to surface the failure at join time. Cooperative
+                // cancel saves the wasted work + the partial cleanup.
+                request_cancel();
             }
         });
     }
