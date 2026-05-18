@@ -21,12 +21,14 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -225,8 +227,25 @@ size_t write_plot_file_parallel(
         for (auto& f : tasks) f.get();
     }
 
-    // Serial write phase — file I/O is sequential anyway.
-    std::ofstream out(filename, std::ios::binary);
+    // Serial write phase — file I/O is sequential anyway. Write to
+    // <filename>.partial and rename on success so SIGINT / crash /
+    // ENOSPC never leaves a malformed .plot2 at the destination. The
+    // PartialGuard RAII unlinks the partial on any early exit
+    // (exception, cooperative cancel propagated upstream, anything
+    // that unwinds the stack before we set committed=true).
+    std::string const partial = filename + ".partial";
+    struct PartialGuard {
+        std::string const& path;
+        bool committed = false;
+        ~PartialGuard() {
+            if (!committed) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        }
+    } guard{partial};
+
+    std::ofstream out(partial, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("Failed to open " + filename);
 
     out.write("pos2", 4);
@@ -274,6 +293,19 @@ size_t write_plot_file_parallel(
     }
     if (!out) throw std::runtime_error("Failed to write chunk offsets to " + filename);
     out.seekp(0, std::ios::end);
+
+    // Close before rename so buffered writes are flushed and the
+    // destination sees the final byte image.
+    out.close();
+    if (!out) throw std::runtime_error("Failed to close " + partial);
+
+    std::error_code ec;
+    std::filesystem::rename(partial, filename, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "Failed to rename " + partial + " -> " + filename + ": " + ec.message());
+    }
+    guard.committed = true;
 
     return bytes_written;
 }
