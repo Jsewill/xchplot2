@@ -820,6 +820,22 @@ fn main() {
         println!("cargo:rustc-link-lib=static=cudart_static");
         println!("cargo:rustc-link-lib=static=culibos");
         println!("cargo:rustc-link-lib=static=cudadevrt");
+
+        // WSL defensive rpath. libcudart_static's dlopen("libcuda.so.1")
+        // needs /usr/lib/wsl/lib on the runtime loader path. WSL distros
+        // usually set that up via /etc/ld.so.conf.d/ld.wsl.conf, but
+        // non-wslg / custom images can be missing the entry — then the
+        // binary installs fine but fails at first GPU call. Bake
+        // /usr/lib/wsl/lib into the binary's runtime search path.
+        //
+        // --disable-new-dtags emits DT_RPATH (legacy) instead of
+        // DT_RUNPATH. We need DT_RPATH because it propagates to dlopen
+        // calls made from libraries linked into this binary (libcudart);
+        // DT_RUNPATH only helps DT_NEEDED resolution we declare directly.
+        //
+        // No cost on non-WSL: loader hits the missing dir, skips it.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/wsl/lib");
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
 
     // ---- HIP runtime ----
