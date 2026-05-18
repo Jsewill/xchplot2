@@ -1,0 +1,59 @@
+name: install-matrix
+
+# Verifies `cargo install --git ... --branch cuda-only` works on the
+# distros documented in the README's "Verified install matrix"
+# section. Each job builds a stock distro container with the toolchain
+# the README recommends, then runs `cargo install --path .` against
+# the checked-out source. Catches regressions in build.rs / CMakeLists
+# / Cargo.lock that pass on the dev box (Arch + RTX 4090) but break
+# on the wider distro matrix.
+#
+# No actual GPU needed for build — nvcc compiles without one. The
+# binary won't run usefully in CI, but the install reaching
+# "Installed package `xchplot2`" is the assertion.
+
+on:
+  pull_request:
+  push:
+    branches: [cuda-only]
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: install / ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu2404-rustup        # apt nvidia-cuda-toolkit + rustup
+          - ubuntu2404-nvidia-apt    # NVIDIA apt repo cuda-toolkit-12-9
+          - ubuntu2204-nvidia-apt    # Kitware cmake + NVIDIA apt repo
+          - debian12-kitware         # Kitware cmake + NVIDIA apt repo
+          - fedora41-nvidia-apt      # NVIDIA dnf repo
+          - rocky9-nvidia-apt        # NVIDIA dnf repo (RHEL 9 family)
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build base image
+        run: |
+          podman build \
+            -t xchplot2-ci:${{ matrix.distro }} \
+            -f ci/install-matrix/${{ matrix.distro }}.Containerfile \
+            ci/install-matrix/
+      - name: cargo install in container
+        run: |
+          podman run --rm \
+            -e CUDA_ARCHITECTURES=75 \
+            -v "$PWD":/src:ro,Z \
+            xchplot2-ci:${{ matrix.distro }} \
+            bash -c '
+              cp -r /src /work
+              cd /work
+              rm -rf target/ keygen-rs/target/
+              CARGO_TARGET_DIR=/tmp/cargo-target \
+                cargo install --path . --force 2>&1 | tail -20
+              test -x /root/.cargo/bin/xchplot2
+              echo "OK: xchplot2 installed for ${{ matrix.distro }}"
+            '

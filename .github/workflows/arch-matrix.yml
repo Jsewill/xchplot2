@@ -1,0 +1,62 @@
+name: arch-matrix
+
+# Verifies the README-documented CUDA arch matrix stays buildable.
+# Each job sets CUDA_ARCHITECTURES to one of the documented targets
+# and runs `cmake --build` to ensure nvcc accepts the arch + our
+# C++20-CUDA / sm-feature usage compiles for it. No GPU required.
+#
+# Arch coverage mirrors the README "Common values" line:
+#   61  GTX 10-series       (Pascal)        — requires CUDA 12.x (12.9 last with codegen)
+#   75  Turing 2080 Ti       (Turing)
+#   86  RTX 30-series        (Ampere)
+#   89  RTX 40-series        (Ada)            — also default arch
+#   120 RTX 50-series        (Blackwell)      — requires CUDA 12.8+
+#
+# We pin the toolkit images per arch so the Pascal job uses 12.9
+# (Pascal's last toolkit) and Blackwell uses 12.8+.
+
+on:
+  pull_request:
+  push:
+    branches: [cuda-only]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: arch / sm_${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 61
+            image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+          - arch: 75
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 86
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 89
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 120
+            image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake git curl ca-certificates pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v5
+      - name: cmake configure + build (arch=${{ matrix.arch }})
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
+          cmake --build build -j --target pos2_gpu_cuda_obj
