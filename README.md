@@ -143,7 +143,10 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
   12 GB + one 8 GB card) plot concurrently with each device on its
-  matching tier.
+  matching tier. The `<id>:<tier>` suffix on `--devices` (see
+  [Per-GPU streaming tier](#per-gpu-streaming-tier)) overrides the
+  auto-pick per GPU, useful when a card is also serving the desktop
+  and needs more headroom than the picker would leave.
 - **PCIe:** Gen4 x16 or wider recommended. A physically narrower slot
   (e.g. Gen4 x4) adds ~240 ms per plot to the final fragment D2H
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
