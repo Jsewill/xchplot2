@@ -748,16 +748,37 @@ fn main() {
     // nothing in the static archives references cudart, so emitting
     // `-lcudart` would make rust-lld fail with "unable to find library".
     if build_cuda == "ON" {
-        // Honour $CUDA_PATH / $CUDA_HOME if set, else fall back to
-        // /opt/cuda (Arch / CachyOS) then /usr/local/cuda (Debian-ish).
+        // Order matters: the *first* libcudart_static.a the linker
+        // finds wins. If the user has multiple toolkits installed and
+        // /usr/local/cuda symlinks to a stale CUDA 11.x leftover, we'd
+        // statically link the wrong runtime and fail on the v2 ABI.
+        // The reliable source of truth is the nvcc that CMake actually
+        // invoked — its sibling lib dirs always hold a matching
+        // libcudart_static.a. Canonicalize `which nvcc` to resolve
+        // the `/usr/local/cuda` symlink chain and put that toolkit's
+        // lib dirs first on the search list. See cuda-only branch
+        // commit history for the user-bug-report context.
+        let nvcc_toolkit_root = nvcc_canonical_toolkit_root();
         let cuda_root = env::var("CUDA_PATH")
             .or_else(|_| env::var("CUDA_HOME"))
-            .unwrap_or_else(|_| {
+            .ok()
+            .or_else(|| nvcc_toolkit_root.clone())
+            .unwrap_or_else(|| {
                 for guess in ["/opt/cuda", "/usr/local/cuda"] {
                     if std::path::Path::new(guess).exists() { return guess.to_string(); }
                 }
                 "/opt/cuda".to_string()
             });
+        // nvcc's own toolkit dirs FIRST (when distinct from cuda_root),
+        // so the linker resolves libcudart_static.a from there ahead
+        // of any stale lookalikes under /usr/local/cuda or /opt/cuda.
+        if let Some(ref root) = nvcc_toolkit_root {
+            if root != &cuda_root {
+                println!("cargo:rustc-link-search=native={root}/targets/x86_64-linux/lib");
+                println!("cargo:rustc-link-search=native={root}/lib64");
+                println!("cargo:rustc-link-search=native={root}/lib");
+            }
+        }
         println!("cargo:rustc-link-search=native={cuda_root}/lib64");
         println!("cargo:rustc-link-search=native={cuda_root}/lib");
         // Per-host-triple library layout used by recent NVIDIA toolkits
@@ -872,4 +893,36 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+}
+
+/// Locate nvcc on PATH (or under $CUDA_PATH/bin, $CUDA_HOME/bin) and
+/// return the canonical (symlink-resolved) parent-of-bin directory.
+/// That dir is the toolkit root whose lib subdirs hold the
+/// libcudart_static.a that matches what nvcc compiled the .o against.
+///
+/// Returns None if no nvcc is reachable — caller falls back to the
+/// legacy /opt/cuda / /usr/local/cuda probe.
+fn nvcc_canonical_toolkit_root() -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for var in &["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(p) = env::var(var) {
+            candidates.push(std::path::PathBuf::from(p).join("bin").join("nvcc"));
+        }
+    }
+    if let Ok(path) = env::var("PATH") {
+        for dir in env::split_paths(&path) {
+            candidates.push(dir.join("nvcc"));
+        }
+    }
+    for cand in candidates {
+        if !cand.is_file() { continue; }
+        let real = match std::fs::canonicalize(&cand) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Some(toolkit) = real.parent().and_then(|bin| bin.parent()) {
+            return toolkit.to_str().map(String::from);
+        }
+    }
+    None
 }
