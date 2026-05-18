@@ -274,6 +274,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 {
     (void)worker_id;
 
+    // Per-worker log prefix. Multi-GPU runs interleave stderr from N
+    // workers, so prefix every line with which device it came from to
+    // keep the log readable. Single-default-device path keeps the
+    // historical "[batch]" prefix unchanged for zero log-diff churn
+    // on the common case.
+    std::string const log_prefix =
+        (device_id == kCpuDeviceId) ? std::string("[batch:cpu]") :
+        (device_id <  0)            ? std::string("[batch]")     :
+        ("[batch:gpu" + std::to_string(device_id) + "]");
+
     // CPU worker: bypass the GPU pool / streaming path entirely. pos2-chip's
     // Plotter manages all internal state itself, so each plot is a
     // synchronous run_one_plot_cpu() call. Single-threaded internally;
@@ -304,8 +314,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (looks_like_complete_plot(out_path)) {
                     if (opts.verbose) {
                         std::fprintf(stderr,
-                            "[batch:cpu] skipping plot %zu: %s (already exists)\n",
-                            i, out_path.string().c_str());
+                            "%s skipping plot %zu: %s (already exists)\n",
+                            log_prefix.c_str(), i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
                     continue;
@@ -316,12 +326,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 ++res.plots_written;
                 if (opts.verbose) {
                     std::fprintf(stderr,
-                        "[batch:cpu] plot %zu done: %s\n",
+                        "%s plot %zu done: %s\n",
+                        log_prefix.c_str(),
                         i, entries[i].out_name.c_str());
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
-                    "[batch:cpu] plot %zu FAILED: %s\n", i, ex.what());
+                    "%s plot %zu FAILED: %s\n",
+                    log_prefix.c_str(), i, ex.what());
                 ++res.plots_failed;
                 if (!opts.continue_on_error) {
                     res.total_wall_seconds = std::chrono::duration<double>(
@@ -428,15 +440,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             pool_k, pool_strength, pool_testnet);
     } catch (InsufficientVramError const& e) {
         if (tier_forced) {
-            std::fprintf(stderr, "[batch] --tier override — using "
-                                 "streaming pipeline per plot\n");
+            std::fprintf(stderr, "%s --tier override — using "
+                                 "streaming pipeline per plot\n",
+                                 log_prefix.c_str());
         } else if (force_streaming) {
-            std::fprintf(stderr, "[batch] XCHPLOT2_STREAMING=1 — using "
-                                 "streaming pipeline per plot\n");
+            std::fprintf(stderr, "%s XCHPLOT2_STREAMING=1 — using "
+                                 "streaming pipeline per plot\n",
+                                 log_prefix.c_str());
         } else {
             std::fprintf(stderr,
-                "[batch] pool needs %.2f GiB, only %.2f GiB free — using "
+                "%s pool needs %.2f GiB, only %.2f GiB free — using "
                 "streaming pipeline per plot\n",
+                log_prefix.c_str(),
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
@@ -520,7 +535,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (tier == Tier::Pinned
                 && mem.free_bytes < required + margin) {
                 InsufficientVramError se(
-                    "[batch] streaming pipeline needs ~" +
+                    log_prefix + " streaming pipeline needs ~" +
                     std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
                     " (pinned tier, the smallest available), device reports " +
@@ -537,8 +552,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (tier != Tier::Pinned
                 && mem.free_bytes < required + margin) {
                 std::fprintf(stderr,
-                    "[batch] streaming tier: %s forced (%.2f GiB free < %.2f GiB "
+                    "%s streaming tier: %s forced (%.2f GiB free < %.2f GiB "
                     "%s floor) — proceeding, may OOM mid-plot\n",
+                    log_prefix.c_str(),
                     tier_name(tier),
                     to_gib(mem.free_bytes),
                     to_gib(required + margin),
@@ -561,8 +577,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
 
             std::fprintf(stderr,
-                "[batch] streaming tier: %s "
+                "%s streaming tier: %s "
                 "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
+                log_prefix.c_str(),
                 tier_name(tier),
                 to_gib(mem.free_bytes),
                 to_gib(required),
@@ -586,7 +603,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
             throw std::runtime_error(
-                "[batch] streaming-fallback: pinned D2H buffer allocation failed");
+                log_prefix + " streaming-fallback: pinned D2H buffer allocation failed");
         }
 
         // Stage 4f (compact tier only): amortise streaming-path
@@ -631,16 +648,17 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
                 }
                 throw std::runtime_error(
-                    "[batch] streaming-fallback: pinned-host scratch allocation failed");
+                    log_prefix + " streaming-fallback: pinned-host scratch allocation failed");
             }
         }
     }
     if (verbose && pool_ptr) {
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
-            "[batch] pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
+            "%s pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
             "sort_scratch=%.2f GB pinned=2x%.2f GB "
             "(Xs scratch aliased in pair_b)\n",
+            log_prefix.c_str(),
             pool_ptr->storage_bytes * gb,
             pool_ptr->pair_a_bytes  * gb,
             pool_ptr->pair_b_bytes  * gb,
@@ -691,14 +709,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
                     ++plots_done;
                     if (verbose) {
-                        std::fprintf(stderr, "[batch] consumer wrote plot %zu: %s\n",
+                        std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
+                                     log_prefix.c_str(),
                                      item.index, full_path.string().c_str());
                     }
                 } catch (std::exception const& e) {
                     if (!opts.continue_on_error) throw;
                     ++plots_failed_consumer;
                     std::fprintf(stderr,
-                        "[batch] plot %zu FAILED (write %s): %s — continuing\n",
+                        "%s plot %zu FAILED (write %s): %s — continuing\n",
+                        log_prefix.c_str(),
                         item.index, full_path.string().c_str(), e.what());
                 }
             }
@@ -728,7 +748,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
             if (cancel_requested()) {
                 std::fprintf(stderr,
-                    "[batch] cancel received — stopping before plot %zu\n", i);
+                    "%s cancel received — stopping before plot %zu\n",
+                    log_prefix.c_str(), i);
                 break;
             }
 
@@ -738,7 +759,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (looks_like_complete_plot(out_path)) {
                     if (verbose) {
                         std::fprintf(stderr,
-                            "[batch] skipping plot %zu: %s (already exists)\n",
+                            "%s skipping plot %zu: %s (already exists)\n",
+                            log_prefix.c_str(),
                             i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
@@ -777,8 +799,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (!opts.continue_on_error) throw;
                 ++producer_failed;
                 std::fprintf(stderr,
-                    "[batch] plot %zu FAILED (GPU): %s — continuing\n",
-                    i, e.what());
+                    "%s plot %zu FAILED (GPU): %s — continuing\n",
+                    log_prefix.c_str(), i, e.what());
                 continue;
             }
 
@@ -786,9 +808,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 auto ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t_plot).count();
                 std::fprintf(stderr,
-                    "[batch] producer finished GPU for plot %zu in %.2f ms "
+                    "%s producer finished GPU for plot %zu in %.2f ms "
                     "(T1=%lu T2=%lu T3=%lu)\n",
-                    i, ms,
+                    log_prefix.c_str(), i, ms,
                     (unsigned long)item.result.t1_count,
                     (unsigned long)item.result.t2_count,
                     (unsigned long)item.result.t3_count);
