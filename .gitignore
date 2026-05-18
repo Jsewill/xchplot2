@@ -22,3 +22,7 @@ third_party/
 # Local-only scratch (container build contexts, repro logs, throwaway
 # test artifacts). Never committed.
 tmp/
+
+# Local-only feature backlog. Discoverable at the repo root but never
+# committed — design notes belong in pull requests, not in the tree.
+FEATURES.md
