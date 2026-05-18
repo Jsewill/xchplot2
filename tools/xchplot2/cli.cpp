@@ -28,6 +28,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -359,11 +360,68 @@ std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
     return out;
 }
 
+// Expand `@argfile` tokens in argv. The convention is: any argv
+// element starting with `@` is replaced by the whitespace-tokenised
+// contents of the named file. Lines starting with `#` are ignored.
+// Tilde expansion: a leading `~/` becomes $HOME/.
+//
+// Example ~/.xchplot2:
+//     # default farmer + pool keys + output dir
+//     --farmer-pk 0a1b2c... (96 hex)
+//     --pool-contract xch1abc...
+//     --out /mnt/plots
+//     --tier minimal
+//
+// Then: `xchplot2 plot @~/.xchplot2 --num 10`
+std::vector<std::string> expand_argfiles(int argc, char* argv[])
+{
+    std::vector<std::string> out;
+    out.reserve(argc);
+    char const* home = std::getenv("HOME");
+    auto resolve_path = [&](std::string p) -> std::string {
+        if (home && p.size() >= 2 && p[0] == '~' && p[1] == '/') {
+            return std::string(home) + p.substr(1);
+        }
+        return p;
+    };
+    for (int i = 0; i < argc; ++i) {
+        std::string tok = argv[i];
+        if (tok.size() < 2 || tok[0] != '@') {
+            out.push_back(std::move(tok));
+            continue;
+        }
+        std::ifstream in(resolve_path(tok.substr(1)));
+        if (!in) {
+            std::cerr << "Error: cannot open argfile '" << tok.substr(1) << "'\n";
+            out.push_back(std::move(tok));
+            continue;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (auto h = line.find('#'); h != std::string::npos) {
+                line = line.substr(0, h);
+            }
+            std::istringstream is(line);
+            std::string word;
+            while (is >> word) out.push_back(std::move(word));
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
     pos2gpu::install_cancel_signal_handlers();
+
+    // Expand @argfile tokens before the rest of argument parsing.
+    std::vector<std::string> expanded = expand_argfiles(argc, argv);
+    std::vector<char*> argv_owned;
+    argv_owned.reserve(expanded.size());
+    for (auto& s : expanded) argv_owned.push_back(s.data());
+    argc = static_cast<int>(argv_owned.size());
+    argv = argv_owned.data();
 
     if (argc < 2) {
         print_usage(argv[0]);
