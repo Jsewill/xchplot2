@@ -20,3 +20,10 @@ target/
 # See CMakeLists.txt → FetchContent_Declare(pos2_chip).
 third_party/
 docs/
+
+# Local-only scratch (container build contexts, repro logs, throwaway
+# test artifacts). Never committed.
+tmp/
+
+# Local-only feature backlog (mirror of cuda-only's same file).
+FEATURES.md
