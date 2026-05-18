@@ -180,6 +180,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 {
     (void)worker_id;
 
+    // Per-worker log prefix. Multi-GPU runs interleave stderr from N
+    // workers, so prefix every line with which device it came from to
+    // keep the log readable. Single-default-device path keeps the
+    // historical "[batch]" prefix unchanged for zero log-diff churn
+    // on the common case.
+    std::string const log_prefix =
+        (device_id == kCpuDeviceId) ? std::string("[batch:cpu]") :
+        (device_id <  0)            ? std::string("[batch]")     :
+        ("[batch:gpu" + std::to_string(device_id) + "]");
+
     // CPU worker: bypass GPU pool / streaming entirely. pos2-chip's
     // Plotter manages its own state, so each plot is a synchronous
     // run_one_plot_cpu() call — no CUDA, no GpuBufferPool. Single-
@@ -198,7 +208,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (i >= entries.size()) break;
             if (cancel_requested()) {
                 std::fprintf(stderr,
-                    "[batch:cpu] cancel received — stopping before plot %zu\n", i);
+                    "%s cancel received — stopping before plot %zu\n",
+                    log_prefix.c_str(), i);
                 break;
             }
             try {
@@ -206,12 +217,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 ++res.plots_written;
                 if (opts.verbose) {
                     std::fprintf(stderr,
-                        "[batch:cpu] plot %zu done: %s\n",
-                        i, entries[i].out_name.c_str());
+                        "%s plot %zu done: %s\n",
+                        log_prefix.c_str(), i, entries[i].out_name.c_str());
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
-                    "[batch:cpu] plot %zu FAILED: %s\n", i, ex.what());
+                    "%s plot %zu FAILED: %s\n",
+                    log_prefix.c_str(), i, ex.what());
                 // cuda-only's BatchOptions doesn't have continue_on_error
                 // — match the GPU path's behavior of returning early on
                 // a per-plot failure (caller decides whether to retry).
@@ -312,15 +324,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             pool_k, pool_strength, pool_testnet);
     } catch (InsufficientVramError const& e) {
         if (tier_forced) {
-            std::fprintf(stderr, "[batch] --tier override — using "
-                                 "streaming pipeline per plot\n");
+            std::fprintf(stderr, "%s --tier override — using "
+                                 "streaming pipeline per plot\n",
+                                 log_prefix.c_str());
         } else if (force_streaming) {
-            std::fprintf(stderr, "[batch] XCHPLOT2_STREAMING=1 — using "
-                                 "streaming pipeline per plot\n");
+            std::fprintf(stderr, "%s XCHPLOT2_STREAMING=1 — using "
+                                 "streaming pipeline per plot\n",
+                                 log_prefix.c_str());
         } else {
             std::fprintf(stderr,
-                "[batch] pool needs %.2f GiB, only %.2f GiB free — using "
+                "%s pool needs %.2f GiB, only %.2f GiB free — using "
                 "streaming pipeline per plot\n",
+                log_prefix.c_str(),
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
@@ -342,7 +357,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
             throw std::runtime_error(
-                "[batch] streaming-fallback: pinned D2H buffer allocation failed");
+                log_prefix + " streaming-fallback: pinned D2H buffer allocation failed");
         }
 
         // Tiered dispatch: pick plain vs compact streaming based on
@@ -421,14 +436,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // throws because there's no smaller tier to fall back to.
         if (tier == Tier::Plain && free_bytes < kPlainFloorBytes) {
             std::fprintf(stderr,
-                "[batch] streaming tier: plain forced (%.2f GiB free < %.2f GiB "
+                "%s streaming tier: plain forced (%.2f GiB free < %.2f GiB "
                 "plain floor) — proceeding, may OOM mid-plot\n",
+                log_prefix.c_str(),
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
         } else if (tier == Tier::Compact && free_bytes < kCompactFloorBytes) {
             std::fprintf(stderr,
-                "[batch] streaming tier: compact forced (%.2f GiB free < %.2f GiB "
+                "%s streaming tier: compact forced (%.2f GiB free < %.2f GiB "
                 "compact floor) — proceeding, may OOM mid-plot\n",
+                log_prefix.c_str(),
                 free_bytes / double(1ULL << 30),
                 kCompactFloorBytes / double(1ULL << 30));
         }
@@ -436,7 +453,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         if (tier == Tier::Plain) {
             // Plain: zero PCIe overhead, all parks skipped.
             std::fprintf(stderr,
-                "[batch] streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
+                "%s streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
+                log_prefix.c_str(),
                 free_bytes / double(1ULL << 30),
                 kPlainFloorBytes / double(1ULL << 30));
         } else if (tier == Tier::Compact || tier == Tier::Minimal ||
@@ -464,7 +482,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
                 }
                 throw std::runtime_error(
-                    "[batch] streaming-fallback: compact/minimal pinned scratch alloc failed");
+                    log_prefix + " streaming-fallback: compact/minimal pinned scratch alloc failed");
             }
             stream_compact = true;
             stream_scratch.t3_tile_count = 2;
@@ -496,17 +514,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 stream_scratch.t3_input_slice_count = 1 << num_section_bits;
                 if (tier == Tier::Tiny) {
                     std::fprintf(stderr,
-                        "[batch] streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
+                        "%s streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
                         "per-bucket-pair T1/T2/T3 match + streaming-partition T1/T2/T3 sort "
                         "+ host-prepare T2/T3 offsets + d_t3_stage/d_frags_out host alias "
                         "+ Xs gen+sort tiling, ~17 s/plot extra PCIe vs minimal at k=28)\n",
+                        log_prefix.c_str(),
                         free_bytes / double(1ULL << 30),
                         kTinyFloorBytes / double(1ULL << 30));
                 } else {
                     std::fprintf(stderr,
-                        "[batch] streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
+                        "%s streaming tier: minimal (%.2f GiB free, %.2f GiB floor; "
                         "park/rehydrate + N=8 T2 + N=%d T1-match + T1/T2 sort gather + "
                         "N=%d T3 input slicing, expect ~5-15 s/plot extra PCIe)\n",
+                        log_prefix.c_str(),
                         free_bytes / double(1ULL << 30),
                         kMinimalFloorBytes / double(1ULL << 30),
                         stream_scratch.t3_input_slice_count,
@@ -514,8 +534,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
             } else {
                 std::fprintf(stderr,
-                    "[batch] streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
+                    "%s streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
                     "park/rehydrate + N=2 T3 staging, expect ~1-2 s/plot extra PCIe)\n",
+                    log_prefix.c_str(),
                     free_bytes / double(1ULL << 30),
                     kPlainFloorBytes / double(1ULL << 30));
             }
@@ -526,7 +547,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
-            throw std::runtime_error("[batch] internal: unhandled streaming tier");
+            throw std::runtime_error(log_prefix + " internal: unhandled streaming tier");
         }
         // Forced-tiny hard floor: there's no smaller tier to fall back
         // to, so a card below the tiny floor genuinely can't plot at
@@ -539,7 +560,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
             if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
             throw std::runtime_error(
-                "[batch] card too small for k=" + std::to_string(pool_k) +
+                log_prefix + " card too small for k=" + std::to_string(pool_k) +
                 " streaming at any tier: " +
                 std::to_string(free_bytes / (1ULL << 20)) + " MB free < " +
                 std::to_string(kTinyFloorBytes / (1ULL << 20)) +
@@ -550,9 +571,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     if (verbose && pool_ptr) {
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
-            "[batch] pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
+            "%s pool: storage=%.2f GB pair_a=%.2f GB pair_b=%.2f GB "
             "sort_scratch=%.2f GB pinned=2x%.2f GB "
             "(Xs scratch aliased in pair_b)\n",
+            log_prefix.c_str(),
             pool_ptr->storage_bytes * gb,
             pool_ptr->pair_a_bytes  * gb,
             pool_ptr->pair_b_bytes  * gb,
@@ -595,8 +617,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
                 ++plots_done;
                 if (verbose) {
-                    std::fprintf(stderr, "[batch] consumer wrote plot %zu: %s\n",
-                                 item.index, full_path.string().c_str());
+                    std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
+                                 log_prefix.c_str(), item.index, full_path.string().c_str());
                 }
             }
         } catch (...) {
@@ -621,7 +643,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (i >= entries.size()) break;
             if (cancel_requested()) {
                 std::fprintf(stderr,
-                    "[batch] cancel received — stopping before plot %zu\n", i);
+                    "%s cancel received — stopping before plot %zu\n",
+                    log_prefix.c_str(), i);
                 break;
             }
 
@@ -656,9 +679,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 auto ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t_plot).count();
                 std::fprintf(stderr,
-                    "[batch] producer finished GPU for plot %zu in %.2f ms "
+                    "%s producer finished GPU for plot %zu in %.2f ms "
                     "(T1=%lu T2=%lu T3=%lu)\n",
-                    i, ms,
+                    log_prefix.c_str(), i, ms,
                     (unsigned long)item.result.t1_count,
                     (unsigned long)item.result.t2_count,
                     (unsigned long)item.result.t3_count);
