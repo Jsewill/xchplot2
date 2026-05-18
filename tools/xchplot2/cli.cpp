@@ -737,6 +737,104 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
     }
 
+    if (mode == "completions") {
+        // Shell completion script generator.
+        //   xchplot2 completions bash | source /dev/stdin
+        //   xchplot2 completions zsh  > _xchplot2 + add to fpath
+        //   xchplot2 completions fish > ~/.config/fish/completions/xchplot2.fish
+        // Coverage focuses on the most-used surfaces: subcommands,
+        // --tier values, --devices tokens (with :tier suffix awareness
+        // limited to the static value list), and the boolean flags.
+        if (argc < 3) {
+            std::cerr << "Error: xchplot2 completions <bash|zsh|fish>\n";
+            return 1;
+        }
+        std::string const shell = argv[2];
+        if (shell == "bash") {
+            std::cout << R"(# bash completion for xchplot2 — source this from ~/.bashrc:
+#     source <(xchplot2 completions bash)
+_xchplot2() {
+    local cur prev words cword
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local subcmds="batch plot test devices parity-check completions"
+    local tiers="plain compact minimal tiny auto"
+    local devices_tokens="all gpu cpu 0 1 2 3"
+    case "${prev}" in
+        --tier)            COMPREPLY=( $(compgen -W "${tiers}" -- "$cur") ); return 0 ;;
+        --devices)         COMPREPLY=( $(compgen -W "${devices_tokens}" -- "$cur") ); return 0 ;;
+        -o|--out)          COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
+        completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
+    esac
+    if [ $COMP_CWORD -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "${subcmds}" -- "$cur") )
+        return 0
+    fi
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "-v --verbose --progress --cpu --tier --devices --shard-plot -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        return 0
+    fi
+}
+complete -F _xchplot2 xchplot2
+)";
+        } else if (shell == "zsh") {
+            std::cout << R"(#compdef xchplot2
+# zsh completion for xchplot2 — add this directory to fpath and
+# autoload xchplot2's completion function, then 'autoload -U compinit; compinit'.
+_xchplot2() {
+    local -a subcmds tiers
+    subcmds=(batch:"Run a manifest of plots" plot:"Single-plot farmable mode" test:"Single test plot" devices:"List available GPU/CPU" parity-check:"Run parity tests" completions:"Emit shell completion script")
+    tiers=(plain compact minimal tiny auto)
+    case "$state" in
+        cmds) _describe 'command' subcmds ;;
+    esac
+    if (( CURRENT == 2 )); then
+        _describe 'subcommand' subcmds
+        return
+    fi
+    _arguments \
+        '--tier[Streaming tier]:tier:(plain compact minimal tiny auto)' \
+        '--devices[Device selector]:spec:(all gpu cpu 0 1 2 3)' \
+        '--progress[Aggregate progress line]' \
+        '-v[Verbose]' '--verbose[Verbose]' \
+        '--cpu[Add CPU worker]' \
+        '--shard-plot[Single-plot multi-GPU]' \
+        '-o[Output dir]:dir:_files -/' \
+        '*:: :->args'
+}
+_xchplot2 "$@"
+)";
+        } else if (shell == "fish") {
+            std::cout << R"(# fish completion for xchplot2 — install at:
+#     ~/.config/fish/completions/xchplot2.fish
+complete -c xchplot2 -f
+# Subcommands
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'batch'         -d 'Run a manifest of plots'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'plot'          -d 'Single-plot farmable mode'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'test'          -d 'Single test plot'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'devices'       -d 'List available GPU/CPU'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'parity-check'  -d 'Run parity tests'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shell completion script'
+# Flags
+complete -c xchplot2 -l tier      -x -a 'plain compact minimal tiny auto'  -d 'Streaming tier'
+complete -c xchplot2 -l devices   -x -a 'all gpu cpu 0 1 2 3'              -d 'Device selector'
+complete -c xchplot2 -l progress  -d 'Aggregate progress line'
+complete -c xchplot2 -s v -l verbose -d 'Verbose'
+complete -c xchplot2 -l cpu       -d 'Add CPU worker'
+complete -c xchplot2 -l shard-plot -d 'Single-plot multi-GPU (experimental)'
+complete -c xchplot2 -s o -l out  -r -d 'Output dir'
+complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
+)";
+        } else {
+            std::cerr << "Error: unknown shell '" << shell
+                      << "' (expect bash, zsh, or fish)\n";
+            return 1;
+        }
+        return 0;
+    }
+
     if (mode != "test") {
         print_usage(argv[0]);
         return 1;
