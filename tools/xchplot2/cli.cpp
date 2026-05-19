@@ -465,7 +465,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 std::string const flag =
                     (k.size() > 0 && k[0] == '-') ? k : ("--" + k);
                 if (as_bool) {
-                    if (*as_bool) config_tokens.push_back(flag);
+                    if (*as_bool) {
+                        config_tokens.push_back(flag);
+                    } else if (flag.size() > 2 && flag.substr(0, 2) == "--") {
+                        // false → --no-XXX so the CLI can re-enable
+                        // via --XXX (last-wins). Short flags don't
+                        // have a canonical negation form; skip them.
+                        config_tokens.push_back("--no-" + flag.substr(2));
+                    }
                     continue;
                 }
                 config_tokens.push_back(flag);
@@ -567,12 +574,21 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose")        opts.verbose = true;
+            else if (a == "--no-verbose")                  opts.verbose = false;
             else if (a == "--progress")                    opts.progress = true;
-            else if (a == "--skip-existing")               opts.skip_existing = true;
+            else if (a == "--no-progress")                 opts.progress = false;
+            else if (a == "--skip-existing"
+                  || a == "--resume")                      opts.skip_existing = true;
+            else if (a == "--no-skip-existing"
+                  || a == "--no-resume")                   opts.skip_existing = false;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
+            else if (a == "--no-continue-on-error")        opts.continue_on_error = false;
             else if (a == "--cpu")                         opts.include_cpu = true;
+            else if (a == "--no-cpu")                      opts.include_cpu = false;
             else if (a == "--shard-plot")                  opts.shard_plot = true;
+            else if (a == "--no-shard-plot")               opts.shard_plot = false;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
+            else if (a == "--no-pipeline-plot")            opts.pipeline_plot = false;
             else if (a == "--pipeline-depth" && i + 1 < argc) {
                 int const d = std::atoi(argv[++i]);
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
@@ -834,13 +850,23 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--meta-group" || a == "-g") && need(1)) meta_group      = std::atoi(argv[++i]);
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
+            else if  (a == "--no-testnet")              testnet = false;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
+            else if  (a == "--no-verbose")              verbose = false;
             else if  (a == "--progress")                plot_progress = true;
-            else if  (a == "--skip-existing")           skip_existing = true;
+            else if  (a == "--no-progress")             plot_progress = false;
+            else if  (a == "--skip-existing"
+                   || a == "--resume")                  skip_existing = true;
+            else if  (a == "--no-skip-existing"
+                   || a == "--no-resume")               skip_existing = false;
             else if  (a == "--continue-on-error")       continue_on_error = true;
+            else if  (a == "--no-continue-on-error")    continue_on_error = false;
             else if  (a == "--cpu")                     plot_include_cpu = true;
+            else if  (a == "--no-cpu")                  plot_include_cpu = false;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
+            else if  (a == "--no-shard-plot")           plot_shard_plot = false;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
+            else if  (a == "--no-pipeline-plot")        plot_pipeline_plot = false;
             else if  (a == "--pipeline-depth" && need(1)) {
                 int const d = std::atoi(argv[++i]);
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
