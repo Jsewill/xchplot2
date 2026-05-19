@@ -434,14 +434,31 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string subcmd = (strip_argc >= 2) ? std::string(argv_stripped[1]) : "";
         auto emit_section = [&](std::string const& name) {
             for (auto const& [k, v] : cfg.section_view(name)) {
-                // Bool true → bare flag (`--progress` not `--progress true`).
-                // Bool false → skipped (the default for missing flags).
-                // Everything else → flag + value pair.
+                // Bool true  → bare flag (`--progress`).
+                // Bool false → `--no-progress` so the parser flips the
+                //              same opts.progress bit. Important for
+                //              config-set defaults the user wants to
+                //              override on CLI: without the `--no-`
+                //              path a config-set bool was permanently
+                //              on (the only way to "negate" a flag is
+                //              to not pass it, but config-injection
+                //              forces it in every invocation).
+                // Other      → flag + value pair.
                 auto const as_bool = cfg.get_bool(name, k);
                 std::string const flag =
                     (k.size() > 0 && k[0] == '-') ? k : ("--" + k);
                 if (as_bool) {
-                    if (*as_bool) config_tokens.push_back(flag);
+                    if (*as_bool) {
+                        config_tokens.push_back(flag);
+                    } else {
+                        // Emit `--no-XXX`. Only works for the `--`
+                        // (long) form — short flags (`-v`) don't have
+                        // a canonical negation, so skip the emit and
+                        // rely on default-off behaviour.
+                        if (flag.size() > 2 && flag.substr(0, 2) == "--") {
+                            config_tokens.push_back("--no-" + flag.substr(2));
+                        }
+                    }
                     continue;
                 }
                 config_tokens.push_back(flag);
@@ -554,11 +571,17 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose") opts.verbose = true;
+            else if (a == "--no-verbose")           opts.verbose = false;
             else if (a == "--progress")             opts.progress = true;
+            else if (a == "--no-progress")          opts.progress = false;
             else if (a == "--skip-existing"
                   || a == "--resume")               opts.skip_existing = true;
+            else if (a == "--no-skip-existing"
+                  || a == "--no-resume")            opts.skip_existing = false;
             else if (a == "--cpu")                  opts.include_cpu = true;
+            else if (a == "--no-cpu")               opts.include_cpu = false;
             else if (a == "--shard-plot")           opts.shard_plot = true;
+            else if (a == "--no-shard-plot")        opts.shard_plot = false;
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" &&
@@ -716,12 +739,19 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--meta-group" || a == "-g") && need(1)) meta_group      = std::atoi(argv[++i]);
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
+            else if  (a == "--no-testnet")              testnet = false;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
+            else if  (a == "--no-verbose")              verbose = false;
             else if  (a == "--progress")                plot_progress = true;
+            else if  (a == "--no-progress")             plot_progress = false;
             else if  (a == "--skip-existing"
                    || a == "--resume")                  plot_skip_existing = true;
+            else if  (a == "--no-skip-existing"
+                   || a == "--no-resume")               plot_skip_existing = false;
             else if  (a == "--cpu")                     plot_include_cpu = true;
+            else if  (a == "--no-cpu")                  plot_include_cpu = false;
             else if  (a == "--shard-plot")              plot_shard_plot = true;
+            else if  (a == "--no-shard-plot")           plot_shard_plot = false;
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal" &&
