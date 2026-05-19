@@ -257,7 +257,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             BatchOptions const& opts,
                             int                 device_id,
                             int                 worker_id,
-                            std::atomic<std::size_t>* shared_idx = nullptr)
+                            std::atomic<std::size_t>* shared_idx = nullptr,
+                            std::atomic<std::size_t>* global_done = nullptr)
 {
     (void)worker_id;
 
@@ -308,11 +309,31 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
             try {
                 run_one_plot_cpu(entries[i], opts);
-                ++res.plots_written;
+                size_t const local_done = ++res.plots_written;
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "%s plot %zu done: %s\n",
                         log_prefix.c_str(), i, entries[i].out_name.c_str());
+                }
+                if (opts.progress) {
+                    size_t const done_now =
+                        global_done
+                            ? (global_done->fetch_add(1, std::memory_order_relaxed) + 1)
+                            : local_done;
+                    auto const elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_start).count();
+                    double const avg = elapsed / double(done_now);
+                    size_t const total = entries.size();
+                    double const eta_s = avg * double(total - done_now);
+                    int const eta_m = int(eta_s) / 60;
+                    int const eta_r = int(eta_s) % 60;
+                    std::fprintf(stderr,
+                        "%s progress: plot %zu/%zu done "
+                        "(%.1f%%, %.2f s/plot avg, ~%dm%02ds left)\n",
+                        log_prefix.c_str(),
+                        done_now, total,
+                        100.0 * double(done_now) / double(total),
+                        avg, eta_m, eta_r);
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
@@ -709,18 +730,25 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     static_cast<uint8_t>(item.entry.meta_group),
                     std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
-                size_t const done_now = ++plots_done;
+                size_t const local_done = ++plots_done;
                 if (verbose) {
                     std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
                                  log_prefix.c_str(), item.index, full_path.string().c_str());
                 }
-                if (opts.progress && shared_idx == nullptr) {
-                    // Aggregate per-batch progress only makes sense when
-                    // this worker IS the batch (single-worker path).
-                    // With shared_idx in play (multi-device work-queue),
-                    // each worker only sees a slice — its plots_done /
-                    // entries.size() ratio understates real progress.
-                    // Multi-device aggregate progress is FEATURES.md.
+                if (opts.progress) {
+                    // Progress accounting:
+                    //   single-worker path → use this worker's plots_done
+                    //     (plots_done == batch progress when one worker
+                    //      owns the whole manifest)
+                    //   multi-worker path  → fetch_add on the shared
+                    //     global_done atomic; whichever worker finishes a
+                    //     plot last wins the right to print the next
+                    //     progress line, all lines are aggregate not
+                    //     per-worker
+                    size_t const done_now =
+                        global_done
+                            ? (global_done->fetch_add(1, std::memory_order_relaxed) + 1)
+                            : local_done;
                     auto const elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_start).count();
                     double const avg = elapsed / double(done_now);
@@ -985,6 +1013,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     std::fprintf(stderr, "\n");
 
     std::atomic<std::size_t> next_idx{0};
+    // Shared progress counter for --progress on multi-device runs.
+    // Each consumer thread fetch_adds when a plot finishes, so the
+    // emitted "N/M done" line is aggregate across workers — not the
+    // per-worker slice it'd otherwise reflect.
+    std::atomic<std::size_t> global_done{0};
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -994,7 +1027,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
             try {
                 per_worker[i] = run_batch_slice(
                     entries, opts, device_ids[i],
-                    static_cast<int>(i), &next_idx);
+                    static_cast<int>(i), &next_idx, &global_done);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
                 // Tell peer workers to drain after their current plot
