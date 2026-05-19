@@ -18,11 +18,27 @@ name: arch-matrix
 on:
   pull_request:
     paths-ignore:
+      # Docs & metadata
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      # Runtime / user-facing scripts not exercised by the arch
+      # matrix (it runs cmake configure + builds pos2_gpu_cuda_obj).
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      # Sibling CI workflows + install-matrix-only containerfiles.
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/install-matrix.yml'
+      - 'ci/install-matrix/**'
   push:
     branches: [cuda-only]
     paths-ignore:
@@ -31,6 +47,18 @@ on:
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/install-matrix.yml'
+      - 'ci/install-matrix/**'
 
 permissions:
   contents: read

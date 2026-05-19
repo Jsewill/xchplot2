@@ -15,11 +15,28 @@ name: install-matrix
 on:
   pull_request:
     paths-ignore:
+      # Docs & metadata
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      # Runtime / user-facing scripts not exercised by the install
+      # matrix (CI calls `podman build` directly; these are host-side
+      # wrappers and runtime tests).
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      # Sibling CI workflows — editing arch-matrix or the lint
+      # workflow shouldn't drag in the install matrix.
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/arch-matrix.yml'
   push:
     branches: [cuda-only]
     paths-ignore:
@@ -28,6 +45,17 @@ on:
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/arch-matrix.yml'
 
 permissions:
   contents: read
