@@ -92,15 +92,29 @@ jobs:
               --build-arg ACPP_TARGETS=omp
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
-          # AMD ROCm — AdaptiveCpp HIP backend. ACPP_TARGETS pinned to
-          # gfx1100 (RDNA3 / RX 7900); the arch choice doesn't matter
-          # for the build-only assertion since no GPU is present in
-          # CI. The 5+ GB ROCm base image dominates the job wall.
+          # AMD ROCm — AdaptiveCpp generic (SSCP JIT). Two reasons for
+          # `generic` instead of `hip:gfxNNNN` AOT compilation in CI:
+          #
+          #   1. rocm/dev-ubuntu-24.04:latest ships device bitcode
+          #      (ocml.bc) built with rolling LLVM 22+. AdaptiveCpp's
+          #      install-deps.sh pins clang/lld to LLVM 18 for
+          #      compatibility with its own build. The LLVM-18 clang
+          #      can't link bitcode produced by LLVM-22 (attribute
+          #      kind 102 added in LLVM 22) — hard build error.
+          #
+          #   2. CI has no AMD GPU anyway, so AOT-for-gfxNNNN doesn't
+          #      give us runtime signal. SSCP defers device codegen
+          #      to runtime, lets the build prove "the SYCL TUs
+          #      compile against ROCm headers + libs" which is the
+          #      meaningful CI assertion.
+          #
+          # Same pattern the README recommends for RDNA1 cards
+          # (gfx101x) and matches the Intel oneAPI entry below.
           - name: amd-rocm
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/rocm/dev-ubuntu-24.04:latest
               --build-arg BASE_RUNTIME=docker.io/rocm/dev-ubuntu-24.04:latest
-              --build-arg ACPP_TARGETS=hip:gfx1100
+              --build-arg ACPP_TARGETS=generic
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
           # Intel oneAPI — AdaptiveCpp generic (SSCP) → Level Zero.
