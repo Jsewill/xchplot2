@@ -17,8 +17,20 @@ name: arch-matrix
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
   push:
     branches: [cuda-only]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
 
 permissions:
   contents: read
