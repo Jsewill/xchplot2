@@ -228,6 +228,7 @@ add_library(pos2_gpu_host STATIC
     src/host/BatchPlotter.cpp
     src/host/CpuPlotter.cpp
     src/host/Cancel.cpp
+    src/host/ConfigFile.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)

@@ -14,6 +14,7 @@
                                    // (compiled by g++) doesn't need
                                    // the CUDA include path.
 #include "host/Cancel.hpp"
+#include "host/ConfigFile.hpp"
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
@@ -384,10 +385,113 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 {
     pos2gpu::install_cancel_signal_handlers();
 
-    // Expand @argfile tokens before the rest of argument parsing —
-    // see expand_argfiles() comment. Most users won't use this, so
-    // the no-@ fast path is a single push_back per argv element.
-    std::vector<std::string> expanded = expand_argfiles(argc, argv);
+    // Layer 1: structured TOML-subset config from `--config PATH` or
+    // `~/.config/xchplot2/config.toml` if it exists. Schema:
+    //   [defaults]              keys applied to every subcommand
+    //   [batch] / [plot] / ...  per-subcommand overrides
+    // Each key/value is translated to a CLI flag and prepended to
+    // argv, so the existing per-subcommand parsers process them
+    // exactly as if they'd been typed. Real CLI args still win
+    // because they come AFTER in argv (parsers process left-to-
+    // right; last assignment wins for non-accumulating flags).
+    std::string config_path;
+    int strip_argc = argc;
+    std::vector<char*> argv_stripped;
+    {
+        argv_stripped.reserve(argc);
+        for (int i = 0; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--config" && i + 1 < argc) {
+                config_path = argv[i + 1];
+                ++i;
+                continue;
+            }
+            argv_stripped.push_back(argv[i]);
+        }
+        strip_argc = static_cast<int>(argv_stripped.size());
+    }
+    if (config_path.empty()) {
+        if (char const* home = std::getenv("HOME")) {
+            std::string const default_path =
+                std::string(home) + "/.config/xchplot2/config.toml";
+            std::ifstream probe(default_path);
+            if (probe) config_path = default_path;
+        }
+    }
+    std::vector<std::string> config_tokens;
+    if (!config_path.empty()) {
+        pos2gpu::ConfigFile cfg;
+        try {
+            cfg = pos2gpu::ConfigFile::load(config_path);
+        } catch (std::exception const& ex) {
+            std::cerr << "Error: parsing " << config_path << ": "
+                      << ex.what() << "\n";
+            return 1;
+        }
+        // Pick the subcommand-specific section if present (argv[1]
+        // is the subcommand). Apply [defaults] first then override
+        // with [<subcmd>] so per-subcommand values win.
+        std::string subcmd = (strip_argc >= 2) ? std::string(argv_stripped[1]) : "";
+        auto emit_section = [&](std::string const& name) {
+            for (auto const& [k, v] : cfg.section_view(name)) {
+                // Bool true → bare flag (`--progress` not `--progress true`).
+                // Bool false → skipped (the default for missing flags).
+                // Everything else → flag + value pair.
+                auto const as_bool = cfg.get_bool(name, k);
+                std::string const flag =
+                    (k.size() > 0 && k[0] == '-') ? k : ("--" + k);
+                if (as_bool) {
+                    if (*as_bool) config_tokens.push_back(flag);
+                    continue;
+                }
+                config_tokens.push_back(flag);
+                config_tokens.push_back(v);
+            }
+        };
+        emit_section("defaults");
+        if (!subcmd.empty()) emit_section(subcmd);
+    }
+
+    // Layer 2: expand @argfile tokens (in argv AND in config-derived
+    // tokens — a config value can itself reference @some/other/file).
+    // The expansion's purpose is unchanged from before the config
+    // layer landed: drop common args in a file, prefix invocations
+    // with `@~/.xchplot2`.
+    //
+    // Inject config tokens between user positional args and user
+    // flags so positional parsers (e.g. batch's `argv[2] = manifest`)
+    // still see the right positionals, and user-provided flags appear
+    // AFTER config-provided ones (last-wins → user overrides config).
+    std::vector<std::string> expanded;
+    if (!config_tokens.empty()) {
+        // Find the first user arg that looks like a flag (starts with
+        // `-` and isn't a bare `-`). Everything before it is positional,
+        // everything from it onward is user flags.
+        int flag_start = strip_argc;  // default: no flags → append
+        for (int i = 2; i < strip_argc; ++i) {
+            std::string const a = argv_stripped[i];
+            if (a.size() >= 2 && a[0] == '-' && a[1] != '\0') {
+                flag_start = i;
+                break;
+            }
+        }
+        std::vector<char*> combined;
+        combined.reserve(strip_argc + config_tokens.size());
+        // [prog] [subcmd] [positional args...]
+        for (int i = 0; i < flag_start; ++i) {
+            combined.push_back(argv_stripped[i]);
+        }
+        // <config flags>
+        std::vector<std::string> ct_owned = config_tokens;
+        for (auto& t : ct_owned) combined.push_back(t.data());
+        // [user flags...]
+        for (int i = flag_start; i < strip_argc; ++i) {
+            combined.push_back(argv_stripped[i]);
+        }
+        expanded = expand_argfiles(static_cast<int>(combined.size()), combined.data());
+    } else {
+        expanded = expand_argfiles(strip_argc, argv_stripped.data());
+    }
     std::vector<char*> argv_owned;
     argv_owned.reserve(expanded.size());
     for (auto& s : expanded) argv_owned.push_back(s.data());
