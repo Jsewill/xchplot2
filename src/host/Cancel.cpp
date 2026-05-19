@@ -68,6 +68,23 @@ void install_cancel_signal_handlers()
 #if defined(SIGHUP)
     std::signal(SIGHUP, cancel_handler);
 #endif
+    // SIGXFSZ → ignore. Linux sends this in addition to write(2)
+    // returning EFBIG when RLIMIT_FSIZE is exceeded; the default
+    // disposition kills the process before our writer's RAII guard
+    // can remove the .partial file. Ignoring the signal lets
+    // write() return EFBIG cleanly, ofstream sets failbit, our
+    // throw chain in PlotFileWriterParallel fires, and the
+    // PartialGuard destructor unlinks the partial as designed.
+    // Same shape as ENOSPC handling, just a different trigger.
+#if defined(SIGXFSZ)
+    std::signal(SIGXFSZ, SIG_IGN);
+#endif
+    // SIGPIPE → ignore. The writer + reader stream paths use write()
+    // not pipes, but downstream notify-style hooks (e.g. logging to
+    // a fifo) shouldn't kill the process. Cheap insurance.
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 }
 
 bool cancel_requested() noexcept
