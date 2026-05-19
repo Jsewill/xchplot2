@@ -114,6 +114,23 @@ jobs:
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v5
+      - name: Cache /opt/adaptivecpp
+        id: cache-adaptivecpp
+        uses: actions/cache@v4
+        with:
+          path: /opt/adaptivecpp
+          # Key components — invalidate the cache when any of these change:
+          #   matrix.image     LLVM version in the base image differs
+          #                    between CUDA 12.9 and 13.0 → ABI-relevant
+          #                    for AdaptiveCpp's built-against-LLVM bits
+          #   install-deps.sh  ACPP_REF default + apt package list live
+          #                    here; any edit means rebuild
+          # Restore is best-effort; install-deps.sh detects an existing
+          # /opt/adaptivecpp and skips its build, so a partial / stale
+          # cache that lands the dir but is corrupt would only show as
+          # a downstream link error — at which point bumping
+          # install-deps.sh's hash naturally re-keys the cache.
+          key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh') }}
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
           # cargo is already on PATH from the rustup step above, so
@@ -121,10 +138,17 @@ jobs:
           # own rustup install entirely.
           # Distro-aware bootstrap: apt-installs build-essential, cmake,
           # llvm-18 / clang-18 / lld-18, boost, then builds AdaptiveCpp
-          # v25.10.0 from source at /opt/adaptivecpp. ~15-20 min cold.
+          # v25.10.0 from source at /opt/adaptivecpp. ~15-20 min cold,
+          # ~2 min on a cache hit (the apt-installed LLVM bits still
+          # need to land but the AdaptiveCpp build itself is skipped
+          # because the dir already exists from cache restore).
           # --gpu nvidia tells it to skip the AMD-only ROCm headers
           # path (we're inside a nvidia/cuda image already).
           export PATH="$HOME/.cargo/bin:$PATH"
+          if [ "${{ steps.cache-adaptivecpp.outputs.cache-hit }}" = "true" ]; then
+            echo "[ci] AdaptiveCpp restored from cache; install-deps.sh"
+            echo "[ci] will detect it at /opt/adaptivecpp and skip the build."
+          fi
           bash scripts/install-deps.sh --gpu nvidia
       - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
         run: |
