@@ -1,0 +1,69 @@
+name: arch-matrix
+
+# Verifies the README-documented CUDA arch matrix stays buildable
+# under the SYCL build (XCHPLOT2_BUILD_CUDA=ON, the default when
+# nvcc is present). Each job sets CMAKE_CUDA_ARCHITECTURES to one
+# of the documented targets and runs cmake configure + builds the
+# CUDA TUs. No accelerator needed.
+#
+# Arch coverage mirrors the README "Common values" line:
+#   61  GTX 10-series   (Pascal)   — needs CUDA 12.x (12.9 last)
+#   75  Turing
+#   86  RTX 30-series   (Ampere)
+#   89  RTX 40-series   (Ada)      — also the default
+#   120 RTX 50-series   (Blackwell) — needs CUDA 12.8+
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: arch / sm_${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 61
+            image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+          - arch: 75
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 86
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 89
+            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          - arch: 120
+            image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake git curl ca-certificates pkg-config \
+            libboost-context-dev libboost-fiber-dev
+          # AdaptiveCpp prerequisites and the lib itself live in
+          # scripts/install-deps.sh; for a tight CI loop we skip the
+          # full SYCL build and only configure + build the CUDA TUs,
+          # which are what the arch matrix actually exercises.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v5
+      - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # XCHPLOT2_BUILD_CUDA=ON exercises the CUDA path even though
+          # we're not building the full SYCL binary here; the arch
+          # matrix is about confirming nvcc accepts the target.
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DXCHPLOT2_BUILD_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
+          cmake --build build -j --target pos2_gpu_cuda_obj
