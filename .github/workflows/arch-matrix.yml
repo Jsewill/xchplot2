@@ -86,26 +86,42 @@ jobs:
           - arch: 120
             image: nvidia/cuda:12.9.1-devel-ubuntu24.04
     steps:
-      - name: Install build deps
+      - name: Bootstrap apt + sudo stub (container runs as root)
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake git curl ca-certificates pkg-config \
-            libboost-context-dev libboost-fiber-dev
-          # AdaptiveCpp prerequisites and the lib itself live in
-          # scripts/install-deps.sh; for a tight CI loop we skip the
-          # full SYCL build and only configure + build the CUDA TUs,
-          # which are what the arch matrix actually exercises.
+            ca-certificates curl git
+          # scripts/install-deps.sh calls `sudo` throughout; we're
+          # already root in the container, so wire `sudo` to exec the
+          # rest of the args directly. Cheaper than `apt install sudo`
+          # which pulls a chunk of policy / pam state we don't need.
+          cat > /usr/local/bin/sudo <<'EOF'
+          #!/bin/sh
+          exec "$@"
+          EOF
+          chmod +x /usr/local/bin/sudo
+      - uses: actions/checkout@v5
+      - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
+        run: |
+          # Distro-aware bootstrap: apt-installs build-essential, cmake,
+          # llvm-18 / clang-18 / lld-18, boost, then builds AdaptiveCpp
+          # v25.10.0 from source at /opt/adaptivecpp. ~15-20 min cold.
+          # --gpu nvidia tells it to skip the AMD-only ROCm headers
+          # path (we're inside a nvidia/cuda image already).
+          bash scripts/install-deps.sh --gpu nvidia
+      - name: Install rustup (toolchain for keygen-rs sub-build)
+        run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v5
       - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           # XCHPLOT2_BUILD_CUDA=ON exercises the CUDA path even though
           # we're not building the full SYCL binary here; the arch
           # matrix is about confirming nvcc accepts the target.
+          # AdaptiveCpp is already installed at /opt/adaptivecpp by
+          # install-deps.sh — CMake's probe picks it up automatically.
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DXCHPLOT2_BUILD_CUDA=ON \
