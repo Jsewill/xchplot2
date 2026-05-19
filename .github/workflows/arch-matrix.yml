@@ -100,20 +100,32 @@ jobs:
           exec "$@"
           EOF
           chmod +x /usr/local/bin/sudo
+      - name: Install rustup (with retries) — keygen-rs sub-build needs cargo
+        run: |
+          # curl with --retry: GitHub Actions has seen transient connect
+          # failures to sh.rustup.rs. 5 attempts at 10s spacing covers
+          # short outages without padding cold-cache jobs.
+          # Done BEFORE install-deps.sh so that script's own rustup
+          # branch (which has no retries) gets skipped via its
+          # `command -v cargo` probe.
+          curl --proto '=https' --tlsv1.2 -sSfL \
+            --retry 5 --retry-delay 10 --retry-all-errors \
+            https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v5
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
+          # cargo is already on PATH from the rustup step above, so
+          # install-deps.sh's `if ! command -v cargo` guard skips its
+          # own rustup install entirely.
           # Distro-aware bootstrap: apt-installs build-essential, cmake,
           # llvm-18 / clang-18 / lld-18, boost, then builds AdaptiveCpp
           # v25.10.0 from source at /opt/adaptivecpp. ~15-20 min cold.
           # --gpu nvidia tells it to skip the AMD-only ROCm headers
           # path (we're inside a nvidia/cuda image already).
+          export PATH="$HOME/.cargo/bin:$PATH"
           bash scripts/install-deps.sh --gpu nvidia
-      - name: Install rustup (toolchain for keygen-rs sub-build)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
