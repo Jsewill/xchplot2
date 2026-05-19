@@ -1138,7 +1138,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --progress --cpu --tier --devices --shard-plot --pipeline-plot --host-bounce -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --progress --cpu --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
