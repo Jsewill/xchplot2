@@ -56,7 +56,7 @@ public:
     // Convenience: bool / int coercion via the same get() lookup.
     // Bool accepts {true, false, 1, 0, yes, no, on, off} case-
     // insensitive. Int accepts decimal. Returns nullopt on absent
-    // or unparseable; the caller is responsible for fall-through.
+    // or unparsable; the caller is responsible for fall-through.
     std::optional<bool> get_bool(std::string const& section,
                                  std::string const& key) const;
     std::optional<long> get_int (std::string const& section,
