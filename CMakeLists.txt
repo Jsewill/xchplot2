@@ -612,6 +612,7 @@ add_library(pos2_gpu_host STATIC
     src/host/BatchPlotter.cpp
     src/host/CpuPlotter.cpp
     src/host/Cancel.cpp
+    src/host/ConfigFile.cpp
     src/host/MultiGpuPlotPipeline.cpp
     src/host/MultiGpuPipelineParallel.cpp
     src/host/TempFile.cpp

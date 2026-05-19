@@ -13,6 +13,7 @@
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
 #include "host/Cancel.hpp"
+#include "host/ConfigFile.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
@@ -415,8 +416,90 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 {
     pos2gpu::install_cancel_signal_handlers();
 
-    // Expand @argfile tokens before the rest of argument parsing.
-    std::vector<std::string> expanded = expand_argfiles(argc, argv);
+    // Layer 1: TOML-subset config from `--config PATH` or
+    // `~/.config/xchplot2/config.toml`. Schema:
+    //   [defaults]              keys applied to every subcommand
+    //   [batch] / [plot] / ...  per-subcommand overrides
+    // Each key/value becomes a CLI flag and is injected into argv
+    // BETWEEN the user's positional args and their flags so the
+    // existing per-subcommand parsers see the same positional shape
+    // and user-provided flags take precedence (last-wins).
+    std::string config_path;
+    int strip_argc = argc;
+    std::vector<char*> argv_stripped;
+    {
+        argv_stripped.reserve(argc);
+        for (int i = 0; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--config" && i + 1 < argc) {
+                config_path = argv[i + 1];
+                ++i;
+                continue;
+            }
+            argv_stripped.push_back(argv[i]);
+        }
+        strip_argc = static_cast<int>(argv_stripped.size());
+    }
+    if (config_path.empty()) {
+        if (char const* home = std::getenv("HOME")) {
+            std::string const default_path =
+                std::string(home) + "/.config/xchplot2/config.toml";
+            std::ifstream probe(default_path);
+            if (probe) config_path = default_path;
+        }
+    }
+    std::vector<std::string> config_tokens;
+    if (!config_path.empty()) {
+        pos2gpu::ConfigFile cfg;
+        try {
+            cfg = pos2gpu::ConfigFile::load(config_path);
+        } catch (std::exception const& ex) {
+            std::cerr << "Error: parsing " << config_path << ": "
+                      << ex.what() << "\n";
+            return 1;
+        }
+        std::string subcmd = (strip_argc >= 2) ? std::string(argv_stripped[1]) : "";
+        auto emit_section = [&](std::string const& name) {
+            for (auto const& [k, v] : cfg.section_view(name)) {
+                auto const as_bool = cfg.get_bool(name, k);
+                std::string const flag =
+                    (k.size() > 0 && k[0] == '-') ? k : ("--" + k);
+                if (as_bool) {
+                    if (*as_bool) config_tokens.push_back(flag);
+                    continue;
+                }
+                config_tokens.push_back(flag);
+                config_tokens.push_back(v);
+            }
+        };
+        emit_section("defaults");
+        if (!subcmd.empty()) emit_section(subcmd);
+    }
+
+    // Layer 2: expand @argfile tokens. Inject config tokens between
+    // user positional args and user flags so positional parsers
+    // (batch's `argv[2] = manifest` etc.) still index correctly and
+    // user-provided flags appear after config-provided ones.
+    std::vector<std::string> expanded;
+    if (!config_tokens.empty()) {
+        int flag_start = strip_argc;
+        for (int i = 2; i < strip_argc; ++i) {
+            std::string const a = argv_stripped[i];
+            if (a.size() >= 2 && a[0] == '-' && a[1] != '\0') {
+                flag_start = i;
+                break;
+            }
+        }
+        std::vector<char*> combined;
+        combined.reserve(strip_argc + config_tokens.size());
+        for (int i = 0; i < flag_start; ++i) combined.push_back(argv_stripped[i]);
+        std::vector<std::string> ct_owned = config_tokens;
+        for (auto& t : ct_owned) combined.push_back(t.data());
+        for (int i = flag_start; i < strip_argc; ++i) combined.push_back(argv_stripped[i]);
+        expanded = expand_argfiles(static_cast<int>(combined.size()), combined.data());
+    } else {
+        expanded = expand_argfiles(strip_argc, argv_stripped.data());
+    }
     std::vector<char*> argv_owned;
     argv_owned.reserve(expanded.size());
     for (auto& s : expanded) argv_owned.push_back(s.data());
