@@ -49,6 +49,27 @@ jobs:
               --build-arg ACPP_TARGETS=omp
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
+          # AMD ROCm — AdaptiveCpp HIP backend. ACPP_TARGETS pinned to
+          # gfx1100 (RDNA3 / RX 7900); the arch choice doesn't matter
+          # for the build-only assertion since no GPU is present in
+          # CI. The 5+ GB ROCm base image dominates the job wall.
+          - name: amd-rocm
+            extra_args: >-
+              --build-arg BASE_DEVEL=docker.io/rocm/dev-ubuntu-24.04:latest
+              --build-arg BASE_RUNTIME=docker.io/rocm/dev-ubuntu-24.04:latest
+              --build-arg ACPP_TARGETS=hip:gfx1100
+              --build-arg XCHPLOT2_BUILD_CUDA=OFF
+              --build-arg INSTALL_CUDA_HEADERS=1
+          # Intel oneAPI — AdaptiveCpp generic (SSCP) → Level Zero.
+          # README flags this path as experimental / not perf-tested;
+          # CI's role is "the build still works", not "it runs well".
+          - name: intel-oneapi
+            extra_args: >-
+              --build-arg BASE_DEVEL=docker.io/intel/oneapi-basekit:latest
+              --build-arg BASE_RUNTIME=docker.io/intel/oneapi-runtime:latest
+              --build-arg ACPP_TARGETS=generic
+              --build-arg XCHPLOT2_BUILD_CUDA=OFF
+              --build-arg INSTALL_CUDA_HEADERS=1
     steps:
       - uses: actions/checkout@v5
       - name: podman build (${{ matrix.target.name }})
