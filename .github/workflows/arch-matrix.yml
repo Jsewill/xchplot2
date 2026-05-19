@@ -16,11 +16,30 @@ name: arch-matrix
 on:
   pull_request:
     paths-ignore:
+      # Docs & metadata
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      # Runtime scripts not exercised by the arch matrix (it runs
+      # cmake configure + builds pos2_gpu_cuda_obj only).
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      # Containerfile / compose are install-matrix-only — arch
+      # matrix uses a stock nvidia/cuda image and never touches them.
+      - 'Containerfile'
+      - 'compose.yaml'
+      # Sibling CI workflows.
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/install-matrix.yml'
   push:
     branches: [main]
     paths-ignore:
@@ -29,6 +48,19 @@ on:
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      - 'Containerfile'
+      - 'compose.yaml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/install-matrix.yml'
 
 permissions:
   contents: read

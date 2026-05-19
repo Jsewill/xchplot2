@@ -14,11 +14,30 @@ name: install-matrix
 on:
   pull_request:
     paths-ignore:
+      # Docs & metadata
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      # Runtime scripts not exercised by the install matrix.
+      # scripts/install-deps.sh IS used inside Containerfile RUNs,
+      # so it's NOT in this list.
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      # docker-compose isn't exercised by CI (we drive podman build
+      # directly).
+      - 'compose.yaml'
+      # Sibling CI workflows.
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/arch-matrix.yml'
   push:
     branches: [main]
     paths-ignore:
@@ -27,6 +46,18 @@ on:
       - 'LICENSE*'
       - '.gitignore'
       - '.gitattributes'
+      - '.editorconfig'
+      - '.markdownlint*'
+      - '.github/dependabot.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+      - 'scripts/test/**'
+      - 'scripts/test-multi-gpu.sh'
+      - 'scripts/build-container.sh'
+      - 'scripts/install-container-deps.sh'
+      - 'compose.yaml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/arch-matrix.yml'
 
 permissions:
   contents: read
