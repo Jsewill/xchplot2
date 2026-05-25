@@ -128,7 +128,7 @@ jobs:
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: podman build (${{ matrix.target.name }})
         run: |
           podman build -t xchplot2-ci:${{ matrix.target.name }} \

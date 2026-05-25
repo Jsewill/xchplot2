@@ -113,7 +113,7 @@ jobs:
             https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache /opt/adaptivecpp
         id: cache-adaptivecpp
         uses: actions/cache@v4
