@@ -75,6 +75,67 @@ if(_xchplot2_nvcc)
         endif()
     endif()
 endif()
+# Symmetric ceiling check: a target arch NEWER than this nvcc can codegen
+# — e.g. a Blackwell GeForce RTX 50-series (compute_cap 12.0 -> sm_120) on
+# a CUDA < 12.8 toolkit, where nvcc dies with "Unsupported gpu architecture
+# 'compute_120'". PTX is forward-compatible, so fall back to PTX from the
+# highest arch this nvcc supports (queried authoritatively via
+# `nvcc --list-gpu-arch`); the driver JIT-compiles it to the real GPU at
+# runtime. Mirrors build.rs's cargo-install path. Must run BEFORE project()
+# so enable_language(CUDA)'s TryCompile uses the corrected arch.
+if(_xchplot2_nvcc)
+    execute_process(
+        COMMAND "${_xchplot2_nvcc}" --list-gpu-arch
+        OUTPUT_VARIABLE _nvcc_arch_out
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    # Highest compute_XX nvcc can emit. The list is NOT sorted on CUDA 13.x
+    # (compute_100, compute_110, compute_103, ...), so take the max.
+    set(_max_supported 0)
+    string(REGEX MATCHALL "compute_([0-9]+)" _arch_matches "${_nvcc_arch_out}")
+    foreach(_m IN LISTS _arch_matches)
+        string(REGEX REPLACE "compute_" "" _m "${_m}")
+        if(_m GREATER _max_supported)
+            set(_max_supported ${_m})
+        endif()
+    endforeach()
+    # Target arch: user-passed list if any, else the same default 89 the
+    # floor check used. Resolve `native`/`all` via the live GPU compute_cap.
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(_ceil_arches "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(_ceil_arches 89)
+    endif()
+    set(_want 0)
+    if(_ceil_arches MATCHES "native|all")
+        execute_process(
+            COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
+            OUTPUT_VARIABLE _cap_out
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_cap_out MATCHES "([0-9]+)\\.([0-9]+)")
+            math(EXPR _want "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")
+        endif()
+    else()
+        foreach(_a IN LISTS _ceil_arches)
+            string(REGEX REPLACE "^(sm_|compute_)" "" _a "${_a}")
+            string(REGEX REPLACE "-(real|virtual)$" "" _a "${_a}")
+            if(_a MATCHES "^[0-9]+$" AND _a GREATER _want)
+                set(_want ${_a})
+            endif()
+        endforeach()
+    endif()
+    if(_max_supported GREATER 0 AND _want GREATER _max_supported)
+        message(WARNING
+            "xchplot2 (cuda-only): target sm_${_want} is newer than this CUDA Toolkit "
+            "can codegen (nvcc tops out at compute_${_max_supported}; sm_100/sm_120 "
+            "Blackwell need CUDA 12.8+). Falling back to compute_${_max_supported} PTX, "
+            "which the driver JIT-compiles to your GPU at runtime. For native SASS "
+            "install CUDA 12.8+ and point cmake at it with "
+            "-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc.")
+        set(CMAKE_CUDA_ARCHITECTURES "${_max_supported}-virtual")
+    endif()
+endif()
 unset(_xchplot2_nvcc CACHE)
 
 project(pos2-gpu VERSION 0.7.3 LANGUAGES C CXX CUDA)
