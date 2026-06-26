@@ -145,19 +145,49 @@ fn detect_nvcc_major() -> Option<u32> {
     None
 }
 
+/// The virtual GPU architectures the installed nvcc can actually codegen,
+/// via `nvcc --list-gpu-arch` (CUDA 11.5+). Output is one `compute_XX`
+/// per line — and NOT sorted (CUDA 13.x prints
+/// `compute_100 compute_110 compute_103 compute_120 compute_121`), so the
+/// caller must take the numeric max, not the last line. Returns the parsed
+/// arches (e.g. [75,80,86,89,90]); None when nvcc is missing, predates the
+/// flag, or the output can't be parsed — callers then skip the ceiling
+/// check and let cmake try, preserving prior behaviour.
+fn nvcc_supported_arches() -> Option<Vec<u32>> {
+    let out = Command::new("nvcc").arg("--list-gpu-arch").output().ok()?;
+    if !out.status.success() { return None; }
+    let s = std::str::from_utf8(&out.stdout).ok()?;
+    let v: Vec<u32> = s.lines()
+        .filter_map(|l| l.trim().strip_prefix("compute_"))
+        // `compute_90a` and friends -> drop the arch-feature suffix
+        .filter_map(|n| n.split(|c: char| !c.is_ascii_digit()).next())
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// Parse one CMake CUDA_ARCHITECTURES token to its integer arch,
+/// tolerating the `sm_`/`compute_` prefixes Cargo users pass through and
+/// the `-real`/`-virtual` suffixes CMake accepts ("sm_90" / "compute_90"
+/// / "90-virtual" -> 90). None for non-numeric tokens ("native", "all").
+fn arch_num(tok: &str) -> Option<u32> {
+    let t = tok.trim()
+        .trim_start_matches("sm_")
+        .trim_start_matches("compute_");
+    t.split('-').next().unwrap_or(t).parse().ok()
+}
+
 /// Minimum integer arch from a CMake-style CUDA_ARCHITECTURES list
-/// ("61", "61;86", "61;86;120"). Tolerates "sm_61" / "compute_61"
-/// prefixes that Cargo users sometimes pass through. Returns None
-/// when the list parses to nothing.
+/// ("61", "61;86", "61;86;120"). None when nothing parses.
 fn min_arch(arch_list: &str) -> Option<u32> {
-    arch_list.split(';')
-        .filter_map(|s| {
-            let s = s.trim()
-                .trim_start_matches("sm_")
-                .trim_start_matches("compute_");
-            s.parse().ok()
-        })
-        .min()
+    arch_list.split(';').filter_map(arch_num).min()
+}
+
+/// Maximum integer arch from a CMake-style CUDA_ARCHITECTURES list.
+/// Used to catch a target arch NEWER than the installed nvcc can
+/// codegen (e.g. sm_120 Blackwell on a CUDA 12.4 toolkit).
+fn max_arch(arch_list: &str) -> Option<u32> {
+    arch_list.split(';').filter_map(arch_num).max()
 }
 
 /// Probe /sys/class/drm for a display-class PCI device with Intel's
@@ -446,7 +476,7 @@ fn main() {
     //   2. nvidia-smi probe of the build machine's local GPU.
     //   3. 89 (sm_89, RTX 4090 / Ada Lovelace) as a sensible default for
     //      machines without nvidia-smi (e.g. CI, headless package builds).
-    let (cuda_arch, source) = match env::var("CUDA_ARCHITECTURES") {
+    let (mut cuda_arch, source) = match env::var("CUDA_ARCHITECTURES") {
         Ok(v) => (v, "$CUDA_ARCHITECTURES"),
         Err(_) => match detect_cuda_arch() {
             Some(v) => (v, "nvidia-smi probe"),
@@ -625,6 +655,50 @@ fn main() {
                      \n\
                      {fix_block}"
                 );
+            }
+        }
+    }
+
+    // Symmetric ceiling check: a target arch NEWER than this nvcc can
+    // codegen. A Blackwell GeForce RTX 50-series reports compute_cap 12.0,
+    // so autodetect targets sm_120 — but only CUDA 12.8+ added compute_120
+    // codegen. On an older toolkit nvcc dies with
+    //   "nvcc fatal: Unsupported gpu architecture 'compute_120'"
+    // deep inside a CMake TryCompile (exactly the cargo-install failure
+    // Blackwell users hit on CUDA 12.4). PTX is forward-compatible, so
+    // rather than fail we emit PTX for the highest arch THIS nvcc supports;
+    // the driver JIT-compiles it to the real GPU at runtime (the driver
+    // clearly knows the GPU — nvidia-smi just read its compute_cap). Native
+    // SASS for any already-supported arch in the list is preserved. We
+    // loudly recommend a 12.8+ toolkit for native codegen.
+    if build_cuda == "ON" {
+        if let (Some(supported), Some(want)) =
+            (nvcc_supported_arches(), max_arch(&cuda_arch))
+        {
+            let max_supported = supported.iter().copied().max().unwrap();
+            if want > max_supported {
+                // Keep every requested arch the toolkit CAN target as-is
+                // (real SASS); replace the too-new ones with one PTX entry
+                // from the highest supported arch.
+                let mut kept: Vec<String> = cuda_arch
+                    .split(';')
+                    .filter(|tok| arch_num(tok).map_or(true, |n| n <= max_supported))
+                    .map(|tok| tok.trim().to_string())
+                    .collect();
+                let ptx = format!("{max_supported}-virtual");
+                if !kept.iter().any(|k| *k == ptx) {
+                    kept.push(ptx);
+                }
+                let new_arch = kept.join(";");
+                println!(
+                    "cargo:warning=xchplot2: target sm_{want} is newer than this CUDA \
+                     Toolkit can codegen (nvcc tops out at compute_{max_supported}; \
+                     sm_100/sm_120 Blackwell need CUDA 12.8+). Falling back to \
+                     CUDA_ARCHITECTURES={new_arch} — PTX the driver JIT-compiles to your \
+                     GPU at runtime. For native SASS install CUDA 12.8+ and rebuild with \
+                     CUDA_PATH=/usr/local/cuda-12.8 (or set CUDA_ARCHITECTURES explicitly)."
+                );
+                cuda_arch = new_arch;
             }
         }
     }

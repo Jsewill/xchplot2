@@ -163,8 +163,14 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     preflight and points at the fix path.
   - `sm_75` – `sm_90` (Turing / Ampere / Hopper): 12.x or 13.x both
     work.
-  - `sm_120` (RTX 50-series Blackwell): need 12.8+; earlier toolkits
-    lack Blackwell codegen.
+  - `sm_120` (RTX 50-series Blackwell): native SASS needs CUDA **12.8+**
+    (earlier toolkits lack Blackwell codegen — nvcc fails with
+    `Unsupported gpu architecture 'compute_120'`). On an older toolkit
+    the build no longer hard-fails: `build.rs` falls back to PTX for the
+    highest arch the toolkit supports (e.g. `compute_90` on 12.4), which
+    your driver JIT-compiles to the GPU at first run — so it still builds
+    and plots. Install 12.8+ for native codegen, or force the fallback
+    yourself with `CUDA_ARCHITECTURES=90-virtual cargo install …`.
 - **OS:** Linux (tested on modern glibc distributions) is the supported
   path. Windows users route through either the `cuda-only` branch
   natively (NVIDIA + MSVC + CUDA) or WSL2 (any vendor WSL2 supports)
