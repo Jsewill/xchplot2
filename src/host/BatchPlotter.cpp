@@ -29,6 +29,8 @@
 #include <thread>
 #include <utility>
 
+#include <unistd.h>  // isatty — in-place progress line only on a TTY
+
 namespace pos2gpu {
 
 void initialize_aes_tables(); // forward decl from AesGpu.cu
@@ -218,13 +220,21 @@ void emit_progress_line(std::string const& log_prefix,
     double const eta_s = avg * double(total - done_now);
     double const rate_tib_s =
         static_cast<double>(cumulative_bytes) / elapsed_s / kTibBytes;
+    // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
+    // one-line-per-plot when redirected to a file/pipe or when verbose
+    // logging would interleave and garble the in-place line.
+    static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
+    bool const in_place = stderr_tty && !opts.verbose;
     std::fprintf(stderr,
-        "%s progress: plot %zu/%zu done "
-        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, fully plotted in ~%s)\n",
+        "%s%s progress: plot %zu/%zu done "
+        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, fully plotted in ~%s)%s",
+        in_place ? "\r\033[K" : "",
         log_prefix.c_str(),
         done_now, total,
         100.0 * double(done_now) / double(total),
-        avg, rate_tib_s, format_duration_hms(eta_s).c_str());
+        avg, rate_tib_s, format_duration_hms(eta_s).c_str(),
+        (!in_place || done_now >= total) ? "\n" : "");
+    if (in_place) std::fflush(stderr);
 }
 
 void record_plot_completion(BatchResult& res,
