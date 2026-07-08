@@ -697,6 +697,37 @@ already a complete `.plot2` (magic bytes + non-trivial size), and
 `--continue-on-error` logs per-plot failures and keeps going instead of
 aborting the whole run. Both flags work for `plot` and `batch` modes.
 
+`--progress` prints an aggregate one-liner after each plot completes:
+
+```
+[batch] progress: plot 3/10 done (30.0%, 2.41 s/plot avg, 0.000373 TiB/s, fully plotted in ~17s)
+```
+
+The ETA is plots-based (average s/plot × remaining), formatted as
+hours/minutes/seconds when the estimate exceeds one hour.
+
+### Benchmark throughput
+
+`bench` measures how fast your hardware plots by writing synthetic
+unfarmable `.plot2` files (random plot_ids, no keys), then reports
+steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
+(30-day basis):
+
+```bash
+# Quick smoke (k=18 finishes in seconds on most GPUs)
+xchplot2 bench -k 18 -n 3 -o /tmp
+
+# Full measurement at k=28 (default: 1 warmup + 5 measured plots/worker)
+xchplot2 bench -k 28 -o /scratch
+
+# Also run a tmpfs pass to isolate compute from disk I/O
+xchplot2 bench -k 28 -o /scratch --compute-only
+```
+
+Bench deletes the files it creates unless `--keep` is set. Pass
+`--target-size TiB` to estimate time-to-fill a specific capacity instead
+of the output directory's free space.
+
 Plots are written to `<name>.plot2.partial` and atomically renamed on
 completion, so a crash / `SIGINT` / `ENOSPC` mid-write never leaves a
 malformed plot at the destination. A first `Ctrl-C` asks the plotter to
@@ -833,7 +864,8 @@ runs a live k=22 plot across `--devices 0,1`.
 ```bash
 xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
 xchplot2 batch         <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
-                                             [--devices <SPEC>]
+                                             [--devices <SPEC>] [--progress]
+xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
 xchplot2 verify        <file.plot2> [--trials N]           # run N random challenges
 xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen
 ```

@@ -25,7 +25,7 @@
 
 namespace pos2gpu {
 
-void run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
+std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
 {
     // Build pos2-chip's ProofParams from BatchEntry's existing fields.
     // ProofParams is in the global namespace (pos2-chip doesn't wrap
@@ -67,6 +67,9 @@ void run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
                           static_cast<uint8_t>(entry.meta_group),
                           std::span<uint8_t const>(entry.memo.data(),
                                                    entry.memo.size()));
+
+    return static_cast<std::uint64_t>(
+        std::filesystem::file_size(out_path));
 }
 
 } // namespace pos2gpu

@@ -39,6 +39,10 @@ struct BatchResult {
     size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
     size_t plots_failed  = 0;  // raised an exception under BatchOptions::continue_on_error
     double total_wall_seconds = 0.0;
+    std::uint64_t bytes_written = 0;
+    // Per-finished-plot wall offset (seconds from that worker's start), in
+    // completion order. Merged + sorted across workers in run_batch().
+    std::vector<double> completion_seconds;
 };
 
 // Options controlling batch behavior.
@@ -181,12 +185,11 @@ struct BatchOptions {
     bool prefer_peer_copy  = true;
 
     // Opt-in aggregate progress: prints a one-liner after each plot
-    // completes showing "N/M done (%, avg s/plot, ETA)". Independent
-    // of verbose (which is finer-grained per-phase noise) and useful
-    // for long batches where the user wants a single watch-line
-    // without enabling the full verbose stream. v1 only fires in the
-    // single-worker path; multi-device aggregate progress is on the
-    // FEATURES backlog.
+    // completes showing "N/M done (%, avg s/plot, TiB/s, fully-plotted
+    // ETA)". Independent of verbose (which is finer-grained per-phase
+    // noise) and useful for long batches where the user wants a single
+    // watch-line without enabling the full verbose stream. Fires in
+    // all three batch strategies (work-queue, shard-plot, pipeline-plot).
     bool progress          = false;
 };
 
@@ -231,5 +234,23 @@ BatchStrategy select_strategy(
 BatchStrategy select_strategy(
     StrategyPickInputs const& inputs,
     std::string*              reason_out = nullptr);
+
+// Resolve BatchOptions' device selection to the concrete id list
+// run_batch will use (use_all_devices → enumerate, device_ids →
+// as-given, include_cpu → append kCpuDeviceId; empty → default
+// selector). Pure; run_batch calls this too, so callers that need
+// the list (e.g. bench sizing its entry count) cannot drift.
+std::vector<int> resolve_batch_devices(BatchOptions const& opts);
+
+// Resolve the effective strategy the same way run_batch does
+// (explicit opts.strategy > legacy shard/pipeline bools > heuristic).
+BatchStrategy resolve_batch_strategy(BatchOptions const& opts,
+                                     std::vector<int> const& device_ids,
+                                     int k,
+                                     std::string* reason_out = nullptr);
+
+// Number of concurrently-plotting workers run_batch will spawn for
+// these options (shard-plot and pipeline-plot act as one team = 1).
+std::size_t batch_worker_count(BatchOptions const& opts, int k);
 
 } // namespace pos2gpu
