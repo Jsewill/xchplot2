@@ -717,7 +717,7 @@ steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
 # Quick smoke (k=18 finishes in seconds on most GPUs)
 xchplot2 bench -k 18 -n 3 -o /tmp
 
-# Full measurement at k=28 (default: 1 warmup + 5 measured plots/worker)
+# Full measurement at k=28 (default: 1 warmup + 10 measured plots/worker)
 xchplot2 bench -k 28 -o /scratch
 
 # Also run a tmpfs pass to isolate compute from disk I/O
