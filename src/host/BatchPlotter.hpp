@@ -108,12 +108,18 @@ struct BatchOptions {
     bool             shard_plot      = false;
     std::string      shard_strategy  = "bucket";
 
-    // Opt-in aggregate progress: prints a one-liner after each plot
-    // completes showing "N/M done (%, avg s/plot, TiB/s, fully-plotted
-    // ETA)". Independent of verbose (which is finer-grained per-phase
-    // noise) and useful for long batches where the user wants a single
-    // watch-line without enabling the full verbose stream.
+    // Aggregate progress: prints a one-liner after each plot completes
+    // showing "N/M done (%, avg s/plot, TiB/s, fully-plotted ETA)";
+    // rewritten in place when stderr is a TTY. Independent of verbose
+    // (which is finer-grained per-phase noise). The CLI defaults this
+    // to isatty(stderr); `--progress`/`--no-progress` force it.
     bool             progress        = false;
+
+    // Quiet (CLI: -q/--quiet): suppress info-level stderr lines —
+    // streaming-tier selection notes, multi-device worker banner.
+    // Warnings, errors, and per-plot FAILED lines always print.
+    // Does not imply --no-progress; the CLI wires that separately.
+    bool             quiet           = false;
 
     // Resume support: if an output .plot2 already exists at the
     // target path AND passes a quick "looks like a complete plot"

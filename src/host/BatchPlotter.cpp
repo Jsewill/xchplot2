@@ -502,7 +502,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         pool_ptr = std::make_unique<GpuBufferPool>(
             pool_k, pool_strength, pool_testnet);
     } catch (InsufficientVramError const& e) {
-        if (tier_forced) {
+        if (opts.quiet) {
+            // info-level: which pipeline was picked and why
+        } else if (tier_forced) {
             std::fprintf(stderr, "%s --tier override — using "
                                  "streaming pipeline per plot\n",
                                  log_prefix.c_str());
@@ -631,11 +633,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
         if (tier == Tier::Plain) {
             // Plain: zero PCIe overhead, all parks skipped.
-            std::fprintf(stderr,
-                "%s streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
-                log_prefix.c_str(),
-                free_bytes / double(1ULL << 30),
-                kPlainFloorBytes / double(1ULL << 30));
+            if (!opts.quiet) {
+                std::fprintf(stderr,
+                    "%s streaming tier: plain (%.2f GiB free, %.2f GiB floor)\n",
+                    log_prefix.c_str(),
+                    free_bytes / double(1ULL << 30),
+                    kPlainFloorBytes / double(1ULL << 30));
+            }
         } else if (tier == Tier::Compact || tier == Tier::Minimal ||
                    tier == Tier::Tiny) {
             // Compact + Minimal share the same pinned-host scratch
@@ -691,7 +695,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // device. Drops T3 match peak from ~5200 → ~3700 MB.
                 int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
                 stream_scratch.t3_input_slice_count = 1 << num_section_bits;
-                if (tier == Tier::Tiny) {
+                if (opts.quiet) {
+                    // info-level tier note suppressed
+                } else if (tier == Tier::Tiny) {
                     std::fprintf(stderr,
                         "%s streaming tier: tiny (%.2f GiB free, %.2f GiB floor; "
                         "per-bucket-pair T1/T2/T3 match + streaming-partition T1/T2/T3 sort "
@@ -711,7 +717,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         stream_scratch.t3_input_slice_count,
                         stream_scratch.t3_input_slice_count);
                 }
-            } else {
+            } else if (!opts.quiet) {
                 std::fprintf(stderr,
                     "%s streaming tier: compact (%.2f GiB free < %.2f GiB plain floor; "
                     "park/rehydrate + N=2 T3 staging, expect ~1-2 s/plot extra PCIe)\n",
@@ -1051,13 +1057,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // zero cross-worker shared state beyond `next_idx`, stderr, and
     // the filesystem.
     size_t const N = device_ids.size();
-    std::fprintf(stderr,
-        "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
-        entries.size(), N);
-    for (size_t i = 0; i < N; ++i) {
-        std::fprintf(stderr, " %d", device_ids[i]);
+    if (!opts.quiet) {
+        std::fprintf(stderr,
+            "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
+            entries.size(), N);
+        for (size_t i = 0; i < N; ++i) {
+            std::fprintf(stderr, " %d", device_ids[i]);
+        }
+        std::fprintf(stderr, "\n");
     }
-    std::fprintf(stderr, "\n");
 
     std::atomic<std::size_t> next_idx{0};
     // Shared progress counter for --progress on multi-device runs.
