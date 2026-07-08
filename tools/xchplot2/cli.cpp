@@ -49,16 +49,17 @@ void print_usage(char const* prog)
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose]\n"
         << "         [--skip-existing] [--continue-on-error] [--progress]\n"
         << "         [--devices <SPEC>]\n"
-        << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
-        << "         [--tier T] [--cpu] [--warmup W] [--keep] [-T|--testnet]\n"
-        << "         [--target-size TiB] [--compute-only]\n"
-        << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
-        << "    synthetic unfarmable plots. Writes real .plot2 files unless\n"
-        << "    --keep is set; deletes them on exit by default.\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
+        << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
+        << "         [--tier T] [--cpu] [--warmup W] [--keep] [-T|--testnet]\n"
+        << "         [--target-size TiB] [--compute-only]\n"
+        << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
+        << "    synthetic unfarmable plots (default: 1 warmup + 10 measured\n"
+        << "    plots/worker). Writes real .plot2 files unless --keep is set;\n"
+        << "    deletes them on exit by default.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
         << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v]\n"
         << "         [--skip-existing] [--continue-on-error]\n"
@@ -838,7 +839,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     if (mode == "bench") {
         int k = 28;
         int strength = 2;
-        int measured = 5;
+        int measured = 10;
         int warmup = 1;
         bool keep = false;
         bool compute_only = false;
