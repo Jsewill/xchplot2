@@ -163,9 +163,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chia"
-version = "0.45.0"
+version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a11ccc08fd3ee8931390562b1f74bfde5b4910ab5027a77b212850bdf73385ed"
+checksum = "4a51f5992fb4987321ee37a11bb686e41a4ab4a2f874efa3a057ce22ff666ee4"
 dependencies = [
  "chia-bls 0.45.0",
  "chia-client",
