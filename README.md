@@ -697,14 +697,22 @@ already a complete `.plot2` (magic bytes + non-trivial size), and
 `--continue-on-error` logs per-plot failures and keeps going instead of
 aborting the whole run. Both flags work for `plot` and `batch` modes.
 
-`--progress` prints an aggregate one-liner after each plot completes:
+An aggregate progress line updates after each plot completes:
 
 ```
 [batch] progress: plot 3/10 done (30.0%, 2.41 s/plot avg, 0.000373 TiB/s, fully plotted in ~17s)
 ```
 
-The ETA is plots-based (average s/plot × remaining), formatted as
+On a terminal it rewrites itself in place and is on by default; when
+stderr is redirected it prints one line per plot and defaults to off.
+`--progress` / `--no-progress` force it either way. The ETA is
+plots-based (average s/plot × remaining), formatted as
 hours/minutes/seconds when the estimate exceeds one hour.
+
+`-q`/`--quiet` suppresses info-level stderr output — the progress line,
+end-of-run summaries, and streaming-tier notes. Warnings and errors
+still print, and `plot` mode's stdout listing of created plot paths is
+kept so scripts can consume it. `-q` and `-v` are mutually exclusive.
 
 ### Benchmark throughput
 
@@ -863,8 +871,8 @@ runs a live k=22 plot across `--devices 0,1`.
 
 ```bash
 xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
-xchplot2 batch         <manifest.tsv> [-v] [--skip-existing] [--continue-on-error]
-                                             [--devices <SPEC>] [--progress]
+xchplot2 batch         <manifest.tsv> [-v] [-q] [--skip-existing] [--continue-on-error]
+                                             [--devices <SPEC>] [--progress|--no-progress]
 xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
 xchplot2 verify        <file.plot2> [--trials N]           # run N random challenges
 xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen

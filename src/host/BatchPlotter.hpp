@@ -184,13 +184,20 @@ struct BatchOptions {
     // to ~3.2 GB/shard for u32_u64+u32 in T2's sort).
     bool prefer_peer_copy  = true;
 
-    // Opt-in aggregate progress: prints a one-liner after each plot
-    // completes showing "N/M done (%, avg s/plot, TiB/s, fully-plotted
-    // ETA)". Independent of verbose (which is finer-grained per-phase
-    // noise) and useful for long batches where the user wants a single
-    // watch-line without enabling the full verbose stream. Fires in
-    // all three batch strategies (work-queue, shard-plot, pipeline-plot).
+    // Aggregate progress: prints a one-liner after each plot completes
+    // showing "N/M done (%, avg s/plot, TiB/s, fully-plotted ETA)";
+    // rewritten in place when stderr is a TTY. Independent of verbose
+    // (which is finer-grained per-phase noise). Fires in all three
+    // batch strategies (work-queue, shard-plot, pipeline-plot). The
+    // CLI defaults this to isatty(stderr); `--progress`/`--no-progress`
+    // force it either way.
     bool progress          = false;
+
+    // Quiet (CLI: -q/--quiet): suppress info-level stderr lines —
+    // streaming-tier selection notes, multi-device worker banner.
+    // Warnings, errors, and per-plot FAILED lines always print.
+    // Does not imply --no-progress; the CLI wires that separately.
+    bool quiet             = false;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp

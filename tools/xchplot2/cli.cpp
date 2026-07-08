@@ -37,7 +37,19 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>  // isatty — progress defaults to on for interactive runs
+
 namespace {
+
+// Tri-state --progress resolution: explicit --progress/--no-progress
+// wins; otherwise default to on when stderr is a TTY (where the line
+// rewrites in place) and off when redirected or under -q/--quiet.
+// -1 = auto, 0 = forced off, 1 = forced on.
+bool resolve_progress(int tri, bool quiet)
+{
+    if (tri >= 0) return tri != 0;
+    return !quiet && ::isatty(::fileno(stderr)) != 0;
+}
 
 void print_usage(char const* prog)
 {
@@ -46,22 +58,22 @@ void print_usage(char const* prog)
         << "  " << prog << " test <k> <plot_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
         << "         [-T|--testnet] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
-        << "  " << prog << " batch <manifest.tsv> [-v|--verbose]\n"
-        << "         [--skip-existing] [--continue-on-error] [--progress]\n"
-        << "         [--devices <SPEC>]\n"
+        << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
+        << "         [--skip-existing] [--continue-on-error]\n"
+        << "         [--progress|--no-progress] [--devices <SPEC>]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
         << "         [--tier T] [--cpu] [--warmup W] [--keep] [-T|--testnet]\n"
-        << "         [--target-size TiB] [--compute-only]\n"
+        << "         [--target-size TiB] [--compute-only] [-q|--quiet]\n"
         << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
         << "    synthetic unfarmable plots (default: 1 warmup + 10 measured\n"
         << "    plots/worker). Writes real .plot2 files unless --keep is set;\n"
         << "    deletes them on exit by default.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
-        << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v]\n"
+        << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
         << "         [--skip-existing] [--continue-on-error]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
@@ -82,6 +94,14 @@ void print_usage(char const* prog)
         << "                                      fresh /dev/urandom per plot.\n"
         << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
+        << "    -q, --quiet                     : suppress info-level stderr output\n"
+        << "                                      (progress line, summaries, tier\n"
+        << "                                      notes). Warnings/errors and the\n"
+        << "                                      stdout path listing still print.\n"
+        << "    --progress / --no-progress      : force the aggregate progress line\n"
+        << "                                      on/off. Default: on when stderr is\n"
+        << "                                      a terminal (rewrites in place),\n"
+        << "                                      off when redirected or with -q.\n"
     << "    --skip-existing                 : skip plots whose output file is already a\n"
         << "                                      complete .plot2 (magic + non-trivial size).\n"
         << "    --continue-on-error             : log per-plot failures and keep going\n"
@@ -613,7 +633,7 @@ BenchMeasurement run_bench_pass(
         paths.push_back(std::filesystem::path(e.out_dir) / e.out_name);
     }
     pos2gpu::BatchOptions run_opts = opts;
-    run_opts.progress = true;
+    run_opts.progress = !opts.quiet;
     run_opts.skip_existing = false;
     run_opts.continue_on_error = false;
     try {
@@ -864,6 +884,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--out" || a == "-o") && need(1)) out_dir = argv[++i];
             else if (a == "--keep") keep = true;
             else if (a == "--compute-only") compute_only = true;
+            else if (a == "--quiet" || a == "-q") opts.quiet = true;
+            else if (a == "--no-quiet") opts.quiet = false;
             else if (a == "--testnet" || a == "-T") testnet = true;
             else if (a == "--target-size" && need(1)) {
                 target_size_tib = std::atof(argv[++i]);
@@ -916,9 +938,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
 
         try {
-            std::fprintf(stderr,
-                "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
-                warmup, measured);
+            if (!opts.quiet) {
+                std::fprintf(stderr,
+                    "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
+                    warmup, measured);
+            }
 
             BenchMeasurement e2e = run_bench_pass(
                 k, strength, testnet, plot_count, out_dir, opts,
@@ -1004,12 +1028,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         if (argc < 3) { print_usage(argv[0]); return 1; }
         std::string manifest = argv[2];
         pos2gpu::BatchOptions opts{};
+        int progress_tri = -1;  // -1 auto (TTY), 0 off, 1 on
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-v" || a == "--verbose")        opts.verbose = true;
             else if (a == "--no-verbose")                  opts.verbose = false;
-            else if (a == "--progress")                    opts.progress = true;
-            else if (a == "--no-progress")                 opts.progress = false;
+            else if (a == "-q" || a == "--quiet")          opts.quiet = true;
+            else if (a == "--no-quiet")                    opts.quiet = false;
+            else if (a == "--progress")                    progress_tri = 1;
+            else if (a == "--no-progress")                 progress_tri = 0;
             else if (a == "--skip-existing"
                   || a == "--resume")                      opts.skip_existing = true;
             else if (a == "--no-skip-existing"
@@ -1102,11 +1129,19 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 return 1;
             }
         }
+        if (opts.quiet && opts.verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually "
+                         "exclusive\n";
+            return 1;
+        }
+        opts.progress = resolve_progress(progress_tri, opts.quiet);
         try {
             auto entries = pos2gpu::parse_manifest(manifest);
-            std::cerr << "[batch] " << entries.size() << " plots queued\n";
+            if (!opts.quiet) {
+                std::cerr << "[batch] " << entries.size() << " plots queued\n";
+            }
             auto res = pos2gpu::run_batch(entries, opts);
-            print_run_summary("[batch]", res);
+            if (!opts.quiet) print_run_summary("[batch]", res);
             return (res.plots_failed > 0) ? 3 : 0;
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
@@ -1245,7 +1280,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         bool plot_use_all_devices = false;
         bool plot_include_cpu     = false;
         bool plot_shard_plot      = false;
-        bool plot_progress        = false;
+        int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
+        bool plot_quiet           = false;
         bool plot_pipeline_plot   = false;
         int  plot_pipeline_depth  = 2;
         pos2gpu::BatchStrategy plot_strategy = pos2gpu::BatchStrategy::Auto;
@@ -1279,8 +1315,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--no-testnet")              testnet = false;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
             else if  (a == "--no-verbose")              verbose = false;
-            else if  (a == "--progress")                plot_progress = true;
-            else if  (a == "--no-progress")             plot_progress = false;
+            else if  (a == "-q" || a == "--quiet")      plot_quiet = true;
+            else if  (a == "--no-quiet")                plot_quiet = false;
+            else if  (a == "--progress")                plot_progress_tri = 1;
+            else if  (a == "--no-progress")             plot_progress_tri = 0;
             else if  (a == "--skip-existing"
                    || a == "--resume")                  skip_existing = true;
             else if  (a == "--no-skip-existing"
@@ -1380,6 +1418,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
         }
 
+        if (plot_quiet && verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually "
+                         "exclusive\n";
+            return 1;
+        }
         if (farmer_pk_hex.empty()) {
             std::cerr << "Error: --farmer-pk is required\n";
             return 1;
@@ -1537,9 +1580,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.streaming_tier    = plot_streaming_tier;
             opts.per_device_tier   = plot_per_device_tier;
             opts.all_gpus_tier     = plot_all_gpus_tier;
-            opts.progress          = plot_progress;
+            opts.quiet             = plot_quiet;
+            opts.progress          = resolve_progress(plot_progress_tri, plot_quiet);
             auto res = pos2gpu::run_batch(entries, opts);
-            print_run_summary("[plot]", res);
+            if (!plot_quiet) print_run_summary("[plot]", res);
+            // stdout path listing is the machine-readable result — kept
+            // under -q so scripts can still consume it.
             for (auto const& e : entries) {
                 std::cout << out_dir << "/" << e.out_name << "\n";
             }
@@ -1583,7 +1629,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --progress --cpu --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -1601,8 +1647,10 @@ _xchplot2() {
     _arguments \
         '--tier[Streaming tier]:tier:(plain compact minimal tiny pinned auto)' \
         '--devices[Device selector]:spec:(all gpu cpu 0 1 2 3)' \
-        '--progress[Aggregate progress line]' \
+        '--progress[Force aggregate progress line on]' \
+        '--no-progress[Force aggregate progress line off]' \
         '-v[Verbose]' '--verbose[Verbose]' \
+        '-q[Quiet — suppress info-level output]' '--quiet[Quiet — suppress info-level output]' \
         '--cpu[Add CPU worker]' \
         '--shard-plot[Single-plot multi-GPU]' \
         '--pipeline-plot[Pipeline-parallel multi-stage]' \
@@ -1624,8 +1672,10 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'parity-check'  -d 'Run parit
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shell completion script'
 complete -c xchplot2 -l tier      -x -a 'plain compact minimal tiny pinned auto'  -d 'Streaming tier'
 complete -c xchplot2 -l devices   -x -a 'all gpu cpu 0 1 2 3'                      -d 'Device selector'
-complete -c xchplot2 -l progress  -d 'Aggregate progress line'
+complete -c xchplot2 -l progress  -d 'Force aggregate progress line on'
+complete -c xchplot2 -l no-progress -d 'Force aggregate progress line off'
 complete -c xchplot2 -s v -l verbose -d 'Verbose'
+complete -c xchplot2 -s q -l quiet -d 'Quiet — suppress info-level output'
 complete -c xchplot2 -l cpu       -d 'Add CPU worker'
 complete -c xchplot2 -l shard-plot     -d 'Single-plot multi-GPU (experimental)'
 complete -c xchplot2 -l pipeline-plot  -d 'Pipeline-parallel multi-stage'

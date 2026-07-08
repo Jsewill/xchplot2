@@ -524,7 +524,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         pool_ptr = std::make_unique<GpuBufferPool>(
             pool_k, pool_strength, pool_testnet);
     } catch (InsufficientVramError const& e) {
-        if (tier_forced) {
+        if (opts.quiet) {
+            // info-level: which pipeline was picked and why
+        } else if (tier_forced) {
             std::fprintf(stderr, "%s --tier override — using "
                                  "streaming pipeline per plot\n",
                                  log_prefix.c_str());
@@ -661,14 +663,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 stream_scratch.gather_tile_count = 4;
             }
 
-            std::fprintf(stderr,
-                "%s streaming tier: %s "
-                "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
-                log_prefix.c_str(),
-                tier_name(tier),
-                to_gib(mem.free_bytes),
-                to_gib(required),
-                to_gib(plain_peak + margin));
+            if (!opts.quiet) {
+                std::fprintf(stderr,
+                    "%s streaming tier: %s "
+                    "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
+                    log_prefix.c_str(),
+                    tier_name(tier),
+                    to_gib(mem.free_bytes),
+                    to_gib(required),
+                    to_gib(plain_peak + margin));
+            }
         }
         // Size the pinned buffers using the same cap formula as the pool.
         int const num_section_bits = (pool_k < 28) ? 2 : (pool_k - 26);
@@ -1670,13 +1674,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // zero cross-worker shared state beyond `next_idx`, stderr, and
     // the filesystem.
     size_t const N = device_ids.size();
-    std::fprintf(stderr,
-        "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
-        entries.size(), N);
-    for (size_t i = 0; i < N; ++i) {
-        std::fprintf(stderr, " %d", device_ids[i]);
+    if (!opts.quiet) {
+        std::fprintf(stderr,
+            "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
+            entries.size(), N);
+        for (size_t i = 0; i < N; ++i) {
+            std::fprintf(stderr, " %d", device_ids[i]);
+        }
+        std::fprintf(stderr, "\n");
     }
-    std::fprintf(stderr, "\n");
 
     std::atomic<std::size_t> next_idx{0};
     // Shared progress counter for --progress on multi-device runs.
