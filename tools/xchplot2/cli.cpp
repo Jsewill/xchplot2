@@ -20,8 +20,10 @@
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +52,12 @@ void print_usage(char const* prog)
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
+        << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
+        << "         [--tier T] [--cpu] [--warmup W] [--keep] [-T|--testnet]\n"
+        << "         [--target-size TiB] [--compute-only]\n"
+        << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
+        << "    synthetic unfarmable plots. Writes real .plot2 files unless\n"
+        << "    --keep is set; deletes them on exit by default.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
         << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
@@ -320,6 +328,265 @@ std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
     return out;
 }
 
+constexpr double kGiBBytes = 1024.0 * 1024.0 * 1024.0;
+constexpr double kTibBytes = kGiBBytes * 1024.0;
+
+std::string bytes_to_hex(std::array<uint8_t, 32> const& id)
+{
+    static char const hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (uint8_t b : id) {
+        out += hex[b >> 4];
+        out += hex[b & 0xF];
+    }
+    return out;
+}
+
+std::string format_duration_dh(double seconds)
+{
+    if (seconds < 0.0) seconds = 0.0;
+    int const total_s = static_cast<int>(seconds);
+    int const d = total_s / 86400;
+    int const h = (total_s % 86400) / 3600;
+    int const m = (total_s % 3600) / 60;
+    int const s = total_s % 60;
+    char buf[32];
+    if (d > 0) {
+        std::snprintf(buf, sizeof(buf), "%dd %dh", d, h);
+    } else if (h > 0) {
+        std::snprintf(buf, sizeof(buf), "%dh", h);
+    } else if (m > 0) {
+        std::snprintf(buf, sizeof(buf), "%dm%02ds", m, s);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%ds", s);
+    }
+    return buf;
+}
+
+void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
+{
+    double const per = res.plots_written
+        ? res.total_wall_seconds / double(res.plots_written) : 0.0;
+    std::cerr << prefix << " wrote " << res.plots_written << " plots in "
+              << res.total_wall_seconds << " s (" << per << " s/plot)";
+    if (res.plots_skipped) std::cerr << "; skipped " << res.plots_skipped;
+    if (res.bytes_written > 0 && res.total_wall_seconds > 0.0) {
+        double const gib = static_cast<double>(res.bytes_written) / kGiBBytes;
+        double const tib_per_hour =
+            (static_cast<double>(res.bytes_written) / kTibBytes) /
+            (res.total_wall_seconds / 3600.0);
+        std::cerr << "; " << gib << " GiB written ("
+                  << tib_per_hour << " TiB/hour effective)";
+    }
+    std::cerr << "\n";
+}
+
+std::string resolve_tmpfs_dir()
+{
+    if (char const* x = std::getenv("XDG_RUNTIME_DIR"); x && x[0]) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(x, ec)) return x;
+    }
+    std::error_code ec;
+    if (std::filesystem::is_directory("/dev/shm", ec)) return "/dev/shm";
+    return {};
+}
+
+struct BenchMeasurement {
+    pos2gpu::BatchResult result;
+    std::vector<std::filesystem::path> paths;
+    std::vector<std::uint64_t> plot_sizes;
+    double rate_tib_s = 0.0;
+    double s_per_plot = 0.0;
+    double gib_per_plot = 0.0;
+    double interval_min = 0.0;
+    double interval_max = 0.0;
+    double interval_stddev = 0.0;
+    double size_gib_min = 0.0;
+    double size_gib_max = 0.0;
+};
+
+BenchMeasurement analyze_bench_run(
+    pos2gpu::BatchResult const& res,
+    std::vector<std::filesystem::path> const& paths,
+    std::size_t warmup_drop)
+{
+    BenchMeasurement out;
+    out.result = res;
+    out.paths = paths;
+    out.plot_sizes.reserve(paths.size());
+    for (auto const& p : paths) {
+        out.plot_sizes.push_back(
+            static_cast<std::uint64_t>(std::filesystem::file_size(p)));
+    }
+
+    if (out.plot_sizes.size() != res.plots_written) {
+        throw std::runtime_error(
+            "bench internal error: path count != plots_written");
+    }
+
+    std::uint64_t const tally_bytes = [&] {
+        std::uint64_t sum = 0;
+        for (auto s : out.plot_sizes) sum += s;
+        return sum;
+    }();
+    if (tally_bytes != res.bytes_written) {
+        std::fprintf(stderr,
+            "[bench] WARNING: writer byte tally (%llu) != file_size sum "
+            "(%llu) — unexpected write path\n",
+            static_cast<unsigned long long>(res.bytes_written),
+            static_cast<unsigned long long>(tally_bytes));
+    }
+
+    auto times = res.completion_seconds;
+    std::sort(times.begin(), times.end());
+    if (times.size() <= warmup_drop) {
+        throw std::runtime_error(
+            "bench: no measured plots after warmup exclusion "
+            "(increase -n or reduce --warmup)");
+    }
+    // Epoch for the measured window: the last warmup completion, or the
+    // run start (offset 0) when warmup is disabled. Anchoring here means
+    // the first measured plot's own production time is counted — without
+    // it the rate divides N plots' bytes by only N-1 intervals of wall,
+    // inflating throughput by N/(N-1).
+    double const epoch = warmup_drop > 0 ? times[warmup_drop - 1] : 0.0;
+    times.erase(times.begin(),
+                times.begin() + static_cast<std::ptrdiff_t>(warmup_drop));
+
+    // One interval per measured plot (epoch → t1, t1 → t2, ...).
+    std::vector<double> intervals;
+    intervals.reserve(times.size());
+    double prev = epoch;
+    for (double t : times) {
+        intervals.push_back(t - prev);
+        prev = t;
+    }
+
+    double interval_sum = 0.0;
+    out.interval_min = intervals[0];
+    out.interval_max = intervals[0];
+    for (double iv : intervals) {
+        interval_sum += iv;
+        out.interval_min = std::min(out.interval_min, iv);
+        out.interval_max = std::max(out.interval_max, iv);
+    }
+    out.s_per_plot = interval_sum / double(intervals.size());
+
+    double var = 0.0;
+    for (double iv : intervals) {
+        double const d = iv - out.s_per_plot;
+        var += d * d;
+    }
+    out.interval_stddev = intervals.size() > 1
+        ? std::sqrt(var / double(intervals.size() - 1)) : 0.0;
+
+    out.size_gib_min = static_cast<double>(out.plot_sizes.front()) / kGiBBytes;
+    out.size_gib_max = out.size_gib_min;
+    std::uint64_t size_sum = 0;
+    for (auto s : out.plot_sizes) {
+        double const gib = static_cast<double>(s) / kGiBBytes;
+        out.size_gib_min = std::min(out.size_gib_min, gib);
+        out.size_gib_max = std::max(out.size_gib_max, gib);
+        size_sum += s;
+    }
+    out.gib_per_plot = static_cast<double>(size_sum) /
+        (kGiBBytes * static_cast<double>(out.plot_sizes.size()));
+
+    // plot_sizes is in entry order, not completion order, so the sizes
+    // of the measured plots specifically can't be identified. Use the
+    // mean size across the run instead — on-disk size at fixed k is
+    // near-constant, and this keeps the rate consistent with the
+    // s/plot and GiB/plot figures printed alongside it.
+    double const mean_plot_bytes =
+        static_cast<double>(size_sum) / double(out.plot_sizes.size());
+    double measured_wall = times.back() - epoch;
+    if (measured_wall <= 0.0) {
+        measured_wall = res.total_wall_seconds;
+    }
+    out.rate_tib_s = measured_wall > 0.0
+        ? (mean_plot_bytes * double(times.size()) / kTibBytes) / measured_wall
+        : 0.0;
+
+    return out;
+}
+
+void print_bench_measurement(char const* label,
+                           BenchMeasurement const& m,
+                           int k,
+                           char const* suffix = nullptr)
+{
+    (void)k;
+    double const tib_hour = m.rate_tib_s * 3600.0;
+    double const tib_day  = tib_hour * 24.0;
+    double const tib_month = tib_day * 30.0;
+    std::fprintf(stderr,
+        "[bench] %s: %.6f TiB/s | %.3g TiB/hour | %.3g TiB/day | "
+        "%.3g TiB/month (30d)",
+        label, m.rate_tib_s, tib_hour, tib_day, tib_month);
+    if (suffix && suffix[0]) std::fprintf(stderr, "  [%s]", suffix);
+    std::fprintf(stderr, "\n");
+}
+
+std::vector<pos2gpu::BatchEntry> build_bench_entries(
+    int k, int strength, bool testnet, int count, std::string const& out_dir)
+{
+    std::vector<pos2gpu::BatchEntry> entries;
+    entries.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        pos2gpu::BatchEntry e;
+        e.k = k;
+        e.strength = strength;
+        e.plot_index = 0;
+        e.meta_group = 0;
+        e.testnet = testnet;
+        read_urandom(e.plot_id.data(), e.plot_id.size());
+        e.out_dir = out_dir;
+        e.out_name = "bench-" + bytes_to_hex(e.plot_id) + ".plot2";
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+void cleanup_bench_files(std::vector<std::filesystem::path> const& paths)
+{
+    for (auto const& p : paths) {
+        std::error_code ec;
+        std::filesystem::remove(p, ec);
+    }
+}
+
+BenchMeasurement run_bench_pass(
+    int k, int strength, bool testnet, int count,
+    std::string const& out_dir,
+    pos2gpu::BatchOptions const& opts,
+    std::size_t warmup_plots,
+    bool keep)
+{
+    auto entries = build_bench_entries(k, strength, testnet, count, out_dir);
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(entries.size());
+    for (auto const& e : entries) {
+        paths.push_back(std::filesystem::path(e.out_dir) / e.out_name);
+    }
+    pos2gpu::BatchOptions run_opts = opts;
+    run_opts.progress = true;
+    run_opts.skip_existing = false;
+    try {
+        auto const res = pos2gpu::run_batch(entries, run_opts);
+        if (res.plots_written == 0) {
+            throw std::runtime_error("bench plotting pass failed");
+        }
+        return analyze_bench_run(res, paths, warmup_plots);
+    } catch (...) {
+        // Don't leave partial bench output behind on failure (the files
+        // are unfarmable junk; --keep only applies to successful runs).
+        if (!keep) cleanup_bench_files(paths);
+        throw;
+    }
+}
+
 // Expand `@argfile` tokens in argv. The convention is: any argv
 // element starting with `@` is replaced by the whitespace-tokenised
 // contents of the named file (`@~/.xchplot2` etc). Lines starting
@@ -564,6 +831,169 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         return 0;
     }
 
+    if (mode == "bench") {
+        int k = 28;
+        int strength = 2;
+        int measured = 5;
+        int warmup = 1;
+        bool keep = false;
+        bool compute_only = false;
+        bool testnet = false;
+        std::string out_dir = ".";
+        double target_size_tib = -1.0;
+        pos2gpu::BatchOptions opts{};
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            auto need = [&](int more) -> bool {
+                if (i + more >= argc) {
+                    std::cerr << "Error: " << a << " requires " << more << " arg(s)\n";
+                    return false;
+                }
+                return true;
+            };
+            if      ((a == "--k" || a == "-k") && need(1)) k = std::atoi(argv[++i]);
+            else if ((a == "--strength" || a == "-s") && need(1)) strength = std::atoi(argv[++i]);
+            else if ((a == "--num" || a == "-n") && need(1)) measured = std::atoi(argv[++i]);
+            else if (a == "--warmup" && need(1)) warmup = std::atoi(argv[++i]);
+            else if ((a == "--out" || a == "-o") && need(1)) out_dir = argv[++i];
+            else if (a == "--keep") keep = true;
+            else if (a == "--compute-only") compute_only = true;
+            else if (a == "--testnet" || a == "-T") testnet = true;
+            else if (a == "--target-size" && need(1)) {
+                target_size_tib = std::atof(argv[++i]);
+                if (target_size_tib <= 0.0) {
+                    std::cerr << "Error: --target-size must be > 0 TiB\n";
+                    return 1;
+                }
+            }
+            else if (a == "-v" || a == "--verbose") opts.verbose = true;
+            else if (a == "--cpu") opts.include_cpu = true;
+            else if (a == "--shard-plot") opts.shard_plot = true;
+            else if (a == "--tier" && need(1)) {
+                std::string t = argv[++i];
+                if (t != "plain" && t != "compact" && t != "minimal"
+                    && t != "tiny" && t != "auto") {
+                    std::cerr << "Error: --tier expects plain|compact|minimal|tiny|auto\n";
+                    return 1;
+                }
+                opts.streaming_tier = (t == "auto") ? "" : t;
+            }
+            else if (a == "--devices" && need(1)) {
+                if (!parse_devices_arg(argv[++i], opts)) {
+                    std::cerr << "Error: invalid --devices value\n";
+                    return 1;
+                }
+            }
+            else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+
+        if (k < 18 || k > 32 || (k % 2) != 0) {
+            std::cerr << "Error: -k must be an even integer in [18, 32]\n";
+            return 1;
+        }
+        if (measured < 1) {
+            std::cerr << "Error: -n must be >= 1\n";
+            return 1;
+        }
+        if (warmup < 0) {
+            std::cerr << "Error: --warmup must be >= 0\n";
+            return 1;
+        }
+
+        std::size_t const worker_count = pos2gpu::batch_worker_count(opts);
+        std::size_t const warmup_total = static_cast<std::size_t>(warmup) * worker_count;
+        int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
+
+        try {
+            std::fprintf(stderr,
+                "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
+                warmup, measured);
+
+            BenchMeasurement e2e = run_bench_pass(
+                k, strength, testnet, plot_count, out_dir, opts,
+                warmup_total, keep);
+
+            std::fprintf(stderr,
+                "[bench] steady-state: %.2f s/plot, %.3f GiB/plot (k=%d, %zu worker%s)\n",
+                e2e.s_per_plot, e2e.gib_per_plot, k, worker_count,
+                worker_count == 1 ? "" : "s");
+            std::fprintf(stderr,
+                "[bench]   per-plot spread: size %.3f GiB (min %.3f / max %.3f), "
+                "interval %.2f s (min %.2f / max %.2f, σ %.2f)\n",
+                e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max,
+                e2e.s_per_plot, e2e.interval_min, e2e.interval_max,
+                e2e.interval_stddev);
+
+            print_bench_measurement("end-to-end", e2e, k);
+
+            BenchMeasurement compute{};
+            std::string compute_label;
+            if (compute_only) {
+                std::string compute_dir = resolve_tmpfs_dir();
+                if (compute_dir.empty()) {
+                    compute_dir = out_dir;
+                    compute_label = "compute+cache";
+                    std::fprintf(stderr,
+                        "[bench] WARNING: no tmpfs available — compute-only uses "
+                        "%s and may reflect page cache, not RAM\n",
+                        compute_dir.c_str());
+                } else {
+                    compute_dir += "/xchplot2-bench";
+                    std::filesystem::create_directories(compute_dir);
+                    compute_label = "tmpfs";
+                }
+                compute = run_bench_pass(
+                    k, strength, testnet, plot_count, compute_dir, opts,
+                    warmup_total, keep);
+                print_bench_measurement("compute-only", compute, k,
+                                        compute_label.c_str());
+                if (e2e.rate_tib_s > 0.0 && compute.rate_tib_s > 0.0) {
+                    double const overhead_pct =
+                        100.0 * (1.0 - e2e.rate_tib_s / compute.rate_tib_s);
+                    std::fprintf(stderr,
+                        "[bench]   disk overhead: ~%.1f%% of wall\n", overhead_pct);
+                }
+            }
+
+            // Delete before measuring free space so the fill estimate
+            // isn't reduced by the bench's own just-written output.
+            if (!keep) {
+                cleanup_bench_files(e2e.paths);
+                cleanup_bench_files(compute.paths);
+            } else {
+                for (auto const& p : e2e.paths) {
+                    std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                }
+                for (auto const& p : compute.paths) {
+                    std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                }
+            }
+
+            double const fill_bytes = (target_size_tib > 0.0)
+                ? target_size_tib * kTibBytes
+                : static_cast<double>(
+                    std::filesystem::space(out_dir).available);
+            if (e2e.rate_tib_s > 0.0 && fill_bytes > 0.0) {
+                double const fill_s = fill_bytes / (e2e.rate_tib_s * kTibBytes);
+                std::fprintf(stderr,
+                    "[bench] %s: %.3g TiB %s — fully plotted in ~%s (end-to-end rate)\n",
+                    out_dir.c_str(),
+                    fill_bytes / kTibBytes,
+                    target_size_tib > 0.0 ? "target" : "free",
+                    format_duration_dh(fill_s).c_str());
+            }
+            return 0;
+        } catch (std::exception const& e) {
+            std::cerr << "[bench] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
     if (mode == "batch") {
         if (argc < 3) { print_usage(argv[0]); return 1; }
         std::string manifest = argv[2];
@@ -611,10 +1041,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             auto entries = pos2gpu::parse_manifest(manifest);
             std::cerr << "[batch] " << entries.size() << " plots queued\n";
             auto res = pos2gpu::run_batch(entries, opts);
-            double per = res.plots_written ? res.total_wall_seconds / res.plots_written : 0;
-            std::cerr << "[batch] wrote " << res.plots_written << " plots in "
-                      << res.total_wall_seconds << " s ("
-                      << per << " s/plot)\n";
+            print_run_summary("[batch]", res);
             return 0;
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
@@ -932,11 +1359,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.per_device_tier  = plot_per_device_tier;
             opts.all_gpus_tier    = plot_all_gpus_tier;
             auto res = pos2gpu::run_batch(entries, opts);
-            double per = res.plots_written
-                ? res.total_wall_seconds / double(res.plots_written) : 0;
-            std::cerr << "[plot] wrote " << res.plots_written << " plots in "
-                      << res.total_wall_seconds << " s ("
-                      << per << " s/plot)\n";
+            print_run_summary("[plot]", res);
             for (auto const& e : entries) {
                 std::cout << out_dir << "/" << e.out_name << "\n";
             }
@@ -968,7 +1391,7 @@ _xchplot2() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local subcmds="batch plot test devices parity-check completions"
+    local subcmds="batch plot bench test devices parity-check completions"
     local tiers="plain compact minimal tiny auto"
     local devices_tokens="all gpu cpu 0 1 2 3"
     case "${prev}" in
@@ -995,7 +1418,7 @@ complete -F _xchplot2 xchplot2
 # autoload xchplot2's completion function, then 'autoload -U compinit; compinit'.
 _xchplot2() {
     local -a subcmds tiers
-    subcmds=(batch:"Run a manifest of plots" plot:"Single-plot farmable mode" test:"Single test plot" devices:"List available GPU/CPU" parity-check:"Run parity tests" completions:"Emit shell completion script")
+    subcmds=(batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" parity-check:"Run parity tests" completions:"Emit shell completion script")
     tiers=(plain compact minimal tiny auto)
     case "$state" in
         cmds) _describe 'command' subcmds ;;
@@ -1023,6 +1446,7 @@ complete -c xchplot2 -f
 # Subcommands
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'batch'         -d 'Run a manifest of plots'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plot'          -d 'Single-plot farmable mode'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'bench'         -d 'Measure plotting throughput'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'test'          -d 'Single test plot'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'devices'       -d 'List available GPU/CPU'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'parity-check'  -d 'Run parity tests'

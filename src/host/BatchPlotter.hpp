@@ -13,6 +13,7 @@
 
 #include "host/GpuPlotter.hpp"
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -35,6 +36,10 @@ struct BatchResult {
     size_t plots_written = 0;
     size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
     double total_wall_seconds = 0.0;
+    std::uint64_t bytes_written = 0;
+    // Per-finished-plot wall offset (seconds from that worker's start), in
+    // completion order. Merged + sorted across workers in run_batch().
+    std::vector<double> completion_seconds;
 };
 
 // Options controlling batch behavior.
@@ -104,10 +109,10 @@ struct BatchOptions {
     std::string      shard_strategy  = "bucket";
 
     // Opt-in aggregate progress: prints a one-liner after each plot
-    // completes showing "N/M done (%, avg s/plot, ETA)". Independent
-    // of verbose (which is finer-grained per-phase noise) and useful
-    // for long batches where the user wants a single watch-line
-    // without enabling the full verbose stream.
+    // completes showing "N/M done (%, avg s/plot, TiB/s, fully-plotted
+    // ETA)". Independent of verbose (which is finer-grained per-phase
+    // noise) and useful for long batches where the user wants a single
+    // watch-line without enabling the full verbose stream.
     bool             progress        = false;
 
     // Resume support: if an output .plot2 already exists at the
@@ -136,5 +141,16 @@ inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
     opts.verbose = verbose;
     return run_batch(entries, opts);
 }
+
+// Resolve BatchOptions' device selection to the concrete id list
+// run_batch will use (use_all_devices → enumerate, device_ids →
+// as-given, include_cpu → append kCpuDeviceId; empty → CUDA-default
+// device). Pure; run_batch calls this too, so callers that need the
+// list (e.g. bench sizing its entry count) cannot drift.
+std::vector<int> resolve_batch_devices(BatchOptions const& opts);
+
+// Number of concurrently-plotting workers run_batch will spawn for
+// these options (shard-plot acts as one team = 1).
+std::size_t batch_worker_count(BatchOptions const& opts);
 
 } // namespace pos2gpu

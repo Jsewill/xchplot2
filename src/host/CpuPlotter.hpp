@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace pos2gpu {
 
 struct BatchEntry;
 struct BatchOptions;
 
-void run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts);
+// Returns on-disk .plot2 size in bytes (via file_size post-write).
+std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts);
 
 } // namespace pos2gpu

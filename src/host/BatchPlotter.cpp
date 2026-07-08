@@ -186,6 +186,59 @@ void preflight_disk_space(std::vector<BatchEntry> const& entries,
     }
 }
 
+constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+std::string format_duration_hms(double seconds)
+{
+    if (seconds < 0.0) seconds = 0.0;
+    int const total_s = static_cast<int>(seconds);
+    int const h = total_s / 3600;
+    int const m = (total_s % 3600) / 60;
+    int const s = total_s % 60;
+    char buf[32];
+    if (h > 0) {
+        std::snprintf(buf, sizeof(buf), "%dh%02dm%02ds", h, m, s);
+    } else if (m > 0) {
+        std::snprintf(buf, sizeof(buf), "%dm%02ds", m, s);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%ds", s);
+    }
+    return buf;
+}
+
+void emit_progress_line(std::string const& log_prefix,
+                        BatchOptions const& opts,
+                        std::size_t done_now,
+                        std::size_t total,
+                        double elapsed_s,
+                        std::uint64_t cumulative_bytes)
+{
+    if (!opts.progress || done_now == 0 || elapsed_s <= 0.0) return;
+    double const avg = elapsed_s / double(done_now);
+    double const eta_s = avg * double(total - done_now);
+    double const rate_tib_s =
+        static_cast<double>(cumulative_bytes) / elapsed_s / kTibBytes;
+    std::fprintf(stderr,
+        "%s progress: plot %zu/%zu done "
+        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, fully plotted in ~%s)\n",
+        log_prefix.c_str(),
+        done_now, total,
+        100.0 * double(done_now) / double(total),
+        avg, rate_tib_s, format_duration_hms(eta_s).c_str());
+}
+
+void record_plot_completion(BatchResult& res,
+                            std::uint64_t plot_bytes,
+                            double completion_offset_s,
+                            std::atomic<std::uint64_t>* global_bytes)
+{
+    res.bytes_written += plot_bytes;
+    res.completion_seconds.push_back(completion_offset_s);
+    if (global_bytes) {
+        global_bytes->fetch_add(plot_bytes, std::memory_order_relaxed);
+    }
+}
+
 // Bounded SPSC queue + end-of-stream signal.
 //
 // Depth = kNumPinnedBuffers - 1 so the producer never overtakes the
@@ -258,7 +311,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             int                 device_id,
                             int                 worker_id,
                             std::atomic<std::size_t>* shared_idx = nullptr,
-                            std::atomic<std::size_t>* global_done = nullptr)
+                            std::atomic<std::size_t>* global_done = nullptr,
+                            std::atomic<std::uint64_t>* global_bytes = nullptr)
 {
     (void)worker_id;
 
@@ -308,8 +362,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
             }
             try {
-                run_one_plot_cpu(entries[i], opts);
+                std::uint64_t const plot_bytes =
+                    run_one_plot_cpu(entries[i], opts);
                 size_t const local_done = ++res.plots_written;
+                double const completion_offset = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                record_plot_completion(
+                    res, plot_bytes, completion_offset, global_bytes);
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "%s plot %zu done: %s\n",
@@ -322,18 +381,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             : local_done;
                     auto const elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_start).count();
-                    double const avg = elapsed / double(done_now);
-                    size_t const total = entries.size();
-                    double const eta_s = avg * double(total - done_now);
-                    int const eta_m = int(eta_s) / 60;
-                    int const eta_r = int(eta_s) % 60;
-                    std::fprintf(stderr,
-                        "%s progress: plot %zu/%zu done "
-                        "(%.1f%%, %.2f s/plot avg, ~%dm%02ds left)\n",
-                        log_prefix.c_str(),
-                        done_now, total,
-                        100.0 * double(done_now) / double(total),
-                        avg, eta_m, eta_r);
+                    std::uint64_t const cumulative_bytes =
+                        global_bytes
+                            ? global_bytes->load(std::memory_order_relaxed)
+                            : res.bytes_written;
+                    emit_progress_line(
+                        log_prefix, opts, done_now, entries.size(),
+                        elapsed, cumulative_bytes);
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
@@ -719,7 +773,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // Fragments are borrowed from the pool's pinned slot; the
                 // producer is synchronised via the depth-1 channel so that
                 // slot won't be reused until we're done here.
-                write_plot_file_parallel(
+                std::uint64_t const plot_bytes = write_plot_file_parallel(
                     full_path.string(),
                     item.result.fragments(),
                     item.entry.plot_id.data(),
@@ -731,6 +785,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
                 size_t const local_done = ++plots_done;
+                double const completion_offset = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                record_plot_completion(
+                    res, plot_bytes, completion_offset, global_bytes);
                 if (verbose) {
                     std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
                                  log_prefix.c_str(), item.index, full_path.string().c_str());
@@ -751,18 +809,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             : local_done;
                     auto const elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_start).count();
-                    double const avg = elapsed / double(done_now);
-                    size_t const total = entries.size();
-                    double const eta_s = avg * double(total - done_now);
-                    int const eta_m = int(eta_s) / 60;
-                    int const eta_r = int(eta_s) % 60;
-                    std::fprintf(stderr,
-                        "%s progress: plot %zu/%zu done "
-                        "(%.1f%%, %.2f s/plot avg, ~%dm%02ds left)\n",
-                        log_prefix.c_str(),
-                        done_now, total,
-                        100.0 * double(done_now) / double(total),
-                        avg, eta_m, eta_r);
+                    std::uint64_t const cumulative_bytes =
+                        global_bytes
+                            ? global_bytes->load(std::memory_order_relaxed)
+                            : res.bytes_written;
+                    emit_progress_line(
+                        log_prefix, opts, done_now, entries.size(),
+                        elapsed, cumulative_bytes);
                 }
             }
         } catch (...) {
@@ -939,34 +992,18 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // of N minutes into a doomed batch.
     preflight_disk_space(entries, opts);
 
-    // Resolve the target device list:
+    // Resolve the target device list (see resolve_batch_devices):
     //   use_all_devices  → enumerate at runtime, one worker per GPU
     //   device_ids       → use these explicit ids
     //   (neither)        → empty list → single-device, CUDA-default device
-    std::vector<int> device_ids;
-    if (opts.use_all_devices) {
-        int const n = gpu_device_count();
-        if (n <= 0) {
-            std::fprintf(stderr,
-                "[batch] --devices all: runtime enumerated 0 GPUs — "
-                "falling back to the CUDA-default device\n");
-        } else {
-            device_ids.reserve(static_cast<size_t>(n));
-            for (int i = 0; i < n; ++i) device_ids.push_back(i);
-        }
-    } else if (!opts.device_ids.empty()) {
-        device_ids = opts.device_ids;
-    }
-    // include_cpu is orthogonal: append a CPU worker (kCpuDeviceId)
-    // alongside whatever GPUs are already selected. Don't dedup —
-    // caller can pass `cpu` multiple times for multi-core CPU
-    // (e.g. --devices cpu,cpu,cpu,cpu on a 4-core host) — but
-    // collapse the case where include_cpu was set both via --cpu
-    // AND via a `cpu` token in --devices.
-    if (opts.include_cpu &&
-        std::find(device_ids.begin(), device_ids.end(), kCpuDeviceId)
-            == device_ids.end()) {
-        device_ids.push_back(kCpuDeviceId);
+    //   include_cpu      → orthogonal: append a CPU worker (kCpuDeviceId)
+    std::vector<int> const device_ids = resolve_batch_devices(opts);
+    if (opts.use_all_devices &&
+        std::none_of(device_ids.begin(), device_ids.end(),
+                     [](int id) { return id != kCpuDeviceId; })) {
+        std::fprintf(stderr,
+            "[batch] --devices all: runtime enumerated 0 GPUs — "
+            "falling back to the CUDA-default device\n");
     }
 
     auto const t_start = std::chrono::steady_clock::now();
@@ -1018,6 +1055,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // emitted "N/M done" line is aggregate across workers — not the
     // per-worker slice it'd otherwise reflect.
     std::atomic<std::size_t> global_done{0};
+    std::atomic<std::uint64_t> global_bytes{0};
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -1027,7 +1065,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
             try {
                 per_worker[i] = run_batch_slice(
                     entries, opts, device_ids[i],
-                    static_cast<int>(i), &next_idx, &global_done);
+                    static_cast<int>(i), &next_idx, &global_done,
+                    &global_bytes);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
                 // Tell peer workers to drain after their current plot
@@ -1052,10 +1091,51 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     BatchResult agg;
     for (auto const& r : per_worker) {
         agg.plots_written += r.plots_written;
+        agg.plots_skipped += r.plots_skipped;
+        agg.bytes_written += r.bytes_written;
+        agg.completion_seconds.insert(
+            agg.completion_seconds.end(),
+            r.completion_seconds.begin(), r.completion_seconds.end());
     }
+    std::sort(agg.completion_seconds.begin(), agg.completion_seconds.end());
     agg.total_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
     return agg;
+}
+
+std::vector<int> resolve_batch_devices(BatchOptions const& opts)
+{
+    std::vector<int> device_ids;
+    if (opts.use_all_devices) {
+        int const n = gpu_device_count();
+        if (n > 0) {
+            device_ids.reserve(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) device_ids.push_back(i);
+        }
+    } else if (!opts.device_ids.empty()) {
+        device_ids = opts.device_ids;
+    }
+    // include_cpu is orthogonal: append a CPU worker (kCpuDeviceId)
+    // alongside whatever GPUs are already selected. Don't dedup —
+    // caller can pass `cpu` multiple times for multi-core CPU — but
+    // collapse the case where include_cpu was set both via --cpu
+    // AND via a `cpu` token in --devices.
+    if (opts.include_cpu &&
+        std::find(device_ids.begin(), device_ids.end(), kCpuDeviceId)
+            == device_ids.end()) {
+        device_ids.push_back(kCpuDeviceId);
+    }
+    return device_ids;
+}
+
+std::size_t batch_worker_count(BatchOptions const& opts)
+{
+    auto const device_ids = resolve_batch_devices(opts);
+    if (opts.shard_plot && device_ids.size() > 1) {
+        return 1;  // devices form one team; one plot in flight
+    }
+    if (device_ids.size() <= 1) return 1;
+    return device_ids.size();
 }
 
 } // namespace pos2gpu

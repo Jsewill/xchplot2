@@ -391,11 +391,34 @@ Smoke test: `scripts/test-multi-gpu.sh` exercises argument parsing
 (works on any host, even single-GPU) and, when 2+ GPUs are visible,
 runs a live k=22 plot across `--devices 0,1`.
 
+### Benchmark throughput
+
+`bench` measures how fast your hardware plots by writing synthetic
+unfarmable `.plot2` files (random plot_ids, no keys), then reports
+steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
+(30-day basis):
+
+```bash
+# Quick smoke (k=18 finishes in seconds on most GPUs)
+xchplot2 bench -k 18 -n 3 -o /tmp
+
+# Full measurement at k=28 (default: 1 warmup + 5 measured plots/worker)
+xchplot2 bench -k 28 -o /scratch
+
+# Also run a tmpfs pass to isolate compute from disk I/O
+xchplot2 bench -k 28 -o /scratch --compute-only
+```
+
+Bench deletes the files it creates unless `--keep` is set. Pass
+`--target-size TiB` to estimate time-to-fill a specific capacity instead
+of the output directory's free space.
+
 ### Lower-level subcommands
 
 ```bash
 xchplot2 test          <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
 xchplot2 batch         <manifest.tsv> [-v] [--devices <SPEC>]
+xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
 xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression screen
 ```
 
