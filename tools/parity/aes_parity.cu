@@ -95,6 +95,98 @@ __global__ void mt_kernel(
         keys, in[idx].table_id, in[idx].match_key, in[idx].meta, /*extra_rounds_bits=*/0);
 }
 
+// ---- shared-memory wrappers (ttable4 + tezcan16) ------------------------
+// Inventory of hot-kernel entry points: g_x_smem (Xs), pairing_smem +
+// matching_target_smem (T1/T2/T3). chain_smem is unused by those kernels
+// but covered here so a future caller cannot silently diverge.
+
+__global__ void g_x_smem_ttable4_kernel(
+    pos2gpu::AesHashKeys keys, uint32_t* out, uint64_t total, int k)
+{
+    __shared__ uint32_t sT[4 * 256];
+    pos2gpu::load_aes_tables_smem(sT);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = pos2gpu::g_x_smem(keys, static_cast<uint32_t>(idx), k, sT, kRounds);
+}
+
+template<int BANK>
+__global__ void g_x_smem_tezcan_kernel(
+    pos2gpu::AesHashKeys keys, uint32_t* out, uint64_t total, int k)
+{
+    __shared__ uint32_t sT0[256 * BANK];
+    pos2gpu::load_aes_t0_smem_rep<BANK>(sT0);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = pos2gpu::g_x_smem_tezcan<BANK>(
+        keys, static_cast<uint32_t>(idx), k, sT0, kRounds);
+}
+
+__global__ void pairing_smem_ttable4_kernel(
+    pos2gpu::AesHashKeys keys, PairingIn const* in, PairingOut* out, uint64_t total)
+{
+    __shared__ uint32_t sT[4 * 256];
+    pos2gpu::load_aes_tables_smem(sT);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    auto p = pos2gpu::pairing_smem(keys, in[idx].l, in[idx].r, sT, 0);
+    PairingOut o; o.r[0] = p.r[0]; o.r[1] = p.r[1]; o.r[2] = p.r[2]; o.r[3] = p.r[3];
+    out[idx] = o;
+}
+
+template<int BANK>
+__global__ void pairing_smem_tezcan_kernel(
+    pos2gpu::AesHashKeys keys, PairingIn const* in, PairingOut* out, uint64_t total)
+{
+    __shared__ uint32_t sT0[256 * BANK];
+    pos2gpu::load_aes_t0_smem_rep<BANK>(sT0);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    auto p = pos2gpu::pairing_smem_tezcan<BANK>(keys, in[idx].l, in[idx].r, sT0, 0);
+    PairingOut o; o.r[0] = p.r[0]; o.r[1] = p.r[1]; o.r[2] = p.r[2]; o.r[3] = p.r[3];
+    out[idx] = o;
+}
+
+__global__ void mt_smem_ttable4_kernel(
+    pos2gpu::AesHashKeys keys, MtIn const* in, uint32_t* out, uint64_t total)
+{
+    __shared__ uint32_t sT[4 * 256];
+    pos2gpu::load_aes_tables_smem(sT);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = pos2gpu::matching_target_smem(
+        keys, in[idx].table_id, in[idx].match_key, in[idx].meta, sT, 0);
+}
+
+template<int BANK>
+__global__ void mt_smem_tezcan_kernel(
+    pos2gpu::AesHashKeys keys, MtIn const* in, uint32_t* out, uint64_t total)
+{
+    __shared__ uint32_t sT0[256 * BANK];
+    pos2gpu::load_aes_t0_smem_rep<BANK>(sT0);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = pos2gpu::matching_target_smem_tezcan<BANK>(
+        keys, in[idx].table_id, in[idx].match_key, in[idx].meta, sT0, 0);
+}
+
+__global__ void chain_smem_ttable4_kernel(
+    pos2gpu::AesHashKeys keys, uint64_t const* in, uint64_t* out, uint64_t total)
+{
+    __shared__ uint32_t sT[4 * 256];
+    pos2gpu::load_aes_tables_smem(sT);
+    __syncthreads();
+    uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = pos2gpu::chain_smem(keys, in[idx], sT);
+}
+
 // ---- harness helpers ----------------------------------------------------
 
 template <typename T>
@@ -230,6 +322,140 @@ bool run_for_plot_id(uint32_t seed)
                     static_cast<unsigned long long>(s.total),
                     s.ok() ? "OK" : "FAIL");
         all_ok = all_ok && s.ok();
+    }
+
+    // ---- smem wrappers vs soft-AES (ttable4 + tezcan16) ----
+    // Reuse the same deterministic inputs as the constant-memory paths
+    // above by reseeding the RNG to the same stream start.
+    {
+        std::mt19937_64 rng_smem(0xC1A5DEADBEEF0000ULL ^ seed);
+
+        // g_x_smem ttable4 + tezcan16
+        {
+            std::vector<uint32_t> cpu_out(kGxSamples);
+            for (uint64_t x = 0; x < kGxSamples; ++x)
+                cpu_out[x] = cpu.g_x<true>(static_cast<uint32_t>(x), kRounds);
+
+            auto gpu_tt = COLLECT(
+                (g_x_smem_ttable4_kernel<<<blocks, kThreads>>>(gpu_keys, d_out, kGxSamples, kK)),
+                kGxSamples, uint32_t);
+            auto s_tt = compare(kGxSamples, [&](uint64_t i){ return cpu_out[i] == gpu_tt[i]; },
+                                "g_x_smem_ttable4", seed);
+            std::printf("  g_x_smem_ttable4: %llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tt.total - s_tt.mismatches),
+                        static_cast<unsigned long long>(s_tt.total),
+                        s_tt.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tt.ok();
+
+            auto gpu_tz = COLLECT(
+                (g_x_smem_tezcan_kernel<16><<<blocks, kThreads>>>(gpu_keys, d_out, kGxSamples, kK)),
+                kGxSamples, uint32_t);
+            auto s_tz = compare(kGxSamples, [&](uint64_t i){ return cpu_out[i] == gpu_tz[i]; },
+                                "g_x_smem_tezcan16", seed);
+            std::printf("  g_x_smem_tezcan16:%llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tz.total - s_tz.mismatches),
+                        static_cast<unsigned long long>(s_tz.total),
+                        s_tz.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tz.ok();
+        }
+
+        // pairing_smem
+        {
+            std::vector<PairingIn>  in(kRandomSamples);
+            std::vector<PairingOut> cpu_out(kRandomSamples);
+            for (uint64_t i = 0; i < kRandomSamples; ++i) {
+                in[i].l = rng_smem();
+                in[i].r = rng_smem();
+                auto p = cpu.pairing<true>(in[i].l, in[i].r, /*extra_rounds_bits=*/0);
+                cpu_out[i].r[0] = p.r[0]; cpu_out[i].r[1] = p.r[1];
+                cpu_out[i].r[2] = p.r[2]; cpu_out[i].r[3] = p.r[3];
+            }
+            auto* d_in = device_alloc_and_copy(in);
+            auto gpu_tt = COLLECT(
+                (pairing_smem_ttable4_kernel<<<blocks, kThreads>>>(gpu_keys, d_in, d_out, kRandomSamples)),
+                kRandomSamples, PairingOut);
+            auto s_tt = compare(kRandomSamples, [&](uint64_t i) {
+                for (int j = 0; j < 4; ++j) if (cpu_out[i].r[j] != gpu_tt[i].r[j]) return false;
+                return true;
+            }, "pairing_smem_ttable4", seed);
+            std::printf("  pairing_smem_tt: %llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tt.total - s_tt.mismatches),
+                        static_cast<unsigned long long>(s_tt.total),
+                        s_tt.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tt.ok();
+
+            auto gpu_tz = COLLECT(
+                (pairing_smem_tezcan_kernel<16><<<blocks, kThreads>>>(gpu_keys, d_in, d_out, kRandomSamples)),
+                kRandomSamples, PairingOut);
+            CHECK(cudaFree(d_in));
+            auto s_tz = compare(kRandomSamples, [&](uint64_t i) {
+                for (int j = 0; j < 4; ++j) if (cpu_out[i].r[j] != gpu_tz[i].r[j]) return false;
+                return true;
+            }, "pairing_smem_tezcan16", seed);
+            std::printf("  pairing_smem_tz: %llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tz.total - s_tz.mismatches),
+                        static_cast<unsigned long long>(s_tz.total),
+                        s_tz.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tz.ok();
+        }
+
+        // chain_smem (ttable4 only — unused by hot kernels, still covered)
+        {
+            std::vector<uint64_t> in(kRandomSamples);
+            std::vector<uint64_t> cpu_out(kRandomSamples);
+            for (uint64_t i = 0; i < kRandomSamples; ++i) {
+                in[i] = rng_smem();
+                cpu_out[i] = cpu.chain<true>(in[i]);
+            }
+            auto* d_in = device_alloc_and_copy(in);
+            auto gpu_out = COLLECT(
+                (chain_smem_ttable4_kernel<<<blocks, kThreads>>>(gpu_keys, d_in, d_out, kRandomSamples)),
+                kRandomSamples, uint64_t);
+            CHECK(cudaFree(d_in));
+            auto s = compare(kRandomSamples, [&](uint64_t i){ return cpu_out[i] == gpu_out[i]; },
+                             "chain_smem_ttable4", seed);
+            std::printf("  chain_smem_tt:   %llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s.total - s.mismatches),
+                        static_cast<unsigned long long>(s.total),
+                        s.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s.ok();
+        }
+
+        // matching_target_smem
+        {
+            std::vector<MtIn>     in(kRandomSamples);
+            std::vector<uint32_t> cpu_out(kRandomSamples);
+            for (uint64_t i = 0; i < kRandomSamples; ++i) {
+                in[i].table_id  = uint32_t(rng_smem() % 3) + 1;
+                in[i].match_key = uint32_t(rng_smem());
+                in[i].meta      = rng_smem();
+                cpu_out[i] = cpu.matching_target<true>(
+                    in[i].table_id, in[i].match_key, in[i].meta, /*extra_rounds_bits=*/0);
+            }
+            auto* d_in = device_alloc_and_copy(in);
+            auto gpu_tt = COLLECT(
+                (mt_smem_ttable4_kernel<<<blocks, kThreads>>>(gpu_keys, d_in, d_out, kRandomSamples)),
+                kRandomSamples, uint32_t);
+            auto s_tt = compare(kRandomSamples, [&](uint64_t i){ return cpu_out[i] == gpu_tt[i]; },
+                                "mt_smem_ttable4", seed);
+            std::printf("  mt_smem_ttable4: %llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tt.total - s_tt.mismatches),
+                        static_cast<unsigned long long>(s_tt.total),
+                        s_tt.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tt.ok();
+
+            auto gpu_tz = COLLECT(
+                (mt_smem_tezcan_kernel<16><<<blocks, kThreads>>>(gpu_keys, d_in, d_out, kRandomSamples)),
+                kRandomSamples, uint32_t);
+            CHECK(cudaFree(d_in));
+            auto s_tz = compare(kRandomSamples, [&](uint64_t i){ return cpu_out[i] == gpu_tz[i]; },
+                                "mt_smem_tezcan16", seed);
+            std::printf("  mt_smem_tezcan16:%llu / %llu  %s\n",
+                        static_cast<unsigned long long>(s_tz.total - s_tz.mismatches),
+                        static_cast<unsigned long long>(s_tz.total),
+                        s_tz.ok() ? "OK" : "FAIL");
+            all_ok = all_ok && s_tz.ok();
+        }
     }
 
     return all_ok;

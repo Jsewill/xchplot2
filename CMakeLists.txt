@@ -180,6 +180,27 @@ endif()
 # call. Off by default — enable with -DXCHPLOT2_INSTRUMENT_MATCH=ON.
 option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 breakdown" OFF)
 
+# Shared-memory AES round variant for the hot kernels (Xs/T1/T2/T3).
+#   auto     — tezcan16 on sm_89 when a TU opts in via XCHPLOT2_AES_TEZCAN_KERNEL;
+#              ttable4 elsewhere / without opt-in (safe default for fat builds)
+#   ttable4  — force the 4-table 4 KB path everywhere
+#   tezcan16 — force Tezcan 16x-replica 16 KB path everywhere (needs hardware
+#              validation on non-Ada arches; community measurements wanted)
+set(XCHPLOT2_AES_ROUND "auto" CACHE STRING
+    "AES smem round: auto | ttable4 | tezcan16")
+set_property(CACHE XCHPLOT2_AES_ROUND PROPERTY STRINGS auto ttable4 tezcan16)
+if(XCHPLOT2_AES_ROUND STREQUAL "ttable4")
+    set(_AES_ROUND_DEFINE XCHPLOT2_AES_FORCE_TTABLE4=1)
+elseif(XCHPLOT2_AES_ROUND STREQUAL "tezcan16")
+    set(_AES_ROUND_DEFINE XCHPLOT2_AES_FORCE_TEZCAN16=1)
+elseif(XCHPLOT2_AES_ROUND STREQUAL "auto")
+    set(_AES_ROUND_DEFINE "")
+else()
+    message(FATAL_ERROR
+        "XCHPLOT2_AES_ROUND must be auto, ttable4, or tezcan16 (got '${XCHPLOT2_AES_ROUND}')")
+endif()
+message(STATUS "XCHPLOT2_AES_ROUND=${XCHPLOT2_AES_ROUND}")
+
 # pos2-chip dependency.
 #
 # Default behavior: FetchContent auto-clones Chia-Network/pos2-chip into
@@ -278,6 +299,9 @@ set_target_properties(pos2_gpu_cuda_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu_cuda_obj PRIVATE XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
+if(_AES_ROUND_DEFINE)
+    target_compile_definitions(pos2_gpu_cuda_obj PRIVATE ${_AES_ROUND_DEFINE})
+endif()
 
 # pos2_gpu: INTERFACE lib. Only propagates the include path and the
 # pos2_chip_headers / fse / AES compile flags. Carries no .o files —
@@ -288,6 +312,9 @@ target_link_libraries(pos2_gpu INTERFACE pos2_chip_headers)
 target_compile_features(pos2_gpu INTERFACE cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu INTERFACE XCHPLOT2_INSTRUMENT_MATCH=1)
+endif()
+if(_AES_ROUND_DEFINE)
+    target_compile_definitions(pos2_gpu INTERFACE ${_AES_ROUND_DEFINE})
 endif()
 
 # Host orchestration (no CUDA code, just thin wrappers).

@@ -23,11 +23,13 @@
 // These variants are bit-identical to pos2gpu::aesenc_round_smem; they
 // differ only in memory layout and access pattern. Parity-verified in
 // tools/parity/aes_tezcan_bench.cu before any benchmarking.
+//
+// Hash-layer wrappers (g_x / pairing / matching_target / run_rounds) live
+// in AesHashGpu.cuh so this header stays free of that include cycle.
 
 #pragma once
 
 #include "gpu/AesGpu.cuh"
-#include "gpu/AesHashGpu.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -95,59 +97,6 @@ __device__ __forceinline__ AesState aesenc_round_smem_tezcan(
         out.w[c] = v0 ^ v1 ^ v2 ^ v3 ^ key.w[c];
     }
     return out;
-}
-
-template<int BANK_SIZE>
-__device__ __forceinline__ AesState run_rounds_smem_tezcan(
-    AesState state, AesHashKeys const& keys, int rounds,
-    uint32_t const* __restrict__ sT0)
-{
-    #pragma unroll 2
-    for (int r = 0; r < rounds; ++r) {
-        state = aesenc_round_smem_tezcan<BANK_SIZE>(state, keys.round_key_1, sT0);
-        state = aesenc_round_smem_tezcan<BANK_SIZE>(state, keys.round_key_2, sT0);
-    }
-    return state;
-}
-
-// Hash-layer wrappers that mirror their _smem counterparts in AesHashGpu.cuh
-// but route through the Tezcan T0 path.
-
-template<int BANK_SIZE>
-__device__ __forceinline__ Result128 pairing_smem_tezcan(
-    AesHashKeys const& keys,
-    uint64_t meta_l, uint64_t meta_r,
-    uint32_t const* __restrict__ sT0,
-    int extra_rounds_bits = 0)
-{
-    int32_t i0 = static_cast<int32_t>(meta_l & 0xFFFFFFFFu);
-    int32_t i1 = static_cast<int32_t>((meta_l >> 32) & 0xFFFFFFFFu);
-    int32_t i2 = static_cast<int32_t>(meta_r & 0xFFFFFFFFu);
-    int32_t i3 = static_cast<int32_t>((meta_r >> 32) & 0xFFFFFFFFu);
-    AesState s = set_int_vec_i128(i3, i2, i1, i0);
-    int rounds = kAesPairingRounds << extra_rounds_bits;
-    s = run_rounds_smem_tezcan<BANK_SIZE>(s, keys, rounds, sT0);
-    Result128 out;
-    out.r[0] = s.w[0]; out.r[1] = s.w[1];
-    out.r[2] = s.w[2]; out.r[3] = s.w[3];
-    return out;
-}
-
-template<int BANK_SIZE>
-__device__ __forceinline__ uint32_t matching_target_smem_tezcan(
-    AesHashKeys const& keys,
-    uint32_t table_id, uint32_t match_key, uint64_t meta,
-    uint32_t const* __restrict__ sT0,
-    int extra_rounds_bits = 0)
-{
-    int32_t i0 = static_cast<int32_t>(table_id);
-    int32_t i1 = static_cast<int32_t>(match_key);
-    int32_t i2 = static_cast<int32_t>(meta & 0xFFFFFFFFu);
-    int32_t i3 = static_cast<int32_t>((meta >> 32) & 0xFFFFFFFFu);
-    AesState s = set_int_vec_i128(i3, i2, i1, i0);
-    int rounds = kAesMatchingTargetRounds << extra_rounds_bits;
-    s = run_rounds_smem_tezcan<BANK_SIZE>(s, keys, rounds, sT0);
-    return s.w[0];
 }
 
 } // namespace pos2gpu

@@ -168,6 +168,12 @@ cmake --build build -j
 `pos2-chip` is auto-fetched via `FetchContent`; override with
 `-DPOS2_CHIP_DIR=/abs/path/to/pos2-chip` to point at a local checkout.
 
+Shared-memory AES round (hot kernels): `-DXCHPLOT2_AES_ROUND=auto`
+(default) selects Tezcan 16x-replica on sm_89 when a kernel family has
+opted in, and the 4-table path elsewhere. Force either path with
+`ttable4` or `tezcan16` (the latter is measured on Ada; results for
+sm_75/86/90/120 are welcome).
+
 Outputs:
 
 - `build/tools/xchplot2/xchplot2`
@@ -432,6 +438,7 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `cudaMalloc` / `cudaFree`.                     |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
+| `POS2GPU_NO_ASYNC_ALLOC=1`    | Disable stream-ordered `cudaMallocAsync` pooling (audit kill switch).   |
 | `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
 | `CUDA_PATH=/path/to/cuda`     | Override the CUDA Toolkit root for linking (default: `/opt/cuda`, `/usr/local/cuda`). Useful on JetPack / non-standard installs. |
 | `CUDA_HOME=/path/to/cuda`     | Fallback for `CUDA_PATH` — same effect.                                 |

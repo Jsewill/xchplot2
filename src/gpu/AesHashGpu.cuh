@@ -12,6 +12,8 @@
 #pragma once
 
 #include "gpu/AesGpu.cuh"
+#include "gpu/AesSmemConfig.cuh"
+#include "gpu/AesTezcan.cuh"
 #include <cstdint>
 
 namespace pos2gpu {
@@ -114,12 +116,14 @@ __device__ __forceinline__ uint64_t chain(AesHashKeys const& keys, uint64_t inpu
 }
 
 // =========================================================================
-// Shared-memory T-table variants. Use after load_aes_tables_smem(sT) +
-// __syncthreads(). All four functions mirror their constant-memory peers
-// above; only the inner aesenc_round call changes.
+// Shared-memory T-table variants. Use after XCHPLOT2_AES_SMEM_LOAD(sT) +
+// __syncthreads() (or the legacy load_aes_tables_smem). The public
+// run_rounds_smem / g_x_smem / pairing_smem / matching_target_smem entry
+// points dispatch to ttable4 or tezcan16 via AesSmemConfig.cuh.
+// chain_smem exists for completeness but is unused by the hot kernels.
 // =========================================================================
 
-__device__ __forceinline__ AesState run_rounds_smem(
+__device__ __forceinline__ AesState run_rounds_smem_ttable4(
     AesState state, AesHashKeys const& keys, int rounds, uint32_t const* __restrict__ sT)
 {
     #pragma unroll 2
@@ -130,6 +134,29 @@ __device__ __forceinline__ AesState run_rounds_smem(
     return state;
 }
 
+template<int BANK_SIZE>
+__device__ __forceinline__ AesState run_rounds_smem_tezcan(
+    AesState state, AesHashKeys const& keys, int rounds,
+    uint32_t const* __restrict__ sT0)
+{
+    #pragma unroll 2
+    for (int r = 0; r < rounds; ++r) {
+        state = aesenc_round_smem_tezcan<BANK_SIZE>(state, keys.round_key_1, sT0);
+        state = aesenc_round_smem_tezcan<BANK_SIZE>(state, keys.round_key_2, sT0);
+    }
+    return state;
+}
+
+__device__ __forceinline__ AesState run_rounds_smem(
+    AesState state, AesHashKeys const& keys, int rounds, uint32_t const* __restrict__ sT)
+{
+#if defined(XCHPLOT2_AES_SMEM_TEZCAN)
+    return run_rounds_smem_tezcan<XCHPLOT2_AES_TEZCAN_BANK>(state, keys, rounds, sT);
+#else
+    return run_rounds_smem_ttable4(state, keys, rounds, sT);
+#endif
+}
+
 __device__ __forceinline__ uint32_t g_x_smem(
     AesHashKeys const& keys, uint32_t x, int k,
     uint32_t const* __restrict__ sT, int rounds = kAesGRounds)
@@ -137,6 +164,17 @@ __device__ __forceinline__ uint32_t g_x_smem(
     AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
     s = run_rounds_smem(s, keys, rounds, sT);
     // (1u << 32) is UB; k == 32 means "keep all 32 bits".
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return s.w[0] & mask;
+}
+
+template<int BANK_SIZE>
+__device__ __forceinline__ uint32_t g_x_smem_tezcan(
+    AesHashKeys const& keys, uint32_t x, int k,
+    uint32_t const* __restrict__ sT0, int rounds = kAesGRounds)
+{
+    AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
+    s = run_rounds_smem_tezcan<BANK_SIZE>(s, keys, rounds, sT0);
     uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
     return s.w[0] & mask;
 }
@@ -160,6 +198,26 @@ __device__ __forceinline__ Result128 pairing_smem(
     return out;
 }
 
+template<int BANK_SIZE>
+__device__ __forceinline__ Result128 pairing_smem_tezcan(
+    AesHashKeys const& keys,
+    uint64_t meta_l, uint64_t meta_r,
+    uint32_t const* __restrict__ sT0,
+    int extra_rounds_bits = 0)
+{
+    int32_t i0 = static_cast<int32_t>(meta_l & 0xFFFFFFFFu);
+    int32_t i1 = static_cast<int32_t>((meta_l >> 32) & 0xFFFFFFFFu);
+    int32_t i2 = static_cast<int32_t>(meta_r & 0xFFFFFFFFu);
+    int32_t i3 = static_cast<int32_t>((meta_r >> 32) & 0xFFFFFFFFu);
+    AesState s = set_int_vec_i128(i3, i2, i1, i0);
+    int rounds = kAesPairingRounds << extra_rounds_bits;
+    s = run_rounds_smem_tezcan<BANK_SIZE>(s, keys, rounds, sT0);
+    Result128 out;
+    out.r[0] = s.w[0]; out.r[1] = s.w[1];
+    out.r[2] = s.w[2]; out.r[3] = s.w[3];
+    return out;
+}
+
 __device__ __forceinline__ uint32_t matching_target_smem(
     AesHashKeys const& keys,
     uint32_t table_id, uint32_t match_key, uint64_t meta,
@@ -173,6 +231,23 @@ __device__ __forceinline__ uint32_t matching_target_smem(
     AesState s = set_int_vec_i128(i3, i2, i1, i0);
     int rounds = kAesMatchingTargetRounds << extra_rounds_bits;
     s = run_rounds_smem(s, keys, rounds, sT);
+    return s.w[0];
+}
+
+template<int BANK_SIZE>
+__device__ __forceinline__ uint32_t matching_target_smem_tezcan(
+    AesHashKeys const& keys,
+    uint32_t table_id, uint32_t match_key, uint64_t meta,
+    uint32_t const* __restrict__ sT0,
+    int extra_rounds_bits = 0)
+{
+    int32_t i0 = static_cast<int32_t>(table_id);
+    int32_t i1 = static_cast<int32_t>(match_key);
+    int32_t i2 = static_cast<int32_t>(meta & 0xFFFFFFFFu);
+    int32_t i3 = static_cast<int32_t>((meta >> 32) & 0xFFFFFFFFu);
+    AesState s = set_int_vec_i128(i3, i2, i1, i0);
+    int rounds = kAesMatchingTargetRounds << extra_rounds_bits;
+    s = run_rounds_smem_tezcan<BANK_SIZE>(s, keys, rounds, sT0);
     return s.w[0];
 }
 
