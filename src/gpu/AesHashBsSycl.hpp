@@ -315,7 +315,10 @@ inline uint32_t g_x_bs32(sycl::sub_group const& sg,
     run_rounds_bs32(sg, bs, k1_bs, k2_bs, rounds);
     AesState out;
     bs32_unpack(sg, bs, out);
-    return out.w[0] & ((1u << k) - 1u);
+    // k = 32 guard: `1u << 32` is UB and differs across targets
+    // (NVPTX vs x86/amdgcn). Mirrors g_x_smem in AesHashGpu.cuh.
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return out.w[0] & mask;
 }
 
 // matching_target_bs32 — bitsliced equivalent of matching_target_smem.

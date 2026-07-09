@@ -91,6 +91,15 @@ void launch_streaming_partition_u32_u64(
         throw std::invalid_argument(
             "launch_streaming_partition_u32_u64: top_bit_offset + num_top_bits out of range");
     }
+    // The histogram, cursors and h_bucket_starts are u32 — an entry
+    // count at or above 2^32 would wrap the prefix sums. Reject it
+    // explicitly (clearer than the downstream "histogram total
+    // mismatch" it would otherwise trip).
+    if (count > uint64_t{0xFFFFFFFFu}) {
+        throw std::invalid_argument(
+            "launch_streaming_partition_u32_u64: count exceeds 2^32-1 "
+            "(u32 bucket offsets) — use a smaller k on this tier");
+    }
 
     size_t const num_buckets   = size_t{1} << num_top_bits;
     uint64_t const tiles       = pick_tile_n(count, tile_count);
@@ -234,6 +243,12 @@ void launch_streaming_partition_u32_u64_u32(
         throw std::invalid_argument(
             "launch_streaming_partition_u32_u64_u32: top_bit_offset + num_top_bits out of range");
     }
+    // u32 bucket-offset guard — see launch_streaming_partition_u32_u64.
+    if (count > uint64_t{0xFFFFFFFFu}) {
+        throw std::invalid_argument(
+            "launch_streaming_partition_u32_u64_u32: count exceeds 2^32-1 "
+            "(u32 bucket offsets) — use a smaller k on this tier");
+    }
 
     size_t const num_buckets   = size_t{1} << num_top_bits;
     uint64_t const tiles       = pick_tile_n(count, tile_count);
@@ -303,10 +318,16 @@ void launch_streaming_partition_u32_u64_u32(
         if (tile_off >= count) break;
         uint64_t const tile_n   = std::min(tile_size, count - tile_off);
 
-        q.memcpy(d_vals_tile,  h_vals_in  + tile_off,
-                 tile_n * sizeof(uint64_t));
-        q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
-                 tile_n * sizeof(uint32_t)).wait();
+        // The queue is out-of-order: both H2D copies must complete
+        // before the partition kernel reads the tiles, so wait on each
+        // event (waiting only on the second would let the kernel race
+        // the first copy).
+        auto e_vals  = q.memcpy(d_vals_tile,  h_vals_in  + tile_off,
+                                tile_n * sizeof(uint64_t));
+        auto e_vals2 = q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
+                                tile_n * sizeof(uint32_t));
+        e_vals.wait();
+        e_vals2.wait();
 
         uint32_t* const part_keys  = h_part_keys;
         uint64_t* const part_vals  = h_part_vals;

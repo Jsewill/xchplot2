@@ -546,6 +546,15 @@ if(XCHPLOT2_BUILD_CUDA)
     target_link_libraries(pos2_gpu_cuda_obj PRIVATE pos2_chip_headers)
     target_compile_features(pos2_gpu_cuda_obj PRIVATE cxx_std_20)
     set_target_properties(pos2_gpu_cuda_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # Explicit optimization level, mirroring the SYCL target below.
+    # build.rs pins CMAKE_BUILD_TYPE=Release (which already implies
+    # -O3 -DNDEBUG via CMAKE_CUDA_FLAGS_RELEASE), but a manual
+    # RelWithDebInfo / unspecified-config build would otherwise ship
+    # unoptimized AES-heavy kernels with no warning.
+    target_compile_options(pos2_gpu_cuda_obj PRIVATE
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:RelWithDebInfo>:-O2>
+        $<$<CONFIG:MinSizeRel>:-Os>)
     if(XCHPLOT2_INSTRUMENT_MATCH)
         target_compile_definitions(pos2_gpu_cuda_obj PRIVATE XCHPLOT2_INSTRUMENT_MATCH=1)
     endif()

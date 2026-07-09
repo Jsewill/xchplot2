@@ -980,9 +980,23 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={p}");
     }
-    println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    // Every env var read anywhere in this script must appear here, or a
+    // user flipping it (e.g. XCHPLOT2_BUILD_CUDA=OFF after a failed
+    // build) silently keeps the stale configuration.
+    for var in &[
+        "CUDA_ARCHITECTURES",
+        "CUDA_PATH",
+        "CUDA_HOME",
+        "ACPP_TARGETS",
+        "ACPP_PREFIX",
+        "AdaptiveCpp_ROOT",
+        "ROCM_PATH",
+        "XCHPLOT2_BUILD_CUDA",
+        "XCHPLOT2_FORCE_GFX_SPOOF",
+        "XCHPLOT2_NO_GFX_SPOOF",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 }
 
 /// Locate nvcc on PATH (or under $CUDA_PATH/bin, $CUDA_HOME/bin) and

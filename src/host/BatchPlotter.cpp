@@ -265,12 +265,18 @@ class Channel {
 public:
     explicit Channel(std::size_t capacity) : capacity_(capacity) {}
 
-    void push(WorkItem item) {
+    // Returns false when the channel was closed while waiting — the
+    // item was NOT enqueued and will never reach the consumer. Callers
+    // must check the result: silently dropping a finished plot here
+    // would under-count failures, and a consumer that dies with the
+    // queue full would otherwise leave the producer blocked forever.
+    [[nodiscard]] bool push(WorkItem item) {
         std::unique_lock<std::mutex> lock(mu_);
         cv_not_full_.wait(lock, [&]{ return q_.size() < capacity_ || closed_; });
-        if (closed_) return;
+        if (closed_) return false;
         q_.push(std::move(item));
         cv_not_empty_.notify_one();
+        return true;
     }
     // Returns false when the channel is closed AND empty.
     bool pop(WorkItem& out) {
@@ -296,6 +302,50 @@ private:
     std::queue<WorkItem>      q_;
     std::size_t               capacity_;
     bool                      closed_ = false;
+};
+
+// Consumption acknowledgment for the rotating pinned slots.
+//
+// The Channel's depth alone is NOT enough to make slot reuse safe: a
+// depth of (kNumPinnedBuffers - 1) only guarantees the consumer has
+// POPPED plot (i - N) before the producer starts plot i — the consumer
+// may still be reading that slot's fragments inside
+// write_plot_file_parallel (FSE compression + disk write borrow the
+// pinned memory via external_fragments_ptr). Whenever the file write
+// is slower than one GPU pass (slow disk, NFS), the producer's D2H
+// for plot i would land on top of the in-flight read and silently
+// corrupt the written plot.
+//
+// The consumer therefore signals here after it has FINISHED with each
+// item (write complete or failed — either way the slot is no longer
+// read), and the producer waits until the previous occupant of its
+// target slot has been signalled before running the GPU pipeline into
+// that slot.
+class SlotGate {
+public:
+    // Consumer: item fully processed; its pinned slot is reusable.
+    void signal_consumed() {
+        { std::lock_guard<std::mutex> lock(mu_); ++consumed_; }
+        cv_.notify_all();
+    }
+    // Consumer failed: wake any waiting producer so it can observe the
+    // failure instead of blocking forever on an ack that never comes.
+    void abort() {
+        { std::lock_guard<std::mutex> lock(mu_); aborted_ = true; }
+        cv_.notify_all();
+    }
+    // Producer: block until at least `need` items have been consumed
+    // (or the consumer aborted). Returns false on abort.
+    bool wait_consumed(std::size_t need) {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&]{ return consumed_ >= need || aborted_; });
+        return !aborted_;
+    }
+private:
+    std::mutex              mu_;
+    std::condition_variable cv_;
+    std::size_t             consumed_ = 0;
+    bool                    aborted_  = false;
 };
 
 } // namespace
@@ -741,6 +791,34 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             }
         }
     }
+    // RAII release of the streaming-fallback pinned buffers. These
+    // MUST be freed on every exit path, not just the straight-line
+    // return: the producer rethrows through `catch (...)` and the
+    // consumer error path rethrows after join — and in multi-device
+    // work-queue mode the peer workers keep running, so ~6-12 GB of
+    // leaked pinned host memory would starve their allocations long
+    // before process exit.
+    struct StreamBuffersGuard {
+        uint64_t** pinned;
+        StreamingPinnedScratch* scratch;
+        ~StreamBuffersGuard() {
+            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                if (pinned[s]) streaming_free_pinned_uint64(pinned[s]);
+                pinned[s] = nullptr;
+            }
+            if (scratch->h_meta)        streaming_free_pinned_uint64(scratch->h_meta);
+            if (scratch->h_keys_merged) streaming_free_pinned_uint32(scratch->h_keys_merged);
+            if (scratch->h_t2_xbits)    streaming_free_pinned_uint32(scratch->h_t2_xbits);
+            if (scratch->h_t2_meta)     streaming_free_pinned_uint64(scratch->h_t2_meta);
+            if (scratch->h_t3)          streaming_free_pinned_uint64(scratch->h_t3);
+            scratch->h_meta = nullptr;
+            scratch->h_keys_merged = nullptr;
+            scratch->h_t2_xbits = nullptr;
+            scratch->h_t2_meta = nullptr;
+            scratch->h_t3 = nullptr;
+        }
+    } stream_buffers_guard{stream_pinned, &stream_scratch};
+
     if (verbose && pool_ptr) {
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
@@ -757,6 +835,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
     // Depth = kNumPinnedBuffers - 1. See Channel's comment block above.
     Channel chan(static_cast<std::size_t>(GpuBufferPool::kNumPinnedBuffers - 1));
+    // Slot-reuse acknowledgment — see SlotGate's comment block. The
+    // channel depth bounds queue growth; the gate is what actually
+    // makes pinned-slot reuse safe when the consumer is slower than
+    // the producer.
+    SlotGate slot_gate;
     std::atomic<bool>     consumer_failed{false};
     std::atomic<size_t>   plots_done{0};
     std::exception_ptr    consumer_err;
@@ -829,10 +912,17 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         log_prefix.c_str(),
                         item.index, full_path.string().c_str(), e.what());
                 }
+                // Success or logged failure: either way we're done
+                // reading this item's pinned slot — let the producer
+                // reuse it.
+                slot_gate.signal_consumed();
             }
         } catch (...) {
             consumer_err = std::current_exception();
             consumer_failed = true;
+            // Unblock a producer waiting on a slot ack that will
+            // never come.
+            slot_gate.abort();
             // ENOSPC from the writer, or any other consumer-side I/O
             // failure, means peer workers will hit the same problem.
             // Cooperative-cancel them so they stop pulling new plots
@@ -896,15 +986,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             item.index  = i;
             int const slot = static_cast<int>(
                 local_count % GpuBufferPool::kNumPinnedBuffers);
+            // Slot-reuse gate: the previous occupant of this slot was
+            // push number (local_count - kNumPinnedBuffers); wait until
+            // the consumer has fully finished it (not merely popped it)
+            // before the pipeline's D2H writes into the slot.
+            if (local_count >= std::size_t(GpuBufferPool::kNumPinnedBuffers)) {
+                std::size_t const need =
+                    local_count - GpuBufferPool::kNumPinnedBuffers + 1;
+                if (!slot_gate.wait_consumed(need)) break;  // consumer died
+            }
             try {
                 if (pool_ptr) {
-                    // Pool path: rotate pinned slot per plot. The channel's
-                    // (kNumPinnedBuffers - 1) depth holds the producer back
-                    // before it overtakes the consumer's read of that slot.
+                    // Pool path: rotate pinned slot per plot. The channel
+                    // bounds queue depth; the slot_gate wait above is what
+                    // guarantees the consumer is done reading this slot.
                     item.result = run_gpu_pipeline(cfg, *pool_ptr, slot);
                 } else {
                     // Streaming path with externally-owned pinned: same
-                    // rotation + channel-depth invariant.
+                    // rotation + gate invariant.
                     item.result = run_gpu_pipeline_streaming(
                         cfg, stream_pinned[slot], stream_pinned_cap,
                         stream_scratch);
@@ -930,7 +1029,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     (unsigned long)item.result.t3_count);
             }
 
-            chan.push(std::move(item));
+            if (!chan.push(std::move(item))) {
+                // Channel closed under us (consumer died): this plot's
+                // GPU work completed but will never be written. Count
+                // it as a failure so the batch summary stays honest.
+                ++producer_failed;
+                break;
+            }
             ++local_count;
         }
     } catch (...) {
@@ -944,16 +1049,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
     if (consumer_failed && consumer_err) std::rethrow_exception(consumer_err);
 
-    for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
-        streaming_free_pinned_uint64(stream_pinned[s]);
-    }
-    // Stage 4f: free the amortised streaming scratch (no-op if pool path
-    // was used — all fields stay nullptr in that case).
-    if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
-    if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
-    if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
-    if (stream_scratch.h_t2_meta)     streaming_free_pinned_uint64(stream_scratch.h_t2_meta);
-    if (stream_scratch.h_t3)          streaming_free_pinned_uint64(stream_scratch.h_t3);
+    // Pinned buffers + streaming scratch are freed by
+    // stream_buffers_guard on every exit path (including the rethrows
+    // above and the producer's catch).
 
     res.plots_written = plots_done.load();
     res.plots_failed  = producer_failed + plots_failed_consumer.load();

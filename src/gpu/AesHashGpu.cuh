@@ -67,7 +67,11 @@ __device__ __forceinline__ uint32_t g_x(AesHashKeys const& keys, uint32_t x, int
 {
     AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
     s = run_rounds(s, keys, rounds);
-    return s.w[0] & ((1u << k) - 1u);
+    // Guard k = 32: `1u << 32` is UB and evaluates differently across
+    // targets (NVPTX clamps to 0 → mask 0xFFFFFFFF; x86/amdgcn mask the
+    // shift count → mask 0). Match the sibling kernels' >= 32 handling.
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return s.w[0] & mask;
 }
 #endif
 
@@ -152,7 +156,9 @@ POS2_DEVICE_INLINE uint32_t g_x_smem(
 {
     AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
     s = run_rounds_smem(s, keys, rounds, sT);
-    return s.w[0] & ((1u << k) - 1u);
+    // k = 32 guard — see g_x above.
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return s.w[0] & mask;
 }
 
 POS2_DEVICE_INLINE Result128 pairing_smem(

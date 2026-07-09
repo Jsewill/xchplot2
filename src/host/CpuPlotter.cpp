@@ -22,6 +22,15 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace pos2gpu {
 
@@ -60,13 +69,59 @@ std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts
     std::filesystem::path const out_path =
         std::filesystem::path(entry.out_dir) / entry.out_name;
 
-    ::PlotFile::writeData(out_path.string(),
+    // Write to <name>.partial and rename on success — same atomicity
+    // contract as the GPU writer (write_plot_file_parallel). Writing
+    // straight to the final name would leave a truncated file with a
+    // valid header behind on a hard kill / ENOSPC / crash, which
+    // --skip-existing would then treat as a complete plot.
+    std::string const partial = out_path.string() + ".partial";
+    struct PartialGuard {
+        std::string const& path;
+        bool committed = false;
+        ~PartialGuard() {
+            if (!committed) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        }
+    } guard{partial};
+
+    ::PlotFile::writeData(partial,
                           plot,
                           params,
                           static_cast<uint16_t>(entry.plot_index),
                           static_cast<uint8_t>(entry.meta_group),
                           std::span<uint8_t const>(entry.memo.data(),
                                                    entry.memo.size()));
+
+    // Flush to stable storage before the rename so a power loss can't
+    // leave a truncated file at the final name.
+#ifdef _WIN32
+    {
+        int fd = ::_open(partial.c_str(), _O_RDWR | _O_BINARY);
+        if (fd < 0) throw std::runtime_error("CpuPlotter: failed to reopen for flush: " + partial);
+        int const rc = ::_commit(fd);
+        ::_close(fd);
+        if (rc != 0) throw std::runtime_error("CpuPlotter: failed to flush " + partial);
+    }
+#else
+    {
+        int fd = ::open(partial.c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("CpuPlotter: failed to reopen for fsync: " + partial);
+        int const rc = ::fsync(fd);
+        ::close(fd);
+        if (rc != 0) throw std::runtime_error("CpuPlotter: failed to fsync " + partial);
+    }
+#endif
+
+    std::error_code ec;
+    std::filesystem::rename(partial, out_path, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "CpuPlotter: failed to rename " + partial + " -> " +
+            out_path.string() + ": " + ec.message());
+    }
+    guard.committed = true;
 
     return static_cast<std::uint64_t>(
         std::filesystem::file_size(out_path));

@@ -187,17 +187,24 @@ inline int get_gpu_device_count()
 }
 
 // AES T-tables uploaded into a USM device buffer on first use, kept
-// alive for the thread's queue lifetime — mirrors the CUDA path's
-// __constant__ T-tables. Thread-local because each worker thread's queue
-// is on a different device; the table upload must happen once per device,
-// not once per process.
+// alive for the process lifetime — mirrors the CUDA path's
+// __constant__ T-tables. The cache is keyed by the queue's device, NOT
+// per-thread: the multi-GPU shard pipeline drives several queues (one
+// per device) from a single thread, so a plain thread_local pointer
+// would hand shards 1..N-1 a pointer allocated on shard 0's device —
+// an illegal cross-device access. Two threads racing on the same
+// device at worst upload a duplicate 4 KiB table; each caller still
+// gets a pointer valid for its own device.
 //
 // Pointer layout matches what the _smem family expects: [T0|T1|T2|T3],
 // 256 entries each.
 inline uint32_t* aes_tables_device(sycl::queue& q)
 {
-    thread_local uint32_t* d_tables = nullptr;
-    if (d_tables) return d_tables;
+    thread_local std::vector<std::pair<sycl::device, uint32_t*>> cache;
+    sycl::device const dev = q.get_device();
+    for (auto const& [d, ptr] : cache) {
+        if (d == dev) return ptr;
+    }
 
     std::vector<uint32_t> sT_host(4 * 256);
     for (int i = 0; i < 256; ++i) {
@@ -206,8 +213,9 @@ inline uint32_t* aes_tables_device(sycl::queue& q)
         sT_host[2 * 256 + i] = pos2gpu::aes_tables::T2[i];
         sT_host[3 * 256 + i] = pos2gpu::aes_tables::T3[i];
     }
-    d_tables = sycl::malloc_device<uint32_t>(4 * 256, q);
+    uint32_t* d_tables = sycl::malloc_device<uint32_t>(4 * 256, q);
     q.memcpy(d_tables, sT_host.data(), sizeof(uint32_t) * 4 * 256).wait();
+    cache.emplace_back(dev, d_tables);
     return d_tables;
 }
 

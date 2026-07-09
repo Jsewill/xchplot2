@@ -8,6 +8,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -103,6 +104,7 @@ struct T2CandScratch {
     uint32_t* d_cand_l     = nullptr;
     uint32_t* d_cand_r     = nullptr;
     uint64_t* d_cand_count = nullptr;
+    uint32_t* d_overflow   = nullptr;  // sticky flag: any bucket blew cand_cap
     uint64_t  cap          = 0;
 };
 
@@ -116,13 +118,16 @@ T2CandScratch& acquire_t2_cand_scratch(sycl::queue& q, uint64_t cand_cap)
         if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
         if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
         if (s.d_cand_count) sycl::free(s.d_cand_count, q);
+        if (s.d_overflow)   sycl::free(s.d_overflow, q);
         s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
         s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
         s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count) {
+        s.d_overflow   = sycl::malloc_device<uint32_t>(1, q);
+        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count || !s.d_overflow) {
             if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
             if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
             if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
+            if (s.d_overflow)   { sycl::free(s.d_overflow, q);   s.d_overflow   = nullptr; }
             s.cap = 0;
             throw std::runtime_error("T2 two-phase: candidate buffer alloc failed");
         }
@@ -143,8 +148,12 @@ T2CandScratch& acquire_t2_cand_scratch(sycl::queue& q, uint64_t cand_cap)
 //     candidate does exactly one pairing AES + test + the T2 output
 //     (meta / match_info / x_bits).
 // Tiled one bucket at a time so the candidate scratch stays bounded.
-// Gated behind POS2GPU_T2_TWOPHASE=1; default path unchanged when unset.
-void run_t2_match_twophase(
+// Default-on (POS2GPU_T2_TWOPHASE=0 disables).
+//
+// Returns false when a bucket overflowed the candidate scratch — the
+// caller rewinds the output counter and re-runs the range through the
+// single-kernel path, which tolerates any skew.
+[[nodiscard]] bool run_t2_match_twophase(
     AesHashKeys const& keys,
     uint64_t const* d_sorted_meta,
     uint32_t const* d_sorted_mi,
@@ -193,10 +202,16 @@ void run_t2_match_twophase(
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
+    uint32_t* d_overflow   = scratch.d_overflow;
     auto* d_cand_count_ull =
         reinterpret_cast<unsigned long long*>(d_cand_count);
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
+
+    // Sticky overflow flag, checked once after the bucket loop —
+    // silent candidate truncation would produce a plot that farms
+    // fewer proofs with no diagnostic.
+    q.memset(d_overflow, 0, sizeof(uint32_t)).wait();
 
     // Production v2: per-bucket ops chain through SYCL event deps —
     // memset → Phase A → Phase B → next bucket — with zero host sync per
@@ -265,7 +280,14 @@ void run_t2_match_twophase(
                                          sycl::memory_scope::device>
                             cand_atomic{ *d_cand_count_ull };
                         unsigned long long ci = cand_atomic.fetch_add(1ULL);
-                        if (ci >= cand_cap) return;
+                        if (ci >= cand_cap) {
+                            sycl::atomic_ref<uint32_t,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device>
+                                ovf{ *d_overflow };
+                            ovf.store(1u);
+                            return;
+                        }
                         d_cand_l[ci] = static_cast<uint32_t>(l);
                         d_cand_r[ci] = static_cast<uint32_t>(r);
                     }
@@ -358,13 +380,20 @@ void run_t2_match_twophase(
     // the wait the cached scratch is fully drained for the next call;
     // no free — the per-queue cache owns the buffers.
     q.wait();
+
+    uint32_t overflowed = 0;
+    q.memcpy(&overflowed, d_overflow, sizeof(uint32_t)).wait();
+    return overflowed == 0;
 }
 
 bool t2_twophase_enabled()
 {
+    // Default ON — same divergence rationale as T3 (see
+    // t3_twophase_enabled in T3OffsetsSycl.cpp). POS2GPU_T2_TWOPHASE=0
+    // falls back to the single-kernel path.
     static bool const enabled = [] {
         char const* v = std::getenv("POS2GPU_T2_TWOPHASE");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
     return enabled;
 }
@@ -403,15 +432,23 @@ void launch_t2_match_all_buckets(
 
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    // Phase 2 prototype: env-gated two-phase split (see run_t2_match_twophase).
-    if (t2_twophase_enabled()) {
-        run_t2_match_twophase(
-            keys, d_sorted_meta, d_sorted_mi, d_offsets, d_fine_offsets,
-            num_match_keys, k, num_section_bits, num_match_target_bits,
-            fine_bits, target_mask, num_test_bits, num_match_info_bits, half_k,
-            d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
-            l_count_max, bucket_begin, bucket_end, d_aes_tables, q);
-        return;
+    // Two-phase split, on by default (see run_t2_match_twophase).
+    // Gated on out_capacity <= UINT32_MAX: the candidate scratch stores
+    // row indices as u32, which wraps at k = 32 stream capacities. On
+    // candidate-scratch overflow (skewed buckets), rewind the output
+    // counter and redo the range through the single-kernel path.
+    if (t2_twophase_enabled() && out_capacity <= UINT32_MAX) {
+        uint64_t saved_count = 0;
+        q.memcpy(&saved_count, d_out_count, sizeof(uint64_t)).wait();
+        if (run_t2_match_twophase(
+                keys, d_sorted_meta, d_sorted_mi, d_offsets, d_fine_offsets,
+                num_match_keys, k, num_section_bits, num_match_target_bits,
+                fine_bits, target_mask, num_test_bits, num_match_info_bits, half_k,
+                d_out_meta, d_out_mi, d_out_xbits, d_out_count, out_capacity,
+                l_count_max, bucket_begin, bucket_end, d_aes_tables, q)) {
+            return;
+        }
+        q.memcpy(d_out_count, &saved_count, sizeof(uint64_t)).wait();
     }
 
     constexpr size_t threads = 256;

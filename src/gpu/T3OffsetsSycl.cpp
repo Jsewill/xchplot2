@@ -11,6 +11,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -37,6 +38,7 @@ struct T3CandScratch {
     uint32_t* d_cand_l     = nullptr;
     uint32_t* d_cand_r     = nullptr;
     uint64_t* d_cand_count = nullptr;
+    uint32_t* d_overflow   = nullptr;  // sticky flag: any bucket blew cand_cap
     uint64_t  cap          = 0;
 };
 
@@ -50,13 +52,16 @@ T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
         if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
         if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
         if (s.d_cand_count) sycl::free(s.d_cand_count, q);
+        if (s.d_overflow)   sycl::free(s.d_overflow, q);
         s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
         s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
         s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count) {
+        s.d_overflow   = sycl::malloc_device<uint32_t>(1, q);
+        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count || !s.d_overflow) {
             if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
             if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
             if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
+            if (s.d_overflow)   { sycl::free(s.d_overflow, q);   s.d_overflow   = nullptr; }
             s.cap = 0;
             throw std::runtime_error("T3 two-phase: candidate buffer alloc failed");
         }
@@ -82,12 +87,17 @@ T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
 //     meta/xbits, runs the pairing AES + test + Feistel + output write.
 //     Fully convergent — every thread does exactly one pairing.
 //
-// Gated behind POS2GPU_T3_TWOPHASE=1. Prototype scope: tiled one bucket
-// at a time so the candidate scratch stays small (~1 GB at k=28) and the
-// path works regardless of card size; the scratch is malloc'd here, not
-// pool-integrated. Output order still races on the atomic, which is fine
-// — T3 output is sorted by proof_fragment afterward.
-void run_t3_match_twophase(
+// Default-on (POS2GPU_T3_TWOPHASE=0 disables). Tiled one bucket at a
+// time so the candidate scratch stays small (~1 GB at k=28) and the
+// path works regardless of card size. Output order still races on the
+// atomic, which is fine — T3 output is sorted by proof_fragment
+// afterward.
+//
+// Returns false when a bucket overflowed the candidate scratch (skewed
+// distributions at small k / high strength) — the caller restores the
+// output counter and re-runs the range through the single-kernel path,
+// which is correct for any skew.
+[[nodiscard]] bool run_t3_match_twophase(
     AesHashKeys const& keys,
     FeistelKey const& fk,
     uint64_t const* d_sorted_meta,
@@ -136,10 +146,18 @@ void run_t3_match_twophase(
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
+    uint32_t* d_overflow   = scratch.d_overflow;
     auto* d_cand_count_ull =
         reinterpret_cast<unsigned long long*>(d_cand_count);
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
+
+    // Sticky overflow flag, checked once after the bucket loop. A
+    // skewed bucket that blows past cand_cap must fail LOUDLY —
+    // silently dropping candidates produces a plot that is no longer
+    // byte-identical to the reference and farms fewer proofs, with
+    // nothing to tell the user.
+    q.memset(d_overflow, 0, sizeof(uint32_t)).wait();
 
     // Process one bucket per iteration: Phase A enumerates that bucket's
     // candidate pairs, Phase B drains them into the shared output.
@@ -223,7 +241,14 @@ void run_t3_match_twophase(
                                          sycl::memory_scope::device>
                             cand_atomic{ *d_cand_count_ull };
                         unsigned long long ci = cand_atomic.fetch_add(1ULL);
-                        if (ci >= cand_cap) return;
+                        if (ci >= cand_cap) {
+                            sycl::atomic_ref<uint32_t,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device>
+                                ovf{ *d_overflow };
+                            ovf.store(1u);
+                            return;
+                        }
                         d_cand_l[ci] = static_cast<uint32_t>(l);
                         d_cand_r[ci] = static_cast<uint32_t>(r);
                     }
@@ -312,6 +337,10 @@ void run_t3_match_twophase(
     // fully drained and ready for the next call on this queue; no free
     // — the per-queue cache owns the buffers for the process lifetime.
     q.wait();
+
+    uint32_t overflowed = 0;
+    q.memcpy(&overflowed, d_overflow, sizeof(uint32_t)).wait();
+    return overflowed == 0;
 }
 
 // Two-phase variant of launch_t3_match_section_pair (streaming-tier
@@ -319,7 +348,8 @@ void run_t3_match_twophase(
 // from a section-sliced buffer (caller guarantees bucket range fits in
 // one section_l). xbits and mi remain full-cap (per the section_pair
 // contract). Shares the same acquire_t3_cand_scratch per-queue cache.
-void run_t3_match_section_pair_twophase(
+// Returns false on candidate-scratch overflow (see run_t3_match_twophase).
+[[nodiscard]] bool run_t3_match_section_pair_twophase(
     AesHashKeys const& keys,
     FeistelKey const& fk,
     uint64_t const* d_meta_l_slice,
@@ -363,10 +393,14 @@ void run_t3_match_section_pair_twophase(
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
+    uint32_t* d_overflow   = scratch.d_overflow;
     auto* d_cand_count_ull =
         reinterpret_cast<unsigned long long*>(d_cand_count);
     auto* d_out_count_ull =
         reinterpret_cast<unsigned long long*>(d_out_count);
+
+    // Sticky overflow flag — see run_t3_match_twophase.
+    q.memset(d_overflow, 0, sizeof(uint32_t)).wait();
 
     size_t const b_blocks_max = static_cast<size_t>(
         (cand_cap + threads - 1) / threads);
@@ -432,7 +466,14 @@ void run_t3_match_section_pair_twophase(
                                          sycl::memory_scope::device>
                             cand_atomic{ *d_cand_count_ull };
                         unsigned long long ci = cand_atomic.fetch_add(1ULL);
-                        if (ci >= cand_cap) return;
+                        if (ci >= cand_cap) {
+                            sycl::atomic_ref<uint32_t,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device>
+                                ovf{ *d_overflow };
+                            ovf.store(1u);
+                            return;
+                        }
                         d_cand_l[ci] = static_cast<uint32_t>(l);
                         d_cand_r[ci] = static_cast<uint32_t>(r);
                     }
@@ -511,13 +552,24 @@ void run_t3_match_section_pair_twophase(
     }
 
     q.wait();
+
+    uint32_t overflowed = 0;
+    q.memcpy(&overflowed, d_overflow, sizeof(uint32_t)).wait();
+    return overflowed == 0;
 }
 
 bool t3_twophase_enabled()
 {
+    // Default ON: ncu measured the single-kernel path at ~61% speed-of-
+    // light (latency-bound, ~12.5/32 lanes active from the divergent
+    // r-loop around the 32-round pairing AES + Feistel); the two-phase
+    // split fixes the divergence and chains per-bucket ops through
+    // events. POS2GPU_T3_TWOPHASE=0 falls back to the single-kernel
+    // path. Overflow of the candidate scratch throws loudly (see
+    // acquire_t3_cand_scratch) rather than silently dropping pairs.
     static bool const enabled = [] {
         char const* v = std::getenv("POS2GPU_T3_TWOPHASE");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
     return enabled;
 }
@@ -554,16 +606,26 @@ void launch_t3_match_all_buckets(
 
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    // Phase 2 prototype: env-gated two-phase split (see run_t3_match_twophase).
-    if (t3_twophase_enabled()) {
-        run_t3_match_twophase(
-            keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
-            d_offsets, d_fine_offsets, num_match_keys,
-            k, num_section_bits, num_match_target_bits, fine_bits,
-            target_mask, num_test_bits,
-            d_out_pairings, d_out_count, out_capacity, l_count_max,
-            bucket_begin, bucket_end, d_aes_tables, q);
-        return;
+    // Two-phase split, on by default (see run_t3_match_twophase). The
+    // candidate scratch stores row indices as u32, so the path is only
+    // valid while the stream capacity fits in 32 bits (true for k <= 31;
+    // at k = 32 the cap is ~2^32 + 2^28 and indices would wrap, gathering
+    // wrong rows in Phase B). Fall through to the single-kernel path
+    // beyond that — and on candidate-scratch overflow (skewed buckets),
+    // rewind the output counter and redo the range single-kernel.
+    if (t3_twophase_enabled() && out_capacity <= UINT32_MAX) {
+        uint64_t saved_count = 0;
+        q.memcpy(&saved_count, d_out_count, sizeof(uint64_t)).wait();
+        if (run_t3_match_twophase(
+                keys, fk, d_sorted_meta, d_sorted_xbits, d_sorted_mi,
+                d_offsets, d_fine_offsets, num_match_keys,
+                k, num_section_bits, num_match_target_bits, fine_bits,
+                target_mask, num_test_bits,
+                d_out_pairings, d_out_count, out_capacity, l_count_max,
+                bucket_begin, bucket_end, d_aes_tables, q)) {
+            return;
+        }
+        q.memcpy(d_out_count, &saved_count, sizeof(uint64_t)).wait();
     }
 
     constexpr size_t threads = 256;
@@ -688,17 +750,22 @@ void launch_t3_match_section_pair(
 
     uint32_t* d_aes_tables = sycl_backend::aes_tables_device(q);
 
-    // Phase 2 prototype: env-gated two-phase split (Minimal-tier path).
-    if (t3_twophase_enabled()) {
-        run_t3_match_section_pair_twophase(
-            keys, fk, d_meta_l_slice, section_l_row_start,
-            d_meta_r_slice, section_r_row_start,
-            d_sorted_xbits, d_sorted_mi, d_offsets, d_fine_offsets,
-            num_match_keys, k, num_section_bits, num_match_target_bits,
-            fine_bits, target_mask, num_test_bits,
-            d_out_pairings, d_out_count, out_capacity, l_count_max,
-            bucket_begin, bucket_end, d_aes_tables, q);
-        return;
+    // Two-phase split, on by default (Minimal-tier path). u32 gate and
+    // overflow fallback — see launch_t3_match_all_buckets.
+    if (t3_twophase_enabled() && out_capacity <= UINT32_MAX) {
+        uint64_t saved_count = 0;
+        q.memcpy(&saved_count, d_out_count, sizeof(uint64_t)).wait();
+        if (run_t3_match_section_pair_twophase(
+                keys, fk, d_meta_l_slice, section_l_row_start,
+                d_meta_r_slice, section_r_row_start,
+                d_sorted_xbits, d_sorted_mi, d_offsets, d_fine_offsets,
+                num_match_keys, k, num_section_bits, num_match_target_bits,
+                fine_bits, target_mask, num_test_bits,
+                d_out_pairings, d_out_count, out_capacity, l_count_max,
+                bucket_begin, bucket_end, d_aes_tables, q)) {
+            return;
+        }
+        q.memcpy(d_out_count, &saved_count, sizeof(uint64_t)).wait();
     }
 
     constexpr size_t threads = 256;
