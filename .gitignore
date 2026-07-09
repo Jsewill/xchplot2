@@ -26,3 +26,6 @@ tmp/
 # Local-only feature backlog. Discoverable at the repo root but never
 # committed — design notes belong in pull requests, not in the tree.
 FEATURES.md
+
+# Local-only planning docs (same policy as FEATURES.md).
+docs/perf-backlog-implementation-plan.md
