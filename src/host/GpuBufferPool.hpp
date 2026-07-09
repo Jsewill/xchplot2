@@ -101,6 +101,21 @@ struct GpuBufferPool {
     // "safe" consumer/producer ratio.
     static constexpr int kNumPinnedBuffers = 3;
     uint64_t* h_pinned_t3[kNumPinnedBuffers] = {};
+
+    // Optional dedicated fragment buffer for overlapping the final D2H
+    // with the next plot's Xs phase (P3). Auto-enabled when free VRAM
+    // covers pool + cap*8 + 512 MB margin; POS2GPU_NO_D2H_OVERLAP=1
+    // forces the aliased (d_pair_b) path. When overlap_d2h is false,
+    // d_frags_dedicated is null and behaviour matches the pre-P3 pool.
+    void*     d_frags_dedicated = nullptr;
+    bool      overlap_d2h       = false;
+    // Opaque cudaEvent_t / cudaStream_t handles (void* so this header
+    // stays CUDA-free for .cpp consumers). Owned by the pool; valid
+    // only when overlap_d2h is true.
+    void*     copy_stream       = nullptr; // cudaStream_t
+    void*     e_t3_sorted       = nullptr; // cudaEvent_t
+    void*     e_evacuated       = nullptr; // cudaEvent_t
+    void*     e_d2h_done        = nullptr; // cudaEvent_t
 };
 
 } // namespace pos2gpu

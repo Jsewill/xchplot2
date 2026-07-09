@@ -441,6 +441,7 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 | `POS2GPU_NO_ASYNC_ALLOC=1`    | Disable stream-ordered `cudaMallocAsync` pooling (audit kill switch).   |
 | `POS2GPU_TINY_OVERLAP=1`      | Opt in to tiny-tier T1-match double-buffer (off by default; regresses on Ada). |
 | `POS2GPU_NO_TINY_OVERLAP=1`   | Force single-stream tiny T1 match even if `POS2GPU_TINY_OVERLAP=1`.     |
+| `POS2GPU_NO_D2H_OVERLAP=1`    | Disable pool-path final-fragment D2H overlap with next plot's Xs.       |
 | `CUDA_ARCHITECTURES=sm_XX`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |
 | `CUDA_PATH=/path/to/cuda`     | Override the CUDA Toolkit root for linking (default: `/opt/cuda`, `/usr/local/cuda`). Useful on JetPack / non-standard installs. |
 | `CUDA_HOME=/path/to/cuda`     | Fallback for `CUDA_PATH` — same effect.                                 |

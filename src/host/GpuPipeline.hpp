@@ -57,7 +57,17 @@ struct GpuPipelineResult {
     uint64_t t1_count = 0;
     uint64_t t2_count = 0;
     uint64_t t3_count = 0;
+
+    // When the pool path overlaps D2H with the next plot, the producer
+    // returns before the copy drains. Opaque cudaEvent_t (void* so this
+    // header stays CUDA-free); consumer must call wait_pipeline_d2h()
+    // before reading fragments(). Null when overlap is off / one-shot.
+    void* d2h_done_event = nullptr;
 };
+
+// Block until a pipeline result's overlapped D2H has landed in the
+// pinned slot. No-op when d2h_done_event is null.
+void wait_pipeline_d2h(GpuPipelineResult const& result);
 
 // One-shot path: allocates a transient pool, runs the pipeline, then copies
 // the pinned T3 fragments into t3_fragments_storage so the result is

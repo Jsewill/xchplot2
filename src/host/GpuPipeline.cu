@@ -847,9 +847,22 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 
     // Sort T3 by proof_fragment (low 2k bits). T3PairingGpu is just a
     // uint64_t, so reinterpret the d_pair_a slot directly.
+    //
+    // Pool alias table (P3 D2H overlap):
+    //   d_frags_in  = d_pair_a (T3 match output)
+    //   d_frags_out = overlap_d2h ? d_frags_dedicated : d_pair_b
+    // When overlap is on, DoubleBuffer(d_frags_in, d_frags_dedicated):
+    //   - sort ends in dedicated → D2H directly; e_evacuated = e_t3_sorted
+    //   - sort ends in d_frags_in → D2D evacuate to dedicated (~3 ms), then
+    //     D2H; default stream waits on e_evacuated once before next plot's
+    //     first op so pair_a ownership handoff is a single event.
     uint64_t* d_frags_in = reinterpret_cast<uint64_t*>(d_t3);
+    if (pool.overlap_d2h && pool.d_frags_dedicated) {
+        d_frags_out = static_cast<uint64_t*>(pool.d_frags_dedicated);
+    }
     uint64_t const* d_frags_sorted = d_frags_out;
     int p_t3_sort = begin_phase("T3 sort");
+    bool sort_ended_in_dedicated = true;
     {
         cub::DoubleBuffer<uint64_t> dfrag(d_frags_in, d_frags_out);
         size_t sort_bytes = pool.sort_scratch_bytes;
@@ -857,9 +870,8 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             d_sort_scratch, sort_bytes,
             dfrag,
             t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
-        // Result may land in either buffer; the D2H below copies from
-        // wherever it is.
         d_frags_sorted = dfrag.Current();
+        sort_ended_in_dedicated = (dfrag.Current() == d_frags_out);
     }
     end_phase(p_t3_sort);
 
@@ -871,10 +883,45 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     result.t3_count = t3_count;
 
     if (t3_count > 0) {
-        CHECK(cudaMemcpyAsync(h_pinned_t3, d_frags_sorted,
-                              sizeof(uint64_t) * t3_count,
-                              cudaMemcpyDeviceToHost, stream));
-        CHECK(cudaStreamSynchronize(stream));
+        if (pool.overlap_d2h && pool.copy_stream && pool.e_t3_sorted &&
+            pool.e_evacuated && pool.e_d2h_done)
+        {
+            auto e_t3  = static_cast<cudaEvent_t>(pool.e_t3_sorted);
+            auto e_evac = static_cast<cudaEvent_t>(pool.e_evacuated);
+            auto e_d2h = static_cast<cudaEvent_t>(pool.e_d2h_done);
+            auto cs    = static_cast<cudaStream_t>(pool.copy_stream);
+
+            CHECK(cudaEventRecord(e_t3, stream));
+            CHECK(cudaStreamWaitEvent(cs, e_t3, 0));
+
+            uint64_t const* d2h_src = d_frags_sorted;
+            if (!sort_ended_in_dedicated) {
+                // Evacuate pair_a → dedicated before plot N+1 touches pair_a.
+                CHECK(cudaMemcpyAsync(d_frags_out,
+                                      const_cast<uint64_t*>(d_frags_sorted),
+                                      sizeof(uint64_t) * t3_count,
+                                      cudaMemcpyDeviceToDevice, cs));
+                CHECK(cudaEventRecord(e_evac, cs));
+                d2h_src = d_frags_out;
+            } else {
+                // Uniform wait: record e_evacuated immediately after sort.
+                CHECK(cudaEventRecord(e_evac, cs));
+            }
+            // Next plot's default stream waits once on evacuation.
+            CHECK(cudaStreamWaitEvent(stream, e_evac, 0));
+
+            CHECK(cudaMemcpyAsync(h_pinned_t3, d2h_src,
+                                  sizeof(uint64_t) * t3_count,
+                                  cudaMemcpyDeviceToHost, cs));
+            CHECK(cudaEventRecord(e_d2h, cs));
+            result.d2h_done_event = e_d2h;
+            // Do NOT synchronize — producer returns; consumer waits.
+        } else {
+            CHECK(cudaMemcpyAsync(h_pinned_t3, d_frags_sorted,
+                                  sizeof(uint64_t) * t3_count,
+                                  cudaMemcpyDeviceToHost, stream));
+            CHECK(cudaStreamSynchronize(stream));
+        }
     }
     end_phase(p_d2h);
 
@@ -903,6 +950,17 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     return result;
 }
 
+void wait_pipeline_d2h(GpuPipelineResult const& result)
+{
+    if (!result.d2h_done_event) return;
+    cudaError_t err = cudaEventSynchronize(
+        static_cast<cudaEvent_t>(result.d2h_done_event));
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("wait_pipeline_d2h: ") + cudaGetErrorString(err));
+    }
+}
+
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 {
     // Explicit override for callers that want the streaming path without
@@ -925,6 +983,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
     try {
         GpuBufferPool pool(cfg.k, cfg.strength, cfg.testnet);
         GpuPipelineResult r = run_gpu_pipeline(cfg, pool, /*pinned_index=*/0);
+        // Overlapped D2H may still be in flight — drain before reading
+        // the pinned slot (and before the pool dtor frees it).
+        wait_pipeline_d2h(r);
         // Pool (and its pinned buffer) is about to be destroyed, so
         // materialise a self-contained copy before returning.
         if (r.external_fragments_ptr && r.external_fragments_count > 0) {
@@ -935,6 +996,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
         }
         r.external_fragments_ptr   = nullptr;
         r.external_fragments_count = 0;
+        r.d2h_done_event           = nullptr;
         return r;
     } catch (InsufficientVramError const& e) {
         std::fprintf(stderr,

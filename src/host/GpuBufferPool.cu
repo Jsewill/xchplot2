@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -147,6 +148,16 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
 
     pinned_bytes = cap * sizeof(uint64_t);
 
+    // Dedicated frags buffer for D2H/Xs overlap (P3). Policy: auto-enable
+    // when free_vram >= pool_total + cap*8 + 512 MB; POS2GPU_NO_D2H_OVERLAP=1
+    // forces the aliased path. Allocation happens after the base pool
+    // buffers so a mid-sequence OOM still cleans up cleanly.
+    size_t const frags_dedicated_bytes = static_cast<size_t>(cap) * sizeof(uint64_t);
+    bool const force_no_overlap = [] {
+        char const* v = std::getenv("POS2GPU_NO_D2H_OVERLAP");
+        return v && v[0] == '1';
+    }();
+
     // Check free VRAM before attempting allocation so we can give a useful
     // diagnostic instead of a generic cudaErrorMemoryAllocation. The margin
     // covers CUDA driver/context state, CUB internal scratch, AES T-tables,
@@ -173,6 +184,12 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             e.total_bytes    = total_b;
             throw e;
         }
+        // Overlap headroom: pool + dedicated frags + another 512 MB margin.
+        overlap_d2h = !force_no_overlap &&
+            (free_b >= required_device + frags_dedicated_bytes + margin);
+        if (!overlap_d2h && !force_no_overlap) {
+            // Silent fallback; one -v / POOL_DEBUG line below.
+        }
     }
 
     if (getenv("POS2GPU_POOL_DEBUG")) {
@@ -185,9 +202,11 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             free_b/1e9, total_b/1e9);
         std::fprintf(stderr,
             "[pool] sizes: storage=%.2fGB pair_a=%.2fGB pair_b=%.2fGB "
-            "xs_temp(alias→pair_b)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB\n",
+            "xs_temp(alias→pair_b)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB "
+            "overlap_d2h=%s\n",
             storage_bytes/1e9, pair_a_bytes/1e9, pair_b_bytes/1e9,
-            xs_temp_bytes/1e9, sort_scratch_bytes/1e9, pinned_bytes/1e9);
+            xs_temp_bytes/1e9, sort_scratch_bytes/1e9, pinned_bytes/1e9,
+            overlap_d2h ? "yes" : "no");
     }
 
     // Wrap allocations so a mid-sequence failure (e.g. d_pair_b OOM after
@@ -200,6 +219,20 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         if (d_pair_b)        { cudaFree(d_pair_b);       d_pair_b       = nullptr; }
         if (d_sort_scratch)  { cudaFree(d_sort_scratch); d_sort_scratch = nullptr; }
         if (d_counter)       { cudaFree(d_counter);      d_counter      = nullptr; }
+        if (d_frags_dedicated) {
+            cudaFree(d_frags_dedicated);
+            d_frags_dedicated = nullptr;
+        }
+        if (copy_stream) {
+            cudaStreamDestroy(static_cast<cudaStream_t>(copy_stream));
+            copy_stream = nullptr;
+        }
+        auto destroy_ev = [](void*& p) {
+            if (p) { cudaEventDestroy(static_cast<cudaEvent_t>(p)); p = nullptr; }
+        };
+        destroy_ev(e_t3_sorted);
+        destroy_ev(e_evacuated);
+        destroy_ev(e_d2h_done);
         for (int i = 0; i < kNumPinnedBuffers; ++i) {
             if (h_pinned_t3[i]) { cudaFreeHost(h_pinned_t3[i]); h_pinned_t3[i] = nullptr; }
         }
@@ -215,6 +248,29 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                             pinned_bytes,
                             ("h_pinned_t3[" + std::to_string(i) + "]").c_str());
         }
+        if (overlap_d2h) {
+            pool_alloc(d_frags_dedicated, frags_dedicated_bytes, "d_frags_dedicated");
+            cudaStream_t cs = nullptr;
+            POOL_CHECK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+            copy_stream = cs;
+            cudaEvent_t e0 = nullptr, e1 = nullptr, e2 = nullptr;
+            POOL_CHECK(cudaEventCreateWithFlags(&e0, cudaEventDisableTiming));
+            POOL_CHECK(cudaEventCreateWithFlags(&e1, cudaEventDisableTiming));
+            POOL_CHECK(cudaEventCreateWithFlags(&e2, cudaEventDisableTiming));
+            e_t3_sorted = e0;
+            e_evacuated = e1;
+            e_d2h_done  = e2;
+            if (getenv("POS2GPU_POOL_DEBUG")) {
+                std::fprintf(stderr,
+                    "[pool] D2H overlap enabled (dedicated frags %.2f GB)\n",
+                    frags_dedicated_bytes / 1e9);
+            }
+        } else if (getenv("POS2GPU_POOL_DEBUG") || force_no_overlap) {
+            std::fprintf(stderr,
+                "[pool] D2H overlap disabled (%s)\n",
+                force_no_overlap ? "POS2GPU_NO_D2H_OVERLAP=1"
+                                 : "insufficient free VRAM headroom");
+        }
     } catch (...) {
         cleanup_partial();
         throw;
@@ -228,6 +284,15 @@ GpuBufferPool::~GpuBufferPool()
     if (d_pair_b)        cudaFree(d_pair_b);
     if (d_sort_scratch)  cudaFree(d_sort_scratch);
     if (d_counter)       cudaFree(d_counter);
+    if (d_frags_dedicated) cudaFree(d_frags_dedicated);
+    if (copy_stream)
+        cudaStreamDestroy(static_cast<cudaStream_t>(copy_stream));
+    if (e_t3_sorted)
+        cudaEventDestroy(static_cast<cudaEvent_t>(e_t3_sorted));
+    if (e_evacuated)
+        cudaEventDestroy(static_cast<cudaEvent_t>(e_evacuated));
+    if (e_d2h_done)
+        cudaEventDestroy(static_cast<cudaEvent_t>(e_d2h_done));
     for (int i = 0; i < kNumPinnedBuffers; ++i) {
         if (h_pinned_t3[i]) cudaFreeHost(h_pinned_t3[i]);
     }

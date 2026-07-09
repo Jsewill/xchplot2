@@ -866,8 +866,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
 
                 // Fragments are borrowed from the pool's pinned slot;
-                // the SlotGate ack below is what lets the producer
-                // reuse that slot once we're done reading it.
+                // wait for any overlapped D2H to land before reading,
+                // then the SlotGate ack below lets the producer reuse
+                // that slot once we're done.
+                wait_pipeline_d2h(item.result);
                 std::uint64_t const plot_bytes = write_plot_file_parallel(
                     full_path.string(),
                     item.result.fragments(),
