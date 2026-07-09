@@ -54,7 +54,9 @@ __device__ __forceinline__ uint32_t g_x(AesHashKeys const& keys, uint32_t x, int
 {
     AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
     s = run_rounds(s, keys, rounds);
-    return s.w[0] & ((1u << k) - 1u);
+    // (1u << 32) is UB; k == 32 means "keep all 32 bits".
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return s.w[0] & mask;
 }
 
 // pairing: load (meta_l_lo, meta_l_hi, meta_r_lo, meta_r_hi) into i0..i3,
@@ -134,7 +136,9 @@ __device__ __forceinline__ uint32_t g_x_smem(
 {
     AesState s = set_int_vec_i128(0, 0, 0, static_cast<int32_t>(x));
     s = run_rounds_smem(s, keys, rounds, sT);
-    return s.w[0] & ((1u << k) - 1u);
+    // (1u << 32) is UB; k == 32 means "keep all 32 bits".
+    uint32_t const mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+    return s.w[0] & mask;
 }
 
 __device__ __forceinline__ Result128 pairing_smem(

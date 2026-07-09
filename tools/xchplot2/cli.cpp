@@ -162,7 +162,7 @@ void print_usage(char const* prog)
         << "    capability. Use the printed [N] / [cpu] index with --devices.\n"
         << "\n"
         << "  test-mode positional args:\n"
-        << "    <k>            : even integer in [18, 32]\n"
+        << "    <k>            : even integer in [18, 30]\n"
         << "    <plot_id_hex>  : 64 hex characters\n"
         << "    [strength]     : optional, defaults to 2\n"
         << "    [plot_index]   : optional, defaults to 0\n"
@@ -916,8 +916,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
         }
 
-        if (k < 18 || k > 32 || (k % 2) != 0) {
-            std::cerr << "Error: -k must be an even integer in [18, 32]\n";
+        if (k < 18 || k > 30 || (k % 2) != 0) {
+            std::cerr << "Error: -k must be an even integer in [18, 30]\n";
+            return 1;
+        }
+        if (strength < 2 || strength > 63) {
+            std::cerr << "Error: --strength must be in [2, 63]\n";
             return 1;
         }
         if (measured < 1) {
@@ -1286,6 +1290,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
         if (meta_group < 0 || meta_group > 0xFF) {
             std::cerr << "Error: --meta-group must be in [0, 255]\n";
+            return 1;
+        }
+        if (strength < 2 || strength > 63) {
+            std::cerr << "Error: --strength must be in [2, 63]\n";
             return 1;
         }
 

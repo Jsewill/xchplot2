@@ -140,6 +140,17 @@ unset(_xchplot2_nvcc CACHE)
 
 project(pos2-gpu VERSION 0.8.0 LANGUAGES C CXX CUDA)
 
+# Default to Release: a plain `cmake -B build -S .` otherwise builds
+# with EMPTY optimization flags — host C++ (FSE compression, writer,
+# host-side merges) at -O0 silently runs several times slower while
+# still producing valid plots. build.rs pins Release explicitly; this
+# covers manual configures (e.g. the README's Windows snippet).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY
+                 STRINGS Release Debug RelWithDebInfo MinSizeRel)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

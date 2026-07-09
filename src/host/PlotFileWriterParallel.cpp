@@ -32,6 +32,14 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace pos2gpu {
 
 namespace {
@@ -112,27 +120,83 @@ private:
     bool                              stop_ = false;
 };
 
-// Inline equivalent of pos2-chip's
-// ChunkedProofFragments::convertToChunkedProofFragments, but operating on
-// a span so callers can point at pinned memory directly.
-ChunkedProofFragments chunkify_proof_fragments_span(
-    std::span<uint64_t const> t3_fragments, uint64_t range_per_chunk,
-    unsigned thread_count)
+// Wait for ALL futures before propagating any failure. Rethrowing on
+// the first failed future (plain `for (f : tasks) f.get()`) would
+// unwind the caller's frame while sibling tasks are still queued or
+// running — and those tasks capture the caller's stack locals by
+// reference, so a single std::bad_alloc in one task would turn into
+// use-after-free writes in every other. Drain everything, then rethrow
+// the first stored exception.
+void wait_all_rethrow_first(std::vector<std::future<void>>& tasks)
+{
+    std::exception_ptr first;
+    for (auto& f : tasks) {
+        try { f.get(); }
+        catch (...) { if (!first) first = std::current_exception(); }
+    }
+    if (first) std::rethrow_exception(first);
+}
+
+// Flush the file at `path` to stable storage; throws on failure.
+void fsync_path_or_throw(std::string const& path)
+{
+#ifdef _WIN32
+    int fd = ::_open(path.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to reopen for flush: " + path);
+    }
+    int const rc = ::_commit(fd);
+    ::_close(fd);
+    if (rc != 0) throw std::runtime_error("Failed to flush " + path);
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to reopen for fsync: " + path);
+    }
+    int const rc = ::fsync(fd);
+    ::close(fd);
+    if (rc != 0) throw std::runtime_error("Failed to fsync " + path);
+#endif
+}
+
+// Flush the directory entry after a rename so the new name survives a
+// crash. Best-effort: some filesystems reject directory fsync, and the
+// data itself was already fsynced.
+void fsync_parent_dir_best_effort(std::string const& path)
+{
+#ifndef _WIN32
+    auto dir = std::filesystem::path(path).parent_path();
+    if (dir.empty()) dir = ".";
+    int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+#else
+    (void)path;
+#endif
+}
+
+// Chunk boundary table for the already-sorted fragment array. Chunk i
+// covers value range [i*R, (i+1)*R) where R = range_per_chunk; a single
+// O(N) sweep records where each chunk starts. The fragments themselves
+// are NOT copied — ChunkCompressor::compressProofFragments takes a
+// span, so each chunk is compressed straight out of the (often pinned)
+// source buffer. The previous implementation materialised every chunk
+// into its own std::vector first: a full extra pass over ~2 GB at k=28
+// plus thousands of allocations, on the consumer thread that gates
+// plot completion.
+std::vector<std::size_t> chunk_boundaries_span(
+    std::span<uint64_t const> t3_fragments, uint64_t range_per_chunk)
 {
     if (range_per_chunk == 0) {
         throw std::invalid_argument("range_per_chunk must be > 0");
     }
-    ChunkedProofFragments chunked;
-    if (t3_fragments.empty()) return chunked;
+    if (t3_fragments.empty()) return {};
 
     uint64_t const max_value = t3_fragments.back();
     std::size_t const num_spans = static_cast<std::size_t>(max_value / range_per_chunk + 1);
-    chunked.proof_fragments_chunks.resize(num_spans);
 
-    // Step 1: find chunk boundaries in the already-sorted fragment array.
-    // fragments are ascending, each chunk i covers [i*R, (i+1)*R) where R =
-    // range_per_chunk, so a single O(N) sweep records the position where
-    // each chunk starts. No per-fragment allocations.
     std::vector<std::size_t> boundaries(num_spans + 1);
     boundaries[0] = 0;
     std::size_t ci          = 0;
@@ -145,32 +209,7 @@ ChunkedProofFragments chunkify_proof_fragments_span(
         }
     }
     for (std::size_t c = ci + 1; c <= num_spans; ++c) boundaries[c] = N;
-
-    // Step 2: parallel copy, one task per contiguous range of chunks.
-    // thread_count here is task-split granularity, not worker-thread
-    // count — every task is enqueued on the process-global
-    // WriterThreadPool, so the total number of OS threads is fixed
-    // regardless of how many writers are running concurrently.
-    std::size_t const tasks_n       = std::min<std::size_t>(thread_count, num_spans);
-    std::size_t const chunks_per_tk = (num_spans + tasks_n - 1) / tasks_n;
-
-    std::vector<std::future<void>> tasks;
-    tasks.reserve(tasks_n);
-    for (std::size_t tstart = 0; tstart < num_spans; tstart += chunks_per_tk) {
-        std::size_t const tend = std::min<std::size_t>(tstart + chunks_per_tk, num_spans);
-        tasks.emplace_back(WriterThreadPool::instance().submit(
-            [&, tstart, tend]() {
-                for (std::size_t c = tstart; c < tend; ++c) {
-                    std::size_t const a = boundaries[c];
-                    std::size_t const b = boundaries[c + 1];
-                    chunked.proof_fragments_chunks[c].assign(
-                        t3_fragments.begin() + a, t3_fragments.begin() + b);
-                }
-            }));
-    }
-    for (auto& f : tasks) f.get();
-
-    return chunked;
+    return boundaries;
 }
 
 } // namespace
@@ -189,42 +228,51 @@ size_t write_plot_file_parallel(
 {
     ProofParams params(plot_id_32, k, strength, testnet);
 
+    // thread_count is the task-split granularity, not a thread count:
+    // every task routes through the shared WriterThreadPool, whose
+    // worker count is fixed at hardware_concurrency(). 0 ⇒ split into
+    // one task per pool worker.
     if (thread_count == 0) {
-        thread_count = std::thread::hardware_concurrency();
-        if (thread_count == 0) thread_count = 4;
+        thread_count =
+            static_cast<unsigned>(WriterThreadPool::instance().size());
     }
 
-    // Build chunked representation (cheap; single pass over fragments)
+    // Chunk boundary table (cheap; single pass over fragments). Chunks
+    // are compressed directly from the source span — no per-chunk copy.
     uint64_t const range_per_chunk = (1ULL << (params.get_k() + PlotFile::CHUNK_SPAN_RANGE_BITS));
-    ChunkedProofFragments chunked
-        = chunkify_proof_fragments_span(t3_fragments, range_per_chunk, thread_count);
+    std::vector<std::size_t> const boundaries =
+        chunk_boundaries_span(t3_fragments, range_per_chunk);
 
-    uint64_t const num_chunks = static_cast<uint64_t>(chunked.proof_fragments_chunks.size());
+    uint64_t const num_chunks =
+        boundaries.empty() ? 0 : static_cast<uint64_t>(boundaries.size() - 1);
     int const stub_bits = params.get_k() - PlotFile::MINUS_STUB_BITS;
 
-    // Parallel chunk compression. Static partitioning: thread_count tasks,
-    // each loops over a contiguous range of chunks. Tasks are enqueued on
-    // the process-global WriterThreadPool so concurrent writers share the
-    // same pool of OS threads instead of each spawning their own
+    // Parallel chunk compression. Static partitioning: tasks_n tasks,
+    // each loops over a contiguous range of chunks, all routed through
+    // the shared WriterThreadPool so concurrent writers share the same
+    // pool of OS threads instead of each spawning their own
     // hardware_concurrency() workers.
     std::vector<std::vector<uint8_t>> compressed(num_chunks);
     if (num_chunks > 0) {
         uint64_t const tasks_n       = std::min<uint64_t>(thread_count, num_chunks);
         uint64_t const chunks_per_tk = (num_chunks + tasks_n - 1) / tasks_n;
+        auto& pool = WriterThreadPool::instance();
         std::vector<std::future<void>> tasks;
         tasks.reserve(tasks_n);
         for (uint64_t tstart = 0; tstart < num_chunks; tstart += chunks_per_tk) {
             uint64_t const tend = std::min<uint64_t>(tstart + chunks_per_tk, num_chunks);
-            tasks.emplace_back(WriterThreadPool::instance().submit(
+            tasks.emplace_back(pool.submit(
                 [&, tstart, tend]() {
                     for (uint64_t i = tstart; i < tend; ++i) {
                         uint64_t start_range = i * range_per_chunk;
                         compressed[i] = ChunkCompressor::compressProofFragments(
-                            chunked.proof_fragments_chunks[i], start_range, stub_bits);
+                            t3_fragments.subspan(boundaries[i],
+                                                 boundaries[i + 1] - boundaries[i]),
+                            start_range, stub_bits);
                     }
                 }));
         }
-        for (auto& f : tasks) f.get();
+        wait_all_rethrow_first(tasks);
     }
 
     // Serial write phase — file I/O is sequential anyway. Write to
@@ -245,7 +293,15 @@ size_t write_plot_file_parallel(
         }
     } guard{partial};
 
-    std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+    // Multi-MB stream buffer instead of the default ~8 KB: chunk
+    // payloads otherwise go to the kernel in thousands of small
+    // write(2)s. Must be installed before open() for libstdc++ to
+    // honour it.
+    std::vector<char> iobuf(size_t{4} << 20);
+    std::ofstream out;
+    out.rdbuf()->pubsetbuf(iobuf.data(),
+                           static_cast<std::streamsize>(iobuf.size()));
+    out.open(partial, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("Failed to open " + filename);
 
     out.write("pos2", 4);
@@ -299,6 +355,14 @@ size_t write_plot_file_parallel(
     out.close();
     if (!out) throw std::runtime_error("Failed to close " + partial);
 
+    // Durability barrier before the atomic rename. close() only pushes
+    // the bytes to the page cache; without an fsync a power loss after
+    // the rename can leave a truncated file at the FINAL name — which
+    // looks_like_complete_plot() then accepts, so --skip-existing never
+    // replots it. fsync the data, rename, then fsync the directory so
+    // the name change itself is durable.
+    fsync_path_or_throw(partial);
+
     std::error_code ec;
     std::filesystem::rename(partial, filename, ec);
     if (ec) {
@@ -306,6 +370,7 @@ size_t write_plot_file_parallel(
             "Failed to rename " + partial + " -> " + filename + ": " + ec.message());
     }
     guard.committed = true;
+    fsync_parent_dir_best_effort(filename);
 
     return bytes_written;
 }

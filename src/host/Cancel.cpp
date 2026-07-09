@@ -2,6 +2,7 @@
 
 #include "host/Cancel.hpp"
 
+#include <atomic>
 #include <csignal>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -12,11 +13,21 @@ namespace pos2gpu {
 
 namespace {
 
-// sig_atomic_t is the one type C/C++ guarantee is safe to read/write from
-// a signal handler without synchronization concerns. The count lets us
-// turn the second same-signal receipt into a hard kill, so a user whose
-// cooperative shutdown is stuck can still escape with a second Ctrl-C.
-volatile std::sig_atomic_t g_cancel_count = 0;
+// Lock-free std::atomic is both async-signal-safe (per [support.signal])
+// and safe for cross-thread access — request_cancel() is called
+// concurrently from several worker threads, which `volatile
+// sig_atomic_t` (safe only between a handler and the thread it
+// interrupts) did not cover.
+//
+// Two separate flags, deliberately:
+//   g_signal_count — bumped ONLY by the signal handler. The second
+//     same-signal receipt escalates to a hard kill.
+//   g_soft_cancel  — set by request_cancel() (e.g. a worker hitting
+//     ENOSPC asks peers to drain). It must NOT count toward the
+//     escalation: with a single counter, one programmatic cancel meant
+//     the user's FIRST Ctrl-C hard-killed the process mid-plot.
+std::atomic<int>  g_signal_count{0};
+std::atomic<bool> g_soft_cancel{false};
 
 void write_stderr_safe(char const* msg, std::size_t len) noexcept
 {
@@ -35,12 +46,11 @@ extern "C" void cancel_handler(int sig) noexcept
     // On the second receipt, restore the default disposition and re-raise
     // so the process dies immediately. Prevents a hung plotter from
     // needing kill -9 when the user insists.
-    if (g_cancel_count >= 1) {
+    if (g_signal_count.fetch_add(1, std::memory_order_relaxed) >= 1) {
         std::signal(sig, SIG_DFL);
         std::raise(sig);
         return;
     }
-    g_cancel_count = 1;
     static char const msg[] =
         "\n[xchplot2] cancel requested — finishing current plot then "
         "stopping. Press Ctrl-C again to abort immediately.\n";
@@ -89,20 +99,21 @@ void install_cancel_signal_handlers()
 
 bool cancel_requested() noexcept
 {
-    return g_cancel_count > 0;
+    return g_soft_cancel.load(std::memory_order_relaxed)
+        || g_signal_count.load(std::memory_order_relaxed) > 0;
 }
 
 void request_cancel() noexcept
 {
-    // Same flag the signal handler uses, but no async-signal-safety
-    // constraints here — called from a normal C++ thread context
-    // (e.g. a worker catching ENOSPC and asking peers to drain).
-    if (g_cancel_count < 1) g_cancel_count = 1;
+    // Separate soft flag — see the g_soft_cancel comment above for why
+    // this must not feed the signal handler's escalation count.
+    g_soft_cancel.store(true, std::memory_order_relaxed);
 }
 
 void reset_cancel_for_tests() noexcept
 {
-    g_cancel_count = 0;
+    g_signal_count.store(0, std::memory_order_relaxed);
+    g_soft_cancel.store(false, std::memory_order_relaxed);
 }
 
 } // namespace pos2gpu

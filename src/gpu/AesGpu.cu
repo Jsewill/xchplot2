@@ -3,6 +3,8 @@
 
 #include "gpu/AesGpu.cuh"
 #include <array>
+#include <stdexcept>
+#include <string>
 
 namespace pos2gpu {
 
@@ -69,12 +71,31 @@ constexpr auto T3 = build_table(1);
 
 } // namespace
 
+namespace {
+
+// A failed table upload would leave the constant-memory tables zeroed:
+// every hash then computes garbage but the pipeline still runs to
+// completion and writes a structurally-valid, cryptographically-wrong
+// plot. Throwing here is the only place that failure is observable.
+void copy_to_symbol_or_throw(void const* symbol, void const* src,
+                             size_t bytes, char const* name)
+{
+    cudaError_t const err = cudaMemcpyToSymbol(symbol, src, bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("initialize_aes_tables: cudaMemcpyToSymbol(") +
+            name + ") failed: " + cudaGetErrorString(err));
+    }
+}
+
+} // namespace
+
 void initialize_aes_tables()
 {
-    cudaMemcpyToSymbol(kAesT0, T0.data(), sizeof(uint32_t) * 256);
-    cudaMemcpyToSymbol(kAesT1, T1.data(), sizeof(uint32_t) * 256);
-    cudaMemcpyToSymbol(kAesT2, T2.data(), sizeof(uint32_t) * 256);
-    cudaMemcpyToSymbol(kAesT3, T3.data(), sizeof(uint32_t) * 256);
+    copy_to_symbol_or_throw(kAesT0, T0.data(), sizeof(uint32_t) * 256, "kAesT0");
+    copy_to_symbol_or_throw(kAesT1, T1.data(), sizeof(uint32_t) * 256, "kAesT1");
+    copy_to_symbol_or_throw(kAesT2, T2.data(), sizeof(uint32_t) * 256, "kAesT2");
+    copy_to_symbol_or_throw(kAesT3, T3.data(), sizeof(uint32_t) * 256, "kAesT3");
 }
 
 } // namespace pos2gpu

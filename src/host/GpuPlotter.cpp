@@ -43,8 +43,10 @@ void warn_if_gpu_requested_but_unimplemented(GpuPlotOptions const& o)
 
 std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_dir)
 {
-    if (opts.k < 18 || opts.k > 32 || (opts.k & 1) != 0) {
-        throw std::runtime_error("k must be even and in [18, 32]");
+    if (opts.k < 18 || opts.k > 30 || (opts.k & 1) != 0) {
+        throw std::runtime_error(
+            "k must be even and in [18, 30] (k=32 exceeds the 32-bit "
+            "sort-index scheme and is not yet supported)");
     }
     if (opts.strength < 2 || opts.strength > 63) {
         throw std::runtime_error("strength must be in [2, 63]");

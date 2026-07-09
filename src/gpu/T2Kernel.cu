@@ -348,6 +348,23 @@ struct T2Derived {
     uint64_t l_count_max;
 };
 
+// Shift-safety guard — must pass BEFORE derive_t2 is called: derive_t2
+// evaluates (1u << num_section_bits) and (1u << num_match_key_bits),
+// and both derive_t2 and the kernels shift by num_match_target_bits.
+// A large strength (CLI accepts up to 63) makes num_match_target_bits
+// = k - section_bits - strength negative and num_match_key_bits ≥ 32 —
+// negative/oversized shifts are UB, so reject them up front (including
+// on the size-query path, which previously skipped the late guard).
+// num_match_target_bits > kT2FineBits additionally guarantees the
+// fine-bucket pre-index leaves at least one bit of bsearch range.
+bool t2_params_shift_safe(T2MatchParams const& params)
+{
+    return params.num_section_bits      >= 0 && params.num_section_bits   < 32
+        && params.num_match_key_bits    >= 0 && params.num_match_key_bits < 32
+        && params.num_match_target_bits >  kT2FineBits
+        && params.num_match_target_bits <= 32;
+}
+
 T2Derived derive_t2(T2MatchParams const& params)
 {
     T2Derived d{};
@@ -385,6 +402,7 @@ cudaError_t launch_t2_match_prepare(
     if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
     if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
     if (params.strength < 2)            return cudaErrorInvalidValue;
+    if (!t2_params_shift_safe(params))  return cudaErrorInvalidValue;
 
     T2Derived const d = derive_t2(params);
 
@@ -394,7 +412,6 @@ cudaError_t launch_t2_match_prepare(
     }
     if (*temp_bytes < d.temp_needed)     return cudaErrorInvalidValue;
     if (!d_sorted_mi || !d_out_count)    return cudaErrorInvalidValue;
-    if (params.num_match_target_bits <= kT2FineBits) return cudaErrorInvalidValue;
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
     auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
@@ -443,6 +460,7 @@ cudaError_t launch_t2_match_range(
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
     if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
+    if (!t2_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_sorted_meta || !d_sorted_mi ||
         !d_out_meta || !d_out_mi || !d_out_xbits || !d_out_count)
     {
@@ -513,6 +531,7 @@ cudaError_t launch_t2_match_section_pair_split_range(
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
     if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
+    if (!t2_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_meta_l_slice || !d_meta_r_slice || !d_mi_r_slice ||
         !d_out_meta || !d_out_mi || !d_out_xbits || !d_out_count)
     {

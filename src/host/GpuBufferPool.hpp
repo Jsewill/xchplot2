@@ -7,8 +7,11 @@
 // between device time (~2.75 s) and producer wall time (~5.1 s).
 //
 // Memory layout with aliasing (k=28 worst-case sizes in parens):
-//   d_storage      (~2-3 GB)  — Xs candidates during Xs phase,
-//                               then 4×uint32[cap] sort keys/vals during sorts
+//   d_storage      (~2-3 GB)  — Xs candidates during Xs phase, then
+//                               3×uint32[cap] sort keys/vals during sorts
+//                               (keys_out + vals ping-pong pair; key input
+//                               ping-pongs against the match output's mi
+//                               column via cub::DoubleBuffer)
 //   d_pair_a       (~1.3 GB)  — T1/T2/T3 match output (reused across phases).
 //                               Sized to the largest match-output: cap·16 B
 //                               for T2 (meta+mi+xbits SoA). Does NOT alias the

@@ -89,12 +89,15 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     total_xs = 1ULL << k;
     cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
 
-    // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR four
-    // cap-sized uint32 key/val arrays during sort. Cast everything to size_t
-    // so std::max's template deduction finds one common type.
+    // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR
+    // three cap-sized uint32 key/val arrays during sort (keys_out +
+    // vals ping-pong pair; the key INPUT stream lives in d_pair_a's mi
+    // column and ping-pongs against keys_out via cub::DoubleBuffer).
+    // Cast everything to size_t so std::max's template deduction finds
+    // one common type.
     storage_bytes = std::max(
         static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
-        static_cast<size_t>(cap) * 4 * sizeof(uint32_t));
+        static_cast<size_t>(cap) * 3 * sizeof(uint32_t));
 
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
@@ -123,17 +126,23 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     });
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
+    // DoubleBuffer overloads: the pipeline ping-pongs the caller's own
+    // key/val buffers, so CUB's scratch drops from ~cap·8 B (~2.1 GB at
+    // k=28 with the pointer overloads, which internally allocate a full
+    // alternate copy) to a few MB — lowering the pool's VRAM floor.
     size_t s_pairs = 0;
-    POOL_CHECK(cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
-        nullptr, s_pairs,
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        static_cast<uint32_t const*>(nullptr), static_cast<uint32_t*>(nullptr),
-        cap, 0, k, nullptr));
+    {
+        cub::DoubleBuffer<uint32_t> dk(nullptr, nullptr);
+        cub::DoubleBuffer<uint32_t> dv(nullptr, nullptr);
+        POOL_CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, s_pairs, dk, dv, cap, 0, k, nullptr));
+    }
     size_t s_keys = 0;
-    POOL_CHECK(cub::DeviceRadixSort::SortKeys<uint64_t>(
-        nullptr, s_keys,
-        static_cast<uint64_t const*>(nullptr), static_cast<uint64_t*>(nullptr),
-        cap, 0, 2 * k, nullptr));
+    {
+        cub::DoubleBuffer<uint64_t> dk64(nullptr, nullptr);
+        POOL_CHECK(cub::DeviceRadixSort::SortKeys(
+            nullptr, s_keys, dk64, cap, 0, 2 * k, nullptr));
+    }
     sort_scratch_bytes = std::max(s_pairs, s_keys);
 
     pinned_bytes = cap * sizeof(uint64_t);

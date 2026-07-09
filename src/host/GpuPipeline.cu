@@ -30,7 +30,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pos2gpu {
@@ -160,14 +162,18 @@ __global__ void gather_u32(uint32_t const* __restrict__ src,
 // when an alloc would push live past the cap), and (c) emit a per-alloc
 // trace under POS2GPU_STREAMING_STATS=1 for manual audits.
 //
-// Pinned host allocations are NOT counted — the cap is specifically for
-// device VRAM, and the pinned D2H staging buffer is host-resident.
+// Pinned host allocations are NOT counted toward the VRAM cap — the cap
+// is specifically for device VRAM, and the pinned D2H staging buffers
+// are host-resident. They ARE tracked (host_ptrs) so the destructor can
+// release them on unwind: pinned memory is locked physical RAM, and a
+// failed plot in a long batch would otherwise leak gigabytes per retry.
 // =====================================================================
 struct StreamingStats {
     size_t cap  = 0;   // 0 = no cap
     size_t live = 0;
     size_t peak = 0;
     std::unordered_map<void*, size_t> sizes;
+    std::unordered_set<void*> host_ptrs;
     bool        verbose = false;
     char const* phase   = "(init)";
 
@@ -176,15 +182,45 @@ struct StreamingStats {
     // succeeded), this dtor runs on unwind and releases the still-live
     // device buffers instead of leaking them across batch iterations.
     // Without this, an 8 GB card hitting OOM at k=28 leaked ~130 GB of
-    // host-side pinned accounting per failed batch retry.
+    // host-side pinned accounting per failed batch retry. Same for the
+    // tracked pinned-host staging buffers.
     ~StreamingStats() {
-        if (sizes.empty()) return;
         for (auto& [ptr, _bytes] : sizes) {
             if (ptr) cudaFree(ptr);
         }
         sizes.clear();
+        for (void* p : host_ptrs) {
+            if (p) cudaFreeHost(p);
+        }
+        host_ptrs.clear();
     }
 };
+
+// Tracked pinned-host allocation helpers. Every pinned buffer local to
+// the streaming pipeline must go through these so StreamingStats'
+// destructor can free it if an exception unwinds past its manual free.
+// Externally-owned buffers (StreamingPinnedScratch, the caller's D2H
+// slot) must NOT be routed through here.
+inline uint32_t* s_alloc_pinned_u32(StreamingStats& s, size_t count)
+{
+    uint32_t* p = streaming_alloc_pinned_uint32(count);
+    if (p) s.host_ptrs.insert(p);
+    return p;
+}
+
+inline uint64_t* s_alloc_pinned_u64(StreamingStats& s, size_t count)
+{
+    uint64_t* p = streaming_alloc_pinned_uint64(count);
+    if (p) s.host_ptrs.insert(p);
+    return p;
+}
+
+inline void s_free_pinned(StreamingStats& s, void* p)
+{
+    if (!p) return;
+    s.host_ptrs.erase(p);
+    cudaFreeHost(p);
+}
 
 inline void s_init_from_env(StreamingStats& s)
 {
@@ -207,6 +243,44 @@ inline std::string s_fmt_bytes(size_t bytes) {
     std::snprintf(buf, sizeof(buf),
                   "%zu bytes (%.2f MB)", bytes, bytes / 1048576.0);
     return std::string(buf);
+}
+
+// Stream-ordered allocator opt-in. The streaming tiers perform dozens
+// of GB-scale cudaMalloc/cudaFree per plot (some inside per-bucket
+// loops); cudaFree implicitly synchronizes the device and large
+// cudaMalloc calls carry driver overhead, repeated every plot of a
+// batch. cudaMallocAsync/cudaFreeAsync with an unbounded release
+// threshold turn these into cheap pool hits after the first plot,
+// while preserving the exact alloc/free choreography (the VRAM-peak
+// accounting above is ours and unaffected). thread_local because each
+// batch worker thread binds its own device. POS2GPU_NO_ASYNC_ALLOC=1
+// forces the plain cudaMalloc path.
+inline bool s_use_async_pool()
+{
+    thread_local bool const enabled = [] {
+        if (char const* v = std::getenv("POS2GPU_NO_ASYNC_ALLOC");
+            v && v[0] == '1') {
+            return false;
+        }
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        int supported = 0;
+        if (cudaDeviceGetAttribute(&supported,
+                                   cudaDevAttrMemoryPoolsSupported,
+                                   dev) != cudaSuccess || !supported) {
+            return false;
+        }
+        // Keep freed blocks cached in the pool across plots instead of
+        // returning them to the OS at every synchronize.
+        cudaMemPool_t pool{};
+        if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+            uint64_t threshold = UINT64_MAX;
+            cudaMemPoolSetAttribute(
+                pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+        }
+        return true;
+    }();
+    return enabled;
 }
 
 template <typename T>
@@ -234,7 +308,9 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             " would exceed cap=" + s_fmt_bytes(s.cap));
     }
     void* p = nullptr;
-    cudaError_t err = cudaMalloc(&p, bytes);
+    cudaError_t err = s_use_async_pool()
+        ? cudaMallocAsync(&p, bytes, /*stream=*/nullptr)
+        : cudaMalloc(&p, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(
             std::string("cudaMalloc(") + reason + "): " + cudaGetErrorString(err) +
@@ -272,8 +348,43 @@ inline void s_free(StreamingStats& s, T*& ptr)
         }
         s.sizes.erase(it);
     }
-    cudaFree(raw);
+    // cudaFree is legal for cudaMallocAsync allocations too (stream-
+    // ordered allocator interop), but cudaFreeAsync avoids the implicit
+    // device synchronization and lets the pool reuse the block without
+    // a round trip to the OS.
+    if (s_use_async_pool()) {
+        cudaFreeAsync(raw, /*stream=*/nullptr);
+    } else {
+        cudaFree(raw);
+    }
     ptr = nullptr;
+}
+
+// Pairwise merge tree over n_tiles sorted runs whose boundaries are
+// tile_ends[0..n_tiles]. Merges within a level cover disjoint output
+// ranges, so they run concurrently — the GPU is idle during these
+// host merges, and at k=28 a level is a full pass over 1-2 GB, so
+// running the first level's N/2 merges in parallel roughly halves the
+// wall time of the tree. merge(left_end, mid_end, right_end) must
+// merge [left, mid) + [mid, right) in a thread-safe way (i.e. only
+// touch scratch at range-local offsets).
+template <typename MergeFn>
+inline void parallel_merge_tree(int n_tiles,
+                                std::vector<uint64_t> const& tile_ends,
+                                MergeFn const& merge)
+{
+    for (int width = 1; width < n_tiles; width *= 2) {
+        std::vector<std::thread> workers;
+        for (int i = 0; i + width < n_tiles; i += 2 * width) {
+            int const left  = i;
+            int const mid   = i + width;
+            int const right = (i + 2 * width <= n_tiles) ? (i + 2 * width) : n_tiles;
+            workers.emplace_back([&, left, mid, right] {
+                merge(tile_ends[left], tile_ends[mid], tile_ends[right]);
+            });
+        }
+        for (auto& t : workers) t.join();
+    }
 }
 
 // Sanity-check t1_count after T1 match. Healthy plots produce ~2^k
@@ -456,8 +567,14 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    int pinned_index)
 {
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    // k=32 is rejected until a 64-bit sort-index path exists: cap =
+    // 2^32 + 2^28 there, so the uint32_t identity/gather index streams
+    // (init_u32_identity, gather_u64/permute) wrap and the gathers read
+    // the wrong entries — no error, silently wrong plot.
+    if (cfg.k < 18 || cfg.k > 30 || (cfg.k & 1) != 0) {
+        throw std::runtime_error(
+            "k must be even in [18, 30] (k=32 exceeds the 32-bit "
+            "sort-index scheme and is not yet supported)");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -528,12 +645,16 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     void*           d_match_temp   = pool.d_sort_scratch;
 
     // Sort key/val arrays alias d_storage. Safe because Xs is fully consumed
-    // by T1 match (stream-synchronised) before we enter T1 sort.
+    // by T1 match (stream-synchronised) before we enter T1 sort. Only three
+    // cap-sized arrays are needed: the key INPUT stream is the match
+    // output's mi column (d_t1_mi / d_t2_mi in d_pair_a), which ping-pongs
+    // against d_keys_out via cub::DoubleBuffer — shrinking d_sort_scratch
+    // from ~cap·8 B (~2.1 GB at k=28) to a few MB and lowering the pool's
+    // VRAM floor accordingly.
     auto     storage_u32 = static_cast<uint32_t*>(pool.d_storage);
-    uint32_t* d_keys_in  = storage_u32 + 0 * cap;
-    uint32_t* d_keys_out = storage_u32 + 1 * cap;
-    uint32_t* d_vals_in  = storage_u32 + 2 * cap;
-    uint32_t* d_vals_out = storage_u32 + 3 * cap;
+    uint32_t* d_keys_out = storage_u32 + 0 * cap;
+    uint32_t* d_vals_in  = storage_u32 + 1 * cap;
+    uint32_t* d_vals_out = storage_u32 + 2 * cap;
 
     // ---- profiling: cudaEvent helpers ----
     struct PhaseTimer {
@@ -619,15 +740,31 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             d_vals_in, t1_count);
         CHECK(cudaGetLastError());
 
+        // DoubleBuffer mode: keys ping-pong between the match output's
+        // mi column and d_keys_out (both dead after this phase's
+        // consumers), cutting the scratch requirement from ~cap·8 B to
+        // a few MB.
+        cub::DoubleBuffer<uint32_t> dk(d_t1_mi, d_keys_out);
+        cub::DoubleBuffer<uint32_t> dv(d_vals_in, d_vals_out);
         size_t sort_bytes = pool.sort_scratch_bytes;
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, sort_bytes,
-            d_t1_mi, d_keys_out, d_vals_in, d_vals_out,
+            dk, dv,
             t1_count, /*begin_bit=*/0, /*end_bit=*/cfg.k, stream));
 
         gather_u64<<<blocks(t1_count), kThreads, 0, stream>>>(
-            d_t1_meta, d_vals_out, d_t1_meta_sorted, t1_count);
+            d_t1_meta, dv.Current(), d_t1_meta_sorted, t1_count);
         CHECK(cudaGetLastError());
+
+        // T2 match writes d_t2_mi into the SAME d_pair_a mi column that
+        // dk's alternate buffer occupies while reading the sorted T1
+        // match_info stream. If the sort left its result there, move it
+        // to d_keys_out so T2 match never reads memory it is writing.
+        if (dk.Current() != d_keys_out) {
+            CHECK(cudaMemcpyAsync(d_keys_out, dk.Current(),
+                                  t1_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToDevice, stream));
+        }
     }
     end_phase(p_t1_sort);
 
@@ -653,6 +790,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     if (t2_count > cap) throw std::runtime_error("T2 overflow");
 
     int p_t2_sort = begin_phase("T2 sort");
+    uint32_t const* d_t2_mi_sorted = d_keys_out;
     {
         // T2 match emitted match_info as a SoA stream (d_t2_mi) — feed
         // it straight into CUB as the sort key input rather than
@@ -662,22 +800,30 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
             d_vals_in, t2_count);
         CHECK(cudaGetLastError());
 
+        cub::DoubleBuffer<uint32_t> dk(d_t2_mi, d_keys_out);
+        cub::DoubleBuffer<uint32_t> dv(d_vals_in, d_vals_out);
         size_t sort_bytes = pool.sort_scratch_bytes;
         CHECK(cub::DeviceRadixSort::SortPairs(
             d_sort_scratch, sort_bytes,
-            d_t2_mi, d_keys_out, d_vals_in, d_vals_out,
+            dk, dv,
             t2_count, 0, cfg.k, stream));
 
         permute_t2<<<blocks(t2_count), kThreads, 0, stream>>>(
-            d_t2_meta, d_t2_xbits, d_vals_out,
+            d_t2_meta, d_t2_xbits, dv.Current(),
             d_t2_meta_sorted, d_t2_xbits_sorted, t2_count);
         CHECK(cudaGetLastError());
+
+        // No copy-back needed here: T3 match only READS the sorted mi
+        // stream, and its d_t3 output occupies d_pair_a's [0, cap·8 B)
+        // meta column — disjoint from the mi column dk's alternate
+        // buffer lives in. Pass whichever buffer holds the result.
+        d_t2_mi_sorted = dk.Current();
     }
     end_phase(p_t2_sort);
 
     // ---------- Phase T3 ----------
-    // d_keys_out now holds the T2 sorted match_info (T1's was overwritten by
-    // the T2 sort above) — pass as the slim stream for binary search in T3.
+    // d_t2_mi_sorted holds the T2 sorted match_info — pass as the slim
+    // stream for binary search in T3.
     auto t3p = make_t3_params(cfg.k, cfg.strength);
     size_t t3_temp_bytes = 0;
     CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
@@ -689,7 +835,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     int p_t3 = begin_phase("T3 match + Feistel");
     CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
-                          d_keys_out, t2_count,
+                          d_t2_mi_sorted, t2_count,
                           d_t3, d_count, cap,
                           d_match_temp, &t3_temp_bytes, stream));
     end_phase(p_t3);
@@ -702,13 +848,18 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // Sort T3 by proof_fragment (low 2k bits). T3PairingGpu is just a
     // uint64_t, so reinterpret the d_pair_a slot directly.
     uint64_t* d_frags_in = reinterpret_cast<uint64_t*>(d_t3);
+    uint64_t const* d_frags_sorted = d_frags_out;
     int p_t3_sort = begin_phase("T3 sort");
     {
+        cub::DoubleBuffer<uint64_t> dfrag(d_frags_in, d_frags_out);
         size_t sort_bytes = pool.sort_scratch_bytes;
         CHECK(cub::DeviceRadixSort::SortKeys(
             d_sort_scratch, sort_bytes,
-            d_frags_in, d_frags_out,
+            dfrag,
             t3_count, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, stream));
+        // Result may land in either buffer; the D2H below copies from
+        // wherever it is.
+        d_frags_sorted = dfrag.Current();
     }
     end_phase(p_t3_sort);
 
@@ -720,7 +871,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     result.t3_count = t3_count;
 
     if (t3_count > 0) {
-        CHECK(cudaMemcpyAsync(h_pinned_t3, d_frags_out,
+        CHECK(cudaMemcpyAsync(h_pinned_t3, d_frags_sorted,
                               sizeof(uint64_t) * t3_count,
                               cudaMemcpyDeviceToHost, stream));
         CHECK(cudaStreamSynchronize(stream));
@@ -861,8 +1012,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     size_t    pinned_capacity,
     StreamingPinnedScratch const& scratch)
 {
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    // See run_gpu_pipeline: k=32 overflows the uint32_t sort-index
+    // streams (cap > UINT32_MAX), so it is rejected until a 64-bit
+    // index path exists.
+    if (cfg.k < 18 || cfg.k > 30 || (cfg.k & 1) != 0) {
+        throw std::runtime_error(
+            "k must be even in [18, 30] (k=32 exceeds the 32-bit "
+            "sort-index scheme and is not yet supported)");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -1052,11 +1208,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             s_free(stats, d_xs_keys_full);
         }
 
-        // Host paired merge — same shape as cut #5.
+        // Host paired merge — same shape as cut #5. Scratch writes are
+        // range-local (offset `left`) so merges within a tree level can
+        // run concurrently via parallel_merge_tree.
         std::vector<uint32_t> tmp_keys(total_xs);
         std::vector<uint32_t> tmp_vals(total_xs);
         auto paired_merge_xs = [&](uint64_t left, uint64_t mid, uint64_t right) {
-            uint64_t i = left, j = mid, k = 0;
+            uint64_t i = left, j = mid, k = left;
             while (i < mid && j < right) {
                 if (h_xs_keys[i] <= h_xs_keys[j]) {
                     tmp_keys[k] = h_xs_keys[i];
@@ -1078,17 +1236,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 tmp_vals[k] = h_xs_vals[j];
                 ++j; ++k;
             }
-            std::memcpy(h_xs_keys + left, tmp_keys.data(), k * sizeof(uint32_t));
-            std::memcpy(h_xs_vals + left, tmp_vals.data(), k * sizeof(uint32_t));
+            std::memcpy(h_xs_keys + left, tmp_keys.data() + left,
+                        (k - left) * sizeof(uint32_t));
+            std::memcpy(h_xs_vals + left, tmp_vals.data() + left,
+                        (k - left) * sizeof(uint32_t));
         };
-        for (int width = 1; width < N_xs; width *= 2) {
-            for (int i = 0; i + width < N_xs; i += 2 * width) {
-                int const left  = i;
-                int const mid   = i + width;
-                int const right = (i + 2 * width <= N_xs) ? (i + 2 * width) : N_xs;
-                paired_merge_xs(tile_ends_xs[left], tile_ends_xs[mid], tile_ends_xs[right]);
-            }
-        }
+        parallel_merge_tree(N_xs, tile_ends_xs, paired_merge_xs);
 
         // Pack (h_xs_keys, h_xs_vals) → d_xs.
         //
@@ -1110,6 +1263,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     "cudaMallocHost(h_xs_pinned) failed: " +
                     std::string(cudaGetErrorString(err)));
             }
+            // Track for unwind-time release like every other pinned
+            // buffer local to this function.
+            stats.host_ptrs.insert(h_xs_pinned);
 
             uint32_t const xs_num_sections = 1u << num_section_bits;
             int      const xs_section_shift = cfg.k - num_section_bits;
@@ -1320,7 +1476,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_t1_mi_stage,   t1_bucket_pair_cap * sizeof(uint32_t), "d_t1_mi_stage");
         s_malloc(stats, d_t1_match_temp, t1_temp_bytes,                          "d_t1_match_temp");
 
-        uint32_t* h_t1_mi = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t1_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t1_mi) throw std::runtime_error("pinned alloc for h_t1_mi failed");
 
         // Iterate (section_l, mk) bucket-pairs. Each pass H2Ds L
@@ -1405,7 +1561,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t1_meta_stage);
         s_free(stats, d_xs_tile);
         // h_xs_pinned consumed.
-        cudaFreeHost(h_xs_pinned);
+        s_free_pinned(stats, h_xs_pinned);
         h_xs_pinned = nullptr;
 
         // Re-hydrate d_t1_mi full-cap for the upcoming T1 sort
@@ -1415,7 +1571,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         CHECK(cudaMemcpyAsync(d_t1_mi, h_t1_mi, t1_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint32(h_t1_mi);
+        s_free_pinned(stats, h_t1_mi);
         // d_t1_meta stays null — h_meta has the unsorted meta, the
         // existing park step below is gated on d_t1_meta and becomes
         // a no-op. Cut #1's gather phase H2Ds h_meta back into d_t1_meta
@@ -1445,7 +1601,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // T2-match compact path). h_meta serves as the meta accumulator
         // directly — its T1 unsorted-meta park lifetime starts here, so
         // the data lands ready for cut #1's gather phase to read.
-        uint32_t* h_t1_mi = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t1_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t1_mi) throw std::runtime_error("pinned alloc for h_t1_mi failed");
 
         CHECK(launch_t1_match_prepare(t1p, d_xs, total_xs, d_counter,
@@ -1497,7 +1653,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               t1_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint32(h_t1_mi);
+        s_free_pinned(stats, h_t1_mi);
         // d_t1_meta stays null — h_meta has the unsorted meta, the
         // existing park step below is gated on d_t1_meta and becomes
         // a no-op. Cut #1's gather phase H2Ds h_meta back into d_t1_meta
@@ -1577,9 +1733,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // scratch.h_keys_merged is the caller-provided pinned buffer; we
         // write bucketed keys directly into it, then overwrite with
         // sorted keys per-bucket.
-        uint64_t* h_part_vals = streaming_alloc_pinned_uint64(cap);
+        uint64_t* h_part_vals = s_alloc_pinned_u64(stats, cap);
         if (!h_part_vals) throw std::runtime_error("pinned alloc h_part_vals failed");
-        uint32_t* h_bucket_starts = streaming_alloc_pinned_uint32(num_buckets + 1);
+        uint32_t* h_bucket_starts = s_alloc_pinned_u32(stats, num_buckets + 1);
         if (!h_bucket_starts) throw std::runtime_error("pinned alloc h_bucket_starts failed");
 
         // Streaming partition: bucketize (d_t1_mi keys, h_meta vals).
@@ -1672,8 +1828,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_bv_in);
         s_free(stats, d_bk_out);
         s_free(stats, d_bk_in);
-        streaming_free_pinned_uint64(h_part_vals);
-        streaming_free_pinned_uint32(h_bucket_starts);
+        s_free_pinned(stats, h_part_vals);
+        s_free_pinned(stats, h_bucket_starts);
 
         // scratch.h_meta and scratch.h_keys_merged now hold sorted
         // (meta, mi) on host pinned. d_t1_merged_vals stays nullptr
@@ -1755,7 +1911,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         std::vector<uint32_t> tmp_keys(t1_count);
         std::vector<uint32_t> tmp_vals(t1_count);
         auto paired_merge_t1 = [&](uint64_t left, uint64_t mid, uint64_t right) {
-            uint64_t i = left, j = mid, k = 0;
+            uint64_t i = left, j = mid, k = left;
             while (i < mid && j < right) {
                 if (scratch.h_keys_merged[i] <= scratch.h_keys_merged[j]) {
                     tmp_keys[k] = scratch.h_keys_merged[i];
@@ -1777,19 +1933,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 tmp_vals[k] = scratch.h_t2_xbits[j];
                 ++j; ++k;
             }
-            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data(),
-                        k * sizeof(uint32_t));
-            std::memcpy(scratch.h_t2_xbits + left, tmp_vals.data(),
-                        k * sizeof(uint32_t));
+            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data() + left,
+                        (k - left) * sizeof(uint32_t));
+            std::memcpy(scratch.h_t2_xbits + left, tmp_vals.data() + left,
+                        (k - left) * sizeof(uint32_t));
         };
-        for (int width = 1; width < N_t1; width *= 2) {
-            for (int i = 0; i + width < N_t1; i += 2 * width) {
-                int const left  = i;
-                int const mid   = i + width;
-                int const right = (i + 2 * width <= N_t1) ? (i + 2 * width) : N_t1;
-                paired_merge_t1(tile_ends_t1[left], tile_ends_t1[mid], tile_ends_t1[right]);
-            }
-        }
+        parallel_merge_tree(N_t1, tile_ends_t1, paired_merge_t1);
 
         s_malloc(stats, d_t1_merged_vals, cap * sizeof(uint32_t), "d_t1_merged_vals");
         CHECK(cudaMemcpyAsync(d_t1_merged_vals, scratch.h_t2_xbits,
@@ -2016,11 +2165,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Allocate separate output buffers. After T2 match completes,
         // copy → scratch.h_meta + scratch.h_t2_xbits so downstream T2
         // sort (Minimal path) sees the expected layout.
-        uint64_t* h_t2_meta = streaming_alloc_pinned_uint64(cap);
+        uint64_t* h_t2_meta = s_alloc_pinned_u64(stats, cap);
         if (!h_t2_meta) throw std::runtime_error("pinned alloc for h_t2_meta_out failed");
-        uint32_t* h_t2_xbits = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t2_xbits = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_xbits) throw std::runtime_error("pinned alloc for h_t2_xbits_out failed");
-        uint32_t* h_t2_mi = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t2_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_mi) throw std::runtime_error("pinned alloc for h_t2_mi failed");
 
         // Phase 1.6d — host-side T2 prepare. scratch.h_keys_merged is
@@ -2196,15 +2345,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // no longer needed).
         std::memcpy(scratch.h_meta,    h_t2_meta,  t2_count * sizeof(uint64_t));
         std::memcpy(scratch.h_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
-        streaming_free_pinned_uint64(h_t2_meta);
-        streaming_free_pinned_uint32(h_t2_xbits);
+        s_free_pinned(stats, h_t2_meta);
+        s_free_pinned(stats, h_t2_xbits);
 
         // Hydrate d_t2_mi for upcoming T2 sort.
         s_malloc(stats, d_t2_mi, cap * sizeof(uint32_t), "d_t2_mi");
         CHECK(cudaMemcpyAsync(d_t2_mi, h_t2_mi, t2_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint32(h_t2_mi);
+        s_free_pinned(stats, h_t2_mi);
         // d_t1_meta_sorted was never allocated in Tiny; d_t1_keys_merged
         // was never allocated either. No free needed.
     } else if (t2_compact_path) {
@@ -2253,7 +2402,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // after hydrating into d_t2_mi before T2 sort.
         uint64_t* const h_t2_meta  = scratch.h_meta;
         uint32_t* const h_t2_xbits = scratch.h_t2_xbits;
-        uint32_t* h_t2_mi = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t2_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_mi) throw std::runtime_error("pinned alloc for h_t2_mi failed");
 
         CHECK(launch_t2_match_prepare(cfg.plot_id.data(), t2p,
@@ -2323,7 +2472,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               t2_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint32(h_t2_mi);
+        s_free_pinned(stats, h_t2_mi);
     } else if (!tiny_t2_match) {
         // Plain streaming: single-pass full-cap match. Unchanged behavior.
         s_malloc(stats, d_t2_meta,       cap * sizeof(uint64_t), "d_t2_meta");
@@ -2383,7 +2532,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         size_t const num_buckets_t2 = size_t{1} << num_top_bits_t2;
 
         // Pre-compute global_idx [0..t2_count) on host pinned.
-        uint32_t* h_global_idx_in = streaming_alloc_pinned_uint32(t2_count);
+        uint32_t* h_global_idx_in = s_alloc_pinned_u32(stats, t2_count);
         if (!h_global_idx_in) throw std::runtime_error("pinned alloc h_global_idx failed");
         for (uint64_t i = 0; i < t2_count; ++i) {
             h_global_idx_in[i] = static_cast<uint32_t>(i);
@@ -2393,11 +2542,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // bucketed-keys arena (T1's sorted mi parked there is no
         // longer needed after Tiny T2 match's host prepare consumed
         // it). h_part_meta + h_part_global_idx need fresh pinned.
-        uint64_t* h_part_meta = streaming_alloc_pinned_uint64(cap);
+        uint64_t* h_part_meta = s_alloc_pinned_u64(stats, cap);
         if (!h_part_meta) throw std::runtime_error("pinned alloc h_part_meta failed");
-        uint32_t* h_part_global_idx = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_part_global_idx = s_alloc_pinned_u32(stats, cap);
         if (!h_part_global_idx) throw std::runtime_error("pinned alloc h_part_global_idx failed");
-        uint32_t* h_bucket_starts_t2s = streaming_alloc_pinned_uint32(num_buckets_t2 + 1);
+        uint32_t* h_bucket_starts_t2s = s_alloc_pinned_u32(stats, num_buckets_t2 + 1);
         if (!h_bucket_starts_t2s) throw std::runtime_error("pinned alloc h_bucket_starts_t2s failed");
 
         // Triple-val partition with global_idx as val2.
@@ -2428,7 +2577,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         d_t2_mi = nullptr;
 
         // global_idx input array no longer needed (carried through partition).
-        streaming_free_pinned_uint32(h_global_idx_in);
+        s_free_pinned(stats, h_global_idx_in);
 
         // Find max bucket size.
         uint32_t max_bucket_t2s = 0;
@@ -2470,7 +2619,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // global position, so in-place writes to scratch.h_t2_xbits
         // would clobber data still needed by later buckets. Memcpy
         // back to scratch.h_t2_xbits at end.
-        uint32_t* h_t2_xbits_sorted_out = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t2_xbits_sorted_out = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_xbits_sorted_out) throw std::runtime_error("pinned alloc h_t2_xbits_sorted_out failed");
 
         std::vector<uint64_t> h_packed_bucket(max_bucket_t2s);
@@ -2527,9 +2676,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_bv_meta_in);
         s_free(stats, d_bk_packed_out);
         s_free(stats, d_bk_packed_in);
-        streaming_free_pinned_uint64(h_part_meta);
-        streaming_free_pinned_uint32(h_part_global_idx);
-        streaming_free_pinned_uint32(h_bucket_starts_t2s);
+        s_free_pinned(stats, h_part_meta);
+        s_free_pinned(stats, h_part_global_idx);
+        s_free_pinned(stats, h_bucket_starts_t2s);
 
         // Copy sorted xbits back to scratch.h_t2_xbits. After this
         // point, scratch.h_meta + scratch.h_keys_merged + scratch.h_t2_xbits
@@ -2538,7 +2687,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // reads from these.
         std::memcpy(scratch.h_t2_xbits, h_t2_xbits_sorted_out,
                     t2_count * sizeof(uint32_t));
-        streaming_free_pinned_uint32(h_t2_xbits_sorted_out);
+        s_free_pinned(stats, h_t2_xbits_sorted_out);
 
         // Tiny T2 sort done. Skip the rest of the T2 sort phase
         // (tiled_t2_sort + Minimal gather Cut #2) via the
@@ -2624,7 +2773,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // h_keys_merged IS reusable as the keys accumulator: T1's
         // parked sorted-mi was already consumed by T2 match's
         // rehydrate, so by T2 sort entry it's dead.
-        uint32_t* h_t2_sort_vals = streaming_alloc_pinned_uint32(cap);
+        uint32_t* h_t2_sort_vals = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_sort_vals) {
             throw std::runtime_error("pinned alloc for h_t2_sort_vals failed");
         }
@@ -2668,7 +2817,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         std::vector<uint32_t> tmp_keys(t2_count);
         std::vector<uint32_t> tmp_vals(t2_count);
         auto paired_merge_t2 = [&](uint64_t left, uint64_t mid, uint64_t right) {
-            uint64_t i = left, j = mid, k = 0;
+            uint64_t i = left, j = mid, k = left;
             while (i < mid && j < right) {
                 if (scratch.h_keys_merged[i] <= scratch.h_keys_merged[j]) {
                     tmp_keys[k] = scratch.h_keys_merged[i];
@@ -2690,26 +2839,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 tmp_vals[k] = h_t2_sort_vals[j];
                 ++j; ++k;
             }
-            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data(),
-                        k * sizeof(uint32_t));
-            std::memcpy(h_t2_sort_vals + left, tmp_vals.data(),
-                        k * sizeof(uint32_t));
+            std::memcpy(scratch.h_keys_merged + left, tmp_keys.data() + left,
+                        (k - left) * sizeof(uint32_t));
+            std::memcpy(h_t2_sort_vals + left, tmp_vals.data() + left,
+                        (k - left) * sizeof(uint32_t));
         };
-        for (int width = 1; width < N_t2; width *= 2) {
-            for (int i = 0; i + width < N_t2; i += 2 * width) {
-                int const left  = i;
-                int const mid   = i + width;
-                int const right = (i + 2 * width <= N_t2) ? (i + 2 * width) : N_t2;
-                paired_merge_t2(tile_ends_t2[left], tile_ends_t2[mid], tile_ends_t2[right]);
-            }
-        }
+        parallel_merge_tree(N_t2, tile_ends_t2, paired_merge_t2);
 
         s_malloc(stats, d_merged_vals, cap * sizeof(uint32_t), "d_merged_vals");
         CHECK(cudaMemcpyAsync(d_merged_vals, h_t2_sort_vals,
                               t2_count * sizeof(uint32_t),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint32(h_t2_sort_vals);
+        s_free_pinned(stats, h_t2_sort_vals);
         // d_t2_keys_merged stays null — h_keys_merged has the sorted
         // T2 mi stream. Existing T3-match rehydrate reads h_keys_merged.
     } else if (!scratch.tiny_mode) {
@@ -2997,7 +3139,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // re-applied here after #50 (T3 sort streaming) shifted T3
         // match to the new floor.
         T3PairingGpu* d_t3_stage = reinterpret_cast<T3PairingGpu*>(
-            streaming_alloc_pinned_uint64(t3_bucket_pair_cap));
+            s_alloc_pinned_u64(stats, t3_bucket_pair_cap));
         if (!d_t3_stage) throw std::runtime_error("pinned alloc d_t3_stage failed");
 
         // Phase 1.6d (T3) — host-side prepare offsets over
@@ -3064,7 +3206,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Per-plot T3 accumulator on host pinned. h_meta is in use as
         // T2 meta input source across the loop, so we need a separate
         // accumulator.
-        uint64_t* h_t3_acc_raw = streaming_alloc_pinned_uint64(cap);
+        uint64_t* h_t3_acc_raw = s_alloc_pinned_u64(stats, cap);
         if (!h_t3_acc_raw) throw std::runtime_error("pinned alloc for h_t3_acc failed");
         T3PairingGpu* const h_t3_acc = reinterpret_cast<T3PairingGpu*>(h_t3_acc_raw);
 
@@ -3181,7 +3323,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         s_free(stats, d_t3_match_temp);
         // d_t3_stage is host-pinned (not device); free via cudaFreeHost.
-        streaming_free_pinned_uint64(reinterpret_cast<uint64_t*>(d_t3_stage));
+        s_free_pinned(stats, d_t3_stage);
 
         // d_t2_xbits_sorted may be still alive from the (Tiny-mode) T2
         // sort gather hydration above. Free it now (T3 match doesn't
@@ -3199,7 +3341,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // pinned slot that downstream Tiny T3 sort tile-sort reads
         // from + merges in place. d_t3 stays nullptr.
         std::memcpy(scratch.h_meta, h_t3_acc, t3_count * sizeof(T3PairingGpu));
-        streaming_free_pinned_uint64(h_t3_acc_raw);
+        s_free_pinned(stats, h_t3_acc_raw);
         // d_t3 left null — Tiny T3 sort branch below uses scratch.h_meta
         // as input. Downstream T3 sort phase detects via scratch.tiny_mode.
     } else if (t3_input_slice_path) {
@@ -3253,7 +3395,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // meta input source across the per-section_l loop and can't double
         // as the accumulator. Mirror the per-plot h_t2_mi pattern in
         // the T2-match compact path. Sized cap × T3PairingGpu (= cap × u64).
-        uint64_t* h_t3_acc_raw = streaming_alloc_pinned_uint64(cap);
+        uint64_t* h_t3_acc_raw = s_alloc_pinned_u64(stats, cap);
         if (!h_t3_acc_raw) {
             throw std::runtime_error("pinned alloc for h_t3_acc failed");
         }
@@ -3366,7 +3508,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               t3_count * sizeof(T3PairingGpu),
                               cudaMemcpyHostToDevice, stream));
         CHECK(cudaStreamSynchronize(stream));
-        streaming_free_pinned_uint64(h_t3_acc_raw);
+        s_free_pinned(stats, h_t3_acc_raw);
     } else if (t3_stage_path) {
         // Compact/minimal-streaming T3 staging. The four T3-match input
         // buffers (d_t2_meta_sorted 2080 MB + d_t2_xbits_sorted 1040 MB
@@ -3560,17 +3702,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // runs. T3PairingGpu is u64; CUB SortKeys is unstable but
         // determines a unique order for distinct u64 fragments (which
         // Feistel guarantees), so the merge produces a canonical
-        // sorted sequence identical to the full-array sort.
-        for (int width = 1; width < kNumT3TilesTiny; width *= 2) {
-            for (int i = 0; i + width < kNumT3TilesTiny; i += 2 * width) {
-                int const left  = i;
-                int const mid   = i + width;
-                int const right = (i + 2 * width <= kNumT3TilesTiny) ? (i + 2 * width) : kNumT3TilesTiny;
-                std::inplace_merge(scratch.h_meta + tile_ends_tiny[left],
-                                   scratch.h_meta + tile_ends_tiny[mid],
-                                   scratch.h_meta + tile_ends_tiny[right]);
-            }
-        }
+        // sorted sequence identical to the full-array sort. Each tree
+        // level's merges cover disjoint ranges and run concurrently.
+        parallel_merge_tree(
+            kNumT3TilesTiny, tile_ends_tiny,
+            [&](uint64_t left, uint64_t mid, uint64_t right) {
+                std::inplace_merge(scratch.h_meta + left,
+                                   scratch.h_meta + mid,
+                                   scratch.h_meta + right);
+            });
 
         // d_frags_out aliases scratch.h_meta. D2H phase below detects
         // d_frags_out_on_host=true and emits via std::memcpy.
@@ -3651,25 +3791,23 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_sort_scratch);
 
         // Host-side N-way merge over scratch.h_meta. For N=4 this is
-        // three sequential in-place merges:
+        // three in-place merges:
         //   1. merge runs 0+1 → [tile_ends[0], tile_ends[2])
-        //   2. merge runs 2+3 → [tile_ends[2], tile_ends[N])
+        //   2. merge runs 2+3 → [tile_ends[2], tile_ends[N])   (runs
+        //      concurrently with 1 — disjoint ranges)
         //   3. merge halves    → [tile_ends[0], tile_ends[N])
         // Generalises to any power-of-2 N via repeated halving. CUB's
         // SortKeys is stable; std::inplace_merge is stable; sources
         // come in ascending tile-index order so equal keys preserve
         // their original (pre-sort) position the same way a single-
         // shot CUB sort would. Result is byte-identical to non-tiled.
-        for (int width = 1; width < N_t3; width *= 2) {
-            for (int i = 0; i + width < N_t3; i += 2 * width) {
-                int const left  = i;
-                int const mid   = i + width;
-                int const right = (i + 2 * width <= N_t3) ? (i + 2 * width) : N_t3;
-                std::inplace_merge(scratch.h_meta + tile_ends[left],
-                                   scratch.h_meta + tile_ends[mid],
-                                   scratch.h_meta + tile_ends[right]);
-            }
-        }
+        parallel_merge_tree(
+            N_t3, tile_ends,
+            [&](uint64_t left, uint64_t mid, uint64_t right) {
+                std::inplace_merge(scratch.h_meta + left,
+                                   scratch.h_meta + mid,
+                                   scratch.h_meta + right);
+            });
 
         if (scratch.tiny_mode) {
             // Tiny: skip the d_frags_out re-hydrate. scratch.h_meta
@@ -3766,8 +3904,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             result.external_fragments_ptr   = pinned_dst;
             result.external_fragments_count = t3_count;
         } else {
-            uint64_t* h_pinned = nullptr;
-            CHECK(cudaMallocHost(&h_pinned, sizeof(uint64_t) * t3_count));
+            uint64_t* h_pinned = s_alloc_pinned_u64(stats, t3_count);
+            if (!h_pinned) {
+                throw std::runtime_error("pinned alloc for final D2H failed");
+            }
             CHECK(cudaMemcpyAsync(h_pinned, d_frags_out,
                                   sizeof(uint64_t) * t3_count,
                                   cudaMemcpyDeviceToHost, stream));
@@ -3775,7 +3915,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             result.t3_fragments_storage.resize(t3_count);
             std::memcpy(result.t3_fragments_storage.data(), h_pinned,
                         sizeof(uint64_t) * t3_count);
-            CHECK(cudaFreeHost(h_pinned));
+            s_free_pinned(stats, h_pinned);
         }
     }
 
