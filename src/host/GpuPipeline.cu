@@ -859,6 +859,15 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     uint64_t* d_frags_in = reinterpret_cast<uint64_t*>(d_t3);
     if (pool.overlap_d2h && pool.d_frags_dedicated) {
         d_frags_out = static_cast<uint64_t*>(pool.d_frags_dedicated);
+        // The previous plot's D2H may still be reading the dedicated
+        // buffer on the copy stream; the sort below writes into it on
+        // its first radix pass. Wait on e_d2h_done (no-op for the first
+        // plot / when the prior plot had t3_count == 0) so the
+        // write-after-read is ordered. This only narrows the overlap
+        // from this plot's T3 sort onward — the Xs/T1/T2 overlap that
+        // provides the win is untouched.
+        CHECK(cudaStreamWaitEvent(
+            stream, static_cast<cudaEvent_t>(pool.e_d2h_done), 0));
     }
     uint64_t const* d_frags_sorted = d_frags_out;
     int p_t3_sort = begin_phase("T3 sort");
