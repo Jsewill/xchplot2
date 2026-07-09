@@ -1468,22 +1468,115 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             if (sub_pair > max_pair) max_pair = sub_pair;
         }
 
-        XsCandidateGpu* d_xs_tile = nullptr;
-        uint64_t* d_t1_meta_stage = nullptr;
-        uint32_t* d_t1_mi_stage   = nullptr;
-        s_malloc(stats, d_xs_tile, max_pair * sizeof(XsCandidateGpu), "d_xs_tile_pinned");
-        s_malloc(stats, d_t1_meta_stage, t1_bucket_pair_cap * sizeof(uint64_t), "d_t1_meta_stage");
-        s_malloc(stats, d_t1_mi_stage,   t1_bucket_pair_cap * sizeof(uint32_t), "d_t1_mi_stage");
-        s_malloc(stats, d_t1_match_temp, t1_temp_bytes,                          "d_t1_match_temp");
+        // Double-buffer: ping-pong two staging sets across two streams so
+        // pass N+1's H2D overlaps pass N's kernel. Measured on RTX 4090
+        // tiny k=28 as a regression (33.78 vs 31.35 s/plot) — default OFF.
+        // Opt in with POS2GPU_TINY_OVERLAP=1; POS2GPU_NO_TINY_OVERLAP=1
+        // forces the single-stream path even if the opt-in is set.
+        bool const tiny_overlap = [] {
+            if (char const* v = std::getenv("POS2GPU_NO_TINY_OVERLAP");
+                v && v[0] == '1') {
+                return false;
+            }
+            char const* v = std::getenv("POS2GPU_TINY_OVERLAP");
+            return v && v[0] == '1';
+        }();
+        int const nsets = tiny_overlap ? 2 : 1;
+
+        XsCandidateGpu* d_xs_tile[2]          = {nullptr, nullptr};
+        uint64_t*       d_t1_meta_stage[2]    = {nullptr, nullptr};
+        uint32_t*       d_t1_mi_stage[2]      = {nullptr, nullptr};
+        void*           d_t1_match_temp_bb[2] = {nullptr, nullptr};
+        uint64_t*       d_pass_counter[2]     = {nullptr, nullptr};
+        for (int s = 0; s < nsets; ++s) {
+            s_malloc(stats, d_xs_tile[s],
+                     max_pair * sizeof(XsCandidateGpu), "d_xs_tile_pinned");
+            s_malloc(stats, d_t1_meta_stage[s],
+                     t1_bucket_pair_cap * sizeof(uint64_t), "d_t1_meta_stage");
+            s_malloc(stats, d_t1_mi_stage[s],
+                     t1_bucket_pair_cap * sizeof(uint32_t), "d_t1_mi_stage");
+            s_malloc(stats, d_t1_match_temp_bb[s],
+                     t1_temp_bytes, "d_t1_match_temp");
+            s_malloc(stats, d_pass_counter[s],
+                     sizeof(uint64_t), "d_t1_pass_counter");
+        }
+        d_t1_match_temp = d_t1_match_temp_bb[0];
 
         uint32_t* h_t1_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t1_mi) throw std::runtime_error("pinned alloc for h_t1_mi failed");
 
-        // Iterate (section_l, mk) bucket-pairs. Each pass H2Ds L
-        // (full section_l) + R (one bucket of section_r) into
-        // d_xs_tile, runs prepare on the tile, runs match for the
-        // single bucket_id, then D2Hs the staging output.
+        uint64_t* h_pass_counts = s_alloc_pinned_u64(stats, size_t(nsets));
+        if (!h_pass_counts)
+            throw std::runtime_error("pinned alloc for h_pass_counts failed");
+        for (int s = 0; s < nsets; ++s) h_pass_counts[s] = 0;
+
+        cudaStream_t pass_streams[2] = {stream, stream};
+        cudaEvent_t  ev_kernel[2]    = {nullptr, nullptr};
+        cudaEvent_t  ev_d2h[2]       = {nullptr, nullptr};
+        if (tiny_overlap) {
+            CHECK(cudaStreamCreateWithFlags(&pass_streams[0], cudaStreamNonBlocking));
+            CHECK(cudaStreamCreateWithFlags(&pass_streams[1], cudaStreamNonBlocking));
+            for (int s = 0; s < 2; ++s) {
+                CHECK(cudaEventCreateWithFlags(&ev_kernel[s], cudaEventDisableTiming));
+                CHECK(cudaEventCreateWithFlags(&ev_d2h[s], cudaEventDisableTiming));
+                CHECK(cudaEventRecord(ev_d2h[s], pass_streams[s])); // initially free
+            }
+        }
+
+        struct PassMeta {
+            uint32_t section_l = 0;
+            uint32_t mk = 0;
+            bool     kernel_pending = false; // counter D2H issued, sized D2H not yet
+            bool     d2h_pending = false;
+        };
+        PassMeta slot_meta[2]{};
         uint64_t host_offset = 0;
+
+        // Complete sized D2H for a slot whose kernel+counter already finished.
+        auto issue_sized_d2h = [&](int slot) {
+            if (!slot_meta[slot].kernel_pending) return;
+            if (tiny_overlap) {
+                CHECK(cudaEventSynchronize(ev_kernel[slot]));
+            }
+            uint64_t const pass_count = h_pass_counts[slot];
+            if (pass_count > t1_bucket_pair_cap) {
+                throw std::runtime_error(
+                    "T1 match (Tiny sub-section) section_l=" +
+                    std::to_string(slot_meta[slot].section_l) +
+                    " mk=" + std::to_string(slot_meta[slot].mk) +
+                    " produced " + std::to_string(pass_count) +
+                    " pairs, staging holds " + std::to_string(t1_bucket_pair_cap));
+            }
+            if (host_offset + pass_count > cap)
+                throw std::runtime_error("T1 overflow during tiny match");
+            cudaStream_t const s = pass_streams[slot];
+            CHECK(cudaMemcpyAsync(scratch.h_meta + host_offset,
+                                  d_t1_meta_stage[slot],
+                                  pass_count * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, s));
+            CHECK(cudaMemcpyAsync(h_t1_mi + host_offset, d_t1_mi_stage[slot],
+                                  pass_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost, s));
+            if (tiny_overlap) {
+                CHECK(cudaEventRecord(ev_d2h[slot], s));
+            } else {
+                CHECK(cudaStreamSynchronize(s));
+            }
+            host_offset += pass_count;
+            slot_meta[slot].kernel_pending = false;
+            slot_meta[slot].d2h_pending = tiny_overlap;
+        };
+
+        auto wait_slot_free = [&](int slot) {
+            // Finish any deferred sized D2H, then wait for it to land.
+            issue_sized_d2h(slot);
+            if (slot_meta[slot].d2h_pending) {
+                CHECK(cudaEventSynchronize(ev_d2h[slot]));
+                slot_meta[slot].d2h_pending = false;
+            }
+        };
+
+        uint32_t pass_idx = 0;
         for (uint32_t section_l = 0; section_l < num_sections; ++section_l) {
             uint32_t const section_r = matching_section(section_l);
             uint64_t const l_off = h_xs_section_starts[section_l];
@@ -1499,67 +1592,83 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 uint32_t const bucket_begin = section_l * num_match_keys + mk;
                 uint32_t const bucket_end   = bucket_begin + 1;
 
-                // Sorted-bucket layout: smaller section first (kernel's
-                // bucket-offset binary search demands monotone bucket-id
-                // ordering across the tile).
+                int const slot = int(pass_idx % uint32_t(nsets));
+                cudaStream_t const s = pass_streams[slot];
+
+                // Free this slot (may issue/wait prior D2H). The OTHER
+                // slot's kernel keeps running — that is the overlap.
+                wait_slot_free(slot);
+                if (tiny_overlap) {
+                    CHECK(cudaStreamWaitEvent(s, ev_d2h[slot], 0));
+                }
+
                 if (section_l < section_r) {
-                    CHECK(cudaMemcpyAsync(d_xs_tile, h_xs_pinned + l_off,
+                    CHECK(cudaMemcpyAsync(d_xs_tile[slot], h_xs_pinned + l_off,
                                           l_n * sizeof(XsCandidateGpu),
-                                          cudaMemcpyHostToDevice, stream));
-                    CHECK(cudaMemcpyAsync(d_xs_tile + l_n,
+                                          cudaMemcpyHostToDevice, s));
+                    CHECK(cudaMemcpyAsync(d_xs_tile[slot] + l_n,
                                           h_xs_pinned + r_buck_abs_off,
                                           r_buck_n * sizeof(XsCandidateGpu),
-                                          cudaMemcpyHostToDevice, stream));
+                                          cudaMemcpyHostToDevice, s));
                 } else {
-                    CHECK(cudaMemcpyAsync(d_xs_tile, h_xs_pinned + r_buck_abs_off,
+                    CHECK(cudaMemcpyAsync(d_xs_tile[slot], h_xs_pinned + r_buck_abs_off,
                                           r_buck_n * sizeof(XsCandidateGpu),
-                                          cudaMemcpyHostToDevice, stream));
-                    CHECK(cudaMemcpyAsync(d_xs_tile + r_buck_n,
+                                          cudaMemcpyHostToDevice, s));
+                    CHECK(cudaMemcpyAsync(d_xs_tile[slot] + r_buck_n,
                                           h_xs_pinned + l_off,
                                           l_n * sizeof(XsCandidateGpu),
-                                          cudaMemcpyHostToDevice, stream));
+                                          cudaMemcpyHostToDevice, s));
                 }
-                CHECK(cudaStreamSynchronize(stream));
+                if (!tiny_overlap) CHECK(cudaStreamSynchronize(s));
 
-                CHECK(launch_t1_match_prepare(t1p, d_xs_tile, total_for_pass,
-                                              d_counter, d_t1_match_temp,
-                                              &t1_temp_bytes, stream));
-                CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
-
+                CHECK(launch_t1_match_prepare(t1p, d_xs_tile[slot], total_for_pass,
+                                              d_pass_counter[slot],
+                                              d_t1_match_temp_bb[slot],
+                                              &t1_temp_bytes, s));
+                CHECK(cudaMemsetAsync(d_pass_counter[slot], 0, sizeof(uint64_t), s));
                 CHECK(launch_t1_match_range(
-                    cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
-                    d_t1_meta_stage, d_t1_mi_stage, d_counter, t1_bucket_pair_cap,
-                    d_t1_match_temp, bucket_begin, bucket_end, stream));
-
-                uint64_t pass_count = 0;
-                CHECK(cudaMemcpyAsync(&pass_count, d_counter, sizeof(uint64_t),
-                                      cudaMemcpyDeviceToHost, stream));
-                CHECK(cudaStreamSynchronize(stream));
-                if (pass_count > t1_bucket_pair_cap) {
-                    throw std::runtime_error(
-                        "T1 match (Tiny sub-section) section_l=" +
-                        std::to_string(section_l) + " mk=" + std::to_string(mk) +
-                        " produced " + std::to_string(pass_count) +
-                        " pairs, staging holds " + std::to_string(t1_bucket_pair_cap));
+                    cfg.plot_id.data(), t1p, d_xs_tile[slot], total_for_pass,
+                    d_t1_meta_stage[slot], d_t1_mi_stage[slot],
+                    d_pass_counter[slot], t1_bucket_pair_cap,
+                    d_t1_match_temp_bb[slot], bucket_begin, bucket_end, s));
+                CHECK(cudaMemcpyAsync(&h_pass_counts[slot], d_pass_counter[slot],
+                                      sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, s));
+                if (tiny_overlap) {
+                    CHECK(cudaEventRecord(ev_kernel[slot], s));
+                } else {
+                    CHECK(cudaStreamSynchronize(s));
                 }
-                CHECK(cudaMemcpyAsync(scratch.h_meta + host_offset, d_t1_meta_stage,
-                                      pass_count * sizeof(uint64_t),
-                                      cudaMemcpyDeviceToHost, stream));
-                CHECK(cudaMemcpyAsync(h_t1_mi + host_offset, d_t1_mi_stage,
-                                      pass_count * sizeof(uint32_t),
-                                      cudaMemcpyDeviceToHost, stream));
-                CHECK(cudaStreamSynchronize(stream));
-                host_offset += pass_count;
+                slot_meta[slot] = {section_l, mk, true, false};
+                if (!tiny_overlap) {
+                    issue_sized_d2h(slot);
+                }
+                ++pass_idx;
             }
         }
+        wait_slot_free(0);
+        if (nsets > 1) wait_slot_free(1);
+
         t1_count = host_offset;
         if (t1_count > cap) throw std::runtime_error("T1 overflow");
         validate_t1_count(t1_count, cfg.k);
 
-        s_free(stats, d_t1_match_temp);
-        s_free(stats, d_t1_mi_stage);
-        s_free(stats, d_t1_meta_stage);
-        s_free(stats, d_xs_tile);
+        if (tiny_overlap) {
+            for (int s = 0; s < 2; ++s) {
+                CHECK(cudaEventDestroy(ev_kernel[s]));
+                CHECK(cudaEventDestroy(ev_d2h[s]));
+                CHECK(cudaStreamDestroy(pass_streams[s]));
+            }
+        }
+        for (int s = 0; s < nsets; ++s) {
+            s_free(stats, d_pass_counter[s]);
+            s_free(stats, d_t1_match_temp_bb[s]);
+            s_free(stats, d_t1_mi_stage[s]);
+            s_free(stats, d_t1_meta_stage[s]);
+            s_free(stats, d_xs_tile[s]);
+        }
+        s_free_pinned(stats, h_pass_counts);
+        d_t1_match_temp = nullptr;
         // h_xs_pinned consumed.
         s_free_pinned(stats, h_xs_pinned);
         h_xs_pinned = nullptr;
