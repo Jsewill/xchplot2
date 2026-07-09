@@ -48,7 +48,10 @@ __global__ void bench_tt_4table(AesState const* __restrict__ in,
     AesHashKeys keys;
     keys.round_key_1 = key_pairs[(tid / 32) * 2 + 0];
     keys.round_key_2 = key_pairs[(tid / 32) * 2 + 1];
-    out[tid] = pos2gpu::run_rounds_smem(in[tid], keys, rounds, sT);
+    // Explicit ttable4 (not the dispatching run_rounds_smem): this kernel
+    // is the 4-table baseline and its 4 KB buffer must never take the
+    // Tezcan path under XCHPLOT2_AES_ROUND=tezcan16.
+    out[tid] = pos2gpu::run_rounds_smem_ttable4(in[tid], keys, rounds, sT);
 }
 
 // ----- Tezcan: single T0 + __byte_perm, BANK_SIZE replicas -----

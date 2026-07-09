@@ -35,8 +35,8 @@ __global__ void gen_kernel(
     int k,
     uint32_t xor_const)
 {
-    __shared__ uint32_t sT[4 * 256];
-    load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
 
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
@@ -61,8 +61,8 @@ __global__ void gen_kernel_range(
     int k,
     uint32_t xor_const)
 {
-    __shared__ uint32_t sT[4 * 256];
-    load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
 
     uint64_t local_idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;

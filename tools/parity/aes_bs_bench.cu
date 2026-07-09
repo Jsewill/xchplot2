@@ -68,7 +68,9 @@ __global__ void bench_tt_run_rounds_smem(AesState const* __restrict__ in,
     pos2gpu::AesHashKeys keys;
     keys.round_key_1 = key_pairs[(tid / 32) * 2 + 0];
     keys.round_key_2 = key_pairs[(tid / 32) * 2 + 1];
-    out[tid] = pos2gpu::run_rounds_smem(in[tid], keys, rounds, sT);
+    // Explicit ttable4: keeps the baseline semantics (and the 4 KB buffer
+    // in bounds) even under XCHPLOT2_AES_ROUND=tezcan16.
+    out[tid] = pos2gpu::run_rounds_smem_ttable4(in[tid], keys, rounds, sT);
 }
 
 } // namespace

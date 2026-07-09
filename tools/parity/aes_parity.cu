@@ -99,12 +99,18 @@ __global__ void mt_kernel(
 // Inventory of hot-kernel entry points: g_x_smem (Xs), pairing_smem +
 // matching_target_smem (T1/T2/T3). chain_smem is unused by those kernels
 // but covered here so a future caller cannot silently diverge.
+//
+// The *_ttable4_kernel entry points call the DISPATCHING wrappers
+// (g_x_smem etc.), so their smem must use the config macros: under
+// XCHPLOT2_AES_ROUND=tezcan16 the wrappers take the Tezcan path and a
+// hard-coded 4 KB buffer would be read out of bounds. In default builds
+// they exercise ttable4 exactly as the name says.
 
 __global__ void g_x_smem_ttable4_kernel(
     pos2gpu::AesHashKeys keys, uint32_t* out, uint64_t total, int k)
 {
-    __shared__ uint32_t sT[4 * 256];
-    pos2gpu::load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= total) return;
@@ -127,8 +133,8 @@ __global__ void g_x_smem_tezcan_kernel(
 __global__ void pairing_smem_ttable4_kernel(
     pos2gpu::AesHashKeys keys, PairingIn const* in, PairingOut* out, uint64_t total)
 {
-    __shared__ uint32_t sT[4 * 256];
-    pos2gpu::load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= total) return;
@@ -154,8 +160,8 @@ __global__ void pairing_smem_tezcan_kernel(
 __global__ void mt_smem_ttable4_kernel(
     pos2gpu::AesHashKeys keys, MtIn const* in, uint32_t* out, uint64_t total)
 {
-    __shared__ uint32_t sT[4 * 256];
-    pos2gpu::load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= total) return;
@@ -179,8 +185,8 @@ __global__ void mt_smem_tezcan_kernel(
 __global__ void chain_smem_ttable4_kernel(
     pos2gpu::AesHashKeys keys, uint64_t const* in, uint64_t* out, uint64_t total)
 {
-    __shared__ uint32_t sT[4 * 256];
-    pos2gpu::load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
     uint64_t idx = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
     if (idx >= total) return;

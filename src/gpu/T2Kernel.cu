@@ -133,8 +133,8 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets(
     uint64_t out_capacity,
     uint32_t bucket_begin)
 {
-    __shared__ uint32_t sT[4 * 256];
-    load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
 
     uint32_t bucket_id   = bucket_begin + blockIdx.y;
@@ -248,8 +248,8 @@ __global__ __launch_bounds__(256, 4) void match_all_buckets_split(
     uint64_t out_capacity,
     uint32_t bucket_begin)
 {
-    __shared__ uint32_t sT[4 * 256];
-    load_aes_tables_smem(sT);
+    XCHPLOT2_AES_SMEM_DECL(sT);
+    XCHPLOT2_AES_SMEM_LOAD(sT);
     __syncthreads();
 
     uint32_t bucket_id   = bucket_begin + blockIdx.y;
