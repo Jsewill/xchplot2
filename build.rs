@@ -8,8 +8,9 @@
 // compiler, and a Rust toolchain — the last one cargo provides).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// Ask `nvidia-smi` for the local GPU's compute capability and return it as
 /// a CMake-style integer (e.g. "89" for an sm_89 RTX 4090, "120" for an
@@ -110,26 +111,105 @@ fn usable_nvidia_arch() -> Option<String> {
     Some(arch)
 }
 
-/// Check whether nvcc is on $PATH and runnable. Used as the fall-back
-/// signal for XCHPLOT2_BUILD_CUDA when no GPU is enumerable (headless
-/// CI / container builds). Runs `nvcc --version` rather than a simple
-/// PATH lookup so stale symlinks don't pass.
+/// Canonical CUDA Toolkit install prefixes — the same roots that
+/// scripts/install-deps.sh and CMakeLists.txt already probe:
+///   /opt/cuda        Arch / CachyOS / Manjaro (pacman `cuda`)
+///   /usr/local/cuda  NVIDIA's .run and .deb installers, NGC / RunPod
+///                    images, `cuda-toolkit-X-Y` — usually a symlink to a
+///                    versioned /usr/local/cuda-X.Y sibling, which we also
+///                    scan (newest first) in case the symlink is absent.
+fn cuda_prefixes() -> Vec<PathBuf> {
+    let mut prefixes = vec![
+        PathBuf::from("/opt/cuda"),
+        PathBuf::from("/usr/local/cuda"),
+    ];
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        let mut versioned: Vec<(u32, u32, PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?.to_string();
+                let ver = name.strip_prefix("cuda-")?;
+                let mut parts = ver.split('.');
+                let major: u32 = parts.next()?.parse().ok()?;
+                let minor: u32 = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+                Some((major, minor, p))
+            })
+            .collect();
+        // Sort on the parsed version, newest first. Sorting the strings would
+        // rank cuda-9.2 above cuda-12.8, and since this list is the last-resort
+        // probe that would silently select an ancient toolkit on a host with no
+        // /usr/local/cuda symlink — trading a clean "no nvcc" error for a
+        // cryptic C++20 failure deep inside nvcc.
+        versioned.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        prefixes.extend(versioned.into_iter().map(|(_, _, path)| path));
+    }
+    prefixes
+}
+
+/// True when this path is an nvcc that actually executes. Runs
+/// `nvcc --version` rather than testing the exec bit so a stale symlink
+/// or a wrong-arch binary doesn't pass.
+fn nvcc_runs(nvcc: &Path) -> bool {
+    nvcc.is_file()
+        && Command::new(nvcc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
+/// Resolve nvcc to an absolute, runnable path.
+///
+/// Probe order: $CUDAToolkit_ROOT / $CUDA_PATH / $CUDA_HOME (an explicit
+/// override wins) → $PATH → the canonical install prefixes. The env vars
+/// deliberately outrank PATH: that is CMake's own CUDAToolkit precedence,
+/// and it is how a user picks between several installed toolkits when a
+/// stale nvcc also sits on PATH.
+///
+/// The last step is the one that earns its keep. Distro packages do not all
+/// leave nvcc on a default PATH: Arch's `cuda` installs it to /opt/cuda/bin
+/// and front-loads PATH from /etc/profile.d/cuda.sh — which calls
+/// append_path(), a helper defined in /etc/profile, so it only fires in a
+/// *login* shell. The shell that just ran install-deps.sh therefore cannot
+/// see nvcc, and a PATH-only probe concludes "no CUDA Toolkit" on a box that
+/// demonstrably has one — failing the build with an error telling the user
+/// to install what they just installed.
+fn find_nvcc() -> Option<&'static Path> {
+    static NVCC: OnceLock<Option<PathBuf>> = OnceLock::new();
+    NVCC.get_or_init(|| {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for var in ["CUDAToolkit_ROOT", "CUDA_PATH", "CUDA_HOME"] {
+            if let Ok(root) = env::var(var) {
+                if !root.is_empty() {
+                    candidates.push(PathBuf::from(root).join("bin").join("nvcc"));
+                }
+            }
+        }
+        if let Ok(path) = env::var("PATH") {
+            candidates.extend(env::split_paths(&path).map(|dir| dir.join("nvcc")));
+        }
+        candidates.extend(cuda_prefixes().iter().map(|p| p.join("bin").join("nvcc")));
+        candidates.into_iter().find(|c| nvcc_runs(c))
+    })
+    .as_deref()
+}
+
+/// Whether a usable nvcc exists anywhere find_nvcc() looks. Also the
+/// fall-back signal for XCHPLOT2_BUILD_CUDA when no GPU is enumerable
+/// (headless CI / container builds).
 fn detect_nvcc() -> bool {
-    Command::new("nvcc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    find_nvcc().is_some()
 }
 
 /// Parse nvcc's major version from `nvcc --version` output.
 /// The release line looks like:
 ///   "Cuda compilation tools, release 13.0, V13.0.48"
-/// Returns None if nvcc isn't on PATH or the line can't be parsed —
+/// Returns None if no nvcc is reachable or the line can't be parsed —
 /// callers treat that as "skip the version-vs-arch compat check"
 /// rather than blocking the build.
 fn detect_nvcc_major() -> Option<u32> {
-    let out = Command::new("nvcc").arg("--version").output().ok()?;
+    let out = Command::new(find_nvcc()?).arg("--version").output().ok()?;
     if !out.status.success() { return None; }
     let s = std::str::from_utf8(&out.stdout).ok()?;
     for line in s.lines() {
@@ -154,7 +234,7 @@ fn detect_nvcc_major() -> Option<u32> {
 /// flag, or the output can't be parsed — callers then skip the ceiling
 /// check and let cmake try, preserving prior behaviour.
 fn nvcc_supported_arches() -> Option<Vec<u32>> {
-    let out = Command::new("nvcc").arg("--list-gpu-arch").output().ok()?;
+    let out = Command::new(find_nvcc()?).arg("--list-gpu-arch").output().ok()?;
     if !out.status.success() { return None; }
     let s = std::str::from_utf8(&out.stdout).ok()?;
     let v: Vec<u32> = s.lines()
@@ -460,7 +540,13 @@ fn preflight(build_cuda_on: bool) -> Vec<String> {
         missing.push("ld.lld (apt: lld-18, dnf/pacman: lld) — required by AdaptiveCpp's FetchContent build".into());
     }
     if build_cuda_on && !detect_nvcc() {
-        missing.push("nvcc (CUDA Toolkit 12+) — XCHPLOT2_BUILD_CUDA=ON requested but no nvcc on PATH".into());
+        missing.push(
+            "nvcc (CUDA Toolkit 12+) — XCHPLOT2_BUILD_CUDA=ON requested, but no runnable \
+             nvcc on $PATH, under $CUDA_PATH / $CUDA_HOME, or in /opt/cuda or /usr/local/cuda*.\n    \
+             If the toolkit IS installed somewhere else, point us at it:\n      \
+             export CUDA_PATH=/path/to/cuda    # the dir holding bin/nvcc"
+                .into(),
+        );
     }
     missing
 }
@@ -704,7 +790,8 @@ fn main() {
     }
 
     // ---- configure ----
-    let status = Command::new("cmake")
+    let mut configure = Command::new("cmake");
+    configure
         .args([
             "-S", manifest_dir.to_str().unwrap(),
             "-B", cmake_build.to_str().unwrap(),
@@ -712,7 +799,25 @@ fn main() {
         ])
         .arg(format!("-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"))
         .arg(format!("-DACPP_TARGETS={acpp_targets}"))
-        .arg(format!("-DXCHPLOT2_BUILD_CUDA={build_cuda}"))
+        .arg(format!("-DXCHPLOT2_BUILD_CUDA={build_cuda}"));
+
+    // Hand CMake the exact nvcc preflight just validated. enable_language(CUDA)
+    // otherwise runs CMake's own toolkit search, which covers $CUDAToolkit_ROOT,
+    // $CUDA_PATH, $PATH and /usr/local/cuda — but NOT /opt/cuda, where Arch puts
+    // it. Without this, a host whose toolkit we version-checked seconds earlier
+    // still fails configure with "Failed to find nvcc. Please set the
+    // CUDAToolkit_ROOT variable." Passing it explicitly also removes any skew
+    // between the nvcc we checked and the one CMake would have picked.
+    if build_cuda == "ON" {
+        if let Some(nvcc) = find_nvcc() {
+            configure.arg(format!("-DCMAKE_CUDA_COMPILER={}", nvcc.display()));
+            if let Some(root) = nvcc.parent().and_then(|bin| bin.parent()) {
+                configure.arg(format!("-DCUDAToolkit_ROOT={}", root.display()));
+            }
+        }
+    }
+
+    let status = configure
         .status()
         .expect("failed to invoke cmake — is it installed?");
     if !status.success() {
@@ -999,34 +1104,14 @@ fn main() {
     }
 }
 
-/// Locate nvcc on PATH (or under $CUDA_PATH/bin, $CUDA_HOME/bin) and
-/// return the canonical (symlink-resolved) parent-of-bin directory.
-/// That dir is the toolkit root whose lib subdirs hold the
-/// libcudart_static.a that matches what nvcc compiled the .o against.
+/// The canonical (symlink-resolved) toolkit root of the nvcc find_nvcc()
+/// resolved — i.e. the parent of its bin/ dir. That root's lib subdirs hold
+/// the libcudart_static.a matching what nvcc compiled the .o against.
 ///
 /// Returns None if no nvcc is reachable — caller falls back to the
 /// legacy /opt/cuda / /usr/local/cuda probe.
 fn nvcc_canonical_toolkit_root() -> Option<String> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    for var in &["CUDA_PATH", "CUDA_HOME"] {
-        if let Ok(p) = env::var(var) {
-            candidates.push(std::path::PathBuf::from(p).join("bin").join("nvcc"));
-        }
-    }
-    if let Ok(path) = env::var("PATH") {
-        for dir in env::split_paths(&path) {
-            candidates.push(dir.join("nvcc"));
-        }
-    }
-    for cand in candidates {
-        if !cand.is_file() { continue; }
-        let real = match std::fs::canonicalize(&cand) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if let Some(toolkit) = real.parent().and_then(|bin| bin.parent()) {
-            return toolkit.to_str().map(String::from);
-        }
-    }
-    None
+    let real = std::fs::canonicalize(find_nvcc()?).ok()?;
+    let toolkit = real.parent().and_then(|bin| bin.parent())?;
+    toolkit.to_str().map(String::from)
 }

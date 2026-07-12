@@ -190,23 +190,6 @@ install_apt() {
     esac
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
-
-    # Front-load /usr/local/cuda/bin on PATH for non-login shells (e.g.
-    # `ssh host "cmd"` build invocations) so nvcc is found without the
-    # caller having to source ~/.bashrc. NVIDIA's official install
-    # documentation tells users to do this themselves; doing it here
-    # makes the post-install build "just work" on container/CI hosts.
-    if [[ "$GPU" == "nvidia" ]] && [[ -x /usr/local/cuda/bin/nvcc ]] \
-       && [[ ! -f /etc/profile.d/cuda.sh ]]; then
-        # The single quotes below are intentional: we want the *file* to
-        # contain a literal $PATH that expands when each new shell sources
-        # /etc/profile.d, not the script-author's PATH baked in at install
-        # time. shellcheck flags this as SC2016 — silence it on the next line.
-        echo "[install-deps] Writing /etc/profile.d/cuda.sh (PATH front-load /usr/local/cuda/bin)"
-        # shellcheck disable=SC2016
-        echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh >/dev/null
-        sudo chmod +x /etc/profile.d/cuda.sh
-    fi
 }
 
 install_dnf() {
@@ -247,6 +230,54 @@ case "$DISTRO" in
         esac
         ;;
 esac
+
+# ── Put nvcc on PATH ────────────────────────────────────────────────────────
+# Distro packages disagree on where nvcc lands and whether it is on PATH:
+#   Arch     /opt/cuda/bin       — reaches PATH only via /etc/profile.d/cuda.sh,
+#                                  which calls append_path(), a helper defined in
+#                                  /etc/profile. That makes it a *login*-shell
+#                                  hook: the shell running this script never
+#                                  sees it.
+#   deb/NGC  /usr/local/cuda/bin — not on PATH by default at all.
+# Either way the shell the user is sitting in cannot see nvcc when we finish, so
+# the `cargo install --path .` we print below would fail its nvcc preflight on a
+# box that just successfully installed the toolkit. Export it for the rest of
+# this script, and make it stick for future shells.
+CUDA_ROOT=""
+if [[ "$GPU" == "nvidia" ]]; then
+    for cand in "${ACPP_CUDA_TOOLKIT_ROOT:-}" /opt/cuda /usr/local/cuda /usr/local/cuda-*; do
+        [[ -n "$cand" ]] || continue
+        if [[ -x "$cand/bin/nvcc" ]]; then
+            CUDA_ROOT="$cand"
+            break
+        fi
+    done
+    if [[ -n "$CUDA_ROOT" ]]; then
+        export CUDA_PATH="$CUDA_ROOT"
+        export PATH="$CUDA_ROOT/bin:$PATH"
+        # `|| true`: set -o pipefail would abort the script if a broken nvcc
+        # exits nonzero here, and a missing version string is not fatal.
+        nvcc_release=$("$CUDA_ROOT/bin/nvcc" --version 2>/dev/null \
+                       | sed -n 's/.*release \([0-9.]*\).*/\1/p' || true)
+        echo "[install-deps] nvcc ${nvcc_release:-?} at $CUDA_ROOT/bin/nvcc"
+        # Only write our own snippet when the distro didn't ship one — Arch's
+        # cuda package already provides /etc/profile.d/cuda.sh (and sets
+        # NVCC_CCBIN there); clobbering it would be rude and lossy.
+        if [[ ! -f /etc/profile.d/cuda.sh ]] && [[ ! -f /etc/profile.d/xchplot2-cuda.sh ]]; then
+            echo "[install-deps] Writing /etc/profile.d/xchplot2-cuda.sh (PATH front-load $CUDA_ROOT/bin)"
+            # Single quotes on $PATH are intentional: the *file* must contain a
+            # literal $PATH that expands per-shell, not this script's PATH baked
+            # in at install time. shellcheck flags that as SC2016.
+            # shellcheck disable=SC2016
+            printf 'export CUDA_PATH=%s\nexport PATH=%s/bin:$PATH\n' "$CUDA_ROOT" "$CUDA_ROOT" \
+                | sudo tee /etc/profile.d/xchplot2-cuda.sh >/dev/null
+            sudo chmod +x /etc/profile.d/xchplot2-cuda.sh
+        fi
+    else
+        echo "[install-deps] WARNING: packages installed but no nvcc under /opt/cuda" >&2
+        echo "[install-deps] or /usr/local/cuda* — the CUDA build will not work." >&2
+    fi
+fi
 
 # ── Rust toolchain via rustup ───────────────────────────────────────────────
 if ! command -v cargo >/dev/null; then
@@ -379,6 +410,11 @@ case "$GPU" in
         # where CUDA lives under /usr/local/cuda-X.Y rather than
         # /opt/cuda). Caller can still override via ACPP_CUDA_TOOLKIT_
         # ROOT for non-standard installs.
+        # The PATH step above already resolved a toolkit root — reuse it so
+        # AdaptiveCpp and the xchplot2 build agree on which nvcc they target.
+        if [[ -z "${ACPP_CUDA_TOOLKIT_ROOT:-}" ]] && [[ -n "${CUDA_ROOT:-}" ]]; then
+            ACPP_CUDA_TOOLKIT_ROOT="$CUDA_ROOT"
+        fi
         if [[ -z "${ACPP_CUDA_TOOLKIT_ROOT:-}" ]]; then
             for cand in /opt/cuda /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-13 /usr/local/cuda-12.9 /usr/local/cuda-12.8; do
                 if [[ -x "$cand/bin/nvcc" ]]; then
@@ -419,31 +455,44 @@ echo "[install-deps] Done."
 echo "  AdaptiveCpp: $ACPP_PREFIX"
 echo "  Build xchplot2:"
 echo "    export CMAKE_PREFIX_PATH=$ACPP_PREFIX:\$CMAKE_PREFIX_PATH"
+if [[ -n "${CUDA_ROOT:-}" ]]; then
+    echo "    export PATH=$CUDA_ROOT/bin:\$PATH        # nvcc (new login shells get this on their own)"
+fi
 echo "    cargo install --path .                  # or:"
 echo "    cmake -B build -S . && cmake --build build -j"
 
-# Tell users about the nvcc/host-compiler dance when the system gcc is
-# newer than what the installed nvcc supports. nvcc 12.8's default ccbin
-# (/usr/bin/cc → system gcc) chokes on gcc 15+'s libstdc++ <type_traits>.
-# Two ccbins work around it: (a) the side-by-side gcc-14 we install when
-# pinning cuda 12.8 from the Arch archive (cleanest — nvcc's canonical
-# Linux host), or (b) the clang we picked for AdaptiveCpp's build (works
-# for the simple compiler-id test, but on some cuda 12.x point releases
-# crt/math_functions.hpp's rsqrt definition trips clang's exception-spec
-# check). Print whichever is available so non-Arch hosts (where g++-14
-# isn't auto-installed) still get a usable hint.
-if [[ "$GPU" == "nvidia" ]] && command -v gcc >/dev/null; then
-    sys_gcc_major=$(gcc -dumpversion 2>/dev/null | grep -oE '^[0-9]+')
-    if [[ -n "$sys_gcc_major" ]] && (( sys_gcc_major > 14 )); then
+# Warn about the nvcc/host-compiler mismatch ONLY when it actually bites.
+# nvcc pins a maximum supported GCC in crt/host_config.h and refuses to
+# compile against anything newer — but the ceiling moves every point release
+# (CUDA 12.8 → gcc 14, 13.x → gcc 15+), so a hardcoded "your gcc is too new"
+# note is a false alarm as often as not. Probe instead: compile a trivial .cu
+# with nvcc's default ccbin and only speak up if it genuinely fails. Note the
+# probe deliberately runs with whatever NVCC_CCBIN this shell has, which is
+# exactly what the real build will see.
+if [[ "$GPU" == "nvidia" ]] && [[ -n "${CUDA_ROOT:-}" ]]; then
+    # Cleaned up inline, NOT via `trap ... EXIT` — an EXIT trap here would
+    # silently replace the one guarding $ACPP_BUILD_DIR above and leak a
+    # multi-GB AdaptiveCpp build tree.
+    probe_dir=$(mktemp -d -t xchplot2-ccbin-XXXXXX)
+    printf '#include <type_traits>\n__global__ void k(){}\nint main(){return 0;}\n' \
+        > "$probe_dir/probe.cu"
+    if ! "$CUDA_ROOT/bin/nvcc" -c "$probe_dir/probe.cu" -o "$probe_dir/probe.o" \
+         >/dev/null 2>&1; then
+        sys_gcc_major=$(gcc -dumpversion 2>/dev/null | grep -oE '^[0-9]+' || true)
         echo
-        echo "[install-deps] Note: system gcc is $sys_gcc_major; nvcc 12.8's default host"
-        echo "[install-deps] compiler can't parse its libstdc++ headers. Use one of these"
-        echo "[install-deps] as nvcc's ccbin via CMAKE_CUDA_HOST_COMPILER:"
-        if command -v g++-14 >/dev/null; then
-            echo "    -DCMAKE_CUDA_HOST_COMPILER=$(command -v g++-14)   # preferred — nvcc's canonical Linux host"
-        fi
-        if [[ -n "${LLVM_ROOT:-}" ]] && [[ -x "$LLVM_ROOT/bin/clang++" ]]; then
-            echo "    -DCMAKE_CUDA_HOST_COMPILER=$LLVM_ROOT/bin/clang++   # works on most cuda 12.x point releases"
-        fi
+        echo "[install-deps] Note: nvcc ${nvcc_release:-?} rejects its default host compiler"
+        echo "[install-deps] (system gcc ${sys_gcc_major:-?} is newer than this toolkit supports)."
+        echo "[install-deps] Pass an older ccbin — first of these that works:"
+        for ccbin in /usr/bin/g++-15 /usr/bin/g++-14 /usr/bin/g++-13 \
+                     "${LLVM_ROOT:-/nonexistent}/bin/clang++"; do
+            [[ -x "$ccbin" ]] || continue
+            if "$CUDA_ROOT/bin/nvcc" -ccbin "$ccbin" -c "$probe_dir/probe.cu" \
+               -o "$probe_dir/probe.o" >/dev/null 2>&1; then
+                echo "    export NVCC_CCBIN=$ccbin                 # picked up by cargo + cmake"
+                echo "    # or, for a direct cmake build:  -DCMAKE_CUDA_HOST_COMPILER=$ccbin"
+                break
+            fi
+        done
     fi
+    rm -rf "$probe_dir"
 fi
