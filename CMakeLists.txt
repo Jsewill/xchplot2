@@ -136,6 +136,26 @@ if(_xchplot2_nvcc)
         set(CMAKE_CUDA_ARCHITECTURES "${_max_supported}-virtual")
     endif()
 endif()
+# Hand project(LANGUAGES ... CUDA) the nvcc the find_program above located.
+# CMake's built-in toolkit search covers CUDAToolkit_ROOT / CUDA_PATH / $PATH /
+# /usr/local/cuda — but NOT /opt/cuda, where Arch's `cuda` package installs it,
+# and which only reaches PATH via /etc/profile.d/cuda.sh (a login-shell-only
+# hook). Without this, configure dies with "Failed to find nvcc. Please set the
+# CUDAToolkit_ROOT variable" on a host whose toolkit we found, ran, and
+# version-checked seconds earlier. Must precede project() — that is what
+# enables the CUDA language.
+if(_xchplot2_nvcc AND NOT DEFINED CMAKE_CUDA_COMPILER)
+    get_filename_component(_xchplot2_nvcc_bin  "${_xchplot2_nvcc}" DIRECTORY)
+    get_filename_component(_xchplot2_nvcc_root "${_xchplot2_nvcc_bin}" DIRECTORY)
+    set(CMAKE_CUDA_COMPILER "${_xchplot2_nvcc}"
+        CACHE FILEPATH "nvcc located by xchplot2")
+    if(NOT DEFINED CUDAToolkit_ROOT)
+        set(CUDAToolkit_ROOT "${_xchplot2_nvcc_root}"
+            CACHE PATH "CUDA toolkit root located by xchplot2")
+    endif()
+    message(STATUS "xchplot2: nvcc ${_xchplot2_nvcc} "
+                   "(CUDAToolkit_ROOT=${_xchplot2_nvcc_root})")
+endif()
 unset(_xchplot2_nvcc CACHE)
 
 project(pos2-gpu VERSION 0.8.0 LANGUAGES C CXX CUDA)
