@@ -181,25 +181,26 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // GPU driver/context state, sort scratch, AES T-tables, and other small
     // runtime allocations.
     //
-    // SYCL has no portable free-memory query, so slice 17c approximates
-    // free_b == total_b. The actual sycl::malloc_device call will throw if
-    // VRAM is exhausted; the diagnostic message is just less precise about
-    // how much of the total is already consumed by other processes.
+    // Uses query_device_memory(), which on the NVIDIA path asks the driver via
+    // cudaMemGetInfo. This gate used to approximate free_b == total_b ("SYCL
+    // has no portable free-memory query"), which meant it compared the pool's
+    // size against the card's *total* VRAM and ignored the CUDA context, the
+    // display server, and every other process on the device — so it waved cards
+    // into the pool path that could not hold it. It also meant
+    // POS2GPU_MAX_VRAM_MB, the knob for rehearsing a smaller card, had no
+    // effect here at all.
     {
         size_t const required_device =
             storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
-        // Margin covers per-context driver state + AES T-tables + the
-        // tiny (sizeof(uint64_t)) d_counter alloc that's not counted in
-        // sort_scratch. Originally 512 MB (slice 17c); trimmed to 256 MB
-        // after measuring actual runtime overhead on gfx1031/ROCm 6.2
-        // and sm_89/CUDA 13: both land under 150 MB of non-pool device
-        // allocations, so a 256 MB margin leaves >100 MB headroom while
-        // letting cards on the threshold (e.g. 12 GiB reporting ~11.8
-        // GiB free at ctor time) now succeed into the pool path.
-        size_t const margin = 256ULL * 1024 * 1024; // 256 MB
-        size_t const total_b =
-            q.get_device().get_info<sycl::info::device::global_mem_size>();
-        size_t const free_b = total_b;  // approximation — see comment above
+        // Margin covers per-context driver state + AES T-tables + the tiny
+        // (sizeof(uint64_t)) d_counter alloc that's not counted in
+        // sort_scratch. Shares kVramSafetyMargin with the streaming picker —
+        // the two used to disagree (256 here, 128 there), and both were under
+        // the ~390 MiB the CUDA context actually costs.
+        size_t const margin = kVramSafetyMargin;
+        DeviceMemInfo const mem = query_device_memory();
+        size_t const total_b = mem.total_bytes;
+        size_t const free_b  = mem.free_bytes;
         if (free_b < required_device + margin) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
             InsufficientVramError e(
@@ -210,7 +211,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                 " GiB + ~0.25 GiB runtime), only " +
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
-                " GiB total. Use a smaller k or a GPU with more VRAM.");
+                " GiB total. Falling back to the streaming pipeline.");
             e.required_bytes = required_device + margin;
             e.free_bytes     = free_b;
             e.total_bytes    = total_b;
@@ -219,13 +220,12 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     }
 
     if (getenv("POS2GPU_POOL_DEBUG")) {
-        size_t const total_b =
-            q.get_device().get_info<sycl::info::device::global_mem_size>();
+        DeviceMemInfo const dbg_mem = query_device_memory();
         std::fprintf(stderr,
             "[pool] k=%d strength=%d cap=%llu total_xs=%llu "
-            "total=%.2fGB (free unavailable in SYCL build)\n",
+            "total=%.2fGB free=%.2fGB\n",
             k, strength, (unsigned long long)cap, (unsigned long long)total_xs,
-            total_b/1e9);
+            dbg_mem.total_bytes/1e9, dbg_mem.free_bytes/1e9);
         std::fprintf(stderr,
             "[pool] sizes: storage=%.2fGB pair_a=%.2fGB pair_b=%.2fGB "
             "xs_temp(alias→pair_b)=%.2fGB sort_scratch=%.2fGB pinned=%.2fGB\n",
@@ -320,19 +320,66 @@ GpuBufferPool::~GpuBufferPool()
     }
 }
 
+#ifdef XCHPLOT2_HAVE_CUB
+// Defined in DeviceMemCuda.cu. XCHPLOT2_HAVE_CUB is set exactly when the
+// nvcc-compiled TUs (POS2_GPU_CUDA_SRC) are linked, which is the condition we
+// need here: "is the CUDA runtime available to call".
+bool cuda_query_device_memory(int device_ordinal,
+                              std::size_t& free_bytes,
+                              std::size_t& total_bytes);
+#endif
+
+bool device_memory_probe(int device_ordinal,
+                         size_t& free_bytes,
+                         size_t& total_bytes)
+{
+#ifdef XCHPLOT2_HAVE_CUB
+    std::size_t f = 0;
+    std::size_t t = 0;
+    if (!cuda_query_device_memory(device_ordinal < 0 ? 0 : device_ordinal,
+                                  f, t)) {
+        return false;
+    }
+    free_bytes  = f;
+    total_bytes = t;
+    return true;
+#else
+    (void)device_ordinal;
+    (void)free_bytes;
+    (void)total_bytes;
+    return false;
+#endif
+}
+
 DeviceMemInfo query_device_memory()
 {
     sycl::queue& q = sycl_backend::queue();
     DeviceMemInfo info;
     info.total_bytes =
         q.get_device().get_info<sycl::info::device::global_mem_size>();
-    // SYCL has no portable free-memory query; AdaptiveCpp's
-    // global_mem_size returns the device total. On the CUDA backend
-    // the underlying driver often subtracts active reservations
-    // (framebuffer, compositor) before reporting, which gets us
-    // closer to "free" in practice. Treat the result as an upper
-    // bound; sycl::malloc_device is still the source of truth.
+    // Fallback: SYCL has no portable free-memory query and AdaptiveCpp exposes
+    // none, so absent the driver probe below all we have is the device total.
+    // Treat it as an upper bound; sycl::malloc_device remains the source of
+    // truth.
     info.free_bytes = info.total_bytes;
+
+    // Real free-memory query on the NVIDIA path. Without it free_bytes is just
+    // the device total, so the tier picker sizes against memory the CUDA
+    // context (~390 MB), the display server, and every other process on the
+    // card have already taken — and hands out a tier that cannot fit. This is
+    // what the file-header note refers to: the pool used to call cudaMemGetInfo
+    // directly, and the call was dropped, not replaced, when GpuBufferPool.cu
+    // became GpuBufferPool.cpp and the CUDA runtime became unavailable in a
+    // SYCL-only TU.
+    {
+        size_t f = 0;
+        size_t t = 0;
+        int const ord = sycl_backend::current_device_id();
+        if (device_memory_probe(ord, f, t)) {
+            info.free_bytes  = f;
+            info.total_bytes = t;
+        }
+    }
 
     if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
         size_t const cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
@@ -439,10 +486,16 @@ size_t streaming_plain_peak_bytes(int k)
 
 size_t streaming_minimal_peak_bytes(int k)
 {
-    // Anchor: 3760 MB at k=28 (measured 3754 MB on sm_89 + the
-    // streaming-stats trace; rounded up for safety). Bottleneck is T3
-    // match where d_t2_keys_merged + d_t2_xbits_sorted + meta-l/r
-    // slices + d_t3_stage are co-resident.
+    // Anchor: 3900 MB at k=28 (streaming-stats trace reads 3884 MB on sm_89;
+    // rounded up for safety). Bottleneck is T3 match where d_t2_keys_merged +
+    // d_t2_xbits_sorted + meta-l/r slices + d_t3_stage are co-resident.
+    //
+    // Was 3760, from a 3754 MB trace taken when the anchor was first set. The
+    // tracked peak has since drifted up to 3884 MB and the anchor was never
+    // re-measured, so minimal had been quietly over its own budget by ~124 MB
+    // independent of the two-phase scratch bug. See the warning on the
+    // streaming_*_peak_bytes block in GpuBufferPool.hpp about calibrating
+    // against the s_malloc trace.
     //
     // Minimal layers cumulative cuts on top of compact:
     //   1. N=8 T2 match staging (cap/8 ≈ 570 MB vs compact's cap/2).
@@ -458,10 +511,10 @@ size_t streaming_minimal_peak_bytes(int k)
     //      USM-host accumulators; pack tiled with D2H per tile.
     //
     // Cumulative effect at k=28: peak drops from 5200 MB (compact) →
-    // 3754 MB (minimal). Trade-off: ~6 extra cap-sized PCIe round-
+    // 3884 MB (minimal). Trade-off: ~6 extra cap-sized PCIe round-
     // trips per plot (~2.5× wall on NVIDIA — 13 s/plot → 34 s/plot
     // at k=28). Same k-scaling as compact / plain.
-    constexpr size_t anchor_mb = 3760;
+    constexpr size_t anchor_mb = 3900;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

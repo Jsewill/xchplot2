@@ -379,6 +379,83 @@ namespace {
 // a slow CPU worker handles only what it can finish in the same wall.
 // When null (single-device path), the worker iterates 0..entries.size()-1
 // in order — original behaviour.
+namespace {
+
+// Polls the driver's own free-VRAM counter for the life of a batch slice and
+// records the low-water mark, giving us the peak device memory the process
+// ACTUALLY held — as opposed to what the s_malloc trace believes it held.
+//
+// This exists because the tier peak models are calibrated against that trace,
+// and the trace cannot see a raw sycl::malloc_device by construction. A
+// 3128 MiB T2/T3 candidate scratch therefore shipped completely invisible to
+// every model in the ladder: the picker told a 7.6 GB Tesla P4 that minimal
+// needed 3.67 GiB when it really needed 7.74, and the card OOM'd on every tier
+// but tiny. No amount of care with s_malloc would have caught that. Watching
+// the number the driver reports is the only check that cannot be fooled by an
+// allocation someone forgot to account for.
+//
+// Caveat: on a GPU shared with another process, that process allocating
+// mid-run inflates our measured peak. The check is therefore fatal only under
+// POS2GPU_ASSERT_VRAM=1 (which `bench` sets, being a controlled measurement)
+// and merely loud elsewhere.
+class VramWatchdog {
+public:
+    explicit VramWatchdog(int ordinal) : ordinal_(ordinal)
+    {
+        size_t f = 0;
+        size_t t = 0;
+        if (!device_memory_probe(ordinal_, f, t)) return;  // unsupported → inert
+        baseline_free_ = f;
+        min_free_.store(f, std::memory_order_relaxed);
+        started_ = true;
+        th_ = std::thread([this] {
+            while (!stop_.load(std::memory_order_relaxed)) {
+                size_t f = 0;
+                size_t t = 0;
+                if (device_memory_probe(ordinal_, f, t)) {
+                    size_t cur = min_free_.load(std::memory_order_relaxed);
+                    while (f < cur &&
+                           !min_free_.compare_exchange_weak(
+                               cur, f, std::memory_order_relaxed)) {
+                        // cur is reloaded by compare_exchange_weak
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+    }
+    ~VramWatchdog() { stop(); }
+
+    VramWatchdog(VramWatchdog const&)            = delete;
+    VramWatchdog& operator=(VramWatchdog const&) = delete;
+
+    void stop()
+    {
+        if (!started_) return;
+        stop_.store(true, std::memory_order_relaxed);
+        if (th_.joinable()) th_.join();
+        started_ = false;
+    }
+
+    bool     available() const { return baseline_free_ > 0; }
+    uint64_t baseline()  const { return baseline_free_; }
+    uint64_t peak() const
+    {
+        size_t const lo = min_free_.load(std::memory_order_relaxed);
+        return (baseline_free_ > lo) ? (baseline_free_ - lo) : 0;
+    }
+
+private:
+    int                 ordinal_;
+    std::atomic<bool>   stop_{false};
+    std::atomic<size_t> min_free_{0};
+    size_t              baseline_free_ = 0;
+    bool                started_       = false;
+    std::thread         th_;
+};
+
+} // namespace
+
 BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             BatchOptions const& opts,
                             int                 device_id,
@@ -509,6 +586,27 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // VRAM and is still overlapped via the Channel between the producer
     // thread's streaming call and the consumer thread's FSE compression
     // + plot-file write.
+    // Device bytes the T2/T3 two-phase match may spend on its candidate
+    // scratch, granted below once we know which path (pool or streaming tier)
+    // we are on. See SyclBackend.hpp for what this is guarding against.
+    uint64_t twophase_budget_bytes = 0;
+
+    // Modelled device footprint of whichever path we end up on — the tier's
+    // peak for streaming, the pool's full sizing for the pool path. The VRAM
+    // watchdog checks the real peak against this, plus the scratch we granted,
+    // plus the margin.
+    uint64_t declared_base_bytes = 0;
+
+    // Start sampling BEFORE anything is allocated, so the baseline is genuinely
+    // "free VRAM before we touched the card" and the peak covers the pool
+    // allocation itself.
+    VramWatchdog vram(device_id);
+
+    // Free VRAM before we allocate anything. Both grants below are computed
+    // against this, never against free-after-allocation — see the note in the
+    // pool branch about d_pair_a being allocated lazily.
+    DeviceMemInfo const mem_before_pool = query_device_memory();
+
     std::unique_ptr<GpuBufferPool> pool_ptr;
     // Streaming-fallback pinned buffers — double-buffered the same way the
     // pool does, so producer's D2H of plot N+1 can run concurrently with
@@ -573,6 +671,22 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         }
         pool_ptr = std::make_unique<GpuBufferPool>(
             pool_k, pool_strength, pool_testnet);
+
+        // The pool's full device footprint — the same sum its own VRAM gate
+        // checks. Note this is NOT what is resident right now: d_pair_a
+        // (4.36 GB at k=28) is allocated lazily on first use, so querying free
+        // VRAM straight after the constructor overstates the headroom by more
+        // than 4 GB. Grant the two-phase scratch against the pool's full
+        // requirement, exactly as the streaming path grants against the tier's
+        // modelled peak.
+        declared_base_bytes = pool_ptr->storage_bytes
+                            + pool_ptr->pair_a_bytes
+                            + pool_ptr->pair_b_bytes
+                            + pool_ptr->sort_scratch_bytes;
+        twophase_budget_bytes =
+            (mem_before_pool.free_bytes > declared_base_bytes + kVramSafetyMargin)
+                ? mem_before_pool.free_bytes - declared_base_bytes - kVramSafetyMargin
+                : 0;
     } catch (InsufficientVramError const& e) {
         if (opts.quiet) {
             // info-level: which pipeline was picked and why
@@ -592,24 +706,37 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 e.required_bytes / double(1ULL << 30),
                 e.free_bytes     / double(1ULL << 30));
         }
-        // Streaming tier dispatch — three tiers, increasing PCIe pressure
-        // for decreasing peak VRAM:
+        // Streaming tier dispatch — increasing PCIe pressure for decreasing
+        // peak VRAM. Peaks below are the s_malloc-tracked anchors; add ~390 MB
+        // of CUDA context for the true process peak:
         //   plain   (~7290 MB at k=28): no parks, single-pass T2 match.
         //                               Fastest, ~400 ms/plot over compact.
+        //                               Serves ~8 GiB cards and up.
         //   compact (~5200 MB at k=28): all parks + N=2 T2 match staging.
-        //                               Targets 6-8 GiB cards.
-        //   minimal (~3700 MB at k=28): compact's parks + N=8 T2 match
-        //                               staging. Targets 4 GiB cards at
-        //                               the cost of extra PCIe round-trips
-        //                               during T2 match.
-        // Auto-pick takes the largest tier that fits with the margin.
-        // 128 MB margin above measured CUDA-context + driver overhead
-        // on headless cards.
+        //                               Serves ~6 GiB cards and up.
+        //   minimal (~3900 MB at k=28): compact's parks + N=8 T2 match
+        //                               staging. Serves ~5 GiB cards (NOT
+        //                               4 GiB — the true peak with the context
+        //                               is ~4274 MiB; a 4 GiB card lands on
+        //                               tiny, correctly).
+        //   tiny    (~1100 MB at k=28): the FLOOR. Serves ~2 GiB and up.
         //
-        // opts.streaming_tier (--tier CLI flag) > XCHPLOT2_STREAMING_TIER
-        // env var > auto. Forced plain/compact below their floor warn but
-        // proceed (caller's risk); forced minimal below its floor throws
-        // because there is no smaller tier to fall back to.
+        // Auto-pick takes the largest tier that fits with the margin, and
+        // floors at tiny. It used to fall through to `pinned` below tiny —
+        // which could never work, because pinned's anchor (2200 MB) is TWICE
+        // tiny's (1100 MB). The streaming-partition work pinned was scaffolded
+        // for landed inside tiny_mode instead (Phase 1.5/1.6 took tiny from
+        // 2.1 GB to 1064 MB) and pinned's anchor was never revisited, so the
+        // "smaller tier below tiny" was in fact the largest of the two. A card
+        // under tiny's floor got handed a tier needing 2712 MiB when it had
+        // less than 1612, and the very next check threw. Tiny is the floor;
+        // throw there, with an honest message. `--tier pinned` survives as a
+        // manual label only.
+        //
+        // opts.streaming_tier (--tier CLI flag) > XCHPLOT2_STREAMING_TIER env
+        // var > auto. A forced tier below its floor warns but proceeds
+        // (caller's risk); auto-picked tiny below its floor throws, because
+        // there is nothing smaller to fall back to.
         {
             auto const mem            = query_device_memory();
             size_t const plain_peak   = streaming_plain_peak_bytes(pool_k);
@@ -617,7 +744,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const minimal_peak = streaming_minimal_peak_bytes(pool_k);
             size_t const tiny_peak    = streaming_tiny_peak_bytes(pool_k);
             size_t const pinned_peak  = streaming_pinned_peak_bytes(pool_k);
-            size_t const margin       = 128ULL << 20;
+            size_t const margin       = kVramSafetyMargin;
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
             // Use effective_tier resolved at the top of run_batch_slice
@@ -639,17 +766,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             } else if (tier_pref == "pinned") {
                 tier = Tier::Pinned;
             } else {
-                // Auto: pick the largest tier that fits with margin.
-                // Pinned slots in below Tiny — it serves sub-Tiny-peak
-                // cards. With Pinned's peak math currently equal to
-                // Tiny's (Phase 1.3c-i scaffolding), the auto-picker
-                // never reaches the Pinned branch; once 1.3c-ii lowers
-                // the Pinned anchor it becomes the new floor.
+                // Auto: pick the largest tier that fits with margin, flooring
+                // at Tiny. Pinned is deliberately NOT in this ladder — see the
+                // block comment above: its anchor is 2x Tiny's, so using it as
+                // the sub-Tiny fallback guaranteed a throw.
                 tier = (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
                        (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
                        (mem.free_bytes >= minimal_peak + margin) ? Tier::Minimal :
-                       (mem.free_bytes >= tiny_peak    + margin) ? Tier::Tiny    :
-                                                                   Tier::Pinned;
+                                                                   Tier::Tiny;
             }
 
             auto tier_name = [](Tier t) -> char const* {
@@ -666,16 +790,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 tier == Tier::Tiny    ? tiny_peak    :
                                         pinned_peak;
 
-            // Open-ended fallback: if even the smallest tier (now
-            // pinned) won't fit, throw. Forced higher tier below its
-            // floor warns and proceeds.
-            if (tier == Tier::Pinned
+            // Open-ended fallback: if even the smallest tier (tiny) won't fit,
+            // throw. A tier the caller FORCED below its floor warns and
+            // proceeds at their risk — including a forced tiny, which is why
+            // the throw is gated on the tier having been auto-picked.
+            bool const auto_picked = tier_pref.empty();
+            if (tier == Tier::Tiny && auto_picked
                 && mem.free_bytes < required + margin) {
                 InsufficientVramError se(
                     log_prefix + " streaming pipeline needs ~" +
                     std::to_string(to_gib(required + margin)).substr(0, 5) +
                     " GiB peak for k=" + std::to_string(pool_k) +
-                    " (pinned tier, the smallest available), device reports " +
+                    " (tiny tier, the smallest available), device reports " +
                     std::to_string(to_gib(mem.free_bytes)).substr(0, 5) +
                     " GiB free of " +
                     std::to_string(to_gib(mem.total_bytes)).substr(0, 5) +
@@ -686,7 +812,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 se.total_bytes    = mem.total_bytes;
                 throw se;
             }
-            if (tier != Tier::Pinned
+            if (!(tier == Tier::Tiny && auto_picked)
                 && mem.free_bytes < required + margin) {
                 std::fprintf(stderr,
                     "%s streaming tier: %s forced (%.2f GiB free < %.2f GiB "
@@ -697,6 +823,20 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     to_gib(required + margin),
                     tier_name(tier));
             }
+
+            // Two-phase match candidate scratch (see SyclBackend.hpp): grant
+            // what is left after the tier's modelled peak and the margin.
+            // Because the grant is free - peak - margin, the invariant
+            // peak + scratch + margin <= free holds for any tier and any k —
+            // the scratch can never be the thing that pushes a tier past the
+            // VRAM budget it was picked for. When the remainder is too small
+            // the match falls back to the single-kernel path: correct for any
+            // input, allocates nothing, and merely slower.
+            twophase_budget_bytes = (mem.free_bytes > required + margin)
+                ? mem.free_bytes - required - margin
+                : 0;
+            stream_scratch.twophase_budget_bytes = twophase_budget_bytes;
+            declared_base_bytes = required;
 
             stream_scratch.plain_mode  = (tier == Tier::Plain);
             // Pinned inherits Tiny's host-park behaviour as the
@@ -980,6 +1120,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             cfg.strength = entries[i].strength;
             cfg.testnet  = entries[i].testnet;
             cfg.profile  = false;
+            // Pool path reads the two-phase grant from cfg; the streaming path
+            // reads it from stream_scratch. Both are set above.
+            cfg.twophase_budget_bytes = twophase_budget_bytes;
 
             WorkItem item;
             item.entry  = entries[i];
@@ -1052,6 +1195,50 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // Pinned buffers + streaming scratch are freed by
     // stream_buffers_guard on every exit path (including the rethrows
     // above and the producer's catch).
+
+    // VRAM watchdog: compare the peak the driver actually saw against what we
+    // told the tier picker we would use. The peak models cannot see raw
+    // sycl::malloc_device allocations, so this is the only check that catches
+    // an unaccounted one — which is exactly the bug that made every 4-11 GB
+    // NVIDIA card OOM on every tier but tiny.
+    vram.stop();
+    if (vram.available() && declared_base_bytes > 0) {
+        uint64_t const held     = twophase_bytes_held();
+        uint64_t const declared = declared_base_bytes + held + kVramSafetyMargin;
+        uint64_t const peak     = vram.peak();
+        auto to_mib = [](uint64_t b) { return b / double(1ULL << 20); };
+
+        if (!opts.quiet) {
+            std::fprintf(stderr,
+                "%s vram: peak %.0f MiB of %.0f free "
+                "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared)\n",
+                log_prefix.c_str(),
+                to_mib(peak), to_mib(vram.baseline()),
+                to_mib(declared_base_bytes), to_mib(held),
+                to_mib(kVramSafetyMargin), to_mib(declared));
+        }
+        if (peak > declared) {
+            // Loud on every run, fatal when asserting. A path that exceeds its
+            // declared footprint is not a benign overshoot: the picker hands
+            // that tier to cards sized from the model, so whatever slipped
+            // through here is an OOM on somebody's smaller GPU.
+            std::fprintf(stderr,
+                "%s vram: ERROR — peak %.0f MiB exceeds the %.0f MiB declared "
+                "for this path by %.0f MiB. Some device allocation is not "
+                "accounted for in the peak model; a card sized from that model "
+                "will OOM. See the two-phase budget notes in SyclBackend.hpp.\n",
+                log_prefix.c_str(), to_mib(peak), to_mib(declared),
+                to_mib(peak - declared));
+            if (char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
+                v && v[0] == '1')
+            {
+                throw std::runtime_error(
+                    "VRAM assertion failed: peak " +
+                    std::to_string(uint64_t(to_mib(peak))) + " MiB > declared " +
+                    std::to_string(uint64_t(to_mib(declared))) + " MiB");
+            }
+        }
+    }
 
     res.plots_written = plots_done.load();
     res.plots_failed  = producer_failed + plots_failed_consumer.load();

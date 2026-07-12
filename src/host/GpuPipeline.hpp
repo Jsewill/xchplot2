@@ -34,6 +34,19 @@ struct GpuPipelineConfig {
     int strength = 2;
     bool testnet = false;
     bool profile = false;   // print per-phase cudaEvent timing breakdown to stderr
+
+    // Device bytes the T2/T3 two-phase match may spend on its candidate
+    // scratch. The match is a VRAM-for-speed trade that the peak models do
+    // not account for (see the budget notes in SyclBackend.hpp), so the
+    // caller — which is the only party that knows free VRAM and the tier's
+    // modelled peak — grants it explicitly as free - peak - margin. 0
+    // disables two-phase: the match then runs single-kernel, which is
+    // correct for any input and allocates nothing.
+    //
+    // Default 0 is deliberate. A caller that has not reasoned about VRAM
+    // gets the safe, slower path rather than a silent multi-gigabyte
+    // allocation it never budgeted for.
+    uint64_t twophase_budget_bytes = 0;
 };
 
 // T3 fragment ownership depends on which overload produced this result.
@@ -284,12 +297,29 @@ struct StreamingPinnedScratch {
     // does NOT free pool-owned buffers at function exit. nullptr
     // preserves the historical per-plot malloc_host + free behaviour.
     HostPinnedPool* pool = nullptr;
+
+    // Device bytes the T2/T3 two-phase match may spend on its candidate
+    // scratch — see the identical field on GpuPipelineConfig. Set by
+    // BatchPlotter to (free VRAM - tier peak - margin), so that
+    // peak + scratch + margin <= free holds by construction for any tier
+    // and any k. 0 disables two-phase (single-kernel path: correct, no
+    // allocation, ~5-9% slower on plain/compact and ~10% FASTER on
+    // minimal, where the scratch was a net pessimisation).
+    uint64_t twophase_budget_bytes = 0;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
                                              uint64_t* pinned_dst,
                                              size_t    pinned_capacity,
                                              StreamingPinnedScratch const& scratch);
+
+// Device bytes the T2/T3 two-phase candidate scratch is currently holding on
+// the calling thread's queue — 0 when the grant was too small and the match
+// took the single-kernel path. The VRAM watchdog in BatchPlotter uses this to
+// separate the tier's modelled footprint from the optional scratch sitting on
+// top of it, so it can tell "the tier is over budget" (a bug) apart from "we
+// deliberately spent spare VRAM on the fast path" (working as intended).
+uint64_t twophase_bytes_held();
 
 // Allocate / free host-pinned memory — thin wrappers around
 // cudaMallocHost / cudaFreeHost, exposed so plain .cpp consumers (which

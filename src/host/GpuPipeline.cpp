@@ -266,6 +266,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 {
 
     sycl::queue& q = sycl_backend::queue();
+    // Grant the T2/T3 two-phase match its VRAM budget for this queue before
+    // any match runs. Nothing else bounds that allocation, and it is not
+    // covered by the pool sizing — see SyclBackend.hpp.
+    sycl_backend::set_twophase_budget(q, cfg.twophase_budget_bytes);
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
     }
@@ -733,6 +737,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 {
 
     sycl::queue& q = sycl_backend::queue();
+    // Grant the T2/T3 two-phase match its VRAM budget for this queue before
+    // any match runs. The streaming tiers are, by definition, the ones with
+    // no VRAM to spare, and the scratch is not part of any tier's peak
+    // model — see SyclBackend.hpp.
+    sycl_backend::set_twophase_budget(q, scratch.twophase_budget_bytes);
     if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
         throw std::runtime_error("k must be even in [18, 32]");
     }
@@ -4348,6 +4357,11 @@ uint32_t* streaming_alloc_pinned_uint32(size_t count)
     uint32_t* p = static_cast<uint32_t*>(
         sycl::malloc_host(count * sizeof(uint32_t), sycl_backend::queue()));
     return p;  // nullptr on failure
+}
+
+uint64_t twophase_bytes_held()
+{
+    return sycl_backend::twophase_bytes_held(sycl_backend::queue());
 }
 
 void streaming_free_pinned_uint32(uint32_t* ptr)

@@ -22,53 +22,27 @@ namespace pos2gpu {
 
 namespace {
 
-// Per-queue cached candidate scratch for run_t3_match_twophase.
-// Allocated on first use, grown on demand, and reused across every
-// subsequent call on the same queue — drops the ~500–1000 MB device
-// malloc/free that the prototype paid per plot. Multiple work-queue
-// worker threads each call into this with their own queue; the mutex
-// only protects the map, the per-queue buffers themselves are reused
-// serially within one queue (run_t3_match_twophase ends with q.wait()
-// so the buffer is fully drained before the next call sees it).
+// Candidate scratch is sized at kCandCapMultiplier x the average per-bucket
+// output count. Candidates run ~4x outputs (the T3 test filter passes about
+// 1 in 4), so the multiplier is really "expected candidates x headroom". The
+// buffer itself is the ONE that T2 and T3 share — they are never live at the
+// same time, so the peak is the max of the two rather than their sum. See
+// sycl_backend::acquire_twophase_scratch in SyclBackend.hpp.
 //
-// No process-exit teardown — explicit sycl::free at static destruction
-// races the SYCL runtime's own shutdown on AdaptiveCpp; OS reclaims
-// the GPU memory when the process exits.
-struct T3CandScratch {
-    uint32_t* d_cand_l     = nullptr;
-    uint32_t* d_cand_r     = nullptr;
-    uint64_t* d_cand_count = nullptr;
-    uint32_t* d_overflow   = nullptr;  // sticky flag: any bucket blew cand_cap
-    uint64_t  cap          = 0;
-};
-
-T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
-{
-    static std::mutex mu;
-    static std::unordered_map<sycl::queue*, T3CandScratch> cache;
-    std::lock_guard<std::mutex> lk(mu);
-    auto& s = cache[&q];
-    if (s.cap < cand_cap) {
-        if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
-        if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
-        if (s.d_cand_count) sycl::free(s.d_cand_count, q);
-        if (s.d_overflow)   sycl::free(s.d_overflow, q);
-        s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
-        s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
-        s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-        s.d_overflow   = sycl::malloc_device<uint32_t>(1, q);
-        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count || !s.d_overflow) {
-            if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
-            if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
-            if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
-            if (s.d_overflow)   { sycl::free(s.d_overflow, q);   s.d_overflow   = nullptr; }
-            s.cap = 0;
-            throw std::runtime_error("T3 two-phase: candidate buffer alloc failed");
-        }
-        s.cap = cand_cap;
-    }
-    return s;
-}
+// Measured at k=28 on sm_89: the busiest bucket produced 67,137,219
+// candidates against an average per-bucket output of 17,039,360 — a ratio
+// of 3.94, and the spread across all 16 buckets was 0.09% (67,055,571 to
+// 67,137,219). The old multiplier of 8 was sized for an inter-bucket skew
+// that does not exist at production k, and cost 2x the memory it needed:
+// the buffer ran at 49% utilisation. 6 keeps 1.5x headroom over the
+// measured worst bucket while cutting the allocation by a quarter.
+//
+// Under-sizing is safe, not fatal: a bucket that overruns cand_cap sets the
+// sticky overflow flag, run_t3_match_twophase returns false, and the caller
+// rewinds the output counter and redoes the range through the single-kernel
+// path, which is correct for any skew. That makes this a pure
+// speed/memory dial — the failure mode is "slower", never "wrong".
+constexpr uint64_t kCandCapMultiplier = 6;
 
 // ---- Phase 2 prototype: two-phase T3 match ----------------------------
 //
@@ -135,14 +109,17 @@ T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
     // filter passes ~1/4, so total candidates ≈ 4× outputs. Sized at 8×
     // the average per-bucket output count → ~2× headroom over the
     // expected per-bucket candidate count, absorbing inter-bucket
-    // variance. Allocated once, reused across all buckets in the range
-    // — and now also reused across calls on the same queue via the
-    // per-queue cache (acquire_t3_cand_scratch above), so the per-plot
-    // ~500 MB device malloc/free is gone.
+    // variance. Allocated once, reused across all buckets in the range,
+    // and reused across calls on the same queue via the per-queue cache in
+    // sycl_backend::acquire_twophase_scratch — which T2 shares — so the
+    // per-plot ~500 MB device malloc/free is gone.
     uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 8
+        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
+        * kCandCapMultiplier
         + 4096;
-    auto& scratch = acquire_t3_cand_scratch(q, cand_cap);
+    auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
+    if (!scratch_p) return false;   // over budget or OOM → single-kernel path
+    auto& scratch = *scratch_p;
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
@@ -347,7 +324,7 @@ T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
 // Minimal). Same structure as run_t3_match_twophase but reads meta_l
 // from a section-sliced buffer (caller guarantees bucket range fits in
 // one section_l). xbits and mi remain full-cap (per the section_pair
-// contract). Shares the same acquire_t3_cand_scratch per-queue cache.
+// contract). Shares the same acquire_twophase_scratch per-queue cache.
 // Returns false on candidate-scratch overflow (see run_t3_match_twophase).
 [[nodiscard]] bool run_t3_match_section_pair_twophase(
     AesHashKeys const& keys,
@@ -387,9 +364,12 @@ T3CandScratch& acquire_t3_cand_scratch(sycl::queue& q, uint64_t cand_cap)
     }();
 
     uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 8
+        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
+        * kCandCapMultiplier
         + 4096;
-    auto& scratch = acquire_t3_cand_scratch(q, cand_cap);
+    auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
+    if (!scratch_p) return false;   // over budget or OOM → single-kernel path
+    auto& scratch = *scratch_p;
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
@@ -565,8 +545,9 @@ bool t3_twophase_enabled()
     // r-loop around the 32-round pairing AES + Feistel); the two-phase
     // split fixes the divergence and chains per-bucket ops through
     // events. POS2GPU_T3_TWOPHASE=0 falls back to the single-kernel
-    // path. Overflow of the candidate scratch throws loudly (see
-    // acquire_t3_cand_scratch) rather than silently dropping pairs.
+    // path — as does a candidate-scratch overflow, or a scratch that will
+    // not fit the queue's VRAM grant. Never a silent drop of pairs; the
+    // fallback path is correct for any input.
     static bool const enabled = [] {
         char const* v = std::getenv("POS2GPU_T3_TWOPHASE");
         return !(v && v[0] == '0');

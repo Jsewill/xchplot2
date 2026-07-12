@@ -636,6 +636,12 @@ BenchMeasurement run_bench_pass(
     run_opts.progress = !opts.quiet;
     run_opts.skip_existing = false;
     run_opts.continue_on_error = false;
+    // A benchmark is exactly where a VRAM regression should be caught, so the
+    // watchdog's check is fatal here by default: if a tier's real peak exceeds
+    // what its model promised, the run fails instead of quietly publishing a
+    // throughput number for a configuration that will OOM on a smaller card.
+    // The 0 flag leaves an explicit POS2GPU_ASSERT_VRAM=0 from the user alone.
+    setenv("POS2GPU_ASSERT_VRAM", "1", 0);
     try {
         auto const res = pos2gpu::run_batch(entries, run_opts);
         if (res.plots_failed > 0 || res.plots_written == 0) {

@@ -174,32 +174,78 @@ struct DeviceMemInfo {
 };
 DeviceMemInfo query_device_memory();
 
+// Driver-level free/total VRAM for a device ordinal, WITHOUT touching the SYCL
+// queue. query_device_memory() goes through sycl_backend::queue(), which is
+// thread_local — calling it from a sampler thread would construct a second
+// queue (and on some backends a second context) on that thread, which is both
+// wasteful and self-defeating when the thing being measured is VRAM. This is
+// the probe the VRAM watchdog polls with.
+//
+// Returns false when no driver-level query is available (non-CUDA build or
+// host), leaving the caller to skip the measurement rather than report a
+// fabricated one.
+bool device_memory_probe(int device_ordinal,
+                         size_t& free_bytes,
+                         size_t& total_bytes);
+
+// VRAM held by the CUDA / AdaptiveCpp context itself — primary context, JIT'd
+// module, driver bookkeeping — which no tier peak model accounts for. Measured
+// at a consistent ~390 MiB on sm_89 across every tier: the true process peak is
+// always the s_malloc trace plus ~390 MiB.
+//
+// The streaming picker's margin used to be 128 MiB, and its comment already
+// said it was there to cover "measured CUDA-context + driver overhead" — it was
+// simply 3x too small, so every tier over-committed by ~260 MiB before the
+// two-phase scratch was even in the picture. The pool gate independently used
+// 256 MiB. One constant now, used by both.
+constexpr size_t kVramSafetyMargin = 512ULL << 20;
+
 // Upper bound on streaming-pipeline peak device VRAM at given k.
+//
+// IMPORTANT for anyone re-anchoring these: the streaming-stats trace
+// (POS2GPU_STREAMING_STATS=1) only sees allocations that go through s_malloc.
+// It is NOT the true device peak. Raw sycl::malloc_device allocations — the
+// T2/T3 two-phase candidate scratch was one, to the tune of 3128 MiB — are
+// invisible to it, and calibrating an anchor against a blind instrument is
+// exactly how the ladder came to under-predict every non-tiny tier by ~3 GB
+// and OOM every 4-11 GB NVIDIA card. Validate against the driver's own
+// accounting (`bench`, which runs the VramWatchdog), not the trace.
+//
+// Measured true peaks at k=28, two-phase disabled, INCLUDING the ~390 MiB
+// context: tiny 1454, minimal 4274, compact 5590, plain 7680, pool 10860 MiB.
+//
 // streaming_peak_bytes: compact tier (anchored at 5200 MB at k=28).
+//   Serves ~6 GiB cards and up.
 // streaming_plain_peak_bytes: plain tier (anchored at 7290 MB at k=28,
-// pre-park pipeline — saves ~400 ms/plot over compact via fewer PCIe
-// round-trips, at the cost of the higher peak).
-// streaming_minimal_peak_bytes: minimal tier (anchored at 3700 MB at
-// k=28). Same parks as compact plus N=8 T2 match staging (cap/8 vs
-// compact's cap/2) — targets 4 GiB cards at the cost of more PCIe
-// round-trips during T2 match.
-// streaming_tiny_peak_bytes: tiny tier (anchored at 1500 MB at k=28).
-// Layers further cuts on top of minimal — tighter match staging,
-// aggressive park-to-host of full Xs and intermediate streams, smaller
-// per-tile sort scratch — to fit ~2 GB cards. Costs more PCIe round-
-// trips than minimal. Scaffolding lands first; the actual peak-
-// reducing implementation ships in subsequent commits.
+//   pre-park pipeline — saves ~400 ms/plot over compact via fewer PCIe
+//   round-trips, at the cost of the higher peak). Serves ~8 GiB and up.
+// streaming_minimal_peak_bytes: minimal tier (anchored at 3900 MB at k=28).
+//   Same parks as compact plus N=8 T2 match staging (cap/8 vs compact's
+//   cap/2) at the cost of more PCIe round-trips during T2 match.
+//
+//   This used to claim it "targets 4 GiB cards". It does not, and never did:
+//   the tracked peak is 3884 MB and the context adds ~390 MB, so the true
+//   process peak is ~4274 MiB — more than a 4 GiB card can offer. A 4 GiB card
+//   correctly lands on tiny. Minimal serves roughly 5 GiB and up.
+// streaming_tiny_peak_bytes: tiny tier (anchored at 1100 MB at k=28 — the
+//   header said 1500 long after the code moved to 1100). Layers further cuts
+//   on top of minimal: tighter match staging, aggressive park-to-host of the
+//   full Xs and intermediate streams, smaller per-tile sort scratch. Serves
+//   ~2 GiB cards and up, and is the FLOOR of the auto-pick ladder.
 // Dominant terms scale with 2^k, so other k extrapolate linearly.
 size_t streaming_peak_bytes(int k);
 size_t streaming_plain_peak_bytes(int k);
 size_t streaming_minimal_peak_bytes(int k);
 size_t streaming_tiny_peak_bytes(int k);
-// streaming_pinned_peak_bytes: pinned tier — replaces the in-VRAM
-// T1 sort gather (Tiny's floor) with a streaming-partition + per-
-// bucket-sort flow that keeps d_t1_meta host-resident. Targets
-// 2-3 GB cards. Phase 1.3c-i ships scaffolding only (peak math
-// identical to Tiny); Phase 1.3c-ii lowers the anchor once the
-// algorithm change in GpuPipeline.cpp is in place.
+// streaming_pinned_peak_bytes: pinned tier — was meant to replace the in-VRAM
+// T1 sort gather (Tiny's floor) with a streaming-partition + per-bucket-sort
+// flow keeping d_t1_meta host-resident, targeting 2-3 GB cards.
+//
+// It is NOT a sub-Tiny tier and must not be used as one. Its anchor is 2200 MB
+// — TWICE Tiny's 1100 MB — because the streaming-partition work it was
+// scaffolded for landed inside tiny_mode instead (Phase 1.5/1.6 took Tiny from
+// 2.1 GB down to 1064 MB), and Pinned's anchor was never revisited. It survives
+// only as a manual `--tier pinned` label; the auto-pick ladder floors at Tiny.
 size_t streaming_pinned_peak_bytes(int k);
 
 } // namespace pos2gpu

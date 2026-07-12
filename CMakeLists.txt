@@ -522,6 +522,7 @@ if(XCHPLOT2_BUILD_CUDA)
     set(POS2_GPU_CUDA_SRC
         src/gpu/AesGpu.cu
         src/gpu/AesGpuBitsliced.cu
+        src/gpu/DeviceMemCuda.cu
         src/gpu/SortCuda.cu)
     # SortSyclCub.cpp is the SYCL-typed adapter that bridges
     # sycl::queue → CUB. SortCuda.cu used to provide the SYCL-typed

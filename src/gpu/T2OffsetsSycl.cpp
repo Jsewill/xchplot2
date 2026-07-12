@@ -96,45 +96,21 @@ void launch_t2_compute_fine_bucket_offsets(
 
 namespace {
 
-// Per-queue cached candidate scratch for run_t2_match_twophase. See
-// the equivalent in T3OffsetsSycl.cpp for the full rationale; T2 uses
-// its own cache (16× per-bucket-output sizing vs T3's 8×, so they
-// grow independently).
-struct T2CandScratch {
-    uint32_t* d_cand_l     = nullptr;
-    uint32_t* d_cand_r     = nullptr;
-    uint64_t* d_cand_count = nullptr;
-    uint32_t* d_overflow   = nullptr;  // sticky flag: any bucket blew cand_cap
-    uint64_t  cap          = 0;
-};
-
-T2CandScratch& acquire_t2_cand_scratch(sycl::queue& q, uint64_t cand_cap)
-{
-    static std::mutex mu;
-    static std::unordered_map<sycl::queue*, T2CandScratch> cache;
-    std::lock_guard<std::mutex> lk(mu);
-    auto& s = cache[&q];
-    if (s.cap < cand_cap) {
-        if (s.d_cand_l)     sycl::free(s.d_cand_l, q);
-        if (s.d_cand_r)     sycl::free(s.d_cand_r, q);
-        if (s.d_cand_count) sycl::free(s.d_cand_count, q);
-        if (s.d_overflow)   sycl::free(s.d_overflow, q);
-        s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
-        s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
-        s.d_cand_count = sycl::malloc_device<uint64_t>(1, q);
-        s.d_overflow   = sycl::malloc_device<uint32_t>(1, q);
-        if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count || !s.d_overflow) {
-            if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
-            if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
-            if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
-            if (s.d_overflow)   { sycl::free(s.d_overflow, q);   s.d_overflow   = nullptr; }
-            s.cap = 0;
-            throw std::runtime_error("T2 two-phase: candidate buffer alloc failed");
-        }
-        s.cap = cand_cap;
-    }
-    return s;
-}
+// Candidate scratch is sized at kCandCapMultiplier x the average per-bucket
+// output count, and comes from the ONE buffer that T2 and T3 share (see
+// sycl_backend::acquire_twophase_scratch in SyclBackend.hpp — they are never
+// live at the same time, so the peak is the max of the two, not their sum).
+//
+// Measured at k=28 on sm_89, T2's busiest bucket produced 67,158,023
+// candidates against an average per-bucket output of 17,039,360 — a ratio of
+// 3.94, with a 0.09% spread across all 16 buckets. The old multiplier of 16
+// was sized for an inter-bucket skew that does not exist at production k: it
+// ran the buffer at 24.6% utilisation and, because the tier's slicing factor
+// cancels out of (out_capacity / num_buckets_in_range), it allocated a full
+// plot-capacity 2080 MiB buffer in *every* tier — including the ones whose
+// entire purpose is to slice T2 staging down to 570 MiB. 6 keeps 1.5x headroom
+// over the measured worst bucket at a third of the memory.
+constexpr uint64_t kCandCapMultiplier = 6;
 
 // ---- Phase 2 prototype: two-phase T2 match ----------------------------
 //
@@ -192,13 +168,16 @@ T2CandScratch& acquire_t2_cand_scratch(sycl::queue& q, uint64_t cand_cap)
     // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at 16× the
     // average per-bucket output count — generous headroom over the
     // expected candidate:output ratio (~4× for the T3 test filter; T2's
-    // is measured via the debug print). Allocated once, reused per bucket
-    // — and now also reused across calls on the same queue via the
-    // per-queue cache (acquire_t2_cand_scratch above).
+    // is measured via the debug print). Allocated once, reused per bucket,
+    // and reused across calls on the same queue via the per-queue cache in
+    // sycl_backend::acquire_twophase_scratch — which T3 shares.
     uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1)) * 16
+        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
+        * kCandCapMultiplier
         + 4096;
-    auto& scratch = acquire_t2_cand_scratch(q, cand_cap);
+    auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
+    if (!scratch_p) return false;   // over budget or OOM → single-kernel path
+    auto& scratch = *scratch_p;
     uint32_t* d_cand_l     = scratch.d_cand_l;
     uint32_t* d_cand_r     = scratch.d_cand_r;
     uint64_t* d_cand_count = scratch.d_cand_count;
