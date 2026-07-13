@@ -165,12 +165,14 @@ constexpr uint64_t kCandCapMultiplier = 6;
         return v && v[0] == '1';
     }();
 
-    // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at 16× the
-    // average per-bucket output count — generous headroom over the
-    // expected candidate:output ratio (~4× for the T3 test filter; T2's
-    // is measured via the debug print). Allocated once, reused per bucket,
-    // and reused across calls on the same queue via the per-queue cache in
-    // sycl_backend::acquire_twophase_scratch — which T3 shares.
+    // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at kCandCapMultiplier
+    // (6) × the average per-bucket output count — headroom over the measured
+    // candidate:output ratio (~4× for the T3 test filter) for bucket skew. It
+    // was 16×, which is where ~3 GB of this buffer came from; overflow is safe
+    // anyway (sticky flag → caller rewinds and re-runs the single-kernel path),
+    // so the multiplier buys speed, not correctness. Allocated once, reused per
+    // bucket, and reused across calls on the same queue via the per-queue cache
+    // in sycl_backend::acquire_twophase_scratch — which T3 shares.
     uint64_t const cand_cap =
         (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
         * kCandCapMultiplier

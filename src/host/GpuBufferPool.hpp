@@ -237,15 +237,22 @@ size_t streaming_peak_bytes(int k);
 size_t streaming_plain_peak_bytes(int k);
 size_t streaming_minimal_peak_bytes(int k);
 size_t streaming_tiny_peak_bytes(int k);
-// streaming_pinned_peak_bytes: pinned tier — was meant to replace the in-VRAM
-// T1 sort gather (Tiny's floor) with a streaming-partition + per-bucket-sort
-// flow keeping d_t1_meta host-resident, targeting 2-3 GB cards.
+// streaming_pinned_peak_bytes: pinned tier — replaces the in-VRAM T1 sort
+// gather with a streaming-partition + per-bucket-sort flow that keeps d_t1_meta
+// host-resident.
 //
-// It is NOT a sub-Tiny tier and must not be used as one. Its anchor is 2200 MB
-// — TWICE Tiny's 1100 MB — because the streaming-partition work it was
-// scaffolded for landed inside tiny_mode instead (Phase 1.5/1.6 took Tiny from
-// 2.1 GB down to 1064 MB), and Pinned's anchor was never revisited. It survives
-// only as a manual `--tier pinned` label; the auto-pick ladder floors at Tiny.
+// It is NOT a sub-Tiny tier and must not be used as one: measured at k=28 it
+// peaks at 1128 MB against Tiny's 1118 MB — the same footprint, not smaller —
+// so it cannot serve as the fallback below Tiny, and the auto ladder still
+// floors at Tiny. What it IS, on that measurement, is a peer of Tiny that runs
+// a few percent faster, reachable as `--tier pinned` / `<id>:pinned`.
+//
+// Its anchor said 2200 MB until 2026-07-12 — twice its real peak. That number
+// was never measured at k=28: it was extrapolated from k=26, then re-derived as
+// a ratio against Tiny's *old* anchor, which was itself ~3x Tiny's real peak.
+// The bench watchdog cannot catch this class of error (it only fires when the
+// true peak EXCEEDS the declaration); over-declaring just quietly costs the user
+// card capability. Re-derive from the watchdog's true peak, never from a ratio.
 size_t streaming_pinned_peak_bytes(int k);
 
 } // namespace pos2gpu

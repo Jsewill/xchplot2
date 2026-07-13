@@ -208,7 +208,8 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                 std::to_string(k) + " strength=" + std::to_string(strength) +
                 "; need ~" + std::to_string(to_gib(required_device + margin)).substr(0, 5) +
                 " GiB (pool " + std::to_string(to_gib(required_device)).substr(0, 5) +
-                " GiB + ~0.25 GiB runtime), only " +
+                " GiB + " + std::to_string(to_gib(margin)).substr(0, 4) +
+                " GiB runtime), only " +
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
                 " GiB total. Falling back to the streaming pipeline.");
@@ -601,15 +602,24 @@ size_t streaming_pinned_peak_bytes(int k)
     // memory documents the analysis). Phase 1.5+ would attack
     // those; not currently scoped.
     //
-    // Auto-picker window for k=28: free VRAM in [2900, 3200) MB
-    // picks Pinned instead of Tiny. Outside that window the picker
-    // behaves as before (Tiny for >= 3200, throw below 2900 - margin).
-    // Post-1.5c-a measurement: Pinned is ~68% of Tiny at k=22/24/26
-    // on RTX 4090. Lower the anchor from 2900 to 2200 MB at k=28
-    // (= 3200 * 0.68 ≈ 2176, round up to 2200 for safety margin).
-    // This widens the auto-picker's Pinned-only window from
-    // [2900, 3200) MB to [2200, 3200) MB.
-    constexpr size_t anchor_mb = 2200;
+    // MEASURED at k=28 on an RTX 4090 (bench VramWatchdog, true process VRAM):
+    // Pinned peaks at 1128 MB — against Tiny's 1118 MB on the same card. The
+    // two tiers have the same footprint; Pinned is not "2x Tiny", and it is not
+    // a rung above it.
+    //
+    // Every number in the paragraph above this one was derived, never measured
+    // at k=28: 2900 was extrapolated from a k=26 reading, then lowered to 2200
+    // as "3200 * 0.68" — where 3200 was Tiny's *old* anchor, itself ~3x Tiny's
+    // real peak. A ratio applied to a wrong base gave a peak that over-declared
+    // by 2x. Nothing caught it: the bench watchdog only fires when the true peak
+    // exceeds what the tier declared, so over-declaring sails through silently
+    // and merely costs the user card capability (a card that can run Pinned in
+    // ~1.6 GB was told it needed 2.7 GB).
+    //
+    // Anchor 1150 = measured 1128 + a small allowance, matching how Tiny's 1100
+    // sits over its measured 1064. Re-derive this ONLY from the watchdog's true
+    // peak, never from a ratio against another anchor.
+    constexpr size_t anchor_mb = 1150;
     size_t const adj = streaming_sort_scratch_adjustment(k);
     if (k == 28) return (anchor_mb << 20) + adj;
     if (k <  18) return (size_t(16) << 20) + adj;

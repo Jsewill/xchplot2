@@ -146,10 +146,11 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     free post-CUDA-context, well under minimal's 4.31 GiB floor.
     Trade-off: ~13 s/plot extra PCIe vs minimal at k=28 (sm_89
     ~36 s/plot). Tiny is the floor of the auto-pick ladder — a card
-    below it throws. (`--tier pinned` still exists as a manual label,
-    but it is *not* a sub-tiny tier: its peak is ~2200 MB, twice
-    tiny's, because the streaming-partition work it was scaffolded for
-    landed inside tiny instead.)
+    below it throws. (`--tier pinned` is a manual label, not a rung
+    below tiny: measured at k=28 it peaks at **1128 MB** against tiny's
+    1118 MB — the same footprint, a few percent faster. It is not in the
+    auto ladder because it is not *smaller* than tiny, so it cannot be
+    the fallback below it.)
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one

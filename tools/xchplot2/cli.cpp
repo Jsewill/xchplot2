@@ -907,8 +907,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"
-                    && t != "tiny" && t != "auto") {
-                    std::cerr << "Error: --tier expects plain|compact|minimal|tiny|auto\n";
+                    && t != "tiny" && t != "pinned" && t != "auto") {
+                    std::cerr << "Error: --tier expects "
+                                 "plain|compact|minimal|tiny|pinned|auto\n";
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
@@ -1114,9 +1115,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"
-                    && t != "tiny" && t != "auto") {
+                    && t != "tiny" && t != "pinned" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', 'tiny', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', 'pinned', or 'auto' (got '"
+                              << t << "')\n";
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
@@ -1396,9 +1398,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"
-                    && t != "tiny" && t != "auto") {
+                    && t != "tiny" && t != "pinned" && t != "auto") {
                     std::cerr << "Error: --tier expects 'plain', 'compact', "
-                                 "'minimal', 'tiny', or 'auto' (got '" << t << "')\n";
+                                 "'minimal', 'tiny', 'pinned', or 'auto' (got '"
+                              << t << "')\n";
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;
