@@ -30,10 +30,21 @@
 //                                 the producer from overwriting in-flight
 //                                 reads. N defaults to 3 (see kNumPinnedBuffers).
 //
-// Total ~9 GB device + ~6.6 GB pinned host at k=28 — fits in 12 GB free VRAM
-// on a Navi 22 / RTX 4080 12 GB. Pre-split this peaked at ~12.7 GB device
-// because pair_bytes was a single max(pairings, xs_temp) and applied to BOTH
-// d_pair_a and d_pair_b, double-counting the Xs scratch.
+// MEASURED at k=28 (bench's VramWatchdog, i.e. the driver's own accounting, not
+// a sum of what we think we asked for): 11484 MiB of device buffers, and the
+// driver puts the running pipeline 18 MiB over that — run_gpu_pipeline allocates
+// nothing at runtime, so these buffers really are the whole footprint. Plus
+// ~6.6 GB pinned *host* (3 rotating slots), which costs no VRAM.
+//
+// With the 128 MiB gate margin that is an 11612 MiB floor, so it does fit a
+// Navi 22 / RTX 4080 12 GB — but only just, and only since the margin was
+// corrected from 512 (which put the floor at 11996 and locked those cards out
+// of the path this header claims they run). D2H/Xs overlap wants a further
+// 2080 MiB on top; below that the pool aliases d_pair_b and runs anyway.
+//
+// Pre-split this peaked at ~12.7 GB device because pair_bytes was a single
+// max(pairings, xs_temp) and applied to BOTH d_pair_a and d_pair_b,
+// double-counting the Xs scratch.
 //
 // Note: T1/T2/T3 match kernels report temp_bytes = 0 (no scratch needed).
 // Only the Xs phase wants ~4.4 GB of scratch, and we alias d_pair_b for that.
@@ -56,6 +67,32 @@ struct InsufficientVramError : std::runtime_error {
     size_t free_bytes     = 0;
     size_t total_bytes    = 0;
 };
+
+// Free VRAM the pool gate leaves unclaimed, in bytes. 128 MiB, overridable with
+// POS2GPU_VRAM_MARGIN_MB. Matches the SYCL tree's vram_safety_margin().
+//
+// This margin is NOT an accounting fudge for unmodelled allocations. The pooled
+// path (run_gpu_pipeline) allocates nothing at runtime — every device byte it
+// touches comes from the buffers sized in this ctor — so required_device_bytes
+// is its complete device footprint, and the driver agrees to within 8 MiB.
+// What the margin actually buys is tolerance for *other tenants* on the card
+// taking VRAM after the gate has already waved us through.
+//
+// It was 512 MiB, which double-counted the CUDA context: cudaMemGetInfo reports
+// free *after* context creation, so the ~390 MiB context is already excluded
+// from free_b — the margin was reserving it a second time. That cost every card
+// 384 MiB of capability for nothing, and at k=28 it is the difference between a
+// 12 GiB card getting the pooled path and being pushed onto streaming.
+//
+// DO NOT unify this with BatchPlotter's kFloorMarginBytes (256 MiB), which
+// looks like the same number and is not. The streaming tiers run under the
+// budgeted allocator in GpuPipeline.cu, which holds kStreamSafetyBytes
+// (128 MiB) back from its own budget; a streaming floor of peak+256 therefore
+// yields a working budget of peak+128. Cut that to 128 and the budget collapses
+// to exactly peak, with nothing left for allocation granularity, and the tier
+// OOMs on its first rounded-up request. The pooled path has no such allocator
+// and no such holdback, which is why it can run on the thinner margin.
+size_t vram_safety_margin();
 
 struct GpuBufferPool {
     // Allocates all buffers sized for (k, strength, testnet). Throws
@@ -83,6 +120,15 @@ struct GpuBufferPool {
     size_t   sort_scratch_bytes = 0;
     size_t   pinned_bytes       = 0; // per pinned buffer
 
+    // Every device byte this pool holds. The pooled path allocates nothing at
+    // runtime, so these two are its complete device footprint — which is what
+    // makes them meaningful as a *declaration*: `bench`'s VRAM watchdog checks
+    // the driver's observed peak against them, so an allocation someone adds to
+    // run_gpu_pipeline later without accounting for it here gets caught instead
+    // of silently OOMing whichever card was closest to the line.
+    size_t   required_device_bytes = 0; // the five base buffers (what the gate checks)
+    size_t   frags_dedicated_bytes = 0; // d_frags_dedicated, or 0 when overlap is off
+
     // Device buffers (void* because the same region serves multiple roles;
     // callers reinterpret_cast).
     void*     d_storage      = nullptr;
@@ -104,9 +150,11 @@ struct GpuBufferPool {
 
     // Optional dedicated fragment buffer for overlapping the final D2H
     // with the next plot's Xs phase (P3). Auto-enabled when free VRAM
-    // covers pool + cap*8 + 512 MB margin; POS2GPU_NO_D2H_OVERLAP=1
+    // covers pool + cap*8 + vram_safety_margin(); POS2GPU_NO_D2H_OVERLAP=1
     // forces the aliased (d_pair_b) path. When overlap_d2h is false,
     // d_frags_dedicated is null and behaviour matches the pre-P3 pool.
+    // A card sitting exactly on the pool's floor gets the aliased path —
+    // the overlap is a speed-up bought with spare VRAM, never a requirement.
     void*     d_frags_dedicated = nullptr;
     bool      overlap_d2h       = false;
     // Opaque cudaEvent_t / cudaStream_t handles (void* so this header

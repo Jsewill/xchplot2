@@ -40,9 +40,12 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   FP16 still work correctly, with the emulation cost. The AES + match
   kernels at the heart of plotting are integer-only and see no FP16
   penalty.
-- **VRAM:** ~1.3 GiB minimum at k=28. Cards with < 15 GB free use
-  the streaming pipeline (four sub-tiers, auto-picked by free VRAM).
-  Each tier needs its working set plus a 256 MB margin:
+- **VRAM:** ~1.3 GiB minimum at k=28. The pooled path needs 11612 MB
+  free (11484 MB of buffers + a 128 MB margin); it takes another
+  2080 MB to also enable the D2H/Xs overlap, which is a speed-up and
+  not a requirement. Cards below the pool's floor use the streaming
+  pipeline (four sub-tiers, auto-picked by free VRAM). Each streaming
+  tier needs its working set plus a 256 MB margin:
 
   | tier | working set (k=28) | free VRAM needed |
   |------|--------------------|------------------|
@@ -442,9 +445,10 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (k=28 working sets / free-VRAM floors: plain 7290/7546 MB, compact 5200/5456, minimal 3640/3896, tiny 1064/1320). Equivalent CLI flag: `--tier`. Either form forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
-| `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback.          |
+| `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback. Only caps what the *picker* sees; real allocation still succeeds on a big card, so it cannot validate that a tier fits. To rehearse a smaller card for real, hold the VRAM with a ballast process. |
+| `POS2GPU_VRAM_MARGIN_MB=N`    | Free VRAM the pool's gate leaves unclaimed. Default 128 MB. This is headroom against *other tenants* on the card, not an allowance for our own unmodelled allocations (the pooled path has none) — raise it if the GPU also drives a desktop, leave it alone on a headless rig. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path allocation, plus the CUDA memory pool's physical high-water and the plot's VRAM budget. The pool reserves more than it hands out — size a tier from the physical number, not the logical one. |
-| `POS2GPU_ASSERT_VRAM=1`       | Fail a plot if a streaming tier's working set outgrows the peak its floor is derived from. Armed by `bench`. |
+| `POS2GPU_ASSERT_VRAM=1`       | Fail a plot if a streaming tier's working set outgrows the peak its floor is derived from, or if the pooled path exceeds the buffers it declared. Armed by `bench`. |
 | `POS2GPU_POOL_CACHE_MB=N`     | Override how much the CUDA memory pool may keep cached. Default: whatever the card has spare beyond the tier's working set — generous on a big card (cross-plot reuse), near zero on a card at its floor. Only for measurement. |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
@@ -499,10 +503,21 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 PoS2 plots are k=28 by spec. Four code paths, dispatched automatically
 based on available VRAM:
 
-- **Pool path (~15 GB, 16 GB+ cards).** The persistent buffer pool is
-  sized worst-case and reused across plots in `batch` mode for
-  amortised allocator cost and double-buffered D2H. Targets for
-  steady-state: RTX 4080 / 4090 / 5080 / 5090, A6000, etc.
+- **Pool path (11612 MB floor; 12 GB+ cards).** The persistent buffer
+  pool is sized worst-case and reused across plots in `batch` mode for
+  amortised allocator cost and double-buffered D2H. 11484 MB of buffers
+  + a 128 MB margin. Above 13692 MB free it also takes a dedicated 2080 MB
+  fragment buffer to overlap the final D2H with the next plot's Xs phase —
+  a speed-up bought with spare VRAM, never a requirement, so a card at the
+  floor simply aliases it. Targets for steady-state: RTX 4080 / 4090 /
+  5080 / 5090, A6000, etc.
+
+  The floor was 11996 MB until the gate's margin was corrected from 512 MB
+  to 128 MB. That 512 double-counted the ~390 MB CUDA context, which
+  `cudaMemGetInfo` has already deducted from the free figure it reports —
+  and it cost exactly the 12 GB cards this path was documented to serve.
+  Measured: the pooled path allocates nothing at runtime, so those buffers
+  are its whole device footprint, and the driver puts it 18 MB over them.
 Every streaming floor below is that tier's measured working set at k=28
 plus a 256 MB margin. The margin covers the 128 MB the streaming
 allocator holds back for the CUDA context's growth, plus the allocator's
@@ -586,12 +601,22 @@ its floor was derived from.
 
 `xchplot2` queries `cudaMemGetInfo` at pool construction; if the
 pool doesn't fit, the streaming-tier dispatch picks the largest
-streaming tier that fits with a 128 MB margin. Force streaming on
+streaming tier that fits with a 256 MB margin. Force streaming on
 any card with `XCHPLOT2_STREAMING=1`. `--tier
 plain|compact|minimal|tiny|auto` (or `XCHPLOT2_STREAMING_TIER`)
 overrides the auto-pick — useful for testing or to step down from
 a tight margin (e.g. an 8 GiB card OOMing mid-plot can
 `--tier compact`).
+
+The two margins are different numbers on purpose. The pool's gate leaves
+128 MB (`POS2GPU_VRAM_MARGIN_MB`) — pure headroom against other tenants on
+the card, since the pooled path allocates nothing beyond the buffers it
+sizes up front. A streaming tier leaves 256 MB, because it runs under the
+budgeted allocator, which holds 128 MB back from its own budget: a floor of
+`working set + 256` yields a working budget of `working set + 128`, and that
+128 is what absorbs allocation granularity. Cut the streaming margin to 128
+and the budget collapses to exactly the working set, with nothing left to
+round up into.
 
 Plot output is bit-identical across all paths — streaming
 reorganises memory, not algorithms.

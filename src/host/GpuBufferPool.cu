@@ -20,6 +20,18 @@
 
 namespace pos2gpu {
 
+size_t vram_safety_margin()
+{
+    static size_t const margin = [] () -> size_t {
+        if (char const* v = std::getenv("POS2GPU_VRAM_MARGIN_MB"); v && v[0]) {
+            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        return 128ULL << 20;
+    }();
+    return margin;
+}
+
 namespace {
 
 // Variadic so the preprocessor doesn't choke on template-argument commas
@@ -148,24 +160,32 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
 
     pinned_bytes = cap * sizeof(uint64_t);
 
-    // Dedicated frags buffer for D2H/Xs overlap (P3). Policy: auto-enable
-    // when free_vram >= pool_total + cap*8 + 512 MB; POS2GPU_NO_D2H_OVERLAP=1
-    // forces the aliased path. Allocation happens after the base pool
-    // buffers so a mid-sequence OOM still cleans up cleanly.
-    size_t const frags_dedicated_bytes = static_cast<size_t>(cap) * sizeof(uint64_t);
+    // Dedicated frags buffer for D2H/Xs overlap (P3). Policy: auto-enable when
+    // free_vram >= pool_total + cap*8 + vram_safety_margin();
+    // POS2GPU_NO_D2H_OVERLAP=1 forces the aliased path. Allocation happens after
+    // the base pool buffers so a mid-sequence OOM still cleans up cleanly.
+    size_t const frags_overlap_bytes = static_cast<size_t>(cap) * sizeof(uint64_t);
     bool const force_no_overlap = [] {
         char const* v = std::getenv("POS2GPU_NO_D2H_OVERLAP");
         return v && v[0] == '1';
     }();
 
     // Check free VRAM before attempting allocation so we can give a useful
-    // diagnostic instead of a generic cudaErrorMemoryAllocation. The margin
-    // covers CUDA driver/context state, CUB internal scratch, AES T-tables,
-    // and other small runtime allocations.
+    // diagnostic instead of a generic cudaErrorMemoryAllocation.
+    //
+    // required_device is the whole story: run_gpu_pipeline allocates nothing at
+    // runtime — every device byte it touches comes from the buffers sized here —
+    // so this sum IS the pooled path's device footprint, and the driver agrees
+    // to within 8 MiB. The margin is therefore not covering unmodelled
+    // allocations (there are none); it is headroom against other tenants on the
+    // card grabbing VRAM after this gate has waved us through. It was 512 MiB,
+    // which double-counted the ~390 MiB CUDA context that cudaMemGetInfo has
+    // already excluded from free_b. See vram_safety_margin().
     {
         size_t const required_device =
             storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
-        size_t const margin = 512ULL * 1024 * 1024; // 512 MB
+        size_t const margin = vram_safety_margin();
+        required_device_bytes = required_device;
         size_t free_b = 0, total_b = 0;
         POOL_CHECK(cudaMemGetInfo(&free_b, &total_b));
         if (free_b < required_device + margin) {
@@ -175,7 +195,8 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
                 std::to_string(k) + " strength=" + std::to_string(strength) +
                 "; need ~" + std::to_string(to_gib(required_device + margin)).substr(0, 5) +
                 " GiB (pool " + std::to_string(to_gib(required_device)).substr(0, 5) +
-                " GiB + ~0.5 GiB runtime), only " +
+                " GiB + " + std::to_string(to_gib(margin)).substr(0, 4) +
+                " GiB runtime), only " +
                 std::to_string(to_gib(free_b)).substr(0, 5) +
                 " GiB free of " + std::to_string(to_gib(total_b)).substr(0, 5) +
                 " GiB total. Use a smaller k or a GPU with more VRAM.");
@@ -184,12 +205,12 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             e.total_bytes    = total_b;
             throw e;
         }
-        // Overlap headroom: pool + dedicated frags + another 512 MB margin.
+        // Overlap headroom: pool + dedicated frags + the same margin. A card
+        // sitting on the pool's floor takes the aliased path instead — the
+        // overlap is a speed-up bought with spare VRAM, never a requirement.
         overlap_d2h = !force_no_overlap &&
-            (free_b >= required_device + frags_dedicated_bytes + margin);
-        if (!overlap_d2h && !force_no_overlap) {
-            // Silent fallback; one -v / POOL_DEBUG line below.
-        }
+            (free_b >= required_device + frags_overlap_bytes + margin);
+        frags_dedicated_bytes = overlap_d2h ? frags_overlap_bytes : 0;
     }
 
     if (getenv("POS2GPU_POOL_DEBUG")) {
@@ -207,6 +228,14 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             storage_bytes/1e9, pair_a_bytes/1e9, pair_b_bytes/1e9,
             xs_temp_bytes/1e9, sort_scratch_bytes/1e9, pinned_bytes/1e9,
             overlap_d2h ? "yes" : "no");
+        std::fprintf(stderr,
+            "[pool] device: required=%.0f MiB frags=%.0f MiB margin=%.0f MiB "
+            "=> declared %.0f MiB\n",
+            required_device_bytes / double(1ULL << 20),
+            frags_dedicated_bytes / double(1ULL << 20),
+            vram_safety_margin()  / double(1ULL << 20),
+            (required_device_bytes + frags_dedicated_bytes
+                 + vram_safety_margin()) / double(1ULL << 20));
     }
 
     // Wrap allocations so a mid-sequence failure (e.g. d_pair_b OOM after

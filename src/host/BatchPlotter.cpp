@@ -343,6 +343,88 @@ private:
     bool                    aborted_  = false;
 };
 
+// Samples free VRAM from the driver and remembers the low-water mark, so a run
+// can be checked against what it declared it would use.
+//
+// peak() is baseline-relative: free-at-start minus free-at-worst, i.e. the VRAM
+// this process consumed *after* the tier was picked. That is deliberately the
+// same quantity the picker compares against free VRAM, so peak() and the tier
+// model are directly comparable. (The *process* peak would additionally include
+// the ~390 MiB CUDA context, which cudaMemGetInfo has already deducted from the
+// free figure the picker saw — conflating the two is exactly how the SYCL tree's
+// safety margin came to double-count the context and got set 4x too high.)
+//
+// Why sample the driver at all when the pool sizes every buffer up front: because
+// the sizing is a *model*, and a model only catches allocations someone
+// remembered to model. The bug that made every 4-11 GB card OOM was a 3128 MiB
+// buffer allocated outside the accounted path, invisible to every in-process
+// counter and obvious to the driver.
+//
+// Caveat: on a shared GPU another process allocating mid-run inflates our
+// measured peak. The check is therefore fatal only under POS2GPU_ASSERT_VRAM=1
+// (which `bench` sets, being a controlled measurement) and merely loud elsewhere.
+class VramWatchdog {
+public:
+    explicit VramWatchdog(int ordinal) : ordinal_(ordinal)
+    {
+        size_t f = 0;
+        size_t t = 0;
+        if (!streaming_device_memory_probe(ordinal_, f, t)) return;  // unsupported → inert
+        baseline_free_ = f;
+        min_free_.store(f, std::memory_order_relaxed);
+        started_ = true;
+        th_ = std::thread([this] {
+            while (!stop_.load(std::memory_order_relaxed)) {
+                size_t f = 0;
+                size_t t = 0;
+                if (streaming_device_memory_probe(ordinal_, f, t)) {
+                    size_t cur = min_free_.load(std::memory_order_relaxed);
+                    while (f < cur &&
+                           !min_free_.compare_exchange_weak(
+                               cur, f, std::memory_order_relaxed)) {
+                        // cur is reloaded by compare_exchange_weak
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+    }
+    ~VramWatchdog() { stop(); }
+
+    VramWatchdog(VramWatchdog const&)            = delete;
+    VramWatchdog& operator=(VramWatchdog const&) = delete;
+
+    void stop()
+    {
+        if (!started_) return;
+        stop_.store(true, std::memory_order_relaxed);
+        if (th_.joinable()) th_.join();
+        started_ = false;
+    }
+
+    bool     available() const { return baseline_free_ > 0; }
+    uint64_t baseline()  const { return baseline_free_; }
+    uint64_t peak() const
+    {
+        size_t const lo = min_free_.load(std::memory_order_relaxed);
+        return (baseline_free_ > lo) ? (baseline_free_ - lo) : 0;
+    }
+
+private:
+    int                 ordinal_;
+    std::atomic<bool>   stop_{false};
+    std::atomic<size_t> min_free_{0};
+    size_t              baseline_free_ = 0;
+    bool                started_       = false;
+    std::thread         th_;
+};
+
+bool assert_vram_enabled()
+{
+    char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
+    return v && v[0] == '1';
+}
+
 } // namespace
 
 namespace {
@@ -495,6 +577,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // thread's streaming call and the consumer thread's FSE compression
     // + plot-file write.
     std::unique_ptr<GpuBufferPool> pool_ptr;
+
+    // Start sampling free VRAM before anything allocates, so the baseline is
+    // "the card as the tier picker saw it" and peak() is what this run consumed
+    // on top. Reported at the end of the run; see the VramWatchdog comment.
+    VramWatchdog vram(device_id);
+
     // Streaming-fallback pinned buffers — double-buffered the same way the
     // pool does, so producer's D2H of plot N+1 can run concurrently with
     // the consumer reading plot N. cudaMallocHost is ~600 ms, so doing it
@@ -1097,6 +1185,60 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // above and the producer's catch).
     {
         (void)stream_compact;  // avoid unused-warning on plain-only builds
+    }
+
+    // VRAM watchdog: what the driver saw vs what we declared.
+    //
+    // The bound is only asserted on the POOLED path, and deliberately so. The
+    // pool sizes every buffer up front and run_gpu_pipeline allocates nothing at
+    // runtime, so its declaration is exact and any excess is a real bug. The
+    // streaming path runs under the budgeted allocator in GpuPipeline.cu, which
+    // is *supposed* to let the async pool cache freely on a card with headroom —
+    // its peak legitimately exceeds the tier model there, and it enforces its own
+    // bound (POS2GPU_ASSERT_VRAM + POS2GPU_STREAMING_STATS=1 for the breakdown).
+    // Asserting a driver-level bound on it would fire on every roomy card.
+    // -q suppresses the routine line, never the warning or the assert: a run
+    // that quietly skipped its own VRAM check would be worse than useless.
+    vram.stop();
+    if (vram.available()) {
+        auto to_mib = [](uint64_t b) { return b / double(1ULL << 20); };
+        uint64_t const peak = vram.peak();
+
+        if (pool_ptr) {
+            uint64_t const declared = pool_ptr->required_device_bytes
+                                    + pool_ptr->frags_dedicated_bytes
+                                    + vram_safety_margin();
+            if (!opts.quiet) {
+                std::fprintf(stderr,
+                    "%s vram: peak %.0f MiB of %.0f free "
+                    "(pool %.0f + frags %.0f + margin %.0f = %.0f declared)\n",
+                    log_prefix.c_str(), to_mib(peak), to_mib(vram.baseline()),
+                    to_mib(pool_ptr->required_device_bytes),
+                    to_mib(pool_ptr->frags_dedicated_bytes),
+                    to_mib(vram_safety_margin()), to_mib(declared));
+            }
+
+            if (peak > declared) {
+                std::fprintf(stderr,
+                    "%s vram: %s — pooled path peaked at %.0f MiB but declared "
+                    "%.0f MiB. Something in run_gpu_pipeline is allocating "
+                    "outside the pool; the gate that decides whether this card "
+                    "can hold the pool is now wrong by at least %.0f MiB.\n",
+                    log_prefix.c_str(),
+                    assert_vram_enabled() ? "FATAL" : "WARNING",
+                    to_mib(peak), to_mib(declared), to_mib(peak - declared));
+                if (assert_vram_enabled()) {
+                    throw std::runtime_error(
+                        "POS2GPU_ASSERT_VRAM: pooled path exceeded its declared VRAM");
+                }
+            }
+        } else if (!opts.quiet) {
+            std::fprintf(stderr,
+                "%s vram: peak %.0f MiB of %.0f free (streaming; the budgeted "
+                "allocator caches spare VRAM by design — POS2GPU_STREAMING_STATS=1 "
+                "for the per-phase breakdown)\n",
+                log_prefix.c_str(), to_mib(peak), to_mib(vram.baseline()));
+        }
     }
 
     res.plots_written = plots_done.load();

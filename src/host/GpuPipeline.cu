@@ -4407,6 +4407,24 @@ size_t streaming_query_free_vram_bytes()
     return free_b;
 }
 
+bool streaming_device_memory_probe(int ordinal, size_t& free_b, size_t& total_b)
+{
+    // Bind this thread to the target device. The watchdog polls from its own
+    // thread, and cudaMemGetInfo reports for whichever device the *calling*
+    // thread is bound to — an unbound poller would silently report device 0 and
+    // make a multi-GPU run's watchdog nonsense.
+    //
+    // This binds to the device's existing primary context (contexts are
+    // per-process, not per-thread), so it costs no extra VRAM. And because
+    // cudaMemGetInfo forces context creation before it reports, free_b already
+    // excludes the ~390 MiB context — which is why the peak this feeds is
+    // "memory consumed after the tier was picked", the quantity that actually
+    // has to fit in the free VRAM the picker saw.
+    if (ordinal >= 0 && cudaSetDevice(ordinal) != cudaSuccess) return false;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+    return true;
+}
+
 uint64_t* streaming_alloc_pinned_uint64(size_t count)
 {
     uint64_t* p = nullptr;

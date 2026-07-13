@@ -208,6 +208,15 @@ void      streaming_free_pinned_uint32(uint32_t* ptr);
 // Used by BatchPlotter to pick between plain and compact streaming.
 size_t streaming_query_free_vram_bytes();
 
+// Raw cudaMemGetInfo for the given device ordinal. False when the query fails.
+//
+// Deliberately does NOT honour POS2GPU_MAX_VRAM_MB, unlike the query above: this
+// is the driver's own accounting, used by bench's VRAM watchdog to check what a
+// plot really consumed. Feeding it a synthetic cap would make the watchdog
+// measure the pretend card instead of the real one — and the watchdog exists
+// precisely to catch the cases where our model and the driver disagree.
+bool streaming_device_memory_probe(int ordinal, size_t& free_b, size_t& total_b);
+
 // Multi-GPU device binding. bind_current_device() calls cudaSetDevice
 // on the calling thread, which routes all subsequent CUDA runtime
 // calls (cudaMalloc, kernel launches, cudaMemcpyToSymbol, etc.) to the
