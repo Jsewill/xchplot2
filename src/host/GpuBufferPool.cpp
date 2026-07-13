@@ -196,11 +196,17 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     {
         size_t const required_device =
             storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
-        // Margin covers per-context driver state + AES T-tables + the tiny
-        // (sizeof(uint64_t)) d_counter alloc that's not counted in
-        // sort_scratch. Shares vram_safety_margin() with the streaming picker —
-        // the two used to disagree (256 here, 128 there), and both were under
-        // the ~390 MiB the CUDA context actually costs.
+        // Shares vram_safety_margin() with the streaming picker; the two used to
+        // disagree (256 here, 128 there) for no reason anyone recorded.
+        //
+        // The margin is NOT an allowance for the CUDA context: free_bytes comes
+        // from cudaMemGetInfo, and query_device_memory() builds the SYCL queue
+        // before calling it, so the ~390 MiB context is already deducted. Nor is
+        // it an allowance for unmodelled allocations — required_device is the
+        // whole footprint, and the driver agrees to within 8 MiB. It is headroom
+        // against *other tenants* on the card taking VRAM after this gate has
+        // waved us through. See vram_safety_margin() for how sizing it against
+        // the wrong quantity got it set to 512 and cost every card 384 MiB.
         size_t const margin = vram_safety_margin();
         DeviceMemInfo const mem = query_device_memory();
         size_t const total_b = mem.total_bytes;
