@@ -192,6 +192,12 @@ struct StreamingStats {
     // check is only armed when the card is tight. The OOM trim-and-retry in
     // s_malloc is the safety net if that ever proves optimistic.
     bool enforce_budget = true;
+    // Track phys_peak whenever the budget is being enforced — that path already
+    // queries the driver's reservation, so the sample is nearly free, and it is
+    // exactly the case (a tight card) where the number is worth having. On a
+    // card with headroom it is only sampled under POS2GPU_STREAMING_STATS,
+    // because there the driver query is pure overhead on the hot path.
+    bool sample_phys = false;
     std::unordered_map<void*, size_t> sizes;
     std::unordered_set<void*> async_ptrs;   // pointers owned by the pool
     std::unordered_set<void*> host_ptrs;
@@ -242,6 +248,18 @@ inline void s_free_pinned(StreamingStats& s, void* p)
     if (!p) return;
     s.host_ptrs.erase(p);
     cudaFreeHost(p);
+}
+
+// POS2GPU_ASSERT_VRAM=1 (armed by `bench`) makes a plot fail loudly if the tier
+// outgrew the peak its floor is derived from. It keys on the LOGICAL peak, not
+// the physical one: the allocator already bounds physical residency to the
+// card's budget, so the only way a floor can go stale is the tier's working set
+// growing past the constant BatchPlotter derived it from. Costs nothing — no
+// driver calls, no sampling.
+inline bool s_assert_vram()
+{
+    char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
+    return v && v[0] == '1';
 }
 
 inline void s_init_from_env(StreamingStats& s)
@@ -404,6 +422,7 @@ inline void s_init_budget(StreamingStats& s, uint64_t expected_peak)
     // hit the ceiling. 2x the working set is well clear of the worst measured
     // pool bloat (1.62x), and an unknown peak (0) stays armed.
     s.enforce_budget = (expected_peak == 0) || (s.budget < 2 * expected_peak);
+    s.sample_phys    = s.verbose || s.enforce_budget;
 
     if (!s_use_async_pool()) return;
     int dev = 0;
@@ -509,7 +528,7 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
     out = static_cast<T*>(p);
     if (use_async) s.async_ptrs.insert(p);
     else           s.raw_live += bytes;
-    if (s.verbose) {   // diagnostic only — the driver query is not free
+    if (s.sample_phys) {
         uint64_t const phys_now = s_pool_reserved_now() + s.raw_live;
         if (phys_now > s.phys_peak) s.phys_peak = phys_now;
     }
@@ -4304,6 +4323,31 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_frags_out);
     }
     s_free(stats, d_counter);
+
+    // Regression guard. The tier floors in BatchPlotter are (expected_peak +
+    // margin); if the pipeline's working set outgrows the constant they were
+    // derived from, every floor is quietly wrong again — which is the bug this
+    // whole path exists to prevent. Fail loudly instead of shipping it.
+    // Slack, because the declared peaks are round MB just under the measured
+    // fractional ones (plain measures 7290.05 against a 7290 constant), and a
+    // guard that cries wolf gets switched off. A real regression — a new buffer,
+    // a wider stage — is tens or hundreds of MB, nowhere near this.
+    constexpr uint64_t kAssertSlackBytes = 16ULL << 20;
+    if (s_assert_vram() && scratch.expected_peak_bytes
+        && stats.peak > scratch.expected_peak_bytes + kAssertSlackBytes) {
+        PoolHighWater hw;
+        bool const have_hw = s_pool_highwater(hw);
+        throw std::runtime_error(
+            std::string("POS2GPU_ASSERT_VRAM: streaming tier outgrew its "
+                        "declared peak — logical peak ") +
+            s_fmt_bytes(stats.peak) + " > declared " +
+            s_fmt_bytes(scratch.expected_peak_bytes) +
+            (have_hw ? " (pool reserved_high " + s_fmt_bytes(hw.reserved) + ")"
+                     : "") +
+            ". The tier floor is derived from the declared peak, so it is now "
+            "too low. Re-measure and update the per-tier peak constant in "
+            "BatchPlotter.cpp.");
+    }
 
     if (stats.verbose) {
         std::fprintf(stderr,

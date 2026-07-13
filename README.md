@@ -40,12 +40,20 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   FP16 still work correctly, with the emulation cost. The AES + match
   kernels at the heart of plotting are integer-only and see no FP16
   penalty.
-- **VRAM:** ~1.1 GiB minimum at k=28. Cards with < 15 GB free use
-  the streaming pipeline (four sub-tiers — plain ~7.4 GiB, compact
-  ~5.3 GiB, minimal ~3.7 GiB, tiny ~1.1 GiB — auto-picked by free
-  VRAM); 16 GB+ cards use the persistent buffer pool for faster
-  steady-state. All paths produce byte-identical plots. Detailed
-  breakdown in [VRAM](#vram).
+- **VRAM:** ~1.3 GiB minimum at k=28. Cards with < 15 GB free use
+  the streaming pipeline (four sub-tiers, auto-picked by free VRAM).
+  Each tier needs its working set plus a 256 MB margin:
+
+  | tier | working set (k=28) | free VRAM needed |
+  |------|--------------------|------------------|
+  | plain | 7290 MB | 7546 MB |
+  | compact | 5200 MB | 5456 MB |
+  | minimal | 3640 MB | 3896 MB |
+  | tiny | 1064 MB | 1320 MB |
+
+  16 GB+ cards use the persistent buffer pool for faster steady-state.
+  All paths produce byte-identical plots. Detailed breakdown in
+  [VRAM](#vram).
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   pool-vs-streaming path from its own GPU's free VRAM — heterogeneous
@@ -433,9 +441,11 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
-| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain ~7.4 GiB peak, compact ~5.3 GiB, minimal ~3.7 GiB, tiny ~1.1 GiB — k=28 measured). Equivalent CLI flag: `--tier`. Either form forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
+| `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (k=28 working sets / free-VRAM floors: plain 7290/7546 MB, compact 5200/5456, minimal 3640/3896, tiny 1064/1320). Equivalent CLI flag: `--tier`. Either form forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback.          |
-| `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `cudaMalloc` / `cudaFree`.                     |
+| `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path allocation, plus the CUDA memory pool's physical high-water and the plot's VRAM budget. The pool reserves more than it hands out — size a tier from the physical number, not the logical one. |
+| `POS2GPU_ASSERT_VRAM=1`       | Fail a plot if a streaming tier's working set outgrows the peak its floor is derived from. Armed by `bench`. |
+| `POS2GPU_POOL_CACHE_MB=N`     | Override how much the CUDA memory pool may keep cached. Default: whatever the card has spare beyond the tier's working set — generous on a big card (cross-plot reuse), near zero on a card at its floor. Only for measurement. |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
 | `POS2GPU_NO_ASYNC_ALLOC=1`    | Disable stream-ordered `cudaMallocAsync` pooling (audit kill switch).   |
@@ -493,15 +503,30 @@ based on available VRAM:
   sized worst-case and reused across plots in `batch` mode for
   amortised allocator cost and double-buffered D2H. Targets for
   steady-state: RTX 4080 / 4090 / 5080 / 5090, A6000, etc.
-- **Plain streaming (~7.4 GiB floor).** Allocates per-phase and frees
-  between phases; no pinned-host parks, single-pass T2 match. Used
-  on 10-11 GB cards that can't fit the pool but have headroom above
-  compact. ~400 ms/plot faster than compact.
-- **Compact streaming (~5.3 GiB floor).** Park/rehydrate of the large
+Every streaming floor below is that tier's measured working set at k=28
+plus a 256 MB margin. The margin covers the 128 MB the streaming
+allocator holds back for the CUDA context's growth, plus the allocator's
+own granularity surplus (~30-70 MB).
+
+A note on how these are derived, because it is easy to get wrong: the
+per-plot VRAM trace (`POS2GPU_STREAMING_STATS=1`) counts the bytes the
+pipeline *asked for*. The CUDA memory pool **reserves more than it hands
+out** — it once sat on 3.2 GB past the working set on plain and compact —
+and that reservation is what has to fit in the card. The trace now prints
+the pool's physical high-water and the budget next to the logical peak.
+Re-derive a floor from those, never from the logical peak alone.
+`bench` fails loudly (`POS2GPU_ASSERT_VRAM`) if a tier outgrows the peak
+its floor was derived from.
+
+- **Plain streaming (7546 MB floor; 7290 MB working set).** Allocates
+  per-phase and frees between phases; no pinned-host parks, single-pass
+  T2 match. Used on 8-11 GB cards that can't fit the pool but have
+  headroom above compact. ~400 ms/plot faster than compact.
+- **Compact streaming (5456 MB floor; 5200 MB working set).** Park/rehydrate of the large
   intermediates on pinned host across their idle windows + N=2 T2
   match staging (cap/2 ≈ 2280 MB at k=28). T1/T2 sorts are tiled
   (N=2 and N=4) with merge trees. Targets 6-8 GiB cards.
-- **Minimal streaming (~3.7 GiB floor).** Compact's parks plus
+- **Minimal streaming (3896 MB floor; 3640 MB working set).** Compact's parks plus
   six layered cuts that bring every phase below the 4 GiB cliff:
   (1) N=8 T2 match staging (cap/8 ≈ 570 MB at k=28); (2) N=4
   T1/T2 sort gather tiling — the merged-key + permuted-meta
@@ -530,7 +555,7 @@ based on available VRAM:
   for compact (~2.6×). 4 GiB cards remain an edge case since
   real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context;
   please report actual fit.
-- **Tiny streaming (~1.1 GiB floor).** Full Phase 1.4 + 1.5 + 1.6
+- **Tiny streaming (1320 MB floor; 1064 MB working set).** Full Phase 1.4 + 1.5 + 1.6
   algorithm port, byte-for-byte peak parity with the SYCL Tiny
   tier. On top of Minimal's six cuts, adds: per-section-pair T1
   match tile (Xs data parks on pinned host h_xs_pinned; T1 reads

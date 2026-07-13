@@ -648,9 +648,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // peak VRAM at the cost of 6 extra PCIe round-trips during T2
         // match. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
         // MX450).
-        //   minimal: peak 3640 + 128 = 3768 MB floor
-        // (3640 is measured; an earlier comment estimated 3760, which left
-        // this floor with an 8 MB margin it only survived by luck.)
+        //   minimal: peak 3640 + 256 = 3896 MB floor
+        // (3640 is measured; an earlier comment estimated 3760, which left the
+        // old 3768 floor an 8 MB margin it only survived by luck.)
         constexpr uint64_t kMinimalPeakBytes  = 3640ULL * 1024 * 1024;
         constexpr uint64_t kMinimalFloorBytes = kMinimalPeakBytes + kFloorMarginBytes;  // 3896
         // Tiny tier: full Phase 1.4 + 1.5 + 1.6 algorithm port,
@@ -663,13 +663,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // 1056, T2 match 1040, T2 sort 1064 (floor), T3 match 1024,
         // T3 sort 1047. All phases ≤ 1064 MB.
         //
-        //   tiny: peak 1064 + 128 = 1192 MB floor
+        //   tiny: peak 1064 + 256 = 1320 MB floor
         // Was 1100 MB, a 36 MB margin — thinner than the 128 MB the streaming
         // allocator holds back, so Tiny could not in fact run on a card at its
         // own floor: it OOM'd in T2 sort asking for 24 MB. Auto-picker selects
-        // Tiny from ~1.2 GB free up to Minimal's 3.7 GB floor. Targets sub-2
+        // Tiny from ~1.3 GB free up to Minimal's 3.9 GB floor. Targets sub-2
         // GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB, laptop dGPUs),
-        // all of which clear 1192 MB.
+        // all of which clear 1320 MB.
         constexpr uint64_t kTinyPeakBytes     = 1064ULL * 1024 * 1024;
         constexpr uint64_t kTinyFloorBytes    = kTinyPeakBytes + kFloorMarginBytes;  // 1320
         size_t const free_bytes = streaming_query_free_vram_bytes();
@@ -730,6 +730,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 log_prefix.c_str(),
                 free_bytes / double(1ULL << 30),
                 kCompactFloorBytes / double(1ULL << 30));
+        } else if (tier == Tier::Minimal && free_bytes < kMinimalFloorBytes) {
+            std::fprintf(stderr,
+                "%s streaming tier: minimal forced (%.2f GiB free < %.2f GiB "
+                "minimal floor) — proceeding, may OOM mid-plot\n",
+                log_prefix.c_str(),
+                free_bytes / double(1ULL << 30),
+                kMinimalFloorBytes / double(1ULL << 30));
         }
 
         if (tier == Tier::Plain) {

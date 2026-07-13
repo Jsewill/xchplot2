@@ -938,6 +938,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
 
         try {
+            // Fail the bench if a streaming tier outgrows the peak its floor is
+            // derived from — the floors are only honest while that holds. Costs
+            // nothing (no driver calls); setenv does not clobber an explicit 0.
+            setenv("POS2GPU_ASSERT_VRAM", "1", 0);
+
             if (!opts.quiet) {
                 std::fprintf(stderr,
                     "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
