@@ -227,7 +227,7 @@ void emit_progress_line(std::string const& log_prefix,
     bool const in_place = stderr_tty && !opts.verbose;
     std::fprintf(stderr,
         "%s%s progress: plot %zu/%zu done "
-        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, fully plotted in ~%s)%s",
+        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, batch ETA ~%s)%s",
         in_place ? "\r\033[K" : "",
         log_prefix.c_str(),
         done_now, total,
@@ -448,13 +448,21 @@ namespace {
 // a slow CPU worker handles only what it can finish in the same wall.
 // When null (single-device path), the worker iterates 0..entries.size()-1
 // in order — original behaviour.
+// run_epoch (default null) is the steady_clock origin every worker in a
+// multi-device run must share. Completion offsets from a per-worker origin
+// cannot be compared across workers — a GPU slice takes its origin after pool
+// construction and pinned-host allocation, seconds behind a CPU slice's — so
+// merging them yields a timeline that never happened. Null → take a local
+// origin (single-worker paths, where nothing is compared across workers).
 BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             BatchOptions const& opts,
                             int                 device_id,
                             int                 worker_id,
                             std::atomic<std::size_t>* shared_idx = nullptr,
                             std::atomic<std::size_t>* global_done = nullptr,
-                            std::atomic<std::uint64_t>* global_bytes = nullptr)
+                            std::atomic<std::uint64_t>* global_bytes = nullptr,
+                            std::chrono::steady_clock::time_point const*
+                                run_epoch = nullptr)
 {
     (void)worker_id;
 
@@ -477,7 +485,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     if (device_id == kCpuDeviceId) {
         BatchResult res;
         if (entries.empty()) return res;
-        auto const t_start = std::chrono::steady_clock::now();
+        auto const t_start = run_epoch ? *run_epoch
+                                       : std::chrono::steady_clock::now();
+        res.work_start_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
         std::size_t local_idx = 0;
         while (true) {
             std::size_t const i = shared_idx
@@ -998,7 +1009,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     std::atomic<size_t>   plots_done{0};
     std::exception_ptr    consumer_err;
 
-    auto t_start = std::chrono::steady_clock::now();
+    // Everything above — device bind, pool construction, pinned-host
+    // allocation, the tier probe — is per-batch setup, not per-plot cost. With
+    // a run epoch it stays in the timeline (so this worker's offsets are
+    // comparable with its peers'), and work_start_seconds below records where
+    // it ended so the bench can exclude it.
+    auto t_start = run_epoch ? *run_epoch : std::chrono::steady_clock::now();
+    res.work_start_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
 
     // Consumer: takes finished GpuPipelineResults and writes plot files.
     std::thread consumer([&] {
@@ -1321,6 +1339,18 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
 
     auto const t_start = std::chrono::steady_clock::now();
 
+    // Single-worker strategies below run one plot at a time, so their whole
+    // timeline belongs to one worker: publish it as such. Nothing is compared
+    // across workers when there is only one, so their own steady_clock origin
+    // is fine as the epoch — only the work-queue fan-out needs a shared one.
+    auto as_single_worker = [](BatchResult& r, int dev) {
+        WorkerTimeline w;
+        w.device_id          = dev;
+        w.work_start_seconds = r.work_start_seconds;
+        w.completion_seconds = r.completion_seconds;
+        r.workers.assign(1, std::move(w));
+    };
+
     // Single-plot-multi-GPU dispatch (opt in via --shard-plot). Each
     // plot runs across all selected devices as a "team" instead of
     // distributing plots between independent workers. Phase 1 ships
@@ -1332,6 +1362,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         BatchResult r = run_batch_sharded(entries, opts, device_ids);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
+        as_single_worker(r, device_ids[0]);  // the team plots as one worker
         return r;
     }
 
@@ -1339,10 +1370,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // caller thread — identical control flow to pre-multi-GPU except
     // for the optional cudaSetDevice at the top of the slice.
     if (device_ids.size() <= 1) {
-        int const dev = device_ids.empty() ? -1 : device_ids[0];
-        BatchResult r = run_batch_slice(entries, opts, dev, -1);
+        int const dev = device_ids.empty() ? kDefaultGpuId : device_ids[0];
+        BatchResult r = run_batch_slice(entries, opts, dev, -1,
+                                        nullptr, nullptr, nullptr, &t_start);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
+        as_single_worker(r, dev);
         return r;
     }
 
@@ -1355,13 +1388,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // the filesystem.
     size_t const N = device_ids.size();
     if (!opts.quiet) {
-        std::fprintf(stderr,
-            "[batch] multi-device: %zu plots across %zu workers (work-queue) — devices:",
-            entries.size(), N);
+        std::string devs;
         for (size_t i = 0; i < N; ++i) {
-            std::fprintf(stderr, " %d", device_ids[i]);
+            if (i) devs += ", ";
+            devs += device_label(device_ids[i]);
         }
-        std::fprintf(stderr, "\n");
+        std::fprintf(stderr,
+            "[batch] multi-device: %zu plots across %zu workers "
+            "(work-queue: pulled by speed, not split evenly) — devices: %s\n",
+            entries.size(), N, devs.c_str());
     }
 
     std::atomic<std::size_t> next_idx{0};
@@ -1381,7 +1416,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 per_worker[i] = run_batch_slice(
                     entries, opts, device_ids[i],
                     static_cast<int>(i), &next_idx, &global_done,
-                    &global_bytes);
+                    &global_bytes, &t_start);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
                 // Tell peer workers to drain after their current plot
@@ -1404,13 +1439,26 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     }
 
     BatchResult agg;
-    for (auto const& r : per_worker) {
+    agg.workers.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
+        BatchResult const& r = per_worker[i];
         agg.plots_written += r.plots_written;
         agg.plots_skipped += r.plots_skipped;
         agg.bytes_written += r.bytes_written;
         agg.completion_seconds.insert(
             agg.completion_seconds.end(),
             r.completion_seconds.begin(), r.completion_seconds.end());
+
+        // Keep each worker's timeline intact alongside the merged one. Who
+        // finished what is not recoverable once the lists are merged, and a
+        // work-queue gives no worker a predictable share — so any per-worker
+        // question (its own steady-state, its warmup, whether it idled while a
+        // peer drained the queue) can only be answered from here.
+        WorkerTimeline w;
+        w.device_id          = device_ids[i];
+        w.work_start_seconds = r.work_start_seconds;
+        w.completion_seconds = r.completion_seconds;  // already ascending
+        agg.workers.push_back(std::move(w));
     }
     std::sort(agg.completion_seconds.begin(), agg.completion_seconds.end());
     agg.total_wall_seconds = std::chrono::duration<double>(

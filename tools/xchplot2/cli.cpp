@@ -6,6 +6,7 @@
 //           BLS keys via the keygen-rs Rust shim, then dispatches through
 //           batch internally. The "real" entrypoint for users.
 
+#include "gpu/DeviceIds.hpp"       // device_label() — never print a raw device id
 #include "gpu/CudaDeviceList.hpp"  // list_cuda_devices() — backs the
                                    // `devices` subcommand below.
                                    // Plain-types header; the
@@ -422,17 +423,19 @@ struct BenchMeasurement {
     double rate_tib_s = 0.0;
     double s_per_plot = 0.0;
     double gib_per_plot = 0.0;
-    double interval_min = 0.0;
-    double interval_max = 0.0;
-    double interval_stddev = 0.0;
     double size_gib_min = 0.0;
     double size_gib_max = 0.0;
+    pos2gpu::BenchStats stats;   // per-worker + aggregate; see BenchStats.hpp
 };
 
+// warmup_per_worker, NOT a global count. This used to take `warmup * workers`
+// and drop that many plots off the front of the merged timeline, which is only
+// the same thing when every worker runs at the same speed. On a GPU+CPU rig it
+// dropped the GPU's first two plots and kept the CPU's cold-start one.
 BenchMeasurement analyze_bench_run(
     pos2gpu::BatchResult const& res,
     std::vector<std::filesystem::path> const& paths,
-    std::size_t warmup_drop)
+    std::size_t warmup_per_worker)
 {
     BenchMeasurement out;
     out.result = res;
@@ -461,48 +464,19 @@ BenchMeasurement analyze_bench_run(
             static_cast<unsigned long long>(tally_bytes));
     }
 
-    auto times = res.completion_seconds;
-    std::sort(times.begin(), times.end());
-    if (times.size() <= warmup_drop) {
+    // Throughput comes from the per-worker timelines, never from the merged
+    // completion list: a work-queue gives no worker a predictable share, so
+    // once the lists are merged there is no way to tell a worker's cold plot
+    // from a peer's steady one, nor to see the drain tail where a worker that
+    // has emptied the queue sits idle while a slower peer finishes. Both of
+    // those land inside the measured window if you average the merged gaps.
+    out.stats = pos2gpu::compute_bench_stats(res.workers, warmup_per_worker);
+    if (!out.stats.valid) {
         throw std::runtime_error(
-            "bench: no measured plots after warmup exclusion "
-            "(increase -n or reduce --warmup)");
+            "bench: no worker finished a measurable plot after its own warmup "
+            "exclusion (increase -n or reduce --warmup)");
     }
-    // Epoch for the measured window: the last warmup completion, or the
-    // run start (offset 0) when warmup is disabled. Anchoring here means
-    // the first measured plot's own production time is counted — without
-    // it the rate divides N plots' bytes by only N-1 intervals of wall,
-    // inflating throughput by N/(N-1).
-    double const epoch = warmup_drop > 0 ? times[warmup_drop - 1] : 0.0;
-    times.erase(times.begin(),
-                times.begin() + static_cast<std::ptrdiff_t>(warmup_drop));
-
-    // One interval per measured plot (epoch → t1, t1 → t2, ...).
-    std::vector<double> intervals;
-    intervals.reserve(times.size());
-    double prev = epoch;
-    for (double t : times) {
-        intervals.push_back(t - prev);
-        prev = t;
-    }
-
-    double interval_sum = 0.0;
-    out.interval_min = intervals[0];
-    out.interval_max = intervals[0];
-    for (double iv : intervals) {
-        interval_sum += iv;
-        out.interval_min = std::min(out.interval_min, iv);
-        out.interval_max = std::max(out.interval_max, iv);
-    }
-    out.s_per_plot = interval_sum / double(intervals.size());
-
-    double var = 0.0;
-    for (double iv : intervals) {
-        double const d = iv - out.s_per_plot;
-        var += d * d;
-    }
-    out.interval_stddev = intervals.size() > 1
-        ? std::sqrt(var / double(intervals.size() - 1)) : 0.0;
+    out.s_per_plot = out.stats.s_per_plot;
 
     out.size_gib_min = static_cast<double>(out.plot_sizes.front()) / kGiBBytes;
     out.size_gib_max = out.size_gib_min;
@@ -523,12 +497,14 @@ BenchMeasurement analyze_bench_run(
     // s/plot and GiB/plot figures printed alongside it.
     double const mean_plot_bytes =
         static_cast<double>(size_sum) / double(out.plot_sizes.size());
-    double measured_wall = times.back() - epoch;
-    if (measured_wall <= 0.0) {
-        measured_wall = res.total_wall_seconds;
-    }
-    out.rate_tib_s = measured_wall > 0.0
-        ? (mean_plot_bytes * double(times.size()) / kTibBytes) / measured_wall
+
+    // Derive the rate from the aggregate s/plot rather than recomputing it from
+    // a wall span, so every figure the bench prints (s/plot, GiB/plot, TiB/s,
+    // TiB/day, disk-fill ETA) descends from one number and none can disagree
+    // with the others. For a single worker this is identically the old
+    // bytes x N / wall — same value, same digits.
+    out.rate_tib_s = out.s_per_plot > 0.0
+        ? (mean_plot_bytes / kTibBytes) / out.s_per_plot
         : 0.0;
 
     return out;
@@ -549,6 +525,57 @@ void print_bench_measurement(char const* label,
         label, m.rate_tib_s, tib_hour, tib_day, tib_month);
     if (suffix && suffix[0]) std::fprintf(stderr, "  [%s]", suffix);
     std::fprintf(stderr, "\n");
+}
+
+// Per-worker breakdown. On a work-queue this is the only honest view of a
+// multi-device run: the plot counts show how unevenly the queue actually split,
+// each worker's σ is the real per-plot spread (the merged timeline's gaps are
+// an interleaving artifact), and the aggregate steady-state is the SUM of the
+// rates printed here.
+void print_bench_workers(pos2gpu::BenchStats const& stats,
+                         std::size_t warmup_per_worker)
+{
+    std::fprintf(stderr, "[bench] per-worker steady-state:\n");
+    for (auto const& w : stats.workers) {
+        std::string const name = pos2gpu::device_label(w.device_id);
+        if (!w.measured) {
+            std::fprintf(stderr,
+                "[bench]   %-5s %zu plot%s finished — too few to measure past a "
+                "%zu-plot warmup; excluded from the aggregate (raise -n)\n",
+                name.c_str(), w.plots_total, w.plots_total == 1 ? "" : "s",
+                warmup_per_worker);
+            continue;
+        }
+        char dropped[64] = {0};
+        if (w.past_window > 0) {
+            std::snprintf(dropped, sizeof(dropped), ", %zu past window",
+                          w.past_window);
+        }
+        char tail[96] = {0};
+        if (w.idle_tail_seconds >= 0.05) {
+            std::snprintf(tail, sizeof(tail),
+                          " — then idle %.1f s while a peer drained the queue",
+                          w.idle_tail_seconds);
+        }
+        std::fprintf(stderr,
+            "[bench]   %-5s %zu plots (%zu warmup, %zu measured%s) — "
+            "%.2f s/plot (min %.2f / max %.2f, σ %.2f)%s\n",
+            name.c_str(), w.plots_total, w.warmup_dropped, w.plots_measured,
+            dropped, w.s_per_plot, w.interval_min, w.interval_max,
+            w.interval_stddev, tail);
+        if (w.plots_measured < 3) {
+            std::fprintf(stderr,
+                "[bench]   WARNING: %s measured on only %zu plot%s — its rate is "
+                "noisy and it feeds the aggregate; raise -n\n",
+                name.c_str(), w.plots_measured,
+                w.plots_measured == 1 ? "" : "s");
+        }
+    }
+    std::fprintf(stderr,
+        "[bench]   steady window: %.1f s → %.1f s (%.1f s, every worker busy) — "
+        "the aggregate below is the sum of the rates above\n",
+        stats.window_begin, stats.window_end,
+        stats.window_end - stats.window_begin);
 }
 
 std::vector<pos2gpu::BatchEntry> build_bench_entries(
@@ -934,7 +961,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
 
         std::size_t const worker_count = pos2gpu::batch_worker_count(opts);
-        std::size_t const warmup_total = static_cast<std::size_t>(warmup) * worker_count;
+        // Per worker, not a global total: each worker has its own cold-start
+        // plot to exclude. The queue size is still sized off the worker count.
+        std::size_t const warmup_per_worker = static_cast<std::size_t>(warmup);
         int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
 
         try {
@@ -944,25 +973,61 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             setenv("POS2GPU_ASSERT_VRAM", "1", 0);
 
             if (!opts.quiet) {
-                std::fprintf(stderr,
-                    "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
-                    warmup, measured);
+                if (worker_count == 1) {
+                    std::fprintf(stderr,
+                        "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
+                        warmup, measured);
+                } else {
+                    std::fprintf(stderr,
+                        "[bench] warmup: %d plot/worker (excluded). queue: %d plots "
+                        "for %zu workers.\n", warmup, plot_count, worker_count);
+                    std::fprintf(stderr,
+                        "[bench]   the work-queue hands each plot to whoever is free, "
+                        "so -n is a target for the run, not a per-worker share — see "
+                        "the split below.\n");
+                }
             }
 
             BenchMeasurement e2e = run_bench_pass(
                 k, strength, testnet, plot_count, out_dir, opts,
-                warmup_total, keep);
+                warmup_per_worker, keep);
 
+            std::size_t const ran = e2e.stats.workers.size();
+            if (ran > 1) print_bench_workers(e2e.stats, warmup_per_worker);
+
+            // A worker that finished too few plots to measure still did work
+            // and still contended for the host — it just can't be credited. The
+            // aggregate is then strictly below what the rig sustains, and must
+            // not be quoted as if it were the answer.
+            char bound[80] = {0};
+            if (e2e.stats.workers_unmeasured > 0) {
+                std::snprintf(bound, sizeof(bound),
+                    "  [LOWER BOUND — %zu worker(s) unmeasured]",
+                    e2e.stats.workers_unmeasured);
+            }
             std::fprintf(stderr,
-                "[bench] steady-state: %.2f s/plot, %.3f GiB/plot (k=%d, %zu worker%s)\n",
-                e2e.s_per_plot, e2e.gib_per_plot, k, worker_count,
-                worker_count == 1 ? "" : "s");
-            std::fprintf(stderr,
-                "[bench]   per-plot spread: size %.3f GiB (min %.3f / max %.3f), "
-                "interval %.2f s (min %.2f / max %.2f, σ %.2f)\n",
-                e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max,
-                e2e.s_per_plot, e2e.interval_min, e2e.interval_max,
-                e2e.interval_stddev);
+                "[bench] steady-state: %.2f s/plot, %.3f GiB/plot (k=%d, %zu worker%s)%s\n",
+                e2e.s_per_plot, e2e.gib_per_plot, k, ran,
+                ran == 1 ? "" : "s", bound);
+
+            if (ran == 1) {
+                auto const& w = e2e.stats.workers.front();
+                std::fprintf(stderr,
+                    "[bench]   per-plot spread: size %.3f GiB (min %.3f / max %.3f), "
+                    "interval %.2f s (min %.2f / max %.2f, σ %.2f)\n",
+                    e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max,
+                    w.s_per_plot, w.interval_min, w.interval_max,
+                    w.interval_stddev);
+            } else {
+                // No aggregate interval spread here: the gap between successive
+                // completions across workers is short when two finish together
+                // and long across a slow worker's plot, so it measures the
+                // interleaving, not the plotter. The per-worker σ above is the
+                // real spread. Size spread is still meaningful.
+                std::fprintf(stderr,
+                    "[bench]   per-plot spread: size %.3f GiB (min %.3f / max %.3f)\n",
+                    e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max);
+            }
 
             print_bench_measurement("end-to-end", e2e, k);
 
@@ -984,7 +1049,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 compute = run_bench_pass(
                     k, strength, testnet, plot_count, compute_dir, opts,
-                    warmup_total, keep);
+                    warmup_per_worker, keep);
                 print_bench_measurement("compute-only", compute, k,
                                         compute_label.c_str());
                 if (e2e.rate_tib_s > 0.0 && compute.rate_tib_s > 0.0) {

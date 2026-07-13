@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "host/BenchStats.hpp"
 #include "host/GpuPlotter.hpp"
 
 #include <cstdint>
@@ -37,9 +38,25 @@ struct BatchResult {
     size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
     double total_wall_seconds = 0.0;
     std::uint64_t bytes_written = 0;
-    // Per-finished-plot wall offset (seconds from that worker's start), in
-    // completion order. Merged + sorted across workers in run_batch().
-    std::vector<double> completion_seconds;
+    // Per-finished-plot wall offset in completion order, in seconds from the
+    // RUN's epoch — one steady_clock origin shared by every worker, handed to
+    // each slice by run_batch(). It used to be each worker's own start, which
+    // made the merged list below meaningless: a GPU worker's origin is taken
+    // after its pool construction and pinned-host allocation, so its offsets
+    // ran seconds ahead of a CPU worker's on the same wall clock, and sorting
+    // them together produced a timeline that never happened.
+    std::vector<double> completion_seconds;  // merged + sorted in run_batch()
+    // When this worker began its first plot (device init + pool construction
+    // sit before it). Only load-bearing under --warmup 0; otherwise a warmup
+    // completion is the epoch and init is excluded by construction.
+    double work_start_seconds = 0.0;
+    // Per-worker breakdown, in device order. run_batch() populates this for
+    // every strategy — single-worker strategies produce exactly one entry.
+    // Throughput must be derived from this, never from the merged list above:
+    // workers do NOT finish an equal share of a work-queue, so per-worker
+    // warmup exclusion and the drain tail are invisible once merged. See
+    // BenchStats.hpp.
+    std::vector<WorkerTimeline> workers;
 };
 
 // Options controlling batch behavior.
@@ -48,11 +65,15 @@ struct BatchResult {
 //                     empty and use_all_devices is false, run on the
 //                     currently-bound CUDA device (pre-multi-GPU
 //                     behavior: device 0 by default).
-//                     With multiple ids the batch is partitioned across
+//                     With multiple ids the batch is spread across
 //                     workers — one thread per device, each with its
 //                     own GpuBufferPool and producer/consumer channel.
-//                     Plots are assigned round-robin (entry i → worker
-//                     i % N).
+//                     Plots are NOT partitioned up front: workers race
+//                     to pull the next entry off a shared queue, so a
+//                     worker takes plots in proportion to its speed and
+//                     a 3x-faster GPU finishes roughly 3x the plots of
+//                     its CPU peer. Nothing here hands each worker an
+//                     equal share, and callers must not assume one.
 //   use_all_devices — enumerate all visible CUDA devices at runtime and
 //                     use them. Overrides device_ids.
 //   include_cpu     — append a CPU worker alongside any GPUs already
