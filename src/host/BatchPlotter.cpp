@@ -1217,6 +1217,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 to_mib(declared_base_bytes), to_mib(held),
                 to_mib(kVramSafetyMargin), to_mib(declared));
         }
+        // The watchdog above only catches a model that under-declares — the OOM
+        // direction. Over-declaring is silent and still wrong: the picker then
+        // refuses the tier to cards that could run it. Pinned sat at an anchor
+        // of 2200 MB against a true peak of 1128 for exactly this reason (the
+        // number was a ratio against another anchor, never a measurement), and
+        // nothing complained while it demanded 2.7 GB for a tier that fits in
+        // 1.7 GB. Warn, never fail: an over-declared model costs throughput, not
+        // correctness, and a legitimately idle-heavy phase could trip a strict
+        // bound.
+        if (peak > 0 && declared_base_bytes > peak * 3 / 2) {
+            std::fprintf(stderr,
+                "%s vram: WARNING — model declares %.0f MiB but the path only "
+                "peaked at %.0f MiB. An over-declared model denies this path to "
+                "cards that can run it. Re-derive the peak from this measured "
+                "number, not from a ratio against another tier's anchor.\n",
+                log_prefix.c_str(), to_mib(declared_base_bytes), to_mib(peak));
+        }
+
         if (peak > declared) {
             // Loud on every run, fatal when asserting. A path that exceeds its
             // declared footprint is not a benign overshoot: the picker hands

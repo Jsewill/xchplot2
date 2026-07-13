@@ -7,6 +7,10 @@
 // CUDA host code share the same primary CUDA context).
 
 #include "host/GpuBufferPool.hpp"
+
+#ifndef _WIN32
+#include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
+#endif
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "host/PoolSizing.hpp"
@@ -330,6 +334,71 @@ bool cuda_query_device_memory(int device_ordinal,
                               std::size_t& total_bytes);
 #endif
 
+// AMD free-VRAM probe. Resolved at runtime rather than linked, deliberately:
+// asking CMake for HIP would add a build-time dependency and a libamdhip64 link
+// to every build, including the NVIDIA ones that will never call this. On a
+// ROCm build AdaptiveCpp has already loaded the HIP runtime into the process,
+// so the symbol is simply there; on any other build the lookup fails once and
+// we fall back exactly as before. Nothing about a non-AMD build changes.
+//
+// Without this an AMD card gets free_bytes = total_bytes (see below), and the
+// tier picker sizes against VRAM the driver, the display server and everything
+// else on the card have already taken — an 8 GB card reports 8192 MB free,
+// picks plain (needs 7802), actually has ~7400, and OOMs mid-plot. Same bug the
+// NVIDIA path had.
+#ifndef _WIN32
+namespace {
+
+bool hip_query_device_memory(int device_ordinal,
+                             size_t& free_bytes,
+                             size_t& total_bytes)
+{
+    using MemGetInfoFn = int (*)(size_t*, size_t*);
+    using SetDeviceFn  = int (*)(int);
+    using GetDeviceFn  = int (*)(int*);
+
+    static void* const handle = [] () -> void* {
+        // Already in-process? A ROCm build has it loaded before we get here.
+        if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
+            if (dlsym(self, "hipMemGetInfo")) return self;
+            dlclose(self);
+        }
+        for (char const* soname : {"libamdhip64.so", "libamdhip64.so.6",
+                                   "libamdhip64.so.5"}) {
+            if (void* h = dlopen(soname, RTLD_LAZY | RTLD_LOCAL)) return h;
+        }
+        return nullptr;
+    }();
+    if (!handle) return false;
+
+    static auto const mem_get_info =
+        reinterpret_cast<MemGetInfoFn>(dlsym(handle, "hipMemGetInfo"));
+    static auto const set_device =
+        reinterpret_cast<SetDeviceFn>(dlsym(handle, "hipSetDevice"));
+    static auto const get_device =
+        reinterpret_cast<GetDeviceFn>(dlsym(handle, "hipGetDevice"));
+    if (!mem_get_info) return false;
+
+    int  prev     = 0;
+    bool switched = false;
+    if (device_ordinal >= 0 && get_device && set_device
+        && get_device(&prev) == 0 && prev != device_ordinal) {
+        if (set_device(device_ordinal) != 0) return false;
+        switched = true;
+    }
+    size_t f = 0, t = 0;
+    int const rc = mem_get_info(&f, &t);       // hipSuccess == 0
+    if (switched) set_device(prev);
+    if (rc != 0 || t == 0) return false;
+
+    free_bytes  = f;
+    total_bytes = t;
+    return true;
+}
+
+} // namespace
+#endif  // !_WIN32
+
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes)
@@ -337,19 +406,23 @@ bool device_memory_probe(int device_ordinal,
 #ifdef XCHPLOT2_HAVE_CUB
     std::size_t f = 0;
     std::size_t t = 0;
-    if (!cuda_query_device_memory(device_ordinal < 0 ? 0 : device_ordinal,
-                                  f, t)) {
-        return false;
+    if (cuda_query_device_memory(device_ordinal < 0 ? 0 : device_ordinal,
+                                 f, t)) {
+        free_bytes  = f;
+        total_bytes = t;
+        return true;
     }
-    free_bytes  = f;
-    total_bytes = t;
-    return true;
-#else
+#endif
+#ifndef _WIN32
+    // NVIDIA build with no CUDA device, or an AMD build: try HIP.
+    if (hip_query_device_memory(device_ordinal, free_bytes, total_bytes)) {
+        return true;
+    }
+#endif
     (void)device_ordinal;
     (void)free_bytes;
     (void)total_bytes;
-    return false;
-#endif
+    return false;   // neither runtime answered — caller falls back to total
 }
 
 DeviceMemInfo query_device_memory()
