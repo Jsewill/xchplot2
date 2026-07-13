@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <string>
+
 namespace pos2gpu {
 
 // Default thread-local value of sycl_backend::current_device_id_ref().
@@ -22,5 +24,16 @@ inline constexpr int kDefaultGpuId = -1;
 // into device_ids when --cpu (or `cpu` in --devices) is requested,
 // so the multi-device fan-out treats CPU like just-another-device.
 inline constexpr int kCpuDeviceId = -2;
+
+// The sentinels above are an internal encoding and must never reach a log
+// line: printing device_ids with a bare %d renders the CPU worker as "-2",
+// which reads as a mangled flag rather than a device. Everything user-facing
+// goes through here.
+inline std::string device_label(int device_id)
+{
+    if (device_id == kCpuDeviceId)   return "cpu";
+    if (device_id == kDefaultGpuId)  return "gpu";
+    return "gpu" + std::to_string(device_id);
+}
 
 } // namespace pos2gpu

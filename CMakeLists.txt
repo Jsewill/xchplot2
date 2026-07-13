@@ -879,6 +879,16 @@ target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 add_executable(temp_file_test tools/parity/temp_file_test.cpp)
 target_link_libraries(temp_file_test PRIVATE pos2_gpu_host)
 target_compile_features(temp_file_test PRIVATE cxx_std_20)
+
+# bench_stats_test — the multi-worker bench arithmetic (per-worker warmup
+# exclusion, drain-tail truncation, sum-of-rates aggregate). BenchStats.hpp is
+# header-only and free of SYCL/GPU deps precisely so this can be built and run
+# anywhere, with no device present: it is pure arithmetic over synthetic
+# timelines, and it is the only thing standing between a plausible-looking
+# throughput number and a wrong one.
+add_executable(bench_stats_test tools/parity/bench_stats_test.cpp)
+target_include_directories(bench_stats_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(bench_stats_test PRIVATE cxx_std_20)
 target_compile_features(sycl_bucket_offsets_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_bucket_offsets_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
