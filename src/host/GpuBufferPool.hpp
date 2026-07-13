@@ -188,17 +188,33 @@ bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes);
 
-// VRAM held by the CUDA / AdaptiveCpp context itself — primary context, JIT'd
-// module, driver bookkeeping — which no tier peak model accounts for. Measured
-// at a consistent ~390 MiB on sm_89 across every tier: the true process peak is
-// always the s_malloc trace plus ~390 MiB.
+// VRAM the picker holds back beyond a path's model peak, shared by the pool
+// gate and the streaming tier picker.
 //
-// The streaming picker's margin used to be 128 MiB, and its comment already
-// said it was there to cover "measured CUDA-context + driver overhead" — it was
-// simply 3x too small, so every tier over-committed by ~260 MiB before the
-// two-phase scratch was even in the picture. The pool gate independently used
-// 256 MiB. One constant now, used by both.
-constexpr size_t kVramSafetyMargin = 512ULL << 20;
+// This is NOT an accounting number. Every path was measured (bench's watchdog,
+// each ballasted to its own floor so the two-phase grant is zero) to overshoot
+// its model by at most 28 MiB:
+//
+//   pool 10468 -> 10476 (+8)     plain   7290 -> 7304 (+14)
+//   compact 5200 -> 5228 (+28)   minimal 3900 -> 3917 (+17)
+//   tiny 1100 -> 1094 (-6)       pinned  1150 -> 1112 (-38)
+//
+// What the margin actually buys is tolerance for *other tenants* on the card —
+// a compositor, a browser, a second plotter — taking VRAM after the pick. 128
+// MiB leaves ~100 MiB for that. That is right for a headless plotting rig and
+// thin for a GPU also driving a desktop: raise it with POS2GPU_VRAM_MARGIN_MB
+// if you share the card. (Idle drift on a desktop RTX 4090 measured 31 MiB over
+// 40 s, for calibration.)
+//
+// It was 512 MiB, which double-counted the CUDA context. free_bytes comes from
+// cudaMemGetInfo, and query_device_memory constructs the SYCL queue *before*
+// calling it, so the ~390 MiB context is already excluded from free — the margin
+// was reserving it a second time. The watchdog's `peak` is baseline-relative
+// (memory consumed after the pick), which is the quantity that has to fit inside
+// free; sizing the margin against the *process* peak instead was the error. It
+// cost every card 512 MiB of capability: an 8 GB card was denied `plain`, which
+// consumes 7304 MiB and fits with ~290 MiB to spare, and demoted to compact.
+size_t vram_safety_margin();
 
 // Upper bound on streaming-pipeline peak device VRAM at given k.
 //

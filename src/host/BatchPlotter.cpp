@@ -684,8 +684,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             + pool_ptr->pair_b_bytes
                             + pool_ptr->sort_scratch_bytes;
         twophase_budget_bytes =
-            (mem_before_pool.free_bytes > declared_base_bytes + kVramSafetyMargin)
-                ? mem_before_pool.free_bytes - declared_base_bytes - kVramSafetyMargin
+            (mem_before_pool.free_bytes > declared_base_bytes + vram_safety_margin())
+                ? mem_before_pool.free_bytes - declared_base_bytes - vram_safety_margin()
                 : 0;
     } catch (InsufficientVramError const& e) {
         if (opts.quiet) {
@@ -744,7 +744,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const minimal_peak = streaming_minimal_peak_bytes(pool_k);
             size_t const tiny_peak    = streaming_tiny_peak_bytes(pool_k);
             size_t const pinned_peak  = streaming_pinned_peak_bytes(pool_k);
-            size_t const margin       = kVramSafetyMargin;
+            size_t const margin       = vram_safety_margin();
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
 
             // Use effective_tier resolved at the top of run_batch_slice
@@ -1204,7 +1204,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     vram.stop();
     if (vram.available() && declared_base_bytes > 0) {
         uint64_t const held     = twophase_bytes_held();
-        uint64_t const declared = declared_base_bytes + held + kVramSafetyMargin;
+        uint64_t const declared = declared_base_bytes + held + vram_safety_margin();
         uint64_t const peak     = vram.peak();
         auto to_mib = [](uint64_t b) { return b / double(1ULL << 20); };
 
@@ -1215,7 +1215,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 log_prefix.c_str(),
                 to_mib(peak), to_mib(vram.baseline()),
                 to_mib(declared_base_bytes), to_mib(held),
-                to_mib(kVramSafetyMargin), to_mib(declared));
+                to_mib(vram_safety_margin()), to_mib(declared));
         }
         // The watchdog above only catches a model that under-declares — the OOM
         // direction. Over-declaring is silent and still wrong: the picker then

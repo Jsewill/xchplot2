@@ -103,24 +103,34 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
 - **VRAM:** five tiers, picked automatically based on free device
   VRAM at k=28. All five produce byte-identical plots.
 
-  Peaks below are the pipeline's own device allocations. The CUDA /
-  AdaptiveCpp context costs a further **~390 MB** on top, which the
-  512 MB safety margin covers — so the free VRAM a tier needs is
-  `peak + 512 MB`. Free VRAM is read from the driver
-  (`cudaMemGetInfo`), not from the card's total, so anything the
-  display server or another process is already holding is accounted
-  for. `xchplot2 bench` samples the driver's counter for the whole run
-  and fails if a tier exceeds what it declared.
+  Peaks below are the pipeline's own device allocations, and the free
+  VRAM a path needs is `peak + 128 MB`. Free VRAM is read from the
+  driver (`cudaMemGetInfo`) *after* the CUDA / AdaptiveCpp context
+  exists, so the context's own ~390 MB — along with anything the display
+  server or another process is holding — is already excluded from the
+  number the picker sees. The margin does **not** need to cover it.
+
+  What the 128 MB does cover is other tenants taking VRAM *after* the
+  pick. It is not an accounting figure: measured at k=28 with each path
+  ballasted to its own floor, every one of them overshoots its model by
+  at most 28 MB (pool +8, plain +14, minimal +17, compact +28; tiny and
+  pinned come in *under* their models). If the GPU also drives a desktop
+  and you see mid-plot OOMs, raise it with `POS2GPU_VRAM_MARGIN_MB`.
+
+  `xchplot2 bench` samples the driver's counter for the whole run, fails
+  if a path exceeds what it declared, and warns if a path declares far
+  more than it uses (an over-declared model quietly denies the path to
+  cards that can run it).
   - **Pool** (~10.5 GB device + ~4 GB pinned host): fastest steady-state,
     used on 12 GB+ cards.
-  - **Plain streaming** (~7.3 GB peak + 512 MB margin): per-plot
+  - **Plain streaming** (~7.3 GB peak + 128 MB margin): per-plot
     allocations, no pinned-host parks, single-pass T2 match. ~400 ms/
     plot faster than compact. Used on 8-11 GB cards that can't fit
     the pool but have headroom above compact.
-  - **Compact streaming** (~5.2 GB peak + 512 MB margin): full
+  - **Compact streaming** (~5.2 GB peak + 128 MB margin): full
     park/rehydrate + N=2 T2 match tiling. Used on 6-8 GB cards where
     plain won't fit — including 8 GB datacenter parts like the Tesla P4.
-  - **Minimal streaming** (~3.9 GB peak + 512 MB margin): six layered
+  - **Minimal streaming** (~3.9 GB peak + 128 MB margin): six layered
     cuts on top of compact — N=8 T2 match staging, tiled gathers in
     T1/T2 sort, sliced T1 match (per section_l), sliced T3 match
     (T2 inputs parked on host, slice H2D'd per section pair),
@@ -962,6 +972,8 @@ binaries first.
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (plain = ~7.3 GB peak, no parks; compact = ~5.2 GB peak, full parks + N=2 T2 match tiling; minimal = ~3.9 GB peak with full host-pinned slicing of T1/T3 match + tiled CUB outputs in all sort phases + tiled Xs gen/sort/pack — targets 5 GiB+ cards; tiny = ~1.07 GiB peak, k=28 measured 1064 MB, layers Phase 1.4/1.5/1.6 streaming-partition + per-bucket-pair match + host-prepare offsets on top of minimal — targets sub-2 GiB cards like Quadro P620 / GTX 1050 2 GB). Equivalent CLI flag: `--tier`. Either form now forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the pool/streaming VRAM query to N MB (exercise streaming fallback).|
+| `POS2GPU_VRAM_MARGIN_MB=N`    | VRAM the picker holds back beyond a path's peak. Default 128. Every path was measured to overshoot its model by at most 28 MB, so this is not an accounting figure — it is headroom for *other tenants* on the card. Raise it if the GPU also drives a desktop and you see mid-plot OOMs. |
+| `POS2GPU_ASSERT_VRAM=1`       | Fail (not just warn) when a path's true peak exceeds what it declared. Armed by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
@@ -1025,7 +1037,7 @@ based on available VRAM at batch start:
   `max(cap·12, 4·N·u32 + cub)` to `max(cap·12, 3·N·u32 + cub)` —
   saves ~1 GiB at k=28. Targets: RTX 4090 / 5090, A6000, H100,
   RTX 4080 (16 GB), and 12 GB cards like RTX 3060 / RX 6700 XT.
-- **Plain streaming (~7.3 GB peak + 128 MB margin; ≥ 7.42 GiB free at
+- **Plain streaming (~7.3 GB peak + 128 MB margin; ≥ 7.24 GiB free at
   k=28).** Allocates per-phase and frees between phases, but keeps
   large intermediates (`d_t1_meta`, `d_t1_keys_merged`, `d_t2_meta`,
   `d_t2_xbits`, `d_t2_keys_merged`) alive across their idle windows
@@ -1033,7 +1045,7 @@ based on available VRAM at batch start:
   full-cap pass (N=1). Used on 10-11 GB cards that can't fit the pool
   but have headroom above the compact floor. ~400 ms/plot faster than
   compact at k=28 because there are no park/rehydrate PCIe round-trips.
-- **Compact streaming (~5.2 GB peak + 128 MB margin; ≥ 5.33 GiB free
+- **Compact streaming (~5.2 GB peak + 128 MB margin; ≥ 5.20 GiB free
   at k=28).** All three match phases (T1/T2/T3) are tiled N=2 across
   disjoint bucket ranges with half-cap device staging and
   D2H-to-pinned-host between passes. T1 + T2 sorts are tiled (N=2 and
@@ -1069,7 +1081,7 @@ based on available VRAM at batch start:
   cards OOM on tiers the picker had told them would fit. `xchplot2
   bench` now samples the driver's own free-VRAM counter for the whole
   run and fails if the real peak exceeds what the tier declared.
-- **Minimal streaming (~3.9 GB peak + 512 MB margin; ≥ 4.31 GiB free
+- **Minimal streaming (~3.9 GB peak + 128 MB margin; ≥ 3.93 GiB free
   at k=28).** Layered cuts on top of compact:
   - **N=8 T2 match staging.** cap/8 ≈ 570 MB vs compact's cap/2
     ≈ 2280 MB — saves ~1.5 GB on the T2-match peak.
@@ -1105,11 +1117,11 @@ based on available VRAM at batch start:
   Targets 5 GiB+ cards comfortably (RTX 2060, RX 6600 XT, RX 7600
   with ~1.7+ GiB headroom). 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050
   4GB, MX450) are an edge case — real 4 GiB physical hardware
-  reports ~3.5 GiB free post-CUDA-context, just under the 3.80 GiB
-  required floor. Trade-off: ~6 extra cap-sized PCIe round-trips per
-  plot push k=28 wall on sm_89 from ~13 s/plot (compact) to ~34
-  s/plot (minimal). There is no smaller tier — a forced minimal on a
-  card below the floor throws rather than falling further.
+  reports ~3.5 GiB free post-CUDA-context, just under the 3.93 GiB
+  required floor, so they auto-select tiny instead. Trade-off: ~6 extra
+  cap-sized PCIe round-trips per plot push k=28 wall on sm_89 from ~13
+  s/plot (compact) to ~34 s/plot (minimal). Minimal is not the bottom of
+  the ladder — tiny is, and a card below tiny's floor throws.
 
 At pool construction `xchplot2` queries `cudaMemGetInfo` on the
 CUDA-only build, or `global_mem_size` (device total) on the SYCL

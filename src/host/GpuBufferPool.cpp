@@ -198,10 +198,10 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
             storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t);
         // Margin covers per-context driver state + AES T-tables + the tiny
         // (sizeof(uint64_t)) d_counter alloc that's not counted in
-        // sort_scratch. Shares kVramSafetyMargin with the streaming picker —
+        // sort_scratch. Shares vram_safety_margin() with the streaming picker —
         // the two used to disagree (256 here, 128 there), and both were under
         // the ~390 MiB the CUDA context actually costs.
-        size_t const margin = kVramSafetyMargin;
+        size_t const margin = vram_safety_margin();
         DeviceMemInfo const mem = query_device_memory();
         size_t const total_b = mem.total_bytes;
         size_t const free_b  = mem.free_bytes;
@@ -423,6 +423,18 @@ bool device_memory_probe(int device_ordinal,
     (void)free_bytes;
     (void)total_bytes;
     return false;   // neither runtime answered — caller falls back to total
+}
+
+size_t vram_safety_margin()
+{
+    static size_t const margin = [] () -> size_t {
+        if (char const* v = std::getenv("POS2GPU_VRAM_MARGIN_MB"); v && v[0]) {
+            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        return 128ULL << 20;
+    }();
+    return margin;
 }
 
 DeviceMemInfo query_device_memory()
