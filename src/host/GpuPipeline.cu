@@ -172,7 +172,28 @@ struct StreamingStats {
     size_t cap  = 0;   // 0 = no cap
     size_t live = 0;
     size_t peak = 0;
+    // Physical VRAM this plot may hold (0 = unbounded). `live`/`peak` count
+    // the bytes we asked for; the stream-ordered pool *reserves* more than it
+    // hands out, and it is the reservation that has to fit in the card. The
+    // budget is therefore checked against the driver's own reservation
+    // counter, never against `live`. See s_init_budget / s_malloc.
+    uint64_t budget   = 0;
+    size_t   raw_live = 0;   // bytes held via plain cudaMalloc (outside the pool)
+    // True simultaneous high-water of physical VRAM this pipeline holds:
+    // (pool reservation + exact allocations), sampled at each allocation. This
+    // is the number that has to fit in the card. Note it is NOT
+    // reserved_high + raw_peak — those two maxima occur at different moments,
+    // and adding them overstates the peak.
+    uint64_t phys_peak = 0;
+    // Whether every allocation has to check the pool's reservation against the
+    // budget. Reading the driver's reservation counter is not free, and on a
+    // card with room to spare the pool cannot reach the budget anyway (its
+    // reservation never exceeded 1.62x the logical peak in measurement), so the
+    // check is only armed when the card is tight. The OOM trim-and-retry in
+    // s_malloc is the safety net if that ever proves optimistic.
+    bool enforce_budget = true;
     std::unordered_map<void*, size_t> sizes;
+    std::unordered_set<void*> async_ptrs;   // pointers owned by the pool
     std::unordered_set<void*> host_ptrs;
     bool        verbose = false;
     char const* phase   = "(init)";
@@ -186,9 +207,10 @@ struct StreamingStats {
     // tracked pinned-host staging buffers.
     ~StreamingStats() {
         for (auto& [ptr, _bytes] : sizes) {
-            if (ptr) cudaFree(ptr);
+            if (ptr) cudaFree(ptr);   // legal for pool pointers too
         }
         sizes.clear();
+        async_ptrs.clear();
         for (void* p : host_ptrs) {
             if (p) cudaFreeHost(p);
         }
@@ -250,11 +272,21 @@ inline std::string s_fmt_bytes(size_t bytes) {
 // loops); cudaFree implicitly synchronizes the device and large
 // cudaMalloc calls carry driver overhead, repeated every plot of a
 // batch. cudaMallocAsync/cudaFreeAsync with an unbounded release
-// threshold turn these into cheap pool hits after the first plot,
-// while preserving the exact alloc/free choreography (the VRAM-peak
-// accounting above is ours and unaffected). thread_local because each
-// batch worker thread binds its own device. POS2GPU_NO_ASYNC_ALLOC=1
-// forces the plain cudaMalloc path.
+// threshold turn these into cheap pool hits after the first plot.
+// thread_local because each batch worker thread binds its own device.
+// POS2GPU_NO_ASYNC_ALLOC=1 forces the plain cudaMalloc path.
+//
+// The unbounded release threshold means the pool never hands a freed
+// block back to the driver on its own. The `live`/`peak` counters below
+// track *logical* bytes and go down on s_free; the pool's *physical*
+// reservation does not. The two diverge by ~3.1 GB at k=28 on plain and
+// compact, which is invisible to POS2GPU_STREAMING_STATS and to the tier
+// floors calibrated from it — measured true peak 10441 MB against a
+// 7418 MB plain floor. On a card sized to that floor the pool then fails
+// an allocation it will not free its own cache to satisfy, and the plot
+// dies with GBs of VRAM reserved-but-idle (the Tesla P4 report). s_malloc
+// trims and retries on OOM so the reservation can never outlive its
+// usefulness; see s_trim_async_pool.
 inline bool s_use_async_pool()
 {
     thread_local bool const enabled = [] {
@@ -270,17 +302,133 @@ inline bool s_use_async_pool()
                                    dev) != cudaSuccess || !supported) {
             return false;
         }
-        // Keep freed blocks cached in the pool across plots instead of
-        // returning them to the OS at every synchronize.
-        cudaMemPool_t pool{};
-        if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
-            uint64_t threshold = UINT64_MAX;
-            cudaMemPoolSetAttribute(
-                pool, cudaMemPoolAttrReleaseThreshold, &threshold);
-        }
+        // How much the pool may cache is set per plot in s_init_budget, from
+        // the VRAM the card can actually spare beyond the tier's working set.
+        //
+        // It used to be UINT64_MAX — hoard everything. The big-block tiers
+        // churn unequal buffers (2080 MB, 1040 MB, ...), and a cached block
+        // cannot serve a differently-sized request, so the pool reserved fresh
+        // memory and the dead cache compounded: at k=28 the physical
+        // reservation ran 3174 MB over the logical peak on plain and 3184 MB on
+        // compact (43% and 61%), while minimal and tiny — whose uniform slices
+        // the pool can recycle — sat at 8 MB and 24 MB. None of that is visible
+        // to StreamingStats (it counts logical bytes) nor to the tier floors
+        // calibrated from it, so a card sized to its floor OOM'd with GBs
+        // reserved-but-idle. Trimming does not reliably win it back either:
+        // pool backing is released only when an entire chunk is free, so one
+        // live allocation pins the whole chunk.
         return true;
     }();
     return enabled;
+}
+
+// The driver's own accounting for the stream-ordered pool.
+//
+//   used     = logical bytes handed out (what StreamingStats::peak tracks)
+//   reserved = physical VRAM the pool actually took from the driver
+//
+// These diverge: the pool reserves in granular chunks and caches freed
+// blocks, so `reserved` runs above `used`. `reserved` is the number a tier
+// floor has to cover — and reading it here, from inside the process, makes
+// the measurement immune to whatever else happens to be resident on the
+// card. Deriving it from nvidia-smi free-VRAM deltas does not.
+struct PoolHighWater { uint64_t reserved = 0; uint64_t used = 0; };
+
+inline bool s_pool_highwater(PoolHighWater& out)
+{
+    if (!s_use_async_pool()) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return false;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh,
+                                &out.reserved) != cudaSuccess) return false;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh,
+                                &out.used) != cudaSuccess) return false;
+    return true;
+}
+
+// Writing 0 to a high-water attribute resets it to the current value, so
+// each plot reports its own peak rather than the batch's running maximum.
+inline void s_pool_reset_highwater()
+{
+    if (!s_use_async_pool()) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return;
+    uint64_t zero = 0;
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &zero);
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &zero);
+}
+
+// Physical VRAM the pool is holding from the driver right now.
+inline uint64_t s_pool_reserved_now()
+{
+    if (!s_use_async_pool()) return 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return 0;
+    uint64_t v = 0;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &v)
+        != cudaSuccess) return 0;
+    return v;
+}
+
+// Headroom left unclaimed, for the CUDA context's own growth past this point
+// (lazy module loads) and for allocator page rounding. Measured at ~23 MB on
+// sm_89; the tier floors carry the same margin over their logical peaks.
+constexpr uint64_t kStreamSafetyBytes = 128ULL << 20;
+
+// The physical VRAM this plot may hold: what the driver says is free right now,
+// plus whatever the pool is already sitting on (that memory is ours and
+// reusable), less the safety headroom. Computed per plot from the card's actual
+// state rather than hardcoded, so it is right on any card and accounts for
+// whatever else happens to be resident at the time.
+//
+// expected_peak is the tier's logical working set (BatchPlotter's per-tier peak
+// constant). Everything above it is genuinely spare, and that — not a fixed
+// number — is how much the pool may cache: a big card keeps the full cross-plot
+// reuse the pool was added for, while a card sized to its tier's floor has
+// almost nothing spare and so the pool stays lean, which is the whole ballgame,
+// because hoarding on a small card is what was OOM'ing these tiers.
+inline void s_init_budget(StreamingStats& s, uint64_t expected_peak)
+{
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    uint64_t const have = uint64_t(free_b) + s_pool_reserved_now();
+    s.budget = have > kStreamSafetyBytes ? have - kStreamSafetyBytes : 0;
+
+    // Arm the per-allocation budget check only on a card that could actually
+    // hit the ceiling. 2x the working set is well clear of the worst measured
+    // pool bloat (1.62x), and an unknown peak (0) stays armed.
+    s.enforce_budget = (expected_peak == 0) || (s.budget < 2 * expected_peak);
+
+    if (!s_use_async_pool()) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return;
+    uint64_t spare = (s.budget > expected_peak) ? s.budget - expected_peak : 0;
+    if (char const* v = std::getenv("POS2GPU_POOL_CACHE_MB"); v && v[0]) {
+        spare = std::strtoull(v, nullptr, 10) * (1ULL << 20);
+    }
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &spare);
+}
+
+// Hand every block the pool is caching back to the driver. cudaFreeAsync
+// is stream-ordered, so the frees have to have completed before the pool
+// can release the pages — hence the device sync. Only called when an
+// allocation has already failed, so the sync is never on the fast path.
+inline void s_trim_async_pool()
+{
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return;
+    cudaDeviceSynchronize();
+    cudaMemPoolTrimTo(pool, 0);
 }
 
 template <typename T>
@@ -308,9 +456,47 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             " would exceed cap=" + s_fmt_bytes(s.cap));
     }
     void* p = nullptr;
-    cudaError_t err = s_use_async_pool()
+    bool use_async = s_use_async_pool();
+
+    // Would the pool still fit in our budget? Its reservation is what occupies
+    // the card, and it runs well above what we asked for: the big-block tiers
+    // churn unequal buffers (2080 MB, 1040 MB, ...), a cached block cannot
+    // serve a differently-sized request, so the pool reserves fresh memory and
+    // the dead cache compounds — 3174 MB over the logical peak on plain at
+    // k=28, 3184 MB on compact, against 8 MB on minimal and 24 MB on tiny,
+    // whose uniform slices it can recycle. That surplus cannot be capped by
+    // the release threshold (it only fires at synchronize, after the peak is
+    // already set) nor reliably reclaimed by trimming (pool backing is
+    // released only when an entire chunk is free, so one live allocation pins
+    // the chunk). So do not try to bound the pool — just decline to use it
+    // once it no longer fits, and take the exact memory instead.
+    if (use_async && s.enforce_budget && s.budget
+        && s_pool_reserved_now() + s.raw_live + bytes > s.budget) {
+        s_trim_async_pool();
+        if (s_pool_reserved_now() + s.raw_live + bytes > s.budget) {
+            use_async = false;
+        }
+    }
+
+    cudaError_t err = use_async
         ? cudaMallocAsync(&p, bytes, /*stream=*/nullptr)
         : cudaMalloc(&p, bytes);
+
+    if (err == cudaErrorMemoryAllocation && use_async) {
+        // The pool has run out and will not surrender its cache. Hand the
+        // pages back and take exactly what we need.
+        cudaGetLastError();   // clear the failed-allocation error
+        s_trim_async_pool();
+        err = cudaMalloc(&p, bytes);
+        use_async = false;
+    }
+    if (s.verbose && !use_async && s_use_async_pool()) {
+        std::fprintf(stderr,
+            "[stream %-8s] pool over budget — exact alloc: want=%.0f MB "
+            " reserved=%.0f  raw=%.0f  budget=%.0f\n",
+            s.phase, bytes / 1048576.0, s_pool_reserved_now() / 1048576.0,
+            s.raw_live / 1048576.0, s.budget / 1048576.0);
+    }
     if (err != cudaSuccess) {
         throw std::runtime_error(
             std::string("cudaMalloc(") + reason + "): " + cudaGetErrorString(err) +
@@ -321,6 +507,12 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             "pipeline; try a smaller k or a card with more VRAM.");
     }
     out = static_cast<T*>(p);
+    if (use_async) s.async_ptrs.insert(p);
+    else           s.raw_live += bytes;
+    if (s.verbose) {   // diagnostic only — the driver query is not free
+        uint64_t const phys_now = s_pool_reserved_now() + s.raw_live;
+        if (phys_now > s.phys_peak) s.phys_peak = phys_now;
+    }
     s.live += bytes;
     if (s.live > s.peak) s.peak = s.live;
     s.sizes[p] = bytes;
@@ -337,25 +529,28 @@ inline void s_free(StreamingStats& s, T*& ptr)
 {
     if (!ptr) return;
     void* raw = static_cast<void*>(ptr);
+    size_t freed = 0;
     auto it = s.sizes.find(raw);
     if (it != s.sizes.end()) {
-        s.live -= it->second;
+        freed = it->second;
+        s.live -= freed;
         if (s.verbose) {
             std::fprintf(stderr,
                 "[stream %-8s] -%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
-                s.phase, it->second / 1048576.0, "(free)",
+                s.phase, freed / 1048576.0, "(free)",
                 s.live / 1048576.0, s.peak / 1048576.0);
         }
         s.sizes.erase(it);
     }
-    // cudaFree is legal for cudaMallocAsync allocations too (stream-
-    // ordered allocator interop), but cudaFreeAsync avoids the implicit
-    // device synchronization and lets the pool reuse the block without
-    // a round trip to the OS.
-    if (s_use_async_pool()) {
+    // Free through whichever allocator produced this pointer. cudaFree is
+    // legal for cudaMallocAsync allocations too (stream-ordered allocator
+    // interop), but cudaFreeAsync avoids the implicit device synchronization
+    // and lets the pool reuse the block without a round trip to the OS.
+    if (s.async_ptrs.erase(raw)) {
         cudaFreeAsync(raw, /*stream=*/nullptr);
     } else {
         cudaFree(raw);
+        s.raw_live -= (freed < s.raw_live) ? freed : s.raw_live;
     }
     ptr = nullptr;
 }
@@ -1110,6 +1305,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     StreamingStats stats;
     s_init_from_env(stats);
+    s_pool_reset_highwater();
+    s_init_budget(stats, scratch.expected_peak_bytes);
 
     // --- pipeline-wide tiny allocations ---
     // d_counter: per-phase uint64 count output (reused).
@@ -4112,6 +4309,26 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         std::fprintf(stderr,
             "[streaming] k=%d strength=%d  peak device VRAM = %.2f MB\n",
             cfg.k, cfg.strength, stats.peak / 1048576.0);
+        // The number that actually has to fit in the card: what the pool
+        // physically reserved, plus anything allocated outside it. Compare this
+        // — never stats.peak alone — against the tier's floor. stats.peak counts
+        // logical bytes and cannot see the pool's reservation, which is exactly
+        // how these tiers came to ship ~3 GB over their advertised floors.
+        PoolHighWater hw;
+        if (s_pool_highwater(hw)) {
+            std::fprintf(stderr,
+                "[streaming] pool: used_high = %.2f MB  reserved_high = %.2f MB"
+                "  (surplus %.2f MB)\n",
+                hw.used / 1048576.0, hw.reserved / 1048576.0,
+                (hw.reserved - hw.used) / 1048576.0);
+            std::fprintf(stderr,
+                "[streaming] PHYSICAL high = %.2f MB  (logical %.2f, surplus"
+                " %.2f)  budget = %.2f MB\n",
+                stats.phys_peak / 1048576.0, stats.peak / 1048576.0,
+                (stats.phys_peak > stats.peak
+                     ? stats.phys_peak - stats.peak : 0) / 1048576.0,
+                stats.budget / 1048576.0);
+        }
     }
     return result;
 }

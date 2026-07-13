@@ -604,18 +604,55 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // Compact pays ~1-2 s/plot of PCIe round-trips, so we only opt
         // into it when the card can't fit plain.
         //
-        // Thresholds (measured on sm_89):
-        //   plain:   peak 7290 + margin 128 = 7418 MB floor
-        //   compact: peak 5200 + margin 128 = 5328 MB floor
-        constexpr uint64_t kPlainFloorBytes   = 7418ULL * 1024 * 1024;
-        constexpr uint64_t kCompactFloorBytes = 5328ULL * 1024 * 1024;
+        // Every floor below is (logical peak at k=28) + 128 MB, where 128 MB is
+        // kStreamSafetyBytes in GpuPipeline.cu — the headroom the streaming
+        // allocator holds back for the CUDA context's growth after this point.
+        // A tier fits iff free >= its logical peak + that margin, so the two
+        // constants must agree; the allocator budgets against the driver's real
+        // reservation to keep it that way.
+        //
+        // The peaks are what StreamingStats::peak reports, which is only the
+        // truth because the allocator is now budgeted. It did not used to be:
+        // the stream-ordered pool reserved 3174 MB beyond the logical peak on
+        // plain and 3184 MB on compact (it cannot recycle a cached block for a
+        // differently-sized request, and these tiers churn 2080/1040 MB
+        // buffers), which no tier floor accounted for and no VRAM trace could
+        // see. Cards sized to these floors OOM'd with GBs reserved-but-idle.
+        // Do not re-derive a floor from stats.peak without checking it against
+        // the pool's reserved_high (POS2GPU_STREAMING_STATS=1 prints both).
+        //
+        // Each tier's logical peak is the single source of truth: the floor is
+        // derived from it, and it is handed to the streaming allocator (as
+        // cfg.expected_peak_bytes) to bound how much the CUDA memory pool may
+        // cache. Change a peak here and both follow.
+        //
+        // Peaks measured on sm_89 at k=28 via StreamingStats::peak, each one
+        // cross-checked against the pool's reserved_high — see the note above.
+        // The margin has to cover two things at once, or a card sitting exactly
+        // on a floor does not actually fit:
+        //   - kStreamSafetyBytes (128 MB), which the streaming allocator holds
+        //     back from its budget for the CUDA context's growth; and
+        //   - the allocator's own granularity surplus (physical reservation
+        //     over logical bytes), ~30-50 MB at k=28.
+        // 128 MB covered only the first, which left compact with 7 MB of slack
+        // at its floor and made it fail intermittently. 256 MB covers both with
+        // ~78 MB to spare. POS2GPU_STREAMING_STATS=1 prints the physical
+        // high-water and the budget, which is how to re-derive this.
+        constexpr uint64_t kFloorMarginBytes  = 256ULL * 1024 * 1024;
+        constexpr uint64_t kPlainPeakBytes    = 7290ULL * 1024 * 1024;
+        constexpr uint64_t kCompactPeakBytes  = 5200ULL * 1024 * 1024;
+        constexpr uint64_t kPlainFloorBytes   = kPlainPeakBytes   + kFloorMarginBytes;  // 7546
+        constexpr uint64_t kCompactFloorBytes = kCompactPeakBytes + kFloorMarginBytes;  // 5456
         // Minimal tier: compact's pinned-host parking + N=8 T2 match
         // staging (cap/8 vs compact's cap/2). Saves ~1.5 GiB of T2-match
         // peak VRAM at the cost of 6 extra PCIe round-trips during T2
         // match. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
-        // MX450). Floor is estimated, not measured on real 4 GiB
-        // hardware — please report actual fit on a 4 GiB card.
-        constexpr uint64_t kMinimalFloorBytes = 3768ULL * 1024 * 1024;
+        // MX450).
+        //   minimal: peak 3640 + 128 = 3768 MB floor
+        // (3640 is measured; an earlier comment estimated 3760, which left
+        // this floor with an 8 MB margin it only survived by luck.)
+        constexpr uint64_t kMinimalPeakBytes  = 3640ULL * 1024 * 1024;
+        constexpr uint64_t kMinimalFloorBytes = kMinimalPeakBytes + kFloorMarginBytes;  // 3896
         // Tiny tier: full Phase 1.4 + 1.5 + 1.6 algorithm port,
         // capped off with the Xs gen+sort tiling, T3 sort streaming,
         // and host-pinned d_t3_stage that brought cuda-only Tiny to
@@ -626,12 +663,15 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // 1056, T2 match 1040, T2 sort 1064 (floor), T3 match 1024,
         // T3 sort 1047. All phases ≤ 1064 MB.
         //
-        // Anchor set to 1100 MB (+3% safety margin over the 1064 MB
-        // measured) — matches SYCL Tiny's anchor exactly. Auto-picker
-        // selects Tiny on cards from ~1.1 GB free up to Minimal's
-        // 3.7 GB floor. Targets sub-2 GiB NVIDIA cards (Quadro P620
-        // 2 GB, GTX 1050 2 GB, older laptop dGPUs).
-        constexpr uint64_t kTinyFloorBytes    = 1100ULL * 1024 * 1024;
+        //   tiny: peak 1064 + 128 = 1192 MB floor
+        // Was 1100 MB, a 36 MB margin — thinner than the 128 MB the streaming
+        // allocator holds back, so Tiny could not in fact run on a card at its
+        // own floor: it OOM'd in T2 sort asking for 24 MB. Auto-picker selects
+        // Tiny from ~1.2 GB free up to Minimal's 3.7 GB floor. Targets sub-2
+        // GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB, laptop dGPUs),
+        // all of which clear 1192 MB.
+        constexpr uint64_t kTinyPeakBytes     = 1064ULL * 1024 * 1024;
+        constexpr uint64_t kTinyFloorBytes    = kTinyPeakBytes + kFloorMarginBytes;  // 1320
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
         // Tier selection: use the effective_tier resolved at the top
@@ -639,9 +679,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // > global --tier > env), falling back to auto-pick by free
         // VRAM when no override is in effect. The manual overrides
         // bypass the auto-pick threshold but still bail out cleanly
-        // if the chosen tier definitely won't fit (minimal floor is
-        // the hard lower bound; forced higher tier on a card below
-        // that tier's floor warns + proceeds — caller asked).
+        // if the chosen tier definitely won't fit (Tiny's floor is
+        // the hard lower bound — there is no smaller tier; a forced
+        // higher tier on a card below that tier's floor warns and
+        // proceeds — caller asked).
         std::string const& tier_pref = effective_tier;
 
         enum class Tier { Plain, Compact, Minimal, Tiny };
@@ -662,8 +703,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                                                         Tier::Tiny;
         }
 
+        // Hand the chosen tier's working set to the streaming allocator. It
+        // caches only what the card has beyond this, so a big card keeps the
+        // memory pool's cross-plot reuse while a card sized to its floor holds
+        // the pool to the working set — which is what the floors assume.
+        stream_scratch.expected_peak_bytes =
+            (tier == Tier::Plain)   ? kPlainPeakBytes   :
+            (tier == Tier::Compact) ? kCompactPeakBytes :
+            (tier == Tier::Minimal) ? kMinimalPeakBytes :
+                                      kTinyPeakBytes;
+
         // Forced-tier fit warnings. Forced tiers below their floor are
-        // allowed (caller's risk) — except minimal below its floor still
+        // allowed (caller's risk) — except Tiny below its floor still
         // throws because there's no smaller tier to fall back to.
         if (tier == Tier::Plain && free_bytes < kPlainFloorBytes) {
             std::fprintf(stderr,
