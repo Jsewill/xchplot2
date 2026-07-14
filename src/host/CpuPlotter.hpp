@@ -8,11 +8,26 @@
 // directly rather than routing SYCL kernels through AdaptiveCpp's
 // OpenMP backend.
 //
-// Single-threaded internally (the Plotter constructs T1/T2/T3 in
-// sequence), and BatchPlotter spawns exactly one of it — include_cpu is a
-// bool, so `--devices cpu,cpu` runs ONE worker, not two. (This comment
-// used to promise one per token; nothing ever counted them.) Concurrent
-// CPU plots would need N copies of this Plotter's working set in RAM.
+// NOT single-threaded. pos2-chip fans out to hardware_concurrency()
+// internally — RadixSort.hpp:33 and TableConstructorGeneric.hpp:391 call it
+// directly, and parallel_for_range defaults to it — with no cap, no pool, and
+// a fresh set of threads per parallel region. Measured at k=28 on a 32-thread
+// 5950X: 26–30 of 32 cores busy right through table construction. (This
+// comment claimed "single-threaded internally" for two revisions. It is why
+// the CPU worker looked free to co-schedule alongside a GPU, and it is not.)
+//
+// The tail is the exception: PlotFile::writeData FSE-compresses the plot in a
+// plain serial for-loop (PlotFile.hpp:114), so a k=28 plot ends with ~10 s
+// pinned to ONE core — ~19% of its wall. Our own write_plot_file_parallel
+// already parallelises exactly that, through a shared pool, and already
+// accepts pos2-chip's fragment layout (ProofFragment is uint64_t, and
+// PlotData::t3_proof_fragments is a flat vector of them). See
+// PlotFileWriterParallel.hpp.
+//
+// BatchPlotter spawns exactly one of these — include_cpu is a bool, so
+// `--devices cpu,cpu` runs ONE worker, not two. Concurrent CPU plots each need
+// their own copy of the Plotter's working set: 12.13 GiB peak RSS per plot at
+// k=28, so N workers costs N × that.
 //
 // Throws std::runtime_error on plotting failure (caller decides
 // whether to continue under continue_on_error).
