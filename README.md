@@ -395,9 +395,31 @@ and you are told when it caps you:
         k=28, host has 61.4 GiB available and 2 GPU workers reserve 10.5 GiB of it
 ```
 
+The gate is **re-asked at every plot boundary**, not just at startup. A batch runs
+for hours, and the box it runs on is usually a machine you also use: if a compile
+or a browser takes 40 GB an hour in, the count decided at t=0 is now a lie, and the
+OOM killer is what notices — taking the GPU workers' in-flight plots down with the
+CPU's. A plot boundary is the one place the question can be asked honestly, because
+between plots a CPU worker holds nothing.
+
+It cannot *shrink* a running plot — the actuator is a whole 52-second plot and the
+OOM killer acts in milliseconds — so this is admission control, not a live
+controller. Workers wait for room, and say so:
+
+```
+[batch:cpu#1] waiting for memory: its next plot needs 12.1 GiB, the host has
+              3.2 GiB to spare (2 peers plotting — each one finishing frees 12.1 GiB)
+[batch:cpu#1] resumed — memory came back
+```
+
+If the box stays too small for a full grace period (`XCHPLOT2_CPU_WAIT_SECS`,
+default 300 s) with no peer of ours holding anything it could give back, the CPU
+worker retires — quietly, if there are GPU workers still draining the queue.
+
 | env var | effect |
 |---|---|
 | `XCHPLOT2_CPU_RESERVE_MB` | host RAM to leave alone — for the machine you also work on |
+| `XCHPLOT2_CPU_WAIT_SECS` | how long a worker waits for memory before retiring (default 300) |
 | `XCHPLOT2_CPU_WORKERS_UNGATED=1` | skip the gate entirely (and risk the OOM killer taking the whole batch) |
 | `XCHPLOT2_CPU_NICE` | how far to de-prioritise CPU workers below GPU workers (default 10; `0` disables) |
 
