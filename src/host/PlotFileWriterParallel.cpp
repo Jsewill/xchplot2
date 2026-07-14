@@ -219,6 +219,16 @@ std::vector<std::size_t> chunk_boundaries_span(
 
 } // namespace
 
+// Construct the pool on the CALLING thread. See the header for why the caller's
+// identity matters: on Linux the pool's workers inherit the constructing
+// thread's nice value, and BatchPlotter deliberately nices its CPU worker down.
+// Whoever touches the pool first therefore decides the priority of every GPU
+// worker's FSE, and there is no way to raise it back afterwards.
+void warm_writer_pool()
+{
+    (void)WriterThreadPool::instance();
+}
+
 size_t write_plot_file_parallel(
     std::string const& filename,
     std::span<uint64_t const> t3_fragments,

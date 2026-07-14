@@ -47,6 +47,24 @@ size_t write_plot_file_parallel(
     std::span<uint8_t const> memo,
     unsigned thread_count = 0);
 
+// Construct the shared compression pool NOW, on the calling thread.
+//
+// The pool is a function-local static, so its worker threads are created by
+// whichever thread first reaches write_plot_file_parallel() — and on Linux they
+// inherit that thread's nice value, because nice is a per-thread attribute that
+// clone() copies into children.
+//
+// That is a live hazard: BatchPlotter nices its CPU worker down so it stops
+// starving the GPU workers (see nice_current_thread there), and the CPU worker
+// now writes through this pool too. If it won the race to construct the pool,
+// all 32 compression threads would be born niced and EVERY GPU worker's FSE
+// would inherit the penalty — the exact opposite of the intent, silently, and
+// unfixable at runtime since an unprivileged process cannot lower nice again.
+//
+// So run_batch calls this from the main thread before it spawns any worker.
+// Idempotent; cheap after the first call.
+void warm_writer_pool();
+
 // Run pos2-chip's CPU `Plotter` end-to-end and return the sorted T3
 // proof_fragment vector. Encapsulated here so other TUs don't need to
 // include plot/Plotter.hpp (and through it pos/aes/soft_aes.hpp).

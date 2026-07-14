@@ -15,6 +15,12 @@
 
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
+#ifdef __linux__
+#include <sys/resource.h>  // setpriority / PRIO_PROCESS — see nice_current_thread
+#include <cerrno>
+#include <cstring>         // std::strerror
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -349,6 +355,95 @@ void emit_progress_line(std::string const& log_prefix,
         format_duration_hms(eta.seconds).c_str(),
         (!in_place || done_now >= total) ? "\n" : "");
     if (in_place) std::fflush(stderr);
+}
+
+// Drop the CALLING thread's scheduling priority — and, with it, every thread
+// that thread goes on to spawn.
+//
+// Why this exists: pos2-chip's Plotter fans out to hardware_concurrency()
+// threads with no cap and no pool (RadixSort.hpp, TableConstructorGeneric.hpp),
+// and our WriterThreadPool is also sized at hardware_concurrency(). A GPU+CPU
+// batch therefore puts ~2x core_count runnable threads on the box, and the CPU
+// plotter is the one that runs hot continuously. CFS splits the machine roughly
+// evenly during every FSE burst, the GPU worker's consumer takes twice as long,
+// its depth-1 channel backs up, and the GPU — which retires a plot 6-8x faster
+// than the CPU does — stalls waiting on it. On the tester's 12900k/RTX3080 that
+// cost 62% of the CPU worker's whole contribution: adding the CPU should have
+// taken 6.7 -> 5.74 s/plot, and only reached 6.3.
+//
+// How it works: Linux nice is a PER-THREAD attribute (POSIX says per-process;
+// NPTL disagrees), and clone() copies it into children. So nicing this one
+// worker thread also nices the entire fan-out pos2-chip spawns inside
+// run_one_plot_cpu(). We cannot cap that fan-out without patching pos2-chip —
+// but we can make all of it yield.
+//
+// Why priority rather than a thread cap: the GPU workers' demand for the host is
+// BURSTY (FSE fires once per plot completion, then nothing). A statically
+// reserved core would sit idle between bursts. Priority is work-conserving — the
+// CPU plotter still gets the whole machine whenever no GPU worker wants it, and
+// steps aside the instant one does. (Affinity is not an option either: measured,
+// glibc 2.43's hardware_concurrency() ignores the affinity mask, so taskset
+// confines the threads without reducing how many spawn.)
+//
+// ONE-WAY DOOR: an unprivileged process may RAISE its nice value but not lower
+// it again — that needs CAP_SYS_NICE or RLIMIT_NICE headroom. So this may only
+// be called on a thread we are content to leave niced for its entire life, and
+// never on a thread that will later construct something shared. That is exactly
+// why run_batch calls warm_writer_pool() from the main thread first: the CPU
+// worker now writes through the shared WriterThreadPool, and if it won the race
+// to construct it, all 32 compression threads would be born niced and every GPU
+// worker's FSE would inherit the penalty — permanently, and silently.
+//
+// Windows: SetThreadPriority affects only the calling thread and is NOT
+// inherited by threads it creates, so the fan-out would stay at normal priority
+// and nothing would change. Left unimplemented rather than faked. The CPU worker
+// still contends there; the fix on Windows is a pos2-chip thread cap.
+// How many nice levels to drop the CPU worker BELOW its peers. A delta, not an
+// absolute — see nice_current_thread. 0 disables the whole mechanism.
+int cpu_worker_nice_delta()
+{
+    if (char const* v = std::getenv("XCHPLOT2_CPU_NICE"); v && v[0]) {
+        int const n = std::atoi(v);
+        if (n >= 0 && n <= 39) return n;  // 39 = the full -20..19 span
+    }
+    return 10;  // ~9x less CFS weight than its peers under contention
+}
+
+void nice_current_thread(int nice_delta, char const* who)
+{
+    if (nice_delta <= 0) return;
+#if defined(__linux__)
+    // PRIO_PROCESS with who=0 acts on the CALLING THREAD on Linux — the kernel
+    // resolves who==0 to `current`, which is the task, i.e. the thread — despite
+    // the POSIX wording that says process.
+    //
+    // setpriority() takes an ABSOLUTE nice value, not a delta, so read where we
+    // actually are and add. The process baseline is NOT reliably 0: this dev box
+    // runs ananicy-cpp, which renices by rule, and every thread starts at nice
+    // -4. Writing the delta straight through as an absolute would have dropped
+    // the worker 14 levels instead of 10 — a ~28x CFS weight ratio against its
+    // peers rather than the ~9x the default is tuned for. Same code, two very
+    // different machines.
+    errno = 0;
+    int const cur = ::getpriority(PRIO_PROCESS, 0);
+    if (cur == -1 && errno != 0) {  // -1 is also a legal nice value, hence errno
+        std::fprintf(stderr,
+            "%s warning: could not read scheduling priority (%s); leaving the "
+            "CPU worker at normal priority.\n", who, std::strerror(errno));
+        return;
+    }
+    int const target = std::min(19, cur + nice_delta);  // 19 = the nice ceiling
+    errno = 0;
+    if (::setpriority(PRIO_PROCESS, 0, target) != 0 && errno != 0) {
+        std::fprintf(stderr,
+            "%s warning: could not lower scheduling priority to nice %d (%s). "
+            "The CPU worker will compete with the GPU workers for the host.\n",
+            who, target, std::strerror(errno));
+    }
+#else
+    (void)nice_delta;
+    (void)who;
+#endif
 }
 
 // Where this worker's per-plot cost starts. Device bind, pool construction and
@@ -702,6 +797,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     if (device_id == kCpuDeviceId && !sycl_cpu_bench) {
         BatchResult res;
         if (entries.empty()) return res;
+
+        // Yield to the GPU workers. Only when there ARE any: with the CPU as the
+        // sole worker there is nothing to yield to, this slice runs on the MAIN
+        // thread (run_batch's single-worker fast path calls run_batch_slice
+        // inline), and nicing is irreversible for an unprivileged process — so
+        // we would be permanently de-prioritising the whole process to no end.
+        //
+        // live.workers.size() > 1 is exactly the right test: there is at most one
+        // CPU worker, so any peer is a GPU.
+        if (live.workers.size() > 1) {
+            nice_current_thread(cpu_worker_nice_delta(), log_prefix.c_str());
+        }
+
         auto const t_start = run_epoch ? *run_epoch
                                        : std::chrono::steady_clock::now();
         res.work_start_seconds = std::chrono::duration<double>(
@@ -2123,6 +2231,19 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts)
 {
     if (entries.empty()) return BatchResult{};
+
+    // Pin WHO builds the shared FSE pool: this thread, before any worker exists.
+    //
+    // The pool is a function-local static built on first use, and on Linux its
+    // 32 workers inherit the nice value of the thread that constructs them. The
+    // CPU worker is niced down (nice_current_thread) and — since the writer swap
+    // — also writes through this pool, so if it got there first every GPU
+    // worker's FSE would be born niced too. That is irreversible for an
+    // unprivileged process. Constructing the pool here, on the un-niced caller,
+    // makes the race unlosable rather than merely unlikely.
+    //
+    // Free: the pool would be constructed by the first write regardless.
+    warm_writer_pool();
 
     // Homogeneity check (all entries must share k/strength/testnet) —
     // runs once on the full list before any per-worker dispatch so both
