@@ -93,12 +93,49 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
 using PipelineBatchPlotCallback =
     std::function<void(int cfg_idx, PipelineParallelSplitResult result)>;
 
+// Fired exactly once, by whichever stage thread is LAST to bind its device and
+// construct its HostPinnedPool — i.e. the instant the rig is actually ready to
+// plot.
+//
+// The bench needs this. WorkerTimeline::work_start_seconds is documented as
+// "when this worker began its first plot — after its device init and pool
+// construction", and compute_bench_stats uses it as the measurement epoch
+// whenever warmup is 0. But run_batch_pipeline_plot could only stamp it BEFORE
+// calling in here, and the per-device contexts and pools are built INSIDE, on
+// the stage threads — so under --warmup 0 that setup was amortised into every
+// plot's measured cost, on the one strategy whose whole purpose is comparing
+// device assignments. (The default --warmup 1 anchors on a completion instead
+// and was never affected.)
+using PipelineReadyCallback = std::function<void()>;
+
+// Where each stage's wall actually goes. A pipeline's throughput IS its slowest
+// stage, and which phase runs on which device is the only lever a --pipeline-plot
+// user has — so an aggregate s/plot on its own tells them nothing they can act
+// on. These three numbers name the bottleneck directly:
+//
+//   the bottleneck stage   → busy ~= wall,   starved ~= 0, blocked ~= 0
+//   a stage ahead of it    → blocked  large  (backpressured: downstream is slower)
+//   a stage behind it      → starved  large  (upstream cannot feed it)
+//
+// Wall-clock seconds, accumulated by the stage's own thread — no atomics needed,
+// each stage is exactly one thread.
+struct PipelineStageStats {
+    int         stage            = 0;
+    int         device_id        = -1;
+    double      busy_seconds     = 0.0;  // inside run_gpu_pipeline_streaming
+    double      starved_seconds  = 0.0;  // blocked in recv() — nothing to take
+    double      blocked_seconds  = 0.0;  // blocked in send() — nowhere to put it
+    std::size_t plots            = 0;
+};
+
 std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<GpuPipelineConfig> const& cfgs,
     std::vector<int> const&               device_ids,
     int                                   depth = 2,
     std::vector<PipelineStageTier> const& tiers = {},
-    PipelineBatchPlotCallback             on_plot_complete = {});
+    PipelineBatchPlotCallback             on_plot_complete = {},
+    PipelineReadyCallback                 on_ready = {},
+    std::vector<PipelineStageStats>*      stage_stats = nullptr);
 
 // Phase 2-C: device-VRAM-aware stage assignment.
 //

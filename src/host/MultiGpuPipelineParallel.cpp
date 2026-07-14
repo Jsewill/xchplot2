@@ -410,7 +410,9 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<int> const&               device_ids,
     int                                   depth,
     std::vector<PipelineStageTier> const& tiers,
-    PipelineBatchPlotCallback             on_plot_complete)
+    PipelineBatchPlotCallback             on_plot_complete,
+    PipelineReadyCallback                 on_ready,
+    std::vector<PipelineStageStats>*      stage_stats)
 {
     if (cfgs.empty()) return {};
     if (depth < 1) depth = 1;
@@ -575,10 +577,29 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     std::vector<PipelineParallelSplitResult> results(cfgs.size());
     std::vector<std::exception_ptr> excs(N);
 
+    // Per-stage wall accounting. Each stage is exactly one thread, so these are
+    // written by one writer and read only after the join — no atomics.
+    std::vector<PipelineStageStats> stats(N);
+    for (int s = 0; s < N; ++s) {
+        stats[static_cast<std::size_t>(s)].stage     = s;
+        stats[static_cast<std::size_t>(s)].device_id = roles[s].device_id;
+    }
+
+    // Readiness latch. The LAST stage to finish binding + building its pool is
+    // when the rig can actually start plotting; that is the instant the bench
+    // wants as its epoch, not the moment this function was called.
+    std::atomic<int> ready_count{0};
+
+    using clock = std::chrono::steady_clock;
+    auto since = [](clock::time_point t0) {
+        return std::chrono::duration<double>(clock::now() - t0).count();
+    };
+
     std::vector<std::thread> stage_threads;
     stage_threads.reserve(N);
     for (int s = 0; s < N; ++s) {
         stage_threads.emplace_back([&, s] {
+            auto& st = stats[static_cast<std::size_t>(s)];
             try {
                 bind_current_device(roles[s].device_id);
                 // Per-thread host-pinned pool: amortises per-plot allocs
@@ -586,12 +607,27 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 // across all plots this thread handles.
                 HostPinnedPool stage_pool;
 
+                // Device + pool are up on THIS stage. When the last stage gets
+                // here the rig is warm; tell the caller so it can stamp its
+                // measurement epoch after setup rather than before it.
+                if (ready_count.fetch_add(1, std::memory_order_acq_rel) == N - 1
+                    && on_ready) {
+                    on_ready();
+                }
+
                 bool const is_first = (s == 0);
                 bool const is_last  = (s == N - 1);
                 std::size_t plot_idx = 0;
 
                 for (;;) {
+                    // Starved: nothing upstream has handed us. On the first
+                    // stage this is the free-slot channel, so it means the
+                    // pipeline is full — which is backpressure, not starvation.
+                    // Reported as starved either way; the first stage's number
+                    // is read as "how long I waited for a slot to free up".
+                    auto const t_recv = clock::now();
                     int const slot = channels[s]->recv();
+                    st.starved_seconds += since(t_recv);
                     if (slot < 0) break;
 
                     int cfg_idx;
@@ -619,8 +655,13 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                     sc.t2_count_in        = slot_state[slot].t2_count;
                     sc.pool               = &stage_pool;
 
+                    // Busy: this stage's own GPU work. The bottleneck stage is
+                    // the one whose busy time approaches the whole run's wall.
+                    auto const t_busy = clock::now();
                     auto r = run_gpu_pipeline_streaming(
                         cfgs[cfg_idx], bufs[slot].pinned_dst, cap, sc);
+                    st.busy_seconds += since(t_busy);
+                    ++st.plots;
 
                     if (is_first) {
                         slot_state[slot].cfg_idx = cfg_idx;
@@ -631,7 +672,12 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                         // (start_at_*) and writes new counts otherwise.
                         slot_state[slot].t1_count = r.t1_count;
                         slot_state[slot].t2_count = r.t2_count;
+                        // Blocked: downstream has no free slot, so it is slower
+                        // than we are and we are waiting on it. A large number
+                        // here means the bottleneck is BELOW this stage.
+                        auto const t_send = clock::now();
                         channels[s + 1]->send(slot);
+                        st.blocked_seconds += since(t_send);
                     } else {
                         // Final stage: capture fragments + recycle slot.
                         auto frags = r.fragments();
@@ -670,6 +716,10 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     for (auto& t : stage_threads) t.join();
 
     for (auto& b : bufs) free_boundary(b);
+
+    // Publish before rethrowing: a stage that threw is exactly when the caller
+    // most wants to see where the wall went.
+    if (stage_stats) *stage_stats = stats;
 
     for (auto& e : excs) if (e) std::rethrow_exception(e);
     return results;

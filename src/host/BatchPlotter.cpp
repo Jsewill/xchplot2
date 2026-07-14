@@ -2088,20 +2088,25 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
             q_cv.notify_one();
         };
 
-    // Best available per-plot start. Under --warmup 0 this is the bench's epoch,
-    // and leaving it at 0 amortised setup across every plot. Honest caveat: the
-    // orchestrator builds its own per-device contexts and pools INSIDE
-    // run_pipeline_parallel_batch, so that part of the setup is still counted
-    // here. Excluding it would mean a readiness callback through the orchestrator;
-    // until then --warmup 0 on this path reads a touch pessimistic (the default
-    // --warmup 1 anchors on a completion and is unaffected).
-    res.work_start_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t_start).count();
-    live_work_start(live, 0, res.work_start_seconds);
+    // The measurement epoch is the instant the rig can actually plot — after
+    // every stage has bound its device and built its pool. Those are constructed
+    // on the stage threads INSIDE run_pipeline_parallel_batch, so this used to
+    // be stamped before the call and silently amortised the rig's whole setup
+    // across every plot under --warmup 0. The orchestrator now fires on_ready
+    // from the last stage to come up, which is what WorkerTimeline's contract
+    // ("after its device init and pool construction") always said this was.
+    auto on_ready = [&]() {
+        res.work_start_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        live_work_start(live, 0, res.work_start_seconds);
+    };
+
+    std::vector<PipelineStageStats> stage_stats;
 
     try {
         run_pipeline_parallel_batch(
-            cfgs, staged_devices, depth, resolved_tiers, on_plot_complete);
+            cfgs, staged_devices, depth, resolved_tiers, on_plot_complete,
+            on_ready, &stage_stats);
     } catch (...) {
         // Make sure the writer thread can exit even if the
         // orchestrator throws — otherwise we leak the std::thread.
@@ -2119,6 +2124,42 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     res.plots_failed  = plots_failed_ct.load();
     res.total_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
+
+    // Name the bottleneck. An aggregate s/plot tells a --pipeline-plot user
+    // nothing they can act on: their only lever is WHICH phase runs on WHICH
+    // device, and a pipeline retires plots at the rate of its slowest stage. So
+    // report where each stage's wall actually went. The bottleneck is the stage
+    // that is busy nearly all the time and waiting on nobody; every other stage
+    // is either backpressured by it (blocked, sitting above it) or starved by it
+    // (waiting, sitting below it).
+    if (!opts.quiet && !stage_stats.empty() && res.total_wall_seconds > 0.0) {
+        double busiest = 0.0;
+        for (auto const& s : stage_stats) busiest = std::max(busiest, s.busy_seconds);
+
+        std::fprintf(stderr,
+            "[pipeline-plot] stage walls over %.1fs (the rig runs at the speed "
+            "of its slowest stage):\n", res.total_wall_seconds);
+        for (auto const& s : stage_stats) {
+            bool const is_bottleneck = (s.busy_seconds >= busiest - 1e-9);
+            char const* note =
+                is_bottleneck                              ? "  <-- BOTTLENECK" :
+                (s.blocked_seconds > s.starved_seconds)    ? "  (backpressured — the stage below it is slower)" :
+                (s.starved_seconds > 0.0)                  ? "  (starved — the stage above it cannot feed it)" :
+                                                             "";
+            std::fprintf(stderr,
+                "[pipeline-plot]   stage %d (gpu%d): busy %.1fs (%.0f%%), "
+                "starved %.1fs, blocked %.1fs, %zu plots%s\n",
+                s.stage, s.device_id,
+                s.busy_seconds,
+                100.0 * s.busy_seconds / res.total_wall_seconds,
+                s.starved_seconds, s.blocked_seconds, s.plots, note);
+        }
+        if (busiest > 0.0) {
+            std::fprintf(stderr,
+                "[pipeline-plot] move work off the bottleneck stage, or give it "
+                "the faster device — nothing else changes the rig's rate.\n");
+        }
+    }
     return res;
 }
 
