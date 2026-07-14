@@ -639,13 +639,34 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
     // CPU worker: bypass GPU pool / streaming entirely. pos2-chip's
     // Plotter manages its own state, so each plot is a synchronous
-    // run_one_plot_cpu() call — no CUDA, no GpuBufferPool. Single-threaded
-    // internally, and there is exactly ONE of it: BatchOptions::include_cpu is a
-    // bool, so repeating `cpu` in --devices changes nothing. (This comment used
-    // to claim `--devices cpu,cpu,cpu,cpu` gave four workers on a 4-core host. It
-    // never did — nothing ever counted the tokens — so anyone who believed it
-    // benchmarked one worker and attributed it to four. The CLI now warns on a
-    // repeated `cpu`.)
+    // run_one_plot_cpu() call — no CUDA, no GpuBufferPool.
+    //
+    // It is NOT single-threaded (this comment said so for two revisions; see
+    // CpuPlotter.hpp for the measurements). pos2-chip fans out to
+    // hardware_concurrency() with no cap and no pool, so on a GPU+CPU batch it
+    // and our WriterThreadPool — also sized at hardware_concurrency() — put
+    // ~2x core_count runnable threads on the box, and the CPU plotter is the
+    // one that runs hot continuously. CFS then splits the machine during every
+    // FSE burst, the GPU's consumer slows, its depth-1 channel backs up, and
+    // the GPU stalls. On a 12900k/RTX3080 that cost 62% of the CPU worker's
+    // theoretical contribution: adding it should have taken 6.7 -> 5.74 s/plot
+    // and only reached 6.3. The fix is to de-prioritise this worker (nice is a
+    // per-thread attribute on Linux and clone() carries it into the threads
+    // pos2-chip spawns), NOT to cap its thread count: capping is static, and
+    // the GPU's demand for the host is bursty, so a reserved core sits idle
+    // between bursts. Affinity is not a substitute — measured, glibc 2.43's
+    // hardware_concurrency() ignores the affinity mask, so taskset confines
+    // the threads without reducing how many get spawned.
+    //
+    // There is exactly ONE of it: BatchOptions::include_cpu is a bool, so
+    // repeating `cpu` in --devices changes nothing. (It used to claim
+    // `--devices cpu,cpu,cpu,cpu` gave four workers. It never did — nothing
+    // counted the tokens — so anyone who believed it benchmarked one worker and
+    // attributed it to four. The CLI now warns on a repeated `cpu`.) N CPU
+    // workers IS a real win — the plotter is memory-latency-bound, so concurrent
+    // plots interleave each other's stalls rather than queueing for a core — but
+    // each one needs its own copy of the working set (12.14 GiB at k=28), so it
+    // needs an explicit flag and a RAM gate, not a bool.
     if (device_id == kCpuDeviceId) {
         BatchResult res;
         if (entries.empty()) return res;
