@@ -9,9 +9,10 @@
 // OpenMP backend.
 //
 // Single-threaded internally (the Plotter constructs T1/T2/T3 in
-// sequence). Multi-core utilization comes from BatchPlotter spawning
-// one of these per `cpu` token in --devices, e.g. `--devices cpu,cpu`
-// runs two concurrent plots on two cores.
+// sequence), and BatchPlotter spawns exactly one of it — include_cpu is a
+// bool, so `--devices cpu,cpu` runs ONE worker, not two. (This comment
+// used to promise one per token; nothing ever counted them.) Concurrent
+// CPU plots would need N copies of this Plotter's working set in RAM.
 //
 // Throws std::runtime_error on plotting failure (caller decides
 // whether to continue under continue_on_error).

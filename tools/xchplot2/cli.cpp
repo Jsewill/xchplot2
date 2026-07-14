@@ -347,6 +347,16 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "cpu") {
             if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
+            // include_cpu is a bool, so repeating `cpu` adds nothing. Say so.
+            // src/host/CpuPlotter.hpp and BatchPlotter.cpp both promise one CPU
+            // worker per token ("--devices cpu,cpu runs two concurrent plots"),
+            // and that was never implemented — a user following those comments
+            // would benchmark one worker believing they had measured four.
+            if (opts.include_cpu) {
+                std::fprintf(stderr,
+                    "[devices] WARNING: repeated `cpu` in --devices adds no "
+                    "workers — one CPU worker is created regardless\n");
+            }
             opts.include_cpu = true;
         } else {
             char* endp = nullptr;
@@ -409,14 +419,18 @@ std::string bytes_to_hex(std::array<uint8_t, 32> const& id)
 std::string format_duration_dh(double seconds)
 {
     if (seconds < 0.0) seconds = 0.0;
-    int const total_s = static_cast<int>(seconds);
-    int const d = total_s / 86400;
-    int const h = (total_s % 86400) / 3600;
-    int const m = (total_s % 3600) / 60;
-    int const s = total_s % 60;
-    char buf[32];
+    // long long, not int: a slow rig with a big --target-size overflows a 32-bit
+    // seconds count (k=18 at ~5.6e-7 TiB/s and --target-size 2000 is ~3.5e9 s),
+    // and the signed overflow printed "-24855d -20h".
+    long long const total_s = static_cast<long long>(
+        std::min(seconds, 9.0e15));
+    long long const d = total_s / 86400;
+    int const h = static_cast<int>((total_s % 86400) / 3600);
+    int const m = static_cast<int>((total_s % 3600) / 60);
+    int const s = static_cast<int>(total_s % 60);
+    char buf[48];
     if (d > 0) {
-        std::snprintf(buf, sizeof(buf), "%dd %dh", d, h);
+        std::snprintf(buf, sizeof(buf), "%lldd %dh", d, h);
     } else if (h > 0) {
         // Carry the minutes. Truncating to whole hours threw away up to 59 of
         // them against a base of one, so a 1 h 53 m disk fill printed as "~1h" —
@@ -450,15 +464,64 @@ void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
     std::cerr << "\n";
 }
 
+// Pick the roomiest tmpfs, not the first one that happens to exist. The old
+// order took $XDG_RUNTIME_DIR ahead of /dev/shm — but systemd sizes /run/user at
+// 10% of RAM and caps it, while /dev/shm gets 50%, so it reached for the smaller
+// of the two for a pass that writes the entire plot set at once and deletes
+// nothing until the end.
 std::string resolve_tmpfs_dir()
 {
-    if (char const* x = std::getenv("XDG_RUNTIME_DIR"); x && x[0]) {
+    std::string    best;
+    std::uintmax_t best_avail = 0;
+    auto consider = [&](std::string const& dir) {
         std::error_code ec;
-        if (std::filesystem::is_directory(x, ec)) return x;
-    }
+        if (!std::filesystem::is_directory(dir, ec)) return;
+        auto const sp = std::filesystem::space(dir, ec);
+        if (ec) return;
+        if (sp.available > best_avail) {
+            best_avail = sp.available;
+            best = dir;
+        }
+    };
+    if (char const* x = std::getenv("XDG_RUNTIME_DIR"); x && x[0]) consider(x);
+    consider("/dev/shm");
+    return best;
+}
+
+// A scratch dir on the roomiest tmpfs that we have actually proven we can write
+// to, or "" to say there isn't one.
+//
+// The old code appended a FIXED "/xchplot2-bench" and called create_directories.
+// On /dev/shm that is a shared, world-visible path: whoever creates it first owns
+// it, and create_directories then quietly SUCCEEDS for everyone else (the
+// directory exists — that is all it checks) until the first plot open() dies with
+// EACCES. On this dev box a root-owned /dev/shm/xchplot2-bench from July 8 made
+// every --compute-only run fail that way, and it failed only after the e2e pass
+// had already been paid for. Namespace the dir per user + process, and prove the
+// write before handing it back.
+std::string prepare_tmpfs_scratch()
+{
+    std::string const base = resolve_tmpfs_dir();
+    if (base.empty()) return {};
+
+    std::string const dir = base + "/xchplot2-bench-"
+        + std::to_string(static_cast<unsigned>(::getuid())) + "-"
+        + std::to_string(static_cast<unsigned>(::getpid()));
+
     std::error_code ec;
-    if (std::filesystem::is_directory("/dev/shm", ec)) return "/dev/shm";
-    return {};
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+
+    auto const probe = std::filesystem::path(dir) / ".probe";
+    {
+        std::ofstream f(probe, std::ios::binary);
+        if (!f) {
+            std::filesystem::remove_all(dir, ec);
+            return {};
+        }
+    }
+    std::filesystem::remove(probe, ec);
+    return dir;
 }
 
 struct BenchMeasurement {
@@ -563,8 +626,12 @@ void print_bench_measurement(char const* label,
     double const tib_hour = m.rate_tib_s * 3600.0;
     double const tib_day  = tib_hour * 24.0;
     double const tib_month = tib_day * 30.0;
+    // %.3g, not %.6f. The README's own smoke test (-k 18) runs at ~5.6e-7 TiB/s,
+    // which %.6f rounds to a printed "0.000000" — a zero rate — while the three
+    // fields beside it (already %.3g) carry three real digits off the same
+    // number. One line, contradicting itself. At k=28 both spellings agree.
     std::fprintf(stderr,
-        "[bench] %s: %.6f TiB/s | %.3g TiB/hour | %.3g TiB/day | "
+        "[bench] %s: %.3g TiB/s | %.3g TiB/hour | %.3g TiB/day | "
         "%.3g TiB/month (30d)",
         label, m.rate_tib_s, tib_hour, tib_day, tib_month);
     if (suffix && suffix[0]) std::fprintf(stderr, "  [%s]", suffix);
@@ -577,17 +644,36 @@ void print_bench_measurement(char const* label,
 // an interleaving artifact), and the aggregate steady-state is the SUM of the
 // rates printed here.
 void print_bench_workers(pos2gpu::BenchStats const& stats,
-                         std::size_t warmup_per_worker)
+                         std::size_t warmup_per_worker,
+                         std::size_t queue_len,
+                         std::size_t worker_count)
 {
+    // "raise -n" is useless advice on its own: the queue is sized as if the
+    // workers were equal, and they never are, so a user has no way to guess how
+    // far to raise it. We DO know — this worker retired `plots_total` out of a
+    // `queue_len` queue, so scale that up to the warmup + 3 it needs and say the
+    // number. On a fast GPU + CPU rig the honest answer is startlingly large,
+    // which is itself the finding.
+    auto suggest_n = [&](std::size_t plots_total) -> int {
+        std::size_t const want = warmup_per_worker + 3;
+        double const got = static_cast<double>(std::max<std::size_t>(plots_total, 1));
+        double const need_queue =
+            static_cast<double>(queue_len) * (static_cast<double>(want) / got);
+        double const n = need_queue / static_cast<double>(worker_count)
+                       - static_cast<double>(warmup_per_worker);
+        return static_cast<int>(std::ceil(std::max(1.0, n)));
+    };
+
     std::fprintf(stderr, "[bench] per-worker steady-state:\n");
     for (auto const& w : stats.workers) {
         std::string const name = pos2gpu::device_label(w.device_id);
         if (!w.measured) {
             std::fprintf(stderr,
                 "[bench]   %-5s %zu plot%s finished — too few to measure past a "
-                "%zu-plot warmup; excluded from the aggregate (raise -n)\n",
+                "%zu-plot warmup; excluded from the aggregate (needs about "
+                "-n %d to be measurable here)\n",
                 name.c_str(), w.plots_total, w.plots_total == 1 ? "" : "s",
-                warmup_per_worker);
+                warmup_per_worker, suggest_n(w.plots_total));
             continue;
         }
         char dropped[64] = {0};
@@ -618,9 +704,9 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
         if (w.plots_measured < 3) {
             std::fprintf(stderr,
                 "[bench]   WARNING: %s measured on only %zu plot%s — its rate is "
-                "noisy and it feeds the aggregate; raise -n\n",
+                "noisy and it feeds the aggregate; try -n %d\n",
                 name.c_str(), w.plots_measured,
-                w.plots_measured == 1 ? "" : "s");
+                w.plots_measured == 1 ? "" : "s", suggest_n(w.plots_total));
         }
     }
     std::fprintf(stderr,
@@ -985,6 +1071,35 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::size_t const warmup_per_worker = static_cast<std::size_t>(warmup);
         int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
 
+        // Hoisted out of the try so the catch can still sweep them: once a pass
+        // SUCCEEDS its plots are on disk, and run_bench_pass only removes the
+        // output of the pass that threw. A --compute-only run whose second pass
+        // died therefore returned straight out of the catch and abandoned the
+        // first pass's entire set — 10-30 GiB at k=28.
+        BenchMeasurement e2e{};
+        BenchMeasurement compute{};
+        std::string      tmpfs_scratch;  // per-run dir to remove, if we made one
+
+        // Both passes' plots, and the tmpfs dir we minted for the second, on every
+        // exit path. Deleting the e2e output before measuring free space is also
+        // load-bearing: the disk-fill estimate must not be reduced by the bench's
+        // own just-written output.
+        auto sweep = [&] {
+            if (!keep) {
+                cleanup_bench_files(e2e.paths);
+                cleanup_bench_files(compute.paths);
+            }
+            // The tmpfs scratch goes even under --keep. Those plots are a second
+            // copy of the same synthetic set, written to RAM only so the pass
+            // could be timed without a disk; "keeping" them means pinning 10-30
+            // GiB of RAM until reboot, which is not what anyone means by --keep.
+            // The e2e set on the real disk is the one worth keeping.
+            if (!tmpfs_scratch.empty()) {
+                std::error_code ec;
+                std::filesystem::remove_all(tmpfs_scratch, ec);
+            }
+        };
+
         try {
             if (!opts.quiet) {
                 if (worker_count == 1) {
@@ -992,22 +1107,32 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         "[bench] warmup: %d plot/worker (excluded). measured: %d plots/worker.\n",
                         warmup, measured);
                 } else {
+                    // Say what -n actually does. It is neither a run total (the
+                    // queue holds worker_count times more than that) nor a
+                    // per-worker share (nobody hands out shares) — it sizes the
+                    // queue, and the queue then pays out by speed.
                     std::fprintf(stderr,
                         "[bench] warmup: %d plot/worker (excluded). queue: %d plots "
                         "for %zu workers.\n", warmup, plot_count, worker_count);
                     std::fprintf(stderr,
-                        "[bench]   the work-queue hands each plot to whoever is free, "
-                        "so -n is a target for the run, not a per-worker share — see "
-                        "the split below.\n");
+                        "[bench]   -n %d sizes the queue at (%d warmup + %d) x %zu "
+                        "workers; the work-queue then hands each plot to whoever is "
+                        "free, so a fast worker takes more than %d and a slow one "
+                        "fewer — see the split below.\n",
+                        measured, warmup, measured, worker_count, measured);
                 }
             }
 
-            BenchMeasurement e2e = run_bench_pass(
+            e2e = run_bench_pass(
                 k, strength, testnet, plot_count, out_dir, opts,
                 warmup_per_worker, keep);
 
             std::size_t const ran = e2e.stats.workers.size();
-            if (ran > 1) print_bench_workers(e2e.stats, warmup_per_worker);
+            if (ran > 1) {
+                print_bench_workers(e2e.stats, warmup_per_worker,
+                                    static_cast<std::size_t>(plot_count),
+                                    worker_count);
+            }
 
             // A worker that finished too few plots to measure still did work
             // and still contended for the host — it just can't be credited. The
@@ -1045,46 +1170,97 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
             print_bench_measurement("end-to-end", e2e, k);
 
-            BenchMeasurement compute{};
             std::string compute_label;
             if (compute_only) {
-                std::string compute_dir = resolve_tmpfs_dir();
+                // The compute-only pass writes the SAME plot_count plots, and
+                // nothing is deleted until the whole run ends — so the tmpfs has
+                // to hold the entire set at once. /dev/shm defaults to half of
+                // RAM: at k=28 a 2-worker -n 10 run is 22 x 0.92 GiB = 20 GiB,
+                // which ENOSPCs a 32 GB box partway through a pass that already
+                // cost minutes. The e2e pass just measured the real plot size, so
+                // check before spending the time, not during.
+                double const need_bytes =
+                    e2e.gib_per_plot * kGiBBytes * static_cast<double>(plot_count);
+                std::string compute_dir = prepare_tmpfs_scratch();
+                if (!compute_dir.empty()) {
+                    double const avail = static_cast<double>(
+                        std::filesystem::space(compute_dir).available);
+                    if (need_bytes > avail) {
+                        std::fprintf(stderr,
+                            "[bench] WARNING: compute-only needs %.1f GiB in %s "
+                            "but only %.1f GiB is free\n",
+                            need_bytes / kGiBBytes, compute_dir.c_str(),
+                            avail / kGiBBytes);
+                        std::error_code rm_ec;
+                        std::filesystem::remove_all(compute_dir, rm_ec);
+                        compute_dir.clear();
+                    }
+                }
                 if (compute_dir.empty()) {
                     compute_dir = out_dir;
                     compute_label = "compute+cache";
                     std::fprintf(stderr,
-                        "[bench] WARNING: no tmpfs available — compute-only uses "
+                        "[bench] WARNING: no usable tmpfs — compute-only uses "
                         "%s and may reflect page cache, not RAM\n",
                         compute_dir.c_str());
                 } else {
-                    compute_dir += "/xchplot2-bench";
-                    std::filesystem::create_directories(compute_dir);
                     compute_label = "tmpfs";
+                    tmpfs_scratch = compute_dir;  // remove the dir, not just its plots
                 }
                 compute = run_bench_pass(
                     k, strength, testnet, plot_count, compute_dir, opts,
                     warmup_per_worker, keep);
                 print_bench_measurement("compute-only", compute, k,
                                         compute_label.c_str());
-                if (e2e.rate_tib_s > 0.0 && compute.rate_tib_s > 0.0) {
+                if (e2e.s_per_plot > 0.0 && compute.s_per_plot > 0.0) {
+                    // From the two s/plot figures directly, NOT from the two
+                    // rates. rate = mean_plot_bytes / s_per_plot, and the passes
+                    // mint fresh random plot_ids, so a rate ratio carries a
+                    // stray (B_e2e / B_compute) size factor. Disk overhead is a
+                    // few percent, so even a sub-percent size difference is a
+                    // large relative error in it — large enough to flip the sign.
                     double const overhead_pct =
-                        100.0 * (1.0 - e2e.rate_tib_s / compute.rate_tib_s);
-                    std::fprintf(stderr,
-                        "[bench]   disk overhead: ~%.1f%% of wall\n", overhead_pct);
+                        100.0 * (1.0 - compute.s_per_plot / e2e.s_per_plot);
+                    // A negative "overhead" is not a disk that gives time back:
+                    // it means the two passes differ by more than the effect being
+                    // measured. Printing "~-2.3%" invited reading it as a result.
+                    if (overhead_pct >= 0.0) {
+                        std::fprintf(stderr,
+                            "[bench]   disk overhead: ~%.1f%% of wall\n",
+                            overhead_pct);
+                    } else {
+                        std::fprintf(stderr,
+                            "[bench]   disk overhead: none measurable — the "
+                            "in-RAM pass came out %.1f%% slower, so run-to-run "
+                            "noise here exceeds the disk's cost\n",
+                            -overhead_pct);
+                    }
                 }
             }
 
             // Delete before measuring free space so the fill estimate
             // isn't reduced by the bench's own just-written output.
-            if (!keep) {
-                cleanup_bench_files(e2e.paths);
-                cleanup_bench_files(compute.paths);
-            } else {
+            sweep();
+            if (keep) {
                 for (auto const& p : e2e.paths) {
                     std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
                 }
+                // ...but only the ones sweep() actually left behind: the
+                // compute-only set is gone if it lived in the tmpfs scratch.
+                std::size_t dropped = 0;
                 for (auto const& p : compute.paths) {
-                    std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                    std::error_code ec;
+                    if (std::filesystem::exists(p, ec)) {
+                        std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                    } else {
+                        ++dropped;
+                    }
+                }
+                if (dropped > 0) {
+                    std::fprintf(stderr,
+                        "[bench] note: %zu compute-only plot(s) not kept — they "
+                        "were written to RAM (tmpfs) and would have held it "
+                        "until reboot\n", dropped);
                 }
             }
 
@@ -1103,6 +1279,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             return 0;
         } catch (std::exception const& e) {
+            sweep();
             std::cerr << "[bench] FAILED: " << e.what() << "\n";
             return 2;
         }

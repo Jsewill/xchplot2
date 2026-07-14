@@ -31,6 +31,41 @@ bool near(double a, double b, double tol = 1e-6)
     return std::fabs(a - b) <= tol;
 }
 
+// The queue handout estimate_eta_seconds() is standing in for: give each queued
+// entry to whichever worker's next free slot is earliest, one entry at a time,
+// exactly as the work-queue does. Correct but O(queue x workers), and the real
+// path runs it on every completion of a manifest that can hold 100k entries — so
+// the shipped version binary-searches for the same instant. Asserting the two
+// agree is what licenses that substitution.
+double greedy_eta(std::vector<pos2gpu::WorkerLive> const& live,
+                  std::size_t unclaimed, double now)
+{
+    struct Train { double base; double s; std::size_t n; };
+    std::vector<Train> ws;
+    for (auto const& l : live) {
+        if (!(l.s_per_plot > 0.0)) continue;
+        ws.push_back(Train{std::max(l.last_done, now - l.s_per_plot),
+                           l.s_per_plot, l.in_flight});
+    }
+    if (ws.empty()) return 0.0;
+
+    double finish = now;
+    for (auto const& w : ws) {
+        if (w.n > 0) finish = std::max(finish, w.base + double(w.n) * w.s);
+    }
+    for (std::size_t u = 0; u < unclaimed; ++u) {
+        std::size_t best = 0;
+        double best_t = ws[0].base + double(ws[0].n + 1) * ws[0].s;
+        for (std::size_t i = 1; i < ws.size(); ++i) {
+            double const t = ws[i].base + double(ws[i].n + 1) * ws[i].s;
+            if (t < best_t) { best_t = t; best = i; }
+        }
+        ++ws[best].n;
+        finish = std::max(finish, best_t);
+    }
+    return std::max(0.0, finish - now);
+}
+
 // The pre-rewrite algorithm, kept here as the thing we are asserting we no
 // longer do: merge every worker's completions, sort, drop the first
 // `warmup * workers`, mean of the inter-completion gaps.
@@ -225,6 +260,154 @@ int main()
         auto const st2 = pos2gpu::compute_bench_stats({one}, 1);
         all_ok = check(!st2.valid, "degenerate: warmup eats every plot → invalid")
                  && all_ok;
+    }
+
+    // ---------------------------------------------------------------------
+    // --warmup 0: the epoch is work_start_seconds, so per-batch SETUP (device
+    // bind, pool construction, the tier probe) must sit outside the window.
+    //
+    // This is the case that had no test, and its absence let a real bug ship:
+    // run_batch_sharded and run_batch_pipeline_plot never assigned
+    // work_start_seconds, so it stayed 0.0 and the whole multi-GPU setup got
+    // amortised across every plot — silently understating those rigs by a few
+    // percent, and only under --warmup 0. Pin the invariant here so a path that
+    // forgets to publish its work start fails loudly instead of quietly.
+    // ---------------------------------------------------------------------
+    {
+        // Same 10 plots at 49 s, but one rig spent 5 s in setup and the other 90.
+        auto const quick = make_worker(0, 5.0, 49.0, 49.0, 10);
+        auto const slow_setup = make_worker(0, 90.0, 49.0, 49.0, 10);
+        auto const a = pos2gpu::compute_bench_stats({quick}, 0);
+        auto const b = pos2gpu::compute_bench_stats({slow_setup}, 0);
+
+        all_ok = check(near(a.s_per_plot, 49.0),
+                       "warmup 0: epoch is work_start, so setup is excluded")
+                 && all_ok;
+        all_ok = check(near(a.s_per_plot, b.s_per_plot),
+                       "warmup 0: 85 s more setup must not change s/plot") && all_ok;
+
+        // And the failure it is guarding against: a path that leaves
+        // work_start_seconds at 0 charges its setup to the plots.
+        auto forgot = slow_setup;
+        forgot.work_start_seconds = 0.0;
+        auto const c = pos2gpu::compute_bench_stats({forgot}, 0);
+        all_ok = check(c.s_per_plot > 57.0,
+                       "warmup 0: unset work_start inflates s/plot (the bug)")
+                 && all_ok;
+    }
+
+    // ---- estimate_eta_seconds -------------------------------------------
+    {
+        using pos2gpu::WorkerLive;
+        using pos2gpu::estimate_eta_seconds;
+
+        // The case that motivated the fix. At the instant the GPU retired the
+        // last queued plot (t=325.3), the queue was empty, the GPU was idle, and
+        // the CPU was 9.8 s into a plot it had started at 315.5. The old ETA was
+        // remaining x batch-mean = 1 x (325.3/51) = 6.4 s. It took 32.6 more.
+        {
+            std::vector<WorkerLive> live = {
+                WorkerLive{6.93, 325.3, 0},   // gpu: done, nothing in flight
+                WorkerLive{63.70, 315.5, 1},  // cpu: one plot in flight
+            };
+            double const eta = estimate_eta_seconds(live, 0, 325.3).seconds;
+            all_ok = check(near(eta, 53.9, 0.05),
+                           "eta: drain tail prices the in-flight CPU plot") && all_ok;
+            // What the old arithmetic said, kept as the thing we no longer do.
+            double const legacy = (325.3 / 51.0) * 1.0;
+            all_ok = check(near(legacy, 6.378, 0.01) && eta > 8.0 * legacy,
+                           "eta: old batch-mean understated the tail by >8x") && all_ok;
+            // Truth was 32.6 s (the CPU sped up once the GPU stopped competing
+            // for cores). Erring long beats claiming the batch is 6 s from done.
+            all_ok = check(eta > 32.6, "eta: errs long, not short, on the tail")
+                     && all_ok;
+        }
+
+        // Nothing in flight and nothing queued → the batch is over.
+        {
+            std::vector<WorkerLive> live = {WorkerLive{7.0, 100.0, 0}};
+            all_ok = check(near(estimate_eta_seconds(live, 0, 100.0).seconds, 0.0),
+                           "eta: idle rig with an empty queue → 0") && all_ok;
+        }
+
+        // One worker: base + remaining*s, i.e. exactly the old meaning.
+        {
+            std::vector<WorkerLive> live = {WorkerLive{7.0, 100.0, 1}};
+            all_ok = check(near(estimate_eta_seconds(live, 9, 100.0).seconds, 70.0, 1e-3),
+                           "eta: single worker degenerates to remaining * s")
+                     && all_ok;
+        }
+
+        // Deep queue: converges on the aggregate rate (the sum of the per-worker
+        // rates), which is the regime the old batch-mean got right.
+        {
+            std::vector<WorkerLive> live = {
+                WorkerLive{7.0, 100.0, 1},
+                WorkerLive{63.0, 95.0, 1},
+            };
+            double const eta = estimate_eta_seconds(live, 200, 100.0).seconds;
+            double const aggregate = 200.0 / (1.0 / 7.0 + 1.0 / 63.0);
+            all_ok = check(near(eta, aggregate, 0.05 * aggregate),
+                           "eta: deep queue converges on the summed rate") && all_ok;
+        }
+
+        // A worker that has finished nothing has no rate, so it cannot be
+        // modelled — and must not be credited with capacity it has not shown.
+        {
+            std::vector<WorkerLive> live = {
+                WorkerLive{7.0, 100.0, 1},
+                WorkerLive{0.0, 0.0, 1},  // no completion yet
+            };
+            auto const est = estimate_eta_seconds(live, 9, 100.0);
+            double const eta = est.seconds;
+            all_ok = check(near(eta, 70.0, 1e-3),
+                           "eta: rate-less worker excluded, not invented") && all_ok;
+            // ...but it is holding a plot, and the batch cannot end before that
+            // plot does. Dropping it silently is the same optimism this whole
+            // estimator exists to kill, so the number has to be flagged a floor.
+            all_ok = check(est.lower_bound,
+                           "eta: busy rate-less worker makes the ETA a floor")
+                     && all_ok;
+            auto const idle_est = estimate_eta_seconds(
+                {WorkerLive{7.0, 100.0, 1}, WorkerLive{0.0, 0.0, 0}}, 9, 100.0);
+            all_ok = check(!idle_est.lower_bound,
+                           "eta: an idle rate-less worker holds nothing → not a floor")
+                     && all_ok;
+        }
+
+        // The binary search must agree with the handout it is standing in for.
+        // This is the assertion that makes the closed form safe: if they ever
+        // disagree, the fast path is wrong.
+        {
+            bool agree = true;
+            double worst = 0.0;
+            for (int a = 1; a <= 9; ++a) {
+                for (int b = 1; b <= 9; ++b) {
+                    for (std::size_t f1 = 0; f1 <= 2; ++f1) {
+                        for (std::size_t f2 = 0; f2 <= 2; ++f2) {
+                            for (std::size_t q : {std::size_t(0), std::size_t(1),
+                                                  std::size_t(3), std::size_t(17),
+                                                  std::size_t(64)}) {
+                                std::vector<WorkerLive> live = {
+                                    WorkerLive{double(a) * 1.7, 100.0 - a, f1},
+                                    WorkerLive{double(b) * 9.3, 100.0 - b, f2},
+                                    WorkerLive{double(a + b), 100.0, f1 + f2},
+                                };
+                                double const fast =
+                                    estimate_eta_seconds(live, q, 100.0).seconds;
+                                double const slow = greedy_eta(live, q, 100.0);
+                                worst = std::max(worst, std::fabs(fast - slow));
+                                if (!near(fast, slow, 1e-4)) agree = false;
+                            }
+                        }
+                    }
+                }
+            }
+            std::printf("       (worst |binary-search - greedy| = %.2e s)\n", worst);
+            all_ok = check(agree,
+                           "eta: closed form == brute-force queue handout (3645 cases)")
+                     && all_ok;
+        }
     }
 
     return all_ok ? 0 : 1;

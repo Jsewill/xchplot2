@@ -195,6 +195,38 @@ void preflight_disk_space(std::vector<BatchEntry> const& entries,
 
 constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
+// Live, lock-free progress for the ETA. A work-queue's remaining plots are held
+// by SPECIFIC workers running at their OWN rates, so no batch-wide mean can
+// price the drain — the estimator needs each worker's rate and its own in-flight
+// count. See estimate_eta_seconds() in BenchStats.hpp for the model.
+//
+// Every strategy publishes here, single-worker ones into a one-slot table, so
+// emit_progress_line has exactly one shape to reason about.
+struct LiveWorker {
+    std::atomic<std::size_t> written{0};
+    std::atomic<std::size_t> in_flight{0};  // pulled off the queue, not retired
+    std::atomic<double>      work_start{0.0};
+    std::atomic<double>      first_done{0.0};
+    std::atomic<double>      last_done{0.0};
+};
+
+struct BatchProgress {
+    std::vector<LiveWorker>    workers;
+    // Retired = written + skipped. It doubles as the ticket counter for the
+    // display: each emitting thread prints the value its own fetch_add returned,
+    // so the in-place TTY line cannot tick backwards even though N workers write
+    // to it. (Summing the per-worker counters instead would let two threads race
+    // to the same total and print it out of order.)
+    std::atomic<std::size_t>   retired{0};
+    std::atomic<std::size_t>   written{0};
+    std::atomic<std::size_t>   skipped{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::size_t                total = 0;
+
+    BatchProgress(std::size_t worker_count, std::size_t total_entries)
+        : workers(worker_count), total(total_entries) {}
+};
+
 std::string format_duration_hms(double seconds)
 {
     if (seconds < 0.0) seconds = 0.0;
@@ -213,49 +245,172 @@ std::string format_duration_hms(double seconds)
     return buf;
 }
 
+// done_now is the emitting thread's own `retired` ticket, not a re-read of the
+// counter — see BatchProgress.
 void emit_progress_line(std::string const& log_prefix,
                         BatchOptions const& opts,
+                        BatchProgress const& live,
                         std::size_t done_now,
-                        std::size_t total,
-                        double elapsed_s,
-                        std::uint64_t cumulative_bytes)
+                        double elapsed_s)
 {
     if (!opts.progress || done_now == 0 || elapsed_s <= 0.0) return;
-    double const avg = elapsed_s / double(done_now);
-    double const eta_s = avg * double(total - done_now);
+
+    std::size_t const total   = live.total;
+    std::size_t const written = live.written.load(std::memory_order_relaxed);
+    std::size_t const skipped = live.skipped.load(std::memory_order_relaxed);
+
+    // Per-worker view for the ETA. Each worker's rate is taken from its OWN
+    // completions, anchored on its first — exactly as the bench's steady-state
+    // does — so its cold plot stops dragging the estimate from the second plot
+    // onward. With a single completion there is nothing to measure between, so
+    // fall back to that plot's full cold duration: runs long, for one plot.
+    std::vector<pos2gpu::WorkerLive> model;
+    model.reserve(live.workers.size());
+    std::size_t in_flight_total = 0;
+    for (auto const& w : live.workers) {
+        std::size_t const n  = w.written.load(std::memory_order_relaxed);
+        std::size_t const nf = w.in_flight.load(std::memory_order_relaxed);
+        in_flight_total += nf;
+
+        pos2gpu::WorkerLive m;
+        m.in_flight = nf;
+        m.last_done = w.last_done.load(std::memory_order_relaxed);
+        if (n >= 2) {
+            double const first = w.first_done.load(std::memory_order_relaxed);
+            m.s_per_plot = (m.last_done - first) / static_cast<double>(n - 1);
+        } else if (n == 1) {
+            m.s_per_plot =
+                m.last_done - w.work_start.load(std::memory_order_relaxed);
+        }
+        model.push_back(m);
+    }
+
+    // Read the retired counter rather than recomputing written + skipped: a
+    // FAILED entry is retired too — off the queue, never to be plotted — and
+    // counting it as still-queued would have the ETA wait on it.
+    std::size_t const retired = live.retired.load(std::memory_order_relaxed);
+    std::size_t const unclaimed =
+        total > retired + in_flight_total ? total - retired - in_flight_total : 0;
+
+    // Entries that get skipped on arrival cost nothing, so the queue's tail is
+    // not all work. Discount it by the skip rate this run has actually seen,
+    // rather than promising to plot entries that are already on disk.
+    double const write_frac =
+        retired > 0 ? static_cast<double>(written) / static_cast<double>(retired)
+                    : 1.0;
+    std::size_t const queued_writes = static_cast<std::size_t>(
+        std::llround(static_cast<double>(unclaimed) * write_frac));
+
+    double const avg =
+        written > 0 ? elapsed_s / static_cast<double>(written) : 0.0;
+    pos2gpu::EtaEstimate const eta =
+        pos2gpu::estimate_eta_seconds(model, queued_writes, elapsed_s);
     double const rate_tib_s =
-        static_cast<double>(cumulative_bytes) / elapsed_s / kTibBytes;
+        static_cast<double>(live.bytes.load(std::memory_order_relaxed))
+        / elapsed_s / kTibBytes;
+
     // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
     // one-line-per-plot when redirected to a file/pipe or when verbose
     // logging would interleave and garble the in-place line.
     static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
     bool const in_place = stderr_tty && !opts.verbose;
+
+    // Only surfaces on a resume (--skip-existing). Without it the line counts
+    // skipped entries as done in "N/M" while excluding them from every rate
+    // beside it, and there is nothing on screen to explain the gap.
+    char skip_note[40] = {0};
+    if (skipped > 0) {
+        std::snprintf(skip_note, sizeof(skip_note), "%zu skipped, ", skipped);
+    }
+
     // "batch ETA", not "fully plotted in": this is the time left to finish the
     // plots in THIS run, whereas `bench` closes with a "fully plotted in ~3d
     // 20h" line meaning the time to fill the destination disk. The same phrase
     // for both had a 95%-done progress line reading "fully plotted in ~35s".
+    //
+    // ">=" when a worker is holding a plot we have no rate for: the batch cannot
+    // end before that plot does and we cannot say when that is, so the number is
+    // a floor. Saying "~" there is how a slow CPU's first plot gets quietly
+    // written out of the estimate.
+    //
+    // "%.3g", not "%.6f", for TiB/s: at k=18 the true rate is 5.6e-7 TiB/s, which
+    // %.6f rounds to a printed "0.000000" while the TiB/hour field beside it
+    // (already %.3g) shows three real digits — the same line contradicting itself.
     std::fprintf(stderr,
         "%s%s progress: plot %zu/%zu done "
-        "(%.1f%%, %.2f s/plot avg, %.6f TiB/s, batch ETA ~%s)%s",
+        "(%.1f%%, %s%.2f s/plot avg, %.3g TiB/s, batch ETA %s%s)%s",
         in_place ? "\r\033[K" : "",
         log_prefix.c_str(),
         done_now, total,
         100.0 * double(done_now) / double(total),
-        avg, rate_tib_s, format_duration_hms(eta_s).c_str(),
+        skip_note,
+        avg, rate_tib_s,
+        eta.lower_bound ? ">=" : "~",
+        format_duration_hms(eta.seconds).c_str(),
         (!in_place || done_now >= total) ? "\n" : "");
     if (in_place) std::fflush(stderr);
 }
 
-void record_plot_completion(BatchResult& res,
-                            std::uint64_t plot_bytes,
-                            double completion_offset_s,
-                            std::atomic<std::uint64_t>* global_bytes)
+// Where this worker's per-plot cost starts. Device bind, pool construction and
+// the tier probe sit before it and are per-batch setup, not per-plot cost.
+void live_work_start(BatchProgress& live, int slot, double at_s)
+{
+    live.workers[static_cast<std::size_t>(slot)].work_start.store(
+        at_s, std::memory_order_relaxed);
+}
+
+// A worker pulled an entry off the queue. It now owes a retirement — a plot or a
+// skip — and the ETA prices it as work in flight until then. Getting this wrong
+// in either direction is what makes a drain ETA lie, so it is paired strictly
+// with live_skip / record_plot_completion below.
+void live_claim(BatchProgress& live, int slot)
+{
+    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+// ...retired without plotting: the entry was already on disk. Costs no time, so
+// it must leave in_flight (or the ETA prices a plot that will never run) but
+// must not touch `written` (or it dilutes every rate beside it).
+std::size_t live_skip(BatchProgress& live, int slot)
+{
+    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
+        1, std::memory_order_relaxed);
+    live.skipped.fetch_add(1, std::memory_order_relaxed);
+    return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+// ...retired by failing. It is off the queue and will never be plotted, so it
+// must leave in_flight (or the ETA waits forever on a plot nobody is making) and
+// must not land in `written` (or it credits the rate with a plot that produced
+// nothing). Exactly one of live_skip / live_fail / record_plot_completion pairs
+// with each live_claim.
+std::size_t live_fail(BatchProgress& live, int slot)
+{
+    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
+        1, std::memory_order_relaxed);
+    return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+// ...retired by producing a plot. Returns this thread's display ticket.
+std::size_t record_plot_completion(BatchResult& res,
+                                   std::uint64_t plot_bytes,
+                                   double completion_offset_s,
+                                   BatchProgress& live,
+                                   int slot)
 {
     res.bytes_written += plot_bytes;
     res.completion_seconds.push_back(completion_offset_s);
-    if (global_bytes) {
-        global_bytes->fetch_add(plot_bytes, std::memory_order_relaxed);
-    }
+
+    LiveWorker& w = live.workers[static_cast<std::size_t>(slot)];
+    std::size_t const n = w.written.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1) w.first_done.store(completion_offset_s, std::memory_order_relaxed);
+    w.last_done.store(completion_offset_s, std::memory_order_relaxed);
+    w.in_flight.fetch_sub(1, std::memory_order_relaxed);
+
+    live.bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
+    live.written.fetch_add(1, std::memory_order_relaxed);
+    return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 // Bounded SPSC queue + end-of-stream signal.
@@ -470,13 +625,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             BatchOptions const& opts,
                             int                 device_id,
                             int                 worker_id,
+                            BatchProgress&      live,
                             std::atomic<std::size_t>* shared_idx = nullptr,
-                            std::atomic<std::size_t>* global_done = nullptr,
-                            std::atomic<std::uint64_t>* global_bytes = nullptr,
                             std::chrono::steady_clock::time_point const*
                                 run_epoch = nullptr)
 {
-    (void)worker_id;
 
     // Per-worker log prefix. Multi-GPU runs interleave stderr from N
     // workers, so prefix every line with which device it came from to
@@ -489,22 +642,27 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         ("[batch:gpu" + std::to_string(device_id) + "]");
 
     // ...but the progress line is the one thing here that is NOT this worker's.
-    // Its counters come from the shared `global_done` / `global_bytes` atomics,
-    // so "s/plot avg" is the whole queue's average across every worker. Wearing
-    // a per-worker prefix, it read as that worker's rate: a real 2-worker run
-    // signed off with "[batch:cpu] ... 6.88 s/plot avg" while that CPU was
-    // plodding at 63.7 s/plot and the GPU was carrying the batch. Aggregate
-    // numbers get an aggregate prefix; per-worker rates live in bench's
+    // Its counters are the whole batch's, so "s/plot avg" is the average across
+    // every worker. Wearing a per-worker prefix, it read as that worker's rate: a
+    // real 2-worker run signed off with "[batch:cpu] ... 6.88 s/plot avg" while
+    // that CPU was plodding at 63.7 s/plot and the GPU was carrying the batch.
+    // Aggregate numbers get an aggregate prefix; per-worker rates live in bench's
     // per-worker block. Single-worker keeps its prefix — there the batch IS the
     // worker, and the two agree.
     std::string const progress_prefix =
-        global_done ? std::string("[batch]") : log_prefix;
+        live.workers.size() > 1 ? std::string("[batch]") : log_prefix;
 
     // CPU worker: bypass the GPU pool / streaming path entirely. pos2-chip's
     // Plotter manages all internal state itself, so each plot is a
-    // synchronous run_one_plot_cpu() call. Single-threaded internally;
-    // multi-core utilization comes from passing `cpu` multiple times in
-    // --devices (e.g. --devices cpu,cpu,cpu,cpu on a 4-core host).
+    // synchronous run_one_plot_cpu() call. Single-threaded internally, and there
+    // is exactly ONE of it: BatchOptions::include_cpu is a bool, so repeating
+    // `cpu` in --devices changes nothing. (This comment used to claim
+    // `--devices cpu,cpu,cpu,cpu` gave four workers on a 4-core host. It never
+    // did — nothing ever counted the tokens — so anyone who believed it
+    // benchmarked one worker and attributed it to four. The CLI now warns on a
+    // repeated `cpu`. Wiring up N CPU workers is a real option, but it costs N
+    // copies of the CPU plotter's working set in RAM and should be a deliberate
+    // choice, not a side effect of a comment.)
     //
     // XCHPLOT2_SYCL_CPU_BENCH=1 routes --cpu through the SYCL pipeline on
     // AdaptiveCpp's CPU backend instead of pos2-chip — exposed as an env
@@ -521,12 +679,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                                        : std::chrono::steady_clock::now();
         res.work_start_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
+        live_work_start(live, worker_id, res.work_start_seconds);
         std::size_t local_idx = 0;
         while (true) {
             std::size_t const i = shared_idx
                 ? shared_idx->fetch_add(1, std::memory_order_relaxed)
                 : local_idx++;
             if (i >= entries.size()) break;
+            live_claim(live, worker_id);
             if (opts.skip_existing) {
                 auto out_path = std::filesystem::path(entries[i].out_dir)
                                 / entries[i].out_name;
@@ -537,17 +697,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             log_prefix.c_str(), i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
+                    std::size_t const done_now = live_skip(live, worker_id);
+                    if (opts.progress) {
+                        emit_progress_line(
+                            progress_prefix, opts, live, done_now,
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_start).count());
+                    }
                     continue;
                 }
             }
             try {
                 std::uint64_t const plot_bytes =
                     run_one_plot_cpu(entries[i], opts);
-                size_t const local_done = ++res.plots_written;
+                ++res.plots_written;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
-                record_plot_completion(
-                    res, plot_bytes, completion_offset, global_bytes);
+                std::size_t const done_now = record_plot_completion(
+                    res, plot_bytes, completion_offset, live, worker_id);
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "%s plot %zu done: %s\n",
@@ -555,25 +722,17 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         i, entries[i].out_name.c_str());
                 }
                 if (opts.progress) {
-                    size_t const done_now =
-                        global_done
-                            ? (global_done->fetch_add(1, std::memory_order_relaxed) + 1)
-                            : local_done;
-                    auto const elapsed = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - t_start).count();
-                    std::uint64_t const cumulative_bytes =
-                        global_bytes
-                            ? global_bytes->load(std::memory_order_relaxed)
-                            : res.bytes_written;
                     emit_progress_line(
-                        progress_prefix, opts, done_now, entries.size(),
-                        elapsed, cumulative_bytes);
+                        progress_prefix, opts, live, done_now,
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count());
                 }
             } catch (std::exception const& ex) {
                 std::fprintf(stderr,
                     "%s plot %zu FAILED: %s\n",
                     log_prefix.c_str(), i, ex.what());
                 ++res.plots_failed;
+                live_fail(live, worker_id);
                 if (!opts.continue_on_error) {
                     res.total_wall_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_start).count();
@@ -1019,6 +1178,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     auto t_start = run_epoch ? *run_epoch : std::chrono::steady_clock::now();
     res.work_start_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
+    live_work_start(live, worker_id, res.work_start_seconds);
 
     std::atomic<size_t> plots_failed_consumer{0};
 
@@ -1053,34 +1213,26 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         static_cast<uint8_t>(item.entry.meta_group),
                         std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
 
-                    size_t const local_done = ++plots_done;
+                    ++plots_done;
                     double const completion_offset = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_start).count();
-                    record_plot_completion(
-                        res, plot_bytes, completion_offset, global_bytes);
+                    std::size_t const done_now = record_plot_completion(
+                        res, plot_bytes, completion_offset, live, worker_id);
                     if (verbose) {
                         std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
                                      log_prefix.c_str(),
                                      item.index, full_path.string().c_str());
                     }
                     if (opts.progress) {
-                        size_t const done_now =
-                            global_done
-                                ? (global_done->fetch_add(1, std::memory_order_relaxed) + 1)
-                                : local_done;
-                        auto const elapsed = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t_start).count();
-                        std::uint64_t const cumulative_bytes =
-                            global_bytes
-                                ? global_bytes->load(std::memory_order_relaxed)
-                                : res.bytes_written;
                         emit_progress_line(
-                            progress_prefix, opts, done_now, entries.size(),
-                            elapsed, cumulative_bytes);
+                            progress_prefix, opts, live, done_now,
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_start).count());
                     }
                 } catch (std::exception const& e) {
                     if (!opts.continue_on_error) throw;
                     ++plots_failed_consumer;
+                    live_fail(live, worker_id);
                     std::fprintf(stderr,
                         "%s plot %zu FAILED (write %s): %s — continuing\n",
                         log_prefix.c_str(),
@@ -1131,6 +1283,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 break;
             }
 
+            // Claim after the cancel check: an entry we bail out before touching
+            // was never in flight, and leaving a phantom there would have the ETA
+            // wait on a plot nobody is making.
+            live_claim(live, worker_id);
+
             if (opts.skip_existing) {
                 auto out_path = std::filesystem::path(entries[i].out_dir)
                                 / entries[i].out_name;
@@ -1142,6 +1299,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
+                    std::size_t const done_now = live_skip(live, worker_id);
+                    if (opts.progress) {
+                        emit_progress_line(
+                            progress_prefix, opts, live, done_now,
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_start).count());
+                    }
                     continue;
                 }
             }
@@ -1188,6 +1352,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             } catch (std::exception const& e) {
                 if (!opts.continue_on_error) throw;
                 ++producer_failed;
+                live_fail(live, worker_id);
                 std::fprintf(stderr,
                     "%s plot %zu FAILED (GPU): %s — continuing\n",
                     log_prefix.c_str(), i, e.what());
@@ -1211,6 +1376,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // GPU work completed but will never be written. Count
                 // it as a failure so the batch summary stays honest.
                 ++producer_failed;
+                live_fail(live, worker_id);
                 break;
             }
             ++local_count;
@@ -1413,8 +1579,10 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
     std::exception_ptr           consumer_err;
     std::atomic<std::size_t>     plots_written_consumer{0};
     std::atomic<std::size_t>     plots_failed_consumer{0};
-    std::atomic<std::size_t>     progress_done{0};
-    std::atomic<std::uint64_t>   progress_bytes{0};
+    // The team plots one at a time, so it publishes as a single worker. No
+    // live_claim(): with one worker an in-flight plot and a queued one land at
+    // the same instant (base + k*s), so the claim would change nothing.
+    BatchProgress                live(1, entries.size());
 
     std::thread consumer([&] {
         for (;;) {
@@ -1444,20 +1612,16 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
                 ++plots_written_consumer;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
-                res.bytes_written += plot_bytes;
-                res.completion_seconds.push_back(completion_offset);
-                progress_bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
+                std::size_t const done_now = record_plot_completion(
+                    res, plot_bytes, completion_offset, live, 0);
                 if (opts.progress) {
-                    std::size_t const done_now =
-                        progress_done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    auto const elapsed = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - t_start).count();
                     emit_progress_line(
-                        "[shard-plot]", opts, done_now, entries.size(),
-                        elapsed,
-                        progress_bytes.load(std::memory_order_relaxed));
+                        "[shard-plot]", opts, live, done_now,
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count());
                 }
             } catch (std::exception const& e) {
+                live_fail(live, 0);
                 std::fprintf(stderr,
                     "[shard-plot] FAILED writing '%s': %s\n",
                     job.entry.out_name.c_str(), e.what());
@@ -1478,6 +1642,14 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
 
     std::size_t plots_failed_producer = 0;
     bool        early_stop            = false;
+    // Everything above — per-shard SYCL queues, shard pools, shard contexts — is
+    // per-batch setup, not per-plot cost. Record where it ended: under --warmup 0
+    // this is the bench's epoch, and leaving it at 0 amortised the whole
+    // multi-GPU setup across every plot and quietly understated the rig.
+    res.work_start_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+    live_work_start(live, 0, res.work_start_seconds);
+
     for (BatchEntry const& entry : entries) {
         if (consumer_failed.load(std::memory_order_acquire)) {
             early_stop = true;
@@ -1669,8 +1841,9 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
 
     std::atomic<std::size_t> plots_written_ct{0};
     std::atomic<std::size_t> plots_failed_ct{0};
-    std::atomic<std::size_t> progress_done{0};
-    std::atomic<std::uint64_t> progress_bytes{0};
+    // The stages plot one at a time, so the rig publishes as a single worker —
+    // see the note in run_batch_sharded for why no live_claim() is needed.
+    BatchProgress live(1, entries.size());
     auto const t_start = std::chrono::steady_clock::now();
 
     auto writer_fn = [&]() {
@@ -1714,18 +1887,13 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                 ++plots_written_ct;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
-                res.bytes_written += plot_bytes;
-                res.completion_seconds.push_back(completion_offset);
-                progress_bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
+                std::size_t const done_now = record_plot_completion(
+                    res, plot_bytes, completion_offset, live, 0);
                 if (opts.progress) {
-                    std::size_t const done_now =
-                        progress_done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    auto const elapsed = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - t_start).count();
                     emit_progress_line(
-                        "[pipeline-plot]", opts, done_now, entries.size(),
-                        elapsed,
-                        progress_bytes.load(std::memory_order_relaxed));
+                        "[pipeline-plot]", opts, live, done_now,
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count());
                 }
                 if (opts.verbose) {
                     std::fprintf(stderr,
@@ -1738,6 +1906,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                     "[pipeline-plot] FAILED for plot '%s': %s\n",
                     entry.out_name.c_str(), e.what());
                 ++plots_failed_ct;
+                live_fail(live, 0);
                 if (!opts.continue_on_error) writer_abort.store(true);
             }
         }
@@ -1753,6 +1922,17 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
             }
             q_cv.notify_one();
         };
+
+    // Best available per-plot start. Under --warmup 0 this is the bench's epoch,
+    // and leaving it at 0 amortised setup across every plot. Honest caveat: the
+    // orchestrator builds its own per-device contexts and pools INSIDE
+    // run_pipeline_parallel_batch, so that part of the setup is still counted
+    // here. Excluding it would mean a readiness callback through the orchestrator;
+    // until then --warmup 0 on this path reads a touch pessimistic (the default
+    // --warmup 1 anchors on a completion and is unaffected).
+    res.work_start_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+    live_work_start(live, 0, res.work_start_seconds);
 
     try {
         run_pipeline_parallel_batch(
@@ -2011,8 +2191,9 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // slice.
     if (device_ids.size() <= 1) {
         int const dev = device_ids.empty() ? kDefaultGpuId : device_ids[0];
-        BatchResult r = run_batch_slice(entries, opts, dev, -1,
-                                        nullptr, nullptr, nullptr, &t_start);
+        BatchProgress live(1, entries.size());
+        BatchResult r = run_batch_slice(entries, opts, dev, 0, live,
+                                        nullptr, &t_start);
         r.total_wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
         as_single_worker(r, dev);
@@ -2040,12 +2221,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     }
 
     std::atomic<std::size_t> next_idx{0};
-    // Shared progress counter for --progress on multi-device runs.
-    // Each consumer (GPU consumer or CPU branch) fetch_adds when a
-    // plot finishes; the emitted "N/M done" line is aggregate across
-    // workers — not the per-worker slice it'd otherwise reflect.
-    std::atomic<std::size_t> global_done{0};
-    std::atomic<std::uint64_t> global_bytes{0};
+    // Shared progress state for --progress on multi-device runs. The emitted
+    // "N/M done" line is aggregate across workers — not the per-worker slice it'd
+    // otherwise reflect — and the ETA reads each worker's OWN rate and in-flight
+    // count out of here, because a work-queue's last plots are held by specific
+    // workers and no batch-wide mean can price that drain.
+    BatchProgress live(N, entries.size());
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -2055,8 +2236,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
             try {
                 per_worker[i] = run_batch_slice(
                     entries, opts, device_ids[i],
-                    static_cast<int>(i), &next_idx, &global_done,
-                    &global_bytes, &t_start);
+                    static_cast<int>(i), live, &next_idx, &t_start);
             } catch (...) {
                 per_worker_exc[i] = std::current_exception();
                 // Tell peer workers to drain after their current plot
