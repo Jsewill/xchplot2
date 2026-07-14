@@ -24,10 +24,35 @@
 // PlotData::t3_proof_fragments is a flat vector of them). See
 // PlotFileWriterParallel.hpp.
 //
-// BatchPlotter spawns exactly one of these — include_cpu is a bool, so
-// `--devices cpu,cpu` runs ONE worker, not two. Concurrent CPU plots each need
-// their own copy of the Plotter's working set: 12.13 GiB peak RSS per plot at
-// k=28, so N workers costs N × that.
+// BatchPlotter spawns as many of these as --cpu-workers asks for (`--devices
+// cpu,cpu` runs two), and they share nothing: each concurrent plot needs its
+// own copy of the Plotter's working set. Measured peak RSS per worker —
+// VmHWM, one plot, CPU only:
+//
+//     k=22    223 568 kB      k=26  3 226 100 kB
+//     k=24    927 036 kB      k=28 12 727 020 kB   (12.14 GiB)
+//
+// so N workers cost N × that, and resolve_batch_devices gates N against host
+// RAM before any of them start.
+//
+// Worth it, but less than it used to be. Aggregate steady-state on a 32-thread
+// 5950X, same binary, in-process:
+//
+//            k=26                        k=28
+//   N=1   13.57 s/plot              52.28 s/plot
+//   N=2   10.59  (+28%)             43.85  (+19%)
+//   N=4    9.63  (+41%)             41.69  (+25%)
+//
+// The plotter is memory-latency-bound, so concurrent plots interleave each
+// other's stalls rather than queueing for a core — that is the whole gain. It
+// shrinks as k rises (a 12 GiB working set already saturates memory bandwidth
+// on its own, so a second worker contends instead of filling idle time) and it
+// shrinks per worker added: at k=28 the 3rd and 4th together buy 5%.
+//
+// An earlier measurement said +27% / +52% at k=28. That was taken BEFORE the
+// serial FSE tail was parallelised (write_plot_file_parallel), and a serial
+// tail is exactly the dead time a concurrent plot fills — so fixing it took
+// back part of what N>1 was being paid for. The two fixes are not additive.
 //
 // Throws std::runtime_error on plotting failure (caller decides
 // whether to continue under continue_on_error).

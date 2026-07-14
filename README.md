@@ -92,12 +92,16 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     ISA natively (build will fail clearly if AdaptiveCpp doesn't
     accept it).
   - **Intel oneAPI** is wired up but untested.
-  - **CPU** (no GPU) via AdaptiveCpp's OpenMP backend. Opt-in with
-    `--cpu` (or `--devices cpu`) — never the default. Plotting is
-    1-2 orders of magnitude slower than a real GPU; intended for
-    headless CI, GPU-less dev machines, or as an extra worker
+  - **CPU** (no GPU) via pos2-chip's hand-tuned CPU plotter — not our
+    SYCL kernels on AdaptiveCpp's OpenMP backend, which are written for
+    tens of thousands of GPU threads and are 4.3x slower on a CPU.
+    Opt-in with `--cpu` (or `--devices cpu`) — never the default.
+    Plotting is 1-2 orders of magnitude slower than a real GPU; intended
+    for headless CI, GPU-less dev machines, or as an extra worker
     alongside GPUs (`--devices all` runs every visible GPU plus a
-    CPU worker on the same batch; `--devices gpu` sticks to GPUs). Build the container with
+    CPU worker on the same batch; `--devices gpu` sticks to GPUs).
+    `--cpu-workers N` runs N concurrent CPU plots (+19% at N=2, k=28),
+    capped at what host RAM holds. Build the container with
     `scripts/build-container.sh --gpu cpu` for the standalone CPU
     image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
 - **VRAM:** five tiers, picked automatically based on free device
@@ -823,8 +827,8 @@ xchplot2 plot ... --devices 0,2,3
 # Explicit single id (same as omitting the flag on a single-GPU host).
 xchplot2 plot ... --devices 0
 
-# CPU-only: AdaptiveCpp OpenMP backend (slow). Use the `cpu` token in
-# --devices, or the standalone --cpu flag (equivalent on its own).
+# CPU-only (slow). Use the `cpu` token in --devices, or the standalone
+# --cpu flag (equivalent on its own).
 xchplot2 plot ... --devices cpu
 xchplot2 plot ... --cpu
 
@@ -835,6 +839,59 @@ xchplot2 plot ... --devices 0,1,cpu
 CPU plotting is **1-2 orders of magnitude slower than GPU** — meant for
 GPU-less hosts, headless CI, or as an extra background worker. Don't
 expect GPU-grade throughput from a CPU worker on a heterogeneous batch.
+
+##### Several CPU workers: `--cpu-workers N`
+
+One CPU worker does not saturate a big host. The CPU plotter is
+memory-latency-bound, so concurrent plots interleave each other's stalls
+rather than queueing for a core — running more than one is worth real
+throughput:
+
+```bash
+# Two concurrent CPU plots. Equivalent: --devices cpu,cpu
+xchplot2 plot ... --cpu-workers 2
+
+# Every GPU, plus four CPU plots alongside them.
+xchplot2 plot ... --devices gpu --cpu-workers 4
+```
+
+Measured on a 32-thread 5950X — aggregate steady-state, alongside each
+worker's own rate (the machine is shared, so per-worker speed drops as you
+add workers even while total throughput rises):
+
+| workers | k=28 aggregate | vs 1 | each worker | k=26 aggregate | vs 1 |
+|---|---|---|---|---|---|
+| 1 | 52.28 s/plot | — | 52.3 s/plot | 13.57 s/plot | — |
+| 2 | 43.85 s/plot | **+19%** | 87.7 s/plot | 10.59 s/plot | **+28%** |
+| 4 | 41.69 s/plot | **+25%** | 166.8 s/plot | 9.63 s/plot | **+41%** |
+
+Note the shape. The gain flattens fast — at k=28 the second worker buys
++19% and the third and fourth *together* buy only another 5% — and it
+shrinks as k grows, because a 12 GiB working set already saturates memory
+bandwidth on its own, so extra workers start contending instead of filling
+idle time. **N=2 is the sweet spot at k=28**; past that you are paying a
+full 12.1 GiB per worker for a few percent.
+
+**Each worker needs its own copy of the plotter's working set** — 12.1 GiB
+at k=28 (3.1 GiB at k=26) — so N workers cost N × that, on top of ~5.3 GiB
+of host RAM per GPU worker. xchplot2 caps N at what the host can actually
+hold and tells you when it does:
+
+```
+[batch] cpu: asked for 8 CPU workers but only 5 fit: each needs 12.1 GiB at
+k=28, host has 73.6 GiB available. Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to
+override (and risk the OOM killer taking the whole batch)
+```
+
+The cap is not advisory — an OOM kill takes the GPU workers' in-flight
+plots down with the CPU's, so it is the batch you lose, not one plot.
+`XCHPLOT2_CPU_WORKERS_UNGATED=1` overrides it if you know your box better
+than `/proc/meminfo` does.
+
+On a GPU+CPU rig the CPU workers are also de-prioritised (`nice +10`, or
+`XCHPLOT2_CPU_NICE`) so they stop stealing cores from the GPU workers'
+compression threads — worth +7.8% on the GPU's own rate. Set
+`XCHPLOT2_CPU_NICE=0` to turn that off.
 
 ##### Per-GPU streaming tier
 

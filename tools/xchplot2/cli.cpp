@@ -111,7 +111,9 @@ void print_usage(char const* prog)
         << "                                      list mixing any of:\n"
         << "                                        all       — every GPU + CPU\n"
         << "                                        gpu       — every visible GPU\n"
-        << "                                        cpu       — CPU worker only (slow)\n"
+        << "                                        cpu       — a CPU worker (slow).\n"
+        << "                                                    Repeat it for more:\n"
+        << "                                                    `cpu,cpu` == --cpu-workers 2\n"
         << "                                        0,1,3     — explicit GPU ids\n"
         << "                                      e.g. gpu,cpu == all.\n"
         << "                                      Any GPU selector accepts a `:tier`\n"
@@ -134,6 +136,17 @@ void print_usage(char const* prog)
         << "                                      is 1-2 orders of magnitude slower\n"
         << "                                      than GPU; intended for GPU-less\n"
         << "                                      hosts or as an extra worker.\n"
+        << "    --cpu-workers N                 : run N CPU plots concurrently\n"
+        << "                                      (same as repeating `cpu` in --devices).\n"
+        << "                                      The CPU plotter is memory-latency-bound,\n"
+        << "                                      so concurrent plots interleave each\n"
+        << "                                      other's stalls. On a 32-thread 5950X at\n"
+        << "                                      k=28: N=2 is +19%, N=4 is +25% (the 3rd\n"
+        << "                                      and 4th together buy only 5% — it\n"
+        << "                                      flattens fast). Each worker needs its own\n"
+        << "                                      copy of the working set (12.1 GiB at\n"
+        << "                                      k=28), so N is capped at what host RAM\n"
+        << "                                      holds — it tells you when it caps you.\n"
         << "    --shard-plot                    : EXPERIMENTAL — opt in to single-plot\n"
         << "                                      multi-GPU. Each plot is processed by\n"
         << "                                      ALL --devices cooperatively (one plot\n"
@@ -282,6 +295,28 @@ void read_urandom(uint8_t* out, size_t n)
 // use_all_devices=false — which triggers the single-device
 // gpu_selector_v path, identical to pre-multi-GPU behavior.
 //
+// --cpu-workers N: how many CPU plots to run concurrently.
+//
+// N is an ASK, not a promise: run_batch caps it at what host RAM actually holds
+// (12.1 GiB per worker at k=28) and says so when it does. The upper bound here
+// is only a sanity limit on the argument itself.
+//
+// Returns false on malformed input (caller prints usage + exits 1).
+bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
+{
+    char* endp = nullptr;
+    long const v = std::strtol(s.c_str(), &endp, 10);
+    if (endp == s.c_str() || *endp != '\0' || v < 0 || v > 64) {
+        std::cerr << "Error: --cpu-workers expects an integer in [0, 64] "
+                     "(got '" << s << "')\n";
+        return false;
+    }
+    // Assign, don't max: this is the explicit, specific flag. `--cpu
+    // --cpu-workers 0` means "no, actually, none" and must not resolve to one.
+    opts.cpu_workers = static_cast<int>(v);
+    return true;
+}
+
 // Returns false on malformed input (caller prints usage + exits 1).
 bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
@@ -317,6 +352,11 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     opts.all_gpus_tier.clear();
     bool any_token = false;
     bool any_gpu_token = false;
+    // Counted locally, not straight into opts: `--cpu` is orthogonal to
+    // --devices (it may have been parsed already, and this function clears the
+    // GPU selection on entry), and a second --devices must not ACCUMULATE CPU
+    // workers the way `cpu,cpu` within one list deliberately does.
+    int cpu_tokens = 0;
     size_t start = 0;
     while (start <= s.size()) {
         size_t const end = s.find(',', start);
@@ -338,7 +378,7 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 
         if (selector == "all") {
             opts.use_all_devices = true;
-            opts.include_cpu = true;
+            ++cpu_tokens;   // "all" means every GPU *and* the CPU — one of it
             any_gpu_token = true;
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "gpu") {
@@ -347,17 +387,15 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "cpu") {
             if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
-            // include_cpu is a bool, so repeating `cpu` adds nothing. Say so.
-            // src/host/CpuPlotter.hpp and BatchPlotter.cpp both promise one CPU
-            // worker per token ("--devices cpu,cpu runs two concurrent plots"),
-            // and that was never implemented — a user following those comments
-            // would benchmark one worker believing they had measured four.
-            if (opts.include_cpu) {
-                std::fprintf(stderr,
-                    "[devices] WARNING: repeated `cpu` in --devices adds no "
-                    "workers — one CPU worker is created regardless\n");
-            }
-            opts.include_cpu = true;
+            // One worker per token — which is what the in-tree comments promised
+            // for two revisions while the code created exactly one regardless, so
+            // anyone who wrote `--devices cpu,cpu,cpu,cpu` benchmarked a single
+            // worker and believed they had measured four. It counts them now.
+            //
+            // No dedup, unlike the GPU ids below: repeating a GPU id cannot give
+            // you a second card, but repeating `cpu` genuinely does give you a
+            // second concurrent plot. run_batch caps the total against host RAM.
+            ++cpu_tokens;
         } else {
             char* endp = nullptr;
             long const v = std::strtol(selector.c_str(), &endp, 10);
@@ -379,7 +417,14 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
         start = end + 1;
     }
     if (!any_token) return false;
-    if (!any_gpu_token && !opts.include_cpu) return false;
+    if (!any_gpu_token && cpu_tokens == 0 && opts.cpu_workers == 0) return false;
+
+    // max, not assign: `--cpu-workers 4 --devices 0,cpu` asked for four workers
+    // and then said where — clobbering that back to one because the list happens
+    // to mention `cpu` once would silently ignore the more specific flag.
+    if (cpu_tokens > 0) {
+        opts.cpu_workers = std::max(opts.cpu_workers, cpu_tokens);
+    }
     std::sort(opts.device_ids.begin(), opts.device_ids.end());
     opts.device_ids.erase(
         std::unique(opts.device_ids.begin(), opts.device_ids.end()),
@@ -665,8 +710,18 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
     };
 
     std::fprintf(stderr, "[bench] per-worker steady-state:\n");
-    for (auto const& w : stats.workers) {
-        std::string const name = pos2gpu::device_label(w.device_id);
+    // Same naming rule the batch's log prefixes use, from the same function, so
+    // the two can be read side by side. It matters here: with --cpu-workers 4
+    // every one of these lines would otherwise be called "cpu", and the block's
+    // whole purpose is telling workers apart.
+    std::vector<int> worker_devices;
+    worker_devices.reserve(stats.workers.size());
+    for (auto const& w : stats.workers) worker_devices.push_back(w.device_id);
+    std::vector<std::string> const names = pos2gpu::worker_labels(worker_devices);
+
+    for (std::size_t wi = 0; wi < stats.workers.size(); ++wi) {
+        auto const& w = stats.workers[wi];
+        std::string const& name = names[wi];
         if (!w.measured) {
             std::fprintf(stderr,
                 "[bench]   %-5s %zu plot%s finished — too few to measure past a "
@@ -1026,7 +1081,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
             }
             else if (a == "-v" || a == "--verbose") opts.verbose = true;
-            else if (a == "--cpu") opts.include_cpu = true;
+            else if (a == "--cpu") opts.cpu_workers = std::max(1, opts.cpu_workers);
+            // bench had --cpu but no --no-cpu, while batch and plot have both.
+            else if (a == "--no-cpu") opts.cpu_workers = 0;
+            else if (a == "--cpu-workers" && need(1)) {
+                if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
+            }
             else if (a == "--shard-plot") opts.shard_plot = true;
             else if (a == "--pipeline-plot") opts.pipeline_plot = true;
             else if (a == "--tier" && need(1)) {
@@ -1304,8 +1364,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                   || a == "--no-resume")                   opts.skip_existing = false;
             else if (a == "--continue-on-error")           opts.continue_on_error = true;
             else if (a == "--no-continue-on-error")        opts.continue_on_error = false;
-            else if (a == "--cpu")                         opts.include_cpu = true;
-            else if (a == "--no-cpu")                      opts.include_cpu = false;
+            else if (a == "--cpu")                         opts.cpu_workers =
+                                                               std::max(1, opts.cpu_workers);
+            else if (a == "--no-cpu")                      opts.cpu_workers = 0;
+            else if (a == "--cpu-workers" && i + 1 < argc) {
+                if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
+            }
             else if (a == "--shard-plot")                  opts.shard_plot = true;
             else if (a == "--no-shard-plot")               opts.shard_plot = false;
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
@@ -1540,7 +1604,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string seed_hex;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
-        bool plot_include_cpu     = false;
+        int  plot_cpu_workers     = 0;
         bool plot_shard_plot      = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
         bool plot_quiet           = false;
@@ -1587,8 +1651,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                    || a == "--no-resume")               skip_existing = false;
             else if  (a == "--continue-on-error")       continue_on_error = true;
             else if  (a == "--no-continue-on-error")    continue_on_error = false;
-            else if  (a == "--cpu")                     plot_include_cpu = true;
-            else if  (a == "--no-cpu")                  plot_include_cpu = false;
+            else if  (a == "--cpu")                     plot_cpu_workers =
+                                                            std::max(1, plot_cpu_workers);
+            else if  (a == "--no-cpu")                  plot_cpu_workers = 0;
+            else if  (a == "--cpu-workers" && need(1)) {
+                pos2gpu::BatchOptions tmp;
+                if (!parse_cpu_workers_arg(argv[++i], tmp)) return 1;
+                plot_cpu_workers = tmp.cpu_workers;
+            }
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--no-shard-plot")           plot_shard_plot = false;
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
@@ -1670,7 +1740,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 plot_device_ids       = std::move(tmp.device_ids);
                 plot_use_all_devices  = tmp.use_all_devices;
-                if (tmp.include_cpu) plot_include_cpu = true;
+                // max, not assign: --cpu / --cpu-workers may have been parsed
+                // already and are orthogonal to --devices (see parse_devices_arg).
+                plot_cpu_workers = std::max(plot_cpu_workers, tmp.cpu_workers);
                 plot_per_device_tier  = std::move(tmp.per_device_tier);
                 plot_all_gpus_tier    = std::move(tmp.all_gpus_tier);
             }
@@ -1833,7 +1905,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.continue_on_error = continue_on_error;
             opts.device_ids        = plot_device_ids;
             opts.use_all_devices   = plot_use_all_devices;
-            opts.include_cpu       = plot_include_cpu;
+            opts.cpu_workers       = plot_cpu_workers;
             opts.shard_plot        = plot_shard_plot;
             opts.pipeline_plot          = plot_pipeline_plot;
             opts.pipeline_depth         = plot_pipeline_depth;
@@ -1892,7 +1964,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --no-cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -1915,6 +1987,7 @@ _xchplot2() {
         '-v[Verbose]' '--verbose[Verbose]' \
         '-q[Quiet — suppress info-level output]' '--quiet[Quiet — suppress info-level output]' \
         '--cpu[Add CPU worker]' \
+        '--cpu-workers[Run N CPU plots concurrently (RAM-gated)]:count:' \
         '--shard-plot[Single-plot multi-GPU]' \
         '--pipeline-plot[Pipeline-parallel multi-stage]' \
         '-o[Output dir]:dir:_files -/' \
