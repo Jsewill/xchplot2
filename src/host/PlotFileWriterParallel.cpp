@@ -214,6 +214,11 @@ std::vector<std::size_t> chunk_boundaries_span(
 
 } // namespace
 
+void warm_writer_pool()
+{
+    (void)WriterThreadPool::instance();
+}
+
 size_t write_plot_file_parallel(
     std::string const& filename,
     std::span<uint64_t const> t3_fragments,
