@@ -476,6 +476,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         (device_id <  0)            ? std::string("[batch]")     :
         ("[batch:gpu" + std::to_string(device_id) + "]");
 
+    // ...but the progress line is the one thing here that is NOT this worker's.
+    // Its counters come from the shared `global_done` / `global_bytes` atomics,
+    // so "s/plot avg" is the whole queue's average across every worker. Wearing
+    // a per-worker prefix, it read as that worker's rate: a real 2-worker run
+    // signed off with "[batch:cpu] ... 6.88 s/plot avg" while that CPU was
+    // plodding at 63.7 s/plot and the GPU was carrying the batch. Aggregate
+    // numbers get an aggregate prefix; per-worker rates live in bench's
+    // per-worker block. Single-worker keeps its prefix — there the batch IS the
+    // worker, and the two agree.
+    std::string const progress_prefix =
+        global_done ? std::string("[batch]") : log_prefix;
+
     // CPU worker: bypass GPU pool / streaming entirely. pos2-chip's
     // Plotter manages its own state, so each plot is a synchronous
     // run_one_plot_cpu() call — no CUDA, no GpuBufferPool. Single-
@@ -539,7 +551,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             ? global_bytes->load(std::memory_order_relaxed)
                             : res.bytes_written;
                     emit_progress_line(
-                        log_prefix, opts, done_now, entries.size(),
+                        progress_prefix, opts, done_now, entries.size(),
                         elapsed, cumulative_bytes);
                 }
             } catch (std::exception const& ex) {
@@ -1075,7 +1087,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             ? global_bytes->load(std::memory_order_relaxed)
                             : res.bytes_written;
                     emit_progress_line(
-                        log_prefix, opts, done_now, entries.size(),
+                        progress_prefix, opts, done_now, entries.size(),
                         elapsed, cumulative_bytes);
                 }
                 // Done reading this item's pinned slot — let the

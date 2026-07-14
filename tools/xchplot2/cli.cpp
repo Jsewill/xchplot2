@@ -378,7 +378,11 @@ std::string format_duration_dh(double seconds)
     if (d > 0) {
         std::snprintf(buf, sizeof(buf), "%dd %dh", d, h);
     } else if (h > 0) {
-        std::snprintf(buf, sizeof(buf), "%dh", h);
+        // Carry the minutes. Truncating to whole hours threw away up to 59 of
+        // them against a base of one, so a 1 h 53 m disk fill printed as "~1h" —
+        // off by 47%, and wrong in the flattering direction on exactly the
+        // single-GPU rigs where the fill is 1-2 h.
+        std::snprintf(buf, sizeof(buf), "%dh%02dm", h, m);
     } else if (m > 0) {
         std::snprintf(buf, sizeof(buf), "%dm%02ds", m, s);
     } else {
@@ -557,9 +561,17 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
                           " — then idle %.1f s while a peer drained the queue",
                           w.idle_tail_seconds);
         }
+        // "interval", not "plot time". A GPU worker is a producer/consumer
+        // pipeline over a depth-1 queue, so what we stamp is when a plot lands
+        // on disk, not how long it took to make. Starve the consumer (a CPU
+        // co-worker eating every core), then free it, and it retires a staged
+        // plot in ~1 s — a real run showed "min 1.01" on a GPU that cannot
+        // produce a plot in under 6.6 s. The mean is exact regardless (the
+        // intervals tile the window by construction); the spread is a contention
+        // signal, and a bare "min" invited reading it as a 1-second plot.
         std::fprintf(stderr,
             "[bench]   %-5s %zu plots (%zu warmup, %zu measured%s) — "
-            "%.2f s/plot (min %.2f / max %.2f, σ %.2f)%s\n",
+            "%.2f s/plot (interval min %.2f / max %.2f, σ %.2f)%s\n",
             name.c_str(), w.plots_total, w.warmup_dropped, w.plots_measured,
             dropped, w.s_per_plot, w.interval_min, w.interval_max,
             w.interval_stddev, tail);
