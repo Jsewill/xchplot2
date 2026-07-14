@@ -36,8 +36,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 namespace pos2gpu {
@@ -194,6 +196,115 @@ inline BenchStats compute_bench_stats(
     out.window_begin = window_begin;
     out.window_end = window_end;
     out.valid = true;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Live ETA for the batch progress line.
+//
+// `remaining x batch_mean` is not an ETA for a work-queue. It is right only
+// while the queue is deep enough to keep every worker fed; once it drains, the
+// last plots are held by SPECIFIC workers running at their OWN rates, and the
+// batch mean stops describing any of them. A real 2-worker run with one plot
+// left on a 63 s/plot CPU announced "batch ETA ~6s" — the batch mean, which the
+// 7 s/plot GPU had earned — and then took 33 more seconds.
+//
+// Model: worker i retires a plot every s_i seconds, so its j-th future
+// completion lands at base_i + j*s_i. The first in_flight_i of those are already
+// committed — those entries are off the queue and no peer can take them. The
+// `unclaimed` entries still ON the queue go to whichever worker offers the
+// earliest free slot, which is exactly what a work-queue does. The batch ends at
+// the latest completion anyone is left holding.
+//
+// For a single worker this is just base + remaining*s, so single-device ETAs
+// keep their old meaning.
+struct WorkerLive {
+    double      s_per_plot = 0.0;  // observed; <= 0 means "no estimate yet"
+    double      last_done  = 0.0;  // run-epoch seconds of its latest completion
+    std::size_t in_flight  = 0;    // pulled off the queue, not yet retired
+};
+
+struct EtaEstimate {
+    double seconds = 0.0;
+    // A worker holding a plot but with no completed plot yet has no rate, so it
+    // cannot be priced — and inventing one for it (the batch mean, say) is how
+    // you get a 63 s/plot CPU billed at the GPU's 7 s. It is dropped from the
+    // model instead, which makes `seconds` a floor: the batch cannot finish
+    // before that worker's plot does, and that plot could take any amount of
+    // time. Callers must present the number as "at least", not "about".
+    bool lower_bound = false;
+};
+
+// Time from `now` (run-epoch seconds) until the last worker retires the last
+// plot. Zero when there is nothing left to do.
+inline EtaEstimate estimate_eta_seconds(std::vector<WorkerLive> const& live,
+                                        std::size_t unclaimed,
+                                        double now)
+{
+    EtaEstimate out;
+
+    struct Train { double base; double s; std::size_t committed; };
+    std::vector<Train> ws;
+    ws.reserve(live.size());
+    for (auto const& l : live) {
+        if (!(l.s_per_plot > 0.0)) {
+            // Unmodellable. If it is holding work, whatever we return is a floor.
+            if (l.in_flight > 0) out.lower_bound = true;
+            continue;
+        }
+        // Phase of this worker's completion train. A worker that is overdue is
+        // mid-plot, not instantly done, so hold its next completion at `now`
+        // rather than letting a stale last_done predict completions in the past.
+        ws.push_back(Train{std::max(l.last_done, now - l.s_per_plot),
+                           l.s_per_plot, l.in_flight});
+    }
+    if (ws.empty()) return out;
+
+    // Committed work: the in-flight plots land s apart and cannot be reassigned.
+    double finish = now;
+    for (auto const& w : ws) {
+        if (w.committed > 0) {
+            finish = std::max(
+                finish, w.base + static_cast<double>(w.committed) * w.s);
+        }
+    }
+    if (unclaimed == 0) {
+        out.seconds = std::max(0.0, finish - now);
+        return out;
+    }
+
+    // Queued work: handing each entry to the earliest-free worker means the LAST
+    // queued entry lands at the `unclaimed`-th smallest free slot across all
+    // workers, where worker i's free slots are base_i + (committed_i + j)*s_i for
+    // j >= 1. Binary-search for that instant rather than simulating the handout
+    // one entry at a time: a manifest can hold 100k entries and this runs once
+    // per completion, so the simulation would be quadratic in the batch size.
+    auto free_slots_by = [&](double t) -> std::size_t {
+        std::size_t n = 0;
+        for (auto const& w : ws) {
+            double const issued = std::floor((t - w.base) / w.s);
+            double const avail = issued - static_cast<double>(w.committed);
+            if (avail <= 0.0) continue;
+            if (avail >= static_cast<double>(unclaimed)) return unclaimed;
+            n += static_cast<std::size_t>(avail);
+            if (n >= unclaimed) return unclaimed;
+        }
+        return n;
+    };
+
+    // Upper bound: whichever single worker could absorb every queued entry
+    // soonest on its own necessarily has them all done by then.
+    double lo = now;
+    double hi = std::numeric_limits<double>::max();
+    for (auto const& w : ws) {
+        hi = std::min(hi, w.base + static_cast<double>(w.committed + unclaimed) * w.s);
+    }
+    for (int it = 0; it < 100 && (hi - lo) > 1e-6; ++it) {
+        double const mid = lo + 0.5 * (hi - lo);
+        if (free_slots_by(mid) >= unclaimed) hi = mid;
+        else                                 lo = mid;
+    }
+    out.seconds = std::max(0.0, std::max(finish, hi) - now);
     return out;
 }
 
