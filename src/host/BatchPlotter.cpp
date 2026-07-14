@@ -464,13 +464,42 @@ void live_claim(BatchProgress& live, int slot)
         1, std::memory_order_relaxed);
 }
 
+// Take one plot out of flight, SATURATING AT ZERO.
+//
+// Not defensive padding — it is load-bearing. run_batch_sharded and
+// run_batch_pipeline_plot deliberately never live_claim(): each publishes as a
+// single worker, and a one-train ETA prices an in-flight plot and a queued one
+// identically, so tracking in-flight there buys nothing. That reasoning is
+// sound. What it missed is that they still RETIRE — and an unmatched fetch_sub
+// on an unsigned counter does not land on -1, it lands on 2^64-1.
+//
+// It did exactly that. in_flight wrapped to SIZE_MAX, `retired + in_flight`
+// wrapped back to 0, so `unclaimed` pinned to the full batch size and never
+// moved, and estimate_eta_seconds priced ~1.8e19 committed plots. --pipeline-plot
+// printed "batch ETA ~14m08s" on a three-second run — and still said 14m08s at
+// 100% done. Neither strategy runs on a single-GPU box, which is why it survived.
+//
+// Saturating here rather than forcing a claim on both paths keeps the invariant
+// that matters (a retire never invents work) true for any future caller that
+// legitimately does not model in-flight, instead of relying on every one of them
+// to remember.
+void live_retire_in_flight(LiveWorker& w)
+{
+    std::size_t cur = w.in_flight.load(std::memory_order_relaxed);
+    while (cur > 0 &&
+           !w.in_flight.compare_exchange_weak(cur, cur - 1,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+        // cur is reloaded by compare_exchange_weak on failure.
+    }
+}
+
 // ...retired without plotting: the entry was already on disk. Costs no time, so
 // it must leave in_flight (or the ETA prices a plot that will never run) but
 // must not touch `written` (or it dilutes every rate beside it).
 std::size_t live_skip(BatchProgress& live, int slot)
 {
-    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
-        1, std::memory_order_relaxed);
+    live_retire_in_flight(live.workers[static_cast<std::size_t>(slot)]);
     live.skipped.fetch_add(1, std::memory_order_relaxed);
     return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
@@ -479,11 +508,11 @@ std::size_t live_skip(BatchProgress& live, int slot)
 // must leave in_flight (or the ETA waits forever on a plot nobody is making) and
 // must not land in `written` (or it credits the rate with a plot that produced
 // nothing). Exactly one of live_skip / live_fail / record_plot_completion pairs
-// with each live_claim.
+// with each live_claim — on the paths that claim at all; see
+// live_retire_in_flight for the two that do not.
 std::size_t live_fail(BatchProgress& live, int slot)
 {
-    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
-        1, std::memory_order_relaxed);
+    live_retire_in_flight(live.workers[static_cast<std::size_t>(slot)]);
     return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
@@ -501,7 +530,7 @@ std::size_t record_plot_completion(BatchResult& res,
     std::size_t const n = w.written.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1) w.first_done.store(completion_offset_s, std::memory_order_relaxed);
     w.last_done.store(completion_offset_s, std::memory_order_relaxed);
-    w.in_flight.fetch_sub(1, std::memory_order_relaxed);
+    live_retire_in_flight(w);
 
     live.bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
     live.written.fetch_add(1, std::memory_order_relaxed);
