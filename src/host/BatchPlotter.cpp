@@ -455,13 +455,43 @@ void live_claim(BatchProgress& live, int slot)
         1, std::memory_order_relaxed);
 }
 
+// Take one plot out of flight, SATURATING AT ZERO.
+//
+// Every retire on this branch is currently paired with a live_claim, so a plain
+// fetch_sub would be correct today. It is written this way because an UNPAIRED
+// one does not land on -1: in_flight is unsigned, so it lands on 2^64-1, and the
+// damage is silent and total. On main, where run_batch_sharded and
+// run_batch_pipeline_plot are implemented, exactly that happened — both retire
+// without claiming (each publishes as a single worker, and a one-train ETA
+// prices an in-flight plot and a queued one identically, so tracking in-flight
+// there buys nothing). in_flight wrapped to SIZE_MAX, `retired + in_flight`
+// wrapped back to 0, `unclaimed` pinned to the full batch size and never moved,
+// and the ETA priced ~1.8e19 committed plots: --pipeline-plot printed "batch ETA
+// ~14m08s" on a three-second run, and still said 14m08s at 100% done.
+//
+// cuda-only cannot hit that yet — run_batch_sharded here is a scaffold that
+// throws, and there is no pipeline-plot path at all. But that scaffold is going
+// to be filled in, and whoever fills it inherits the trap: the natural way to
+// write a single-worker strategy is to retire without claiming. Saturating makes
+// "a retire never invents work" a property of the counter instead of a
+// convention every future caller has to remember.
+void live_retire_in_flight(LiveWorker& w)
+{
+    std::size_t cur = w.in_flight.load(std::memory_order_relaxed);
+    while (cur > 0 &&
+           !w.in_flight.compare_exchange_weak(cur, cur - 1,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+        // cur is reloaded by compare_exchange_weak on failure.
+    }
+}
+
 // ...retired without plotting: the entry was already on disk. Costs no time, so
 // it must leave in_flight (or the ETA prices a plot that will never run) but
 // must not touch `written` (or it dilutes every rate beside it).
 std::size_t live_skip(BatchProgress& live, int slot)
 {
-    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
-        1, std::memory_order_relaxed);
+    live_retire_in_flight(live.workers[static_cast<std::size_t>(slot)]);
     live.skipped.fetch_add(1, std::memory_order_relaxed);
     return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
@@ -472,8 +502,7 @@ std::size_t live_skip(BatchProgress& live, int slot)
 // nothing).
 std::size_t live_fail(BatchProgress& live, int slot)
 {
-    live.workers[static_cast<std::size_t>(slot)].in_flight.fetch_sub(
-        1, std::memory_order_relaxed);
+    live_retire_in_flight(live.workers[static_cast<std::size_t>(slot)]);
     return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
@@ -491,7 +520,7 @@ std::size_t record_plot_completion(BatchResult& res,
     std::size_t const n = w.written.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1) w.first_done.store(completion_offset_s, std::memory_order_relaxed);
     w.last_done.store(completion_offset_s, std::memory_order_relaxed);
-    w.in_flight.fetch_sub(1, std::memory_order_relaxed);
+    live_retire_in_flight(w);
 
     live.bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
     live.written.fetch_add(1, std::memory_order_relaxed);
