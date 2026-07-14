@@ -76,14 +76,32 @@ struct BatchResult {
 //                     equal share, and callers must not assume one.
 //   use_all_devices — enumerate all visible CUDA devices at runtime and
 //                     use them. Overrides device_ids.
-//   include_cpu     — append a CPU worker alongside any GPUs already
-//                     selected. Set by `--cpu` (orthogonal to --devices)
-//                     or by passing `cpu` as a token in --devices. CPU
-//                     is encoded as kCpuDeviceId (-2) in device_ids —
-//                     see src/gpu/DeviceIds.hpp. Plotting on CPU goes
-//                     through pos2-chip's Plotter directly (no CUDA
-//                     calls); 1-2 orders of magnitude slower than GPU,
-//                     useful for GPU-less hosts or as an extra worker.
+//   cpu_workers     — how many CPU workers to append alongside any GPUs
+//                     already selected. 0 = none. Set by `--cpu` (= 1),
+//                     `--cpu-workers N`, or by repeating `cpu` as a token
+//                     in --devices. Each is encoded as one kCpuDeviceId
+//                     (-2) entry in device_ids — see src/gpu/DeviceIds.hpp
+//                     — so N of them are N ordinary work-queue workers.
+//                     Plotting on CPU goes through pos2-chip's Plotter
+//                     directly (no CUDA calls); 1-2 orders of magnitude
+//                     slower than GPU, useful for GPU-less hosts or as an
+//                     extra worker.
+//
+//                     This was a bool. N > 1 is worth real throughput —
+//                     aggregate steady-state on a 32-thread 5950X at k=28:
+//                     52.28 s/plot at N=1, 43.85 at N=2 (+19%), 41.69 at
+//                     N=4 (+25%) — because pos2-chip's plotter is memory-
+//                     latency-bound, so concurrent plots interleave each
+//                     other's stalls rather than queueing for a core. The
+//                     gain is bigger at smaller k (+28% / +41% at k=26) and
+//                     flattens fast: at k=28 the 3rd and 4th worker together
+//                     buy 5%. See CpuPlotter.hpp for the full table and for
+//                     why the pre-writer-swap figures were larger.
+//
+//                     It also costs a full copy of the plotter's working
+//                     set per worker (12.14 GiB at k=28), which is why
+//                     resolve_batch_devices gates the count against host
+//                     RAM instead of trusting the number it is handed.
 //   streaming_tier  — manual override for the streaming pipeline tier
 //                     (when the GPU pool doesn't fit). Accepted values:
 //                     "plain" (~7.4 GiB floor at k=28, ~10-15% faster),
@@ -109,7 +127,7 @@ struct BatchOptions {
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;
-    bool             include_cpu     = false;
+    int              cpu_workers     = 0;  // 0 = none; N = N concurrent CPU plots
     std::string      streaming_tier;
 
     // Per-GPU tier override populated by the --devices `<id>:<tier>`
@@ -169,15 +187,49 @@ inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
     return run_batch(entries, opts);
 }
 
+// Names for a worker list, one per entry, in the same order.
+//
+// device_label() on its own stopped being unique the moment --cpu-workers let
+// one device back N workers: four of them all called "cpu" makes an interleaved
+// log unreadable and a per-worker bench table meaningless. Repeats get a
+// #ordinal suffix ("cpu#0", "cpu#1"); anything that appears once is left exactly
+// as device_label() had it, so existing single-CPU logs do not churn.
+//
+// The bench uses this too — its per-worker block and the batch's log prefixes
+// have to agree on what a worker is called, or they cannot be read together.
+std::vector<std::string> worker_labels(std::vector<int> const& device_ids);
+
+// Peak resident host memory of ONE CPU worker plotting at this k.
+//
+// pos2-chip's Plotter, not ours: no streaming tier can shrink it (the CPU
+// branch of run_batch_slice returns long before the tier machinery), so this
+// is a hard, fixed cost per concurrent CPU plot and the only defence against
+// N of them is to not start them. Measured, not modelled from first
+// principles — see the anchors in the .cpp.
+std::uint64_t cpu_worker_peak_bytes(int k);
+
 // Resolve BatchOptions' device selection to the concrete id list
 // run_batch will use (use_all_devices → enumerate, device_ids →
-// as-given, include_cpu → append kCpuDeviceId; empty → CUDA-default
-// device). Pure; run_batch calls this too, so callers that need the
-// list (e.g. bench sizing its entry count) cannot drift.
-std::vector<int> resolve_batch_devices(BatchOptions const& opts);
+// as-given, cpu_workers → append that many kCpuDeviceId entries;
+// empty → CUDA-default device).
+//
+// NOT pure: it probes host RAM and caps cpu_workers at what actually fits
+// (see cpu_worker_peak_bytes — 12.14 GiB each at k=28, and the OOM killer
+// takes the GPU workers' in-flight plots down with it). It is deterministic
+// within a process, though, because the free-RAM probe is taken once and
+// cached: run_batch and the bench's own sizing call must agree on the worker
+// count, and re-probing would let the CPU workers' own RSS change the answer
+// underneath them. Callers that need the list cannot drift from run_batch.
+//
+// `gate_note`, if non-null, receives a human-readable line whenever the gate
+// changed the count — so run_batch can print it exactly once rather than
+// every caller printing it.
+std::vector<int> resolve_batch_devices(BatchOptions const& opts,
+                                       int                 k,
+                                       std::string*        gate_note = nullptr);
 
 // Number of concurrently-plotting workers run_batch will spawn for
 // these options (shard-plot acts as one team = 1).
-std::size_t batch_worker_count(BatchOptions const& opts);
+std::size_t batch_worker_count(BatchOptions const& opts, int k);
 
 } // namespace pos2gpu

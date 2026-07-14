@@ -36,6 +36,9 @@
 #include <cerrno>
 #include <cstring>         // std::strerror
 #endif
+#ifdef _WIN32
+#include <windows.h>  // GlobalMemoryStatusEx — see host_memory_probe
+#endif
 
 namespace pos2gpu {
 
@@ -196,6 +199,61 @@ void preflight_disk_space(std::vector<BatchEntry> const& entries,
 
 constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
+// Host RAM. The CPU "device" IS the host, so anything sizing a CPU worker has to
+// ask the host — putting the question to a GPU runtime is a category error.
+//
+// (On main this lives in GpuBufferPool.cpp, as a branch of a device_memory_probe()
+// that folds every negative ordinal onto GPU 0 — which quietly swallowed
+// kCpuDeviceId and answered "how much memory does the CPU have?" with the 4090's
+// free VRAM. cuda-only has no such dispatcher: its CPU worker returns from
+// run_batch_slice long before any pool or tier code, so the bug never existed
+// here. The probe still has to exist, because the RAM gate below is its only
+// caller and it is pure host code — hence it lives here, not in a .cu.)
+//
+// MemAvailable, not MemFree: it is the kernel's own estimate of what a fresh
+// allocation can obtain without swapping, and it counts reclaimable page cache.
+// MemFree on a box that has been plotting reads near zero (the cache is holding
+// the plots just written), which would starve every CPU worker for no reason.
+// This box: MemFree 13 GiB, MemAvailable 77 GiB.
+bool host_memory_probe(std::size_t& free_bytes, std::size_t& total_bytes)
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    if (!::GlobalMemoryStatusEx(&st)) return false;
+    free_bytes  = static_cast<std::size_t>(st.ullAvailPhys);
+    total_bytes = static_cast<std::size_t>(st.ullTotalPhys);
+    return true;
+#else
+    std::FILE* fp = std::fopen("/proc/meminfo", "re");
+    if (!fp) return false;
+    unsigned long long avail_kb = 0;
+    unsigned long long total_kb = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), fp)) {
+        unsigned long long v = 0;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &v) == 1)     avail_kb = v;
+        else if (std::sscanf(line, "MemTotal: %llu kB", &v) == 1)    total_kb = v;
+    }
+    std::fclose(fp);
+    if (total_kb == 0) return false;
+    // MemAvailable landed in Linux 3.14. Older kernels report only MemFree, which
+    // understates badly — fall back to MemTotal and let the gate's own arithmetic
+    // be the backstop, rather than silently refusing to start any CPU worker.
+    free_bytes  = static_cast<std::size_t>(avail_kb ? avail_kb : total_kb) << 10;
+    total_bytes = static_cast<std::size_t>(total_kb) << 10;
+    return true;
+#endif
+}
+
+std::uint64_t host_free_bytes_now()
+{
+    std::size_t free_b  = 0;
+    std::size_t total_b = 0;
+    if (!host_memory_probe(free_b, total_b)) return 0;
+    return static_cast<std::uint64_t>(free_b);
+}
+
 // Live, lock-free progress for the ETA. A work-queue's remaining plots are held
 // by SPECIFIC workers running at their OWN rates, so no batch-wide mean can
 // price the drain — the estimator needs each worker's rate and its own in-flight
@@ -209,6 +267,13 @@ struct LiveWorker {
     std::atomic<double>      work_start{0.0};
     std::atomic<double>      first_done{0.0};
     std::atomic<double>      last_done{0.0};
+
+    // What to call this worker in a log line — "gpu0", "cpu#1". Written by
+    // run_batch before any worker thread exists, read-only thereafter (the
+    // vector is sized once and never resized, so no reallocation can race a
+    // reader). Empty on the single-worker fast path, which keeps its historical
+    // device-derived prefix.
+    std::string label;
 };
 
 struct BatchProgress {
@@ -223,6 +288,17 @@ struct BatchProgress {
     std::atomic<std::size_t>   skipped{0};
     std::atomic<std::uint64_t> bytes{0};
     std::size_t                total = 0;
+
+    // Is any worker in this batch a GPU?
+    //
+    // The CPU worker nices itself down so it stops starving the GPU workers, and
+    // that is a one-way door for an unprivileged process — so it must fire only
+    // when there is somebody to yield TO. `workers.size() > 1` used to be exactly
+    // that test, on the reasoning that there was at most one CPU worker and
+    // therefore any peer was a GPU. --cpu-workers makes that false: two CPU
+    // workers and no GPU is now a legal batch, and nicing all of them equally
+    // yields to nobody while permanently out-ranking them under the writer pool.
+    bool gpu_peer_present = false;
 
     BatchProgress(std::size_t worker_count, std::size_t total_entries)
         : workers(worker_count), total(total_entries) {}
@@ -746,10 +822,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // keep the log readable. Single-default-device path keeps the
     // historical "[batch]" prefix unchanged for zero log-diff churn
     // on the common case.
-    std::string const log_prefix =
-        (device_id == kCpuDeviceId) ? std::string("[batch:cpu]") :
-        (device_id <  0)            ? std::string("[batch]")     :
-        ("[batch:gpu" + std::to_string(device_id) + "]");
+    //
+    // run_batch fills in a label per worker (see worker_labels) because the
+    // device id alone stopped being unique once N CPU workers could share one:
+    // four of them all printing "[batch:cpu]" is a log you cannot read. Fall
+    // back to the device-derived form when there is no label — that is the
+    // single-worker fast path, where the id IS unique.
+    std::string const log_prefix = [&]() -> std::string {
+        auto const& lbl = live.workers[static_cast<std::size_t>(worker_id)].label;
+        if (!lbl.empty()) return "[batch:" + lbl + "]";
+        return (device_id == kCpuDeviceId) ? std::string("[batch:cpu]") :
+               (device_id <  0)            ? std::string("[batch]")     :
+               ("[batch:gpu" + std::to_string(device_id) + "]");
+    }();
 
     // ...but the progress line is the one thing here that is NOT this worker's.
     // Its counters are the whole batch's, so "s/plot avg" is the average across
@@ -796,13 +881,21 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         BatchResult res;
         if (entries.empty()) return res;
 
-        // Yield to the GPU workers — but only when there ARE any. Nicing is
-        // irreversible for an unprivileged process, and with the CPU as the sole
-        // worker this slice runs ON THE MAIN THREAD (run_batch's single-worker
-        // fast path calls run_batch_slice inline), so we would permanently
-        // de-prioritise the whole process against everything else on the box in
-        // order to yield to nobody.
-        if (live.workers.size() > 1) {
+        // Yield to the GPU workers. Only when there ARE any:
+        //
+        //  * With the CPU as the sole worker, this slice runs on the MAIN THREAD
+        //    (run_batch's single-worker fast path calls run_batch_slice inline),
+        //    and nicing is irreversible for an unprivileged process — we would
+        //    permanently de-prioritise the whole process to yield to nobody.
+        //
+        //  * With N CPU workers and no GPU, nicing all of them equally yields to
+        //    nobody either — it just parks every plotter below the writer pool's
+        //    threads, which are the one thing that must NOT outrank them.
+        //
+        // So the test is "is there a GPU peer", not "is there a peer". It used to
+        // be workers.size() > 1, which was the same thing only while a batch could
+        // hold at most one CPU worker.
+        if (live.gpu_peer_present) {
             nice_current_thread(cpu_worker_nice_delta(), log_prefix.c_str());
         }
 
@@ -1664,8 +1757,30 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     //   use_all_devices  → enumerate at runtime, one worker per GPU
     //   device_ids       → use these explicit ids
     //   (neither)        → empty list → single-device, CUDA-default device
-    //   include_cpu      → orthogonal: append a CPU worker (kCpuDeviceId)
-    std::vector<int> const device_ids = resolve_batch_devices(opts);
+    //   cpu_workers      → orthogonal: append that many kCpuDeviceId
+    //                      entries so the CPU runs as N more workers.
+    //                      Mixes with the above (--cpu alone → CPU only;
+    //                      --cpu --devices all → all GPUs + CPU; etc.).
+    //                      The count is capped at what host RAM holds.
+    std::string gate_note;
+    std::vector<int> const device_ids =
+        resolve_batch_devices(opts, pool_k, &gate_note);
+    if (!gate_note.empty() && !opts.quiet) {
+        std::fprintf(stderr, "[batch] cpu: %s\n", gate_note.c_str());
+    }
+
+    // The gate can take the count to zero. If that leaves nothing at all to plot
+    // on, say so — the fast path below would otherwise read the empty list as
+    // "no device selected", fall back to the CUDA-default device, and quietly
+    // plot the whole batch on a GPU the user did not ask for.
+    std::size_t const cpu_selected = static_cast<std::size_t>(
+        std::count(device_ids.begin(), device_ids.end(), kCpuDeviceId));
+    if (opts.cpu_workers > 0 && cpu_selected == 0 && device_ids.empty()) {
+        throw std::runtime_error(
+            "run_batch: no CPU worker fits in host RAM and no GPU was selected"
+            " — nothing to plot on. " + gate_note);
+    }
+
     if (opts.use_all_devices &&
         std::none_of(device_ids.begin(), device_ids.end(),
                      [](int id) { return id != kCpuDeviceId; })) {
@@ -1725,11 +1840,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // zero cross-worker shared state beyond `next_idx`, stderr, and
     // the filesystem.
     size_t const N = device_ids.size();
+    auto const labels = worker_labels(device_ids);
     if (!opts.quiet) {
         std::string devs;
         for (size_t i = 0; i < N; ++i) {
             if (i) devs += ", ";
-            devs += device_label(device_ids[i]);
+            devs += labels[i];
         }
         std::fprintf(stderr,
             "[batch] multi-device: %zu plots across %zu workers "
@@ -1744,6 +1860,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // count out of here, because a work-queue's last plots are held by specific
     // workers and no batch-wide mean can price that drain.
     BatchProgress live(N, entries.size());
+    for (size_t i = 0; i < N; ++i) live.workers[i].label = labels[i];
+
+    // Only a GPU peer is worth yielding to — see the nice call in the CPU branch
+    // of run_batch_slice. Everything in this list that is not the CPU is a GPU
+    // (the CUDA-default sentinel never reaches the multi-device path).
+    live.gpu_peer_present =
+        std::any_of(device_ids.begin(), device_ids.end(),
+                    [](int id) { return id != kCpuDeviceId; });
+
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -1803,7 +1928,238 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     return agg;
 }
 
-std::vector<int> resolve_batch_devices(BatchOptions const& opts)
+// ---------------------------------------------------------------------------
+// The --cpu-workers RAM gate.
+//
+// N CPU workers means N concurrent pos2-chip Plotters, and they share nothing:
+// no tier shrinks them (the CPU branch of run_batch_slice returns long before
+// the tier machinery), no pool bounds them. So the only defence against asking
+// for more than the host can hold is to not start them — and getting it wrong
+// does not cost throughput, it costs the whole batch, because the OOM killer
+// takes the GPU workers' in-flight plots down with the CPU's.
+//
+// Both curves below are measured, not modelled: VmHWM out of /proc, the kernel's
+// own high-water mark, polled to process exit on a 32-thread 5950X + RTX 4090.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Host RSS one GPU worker adds — its pinned buffers, fragment buffers, FSE
+// scratch, CUDA context and the binary itself. Not device VRAM: this is the host
+// memory a GPU worker takes AWAY from the CPU workers.
+//
+//   k=22    345 668 kB      (model says 350 396 — +1.4%)
+//   k=26  1 583 524 kB
+//   k=28  5 529 348 kB      (5.27 GiB)
+//
+// Fits A·2^k + B to within 1.4% across all three, with A = 20.07 B/entry and
+// B = 262 MB (context + binary + buffers, none of which scale with k).
+//
+// Measured on a 24 GB card, which auto-picks the largest streaming tier and so
+// the largest host-side footprint. A smaller card picks a smaller tier and needs
+// less than this — over-estimating the reserve costs at most one CPU worker, and
+// that is the direction to err in.
+std::uint64_t gpu_worker_host_peak_bytes(int k)
+{
+    constexpr double kBytesPerEntry = 20.07;
+    constexpr double kFixedBytes    = 262.0 * 1024.0 * 1024.0;
+    double const entries = static_cast<double>(std::uint64_t{1} << k);
+    return static_cast<std::uint64_t>(kBytesPerEntry * entries + kFixedBytes);
+}
+
+// Free host RAM, probed ONCE per process.
+//
+// Cached deliberately. run_batch and the bench's own batch_worker_count() both
+// resolve the device list, and they must agree on how many workers exist — the
+// bench sizes its plot queue off that count. A live probe would not agree with
+// itself: the CPU workers' own 12 GiB apiece is subtracted from MemAvailable the
+// moment they start, so asking again mid-run answers a different question than
+// the one the gate is for ("how many can I start?", not "how much is left now?").
+std::uint64_t host_free_bytes_once()
+{
+    static std::uint64_t const cached = host_free_bytes_now();
+    return cached;
+}
+
+// Slack between "the kernel says this much is available" and "starting another
+// 12 GiB allocation right now is a good idea". MemAvailable already excludes what
+// the kernel wants to keep and already counts reclaimable page cache, so this is
+// not a second guess at the same thing — it is headroom for everything on the box
+// that is not us.
+constexpr std::uint64_t kHostSlackBytes = 1ULL << 30;  // 1 GiB
+
+// Host RAM the user wants left alone — XCHPLOT2_CPU_RESERVE_MB.
+//
+// The gate's job is to stop the CPU workers OOMing the box. But "the box has 73
+// GiB free" and "you may take 73 GiB" are different claims: plenty of people plot
+// on the machine they also work on, and would rather keep 16 GB for the thing they
+// are actually doing than discover, an hour in, that their editor got swapped out.
+std::uint64_t host_reserve_bytes()
+{
+    if (char const* v = std::getenv("XCHPLOT2_CPU_RESERVE_MB"); v && v[0]) {
+        long const mb = std::atol(v);
+        if (mb > 0) return static_cast<std::uint64_t>(mb) << 20;
+    }
+    return 0;
+}
+
+// How many bytes the CPU workers may collectively hold, at batch start.
+std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
+{
+    std::uint64_t const free_now = host_free_bytes_once();
+    std::uint64_t const reserve =
+        kHostSlackBytes + host_reserve_bytes() +
+        static_cast<std::uint64_t>(gpu_count) * gpu_worker_host_peak_bytes(k);
+    return free_now > reserve ? free_now - reserve : 0;
+}
+
+// How many of the `asked` CPU workers actually fit. Never throws:
+// batch_worker_count() calls this from outside the CLI's try block (cli.cpp), so
+// a throw here would terminate instead of printing.
+int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
+                         std::string* note)
+{
+    if (asked <= 0) return 0;
+
+    if (char const* v = std::getenv("XCHPLOT2_CPU_WORKERS_UNGATED");
+        v && v[0] == '1') {
+        return asked;  // "I know my box better than /proc does." Fine — but own it.
+    }
+
+    std::uint64_t const per_worker = cpu_worker_peak_bytes(k);
+    std::uint64_t const free_now   = host_free_bytes_once();
+    if (free_now == 0 || per_worker == 0) {
+        // The probe failed (no /proc/meminfo? a kernel older than 3.14?). Do not
+        // silently drop the user's workers over a failure to READ memory — that
+        // trades a possible OOM for a certain loss of the CPU. Say so, run anyway.
+        if (note) {
+            *note = "could not read host memory — running " +
+                    std::to_string(asked) +
+                    " CPU worker(s) ungated (each needs ~" +
+                    std::to_string(per_worker >> 30) + " GiB at k=" +
+                    std::to_string(k) + ")";
+        }
+        return asked;
+    }
+
+    std::uint64_t const budget = cpu_budget_bytes(k, gpu_count);
+
+    int const fits = static_cast<int>(
+        std::min<std::uint64_t>(budget / per_worker,
+                                static_cast<std::uint64_t>(asked)));
+    if (fits >= asked) return asked;
+
+    if (note) {
+        auto gib = [](std::uint64_t b) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.1f",
+                          static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0));
+            return std::string(buf);
+        };
+        *note = "asked for " + std::to_string(asked) + " CPU worker" +
+                (asked == 1 ? "" : "s") + " but " +
+                (fits == 0 ? std::string("none fit")
+                           : "only " + std::to_string(fits) +
+                                 (fits == 1 ? " fits" : " fit")) +
+                ": each needs " + gib(per_worker) + " GiB at k=" +
+                std::to_string(k) + ", host has " + gib(free_now) +
+                " GiB available";
+        if (gpu_count > 0) {
+            *note += " and " + std::to_string(gpu_count) +
+                     (gpu_count == 1 ? " GPU worker reserves "
+                                     : " GPU workers reserve ") +
+                     gib(static_cast<std::uint64_t>(gpu_count) *
+                         gpu_worker_host_peak_bytes(k)) + " GiB of it";
+        }
+        if (std::uint64_t const held = host_reserve_bytes(); held > 0) {
+            *note += ", and you asked to keep " + gib(held) +
+                     " GiB back (XCHPLOT2_CPU_RESERVE_MB)";
+        }
+        *note += ". Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to override (and risk the "
+                 "OOM killer taking the whole batch)";
+    }
+    return fits;
+}
+
+}  // namespace
+
+std::uint64_t cpu_worker_peak_bytes(int k)
+{
+    // Peak RSS of a one-plot, CPU-only process:
+    //
+    //   k=22      223 568 kB     54.58 B per 2^k entry
+    //   k=24      927 036 kB     56.58
+    //   k=26    3 226 100 kB     49.23
+    //   k=28   12 727 020 kB     48.55      (12.14 GiB)
+    //
+    // The k=28 figure reproduced 0.04% apart across two separate runs, and the
+    // spread across four concurrent workers was 0.03% — this is a tight, stable
+    // number, so there is no fudge factor on it. (The safety lives in the reserve,
+    // which is the term that is genuinely uncertain.)
+    //
+    // It is ~2^k, but not a clean power of two: the coefficient drifts DOWN as k
+    // rises, because table sizes track match counts rather than 2^k exactly. So
+    // interpolate the coefficient between anchors instead of picking one and
+    // pretending it holds everywhere.
+    //
+    // OUTSIDE the measured range, take the largest coefficient ever seen (56.58,
+    // at k=24) rather than extending the trend. The trend is downward, which means
+    // extrapolating it is exactly the way to under-estimate — and this is the
+    // number that decides whether the box survives.
+    struct Anchor { int k; double bytes_per_entry; };
+    static constexpr Anchor kAnchors[] = {
+        {22, 54.58}, {24, 56.58}, {26, 49.23}, {28, 48.55},
+    };
+    static constexpr std::size_t kN = sizeof(kAnchors) / sizeof(kAnchors[0]);
+    static constexpr double kWorstSeen = 56.58;
+
+    double coeff = kWorstSeen;
+    if (k >= kAnchors[0].k && k <= kAnchors[kN - 1].k) {
+        for (std::size_t i = 1; i < kN; ++i) {
+            if (k <= kAnchors[i].k) {
+                Anchor const& lo = kAnchors[i - 1];
+                Anchor const& hi = kAnchors[i];
+                double const t =
+                    static_cast<double>(k - lo.k) / static_cast<double>(hi.k - lo.k);
+                coeff = lo.bytes_per_entry +
+                        t * (hi.bytes_per_entry - lo.bytes_per_entry);
+                break;
+            }
+        }
+    }
+    if (k < 1 || k > 40) return 0;  // nonsense k — let the caller's guards speak
+    double const entries = static_cast<double>(std::uint64_t{1} << k);
+    return static_cast<std::uint64_t>(coeff * entries);
+}
+
+std::vector<std::string> worker_labels(std::vector<int> const& device_ids)
+{
+    // device_label() alone is ambiguous the moment a device repeats — and with N
+    // CPU workers it does, so a 4-worker bench would print four lines all called
+    // "cpu" and a log would interleave four "[batch:cpu]" prefixes with no way to
+    // tell which worker stalled. Suffix repeats with #ordinal; leave unique
+    // devices exactly as they were, so single-CPU logs do not churn.
+    std::vector<std::string> labels;
+    labels.reserve(device_ids.size());
+    for (std::size_t i = 0; i < device_ids.size(); ++i) {
+        std::string base = device_label(device_ids[i]);
+        std::size_t const total = static_cast<std::size_t>(
+            std::count(device_ids.begin(), device_ids.end(), device_ids[i]));
+        if (total > 1) {
+            std::size_t const ordinal = static_cast<std::size_t>(
+                std::count(device_ids.begin(),
+                           device_ids.begin() + static_cast<long>(i),
+                           device_ids[i]));
+            base += "#" + std::to_string(ordinal);
+        }
+        labels.push_back(std::move(base));
+    }
+    return labels;
+}
+
+std::vector<int> resolve_batch_devices(BatchOptions const& opts,
+                                       int                 k,
+                                       std::string*        gate_note)
 {
     std::vector<int> device_ids;
     if (opts.use_all_devices) {
@@ -1815,22 +2171,23 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts)
     } else if (!opts.device_ids.empty()) {
         device_ids = opts.device_ids;
     }
-    // include_cpu is orthogonal: append a CPU worker (kCpuDeviceId)
-    // alongside whatever GPUs are already selected. Don't dedup —
-    // caller can pass `cpu` multiple times for multi-core CPU — but
-    // collapse the case where include_cpu was set both via --cpu
-    // AND via a `cpu` token in --devices.
-    if (opts.include_cpu &&
-        std::find(device_ids.begin(), device_ids.end(), kCpuDeviceId)
-            == device_ids.end()) {
-        device_ids.push_back(kCpuDeviceId);
-    }
+
+    // Every CPU worker is one more kCpuDeviceId in the list — the work-queue needs
+    // no idea they are the same physical device, because they aren't sharing
+    // anything. This used to append at most ONE, no matter what was asked for,
+    // while its own comment promised "caller can pass `cpu` multiple times for
+    // multi-core CPU" — so anyone who believed the comment benchmarked one worker
+    // and attributed it to four. The count is gated against host RAM first.
+    std::size_t const gpu_count = device_ids.size();
+    int const cpu_count =
+        cpu_workers_that_fit(opts.cpu_workers, k, gpu_count, gate_note);
+    for (int i = 0; i < cpu_count; ++i) device_ids.push_back(kCpuDeviceId);
     return device_ids;
 }
 
-std::size_t batch_worker_count(BatchOptions const& opts)
+std::size_t batch_worker_count(BatchOptions const& opts, int k)
 {
-    auto const device_ids = resolve_batch_devices(opts);
+    auto const device_ids = resolve_batch_devices(opts, k);
     if (opts.shard_plot && device_ids.size() > 1) {
         return 1;  // devices form one team; one plot in flight
     }

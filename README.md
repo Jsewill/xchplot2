@@ -355,6 +355,56 @@ xchplot2 plot ... --devices cpu
 xchplot2 plot ... --devices 0,1,cpu
 ```
 
+##### `--cpu-workers N` — several CPU plots at once
+
+The CPU plotter goes through pos2-chip's `Plotter` (no CUDA calls), and it is
+memory-latency-bound rather than core-bound. So running several plots
+concurrently is a real win: they interleave each other's memory stalls instead
+of queueing for a core.
+
+Measured, aggregate steady-state, 32-thread 5950X, same binary:
+
+| workers | k=26 | k=28 |
+|---|---|---|
+| `N=1` | 13.57 s/plot | 52.28 s/plot |
+| `N=2` | 10.59 s/plot (+28%) | 43.85 s/plot (+19%) |
+| `N=4` | 9.63 s/plot (+41%) | 41.69 s/plot (+25%) |
+
+It flattens fast — at k=28 the 3rd and 4th worker together buy 5% — and the gain
+shrinks as k grows, because a 12 GiB working set already saturates memory
+bandwidth on its own.
+
+```bash
+# Four concurrent CPU plots.
+xchplot2 plot ... --cpu-workers 4
+
+# Same thing, spelled in --devices. Repeating `cpu` now counts.
+xchplot2 plot ... --devices cpu,cpu,cpu,cpu
+
+# Two GPUs plus two CPU workers, all pulling from one queue.
+xchplot2 plot ... --devices 0,1,cpu,cpu
+```
+
+**Each worker needs its own full copy of the plotter's working set** — 12.1 GiB
+at k=28, 3.1 GiB at k=26 — because no streaming tier applies to the CPU path.
+So `N` is an ask, not a promise: it is capped at what host RAM actually holds,
+and you are told when it caps you:
+
+```
+[batch] cpu: asked for 6 CPU workers but only 4 fit: each needs 12.1 GiB at
+        k=28, host has 61.4 GiB available and 2 GPU workers reserve 10.5 GiB of it
+```
+
+| env var | effect |
+|---|---|
+| `XCHPLOT2_CPU_RESERVE_MB` | host RAM to leave alone — for the machine you also work on |
+| `XCHPLOT2_CPU_WORKERS_UNGATED=1` | skip the gate entirely (and risk the OOM killer taking the whole batch) |
+| `XCHPLOT2_CPU_NICE` | how far to de-prioritise CPU workers below GPU workers (default 10; `0` disables) |
+
+The CPU workers are niced below the GPU workers when both are present, because
+pos2-chip fans out to every core and would otherwise starve the GPU workers'
+compression threads — costing more GPU throughput than the CPU adds.
+
 ##### Per-GPU streaming tier
 
 Any GPU selector in `--devices` accepts a `:tier` suffix to pin the
