@@ -10,6 +10,8 @@
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
+#else
+#include <windows.h>  // GlobalMemoryStatusEx — see host_memory_probe
 #endif
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
@@ -405,10 +407,67 @@ bool hip_query_device_memory(int device_ordinal,
 } // namespace
 #endif  // !_WIN32
 
+// Host RAM. The CPU "device" IS the host, so its streaming tier has to be
+// sized against host memory — asking a GPU runtime how much memory the CPU has
+// is a category error.
+//
+// MemAvailable, not MemFree: it is the kernel's own estimate of what a fresh
+// allocation can obtain without swapping, and it counts reclaimable page cache.
+// MemFree on a box that has been plotting reads near zero (the cache is holding
+// the plots just written), which would pin every CPU worker to the smallest
+// tier for no reason. This box: MemFree 13 GiB, MemAvailable 77 GiB.
+namespace {
+
+bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    if (!::GlobalMemoryStatusEx(&st)) return false;
+    free_bytes  = static_cast<size_t>(st.ullAvailPhys);
+    total_bytes = static_cast<size_t>(st.ullTotalPhys);
+    return true;
+#else
+    std::FILE* fp = std::fopen("/proc/meminfo", "re");
+    if (!fp) return false;
+    unsigned long long avail_kb = 0;
+    unsigned long long total_kb = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), fp)) {
+        unsigned long long v = 0;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &v) == 1)     avail_kb = v;
+        else if (std::sscanf(line, "MemTotal: %llu kB", &v) == 1)    total_kb = v;
+    }
+    std::fclose(fp);
+    if (total_kb == 0) return false;
+    // MemAvailable landed in Linux 3.14. Older kernels report only MemFree,
+    // which understates badly — fall back to MemTotal and let the pool's own
+    // allocation failures be the backstop, rather than silently choosing Tiny.
+    free_bytes  = static_cast<size_t>(avail_kb ? avail_kb : total_kb) << 10;
+    total_bytes = static_cast<size_t>(total_kb) << 10;
+    return true;
+#endif
+}
+
+}  // namespace
+
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes)
 {
+    // The CPU device is the host. Ask the host.
+    //
+    // This branch did not exist, and the CUDA probe below folds every negative
+    // ordinal onto GPU 0 (`device_ordinal < 0 ? 0 : device_ordinal`). That is
+    // correct for kDefaultGpuId (-1), which really does mean "GPU 0" — but it
+    // also swallowed kCpuDeviceId (-2), so the CPU device sized its streaming
+    // tier against the GPU's free VRAM and logged "vram: peak N of 17690 free"
+    // on a host with 125 GB of RAM. Nothing shipped on top of it yet; the
+    // --cpu-workers RAM gate is about to, so it has to be right first.
+    if (device_ordinal == kCpuDeviceId) {
+        return host_memory_probe(free_bytes, total_bytes);
+    }
+
 #ifdef XCHPLOT2_HAVE_CUB
     std::size_t f = 0;
     std::size_t t = 0;

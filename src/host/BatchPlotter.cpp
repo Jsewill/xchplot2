@@ -641,6 +641,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         (device_id <  0)            ? std::string("[batch]")     :
         ("[batch:gpu" + std::to_string(device_id) + "]");
 
+    // "vram" is a lie on the CPU device: its "device memory" IS host RAM, and
+    // the free figure behind it now comes from /proc/meminfo MemAvailable
+    // rather than a GPU (it used to come from GPU 0 — see device_memory_probe).
+    // The tier machinery below is otherwise identical for both, so only the
+    // noun changes.
+    char const* const mem_label =
+        (device_id == kCpuDeviceId) ? "ram" : "vram";
+
     // ...but the progress line is the one thing here that is NOT this worker's.
     // Its counters are the whole batch's, so "s/plot avg" is the average across
     // every worker. Wearing a per-worker prefix, it read as that worker's rate: a
@@ -1410,9 +1418,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
         if (!opts.quiet) {
             std::fprintf(stderr,
-                "%s vram: peak %.0f MiB of %.0f free "
+                "%s %s: peak %.0f MiB of %.0f free "
                 "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared)\n",
-                log_prefix.c_str(),
+                log_prefix.c_str(), mem_label,
                 to_mib(peak), to_mib(vram.baseline()),
                 to_mib(declared_base_bytes), to_mib(held),
                 to_mib(vram_safety_margin()), to_mib(declared));
@@ -1428,11 +1436,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // bound.
         if (peak > 0 && declared_base_bytes > peak * 3 / 2) {
             std::fprintf(stderr,
-                "%s vram: WARNING — model declares %.0f MiB but the path only "
+                "%s %s: WARNING — model declares %.0f MiB but the path only "
                 "peaked at %.0f MiB. An over-declared model denies this path to "
                 "cards that can run it. Re-derive the peak from this measured "
                 "number, not from a ratio against another tier's anchor.\n",
-                log_prefix.c_str(), to_mib(declared_base_bytes), to_mib(peak));
+                log_prefix.c_str(), mem_label,
+                to_mib(declared_base_bytes), to_mib(peak));
         }
 
         if (peak > declared) {
@@ -1441,11 +1450,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // that tier to cards sized from the model, so whatever slipped
             // through here is an OOM on somebody's smaller GPU.
             std::fprintf(stderr,
-                "%s vram: ERROR — peak %.0f MiB exceeds the %.0f MiB declared "
+                "%s %s: ERROR — peak %.0f MiB exceeds the %.0f MiB declared "
                 "for this path by %.0f MiB. Some device allocation is not "
                 "accounted for in the peak model; a card sized from that model "
                 "will OOM. See the two-phase budget notes in SyclBackend.hpp.\n",
-                log_prefix.c_str(), to_mib(peak), to_mib(declared),
+                log_prefix.c_str(), mem_label, to_mib(peak), to_mib(declared),
                 to_mib(peak - declared));
             if (char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
                 v && v[0] == '1')
