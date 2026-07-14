@@ -888,6 +888,28 @@ plots down with the CPU's, so it is the batch you lose, not one plot.
 `XCHPLOT2_CPU_WORKERS_UNGATED=1` overrides it if you know your box better
 than `/proc/meminfo` does.
 
+**The check is repeated at every plot boundary, not just at the start.** A
+batch runs for hours, and the box it runs on is usually a machine you also
+use — so if a compile or a browser takes 30 GB an hour in, the count chosen
+at startup is now a lie. Before starting each plot (the one moment a CPU
+worker holds *nothing*: pos2-chip's plotter is built per plot), a worker
+re-checks that its 12.1 GiB is really there. If it isn't, it waits for a
+peer to finish rather than starting an allocation it can't fund:
+
+```
+[batch:cpu#1] waiting for memory: its next plot needs 12.1 GiB, the host has
+0.0 GiB to spare (2 peers plotting — each one finishing frees 12.1 GiB)
+[batch:cpu#1] resumed — memory came back
+```
+
+It never interrupts a plot in progress — it can't, and wouldn't want to. If
+the memory never comes back (5 minutes by default, `XCHPLOT2_CPU_WAIT_SECS`),
+the CPU worker retires and the GPU workers carry on without it.
+
+Plotting on the machine you work on? `XCHPLOT2_CPU_RESERVE_MB=16384` keeps
+16 GB out of the plotter's reach entirely, at both the initial count and
+every boundary check.
+
 On a GPU+CPU rig the CPU workers are also de-prioritised (`nice +10`, or
 `XCHPLOT2_CPU_NICE`) so they stop stealing cores from the GPU workers'
 compression threads — worth +7.8% on the GPU's own rate. Set

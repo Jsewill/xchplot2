@@ -31,8 +31,10 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -208,6 +210,257 @@ constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 //
 // Every strategy publishes here, single-worker ones into a one-slot table, so
 // emit_progress_line has exactly one shape to reason about.
+// This process's resident set. Pairs with the free-memory probe — see
+// CpuMemoryGate, which needs the SUM of the two.
+std::uint64_t self_rss_bytes()
+{
+#if defined(__linux__)
+    std::FILE* fp = std::fopen("/proc/self/statm", "re");
+    if (!fp) return 0;
+    unsigned long long total_pages = 0;
+    unsigned long long rss_pages   = 0;
+    int const got = std::fscanf(fp, "%llu %llu", &total_pages, &rss_pages);
+    std::fclose(fp);
+    if (got != 2) return 0;
+    long const page = ::sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 0;
+    return static_cast<std::uint64_t>(rss_pages) *
+           static_cast<std::uint64_t>(page);
+#else
+    return 0;  // gate degrades to the start-of-batch answer — see budget_now()
+#endif
+}
+
+std::uint64_t host_free_bytes_now()
+{
+    std::size_t free_b = 0;
+    std::size_t total_b = 0;
+    if (!device_memory_probe(kCpuDeviceId, free_b, total_b)) return 0;
+    return static_cast<std::uint64_t>(free_b);
+}
+
+// ---------------------------------------------------------------------------
+// Admission control for CPU workers.
+//
+// The start-of-batch gate answers "how many workers can this host fund?" exactly
+// once, before any of them exist. That is the right question at t=0 and the wrong
+// one an hour in: a batch runs for hours, and the box it runs on is usually
+// somebody's actual computer. If a compile, a browser, or a second plotter takes
+// 40 GB while we are running, the count decided at t=0 is now a lie — and the OOM
+// killer is what notices, taking the GPU workers' in-flight plots down with the
+// CPU's.
+//
+// So ask again at every plot boundary. That is the one place it can be asked
+// honestly: between plots a CPU worker holds NOTHING (pos2-chip's Plotter is
+// constructed per plot, inside run_one_plot_cpu), so a worker about to start one
+// is asking "is there room for 12.1 GiB?" while holding none of it.
+//
+// What does NOT work is to simply probe MemAvailable and compare:
+//
+//   * The herd. N workers finishing at the same moment all probe, all see the
+//     same free memory, and all conclude there is room for one more — because
+//     none of them has allocated yet. A probe can see an allocation; it cannot
+//     see a decision.
+//
+//   * The self-measurement. Our own workers' 12 GiB apiece IS most of what
+//     MemAvailable is missing, so a controller that re-reads it mid-run reads its
+//     own footprint as external pressure and shrinks the pool it just created.
+//
+// Both vanish once the two quantities are measured separately:
+//
+//   OUR usage      a reservation counter, incremented on ADMISSION. Exact, and it
+//                  counts decisions rather than allocations, so no herd can form.
+//
+//   EXTERNAL usage (MemAvailable + our own RSS) is invariant under our own
+//                  allocations: touching a page drops MemAvailable and raises
+//                  VmRSS by the same amount, so the sum does not move. The drop in
+//                  that SUM since batch start is therefore what the REST of the
+//                  box has taken — blind to what we are doing, which is exactly
+//                  what a controller of our own size needs it to be.
+//
+// (The GPU workers' host memory is handled by the same invariance: their pinned
+// pools raise our RSS and lower MemAvailable together, so they never look like
+// external pressure — and their share was already subtracted from the budget.)
+class CpuMemoryGate {
+public:
+    enum class Verdict { Admitted, Denied };
+
+    CpuMemoryGate(std::uint64_t per_worker, std::uint64_t budget_at_start)
+        : per_worker_(per_worker)
+        , budget_at_start_(budget_at_start)
+        // Both halves probed at the same instant, or their sum means nothing.
+        , baseline_sum_(static_cast<std::int64_t>(host_free_bytes_now()) +
+                        static_cast<std::int64_t>(self_rss_bytes()))
+    {}
+
+    // Waits until this worker's next plot can be funded.
+    //
+    // `still_wanted` is what keeps a waiter from outliving the work: a worker
+    // blocked in here cannot see the queue drain or a cancel arrive, so on a
+    // GPU+CPU rig the GPUs would finish the batch and then hang forever joining a
+    // CPU worker that is still waiting for memory to make a plot nobody needs.
+    //
+    // Two ways to be woken, and they are not the same:
+    //
+    //   a peer finishing   — notifies, and is GUARANTEED to free per_worker bytes.
+    //   the box relenting  — sends no notification at all. So poll for it, on a
+    //                        1 s tick. This is the case the whole gate exists for,
+    //                        and an earlier version of this function got it badly
+    //                        wrong: it treated "no peer of ours holds memory" as
+    //                        "nothing can ever free memory" and killed the batch
+    //                        on the spot. The rest of the box is not ours to
+    //                        account for — it takes memory without asking and
+    //                        gives it back without telling us.
+    //
+    // Give up only after the box has been too small for a plot CONTINUOUSLY for
+    // the grace period (XCHPLOT2_CPU_WAIT_SECS, default 5 min) with nobody of ours
+    // holding anything — that is a box that has genuinely shrunk, not a compile
+    // that will end.
+    Verdict acquire(char const* who, bool quiet,
+                    std::function<bool()> const& still_wanted)
+    {
+        using clock = std::chrono::steady_clock;
+        std::unique_lock<std::mutex> lk(m_);
+        bool                          announced = false;
+        std::optional<clock::time_point> starved_since;
+
+        for (;;) {
+            std::int64_t const budget = budget_now_locked();
+            if (static_cast<std::int64_t>(committed_ + per_worker_) <= budget) {
+                committed_ += per_worker_;
+                ++holders_;
+                if (announced && !quiet) {
+                    std::fprintf(stderr, "%s resumed — memory came back\n", who);
+                }
+                return Verdict::Admitted;
+            }
+
+            // Nothing left to plot (or we are being cancelled)? Then stop waiting
+            // for the memory to plot it with.
+            if (still_wanted && !still_wanted()) return Verdict::Denied;
+
+            if (!announced && !quiet) {
+                announced = true;
+                std::int64_t const spare =
+                    budget - static_cast<std::int64_t>(committed_);
+                std::fprintf(stderr,
+                    "%s waiting for memory: its next plot needs %.1f GiB, the host "
+                    "has %.1f GiB to spare",
+                    who, gib(per_worker_),
+                    spare > 0 ? gib(static_cast<std::uint64_t>(spare)) : 0.0);
+                if (holders_ > 0) {
+                    std::fprintf(stderr,
+                        " (%d peer%s plotting — each one finishing frees %.1f GiB)\n",
+                        holders_, holders_ == 1 ? "" : "s", gib(per_worker_));
+                } else {
+                    std::fprintf(stderr,
+                        " and no peer of ours is holding any. Waiting up to %lld s "
+                        "for the rest of the box to give it back.\n",
+                        static_cast<long long>(grace_.count()));
+                }
+            }
+
+            auto const now = clock::now();
+            if (holders_ == 0) {
+                if (!starved_since) {
+                    starved_since = now;
+                } else if (now - *starved_since > grace_) {
+                    return Verdict::Denied;   // the box really has shrunk
+                }
+            } else {
+                starved_since.reset();  // a peer is running; it WILL free memory
+            }
+
+            cv_.wait_for(lk, std::chrono::seconds(1));
+        }
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            committed_ = committed_ > per_worker_ ? committed_ - per_worker_ : 0;
+            if (holders_ > 0) --holders_;
+        }
+        cv_.notify_all();  // a waiter can now re-ask
+    }
+
+    std::uint64_t per_worker() const { return per_worker_; }
+
+    // Only meaningful for the error message on a Denied verdict.
+    double budget_gib_now()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        std::int64_t const b = budget_now_locked();
+        return b > 0 ? gib(static_cast<std::uint64_t>(b)) : 0.0;
+    }
+
+private:
+    static double gib(std::uint64_t b)
+    {
+        return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    std::int64_t budget_now_locked() const
+    {
+        std::uint64_t const free_now = host_free_bytes_now();
+        std::uint64_t const rss_now  = self_rss_bytes();
+        if (free_now == 0 || rss_now == 0) {
+            // No probe (not Linux, or /proc unreadable). Fall back to the answer
+            // the start-of-batch gate already gave — never to "unlimited".
+            return static_cast<std::int64_t>(budget_at_start_);
+        }
+        std::int64_t const sum_now = static_cast<std::int64_t>(free_now) +
+                                     static_cast<std::int64_t>(rss_now);
+        std::int64_t const external = baseline_sum_ - sum_now;  // >0: box got busier
+        return static_cast<std::int64_t>(budget_at_start_) - external;
+    }
+
+    // How long the box may stay too small for a single plot, with nobody of ours
+    // holding memory, before we accept that it is not going to relent.
+    static std::chrono::seconds grace_seconds()
+    {
+        if (char const* v = std::getenv("XCHPLOT2_CPU_WAIT_SECS"); v && v[0]) {
+            long const s = std::atol(v);
+            if (s >= 0) return std::chrono::seconds(s);
+        }
+        return std::chrono::seconds(300);
+    }
+
+    std::uint64_t const        per_worker_;
+    std::uint64_t const        budget_at_start_;
+    std::int64_t const         baseline_sum_;
+    std::chrono::seconds const grace_ = grace_seconds();
+    std::uint64_t              committed_ = 0;  // bytes promised to admitted workers
+    int                        holders_   = 0;  // CPU workers currently plotting
+    mutable std::mutex         m_;
+    std::condition_variable    cv_;
+};
+
+// Releases on every path out of the loop body — including the throw.
+class CpuMemoryLease {
+public:
+    CpuMemoryLease() = default;
+    explicit CpuMemoryLease(CpuMemoryGate* g) : gate_(g) {}
+    CpuMemoryLease(CpuMemoryLease&& o) noexcept : gate_(o.gate_) { o.gate_ = nullptr; }
+    CpuMemoryLease& operator=(CpuMemoryLease&& o) noexcept
+    {
+        if (this != &o) { reset(); gate_ = o.gate_; o.gate_ = nullptr; }
+        return *this;
+    }
+    CpuMemoryLease(CpuMemoryLease const&)            = delete;
+    CpuMemoryLease& operator=(CpuMemoryLease const&) = delete;
+    ~CpuMemoryLease() { reset(); }
+
+    void reset()
+    {
+        if (gate_) { gate_->release(); gate_ = nullptr; }
+    }
+
+private:
+    CpuMemoryGate* gate_ = nullptr;
+};
+
 struct LiveWorker {
     std::atomic<std::size_t> written{0};
     std::atomic<std::size_t> in_flight{0};  // pulled off the queue, not retired
@@ -246,6 +499,10 @@ struct BatchProgress {
     // workers and no GPU is now a legal batch, and nicing all of them equally
     // yields to nobody while permanently out-ranking them under the writer pool.
     bool gpu_peer_present = false;
+
+    // Admission control for the CPU workers, re-asked at every plot boundary.
+    // Null when the batch has no CPU worker. See CpuMemoryGate.
+    std::unique_ptr<CpuMemoryGate> cpu_gate;
 
     BatchProgress(std::size_t worker_count, std::size_t total_entries)
         : workers(worker_count), total(total_entries) {}
@@ -873,6 +1130,66 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         live_work_start(live, worker_id, res.work_start_seconds);
         std::size_t local_idx = 0;
         while (true) {
+            // Fund the next plot BEFORE claiming it.
+            //
+            // The order matters: a worker that gave up AFTER pulling an index off
+            // the shared counter would strand that plot — the queue is a
+            // fetch_add, there is nowhere to put one back — and the batch would
+            // quietly finish short. Ask for the memory first; if the answer is no,
+            // this worker simply never claims the work, and its peers take it.
+            //
+            // Declared inside the loop so every exit path — break, continue,
+            // throw, or a normal iteration — hands the reservation back.
+            CpuMemoryLease lease;
+            if (live.cpu_gate) {
+                // Stop waiting for memory the moment the work it was for is gone.
+                // A worker parked in acquire() cannot see the queue drain or a
+                // cancel land, and on a GPU+CPU rig that is a hang: the GPUs
+                // finish the batch and run_batch joins a CPU worker still waiting
+                // to fund a plot nobody needs any more.
+                auto const still_wanted = [&]() -> bool {
+                    if (cancel_requested()) return false;
+                    if (shared_idx &&
+                        shared_idx->load(std::memory_order_relaxed) >=
+                            entries.size()) {
+                        return false;
+                    }
+                    return true;
+                };
+
+                if (live.cpu_gate->acquire(log_prefix.c_str(), opts.quiet,
+                                           still_wanted) ==
+                    CpuMemoryGate::Verdict::Admitted) {
+                    lease = CpuMemoryLease(live.cpu_gate.get());
+                } else if (!still_wanted()) {
+                    break;  // the batch is over, or cancelled — nothing to fund
+                } else {
+                    // Denied: the box has been too small for a single plot,
+                    // continuously, for the whole grace period, with no peer of
+                    // ours holding anything it could give back.
+                    if (live.gpu_peer_present) {
+                        // The GPUs are fine and still have a queue to drain. Leave
+                        // quietly rather than taking the whole batch down.
+                        std::fprintf(stderr,
+                            "%s retiring: the host no longer has room for a %.1f "
+                            "GiB plot (%.1f GiB free to us). The GPU workers "
+                            "continue.\n",
+                            log_prefix.c_str(),
+                            static_cast<double>(live.cpu_gate->per_worker()) /
+                                (1024.0 * 1024.0 * 1024.0),
+                            live.cpu_gate->budget_gib_now());
+                        break;
+                    }
+                    // Nothing else can make progress. Say so instead of spinning.
+                    throw std::runtime_error(
+                        "CPU worker: the host no longer has room for a plot at "
+                        "this k — something else on this machine took the memory "
+                        "since the batch started, and there is no GPU worker to "
+                        "fall back on. Lower --cpu-workers, lower -k, or free "
+                        "memory.");
+                }
+            }
+
             std::size_t const i = shared_idx
                 ? shared_idx->fetch_add(1, std::memory_order_relaxed)
                 : local_idx++;
@@ -2338,6 +2655,40 @@ std::uint64_t host_free_bytes_once()
 // on the box that is not us.
 constexpr std::uint64_t kHostSlackBytes = 1ULL << 30;  // 1 GiB
 
+// Host RAM the user wants left alone — XCHPLOT2_CPU_RESERVE_MB.
+//
+// The gate's job is to stop the CPU workers OOMing the box. But "the box has
+// 73 GiB free" and "you may take 73 GiB" are different claims: plenty of people
+// plot on the machine they also work on, and would rather keep 16 GB for the
+// thing they are actually doing than discover, an hour in, that their editor got
+// swapped out. This is how they say so, and it comes off the top of the budget
+// for both the start-of-batch count and the live gate.
+std::uint64_t host_reserve_bytes()
+{
+    if (char const* v = std::getenv("XCHPLOT2_CPU_RESERVE_MB"); v && v[0]) {
+        long const mb = std::atol(v);
+        if (mb > 0) return static_cast<std::uint64_t>(mb) << 20;
+    }
+    return 0;
+}
+
+// How many bytes the CPU workers may collectively hold, at batch start.
+//
+// One expression, two users: the start-of-batch gate divides it by the per-worker
+// peak to pick N, and CpuMemoryGate carries it as the baseline it tracks external
+// pressure against. If they disagreed about what "budget" means, the live gate
+// would spend the batch either denying workers the static gate had already
+// approved, or approving ones it had not.
+std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
+{
+    std::uint64_t const free_now = host_free_bytes_once();
+    std::uint64_t const reserve =
+        kHostSlackBytes + host_reserve_bytes() +
+        static_cast<std::uint64_t>(gpu_count) * gpu_worker_host_peak_bytes(k);
+    return free_now > reserve ? free_now - reserve : 0;
+}
+
+
 // How many of the `asked` CPU workers actually fit. Never throws: batch_worker_
 // count() calls this from outside the CLI's try block (cli.cpp), so a throw here
 // would terminate instead of printing.
@@ -2367,10 +2718,7 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
         return asked;
     }
 
-    std::uint64_t const reserve =
-        kHostSlackBytes +
-        static_cast<std::uint64_t>(gpu_count) * gpu_worker_host_peak_bytes(k);
-    std::uint64_t const budget = free_now > reserve ? free_now - reserve : 0;
+    std::uint64_t const budget = cpu_budget_bytes(k, gpu_count);
 
     int const fits = static_cast<int>(
         std::min<std::uint64_t>(budget / per_worker,
@@ -2398,6 +2746,10 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
                                      : " GPU workers reserve ") +
                      gib(static_cast<std::uint64_t>(gpu_count) *
                          gpu_worker_host_peak_bytes(k)) + " GiB of it";
+        }
+        if (std::uint64_t const held = host_reserve_bytes(); held > 0) {
+            *note += ", and you asked to keep " + gib(held) +
+                     " GiB back (XCHPLOT2_CPU_RESERVE_MB)";
         }
         *note += ". Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to override (and risk the "
                  "OOM killer taking the whole batch)";
@@ -2669,9 +3021,28 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // caller thread — identical control flow to pre-multi-GPU except
     // for the optional thread-local device bind at the top of the
     // slice.
+    // The live memory gate, shared by every CPU worker. Re-asks at each plot
+    // boundary what the start-of-batch gate could only ask once — see
+    // CpuMemoryGate. Only built when there is a CPU worker to gate, and skipped
+    // entirely when the user has taken the override: XCHPLOT2_CPU_WORKERS_UNGATED
+    // means "I know my box better than /proc does", and it would be a strange
+    // reading of that to keep second-guessing them every 50 seconds.
+    auto make_cpu_gate = [&](std::size_t gpu_count)
+        -> std::unique_ptr<CpuMemoryGate> {
+        if (cpu_selected == 0) return nullptr;
+        if (char const* v = std::getenv("XCHPLOT2_CPU_WORKERS_UNGATED");
+            v && v[0] == '1') {
+            return nullptr;
+        }
+        return std::make_unique<CpuMemoryGate>(
+            cpu_worker_peak_bytes(pool_k),
+            cpu_budget_bytes(pool_k, gpu_count));
+    };
+
     if (device_ids.size() <= 1) {
         int const dev = device_ids.empty() ? kDefaultGpuId : device_ids[0];
         BatchProgress live(1, entries.size());
+        live.cpu_gate = make_cpu_gate(/*gpu_count=*/0);
         BatchResult r = run_batch_slice(entries, opts, dev, 0, live,
                                         nullptr, &t_start);
         r.total_wall_seconds = std::chrono::duration<double>(
@@ -2716,6 +3087,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     live.gpu_peer_present =
         std::any_of(device_ids.begin(), device_ids.end(),
                     [](int id) { return id != kCpuDeviceId; });
+
+    live.cpu_gate = make_cpu_gate(N - cpu_selected);  // the rest are GPUs
 
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
