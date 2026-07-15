@@ -158,7 +158,7 @@ if(_xchplot2_nvcc AND NOT DEFINED CMAKE_CUDA_COMPILER)
 endif()
 unset(_xchplot2_nvcc CACHE)
 
-project(pos2-gpu VERSION 0.8.0 LANGUAGES C CXX CUDA)
+project(pos2-gpu VERSION 0.9.0 LANGUAGES C CXX CUDA)
 
 # Default to Release: a plain `cmake -B build -S .` otherwise builds
 # with EMPTY optimization flags — host C++ (FSE compression, writer,
