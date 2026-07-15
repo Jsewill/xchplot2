@@ -2083,16 +2083,32 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     std::vector<int> const device_ids =
         resolve_batch_devices(opts, pool_k, &gate_note);
     if (!gate_note.empty() && !opts.quiet) {
-        std::fprintf(stderr, "[batch] cpu: %s\n", gate_note.c_str());
+        // Once per distinct message. bench drives two passes (warmup + measured)
+        // through run_batch back to back, and the CPU auto/gate line is identical
+        // across them — no reason to print it twice. (run_batch is a sequential
+        // top-level entry point, so this un-synchronised static is safe.)
+        static std::string last_cpu_note;
+        if (gate_note != last_cpu_note) {
+            last_cpu_note = gate_note;
+            std::fprintf(stderr, "[batch] cpu: %s\n", gate_note.c_str());
+        }
     }
 
-    // The gate can take the count to zero. If that leaves nothing at all to plot
-    // on, say so — the fast path below would otherwise read the empty list as
-    // "no device selected", fall back to the CUDA-default device, and quietly
-    // plot the whole batch on a GPU the user did not ask for.
+    // The gate can take the count to zero. If the user EXPLICITLY asked for CPU
+    // workers (a positive N, or `max`) and none fit AND no GPU was selected, say
+    // so — the fast path below would otherwise read the empty list as "no device
+    // selected", fall back to the CUDA-default device, and either plot on an
+    // unrequested GPU or fail obscurely.
+    //
+    // Auto (the default) is deliberately NOT covered: auto resolving to zero CPU
+    // workers is not a failure, it is the tool declining to add any — the run
+    // should fall through to the GPU (or to a no-device error on a GPU-less host),
+    // exactly as a plain GPU run always has.
+    bool const cpu_explicitly_requested =
+        opts.cpu_workers > 0 || opts.cpu_workers == kCpuWorkersMax;
     std::size_t const cpu_selected = static_cast<std::size_t>(
         std::count(device_ids.begin(), device_ids.end(), kCpuDeviceId));
-    if (opts.cpu_workers > 0 && cpu_selected == 0 && device_ids.empty()) {
+    if (cpu_explicitly_requested && cpu_selected == 0 && device_ids.empty()) {
         throw std::runtime_error(
             "run_batch: no CPU worker fits in host RAM and no GPU was selected"
             " — nothing to plot on. " + gate_note);
@@ -2351,70 +2367,135 @@ std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
     return free_now > reserve ? free_now - reserve : 0;
 }
 
-// How many of the `asked` CPU workers actually fit. Never throws:
-// batch_worker_count() calls this from outside the CLI's try block (cli.cpp), so
-// a throw here would terminate instead of printing.
+// The auto-default CPU worker count: the knee of the throughput curve.
+//
+// pos2-chip's plotter is memory-latency-bound, so concurrent plots interleave
+// each other's stalls — but each already fans out to every core, so the gain
+// plateaus fast (k=28: N=2 +19%, N=4 +25%, flat after). Past the knee you only
+// oversubscribe, and at small k the RAM cap is no help at all (k=22 would permit
+// ~500 workers, each spawning 32 threads). So auto stops at the knee.
+//
+// Capped at half the cores so tiny hosts don't over-spawn; XCHPLOT2_CPU_AUTO_WORKERS
+// overrides for tuning.
+int cpu_worker_auto_count()
+{
+    if (char const* v = std::getenv("XCHPLOT2_CPU_AUTO_WORKERS"); v && v[0]) {
+        int const n = std::atoi(v);
+        if (n >= 1 && n <= 64) return n;
+    }
+    unsigned const hc = std::thread::hardware_concurrency();
+    int const cores = hc ? static_cast<int>(hc) : 8;
+    return std::min(4, std::max(1, cores / 2));
+}
+
+// How many CPU workers actually fit, resolving the cpu_workers request against
+// host RAM:
+//   kCpuWorkersAuto (-1): the knee, then trimmed to what RAM holds.  [default]
+//   kCpuWorkersMax  (-2): as many as RAM holds, capped at the core count.
+//   0                   : none.
+//   N > 0               : exactly N, still RAM-trimmed.
+//
+// Never throws: batch_worker_count() calls this from outside the CLI's try block
+// (cli.cpp), so a throw here would terminate instead of printing.
 int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
                          std::string* note)
 {
-    if (asked <= 0) return 0;
+    if (asked == 0) return 0;   // explicit --no-cpu / --cpu-workers 0
+
+    bool const is_auto = (asked == kCpuWorkersAuto);
+    bool const is_max  = (asked == kCpuWorkersMax);
+    if (asked < 0 && !is_auto && !is_max) return 0;  // unknown sentinel: be safe
+
+    int const knee = cpu_worker_auto_count();
+    unsigned const hc = std::thread::hardware_concurrency();
+    int const core_cap = static_cast<int>(hc ? hc : 8);
+    // Pre-RAM target: auto → the knee; max → the core count (each worker already
+    // fans out to every core, so more than that is pure oversubscription — at k=22
+    // RAM alone would permit ~500); N → exactly N. RAM trims all of them further.
+    long const target = is_auto ? static_cast<long>(knee)
+                      : is_max  ? static_cast<long>(core_cap)
+                                : static_cast<long>(asked);
+
+    auto gib = [](std::uint64_t b) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f",
+                      static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0));
+        return std::string(buf);
+    };
 
     if (char const* v = std::getenv("XCHPLOT2_CPU_WORKERS_UNGATED");
         v && v[0] == '1') {
-        return asked;  // "I know my box better than /proc does." Fine — but own it.
+        // "I know my box better than /proc does." No RAM check; honour the
+        // resolved target as-is (auto → knee, max → core count, N → N).
+        int const n = static_cast<int>(target);
+        return n > 0 ? n : 0;
     }
 
     std::uint64_t const per_worker = cpu_worker_peak_bytes(k);
     std::uint64_t const free_now   = host_free_bytes_once();
     if (free_now == 0 || per_worker == 0) {
         // The probe failed (no /proc/meminfo? a kernel older than 3.14?). Do not
-        // silently drop the user's workers over a failure to READ memory — that
-        // trades a possible OOM for a certain loss of the CPU. Say so, run anyway.
+        // silently drop the CPU over a failure to READ memory — grant the knee
+        // (auto/max) or the exact N, and say so.
+        int const n = (is_auto || is_max) ? knee : static_cast<int>(target);
         if (note) {
-            *note = "could not read host memory — running " +
-                    std::to_string(asked) +
+            *note = "could not read host memory — running " + std::to_string(n) +
                     " CPU worker(s) ungated (each needs ~" +
                     std::to_string(per_worker >> 30) + " GiB at k=" +
                     std::to_string(k) + ")";
         }
-        return asked;
+        return n;
     }
 
     std::uint64_t const budget = cpu_budget_bytes(k, gpu_count);
-
-    int const fits = static_cast<int>(
-        std::min<std::uint64_t>(budget / per_worker,
-                                static_cast<std::uint64_t>(asked)));
-    if (fits >= asked) return asked;
+    long const ram_fits = static_cast<long>(budget / per_worker);
+    int const fits = static_cast<int>(std::max(0L, std::min(target, ram_fits)));
 
     if (note) {
-        auto gib = [](std::uint64_t b) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%.1f",
-                          static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0));
-            return std::string(buf);
-        };
-        *note = "asked for " + std::to_string(asked) + " CPU worker" +
-                (asked == 1 ? "" : "s") + " but " +
-                (fits == 0 ? std::string("none fit")
-                           : "only " + std::to_string(fits) +
-                                 (fits == 1 ? " fits" : " fit")) +
-                ": each needs " + gib(per_worker) + " GiB at k=" +
-                std::to_string(k) + ", host has " + gib(free_now) +
-                " GiB available";
-        if (gpu_count > 0) {
-            *note += " and " + std::to_string(gpu_count) +
-                     (gpu_count == 1 ? " GPU worker reserves "
-                                     : " GPU workers reserve ") +
+        auto reserves = [&](std::string& s) {
+            if (gpu_count > 0) {
+                s += ", " + std::to_string(gpu_count) + " GPU worker" +
+                     (gpu_count == 1 ? " reserves " : "s reserve ") +
                      gib(static_cast<std::uint64_t>(gpu_count) *
-                         gpu_worker_host_peak_bytes(k)) + " GiB of it";
+                         gpu_worker_host_peak_bytes(k)) + " GiB";
+            }
+            if (std::uint64_t const held = host_reserve_bytes(); held > 0) {
+                s += ", " + gib(held) + " GiB kept back (XCHPLOT2_CPU_RESERVE_MB)";
+            }
+        };
+
+        if ((is_auto || is_max) && fits > 0) {
+            // A new opt-OUT default, so say what it picked and why, once.
+            *note = (is_max ? "filling RAM: " : "auto: ") + std::to_string(fits) +
+                    " CPU worker" + (fits == 1 ? "" : "s") + " (each " +
+                    gib(per_worker) + " GiB at k=" + std::to_string(k) +
+                    ", host has " + gib(free_now) + " GiB available";
+            reserves(*note);
+            *note += ")";
+            if (is_auto && ram_fits < knee) {
+                *note += " — RAM holds " + std::to_string(fits) + " of the ~" +
+                         std::to_string(knee) + " that help here";
+            }
+            *note += ". --no-cpu to disable";
+        } else if (is_max && fits == 0) {
+            *note = "no CPU worker fits: each needs " + gib(per_worker) +
+                    " GiB at k=" + std::to_string(k) + ", host has " +
+                    gib(free_now) + " GiB available";
+            reserves(*note);
+        } else if (!is_auto && !is_max && fits < asked) {
+            *note = "asked for " + std::to_string(asked) + " CPU worker" +
+                    (asked == 1 ? "" : "s") + " but " +
+                    (fits == 0 ? std::string("none fit")
+                               : "only " + std::to_string(fits) +
+                                     (fits == 1 ? " fits" : " fit")) +
+                    ": each needs " + gib(per_worker) + " GiB at k=" +
+                    std::to_string(k) + ", host has " + gib(free_now) +
+                    " GiB available";
+            reserves(*note);
+            *note += ". Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to override (and risk "
+                     "the OOM killer taking the whole batch)";
         }
-        if (std::uint64_t const held = host_reserve_bytes(); held > 0) {
-            *note += ", and you asked to keep " + gib(held) +
-                     " GiB back (XCHPLOT2_CPU_RESERVE_MB)";
-        }
-        *note += ". Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to override (and risk the "
-                 "OOM killer taking the whole batch)";
+        // is_auto && fits == 0: stay silent — auto degrades quietly to no CPU.
     }
     return fits;
 }
@@ -2510,15 +2591,35 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
         device_ids = opts.device_ids;
     }
 
+    // Zero-config (no --devices and not --devices all) historically means "the
+    // one default GPU, on the single-worker fast path" — signalled by leaving the
+    // list empty. Now that CPU workers are ON by default, appending them to an
+    // empty list would run CPU-ONLY, silently dropping that default GPU. So when
+    // CPU workers are about to join an implicit selection, materialise the default
+    // GPU (device 0) so it shares the work queue instead of being discarded.
+    bool const gpu_implicit = device_ids.empty() && !opts.use_all_devices;
+    bool default_gpu_available = false;
+    std::size_t gpu_count = device_ids.size();
+    if (gpu_implicit) {
+        default_gpu_available = (gpu_device_count() > 0);
+        if (default_gpu_available) ++gpu_count;  // it costs host RAM once real
+    }
+
     // Every CPU worker is one more kCpuDeviceId in the list — the work-queue needs
     // no idea they are the same physical device, because they aren't sharing
-    // anything. This used to append at most ONE, no matter what was asked for,
-    // while its own comment promised "caller can pass `cpu` multiple times for
-    // multi-core CPU" — so anyone who believed the comment benchmarked one worker
-    // and attributed it to four. The count is gated against host RAM first.
-    std::size_t const gpu_count = device_ids.size();
+    // anything. The count is resolved (auto/max/exact) and RAM-trimmed here.
     int const cpu_count =
         cpu_workers_that_fit(opts.cpu_workers, k, gpu_count, gate_note);
+
+    // Materialise the default GPU whenever CPU plotting is in play (anything but
+    // --no-cpu) and one exists — EVEN IF the count trimmed to zero. That way a run
+    // that wanted CPU workers but couldn't fit them still lands on the GPU (with
+    // the gate note explaining why), instead of being dropped to CPU-only or
+    // spuriously refused. --no-cpu leaves the list empty so the zero-config GPU
+    // fast path is byte-for-byte unchanged.
+    if (opts.cpu_workers != 0 && gpu_implicit && default_gpu_available) {
+        device_ids.push_back(0);
+    }
     for (int i = 0; i < cpu_count; ++i) device_ids.push_back(kCpuDeviceId);
     return device_ids;
 }

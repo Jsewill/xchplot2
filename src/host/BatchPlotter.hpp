@@ -76,32 +76,37 @@ struct BatchResult {
 //                     equal share, and callers must not assume one.
 //   use_all_devices — enumerate all visible CUDA devices at runtime and
 //                     use them. Overrides device_ids.
-//   cpu_workers     — how many CPU workers to append alongside any GPUs
-//                     already selected. 0 = none. Set by `--cpu` (= 1),
-//                     `--cpu-workers N`, or by repeating `cpu` as a token
-//                     in --devices. Each is encoded as one kCpuDeviceId
-//                     (-2) entry in device_ids — see src/gpu/DeviceIds.hpp
-//                     — so N of them are N ordinary work-queue workers.
-//                     Plotting on CPU goes through pos2-chip's Plotter
-//                     directly (no CUDA calls); 1-2 orders of magnitude
-//                     slower than GPU, useful for GPU-less hosts or as an
-//                     extra worker.
+//   cpu_workers     — how many CPU workers to append alongside any GPUs.
+//                     Encoded as kCpuWorkers* sentinels or a positive count:
+//                       kCpuWorkersAuto (-1, THE DEFAULT) — pick automatically:
+//                           the throughput knee (~4), then trimmed to what host
+//                           RAM holds. CPU plotting is now ON by default, on every
+//                           run (bench included); --no-cpu turns it off.
+//                       kCpuWorkersMax  (-2) — as many as fit in RAM, capped at
+//                           the core count. The "as many as make sense" hatch.
+//                       0 — none.
+//                       N > 0 — exactly N (still RAM-trimmed).
+//                     Each worker is one kCpuDeviceId (-2) entry in device_ids —
+//                     see src/gpu/DeviceIds.hpp — so they are ordinary work-queue
+//                     workers. Plotting goes through pos2-chip's Plotter directly
+//                     (no CUDA calls). Set via `--cpu-workers auto|max|N`,
+//                     `--no-cpu`, or repeating `cpu` in --devices.
 //
-//                     This was a bool. N > 1 is worth real throughput —
-//                     aggregate steady-state on a 32-thread 5950X at k=28:
-//                     52.28 s/plot at N=1, 43.85 at N=2 (+19%), 41.69 at
-//                     N=4 (+25%) — because pos2-chip's plotter is memory-
-//                     latency-bound, so concurrent plots interleave each
-//                     other's stalls rather than queueing for a core. The
-//                     gain is bigger at smaller k (+28% / +41% at k=26) and
-//                     flattens fast: at k=28 the 3rd and 4th worker together
-//                     buy 5%. See CpuPlotter.hpp for the full table and for
-//                     why the pre-writer-swap figures were larger.
+//                     Why a knee and not "fill RAM" by default: pos2-chip's
+//                     plotter is memory-latency-bound, so concurrent plots
+//                     interleave each other's stalls — but each already fans out
+//                     to every core, so the gain plateaus fast. Aggregate
+//                     steady-state, 32-thread 5950X at k=28: 52.28 s/plot at N=1,
+//                     43.85 at N=2 (+19%), 41.69 at N=4 (+25%), flat after — the
+//                     3rd and 4th together buy ~5%. Past the knee you only
+//                     oversubscribe (at k=22, RAM alone would permit ~500 workers,
+//                     each spawning 32 threads). So auto caps at the knee;
+//                     kCpuWorkersMax (RAM- and core-bounded) pushes past it.
 //
-//                     It also costs a full copy of the plotter's working
-//                     set per worker (12.14 GiB at k=28), which is why
-//                     resolve_batch_devices gates the count against host
-//                     RAM instead of trusting the number it is handed.
+//                     It also costs a full copy of the plotter's working set per
+//                     worker (12.14 GiB at k=28), which is why resolve_batch_devices
+//                     trims the count against host RAM, subtracting each GPU
+//                     worker's host footprint first.
 //   streaming_tier  — manual override for the streaming pipeline tier
 //                     (when the GPU pool doesn't fit). Accepted values:
 //                     "plain" (~7.4 GiB floor at k=28, ~10-15% faster),
@@ -123,11 +128,16 @@ struct BatchResult {
 //                     "section_l" is the alternative (input-section
 //                     partition). Reserved for Phase 2-4. Ignored when
 //                     N=1.
+// Sentinels for BatchOptions::cpu_workers. Negative so a positive value is always
+// an explicit exact count. See the cpu_workers doc above.
+inline constexpr int kCpuWorkersAuto = -1;  // knee (~4), RAM-trimmed — the default
+inline constexpr int kCpuWorkersMax  = -2;  // as many as fit in RAM, capped at cores
+
 struct BatchOptions {
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;
-    int              cpu_workers     = 0;  // 0 = none; N = N concurrent CPU plots
+    int              cpu_workers     = kCpuWorkersAuto;  // auto; 0 = off; N = exact
     std::string      streaming_tier;
 
     // Per-GPU tier override populated by the --devices `<id>:<tier>`

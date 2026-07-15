@@ -353,14 +353,19 @@ xchplot2 plot ... --devices 0
 # CPU only, or specific GPUs + CPU as a list.
 xchplot2 plot ... --devices cpu
 xchplot2 plot ... --devices 0,1,cpu
+
+# Turn the default CPU workers off — pure GPU.
+xchplot2 plot ... --no-cpu
 ```
 
-##### `--cpu-workers N` — several CPU plots at once
+##### CPU workers are on by default: `--cpu-workers`
 
-The CPU plotter goes through pos2-chip's `Plotter` (no CUDA calls), and it is
-memory-latency-bound rather than core-bound. So running several plots
-concurrently is a real win: they interleave each other's memory stalls instead
-of queueing for a core.
+A few CPU plots run **automatically on every batch** (bench included), alongside
+whatever GPUs are selected and niced below them. The CPU plotter goes through
+pos2-chip's `Plotter` (no CUDA calls) and is memory-latency-bound, so concurrent
+plots interleave each other's stalls instead of queueing for a core — a handful
+is free throughput, and letting it happen by default means a GPU rig stops
+leaving its CPU idle.
 
 Measured, aggregate steady-state, 32-thread 5950X, same binary:
 
@@ -370,20 +375,23 @@ Measured, aggregate steady-state, 32-thread 5950X, same binary:
 | `N=2` | 10.59 s/plot (+28%) | 43.85 s/plot (+19%) |
 | `N=4` | 9.63 s/plot (+41%) | 41.69 s/plot (+25%) |
 
-It flattens fast — at k=28 the 3rd and 4th worker together buy 5% — and the gain
-shrinks as k grows, because a 12 GiB working set already saturates memory
-bandwidth on its own.
-
 ```bash
-# Four concurrent CPU plots.
-xchplot2 plot ... --cpu-workers 4
+# Default: the GPU(s) plus an auto-picked number of CPU workers.
+xchplot2 plot ...
 
-# Same thing, spelled in --devices. Repeating `cpu` now counts.
-xchplot2 plot ... --devices cpu,cpu,cpu,cpu
-
-# Two GPUs plus two CPU workers, all pulling from one queue.
-xchplot2 plot ... --devices 0,1,cpu,cpu
+# Tune or disable it:
+xchplot2 plot ... --no-cpu             # none — pure GPU
+xchplot2 plot ... --cpu-workers 2      # exactly 2 (= --devices cpu,cpu)
+xchplot2 plot ... --cpu-workers max    # as many as fit, capped at core count
+xchplot2 plot ... --cpu-workers auto   # the default, spelled out
 ```
+
+The auto count is the **knee of the throughput curve** (~4), then trimmed to what
+host RAM holds — not "as many as fit". More than the knee only oversubscribes:
+each worker already fans out to every core, so the gain plateaus fast (at k=28
+the 3rd and 4th together buy ~5%), and at small k a pure RAM cap would spawn
+hundreds of workers (k=22 permits ~500) for no benefit. `XCHPLOT2_CPU_AUTO_WORKERS`
+overrides the knee.
 
 **Each worker needs its own full copy of the plotter's working set** — 12.1 GiB
 at k=28, 3.1 GiB at k=26 — because no streaming tier applies to the CPU path.

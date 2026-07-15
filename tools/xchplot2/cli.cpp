@@ -125,24 +125,26 @@ void print_usage(char const* prog)
         << "                                      tier on the CPU worker).\n"
         << "                                      Omitted = single device via the\n"
         << "                                      CUDA-default device (zero-config).\n"
-        << "    --cpu                           : add a CPU worker alongside the\n"
-        << "                                      selected GPUs (or use CPU only when\n"
-        << "                                      no GPU is selected). Goes through\n"
-        << "                                      pos2-chip's Plotter — no CUDA calls,\n"
-        << "                                      works on hosts with no GPU at all.\n"
-        << "                                      Plotting is 1-2 orders of magnitude\n"
-        << "                                      slower than GPU.\n"
-        << "    --cpu-workers N                 : run N CPU plots concurrently\n"
-        << "                                      (same as repeating `cpu` in --devices).\n"
-        << "                                      The CPU plotter is memory-latency-bound,\n"
-        << "                                      so concurrent plots interleave each\n"
-        << "                                      other's stalls. On a 32-thread 5950X at\n"
-        << "                                      k=28: N=2 is +19%, N=4 is +25% (the 3rd\n"
-        << "                                      and 4th together buy only 5% — it\n"
-        << "                                      flattens fast). Each worker needs its own\n"
-        << "                                      copy of the working set (12.1 GiB at\n"
-        << "                                      k=28), so N is capped at what host RAM\n"
-        << "                                      holds — it tells you when it caps you.\n"
+        << "    CPU workers are ON BY DEFAULT (every run, bench included): a few CPU\n"
+        << "    plots run alongside the GPUs, niced below them. --no-cpu turns them off.\n"
+        << "    --no-cpu                        : no CPU workers (pure GPU).\n"
+        << "    --cpu                           : re-enable the default CPU workers\n"
+        << "                                      (only needed after --no-cpu or a config).\n"
+        << "    --cpu-workers auto|max|N|off    : how many CPU plots run concurrently.\n"
+        << "                                        auto (default) — the throughput knee\n"
+        << "                                            (~4), then trimmed to host RAM.\n"
+        << "                                        max            — as many as fit in RAM,\n"
+        << "                                                         capped at core count.\n"
+        << "                                        N              — exactly N.\n"
+        << "                                        off            — none (= --no-cpu).\n"
+        << "                                      The CPU plotter (pos2-chip, no CUDA) is\n"
+        << "                                      memory-latency-bound, so concurrent plots\n"
+        << "                                      interleave each other's stalls — but each\n"
+        << "                                      already uses every core, so it plateaus by\n"
+        << "                                      ~4 (k=28: N=2 +19%, N=4 +25%, flat after).\n"
+        << "                                      Each needs its own working set (12.1 GiB\n"
+        << "                                      at k=28), so the count is RAM-trimmed and\n"
+        << "                                      it tells you what it picked.\n"
         << "    --shard-plot                    : EXPERIMENTAL — opt in to single-plot\n"
         << "                                      multi-GPU. Each plot is processed by\n"
         << "                                      ALL --devices cooperatively (one plot\n"
@@ -253,24 +255,32 @@ void read_urandom(uint8_t* out, size_t n)
 // use_all_devices=false — which triggers the single-device path on the
 // CUDA-default device (identical to pre-multi-GPU behavior).
 //
-// --cpu-workers N: how many CPU plots to run concurrently.
+// Accepts a count or a keyword:
+//   auto        — the throughput knee (~4), RAM-trimmed. This is the DEFAULT even
+//                 without the flag; spelling it re-enables CPU after a --no-cpu.
+//   max         — as many as fit in RAM, capped at the core count.
+//   off / none / 0 — no CPU worker.
+//   N           — exactly N (still RAM-trimmed).
 //
 // N is an ASK, not a promise: run_batch caps it at what host RAM actually holds
-// (12.1 GiB per worker at k=28) and says so when it does. The upper bound here is
-// only a sanity limit on the argument itself.
+// (12.1 GiB per worker at k=28) and says so when it does.
 //
 // Returns false on malformed input (caller prints usage + exits 1).
 bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
+    if (s == "auto")                    { opts.cpu_workers = pos2gpu::kCpuWorkersAuto; return true; }
+    if (s == "max")                     { opts.cpu_workers = pos2gpu::kCpuWorkersMax;  return true; }
+    if (s == "off" || s == "none")      { opts.cpu_workers = 0;                        return true; }
+
     char* endp = nullptr;
     long const v = std::strtol(s.c_str(), &endp, 10);
     if (endp == s.c_str() || *endp != '\0' || v < 0 || v > 64) {
-        std::cerr << "Error: --cpu-workers expects an integer in [0, 64] "
-                     "(got '" << s << "')\n";
+        std::cerr << "Error: --cpu-workers expects an integer in [0, 64], or "
+                     "'auto' / 'max' / 'off' (got '" << s << "')\n";
         return false;
     }
-    // Assign, don't max: this is the explicit, specific flag. `--cpu
-    // --cpu-workers 0` means "no, actually, none" and must not resolve to one.
+    // Assign, don't max: this is the explicit, specific flag. `--cpu-workers 0`
+    // means "no, actually, none" and must not resolve to the auto default.
     opts.cpu_workers = static_cast<int>(v);
     return true;
 }
@@ -380,11 +390,14 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     if (!any_token) return false;
     if (!any_gpu_token && cpu_tokens == 0 && opts.cpu_workers == 0) return false;
 
-    // max, not assign: `--cpu-workers 4 --devices 0,cpu` asked for four workers
-    // and then said where — clobbering that back to one because the list happens
-    // to mention `cpu` once would silently ignore the more specific flag.
+    // A `cpu` token count is an explicit request. Fold it in: keep the larger of
+    // it and an explicit --cpu-workers N (`--cpu-workers 4 --devices 0,cpu` still
+    // means 4), but let it win over the negative auto/max default sentinels —
+    // numeric max on those would be wrong.
     if (cpu_tokens > 0) {
-        opts.cpu_workers = std::max(opts.cpu_workers, cpu_tokens);
+        opts.cpu_workers = (opts.cpu_workers > 0)
+                         ? std::max(opts.cpu_workers, cpu_tokens)
+                         : cpu_tokens;
     }
 
     std::sort(opts.device_ids.begin(), opts.device_ids.end());
@@ -1075,7 +1088,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
             }
             else if (a == "-v" || a == "--verbose") opts.verbose = true;
-            else if (a == "--cpu") opts.cpu_workers = std::max(1, opts.cpu_workers);
+            // CPU is auto by default now; --cpu only re-enables it after a
+            // --no-cpu, and never downgrades an explicit --cpu-workers N.
+            else if (a == "--cpu") { if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
             // bench had --cpu but no --no-cpu, while batch and plot have both.
             else if (a == "--no-cpu") opts.cpu_workers = 0;
             else if (a == "--cpu-workers" && need(1)) {
@@ -1363,7 +1378,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                   || a == "--resume")               opts.skip_existing = true;
             else if (a == "--no-skip-existing"
                   || a == "--no-resume")            opts.skip_existing = false;
-            else if (a == "--cpu")                  opts.cpu_workers = std::max(1, opts.cpu_workers);
+            else if (a == "--cpu")                  { if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
             else if (a == "--no-cpu")               opts.cpu_workers = 0;
             else if (a == "--cpu-workers" && i + 1 < argc) {
                 if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
@@ -1503,7 +1518,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string seed_hex;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
-        int  plot_cpu_workers     = 0;
+        int  plot_cpu_workers     = pos2gpu::kCpuWorkersAuto;  // auto by default
         bool plot_shard_plot      = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
         bool plot_quiet           = false;
@@ -1544,7 +1559,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                    || a == "--resume")                  plot_skip_existing = true;
             else if  (a == "--no-skip-existing"
                    || a == "--no-resume")               plot_skip_existing = false;
-            else if  (a == "--cpu")                     plot_cpu_workers = std::max(1, plot_cpu_workers);
+            else if  (a == "--cpu")                     { if (plot_cpu_workers == 0) plot_cpu_workers = pos2gpu::kCpuWorkersAuto; }
             else if  (a == "--no-cpu")                  plot_cpu_workers = 0;
             else if  (a == "--cpu-workers" && need(1)) {
                 pos2gpu::BatchOptions tmp;
@@ -1574,9 +1589,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 plot_device_ids       = std::move(tmp.device_ids);
                 plot_use_all_devices  = tmp.use_all_devices;
-                // max, not assign — a later --devices must not silently undo an
-                // earlier, more specific --cpu-workers N.
-                plot_cpu_workers = std::max(plot_cpu_workers, tmp.cpu_workers);
+                // Fold in a cpu-token count from --devices only when it carried
+                // one (tmp.cpu_workers > 0); a plain --devices leaves the earlier
+                // request untouched. Numeric max would be wrong — the auto/max
+                // defaults are negative sentinels.
+                if (tmp.cpu_workers > 0) {
+                    plot_cpu_workers = (plot_cpu_workers > 0)
+                                     ? std::max(plot_cpu_workers, tmp.cpu_workers)
+                                     : tmp.cpu_workers;
+                }
                 plot_per_device_tier  = std::move(tmp.per_device_tier);
                 plot_all_gpus_tier    = std::move(tmp.all_gpus_tier);
             }
@@ -1823,7 +1844,7 @@ _xchplot2() {
         '-q[Quiet — suppress info-level output]' '--quiet[Quiet — suppress info-level output]' \
         '-v[Verbose]' '--verbose[Verbose]' \
         '--cpu[Add CPU worker]' \
-        '--cpu-workers[Run N CPU plots concurrently]:count:' \
+        '--cpu-workers[CPU plots to run concurrently: auto|max|N|off (default auto, RAM-gated)]:count:(auto max off)' \
         '--shard-plot[Single-plot multi-GPU]' \
         '-o[Output dir]:dir:_files -/' \
         '*:: :->args'
