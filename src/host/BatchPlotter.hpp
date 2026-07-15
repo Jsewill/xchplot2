@@ -137,6 +137,12 @@ struct BatchOptions {
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;
+    // Set by the CLI whenever --devices was given at all — even --devices cpu,
+    // which leaves device_ids empty. It is the ONLY thing that tells an explicit
+    // CPU-only selection apart from "no --devices at all": both reach
+    // resolve_batch_devices with an empty device_ids, but only the latter should
+    // have the default GPU materialised alongside the auto CPU workers.
+    bool             devices_specified = false;
     int              cpu_workers     = kCpuWorkersAuto;  // auto; 0 = off; N = exact
     std::string      streaming_tier;
 

@@ -2597,7 +2597,13 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
     // empty list would run CPU-ONLY, silently dropping that default GPU. So when
     // CPU workers are about to join an implicit selection, materialise the default
     // GPU (device 0) so it shares the work queue instead of being discarded.
-    bool const gpu_implicit = device_ids.empty() && !opts.use_all_devices;
+    //
+    // `--devices cpu` ALSO arrives here with an empty device_ids — a cpu token is
+    // tracked as a worker count, not a device id — but it is an EXPLICIT CPU-only
+    // request, not zero-config. devices_specified tells the two apart, so we do
+    // not bolt a GPU onto a run that named CPU and only CPU.
+    bool const gpu_implicit = device_ids.empty() && !opts.use_all_devices
+                              && !opts.devices_specified;
     bool default_gpu_available = false;
     std::size_t gpu_count = device_ids.size();
     if (gpu_implicit) {

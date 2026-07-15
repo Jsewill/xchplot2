@@ -291,7 +291,8 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     // Accept comma-separated mix of:
     //   "all"             → all GPUs + CPU worker
     //   "gpu"             → all GPUs
-    //   "cpu"             → CPU worker
+    //   "cpu"             → CPU worker (CPU-only; suppresses the implicit
+    //                       default GPU that a bare run would otherwise add)
     //   "<int>"           → explicit GPU id
     //   "gpu:<tier>"      → all GPUs default to <tier>
     //   "all:<tier>"      → all GPUs default to <tier>, plus CPU worker
@@ -404,6 +405,10 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     opts.device_ids.erase(
         std::unique(opts.device_ids.begin(), opts.device_ids.end()),
         opts.device_ids.end());
+    // Any successful --devices — even a CPU-only one that left device_ids empty —
+    // is an explicit selection. resolve_batch_devices keys off this to avoid
+    // materialising a default GPU on top of an explicit CPU-only request.
+    opts.devices_specified = true;
     return true;
 }
 
@@ -1518,6 +1523,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string seed_hex;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
+        bool plot_devices_specified = false;
         int  plot_cpu_workers     = pos2gpu::kCpuWorkersAuto;  // auto by default
         bool plot_shard_plot      = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
@@ -1589,6 +1595,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 plot_device_ids       = std::move(tmp.device_ids);
                 plot_use_all_devices  = tmp.use_all_devices;
+                plot_devices_specified = true;
                 // Fold in a cpu-token count from --devices only when it carried
                 // one (tmp.cpu_workers > 0); a plain --devices leaves the earlier
                 // request untouched. Numeric max would be wrong — the auto/max
@@ -1760,6 +1767,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.skip_existing    = plot_skip_existing;
             opts.device_ids       = plot_device_ids;
             opts.use_all_devices  = plot_use_all_devices;
+            opts.devices_specified = plot_devices_specified;
             opts.cpu_workers      = plot_cpu_workers;
             opts.shard_plot       = plot_shard_plot;
             opts.streaming_tier   = plot_streaming_tier;
