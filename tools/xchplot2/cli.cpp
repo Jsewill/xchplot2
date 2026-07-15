@@ -336,7 +336,8 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     // Accept comma-separated mix of:
     //   "all"             → all GPUs + CPU worker
     //   "gpu"             → all GPUs
-    //   "cpu"             → CPU worker
+    //   "cpu"             → CPU worker (CPU-only; suppresses the implicit
+    //                       default GPU that a bare run would otherwise add)
     //   "<int>"           → explicit GPU id
     //   "gpu:<tier>"      → all GPUs default to <tier>
     //   "all:<tier>"      → all GPUs default to <tier>, plus CPU worker
@@ -445,6 +446,10 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     opts.device_ids.erase(
         std::unique(opts.device_ids.begin(), opts.device_ids.end()),
         opts.device_ids.end());
+    // Any successful --devices — even a CPU-only one that left device_ids empty —
+    // is an explicit selection. resolve_batch_devices keys off this to avoid
+    // materialising a default GPU on top of an explicit CPU-only request.
+    opts.devices_specified = true;
     return true;
 }
 
@@ -1621,6 +1626,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string seed_hex;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
+        bool plot_devices_specified = false;
         int  plot_cpu_workers     = pos2gpu::kCpuWorkersAuto;  // auto by default
         bool plot_shard_plot      = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
@@ -1757,6 +1763,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 plot_device_ids       = std::move(tmp.device_ids);
                 plot_use_all_devices  = tmp.use_all_devices;
+                plot_devices_specified = true;
                 // --cpu / --cpu-workers may have been parsed already and are
                 // orthogonal to --devices. Fold in a cpu-token count only when
                 // --devices actually carried one (tmp.cpu_workers > 0); a plain
@@ -1929,6 +1936,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.continue_on_error = continue_on_error;
             opts.device_ids        = plot_device_ids;
             opts.use_all_devices   = plot_use_all_devices;
+            opts.devices_specified = plot_devices_specified;
             opts.cpu_workers       = plot_cpu_workers;
             opts.shard_plot        = plot_shard_plot;
             opts.pipeline_plot          = plot_pipeline_plot;
