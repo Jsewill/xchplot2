@@ -30,7 +30,7 @@ xchplot2 plot -k 28 -n 10 \
     -o /mnt/plots
 
 # Multi-GPU — one worker per GPU, round-robin partition.
-# (`--devices all` adds a CPU worker too; `--devices gpu` sticks to GPUs.)
+# (A few CPU workers are added automatically alongside; `--no-cpu` for pure GPU.)
 xchplot2 plot ... --devices gpu
 
 # Single-plot multi-GPU (--shard-plot) — every selected device works
@@ -92,16 +92,16 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     ISA natively (build will fail clearly if AdaptiveCpp doesn't
     accept it).
   - **Intel oneAPI** is wired up but untested.
-  - **CPU** (no GPU) via pos2-chip's hand-tuned CPU plotter — not our
-    SYCL kernels on AdaptiveCpp's OpenMP backend, which are written for
-    tens of thousands of GPU threads and are 4.3x slower on a CPU.
-    Opt-in with `--cpu` (or `--devices cpu`) — never the default.
-    Plotting is 1-2 orders of magnitude slower than a real GPU; intended
-    for headless CI, GPU-less dev machines, or as an extra worker
-    alongside GPUs (`--devices all` runs every visible GPU plus a
-    CPU worker on the same batch; `--devices gpu` sticks to GPUs).
-    `--cpu-workers N` runs N concurrent CPU plots (+19% at N=2, k=28),
-    capped at what host RAM holds. Build the container with
+  - **CPU** via pos2-chip's hand-tuned CPU plotter — not our SYCL kernels
+    on AdaptiveCpp's OpenMP backend, which are written for tens of
+    thousands of GPU threads and are 4.3x slower on a CPU. A few CPU plots
+    now run **by default on every batch** — alongside the GPUs, niced
+    below them — because the CPU plotter is memory-latency-bound and a
+    handful of concurrent plots interleave each other's stalls for free
+    throughput (+19% at N=2, k=28). The count is picked automatically (the
+    throughput knee, ~4, trimmed to what host RAM holds); `--no-cpu` turns
+    it off, `--cpu-workers auto|max|N` tunes it. Per-plot the CPU is still
+    1-2 orders of magnitude slower than a real GPU. Build the container with
     `scripts/build-container.sh --gpu cpu` for the standalone CPU
     image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
 - **VRAM:** five tiers, picked automatically based on free device
@@ -827,33 +827,46 @@ xchplot2 plot ... --devices 0,2,3
 # Explicit single id (same as omitting the flag on a single-GPU host).
 xchplot2 plot ... --devices 0
 
-# CPU-only (slow). Use the `cpu` token in --devices, or the standalone
-# --cpu flag (equivalent on its own).
+# CPU-only (slow). Use the `cpu` token in --devices.
 xchplot2 plot ... --devices cpu
-xchplot2 plot ... --cpu
 
-# Mix tokens: specific GPUs + CPU.
+# Turn the default CPU workers OFF — pure GPU.
+xchplot2 plot ... --no-cpu
+
+# Mix tokens: specific GPUs + an explicit CPU count.
 xchplot2 plot ... --devices 0,1,cpu
 ```
 
-CPU plotting is **1-2 orders of magnitude slower than GPU** — meant for
-GPU-less hosts, headless CI, or as an extra background worker. Don't
-expect GPU-grade throughput from a CPU worker on a heterogeneous batch.
+CPU plotting is **1-2 orders of magnitude slower than GPU** per plot —
+meant for GPU-less hosts, headless CI, or as extra background workers.
+Don't expect GPU-grade throughput from a CPU worker on a heterogeneous
+batch.
 
-##### Several CPU workers: `--cpu-workers N`
+##### CPU workers are on by default: `--cpu-workers`
 
-One CPU worker does not saturate a big host. The CPU plotter is
-memory-latency-bound, so concurrent plots interleave each other's stalls
-rather than queueing for a core — running more than one is worth real
-throughput:
+A few CPU plots run **automatically on every batch** (bench included),
+alongside whatever GPUs are selected and niced below them. The CPU plotter
+is memory-latency-bound, so concurrent plots interleave each other's stalls
+rather than queueing for a core — a handful is free throughput, and letting
+it happen by default means a GPU rig stops leaving its CPU idle.
 
 ```bash
-# Two concurrent CPU plots. Equivalent: --devices cpu,cpu
-xchplot2 plot ... --cpu-workers 2
+# Default: the GPU(s) plus an auto-picked number of CPU workers.
+xchplot2 plot ...
 
-# Every GPU, plus four CPU plots alongside them.
-xchplot2 plot ... --devices gpu --cpu-workers 4
+# Tune or disable it:
+xchplot2 plot ... --no-cpu             # none — pure GPU
+xchplot2 plot ... --cpu-workers 2      # exactly 2 (= --devices cpu,cpu)
+xchplot2 plot ... --cpu-workers max    # as many as fit, capped at core count
+xchplot2 plot ... --cpu-workers auto   # the default, spelled out
 ```
+
+The auto count is the **knee of the throughput curve** (~4), then trimmed
+to what host RAM holds — not "as many as fit". More than the knee only
+oversubscribes: each worker already fans out to every core, so the gain
+plateaus fast, and at small k a pure RAM cap would spawn hundreds of
+workers (k=22 permits ~500) for no benefit. `XCHPLOT2_CPU_AUTO_WORKERS`
+overrides the knee.
 
 Measured on a 32-thread 5950X — aggregate steady-state, alongside each
 worker's own rate (the machine is shared, so per-worker speed drops as you
