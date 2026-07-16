@@ -87,21 +87,32 @@ struct BatchResult {
 //                       use them. Overrides device_ids. Useful when the
 //                       caller doesn't know the host's device count up
 //                       front (e.g. `--devices all` on the CLI).
-//   cpu_workers       — how many CPU workers to append alongside any GPUs.
+//   cpu_workers       — how many CPU workers run ON EACH selected CPU node.
+//                       A COUNT, not a selection: whether the CPU is in the
+//                       batch at all is cpu_selected() — see cpu_node_ids /
+//                       use_all_cpu_nodes / cpu_opt_in. So this is consulted
+//                       only once something has asked for the CPU, and its
+//                       default is what to do THEN, not by default.
+//
+//                       Per node rather than per host so it means one thing on
+//                       every box. On the single-socket hosts this was tuned on
+//                       the two are the same number, so nothing changed.
+//
 //                       Encoded as kCpuWorkers* sentinels or a positive count:
-//                         kCpuWorkersAuto (-1, THE DEFAULT) — pick automatically:
-//                             the throughput knee (~4), then trimmed to what host
-//                             RAM holds. CPU plotting is now ON by default, on
-//                             every run (bench included); --no-cpu turns it off.
+//                         kCpuWorkersAuto (-1, the default once selected) — the
+//                             throughput knee (~4 per node), then trimmed to what
+//                             host RAM holds.
 //                         kCpuWorkersMax  (-2) — as many as fit in RAM, capped at
 //                             the core count (more only oversubscribes). The
 //                             "as many as make sense" escape hatch.
-//                         0 — none.
-//                         N > 0 — exactly N (still RAM-trimmed).
-//                       Each worker is one kCpuDeviceId (-2) entry in device_ids
-//                       — see src/gpu/DeviceIds.hpp — so they are ordinary
-//                       work-queue workers. Set via `--cpu-workers auto|max|N`,
-//                       `--no-cpu`, or repeating `cpu` in --devices.
+//                         0 — none, whatever --devices asked for. This is the one
+//                             way a count speaks to selection, and it is what
+//                             `--no-cpu` used to be.
+//                         N > 0 — exactly N per node (still RAM-trimmed).
+//                       Each worker is one CPU-node id in device_ids — see
+//                       cpu_device_id() in src/gpu/DeviceIds.hpp — so they are
+//                       ordinary work-queue workers. Set via
+//                       `--cpu-workers auto|max|N|off`.
 //
 //                       Why a knee and not "fill RAM" by default: pos2-chip's
 //                       plotter is memory-latency-bound, so concurrent plots
@@ -176,9 +187,34 @@ struct BatchOptions {
     // which leaves device_ids empty. It is the ONLY thing that tells an explicit
     // CPU-only selection apart from "no --devices at all": both reach
     // resolve_batch_devices with an empty device_ids, but only the latter should
-    // have the default GPU materialised alongside the auto CPU workers.
+    // have the default GPU materialised alongside it.
     bool devices_specified = false;
-    int  cpu_workers       = kCpuWorkersAuto;  // auto by default; 0 = off; N = exact
+
+    // CPU selection, mirroring the GPU pair above: `cpu` / `all` set
+    // use_all_cpu_nodes the way `gpu` sets use_all_devices, and `cpu0` / `cpu1`
+    // fill cpu_node_ids the way `gpu0` / `0` fill device_ids. Selection only —
+    // how many plots run on a selected node is cpu_workers, below. Both are
+    // owned by --devices and reset by a later one, exactly like the GPU pair.
+    std::vector<int> cpu_node_ids;
+    bool use_all_cpu_nodes = false;
+    // "The CPU is in this batch", asked for by something OTHER than a --devices
+    // token: `--cpu`, or naming a count with `--cpu-workers N|auto|max`.
+    //
+    // Separate from the two fields above because it has a different owner, and
+    // that is what makes the flags commute. --devices REPLACES the selection it
+    // owns, so if this lived in use_all_cpu_nodes then `--cpu-workers 4
+    // --devices gpu` would silently drop the CPU while `--devices gpu
+    // --cpu-workers 4` kept it. Same flags, different order, different rig.
+    bool cpu_opt_in = false;
+
+    // Is the CPU in this batch at all? Ask the selection — cpu_workers is a
+    // count and answers a different question. `--cpu-workers 0` is the one way
+    // a count speaks to selection: it is how you say "none".
+    bool cpu_selected() const {
+        return (use_all_cpu_nodes || !cpu_node_ids.empty() || cpu_opt_in)
+               && cpu_workers != 0;
+    }
+    int  cpu_workers       = kCpuWorkersAuto;  // per selected node; 0 = off
     std::string streaming_tier;
 
     // Per-GPU tier override populated by the --devices `<id>:<tier>`

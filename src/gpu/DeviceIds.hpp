@@ -19,20 +19,49 @@ namespace pos2gpu {
 // zero-config path users see when --devices is not passed.
 inline constexpr int kDefaultGpuId = -1;
 
-// Routes queue() to sycl::cpu_selector_v — AdaptiveCpp's OMP backend
-// on the CPU build path (ACPP_TARGETS=omp). BatchPlotter pushes this
-// into device_ids when --cpu (or `cpu` in --devices) is requested,
-// so the multi-device fan-out treats CPU like just-another-device.
+// A CPU plotter on host NUMA node 0. BatchPlotter pushes this into
+// device_ids when `cpu` / `cpu0` appears in --devices, so the
+// multi-device fan-out treats a CPU node like just-another-device.
+//
+// Historically this was "the CPU", singular — correct, because every
+// box we ran on had one node. It is now node 0 specifically, and the
+// value is unchanged so a single-node host encodes exactly as before.
 inline constexpr int kCpuDeviceId = -2;
 
+// CPU node n encodes as kCpuDeviceId - n: node 0 = -2, node 1 = -3, ...
+// Growing DOWNWARD keeps node 0 on the historical -2 and leaves -1
+// (kDefaultGpuId) alone. Negative ids below -1 are therefore CPU nodes and
+// nothing else — do not add a third sentinel family here without changing
+// this encoding, because is_cpu_device() below claims the whole range.
+inline constexpr int cpu_device_id(int numa_node)
+{
+    return kCpuDeviceId - numa_node;
+}
+
+inline constexpr bool is_cpu_device(int device_id)
+{
+    return device_id <= kCpuDeviceId;
+}
+
+// Which NUMA node a CPU device id names. Undefined for non-CPU ids.
+inline constexpr int cpu_numa_node(int device_id)
+{
+    return kCpuDeviceId - device_id;
+}
+
 // The sentinels above are an internal encoding and must never reach a log
-// line: printing device_ids with a bare %d renders the CPU worker as "-2",
+// line: printing device_ids with a bare %d renders a CPU worker as "-2",
 // which reads as a mangled flag rather than a device. Everything user-facing
 // goes through here.
+//
+// CPU nodes render "cpu0", "cpu1" — symmetric with "gpu0", "gpu1", and the
+// same spelling --devices accepts back. A single-node host still shows "cpu0"
+// rather than a bare "cpu": one host having one node is not a reason to give
+// its worker a different KIND of name than a two-node host's would get.
 inline std::string device_label(int device_id)
 {
-    if (device_id == kCpuDeviceId)   return "cpu";
-    if (device_id == kDefaultGpuId)  return "gpu";
+    if (device_id == kDefaultGpuId) return "gpu";
+    if (is_cpu_device(device_id))   return "cpu" + std::to_string(cpu_numa_node(device_id));
     return "gpu" + std::to_string(device_id);
 }
 

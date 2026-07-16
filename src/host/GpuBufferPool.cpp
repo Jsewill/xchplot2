@@ -464,7 +464,7 @@ bool device_memory_probe(int device_ordinal,
     // tier against the GPU's free VRAM and logged "vram: peak N of 17690 free"
     // on a host with 125 GB of RAM. Nothing shipped on top of it yet; the
     // --cpu-workers RAM gate is about to, so it has to be right first.
-    if (device_ordinal == kCpuDeviceId) {
+    if (is_cpu_device(device_ordinal)) {
         return host_memory_probe(free_bytes, total_bytes);
     }
 

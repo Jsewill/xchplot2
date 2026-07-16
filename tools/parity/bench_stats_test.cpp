@@ -13,6 +13,10 @@
 
 #include "host/BenchStats.hpp"
 
+// Dependency-free (it is <string> and two constants), so it does not compromise
+// the no-GPU-headers rule BenchStats.hpp keeps for testability.
+#include "gpu/DeviceIds.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -408,6 +412,175 @@ int main()
                            "eta: closed form == brute-force queue handout (3645 cases)")
                      && all_ok;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // pick_batch_sizing(): batch sizes where every worker lands together.
+    //
+    // The headline case is the rig this was written for: a 8.79 s/plot GPU
+    // beside a 63 s/plot CPU. Hand-worked so the expectations are independent
+    // of the implementation --
+    //
+    //   The CPU is worth 8.79/63 of the GPU, so its fair share of a batch is
+    //   8.79/(8.79+63) = 0.12244 of it. Multiply out:
+    //     8 plots  -> 0.9795 CPU, 7.0205 GPU. The queue hands it 7/1: the GPU
+    //                 lands at 7*8.79 = 61.53, the CPU at 63.0. Idle 1.47 s,
+    //                 2.33% of the run -- inside the 5% workable bar.
+    //    49 plots  -> 5.9995 CPU, 43.0005 GPU. 43/6: GPU 43*8.79 = 377.97,
+    //                 CPU 6*63 = 378.0. Idle 0.03 s, 0.008% -- inside the
+    //                 0.1% exact bar.
+    // ---------------------------------------------------------------------
+    {
+        using pos2gpu::pick_batch_sizing;
+        auto const opt = pick_batch_sizing({8.79, 63.0}, {0, pos2gpu::kCpuDeviceId});
+
+        all_ok = check(opt.valid, "sizing: valid") && all_ok;
+        all_ok = check(opt.workers_modelled == 2 && opt.workers_unrated == 0,
+                       "sizing: both workers modelled") && all_ok;
+
+        all_ok = check(opt.workable.plots == 8, "sizing: workable is 8 plots")
+                 && all_ok;
+        all_ok = check(opt.workable.split[0].plots == 7
+                           && opt.workable.split[1].plots == 1,
+                       "sizing: 8 splits gpu 7 / cpu 1") && all_ok;
+        all_ok = check(near(opt.workable.split[0].finish_seconds, 61.53, 1e-9),
+                       "sizing: 8 -> gpu lands at 61.53 s") && all_ok;
+        all_ok = check(near(opt.workable.split[1].finish_seconds, 63.0, 1e-9),
+                       "sizing: 8 -> cpu lands at 63.00 s") && all_ok;
+        all_ok = check(near(opt.workable.spread_seconds, 1.47, 1e-9),
+                       "sizing: 8 -> 1.47 s idle") && all_ok;
+        all_ok = check(near(opt.workable.idle_fraction, 1.47 / 63.0, 1e-9),
+                       "sizing: 8 -> 2.33% idle") && all_ok;
+
+        all_ok = check(opt.exact.plots == 49, "sizing: exact is 49 plots") && all_ok;
+        all_ok = check(opt.exact.split[0].plots == 43
+                           && opt.exact.split[1].plots == 6,
+                       "sizing: 49 splits gpu 43 / cpu 6") && all_ok;
+        all_ok = check(opt.exact.spread_seconds < 0.05,
+                       "sizing: 49 -> under 0.05 s idle") && all_ok;
+        all_ok = check(!opt.coincide, "sizing: 8 != 49, so both are worth printing")
+                 && all_ok;
+        std::printf("       (workable %zu plots, %.3f s idle; exact %zu plots, "
+                    "%.3f s idle)\n",
+                    opt.workable.plots, opt.workable.spread_seconds,
+                    opt.exact.plots, opt.exact.spread_seconds);
+    }
+
+    // Matched workers need no balancing act: one plot each already lands them
+    // together, so the smallest answer is the worker count and it is exact.
+    {
+        auto const opt = pos2gpu::pick_batch_sizing({9.0, 9.0, 9.0}, {0, 1, 2});
+        all_ok = check(opt.valid && opt.workable.plots == 3,
+                       "sizing: 3 matched GPUs -> 3 plots") && all_ok;
+        all_ok = check(near(opt.workable.spread_seconds, 0.0),
+                       "sizing: matched GPUs land together exactly") && all_ok;
+        all_ok = check(opt.coincide,
+                       "sizing: matched GPUs -> workable == exact, print once")
+                 && all_ok;
+    }
+
+    // A worker with no rate yet cannot be sized around. It must be excluded and
+    // COUNTED -- pricing it at a peer's rate is the same mistake EtaEstimate
+    // refuses to make, and here it would silently recommend a batch size that
+    // starves or stalls on it.
+    {
+        auto const opt = pos2gpu::pick_batch_sizing({8.79, 0.0, 63.0},
+                                                    {0, 1, pos2gpu::kCpuDeviceId});
+        all_ok = check(opt.workers_modelled == 2 && opt.workers_unrated == 1,
+                       "sizing: unrated worker excluded and counted") && all_ok;
+        all_ok = check(opt.valid && opt.workable.plots == 8,
+                       "sizing: unrated worker does not perturb the answer")
+                 && all_ok;
+        all_ok = check(opt.workable.split[1].device_id == pos2gpu::kCpuDeviceId,
+                       "sizing: split carries device ids past the dropped worker")
+                 && all_ok;
+        // The dropped worker sat at index 1, so the CPU is split[1] but worker 2.
+        // Naming it from its position in `split` would call it "gpu1".
+        all_ok = check(opt.workable.split[0].worker_index == 0
+                           && opt.workable.split[1].worker_index == 2,
+                       "sizing: worker_index points past the dropped worker")
+                 && all_ok;
+    }
+
+    // worker_index must survive a rig whose unrated worker is a REPEAT of a
+    // rated one -- the case where naming from `split` alone silently renames
+    // every later worker. Two CPUs where the first has no rate yet: the rated
+    // one is worker 2 ("cpu#1" to worker_labels), not worker 1 ("cpu#0").
+    {
+        auto const opt = pos2gpu::pick_batch_sizing(
+            {8.79, 0.0, 63.0},
+            {0, pos2gpu::kCpuDeviceId, pos2gpu::kCpuDeviceId});
+        all_ok = check(opt.valid && opt.workers_modelled == 2,
+                       "sizing: repeat-device rig modelled") && all_ok;
+        all_ok = check(opt.workable.split[1].worker_index == 2,
+                       "sizing: rated cpu keeps its ordinal past an unrated twin")
+                 && all_ok;
+    }
+
+    // Nothing to balance with fewer than two rated workers.
+    {
+        all_ok = check(!pos2gpu::pick_batch_sizing({8.79}, {0}).valid,
+                       "sizing: lone worker -> no answer") && all_ok;
+        all_ok = check(!pos2gpu::pick_batch_sizing({}, {}).valid,
+                       "sizing: no workers -> no answer") && all_ok;
+        all_ok = check(!pos2gpu::pick_batch_sizing({0.0, 0.0}, {0, 1}).valid,
+                       "sizing: no rates -> no answer") && all_ok;
+    }
+
+    // ---------------------------------------------------------------------
+    // The shipped search walks the queue ONCE to the cap and reads each batch
+    // size off as a prefix of that walk, which is only legal because greedy
+    // assignment is incremental: where job j goes cannot depend on how many
+    // jobs follow it. Assert that against the obvious-but-quadratic version --
+    // simulate each size from an empty queue -- exactly as the ETA test above
+    // licenses its binary search against a brute-force handout.
+    // ---------------------------------------------------------------------
+    {
+        auto from_scratch = [](std::vector<double> const& s, std::size_t n) {
+            std::vector<double> free_at(s.size(), 0.0);
+            for (std::size_t j = 0; j < n; ++j) {
+                std::size_t pick = 0;
+                for (std::size_t i = 1; i < s.size(); ++i) {
+                    if (free_at[i] < free_at[pick]) pick = i;
+                }
+                free_at[pick] += s[pick];
+            }
+            return free_at;
+        };
+
+        bool   agree = true;
+        double worst = 0.0;
+        std::size_t cases = 0;
+        // Rates spanning the real spread: matched cards, mild asymmetry
+        // (4090 + 3060), and the ~7x GPU-vs-CPU gap that motivates the feature.
+        for (double a : {6.6, 8.79, 9.0, 14.0}) {
+            for (double b : {6.6, 9.0, 21.5, 63.0, 120.0}) {
+                for (double c : {0.0, 10.0, 63.7}) {
+                    std::vector<double> rates = {a, b};
+                    std::vector<int>    ids   = {0, 1};
+                    if (c > 0.0) { rates.push_back(c); ids.push_back(2); }
+
+                    auto const opt = pos2gpu::pick_batch_sizing(rates, ids);
+                    if (!opt.valid) continue;
+                    for (auto const* b2 : {&opt.workable, &opt.exact}) {
+                        if (!b2->valid) continue;
+                        ++cases;
+                        auto const ref = from_scratch(rates, b2->plots);
+                        for (std::size_t i = 0; i < b2->split.size(); ++i) {
+                            double const d =
+                                std::fabs(b2->split[i].finish_seconds - ref[i]);
+                            worst = std::max(worst, d);
+                            if (d > 1e-9) agree = false;
+                        }
+                    }
+                }
+            }
+        }
+        std::printf("       (worst |prefix-walk - from-scratch| = %.2e s over "
+                    "%zu sizings)\n", worst, cases);
+        all_ok = check(agree,
+                       "sizing: one-pass prefix == per-size simulation from empty")
+                 && all_ok;
     }
 
     return all_ok ? 0 : 1;

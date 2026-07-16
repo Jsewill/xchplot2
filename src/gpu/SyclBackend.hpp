@@ -148,7 +148,7 @@ inline sycl::queue& queue()
     thread_local std::unique_ptr<sycl::queue> q;
     if (!q) {
         int const id = current_device_id();
-        if (id == kCpuDeviceId) {
+        if (is_cpu_device(id)) {
             // AdaptiveCpp's OpenMP backend exposes its host device as
             // `info::device_type::host`, which SYCL 2020's `cpu_selector_v`
             // *can* reject (host-device is deprecated in 2020), and a custom
