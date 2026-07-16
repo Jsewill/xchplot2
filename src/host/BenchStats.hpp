@@ -308,4 +308,175 @@ inline EtaEstimate estimate_eta_seconds(std::vector<WorkerLive> const& live,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Batch sizes that leave nobody waiting.
+//
+// The work-queue hands the next plot to whichever worker frees up first, so it
+// already splits a batch in proportion to the workers' rates without being told
+// them. What it cannot do is split a PLOT. Beside a 63 s/plot CPU, a 8.79
+// s/plot GPU is worth 7.17 of it, so the CPU's fair share of a 10-plot batch is
+// 1.22 plots — and the queue has to hand it 1 or 2. At 1 the GPU covers the
+// other 9 and runs 7 s past the CPU; at 2 the CPU grinds a second plot while
+// the GPU sits idle for 56 s. Either way somebody waits, and waiting is rig you
+// paid for and did not use.
+//
+// At some batch sizes the fair shares land on (near-)whole plots and nobody
+// waits: on that rig 49 plots split 43/6 and both workers finish within 0.03 s
+// of each other. Those sizes are what this finds. They are a property of the
+// RATES, not of the batch, so the answer holds for any multiple — the split
+// scales with it and the idle stays the same fraction of the run.
+//
+// Two answers, because they trade off:
+//   * `workable` — the smallest size that wastes little. Easy to act on.
+//   * `exact`    — the smallest size where the landing is essentially perfect.
+//     Always >= workable, and can be an awkward number, but its multiples stay
+//     tight where a workable size's error compounds in absolute terms (that
+//     8-plot split idles 1.47 s; 16 idles 2.94 s; 24 idles 4.41 s).
+//
+// The search simulates the scheduler rather than rounding the fair shares:
+// list-scheduling identical jobs onto uniform machines is precisely what
+// fetch_add-on-a-shared-queue does, so modelling it directly costs nothing and
+// removes the question of whether the rounding agrees with it. And because
+// greedy assignment is incremental — job j's destination does not depend on how
+// many jobs come after it — ONE pass out to the cap yields the split for every
+// size along the way as its own prefix, instead of a fresh simulation per size.
+//
+// Every worker gets at least one plot by construction: they all start free, so
+// the first W jobs go one apiece. Sizes below W are therefore never considered
+// — a size where a device plots nothing is not a size where every device lands
+// together, it is a size where you should have used fewer devices.
+
+// A worker's share of a batch sized by pick_batch_sizing().
+struct WorkerSplit {
+    int         device_id = -1;
+    // Index into the caller's own s_per_plot / device_ids arrays. Unrated
+    // workers are dropped from the split, so this is NOT the position in
+    // `split` — and it is what a caller must use to name the worker:
+    // worker_labels() numbers repeats by their position in the FULL device
+    // list ("cpu#0", "cpu#1"), so an unrated CPU in the middle would shift
+    // every later ordinal if the labels were rebuilt from the split alone.
+    std::size_t worker_index = 0;
+    std::size_t plots = 0;
+    double      finish_seconds = 0.0;  // its last plot lands here, batch-relative
+};
+
+struct BatchSizing {
+    std::size_t plots = 0;  // the batch size this describes ("N")
+    std::vector<WorkerSplit> split;
+    // Wall between the first worker going idle and the last one finishing. This
+    // is the waste: every worker but one is done and holding still for it.
+    double      spread_seconds = 0.0;
+    double      makespan_seconds = 0.0;
+    double      idle_fraction = 0.0;  // spread / makespan
+    bool        valid = false;
+};
+
+struct OptimalBatch {
+    BatchSizing workable;
+    BatchSizing exact;
+    // The two searches landed on the same size — the smallest size that wastes
+    // little already wastes ~nothing. Callers should print one answer, not two.
+    bool        coincide = false;
+    std::size_t workers_modelled = 0;
+    // Workers with no rate yet. They are left out of the model entirely rather
+    // than priced at a peer's rate, so a size chosen here does not account for
+    // them — see the same reasoning on EtaEstimate::lower_bound.
+    std::size_t workers_unrated = 0;
+    bool        valid = false;
+};
+
+// Idle you would not bother restructuring a batch to recover.
+inline constexpr double kWorkableIdleFraction = 0.05;
+// Idle indistinguishable from run-to-run noise.
+inline constexpr double kExactIdleFraction = 0.001;
+// Far past any batch a person would size by hand, and the walk out to it is
+// O(cap * workers) total — the incremental-prefix property above means raising
+// it is nearly free.
+inline constexpr std::size_t kMaxBatchSearch = 4096;
+
+// s_per_plot / device_ids are parallel; a worker with s_per_plot <= 0 has no
+// rate and is dropped. Returns valid=false when fewer than 2 workers have one,
+// since a lone worker's plots always land in a row and there is nothing to
+// balance.
+inline OptimalBatch pick_batch_sizing(std::vector<double> const& s_per_plot,
+                                      std::vector<int> const& device_ids,
+                                      std::size_t max_n = kMaxBatchSearch)
+{
+    OptimalBatch out;
+
+    std::vector<double>      s;
+    std::vector<int>         ids;
+    std::vector<std::size_t> origin;  // back-reference into the caller's arrays
+    for (std::size_t i = 0; i < s_per_plot.size(); ++i) {
+        if (s_per_plot[i] > 0.0) {
+            s.push_back(s_per_plot[i]);
+            ids.push_back(i < device_ids.size() ? device_ids[i] : -1);
+            origin.push_back(i);
+        } else {
+            ++out.workers_unrated;
+        }
+    }
+    out.workers_modelled = s.size();
+    if (s.size() < 2) return out;
+    if (max_n < s.size()) return out;
+
+    // free[i] is when worker i next comes free — and, since it starts free and
+    // plots back to back, also when its last plot so far landed. So the finish
+    // times fall out of the simulation with no second pass.
+    std::vector<double>      free_at(s.size(), 0.0);
+    std::vector<std::size_t> counts(s.size(), 0);
+
+    auto snapshot = [&](std::size_t n) {
+        BatchSizing b;
+        b.plots = n;
+        b.split.reserve(s.size());
+        double lo = free_at[0], hi = free_at[0];
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            b.split.push_back(
+                WorkerSplit{ids[i], origin[i], counts[i], free_at[i]});
+            lo = std::min(lo, free_at[i]);
+            hi = std::max(hi, free_at[i]);
+        }
+        b.spread_seconds = hi - lo;
+        b.makespan_seconds = hi;
+        b.idle_fraction = hi > 0.0 ? (hi - lo) / hi : 0.0;
+        b.valid = true;
+        return b;
+    };
+
+    for (std::size_t n = 1; n <= max_n; ++n) {
+        // Next plot goes to whoever is free soonest. Ties break to the lowest
+        // index, which is what puts one plot on each worker before any worker
+        // takes a second — see the note on sizes below W above.
+        std::size_t pick = 0;
+        for (std::size_t i = 1; i < s.size(); ++i) {
+            if (free_at[i] < free_at[pick]) pick = i;
+        }
+        free_at[pick] += s[pick];
+        ++counts[pick];
+
+        if (n < s.size()) continue;  // somebody is still on zero plots
+
+        double lo = free_at[0], hi = free_at[0];
+        for (double f : free_at) { lo = std::min(lo, f); hi = std::max(hi, f); }
+        double const idle = hi > 0.0 ? (hi - lo) / hi : 0.0;
+
+        if (!out.workable.valid && idle <= kWorkableIdleFraction) {
+            out.workable = snapshot(n);
+        }
+        if (idle <= kExactIdleFraction) {
+            out.exact = snapshot(n);
+            // Both searches want the SMALLEST qualifying size, and any size
+            // this tight is trivially workable too — so if the looser search is
+            // still empty here, this size is its answer as well.
+            if (!out.workable.valid) out.workable = out.exact;
+            break;
+        }
+    }
+
+    out.valid = out.workable.valid;
+    out.coincide = out.exact.valid && out.workable.plots == out.exact.plots;
+    return out;
+}
+
 }  // namespace pos2gpu

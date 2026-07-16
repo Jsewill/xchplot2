@@ -7,6 +7,7 @@
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
+#include "host/NumaTopology.hpp"  // CPU-node enumeration + per-worker pinning
 
 // Deliberately no pos2-chip includes here — see PlotFileWriterParallel.cpp.
 
@@ -524,14 +525,39 @@ struct BatchProgress {
     std::vector<LiveWorker>    workers;
     // Retired = written + skipped. It doubles as the ticket counter for the
     // display: each emitting thread prints the value its own fetch_add returned,
-    // so the in-place TTY line cannot tick backwards even though N workers write
-    // to it. (Summing the per-worker counters instead would let two threads race
-    // to the same total and print it out of order.)
+    // so two threads can never race to the same total and print it twice. (That
+    // is what summing the per-worker counters at print time would allow.)
+    //
+    // It does NOT by itself stop the line ticking backwards — minting ordered
+    // tickets says nothing about the order threads then reach the terminal in.
+    // painted_ticket below is what enforces that.
     std::atomic<std::size_t>   retired{0};
     std::atomic<std::size_t>   written{0};
     std::atomic<std::size_t>   skipped{0};
     std::atomic<std::uint64_t> bytes{0};
     std::size_t                total = 0;
+
+    // Lines the multi-worker progress block last painted, so the next paint
+    // knows how far back up to move. Per-batch rather than a file-scope static
+    // because a bench run calls run_batch twice in one process (e2e, then
+    // --compute-only) and the second pass must not try to scroll back over the
+    // first's block. Zero = nothing painted yet, so don't move at all.
+    //
+    // mutable because emitting progress does not change the BATCH — every other
+    // field here is read-only to the emitter, and widening its reference to
+    // non-const to carry a cursor position would lose that guarantee.
+    mutable std::atomic<int>   painted_lines{0};
+
+    // Highest ticket already on screen. Tickets are unique and ordered, but the
+    // fetch_add that mints them does NOT order the printing that follows: the
+    // thread holding N can reach the terminal before the thread holding N-1.
+    // The comment above once claimed the ticket alone stopped the line ticking
+    // backwards; it stops two threads printing the SAME total, which is not the
+    // same thing. Whoever loses that race must not paint — with one line it
+    // showed a stale count, and with the multi-line block it skips the cursor-up
+    // (its `painted_lines` was already consumed) and leaves a second, stale
+    // block below the final one.
+    mutable std::atomic<std::size_t> painted_ticket{0};
 
     // Is any worker in this batch a GPU?
     //
@@ -570,6 +596,10 @@ std::string format_duration_hms(double seconds)
     return buf;
 }
 
+// Width of the per-worker share bar in the multi-worker progress block. Small
+// on purpose: it shares an 80-column line with the label, count, and rate.
+inline constexpr std::size_t kProgressBarCells = 10;
+
 // done_now is the emitting thread's own `retired` ticket, not a re-read of the
 // counter — see BatchProgress.
 void emit_progress_line(std::string const& log_prefix,
@@ -579,6 +609,18 @@ void emit_progress_line(std::string const& log_prefix,
                         double elapsed_s)
 {
     if (!opts.progress || done_now == 0 || elapsed_s <= 0.0) return;
+
+    // Claim the screen for this ticket, or drop out. Only strictly-increasing
+    // tickets paint, so a thread overtaken between its fetch_add and here says
+    // nothing rather than repainting the past. The final ticket is the batch's
+    // highest by construction, so it can never be the one dropped.
+    {
+        std::size_t seen = live.painted_ticket.load(std::memory_order_relaxed);
+        do {
+            if (done_now <= seen) return;
+        } while (!live.painted_ticket.compare_exchange_weak(
+                     seen, done_now, std::memory_order_relaxed));
+    }
 
     std::size_t const total   = live.total;
     std::size_t const written = live.written.load(std::memory_order_relaxed);
@@ -656,19 +698,103 @@ void emit_progress_line(std::string const& log_prefix,
     // "%.3g", not "%.6f", for TiB/s: at k=18 the true rate is 5.6e-7 TiB/s, which
     // %.6f rounds to a printed "0.000000" while the TiB/hour field beside it
     // (already %.3g) shows three real digits — the same line contradicting itself.
-    std::fprintf(stderr,
-        "%s%s progress: plot %zu/%zu done "
-        "(%.1f%%, %s%.2f s/plot avg, %.3g TiB/s, batch ETA %s%s)%s",
-        in_place ? "\r\033[K" : "",
+    char head[512];
+    std::snprintf(head, sizeof(head),
+        "%s progress: plot %zu/%zu done "
+        "(%.1f%%, %s%.2f s/plot avg, %.3g TiB/s, batch ETA %s%s)",
         log_prefix.c_str(),
         done_now, total,
         100.0 * double(done_now) / double(total),
         skip_note,
         avg, rate_tib_s,
         eta.lower_bound ? ">=" : "~",
-        format_duration_hms(eta.seconds).c_str(),
-        (!in_place || done_now >= total) ? "\n" : "");
-    if (in_place) std::fflush(stderr);
+        format_duration_hms(eta.seconds).c_str());
+
+    // One worker, or nowhere to rewind to (a pipe, or verbose logging that would
+    // land between the block and its next repaint): the historical single line.
+    // The per-worker rates are not lost in that case — print_run_summary prints
+    // them once the batch ends, which is what a redirected run is read for.
+    if (!in_place || live.workers.size() < 2) {
+        std::fprintf(stderr, "%s%s%s",
+                     in_place ? "\r\033[K" : "", head,
+                     (!in_place || done_now >= total) ? "\n" : "");
+        if (in_place) std::fflush(stderr);
+        return;
+    }
+
+    // Multi-worker on a TTY: the aggregate header, then a line per worker.
+    //
+    // The header keeps the aggregate prefix and the aggregate average, and the
+    // per-worker numbers live on their own labelled lines — never side by side.
+    // That is the whole point of the split: a real run printed "[batch:cpu] 6.88
+    // s/plot avg" for a CPU actually running at 63.7 (see progress_prefix), and
+    // a per-worker label next to a batch-wide number is how that reads.
+    //
+    // Rates come from `model` — the same ones the ETA is priced from, so the
+    // block and the ETA beside it cannot disagree.
+    //
+    // The whole block goes out as ONE write. N workers means N+1 lines, and the
+    // cursor-up that precedes them only lands correctly if nothing interleaves
+    // between it and the repaint; separate fprintf calls per line would let a
+    // peer's completion land mid-block and scroll the rest into the wrong rows.
+    std::size_t max_written = 1;
+    for (auto const& w : live.workers) {
+        max_written = std::max(max_written, w.written.load(std::memory_order_relaxed));
+    }
+
+    int const lines = 1 + static_cast<int>(live.workers.size());
+    // Leave the finished block on screen: zero means the next paint (a late
+    // failure, say) starts a fresh one below rather than scribbling over it.
+    int const prev = live.painted_lines.exchange(
+        done_now >= total ? 0 : lines, std::memory_order_relaxed);
+
+    std::string out;
+    out.reserve(static_cast<std::size_t>(lines) * 96);
+    if (prev > 0) out += "\033[" + std::to_string(prev) + "A";
+    out += "\r\033[K";
+    out += head;
+    out += "\n";
+
+    for (std::size_t i = 0; i < live.workers.size(); ++i) {
+        auto const& w = live.workers[i];
+        std::size_t const n = w.written.load(std::memory_order_relaxed);
+
+        // Share of the batch so far, against the busiest worker. This is the
+        // work-queue's split made visible: on a mixed rig the bars are supposed
+        // to come out lopsided, because that is the queue paying each worker by
+        // what it can actually do.
+        char bar[kProgressBarCells + 1];
+        std::size_t const filled = max_written > 0
+            ? (n * kProgressBarCells + max_written / 2) / max_written : 0;
+        for (std::size_t c = 0; c < kProgressBarCells; ++c) {
+            bar[c] = c < filled ? '#' : '-';
+        }
+        bar[kProgressBarCells] = '\0';
+
+        char rate[24];
+        if (model[i].s_per_plot > 0.0) {
+            std::snprintf(rate, sizeof(rate), "%7.2f s/plot", model[i].s_per_plot);
+        } else {
+            // No completion yet, so no rate. The ETA refuses to invent one for
+            // this worker (EtaEstimate::lower_bound); neither does the display.
+            // Six spaces + the dash to occupy the same seven columns "%7.2f"
+            // would — it is three BYTES, so a width field here would pad it by
+            // display width and break the column.
+            std::snprintf(rate, sizeof(rate), "      — s/plot");
+        }
+
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s   %-6s %4zu plot%s  %s  %s",
+                      log_prefix.c_str(),
+                      w.label.empty() ? "?" : w.label.c_str(),
+                      n, n == 1 ? " " : "s", rate, bar);
+        out += "\r\033[K";
+        out += line;
+        out += "\n";
+    }
+
+    std::fwrite(out.data(), 1, out.size(), stderr);
+    std::fflush(stderr);
 }
 
 // Drop the CALLING thread's scheduling priority — and, with it, every thread
@@ -1079,7 +1205,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     std::string const log_prefix = [&]() -> std::string {
         auto const& lbl = live.workers[static_cast<std::size_t>(worker_id)].label;
         if (!lbl.empty()) return "[batch:" + lbl + "]";
-        return (device_id == kCpuDeviceId) ? std::string("[batch:cpu]") :
+        return is_cpu_device(device_id) ? std::string("[batch:cpu]") :
                (device_id <  0)            ? std::string("[batch]")     :
                ("[batch:gpu" + std::to_string(device_id) + "]");
     }();
@@ -1125,9 +1251,45 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // plots interleave each other's stalls rather than queueing for a core — but
     // each one needs its own copy of the working set (12.14 GiB at k=28), so it
     // needs an explicit flag and a RAM gate, not a bool.
-    if (device_id == kCpuDeviceId) {
+    if (is_cpu_device(device_id)) {
         BatchResult res;
         if (entries.empty()) return res;
+
+        // Confine this worker to its own NUMA node — and, because Linux copies
+        // the affinity mask at clone(), the entire fan-out pos2-chip spawns
+        // inside run_one_plot_cpu() too. Same inheritance trick the nice below
+        // rides on, and it must happen here for the same reason: before the
+        // threads that need to inherit it exist.
+        //
+        // The point is memory locality, not core budgeting. This plotter is
+        // memory-latency-bound, so a worker reading a working set that lives on
+        // another socket pays the remote hop on its hottest path. It does NOT
+        // reduce the fan-out — hardware_concurrency() reports the whole host
+        // whatever the mask says (NumaTopology.hpp) — so a node-pinned worker
+        // still oversubscribes its node, and the per-node knee has to be
+        // measured rather than assumed.
+        //
+        // Gated on nodes.size() > 1, so a single-node host never pins: there is
+        // nowhere else for the memory to be, and narrowing a mask to the only
+        // node it could already use buys nothing.
+        //
+        // The guard outlives the pin for the whole slice and hands the thread's
+        // mask back on the way out — load-bearing because the single-worker fast
+        // path runs this on the CALLER's thread. See ScopedThreadAffinity.
+        ScopedThreadAffinity affinity_restore;
+        if (auto const nodes = host_numa_nodes(); nodes.size() > 1) {
+            int const want = cpu_numa_node(device_id);
+            for (auto const& n : nodes) {
+                if (n.node_id != want) continue;
+                if (!pin_thread_to_cpus(n.cpus) && !opts.quiet) {
+                    std::fprintf(stderr,
+                        "%s could not pin to NUMA node %d — running unpinned "
+                        "(slower on a multi-socket host, but not wrong)\n",
+                        log_prefix.c_str(), want);
+                }
+                break;
+            }
+        }
 
         // Yield to the GPU workers. Only when there ARE any:
         //
@@ -2100,15 +2262,19 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // selected", fall back to the CUDA-default device, and either plot on an
     // unrequested GPU or fail obscurely.
     //
-    // Auto (the default) is deliberately NOT covered: auto resolving to zero CPU
-    // workers is not a failure, it is the tool declining to add any — the run
-    // should fall through to the GPU (or to a no-device error on a GPU-less host),
-    // exactly as a plain GPU run always has.
-    bool const cpu_explicitly_requested =
-        opts.cpu_workers > 0 || opts.cpu_workers == kCpuWorkersMax;
-    std::size_t const cpu_selected = static_cast<std::size_t>(
-        std::count(device_ids.begin(), device_ids.end(), kCpuDeviceId));
-    if (cpu_explicitly_requested && cpu_selected == 0 && device_ids.empty()) {
+    // This used to exclude `auto`, on the reasoning that auto resolving to zero
+    // was not a failure but the tool declining to add CPU workers nobody had
+    // asked for. That reasoning died with the opt-in: auto is now only reached
+    // once something HAS asked for the CPU, so `--devices cpu` on a host too
+    // tight to fit one is a request that cannot be honoured, not a default
+    // quietly declining. Ask the SELECTION, not the count.
+    //
+    // A run that also named GPUs still falls through to them with the gate note
+    // — device_ids is non-empty, so the throw does not fire.
+    std::size_t const cpu_workers_placed = static_cast<std::size_t>(
+        std::count_if(device_ids.begin(), device_ids.end(),
+                      [](int id) { return is_cpu_device(id); }));
+    if (opts.cpu_selected() && cpu_workers_placed == 0 && device_ids.empty()) {
         throw std::runtime_error(
             "run_batch: no CPU worker fits in host RAM and no GPU was selected"
             " — nothing to plot on. " + gate_note);
@@ -2116,7 +2282,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
 
     if (opts.use_all_devices &&
         std::none_of(device_ids.begin(), device_ids.end(),
-                     [](int id) { return id != kCpuDeviceId; })) {
+                     [](int id) { return !is_cpu_device(id); })) {
         std::fprintf(stderr,
             "[batch] --devices all: runtime enumerated 0 GPUs — "
             "falling back to the CUDA-default device\n");
@@ -2159,7 +2325,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // reading of that to keep second-guessing them every 50 seconds.
     auto make_cpu_gate = [&](std::size_t gpu_count)
         -> std::unique_ptr<CpuMemoryGate> {
-        if (cpu_selected == 0) return nullptr;
+        if (cpu_workers_placed == 0) return nullptr;
         if (char const* v = std::getenv("XCHPLOT2_CPU_WORKERS_UNGATED");
             v && v[0] == '1') {
             return nullptr;
@@ -2219,9 +2385,9 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // (the CUDA-default sentinel never reaches the multi-device path).
     live.gpu_peer_present =
         std::any_of(device_ids.begin(), device_ids.end(),
-                    [](int id) { return id != kCpuDeviceId; });
+                    [](int id) { return !is_cpu_device(id); });
 
-    live.cpu_gate = make_cpu_gate(N - cpu_selected);  // the rest are GPUs
+    live.cpu_gate = make_cpu_gate(N - cpu_workers_placed);  // the rest are GPUs
 
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
@@ -2377,44 +2543,70 @@ std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
 //
 // Capped at half the cores so tiny hosts don't over-spawn; XCHPLOT2_CPU_AUTO_WORKERS
 // overrides for tuning.
-int cpu_worker_auto_count()
+//
+// `node_cores` is the core count of the NODE this count is for, not the host's.
+// The knee is a property of one node's memory system — it is where extra plots
+// stop hiding each other's stalls — so a 2-socket box wants the knee twice, not
+// a knee sized by twice the cores.
+//
+// CAUTION: the ~4 was measured on a single-socket host, where a node IS the
+// machine. On a multi-socket host a node-pinned worker still spawns a
+// WHOLE-HOST-sized thread fan-out onto its node's cores (see NumaTopology.hpp),
+// so the real knee there is probably lower, and this is a starting point for
+// measurement rather than a number anyone has stood behind.
+int cpu_worker_auto_count(int node_cores)
 {
     if (char const* v = std::getenv("XCHPLOT2_CPU_AUTO_WORKERS"); v && v[0]) {
         int const n = std::atoi(v);
         if (n >= 1 && n <= 64) return n;
     }
-    unsigned const hc = std::thread::hardware_concurrency();
-    int const cores = hc ? static_cast<int>(hc) : 8;
+    int const cores = node_cores > 0 ? node_cores : 8;
     return std::min(4, std::max(1, cores / 2));
 }
 
 // How many CPU workers actually fit, resolving the cpu_workers request against
-// host RAM:
-//   kCpuWorkersAuto (-1): the knee, then trimmed to what RAM holds.  [default]
+// host RAM. `asked` is PER NODE; the return is the HOST-WIDE TOTAL across
+// `nodes` of them, because RAM is a host resource and gating per node would let
+// a 4-socket box authorise 4x what /proc/meminfo actually has.
+//   kCpuWorkersAuto (-1): the knee per node, then trimmed to what RAM holds.
 //   kCpuWorkersMax  (-2): as many as RAM holds, capped at the core count.
 //   0                   : none.
-//   N > 0               : exactly N, still RAM-trimmed.
+//   N > 0               : exactly N per node, still RAM-trimmed.
 //
 // Never throws: batch_worker_count() calls this from outside the CLI's try block
 // (cli.cpp), so a throw here would terminate instead of printing.
 int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
+                         std::vector<NumaNode> const& nodes,
                          std::string* note)
 {
-    if (asked == 0) return 0;   // explicit --no-cpu / --cpu-workers 0
+    if (asked == 0 || nodes.empty()) return 0;  // --cpu-workers 0, or no CPU selected
 
     bool const is_auto = (asked == kCpuWorkersAuto);
     bool const is_max  = (asked == kCpuWorkersMax);
     if (asked < 0 && !is_auto && !is_max) return 0;  // unknown sentinel: be safe
 
-    int const knee = cpu_worker_auto_count();
     unsigned const hc = std::thread::hardware_concurrency();
-    int const core_cap = static_cast<int>(hc ? hc : 8);
-    // Pre-RAM target: auto → the knee; max → the core count (each worker already
-    // fans out to every core, so more than that is pure oversubscription — at k=22
-    // RAM alone would permit ~500); N → exactly N. RAM trims all of them further.
+    int const host_cores = static_cast<int>(hc ? hc : 8);
+    // A node only reports an empty cpu list when the kernel has no NUMA sysfs at
+    // all (host_numa_nodes then synthesises one node meaning "the machine"). A
+    // single-node CONFIG_NUMA host — the common case — DOES list its cpus, so
+    // this fallback is for the sysfs-less host, not the single-socket one.
+    auto node_cores = [&](NumaNode const& n) {
+        return n.cpus.empty() ? host_cores : static_cast<int>(n.cpus.size());
+    };
+
+    int knee = 0;
+    for (auto const& n : nodes) knee += cpu_worker_auto_count(node_cores(n));
+
+    // Pre-RAM target: auto → the summed per-node knee; max → the HOST core count
+    // (each worker already fans out to every core, so more than that is pure
+    // oversubscription — at k=22 RAM alone would permit ~500, and that cap is
+    // about the machine, so it is not multiplied by the node count); N → N on
+    // each node. RAM trims all of them further.
     long const target = is_auto ? static_cast<long>(knee)
-                      : is_max  ? static_cast<long>(core_cap)
-                                : static_cast<long>(asked);
+                      : is_max  ? static_cast<long>(host_cores)
+                                : static_cast<long>(asked) *
+                                      static_cast<long>(nodes.size());
 
     auto gib = [](std::uint64_t b) {
         char buf[32];
@@ -2476,15 +2668,27 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
                 *note += " — RAM holds " + std::to_string(fits) + " of the ~" +
                          std::to_string(knee) + " that help here";
             }
-            *note += ". --no-cpu to disable";
-        } else if (is_max && fits == 0) {
+            *note += ". --cpu-workers 0 to disable";
+        // Auto used to stay silent here, because auto was the DEFAULT and
+        // declining to add CPU workers nobody asked for is not news. Under the
+        // opt-in it is: reaching auto at all means the CPU was requested, so
+        // resolving to zero is a request going unhonoured and has to be said —
+        // not least because the "nothing to plot on" throw quotes this note.
+        } else if ((is_max || is_auto) && fits == 0) {
             *note = "no CPU worker fits: each needs " + gib(per_worker) +
                     " GiB at k=" + std::to_string(k) + ", host has " +
                     gib(free_now) + " GiB available";
             reserves(*note);
-        } else if (!is_auto && !is_max && fits < asked) {
-            *note = "asked for " + std::to_string(asked) + " CPU worker" +
-                    (asked == 1 ? "" : "s") + " but " +
+        // `target`, not `asked`: both sides must be host-wide totals. asked is
+        // per node, so on a 2-node box `--cpu-workers 4` that trimmed to 5 would
+        // compare 5 < 4, call it a success, and never mention losing 3 workers.
+        } else if (!is_auto && !is_max && fits < target) {
+            *note = "asked for " + std::to_string(target) + " CPU worker" +
+                    (target == 1 ? "" : "s") +
+                    (nodes.size() > 1 ? " (" + std::to_string(asked) + " on each of " +
+                                            std::to_string(nodes.size()) + " nodes)"
+                                      : "") +
+                    " but " +
                     (fits == 0 ? std::string("none fit")
                                : "only " + std::to_string(fits) +
                                      (fits == 1 ? " fits" : " fit")) +
@@ -2495,7 +2699,8 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
             *note += ". Set XCHPLOT2_CPU_WORKERS_UNGATED=1 to override (and risk "
                      "the OOM killer taking the whole batch)";
         }
-        // is_auto && fits == 0: stay silent — auto degrades quietly to no CPU.
+        // Every (asked, fits) pair now says something; nothing falls through
+        // silently. See the auto note above for why that changed.
     }
     return fits;
 }
@@ -2593,15 +2798,15 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
 
     // Zero-config (no --devices and not --devices all) historically means "the
     // one default GPU, on the single-worker fast path" — signalled by leaving the
-    // list empty. Now that CPU workers are ON by default, appending them to an
-    // empty list would run CPU-ONLY, silently dropping that default GPU. So when
-    // CPU workers are about to join an implicit selection, materialise the default
-    // GPU (device 0) so it shares the work queue instead of being discarded.
+    // list empty. `--cpu` can join CPU workers to that implicit selection, and
+    // appending them to an empty list would run CPU-ONLY, silently dropping the
+    // default GPU. So when CPU workers join an implicit selection, materialise
+    // the default GPU (device 0) so it shares the work queue.
     //
-    // `--devices cpu` ALSO arrives here with an empty device_ids — a cpu token is
-    // tracked as a worker count, not a device id — but it is an EXPLICIT CPU-only
-    // request, not zero-config. devices_specified tells the two apart, so we do
-    // not bolt a GPU onto a run that named CPU and only CPU.
+    // `--devices cpu` ALSO arrives here with an empty device_ids — CPU nodes are
+    // tracked separately from GPU ids — but it is an EXPLICIT CPU-only request,
+    // not zero-config. devices_specified tells the two apart, so we do not bolt
+    // a GPU onto a run that named CPU and only CPU.
     bool const gpu_implicit = device_ids.empty() && !opts.use_all_devices
                               && !opts.devices_specified;
     bool default_gpu_available = false;
@@ -2611,22 +2816,59 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
         if (default_gpu_available) ++gpu_count;  // it costs host RAM once real
     }
 
-    // Every CPU worker is one more kCpuDeviceId in the list — the work-queue needs
-    // no idea they are the same physical device, because they aren't sharing
-    // anything. The count is resolved (auto/max/exact) and RAM-trimmed here.
-    int const cpu_count =
-        cpu_workers_that_fit(opts.cpu_workers, k, gpu_count, gate_note);
+    // Which CPU nodes are in. `cpu` / `all` take every node the host has, as
+    // `gpu` takes every card; `cpu0` names one, as `gpu0` does. An unselected
+    // CPU yields an empty list, and everything below is then a no-op.
+    std::vector<NumaNode> cpu_nodes;
+    if (opts.cpu_selected()) {
+        auto const topo = host_numa_nodes();  // never empty; see NumaTopology.hpp
+        if (opts.use_all_cpu_nodes || opts.cpu_node_ids.empty()) {
+            cpu_nodes = topo;
+        } else {
+            for (int want : opts.cpu_node_ids) {
+                auto const it = std::find_if(
+                    topo.begin(), topo.end(),
+                    [&](NumaNode const& n) { return n.node_id == want; });
+                if (it != topo.end()) {
+                    cpu_nodes.push_back(*it);
+                } else if (gate_note) {
+                    // Naming a node the host does not have is a typo worth
+                    // saying out loud — silently plotting on fewer nodes than
+                    // asked is the kind of thing nobody notices until the
+                    // throughput number is unexplainable.
+                    *gate_note = "no NUMA node " + std::to_string(want) +
+                                 " on this host (it has " +
+                                 std::to_string(topo.size()) + ") — ignoring cpu" +
+                                 std::to_string(want);
+                }
+            }
+        }
+    }
 
-    // Materialise the default GPU whenever CPU plotting is in play (anything but
-    // --no-cpu) and one exists — EVEN IF the count trimmed to zero. That way a run
-    // that wanted CPU workers but couldn't fit them still lands on the GPU (with
-    // the gate note explaining why), instead of being dropped to CPU-only or
-    // spuriously refused. --no-cpu leaves the list empty so the zero-config GPU
-    // fast path is byte-for-byte unchanged.
-    if (opts.cpu_workers != 0 && gpu_implicit && default_gpu_available) {
+    // Every CPU worker is one more CPU-node id in the list — the work-queue needs
+    // no idea several of them share a socket, because what they share (cores,
+    // memory bandwidth) is not something it arbitrates. Resolved per node
+    // (auto/max/exact) and RAM-trimmed host-wide.
+    int const cpu_count =
+        cpu_workers_that_fit(opts.cpu_workers, k, gpu_count, cpu_nodes, gate_note);
+
+    // Materialise the default GPU whenever CPU plotting is in play and one
+    // exists — EVEN IF the count trimmed to zero. That way a run that wanted CPU
+    // workers but couldn't fit them still lands on the GPU (with the gate note
+    // explaining why), instead of being dropped to CPU-only or spuriously
+    // refused. No CPU leaves the list empty, so the zero-config GPU fast path is
+    // byte-for-byte unchanged.
+    if (opts.cpu_selected() && gpu_implicit && default_gpu_available) {
         device_ids.push_back(0);
     }
-    for (int i = 0; i < cpu_count; ++i) device_ids.push_back(kCpuDeviceId);
+    // Round-robin across the selected nodes rather than filling one at a time:
+    // the RAM trim is host-wide, so when it cuts the total the survivors should
+    // still be spread over the sockets instead of piling onto node 0 — which is
+    // the arrangement the pinning exists to avoid.
+    for (int i = 0; i < cpu_count && !cpu_nodes.empty(); ++i) {
+        device_ids.push_back(
+            cpu_device_id(cpu_nodes[static_cast<std::size_t>(i) % cpu_nodes.size()].node_id));
+    }
     return device_ids;
 }
 

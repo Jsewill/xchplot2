@@ -18,6 +18,7 @@
 #include "host/ConfigFile.hpp"
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
+#include "host/NumaTopology.hpp"  // host_numa_nodes() — one `devices` row per CPU node
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
 #include <algorithm>
@@ -104,13 +105,16 @@ void print_usage(char const* prog)
         << "                                      off when redirected or with -q.\n"
         << "    --devices SPEC                  : multi-device. SPEC is a comma\n"
         << "                                      list mixing any of:\n"
-        << "                                        all       — every GPU + CPU\n"
+        << "                                        all       — every GPU + every CPU node\n"
         << "                                        gpu       — every visible CUDA GPU\n"
-        << "                                        cpu       — a CPU worker (slow).\n"
-        << "                                                    Repeat it for more:\n"
-        << "                                                    `cpu,cpu` == --cpu-workers 2\n"
-        << "                                        0,1,3     — explicit GPU ids\n"
-        << "                                      e.g. gpu,cpu == all.\n"
+        << "                                        cpu       — every CPU node (slow)\n"
+        << "                                        gpu0,gpu2 — those GPUs\n"
+        << "                                        cpu1      — that CPU (NUMA) node only\n"
+        << "                                        0,1,3     — explicit GPU ids (== gpu0,..)\n"
+        << "                                      e.g. gpu,cpu == all. This flag names\n"
+        << "                                      DEVICES; --cpu-workers says how many\n"
+        << "                                      plots run on each, so `cpu,cpu` is just\n"
+        << "                                      `cpu` — repeats dedup, as `0,0` does.\n"
         << "                                      Any GPU selector accepts a `:tier`\n"
         << "                                      suffix to pin the streaming tier for\n"
         << "                                      that device(s). Tier ∈ plain | compact\n"
@@ -125,18 +129,22 @@ void print_usage(char const* prog)
         << "                                      tier on the CPU worker).\n"
         << "                                      Omitted = single device via the\n"
         << "                                      CUDA-default device (zero-config).\n"
-        << "    CPU workers are ON BY DEFAULT (every run, bench included): a few CPU\n"
-        << "    plots run alongside the GPUs, niced below them. --no-cpu turns them off.\n"
-        << "    --no-cpu                        : no CPU workers (pure GPU).\n"
-        << "    --cpu                           : re-enable the default CPU workers\n"
-        << "                                      (only needed after --no-cpu or a config).\n"
-        << "    --cpu-workers auto|max|N|off    : how many CPU plots run concurrently.\n"
+        << "    CPU plotting is OPT-IN: ask for it with `--devices cpu` / `--devices all`\n"
+        << "    (or --cpu, which adds it to whatever GPUs are already selected). CPU\n"
+        << "    plots run alongside the GPUs, niced below them, and on a multi-socket\n"
+        << "    host each worker is pinned to its own NUMA node.\n"
+        << "    --cpu                           : add CPU workers to the current selection\n"
+        << "                                      (every node), without naming --devices.\n"
+        << "    --cpu-workers auto|max|N|off    : how many CPU plots run concurrently\n"
+        << "                                      ON EACH selected node. Naming any count\n"
+        << "                                      but 0 also opts the CPU in.\n"
         << "                                        auto (default) — the throughput knee\n"
         << "                                            (~4), then trimmed to host RAM.\n"
         << "                                        max            — as many as fit in RAM,\n"
         << "                                                         capped at core count.\n"
-        << "                                        N              — exactly N.\n"
-        << "                                        off            — none (= --no-cpu).\n"
+        << "                                        N              — exactly N per node.\n"
+        << "                                        off            — none, overriding\n"
+        << "                                                         --devices cpu.\n"
         << "                                      The CPU plotter (pos2-chip, no CUDA) is\n"
         << "                                      memory-latency-bound, so concurrent plots\n"
         << "                                      interleave each other's stalls — but each\n"
@@ -255,12 +263,23 @@ void read_urandom(uint8_t* out, size_t n)
 // use_all_devices=false — which triggers the single-device path on the
 // CUDA-default device (identical to pre-multi-GPU behavior).
 //
+// --cpu-workers N: how many CPU plots run concurrently ON EACH SELECTED CPU NODE.
+//
+// Per node, not per host, so it means the same thing on a 1-socket box as on a
+// 4-socket one — and on the 1-socket box (every rig this was tuned on) per-node
+// and per-host are the same number, so nothing about it has changed.
+//
 // Accepts a count or a keyword:
-//   auto        — the throughput knee (~4), RAM-trimmed. This is the DEFAULT even
-//                 without the flag; spelling it re-enables CPU after a --no-cpu.
+//   auto        — the throughput knee (~4), RAM-trimmed. The default WHEN the
+//                 CPU is selected; the CPU itself is opt-in (`--devices cpu`,
+//                 `--devices all`, or `--cpu`).
 //   max         — as many as fit in RAM, capped at the core count.
-//   off / none / 0 — no CPU worker.
-//   N           — exactly N (still RAM-trimmed).
+//   off / none / 0 — no CPU workers, whatever --devices asked for.
+//   N           — exactly N per node (still RAM-trimmed).
+//
+// Naming any count but zero is itself a request for the CPU: `--cpu-workers 4`
+// on its own means the CPU is in, on every node. Zero means it is out — that is
+// the one way a count speaks to selection, and it is what `--no-cpu` used to be.
 //
 // N is an ASK, not a promise: run_batch caps it at what host RAM actually holds
 // (12.1 GiB per worker at k=28) and says so when it does.
@@ -268,9 +287,13 @@ void read_urandom(uint8_t* out, size_t n)
 // Returns false on malformed input (caller prints usage + exits 1).
 bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
-    if (s == "auto")                    { opts.cpu_workers = pos2gpu::kCpuWorkersAuto; return true; }
-    if (s == "max")                     { opts.cpu_workers = pos2gpu::kCpuWorkersMax;  return true; }
-    if (s == "off" || s == "none")      { opts.cpu_workers = 0;                        return true; }
+    // Selecting the CPU here, rather than in the --devices parser, is what lets
+    // the two flags commute — see BatchOptions::cpu_opt_in.
+    auto opt_in = [&](int n) { opts.cpu_workers = n; opts.cpu_opt_in = true; return true; };
+
+    if (s == "auto")               return opt_in(pos2gpu::kCpuWorkersAuto);
+    if (s == "max")                return opt_in(pos2gpu::kCpuWorkersMax);
+    if (s == "off" || s == "none") { opts.cpu_workers = 0; return true; }
 
     char* endp = nullptr;
     long const v = std::strtol(s.c_str(), &endp, 10);
@@ -280,9 +303,10 @@ bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
         return false;
     }
     // Assign, don't max: this is the explicit, specific flag. `--cpu-workers 0`
-    // means "no, actually, none" and must not resolve to the auto default.
-    opts.cpu_workers = static_cast<int>(v);
-    return true;
+    // means "no, actually, none" and must not resolve to the auto default — nor
+    // opt the CPU in, which is why it does not go through opt_in().
+    if (v == 0) { opts.cpu_workers = 0; return true; }
+    return opt_in(static_cast<int>(v));
 }
 
 // Returns false on malformed input (caller prints usage + exits 1).
@@ -316,17 +340,19 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
         return false;
     };
 
+    // A --devices list REPLACES any earlier one, so every selection it can
+    // express resets here — CPU included. Leaving the CPU selection standing
+    // would make `--devices all --devices gpu` keep a CPU nobody asked for.
+    // cpu_workers is deliberately NOT reset: it is a count, not a selection,
+    // and an explicit --cpu-workers must survive a later --devices.
     opts.device_ids.clear();
+    opts.use_all_devices = false;
     opts.per_device_tier.clear();
     opts.all_gpus_tier.clear();
+    opts.cpu_node_ids.clear();
+    opts.use_all_cpu_nodes = false;
     bool any_token = false;
     bool any_gpu_token = false;
-
-    // Counted locally, not straight into opts: `--cpu` is orthogonal to --devices
-    // (it may have been parsed already, and this function clears the GPU selection
-    // on entry), and a second --devices must not ACCUMULATE CPU workers the way
-    // `cpu,cpu` within one list deliberately does.
-    int cpu_tokens = 0;
     size_t start = 0;
     while (start <= s.size()) {
         size_t const end = s.find(',', start);
@@ -347,9 +373,25 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             }
         }
 
+        // "gpu7" / "cpu1" — a kind plus an index. Bare "7" is the historical
+        // spelling of "gpu7" and still parses, below.
+        auto indexed = [](std::string const& t, char const* kind) -> std::optional<int> {
+            std::string const prefix(kind);
+            if (t.size() <= prefix.size() || t.compare(0, prefix.size(), prefix) != 0) {
+                return std::nullopt;
+            }
+            std::string const digits = t.substr(prefix.size());
+            char* endp = nullptr;
+            long const v = std::strtol(digits.c_str(), &endp, 10);
+            if (endp == digits.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+                return std::nullopt;
+            }
+            return static_cast<int>(v);
+        };
+
         if (selector == "all") {
-            opts.use_all_devices = true;
-            ++cpu_tokens;   // "all" means every GPU *and* the CPU — one of it
+            opts.use_all_devices   = true;
+            opts.use_all_cpu_nodes = true;  // every GPU *and* every CPU node
             any_gpu_token = true;
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "gpu") {
@@ -358,20 +400,30 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "cpu") {
             if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
-            // One worker per token — which is what the in-tree comments promised
-            // for two revisions while the code created exactly one regardless, so
-            // anyone who wrote `--devices cpu,cpu,cpu,cpu` benchmarked a single
-            // worker and believed they had measured four. It counts them now.
-            //
-            // No dedup, unlike the GPU ids below: repeating a GPU id cannot give
-            // you a second card, but repeating `cpu` genuinely does give you a
-            // second concurrent plot. run_batch caps the total against host RAM.
-            ++cpu_tokens;
+            // Every CPU node, exactly as `gpu` means every GPU. It is a
+            // SELECTION, not a count: --cpu-workers says how many plots run per
+            // node. So repeats dedup — `cpu,cpu` names the same hardware twice
+            // and cannot mean more of it, any more than `0,0` means two cards.
+            opts.use_all_cpu_nodes = true;
+        } else if (auto const node = indexed(selector, "cpu")) {
+            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
+            opts.cpu_node_ids.push_back(*node);
+        } else if (auto const gid = indexed(selector, "gpu")) {
+            opts.device_ids.push_back(*gid);
+            any_gpu_token = true;
+            if (!tier_suffix.empty()) {
+                auto const it = opts.per_device_tier.find(*gid);
+                if (it != opts.per_device_tier.end() && it->second != tier_suffix) {
+                    return bad("same GPU id given two different :tier overrides");
+                }
+                opts.per_device_tier[*gid] = tier_suffix;
+            }
         } else {
             char* endp = nullptr;
             long const v = std::strtol(selector.c_str(), &endp, 10);
             if (endp == selector.c_str() || *endp != '\0' || v < 0 || v > 1023) {
-                return bad("unrecognised device token (expect all|gpu|cpu|<id>)");
+                return bad("unrecognised device token "
+                           "(expect all|gpu|cpu|gpu<n>|cpu<n>|<id>)");
             }
             int const id = static_cast<int>(v);
             opts.device_ids.push_back(id);
@@ -389,22 +441,18 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
         start = end + 1;
     }
     if (!any_token) return false;
-    if (!any_gpu_token && cpu_tokens == 0 && opts.cpu_workers == 0) return false;
+    bool const any_cpu_token = opts.use_all_cpu_nodes || !opts.cpu_node_ids.empty();
+    if (!any_gpu_token && !any_cpu_token) return false;
 
-    // A `cpu` token count is an explicit request. Fold it in: keep the larger of
-    // it and an explicit --cpu-workers N (`--cpu-workers 4 --devices 0,cpu` still
-    // means 4), but let it win over the negative auto/max default sentinels —
-    // numeric max on those would be wrong.
-    if (cpu_tokens > 0) {
-        opts.cpu_workers = (opts.cpu_workers > 0)
-                         ? std::max(opts.cpu_workers, cpu_tokens)
-                         : cpu_tokens;
-    }
+    // `cpu` covers every node, so listing nodes as well is redundant.
+    if (opts.use_all_cpu_nodes) opts.cpu_node_ids.clear();
 
-    std::sort(opts.device_ids.begin(), opts.device_ids.end());
-    opts.device_ids.erase(
-        std::unique(opts.device_ids.begin(), opts.device_ids.end()),
-        opts.device_ids.end());
+    auto dedup = [](std::vector<int>& v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    dedup(opts.device_ids);
+    dedup(opts.cpu_node_ids);
     // Any successful --devices — even a CPU-only one that left device_ids empty —
     // is an explicit selection. resolve_batch_devices keys off this to avoid
     // materialising a default GPU on top of an explicit CPU-only request.
@@ -470,6 +518,124 @@ std::string format_duration_dh(double seconds)
     return buf;
 }
 
+// Render one worker's share of a sized batch as "gpu0 43, cpu1 6".
+std::string format_split(std::vector<pos2gpu::WorkerSplit> const& split,
+                         std::vector<std::string> const& names)
+{
+    std::string out;
+    for (auto const& w : split) {
+        if (!out.empty()) out += ", ";
+        // worker_index, never the position in `split` — see WorkerSplit.
+        out += (w.worker_index < names.size() ? names[w.worker_index]
+                                              : pos2gpu::device_label(w.device_id));
+        out += " " + std::to_string(w.plots);
+    }
+    return out;
+}
+
+// The batch sizes that leave nobody waiting on a peer. Shared by bench and the
+// plot/batch run summary so the two give the same advice in the same words.
+//
+// `device_ids` is the FULL worker list, including any the model dropped for
+// want of a rate: worker_labels() numbers repeats by position in it.
+void print_batch_sizing(char const* prefix,
+                        pos2gpu::OptimalBatch const& opt,
+                        std::vector<int> const& device_ids)
+{
+    if (!opt.valid) return;
+
+    auto const names = pos2gpu::worker_labels(device_ids);
+    auto const& w = opt.workable;
+
+    // Matched workers land together at one plot apiece — there is no trade-off
+    // to explain and no second number to offer.
+    if (opt.coincide) {
+        std::fprintf(stderr,
+            "%s   optimal batch: multiples of %zu — %s — every worker lands "
+            "together\n",
+            prefix, w.plots, format_split(w.split, names).c_str());
+    } else {
+        std::fprintf(stderr,
+            "%s   optimal batch: multiples of %zu — %s — every worker lands "
+            "within %.2f s (%.1f%% idle)\n",
+            prefix, w.plots, format_split(w.split, names).c_str(),
+            w.spread_seconds, 100.0 * w.idle_fraction);
+        if (opt.exact.valid) {
+            // Worth a second line because the workable size's error is a
+            // FRACTION: double the batch and you double the seconds wasted. The
+            // exact size is the one that stays tight however many you run.
+            //
+            // Quote the percentage, not the seconds. The two sizes are different
+            // batches, so their absolute waits are not comparable — a 2-plot
+            // batch idling 0.01 s and an 83-plot batch idling 0.01 s look
+            // identical spelled that way, and the second is 40x the better deal.
+            // The fraction is the part that holds still.
+            std::fprintf(stderr,
+                "%s     for a near-exact landing use multiples of %zu — %s — "
+                "%.2f%% idle\n",
+                prefix, opt.exact.plots,
+                format_split(opt.exact.split, names).c_str(),
+                100.0 * opt.exact.idle_fraction);
+        }
+    }
+
+    if (opt.workers_unrated > 0) {
+        std::fprintf(stderr,
+            "%s     (%zu worker%s had no rate yet and %s left out of this — run "
+            "more plots to size around %s)\n",
+            prefix, opt.workers_unrated, opt.workers_unrated == 1 ? "" : "s",
+            opt.workers_unrated == 1 ? "was" : "were",
+            opt.workers_unrated == 1 ? "it" : "them");
+    }
+}
+
+// Per-worker rates for a plot/batch run, plus the sizing advice they imply.
+//
+// The live progress block shows the same rates while the run is going, but it
+// only exists on a TTY — a run redirected to a log never saw it, and that is
+// exactly the run someone reads afterwards to decide how to size the next one.
+//
+// warmup=0: unlike bench, this reports the run that actually happened rather
+// than a steady-state estimate, so no plot is excluded. compute_bench_stats
+// still anchors on work_start_seconds, keeping device init and pool
+// construction — which are not per-plot costs — out of the rates.
+void print_run_workers(char const* prefix, pos2gpu::BatchResult const& res)
+{
+    if (res.workers.size() < 2) return;  // nothing to compare or balance
+
+    auto const stats = pos2gpu::compute_bench_stats(res.workers, 0);
+    if (!stats.valid) return;
+
+    std::vector<int> ids;
+    ids.reserve(res.workers.size());
+    for (auto const& w : res.workers) ids.push_back(w.device_id);
+    auto const names = pos2gpu::worker_labels(ids);
+
+    std::fprintf(stderr, "%s per-worker:\n", prefix);
+    std::vector<double> rates(stats.workers.size(), 0.0);
+    for (std::size_t i = 0; i < stats.workers.size(); ++i) {
+        auto const& w = stats.workers[i];
+        char const* name = i < names.size() ? names[i].c_str() : "?";
+        if (!w.measured) {
+            std::fprintf(stderr,
+                "%s   %-5s %zu plot%s — too few to measure a rate\n",
+                prefix, name, w.plots_total, w.plots_total == 1 ? "" : "s");
+            continue;
+        }
+        rates[i] = w.s_per_plot;
+        char tail[80] = {0};
+        if (w.idle_tail_seconds >= 0.05) {
+            std::snprintf(tail, sizeof(tail), " — then idle %.1f s waiting on a peer",
+                          w.idle_tail_seconds);
+        }
+        std::fprintf(stderr, "%s   %-5s %zu plot%s — %.2f s/plot%s\n",
+                     prefix, name, w.plots_total, w.plots_total == 1 ? "" : "s",
+                     w.s_per_plot, tail);
+    }
+
+    print_batch_sizing(prefix, pos2gpu::pick_batch_sizing(rates, ids), ids);
+}
+
 void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
 {
     double const per = res.plots_written
@@ -486,6 +652,12 @@ void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
                   << tib_per_hour << " TiB/hour effective)";
     }
     std::cerr << "\n";
+    // After the aggregate, never beside it: the s/plot above is the batch's,
+    // and a per-worker name next to a batch number is the confusion the
+    // progress prefix already had to be fixed for (see BatchPlotter's
+    // progress_prefix).
+    std::cerr.flush();
+    print_run_workers(prefix, res);
 }
 
 // Pick the roomiest tmpfs, not the first one that happens to exist. The old
@@ -750,6 +922,15 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
         "the aggregate below is the sum of the rates above\n",
         stats.window_begin, stats.window_end,
         stats.window_end - stats.window_begin);
+
+    // The rates above are exactly what sizing a batch needs, and a bench run is
+    // where someone has just measured them. An unmeasured worker's s_per_plot is
+    // 0, which pick_batch_sizing reads as "no rate" and drops.
+    std::vector<double> rates;
+    rates.reserve(stats.workers.size());
+    for (auto const& w : stats.workers) rates.push_back(w.s_per_plot);
+    print_batch_sizing("[bench]", pos2gpu::pick_batch_sizing(rates, worker_devices),
+                       worker_devices);
 }
 
 std::vector<pos2gpu::BatchEntry> build_bench_entries(
@@ -1024,32 +1205,62 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::printf("The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
             return 1;
         }
-        std::printf("Visible devices (%zu GPU + 1 CPU):\n", query.devices.size());
+        auto const cpu_nodes = pos2gpu::host_numa_nodes();
+        // "1 CPU" was hard-coded, which a multi-socket host makes a lie — it
+        // gets one selectable row per node, and the header has to count them.
+        std::printf("Visible devices (%zu GPU + %zu CPU node%s):\n",
+                    query.devices.size(), cpu_nodes.size(),
+                    cpu_nodes.size() == 1 ? "" : "s");
         for (auto const& d : query.devices) {
             std::size_t vram_mb =
                 static_cast<std::size_t>(d.vram_bytes / (1024ull * 1024ull));
-            std::printf("  [%d]   %-32s vram=%5zu MB  SMs=%-3d  CC=%d.%d\n",
-                        d.id, d.name.c_str(), vram_mb,
+            // One tag column shared with the CPU rows below, wide enough for the
+            // longest tag either side prints ("[cpu0]"). The old hard-coded
+            // "[%d]   " also silently shunted the name column right on any host
+            // with a two-digit GPU id.
+            std::string const tag = "[" + std::to_string(d.id) + "]";
+            std::printf("  %-7s%-32s vram=%5zu MB  SMs=%-3d  CC=%d.%d\n",
+                        tag.c_str(), d.name.c_str(), vram_mb,
                         d.sm_count, d.cc_major, d.cc_minor);
         }
-        unsigned threads = std::thread::hardware_concurrency();
-        if (threads == 0) {
-            std::printf("  [cpu] %-32s threads=  ?                          (1-2 orders slower than GPU)\n",
-                        "Host CPU plotter");
-        } else {
-            std::printf("  [cpu] %-32s threads=%-4u                       (1-2 orders slower than GPU)\n",
-                        "Host CPU plotter", threads);
+        // One row per CPU node, because those are the ids --devices accepts.
+        // hardware_concurrency() returns 0 when it can't figure the count out
+        // (rare), in which case print "?".
+        unsigned const threads = std::thread::hardware_concurrency();
+        for (auto const& node : cpu_nodes) {
+            // An empty cpu list means the kernel had no NUMA sysfs and
+            // host_numa_nodes synthesised a node meaning "the machine" — so the
+            // machine's thread count is the honest answer. (A single-socket host
+            // with CONFIG_NUMA does list its cpus, and lands here with the same
+            // number by a different route.)
+            std::size_t const node_threads =
+                node.cpus.empty() ? threads : node.cpus.size();
+            std::string const tag = "[" + pos2gpu::device_label(
+                pos2gpu::cpu_device_id(node.node_id)) + "]";
+            std::string const name = cpu_nodes.size() > 1
+                ? "Host CPU plotter (NUMA node " + std::to_string(node.node_id) + ")"
+                : std::string("Host CPU plotter");
+            if (node_threads == 0) {
+                std::printf("  %-7s%-32s threads=  ?                          (1-2 orders slower than GPU)\n",
+                            tag.c_str(), name.c_str());
+            } else {
+                std::printf("  %-7s%-32s threads=%-4zu                       (1-2 orders slower than GPU)\n",
+                            tag.c_str(), name.c_str(), node_threads);
+            }
         }
         if (query.devices.empty()) {
             std::printf("\nNo CUDA devices visible.\n"
                         "Check `nvidia-smi -L` and that the driver is loaded.\n"
                         "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
         } else {
-            std::printf("\nUse `--devices N` (id) for a specific GPU,\n"
+            std::printf("\nUse `--devices gpu0` (or bare `0`) for a specific GPU,\n"
                         "     `--devices gpu` for every GPU,\n"
-                        "     `--devices cpu` for the host CPU only,\n"
-                        "     `--devices all` for every GPU + CPU,\n"
-                        "  or any comma combination (e.g. `0,2,cpu`).\n");
+                        "     `--devices cpu` for every CPU node (opt-in; slow),\n"
+                        "     `--devices cpu0` for one CPU node,\n"
+                        "     `--devices all` for every GPU + every CPU node,\n"
+                        "  or any comma combination (e.g. `0,2,cpu`).\n"
+                        "--devices names DEVICES; `--cpu-workers N` sets how many\n"
+                        "plots run on each CPU node.\n");
         }
         return 0;
     }
@@ -1093,11 +1304,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
             }
             else if (a == "-v" || a == "--verbose") opts.verbose = true;
-            // CPU is auto by default now; --cpu only re-enables it after a
-            // --no-cpu, and never downgrades an explicit --cpu-workers N.
-            else if (a == "--cpu") { if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
-            // bench had --cpu but no --no-cpu, while batch and plot have both.
-            else if (a == "--no-cpu") opts.cpu_workers = 0;
+            // CPU is opt-in. --cpu asks for it on every node without naming
+            // --devices; it says nothing about HOW MANY, so it never disturbs an
+            // explicit --cpu-workers N in either direction.
+            else if (a == "--cpu") opts.cpu_opt_in = true;
             else if (a == "--cpu-workers" && need(1)) {
                 if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
             }
@@ -1383,8 +1593,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                   || a == "--resume")               opts.skip_existing = true;
             else if (a == "--no-skip-existing"
                   || a == "--no-resume")            opts.skip_existing = false;
-            else if (a == "--cpu")                  { if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
-            else if (a == "--no-cpu")               opts.cpu_workers = 0;
+            else if (a == "--cpu")                  opts.cpu_opt_in = true;
             else if (a == "--cpu-workers" && i + 1 < argc) {
                 if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
             }
@@ -1403,9 +1612,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
-                    std::cerr << "Error: --devices expects 'all', 'cpu', or a "
-                                 "comma-separated list of device ids "
-                                 "(got '" << argv[i] << "')\n";
+                    std::cerr << "Error: --devices expects 'all', 'gpu', 'cpu', "
+                                 "'gpu<n>', 'cpu<n>', or a comma-separated list "
+                                 "of device ids (got '" << argv[i] << "')\n";
                     return 1;
                 }
             }
@@ -1524,7 +1733,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
         bool plot_devices_specified = false;
-        int  plot_cpu_workers     = pos2gpu::kCpuWorkersAuto;  // auto by default
+        int  plot_cpu_workers     = pos2gpu::kCpuWorkersAuto;  // count, once selected
+        bool plot_cpu_opt_in      = false;   // --cpu / --cpu-workers N; CPU is opt-in
+        std::vector<int> plot_cpu_node_ids;  // --devices cpu0,cpu1
+        bool plot_use_all_cpu_nodes = false; // --devices cpu / all
         bool plot_shard_plot      = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
         bool plot_quiet           = false;
@@ -1565,12 +1777,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                    || a == "--resume")                  plot_skip_existing = true;
             else if  (a == "--no-skip-existing"
                    || a == "--no-resume")               plot_skip_existing = false;
-            else if  (a == "--cpu")                     { if (plot_cpu_workers == 0) plot_cpu_workers = pos2gpu::kCpuWorkersAuto; }
-            else if  (a == "--no-cpu")                  plot_cpu_workers = 0;
+            else if  (a == "--cpu")                     plot_cpu_opt_in = true;
             else if  (a == "--cpu-workers" && need(1)) {
                 pos2gpu::BatchOptions tmp;
                 if (!parse_cpu_workers_arg(argv[++i], tmp)) return 1;
                 plot_cpu_workers = tmp.cpu_workers;
+                // Naming a count is a request for the CPU — carry that, or
+                // `plot --cpu-workers 4` would set a count for a CPU it never
+                // selected and plot on the GPU alone.
+                plot_cpu_opt_in |= tmp.cpu_opt_in;
             }
             else if  (a == "--shard-plot")              plot_shard_plot = true;
             else if  (a == "--no-shard-plot")           plot_shard_plot = false;
@@ -1588,23 +1803,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
                 if (!parse_devices_arg(argv[++i], tmp)) {
-                    std::cerr << "Error: --devices expects 'all', 'cpu', or a "
-                                 "comma-separated list of device ids "
-                                 "(got '" << argv[i] << "')\n";
+                    std::cerr << "Error: --devices expects 'all', 'gpu', 'cpu', "
+                                 "'gpu<n>', 'cpu<n>', or a comma-separated list "
+                                 "of device ids (got '" << argv[i] << "')\n";
                     return 1;
                 }
                 plot_device_ids       = std::move(tmp.device_ids);
                 plot_use_all_devices  = tmp.use_all_devices;
                 plot_devices_specified = true;
-                // Fold in a cpu-token count from --devices only when it carried
-                // one (tmp.cpu_workers > 0); a plain --devices leaves the earlier
-                // request untouched. Numeric max would be wrong — the auto/max
-                // defaults are negative sentinels.
-                if (tmp.cpu_workers > 0) {
-                    plot_cpu_workers = (plot_cpu_workers > 0)
-                                     ? std::max(plot_cpu_workers, tmp.cpu_workers)
-                                     : tmp.cpu_workers;
-                }
+                // The CPU SELECTION is --devices' to replace; the count is not,
+                // so plot_cpu_workers is untouched here. plot_cpu_opt_in is also
+                // untouched — it belongs to --cpu / --cpu-workers, and letting a
+                // later --devices clear it would make those flags order-dependent.
+                plot_cpu_node_ids       = std::move(tmp.cpu_node_ids);
+                plot_use_all_cpu_nodes  = tmp.use_all_cpu_nodes;
                 plot_per_device_tier  = std::move(tmp.per_device_tier);
                 plot_all_gpus_tier    = std::move(tmp.all_gpus_tier);
             }
@@ -1769,6 +1981,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.use_all_devices  = plot_use_all_devices;
             opts.devices_specified = plot_devices_specified;
             opts.cpu_workers      = plot_cpu_workers;
+            opts.cpu_node_ids     = plot_cpu_node_ids;
+            opts.use_all_cpu_nodes = plot_use_all_cpu_nodes;
+            opts.cpu_opt_in       = plot_cpu_opt_in;
             opts.shard_plot       = plot_shard_plot;
             opts.streaming_tier   = plot_streaming_tier;
             opts.per_device_tier  = plot_per_device_tier;

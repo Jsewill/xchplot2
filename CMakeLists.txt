@@ -346,6 +346,7 @@ add_library(pos2_gpu_host STATIC
     src/host/PlotFileWriterParallel.cpp
     src/host/BatchPlotter.cpp
     src/host/CpuPlotter.cpp
+    src/host/NumaTopology.cpp
     src/host/Cancel.cpp
     src/host/ConfigFile.cpp
 )
@@ -482,6 +483,18 @@ add_executable(bench_stats_test tools/parity/bench_stats_test.cpp)
 target_include_directories(bench_stats_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(bench_stats_test PRIVATE cxx_std_20)
 set_target_properties(bench_stats_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# numa_topology_test — the sysfs cpulist grammar that decides which cores a CPU
+# worker is pinned to. Same reasoning as bench_stats_test: NumaTopology is free
+# of CUDA deps so this runs on any host, and it covers the multi-socket cpulist
+# shapes ("0-15,32-47") that a single-socket dev box cannot produce and
+# therefore cannot catch by running the real thing.
+add_executable(numa_topology_test
+    tools/parity/numa_topology_test.cpp
+    src/host/NumaTopology.cpp)
+target_include_directories(numa_topology_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(numa_topology_test PRIVATE cxx_std_20)
+set_target_properties(numa_topology_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")

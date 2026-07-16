@@ -17,8 +17,8 @@ xchplot2 plot -k 28 -n 10 \
     -c <pool-contract-xch1-or-txch1> \
     -o /mnt/plots
 
-# Multi-GPU — one worker per GPU, round-robin partition.
-# (`--devices all` adds a CPU worker too; `--devices gpu` sticks to GPUs.)
+# Multi-GPU — one worker per GPU, pulling from a shared queue.
+# (`--devices all` adds the CPU too; `--devices gpu` sticks to GPUs.)
 xchplot2 plot ... --devices gpu
 ```
 
@@ -297,6 +297,42 @@ Pool variants: `-p <pool-pk>` or `--pool-ph <pool-ph>`. Other common
 flags: `-s <strength>`, `-T` testnet, `-S <seed>` for reproducible runs,
 `-v` verbose. Full help: `xchplot2 -h`.
 
+#### Per-worker rates and the batch size that lands them together
+
+Any multi-worker run — `bench`, `plot`, or `batch` — reports what each
+worker actually did, because on a shared queue the batch average is
+nobody's rate. On a TTY the progress display carries a line per worker as
+it goes (the bars are each worker's share of the batch so far, so on a
+mixed rig they are *supposed* to come out lopsided); redirected to a log
+it stays one line, and the same breakdown prints once at the end.
+
+```
+[batch] progress: plot 5/6 done (83.3%, 0.37 s/plot avg, 1.6e-06 TiB/s, batch ETA ~0s)
+[batch]   gpu0     34 plots     8.79 s/plot  ##########
+[batch]   cpu0#0    5 plots    63.10 s/plot  #---------
+
+[batch] per-worker:
+[batch]   gpu0   34 plots — 8.79 s/plot
+[batch]   cpu0#0  5 plots — 63.10 s/plot — then idle 4.2 s waiting on a peer
+[batch]   optimal batch: multiples of 8 — gpu0 7, cpu0#0 1 — every worker lands within 1.47 s (2.3% idle)
+[batch]     for a near-exact landing use multiples of 49 — gpu0 43, cpu0#0 6 — 0.01% idle
+```
+
+The **optimal batch** line answers "how many plots should I ask for so
+nobody waits". The queue splits a batch in proportion to the workers'
+rates without being told them, but it cannot split a *plot*: beside a
+63 s/plot CPU, a 8.79 s/plot GPU is worth 7.17 of it, so the CPU's fair
+share of 10 plots is 1.22 — and it must be handed 1 or 2. Either way
+somebody waits. At some sizes the fair shares land on whole plots and
+nobody does; those are the sizes worth plotting in, and any multiple of
+one works.
+
+Two are offered because they trade off. The first is the smallest size
+that wastes little. The second is the smallest that lands near-exactly —
+worth knowing because the first's error is a *fraction*, so doubling the
+batch doubles the seconds lost (8 plots idles 1.47 s; 16 idles 2.94 s),
+while the near-exact size stays tight however many you run.
+
 #### Grouping plots: `-i <plot-index>` and `-g <meta-group>`
 
 Both are v2 PoS fields and default to 0.
@@ -320,21 +356,25 @@ will expect.
 
 `xchplot2 devices` prints id, name, VRAM, SM count, and compute
 capability for every visible CUDA device, plus the host CPU plotter
-row. Use the printed `[N]` / `[cpu]` index with `--devices`:
+row. Use the printed `[gpu0]` / `[cpu0]` index with `--devices`:
 
 ```
 $ xchplot2 devices
-Visible devices (1 GPU + 1 CPU):
-  [0]   NVIDIA GeForce RTX 4090          vram=24076 MB  SMs=128  CC=8.9
-  [cpu] Host CPU plotter                 threads=32                       (1-2 orders slower than GPU)
+Visible devices (1 GPU + 1 CPU node):
+  [0]    NVIDIA GeForce RTX 4090          vram=24076 MB  SMs=128  CC=8.9
+  [cpu0] Host CPU plotter                 threads=32                         (1-2 orders slower than GPU)
 ```
+
+A multi-socket host prints one `[cpuN]` row per NUMA node, and each is
+separately selectable.
 
 Both `plot` and `batch` accept `--devices <SPEC>` to fan plots out
 across multiple NVIDIA GPUs — one worker thread per device, each
 bound via `cudaSetDevice` and carrying its own buffer pool + writer
-channel. Plots are partitioned round-robin, so a batch of 10 plots on
-2 GPUs sends plots 0/2/4/6/8 to the first GPU and 1/3/5/7/9 to the
-second.
+channel. Plots are not partitioned up front: the workers race for the
+next one off a shared queue, so each takes work in proportion to its own
+speed. A GPU twice as fast as its neighbour simply finishes about twice
+as many.
 
 ```bash
 # Every visible CUDA device — enumerated at runtime. No CPU worker.
@@ -353,19 +393,23 @@ xchplot2 plot ... --devices 0
 # CPU only, or specific GPUs + CPU as a list.
 xchplot2 plot ... --devices cpu
 xchplot2 plot ... --devices 0,1,cpu
+xchplot2 plot ... --devices gpu0,gpu1,cpu   # same thing, spelled out
 
-# Turn the default CPU workers off — pure GPU.
-xchplot2 plot ... --no-cpu
+# One NUMA node's worth of CPU only (multi-socket hosts).
+xchplot2 plot ... --devices cpu1
 ```
 
-##### CPU workers are on by default: `--cpu-workers`
+##### CPU plotting is opt-in: `--cpu` / `--cpu-workers`
 
-A few CPU plots run **automatically on every batch** (bench included), alongside
-whatever GPUs are selected and niced below them. The CPU plotter goes through
-pos2-chip's `Plotter` (no CUDA calls) and is memory-latency-bound, so concurrent
-plots interleave each other's stalls instead of queueing for a core — a handful
-is free throughput, and letting it happen by default means a GPU rig stops
-leaving its CPU idle.
+`--devices` names **devices**; `--cpu-workers` says how many plots run on each
+of them. So `cpu` means every CPU node the way `gpu` means every GPU, `cpu0`
+names one node the way `gpu0` names one card, and repeats dedup — `cpu,cpu` is
+just `cpu`, exactly as `0,0` is `0`.
+
+Once the CPU is in, its plots run alongside whatever GPUs are selected, niced
+below them. The CPU plotter goes through pos2-chip's `Plotter` (no CUDA calls)
+and is memory-latency-bound, so concurrent plots interleave each other's stalls
+instead of queueing for a core — a handful is free throughput.
 
 Measured, aggregate steady-state, 32-thread 5950X, same binary:
 
@@ -376,15 +420,34 @@ Measured, aggregate steady-state, 32-thread 5950X, same binary:
 | `N=4` | 9.63 s/plot (+41%) | 41.69 s/plot (+25%) |
 
 ```bash
-# Default: the GPU(s) plus an auto-picked number of CPU workers.
+# Default: no CPU. Zero-config is the GPU alone.
 xchplot2 plot ...
 
-# Tune or disable it:
-xchplot2 plot ... --no-cpu             # none — pure GPU
-xchplot2 plot ... --cpu-workers 2      # exactly 2 (= --devices cpu,cpu)
+# Opt in:
+xchplot2 plot ... --cpu                # GPU(s) + CPU, without naming --devices
+xchplot2 plot ... --devices all        # every GPU + every CPU node
+xchplot2 plot ... --devices cpu        # CPU only
+
+# Tune the count (naming one also opts the CPU in):
+xchplot2 plot ... --cpu-workers 2      # exactly 2 per node
 xchplot2 plot ... --cpu-workers max    # as many as fit, capped at core count
-xchplot2 plot ... --cpu-workers auto   # the default, spelled out
+xchplot2 plot ... --cpu-workers auto   # the knee — the default once selected
+xchplot2 plot ... --devices all --cpu-workers 0   # ...never mind, no CPU
 ```
+
+On a **multi-socket host** each CPU worker is pinned to one NUMA node, so its
+working set is allocated and read node-locally rather than across the
+interconnect — which matters precisely because the plotter is
+memory-latency-bound. `--cpu-workers N` is therefore *per node*: on the
+single-socket hosts these numbers were tuned on, per-node and per-host are the
+same thing.
+
+Note that pinning buys **locality, not a thread cap**: pos2-chip sizes its
+fan-out from `hardware_concurrency()`, which reports the whole host whatever the
+affinity mask says, so a node-pinned worker still oversubscribes its node. The
+~4 knee below was measured on a single socket, where a node *is* the machine; on
+a multi-socket box expect the real knee to be lower and measure it
+(`--cpu-workers N`) rather than trusting the default.
 
 The auto count is the **knee of the throughput curve** (~4), then trimmed to what
 host RAM holds — not "as many as fit". More than the knee only oversubscribes:
@@ -475,9 +538,11 @@ to pre-multi-GPU behavior, zero regression risk.
 
 **Caveats for v1:**
 
-- Static round-robin partition. If your GPUs differ in speed the
-  batch finishes only as fast as the slowest worker's slice; use
-  `--devices` to pick matched cards when that matters.
+- Mismatched devices still leave a tail. The shared queue keeps every
+  worker fed, so speed differences cost nothing until it runs dry —
+  but the last plots are held by specific workers at their own rates,
+  and a fast card can idle while a slow one finishes. `bench` prints
+  the batch sizes that land everyone together; see "Per-worker rates".
 - Each worker gets its own ~4 GB pinned host pool (pool path) or
   ~6 GB pinned scratch (compact streaming), so host RAM scales
   linearly. A 4-GPU rig pins ~16-24 GB — size accordingly.
@@ -713,11 +778,12 @@ k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
 | Producer GPU time, steady-state | 1.96 s |
 | Device-kernel floor (single-plot nsys) | 1.91 s |
 
-Numbers above are single-GPU. With `--devices 0,1,...` the batch is
-partitioned round-robin across N worker threads (one per device), so
-wall-clock throughput is bounded by the slowest device's slice —
-≈ linear scaling on matched cards, less if cards differ. Live
-multi-GPU plots were confirmed end-to-end on NVIDIA.
+Numbers above are single-GPU. With `--devices 0,1,...` N worker threads
+(one per device) race for plots off a shared queue, so each device takes
+work at its own rate and throughput is the SUM of their rates — ≈ linear
+scaling on matched cards, and mismatched cards still each contribute
+fully rather than being held to the slowest. Live multi-GPU plots were
+confirmed end-to-end on NVIDIA.
 
 ## License
 
