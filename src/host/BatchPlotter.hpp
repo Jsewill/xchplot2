@@ -101,7 +101,8 @@ struct BatchResult {
 //                       Encoded as kCpuWorkers* sentinels or a positive count:
 //                         kCpuWorkersAuto (-1, the default once selected) — the
 //                             throughput knee (~4 per node), then trimmed to what
-//                             host RAM holds.
+//                             host RAM holds. Beside a GPU the knee is 1 per
+//                             node instead — see "Why a knee" below.
 //                         kCpuWorkersMax  (-2) — as many as fit in RAM, capped at
 //                             the core count (more only oversubscribes). The
 //                             "as many as make sense" escape hatch.
@@ -125,6 +126,19 @@ struct BatchResult {
 //                       workers, each spawning 32 threads). So auto caps at the
 //                       knee; kCpuWorkersMax (RAM- and core-bounded) is there if
 //                       you want to push past it.
+//
+//                       Those are `--devices cpu` numbers, and beside a GPU they
+//                       are the wrong curve: they measure what extra workers ADD
+//                       and cannot see what they COST, which is the GPU worker's
+//                       host-side FSE consumer. Measured 2026-07-17 on an RTX
+//                       4090 + 5950X at k=28, the knee of 4 ran a batch 2.39x
+//                       SLOWER than the GPU alone (336.4 s vs 140.8 s for 55
+//                       plots) as the GPU's own rate fell 2.56 → 4.23 s/plot; 1
+//                       worker was a wash (2.57). So auto uses a knee of 1 per
+//                       node whenever a GPU worker is in the batch. Both effects
+//                       that make 4 wrong ease as the GPU slows, so a weak-GPU
+//                       host may want more — measure it with
+//                       XCHPLOT2_CPU_AUTO_WORKERS before assuming.
 //
 //                       It also costs a full copy of the plotter's working set
 //                       per worker (12.14 GiB at k=28), which is why

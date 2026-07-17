@@ -97,12 +97,14 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     thousands of GPU threads and are 4.3x slower on a CPU. CPU plotting is
     **opt-in** — `--devices cpu`, `--devices all`, or `--cpu` — and runs
     alongside the GPUs, niced below them. Once asked for, the count is
-    picked automatically (the throughput knee, ~4 per NUMA node, trimmed to
-    what host RAM holds), because the CPU plotter is memory-latency-bound
-    and a handful of concurrent plots interleave each other's stalls for
-    free throughput (+19% at N=2, k=28). `--cpu-workers auto|max|N|off`
-    tunes it. Per-plot the CPU is still 1-2 orders of magnitude slower than
-    a real GPU. Build the container with
+    picked automatically and trimmed to what host RAM holds: the throughput
+    knee (~4 per NUMA node) when the CPU plots **alone**, where concurrent
+    plots interleave each other's memory stalls for free throughput (+19% at
+    N=2, k=28) — but **1 per node beside a GPU**, where they are not free and
+    are bought with the cores the GPU's FSE consumer needs (on an RTX 4090 at
+    k=28 the CPU-only knee of 4 ran a batch 2.39x *slower* than the GPU
+    alone). `--cpu-workers auto|max|N|off` tunes it. Per-plot the CPU is
+    still 1-2 orders of magnitude slower than a real GPU. Build the container with
     `scripts/build-container.sh --gpu cpu` for the standalone CPU
     image (`xchplot2:cpu`, ~400 MB; no CUDA / ROCm in the image).
 - **VRAM:** five tiers, picked automatically based on free device
@@ -897,7 +899,18 @@ each of them. So `cpu` means every CPU node the way `gpu` means every GPU,
 Once the CPU is in, its plots run alongside whatever GPUs are selected,
 niced below them. The CPU plotter is memory-latency-bound, so concurrent
 plots interleave each other's stalls rather than queueing for a core — a
-handful is free throughput.
+handful is free throughput **when the CPU plots alone**.
+
+Beside a GPU it is not free, and `auto` picks **1 per node** rather than the
+~4 knee. Each CPU worker fans out to every core, and the cores it takes are
+the ones the GPU worker's FSE consumer needs to turn a finished plot around.
+That compression work is fixed by `k` while the GPU's compute time is not, so
+the faster the card, the worse the trade: on an RTX 4090 at k=28 the CPU-only
+knee of 4 cost 65% of the GPU's own rate (2.56 → 4.23 s/plot) to add 4% of
+its own, running a 55-plot batch **2.39x slower than the GPU alone**. One
+worker was a wash. A slower card flips this — its consumer has ten times as
+long for the same work, and the CPU's share of the total rises — so a
+slow-GPU host may want more, which `--cpu-workers N` sets.
 
 ```bash
 # Default: no CPU. Zero-config is the GPU alone.
@@ -911,7 +924,7 @@ xchplot2 plot ... --devices cpu        # CPU only
 # Tune the count (naming one also opts the CPU in):
 xchplot2 plot ... --cpu-workers 2      # exactly 2 per node
 xchplot2 plot ... --cpu-workers max    # as many as fit, capped at core count
-xchplot2 plot ... --cpu-workers auto   # the knee — the default once selected
+xchplot2 plot ... --cpu-workers auto   # the knee (1 beside a GPU) — the default once selected
 xchplot2 plot ... --devices all --cpu-workers 0   # ...never mind, no CPU
 ```
 
