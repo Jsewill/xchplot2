@@ -912,6 +912,16 @@ worker was a wash. A slower card flips this — its consumer has ten times as
 long for the same work, and the CPU's share of the total rises — so a
 slow-GPU host may want more, which `--cpu-workers N` sets.
 
+Either way, a slow worker no longer drags out the tail of a run. As the queue
+drains, each worker stands down rather than start a plot the faster workers would
+finish the whole remainder before — so a CPU worker beside a fast 4090 stops
+pulling with ~16-20 plots left (fewer as the card slows, since each GPU plot
+takes longer), and does not run at all on a batch too short to help. The same
+guard covers a **slow GPU beside a fast one**: it is worker-general, not a CPU
+special case. It can only ever decline work a worker would finish last on, so it
+never lengthens a run, and a uniform fleet (nobody strictly faster) is left
+untouched. `XCHPLOT2_TAIL_GUARD=0` turns it off.
+
 ```bash
 # Default: no CPU. Zero-config is the GPU alone.
 xchplot2 plot ...
