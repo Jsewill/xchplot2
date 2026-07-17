@@ -516,6 +516,39 @@ inline bool cpu_adaptive_enabled()
     return v && v[0] == '1';
 }
 
+// The tail guard (default ON; XCHPLOT2_TAIL_GUARD=0 disables). A worker about to
+// pull the next job retires instead when the workers strictly faster than it can
+// drain everything left before it would finish one more plot — so a slow worker
+// (a CPU beside a GPU, or a slow card beside a fast one) never grabs a tail job a
+// faster peer would clear sooner, and never starts at all on a batch too short to
+// help. Worker-general, and one-directional: it can only ever DECLINE work a
+// worker would finish last on, so it cannot lengthen a run, and a uniform fleet
+// (nobody strictly faster) is left untouched. Unlike XCHPLOT2_CPU_ADAPTIVE, which
+// governs how MANY CPU workers run beside a GPU, this governs whether ANY worker
+// should take the next job as the queue drains — a different question, so a
+// different switch.
+inline bool tail_guard_enabled()
+{
+    char const* v = std::getenv("XCHPLOT2_TAIL_GUARD");
+    return !(v && v[0] == '0');
+}
+
+// Seconds/plot the tail guard assumes for a worker that has not measured its own
+// rate yet, seeded by device class so a known-slow CPU worker can stand down on a
+// batch too short to help before it has finished even one plot. Replaced by the
+// worker's measured rate after two completions. The CPU prior is overridable (for
+// other CPUs / other k); the GPU prior only has to sit well below it, so any card
+// reads as "faster" than the CPU pre-measurement.
+inline double cpu_plot_seconds_prior()
+{
+    if (char const* v = std::getenv("XCHPLOT2_CPU_PLOT_SECONDS"); v && v[0]) {
+        double const d = std::atof(v);
+        if (d > 0.0) return d;
+    }
+    return 45.0;  // measured 40-50 s on a desktop core group at k=28
+}
+inline constexpr double kGpuPlotSecondsPrior = 3.0;
+
 // Defined below, next to cpu_worker_auto_count; CpuRateGovernor needs it here.
 int cpu_target_for_gpu_rate(double s_gpu_seconds);
 
@@ -533,6 +566,20 @@ struct LiveWorker {
     // device-derived prefix.
     std::string label;
 };
+
+// A worker's measured seconds-per-plot from its own completions, anchored on its
+// first (cold) plot the way the ETA and the governor do — 0 until it has two, so
+// a single cold plot cannot fake a rate. The tail guard falls back to the seeded
+// prior while this is 0.
+inline double worker_measured_s_per_plot(LiveWorker const& w)
+{
+    std::size_t const n = w.written.load(std::memory_order_relaxed);
+    if (n < 2) return 0.0;
+    double const first = w.first_done.load(std::memory_order_relaxed);
+    double const last  = w.last_done.load(std::memory_order_relaxed);
+    if (last <= first) return 0.0;
+    return (last - first) / static_cast<double>(n - 1);
+}
 
 // Adaptive admission for CPU workers, complementing CpuMemoryGate.
 //
@@ -688,9 +735,68 @@ struct BatchProgress {
     // XCHPLOT2_CPU_ADAPTIVE=1 on a GPU+CPU batch. See CpuRateGovernor.
     std::unique_ptr<CpuRateGovernor> cpu_rate_gov;
 
+    // Per-worker seconds/plot prior for the tail guard, used until each worker has
+    // measured its own rate. Seeded by device class in run_batch (CPU slow, GPU
+    // fast); 0 in an unseeded slot, which makes the guard fall back to measured-
+    // only for it. Sized with the worker count so the guard can index it freely.
+    std::vector<double> worker_prior_s;
+
     BatchProgress(std::size_t worker_count, std::size_t total_entries)
-        : workers(worker_count), total(total_entries) {}
+        : workers(worker_count), total(total_entries),
+          worker_prior_s(worker_count, 0.0) {}
 };
+
+// Worker-general tail guard — see tail_guard_enabled(). Returns true (→ this
+// worker should retire from the queue rather than pull) when the workers strictly
+// faster than it can drain the `remaining` unclaimed plots before it would finish
+// one more of its own. `why`, if given, gets a one-line reason for the log.
+//
+// The rule: faster workers supply rate_faster plots/sec, so they clear `remaining`
+// in remaining / rate_faster s; retire once that is <= this worker's own per-plot
+// time, i.e. remaining <= t_self * rate_faster. Nobody strictly faster — a uniform
+// fleet, or the fastest worker itself — gives rate_faster 0 and never retires. The
+// 10% margin keeps near-equal peers from counting each other, so rate noise cannot
+// churn a balanced fleet. Rates are read lock-free: a torn read only misprices one
+// iteration of a heuristic re-asked at every pull.
+bool tail_guard_should_retire(BatchProgress const& live, int worker_id,
+                              std::size_t remaining, std::string* why)
+{
+    if (remaining == 0) return false;  // queue already dry — the pull loop breaks
+    if (worker_id < 0 ||
+        static_cast<std::size_t>(worker_id) >= live.workers.size()) return false;
+    if (live.worker_prior_s.size() != live.workers.size()) return false;
+    std::size_t const self = static_cast<std::size_t>(worker_id);
+
+    auto s_per_plot = [&](std::size_t i) -> double {
+        double const m = worker_measured_s_per_plot(live.workers[i]);
+        return m > 0.0 ? m : live.worker_prior_s[i];  // measured, else seeded prior
+    };
+    double const t_self = s_per_plot(self);
+    if (t_self <= 0.0) return false;  // no estimate for this worker — do not guard
+
+    double rate_faster = 0.0;  // plots/sec of workers meaningfully faster than self
+    int    n_faster    = 0;
+    for (std::size_t i = 0; i < live.workers.size(); ++i) {
+        if (i == self) continue;
+        double const t_i = s_per_plot(i);
+        if (t_i > 0.0 && t_i < 0.9 * t_self) { rate_faster += 1.0 / t_i; ++n_faster; }
+    }
+    if (rate_faster <= 0.0) return false;  // nobody faster can cover the tail
+
+    if (static_cast<double>(remaining) > t_self * rate_faster) return false;
+
+    if (why) {
+        char buf[224];
+        std::snprintf(buf, sizeof(buf),
+            "standing down: %zu plot%s left — the faster worker%s finish %s before "
+            "one more ~%.0f s plot here would; idle from here",
+            remaining, remaining == 1 ? "" : "s",
+            n_faster == 1 ? "" : "s",
+            remaining == 1 ? "it" : "them", t_self);
+        *why = buf;
+    }
+    return true;
+}
 
 std::string format_duration_hms(double seconds)
 {
@@ -1506,6 +1612,25 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 break;  // the batch is over, or cancelled — this worker retires
             }
 
+            // Tail guard (default on): stop pulling once the faster workers will
+            // clear the queue before this CPU worker finishes one more plot — the
+            // 40-50 s CPU tail a fast GPU would otherwise wait on, and the whole of
+            // a batch too short to help. Ahead of the memory gate so a stood-down
+            // worker never sat holding RAM.
+            if (tail_guard_enabled() && shared_idx) {
+                std::size_t const claimed =
+                    shared_idx->load(std::memory_order_relaxed);
+                std::size_t const remaining =
+                    claimed < entries.size() ? entries.size() - claimed : 0;
+                std::string why;
+                if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
+                    if (!opts.quiet)
+                        std::fprintf(stderr, "%s %s\n",
+                                     log_prefix.c_str(), why.c_str());
+                    break;
+                }
+            }
+
             CpuMemoryLease lease;
             if (live.cpu_gate) {
                 if (live.cpu_gate->acquire(log_prefix.c_str(), opts.quiet,
@@ -2146,6 +2271,26 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         std::size_t local_count = 0;
         while (true) {
             if (consumer_failed) break;
+
+            // Tail guard (default on): a slower card stops pulling once the faster
+            // cards can drain what's left before it finishes one more plot, so it
+            // never grabs a tail job a faster peer would clear sooner. A no-op for
+            // the fastest worker (nobody strictly faster) and for single-worker
+            // runs (no shared queue). See tail_guard_should_retire.
+            if (tail_guard_enabled() && shared_idx) {
+                std::size_t const claimed =
+                    shared_idx->load(std::memory_order_relaxed);
+                std::size_t const remaining =
+                    claimed < entries.size() ? entries.size() - claimed : 0;
+                std::string why;
+                if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
+                    if (!opts.quiet)
+                        std::fprintf(stderr, "%s %s\n",
+                                     log_prefix.c_str(), why.c_str());
+                    break;
+                }
+            }
+
             std::size_t const i = shared_idx
                 ? shared_idx->fetch_add(1, std::memory_order_relaxed)
                 : local_idx++;
@@ -2551,6 +2696,15 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     live.gpu_peer_present =
         std::any_of(device_ids.begin(), device_ids.end(),
                     [](int id) { return !is_cpu_device(id); });
+
+    // Seed the tail guard's per-worker priors by device class, so a known-slow CPU
+    // worker can stand down on a batch too short to help before it has measured
+    // its own rate. Each is replaced by that worker's measured rate after 2 plots.
+    for (std::size_t i = 0; i < N && i < live.worker_prior_s.size(); ++i) {
+        live.worker_prior_s[i] = is_cpu_device(device_ids[i])
+                                     ? cpu_plot_seconds_prior()
+                                     : kGpuPlotSecondsPrior;
+    }
 
     live.cpu_gate = make_cpu_gate(N - cpu_workers_placed);  // the rest are GPUs
 
