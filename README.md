@@ -409,7 +409,8 @@ just `cpu`, exactly as `0,0` is `0`.
 Once the CPU is in, its plots run alongside whatever GPUs are selected, niced
 below them. The CPU plotter goes through pos2-chip's `Plotter` (no CUDA calls)
 and is memory-latency-bound, so concurrent plots interleave each other's stalls
-instead of queueing for a core — a handful is free throughput.
+instead of queueing for a core — a handful is free throughput **when the CPU
+plots alone**.
 
 Measured, aggregate steady-state, 32-thread 5950X, same binary:
 
@@ -418,6 +419,15 @@ Measured, aggregate steady-state, 32-thread 5950X, same binary:
 | `N=1` | 13.57 s/plot | 52.28 s/plot |
 | `N=2` | 10.59 s/plot (+28%) | 43.85 s/plot (+19%) |
 | `N=4` | 9.63 s/plot (+41%) | 41.69 s/plot (+25%) |
+
+Beside a GPU those are the wrong curve: they are `--devices cpu` figures, so
+they see what extra workers ADD but not what they COST the GPU worker's
+host-side FSE consumer. On an RTX 4090 at k=28 the knee of 4 ran a 55-plot
+batch **2.39x slower than the GPU alone** (the GPU's own rate fell 2.56 → 4.23
+s/plot); one worker was a wash. So `auto` picks **1 per node** beside a GPU. A
+slower card flips this — its consumer has ten times as long for the same work
+— so a slow-GPU host may want more, which `--cpu-workers N` sets, or
+`XCHPLOT2_CPU_ADAPTIVE=1` picks automatically from the GPU's measured rate.
 
 ```bash
 # Default: no CPU. Zero-config is the GPU alone.
@@ -431,7 +441,7 @@ xchplot2 plot ... --devices cpu        # CPU only
 # Tune the count (naming one also opts the CPU in):
 xchplot2 plot ... --cpu-workers 2      # exactly 2 per node
 xchplot2 plot ... --cpu-workers max    # as many as fit, capped at core count
-xchplot2 plot ... --cpu-workers auto   # the knee — the default once selected
+xchplot2 plot ... --cpu-workers auto   # the knee (1 beside a GPU) — the default once selected
 xchplot2 plot ... --devices all --cpu-workers 0   # ...never mind, no CPU
 ```
 

@@ -506,6 +506,19 @@ private:
 //
 // Every strategy publishes here, single-worker ones into a one-slot table, so
 // emit_progress_line has exactly one shape to reason about.
+// Enabled by XCHPLOT2_CPU_ADAPTIVE=1: beside a GPU, spawn the RAM-capped knee of
+// CPU workers and let CpuRateGovernor throttle how many actually RUN by the GPU's
+// measured plot rate, instead of hardcoding 1. Opt-in while it proves out; the
+// default path is unchanged, so it cannot regress the shipped behaviour.
+inline bool cpu_adaptive_enabled()
+{
+    char const* v = std::getenv("XCHPLOT2_CPU_ADAPTIVE");
+    return v && v[0] == '1';
+}
+
+// Defined below, next to cpu_worker_auto_count; CpuRateGovernor needs it here.
+int cpu_target_for_gpu_rate(double s_gpu_seconds);
+
 struct LiveWorker {
     std::atomic<std::size_t> written{0};
     std::atomic<std::size_t> in_flight{0};  // pulled off the queue, not retired
@@ -519,6 +532,103 @@ struct LiveWorker {
     // reader). Empty on the single-worker fast path, which keeps its historical
     // device-derived prefix.
     std::string label;
+};
+
+// Adaptive admission for CPU workers, complementing CpuMemoryGate.
+//
+// CpuMemoryGate answers "does the host have RAM for one more plot?" — a question
+// about the box. This answers "does the GPU's measured speed justify one more CPU
+// worker?" — a question about the peer. cpu_worker_auto_count picks 1 beside a GPU
+// because at t=0 it cannot know the GPU's speed; here, a few plots in, we can.
+//
+// The pattern mirrors the memory gate: spawn the RAM-capped knee of CPU workers,
+// then keep only cpu_target_for_gpu_rate(measured) of them ACTIVE. A surplus
+// worker parks in wait_active() holding no RAM and (having never claimed a plot)
+// no cores, ready to step in if the GPU turns out slow. Two deliberate choices
+// keep the bimodal rate noise (the very thing that defeated the crossover sweep)
+// from thrashing workers:
+//
+//   * MEASURE FIRST. Until the GPUs have a few WARM plots (rate anchored on each
+//     one's first completion, cold plot excluded — as the ETA does), hold at the
+//     floor of 1. A cold first plot must not fake a slow reading and over-spawn on
+//     a fast card.
+//   * MONOTONIC UP. The active count only ever rises — we raise it once we learn
+//     the GPU is slow, and never kill an already-running worker on a later wobble.
+//
+// Bound to BatchProgress::workers (constructed first). No notification path: a
+// parked worker re-checks on a 1 s tick, which is immaterial against ~seconds per
+// plot and needs no producer to remember to wake it.
+class CpuRateGovernor {
+public:
+    // gpu_slots / cpu_ordinal index into the same `workers` vector: gpu_slots are
+    // the GPU workers whose rate we read; cpu_ordinal[i] is worker i's 0-based
+    // rank among CPU workers, or -1 if it is not one.
+    CpuRateGovernor(std::vector<LiveWorker> const& workers,
+                    std::vector<std::size_t>       gpu_slots,
+                    std::vector<int>               cpu_ordinal)
+        : workers_(workers)
+        , gpu_slots_(std::move(gpu_slots))
+        , cpu_ordinal_(std::move(cpu_ordinal))
+    {}
+
+    // Blocks until worker `worker_id`'s CPU ordinal is within the active count the
+    // GPU's rate currently allows. Returns false (→ the worker retires) when the
+    // work is gone, so a parked worker can never outlive the batch and hang join.
+    bool wait_active(int worker_id, std::function<bool()> const& still_wanted)
+    {
+        int const ord = (worker_id >= 0 &&
+                         worker_id < static_cast<int>(cpu_ordinal_.size()))
+                            ? cpu_ordinal_[static_cast<std::size_t>(worker_id)]
+                            : -1;
+        if (ord < 0) return true;  // not a CPU worker — nothing to govern
+
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            if (still_wanted && !still_wanted()) return false;
+            if (ord < target_locked()) return true;
+            cv_.wait_for(lk, std::chrono::seconds(1));  // re-check as rate settles
+        }
+    }
+
+private:
+    // How many CPU workers the GPUs' current rate justifies. Only ever grows.
+    int target_locked()
+    {
+        std::size_t gpu_done = 0;
+        double      sum_s    = 0.0;
+        int         rated    = 0;
+        for (std::size_t slot : gpu_slots_) {
+            LiveWorker const& w = workers_[slot];
+            std::size_t const n = w.written.load(std::memory_order_relaxed);
+            gpu_done += n;
+            if (n >= 2) {
+                double const first = w.first_done.load(std::memory_order_relaxed);
+                double const last  = w.last_done.load(std::memory_order_relaxed);
+                if (last > first) {
+                    sum_s += (last - first) / static_cast<double>(n - 1);
+                    ++rated;
+                }
+            }
+        }
+        // Still measuring: hold at whatever we have committed (the floor at start).
+        if (gpu_done < kMeasurePlots || rated == 0) return committed_target_;
+
+        int const want = cpu_target_for_gpu_rate(sum_s / rated);  // mean per-GPU
+        if (want > committed_target_) committed_target_ = want;   // monotonic up
+        return committed_target_;
+    }
+
+    // Warm GPU plots (across all GPUs) required before the rate is trusted. The
+    // first is cold and excluded from the rate, so this leaves ~kMeasurePlots-1
+    // warm intervals to average — enough to shrug off a single slow plot.
+    static constexpr std::size_t kMeasurePlots = 6;
+
+    std::vector<LiveWorker> const& workers_;
+    std::vector<std::size_t> const gpu_slots_;
+    std::vector<int> const         cpu_ordinal_;
+    std::mutex                     m_;
+    std::condition_variable        cv_;
+    int                            committed_target_ = 1;  // opt-in floor
 };
 
 struct BatchProgress {
@@ -573,6 +683,10 @@ struct BatchProgress {
     // Admission control for the CPU workers, re-asked at every plot boundary.
     // Null when the batch has no CPU worker. See CpuMemoryGate.
     std::unique_ptr<CpuMemoryGate> cpu_gate;
+
+    // Adaptive CPU-worker throttle, keyed on the GPU's measured rate. Null unless
+    // XCHPLOT2_CPU_ADAPTIVE=1 on a GPU+CPU batch. See CpuRateGovernor.
+    std::unique_ptr<CpuRateGovernor> cpu_rate_gov;
 
     BatchProgress(std::size_t worker_count, std::size_t total_entries)
         : workers(worker_count), total(total_entries) {}
@@ -1367,23 +1481,33 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             //
             // Declared inside the loop so every exit path — break, continue,
             // throw, or a normal iteration — hands the reservation back.
+            // Stop waiting the moment the work is gone. A worker parked in a gate
+            // cannot see the queue drain or a cancel land, and on a GPU+CPU rig
+            // that is a hang: the GPUs finish the batch and run_batch joins a CPU
+            // worker still waiting to fund (or be admitted for) a plot nobody
+            // needs any more. Shared by both admission gates below.
+            auto const still_wanted = [&]() -> bool {
+                if (cancel_requested()) return false;
+                if (shared_idx &&
+                    shared_idx->load(std::memory_order_relaxed) >=
+                        entries.size()) {
+                    return false;
+                }
+                return true;
+            };
+
+            // Adaptive admission, ahead of the memory gate: park this worker until
+            // the GPU's measured rate justifies its ordinal (XCHPLOT2_CPU_ADAPTIVE).
+            // A no-op when the governor is unset (the default) or the worker is
+            // already within target. Parking here holds no memory, so it never
+            // deadlocks the memory gate.
+            if (live.cpu_rate_gov &&
+                !live.cpu_rate_gov->wait_active(worker_id, still_wanted)) {
+                break;  // the batch is over, or cancelled — this worker retires
+            }
+
             CpuMemoryLease lease;
             if (live.cpu_gate) {
-                // Stop waiting for memory the moment the work it was for is gone.
-                // A worker parked in acquire() cannot see the queue drain or a
-                // cancel land, and on a GPU+CPU rig that is a hang: the GPUs
-                // finish the batch and run_batch joins a CPU worker still waiting
-                // to fund a plot nobody needs any more.
-                auto const still_wanted = [&]() -> bool {
-                    if (cancel_requested()) return false;
-                    if (shared_idx &&
-                        shared_idx->load(std::memory_order_relaxed) >=
-                            entries.size()) {
-                        return false;
-                    }
-                    return true;
-                };
-
                 if (live.cpu_gate->acquire(log_prefix.c_str(), opts.quiet,
                                            still_wanted) ==
                     CpuMemoryGate::Verdict::Admitted) {
@@ -2430,6 +2554,24 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
 
     live.cpu_gate = make_cpu_gate(N - cpu_workers_placed);  // the rest are GPUs
 
+    // Adaptive CPU throttle: only when opted in, and only on a mixed GPU+CPU team
+    // — it reads GPU rate to gate CPU workers, so it needs both present. The spawn
+    // count stayed the knee (cpu_worker_auto_count under adaptive); the governor
+    // decides how many of those workers actually run.
+    if (cpu_adaptive_enabled() && live.gpu_peer_present) {
+        std::vector<std::size_t> gpu_slots;
+        std::vector<int>         cpu_ordinal(N, -1);
+        int cpu_seen = 0;
+        for (std::size_t i = 0; i < N; ++i) {
+            if (is_cpu_device(device_ids[i])) cpu_ordinal[i] = cpu_seen++;
+            else                              gpu_slots.push_back(i);
+        }
+        if (!gpu_slots.empty() && cpu_seen > 0) {
+            live.cpu_rate_gov = std::make_unique<CpuRateGovernor>(
+                live.workers, std::move(gpu_slots), std::move(cpu_ordinal));
+        }
+    }
+
     std::vector<BatchResult>         per_worker(N);
     std::vector<std::exception_ptr>  per_worker_exc(N);
     std::vector<std::thread>         workers;
@@ -2595,14 +2737,74 @@ std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
 // WHOLE-HOST-sized thread fan-out onto its node's cores (see NumaTopology.hpp),
 // so the real knee there is probably lower, and this is a starting point for
 // measurement rather than a number anyone has stood behind.
-int cpu_worker_auto_count(int node_cores)
+//
+// `gpu_peer` collapses the knee to 1, because the curve above is the wrong one
+// to be standing on beside a GPU. It was measured under `--devices cpu`, so it
+// can only see what extra workers ADD (they interleave each other's memory
+// stalls: +36% at N=4). What it cannot see is what they COST, which is the GPU
+// worker's FSE consumer: that runs on the host, its work per plot is fixed by k
+// while the GPU's compute time is not, and a fast card needs it to turn a plot
+// around every couple of seconds. A CPU worker's whole-host thread fan-out
+// starves exactly that, and the peer it starves is worth ~24 of it.
+//
+// Measured 2026-07-17, RTX 4090 + 5950X at k=28:
+//
+//   workers   GPU rate      aggregate    vs GPU alone
+//   0         2.56 s/plot   2.56         —
+//   1         2.68          2.57         a wash (-0.35%)
+//   4 (knee)  4.23          4.23         2.39x SLOWER whole-run
+//
+// At the CPU-only knee of 4 the batch took 336.4 s against the 140.8 s the GPU
+// would have needed alone, and the GPU's own rate fell by 65%. One worker is a
+// wash here and still buys 74% of the CPU's own N=4 throughput, so it is the
+// risk-adjusted pick: near-free on a card this fast, and most of the prize on a
+// slow one. The two effects that make 4 wrong both ease as the GPU slows (a
+// slower card's consumer has a lower duty cycle, and the CPU's share of the
+// total rises), so a slow-GPU host may well want more than 1 — but nobody has
+// measured one. Until somebody does, 1 is the number that cannot lose badly.
+// XCHPLOT2_CPU_AUTO_WORKERS overrides for exactly that measurement.
+int cpu_worker_auto_count(int node_cores, bool gpu_peer)
 {
     if (char const* v = std::getenv("XCHPLOT2_CPU_AUTO_WORKERS"); v && v[0]) {
         int const n = std::atoi(v);
         if (n >= 1 && n <= 64) return n;
     }
     int const cores = node_cores > 0 ? node_cores : 8;
-    return std::min(4, std::max(1, cores / 2));
+    int const knee  = std::min(4, std::max(1, cores / 2));
+    // Beside a GPU the safe pick is 1 (see the table above) — UNLESS the adaptive
+    // governor is on, in which case we spawn the knee and let CpuRateGovernor
+    // throttle the ACTIVE count down from it by the GPU's measured rate.
+    if (gpu_peer) return cpu_adaptive_enabled() ? knee : 1;
+    return knee;
+}
+
+// Adaptive CPU-worker target from the GPU's MEASURED plot rate.
+//
+// cpu_worker_auto_count cannot know the GPU's speed — it sees only cores and RAM
+// — so beside a GPU it plays safe and picks 1. But the right count is a steep
+// function of how fast the GPU actually is, and that becomes knowable a few plots
+// in. This maps a measured GPU s/plot to the worker count that maximised rig
+// throughput in the 2026-07-17 k=28 bench-A/B sweeps (RTX 4090 + 5950X):
+//
+//   s_gpu (s/plot)   n*   evidence
+//   2.56 (native)    ~0   1 was a wash, 4 ran 2.39x slower whole-run
+//   6.86 (1005 MHz)  1    gains 13.3 / 11.2 / 10.7 — decreasing in n
+//   9.45-9.50        4    two runs agree: native 510 MHz + bracket-validated 705
+//
+// The 6.9-9.5 gap is UNMEASURED: the throttled 4090's rate proved too bimodal to
+// pin the crossover. The ramp across it is a monotone interpolation between the
+// two solid endpoints — and as an adaptive input (re-evaluated against the live
+// rate, not frozen at t=0) it is a forgiving place for a guess. The floor is 1,
+// never 0: --cpu is opt-in, so resolving a request to zero would ignore it, and 1
+// is a wash at worst on a card this fast. The ceiling is 4 (measured); RAM trims
+// it further at the call site, so this need not know the host's memory.
+int cpu_target_for_gpu_rate(double s_gpu_seconds)
+{
+    if (s_gpu_seconds <= 0.0) return 1;   // no rate yet — the safe opt-in floor
+    if (s_gpu_seconds < 7.0)  return 1;   // fast GPU: 6.86 measured n*=1
+    if (s_gpu_seconds < 8.0)  return 2;   // crossover ramp (interpolated)
+    if (s_gpu_seconds < 9.0)  return 3;   // crossover ramp (interpolated)
+    return 4;                             // slow GPU: 9.45-9.50 measured n*=4
 }
 
 // How many CPU workers actually fit, resolving the cpu_workers request against
@@ -2636,8 +2838,12 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
         return n.cpus.empty() ? host_cores : static_cast<int>(n.cpus.size());
     };
 
+    // Only `auto` is GPU-aware. `max` and an exact N are the caller saying what
+    // they want; this is the one setting that asked US to choose, so it is the
+    // only one entitled to change its mind about the answer.
+    bool const gpu_peer = gpu_count > 0;
     int knee = 0;
-    for (auto const& n : nodes) knee += cpu_worker_auto_count(node_cores(n));
+    for (auto const& n : nodes) knee += cpu_worker_auto_count(node_cores(n), gpu_peer);
 
     // Pre-RAM target: auto → the summed per-node knee; max → the HOST core count
     // (each worker already fans out to every core, so more than that is pure
@@ -2709,7 +2915,20 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
                 *note += " — RAM holds " + std::to_string(fits) + " of the ~" +
                          std::to_string(knee) + " that help here";
             }
-            *note += ". --cpu-workers 0 to disable";
+            if (is_auto && gpu_peer && cpu_adaptive_enabled()) {
+                *note += " — spawned beside a GPU for the adaptive governor to "
+                         "throttle: only as many run as the GPU's measured plot "
+                         "rate justifies (1 on a fast card, up to the knee on a "
+                         "slow one)";
+            } else if (is_auto && gpu_peer) {
+                *note += " — held to 1 per node beside a GPU: the CPU-only knee "
+                         "(~4) measures what extra workers add, not what they "
+                         "cost the GPU's FSE consumer (4 of them ran 2.39x "
+                         "slower than the GPU alone on a 4090)";
+            }
+            *note += is_auto && gpu_peer
+                         ? ". --cpu-workers N to override, 0 to disable"
+                         : ". --cpu-workers 0 to disable";
         // Auto used to stay silent here, because auto was the DEFAULT and
         // declining to add CPU workers nobody asked for is not news. Under the
         // opt-in it is: reaching auto at all means the CPU was requested, so

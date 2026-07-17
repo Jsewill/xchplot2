@@ -118,6 +118,14 @@ struct BatchResult {
 //                     worker (12.14 GiB at k=28), which is why resolve_batch_devices
 //                     trims the count against host RAM, subtracting each GPU
 //                     worker's host footprint first.
+//
+//                     Beside a GPU those are the wrong numbers: measured under
+//                     `--devices cpu`, they see what extra workers ADD, never what
+//                     they COST the GPU worker's host-side FSE consumer. On an RTX
+//                     4090 at k=28 the knee of 4 ran a batch 2.39x SLOWER than the
+//                     GPU alone, so auto picks 1 per node whenever a GPU worker is
+//                     present. XCHPLOT2_CPU_ADAPTIVE=1 instead spawns the knee and
+//                     throttles the active count by the GPU's measured plot rate.
 //   streaming_tier  — manual override for the streaming pipeline tier
 //                     (when the GPU pool doesn't fit). Accepted values:
 //                     "plain" (~7.4 GiB floor at k=28, ~10-15% faster),
