@@ -56,6 +56,40 @@ int main()
     all_ok = check(eq(parse_cpu_list("2-4,3-5"), {2, 3, 4, 5}),
                    "cpulist: overlapping ranges merge") && all_ok;
 
+    // format_cpu_list: the inverse, used to REPORT a pin the operator would
+    // otherwise have to take on trust. It renders a mask read back out of the
+    // kernel, so a wrong answer here misreports a correct pin (or vouches for a
+    // broken one) in the one line written to reassure someone.
+    {
+        using pos2gpu::format_cpu_list;
+        all_ok = check(format_cpu_list({}).empty(), "format: empty renders empty")
+                 && all_ok;
+        all_ok = check(format_cpu_list({4}) == "4", "format: single id, not 4-4")
+                 && all_ok;
+        all_ok = check(format_cpu_list({0, 1, 2, 3}) == "0-3",
+                       "format: a run collapses") && all_ok;
+        all_ok = check(format_cpu_list({1, 3, 5}) == "1,3,5",
+                       "format: non-adjacent ids stay listed") && all_ok;
+        // The case this exists for: one socket of a dual-socket box.
+        std::vector<int> socket1;
+        for (int c = 32; c <= 63; ++c) socket1.push_back(c);
+        all_ok = check(format_cpu_list(socket1) == "32-63",
+                       "format: a whole socket is one range") && all_ok;
+        all_ok = check(format_cpu_list({5, 1, 3, 1}) == "1,3,5",
+                       "format: unsorted/duplicated input normalises") && all_ok;
+
+        // Round-trip against the parser on the shapes sysfs actually emits.
+        // Either direction alone can be self-consistently wrong; together they
+        // pin the grammar.
+        for (char const* s : {"0", "0-31", "1,3,5", "0-15,32-47", "0-3,8,10-11"}) {
+            auto const ids = parse_cpu_list(s);
+            all_ok = check(format_cpu_list(ids) == s,
+                           "format: round-trips its own cpulist") && all_ok;
+            all_ok = check(eq(parse_cpu_list(format_cpu_list(ids)), ids),
+                           "format: parse(format(x)) == x") && all_ok;
+        }
+    }
+
     // Absent sysfs reads as empty, which must mean "no cpus", never "cpu 0".
     // pin_thread_to_cpus treats empty as "do not pin" — a mask of exactly CPU 0
     // would instead confine the whole plotter to one core.

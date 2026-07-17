@@ -1276,16 +1276,57 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // The guard outlives the pin for the whole slice and hands the thread's
         // mask back on the way out — load-bearing because the single-worker fast
         // path runs this on the CALLER's thread. See ScopedThreadAffinity.
+        //
+        // XCHPLOT2_CPU_NO_PIN=1 keeps the node-per-worker layout and the labels
+        // but skips the pin, which is the only way to A/B what locality is worth
+        // on a given box: the alternative (`--devices cpu0`) also halves the
+        // cores, so it measures two changes at once. It is a diagnostic, and it
+        // makes the cpuN labels describe an intent the run no longer honours —
+        // so it announces itself rather than skewing a benchmark silently.
+        char const* no_pin = std::getenv("XCHPLOT2_CPU_NO_PIN");
+        bool const  pin_disabled = no_pin && no_pin[0] == '1';
+
         ScopedThreadAffinity affinity_restore;
-        if (auto const nodes = host_numa_nodes(); nodes.size() > 1) {
+        auto const nodes = host_numa_nodes();
+        // Both branches require a multi-node host: on a single-node box there is
+        // no pin to make and none to skip, so NO_PIN must stay silent there
+        // rather than announce a no-op as though it had changed something.
+        //
+        // `quiet` gates only the message, never the dispatch — folding it into
+        // this condition would let `--quiet` fall through to the pin and make
+        // NO_PIN silently do nothing, which is the one way a diagnostic can lie.
+        if (nodes.size() > 1 && pin_disabled) {
+            if (!opts.quiet) {
+                std::fprintf(stderr,
+                    "%s XCHPLOT2_CPU_NO_PIN=1 — NUMA pin skipped; this worker "
+                    "may run on any node regardless of its label\n",
+                    log_prefix.c_str());
+            }
+        } else if (nodes.size() > 1) {
             int const want = cpu_numa_node(device_id);
             for (auto const& n : nodes) {
                 if (n.node_id != want) continue;
-                if (!pin_thread_to_cpus(n.cpus) && !opts.quiet) {
-                    std::fprintf(stderr,
-                        "%s could not pin to NUMA node %d — running unpinned "
-                        "(slower on a multi-socket host, but not wrong)\n",
-                        log_prefix.c_str(), want);
+                if (!pin_thread_to_cpus(n.cpus)) {
+                    if (!opts.quiet) {
+                        std::fprintf(stderr,
+                            "%s could not pin to NUMA node %d — running unpinned "
+                            "(slower on a multi-socket host, but not wrong)\n",
+                            log_prefix.c_str(), want);
+                    }
+                } else if (opts.verbose) {
+                    // Read the mask BACK rather than echoing what we asked for.
+                    // The label already says which node this worker was meant to
+                    // get; only the kernel can say which cpus it may actually
+                    // use, and a silent success is indistinguishable from a
+                    // no-op. Thread count cannot stand in for this: pos2-chip
+                    // sizes its fan-out from hardware_concurrency(), which
+                    // ignores the mask, so a pinned worker still spawns the
+                    // whole host's worth of threads onto this node's cpus.
+                    auto const got = current_thread_cpus();
+                    std::fprintf(stderr, "%s pinned to NUMA node %d (cpus %s)\n",
+                                 log_prefix.c_str(), want,
+                                 got.empty() ? "unreadable"
+                                             : format_cpu_list(got).c_str());
                 }
                 break;
             }

@@ -41,6 +41,16 @@ struct NumaNode {
 // pins a worker to the wrong cores rather than failing.
 std::vector<int> parse_cpu_list(std::string const& text);
 
+// Render CPU ids back into the Linux cpulist form ("0-15,32"). The inverse of
+// parse_cpu_list, and round-tripped against it in the tests.
+//
+// This exists so a pin can be REPORTED rather than trusted. A worker's label
+// says which node it was ASKED to run on; only reading the mask back out of the
+// kernel says where it may actually run — and the two diverge exactly when
+// something is wrong, which is when it matters. Printing an ascending id list
+// raw would be 32+ numbers a line, so collapse the runs.
+std::string format_cpu_list(std::vector<int> const& cpus);
+
 // Online NUMA nodes and their CPUs, read from /sys/devices/system/node/.
 //
 // Never returns empty: a host with no NUMA sysfs at all (a kernel built without
