@@ -149,8 +149,11 @@ install_arch() {
 }
 
 install_apt() {
+    # libclang-rt-18-dev = compiler-rt builtins (libclang_rt.builtins-x86_64.a).
+    # AdaptiveCpp's HIP/ROCm backend link needs it; harmless for nvidia/cpu targets.
     local pkgs=(cmake git ninja-build build-essential python3 pkg-config
                 llvm-18 llvm-18-dev clang-18 lld-18 libclang-18-dev libclang-cpp18-dev
+                libclang-rt-18-dev
                 libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
     case "$GPU" in
         nvidia)
