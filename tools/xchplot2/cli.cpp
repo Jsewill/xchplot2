@@ -589,21 +589,49 @@ void print_batch_sizing(char const* prefix,
     }
 }
 
+// Why a worker has no rate, in the operator's terms. Read off WorkerStats::why
+// rather than assumed: both printers used to hardcode "too few plots", which is
+// the wrong reason — and the wrong advice — for a worker excluded by the window
+// rather than by its plot count.
+char const* unmeasured_reason(pos2gpu::Unmeasured why)
+{
+    switch (why) {
+        case pos2gpu::Unmeasured::NoPlots:
+            return "no plots finished";
+        case pos2gpu::Unmeasured::AllWarmup:
+            return "none survived the warmup drop";
+        case pos2gpu::Unmeasured::AllPastWindow:
+            return "every plot landed after a peer ran dry";
+        case pos2gpu::Unmeasured::Degenerate:
+            return "measurement window collapsed";
+        case pos2gpu::Unmeasured::No:
+            break;
+    }
+    return "no rate";
+}
+
 // Per-worker rates for a plot/batch run, plus the sizing advice they imply.
 //
 // The live progress block shows the same rates while the run is going, but it
 // only exists on a TTY — a run redirected to a log never saw it, and that is
 // exactly the run someone reads afterwards to decide how to size the next one.
 //
-// warmup=0: unlike bench, this reports the run that actually happened rather
-// than a steady-state estimate, so no plot is excluded. compute_bench_stats
-// still anchors on work_start_seconds, keeping device init and pool
-// construction — which are not per-plot costs — out of the rates.
+// warmup=0 + WholeRun: unlike bench, this reports the run that actually
+// happened rather than a steady-state estimate, so no plot is excluded.
+// compute_bench_stats still anchors on work_start_seconds, keeping device init
+// and pool construction — which are not per-plot costs — out of the rates.
+//
+// WholeRun is load-bearing, not a nicety. Under the bench's FullQueue window a
+// batch of 4 plots across 4 workers reported three of them as unmeasurable and
+// printed no sizing at all: every worker finished exactly one plot, the window
+// shut at the earliest of those four completions, and the other three landed
+// 0.3 s past it. See RateWindow in BenchStats.hpp.
 void print_run_workers(char const* prefix, pos2gpu::BatchResult const& res)
 {
     if (res.workers.size() < 2) return;  // nothing to compare or balance
 
-    auto const stats = pos2gpu::compute_bench_stats(res.workers, 0);
+    auto const stats = pos2gpu::compute_bench_stats(
+        res.workers, 0, pos2gpu::RateWindow::WholeRun);
     if (!stats.valid) return;
 
     std::vector<int> ids;
@@ -617,9 +645,10 @@ void print_run_workers(char const* prefix, pos2gpu::BatchResult const& res)
         auto const& w = stats.workers[i];
         char const* name = i < names.size() ? names[i].c_str() : "?";
         if (!w.measured) {
-            std::fprintf(stderr,
-                "%s   %-5s %zu plot%s — too few to measure a rate\n",
-                prefix, name, w.plots_total, w.plots_total == 1 ? "" : "s");
+            // WholeRun clips nothing, so in practice this is a worker still on
+            // its first plot when the batch ended.
+            std::fprintf(stderr, "%s   %-5s %s\n",
+                         prefix, name, unmeasured_reason(w.why));
             continue;
         }
         rates[i] = w.s_per_plot;
@@ -876,12 +905,14 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
         auto const& w = stats.workers[wi];
         std::string const& name = names[wi];
         if (!w.measured) {
+            // A deeper queue answers both live reasons — it leaves more plots
+            // past the warmup drop AND holds the window open longer — so the
+            // -n suggestion stands whichever one fired.
             std::fprintf(stderr,
-                "[bench]   %-5s %zu plot%s finished — too few to measure past a "
-                "%zu-plot warmup; excluded from the aggregate (needs about "
-                "-n %d to be measurable here)\n",
+                "[bench]   %-5s %zu plot%s finished — %s; excluded from the "
+                "aggregate (needs about -n %d to be measurable here)\n",
                 name.c_str(), w.plots_total, w.plots_total == 1 ? "" : "s",
-                warmup_per_worker, suggest_n(w.plots_total));
+                unmeasured_reason(w.why), suggest_n(w.plots_total));
             continue;
         }
         char dropped[64] = {0};

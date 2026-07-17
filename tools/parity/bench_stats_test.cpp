@@ -300,6 +300,118 @@ int main()
                  && all_ok;
     }
 
+    // ---------------------------------------------------------------------
+    // RateWindow: the run report asks a different question than the bench, and
+    // asking the bench's question of a finished run destroys it.
+    //
+    // The timeline is a real reported run: `plot -n 4 --devices cpu`, four CPU
+    // workers on a 32-core box, one plot each, k=28. It is the worst case for
+    // FullQueue by construction — a batch of one round. A batch ENDS by
+    // draining, so the earliest worker's last completion always bounds the
+    // window, and here that is every plot anyone has. Three of four workers
+    // then report no rate, the run's own sizing advice cannot be computed at
+    // all, and the aggregate misses reality by 4x.
+    //
+    // The reasons matter as much as the rates: those three workers each
+    // finished exactly as many plots as the one that WAS measured, so a
+    // printer that assumes "unmeasured == too few plots" tells their operator
+    // to raise -n against a problem they do not have.
+    // ---------------------------------------------------------------------
+    {
+        auto one_plot = [](int dev, double at) {
+            pos2gpu::WorkerTimeline w;
+            w.device_id = dev;
+            w.work_start_seconds = 0.0;  // CPU workers have no device init
+            w.completion_seconds = {at};
+            return w;
+        };
+        std::vector<pos2gpu::WorkerTimeline> const run{
+            one_plot(pos2gpu::cpu_device_id(0), 165.59),
+            one_plot(pos2gpu::cpu_device_id(0), 165.33),  // earliest → bounds it
+            one_plot(pos2gpu::cpu_device_id(0), 166.10),  // last → the real end
+            one_plot(pos2gpu::cpu_device_id(0), 165.69),
+        };
+
+        // What the run report used to do, and must never do again.
+        auto const clipped = pos2gpu::compute_bench_stats(run, 0);
+        all_ok = check(clipped.workers_unmeasured == 3,
+                       "window: FullQueue discards 3 of 4 one-plot workers")
+                 && all_ok;
+        all_ok = check(near(clipped.s_per_plot, 165.33),
+                       "window: FullQueue aggregate is ~4x reality (the bug)")
+                 && all_ok;
+        for (std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{3}}) {
+            all_ok = check(clipped.workers[i].why ==
+                               pos2gpu::Unmeasured::AllPastWindow,
+                           "window: excluded for landing late, NOT for plot count")
+                     && all_ok;
+            all_ok = check(clipped.workers[i].plots_total == 1 &&
+                               clipped.workers[i].past_window == 1,
+                           "window: it finished as many plots as the one kept")
+                     && all_ok;
+        }
+
+        // What it does now.
+        auto const whole =
+            pos2gpu::compute_bench_stats(run, 0, pos2gpu::RateWindow::WholeRun);
+        all_ok = check(whole.valid && whole.workers_unmeasured == 0,
+                       "window: WholeRun measures every worker") && all_ok;
+        all_ok = check(near(whole.workers[0].s_per_plot, 165.59) &&
+                           near(whole.workers[1].s_per_plot, 165.33) &&
+                           near(whole.workers[2].s_per_plot, 166.10) &&
+                           near(whole.workers[3].s_per_plot, 165.69),
+                       "window: WholeRun rates are each worker's own plot")
+                 && all_ok;
+        // The batch really wrote 4 plots in 166.097 s = 41.52 s/plot. The
+        // aggregate is a sum of per-worker rates, not that division, so it is
+        // not required to equal it — but it must not disagree materially, and
+        // agreeing to 0.3% is what makes the block readable next to the
+        // summary line directly above it.
+        all_ok = check(std::fabs(whole.s_per_plot - 41.524) < 0.15,
+                       "window: WholeRun aggregate agrees with wall/plots")
+                 && all_ok;
+        // Idle tail is measured against the last completion anywhere, so it is
+        // unaffected by the window and stays true in both modes.
+        all_ok = check(near(whole.workers[1].idle_tail_seconds, 0.77) &&
+                           near(whole.workers[2].idle_tail_seconds, 0.0),
+                       "window: idle tail is unchanged by the window mode")
+                 && all_ok;
+
+        // Every rated worker means the run can finally size its next batch.
+        std::vector<double> rates;
+        std::vector<int> ids;
+        for (auto const& w : whole.workers) {
+            rates.push_back(w.s_per_plot);
+            ids.push_back(w.device_id);
+        }
+        auto const sized = pos2gpu::pick_batch_sizing(rates, ids);
+        all_ok = check(sized.valid && sized.workers_modelled == 4 &&
+                           sized.workers_unrated == 0,
+                       "window: WholeRun rates make the run sizable") && all_ok;
+    }
+
+    // ---------------------------------------------------------------------
+    // The other unmeasured reasons, so the printers can name each one.
+    // ---------------------------------------------------------------------
+    {
+        // Finished nothing: still on its first plot when the batch ended.
+        pos2gpu::WorkerTimeline idle;
+        idle.device_id = pos2gpu::cpu_device_id(0);
+        auto const busy = make_worker(0, 0.0, 49.0, 49.0, 4);
+        auto const st = pos2gpu::compute_bench_stats(
+            {busy, idle}, 0, pos2gpu::RateWindow::WholeRun);
+        all_ok = check(st.workers[1].why == pos2gpu::Unmeasured::NoPlots,
+                       "reason: a worker that finished nothing says so") && all_ok;
+
+        // Everything it finished was warmup (test 3's starved CPU, named).
+        auto const gpu = make_worker(0, 5.0, 60.0, 49.0, 15);
+        auto const cold = make_worker(pos2gpu::cpu_device_id(0), 0.5, 900.0,
+                                      900.0, 1);
+        auto const st2 = pos2gpu::compute_bench_stats({gpu, cold}, 1);
+        all_ok = check(st2.workers[1].why == pos2gpu::Unmeasured::AllWarmup,
+                       "reason: a worker with only warmup plots says so") && all_ok;
+    }
+
     // ---- estimate_eta_seconds -------------------------------------------
     {
         using pos2gpu::WorkerLive;

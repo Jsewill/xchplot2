@@ -58,6 +58,37 @@ struct WorkerTimeline {
     std::vector<double> completion_seconds;  // ascending, one per finished plot
 };
 
+// Which question the rates answer. The two differ only in where a worker's
+// measurement window closes, but that difference decides which plots exist.
+enum class RateWindow {
+    // "What will this rig sustain with a full queue?" — the bench's question.
+    // Every worker's window closes when the FIRST worker runs dry, because past
+    // that instant the survivors are running under less contention (the reason
+    // spelled out at the top of this file). Plots landing later are excluded.
+    FullQueue,
+    // "What did each worker actually do?" — the run report's question. Nothing
+    // is excluded. The clip above cannot be applied to a finished run: a batch
+    // ends BY draining, so the earliest-finishing worker's last completion is
+    // always <= every other worker's last completion. FullQueue therefore always
+    // discards the final plot of every worker but one. Across a deep queue that
+    // is one plot in twenty-five and does not move the rate; when a batch is a
+    // single round (plots ~= workers) it is every plot they have, and all but
+    // the one earliest worker report nothing at all.
+    WholeRun,
+};
+
+// Why a worker contributed no rate. `measured == false` has several causes and
+// they are not interchangeable in a message: a worker dropped for finishing
+// LATE has not finished FEW, and telling its operator to raise -n is advice
+// against a problem they do not have.
+enum class Unmeasured {
+    No,             // it was measured; this worker has a rate
+    NoPlots,        // finished nothing — still on its first plot when time ran out
+    AllWarmup,      // every plot it finished was one of its own warmup plots
+    AllPastWindow,  // everything it finished landed after a peer ran dry
+    Degenerate,     // window collapsed to zero — clock skew, or a bad epoch
+};
+
 struct WorkerStats {
     int device_id = -1;
     std::size_t plots_total = 0;     // everything this worker finished
@@ -72,6 +103,10 @@ struct WorkerStats {
     // Non-zero means it sat idle while a slower peer drained the queue.
     double idle_tail_seconds = 0.0;
     bool measured = false;  // false → contributed nothing to the aggregate
+    // Set whenever measured == false. Print THIS, never a guess: the two
+    // printers used to hardcode "too few plots", which is the wrong reason for
+    // every worker excluded by the window.
+    Unmeasured why = Unmeasured::No;
 };
 
 struct BenchStats {
@@ -90,7 +125,8 @@ struct BenchStats {
 
 inline BenchStats compute_bench_stats(
     std::vector<WorkerTimeline> const& workers,
-    std::size_t warmup_per_worker)
+    std::size_t warmup_per_worker,
+    RateWindow window_mode = RateWindow::FullQueue)
 {
     BenchStats out;
     if (workers.empty()) return out;
@@ -114,6 +150,10 @@ inline BenchStats compute_bench_stats(
         have_end = true;
     }
     if (!have_end) return out;  // nothing finished anywhere
+
+    // WholeRun asks what happened, not what the rig sustains, so its window
+    // closes at the last completion anywhere and clips nothing.
+    if (window_mode == RateWindow::WholeRun) window_end = run_end;
 
     double rate_sum = 0.0;
     double window_begin = 0.0;
@@ -144,6 +184,10 @@ inline BenchStats compute_bench_stats(
         }
 
         if (kept.empty() || kept.back() <= epoch) {
+            s.why = s.plots_total == 0            ? Unmeasured::NoPlots
+                  : s.plots_total == s.warmup_dropped ? Unmeasured::AllWarmup
+                  : kept.empty()                  ? Unmeasured::AllPastWindow
+                                                  : Unmeasured::Degenerate;
             ++out.workers_unmeasured;
             out.workers.push_back(s);
             continue;
