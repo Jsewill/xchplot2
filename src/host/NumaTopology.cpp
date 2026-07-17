@@ -81,6 +81,32 @@ std::vector<int> parse_cpu_list(std::string const& text)
     return out;
 }
 
+std::string format_cpu_list(std::vector<int> const& cpus)
+{
+    if (cpus.empty()) return {};
+
+    std::vector<int> s(cpus);
+    std::sort(s.begin(), s.end());
+    s.erase(std::unique(s.begin(), s.end()), s.end());
+
+    std::string out;
+    for (std::size_t i = 0; i < s.size();) {
+        // Extend while the ids stay consecutive; that run becomes "lo-hi".
+        std::size_t j = i;
+        while (j + 1 < s.size() && s[j + 1] == s[j] + 1) ++j;
+        if (!out.empty()) out += ',';
+        out += std::to_string(s[i]);
+        // A run of exactly two ("4-5") is no shorter than listing them, but a
+        // single id must not become "4-4".
+        if (j > i) {
+            out += '-';
+            out += std::to_string(s[j]);
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
 std::vector<NumaNode> host_numa_nodes()
 {
     std::vector<NumaNode> nodes;

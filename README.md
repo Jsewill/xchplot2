@@ -929,6 +929,28 @@ node. The ~4 knee below was measured on a single socket, where a node *is*
 the machine; on a multi-socket box expect the real knee to be lower and
 measure it (`--cpu-workers N`) rather than trusting the default.
 
+**Checking that the pin took.** A `cpuN#M` label says which node a worker was
+*asked* for, not where it ended up, and a successful pin is otherwise silent.
+`-v` prints each worker's mask read back out of the kernel:
+
+```
+[cpu1#0] pinned to NUMA node 1 (cpus 32-63)
+```
+
+Thread count is not the signal — the fan-out ignores the mask (above), so a
+correctly pinned worker still shows the whole host's worth of threads. If you
+want to confirm the mask reached pos2-chip's threads rather than just the
+worker that set it, every task should report its node's cpus:
+
+```bash
+grep -h Cpus_allowed_list /proc/$(pgrep -n xchplot2)/task/*/status | sort | uniq -c
+```
+
+One bucket on a multi-socket box means nothing is pinned; one bucket per node
+in use means it is. To measure what the pin is *worth*, `XCHPLOT2_CPU_NO_PIN=1`
+keeps the same worker layout and skips only the pin — `--devices cpu0` is not
+that A/B, since it also halves the cores available.
+
 The auto count is the **knee of the throughput curve** (~4), then trimmed
 to what host RAM holds — not "as many as fit". More than the knee only
 oversubscribes: each worker already fans out to every core, so the gain
