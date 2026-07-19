@@ -305,40 +305,155 @@ if(NOT AdaptiveCpp_FOUND)
         message(STATUS "xchplot2:   first build will take ~15-30 min while AdaptiveCpp compiles")
         message(STATUS "xchplot2:   pre-install via scripts/install-deps.sh to skip this")
 
-        # AdaptiveCpp's compiler/CMakeLists requires ld.lld at configure
-        # time and aborts with "Cannot find ld.lld. Please provide path
-        # via -DACPP_LLD_PATH=…" otherwise. Auto-probe the conventional
-        # LLVM-{16..20} prefixes and pass the path through so users on a
-        # FetchContent build don't have to know that detail. If the
-        # binary isn't installed at all, fail loud with a copy-paste
-        # install command — far less confusing than AdaptiveCpp's own
-        # message.
-        find_program(_xchplot2_ld_lld
-            NAMES ld.lld
-            HINTS
-                /usr/lib/llvm-20/bin /usr/lib/llvm-19/bin /usr/lib/llvm-18/bin
-                /usr/lib/llvm-17/bin /usr/lib/llvm-16/bin
-                /usr/lib/llvm20/bin  /usr/lib/llvm19/bin  /usr/lib/llvm18/bin
-                /usr/lib64/llvm20/bin /usr/lib64/llvm19/bin /usr/lib64/llvm18/bin
-                /opt/llvm-20/bin /opt/llvm-19/bin /opt/llvm-18/bin
-                /opt/llvm20/bin  /opt/llvm19/bin  /opt/llvm18/bin
-            DOC "ld.lld required by AdaptiveCpp's compiler/CMakeLists")
-        if(_xchplot2_ld_lld)
-            set(ACPP_LLD_PATH "${_xchplot2_ld_lld}" CACHE FILEPATH
+        # AdaptiveCpp 25.10 hard-errors on LLVM > 20 ("LLVM versions greater
+        # than 20 are not yet tested/supported"), and its find_package(LLVM)
+        # resolves to whatever the system ships. On a rolling release that is
+        # already past the cap — Fedora 43 is 21, Arch 22 — so a FetchContent
+        # build dies at configure even when a perfectly good side-by-side
+        # LLVM 20 is sitting right there installed. Probe for the newest
+        # COMPLETE compatible prefix and pin AdaptiveCpp to it.
+        #
+        # "Complete" matters: on Fedora the `llvm20` package puts only
+        # llvm-config in /usr/lib64/llvm20/bin — clang comes from `clang20`
+        # and ld.lld from `lld20`. Requiring all three together stops us
+        # pinning LLVM_DIR at a prefix that then fails for a missing clang,
+        # and stops us pairing LLVM 20 headers with the system's ld.lld 22.
+        # Mirrors find_llvm_root() in scripts/install-deps.sh.
+        set(_x2_llvm_ver 0)
+        set(_x2_llvm_root "")
+        set(_x2_llvm_cmakedir "")
+        foreach(_x2_p
+                /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18
+                /usr/lib/llvm-17 /usr/lib/llvm-16
+                /usr/lib/llvm20  /usr/lib/llvm19  /usr/lib/llvm18
+                /usr/lib/llvm17  /usr/lib/llvm16
+                /usr/lib64/llvm20 /usr/lib64/llvm19 /usr/lib64/llvm18
+                /usr/lib64/llvm17 /usr/lib64/llvm16
+                /opt/llvm-20 /opt/llvm-19 /opt/llvm-18
+                /opt/llvm20  /opt/llvm19  /opt/llvm18
+                /usr /usr/local)
+            if(EXISTS "${_x2_p}/bin/llvm-config"
+               AND EXISTS "${_x2_p}/bin/clang"
+               AND EXISTS "${_x2_p}/bin/ld.lld")
+                execute_process(
+                    COMMAND "${_x2_p}/bin/llvm-config" --version
+                    OUTPUT_VARIABLE _x2_v OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE _x2_rc)
+                execute_process(
+                    COMMAND "${_x2_p}/bin/llvm-config" --cmakedir
+                    OUTPUT_VARIABLE _x2_cd OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+                string(REGEX MATCH "^[0-9]+" _x2_major "${_x2_v}")
+                # Fedora's compat packages answer with a lib64 INSIDE the
+                # prefix (/usr/lib64/llvm20/lib64/cmake/llvm), so trust
+                # llvm-config over any assumed layout.
+                if(_x2_rc EQUAL 0 AND _x2_major AND _x2_major GREATER_EQUAL 16
+                   AND _x2_major LESS_EQUAL 20
+                   AND EXISTS "${_x2_cd}/LLVMConfig.cmake"
+                   AND _x2_major GREATER _x2_llvm_ver)
+                    set(_x2_llvm_ver "${_x2_major}")
+                    set(_x2_llvm_root "${_x2_p}")
+                    set(_x2_llvm_cmakedir "${_x2_cd}")
+                endif()
+            endif()
+        endforeach()
+
+        if(_x2_llvm_root)
+            message(STATUS "xchplot2:   pinning AdaptiveCpp to LLVM ${_x2_llvm_ver} at ${_x2_llvm_root}")
+            set(LLVM_DIR "${_x2_llvm_cmakedir}" CACHE PATH
+                "LLVM CMake package dir for AdaptiveCpp" FORCE)
+            # AdaptiveCpp find_package(Clang)s too; leaving Clang_DIR unset
+            # would let it resolve to the system clang's config and
+            # re-introduce the very version skew we just removed.
+            foreach(_x2_cl "${_x2_llvm_root}/lib64/cmake/clang"
+                           "${_x2_llvm_root}/lib/cmake/clang")
+                if(EXISTS "${_x2_cl}/ClangConfig.cmake")
+                    set(Clang_DIR "${_x2_cl}" CACHE PATH
+                        "Clang CMake package dir for AdaptiveCpp" FORCE)
+                    break()
+                endif()
+            endforeach()
+            set(ACPP_LLD_PATH "${_x2_llvm_root}/bin/ld.lld" CACHE FILEPATH
                 "Path to ld.lld for AdaptiveCpp's compiler/CMakeLists" FORCE)
-            message(STATUS "xchplot2:   auto-probed ld.lld at ${_xchplot2_ld_lld}")
+            message(STATUS "xchplot2:   ld.lld = ${_x2_llvm_root}/bin/ld.lld")
+
+            # AdaptiveCpp hunts for clang's resource dir only under
+            # ${LLVM_PREFIX_DIR}/{include,lib,lib64}/clang/<major>/include and
+            # SEND_ERRORs ("CLANG_INCLUDE_PATH does not exist") when every
+            # hint misses. Fedora's compat clang answers /usr/lib/clang/20 —
+            # outside the LLVM prefix altogether — so it always misses there.
+            # Ask clang itself: -print-resource-dir names the directory that
+            # holds include/, which is precisely what AdaptiveCpp computes as
+            # FOUND_CLANG_INCLUDE_PATH/.. on the happy path.
+            execute_process(
+                COMMAND "${_x2_llvm_root}/bin/clang" -print-resource-dir
+                OUTPUT_VARIABLE _x2_res OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET RESULT_VARIABLE _x2_res_rc)
+            if(_x2_res_rc EQUAL 0 AND _x2_res)
+                # -print-resource-dir answers relative to bin/ with ../.. hops.
+                file(REAL_PATH "${_x2_res}" _x2_res)
+                if(EXISTS "${_x2_res}/include/__clang_cuda_runtime_wrapper.h")
+                    set(CLANG_INCLUDE_PATH "${_x2_res}" CACHE PATH
+                        "clang internal header dir for AdaptiveCpp" FORCE)
+                    message(STATUS "xchplot2:   clang resource dir = ${_x2_res}")
+                endif()
+            endif()
         else()
+            # Nothing usable. Report the system version we DID find, because
+            # "install LLVM" is unhelpful advice to someone who already has
+            # three of them — the useful fact is which one is missing what.
+            execute_process(COMMAND llvm-config --version
+                OUTPUT_VARIABLE _x2_sys_v OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_x2_sys_v)
+                set(_x2_sys_note "Your system LLVM is ${_x2_sys_v}, past AdaptiveCpp's cap of 20.\n")
+            else()
+                set(_x2_sys_note "")
+            endif()
             message(FATAL_ERROR
-                "xchplot2: AdaptiveCpp's FetchContent build needs ld.lld "
-                "but it isn't installed at any of the standard LLVM-16..20 "
-                "prefixes. Install it:\n"
-                "  Ubuntu/Debian:  sudo apt install lld-18\n"
-                "  Fedora/RHEL:    sudo dnf install lld\n"
-                "  Arch/CachyOS:   sudo pacman -S lld\n"
-                "Or pre-install AdaptiveCpp via scripts/install-deps.sh "
-                "(also installs ld.lld and builds AdaptiveCpp at "
-                "/opt/adaptivecpp). Override the probe with "
-                "-DACPP_LLD_PATH=/path/to/ld.lld.")
+                "xchplot2: AdaptiveCpp's FetchContent build needs an LLVM "
+                "between 16 and 20 providing clang, ld.lld AND the CMake "
+                "package files, all under one prefix. None was found.\n"
+                "${_x2_sys_note}"
+                "A partial install does not count: on Fedora the `llvm20` "
+                "package ships only llvm-config — clang and ld.lld come "
+                "from `clang20` and `lld20`.\n"
+                "  Fedora/RHEL:    sudo dnf install llvm20 llvm20-devel clang20 clang20-devel lld20\n"
+                "  Ubuntu/Debian:  sudo apt install llvm-20 llvm-20-dev clang-20 lld-20 libomp-20-dev\n"
+                "  Arch/CachyOS:   sudo pacman -S llvm20 llvm20-libs clang20 lld20\n"
+                "Better: scripts/install-deps.sh installs exactly that set and "
+                "then builds AdaptiveCpp against it at /opt/adaptivecpp, which "
+                "skips this 15-30 min FetchContent build entirely.\n"
+                "Override the probe with -DLLVM_DIR=… -DACPP_LLD_PATH=….")
+        endif()
+
+        # AdaptiveCpp's HIP backend needs ockl.bc / ocml.bc to compile amdgcn
+        # kernels, and hard-errors with "ROCm device library path not found"
+        # when it can't locate them. It only checks a couple of spots and the
+        # bitcode dir moved between ROCm versions, so probe the known ones
+        # ourselves — scripts/install-deps.sh already does exactly this for
+        # the pre-install path, and the FetchContent path was simply missing
+        # it, which is why an AMD host got that error on a bare
+        # `cargo install`. Harmless elsewhere: on a non-AMD box nothing
+        # matches and nothing is set.
+        if(NOT ROCM_DEVICE_LIBS_PATH)
+            # Versioned prefixes (/opt/rocm-6.2.0) are common alongside the
+            # unversioned symlink, and are all that exists on some installs.
+            file(GLOB _x2_rocm_roots "/opt/rocm" "/opt/rocm-*")
+            foreach(_x2_root ${_x2_rocm_roots})
+                foreach(_x2_sub amdgcn/bitcode lib/llvm-amdgpu/amdgcn/bitcode
+                                share/amdgcn/bitcode)
+                    if(EXISTS "${_x2_root}/${_x2_sub}/ockl.bc")
+                        set(ROCM_DEVICE_LIBS_PATH "${_x2_root}/${_x2_sub}" CACHE PATH
+                            "ROCm device bitcode dir for AdaptiveCpp's HIP backend" FORCE)
+                        message(STATUS "xchplot2:   ROCm device libs = ${ROCM_DEVICE_LIBS_PATH}")
+                        break()
+                    endif()
+                endforeach()
+                if(ROCM_DEVICE_LIBS_PATH)
+                    break()
+                endif()
+            endforeach()
         endif()
 
         include(FetchContent)
