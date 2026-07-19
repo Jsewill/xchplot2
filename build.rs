@@ -53,7 +53,18 @@ fn detect_cuda_arch() -> Option<String> {
 /// Returns Some(arch) only when nvidia-smi reports a card at or
 /// above our minimum; emits a cargo:warning and returns None
 /// otherwise so callers fall through to the AMD / Intel detection.
+///
+/// Memoized: three call sites want this answer (ACPP_TARGETS, the
+/// XCHPLOT2_BUILD_CUDA selector, and the preflight failure message), and
+/// the uncached version forked nvidia-smi once per call AND re-emitted its
+/// cargo:warnings each time — a host with a sub-sm_50 card printed the same
+/// "below our minimum" paragraph twice.
 fn usable_nvidia_arch() -> Option<String> {
+    static ARCH: OnceLock<Option<String>> = OnceLock::new();
+    ARCH.get_or_init(usable_nvidia_arch_probe).clone()
+}
+
+fn usable_nvidia_arch_probe() -> Option<String> {
     let arch = match detect_cuda_arch() {
         Some(a) => a,
         None => {
@@ -562,14 +573,21 @@ fn main() {
     //   2. nvidia-smi probe of the build machine's local GPU.
     //   3. 89 (sm_89, RTX 4090 / Ada Lovelace) as a sensible default for
     //      machines without nvidia-smi (e.g. CI, headless package builds).
-    let (mut cuda_arch, source) = match env::var("CUDA_ARCHITECTURES") {
+    //
+    // Reported below rather than here: every CMAKE_CUDA_ARCHITECTURES
+    // consumer in CMakeLists.txt sits inside an `if(XCHPLOT2_BUILD_CUDA)`,
+    // so on an AMD / Intel host this value is inert. Announcing
+    // "building for CUDA arch 89 (fallback (no nvidia-smi))" before we've
+    // decided BUILD_CUDA made a missing nvidia-smi look like the cause of
+    // any later failure, and sent non-NVIDIA users hunting for a driver
+    // they don't need.
+    let (mut cuda_arch, arch_source) = match env::var("CUDA_ARCHITECTURES") {
         Ok(v) => (v, "$CUDA_ARCHITECTURES"),
         Err(_) => match detect_cuda_arch() {
             Some(v) => (v, "nvidia-smi probe"),
             None    => ("89".to_string(), "fallback (no nvidia-smi)"),
         },
     };
-    println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({source})");
 
     // AdaptiveCpp target precedence:
     //   1. $ACPP_TARGETS if set.
@@ -611,22 +629,43 @@ fn main() {
     //   Intel GPU  → OFF     (SYCL/L0 path)
     //   no GPU, nvcc present → ON  (CI / container build)
     //   no GPU, no nvcc      → OFF
+    //
+    // The vendor probe is hoisted out of the selector below because the
+    // preflight failure message needs the same answer: it used to hardcode
+    // `install-deps.sh --gpu nvidia`, which on an AMD or Intel host sends
+    // the user off to install a full CUDA Toolkit their card can't use —
+    // and whose absence was never why the build failed.
+    //
+    // Precedence NVIDIA > AMD > Intel, matching scripts/install-deps.sh's
+    // detect_gpu_via_pci().
+    //
+    // usable_nvidia_arch(), NOT detect_cuda_arch(): an ancient secondary
+    // NVIDIA card (e.g. sm_52 alongside an AMD W5700) must not claim the
+    // CUB path, because AdaptiveCpp's half.hpp references sm_53+ FP16
+    // intrinsics that the old card's cuda_fp16.h guards out.
+    let nvidia_gpu = usable_nvidia_arch().is_some();
+    // amd_gpu_present, NOT detect_amd_gfx().is_some() — the latter returns
+    // None for RDNA1 (we route those through SSCP instead of an AOT hip:*
+    // target), but the GPU is there and we MUST skip CUDA TUs to avoid
+    // running SortCuda.cu's CUB calls against AMD silicon.
+    let amd_gpu    = amd_gpu_present();
+    let intel_gpu  = detect_intel_gpu();
+
+    // (prose label, matching service in compose.yaml). None = nothing
+    // enumerable — headless CI, or a container without /sys/class/drm.
+    let vendor: Option<(&str, &str)> = if nvidia_gpu {
+        Some(("NVIDIA", "cuda"))
+    } else if amd_gpu {
+        Some(("AMD", "rocm"))
+    } else if intel_gpu {
+        Some(("Intel", "intel"))
+    } else {
+        None
+    };
+
     let (build_cuda, bc_source) = match env::var("XCHPLOT2_BUILD_CUDA") {
         Ok(v) if !v.is_empty() => (v, "$XCHPLOT2_BUILD_CUDA"),
         _ => {
-            // Same usable-arch gate as the ACPP_TARGETS block: an
-            // ancient secondary NVIDIA card (e.g. sm_52 alongside an
-            // AMD W5700) must NOT claim the CUB path, because
-            // AdaptiveCpp half.hpp references sm_53+ FP16 intrinsics
-            // that the old card's cuda_fp16.h guards out.
-            let nvidia_gpu = usable_nvidia_arch().is_some();
-            // amd_gpu_present, NOT detect_amd_gfx().is_some() — the
-            // latter returns None for RDNA1 (we route those through
-            // SSCP instead of an AOT hip:* target), but the GPU is
-            // there and we MUST skip CUDA TUs to avoid running
-            // SortCuda.cu's CUB calls against AMD silicon.
-            let amd_gpu    = amd_gpu_present();
-            let intel_gpu  = detect_intel_gpu();
             if nvidia_gpu {
                 ("ON".to_string(), "NVIDIA GPU detected")
             } else if amd_gpu {
@@ -642,6 +681,12 @@ fn main() {
     };
     println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda} ({bc_source})");
 
+    // Deferred from the arch block above: only meaningful once we know the
+    // CUDA TUs are actually being compiled.
+    if build_cuda == "ON" {
+        println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({arch_source})");
+    }
+
     // Preflight critical system deps BEFORE invoking cmake. Cargo
     // install users land here without reading README.md's Build
     // section; without preflight, missing deps surface as cryptic
@@ -652,33 +697,85 @@ fn main() {
             .map(|m| format!("  - {m}"))
             .collect::<Vec<_>>()
             .join("\n");
+        // Absolute paths, not `./scripts/...`. The audience for this panic
+        // is `cargo install --git` users, whose shell is in some unrelated
+        // cwd while the sources sit under
+        // ~/.cargo/git/checkouts/xchplot2-<hash>/<rev>/ — a relative path
+        // is not runnable for exactly the people it's addressed to.
+        let scripts         = manifest_dir.join("scripts");
+        let install_deps    = scripts.join("install-deps.sh");
+        let build_container = scripts.join("build-container.sh");
+        let install_deps    = install_deps.display();
+        let build_container = build_container.display();
+
+        // install-deps.sh auto-detects the vendor when --gpu is omitted,
+        // using the same PCI precedence we do, so the bare form is right
+        // for NVIDIA and AMD alike. Intel is the exception: that branch
+        // exits 1 (no Intel package path yet) and its own advice is to
+        // take the NVIDIA path for the LLVM toolchain + CUDA headers the
+        // SYCL TUs still #include — the Intel GPU itself is driven by
+        // AdaptiveCpp's generic SSCP target at runtime, not by CUDA.
+        let host_install = match vendor {
+            Some(("Intel", _)) => format!(
+                "- Install those packages on the host:\n      \
+                     {install_deps} --gpu nvidia\n    \
+                   install-deps.sh has no Intel package path yet; --gpu nvidia is its\n    \
+                   documented stand-in — it installs LLVM + the CUDA *headers* the SYCL\n    \
+                   TUs include, not a GPU driver. Your Intel GPU runs through\n    \
+                   AdaptiveCpp's generic SSCP target. The container path below ships\n    \
+                   Intel oneAPI instead and needs no host toolchain at all."
+            ),
+            // Comment on its own line, not trailing the command: the path
+            // is an absolute cargo checkout and the two together wrap.
+            _ => format!(
+                "- Install those packages on the host — it auto-detects your GPU\n    \
+                   vendor and builds AdaptiveCpp:\n      \
+                     {install_deps}"
+            ),
+        };
+
+        // Say plainly that this isn't an NVIDIA problem when we've already
+        // routed the build away from CUDA. Without it, the arch line
+        // further up ("fallback (no nvidia-smi)") reads as the cause and
+        // AMD / Intel users go install a driver that changes nothing.
+        let vendor_note = match vendor {
+            Some((label, _)) if label != "NVIDIA" => format!(
+                "None of the above is NVIDIA-specific. This build already selected the \
+                 {label}\npath (XCHPLOT2_BUILD_CUDA=OFF), so neither nvidia-smi nor nvcc is \
+                 needed —\nthey are host toolchain packages, missing on any fresh machine.\n\n"
+            ),
+            _ => String::new(),
+        };
+
+        // Lead the container example with the service matching the GPU we
+        // found, so it's copy-pasteable rather than aspirational.
+        let service = vendor.map(|(_, svc)| svc).unwrap_or("cpu");
+
         // Surface the container path proactively when we can already
         // see podman/docker — for many users that's the smoothest fix
         // because the toolchain stays bundled in the image.
         let next_steps = match detect_container_engine() {
             Some(engine) => format!(
                 "Two ways forward, pick whichever fits:\n\n  \
-                   - Install those packages on the host:\n      \
-                       ./scripts/install-deps.sh --gpu nvidia    # auto-detects vendor + AdaptiveCpp\n\n  \
+                   {host_install}\n\n  \
                    - Or, since you have {engine} installed, build inside a container —\n    \
                      toolchain stays in the image, no host changes needed:\n      \
-                       ./scripts/build-container.sh\n      \
-                       {engine} compose run --rm cuda plot ...    # or rocm / intel / cpu\n\n\
+                       {build_container}\n      \
+                       {engine} compose run --rm {service} plot ...\n\n\
                  If install-deps.sh just ran and you're still seeing this, check\n\
                  its tail output — it names the failed package before exiting."
             ),
             None => format!(
                 "Two ways forward, pick whichever fits:\n\n  \
-                   - Install those packages on the host:\n      \
-                       ./scripts/install-deps.sh --gpu nvidia    # auto-detects vendor + AdaptiveCpp\n\n  \
+                   {host_install}\n\n  \
                    - Or build inside a container (no host toolchain needed beyond\n    \
                      podman or docker — install whichever you prefer first):\n      \
-                       ./scripts/build-container.sh\n\n\
+                       {build_container}\n\n\
                  If install-deps.sh just ran and you're still seeing this, check\n\
                  its tail output — it names the failed package before exiting."
             ),
         };
-        panic!("\nxchplot2: build prerequisites missing:\n{bullets}\n\n{next_steps}\n");
+        panic!("\nxchplot2: build prerequisites missing:\n{bullets}\n\n{vendor_note}{next_steps}\n");
     }
 
     // CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely
