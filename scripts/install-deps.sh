@@ -2,8 +2,10 @@
 #
 # install-deps.sh — bootstrap xchplot2's native build dependencies.
 #
-# Installs CUDA Toolkit on NVIDIA, ROCm HIP SDK on AMD, LLVM 18+,
-# AdaptiveCpp 25.10, and a Rust toolchain via rustup. After this completes,
+# Installs CUDA Toolkit on NVIDIA, ROCm HIP SDK on AMD, the newest LLVM
+# AdaptiveCpp supports (16-20 — installed side-by-side when the system one is
+# newer), AdaptiveCpp 25.10, and a Rust toolchain via rustup. After this
+# completes,
 # you can build with either:
 #   cargo install --git https://github.com/Jsewill/xchplot2
 #   # or:
@@ -30,6 +32,14 @@ ACPP_PREFIX=${ACPP_PREFIX:-/opt/adaptivecpp}
 SKIP_ACPP=0
 REBUILD_ACPP=0
 GPU=""
+# AdaptiveCpp 25.10's CMake hard-errors outside this range ("LLVM versions
+# greater than 20 are not yet tested/supported"). Single source of truth for
+# both the probe and the packages we install — bump together with $ACPP_REF.
+LLVM_MIN=16
+LLVM_MAX=20
+# Normalized package family (arch / debian / fedora), set by the distro
+# dispatch below so the LLVM helpers don't re-derive it from $DISTRO.
+PKG_FAMILY=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -115,6 +125,108 @@ if [[ "$GPU" == "intel" ]]; then
 fi
 echo "[install-deps] distro=$DISTRO, gpu=$GPU, acpp=${ACPP_REF}, prefix=${ACPP_PREFIX}"
 
+# ── LLVM discovery + install ────────────────────────────────────────────────
+# AdaptiveCpp needs an LLVM in [$LLVM_MIN, $LLVM_MAX] with clang, ld.lld AND
+# the CMake package files. Rolling distros ship newer (Fedora 43 = LLVM 21,
+# Arch = 22), so the usable one is often a side-by-side compat package rather
+# than the system default. All three families package those; picking and
+# installing the newest is our job, not the user's.
+
+# Echo the CMake package dir for an LLVM prefix, or return 1.
+# llvm-config knows the real answer: Fedora's compat packages report
+# /usr/lib64/llvm20/lib64/cmake/llvm — a lib64 INSIDE the prefix — so
+# assuming $root/lib/cmake/llvm silently points at a nonexistent dir.
+llvm_cmake_dir() {
+    local root=$1 d
+    d=$("$root/bin/llvm-config" --cmakedir 2>/dev/null || true)
+    if [[ -n "$d" ]] && [[ -d "$d" ]]; then
+        printf '%s\n' "$d"; return 0
+    fi
+    for d in "$root/lib/cmake/llvm" "$root/lib64/cmake/llvm"; do
+        [[ -d "$d" ]] && { printf '%s\n' "$d"; return 0; }
+    done
+    return 1
+}
+
+# Echo an LLVM prefix's major version if it is complete enough to build
+# AdaptiveCpp against, else return 1. Requiring the CMake dir here (not just
+# the binaries) rejects a clang+lld install whose -devel half is missing,
+# which would otherwise be picked and then fail mid-configure.
+llvm_prefix_version() {
+    local root=$1 ver
+    [[ -x "$root/bin/clang" ]] && [[ -x "$root/bin/ld.lld" ]] || return 1
+    ver=$("$root/bin/clang" --version 2>/dev/null \
+          | head -1 | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
+    [[ -n "$ver" ]] || return 1
+    (( ver >= LLVM_MIN && ver <= LLVM_MAX )) || return 1
+    llvm_cmake_dir "$root" >/dev/null || return 1
+    printf '%s\n' "$ver"
+}
+
+# Echo the prefix of the NEWEST compatible LLVM on the box, or return 1.
+# Scores every candidate rather than taking the first hit off an ordered
+# list, so the answer is "latest compatible" no matter which prefixes exist.
+# /usr and /usr/local are included because on a distro whose system LLVM is
+# already in range (Fedora 42 = 20, Ubuntu 24.04 = 18) the unversioned
+# install is the right answer and installing a compat package is pure waste.
+find_llvm_root() {
+    local best_ver=0 best_root="" cand ver
+    for cand in \
+        /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18 \
+        /usr/lib/llvm-17 /usr/lib/llvm-16 \
+        /usr/lib/llvm20  /usr/lib/llvm19  /usr/lib/llvm18 \
+        /usr/lib/llvm17  /usr/lib/llvm16 \
+        /usr/lib64/llvm20 /usr/lib64/llvm19 /usr/lib64/llvm18 \
+        /usr/lib64/llvm17 /usr/lib64/llvm16 \
+        /opt/llvm20 /opt/llvm-20 /opt/llvm19 /opt/llvm-19 \
+        /opt/llvm18 /opt/llvm-18 \
+        /usr /usr/local; do
+        ver=$(llvm_prefix_version "$cand") || continue
+        if (( ver > best_ver )); then
+            best_ver=$ver
+            best_root=$cand
+        fi
+    done
+    [[ -n "$best_root" ]] || return 1
+    printf '%s\n' "$best_root"
+}
+
+# Install the newest compatible LLVM available in the distro's repos.
+# Walks DOWN from $LLVM_MAX and takes the first version that exists, so a
+# box gets 20 where 20 is packaged and 18 only where it isn't.
+install_compat_llvm() {
+    local v
+    for v in $(seq "$LLVM_MAX" -1 "$LLVM_MIN"); do
+        case "$PKG_FAMILY" in
+            arch)
+                pacman -Si "llvm$v" &>/dev/null || continue
+                echo "[install-deps] Installing side-by-side LLVM $v (llvm$v/clang$v/lld$v)."
+                sudo pacman -S --needed --noconfirm \
+                    "llvm$v" "llvm$v-libs" "clang$v" "lld$v" && return 0
+                ;;
+            debian)
+                # policy, not `apt-cache show`: a package can be known to apt
+                # yet have "Candidate: (none)" when no enabled suite carries
+                # it, and installing that fails.
+                [[ "$(apt-cache policy "llvm-$v-dev" 2>/dev/null \
+                      | awk '/Candidate:/{print $2}')" == [0-9]* ]] || continue
+                echo "[install-deps] Installing side-by-side LLVM $v (llvm-$v/clang-$v/lld-$v)."
+                sudo apt-get install -y --no-install-recommends \
+                    "llvm-$v" "llvm-$v-dev" "clang-$v" "lld-$v" \
+                    "libclang-$v-dev" "libomp-$v-dev" && return 0
+                ;;
+            fedora)
+                dnf -q list --available "llvm$v-devel" &>/dev/null || continue
+                echo "[install-deps] Installing side-by-side LLVM $v (llvm$v/clang$v/lld$v)."
+                sudo dnf install -y \
+                    "llvm$v" "llvm$v-devel" "clang$v" "clang$v-devel" "lld$v" && return 0
+                ;;
+            *)  return 1 ;;
+        esac
+    done
+    return 1
+}
+
 # ── Per-distro packages ─────────────────────────────────────────────────────
 install_arch() {
     # `openmp` is clang's libomp runtime — required by AdaptiveCpp's
@@ -134,18 +246,9 @@ install_arch() {
     esac
     sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 
-    # On rolling Arch, `llvm`/`clang` are often >20 — above AdaptiveCpp's
-    # 16-20 cap. Pull the official side-by-side `llvm20`/`clang20`/`lld20`
-    # from `extra`; they install under /usr/lib/llvm20, the first path
-    # the LLVM probe further down checks.
-    local sys_llvm_major
-    sys_llvm_major=$(pacman -Q llvm 2>/dev/null \
-                     | awk '{print $2}' | grep -oE '^[0-9]+')
-    if [[ -n "$sys_llvm_major" ]] && (( sys_llvm_major > 20 )); then
-        echo "[install-deps] System llvm is $sys_llvm_major (> AdaptiveCpp's 20 cap)."
-        echo "[install-deps] Installing side-by-side llvm20/clang20/lld20 from extra."
-        sudo pacman -S --needed --noconfirm llvm20 llvm20-libs clang20 lld20
-    fi
+    # The side-by-side compat LLVM that rolling Arch needs (system llvm is
+    # 22) is handled generically after the dispatch — every family has the
+    # same problem, so it is no longer special-cased here.
 }
 
 install_apt() {
@@ -210,17 +313,17 @@ install_dnf() {
 }
 
 case "$DISTRO" in
-    arch|cachyos|manjaro|endeavouros)            install_arch ;;
-    ubuntu|debian|pop|linuxmint)                 install_apt  ;;
-    fedora|rhel|centos|rocky|almalinux)          install_dnf  ;;
+    arch|cachyos|manjaro|endeavouros)            PKG_FAMILY=arch;   install_arch ;;
+    ubuntu|debian|pop|linuxmint)                 PKG_FAMILY=debian; install_apt  ;;
+    fedora|rhel|centos|rocky|almalinux)          PKG_FAMILY=fedora; install_dnf  ;;
     *)
         case "$DISTRO_LIKE" in
-            *arch*)   install_arch ;;
-            *debian*) install_apt  ;;
-            *rhel*|*fedora*) install_dnf ;;
+            *arch*)   PKG_FAMILY=arch;   install_arch ;;
+            *debian*) PKG_FAMILY=debian; install_apt  ;;
+            *rhel*|*fedora*) PKG_FAMILY=fedora; install_dnf ;;
             *)
                 echo "[install-deps] Unknown distro '$DISTRO'. Install equivalents of:"
-                echo "  CMake ≥ 3.24, Ninja, LLVM 18+, clang 18+, libclang dev,"
+                echo "  CMake ≥ 3.24, Ninja, LLVM ${LLVM_MIN}-${LLVM_MAX} + clang + ld.lld, libclang dev,"
                 echo "  Boost.Context, libnuma, libomp, Python 3, git,"
                 if [[ "$GPU" == "nvidia" ]]; then
                     echo "  CUDA Toolkit 12+ (with nvcc)"
@@ -233,6 +336,22 @@ case "$DISTRO" in
         esac
         ;;
 esac
+
+# ── Ensure an AdaptiveCpp-compatible LLVM ───────────────────────────────────
+# Runs in the package phase, not lazily at the AdaptiveCpp build below, so
+# every privileged install happens in one burst instead of prompting for sudo
+# again ten minutes later. This is the common case rather than an edge one:
+# the base package sets above pull each distro's *system* LLVM, which on a
+# rolling release is past AdaptiveCpp's cap (Fedora 43 ships 21, Arch 22).
+if llvm_have=$(find_llvm_root); then
+    echo "[install-deps] Compatible LLVM already present: $llvm_have"
+else
+    echo "[install-deps] No LLVM in ${LLVM_MIN}-${LLVM_MAX} found — installing the newest available."
+    # A failure here is not fatal yet: the probe before the AdaptiveCpp
+    # build re-checks and prints the full manual-install guidance.
+    install_compat_llvm \
+        || echo "[install-deps] Automatic LLVM install failed; see the diagnosis below." >&2
+fi
 
 # ── Put nvcc on PATH ────────────────────────────────────────────────────────
 # Distro packages disagree on where nvcc lands and whether it is on PATH:
@@ -315,48 +434,33 @@ ACPP_BUILD_DIR=$(mktemp -d -t xchplot2-acpp-XXXXXX)
 trap 'rm -rf "$ACPP_BUILD_DIR"' EXIT
 
 # ── Find a compatible LLVM ──────────────────────────────────────────────────
-# AdaptiveCpp 25.10 only supports LLVM 16-20. On rolling distros (Arch,
-# Fedora rawhide) the system LLVM is often 21+, which AdaptiveCpp rejects
-# with "LLVM versions greater than 20 are not yet tested/supported". Probe
-# the conventional install prefixes for the newest usable LLVM and pin
-# AdaptiveCpp to it explicitly. Fail fast with a distro-specific install
-# hint rather than letting AdaptiveCpp's CMake fail mid-configure.
-LLVM_ROOT=""
-for cand in \
-    /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18 \
-    /usr/lib/llvm-17 /usr/lib/llvm-16 \
-    /usr/lib/llvm20  /usr/lib/llvm19  /usr/lib/llvm18 \
-    /usr/lib64/llvm20 /usr/lib64/llvm19 /usr/lib64/llvm18 \
-    /opt/llvm20 /opt/llvm-20 /opt/llvm19 /opt/llvm-19 \
-    /opt/llvm18 /opt/llvm-18; do
-    if [[ -x "$cand/bin/clang" ]] && [[ -x "$cand/bin/ld.lld" ]]; then
-        ver=$("$cand/bin/clang" --version 2>/dev/null \
-              | head -1 | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
-        if [[ -n "$ver" ]] && (( ver >= 16 && ver <= 20 )); then
-            LLVM_ROOT="$cand"
-            break
-        fi
-    fi
-done
-
-if [[ -z "$LLVM_ROOT" ]]; then
-    echo "[install-deps] No compatible LLVM (16-20) with ld.lld found." >&2
-    echo "[install-deps] AdaptiveCpp $ACPP_REF only supports LLVM 16-20." >&2
-    echo "[install-deps] Install one and re-run, or use the container path:" >&2
-    case "$DISTRO" in
-        arch|cachyos|manjaro|endeavouros)
-            echo "  yay -S llvm18-bin lld18-bin   # or paru -S, or any AUR helper" >&2 ;;
-        ubuntu|debian|pop|linuxmint)
-            echo "  sudo apt install llvm-18 llvm-18-dev clang-18 lld-18 libomp-18-dev" >&2 ;;
-        fedora|rhel|centos|rocky|almalinux)
-            echo "  sudo dnf install llvm18 llvm18-devel clang18 lld18-devel" >&2 ;;
+# The package phase above should already have installed one. Re-probe here
+# because --no-acpp reruns, $ACPP_PREFIX rebuilds and manual installs all
+# reach this point without having gone through it, and because it is the
+# honest check: what matters is what is on disk now, not what we tried.
+if ! LLVM_ROOT=$(find_llvm_root); then
+    echo "[install-deps] No compatible LLVM (${LLVM_MIN}-${LLVM_MAX}) with ld.lld and" >&2
+    echo "[install-deps] CMake package files found, and none could be installed" >&2
+    echo "[install-deps] automatically. AdaptiveCpp $ACPP_REF rejects anything newer." >&2
+    echo "[install-deps] Install one by hand and re-run, or use the container path:" >&2
+    case "$PKG_FAMILY" in
+        arch)
+            echo "  sudo pacman -S llvm20 llvm20-libs clang20 lld20" >&2 ;;
+        debian)
+            echo "  sudo apt install llvm-20 llvm-20-dev clang-20 lld-20 libomp-20-dev" >&2
+            echo "  # older releases may only carry 18 — substitute the highest ≤ 20 they have" >&2 ;;
+        fedora)
+            echo "  sudo dnf install llvm20 llvm20-devel clang20 clang20-devel lld20" >&2 ;;
         *)
-            echo "  install LLVM 16-20 + clang + ld.lld for your distro" >&2 ;;
+            echo "  install LLVM ${LLVM_MIN}-${LLVM_MAX} + clang + ld.lld for your distro" >&2 ;;
     esac
-    echo "  ./scripts/build-container.sh   # container has LLVM 18 pinned" >&2
+    echo "  ./scripts/build-container.sh   # container has a supported LLVM pinned" >&2
     exit 1
 fi
-echo "[install-deps] Using LLVM at $LLVM_ROOT for AdaptiveCpp build."
+# Ask llvm-config rather than assuming $LLVM_ROOT/lib/cmake/llvm: Fedora's
+# compat packages answer /usr/lib64/llvm20/lib64/cmake/llvm.
+LLVM_CMAKE_DIR=$(llvm_cmake_dir "$LLVM_ROOT")
+echo "[install-deps] Using LLVM $(llvm_prefix_version "$LLVM_ROOT") at $LLVM_ROOT for AdaptiveCpp build."
 
 # ── ROCm device libs path (AMD only) ────────────────────────────────────────
 # AdaptiveCpp's HIP backend needs ockl.bc / ocml.bc to compile kernels for
@@ -446,7 +550,7 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_INSTALL_PREFIX="$ACPP_PREFIX" \
     -DCMAKE_C_COMPILER="$LLVM_ROOT/bin/clang" \
     -DCMAKE_CXX_COMPILER="$LLVM_ROOT/bin/clang++" \
-    -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm" \
+    -DLLVM_DIR="$LLVM_CMAKE_DIR" \
     -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
     "${ACPP_CUDA_FLAGS[@]}" \
     "${ACPP_ROCM_FLAGS[@]}"
