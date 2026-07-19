@@ -324,6 +324,14 @@ fn main() {
             .map(|m| format!("  - {m}"))
             .collect::<Vec<_>>()
             .join("\n");
+        // Absolute path, not `./scripts/...`. The audience for this panic
+        // is `cargo install --git` users, whose shell is in some unrelated
+        // cwd while the sources sit under
+        // ~/.cargo/git/checkouts/xchplot2-<hash>/<rev>/ — a relative path
+        // is not runnable for exactly the people it's addressed to.
+        let build_container = manifest_dir.join("scripts").join("build-container.sh");
+        let build_container = build_container.display();
+
         // Surface the container path proactively when we can already
         // see podman/docker — for many users that's the smoothest fix
         // because the toolchain stays bundled in the image.
@@ -336,7 +344,7 @@ fn main() {
                        sudo apt install cmake build-essential cuda-toolkit-12-9\n\n  \
                    - Or, since you have {engine} installed, build inside a container —\n    \
                      toolchain stays in the image, no host changes needed:\n      \
-                       ./scripts/build-container.sh\n      \
+                       {build_container}\n      \
                        {engine} compose run --rm cuda plot ...\n\n\
                  (cuda-only deliberately has no scripts/install-deps.sh — its small\n\
                  dep set is meant to be installed manually or via the container.)"
@@ -349,7 +357,7 @@ fn main() {
                        sudo apt install cmake build-essential cuda-toolkit-12-9\n\n  \
                    - Or build inside a container (no host toolchain needed beyond\n    \
                      podman or docker — install whichever you prefer first):\n      \
-                       ./scripts/build-container.sh\n\n\
+                       {build_container}\n\n\
                  (cuda-only deliberately has no scripts/install-deps.sh — its small\n\
                  dep set is meant to be installed manually or via the container.)"
             ),
