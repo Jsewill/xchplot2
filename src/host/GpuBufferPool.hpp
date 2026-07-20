@@ -271,4 +271,59 @@ size_t streaming_tiny_peak_bytes(int k);
 // card capability. Re-derive from the watchdog's true peak, never from a ratio.
 size_t streaming_pinned_peak_bytes(int k);
 
+// ---------------------------------------------------------------------------
+// Host memory. The tier ladder above bounds VRAM; these bound the other side.
+// ---------------------------------------------------------------------------
+
+// Peak HOST memory a streaming tier needs at given k, including the pinned
+// staging buffers, the CUDA/SYCL runtime, and the file writer's heap.
+//
+// Host RAM moves OPPOSITE to VRAM across the ladder, because parking tables on
+// the host is what buys the VRAM back. Measured on an RTX 4090, k=28, peak RSS
+// sampled from /proc/PID/status over `bench -n 1 --warmup 0`:
+//
+//   tier      host RSS    VRAM peak   s/plot
+//   plain      7.36 GiB    7.89 GiB     7.46
+//   compact   14.46 GiB    5.86 GiB     6.44
+//   minimal   18.52 GiB    5.00 GiB    26.69
+//   tiny      19.56 GiB    1.12 GiB    40.38
+//
+// So compact buys 2.03 GiB of VRAM for 7.10 GiB of host, and tiny buys 6.77
+// for 12.20 — plus 5.4x the wall clock. Reaching for a lower --tier to "use
+// less memory" makes host RAM worse, which is the single most confusing thing
+// about the ladder and the reason these numbers are in the header.
+//
+// Modelled as cap(k) * bytes_per_entry + a fixed term, because every host
+// buffer is a whole table: cap = 2^k + 2^(k-6), so one u64 array over it is
+// 2.03 GiB at k=28 and that is the quantum the numbers move in. Occupancy is
+// ~98.5% of cap, so there is no headroom to reclaim by sizing.
+//
+// These are ESTIMATES for planning — picking a tier, refusing early with a
+// clear message. They are not the safety mechanism: an analytic model of which
+// buffers a tier allocates drifts the moment a buffer is added, and this one
+// already did, by 27%. host_pinned_reserve_check() below is what actually
+// keeps the machine alive.
+size_t streaming_plain_host_bytes(int k);
+size_t streaming_compact_host_bytes(int k);
+size_t streaming_minimal_host_bytes(int k);
+size_t streaming_tiny_host_bytes(int k);
+
+// Host RAM held back from pinned allocation, so the OS and other tenants keep
+// a working set. Override with XCHPLOT2_HOST_RESERVE_MB.
+size_t host_memory_reserve();
+
+// Throws if committing `bytes` of pinned host memory would push the host below
+// host_memory_reserve(). Inert when the host probe is unavailable.
+//
+// Called at every pinned-host allocation site rather than predicted once up
+// front. Pinned pages are unswappable: the kernel cannot reclaim them under
+// pressure, so it kills processes instead — and it does not necessarily kill
+// ours. A 14 GiB box running k=28 lost its browser, dbus and session systemd
+// before xchplot2 itself died, which is a failure mode no return value can
+// describe. Checking per-allocation costs a /proc/meminfo read on a path that
+// already does a multi-GiB malloc, and is immune to the model drift above:
+// each call re-reads what is actually left, so buffers nobody remembered to
+// count are accounted for by construction.
+void host_pinned_reserve_check(size_t bytes, char const* what);
+
 } // namespace pos2gpu

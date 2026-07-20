@@ -1982,6 +1982,78 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     tier_name(tier));
             }
 
+            // Host RAM. Everything above sized the DEVICE peak; this is the
+            // other half of the budget, and it moves the OPPOSITE way — see
+            // the measured table in GpuBufferPool.hpp. A card small enough to
+            // need Tiny usually sits in a box that can least afford Tiny's
+            // 19.6 GiB of host staging, so weighing only VRAM is how a 14 GiB
+            // machine ends up inviting the OOM killer instead of being told no.
+            //
+            // These are estimates. host_pinned_reserve_check() at each
+            // allocation is the mechanism that actually keeps the host alive;
+            // this exists to fail before the setup cost rather than during it.
+            auto const host_need = [pool_k](Tier t) -> size_t {
+                switch (t) {
+                    case Tier::Plain:   return streaming_plain_host_bytes(pool_k);
+                    case Tier::Compact: return streaming_compact_host_bytes(pool_k);
+                    case Tier::Minimal: return streaming_minimal_host_bytes(pool_k);
+                    // Pinned shares tiny_mode's host-park behaviour, so it
+                    // carries tiny's host cost too.
+                    case Tier::Tiny:
+                    case Tier::Pinned:  break;
+                }
+                return streaming_tiny_host_bytes(pool_k);
+            };
+            size_t const host_required = host_need(tier);
+            size_t const host_reserve  = host_memory_reserve();
+
+            size_t host_free = 0, host_total = 0;
+            bool const have_host =
+                device_memory_probe(kCpuDeviceId, host_free, host_total);
+
+            // A forced tier that costs MORE host RAM than the auto-pick is
+            // worth saying out loud: --tier tiny is the obvious reach for "use
+            // less memory", and it is the single worst choice for host RAM.
+            if (!auto_picked && have_host) {
+                Tier const auto_tier =
+                    (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
+                    (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
+                    (mem.free_bytes >= minimal_peak + margin) ? Tier::Minimal :
+                                                                Tier::Tiny;
+                size_t const auto_host = host_need(auto_tier);
+                if (tier != auto_tier && host_required > auto_host) {
+                    std::fprintf(stderr,
+                        "%s --tier %s needs ~%.2f GiB of HOST RAM; %s also fits "
+                        "this GPU and needs ~%.2f GiB. Lower tiers buy VRAM WITH "
+                        "host memory — they do not reduce memory overall.\n",
+                        log_prefix.c_str(),
+                        tier_name(tier), to_gib(host_required),
+                        tier_name(auto_tier), to_gib(auto_host));
+                }
+            }
+
+            if (have_host && host_free < host_required + host_reserve) {
+                throw std::runtime_error(
+                    log_prefix + " tier " + tier_name(tier) + " needs ~" +
+                    std::to_string(to_gib(host_required)).substr(0, 5) +
+                    " GiB of HOST RAM at k=" + std::to_string(pool_k) +
+                    " plus a " +
+                    std::to_string(to_gib(host_reserve)).substr(0, 5) +
+                    " GiB reserve; host reports " +
+                    std::to_string(to_gib(host_free)).substr(0, 5) +
+                    " GiB available of " +
+                    std::to_string(to_gib(host_total)).substr(0, 5) +
+                    " GiB total. This is host memory, not VRAM — and a LOWER "
+                    "--tier costs MORE of it, not less: plain needs the least "
+                    "(~" +
+                    std::to_string(to_gib(streaming_plain_host_bytes(pool_k))).substr(0, 5) +
+                    " GiB), tiny the most (~" +
+                    std::to_string(to_gib(streaming_tiny_host_bytes(pool_k))).substr(0, 5) +
+                    " GiB). The requirement is fixed for PoS2's k=28. Close "
+                    "what else is holding RAM, or plot on a host with more. "
+                    "(XCHPLOT2_HOST_RESERVE_MB tunes the reserve.)");
+            }
+
             // Two-phase match candidate scratch (see SyclBackend.hpp): grant
             // what is left after the tier's modelled peak and the margin.
             // Because the grant is free - peak - margin, the invariant
@@ -2031,52 +2103,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         uint64_t const cap = per_section * (1ULL << num_section_bits);
         stream_pinned_cap = size_t(cap);
 
-        // Check host RAM before pinning any of it.
-        //
-        // The streaming ladder is a VRAM ladder: tier picks the DEVICE peak and
-        // the gate above compares it against device free memory. The host side
-        // is tier-invariant — every tier stages through the same cap-sized
-        // pinned buffers — so --tier tiny cuts the device peak to ~1 GiB at
-        // k=28 and leaves 14.22 GiB pinned on the host, which is the whole
-        // requirement for PoS2 since k is only ever 28. Nothing checked that, so
-        // a host with less RAM than the pinned total did not fail here: it kept
-        // allocating until the kernel OOM-killer fired, taking unrelated
-        // processes down with it. Reported from a 14 GiB box where every tier
-        // died the same way, which is precisely the signature of a limit that
-        // the tier knob does not move.
-        //
-        // Pinned pages are unswappable, so swap does not save us and
-        // MemAvailable is the honest number to compare against.
-        {
-            auto const to_gib_host = [](std::size_t b) {
-                return b / double(1ULL << 30);
-            };
-            std::size_t const u64_slots =
-                std::size_t(GpuBufferPool::kNumPinnedBuffers)
-                + (stream_scratch.plain_mode ? 0u : (stream_scratch.tiny_mode ? 3u : 2u));
-            std::size_t const u32_slots = stream_scratch.plain_mode ? 0u : 2u;
-            std::size_t const pinned_needed =
-                stream_pinned_cap * (u64_slots * sizeof(std::uint64_t)
-                                     + u32_slots * sizeof(std::uint32_t));
-
-            std::size_t host_free = 0, host_total = 0;
-            if (device_memory_probe(kCpuDeviceId, host_free, host_total)
-                && host_free < pinned_needed)
-            {
-                throw std::runtime_error(
-                    log_prefix + " streaming pipeline needs ~" +
-                    std::to_string(to_gib_host(pinned_needed)).substr(0, 5) +
-                    " GiB of pinned HOST RAM for k=" + std::to_string(pool_k) +
-                    ", host reports " +
-                    std::to_string(to_gib_host(host_free)).substr(0, 5) +
-                    " GiB available of " +
-                    std::to_string(to_gib_host(host_total)).substr(0, 5) +
-                    " GiB total. This is host memory, not VRAM — --tier only "
-                    "bounds the device peak and will not reduce it, and the "
-                    "requirement is fixed for PoS2's k=28. Close what else is "
-                    "holding RAM, or plot on a host with more memory.");
-            }
-        }
+        // The host-RAM pre-flight used to live here, modelling which buffers
+        // each tier allocates. It undercounted by 27% — it missed h_t1_mi,
+        // h_t2_mi and others — which is the failure mode any such model has.
+        // It now sits with the tier pick above (measured per-tier estimates),
+        // and host_pinned_reserve_check() guards each allocation for real.
 
         bool any_fail = false;
         for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {

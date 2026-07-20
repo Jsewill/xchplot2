@@ -3,6 +3,7 @@
 #include "host/MultiGpuPipelineParallel.hpp"
 
 #include "gpu/SyclBackend.hpp"
+#include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 
@@ -258,6 +259,16 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
         // pinned_dst + h_meta stay host-pinned regardless — host-side
         // code touches them (T1 sort tile-merge for h_meta; T3 final
         // frag output for pinned_dst).
+        // Charge the whole boundary set at once. Checking each allocation in
+        // turn would let the first four land and fail only on the fifth, with
+        // ~8 GiB at k=28 already committed and nothing to do but unwind.
+        host_pinned_reserve_check(
+            cap * (2 * sizeof(std::uint64_t)
+                   + (peer_copy ? 0
+                                : sizeof(std::uint64_t)
+                                      + 2 * sizeof(std::uint32_t))),
+            "pipeline-parallel stage boundary");
+
         buf.pinned_dst = static_cast<std::uint64_t*>(
             sycl::malloc_host(cap * sizeof(std::uint64_t), q));
         buf.h_meta     = static_cast<std::uint64_t*>(
@@ -525,17 +536,28 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     // pinned_dst + h_meta always host-pinned (host-side use). The 3
     // T2-boundary buffers become device-on-consumer when peer_copy is
     // on (cross-device D2D via AdaptiveCpp's peer-copy routing).
+    // Only the host arms are charged against host RAM; under peer_copy the
+    // boundary buffers are device allocations and the VRAM gate owns them.
     auto alloc_u64_host = [&](std::size_t n) -> std::uint64_t* {
+        host_pinned_reserve_check(n * sizeof(std::uint64_t), "stage pinned u64");
         return static_cast<std::uint64_t*>(
             sycl::malloc_host(n * sizeof(std::uint64_t), alloc_q));
     };
     auto alloc_u64_boundary = [&](std::size_t n) -> std::uint64_t* {
+        if (!peer_copy) {
+            host_pinned_reserve_check(n * sizeof(std::uint64_t),
+                                      "stage boundary u64");
+        }
         void* p = peer_copy
             ? sycl::malloc_device(n * sizeof(std::uint64_t), alloc_q)
             : sycl::malloc_host(  n * sizeof(std::uint64_t), alloc_q);
         return static_cast<std::uint64_t*>(p);
     };
     auto alloc_u32_boundary = [&](std::size_t n) -> std::uint32_t* {
+        if (!peer_copy) {
+            host_pinned_reserve_check(n * sizeof(std::uint32_t),
+                                      "stage boundary u32");
+        }
         void* p = peer_copy
             ? sycl::malloc_device(n * sizeof(std::uint32_t), alloc_q)
             : sycl::malloc_host(  n * sizeof(std::uint32_t), alloc_q);

@@ -179,6 +179,7 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
 inline void* s_malloc_host_raw(StreamingStats& s, size_t bytes,
                                char const* what, sycl::queue& q)
 {
+    host_pinned_reserve_check(bytes, what);
     void* p = sycl::malloc_host(bytes, q);
     if (!p) {
         throw std::runtime_error(
@@ -4345,6 +4346,11 @@ t3_match_entry:
 
 uint64_t* streaming_alloc_pinned_uint64(size_t count)
 {
+    // Throws rather than returning null: the callers treat null as "allocation
+    // failed, fall back", but a host that is out of RAM has nothing to fall
+    // back TO — every lower tier wants more host memory, not less. Failing
+    // here with the reason beats failing later without one.
+    host_pinned_reserve_check(count * sizeof(uint64_t), "streaming pinned u64");
     uint64_t* p = nullptr;
     p = static_cast<uint64_t*>(
         sycl::malloc_host(count * sizeof(uint64_t), sycl_backend::queue()));
@@ -4354,6 +4360,7 @@ uint64_t* streaming_alloc_pinned_uint64(size_t count)
 
 uint32_t* streaming_alloc_pinned_uint32(size_t count)
 {
+    host_pinned_reserve_check(count * sizeof(uint32_t), "streaming pinned u32");
     uint32_t* p = static_cast<uint32_t*>(
         sycl::malloc_host(count * sizeof(uint32_t), sycl_backend::queue()));
     return p;  // nullptr on failure

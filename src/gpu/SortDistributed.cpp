@@ -36,6 +36,7 @@
 #include "gpu/PipelineKernels.cuh"
 #include "gpu/Sort.cuh"
 #include "gpu/SortDistributedPeer.hpp"  // peer-path scatter kernels (Phase 2.4b)
+#include "host/GpuBufferPool.hpp"            // host_pinned_reserve_check
 #include "host/MultiGpuShardBufferPool.hpp"  // optional pinned-bounce pool
 
 #include <sycl/sycl.hpp>
@@ -113,6 +114,7 @@ std::size_t bucket_of_u64(std::uint64_t key, std::size_t N,
 template <class T>
 T* pinned_alloc(std::size_t n, sycl::queue& q)
 {
+    host_pinned_reserve_check(n * sizeof(T), "distributed sort pinned bounce");
     return sycl::malloc_host<T>(n, q);
 }
 

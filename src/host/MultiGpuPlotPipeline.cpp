@@ -48,6 +48,7 @@
 #include "gpu/T3Kernel.cuh"
 #include "gpu/XsCandidateGpu.hpp"
 #include "gpu/XsKernels.cuh"
+#include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
 #include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
@@ -152,6 +153,7 @@ struct SyclHostPtr {
 template <class T>
 SyclHostPtr<T> sycl_alloc_host_owned(std::size_t n, sycl::queue& q)
 {
+    host_pinned_reserve_check(n * sizeof(T), "shard pinned host");
     return SyclHostPtr<T>(&q, sycl::malloc_host<T>(n, q));
 }
 
@@ -1624,6 +1626,7 @@ void MultiGpuPlotPipeline::run_fragment_phase()
     if (total == 0) return;
 
     auto const t_frag_alloc = sub_begin();
+    host_pinned_reserve_check(total * sizeof(std::uint64_t), "h_fragments");
     h_fragments_ = sycl::malloc_host<std::uint64_t>(total, alloc_q);
     sub_end("fragment.host_alloc", t_frag_alloc);
 

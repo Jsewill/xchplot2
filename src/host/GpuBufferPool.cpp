@@ -87,6 +87,7 @@ inline void* sycl_alloc_device_or_throw(size_t bytes, sycl::queue& q,
 inline void* sycl_alloc_host_or_throw(size_t bytes, sycl::queue& q,
                                       char const* what)
 {
+    host_pinned_reserve_check(bytes, what);
     void* p = nullptr;
     try {
         p = sycl::malloc_host(bytes, q);
@@ -781,6 +782,79 @@ size_t streaming_pinned_peak_bytes(int k)
     }
     int const shift = k - 28;
     return ((size_t(anchor_mb) << 20) << shift) + adj;
+}
+
+namespace {
+
+// Host bytes per cap entry, per tier. Table and provenance in the header.
+//
+// Derived by subtracting the fixed term from each measured peak RSS and
+// dividing by cap(28) = 272,629,760:
+//   plain   (7.36 - 1.27) GiB / cap = 24 B  — exactly the 3-slot D2H ring
+//   compact (14.46 - 1.27)          = 52 B
+//   minimal (18.52 - 1.27)          = 68 B  — gather-tiling holds h_t2_meta
+//                                             live across T3 match
+//   tiny    (19.56 - 1.27)          = 72 B
+//
+// Reconstructing the measurements from these gives 7.36 / 14.47 / 18.53 /
+// 19.55 GiB — within 0.02 GiB of every reading.
+//
+// The fixed term is what does not scale with cap: the CUDA/SYCL context, the
+// binary, and the file writer's compressed-chunk heap. Keeping it separate
+// matters at small k, where it dominates — a pure bytes-per-entry model would
+// predict 81 MB for k=20 against an actual ~1.3 GiB, i.e. wrong in the unsafe
+// direction for a gate.
+constexpr size_t kHostFixedBytes = size_t(1300) << 20;
+
+size_t streaming_host_bytes(int k, unsigned bytes_per_entry)
+{
+    int const num_section_bits = (k < 28) ? 2 : (k - 26);
+    std::uint64_t const cap    = match_phase_capacity(k, num_section_bits);
+    return size_t(cap) * bytes_per_entry + kHostFixedBytes;
+}
+
+}  // namespace
+
+size_t streaming_plain_host_bytes(int k)   { return streaming_host_bytes(k, 24); }
+size_t streaming_compact_host_bytes(int k) { return streaming_host_bytes(k, 52); }
+size_t streaming_minimal_host_bytes(int k) { return streaming_host_bytes(k, 68); }
+size_t streaming_tiny_host_bytes(int k)    { return streaming_host_bytes(k, 72); }
+
+size_t host_memory_reserve()
+{
+    static size_t const reserve = [] () -> size_t {
+        if (char const* v = std::getenv("XCHPLOT2_HOST_RESERVE_MB"); v && v[0]) {
+            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        // Enough for the OS, a shell, and the writer's own heap growth after
+        // the last pinned buffer lands. Not enough to protect a desktop
+        // session — raise it if the plotting host is also driving one.
+        return size_t(512) << 20;
+    }();
+    return reserve;
+}
+
+void host_pinned_reserve_check(size_t bytes, char const* what)
+{
+    size_t free_b = 0, total_b = 0;
+    if (!host_memory_probe(free_b, total_b)) return;   // no probe → inert
+
+    size_t const reserve = host_memory_reserve();
+    if (bytes + reserve <= free_b) return;
+
+    auto const gib = [](size_t b) { return b / double(1ULL << 30); };
+    char msg[768];
+    std::snprintf(msg, sizeof(msg),
+        "pinned host allocation of %.2f GiB for %s would leave this machine "
+        "under its %.2f GiB reserve — %.2f GiB available of %.2f GiB total. "
+        "This is HOST memory, not VRAM: --tier bounds the device peak only, "
+        "and a LOWER tier costs MORE host RAM, not less, so it will not help. "
+        "The requirement is fixed for PoS2's k=28. Close what else is holding "
+        "RAM, or plot on a host with more. "
+        "(XCHPLOT2_HOST_RESERVE_MB overrides the reserve.)",
+        gib(bytes), what, gib(reserve), gib(free_b), gib(total_b));
+    throw std::runtime_error(msg);
 }
 
 } // namespace pos2gpu

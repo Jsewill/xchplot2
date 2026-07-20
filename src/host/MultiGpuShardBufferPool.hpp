@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -96,6 +98,9 @@ public:
         Slot& slot = host_slots_[std::string(name)];
         if (slot.bytes < bytes) {
             if (slot.ptr) sycl::free(slot.ptr, *q_);
+            if (bytes != 0) {
+                host_pinned_reserve_check(bytes, std::string(name).c_str());
+            }
             slot.ptr   = bytes == 0 ? nullptr
                                     : sycl::malloc_host(bytes, *q_);
             slot.bytes = bytes;

@@ -2,6 +2,8 @@
 
 #include "host/HostPinnedPool.hpp"
 
+#include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
+
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +35,9 @@ void* HostPinnedPool::acquire(std::string_view name, std::size_t bytes,
         it->second.ptr = nullptr;
         it->second.bytes = 0;
     }
+    // After the free above, so a grown slot is charged only its delta against
+    // what the host actually has left.
+    host_pinned_reserve_check(bytes, std::string(name).c_str());
     void* p = sycl::malloc_host(bytes, q);
     if (!p) {
         throw std::runtime_error(
