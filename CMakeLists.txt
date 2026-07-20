@@ -283,6 +283,54 @@ if(NOT ACPP_TARGETS)
 endif()
 message(STATUS "xchplot2: ACPP_TARGETS=${ACPP_TARGETS}")
 
+# ── ROCm device bitcode ─────────────────────────────────────────────────────
+# amdgcn codegen needs ockl.bc / ocml.bc, and two separate consumers have to
+# be told where they live:
+#   1. AdaptiveCpp's own build (-DROCM_DEVICE_LIBS_PATH), when we FetchContent
+#      it rather than using an installed one.
+#   2. clang, when it compiles OUR SYCL TUs for a hip:gfx* target. Its
+#      built-in default is /opt/rocm, so on a distro-packaged ROCm every
+#      pos2_gpu TU dies with "cannot find ROCm device library".
+# Hence a single probe out here: scoping it to the FetchContent branch meant
+# it never ran for an already-installed AdaptiveCpp, which is exactly the
+# configuration scripts/install-deps.sh leaves behind.
+#
+# /opt/rocm is AMD's own installer layout. Distros that package ROCm
+# themselves put the bitcode elsewhere — Fedora's rocm-device-libs ships
+# /usr/lib64/rocm/llvm/lib/clang/<rocm-llvm-major>/lib/amdgcn/bitcode and has
+# no /opt/rocm at all. Versioned prefixes (/opt/rocm-6.2.0, clang/22) are
+# common alongside, or instead of, the unversioned ones.
+if(NOT ROCM_DEVICE_LIBS_PATH)
+    file(GLOB _x2_bc_dirs
+        "/opt/rocm*/amdgcn/bitcode"
+        "/opt/rocm*/lib/llvm-amdgpu/amdgcn/bitcode"
+        "/opt/rocm*/share/amdgcn/bitcode"
+        "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
+        "/usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
+        "/usr/lib64/amdgcn/bitcode"
+        "/usr/lib/amdgcn/bitcode"
+        "/usr/share/amdgcn/bitcode")
+    # NATURAL so clang/9 sorts below clang/22; reversed, so highest wins.
+    list(SORT _x2_bc_dirs COMPARE NATURAL)
+    list(REVERSE _x2_bc_dirs)
+    foreach(_x2_bc ${_x2_bc_dirs})
+        if(EXISTS "${_x2_bc}/ockl.bc")
+            set(ROCM_DEVICE_LIBS_PATH "${_x2_bc}" CACHE PATH
+                "ROCm device bitcode dir (amdgcn ockl.bc / ocml.bc)" FORCE)
+            message(STATUS "xchplot2: ROCm device libs = ${_x2_bc}")
+            break()
+        endif()
+    endforeach()
+endif()
+if(ACPP_TARGETS MATCHES "hip" AND NOT ROCM_DEVICE_LIBS_PATH)
+    message(WARNING
+        "xchplot2: ACPP_TARGETS=${ACPP_TARGETS} needs amdgcn device bitcode "
+        "(ockl.bc) but none was found. Install your distro's rocm-device-libs "
+        "package, or pass -DROCM_DEVICE_LIBS_PATH=/path/to/amdgcn/bitcode. "
+        "Without it clang fails every SYCL TU with \"cannot find ROCm device "
+        "library\".")
+endif()
+
 # Lookup precedence:
 #   1. find_package(AdaptiveCpp) — system or local install (e.g. /opt/adaptivecpp).
 #      This is what scripts/install-deps.sh and the Containerfile produce.
@@ -436,36 +484,9 @@ if(NOT AdaptiveCpp_FOUND)
         # it, which is why an AMD host got that error on a bare
         # `cargo install`. Harmless elsewhere: on a non-AMD box nothing
         # matches and nothing is set.
-        if(NOT ROCM_DEVICE_LIBS_PATH)
-            # /opt/rocm is AMD's own installer layout. Distros that package
-            # ROCm themselves put the bitcode elsewhere — Fedora's
-            # rocm-device-libs ships
-            # /usr/lib64/rocm/llvm/lib/clang/<rocm-llvm-major>/lib/amdgcn/bitcode
-            # and has no /opt/rocm at all — so probing only /opt/rocm fails on
-            # every distro-packaged ROCm host. Glob the known layouts;
-            # versioned prefixes (/opt/rocm-6.2.0, clang/22) are common
-            # alongside, or instead of, the unversioned ones.
-            file(GLOB _x2_bc_dirs
-                "/opt/rocm*/amdgcn/bitcode"
-                "/opt/rocm*/lib/llvm-amdgpu/amdgcn/bitcode"
-                "/opt/rocm*/share/amdgcn/bitcode"
-                "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
-                "/usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
-                "/usr/lib64/amdgcn/bitcode"
-                "/usr/lib/amdgcn/bitcode"
-                "/usr/share/amdgcn/bitcode")
-            # NATURAL so clang/9 sorts below clang/22; last = highest.
-            list(SORT _x2_bc_dirs COMPARE NATURAL)
-            list(REVERSE _x2_bc_dirs)
-            foreach(_x2_bc ${_x2_bc_dirs})
-                if(EXISTS "${_x2_bc}/ockl.bc")
-                    set(ROCM_DEVICE_LIBS_PATH "${_x2_bc}" CACHE PATH
-                        "ROCm device bitcode dir for AdaptiveCpp's HIP backend" FORCE)
-                    message(STATUS "xchplot2:   ROCm device libs = ${_x2_bc}")
-                    break()
-                endif()
-            endforeach()
-        endif()
+        # ROCM_DEVICE_LIBS_PATH is probed once near the top of this file — it
+        # is needed for an already-installed AdaptiveCpp too, so it cannot
+        # live in this branch.
 
         include(FetchContent)
         FetchContent_Declare(
@@ -747,6 +768,22 @@ target_compile_options(pos2_gpu PRIVATE
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:RelWithDebInfo>:-O2>
     $<$<CONFIG:MinSizeRel>:-Os>)
+
+# For a hip:gfx* target, acpp hands our TUs to clang for real amdgcn codegen,
+# and clang looks for the device bitcode under its built-in --rocm-path
+# default of /opt/rocm. A distro-packaged ROCm isn't there (Fedora keeps it
+# under /usr/lib64/rocm), so every pos2_gpu TU fails with "cannot find ROCm
+# device library" even though AdaptiveCpp itself built fine — it was told the
+# path at ITS configure time; clang compiling OUR code was not.
+#
+# Only for hip:*: on generic SSCP no amdgcn codegen happens here, the JIT
+# resolves device libs at runtime via AdaptiveCpp's own configuration, and
+# the flag would just draw an unused-argument warning on every TU.
+if(ACPP_TARGETS MATCHES "hip" AND ROCM_DEVICE_LIBS_PATH)
+    target_compile_options(pos2_gpu PRIVATE
+        "--rocm-device-lib-path=${ROCM_DEVICE_LIBS_PATH}")
+    message(STATUS "xchplot2: pos2_gpu --rocm-device-lib-path=${ROCM_DEVICE_LIBS_PATH}")
+endif()
 # The SYCL TUs include CUDA headers (cuda_fp16.h, transitively cuda_runtime.h
 # from the kernel-wrapper headers) on both the CUDA and non-CUDA paths
 # (slice 17 will lift the CUDA-type dependencies out of the public API).
