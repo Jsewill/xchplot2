@@ -51,7 +51,8 @@ if(NOT XCHPLOT2_BUILD_CUDA)
             XCHPLOT2_SKIP_CUDA_RUNTIME
             XCHPLOT2_SKIP_CUDA_FP16)
         message(STATUS "xchplot2: ROCm at ${XCHPLOT2_HIP_RUNTIME_H} — "
-                       "skipping CUDA runtime/fp16 includes (CudaHalfShim stubs)")
+                       "skipping CUDA runtime/fp16 includes (CudaHalfShim "
+                       "falls through to ROCm's own fp16 header)")
     endif()
 endif()
 

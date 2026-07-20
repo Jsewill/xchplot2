@@ -52,6 +52,18 @@
 #if !defined(XCHPLOT2_SKIP_CUDA_FP16) && __has_include(<cuda_fp16.h>)
   #include <cuda_fp16.h>
 #elif __has_include(<hip/hip_fp16.h>)
+  // hip_fp16.h dispatches on __HIP_PLATFORM_AMD__ / __HIP_PLATFORM_NVIDIA__ and
+  // #errors when neither is set. hipcc defines it from the driver; a plain C++
+  // or SYCL compile does not, so a distro that ships the HIP headers in
+  // /usr/include (Fedora's rocm-hip-devel) breaks every TU reaching this arm.
+  // Defining it here is AMD's documented way to consume these headers from a
+  // non-hipcc compiler, and AMD is the only coherent choice at this point: the
+  // NVIDIA arm of hip_fp16.h just re-includes <cuda_fp16.h>, and we are only
+  // here because that header was absent. Guarded so a real HIP compilation,
+  // which sets the macro from the driver, is left exactly as it was.
+  #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_NVIDIA__)
+    #define __HIP_PLATFORM_AMD__ 1
+  #endif
   #include <hip/hip_fp16.h>
 #else
   struct __half  { uint16_t x; };
