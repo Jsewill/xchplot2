@@ -540,23 +540,69 @@ fi
 LLVM_CMAKE_DIR=$(llvm_cmake_dir "$LLVM_ROOT")
 echo "[install-deps] Using LLVM $(llvm_prefix_version "$LLVM_ROOT") at $LLVM_ROOT for AdaptiveCpp build."
 
+# AdaptiveCpp hunts for clang's resource dir only under
+# ${LLVM_PREFIX_DIR}/{include,lib,lib64}/clang/<major>/include and SEND_ERRORs
+# ("CLANG_INCLUDE_PATH does not exist") when every hint misses. Fedora's
+# compat clang answers /usr/lib/clang/20 — outside the LLVM prefix entirely —
+# so it always misses there. Ask clang: -print-resource-dir names the
+# directory holding include/, exactly what AdaptiveCpp computes as
+# FOUND_CLANG_INCLUDE_PATH/.. on the happy path.
+ACPP_CLANG_FLAGS=()
+CLANG_RES=$("$LLVM_ROOT/bin/clang" -print-resource-dir 2>/dev/null || true)
+# -print-resource-dir answers relative to bin/ with ../.. hops.
+[[ -n "$CLANG_RES" ]] && CLANG_RES=$(readlink -f "$CLANG_RES" 2>/dev/null || echo "$CLANG_RES")
+if [[ -n "$CLANG_RES" ]] && [[ -f "$CLANG_RES/include/__clang_cuda_runtime_wrapper.h" ]]; then
+    ACPP_CLANG_FLAGS+=(-DCLANG_INCLUDE_PATH="$CLANG_RES")
+    echo "[install-deps] clang resource dir: $CLANG_RES"
+fi
+# Pin Clang_DIR alongside LLVM_DIR: leaving it unset lets AdaptiveCpp's
+# find_package(Clang) resolve to the system clang's config and re-introduce
+# the very version skew LLVM_DIR just removed.
+for _cl in "$LLVM_ROOT/lib64/cmake/clang" "$LLVM_ROOT/lib/cmake/clang"; do
+    if [[ -f "$_cl/ClangConfig.cmake" ]]; then
+        ACPP_CLANG_FLAGS+=(-DClang_DIR="$_cl")
+        break
+    fi
+done
+
 # ── ROCm device libs path (AMD only) ────────────────────────────────────────
 # AdaptiveCpp's HIP backend needs ockl.bc / ocml.bc to compile kernels for
-# amdgcn. The bitcode location moved between ROCm versions; probe the
-# common spots. CMake will warn if the path's missing on AMD; without a
-# match here, the build fails with "ROCm device library path not found".
+# amdgcn; without a match the build dies with "ROCm device library path not
+# found".
+#
+# This used to probe only /opt/rocm, AMD's own installer layout. Distros that
+# package ROCm themselves put it somewhere else entirely — Fedora's
+# rocm-device-libs ships
+# /usr/lib64/rocm/llvm/lib/clang/<rocm-llvm-major>/lib/amdgcn/bitcode and has
+# no /opt/rocm at all — so every distro-ROCm host failed here. Glob the known
+# layouts and take the highest version when several are installed.
 ACPP_ROCM_FLAGS=()
 if [[ "$GPU" == "amd" ]]; then
-    for d in \
-        /opt/rocm/amdgcn/bitcode \
-        /opt/rocm/lib/llvm-amdgpu/amdgcn/bitcode \
-        /opt/rocm/share/amdgcn/bitcode; do
-        if [[ -f "$d/ockl.bc" ]]; then
-            ACPP_ROCM_FLAGS+=(-DROCM_DEVICE_LIBS_PATH="$d")
-            echo "[install-deps] ROCm device libs: $d"
-            break
-        fi
-    done
+    rocm_bc=""
+    while IFS= read -r d; do
+        rocm_bc="$d"
+    done < <(
+        for d in \
+            /opt/rocm*/amdgcn/bitcode \
+            /opt/rocm*/lib/llvm-amdgpu/amdgcn/bitcode \
+            /opt/rocm*/share/amdgcn/bitcode \
+            /usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode \
+            /usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode \
+            /usr/lib64/amdgcn/bitcode \
+            /usr/lib/amdgcn/bitcode \
+            /usr/share/amdgcn/bitcode; do
+            [[ -f "$d/ockl.bc" ]] && printf '%s\n' "$d"
+        done | sort -V   # -V so clang/9 sorts below clang/22, unlike plain sort
+    )
+    if [[ -n "$rocm_bc" ]]; then
+        ACPP_ROCM_FLAGS+=(-DROCM_DEVICE_LIBS_PATH="$rocm_bc")
+        echo "[install-deps] ROCm device libs: $rocm_bc"
+    else
+        echo "[install-deps] WARNING: no amdgcn bitcode (ockl.bc) found — AdaptiveCpp's" >&2
+        echo "[install-deps] HIP backend will fail to configure. Install your distro's" >&2
+        echo "[install-deps] rocm-device-libs package, or pass the directory yourself:" >&2
+        echo "[install-deps]   ROCM_DEVICE_LIBS_PATH=/path/to/amdgcn/bitcode" >&2
+    fi
 fi
 
 echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
@@ -630,6 +676,7 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DCMAKE_CXX_COMPILER="$LLVM_ROOT/bin/clang++" \
     -DLLVM_DIR="$LLVM_CMAKE_DIR" \
     -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
+    "${ACPP_CLANG_FLAGS[@]}" \
     "${ACPP_CUDA_FLAGS[@]}" \
     "${ACPP_ROCM_FLAGS[@]}"
 cmake --build "$ACPP_BUILD_DIR/build" --parallel

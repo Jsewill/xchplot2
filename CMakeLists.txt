@@ -437,20 +437,31 @@ if(NOT AdaptiveCpp_FOUND)
         # `cargo install`. Harmless elsewhere: on a non-AMD box nothing
         # matches and nothing is set.
         if(NOT ROCM_DEVICE_LIBS_PATH)
-            # Versioned prefixes (/opt/rocm-6.2.0) are common alongside the
-            # unversioned symlink, and are all that exists on some installs.
-            file(GLOB _x2_rocm_roots "/opt/rocm" "/opt/rocm-*")
-            foreach(_x2_root ${_x2_rocm_roots})
-                foreach(_x2_sub amdgcn/bitcode lib/llvm-amdgpu/amdgcn/bitcode
-                                share/amdgcn/bitcode)
-                    if(EXISTS "${_x2_root}/${_x2_sub}/ockl.bc")
-                        set(ROCM_DEVICE_LIBS_PATH "${_x2_root}/${_x2_sub}" CACHE PATH
-                            "ROCm device bitcode dir for AdaptiveCpp's HIP backend" FORCE)
-                        message(STATUS "xchplot2:   ROCm device libs = ${ROCM_DEVICE_LIBS_PATH}")
-                        break()
-                    endif()
-                endforeach()
-                if(ROCM_DEVICE_LIBS_PATH)
+            # /opt/rocm is AMD's own installer layout. Distros that package
+            # ROCm themselves put the bitcode elsewhere — Fedora's
+            # rocm-device-libs ships
+            # /usr/lib64/rocm/llvm/lib/clang/<rocm-llvm-major>/lib/amdgcn/bitcode
+            # and has no /opt/rocm at all — so probing only /opt/rocm fails on
+            # every distro-packaged ROCm host. Glob the known layouts;
+            # versioned prefixes (/opt/rocm-6.2.0, clang/22) are common
+            # alongside, or instead of, the unversioned ones.
+            file(GLOB _x2_bc_dirs
+                "/opt/rocm*/amdgcn/bitcode"
+                "/opt/rocm*/lib/llvm-amdgpu/amdgcn/bitcode"
+                "/opt/rocm*/share/amdgcn/bitcode"
+                "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
+                "/usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
+                "/usr/lib64/amdgcn/bitcode"
+                "/usr/lib/amdgcn/bitcode"
+                "/usr/share/amdgcn/bitcode")
+            # NATURAL so clang/9 sorts below clang/22; last = highest.
+            list(SORT _x2_bc_dirs COMPARE NATURAL)
+            list(REVERSE _x2_bc_dirs)
+            foreach(_x2_bc ${_x2_bc_dirs})
+                if(EXISTS "${_x2_bc}/ockl.bc")
+                    set(ROCM_DEVICE_LIBS_PATH "${_x2_bc}" CACHE PATH
+                        "ROCm device bitcode dir for AdaptiveCpp's HIP backend" FORCE)
+                    message(STATUS "xchplot2:   ROCm device libs = ${_x2_bc}")
                     break()
                 endif()
             endforeach()
