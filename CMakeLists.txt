@@ -509,6 +509,28 @@ if(NOT AdaptiveCpp_FOUND)
     endif()
 endif()
 
+# Wrap add_sycl_to_target so per-target SYCL compile settings attach to the
+# one call that defines a SYCL target, and a target added later can't quietly
+# miss them. Right now that means the ROCm device-lib path: on a hip:* AOT
+# target acpp hands the TUs to clang for real amdgcn codegen, and clang looks
+# under its built-in --rocm-path default of /opt/rocm, which a distro-packaged
+# ROCm doesn't use (Fedora keeps it under /usr/lib64/rocm). Without the flag
+# clang fails every SYCL TU with "cannot find ROCm device library" even though
+# AdaptiveCpp itself built fine — it was told the path at ITS configure time;
+# clang compiling OUR code was not.
+#
+# Only for hip:*: on generic SSCP no amdgcn codegen happens at build time, the
+# JIT resolves device libs at runtime through AdaptiveCpp's own configuration,
+# and the flag would just draw an unused-argument warning on every TU.
+function(x2_add_sycl_to_target)
+    cmake_parse_arguments(_X2_SYCL "" "TARGET" "SOURCES" ${ARGN})
+    add_sycl_to_target(TARGET ${_X2_SYCL_TARGET} SOURCES ${_X2_SYCL_SOURCES})
+    if(ACPP_TARGETS MATCHES "hip" AND ROCM_DEVICE_LIBS_PATH)
+        target_compile_options(${_X2_SYCL_TARGET} PRIVATE
+            "--rocm-device-lib-path=${ROCM_DEVICE_LIBS_PATH}")
+    endif()
+endfunction()
+
 # Export the AdaptiveCpp lib directory to a file so build.rs knows where
 # to add -L for libacpp-rt / libacpp-common at link time. Without this,
 # the Rust binary fails to link on machines where AdaptiveCpp lives
@@ -747,7 +769,7 @@ endif()
 if(XCHPLOT2_BUILD_CUDA)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_HAVE_CUB=1)
 endif()
-add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
+x2_add_sycl_to_target(TARGET pos2_gpu SOURCES ${POS2_GPU_SYCL_SRC})
 
 # AdaptiveCpp's acpp driver doesn't auto-propagate CMake's standard
 # CMAKE_CXX_FLAGS_RELEASE (-O3 -DNDEBUG) into the SYCL compile step.
@@ -770,21 +792,6 @@ target_compile_options(pos2_gpu PRIVATE
     $<$<CONFIG:RelWithDebInfo>:-O2>
     $<$<CONFIG:MinSizeRel>:-Os>)
 
-# For a hip:gfx* target, acpp hands our TUs to clang for real amdgcn codegen,
-# and clang looks for the device bitcode under its built-in --rocm-path
-# default of /opt/rocm. A distro-packaged ROCm isn't there (Fedora keeps it
-# under /usr/lib64/rocm), so every pos2_gpu TU fails with "cannot find ROCm
-# device library" even though AdaptiveCpp itself built fine — it was told the
-# path at ITS configure time; clang compiling OUR code was not.
-#
-# Only for hip:*: on generic SSCP no amdgcn codegen happens here, the JIT
-# resolves device libs at runtime via AdaptiveCpp's own configuration, and
-# the flag would just draw an unused-argument warning on every TU.
-if(ACPP_TARGETS MATCHES "hip" AND ROCM_DEVICE_LIBS_PATH)
-    target_compile_options(pos2_gpu PRIVATE
-        "--rocm-device-lib-path=${ROCM_DEVICE_LIBS_PATH}")
-    message(STATUS "xchplot2: pos2_gpu --rocm-device-lib-path=${ROCM_DEVICE_LIBS_PATH}")
-endif()
 # The SYCL TUs include CUDA headers (cuda_fp16.h, transitively cuda_runtime.h
 # from the kernel-wrapper headers) on both the CUDA and non-CUDA paths
 # (slice 17 will lift the CUDA-type dependencies out of the public API).
@@ -1033,11 +1040,11 @@ set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINA
 # t1_parity full-pipeline test, useful for narrowing any divergence to the
 # SYCL kernel itself.
 add_executable(sycl_bucket_offsets_parity tools/parity/sycl_bucket_offsets_parity.cpp)
-add_sycl_to_target(TARGET sycl_bucket_offsets_parity
+x2_add_sycl_to_target(TARGET sycl_bucket_offsets_parity
                    SOURCES tools/parity/sycl_bucket_offsets_parity.cpp)
 
 add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
-add_sycl_to_target(TARGET host_pinned_pool_test
+x2_add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 
@@ -1074,7 +1081,7 @@ set_target_properties(sycl_bucket_offsets_parity PROPERTIES
 # PortableAttrs.hpp) directly, so a host-vs-device divergence in the AES
 # math isolates here without t1_parity scaffolding.
 add_executable(sycl_g_x_parity tools/parity/sycl_g_x_parity.cpp)
-add_sycl_to_target(TARGET sycl_g_x_parity
+x2_add_sycl_to_target(TARGET sycl_g_x_parity
                    SOURCES tools/parity/sycl_g_x_parity.cpp)
 target_include_directories(sycl_g_x_parity PRIVATE src)
 target_compile_features(sycl_g_x_parity PRIVATE cxx_std_20)
@@ -1087,7 +1094,7 @@ set_target_properties(sycl_g_x_parity PROPERTIES
 # SYCL radix when OFF. Lets the SYCL sort path be validated on NVIDIA
 # hardware without needing AMD/Intel access.
 add_executable(sycl_sort_parity tools/parity/sycl_sort_parity.cpp)
-add_sycl_to_target(TARGET sycl_sort_parity
+x2_add_sycl_to_target(TARGET sycl_sort_parity
                    SOURCES tools/parity/sycl_sort_parity.cpp)
 target_link_libraries(sycl_sort_parity PRIVATE pos2_gpu)
 # On the CUDA build path, pos2_gpu's SortSyclCub.cpp (the SYCL→CUB
@@ -1114,7 +1121,7 @@ set_target_properties(sycl_sort_parity PROPERTIES
 # only needed because pos2_gpu's SortSyclCub.cpp transitively calls
 # CUB symbols, not because scatter itself needs CUB).
 add_executable(sycl_scatter_parity tools/parity/sycl_scatter_parity.cpp)
-add_sycl_to_target(TARGET sycl_scatter_parity
+x2_add_sycl_to_target(TARGET sycl_scatter_parity
                    SOURCES tools/parity/sycl_scatter_parity.cpp)
 target_link_libraries(sycl_scatter_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1132,7 +1139,7 @@ set_target_properties(sycl_scatter_parity PROPERTIES
 # sort over the same inputs, plus structural checks on the
 # d_bucket_starts output array.
 add_executable(sycl_two_level_sort_parity tools/parity/sycl_two_level_sort_parity.cpp)
-add_sycl_to_target(TARGET sycl_two_level_sort_parity
+x2_add_sycl_to_target(TARGET sycl_two_level_sort_parity
                    SOURCES tools/parity/sycl_two_level_sort_parity.cpp)
 target_link_libraries(sycl_two_level_sort_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1150,7 +1157,7 @@ set_target_properties(sycl_two_level_sort_parity PROPERTIES
 # the per-bucket sort, eliminating the need for a downstream random
 # gather of host-pinned data.
 add_executable(sycl_sort_u32_u64_parity tools/parity/sycl_sort_u32_u64_parity.cpp)
-add_sycl_to_target(TARGET sycl_sort_u32_u64_parity
+x2_add_sycl_to_target(TARGET sycl_sort_u32_u64_parity
                    SOURCES tools/parity/sycl_sort_u32_u64_parity.cpp)
 target_link_libraries(sycl_sort_u32_u64_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1168,7 +1175,7 @@ set_target_properties(sycl_sort_u32_u64_parity PROPERTIES
 # is written directly by the kernel).
 add_executable(sycl_streaming_partition_parity
     tools/parity/sycl_streaming_partition_parity.cpp)
-add_sycl_to_target(TARGET sycl_streaming_partition_parity
+x2_add_sycl_to_target(TARGET sycl_streaming_partition_parity
                    SOURCES tools/parity/sycl_streaming_partition_parity.cpp)
 target_link_libraries(sycl_streaming_partition_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1185,7 +1192,7 @@ set_target_properties(sycl_streaming_partition_parity PROPERTIES
 # must travel paired through the partition.
 add_executable(sycl_streaming_partition_u32_u64_u32_parity
     tools/parity/sycl_streaming_partition_u32_u64_u32_parity.cpp)
-add_sycl_to_target(TARGET sycl_streaming_partition_u32_u64_u32_parity
+x2_add_sycl_to_target(TARGET sycl_streaming_partition_u32_u64_u32_parity
                    SOURCES tools/parity/sycl_streaming_partition_u32_u64_u32_parity.cpp)
 target_link_libraries(sycl_streaming_partition_u32_u64_u32_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1204,7 +1211,7 @@ set_target_properties(sycl_streaming_partition_u32_u64_u32_parity PROPERTIES
 # multi-GPU hardware.
 add_executable(sycl_xs_phase_sharded_parity
     tools/parity/sycl_xs_phase_sharded_parity.cpp)
-add_sycl_to_target(TARGET sycl_xs_phase_sharded_parity
+x2_add_sycl_to_target(TARGET sycl_xs_phase_sharded_parity
                    SOURCES tools/parity/sycl_xs_phase_sharded_parity.cpp)
 target_link_libraries(sycl_xs_phase_sharded_parity
     PRIVATE pos2_gpu pos2_gpu_host)
@@ -1226,7 +1233,7 @@ set_target_properties(sycl_xs_phase_sharded_parity PROPERTIES
 # the dev box without real multi-GPU hardware.
 add_executable(sycl_t1_phase_sharded_parity
     tools/parity/sycl_t1_phase_sharded_parity.cpp)
-add_sycl_to_target(TARGET sycl_t1_phase_sharded_parity
+x2_add_sycl_to_target(TARGET sycl_t1_phase_sharded_parity
                    SOURCES tools/parity/sycl_t1_phase_sharded_parity.cpp)
 target_link_libraries(sycl_t1_phase_sharded_parity
     PRIVATE pos2_gpu pos2_gpu_host)
@@ -1247,7 +1254,7 @@ set_target_properties(sycl_t1_phase_sharded_parity PROPERTIES
 # Uses N=2 virtual shards on the same physical queue.
 add_executable(sycl_t2_phase_sharded_parity
     tools/parity/sycl_t2_phase_sharded_parity.cpp)
-add_sycl_to_target(TARGET sycl_t2_phase_sharded_parity
+x2_add_sycl_to_target(TARGET sycl_t2_phase_sharded_parity
                    SOURCES tools/parity/sycl_t2_phase_sharded_parity.cpp)
 target_link_libraries(sycl_t2_phase_sharded_parity
     PRIVATE pos2_gpu pos2_gpu_host)
@@ -1268,7 +1275,7 @@ set_target_properties(sycl_t2_phase_sharded_parity PROPERTIES
 # Uses N=2 virtual shards on the same physical queue.
 add_executable(sycl_t3_phase_sharded_parity
     tools/parity/sycl_t3_phase_sharded_parity.cpp)
-add_sycl_to_target(TARGET sycl_t3_phase_sharded_parity
+x2_add_sycl_to_target(TARGET sycl_t3_phase_sharded_parity
                    SOURCES tools/parity/sycl_t3_phase_sharded_parity.cpp)
 target_link_libraries(sycl_t3_phase_sharded_parity
     PRIVATE pos2_gpu pos2_gpu_host)
@@ -1289,7 +1296,7 @@ set_target_properties(sycl_t3_phase_sharded_parity PROPERTIES
 # T3 phase parity.
 add_executable(sycl_fragment_phase_sharded_parity
     tools/parity/sycl_fragment_phase_sharded_parity.cpp)
-add_sycl_to_target(TARGET sycl_fragment_phase_sharded_parity
+x2_add_sycl_to_target(TARGET sycl_fragment_phase_sharded_parity
                    SOURCES tools/parity/sycl_fragment_phase_sharded_parity.cpp)
 target_link_libraries(sycl_fragment_phase_sharded_parity
     PRIVATE pos2_gpu pos2_gpu_host)
@@ -1310,7 +1317,7 @@ set_target_properties(sycl_fragment_phase_sharded_parity PROPERTIES
 # docs/multi-gpu-single-plot-alt-bucket-partition.md.
 add_executable(sycl_distributed_sort_parity
     tools/parity/sycl_distributed_sort_parity.cpp)
-add_sycl_to_target(TARGET sycl_distributed_sort_parity
+x2_add_sycl_to_target(TARGET sycl_distributed_sort_parity
                    SOURCES tools/parity/sycl_distributed_sort_parity.cpp)
 target_link_libraries(sycl_distributed_sort_parity PRIVATE pos2_gpu)
 if(XCHPLOT2_BUILD_CUDA)
@@ -1335,7 +1342,7 @@ if(XCHPLOT2_BUILD_CUDA)
 else()
     add_executable(sycl_t1_parity tools/parity/sycl_t1_parity.cpp)
 endif()
-add_sycl_to_target(TARGET sycl_t1_parity
+x2_add_sycl_to_target(TARGET sycl_t1_parity
                    SOURCES tools/parity/sycl_t1_parity.cpp)
 target_link_libraries(sycl_t1_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_t1_parity PRIVATE ${_xchplot2_cuda_include})
@@ -1359,7 +1366,7 @@ if(XCHPLOT2_BUILD_CUDA)
 else()
     add_executable(sycl_phase_split_parity tools/parity/sycl_phase_split_parity.cpp)
 endif()
-add_sycl_to_target(TARGET sycl_phase_split_parity
+x2_add_sycl_to_target(TARGET sycl_phase_split_parity
                    SOURCES tools/parity/sycl_phase_split_parity.cpp)
 target_link_libraries(sycl_phase_split_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_phase_split_parity PRIVATE ${_xchplot2_cuda_include})
@@ -1378,7 +1385,7 @@ if(XCHPLOT2_BUILD_CUDA)
 else()
     add_executable(sycl_pipeline_parallel_parity tools/parity/sycl_pipeline_parallel_parity.cpp)
 endif()
-add_sycl_to_target(TARGET sycl_pipeline_parallel_parity
+x2_add_sycl_to_target(TARGET sycl_pipeline_parallel_parity
                    SOURCES tools/parity/sycl_pipeline_parallel_parity.cpp)
 target_link_libraries(sycl_pipeline_parallel_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_pipeline_parallel_parity PRIVATE ${_xchplot2_cuda_include})
@@ -1395,7 +1402,7 @@ set_target_properties(sycl_pipeline_parallel_parity PROPERTIES
 # hellosycl FAILs, no xchplot2-level fix can recover and the issue is
 # below our level (driver mismatch, JIT no-op stubs, etc.).
 add_executable(hellosycl tools/sanity/hellosycl.cpp)
-add_sycl_to_target(TARGET hellosycl SOURCES tools/sanity/hellosycl.cpp)
+x2_add_sycl_to_target(TARGET hellosycl SOURCES tools/sanity/hellosycl.cpp)
 target_compile_features(hellosycl PRIVATE cxx_std_20)
 set_target_properties(hellosycl PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
