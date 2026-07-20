@@ -170,17 +170,20 @@ llvm_prefix_version() {
 # already in range (Fedora 42 = 20, Ubuntu 24.04 = 18) the unversioned
 # install is the right answer and installing a compat package is pure waste.
 find_llvm_root() {
-    local best_ver=0 best_root="" cand ver
-    for cand in \
-        /usr/lib/llvm-20 /usr/lib/llvm-19 /usr/lib/llvm-18 \
-        /usr/lib/llvm-17 /usr/lib/llvm-16 \
-        /usr/lib/llvm20  /usr/lib/llvm19  /usr/lib/llvm18 \
-        /usr/lib/llvm17  /usr/lib/llvm16 \
-        /usr/lib64/llvm20 /usr/lib64/llvm19 /usr/lib64/llvm18 \
-        /usr/lib64/llvm17 /usr/lib64/llvm16 \
-        /opt/llvm20 /opt/llvm-20 /opt/llvm19 /opt/llvm-19 \
-        /opt/llvm18 /opt/llvm-18 \
-        /usr /usr/local; do
+    local best_ver=0 best_root="" cand ver v
+    local -a cands=()
+    # Generated from the supported range rather than spelled out, so bumping
+    # $LLVM_MAX for a newer AdaptiveCpp doesn't leave the probe behind.
+    for v in $(seq "$LLVM_MAX" -1 "$LLVM_MIN"); do
+        cands+=("/usr/lib/llvm-$v"   "/usr/lib/llvm$v"
+                "/usr/lib64/llvm-$v" "/usr/lib64/llvm$v"
+                "/opt/llvm-$v"       "/opt/llvm$v")
+    done
+    # Unversioned prefixes last: a distro whose default LLVM is in range is a
+    # perfectly good answer, but on a tie an explicit versioned prefix is the
+    # more stable one — the default moves at the next upgrade.
+    cands+=(/usr /usr/local)
+    for cand in "${cands[@]}"; do
         ver=$(llvm_prefix_version "$cand") || continue
         if (( ver > best_ver )); then
             best_ver=$ver
@@ -191,48 +194,121 @@ find_llvm_root() {
     printf '%s\n' "$best_root"
 }
 
-# Install the newest compatible LLVM available in the distro's repos.
-# Walks DOWN from $LLVM_MAX and takes the first version that exists, so a
-# box gets 20 where 20 is packaged and 18 only where it isn't.
-install_compat_llvm() {
-    local v
+# The package set for a given LLVM major version, or for the distro's
+# unversioned default when $1 is the literal `system`. Echoed space-separated
+# for the caller to splat. Every name is derived from the version — there are
+# no hardcoded LLVM versions anywhere in this script.
+llvm_pkgs_for() {
+    local v=$1
+    case "$PKG_FAMILY" in
+        arch)
+            if [[ "$v" == system ]]; then
+                echo "llvm clang lld"
+            else
+                echo "llvm$v llvm$v-libs clang$v lld$v"
+            fi ;;
+        debian)
+            if [[ "$v" == system ]]; then
+                echo "llvm llvm-dev clang lld libclang-dev libomp-dev"
+            else
+                echo "llvm-$v llvm-$v-dev clang-$v lld-$v libclang-$v-dev" \
+                     "libclang-cpp$v-dev libclang-rt-$v-dev libomp-$v-dev"
+            fi ;;
+        fedora)
+            if [[ "$v" == system ]]; then
+                echo "llvm llvm-devel clang clang-devel lld libomp-devel"
+            else
+                # libomp$v-devel is only a weak dep of clang$v; name it so the
+                # OpenMP backend still builds under --setopt=install_weak_deps=0.
+                echo "llvm$v llvm$v-devel clang$v clang$v-devel lld$v libomp$v-devel"
+            fi ;;
+    esac
+}
+
+# Can a versioned LLVM $1 be installed from the enabled repos?
+llvm_version_installable() {
+    local v=$1
+    case "$PKG_FAMILY" in
+        arch)   pacman -Si "llvm$v" &>/dev/null ;;
+        # policy, not `apt-cache show`: a package can be known to apt yet have
+        # "Candidate: (none)" when no enabled suite carries it, and installing
+        # that fails.
+        debian) [[ "$(apt-cache policy "llvm-$v-dev" 2>/dev/null \
+                      | awk '/Candidate:/{print $2}')" == [0-9]* ]] ;;
+        # plain `list`, not `list --available`: --available hides a package
+        # that is already installed, which would make us skip a version the
+        # box has half of and silently fall back to an older one.
+        fedora) dnf -q list "llvm$v-devel" &>/dev/null ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Major version of the distro's UNVERSIONED llvm, as the repos would install
+# it. Asking the repo rather than the installed binary lets us decide whether
+# the platform default is usable BEFORE pulling ~1 GB of it down.
+llvm_system_major() {
+    local ver=""
+    case "$PKG_FAMILY" in
+        arch)   ver=$(pacman -Si llvm 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}') ;;
+        debian) ver=$(apt-cache policy llvm-dev 2>/dev/null | awk '/Candidate:/{print $2}') ;;
+        fedora) ver=$(dnf -q info llvm 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}') ;;
+    esac
+    ver=${ver#*:}                      # drop a Debian epoch ("1:18.0-59")
+    ver=$(printf '%s' "$ver" | grep -oE '^[0-9]+') || return 1
+    [[ -n "$ver" ]] || return 1
+    printf '%s\n' "$ver"
+}
+
+# The newest LLVM this platform can provide that AdaptiveCpp supports.
+# Prefers an explicitly versioned set; falls back to the unversioned default
+# when that is itself in range, because a distro shipping a supported LLVM as
+# its default (Fedora 42 ships 20) generally has no compat package to install
+# instead. Echoes a major version or the literal `system`.
+pick_llvm_target() {
+    local v sys
     for v in $(seq "$LLVM_MAX" -1 "$LLVM_MIN"); do
-        case "$PKG_FAMILY" in
-            arch)
-                pacman -Si "llvm$v" &>/dev/null || continue
-                echo "[install-deps] Installing side-by-side LLVM $v (llvm$v/clang$v/lld$v)."
-                sudo pacman -S --needed --noconfirm \
-                    "llvm$v" "llvm$v-libs" "clang$v" "lld$v" && return 0
-                ;;
-            debian)
-                # policy, not `apt-cache show`: a package can be known to apt
-                # yet have "Candidate: (none)" when no enabled suite carries
-                # it, and installing that fails.
-                [[ "$(apt-cache policy "llvm-$v-dev" 2>/dev/null \
-                      | awk '/Candidate:/{print $2}')" == [0-9]* ]] || continue
-                echo "[install-deps] Installing side-by-side LLVM $v (llvm-$v/clang-$v/lld-$v)."
-                sudo apt-get install -y --no-install-recommends \
-                    "llvm-$v" "llvm-$v-dev" "clang-$v" "lld-$v" \
-                    "libclang-$v-dev" "libomp-$v-dev" && return 0
-                ;;
-            fedora)
-                dnf -q list --available "llvm$v-devel" &>/dev/null || continue
-                echo "[install-deps] Installing side-by-side LLVM $v (llvm$v/clang$v/lld$v)."
-                sudo dnf install -y \
-                    "llvm$v" "llvm$v-devel" "clang$v" "clang$v-devel" "lld$v" && return 0
-                ;;
-            *)  return 1 ;;
-        esac
+        if llvm_version_installable "$v"; then
+            printf '%s\n' "$v"
+            return 0
+        fi
     done
+    if sys=$(llvm_system_major) && (( sys >= LLVM_MIN && sys <= LLVM_MAX )); then
+        printf 'system\n'
+        return 0
+    fi
     return 1
+}
+
+# Install that choice. Separate from the per-distro base package sets so the
+# platform's default LLVM is never dragged in just to be rejected: on a
+# rolling release it is past the cap, and installing it costs ~1 GB for
+# nothing.
+install_llvm_target() {
+    local target pkgs
+    target=$(pick_llvm_target) || return 1
+    pkgs=$(llvm_pkgs_for "$target")
+    if [[ "$target" == system ]]; then
+        echo "[install-deps] LLVM: distro default is in range (${LLVM_MIN}-${LLVM_MAX}); installing $pkgs"
+    else
+        echo "[install-deps] LLVM: $target is the newest this platform offers that AdaptiveCpp ${ACPP_REF} supports."
+    fi
+    # Word-splitting $pkgs is intentional — it is a package list.
+    # shellcheck disable=SC2086
+    case "$PKG_FAMILY" in
+        arch)   sudo pacman -S --needed --noconfirm $pkgs ;;
+        debian) sudo apt-get install -y --no-install-recommends $pkgs ;;
+        fedora) sudo dnf install -y $pkgs ;;
+        *)      return 1 ;;
+    esac
 }
 
 # ── Per-distro packages ─────────────────────────────────────────────────────
 install_arch() {
     # `openmp` is clang's libomp runtime — required by AdaptiveCpp's
     # OpenMP backend find_package check, even on the NVIDIA path.
+    # No llvm/clang/lld here — install_llvm_target picks the version and
+    # installs it, so we don't drag in a system LLVM that is past the cap.
     local pkgs=(cmake git base-devel python ninja
-                llvm clang lld
                 boost numactl curl
                 openmp)
     case "$GPU" in
@@ -252,12 +328,12 @@ install_arch() {
 }
 
 install_apt() {
-    # libclang-rt-18-dev = compiler-rt builtins (libclang_rt.builtins-x86_64.a).
-    # AdaptiveCpp's HIP/ROCm backend link needs it; harmless for nvidia/cpu targets.
+    # LLVM (including libclang-rt-*-dev, the compiler-rt builtins
+    # AdaptiveCpp's HIP/ROCm backend link needs) comes from
+    # install_llvm_target. This list used to hardcode 18, which left newer
+    # releases on an old toolchain even where they package 19 or 20.
     local pkgs=(cmake git ninja-build build-essential python3 pkg-config
-                llvm-18 llvm-18-dev clang-18 lld-18 libclang-18-dev libclang-cpp18-dev
-                libclang-rt-18-dev
-                libboost-context-dev libnuma-dev libomp-18-dev curl ca-certificates)
+                libboost-context-dev libnuma-dev curl ca-certificates)
     case "$GPU" in
         nvidia)
             # Detect a pre-existing /usr/local/cuda-X.Y install (RunPod /
@@ -299,9 +375,9 @@ install_apt() {
 }
 
 install_dnf() {
+    # No llvm/clang/lld/libomp here — install_llvm_target picks the version.
     local pkgs=(cmake git ninja-build gcc-c++ python3 pkg-config
-                llvm llvm-devel clang clang-devel lld
-                boost-devel numactl-devel libomp-devel curl)
+                boost-devel numactl-devel curl)
     case "$GPU" in
         nvidia) pkgs+=(cuda-toolkit) ;;
         # No cuda-toolkit on the AMD path — CudaHalfShim.hpp guards the
@@ -344,12 +420,11 @@ esac
 # the base package sets above pull each distro's *system* LLVM, which on a
 # rolling release is past AdaptiveCpp's cap (Fedora 43 ships 21, Arch 22).
 if llvm_have=$(find_llvm_root); then
-    echo "[install-deps] Compatible LLVM already present: $llvm_have"
+    echo "[install-deps] Compatible LLVM already present: $llvm_have (LLVM $(llvm_prefix_version "$llvm_have"))"
 else
-    echo "[install-deps] No LLVM in ${LLVM_MIN}-${LLVM_MAX} found — installing the newest available."
     # A failure here is not fatal yet: the probe before the AdaptiveCpp
     # build re-checks and prints the full manual-install guidance.
-    install_compat_llvm \
+    install_llvm_target \
         || echo "[install-deps] Automatic LLVM install failed; see the diagnosis below." >&2
 fi
 
@@ -443,17 +518,20 @@ if ! LLVM_ROOT=$(find_llvm_root); then
     echo "[install-deps] CMake package files found, and none could be installed" >&2
     echo "[install-deps] automatically. AdaptiveCpp $ACPP_REF rejects anything newer." >&2
     echo "[install-deps] Install one by hand and re-run, or use the container path:" >&2
+    # Package names come from llvm_pkgs_for, the same function the automatic
+    # path uses — so this hint can never drift from what we'd have installed.
     case "$PKG_FAMILY" in
-        arch)
-            echo "  sudo pacman -S llvm20 llvm20-libs clang20 lld20" >&2 ;;
-        debian)
-            echo "  sudo apt install llvm-20 llvm-20-dev clang-20 lld-20 libomp-20-dev" >&2
-            echo "  # older releases may only carry 18 — substitute the highest ≤ 20 they have" >&2 ;;
-        fedora)
-            echo "  sudo dnf install llvm20 llvm20-devel clang20 clang20-devel lld20" >&2 ;;
-        *)
-            echo "  install LLVM ${LLVM_MIN}-${LLVM_MAX} + clang + ld.lld for your distro" >&2 ;;
+        arch)   _llvm_hint_cmd="sudo pacman -S" ;;
+        debian) _llvm_hint_cmd="sudo apt install" ;;
+        fedora) _llvm_hint_cmd="sudo dnf install" ;;
+        *)      _llvm_hint_cmd="" ;;
     esac
+    if [[ -n "$_llvm_hint_cmd" ]]; then
+        echo "  $_llvm_hint_cmd $(llvm_pkgs_for "$LLVM_MAX")" >&2
+        echo "  # or the highest version ≤ ${LLVM_MAX} your release actually carries" >&2
+    else
+        echo "  install LLVM ${LLVM_MIN}-${LLVM_MAX} + clang + ld.lld for your distro" >&2
+    fi
     echo "  ./scripts/build-container.sh   # container has a supported LLVM pinned" >&2
     exit 1
 fi
