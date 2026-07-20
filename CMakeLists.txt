@@ -572,9 +572,23 @@ if(_xchplot2_acpp_lib_dir AND NOT _xchplot2_acpp_lib_dir MATCHES "\\$<")
 endif()
 if(XCHPLOT2_HIP_RUNTIME_H)
     get_filename_component(_xchplot2_rocm_root "${XCHPLOT2_HIP_RUNTIME_H}/.." ABSOLUTE)
-    list(APPEND CMAKE_BUILD_RPATH   "${_xchplot2_rocm_root}/lib")
-    list(APPEND CMAKE_INSTALL_RPATH "${_xchplot2_rocm_root}/lib")
-    message(STATUS "xchplot2: embedded rpath includes ${_xchplot2_rocm_root}/lib")
+    # AMD's installer keeps the runtime in <root>/lib; multilib distros package
+    # it in lib64. Fedora's rocm-hip ships /usr/lib64/libamdhip64.so, and its
+    # headers put XCHPLOT2_HIP_RUNTIME_H at /usr/include, so <root>/lib resolves
+    # to /usr/lib — the wrong directory. Ask for the library rather than
+    # assuming the suffix: the hardcoded path both embedded a useless rpath and
+    # skipped the direct link below (see why that matters there).
+    find_library(XCHPLOT2_AMDHIP64 amdhip64
+                 HINTS "${_xchplot2_rocm_root}" ENV ROCM_PATH /opt/rocm
+                 PATH_SUFFIXES lib64 lib)
+    if(XCHPLOT2_AMDHIP64)
+        get_filename_component(_xchplot2_rocm_libdir "${XCHPLOT2_AMDHIP64}" DIRECTORY)
+    else()
+        set(_xchplot2_rocm_libdir "${_xchplot2_rocm_root}/lib")
+    endif()
+    list(APPEND CMAKE_BUILD_RPATH   "${_xchplot2_rocm_libdir}")
+    list(APPEND CMAKE_INSTALL_RPATH "${_xchplot2_rocm_libdir}")
+    message(STATUS "xchplot2: embedded rpath includes ${_xchplot2_rocm_libdir}")
 
     # Direct-link libamdhip64 so AdaptiveCpp's runtime-dlopen'd HIP
     # backend (librt-backend-hip.so) finds the library already loaded
@@ -586,10 +600,22 @@ if(XCHPLOT2_HIP_RUNTIME_H)
     # report "ALL OK" while having executed entirely on CPU. Mirrors
     # build.rs:631 (cargo:rustc-link-lib=amdhip64) for the cargo
     # build path.
-    if(EXISTS "${_xchplot2_rocm_root}/lib/libamdhip64.so")
-        link_libraries("${_xchplot2_rocm_root}/lib/libamdhip64.so")
-        message(STATUS "xchplot2: link_libraries(libamdhip64.so) — "
+    # It is also what puts the HIP runtime on the link line for targets that
+    # merely consume libpos2_gpu.a rather than compiling SYCL themselves: with
+    # a hip:gfx* AOT target those objects carry hipLaunchKernel /
+    # __hipRegisterFatBinary, and tools/xchplot2 failed to link outright when
+    # this was skipped.
+    if(XCHPLOT2_AMDHIP64)
+        link_libraries("${XCHPLOT2_AMDHIP64}")
+        message(STATUS "xchplot2: link_libraries(${XCHPLOT2_AMDHIP64}) — "
                        "AdaptiveCpp HIP backend will find ROCm at runtime")
+    else()
+        message(WARNING
+            "xchplot2: ROCm headers found at ${XCHPLOT2_HIP_RUNTIME_H} but "
+            "libamdhip64 was not. Install your distro's HIP runtime (Fedora: "
+            "rocm-hip), or pass -DXCHPLOT2_AMDHIP64=/path/to/libamdhip64.so. "
+            "Without it a hip:gfx* build fails to link, and a generic SSCP "
+            "build silently falls through to the OpenMP host device.")
     endif()
 endif()
 

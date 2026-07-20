@@ -1142,12 +1142,31 @@ fn main() {
     // Same approach as CMakeLists.txt's `link_libraries(.../libamdhip64.so)`.
     let rocm_root = env::var("ROCM_PATH")
         .unwrap_or_else(|_| "/opt/rocm".to_string());
-    let amdhip_lib = format!("{rocm_root}/lib/libamdhip64.so");
-    if acpp_targets.starts_with("hip:") || std::path::Path::new(&amdhip_lib).exists() {
+    // <root>/lib is AMD's own installer layout. Multilib distros package the
+    // runtime elsewhere — Fedora's rocm-hip ships /usr/lib64/libamdhip64.so and
+    // has no /opt/rocm at all — so probing only <root>/lib missed it entirely
+    // there. On a hip:gfx* target that merely cost us the positional-path trick
+    // below (the -l fallback still resolves from the default search path), but
+    // on ACPP_TARGETS=generic the whole block was skipped, and per the note
+    // above that means libamdhip64 never reaches DT_NEEDED, the HIP backend
+    // never initialises, and the plotter runs on the OpenMP host device while
+    // reporting success. That is the RDNA1 default path, so it was reachable.
+    let amdhip_lib = [format!("{rocm_root}/lib"), format!("{rocm_root}/lib64"),
+                      "/usr/lib64".to_string(), "/usr/lib".to_string()]
+        .into_iter()
+        .map(|dir| format!("{dir}/libamdhip64.so"))
+        .find(|path| std::path::Path::new(path).exists());
+    if acpp_targets.starts_with("hip:") || amdhip_lib.is_some() {
         println!("cargo:rustc-link-search=native={rocm_root}/lib");
         println!("cargo:rustc-link-search=native={rocm_root}/hip/lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{rocm_root}/lib");
-        if std::path::Path::new(&amdhip_lib).exists() {
+        if let Some(ref amdhip_lib) = amdhip_lib {
+            let libdir = std::path::Path::new(amdhip_lib)
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("{rocm_root}/lib"));
+            println!("cargo:rustc-link-search=native={libdir}");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
             // Wrap with --no-as-needed/--as-needed: even a positional
             // .so path gets dropped from NEEDED by ld's --as-needed
             // when no symbol references it (true for the SSCP path
@@ -1159,10 +1178,11 @@ fn main() {
             println!("cargo:rustc-link-arg={amdhip_lib}");
             println!("cargo:rustc-link-arg=-Wl,--as-needed");
         } else {
-            // Fallback: ROCm not at /opt/rocm/lib but the user set
-            // ACPP_TARGETS=hip:* explicitly. AOT HIP fat binaries
-            // reference HIP symbols directly, so --as-needed keeps
-            // -lamdhip64 in NEEDED on that path.
+            // Fallback: the runtime wasn't in any probed directory, but
+            // the user set ACPP_TARGETS=hip:* explicitly — so trust them
+            // and let the linker's own search path find it. AOT HIP fat
+            // binaries reference HIP symbols directly, so --as-needed
+            // keeps -lamdhip64 in NEEDED on that path.
             println!("cargo:rustc-link-lib=amdhip64");
         }
     }
