@@ -729,6 +729,32 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
 cmake --build "$ACPP_BUILD_DIR/build" --parallel
 sudo cmake --install "$ACPP_BUILD_DIR/build"
 
+# AdaptiveCpp's SSCP path doesn't emit SPIR-V itself — it shells out to a
+# version-matched llvm-spirv that it builds as an ExternalProject (branch
+# llvm_release_<major>0, so our pinned LLVM decides which) and is supposed to
+# install via an install(CODE) hook. The translator compiles, but the hook does
+# not place it: `cmake --install` reports success and nothing warns, leaving
+# lib/hipSYCL/ext/llvm-spirv absent. Its location is baked into the runtime at
+# build time (HIPSYCL_RELATIVE_LLVMSPIRV_PATH) and consulted with no PATH
+# fallback and no env override, so the gap only surfaces much later, on the
+# first kernel submitted to an Intel device:
+#   LLVMToSpirv: llvm-spirv invocation failed with exit code -1
+#   ze_queue: Code object construction failed
+# and then as kernels that complete without writing anything. Drive the install
+# target explicitly from the top-level build dir, where it resolves.
+if [[ -n "$WANT_INTEL" ]]; then
+    LLVM_SPIRV_BIN="$ACPP_PREFIX/lib/hipSYCL/ext/llvm-spirv/bin/llvm-spirv"
+    sudo cmake --build "$ACPP_BUILD_DIR/build" --target InstallLLVMSpirvTranslator || true
+    if [[ -x "$LLVM_SPIRV_BIN" ]]; then
+        echo "[install-deps] llvm-spirv installed for the SPIR-V JIT: $LLVM_SPIRV_BIN"
+    else
+        echo "[install-deps] WARNING: $LLVM_SPIRV_BIN is missing." >&2
+        echo "[install-deps] Intel devices will enumerate but every kernel will fail" >&2
+        echo "[install-deps] with \"llvm-spirv invocation failed\". Build it by hand:" >&2
+        echo "[install-deps]   cmake --build $ACPP_BUILD_DIR/build --target InstallLLVMSpirvTranslator" >&2
+    fi
+fi
+
 echo
 echo "[install-deps] Done."
 echo "  AdaptiveCpp: $ACPP_PREFIX"
