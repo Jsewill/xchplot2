@@ -3598,6 +3598,54 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
     return device_ids;
 }
 
+// Drop selected GPUs that cannot actually run kernels, so one bad device does
+// not take down a run the host's other devices could have finished.
+//
+// sycl_backend::queue() already answers "can this device work at all" — it
+// constructs the queue and runs validate_kernel_dispatch on it — but it answers
+// fatally, and the throw propagates out of whichever worker touched the device
+// first. Observed on a host with an AMD APU and a discrete Intel card: the Arc
+// failed to build a code object, and the run died instead of continuing on the
+// other device. The same applies to a card whose kernels complete without
+// writing, and to a driver that hangs and resets mid-probe.
+//
+// Each probe runs on its own thread: queue() and the AES-table cache are
+// thread_local and keyed off the thread's device id, so probing inline would
+// bind this thread to the last device probed and leave a queue behind on it.
+//
+// Only explicit ids are probed. kDefaultGpuId means "whatever the default
+// selector picks", and there is nothing to fall back TO if it fails, so its
+// failure should stay fatal and keep its original message.
+std::vector<int> usable_batch_devices(std::vector<int> const&    device_ids,
+                                      std::vector<std::string>* dropped)
+{
+    std::vector<int> keep;
+    keep.reserve(device_ids.size());
+    for (int id : device_ids) {
+        if (id < 0) { keep.push_back(id); continue; }  // CPU nodes + default GPU
+        std::string err;
+        std::thread probe([&] {
+            try {
+                sycl_backend::set_current_device_id(id);
+                (void)sycl_backend::queue();
+            } catch (std::exception const& e) {
+                err = e.what();
+            } catch (...) {
+                err = "unknown exception";
+            }
+        });
+        probe.join();
+        if (err.empty()) { keep.push_back(id); continue; }
+        if (dropped) {
+            // First line only — the selftest failure is a paragraph of advice.
+            auto const nl = err.find('\n');
+            dropped->push_back(device_label(id) + ": " +
+                               (nl == std::string::npos ? err : err.substr(0, nl)));
+        }
+    }
+    return keep;
+}
+
 BatchStrategy resolve_batch_strategy(BatchOptions const& opts,
                                      std::vector<int> const& device_ids,
                                      int k,
@@ -3677,8 +3725,26 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     //                      --cpu --devices all → all GPUs + CPU; etc.).
     //                      The count is capped at what host RAM holds.
     std::string gate_note;
-    std::vector<int> const device_ids =
+    std::vector<int> device_ids =
         resolve_batch_devices(opts, pool_k, &gate_note);
+
+    // Validate the selection before committing to it, but only when something
+    // else could carry the run — with a single worker there is nothing to fall
+    // back to, and the original failure is a better message than "dropped".
+    if (device_ids.size() > 1) {
+        std::vector<std::string> dropped;
+        device_ids = usable_batch_devices(device_ids, &dropped);
+        for (auto const& d : dropped) {
+            if (!opts.quiet) {
+                std::fprintf(stderr, "[batch] device dropped — %s\n", d.c_str());
+            }
+        }
+        if (device_ids.empty() && !dropped.empty()) {
+            std::string msg = "every selected device failed its dispatch check:";
+            for (auto const& d : dropped) msg += "\n  - " + d;
+            throw std::runtime_error(msg);
+        }
+    }
     if (!gate_note.empty() && !opts.quiet) {
         // Once per distinct message. bench drives two passes (warmup + measured)
         // through run_batch back to back, and the CPU auto/gate line is identical

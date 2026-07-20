@@ -389,6 +389,16 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
                                        int                 k,
                                        std::string*        gate_note = nullptr);
 
+// Filter a resolved device list down to the devices that can actually run a
+// kernel, so one unusable GPU doesn't abort a run the others could finish.
+// Each id is probed on its own thread (the SYCL queue is thread_local); ids
+// that throw are omitted and, if `dropped` is non-null, appended to it as
+// "<label>: <reason>". Negative ids — CPU nodes and the default-GPU sentinel —
+// pass through unprobed. Probing costs a queue construction and its first-use
+// JIT per device, so callers should only do it when a fallback exists.
+std::vector<int> usable_batch_devices(std::vector<int> const&   device_ids,
+                                      std::vector<std::string>* dropped = nullptr);
+
 // Resolve the effective strategy the same way run_batch does
 // (explicit opts.strategy > legacy shard/pipeline bools > heuristic).
 BatchStrategy resolve_batch_strategy(BatchOptions const& opts,
