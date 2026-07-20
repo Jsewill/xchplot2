@@ -602,11 +602,30 @@ fn main() {
         // them, and acpp rejects an empty target string.
         Ok(v) if !v.is_empty() => (v, "$ACPP_TARGETS"),
         Ok(_) | Err(_) => {
+            // Multi-vendor hosts get generic SSCP, whatever the vendors are.
+            // An AOT target speaks one ISA: hip:gfx* emits amdgcn and nothing
+            // else, so every non-AMD GPU in the box becomes unusable — not
+            // merely unpreferred — because the binary holds no code they can
+            // run. That is reachable on ordinary desktops: an AMD APU (which
+            // rocminfo reports as a gfx agent just like a discrete card) next
+            // to an Intel or NVIDIA card would AOT-pin the whole build to the
+            // integrated GPU and hide the discrete one. Generic JITs per
+            // device at load time, which is what AdaptiveCpp recommends for
+            // exactly this case, at the cost of first-use JIT latency.
+            let vendors = [usable_nvidia_arch().is_some(),
+                           amd_gpu_present(),
+                           detect_intel_gpu()]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+            if vendors > 1 {
+                ("generic".to_string(), "multi-vendor host — using SSCP")
+            }
             // Prefer a USABLE NVIDIA GPU (sm_61+) over AMD, otherwise fall
             // through to AMD / fallback. `detect_cuda_arch` alone would
             // trigger on an ancient secondary NVIDIA card even when AMD is
             // the real plotting target (see usable_nvidia_arch).
-            if usable_nvidia_arch().is_some() {
+            else if usable_nvidia_arch().is_some() {
                 ("generic".to_string(), "NVIDIA detected — using SSCP")
             } else if let Some(gfx) = detect_amd_gfx() {
                 (format!("hip:{gfx}"), "rocminfo probe")
