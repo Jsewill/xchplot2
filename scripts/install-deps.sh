@@ -83,11 +83,30 @@ detect_gpu_via_pci() {
         vendor=$(cat "$entry/device/vendor" 2>/dev/null)
         case "$vendor" in
             0x10de) found="nvidia"; break ;;            # highest precedence
-            0x1002) found="amd" ;;                      # overrides intel
+            0x1002) found="amd" ;;                      # outranks intel
             0x8086) [[ -z "$found" ]] && found="intel" ;; # only if nothing else
         esac
     done
     echo "$found"
+}
+
+# Whether ANY Intel GPU is present, independent of which vendor won the
+# primary $GPU slot above. That slot picks one toolkit (CUDA or ROCm), but a
+# host can have GPUs from two vendors — an AMD APU alongside a discrete Arc is
+# an ordinary desktop, and the precedence above hands the slot to AMD. Level
+# Zero is not part of either toolkit, so without a separate signal AdaptiveCpp
+# gets built with no Level Zero backend and the Intel card is invisible at
+# runtime no matter how the plotter is invoked.
+intel_gpu_present() {
+    local entry name vendor
+    for entry in /sys/class/drm/card*; do
+        name=$(basename "$entry")
+        [[ "$name" =~ ^card[0-9]+$ ]] || continue
+        [[ -r "$entry/device/vendor" ]] || continue
+        vendor=$(cat "$entry/device/vendor" 2>/dev/null)
+        [[ "$vendor" == "0x8086" ]] && return 0
+    done
+    return 1
 }
 
 if [[ -z "$GPU" ]]; then
@@ -114,14 +133,18 @@ if [[ -z "$GPU" ]]; then
     exit 1
 fi
 
-if [[ "$GPU" == "intel" ]]; then
-    echo "[install-deps] Intel GPU detected, but install-deps.sh has no Intel-" >&2
-    echo "[install-deps] specific package path yet. Options:" >&2
-    echo "[install-deps]   --gpu nvidia     install LLVM + CUDA headers (the SYCL" >&2
-    echo "[install-deps]                    path JITs onto Intel via AdaptiveCpp's" >&2
-    echo "[install-deps]                    generic SSCP target at runtime)" >&2
-    echo "[install-deps]   ./scripts/build-container.sh   container with Intel oneAPI" >&2
-    exit 1
+# Level Zero is installed whenever an Intel GPU is present, not only when it
+# won the $GPU slot. AdaptiveCpp enables the backends it can find at ITS
+# configure time, so the loader + headers have to be on disk before the build
+# below or the Intel card can never be driven — and on a multi-vendor host the
+# slot belongs to AMD or NVIDIA, so keying off it alone silently skips this.
+WANT_INTEL=""
+if [[ "$GPU" == "intel" ]] || intel_gpu_present; then
+    WANT_INTEL=1
+    if [[ "$GPU" != "intel" ]]; then
+        echo "[install-deps] Intel GPU also present — adding the Level Zero stack"
+        echo "[install-deps] so AdaptiveCpp builds its Level Zero backend too."
+    fi
 fi
 echo "[install-deps] distro=$DISTRO, gpu=$GPU, acpp=${ACPP_REF}, prefix=${ACPP_PREFIX}"
 
@@ -320,6 +343,9 @@ install_arch() {
         # uchar1/char1 typedef redefinitions.
         amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo) ;;
     esac
+    # Appended, not an arm of the case: see WANT_INTEL.
+    [[ -n "$WANT_INTEL" ]] && pkgs+=(level-zero-headers level-zero-loader
+                                     intel-compute-runtime)
     sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 
     # The side-by-side compat LLVM that rolling Arch needs (system llvm is
@@ -370,6 +396,9 @@ install_apt() {
                 # uchar1/char1 typedef redefinitions.
                 ;;
     esac
+    # Appended, not an arm of the case: see WANT_INTEL.
+    [[ -n "$WANT_INTEL" ]] && pkgs+=(libze-dev libze1 libze-intel-gpu1
+                                     intel-opencl-icd)
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
@@ -385,6 +414,9 @@ install_dnf() {
         # causes uchar1/char1 typedef redefinitions.
         amd)    pkgs+=(rocm-hip-devel rocminfo) ;;
     esac
+    # Appended, not an arm of the case: see WANT_INTEL.
+    [[ -n "$WANT_INTEL" ]] && pkgs+=(oneapi-level-zero oneapi-level-zero-devel
+                                     intel-compute-runtime)
     sudo dnf install -y "${pkgs[@]}"
 }
 
@@ -576,6 +608,20 @@ done
 # /usr/lib64/rocm/llvm/lib/clang/<rocm-llvm-major>/lib/amdgcn/bitcode and has
 # no /opt/rocm at all — so every distro-ROCm host failed here. Glob the known
 # layouts and take the highest version when several are installed.
+# Level Zero has to be switched on by hand. WITH_CUDA_BACKEND and
+# WITH_OPENCL_BACKEND get CACHE defaults derived from whether their toolkit was
+# found, so installing the packages is enough for those; WITH_LEVEL_ZERO_BACKEND
+# has no default declaration anywhere in AdaptiveCpp 25.10, so it evaluates
+# false unless passed on the command line. Installing the loader alone therefore
+# produced a build with only librt-backend-omp.so, and an Intel GPU stayed
+# invisible with the packages sitting right there on disk. The backend links
+# -lze_loader directly, so the loader package is all it needs besides the flag.
+ACPP_INTEL_FLAGS=()
+if [[ -n "$WANT_INTEL" ]]; then
+    ACPP_INTEL_FLAGS+=(-DWITH_LEVEL_ZERO_BACKEND=ON)
+    echo "[install-deps] Enabling AdaptiveCpp's Level Zero backend (Intel GPU)."
+fi
+
 ACPP_ROCM_FLAGS=()
 if [[ "$GPU" == "amd" ]]; then
     rocm_bc=""
@@ -678,7 +724,8 @@ cmake -S "$ACPP_BUILD_DIR/src" -B "$ACPP_BUILD_DIR/build" -G Ninja \
     -DACPP_LLD_PATH="$LLVM_ROOT/bin/ld.lld" \
     "${ACPP_CLANG_FLAGS[@]}" \
     "${ACPP_CUDA_FLAGS[@]}" \
-    "${ACPP_ROCM_FLAGS[@]}"
+    "${ACPP_ROCM_FLAGS[@]}" \
+    "${ACPP_INTEL_FLAGS[@]}"
 cmake --build "$ACPP_BUILD_DIR/build" --parallel
 sudo cmake --install "$ACPP_BUILD_DIR/build"
 
