@@ -2030,6 +2030,54 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             (1ULL << (pool_k - extra_margin_bits));
         uint64_t const cap = per_section * (1ULL << num_section_bits);
         stream_pinned_cap = size_t(cap);
+
+        // Check host RAM before pinning any of it.
+        //
+        // The streaming ladder is a VRAM ladder: tier picks the DEVICE peak and
+        // the gate above compares it against device free memory. The host side
+        // is tier-invariant — every tier stages through the same cap-sized
+        // pinned buffers — so --tier tiny cuts the device peak to ~1 GiB at
+        // k=28 and leaves 14.22 GiB pinned on the host, which is the whole
+        // requirement for PoS2 since k is only ever 28. Nothing checked that, so
+        // a host with less RAM than the pinned total did not fail here: it kept
+        // allocating until the kernel OOM-killer fired, taking unrelated
+        // processes down with it. Reported from a 14 GiB box where every tier
+        // died the same way, which is precisely the signature of a limit that
+        // the tier knob does not move.
+        //
+        // Pinned pages are unswappable, so swap does not save us and
+        // MemAvailable is the honest number to compare against.
+        {
+            auto const to_gib_host = [](std::size_t b) {
+                return b / double(1ULL << 30);
+            };
+            std::size_t const u64_slots =
+                std::size_t(GpuBufferPool::kNumPinnedBuffers)
+                + (stream_scratch.plain_mode ? 0u : (stream_scratch.tiny_mode ? 3u : 2u));
+            std::size_t const u32_slots = stream_scratch.plain_mode ? 0u : 2u;
+            std::size_t const pinned_needed =
+                stream_pinned_cap * (u64_slots * sizeof(std::uint64_t)
+                                     + u32_slots * sizeof(std::uint32_t));
+
+            std::size_t host_free = 0, host_total = 0;
+            if (device_memory_probe(kCpuDeviceId, host_free, host_total)
+                && host_free < pinned_needed)
+            {
+                throw std::runtime_error(
+                    log_prefix + " streaming pipeline needs ~" +
+                    std::to_string(to_gib_host(pinned_needed)).substr(0, 5) +
+                    " GiB of pinned HOST RAM for k=" + std::to_string(pool_k) +
+                    ", host reports " +
+                    std::to_string(to_gib_host(host_free)).substr(0, 5) +
+                    " GiB available of " +
+                    std::to_string(to_gib_host(host_total)).substr(0, 5) +
+                    " GiB total. This is host memory, not VRAM — --tier only "
+                    "bounds the device peak and will not reduce it, and the "
+                    "requirement is fixed for PoS2's k=28. Close what else is "
+                    "holding RAM, or plot on a host with more memory.");
+            }
+        }
+
         bool any_fail = false;
         for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
             stream_pinned[s] = streaming_alloc_pinned_uint64(stream_pinned_cap);
