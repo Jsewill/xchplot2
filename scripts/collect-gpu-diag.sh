@@ -118,6 +118,25 @@ echo
 if [ -d "$REPO/.git" ]; then
     echo "repo HEAD:  $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     echo "repo dirty: $(git -C "$REPO" status --porcelain 2>/dev/null | wc -l) file(s)"
+
+    # A bundle from a tree that predates the fix it is meant to test reads like
+    # a verdict and is not one. Name the missing commits here, at the top, where
+    # it cannot be missed. Bounded and non-fatal -- never block on the network.
+    upstream=$(git -C "$REPO" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    if [ -n "$upstream" ]; then
+        timeout 30 git -C "$REPO" fetch --quiet 2>/dev/null \
+            || echo "            (remote unreachable; comparing against the last fetch)"
+        behind=$(git -C "$REPO" rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)
+        if [ "${behind:-0}" -gt 0 ]; then
+            echo
+            echo "  >>> THIS TREE IS $behind COMMIT(S) BEHIND $upstream:"
+            git -C "$REPO" log --oneline "HEAD..$upstream" 2>/dev/null | sed 's/^/  >>>     /'
+            echo "  >>> If you are testing a fix, it is NOT in this build. Update both"
+            echo "  >>> copies -- an installed binary and a build dir are separate files:"
+            echo "  >>>     git pull && cargo install --path . --force"
+            echo "  >>>     rm -rf $BUILD_DIR   # force the parity build to reconfigure"
+        fi
+    fi
 fi
 
 sec "2. HOST MEMORY"
