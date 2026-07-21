@@ -345,13 +345,52 @@ run_parity() {
         # sizes and seeds and print a line each; "it failed" narrows nothing,
         # while "passes at count=16, fails from 16384 up" points straight at
         # the multi-tile path. Discarding this output cost a full round trip.
-        printf '        rc=%s. failing cases:\n' "$rc"
+        printf '        rc=%s\n' "$rc"
+        # The head carries the "device: <name>" line these tests print at
+        # startup. Without it a failure cannot be attributed to a device --
+        # and on a host where GPU 0 is a ROCm CPU agent, "the sort is broken"
+        # and "the sort is broken ON THE CARD YOU CARE ABOUT" are different
+        # findings. Tail alone cost a round trip.
+        echo "        --- first 4 lines (device attribution) ---"
+        head -4 "$plog" | sed 's/^/          /'
+        echo "        --- failing cases ---"
         grep -iE 'fail|mismatch|abort|error|assert' "$plog" | head -12 | sed 's/^/          /'
         echo "        --- last 15 lines ---"
         tail -15 "$plog" | sed 's/^/          /'
     fi
     rm -f "$plog"
 }
+# The parity tests choose their own device (gpu_selector_v / a bare
+# sycl::queue) and nothing tells them which GPU is under investigation. On a
+# host where GPU 0 is a ROCm CPU agent, that is emphatically not the same
+# device as `--devices 1`, and "the sort is broken" then means something
+# entirely different from "the sort is broken on your card". Mask the visible
+# backends down to the one that owns the requested device so the tests and the
+# plot probe agree on what they are testing. omp stays visible: it is the host
+# device, never enumerated as a GPU, and some paths want it present.
+dev_backend=""
+PARITY_MASK=""
+if [ -n "$DEVICES" ]; then
+    dev_backend=$("$BIN" devices 2>/dev/null \
+        | sed -nE "s/^[[:space:]]*\[$DEVICES\][[:space:]].*backend=([a-z_]+).*/\1/p" \
+        | head -1)
+    case "$dev_backend" in
+        level_zero) PARITY_MASK="ze;omp"   ;;
+        hip)        PARITY_MASK="hip;omp"  ;;
+        cuda)       PARITY_MASK="cuda;omp" ;;
+    esac
+fi
+if [ -n "$PARITY_MASK" ]; then
+    echo "-- pinning parity to ACPP_VISIBILITY_MASK=$PARITY_MASK"
+    echo "   (device $DEVICES reports backend=$dev_backend)"
+    export ACPP_VISIBILITY_MASK="$PARITY_MASK"
+else
+    echo "-- parity NOT pinned: each test picks its own device."
+    echo "   Read the 'device:' line in any failure output below before"
+    echo "   attributing a failure to the GPU you are investigating."
+fi
+echo
+
 # Which ISA were these binaries actually compiled for? A parity test AOT-built
 # for the wrong vendor either fails to dispatch or silently exercises a
 # different GPU than the one under investigation, and either way its verdict
@@ -422,6 +461,9 @@ else
 fi
 
 sec "8. TARGET k=$K (only if small k passed)"
+# Drop the parity mask before plotting again: hiding a backend renumbers the
+# device list, so --devices would no longer mean what it meant in section 5.
+unset ACPP_VISIBILITY_MASK
 if [ "$SMALL_OK" = 0 ]; then
     run_probe "8a. k=$K" "$K"
 else
