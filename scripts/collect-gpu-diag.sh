@@ -335,11 +335,22 @@ run_parity() {
         printf '  %-8s %-34s NOT BUILT   %s\n' "$kind" "$name" "$what"
         return
     fi
-    if timeout 900 "$p" >/dev/null 2>&1; then
+    plog=$(mktemp)
+    if timeout 900 "$p" > "$plog" 2>&1; then
         printf '  %-8s %-34s PASS        %s\n' "$kind" "$name" "$what"
     else
+        rc=$?
         printf '  %-8s %-34s *** FAIL ***  %s\n' "$kind" "$name" "$what"
+        # WHICH cases failed is the whole diagnostic value. These tests sweep
+        # sizes and seeds and print a line each; "it failed" narrows nothing,
+        # while "passes at count=16, fails from 16384 up" points straight at
+        # the multi-tile path. Discarding this output cost a full round trip.
+        printf '        rc=%s. failing cases:\n' "$rc"
+        grep -iE 'fail|mismatch|abort|error|assert' "$plog" | head -12 | sed 's/^/          /'
+        echo "        --- last 15 lines ---"
+        tail -15 "$plog" | sed 's/^/          /'
     fi
+    rm -f "$plog"
 }
 # Which ISA were these binaries actually compiled for? A parity test AOT-built
 # for the wrong vendor either fails to dispatch or silently exercises a
@@ -357,10 +368,13 @@ echo "  (anything other than 'generic' on a multi-vendor host is suspect —"
 echo "   an AOT target speaks one ISA and cannot dispatch to the others)"
 echo
 echo "-- dispatch smoke test --"
-if [ -x "$BUILD_DIR/hellosycl" ]; then
-    try timeout 120 "$BUILD_DIR/hellosycl"
-elif [ -x "$BUILD_DIR/tools/hellosycl" ]; then
-    try timeout 120 "$BUILD_DIR/tools/hellosycl"
+hello=""
+for cand in "$BUILD_DIR/tools/sanity/hellosycl" "$BUILD_DIR/hellosycl" \
+            "$BUILD_DIR/tools/hellosycl"; do
+    [ -x "$cand" ] && { hello="$cand"; break; }
+done
+if [ -n "$hello" ]; then
+    try timeout 120 "$hello"
 else
     echo "  hellosycl NOT BUILT"
 fi
