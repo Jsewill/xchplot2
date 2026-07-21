@@ -280,18 +280,23 @@ size_t streaming_pinned_peak_bytes(int k);
 //
 // Host RAM moves OPPOSITE to VRAM across the ladder, because parking tables on
 // the host is what buys the VRAM back. Measured on an RTX 4090, k=28, peak RSS
-// sampled from /proc/PID/status over `bench -n 1 --warmup 0`:
+// sampled from /proc/PID/status over `bench -n 3 --warmup 0`:
 //
-//   tier      host RSS    VRAM peak   s/plot
-//   plain      7.36 GiB    7.89 GiB     7.46
-//   compact   14.46 GiB    5.86 GiB     6.44
-//   minimal   18.52 GiB    5.00 GiB    26.69
-//   tiny      19.56 GiB    1.12 GiB    40.38
+//   path/tier   host RSS    VRAM peak   s/plot
+//   pool         7.32 GiB   11.00 GiB    4.91   <- default when VRAM allows
+//   plain        7.35 GiB    7.94 GiB    4.23
+//   compact     14.44 GiB    5.86 GiB    5.89
+//   minimal     18.52 GiB    5.00 GiB   25.57
+//   tiny        21.48 GiB    1.08 GiB   38.30
 //
-// So compact buys 2.03 GiB of VRAM for 7.10 GiB of host, and tiny buys 6.77
-// for 12.20 — plus 5.4x the wall clock. Reaching for a lower --tier to "use
-// less memory" makes host RAM worse, which is the single most confusing thing
-// about the ladder and the reason these numbers are in the header.
+// So compact buys 2.08 GiB of VRAM for 7.09 GiB of host, and tiny buys 6.86
+// for 14.13 — plus 9x the wall clock. Reaching for a lower --tier to "use less
+// memory" makes host RAM worse, which is the single most confusing thing about
+// the ladder and the reason these numbers are in the header.
+//
+// Note the cliff is between plain and compact: the two cheapest paths in host
+// RAM are also the two fastest, and they differ by 50 MiB of host. There is no
+// reason to run compact or below unless the card genuinely cannot hold plain.
 //
 // Modelled as cap(k) * bytes_per_entry + a fixed term, because every host
 // buffer is a whole table: cap = 2^k + 2^(k-6), so one u64 array over it is

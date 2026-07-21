@@ -790,14 +790,22 @@ namespace {
 //
 // Derived by subtracting the fixed term from each measured peak RSS and
 // dividing by cap(28) = 272,629,760:
-//   plain   (7.36 - 1.27) GiB / cap = 24 B  — exactly the 3-slot D2H ring
-//   compact (14.46 - 1.27)          = 52 B
+//   plain   (7.35 - 1.27) GiB / cap = 24 B  — exactly the 3-slot D2H ring
+//   compact (14.44 - 1.27)          = 52 B
 //   minimal (18.52 - 1.27)          = 68 B  — gather-tiling holds h_t2_meta
 //                                             live across T3 match
-//   tiny    (19.56 - 1.27)          = 72 B
+//   tiny    (21.48 - 1.27)          = 80 B
 //
-// Reconstructing the measurements from these gives 7.36 / 14.47 / 18.53 /
-// 19.55 GiB — within 0.02 GiB of every reading.
+// Reconstructing gives 7.36 / 14.47 / 18.54 / 21.58 GiB — each within 0.11 GiB
+// of its reading and every one on the high side, which is the safe direction
+// for a gate.
+//
+// CALIBRATE AT n>=3, NOT n=1. Tiny is the only tier whose peak grows with batch
+// depth: 19.56 GiB at n=1 against 21.48 at n=3, because the producer runs ahead
+// of the file writer and tiny is the tier that also aliases the rotating D2H
+// slots as device-visible working buffers. plain / compact / minimal measured
+// identical at n=1 and n=3, so a single-plot calibration silently understates
+// tiny alone — by 2 GiB, on the tier whose users have the least RAM to spare.
 //
 // The fixed term is what does not scale with cap: the CUDA/SYCL context, the
 // binary, and the file writer's compressed-chunk heap. Keeping it separate
@@ -818,7 +826,7 @@ size_t streaming_host_bytes(int k, unsigned bytes_per_entry)
 size_t streaming_plain_host_bytes(int k)   { return streaming_host_bytes(k, 24); }
 size_t streaming_compact_host_bytes(int k) { return streaming_host_bytes(k, 52); }
 size_t streaming_minimal_host_bytes(int k) { return streaming_host_bytes(k, 68); }
-size_t streaming_tiny_host_bytes(int k)    { return streaming_host_bytes(k, 72); }
+size_t streaming_tiny_host_bytes(int k)    { return streaming_host_bytes(k, 80); }
 
 size_t host_memory_reserve()
 {
