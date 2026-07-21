@@ -241,12 +241,49 @@ inline void validate_t1_count(uint64_t t1_count, int k)
     uint64_t const min_plausible = (1ULL << k) >> 6;
     if (t1_count >= min_plausible) return;
 
+    // Did the kernels run at all? A device that faulted mid-run reaches this
+    // check with the same t1_count == 0 as a device that miscompiled the
+    // matcher, and the advice for the two is opposite: one is a driver/device
+    // problem the parity tests cannot reproduce, the other is exactly what
+    // they exist to catch. The async error count decides it.
+    auto& async_log = sycl_backend::async_errors();
+    if (unsigned const n = async_log.count.load(std::memory_order_relaxed); n > 0) {
+        std::string first;
+        {
+            std::lock_guard<std::mutex> lk(async_log.mu);
+            first = async_log.first;
+        }
+        throw std::runtime_error(
+            "T1 match produced " + std::to_string(t1_count) + " entries, and " +
+            std::to_string(n) + " asynchronous backend error(s) were reported "
+            "during the run. The kernels did not compute a wrong answer — they "
+            "did not execute. This is a driver or device fault, NOT a codegen "
+            "or parity problem, and the parity tests will not reproduce it.\n"
+            "  First backend error: " + first + "\n"
+            "  Reading Level Zero codes: 0x70000001 (ze:1879048193) is "
+            "DEVICE_LOST and is the ROOT event. The 0x70000003 "
+            "(ze:1879048195) OUT_OF_DEVICE_MEMORY storm that follows it is a "
+            "dead context reporting on every subsequent call — it is not a "
+            "memory shortage, and chasing it wastes time.\n"
+            "  DEVICE_LOST part-way through a run usually means a kernel "
+            "outran the GPU's job/preemption timeout and the driver reset the "
+            "engine. Check `dmesg` for xe/i915 reset or hangcheck lines. On "
+            "the Xe driver the limit is "
+            "/sys/class/drm/card*/device/tile0/gt0/engines/*/job_timeout_ms "
+            "(and preempt_timeout_us); i915 uses "
+            "i915.enable_hangcheck / preempt_timeout_ms. Re-running at a "
+            "smaller k shortens every kernel and is the fastest way to confirm "
+            "the diagnosis: if a small k completes and k=28 does not, it is "
+            "the timeout, not the code.");
+    }
+
     throw std::runtime_error(
         "T1 match produced " + std::to_string(t1_count) + " entries "
         "(expected ~2^" + std::to_string(k) + " = " +
         std::to_string(1ULL << k) + " for k=" + std::to_string(k) +
-        "). This indicates a kernel correctness issue on this device, "
-        "not a VRAM shortfall. On AMD/HIP this most often means the "
+        "). No asynchronous backend errors were reported, so the kernels ran "
+        "and returned wrong results — a device codegen issue, not a VRAM "
+        "shortfall. On AMD/HIP this most often means the "
         "AdaptiveCpp target produced wrong output for the actual gfx "
         "ISA — either the gfx1013/RDNA1 community AOT spoof or the "
         "generic SSCP JIT path on an unvalidated card. Build the "
