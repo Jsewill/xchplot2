@@ -159,6 +159,30 @@ else
     echo "  know your AdaptiveCpp prefix, run <prefix>/bin/acpp-info by hand."
 fi
 echo
+# Which backends are even installed. These names are also the tokens
+# ACPP_VISIBILITY_MASK accepts (semicolon-separated), so this doubles as the
+# reference for masking a backend out.
+echo "-- installed AdaptiveCpp backends --"
+found_be=0
+for d in /opt/adaptivecpp/lib/hipSYCL /usr/lib/hipSYCL /usr/local/lib/hipSYCL \
+         /usr/lib64/hipSYCL; do
+    for so in "$d"/librt-backend-*.so; do
+        [ -e "$so" ] || continue
+        found_be=1
+        printf '  %s\n' "$(basename "$so" | sed 's/librt-backend-//; s/\.so$//')"
+    done
+done
+[ "$found_be" = 0 ] && echo "  (none found at the usual prefixes)"
+echo
+# THE device list, as xchplot2 itself sees it. Without this the bundle cannot
+# say which device a run actually used -- and --devices takes an INDEX, not a
+# count, so `--devices 1` means "the device at index 1", which is not
+# necessarily the GPU under investigation. AdaptiveCpp's HIP backend has been
+# observed enumerating a ROCm CPU agent as a GPU on hosts whose real AMD GPU
+# is unsupported, which shifts every later index by one.
+echo "-- xchplot2 devices (indices here are what --devices takes) --"
+try timeout 120 "$BIN" devices
+echo
 for v in ZES_ENABLE_SYSMAN NEOReadDebugKeys ACPP_TARGETS ACPP_VISIBILITY_MASK \
          ACPP_ADAPTIVITY_LEVEL ACPP_DEBUG_LEVEL XCHPLOT2_HOST_RESERVE_MB; do
     echo "env $v=${!v-<unset>}"
