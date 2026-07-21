@@ -1,46 +1,63 @@
 #!/usr/bin/env bash
 # collect-gpu-diag.sh — one-shot diagnostic bundle for a GPU that fails to plot.
 #
-# Runs a fixed sequence of probes and two instrumented plot attempts, and writes
-# everything to a single file. Nothing is uploaded; nothing is deleted. Intended
-# to be run once and the resulting file sent to whoever is debugging.
+# Runs a fixed sequence of probes and writes everything to a single file.
+# Nothing is uploaded; nothing is deleted. Run it once, send the file.
 #
-#   ./scripts/collect-gpu-diag.sh [--devices N] [--k 28]
+#   ./scripts/collect-gpu-diag.sh [--devices N] [--k 28] [--no-build]
 #
-# Takes roughly 5-10 minutes. Safe to Ctrl-C; partial output is still useful.
+# Roughly 10-20 minutes, most of it compiling parity tests. Safe to Ctrl-C;
+# partial output is still useful.
 #
-# The k=28 attempt is run inside a memory-limited scope where systemd allows it,
-# so that a host that runs out of RAM kills the plotter instead of the desktop
-# session. That containment is also the experiment: if the plot dies at the cap
-# and completes without it, the problem is host memory, not the GPU.
+# Home directory paths are redacted from the output, because these bundles get
+# pasted into issue trackers.
+#
+# STRUCTURE — the small-k probe BRANCHES the run:
+#
+#   small k passes, target k fails  -> scale-dependent. Chase memory, VRAM
+#                                      tiers, allocation size, timeouts.
+#   small k also fails              -> not scale. Everything about capacity is
+#                                      a dead end; the kernels are wrong or the
+#                                      toolchain is. Go straight to parity.
+#
+# The first version of this script assumed the first branch and hardcoded k=22
+# as a "control" that passes. On the report it was written for, k=22 failed
+# too, and the bundle spent its time measuring memory on a machine whose GPU
+# could not run a 34 MB workload. Do not assume the branch. Test it.
 
 set -u
 
 DEVICES=""
 K=28
+SMALL_K=22
+DO_BUILD=1
 while [ $# -gt 0 ]; do
     case "$1" in
-        --devices) DEVICES="$2"; shift 2 ;;
-        --k)       K="$2";       shift 2 ;;
+        --devices)  DEVICES="$2"; shift 2 ;;
+        --k)        K="$2";       shift 2 ;;
+        --small-k)  SMALL_K="$2"; shift 2 ;;
+        --no-build) DO_BUILD=0;   shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 OUT="xchplot2-diag-$(date +%Y%m%d-%H%M%S).txt"
-# Repo root relative to this script, so the local build is found no matter
-# which directory the script is invoked from.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_BIN="$REPO/target/release/xchplot2"
 BIN="$(command -v xchplot2 || echo "$LOCAL_BIN")"
 DEVARG=""
 [ -n "$DEVICES" ] && DEVARG="--devices $DEVICES"
+BUILD_DIR="$REPO/build-diag"
 
-exec > >(tee "$OUT") 2>&1
+# Redact identifying paths on the way to the file. These bundles are meant to
+# be shared, and a home directory carries a real name more often than not.
+ME="$(id -un 2>/dev/null || echo __nouser__)"
+exec > >(sed -E "s#${HOME}#~#g; s#/home/${ME}#~#g; s#\\b${ME}\\b#<user>#g" \
+         | tee "$OUT") 2>&1
 
-sec() { printf '\n\n========== %s ==========\n' "$1"; }
+sec()  { printf '\n\n========== %s ==========\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
-# Never let one probe's failure end the bundle.
-try() { "$@" 2>&1 || echo "  (command failed: $*)"; }
+try()  { "$@" 2>&1 || echo "  (command failed: $*)"; }
 
 echo "xchplot2 diagnostic bundle"
 echo "date: $(date -Is)"
@@ -86,28 +103,25 @@ PATH_BIN="$(command -v xchplot2 2>/dev/null || true)"
 check_bin "$PATH_BIN"   "on PATH:"
 check_bin "$LOCAL_BIN"  "local build:"
 echo
-if [ -n "$PATH_BIN" ] && [ -x "$LOCAL_BIN" ] \
-   && ! cmp -s "$PATH_BIN" "$LOCAL_BIN"; then
+if [ -n "$PATH_BIN" ] && [ -x "$LOCAL_BIN" ] && ! cmp -s "$PATH_BIN" "$LOCAL_BIN"; then
     echo "  >>> THE TWO BINARIES DIFFER. Everything below used: $BIN"
     echo "  >>> If that is the stale one, this bundle describes the OLD code."
 fi
 echo
-if [ -d .git ]; then
-    echo "repo HEAD: $(git rev-parse --short HEAD 2>/dev/null)"
-    echo "repo dirty: $(git status --porcelain 2>/dev/null | wc -l) file(s)"
+if [ -d "$REPO/.git" ]; then
+    echo "repo HEAD:  $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    echo "repo dirty: $(git -C "$REPO" status --porcelain 2>/dev/null | wc -l) file(s)"
 fi
 
 sec "2. HOST MEMORY"
 try free -h
 echo; try swapon --show
 echo; grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Committed_AS|Dirty' /proc/meminfo
-echo; echo "top 8 RSS consumers:"
-try ps -eo rss,comm --sort=-rss --no-headers
-echo
 
 sec "3. GPU / DRIVER ENVIRONMENT"
 for c in /sys/class/drm/card*; do
     [ -e "$c/device/vendor" ] || continue
+    case "$(basename "$c")" in *-*) continue ;; esac
     drv=$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)" 2>/dev/null)
     printf '%s: vendor=%s device=%s driver=%s\n' \
         "$(basename "$c")" \
@@ -116,42 +130,74 @@ for c in /sys/class/drm/card*; do
         "${drv:-unknown}"
 done
 echo
-echo "-- GPU engine timeouts (a kernel outrunning these is reset by the driver) --"
+echo "-- GPU engine timeouts --"
 found_to=0
 for f in /sys/class/drm/card*/device/tile*/gt*/engines/*/job_timeout_ms \
          /sys/class/drm/card*/device/tile*/gt*/engines/*/preempt_timeout_us \
-         /sys/class/drm/card*/device/preempt_timeout_ms \
-         /sys/class/drm/card*/device/enable_hangcheck; do
+         /sys/class/drm/card*/device/preempt_timeout_ms; do
     [ -r "$f" ] || continue
     found_to=1
     printf '  %s = %s\n' "$f" "$(cat "$f" 2>/dev/null)"
 done
-[ "$found_to" = 0 ] && echo "  (no engine timeout knobs readable)"
+[ "$found_to" = 0 ] && echo "  (none readable)"
 echo
-have acpp-info && { echo "-- acpp-info --"; try acpp-info; } || echo "(acpp-info not on PATH)"
+# acpp-info is usually NOT on PATH -- AdaptiveCpp installs to a prefix that
+# only the build system knows about. Look where it actually lands.
+echo "-- acpp-info (device + backend enumeration) --"
+ACPP_INFO=""
+for p in "$(command -v acpp-info 2>/dev/null || true)" \
+         /opt/adaptivecpp/bin/acpp-info /usr/local/bin/acpp-info \
+         /usr/lib/AdaptiveCpp/bin/acpp-info "$HOME/.local/bin/acpp-info"; do
+    if [ -n "$p" ] && [ -x "$p" ]; then ACPP_INFO="$p"; break; fi
+done
+if [ -n "$ACPP_INFO" ]; then
+    echo "($ACPP_INFO)"
+    try timeout 120 "$ACPP_INFO"
+else
+    echo "  NOT FOUND. This matters: it is the only thing that says how many"
+    echo "  devices AdaptiveCpp sees and which backends are loaded. If you"
+    echo "  know your AdaptiveCpp prefix, run <prefix>/bin/acpp-info by hand."
+fi
 echo
-have clinfo && try clinfo -l || true
 for v in ZES_ENABLE_SYSMAN NEOReadDebugKeys ACPP_TARGETS ACPP_VISIBILITY_MASK \
-         XCHPLOT2_HOST_RESERVE_MB; do
+         ACPP_ADAPTIVITY_LEVEL ACPP_DEBUG_LEVEL XCHPLOT2_HOST_RESERVE_MB; do
     echo "env $v=${!v-<unset>}"
 done
 
-sec "4. DMESG BASELINE (before any plotting)"
-try sh -c 'dmesg -T 2>/dev/null | tail -40 || sudo -n dmesg -T 2>/dev/null | tail -40'
-DMESG_MARK=$(date +%s)
+# Kernel log. dmesg is root-only under kernel.dmesg_restrict on most distros
+# now, but journalctl -k is frequently readable by a normal user, and a GPU
+# page fault or engine reset appears ONLY here.
+klog() {
+    dmesg -T 2>/dev/null \
+        || journalctl -k --no-pager -q 2>/dev/null \
+        || sudo -n dmesg -T 2>/dev/null \
+        || true
+}
 
-# --- instrumented run helper -------------------------------------------------
-# Samples vmstat and peak RSS around a plot attempt. $1=label, rest=extra args.
+sec "4. KERNEL LOG BASELINE (before any plotting)"
+kb="$(klog)"
+if [ -z "$kb" ]; then
+    echo "  UNREADABLE via both dmesg and journalctl -k."
+else
+    printf '%s\n' "$kb" | tail -25
+fi
+
+# --- plot probe ---------------------------------------------------------
+# Returns 0 on success. Samples peak RSS so a memory story can be confirmed
+# or (more usefully) ruled out.
+PROBE_RC=0
 run_probe() {
-    label="$1"; shift
+    label="$1"; kk="$2"
     sec "$label"
-    echo "command: $BIN bench -k $* $DEVARG -n 1"
-    vmlog=$(mktemp); rsslog=$(mktemp)
-    have vmstat && (vmstat 1 > "$vmlog" 2>&1 &  echo $! > "$vmlog.pid")
-
+    echo "command: $BIN bench -k $kk $DEVARG -n 1 --warmup 0"
+    plog=$(mktemp)
     start=$(date +%s.%N)
+    # Redirect to a file rather than piping: $! after a pipeline is the LAST
+    # element's pid, so both the RSS sampling below and the exit status would
+    # describe `tail` instead of the plotter -- and a probe that always
+    # reports success would silently disable the branch in section 5.
     # shellcheck disable=SC2086
-    $BIN bench -k $* $DEVARG -n 1 &
+    $BIN bench -k "$kk" $DEVARG -n 1 --warmup 0 > "$plog" 2>&1 &
     pid=$!
     hwm=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -159,86 +205,189 @@ run_probe() {
         [ -n "${v:-}" ] && [ "$v" -gt "$hwm" ] && hwm=$v
         sleep 0.2
     done
-    wait "$pid"; rc=$?
+    wait "$pid"; PROBE_RC=$?
     end=$(date +%s.%N)
-
-    [ -f "$vmlog.pid" ] && kill "$(cat "$vmlog.pid")" 2>/dev/null
+    # A dying Level Zero context emits the same submit failure hundreds of
+    # times. Summarise by shape first, then show the head verbatim -- the
+    # first few lines are where the actual first failure is.
+    echo "-- output by message shape (digits collapsed) --"
+    sed -E 's/[0-9]+/#/g; s/0x[0-9a-fA-F]+/0xH/g' "$plog" \
+        | sort | uniq -c | sort -rn | head -12 | sed 's/^/  /'
+    echo "-- first 30 lines verbatim --"
+    head -30 "$plog" | sed 's/^/  /'
+    rm -f "$plog"
     echo
-    echo "exit code: $rc"
+    echo "exit code: $PROBE_RC"
     awk -v s="$start" -v e="$end" 'BEGIN{ printf "wall: %.2f s\n", e-s }'
     awk -v h="$hwm" 'BEGIN{ printf "peak RSS: %.2f GiB\n", h/1048576 }'
-    if [ -s "$vmlog" ]; then
-        echo "-- vmstat: si/so nonzero = swapping; high sy = kernel-bound --"
-        head -3 "$vmlog"
-        awk 'NR>2{print}' "$vmlog" | awk '{print}' | tail -25
-    fi
-    rm -f "$vmlog" "$vmlog.pid" "$rsslog"
+    return $PROBE_RC
 }
 
-sec "5. CONTROL — small k (short kernels, small footprint)"
-echo "If this SUCCEEDS and k=$K fails, the failure is scale-dependent."
-run_probe "5a. k=22 run" 22
-
-sec "6. TARGET — k=$K, memory-capped"
-echo "Capped so an out-of-RAM host kills the plotter, not your session."
-if have systemd-run && systemd-run --user --scope true >/dev/null 2>&1; then
-    cap_gib=$(awk '/MemTotal/{printf "%d", ($2/1048576)*0.75}' /proc/meminfo)
-    echo "running under systemd scope, MemoryMax=${cap_gib}G, swap disabled"
-    echo "  -> killed at the cap = host memory is the constraint"
-    echo "  -> same failure well under the cap = not memory"
-    # shellcheck disable=SC2086
-    try systemd-run --user --scope -q \
-        -p MemoryMax=${cap_gib}G -p MemorySwapMax=0 \
-        $BIN bench -k $K $DEVARG -n 1
+sec "5. SMALL-k PROBE — k=$SMALL_K  (this decides what the rest means)"
+run_probe "5a. k=$SMALL_K" "$SMALL_K"
+SMALL_OK=$PROBE_RC
+echo
+if [ "$SMALL_OK" = 0 ]; then
+    echo ">>> SMALL k PASSED. The failure is scale-dependent; k=$K is worth"
+    echo ">>> running, and memory/VRAM/tier explanations are live."
 else
-    echo "(systemd-run --user unavailable; running uncapped)"
+    echo ">>> SMALL k FAILED, at a few tens of MB on any modern card."
+    echo ">>> The failure is NOT about capacity. Host RAM, VRAM tiers, buffer"
+    echo ">>> sizes and the k=28 working set are all ruled out. Skipping the"
+    echo ">>> k=$K run -- it cannot add information -- and going to parity."
 fi
 
-run_probe "6b. k=$K run, uncapped + instrumented" "$K"
+sec "6. PARITY TESTS — do the kernels compute the right answers?"
+cat <<'EOM'
+Read the labels. The suite is NOT uniformly probative:
 
-sec "7. DMESG (GPU resets, hangcheck, OOM kills all land here)"
-dmesg_out=$(dmesg -T 2>/dev/null || sudo -n dmesg -T 2>/dev/null \
-            || dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null || true)
-if [ -z "$dmesg_out" ]; then
-    cat <<'EOM'
-  UNREADABLE — kernel.dmesg_restrict is set and passwordless sudo is not
-  available. This section is important: a GPU engine reset or an OOM kill
-  appears ONLY here. Please re-run just this part and include the output:
+  [ORACLE]  compares GPU output against an INDEPENDENT CPU implementation.
+            A failure here names a broken kernel. This is real evidence.
 
-      sudo dmesg -T | tail -100
-      sudo dmesg -T | grep -iE 'xe |i915|drm|reset|hang|oom|killed process'
+  [SELF]    compares one GPU path against ANOTHER GPU path (sharded vs
+            single-device, scatter vs gather). If a kernel is systematically
+            wrong, both sides are wrong in the same way and the test PASSES.
+            A green [SELF] test proves almost nothing about correctness.
+
+So: a fully green run does NOT exonerate the match kernels. T2 match, T3 match
+and the proof-fragment values have CPU ground truth only in the .cu tests,
+which do not build without CUDA -- i.e. not on the AMD or Intel hosts where
+you would need them. That is a real coverage hole, not an oversight of this
+script.
 EOM
-else
-    echo "-- last 60 lines --"
-    printf '%s\n' "$dmesg_out" | tail -60
+echo
+if [ "$DO_BUILD" = 1 ]; then
+    echo "-- configuring $BUILD_DIR --"
+    # ACPP_TARGETS=generic is FORCED here on purpose. CMakeLists' autodetect
+    # picks hip:gfx<first agent> on a host with any AMD GPU -- including an
+    # integrated one -- which AOT-pins these binaries to amdgcn. On a machine
+    # being diagnosed for an Intel or NVIDIA GPU that means the parity tests
+    # cannot dispatch to the card under investigation at all, and report
+    # nonsense. Do not remove this flag.
+    try cmake -B "$BUILD_DIR" -S "$REPO" -DCMAKE_BUILD_TYPE=Release \
+              -DACPP_TARGETS=generic 2>&1 | tail -15
     echo
-    echo "-- lines matching reset/hang/oom/gpu --"
-    printf '%s\n' "$dmesg_out" \
-        | grep -iE 'xe |i915|drm|reset|hang|oom|killed process|GPU' | tail -40 \
-        || echo "  (none — no GPU reset and no OOM kill was logged)"
+    echo "-- building (slow; AdaptiveCpp TUs) --"
+    try cmake --build "$BUILD_DIR" -j"$(nproc)" --target \
+        hellosycl sycl_g_x_parity sycl_bucket_offsets_parity \
+        sycl_sort_parity sycl_sort_u32_u64_parity \
+        sycl_streaming_partition_parity sycl_t1_parity 2>&1 | tail -25
+else
+    echo "(--no-build: using whatever is already in $BUILD_DIR)"
 fi
-: "$DMESG_MARK"
-
-sec "8. PARITY TESTS (settles codegen: these run tiny, no memory pressure)"
-ran_any=0
-for t in sycl_g_x_parity sycl_sort_parity sycl_bucket_offsets_parity sycl_t1_parity; do
-    for p in "./build/$t" "./$t"; do
-        if [ -x "$p" ]; then
-            ran_any=1
-            printf '%-30s ' "$t"
-            if timeout 300 "$p" >/dev/null 2>&1; then echo PASS; else echo "FAIL/ERROR"; fi
-            break
-        fi
+echo
+run_parity() {
+    name="$1"; kind="$2"; what="$3"
+    p=""
+    for cand in "$BUILD_DIR/tools/parity/$name" "$BUILD_DIR/$name" \
+                "$REPO/build/tools/parity/$name"; do
+        [ -x "$cand" ] && { p="$cand"; break; }
     done
+    if [ -z "$p" ]; then
+        printf '  %-8s %-34s NOT BUILT   %s\n' "$kind" "$name" "$what"
+        return
+    fi
+    if timeout 900 "$p" >/dev/null 2>&1; then
+        printf '  %-8s %-34s PASS        %s\n' "$kind" "$name" "$what"
+    else
+        printf '  %-8s %-34s *** FAIL ***  %s\n' "$kind" "$name" "$what"
+    fi
+}
+# Which ISA were these binaries actually compiled for? A parity test AOT-built
+# for the wrong vendor either fails to dispatch or silently exercises a
+# different GPU than the one under investigation, and either way its verdict
+# is worthless. Never let this be an assumption.
+echo "-- what the parity binaries were compiled for --"
+for d in "$BUILD_DIR" "$REPO/build"; do
+    if [ -f "$d/CMakeCache.txt" ]; then
+        printf '  %-28s %s\n' "$(basename "$d"):" \
+            "$(grep -E '^ACPP_TARGETS(:[A-Z]+)?=' "$d/CMakeCache.txt" 2>/dev/null \
+               | head -1 | cut -d= -f2-)"
+    fi
 done
-[ "$ran_any" = 0 ] && cat <<'EOM'
-(not built. To build them:
-   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-   cmake --build build -j --target sycl_g_x_parity sycl_sort_parity \
-         sycl_bucket_offsets_parity sycl_t1_parity
- If these PASS while k=28 fails, the kernels are correct and the fault is
- environmental — driver, timeout, or memory.)
+echo "  (anything other than 'generic' on a multi-vendor host is suspect —"
+echo "   an AOT target speaks one ISA and cannot dispatch to the others)"
+echo
+echo "-- dispatch smoke test --"
+if [ -x "$BUILD_DIR/hellosycl" ]; then
+    try timeout 120 "$BUILD_DIR/hellosycl"
+elif [ -x "$BUILD_DIR/tools/hellosycl" ]; then
+    try timeout 120 "$BUILD_DIR/tools/hellosycl"
+else
+    echo "  hellosycl NOT BUILT"
+fi
+echo
+echo "-- results --"
+run_parity sycl_g_x_parity                 "[ORACLE]" "AES core vs host-compiled same source"
+run_parity sycl_bucket_offsets_parity      "[ORACLE]" "binary search vs std::lower_bound"
+run_parity sycl_sort_parity                "[ORACLE]" "radix sort vs std::sort"
+run_parity sycl_sort_u32_u64_parity        "[ORACLE]" "u32/u64 sort vs identity-sort + gather"
+run_parity sycl_streaming_partition_parity "[ORACLE]" "partition buckets vs CPU multiset"
+run_parity sycl_t1_parity                  "[ORACLE]" "Xs + T1 match vs pos2-chip CPU Table1Constructor"
+echo
+echo "  sycl_g_x_parity is the one to watch: the AES core is inside every"
+echo "  kernel in the pipeline, so if it fails, nothing downstream is"
+echo "  meaningful. sycl_t1_parity is the only end-to-end phase check with"
+echo "  real CPU ground truth on a non-CUDA host."
+
+sec "7. TOOLCHAIN ISOLATION (only runs if small k failed)"
+if [ "$SMALL_OK" = 0 ]; then
+    echo "(skipped -- small k passed, so the toolchain is producing runnable code)"
+else
+    T1P=""
+    for cand in "$BUILD_DIR/tools/parity/sycl_t1_parity" "$BUILD_DIR/sycl_t1_parity"; do
+        [ -x "$cand" ] && { T1P="$cand"; break; }
+    done
+    if [ -z "$T1P" ]; then
+        echo "(sycl_t1_parity not built -- cannot run the matrix)"
+    else
+        echo "Same binary, same kernels, different JIT/runtime settings. If any"
+        echo "row differs from the others, the fault is in the toolchain rather"
+        echo "than in our kernel logic."
+        echo
+        for combo in "baseline:" \
+                     "no-JIT-specialization:ACPP_ADAPTIVITY_LEVEL=0" \
+                     "JIT-log:ACPP_DEBUG_LEVEL=2"; do
+            lbl="${combo%%:*}"; envv="${combo#*:}"
+            printf '  %-24s ' "$lbl"
+            if [ -n "$envv" ]; then
+                if env "$envv" timeout 600 "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
+            else
+                if timeout 600 "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
+            fi
+        done
+    fi
+fi
+
+sec "8. TARGET k=$K (only if small k passed)"
+if [ "$SMALL_OK" = 0 ]; then
+    run_probe "8a. k=$K" "$K"
+else
+    echo "(skipped -- see section 5)"
+fi
+
+sec "9. KERNEL LOG AFTER  (GPU page faults, engine resets, OOM kills)"
+ka="$(klog)"
+if [ -z "$ka" ]; then
+    cat <<'EOM'
+  UNREADABLE via dmesg and journalctl -k, and passwordless sudo is not
+  available. This section carries more diagnostic weight than any other:
+  a GPU page fault, an engine reset and an OOM kill appear ONLY here, and
+  they are what distinguish "the kernel computed the wrong answer" from
+  "the kernel touched memory it does not own". Please run and include:
+
+      sudo dmesg -T | tail -150
 EOM
+else
+    echo "-- lines matching fault/reset/hang/oom --"
+    printf '%s\n' "$ka" \
+        | grep -iE 'fault|reset|hang|oom|killed process|CAT error|GPU|xe |i915|amdgpu|nvrm' \
+        | tail -60 || echo "  (none)"
+    echo
+    echo "-- last 40 lines --"
+    printf '%s\n' "$ka" | tail -40
+fi
 
 sec "DONE"
 echo "Bundle written to: $OUT"
+echo "Home paths were redacted; skim it before sharing anyway."
