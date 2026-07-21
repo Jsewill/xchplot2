@@ -13,6 +13,7 @@
 #pragma once
 
 #include "gpu/AesTables.inl"
+#include "gpu/AsyncErrorLog.hpp"
 #include "gpu/DeviceIds.hpp"
 
 // cuda_fp16.h must precede sycl/sycl.hpp when this header is consumed
@@ -44,48 +45,23 @@ namespace pos2gpu::sycl_backend {
 // default handler and killed the process before the CLI could exit
 // normally. Logging and swallowing here keeps the synchronous
 // std::runtime_error as the primary signal.
-// Async errors are also COUNTED, not just logged. A backend that fails every
-// kernel launch and one that runs every kernel but miscompiles it both end at
-// the same symptom — a phase that produced zero entries — with completely
-// different causes and completely different fixes. The count is what tells
-// them apart, so the diagnostic can stop guessing. See validate_t1_count().
-struct AsyncErrorLog {
-    std::atomic<unsigned> count{0};
-    std::mutex            mu;
-    std::string           first;   // guarded by mu
-};
-
-inline AsyncErrorLog& async_errors()
-{
-    static AsyncErrorLog log;
-    return log;
-}
-
+// Async errors are also COUNTED, not just logged — see AsyncErrorLog.hpp for
+// why. This is the only place that writes the log.
 inline void async_error_handler(sycl::exception_list exns) noexcept
 {
-    auto record = [](char const* what) noexcept {
-        auto& log = async_errors();
-        log.count.fetch_add(1, std::memory_order_relaxed);
-        try {
-            std::lock_guard<std::mutex> lk(log.mu);
-            if (log.first.empty()) log.first = what;
-        } catch (...) {
-            // Diagnostics must never be the thing that kills the run.
-        }
-    };
     for (std::exception_ptr const& ep : exns) {
         try { std::rethrow_exception(ep); }
         catch (sycl::exception const& e) {
             std::fprintf(stderr, "[sycl async] %s\n", e.what());
-            record(e.what());
+            record_async_error(e.what());
         }
         catch (std::exception const& e) {
             std::fprintf(stderr, "[sycl async] %s\n", e.what());
-            record(e.what());
+            record_async_error(e.what());
         }
         catch (...) {
             std::fprintf(stderr, "[sycl async] (unknown exception type)\n");
-            record("(unknown exception type)");
+            record_async_error("(unknown exception type)");
         }
     }
 }

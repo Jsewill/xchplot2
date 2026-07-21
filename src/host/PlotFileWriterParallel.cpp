@@ -12,6 +12,10 @@
 
 #include "host/PlotFileWriterParallel.hpp"
 
+#include "gpu/AsyncErrorLog.hpp"   // async_error_count / first_async_error
+#include "gpu/DeviceIds.hpp"       // kCpuDeviceId
+#include "host/GpuBufferPool.hpp"  // device_memory_probe
+
 #include "plot/ChunkCompressor.hpp"
 #include "plot/PlotData.hpp"
 #include "plot/PlotFile.hpp"
@@ -286,7 +290,44 @@ size_t write_plot_file_parallel(
                     }
                 }));
         }
-        wait_all_rethrow_first(tasks);
+        // If the device faulted during this run, a compression failure here is
+        // a SYMPTOM, not the fault. ChunkCompressor rejects a gap it cannot
+        // encode in one byte and says so in terms of fragment deltas, which
+        // reads like a plot-format problem; what it actually means is that the
+        // fragments it was handed have holes in them, because the kernels that
+        // should have filled those holes never ran. Say that here, where we
+        // know both halves, instead of leaving a raw invalid_argument about
+        // stub bits to be interpreted by someone who cannot see the device.
+        try {
+            wait_all_rethrow_first(tasks);
+        } catch (std::exception const& e) {
+            unsigned const n = async_error_count();
+            if (n == 0) throw;
+
+            std::size_t host_free = 0, host_total = 0;
+            std::string mem;
+            if (device_memory_probe(kCpuDeviceId, host_free, host_total)) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                    " Host memory at failure: %.2f GiB available of %.2f GiB.",
+                    host_free  / double(1ULL << 30),
+                    host_total / double(1ULL << 30));
+                mem = buf;
+            }
+            throw std::runtime_error(
+                std::string("plot compression failed after ") +
+                std::to_string(n) + " asynchronous backend error(s): " +
+                e.what() +
+                "\n  The proof fragments have gaps far larger than the format "
+                "allows, which means the GPU delivered incomplete output — not "
+                "that the plot format is wrong. Treat the backend errors as the "
+                "root cause; this is downstream of them."
+                "\n  First backend error: " + first_async_error() + mem +
+                "\n  A Level Zero DEVICE_LOST (0x70000001) followed by a storm "
+                "of OUT_OF_DEVICE_MEMORY (0x70000003) is one fault, not many: "
+                "the first killed the context and the rest are it answering "
+                "every later call. Check dmesg for xe/i915 reset lines.");
+        }
     }
 
     // Serial write phase — file I/O is sequential anyway. Write to

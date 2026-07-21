@@ -246,13 +246,8 @@ inline void validate_t1_count(uint64_t t1_count, int k)
     // matcher, and the advice for the two is opposite: one is a driver/device
     // problem the parity tests cannot reproduce, the other is exactly what
     // they exist to catch. The async error count decides it.
-    auto& async_log = sycl_backend::async_errors();
-    if (unsigned const n = async_log.count.load(std::memory_order_relaxed); n > 0) {
-        std::string first;
-        {
-            std::lock_guard<std::mutex> lk(async_log.mu);
-            first = async_log.first;
-        }
+    if (unsigned const n = async_error_count(); n > 0) {
+        std::string const first = first_async_error();
         throw std::runtime_error(
             "T1 match produced " + std::to_string(t1_count) + " entries, and " +
             std::to_string(n) + " asynchronous backend error(s) were reported "
