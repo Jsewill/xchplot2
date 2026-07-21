@@ -12,8 +12,9 @@
 //     local 16-bucket histogram, then writes those 16 counts (no atomics)
 //     into a bucket-major device array tile_hist[d * num_tiles + t]. The
 //     bucket-major layout is what makes phase 2 a single 1-D scan.
-//   Phase 2 — global exclusive scan over the entire tile_hist via
-//     AdaptiveCpp's scanning::scan (decoupled-lookback, multi-WG, parallel).
+//   Phase 2 — global exclusive scan over the entire tile_hist, via our own
+//     three-kernel scan (see exclusive_scan_u32 below; AdaptiveCpp's
+//     decoupled-lookback scan deadlocks some backends and is now opt-in).
 //     The scan output, tile_offsets[d * num_tiles + t], is exactly the
 //     starting position in the output where tile t's bucket-d items go,
 //     because the bucket-major layout means the scan accumulates each
@@ -45,6 +46,7 @@
 #include <AdaptiveCpp/algorithms/numeric.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -80,11 +82,134 @@ uint64_t tile_count_for(uint64_t count)
     return (count + TILE_SIZE - 1) / TILE_SIZE;
 }
 
+// ── Device-wide exclusive scan ──────────────────────────────────────────────
+//
+// Replaces AdaptiveCpp's acpp::algorithms::exclusive_scan for the tile-offset
+// scan. That one is a decoupled-lookback scan, and its lookback is an
+// unbounded spin on a flag published by ANOTHER work-group
+// (decoupled_lookback_scan.hpp:244 in 25.10.0):
+//
+//     while (status_ref.load() == status::invalid)
+//       ;
+//
+// Nothing in SYCL guarantees a work-group makes progress while another spins
+// on it. Where the spinning group can starve the group it waits on, this
+// deadlocks; the spin then outlives job_timeout_ms (5 s on Xe) and the driver
+// resets the engine. On an Arc B580 that reproduced as sycl_sort_parity
+// passing at count=16 (one tile, so the lookback never runs) and failing from
+// 262144 up, with dmesg naming sycl_sort_parity in the engine reset. It also
+// misbehaved, nondeterministically, on a ROCm HSA CPU agent. CUDA is fine
+// because its work-groups are effectively co-resident here.
+//
+// Three kernels, none of which communicate between work-groups:
+//   1. per-block exclusive scan; each block writes its total to block_sums
+//   2. exclusive scan of block_sums by a SINGLE work-group, looping
+//   3. add each block's offset back over its elements
+//
+// Costs one extra pass over the data and a block_sums array. The scanned array
+// is RADIX * num_tiles (4.26M u32 ≈ 17 MB at k=28) and this is not on the hot
+// path -- the match kernels are. Correctness on every backend is worth more
+// here than a saved pass on one.
+constexpr int SCAN_WG    = 256;
+constexpr int SCAN_ITEMS = 4;
+constexpr int SCAN_TILE  = SCAN_WG * SCAN_ITEMS;  // 1024
+
+uint64_t scan_block_count(uint64_t n)
+{
+    return (n + SCAN_TILE - 1) / SCAN_TILE;
+}
+
+// Set XCHPLOT2_ACPP_SCAN=1 to go back to AdaptiveCpp's scan. Kept so the
+// upstream defect stays reproducible on demand from a released build, rather
+// than needing a patched one.
+bool use_acpp_scan()
+{
+    static bool const v = [] {
+        char const* e = std::getenv("XCHPLOT2_ACPP_SCAN");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+void exclusive_scan_u32(sycl::queue& q,
+                        uint32_t const* in, uint32_t* out,
+                        uint32_t* block_sums, uint64_t n)
+{
+    if (n == 0) return;
+    uint64_t const num_blocks = scan_block_count(n);
+
+    // 1. Per-block exclusive scan.
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(num_blocks * SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                int const      tid  = static_cast<int>(it.get_local_id(0));
+                uint64_t const blk  = it.get_group(0);
+                auto const     grp  = it.get_group();
+                uint64_t const base = blk * SCAN_TILE + static_cast<uint64_t>(tid) * SCAN_ITEMS;
+
+                uint32_t v[SCAN_ITEMS];
+                uint32_t tsum = 0;
+                for (int i = 0; i < SCAN_ITEMS; ++i) {
+                    v[i] = (base + i < n) ? in[base + i] : 0u;
+                    tsum += v[i];
+                }
+                uint32_t run = sycl::exclusive_scan_over_group(
+                    grp, tsum, sycl::plus<uint32_t>());
+                for (int i = 0; i < SCAN_ITEMS; ++i) {
+                    if (base + i < n) out[base + i] = run;
+                    run += v[i];
+                }
+                uint32_t const total = sycl::reduce_over_group(
+                    grp, tsum, sycl::plus<uint32_t>());
+                if (tid == 0) block_sums[blk] = total;
+            });
+    });
+    q.wait();
+
+    // 2. Scan block_sums with ONE work-group. A single group needs no
+    //    inter-group ordering, which is the entire point; it loops instead.
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                int const  tid = static_cast<int>(it.get_local_id(0));
+                auto const grp = it.get_group();
+                uint32_t   carry = 0;
+                for (uint64_t chunk = 0; chunk < num_blocks; chunk += SCAN_WG) {
+                    uint64_t const idx = chunk + static_cast<uint64_t>(tid);
+                    uint32_t const val = (idx < num_blocks) ? block_sums[idx] : 0u;
+                    uint32_t const off = sycl::exclusive_scan_over_group(
+                        grp, val, sycl::plus<uint32_t>());
+                    uint32_t const tot = sycl::reduce_over_group(
+                        grp, val, sycl::plus<uint32_t>());
+                    if (idx < num_blocks) block_sums[idx] = carry + off;
+                    carry += tot;
+                }
+            });
+    });
+    q.wait();
+
+    // 3. Fold each block's offset back in.
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(num_blocks * SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                int const      tid  = static_cast<int>(it.get_local_id(0));
+                uint64_t const blk  = it.get_group(0);
+                uint32_t const add  = block_sums[blk];
+                uint64_t const base = blk * SCAN_TILE + static_cast<uint64_t>(tid) * SCAN_ITEMS;
+                for (int i = 0; i < SCAN_ITEMS; ++i) {
+                    if (base + i < n) out[base + i] += add;
+                }
+            });
+    });
+    q.wait();
+}
+
 void radix_pass_pairs_u32(
     sycl::queue& q,
     uint32_t const* in_keys, uint32_t const* in_vals,
     uint32_t* out_keys,      uint32_t* out_vals,
     uint32_t* tile_hist,     uint32_t* tile_offsets,
+    uint32_t* scan_blocks,
     uint64_t count, int bit)
 {
     uint64_t const num_tiles = tile_count_for(count);
@@ -120,17 +245,21 @@ void radix_pass_pairs_u32(
 
     // Phase 2: parallel exclusive scan over the entire tile_hist.
     {
-        acpp::algorithms::util::allocation_group scratch_alloc(
-            &scan_alloc_cache(), q.get_device());
         size_t const scan_size = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-        // Argument order differs from the internal entry point this forwards
-        // to: the public exclusive_scan takes init BEFORE the binary op.
-        acpp::algorithms::exclusive_scan(
-            q, scratch_alloc,
-            tile_hist, tile_hist + scan_size,
-            tile_offsets,
-            uint32_t{0},
-            sycl::plus<uint32_t>{}).wait();
+        if (use_acpp_scan()) {
+            acpp::algorithms::util::allocation_group scratch_alloc(
+                &scan_alloc_cache(), q.get_device());
+            // Argument order differs from the internal entry point this
+            // forwards to: the public exclusive_scan takes init BEFORE the op.
+            acpp::algorithms::exclusive_scan(
+                q, scratch_alloc,
+                tile_hist, tile_hist + scan_size,
+                tile_offsets,
+                uint32_t{0},
+                sycl::plus<uint32_t>{}).wait();
+        } else {
+            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_blocks, scan_size);
+        }
     }
 
     // Phase 3: per-tile stable scatter, cooperative across the WG.
@@ -207,6 +336,7 @@ void radix_pass_keys_u64(
     uint64_t const* in_keys,
     uint64_t* out_keys,
     uint32_t* tile_hist, uint32_t* tile_offsets,
+    uint32_t* scan_blocks,
     uint64_t count, int bit)
 {
     uint64_t const num_tiles = tile_count_for(count);
@@ -241,17 +371,21 @@ void radix_pass_keys_u64(
     q.wait();
 
     {
-        acpp::algorithms::util::allocation_group scratch_alloc(
-            &scan_alloc_cache(), q.get_device());
         size_t const scan_size = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-        // Argument order differs from the internal entry point this forwards
-        // to: the public exclusive_scan takes init BEFORE the binary op.
-        acpp::algorithms::exclusive_scan(
-            q, scratch_alloc,
-            tile_hist, tile_hist + scan_size,
-            tile_offsets,
-            uint32_t{0},
-            sycl::plus<uint32_t>{}).wait();
+        if (use_acpp_scan()) {
+            acpp::algorithms::util::allocation_group scratch_alloc(
+                &scan_alloc_cache(), q.get_device());
+            // Argument order differs from the internal entry point this
+            // forwards to: the public exclusive_scan takes init BEFORE the op.
+            acpp::algorithms::exclusive_scan(
+                q, scratch_alloc,
+                tile_hist, tile_hist + scan_size,
+                tile_offsets,
+                uint32_t{0},
+                sycl::plus<uint32_t>{}).wait();
+        } else {
+            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_blocks, scan_size);
+        }
     }
 
     q.submit([&](sycl::handler& h) {
@@ -332,15 +466,18 @@ void launch_sort_pairs_u32_u32_sycl(
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const bytes = sizeof(uint32_t) * RADIX * num_tiles * 2;
+    size_t const scan_n = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
+    size_t const bytes = sizeof(uint32_t) * scan_n * 2
+                       + sizeof(uint32_t) * scan_block_count(scan_n);
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
     }
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
-    uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * RADIX * num_tiles;
-    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
+    uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* scan_blocks  = reinterpret_cast<uint32_t*>(p);
 
     // First pass reads from keys_in (caller's input). Subsequent passes
     // ping-pong between keys_in and keys_out — we treat keys_in as
@@ -352,7 +489,7 @@ void launch_sort_pairs_u32_u32_sycl(
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
         radix_pass_pairs_u32(q, cur_keys, cur_vals, dst_keys, dst_vals,
-                             tile_hist, tile_offsets, count, bit);
+                             tile_hist, tile_offsets, scan_blocks, count, bit);
         std::swap(cur_keys, dst_keys);
         std::swap(cur_vals, dst_vals);
     }
@@ -377,21 +514,25 @@ void launch_sort_keys_u64_sycl(
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const bytes = sizeof(uint32_t) * RADIX * num_tiles * 2;
+    size_t const scan_n = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
+    size_t const bytes = sizeof(uint32_t) * scan_n * 2
+                       + sizeof(uint32_t) * scan_block_count(scan_n);
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
     }
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
-    uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * RADIX * num_tiles;
-    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
+    uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* scan_blocks  = reinterpret_cast<uint32_t*>(p);
 
     uint64_t* cur = keys_in;
     uint64_t* dst = keys_out;
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
-        radix_pass_keys_u64(q, cur, dst, tile_hist, tile_offsets, count, bit);
+        radix_pass_keys_u64(q, cur, dst, tile_hist, tile_offsets,
+                            scan_blocks, count, bit);
         std::swap(cur, dst);
     }
     q.wait();
