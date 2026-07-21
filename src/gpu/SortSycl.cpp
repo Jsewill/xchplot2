@@ -35,8 +35,14 @@
 
 #include <sycl/sycl.hpp>
 
-#include "hipSYCL/algorithms/scan/scan.hpp"
-#include "hipSYCL/algorithms/util/allocation_cache.hpp"
+// AdaptiveCpp's parallel algorithms library, via its DOCUMENTED entry point.
+// This was previously "hipSYCL/algorithms/scan/scan.hpp" plus a direct call to
+// hipsycl::algorithms::scanning::scan -- an internal detail one layer below the
+// public API. The two are the same code (numeric.hpp's exclusive_scan is a
+// one-line forwarder to scanning::scan<false>), so this is not a behaviour
+// change; it is so that a reproducer against this path is a reproducer against
+// something upstream actually supports and documents.
+#include <AdaptiveCpp/algorithms/numeric.hpp>
 
 #include <cstdint>
 #include <stdexcept>
@@ -62,10 +68,10 @@ using local_atomic_u32 = sycl::atomic_ref<
 
 // Per-process scratch cache for AdaptiveCpp's scan algorithm. Lives for
 // the program's lifetime; allocations are pooled and reused across calls.
-hipsycl::algorithms::util::allocation_cache& scan_alloc_cache()
+acpp::algorithms::util::allocation_cache& scan_alloc_cache()
 {
-    static hipsycl::algorithms::util::allocation_cache cache(
-        hipsycl::algorithms::util::allocation_type::device);
+    static acpp::algorithms::util::allocation_cache cache(
+        acpp::algorithms::util::allocation_type::device);
     return cache;
 }
 
@@ -114,15 +120,17 @@ void radix_pass_pairs_u32(
 
     // Phase 2: parallel exclusive scan over the entire tile_hist.
     {
-        hipsycl::algorithms::util::allocation_group scratch_alloc(
+        acpp::algorithms::util::allocation_group scratch_alloc(
             &scan_alloc_cache(), q.get_device());
         size_t const scan_size = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-        hipsycl::algorithms::scanning::scan</*IsInclusive=*/false>(
+        // Argument order differs from the internal entry point this forwards
+        // to: the public exclusive_scan takes init BEFORE the binary op.
+        acpp::algorithms::exclusive_scan(
             q, scratch_alloc,
             tile_hist, tile_hist + scan_size,
             tile_offsets,
-            sycl::plus<uint32_t>{},
-            uint32_t{0}).wait();
+            uint32_t{0},
+            sycl::plus<uint32_t>{}).wait();
     }
 
     // Phase 3: per-tile stable scatter, cooperative across the WG.
@@ -233,15 +241,17 @@ void radix_pass_keys_u64(
     q.wait();
 
     {
-        hipsycl::algorithms::util::allocation_group scratch_alloc(
+        acpp::algorithms::util::allocation_group scratch_alloc(
             &scan_alloc_cache(), q.get_device());
         size_t const scan_size = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-        hipsycl::algorithms::scanning::scan</*IsInclusive=*/false>(
+        // Argument order differs from the internal entry point this forwards
+        // to: the public exclusive_scan takes init BEFORE the binary op.
+        acpp::algorithms::exclusive_scan(
             q, scratch_alloc,
             tile_hist, tile_hist + scan_size,
             tile_offsets,
-            sycl::plus<uint32_t>{},
-            uint32_t{0}).wait();
+            uint32_t{0},
+            sycl::plus<uint32_t>{}).wait();
     }
 
     q.submit([&](sycl::handler& h) {
