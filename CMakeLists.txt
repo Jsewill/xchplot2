@@ -27,13 +27,39 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # AdaptiveCpp's HIP / Level Zero backends. Default ON to preserve the
 # existing NVIDIA workflow.
 #
-# CAVEAT: with XCHPLOT2_BUILD_CUDA=OFF the build still needs the CUDA
-# Toolkit *headers* on the include path (the SYCL TUs reference cudaError_t
-# / cudaStream_t / cuda_fp16.h via the kernel-wrapper headers). Lifting
-# those CUDA-type dependencies out of the public SYCL API is a follow-up
-# refactor (see slice 17 in docs/gpu-portability-sketch.md). nvcc itself is
-# NOT required when XCHPLOT2_BUILD_CUDA=OFF — only the headers.
-option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ON)
+# With XCHPLOT2_BUILD_CUDA=OFF neither nvcc nor the CUDA Toolkit headers are
+# required: CudaHalfShim.hpp gates every CUDA include behind __has_include and
+# falls through to its own stubs when nothing is found (src/gpu/CudaHalfShim.hpp
+# lines 28 and 52). An earlier caveat here claimed the headers were still
+# needed; that has not been true since the shim gained its final #else.
+#
+# The default is autodetected rather than a bare ON. build.rs already forces
+# OFF whenever an Intel or AMD GPU is the target, but a hand-run cmake got ON
+# and then died inside enable_language(CUDA) with "Failed to find nvcc" — on
+# hosts with no NVIDIA hardware, which neither have CUDA nor want it. That
+# turned "build the parity tests to diagnose my Intel GPU" into a configure
+# error with nothing to do with the GPU being diagnosed.
+#
+# An explicit -DXCHPLOT2_BUILD_CUDA=ON still fails loudly when nvcc is absent,
+# which is correct: if you asked for CUDA you want to hear that it is missing.
+if(NOT DEFINED XCHPLOT2_BUILD_CUDA)
+    find_program(_xchplot2_nvcc_probe nvcc
+        HINTS ENV CUDA_PATH ENV CUDA_HOME /opt/cuda /usr/local/cuda
+        PATH_SUFFIXES bin
+        DOC "nvcc probe for the XCHPLOT2_BUILD_CUDA default")
+    if(_xchplot2_nvcc_probe)
+        set(_xchplot2_cuda_default ON)
+    else()
+        set(_xchplot2_cuda_default OFF)
+        message(STATUS "xchplot2: no nvcc on this host — defaulting "
+                       "XCHPLOT2_BUILD_CUDA=OFF (SYCL-only build). Override "
+                       "with -DXCHPLOT2_BUILD_CUDA=ON.")
+    endif()
+    unset(_xchplot2_nvcc_probe CACHE)
+else()
+    set(_xchplot2_cuda_default ${XCHPLOT2_BUILD_CUDA})
+endif()
+option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ${_xchplot2_cuda_default})
 
 # On dual-toolchain hosts (CUDA Toolkit + ROCm both installed), the SYCL
 # TUs pull in CUDA's <cuda_runtime.h> via CudaHalfShim.hpp AND ROCm's
