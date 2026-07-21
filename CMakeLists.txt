@@ -244,6 +244,10 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 # so the package config sees a non-empty target list. acpp errors on an
 # empty -DACPP_TARGETS= (which we'd otherwise pass through unchanged from
 # the Containerfile's default build-arg).
+#   0. Multi-vendor: generic, ahead of every other rule. An AOT target
+#      speaks one ISA, so hip:gfx* on a host that also holds an Intel or
+#      NVIDIA card leaves that card with no code it can run. See build.rs's
+#      matching arm for the longer version.
 #   1. NVIDIA: stay on "generic" (LLVM SSCP). Empirically a few percent
 #      faster than cuda:sm_XX on our kernels at k=28 — SSCP's runtime
 #      specialization beats the CUDA-AOT path for this workload.
@@ -252,6 +256,14 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 #      safer pick on AMD.
 #   3. Fallback: generic (works everywhere; JITs on first use).
 # Override with -DACPP_TARGETS=... on the cmake command line.
+#
+# Rule 0 was ported here from build.rs, which had it alone for a while. The
+# two must agree: when a cargo build and a hand-run cmake on the same host
+# pick different targets, they produce binaries that fail differently. That
+# is bad on its own, and worse in the case it actually bit — the parity
+# tests a user builds to diagnose an Intel GPU are configured through THIS
+# path, so on an Intel+AMD host they were AOT-pinned to amdgcn and could not
+# dispatch to the GPU under investigation at all.
 if(NOT ACPP_TARGETS)
     execute_process(
         COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
@@ -259,25 +271,63 @@ if(NOT ACPP_TARGETS)
         OUTPUT_STRIP_TRAILING_WHITESPACE
         RESULT_VARIABLE _xchplot2_nvsmi_rc
         ERROR_QUIET)
+    set(_xchplot2_have_nvidia FALSE)
     if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_cuda_cap)
-        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
-        message(STATUS "xchplot2: NVIDIA GPU detected; using ACPP_TARGETS=generic (SSCP)")
-    else()
-        execute_process(
-            COMMAND rocminfo
-            OUTPUT_VARIABLE _xchplot2_rocm_out
-            RESULT_VARIABLE _xchplot2_rocminfo_rc
-            ERROR_QUIET)
-        if(_xchplot2_rocminfo_rc EQUAL 0)
-            string(REGEX MATCH "Name:[ \t]+gfx[0-9a-f]+" _xchplot2_gfx_match "${_xchplot2_rocm_out}")
-            string(REGEX REPLACE "Name:[ \t]+" "" _xchplot2_gfx "${_xchplot2_gfx_match}")
-            if(_xchplot2_gfx)
-                set(ACPP_TARGETS "hip:${_xchplot2_gfx}" CACHE STRING "AdaptiveCpp target list" FORCE)
-                message(STATUS "xchplot2: ACPP_TARGETS auto-detected via rocminfo: ${ACPP_TARGETS}")
+        set(_xchplot2_have_nvidia TRUE)
+    endif()
+
+    execute_process(
+        COMMAND rocminfo
+        OUTPUT_VARIABLE _xchplot2_rocm_out
+        RESULT_VARIABLE _xchplot2_rocminfo_rc
+        ERROR_QUIET)
+    set(_xchplot2_gfx "")
+    if(_xchplot2_rocminfo_rc EQUAL 0)
+        string(REGEX MATCH "Name:[ \t]+gfx[0-9a-f]+" _xchplot2_gfx_match "${_xchplot2_rocm_out}")
+        string(REGEX REPLACE "Name:[ \t]+" "" _xchplot2_gfx "${_xchplot2_gfx_match}")
+    endif()
+
+    # Intel: PCI vendor 0x8086 on any DRM card node, matching build.rs's
+    # detect_intel_gpu(). Connector nodes (card0-DP-1) are skipped the same
+    # way. There is no Intel AOT arm below — Intel only ever reaches generic
+    # — but it still has to be counted here, or it is invisible.
+    set(_xchplot2_have_intel FALSE)
+    file(GLOB _xchplot2_drm_cards LIST_DIRECTORIES TRUE "/sys/class/drm/card*")
+    foreach(_xchplot2_card IN LISTS _xchplot2_drm_cards)
+        get_filename_component(_xchplot2_card_name "${_xchplot2_card}" NAME)
+        if(_xchplot2_card_name MATCHES "-")
+            continue()
+        endif()
+        if(EXISTS "${_xchplot2_card}/device/vendor")
+            file(READ "${_xchplot2_card}/device/vendor" _xchplot2_vid)
+            string(STRIP "${_xchplot2_vid}" _xchplot2_vid)
+            if(_xchplot2_vid STREQUAL "0x8086")
+                set(_xchplot2_have_intel TRUE)
             endif()
         endif()
+    endforeach()
+
+    set(_xchplot2_vendors 0)
+    if(_xchplot2_have_nvidia)
+        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
     endif()
-    if(NOT ACPP_TARGETS)
+    if(_xchplot2_gfx)
+        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
+    endif()
+    if(_xchplot2_have_intel)
+        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
+    endif()
+
+    if(_xchplot2_vendors GREATER 1)
+        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+        message(STATUS "xchplot2: multi-vendor host; using ACPP_TARGETS=generic (SSCP)")
+    elseif(_xchplot2_have_nvidia)
+        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
+        message(STATUS "xchplot2: NVIDIA GPU detected; using ACPP_TARGETS=generic (SSCP)")
+    elseif(_xchplot2_gfx)
+        set(ACPP_TARGETS "hip:${_xchplot2_gfx}" CACHE STRING "AdaptiveCpp target list" FORCE)
+        message(STATUS "xchplot2: ACPP_TARGETS auto-detected via rocminfo: ${ACPP_TARGETS}")
+    else()
         set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
         message(STATUS "xchplot2: ACPP_TARGETS fell back to generic (no nvidia-smi/rocminfo)")
     endif()
