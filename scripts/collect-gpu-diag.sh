@@ -6,7 +6,9 @@
 #
 #   ./scripts/collect-gpu-diag.sh [--devices N] [--k 28] [--no-build]
 #
-# Roughly 10-20 minutes, most of it compiling parity tests. Safe to Ctrl-C;
+# With --no-build, minutes. A full run is dominated by compiling parity tests.
+# Every step is bounded (see PROBE_LIMIT / PARITY_LIMIT below), so it cannot
+# hang indefinitely on a wedged GPU. Safe to Ctrl-C;
 # partial output is still useful.
 #
 # Home directory paths are redacted from the output, because these bundles get
@@ -31,6 +33,11 @@ DEVICES=""
 K=28
 SMALL_K=22
 DO_BUILD=1
+# Per-step ceilings. A diagnostic that outlives the attention of the person
+# running it collects nothing. These are deliberately tight: on a healthy host
+# every one of these steps finishes in seconds.
+PROBE_LIMIT=${PROBE_LIMIT:-420}      # one plot attempt
+PARITY_LIMIT=${PARITY_LIMIT:-240}    # one parity binary
 while [ $# -gt 0 ]; do
     case "$1" in
         --devices)  DEVICES="$2"; shift 2 ;;
@@ -224,12 +231,29 @@ run_probe() {
     $BIN bench -k "$kk" $DEVARG -n 1 --warmup 0 > "$plog" 2>&1 &
     pid=$!
     hwm=0
+    # Watchdog. The plot cannot simply be wrapped in `timeout`, because then
+    # $! is timeout's pid and the RSS sampling below would measure the wrong
+    # process -- so the deadline is enforced here instead. It has to exist: a
+    # GPU that has been reset out from under its context can leave a submission
+    # waiting forever, and an unbounded probe turns a 10-minute diagnostic into
+    # an overnight one that collects nothing.
+    ticks=0
+    probe_killed=0
     while kill -0 "$pid" 2>/dev/null; do
         v=$(awk '/^VmHWM:/{print $2}' "/proc/$pid/status" 2>/dev/null)
         [ -n "${v:-}" ] && [ "$v" -gt "$hwm" ] && hwm=$v
         sleep 0.2
+        ticks=$((ticks + 1))
+        if [ "$ticks" -gt $((PROBE_LIMIT * 5)) ]; then
+            echo "  !! no exit after ${PROBE_LIMIT}s -- killing it."
+            echo "     A hang here is itself a finding: report it."
+            kill -9 "$pid" 2>/dev/null
+            probe_killed=1
+            break
+        fi
     done
-    wait "$pid"; PROBE_RC=$?
+    wait "$pid" 2>/dev/null; PROBE_RC=$?
+    [ "$probe_killed" = 1 ] && PROBE_RC=124
     end=$(date +%s.%N)
     # A dying Level Zero context emits the same submit failure hundreds of
     # times. Summarise by shape first, then show the head verbatim -- the
@@ -336,7 +360,7 @@ run_parity() {
         return
     fi
     plog=$(mktemp)
-    if timeout 900 "$p" > "$plog" 2>&1; then
+    if timeout "$PARITY_LIMIT" "$p" > "$plog" 2>&1; then
         printf '  %-8s %-34s PASS        %s\n' "$kind" "$name" "$what"
     else
         rc=$?
@@ -371,7 +395,7 @@ run_parity() {
 dev_backend=""
 PARITY_MASK=""
 if [ -n "$DEVICES" ]; then
-    dev_backend=$("$BIN" devices 2>/dev/null \
+    dev_backend=$(timeout 60 "$BIN" devices 2>/dev/null \
         | sed -nE "s/^[[:space:]]*\[$DEVICES\][[:space:]].*backend=([a-z_]+).*/\1/p" \
         | head -1)
     case "$dev_backend" in
@@ -452,9 +476,9 @@ else
             lbl="${combo%%:*}"; envv="${combo#*:}"
             printf '  %-24s ' "$lbl"
             if [ -n "$envv" ]; then
-                if env "$envv" timeout 600 "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
+                if env "$envv" timeout "$PARITY_LIMIT" "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
             else
-                if timeout 600 "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
+                if timeout "$PARITY_LIMIT" "$T1P" >/dev/null 2>&1; then echo PASS; else echo "FAIL"; fi
             fi
         done
     fi
