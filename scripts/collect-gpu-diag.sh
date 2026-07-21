@@ -236,6 +236,45 @@ fi
 # Returns 0 on success. Samples peak RSS so a memory story can be confirmed
 # or (more usefully) ruled out.
 PROBE_RC=0
+# A hang and a crash both exit non-zero, and "it hung" narrows nothing. These
+# two need opposite fixes and only a live sample can tell them apart:
+#
+#   burning CPU  -> host-side spin, or a JIT that never finishes. No GPU work
+#                   is in flight, which is why the kernel log stays silent.
+#   blocked      -> a submission or event that never completes. The device is
+#                   idle and nobody is going to wake us.
+#
+# Sample BEFORE killing: once the process is gone this is unrecoverable, and
+# a rerun of a nondeterministic hang may not reproduce it.
+probe_hung_process() {
+    hp="$1"
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    c1=$(awk '{print $14+$15}' "/proc/$hp/stat" 2>/dev/null || echo "")
+    sleep 3
+    c2=$(awk '{print $14+$15}' "/proc/$hp/stat" 2>/dev/null || echo "")
+    echo "     --- what the hung process was doing ---"
+    if [ -n "$c1" ] && [ -n "$c2" ]; then
+        d=$((c2 - c1))
+        echo "     CPU: $d ticks in 3s (one fully busy core = $((hz * 3)))"
+        if   [ "$d" -gt $((hz * 2)) ]; then
+            echo "     => BURNING CPU. Host-side spin or JIT; no kernel is stuck."
+        elif [ "$d" -lt $((hz / 5)) ]; then
+            echo "     => BLOCKED, device idle. Waiting on something that never lands."
+        else
+            echo "     => partially busy."
+        fi
+    fi
+    echo "     state:   $(awk '/^State:/{$1=""; print}' "/proc/$hp/status" 2>/dev/null)"
+    echo "     threads: $(awk '/^Threads:/{print $2}' "/proc/$hp/status" 2>/dev/null)"
+    echo "     wchan:   $(tr -d '\0' < "/proc/$hp/wchan" 2>/dev/null)"
+    for tool in eu-stack pstack; do
+        command -v "$tool" >/dev/null 2>&1 || continue
+        echo "     --- $tool (install elfutils/gdb if absent) ---"
+        timeout 30 "$tool" -p "$hp" 2>/dev/null | head -40 | sed 's/^/     /'
+        break
+    done
+}
+
 run_probe() {
     label="$1"; kk="$2"
     sec "$label"
@@ -266,6 +305,7 @@ run_probe() {
         if [ "$ticks" -gt $((PROBE_LIMIT * 5)) ]; then
             echo "  !! no exit after ${PROBE_LIMIT}s -- killing it."
             echo "     A hang here is itself a finding: report it."
+            probe_hung_process "$pid"
             kill -9 "$pid" 2>/dev/null
             probe_killed=1
             break
@@ -379,10 +419,36 @@ run_parity() {
         return
     fi
     plog=$(mktemp)
-    if timeout "$PARITY_LIMIT" "$p" > "$plog" 2>&1; then
+    phang=$(mktemp)
+    : > "$phang"
+    # stdbuf: these tests print a line per case, and WHERE THEY STOP is the
+    # finding. Block-buffered into a file, SIGKILL discards the buffer, so a
+    # hang reports nothing at all -- precisely when the output matters most.
+    # That cost a round trip: a bundle came back with three timed-out tests and
+    # not one case line between them.
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -oL -eL "$p" > "$plog" 2>&1 &
+    else
+        "$p" > "$plog" 2>&1 &
+    fi
+    pp=$!
+    waited=0
+    while kill -0 "$pp" 2>/dev/null && [ "$waited" -lt "$PARITY_LIMIT" ]; do
+        sleep 2
+        waited=$((waited + 2))
+    done
+    if kill -0 "$pp" 2>/dev/null; then
+        probe_hung_process "$pp" | sed 's/^     /        /' > "$phang"
+        kill -9 "$pp" 2>/dev/null
+        wait "$pp" 2>/dev/null || true
+        rc=124
+    else
+        wait "$pp"
+        rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
         printf '  %-8s %-34s PASS        %s\n' "$kind" "$name" "$what"
     else
-        rc=$?
         printf '  %-8s %-34s *** FAIL ***  %s\n' "$kind" "$name" "$what"
         # WHICH cases failed is the whole diagnostic value. These tests sweep
         # sizes and seeds and print a line each; "it failed" narrows nothing,
@@ -400,8 +466,9 @@ run_parity() {
         grep -iE 'fail|mismatch|abort|error|assert' "$plog" | head -12 | sed 's/^/          /'
         echo "        --- last 15 lines ---"
         tail -15 "$plog" | sed 's/^/          /'
+        [ -s "$phang" ] && cat "$phang"
     fi
-    rm -f "$plog"
+    rm -f "$plog" "$phang"
 }
 # The parity tests choose their own device (gpu_selector_v / a bare
 # sycl::queue) and nothing tells them which GPU is under investigation. On a
