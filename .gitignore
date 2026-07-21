@@ -1,6 +1,15 @@
 build/
 build-*/
 *.plot2
+
+# Diagnostic bundles from scripts/collect-gpu-diag.sh, and the logs people
+# drop in the repo root while debugging. These carry hostnames, device
+# inventories and — when they come from someone else's machine — that
+# person's home directory path. Nothing in this class should ever reach a
+# commit. The script redacts home paths on the way out; this is the backstop
+# for everything it cannot see.
+xchplot2-diag-*.txt
+debug.log
 .cache/
 compile_commands.json
 .vscode/

@@ -281,15 +281,39 @@ script.
 EOM
 echo
 if [ "$DO_BUILD" = 1 ]; then
-    echo "-- configuring $BUILD_DIR --"
-    # ACPP_TARGETS=generic is FORCED here on purpose. CMakeLists' autodetect
-    # picks hip:gfx<first agent> on a host with any AMD GPU -- including an
-    # integrated one -- which AOT-pins these binaries to amdgcn. On a machine
-    # being diagnosed for an Intel or NVIDIA GPU that means the parity tests
-    # cannot dispatch to the card under investigation at all, and report
-    # nonsense. Do not remove this flag.
+    # A configure that FAILED still writes a partial CMakeCache.txt, and every
+    # cached value in it is then sticky: CMakeLists guards its autodetects with
+    # `if(NOT DEFINED ...)` so a stale entry silently wins on the next run. A
+    # bad first configure therefore poisons every retry, including one made
+    # after the bug that caused it was fixed. Start clean if the directory was
+    # never brought to a working state.
+    if [ -d "$BUILD_DIR" ] && [ ! -f "$BUILD_DIR/Makefile" ] \
+       && [ ! -f "$BUILD_DIR/build.ninja" ]; then
+        echo "  ($BUILD_DIR has no generated build system -- a previous"
+        echo "   configure failed and left a stale cache. Removing it.)"
+        rm -rf "$BUILD_DIR"
+    fi
+    # Both flags are passed explicitly rather than left to CMakeLists'
+    # autodetect, because -D beats the cache and the autodetect does not.
+    #
+    # ACPP_TARGETS=generic: the autodetect picks hip:gfx<first agent> on a host
+    # with any AMD GPU -- including an integrated one, or a ROCm CPU agent --
+    # which AOT-pins these binaries to amdgcn. On a machine being diagnosed for
+    # an Intel or NVIDIA GPU that means the parity tests cannot dispatch to the
+    # card under investigation at all.
+    #
+    # XCHPLOT2_BUILD_CUDA: off unless this host actually has nvcc. Otherwise
+    # enable_language(CUDA) kills the configure over a toolkit that has nothing
+    # to do with the GPU being diagnosed.
+    if command -v nvcc >/dev/null 2>&1 || [ -x /opt/cuda/bin/nvcc ] \
+       || [ -x /usr/local/cuda/bin/nvcc ]; then
+        CUDA_FLAG="-DXCHPLOT2_BUILD_CUDA=ON"
+    else
+        CUDA_FLAG="-DXCHPLOT2_BUILD_CUDA=OFF"
+    fi
+    echo "-- configuring $BUILD_DIR ($CUDA_FLAG) --"
     try cmake -B "$BUILD_DIR" -S "$REPO" -DCMAKE_BUILD_TYPE=Release \
-              -DACPP_TARGETS=generic 2>&1 | tail -15
+              -DACPP_TARGETS=generic "$CUDA_FLAG" 2>&1 | tail -15
     echo
     echo "-- building (slow; AdaptiveCpp TUs) --"
     try cmake --build "$BUILD_DIR" -j"$(nproc)" --target \
