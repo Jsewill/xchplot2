@@ -21,6 +21,7 @@ std::vector<GpuDeviceInfo> list_gpu_devices()
         info.vram_bytes      = d.get_info<sycl::info::device::global_mem_size>();
         info.cu_count        = static_cast<unsigned>(
                                    d.get_info<sycl::info::device::max_compute_units>());
+        info.auto_dispatchable = sycl_backend::is_auto_dispatchable(d);
         info.is_cuda_backend = false;
         switch (d.get_backend()) {
             case sycl::backend::cuda:

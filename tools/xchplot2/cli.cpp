@@ -1252,9 +1252,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             // "[%zu]   " also silently shunted the name column right on any host
             // with a two-digit GPU id.
             std::string const tag = "[" + std::to_string(d.id) + "]";
-            std::printf("  %-7s%-32s backend=%-10s vram=%5zu MB  CUs=%-4u  sort:%s\n",
+            // A tiny iGPU is still targetable by explicit index, but auto
+            // dispatch (--devices gpu/all, zero-config) skips it — say so.
+            char const* auto_note = d.auto_dispatchable
+                ? "" : "  (auto-dispatch skips this — explicit --devices only)";
+            std::printf("  %-7s%-32s backend=%-10s vram=%5zu MB  CUs=%-4u  sort:%s%s\n",
                         tag.c_str(), d.name.c_str(), d.backend.c_str(),
-                        vram_mb, d.cu_count, sort_hint);
+                        vram_mb, d.cu_count, sort_hint, auto_note);
         }
         // One row per CPU node, because those are the ids --devices accepts.
         // hardware_concurrency() returns 0 when it can't figure the count out
@@ -1288,7 +1292,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
         } else {
             std::printf("\nUse `--devices gpu0` (or bare `0`) for a specific GPU,\n"
-                        "     `--devices gpu` for every GPU,\n"
+                        "     `--devices gpu` for every plottable GPU (tiny iGPUs skipped),\n"
                         "     `--devices cpu` for every CPU node (opt-in; slow),\n"
                         "     `--devices cpu0` for one CPU node,\n"
                         "     `--devices all` for every GPU + every CPU node,\n"

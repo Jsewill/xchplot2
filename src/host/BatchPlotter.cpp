@@ -3592,11 +3592,11 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
 {
     std::vector<int> device_ids;
     if (opts.use_all_devices) {
-        int const n = gpu_device_count();
-        if (n > 0) {
-            device_ids.reserve(static_cast<size_t>(n));
-            for (int i = 0; i < n; ++i) device_ids.push_back(i);
-        }
+        // "gpu"/"all" means every card fit for AUTOMATIC dispatch -- the tiny
+        // integrated GPUs (a 1-CU iGPU) are filtered out here so a plot never
+        // lands on one. The explicit --devices <index> branch below is verbatim
+        // and bypasses this, so such a device stays deliberately targetable.
+        device_ids = sycl_backend::auto_dispatchable_indices();
     } else if (!opts.device_ids.empty()) {
         device_ids = opts.device_ids;
     }
@@ -3664,7 +3664,11 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
     // refused. No CPU leaves the list empty, so the zero-config GPU fast path is
     // byte-for-byte unchanged.
     if (opts.cpu_selected() && gpu_implicit && default_gpu_available) {
-        device_ids.push_back(0);
+        // The default GPU is the first AUTO-DISPATCHABLE one, not blindly index
+        // 0 -- index 0 may be a tiny iGPU that a CPU-plus-implicit-GPU run would
+        // otherwise pin plots to.
+        auto const dispatchable = sycl_backend::auto_dispatchable_indices();
+        device_ids.push_back(dispatchable.empty() ? 0 : dispatchable.front());
     }
     // Round-robin across the selected nodes rather than filling one at a time:
     // the RAM trim is host-wide, so when it cuts the total the survivors should

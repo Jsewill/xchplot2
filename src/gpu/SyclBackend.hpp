@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -119,6 +120,46 @@ inline std::vector<sycl::device> usable_gpu_devices()
     return devs;
 }
 
+// Minimum max_compute_units for a GPU to be eligible for AUTOMATIC dispatch
+// (--devices gpu/all and the zero-config default). An integrated GPU -- an AMD
+// APU's 1-CU Raphael iGPU, say -- sits far below any discrete card (an Arc A310
+// is 6 Xe-cores, an RX 6400 is 12 CUs, the Arc B580 is 160). Auto-dispatching a
+// plot to one crawls, and the tier picker would size buffers against the system
+// RAM the iGPU presents as VRAM. Overridable via XCHPLOT2_MIN_GPU_CUS; an
+// explicit --devices <index> bypasses the filter, so such a device stays
+// targetable on purpose.
+inline int min_auto_dispatch_cus()
+{
+    if (char const* e = std::getenv("XCHPLOT2_MIN_GPU_CUS")) {
+        int const v = std::atoi(e);
+        if (v >= 0) return v;
+    }
+    return 4;
+}
+
+inline bool is_auto_dispatchable(sycl::device const& d)
+{
+    auto const cus = d.get_info<sycl::info::device::max_compute_units>();
+    return static_cast<int>(cus) >= min_auto_dispatch_cus();
+}
+
+// Indices into usable_gpu_devices() eligible for automatic dispatch -- the tiny
+// integrated GPUs filtered out. Falls back to EVERY device if the filter would
+// leave nothing, so a box whose only GPU is an iGPU can still plot on it.
+// Callers that expand "gpu"/"all" or pick the default GPU use this; the explicit
+// --devices <index> path indexes usable_gpu_devices() directly, so its indices
+// stay stable and any device stays targetable.
+inline std::vector<int> auto_dispatchable_indices()
+{
+    auto const devs = usable_gpu_devices();
+    std::vector<int> out;
+    for (int i = 0; i < static_cast<int>(devs.size()); ++i)
+        if (is_auto_dispatchable(devs[i])) out.push_back(i);
+    if (out.empty())
+        for (int i = 0; i < static_cast<int>(devs.size()); ++i) out.push_back(i);
+    return out;
+}
+
 // Per-thread SYCL queue. Bound to the thread's current device id (see
 // the kDefaultGpuId / kCpuDeviceId sentinels above). A unique_ptr wrapper
 // lets us defer construction until the thread has had a chance to set
@@ -192,7 +233,17 @@ inline sycl::queue& queue()
             }
             q = std::make_unique<sycl::queue>(*host_dev, async_error_handler);
         } else if (id < 0) {
-            q = std::make_unique<sycl::queue>(sycl::gpu_selector_v,
+            // Default GPU: prefer an auto-dispatchable card so a zero-config run
+            // skips a tiny iGPU, but never reject outright -- an iGPU-only box
+            // must still land somewhere. Higher score wins; among peers, more
+            // compute units. (SYCL's gpu_selector_v gives no such guarantee.)
+            auto const default_gpu_scorer = [](sycl::device const& d) -> int {
+                if (!d.is_gpu()) return -1;
+                int const cus = static_cast<int>(
+                    d.get_info<sycl::info::device::max_compute_units>());
+                return (is_auto_dispatchable(d) ? 1000000 : 1) + cus;
+            };
+            q = std::make_unique<sycl::queue>(default_gpu_scorer,
                                               async_error_handler);
         } else {
             auto devices = usable_gpu_devices();
