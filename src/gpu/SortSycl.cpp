@@ -112,46 +112,81 @@ uint64_t tile_count_for(uint64_t count)
 // parallelism does not matter.
 constexpr int SCAN_WG = 256;
 
-// Set XCHPLOT2_ACPP_SCAN=1 to go back to AdaptiveCpp's scan. Kept so the
-// upstream defect stays reproducible on demand from a released build, rather
-// than needing a patched one.
-bool use_acpp_scan()
+// Two escape hatches, both env-gated and off by default:
+//   XCHPLOT2_ACPP_SCAN=1   -> AdaptiveCpp's decoupled-lookback scan (the
+//                             original upstream defect; kept reproducible).
+//   XCHPLOT2_SCAN_SERIAL=1 -> a single-work-item serial scan: no barriers, no
+//                             cross-lane reads, no group collectives, so it
+//                             cannot race and is trivially correct on any
+//                             backend (just slow). It is the control that says
+//                             whether a residual sort failure is in THIS scan
+//                             or downstream of it (histogram / scatter).
+bool env_flag(char const* name)
 {
-    static bool const v = [] {
-        char const* e = std::getenv("XCHPLOT2_ACPP_SCAN");
-        return e && e[0] == '1';
-    }();
-    return v;
+    char const* e = std::getenv(name);
+    return e && e[0] == '1';
 }
+bool use_acpp_scan()   { static bool const v = env_flag("XCHPLOT2_ACPP_SCAN");   return v; }
+bool use_serial_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_SERIAL"); return v; }
 
+// Exclusive prefix sum over `n` u32 in a SINGLE work-group -- no
+// inter-work-group ordering, which is what broke the AdaptiveCpp lookback on
+// Level Zero. Streams the array in WG-sized chunks with a running carry.
+//
+// The per-chunk scan is a local-memory Hillis-Steele: barriers and local loads
+// only, the same primitives the histogram kernel already runs successfully on
+// these devices -- deliberately NOT sycl::exclusive_scan_over_group and NOT a
+// single-writer shared word for the carry. The prior version used both and, on
+// an Arc B580, dropped elements once the chunk loop ran more than once (correct
+// on NVIDIA; correct here at one chunk; off by a few from 16 chunks up -- a
+// carry that did not survive the barrier). This is not the hot path (the match
+// kernels are), so the log-step scan costs nothing that matters.
 void exclusive_scan_u32(sycl::queue& q,
                         uint32_t const* in, uint32_t* out, uint64_t n)
 {
     if (n == 0) return;
+
+    if (use_serial_scan()) {
+        q.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::nd_range<1>(1, 1), [=](sycl::nd_item<1>) {
+                uint32_t running = 0;
+                for (uint64_t i = 0; i < n; ++i) {
+                    uint32_t const v = in[i];
+                    out[i] = running;
+                    running += v;
+                }
+            });
+        });
+        q.wait();
+        return;
+    }
+
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> carry(sycl::range<1>(1), h);
+        sycl::local_accessor<uint32_t, 1> l(sycl::range<1>(SCAN_WG), h);
         h.parallel_for(sycl::nd_range<1>(SCAN_WG, SCAN_WG),
             [=](sycl::nd_item<1> it) {
-                int const  tid = static_cast<int>(it.get_local_id(0));
-                auto const grp = it.get_group();
+                int const tid = static_cast<int>(it.get_local_id(0));
                 uint32_t running = 0;
                 for (uint64_t base = 0; base < n; base += SCAN_WG) {
                     uint64_t const idx = base + static_cast<uint64_t>(tid);
-                    uint32_t const v  = (idx < n) ? in[idx] : 0u;
-                    uint32_t const ex = sycl::exclusive_scan_over_group(
-                        grp, v, sycl::plus<uint32_t>());
-                    if (idx < n) out[idx] = running + ex;
+                    uint32_t const v = (idx < n) ? in[idx] : 0u;
 
-                    // Chunk total = the last lane's inclusive value = ex + v
-                    // there. Publish it through one shared word instead of a
-                    // reduce_over_group. The first barrier closes the previous
-                    // iteration's reads (WAR on carry) -- the scan's own
-                    // internal sync would cover it, but do not rely on that --
-                    // and the second makes the new value visible to all lanes.
+                    // Inclusive Hillis-Steele scan of this chunk in local mem.
+                    // Each step reads a neighbour into a register, barriers so
+                    // every lane has read before any writes, then writes back.
+                    l[tid] = v;
                     it.barrier(sycl::access::fence_space::local_space);
-                    if (tid == SCAN_WG - 1) carry[0] = ex + v;
+                    for (int d = 1; d < SCAN_WG; d <<= 1) {
+                        uint32_t const add = (tid >= d) ? l[tid - d] : 0u;
+                        it.barrier(sycl::access::fence_space::local_space);
+                        l[tid] += add;
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    // Exclusive = inclusive - own value; add the running carry.
+                    if (idx < n) out[idx] = running + (l[tid] - v);
+                    running += l[SCAN_WG - 1];   // chunk total = last inclusive
                     it.barrier(sycl::access::fence_space::local_space);
-                    running += carry[0];
                 }
             });
     });
