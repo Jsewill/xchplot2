@@ -3,8 +3,8 @@
 // and launch_sort_keys_u64 (u64 keys, the T3 shape, bits [0,2k)) at a
 // caller-chosen count, so the scan variants can be compared on any backend:
 //
-//   ./sycl_sort_bench [count] [iters]
-//   XCHPLOT2_SCAN_SINGLE_WG=1 ./sycl_sort_bench <count>   # interim single-WG scan
+//   ./sycl_sort_bench [count] [iters]                     # single-WG scan (default)
+//   XCHPLOT2_SCAN_PARALLEL=1  ./sycl_sort_bench <count>   # parallel scan (B580-unsafe)
 //   XCHPLOT2_SCAN_SERIAL=1    ./sycl_sort_bench <count>   # serial control
 //   XCHPLOT2_ACPP_SCAN=1      ./sycl_sort_bench <count>   # AdaptiveCpp lookback
 //
@@ -127,10 +127,10 @@ double time_keys(uint64_t count, int iters, int end_bit, bool& sorted_ok)
 char const* scan_variant()
 {
     auto on = [](char const* n) { char const* e = std::getenv(n); return e && e[0] == '1'; };
-    if (on("XCHPLOT2_SCAN_SERIAL"))    return "serial";
-    if (on("XCHPLOT2_SCAN_SINGLE_WG")) return "single-wg";
-    if (on("XCHPLOT2_ACPP_SCAN"))      return "acpp-lookback";
-    return "parallel";
+    if (on("XCHPLOT2_SCAN_SERIAL"))   return "serial";
+    if (on("XCHPLOT2_SCAN_PARALLEL")) return "parallel";
+    if (on("XCHPLOT2_ACPP_SCAN"))     return "acpp-lookback";
+    return "single-wg";
 }
 
 } // namespace

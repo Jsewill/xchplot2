@@ -92,28 +92,27 @@ uint64_t tile_count_for(uint64_t count)
 // XCHPLOT2_ACPP_SCAN=1 still selects it so the upstream defect stays
 // reproducible from a released build.
 //
-// The default is a textbook three-kernel parallel scan (block decomposition)
-// built ONLY from primitives proven on the B580 -- local memory, barriers,
-// plain global loads/stores; NO group collective, NO inter-work-group ordering:
-//   A. each block does a local-memory Hillis-Steele exclusive scan of its
-//      SCAN_TILE-element slice and publishes that slice's total to block_sums;
-//   B. a single work-group scans block_sums in place (a few thousand entries at
-//      k=28 -- cheap, and the one-group form has no cross-group dependency);
-//   C. each block adds its block_sums prefix back across its slice.
-// This is the shape the sort had BEFORE the B580 fix, minus the
-// reduce_over_group that hung there -- a block total is just the last inclusive
-// element, so no collective is needed. It restores the parallelism the interim
-// single-work-group scan gave up: that stopgap streamed the whole
-// RADIX*num_tiles array (~4.2M u32 at k=28) through ONE work-group -- ~16k
-// serial chunks on a single Xe-core/CU while the other ~160 idle, 8-16x per
-// sort. Correct, but it left most of the device unused on every AMD and Intel
-// plot (NVIDIA uses CUB, not this file).
+// The default is a single-work-group streaming scan: ONE submit, one
+// work-group streaming the array in WG-sized chunks with a running carry, each
+// chunk a local-memory Hillis-Steele scan (barriers + local loads only). It is
+// robust on every backend, the B580 included -- one submit + q.wait() is the
+// synchronisation shape that device tolerates.
 //
-// XCHPLOT2_SCAN_SINGLE_WG=1 restores that single-work-group stopgap (a
-// conservative fallback and the A/B baseline); XCHPLOT2_SCAN_SERIAL=1 is a
-// single-work-item scan -- no barriers, no cross-lane reads, trivially correct
-// on any backend -- the control that says whether a residual sort failure is in
-// THIS scan or downstream of it (histogram / scatter).
+// XCHPLOT2_SCAN_PARALLEL=1 selects a textbook three-kernel parallel scan
+// (A: per-block local scan + publish block totals; B: scan the block totals in
+// one work-group; C: fold each block's prefix back over its slice). It is
+// collective-free, 4090-parity-correct incl. ragged tails, and ~2.5x faster on
+// the NVIDIA SYCL *test* path -- but it **nondeterministically corrupts or
+// hangs on the Arc B580** (Level Zero): logically correct, yet its multi-submit
+// + cross-kernel event-dependency structure trips L0's event/submission
+// machinery the same way an earlier multi-submit scan did (see
+// project-arc-b580-page-fault). And there is no measured end-to-end B580 gain
+// from it -- the scan is not the bottleneck there; the single-WG "serial" scan
+// plots at the same wall time. So it is opt-in only, for a backend where it has
+// actually been validated (NVIDIA uses CUB, not this file, so that is nowhere
+// in production yet). XCHPLOT2_SCAN_SERIAL=1 is a single-work-item scan -- no
+// barriers, no cross-lane reads, trivially correct on any backend -- the
+// control that isolates a scan fault from a downstream one (histogram/scatter).
 constexpr int SCAN_WG               = 256;
 constexpr int SCAN_ITEMS_PER_THREAD = 8;
 constexpr int SCAN_TILE             = SCAN_WG * SCAN_ITEMS_PER_THREAD;  // 2048
@@ -131,9 +130,9 @@ bool env_flag(char const* name)
     char const* e = std::getenv(name);
     return e && e[0] == '1';
 }
-bool use_acpp_scan()      { static bool const v = env_flag("XCHPLOT2_ACPP_SCAN");      return v; }
-bool use_serial_scan()    { static bool const v = env_flag("XCHPLOT2_SCAN_SERIAL");    return v; }
-bool use_single_wg_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_SINGLE_WG"); return v; }
+bool use_acpp_scan()     { static bool const v = env_flag("XCHPLOT2_ACPP_SCAN");     return v; }
+bool use_serial_scan()   { static bool const v = env_flag("XCHPLOT2_SCAN_SERIAL");   return v; }
+bool use_parallel_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_PARALLEL"); return v; }
 
 // Exclusive scan of `n` u32 in ONE work-group, streaming in SCAN_WG chunks with
 // a running carry; each chunk is a local-memory Hillis-Steele inclusive scan
@@ -142,7 +141,7 @@ bool use_single_wg_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_SINGLE
 // its event so the parallel scan can chain the block_sums pass off kernel A
 // without a host round-trip. In-place safe: each index is read as its own
 // chunk's input before that chunk's store, and no later chunk reads an earlier
-// chunk's output. This is also the XCHPLOT2_SCAN_SINGLE_WG fallback path.
+// chunk's output. This is the DEFAULT scan path (robust on the B580).
 sycl::event submit_single_wg_scan(sycl::queue& q,
                                   uint32_t const* in, uint32_t* out, uint64_t n,
                                   std::vector<sycl::event> const& deps)
@@ -200,9 +199,10 @@ void exclusive_scan_u32(sycl::queue& q,
 
     uint64_t const num_blocks = scan_block_count(n);
 
-    // One block (n <= SCAN_TILE) or the explicit single-WG fallback: stream the
-    // whole array through one work-group; no block_sums / fold-back needed.
-    if (num_blocks <= 1 || use_single_wg_scan()) {
+    // Default, and forced when the array fits one block: the single-work-group
+    // scan. The parallel path below is opt-in (XCHPLOT2_SCAN_PARALLEL=1) because
+    // it corrupts/hangs on the B580 -- see the header note.
+    if (num_blocks <= 1 || !use_parallel_scan()) {
         submit_single_wg_scan(q, in, out, n, {}).wait();
         return;
     }

@@ -166,8 +166,16 @@ int main()
                 q.get_device().get_info<sycl::info::device::name>().c_str());
 
     bool all_pass = true;
+    // The powers of two all make scan_n (= RADIX * ceil(count/1024)) an exact
+    // multiple of the parallel scan's SCAN_TILE, so they only ever exercise
+    // clean block boundaries. The trailing non-power-of-two sizes force a
+    // RAGGED final scan block (132000 -> a 16-element tail; 1500000 -> 912;
+    // 5000003 -> 304). Real per-table plot counts are almost always ragged, so
+    // without these a ragged-block scan bug ships green (see
+    // project-sycl-sort-scan-perf).
     for (uint32_t seed : { 1u, 7u, 31u }) {
-        for (uint64_t n : { 16ull, 1ull << 14, 1ull << 18, 1ull << 20 }) {
+        for (uint64_t n : { 16ull, 1ull << 14, 1ull << 18, 1ull << 20,
+                            132000ull, 1500000ull, 5000003ull }) {
             if (!run_pairs(seed, n)) all_pass = false;
             if (!run_keys (seed, n)) all_pass = false;
         }
