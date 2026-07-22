@@ -193,6 +193,33 @@ void exclusive_scan_u32(sycl::queue& q,
     q.wait();
 }
 
+// Exclusive prefix sum of `v` across a WG_SIZE work-group, in local memory.
+// Stands in for sycl::exclusive_scan_over_group inside the scatter. That group
+// collective drops elements on the Arc B580 once a launch has many work-groups:
+// the sort is correct there at <=16 tiles and wrong from 256 up, and a serial
+// (provably correct) tile-offset scan does NOT fix it, so the fault is the one
+// collective still left in the pipeline. The streaming partition, which scatters
+// with atomics and no group collective, is correct on the same device at 16x
+// this size -- so atomics, multi-work-group global writes and queue syncs are
+// not the problem; the collective is. `scratch` is a WG_SIZE local accessor and
+// is clobbered; call with the whole work-group converged.
+uint32_t wg_exclusive_scan(sycl::nd_item<1> const& it,
+                           sycl::local_accessor<uint32_t, 1> scratch,
+                           int tid, uint32_t v)
+{
+    scratch[tid] = v;
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int d = 1; d < WG_SIZE; d <<= 1) {
+        uint32_t const add = (tid >= d) ? scratch[tid - d] : 0u;
+        it.barrier(sycl::access::fence_space::local_space);
+        scratch[tid] += add;
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    uint32_t const excl = scratch[tid] - v;   // inclusive - own value = exclusive
+    it.barrier(sycl::access::fence_space::local_space);   // before caller reuses scratch
+    return excl;
+}
+
 void radix_pass_pairs_u32(
     sycl::queue& q,
     uint32_t const* in_keys, uint32_t const* in_vals,
@@ -264,11 +291,11 @@ void radix_pass_pairs_u32(
         sycl::local_accessor<uint32_t, 1> local_vals  (sycl::range<1>(TILE_SIZE), h);
         sycl::local_accessor<uint8_t,  1> local_digits(sycl::range<1>(TILE_SIZE), h);
         sycl::local_accessor<uint32_t, 1> local_bases (sycl::range<1>(RADIX),     h);
+        sycl::local_accessor<uint32_t, 1> local_scan  (sycl::range<1>(WG_SIZE),   h);
         h.parallel_for(sycl::nd_range<1>(grid, WG_SIZE),
             [=](sycl::nd_item<1> it) {
                 int const tid = static_cast<int>(it.get_local_id(0));
                 uint64_t const tile = it.get_group(0);
-                auto const grp = it.get_group();
 
                 uint64_t const base = tile * TILE_SIZE;
                 int const items_in_tile = static_cast<int>(
@@ -299,8 +326,8 @@ void radix_pass_pairs_u32(
                         }
                     }
 
-                    uint32_t const my_offset = sycl::exclusive_scan_over_group(
-                        grp, my_count, sycl::plus<uint32_t>());
+                    uint32_t const my_offset =
+                        wg_exclusive_scan(it, local_scan, tid, my_count);
 
                     uint32_t pos_in_bucket = my_offset;
                     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -379,11 +406,11 @@ void radix_pass_keys_u64(
         sycl::local_accessor<uint64_t, 1> local_keys  (sycl::range<1>(TILE_SIZE), h);
         sycl::local_accessor<uint8_t,  1> local_digits(sycl::range<1>(TILE_SIZE), h);
         sycl::local_accessor<uint32_t, 1> local_bases (sycl::range<1>(RADIX),     h);
+        sycl::local_accessor<uint32_t, 1> local_scan  (sycl::range<1>(WG_SIZE),   h);
         h.parallel_for(sycl::nd_range<1>(grid, WG_SIZE),
             [=](sycl::nd_item<1> it) {
                 int const tid = static_cast<int>(it.get_local_id(0));
                 uint64_t const tile = it.get_group(0);
-                auto const grp = it.get_group();
 
                 uint64_t const base = tile * TILE_SIZE;
                 int const items_in_tile = static_cast<int>(
@@ -414,8 +441,8 @@ void radix_pass_keys_u64(
                         }
                     }
 
-                    uint32_t const my_offset = sycl::exclusive_scan_over_group(
-                        grp, my_count, sycl::plus<uint32_t>());
+                    uint32_t const my_offset =
+                        wg_exclusive_scan(it, local_scan, tid, my_count);
 
                     uint32_t pos_in_bucket = my_offset;
                     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
