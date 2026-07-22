@@ -1215,6 +1215,20 @@ target_compile_features(sycl_sort_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_sort_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# Wall-clock A/B harness for the SYCL radix sort's scan variants at real
+# k=28 scale (parity tops out at 2^20). Same wiring as sycl_sort_parity.
+add_executable(sycl_sort_bench tools/parity/sycl_sort_bench.cpp)
+x2_add_sycl_to_target(TARGET sycl_sort_bench
+                   SOURCES tools/parity/sycl_sort_bench.cpp)
+target_link_libraries(sycl_sort_bench PRIVATE pos2_gpu)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(sycl_sort_bench PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_include_directories(sycl_sort_bench PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_sort_bench PRIVATE cxx_std_20)
+set_target_properties(sycl_sort_bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 0 of the StreamingPinned/StreamingDisk tier plan
 # (project_streaming_pinned_disk_spec). Exercises the new scatter
 # family (launch_compute_inverse_u32 + launch_scatter_{u64,u32} +

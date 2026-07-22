@@ -86,66 +86,103 @@ uint64_t tile_count_for(uint64_t count)
 //
 // Replaces AdaptiveCpp's acpp::algorithms::exclusive_scan for the tile-offset
 // scan. That one is a decoupled-lookback scan whose lookback is an unbounded
-// inter-work-group spin (decoupled_lookback_scan.hpp:244 in 25.10.0). SYCL does
-// not guarantee a work-group makes progress while another spins on it, so once
-// there are more scan work-groups than the device keeps co-resident it races.
-// On an Arc B580 the lookback path passes at 1 and 16 tiles and fails from 256
-// tiles up -- wrong offsets first, then a DEVICE_LOST at 1024. (XCHPLOT2_ACPP_SCAN=1
-// still selects it, so the upstream defect stays reproducible from a released
-// build.)
+// inter-work-group spin (decoupled_lookback_scan.hpp:244 in 25.10.0); it drops
+// elements / DEVICE_LOSTs on an Arc B580 once there are more scan work-groups
+// than the device keeps co-resident (see project-arc-b580-page-fault).
+// XCHPLOT2_ACPP_SCAN=1 still selects it so the upstream defect stays
+// reproducible from a released build.
 //
-// A first replacement used three cooperating kernels and sycl::reduce_over_group
-// for the per-block totals. That HUNG on the B580 -- host-side, spinning in the
-// Level Zero event wait with no GPU job ever timed out; eu-stack caught it in
-// ze_node_event::wait() under exclusive_scan_u32. reduce_over_group appears
-// nowhere else in this file and had never executed on that device;
-// exclusive_scan_over_group, by contrast, runs in the scatter phase there
-// without trouble.
+// The default is a textbook three-kernel parallel scan (block decomposition)
+// built ONLY from primitives proven on the B580 -- local memory, barriers,
+// plain global loads/stores; NO group collective, NO inter-work-group ordering:
+//   A. each block does a local-memory Hillis-Steele exclusive scan of its
+//      SCAN_TILE-element slice and publishes that slice's total to block_sums;
+//   B. a single work-group scans block_sums in place (a few thousand entries at
+//      k=28 -- cheap, and the one-group form has no cross-group dependency);
+//   C. each block adds its block_sums prefix back across its slice.
+// This is the shape the sort had BEFORE the B580 fix, minus the
+// reduce_over_group that hung there -- a block total is just the last inclusive
+// element, so no collective is needed. It restores the parallelism the interim
+// single-work-group scan gave up: that stopgap streamed the whole
+// RADIX*num_tiles array (~4.2M u32 at k=28) through ONE work-group -- ~16k
+// serial chunks on a single Xe-core/CU while the other ~160 idle, 8-16x per
+// sort. Correct, but it left most of the device unused on every AMD and Intel
+// plot (NVIDIA uses CUB, not this file).
 //
-// So this stays deliberately close to the primitives known to complete on that
-// device: ONE kernel, ONE work-group, streaming the array in WG-sized chunks
-// with exclusive_scan_over_group plus a single shared word and two barriers for
-// the running carry. No reduce_over_group, and no inter-work-group ordering of
-// any kind. The scanned array is RADIX*num_tiles (~4.2M u32 at k=28); one
-// work-group streaming it costs a few ms and stays well under the 5 s engine
-// timeout, and this is not the hot path (the match kernels are), so the lost
-// parallelism does not matter.
-constexpr int SCAN_WG = 256;
+// XCHPLOT2_SCAN_SINGLE_WG=1 restores that single-work-group stopgap (a
+// conservative fallback and the A/B baseline); XCHPLOT2_SCAN_SERIAL=1 is a
+// single-work-item scan -- no barriers, no cross-lane reads, trivially correct
+// on any backend -- the control that says whether a residual sort failure is in
+// THIS scan or downstream of it (histogram / scatter).
+constexpr int SCAN_WG               = 256;
+constexpr int SCAN_ITEMS_PER_THREAD = 8;
+constexpr int SCAN_TILE             = SCAN_WG * SCAN_ITEMS_PER_THREAD;  // 2048
 
-// Two escape hatches, both env-gated and off by default:
-//   XCHPLOT2_ACPP_SCAN=1   -> AdaptiveCpp's decoupled-lookback scan (the
-//                             original upstream defect; kept reproducible).
-//   XCHPLOT2_SCAN_SERIAL=1 -> a single-work-item serial scan: no barriers, no
-//                             cross-lane reads, no group collectives, so it
-//                             cannot race and is trivially correct on any
-//                             backend (just slow). It is the control that says
-//                             whether a residual sort failure is in THIS scan
-//                             or downstream of it (histogram / scatter).
+// Blocks the parallel scan splits `n` into; also the size (in u32) of the
+// block_sums scratch the launch functions must reserve for it.
+inline uint64_t scan_block_count(uint64_t n)
+{
+    return (n + SCAN_TILE - 1) / SCAN_TILE;
+}
+
+// Escape hatches, all env-gated and off by default. See the header note above.
 bool env_flag(char const* name)
 {
     char const* e = std::getenv(name);
     return e && e[0] == '1';
 }
-bool use_acpp_scan()   { static bool const v = env_flag("XCHPLOT2_ACPP_SCAN");   return v; }
-bool use_serial_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_SERIAL"); return v; }
+bool use_acpp_scan()      { static bool const v = env_flag("XCHPLOT2_ACPP_SCAN");      return v; }
+bool use_serial_scan()    { static bool const v = env_flag("XCHPLOT2_SCAN_SERIAL");    return v; }
+bool use_single_wg_scan() { static bool const v = env_flag("XCHPLOT2_SCAN_SINGLE_WG"); return v; }
 
-// Exclusive prefix sum over `n` u32 in a SINGLE work-group -- no
-// inter-work-group ordering, which is what broke the AdaptiveCpp lookback on
-// Level Zero. Streams the array in WG-sized chunks with a running carry.
-//
-// The per-chunk scan is a local-memory Hillis-Steele: barriers and local loads
-// only, the same primitives the histogram kernel already runs successfully on
-// these devices -- deliberately NOT sycl::exclusive_scan_over_group and NOT a
-// single-writer shared word for the carry. The prior version used both and, on
-// an Arc B580, dropped elements once the chunk loop ran more than once (correct
-// on NVIDIA; correct here at one chunk; off by a few from 16 chunks up -- a
-// carry that did not survive the barrier). This is not the hot path (the match
-// kernels are), so the log-step scan costs nothing that matters.
+// Exclusive scan of `n` u32 in ONE work-group, streaming in SCAN_WG chunks with
+// a running carry; each chunk is a local-memory Hillis-Steele inclusive scan
+// (barriers + local loads only -- the histogram's proven primitives, NOT
+// exclusive_scan_over_group and NOT a single-writer shared carry word). Returns
+// its event so the parallel scan can chain the block_sums pass off kernel A
+// without a host round-trip. In-place safe: each index is read as its own
+// chunk's input before that chunk's store, and no later chunk reads an earlier
+// chunk's output. This is also the XCHPLOT2_SCAN_SINGLE_WG fallback path.
+sycl::event submit_single_wg_scan(sycl::queue& q,
+                                  uint32_t const* in, uint32_t* out, uint64_t n,
+                                  std::vector<sycl::event> const& deps)
+{
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<uint32_t, 1> l(sycl::range<1>(SCAN_WG), h);
+        h.parallel_for(sycl::nd_range<1>(SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                int const tid = static_cast<int>(it.get_local_id(0));
+                uint32_t running = 0;
+                for (uint64_t base = 0; base < n; base += SCAN_WG) {
+                    uint64_t const idx = base + static_cast<uint64_t>(tid);
+                    uint32_t const v = (idx < n) ? in[idx] : 0u;
+                    l[tid] = v;
+                    it.barrier(sycl::access::fence_space::local_space);
+                    for (int d = 1; d < SCAN_WG; d <<= 1) {
+                        uint32_t const add = (tid >= d) ? l[tid - d] : 0u;
+                        it.barrier(sycl::access::fence_space::local_space);
+                        l[tid] += add;
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (idx < n) out[idx] = running + (l[tid] - v);
+                    running += l[SCAN_WG - 1];
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+            });
+    });
+}
+
+// Exclusive prefix sum over `n` u32. `block_sums` is scratch of at least
+// scan_block_count(n) u32, used only by the default parallel path. Variants
+// (serial / single-work-group / AdaptiveCpp) are documented in the header note.
 void exclusive_scan_u32(sycl::queue& q,
-                        uint32_t const* in, uint32_t* out, uint64_t n)
+                        uint32_t const* in, uint32_t* out, uint64_t n,
+                        uint32_t* block_sums)
 {
     if (n == 0) return;
 
+    // Control path: a single work-item, provably correct on any backend.
     if (use_serial_scan()) {
         q.submit([&](sycl::handler& h) {
             h.parallel_for(sycl::nd_range<1>(1, 1), [=](sycl::nd_item<1>) {
@@ -161,19 +198,27 @@ void exclusive_scan_u32(sycl::queue& q,
         return;
     }
 
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> l(sycl::range<1>(SCAN_WG), h);
-        h.parallel_for(sycl::nd_range<1>(SCAN_WG, SCAN_WG),
-            [=](sycl::nd_item<1> it) {
-                int const tid = static_cast<int>(it.get_local_id(0));
-                uint32_t running = 0;
-                for (uint64_t base = 0; base < n; base += SCAN_WG) {
-                    uint64_t const idx = base + static_cast<uint64_t>(tid);
-                    uint32_t const v = (idx < n) ? in[idx] : 0u;
+    uint64_t const num_blocks = scan_block_count(n);
 
-                    // Inclusive Hillis-Steele scan of this chunk in local mem.
-                    // Each step reads a neighbour into a register, barriers so
-                    // every lane has read before any writes, then writes back.
+    // One block (n <= SCAN_TILE) or the explicit single-WG fallback: stream the
+    // whole array through one work-group; no block_sums / fold-back needed.
+    if (num_blocks <= 1 || use_single_wg_scan()) {
+        submit_single_wg_scan(q, in, out, n, {}).wait();
+        return;
+    }
+
+    // A. Per-block local-memory exclusive scan; publish each block's total.
+    sycl::event const ea = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> l(sycl::range<1>(SCAN_WG), h);
+        h.parallel_for(sycl::nd_range<1>(num_blocks * SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                int const      tid   = static_cast<int>(it.get_local_id(0));
+                uint64_t const blk   = it.get_group(0);
+                uint64_t const bbase = blk * static_cast<uint64_t>(SCAN_TILE);
+                uint32_t running = 0;
+                for (int c = 0; c < SCAN_ITEMS_PER_THREAD; ++c) {
+                    uint64_t const idx = bbase + static_cast<uint64_t>(c) * SCAN_WG + tid;
+                    uint32_t const v = (idx < n) ? in[idx] : 0u;
                     l[tid] = v;
                     it.barrier(sycl::access::fence_space::local_space);
                     for (int d = 1; d < SCAN_WG; d <<= 1) {
@@ -182,15 +227,38 @@ void exclusive_scan_u32(sycl::queue& q,
                         l[tid] += add;
                         it.barrier(sycl::access::fence_space::local_space);
                     }
-
-                    // Exclusive = inclusive - own value; add the running carry.
                     if (idx < n) out[idx] = running + (l[tid] - v);
                     running += l[SCAN_WG - 1];   // chunk total = last inclusive
                     it.barrier(sycl::access::fence_space::local_space);
                 }
+                // `running` is group-uniform (every lane summed the same
+                // l[SCAN_WG-1] each chunk); one lane records the block total.
+                if (tid == 0) block_sums[blk] = running;
             });
     });
-    q.wait();
+
+    // B. Scan the block totals in place (single work-group; num_blocks entries,
+    //    a few thousand at k=28 -- one chunk-loop, no cross-group dependency).
+    sycl::event const eb =
+        submit_single_wg_scan(q, block_sums, block_sums, num_blocks, {ea});
+
+    // C. Fold each block's exclusive prefix back over its slice.
+    sycl::event ec = q.submit([&](sycl::handler& h) {
+        h.depends_on(eb);
+        h.parallel_for(sycl::nd_range<1>(num_blocks * SCAN_WG, SCAN_WG),
+            [=](sycl::nd_item<1> it) {
+                uint64_t const blk = it.get_group(0);
+                uint32_t const add = block_sums[blk];
+                if (add == 0u) return;   // block 0 / any zero-prefix: nothing to add
+                int const      tid   = static_cast<int>(it.get_local_id(0));
+                uint64_t const bbase = blk * static_cast<uint64_t>(SCAN_TILE);
+                for (int c = 0; c < SCAN_ITEMS_PER_THREAD; ++c) {
+                    uint64_t const idx = bbase + static_cast<uint64_t>(c) * SCAN_WG + tid;
+                    if (idx < n) out[idx] += add;
+                }
+            });
+    });
+    ec.wait();
 }
 
 // Exclusive prefix sum of `v` across a WG_SIZE work-group, in local memory.
@@ -225,6 +293,7 @@ void radix_pass_pairs_u32(
     uint32_t const* in_keys, uint32_t const* in_vals,
     uint32_t* out_keys,      uint32_t* out_vals,
     uint32_t* tile_hist,     uint32_t* tile_offsets,
+    uint32_t* block_sums,
     uint64_t count, int bit)
 {
     uint64_t const num_tiles = tile_count_for(count);
@@ -273,7 +342,7 @@ void radix_pass_pairs_u32(
                 uint32_t{0},
                 sycl::plus<uint32_t>{}).wait();
         } else {
-            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_size);
+            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_size, block_sums);
         }
     }
 
@@ -351,6 +420,7 @@ void radix_pass_keys_u64(
     uint64_t const* in_keys,
     uint64_t* out_keys,
     uint32_t* tile_hist, uint32_t* tile_offsets,
+    uint32_t* block_sums,
     uint64_t count, int bit)
 {
     uint64_t const num_tiles = tile_count_for(count);
@@ -398,7 +468,7 @@ void radix_pass_keys_u64(
                 uint32_t{0},
                 sycl::plus<uint32_t>{}).wait();
         } else {
-            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_size);
+            exclusive_scan_u32(q, tile_hist, tile_offsets, scan_size, block_sums);
         }
     }
 
@@ -480,8 +550,9 @@ void launch_sort_pairs_u32_u32_sycl(
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const scan_n = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-    size_t const bytes = sizeof(uint32_t) * scan_n * 2;
+    size_t const scan_n      = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
+    size_t const scan_blocks = static_cast<size_t>(scan_block_count(scan_n));
+    size_t const bytes = sizeof(uint32_t) * (scan_n * 2 + scan_blocks);
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
@@ -489,7 +560,8 @@ void launch_sort_pairs_u32_u32_sycl(
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
     uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
-    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
+    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* block_sums   = reinterpret_cast<uint32_t*>(p);
 
     // First pass reads from keys_in (caller's input). Subsequent passes
     // ping-pong between keys_in and keys_out — we treat keys_in as
@@ -501,7 +573,7 @@ void launch_sort_pairs_u32_u32_sycl(
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
         radix_pass_pairs_u32(q, cur_keys, cur_vals, dst_keys, dst_vals,
-                             tile_hist, tile_offsets, count, bit);
+                             tile_hist, tile_offsets, block_sums, count, bit);
         std::swap(cur_keys, dst_keys);
         std::swap(cur_vals, dst_vals);
     }
@@ -526,8 +598,9 @@ void launch_sort_keys_u64_sycl(
     sycl::queue& q)
 {
     uint64_t const num_tiles = tile_count_for(count);
-    size_t const scan_n = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
-    size_t const bytes = sizeof(uint32_t) * scan_n * 2;
+    size_t const scan_n      = static_cast<size_t>(RADIX) * static_cast<size_t>(num_tiles);
+    size_t const scan_blocks = static_cast<size_t>(scan_block_count(scan_n));
+    size_t const bytes = sizeof(uint32_t) * (scan_n * 2 + scan_blocks);
     if (d_temp_storage == nullptr) {
         temp_bytes = bytes;
         return;
@@ -535,14 +608,15 @@ void launch_sort_keys_u64_sycl(
 
     uint8_t* p = static_cast<uint8_t*>(d_temp_storage);
     uint32_t* tile_hist    = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
-    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);
+    uint32_t* tile_offsets = reinterpret_cast<uint32_t*>(p);  p += sizeof(uint32_t) * scan_n;
+    uint32_t* block_sums   = reinterpret_cast<uint32_t*>(p);
 
     uint64_t* cur = keys_in;
     uint64_t* dst = keys_out;
 
     for (int bit = begin_bit; bit < end_bit; bit += RADIX_BITS) {
         radix_pass_keys_u64(q, cur, dst, tile_hist, tile_offsets,
-                            count, bit);
+                            block_sums, count, bit);
         std::swap(cur, dst);
     }
     q.wait();
