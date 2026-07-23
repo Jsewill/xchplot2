@@ -10,6 +10,7 @@
 #include "host/MultiGpuPipelineParallel.hpp"   // --pipeline-plot path (Phase 2.1d)
 #include "host/MultiGpuShardBufferPool.hpp"  // batch-amortised buffer reuse
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/TempFile.hpp"  // resolve_dir / dir_is_ram_backed — spill temp-dir guard
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
 #include "host/NumaTopology.hpp"  // CPU-node enumeration + per-worker pinning
 #include "gpu/SyclBackend.hpp"  // sycl_backend::queue, set_current_device_id
@@ -2017,6 +2018,42 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // the matching scratch fields are left null in the allocation
             // block further down so the pipeline OWNS and spills them.
             if (opts.has_max_host_ram) {
+                // Guard (fail-fast, before any allocation or plotting): refuse
+                // to "spill" onto a RAM-backed temp dir. On most systemd/Arch
+                // boxes /tmp is tmpfs — i.e. RAM — so writing the spill tables
+                // there consumes the very RAM this budget is meant to cap and
+                // invites the OOM killer, defeating the feature. The spill
+                // TempFiles resolve their dir from XCHPLOT2_TEMP_DIR / TMPDIR /
+                // /tmp (--temp-dir feeds XCHPLOT2_TEMP_DIR), so probe that same
+                // resolved dir. XCHPLOT2_ALLOW_RAM_TEMP_DIR (1/true/yes/on)
+                // downgrades the refusal to a warning for the rare disk-backed
+                // /tmp.
+                {
+                    std::string const spill_dir = TempFile::resolve_dir("");
+                    if (TempFile::dir_is_ram_backed(spill_dir)) {
+                        char const* ov =
+                            std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
+                        std::string const ovs = ov ? ov : "";
+                        bool const allow = (ovs == "1" || ovs == "true" ||
+                                            ovs == "yes" || ovs == "on");
+                        if (allow) {
+                            std::fprintf(stderr,
+                                "%s WARNING: --max-host-ram spill temp dir '%s' "
+                                "is on a RAM-backed filesystem (tmpfs); "
+                                "proceeding anyway because "
+                                "XCHPLOT2_ALLOW_RAM_TEMP_DIR is set.\n",
+                                log_prefix.c_str(), spill_dir.c_str());
+                        } else {
+                            throw std::runtime_error(
+                                "--max-host-ram is set but the spill temp dir '" +
+                                spill_dir + "' is on a RAM-backed filesystem "
+                                "(tmpfs); spilling there consumes RAM and "
+                                "defeats the budget. Point --temp-dir (or "
+                                "XCHPLOT2_TEMP_DIR) at real disk.");
+                        }
+                    }
+                }
+
                 // cap entries, from the public estimators: each is
                 // cap·bpe + fixed, so the difference over the bpe delta
                 // (52-24) is cap exactly.

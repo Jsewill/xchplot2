@@ -74,6 +74,17 @@ public:
     // For tests / diagnostics — returns the directory the file lives in.
     static std::string resolve_dir(std::string_view explicit_dir);
 
+    // True when the filesystem hosting `dir` (after resolve_dir) keeps file
+    // contents in RAM — tmpfs, ramfs, or hugetlbfs. Spilling there consumes
+    // the very RAM a --max-host-ram budget is meant to bound, so callers use
+    // this to refuse a RAM-backed spill target before doing any heavy work.
+    // A zram/zswap SWAP device backing a real disk filesystem is NOT flagged:
+    // only the mount's own fs magic is inspected, so files that actually live
+    // on btrfs/ext4 pass even when the system swaps to compressed RAM.
+    // Returns false if statfs() fails — an unprobeable fs must not block
+    // spilling.
+    static bool dir_is_ram_backed(std::string const& dir);
+
 private:
     int           fd_         = -1;
     std::string   path_;

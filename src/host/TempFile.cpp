@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/vfs.h>    // statfs / struct statfs — dir_is_ram_backed
 #include <unistd.h>
 
 namespace pos2gpu {
@@ -22,6 +23,27 @@ std::string TempFile::resolve_dir(std::string_view explicit_dir)
     if (char const* p = std::getenv("XCHPLOT2_TEMP_DIR"); p && *p) return p;
     if (char const* p = std::getenv("TMPDIR");            p && *p) return p;
     return "/tmp";
+}
+
+bool TempFile::dir_is_ram_backed(std::string const& dir)
+{
+    std::string const resolved = resolve_dir(dir);
+    struct statfs st {};
+    if (::statfs(resolved.c_str(), &st) != 0) {
+        return false;  // can't probe — do not block spilling on an unknown fs
+    }
+    // RAM-backed filesystem magics (linux/magic.h), hardcoded so the check
+    // has no dependency on that header across toolchains. Compare the low 32
+    // bits: f_type's width and signedness vary by platform, but every magic
+    // is a 32-bit constant, so a truncating cast matches without sign-
+    // extension surprises.
+    unsigned const     fsmagic         = static_cast<unsigned>(st.f_type);
+    constexpr unsigned kTmpfsMagic     = 0x01021994u;
+    constexpr unsigned kRamfsMagic     = 0x858458f6u;
+    constexpr unsigned kHugetlbfsMagic = 0x958458f6u;
+    return fsmagic == kTmpfsMagic
+        || fsmagic == kRamfsMagic
+        || fsmagic == kHugetlbfsMagic;
 }
 
 TempFile::TempFile(std::string_view dir)
