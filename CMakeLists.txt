@@ -774,7 +774,11 @@ set(POS2_GPU_SYCL_SRC
     src/gpu/T3Kernel.cpp
     src/host/GpuBufferPool.cpp
     src/host/GpuPipeline.cpp
-    src/host/HostPinnedPool.cpp)
+    src/host/HostPinnedPool.cpp
+    # P1 host-RAM disk-offload: GpuPipeline.cpp's h_t1_meta spill path
+    # consumes TempFile, so it must live in this (lowest-level) archive.
+    # pos2_gpu_host still gets it transitively via its pos2_gpu dep.
+    src/host/TempFile.cpp)
 
 # Sort path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) is now
 # always compiled — it's the runtime fallback for non-CUDA backends on
@@ -973,7 +977,7 @@ add_library(pos2_gpu_host STATIC
     src/host/ConfigFile.cpp
     src/host/MultiGpuPlotPipeline.cpp
     src/host/MultiGpuPipelineParallel.cpp
-    src/host/TempFile.cpp
+    # TempFile.cpp moved to pos2_gpu (POS2_GPU_SYCL_SRC) — see note there.
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)

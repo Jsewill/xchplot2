@@ -46,6 +46,22 @@ public:
     // `bytes` consumed) or errors.
     void pread_at(std::uint64_t offset, void* data, std::size_t bytes);
 
+    // Pageable, file-backed home for a CPU-touched buffer (host-RAM
+    // disk-offload, docs/host-ram-disk-offload.md). ftruncate()s the
+    // file to `bytes` and MAP_SHARED-maps it, returning a normal host
+    // pointer the CPU (and pageable-host DMA) can use as a drop-in
+    // replacement for a pinned allocation. Unlike pinned pages, these
+    // are reclaimable: under memory pressure the kernel writes dirty
+    // pages back to THIS temp file (not swap) and evicts clean ones, so
+    // the resident set can fall below `bytes`. Only ONE mapping per
+    // TempFile; call unmap() (or let the destructor run) to release it.
+    // NOT usable for buffers a device KERNEL writes via USM-host — the
+    // mapping is not device-accessible; use SpillBuffer for those.
+    void* map(std::size_t bytes);
+
+    // Release the mapping created by map(). Idempotent.
+    void unmap() noexcept;
+
     // High-water mark — max(end-offset) ever written.
     std::uint64_t size() const noexcept { return high_water_; }
 
@@ -62,6 +78,8 @@ private:
     int           fd_         = -1;
     std::string   path_;
     std::uint64_t high_water_ = 0;
+    void*         map_        = nullptr;   // MAP_SHARED region, if map() was called
+    std::size_t   map_bytes_  = 0;
 };
 
 } // namespace pos2gpu

@@ -2007,6 +2007,99 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const host_required = host_need(tier);
             size_t const host_reserve  = host_memory_reserve();
 
+            // Host-RAM disk-offload budget policy
+            // (docs/host-ram-disk-offload.md). When --max-host-ram is set,
+            // turn the guard's "refuse" (below) into "spill enough, then
+            // proceed": redirect the large cold pinned tables to a
+            // TempFile-backed home, LARGEST-FIRST, until the modelled
+            // resident host peak fits under the budget. The chosen set is
+            // threaded to the streaming pipeline via stream_scratch.spill;
+            // the matching scratch fields are left null in the allocation
+            // block further down so the pipeline OWNS and spills them.
+            if (opts.has_max_host_ram) {
+                // cap entries, from the public estimators: each is
+                // cap·bpe + fixed, so the difference over the bpe delta
+                // (52-24) is cap exactly.
+                uint64_t const cap_entries =
+                    (streaming_compact_host_bytes(pool_k)
+                       - streaming_plain_host_bytes(pool_k)) / 28;
+                uint64_t const table8 = uint64_t(8) * cap_entries;  // an 8-B/entry table
+                uint64_t const table4 = uint64_t(4) * cap_entries;  // a 4-B/entry table
+                uint64_t const B      = opts.max_host_ram;          // 0 == "min"
+
+                // Routable tables for this tier, LARGEST-FIRST (all 8-B
+                // tables before the 4-B one). Only those whose spill path
+                // is implemented AND safe for the tier are listed (see
+                // GpuPipeline.cpp):
+                //   h_t1_meta  (8 B, Tiny only,            DMA/SpillBuffer)
+                //   h_t3       (8 B, Compact/Minimal/Tiny, DMA/SpillBuffer)
+                //   h_frags    (8 B, Compact/Minimal only, mmap/pageable)
+                //   h_t2_xbits (4 B, Compact/Minimal only, DMA/SpillBuffer)
+                //
+                // Deliberately NOT routable (device KERNELS read/write them
+                // through USM-host pointers, so they must stay device-
+                // accessible pinned memory — a disk file or mmap would
+                // corrupt or crash the kernel access):
+                //   h_keys_merged — the streaming-partition kernel writes it.
+                //   h_t2_meta     — distinct from h_meta only in Tiny, and
+                //                   Tiny's T2 sort (Phase 1.5b partition,
+                //                   GpuPipeline.cpp ~3348) reads it as a
+                //                   USM-host value input. Aliased to h_meta
+                //                   in Compact/Minimal, so not independently
+                //                   routable there either.
+                //   h_t2_xbits in Tiny — same Tiny T2-sort partition reads
+                //                   it USM-host; only Compact/Minimal route
+                //                   it (their gather paths use q.memcpy).
+                bool const tier_tiny    = (tier == Tier::Tiny || tier == Tier::Pinned);
+                bool const tier_streams = (tier != Tier::Plain);
+
+                uint64_t est            = host_required;
+                uint64_t routable_total = 0;
+                StreamingPinnedScratch::SpillPlan plan;
+                auto consider = [&](uint64_t table, bool available, bool& bit) {
+                    if (!available) return;
+                    routable_total += table;
+                    if (B == 0 || est > B) { bit = true; est -= std::min(table, est); }
+                };
+                consider(table8, tier_tiny,                  plan.h_t1_meta);
+                consider(table8, tier_streams,               plan.h_t3);
+                consider(table8, tier_streams && !tier_tiny, plan.h_frags);
+                consider(table4, tier_streams && !tier_tiny, plan.h_t2_xbits);
+
+                uint64_t const floor_bytes =
+                    host_required - std::min(routable_total, host_required);
+
+                if (B != 0 && est > B) {
+                    throw std::runtime_error(
+                        log_prefix + " host-RAM budget " +
+                        std::to_string(to_gib(B)).substr(0, 5) +
+                        " GiB is unreachable for tier " + tier_name(tier) +
+                        " at k=" + std::to_string(pool_k) +
+                        ": the lowest floor with every routable table spilled "
+                        "is ~" + std::to_string(to_gib(floor_bytes)).substr(0, 5) +
+                        " GiB. Raise --max-host-ram, choose a higher --tier, or "
+                        "route more buffers.");
+                }
+                stream_scratch.spill = plan;
+                char budget_label[32];
+                if (B == 0) std::snprintf(budget_label, sizeof(budget_label), "min");
+                else        std::snprintf(budget_label, sizeof(budget_label),
+                                          "%.2f GiB", to_gib(B));
+                std::string spilled;
+                if (plan.h_t1_meta)  spilled += " h_t1_meta";
+                if (plan.h_t3)       spilled += " h_t3";
+                if (plan.h_frags)    spilled += " h_frags";
+                if (plan.h_t2_xbits) spilled += " h_t2_xbits";
+                if (spilled.empty()) spilled = " (none)";
+                std::fprintf(stderr,
+                    "%s host-RAM budget %s (tier %s, k=%d): spilling%s -> "
+                    "modelled resident host peak ~%.2f GiB (routable floor "
+                    "~%.2f GiB)\n",
+                    log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
+                    spilled.c_str(),
+                    to_gib(est), to_gib(floor_bytes));
+            }
+
             size_t host_free = 0, host_total = 0;
             bool const have_host =
                 device_memory_probe(kCpuDeviceId, host_free, host_total);
@@ -2032,7 +2125,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
             }
 
-            if (have_host && host_free < host_required + host_reserve) {
+            if (!opts.has_max_host_ram
+                && have_host && host_free < host_required + host_reserve) {
                 throw std::runtime_error(
                     log_prefix + " tier " + tier_name(tier) + " needs ~" +
                     std::to_string(to_gib(host_required)).substr(0, 5) +
@@ -2138,10 +2232,36 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // of round-tripping malloc_host on every plot.
         stream_scratch.pool = &stream_pool;
         if (!stream_scratch.plain_mode) {
-            stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            // Host-RAM disk-offload (docs/host-ram-disk-offload.md): for a
+            // table the budget policy (stream_scratch.spill, set above) or
+            // the legacy XCHPLOT2_SPILL_T1META flag selected for spill, do
+            // NOT pre-allocate its shared pinned buffer. Leaving it null
+            // makes the streaming pipeline OWN the table and redirect it to
+            // a TempFile via the shared SpillEngine instead of a full
+            // pinned alloc.
+            //   - h_meta backs h_t1_meta; spillable in tiny only (T2 meta
+            //     uses the separate h_t2_meta below, so nulling is safe).
+            //   - h_t3 is spillable in compact / minimal / tiny.
+            bool const spill_t1meta = stream_scratch.tiny_mode &&
+                (stream_scratch.spill.h_t1_meta ||
+                 [] { char const* v = std::getenv("XCHPLOT2_SPILL_T1META");
+                      return v && v[0] == '1'; }());
+            stream_scratch.spill.h_t1_meta = spill_t1meta;  // reconcile with legacy env
+            bool const spill_t3 = stream_scratch.spill.h_t3;
+            // h_t2_xbits is routed to disk only in Compact/Minimal (Tiny's
+            // T2-sort partition reads it via a USM-host kernel, so it must
+            // stay pinned — the budget policy never sets the bit for Tiny).
+            bool const spill_t2xbits = stream_scratch.spill.h_t2_xbits;
+            if (!spill_t1meta) {
+                stream_scratch.h_meta    = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            }
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
-            stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
-            stream_scratch.h_t3          = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            if (!spill_t2xbits) {
+                stream_scratch.h_t2_xbits = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            }
+            if (!spill_t3) {
+                stream_scratch.h_t3      = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            }
             // Tiny tier needs a separate h_t2_meta to avoid the
             // h_t1_meta/h_t2_meta buffer-reuse race in T2 match's
             // per-pass loop. Compact / minimal modes don't trip the
@@ -2151,8 +2271,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (stream_scratch.tiny_mode) {
                 stream_scratch.h_t2_meta = streaming_alloc_pinned_uint64(stream_pinned_cap);
             }
-            if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
-                !stream_scratch.h_t2_xbits || !stream_scratch.h_t3 ||
+            if ((!spill_t1meta && !stream_scratch.h_meta) || !stream_scratch.h_keys_merged ||
+                (!spill_t2xbits && !stream_scratch.h_t2_xbits) ||
+                (!spill_t3 && !stream_scratch.h_t3) ||
                 (stream_scratch.tiny_mode && !stream_scratch.h_t2_meta))
             {
                 if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);

@@ -13,6 +13,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/TempFile.hpp"   // P1 host-RAM disk-offload (XCHPLOT2_SPILL_T1META)
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/XsKernel.cuh"
@@ -34,10 +35,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -224,6 +229,265 @@ inline void s_free(StreamingStats& s, T*& ptr)
     sycl::free(raw, sycl_backend::queue());
     ptr = nullptr;
 }
+
+// ---------------------------------------------------------------------
+// Host-RAM disk-offload — generalized overlapped/double-buffered spill.
+// See docs/host-ram-disk-offload.md. Two cooperating pieces:
+//
+//   SpillEngine — ONE per pipeline invocation. Owns the background I/O
+//     worker thread, the TWO ping-pong staging windows (64 MiB pinned
+//     total), and a single monotonic FIFO ticket space. EVERY spilled
+//     table shares this one engine, so the pinned staging cost stays
+//     fixed at 64 MiB no matter how many tables spill — that is the
+//     whole point of the generalization over P1.5's per-table windows.
+//
+//   SpillBuffer — one per spilled table (h_t1_meta, h_t3, ...). Owns
+//     ONLY a TempFile (its own on-disk backing) plus its element size;
+//     it holds no windows and no thread. All of its device<->disk
+//     traffic flows through the shared engine's windows. The spilled
+//     tables have disjoint access phases (h_t1_meta in T1, h_t3 in T3),
+//     so the shared windows are never contended; the FIFO worker + the
+//     per-slot / drain waits serialize any cross-table op and preserve
+//     the exact byte-for-byte semantics of the original single-table
+//     path — the ping-pong cursor and slot tickets are shared, so a
+//     deferred write always lands before its window is repopulated,
+//     across tables too.
+//
+// Semantics (unchanged from P1.5, now table-agnostic):
+//   - WRITES are DEFERRED + ping-pong: D2H into a free window (wait),
+//     hand it to the worker for pwrite, return. The pwrite overlaps the
+//     caller's next kernel. A window is not reused until its prior op
+//     completes (per-slot wait).
+//   - READS are double-buffered: drain pending writes, then pipeline
+//     pread(chunk+1) with H2D(chunk).
+//   - The streaming-partition source-tile read (T1 sort) is driven via
+//     SpillTileReader (see StreamingPartition.cuh), also double-buffered.
+//   - A drain() barrier lands all outstanding writes before a re-read.
+// Gated per-table by the budget policy (BatchPlotter) / the legacy
+// XCHPLOT2_SPILL_T1META flag; default OFF is byte-identical to the
+// all-pinned path. XCHPLOT2_SPILL_NO_OVERLAP=1 forces synchronous I/O
+// (A/B measurement only).
+struct SpillEngine {
+    // 32 MiB per window. TWO windows = 64 MiB pinned resident, SHARED by
+    // all spilled tables. Each window also bounds the streaming-partition
+    // source tile (32 MiB / 8 B = 4M u64 entries), see SpillBuffer.
+    static constexpr uint64_t kStageBytes = 32ULL << 20;
+    static constexpr int      kNumWindows = 2;
+
+    StreamingStats*   stats = nullptr;
+    sycl::queue*      q     = nullptr;
+    uint8_t*          win[kNumWindows] = {nullptr, nullptr};   // byte windows; typed by SpillBuffer
+
+    enum class Op { Write, Read, Stop };
+    struct Job { Op op; int slot; pos2gpu::TempFile* file;
+                 uint64_t off_bytes; size_t bytes; uint64_t ticket; };
+
+    std::thread             io_thread;
+    std::mutex              mtx;
+    std::condition_variable cv_work;                 // worker waits for jobs
+    std::condition_variable cv_done;                 // producers wait for completion
+    std::deque<Job>         jobs;
+    uint64_t                next_ticket = 0;         // last enqueued
+    uint64_t                done_ticket = 0;         // last completed (FIFO => monotonic)
+    uint64_t                slot_ticket[kNumWindows] = {0, 0};  // last job touching each window
+    int                     write_slot = 0;          // ping-pong cursor for writes (SHARED across tables)
+    std::string             io_error;                // first worker error, re-raised on wait/drain
+    bool                    overlap = true;          // XCHPLOT2_SPILL_NO_OVERLAP=1 => synchronous (A/B measure only)
+    uint64_t                blocked_ns = 0;          // wall the main thread spent stalled on disk I/O (this plot)
+
+    SpillEngine(StreamingStats& s, sycl::queue& queue)
+        : stats(&s), q(&queue)
+    {
+        if (char const* v = std::getenv("XCHPLOT2_SPILL_NO_OVERLAP"); v && v[0] == '1')
+            overlap = false;
+        for (int i = 0; i < kNumWindows; ++i) {
+            win[i] = static_cast<uint8_t*>(s_malloc_host_raw(
+                s, kStageBytes, "h_spill_stage_window", queue));
+        }
+        io_thread = std::thread([this] { worker_loop(); });
+    }
+
+    ~SpillEngine() {
+        try { drain(); } catch (...) { /* destructor: swallow late I/O errors */ }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            jobs.push_back({Op::Stop, 0, nullptr, 0, 0, 0});
+            cv_work.notify_all();
+        }
+        if (io_thread.joinable()) io_thread.join();
+        std::fprintf(stderr,
+            "[spill] pipeline stalled %.2f s on disk I/O this plot (overlap=%s)\n",
+            blocked_ns / 1e9, overlap ? "on" : "off");
+        for (int i = 0; i < kNumWindows; ++i)
+            if (win[i]) s_free_host(*stats, win[i], *q);
+    }
+
+    SpillEngine(SpillEngine const&)            = delete;
+    SpillEngine& operator=(SpillEngine const&) = delete;
+
+    // ---- background worker + ticket bookkeeping ----
+    void worker_loop() {
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_work.wait(lk, [this] { return !jobs.empty(); });
+                j = jobs.front();
+                jobs.pop_front();
+            }
+            if (j.op == Op::Stop) return;
+            try {
+                if (j.op == Op::Write) j.file->pwrite_at(j.off_bytes, win[j.slot], j.bytes);
+                else                   j.file->pread_at (j.off_bytes, win[j.slot], j.bytes);
+            } catch (std::exception const& e) {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (io_error.empty()) io_error = e.what();
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                done_ticket = j.ticket;              // FIFO => monotonic
+                cv_done.notify_all();
+            }
+        }
+    }
+
+    // Enqueue one disk op against window `slot` targeting `file`. The
+    // window MUST already be safe to touch (caller did wait_slot + D2H
+    // for writes; the read path enqueues only into a window whose last
+    // H2D has completed).
+    uint64_t enqueue(Op op, int slot, pos2gpu::TempFile* file,
+                     uint64_t off_bytes, size_t bytes) {
+        std::lock_guard<std::mutex> lk(mtx);
+        uint64_t const t = ++next_ticket;
+        jobs.push_back({op, slot, file, off_bytes, bytes, t});
+        slot_ticket[slot] = t;
+        cv_work.notify_one();
+        return t;
+    }
+
+    void rethrow_locked() {
+        if (!io_error.empty()) throw std::runtime_error("SpillEngine I/O error: " + io_error);
+    }
+
+    // Block until window `slot`'s most recent op has completed.
+    void wait_slot(int slot) {
+        auto const t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(mtx);
+        uint64_t const target = slot_ticket[slot];
+        cv_done.wait(lk, [this, target] { return done_ticket >= target; });
+        blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+        rethrow_locked();
+    }
+
+    // Block until every enqueued op has completed (write-back barrier).
+    void drain() {
+        auto const t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(mtx);
+        uint64_t const target = next_ticket;
+        cv_done.wait(lk, [this, target] { return done_ticket >= target; });
+        blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+        rethrow_locked();
+    }
+};
+
+// One spilled table. Owns its TempFile + element size; borrows the
+// shared SpillEngine for all windows/thread/tickets. Method names match
+// the original single-table object so the call sites are unchanged.
+struct SpillBuffer {
+    SpillEngine*      eng  = nullptr;
+    pos2gpu::TempFile file;                          // mkstemp+unlink; honors XCHPLOT2_TEMP_DIR
+    size_t            elem = 1;                       // element width in bytes
+
+    SpillBuffer(SpillEngine& e, size_t elem_bytes) : eng(&e), elem(elem_bytes) {}
+    SpillBuffer(SpillBuffer const&)            = delete;
+    SpillBuffer& operator=(SpillBuffer const&) = delete;
+
+    // Entries that fit one window, and the tile count for the streaming-
+    // partition read so each tile fits a window (see SpillTileReader).
+    uint64_t win_entries() const { return SpillEngine::kStageBytes / elem; }
+    uint64_t tile_count_for(uint64_t count) const {
+        uint64_t const we = win_entries();
+        return (count + we - 1) / we;
+    }
+    void drain() { eng->drain(); }
+
+    // ---- WRITE: device buffer -> disk, deferred + ping-pong ----
+    void write_from_device(void const* d_src, uint64_t entry_off, uint64_t n) {
+        uint8_t const* src = static_cast<uint8_t const*>(d_src);
+        uint64_t const nb  = n * elem;
+        uint64_t const base = entry_off * elem;
+        for (uint64_t done = 0; done < nb; ) {
+            uint64_t const c    = std::min<uint64_t>(SpillEngine::kStageBytes, nb - done);
+            int const      slot = eng->write_slot;
+            eng->wait_slot(slot);                                       // prior op on this window done
+            eng->q->memcpy(eng->win[slot], src + done, c).wait();       // D2H into window
+            eng->enqueue(SpillEngine::Op::Write, slot, &file, base + done, c);  // async pwrite
+            if (!eng->overlap) eng->wait_slot(slot);                    // A/B measure: block on the pwrite
+            eng->write_slot ^= 1;
+            done += c;
+        }
+    }
+
+    // ---- READ: disk -> device buffer, double-buffered ----
+    void read_to_device(void* d_dst, uint64_t entry_off, uint64_t n) {
+        if (n == 0) return;
+        uint8_t*       dst  = static_cast<uint8_t*>(d_dst);
+        uint64_t const nb   = n * elem;
+        uint64_t const base = entry_off * elem;
+        eng->drain();                                                   // pending writes must land first
+        if (!eng->overlap) {                                           // A/B measure: serial pread -> H2D
+            for (uint64_t done = 0; done < nb; ) {
+                uint64_t const c = std::min<uint64_t>(SpillEngine::kStageBytes, nb - done);
+                eng->enqueue(SpillEngine::Op::Read, 0, &file, base + done, c);
+                eng->wait_slot(0);
+                eng->q->memcpy(dst + done, eng->win[0], c).wait();
+                done += c;
+            }
+            return;
+        }
+        int slot = 0;
+        uint64_t const c0 = std::min<uint64_t>(SpillEngine::kStageBytes, nb);
+        eng->enqueue(SpillEngine::Op::Read, slot, &file, base, c0);
+        for (uint64_t done = 0; done < nb; ) {
+            uint64_t const c         = std::min<uint64_t>(SpillEngine::kStageBytes, nb - done);
+            uint64_t const next_done = done + c;
+            int const      next_slot = slot ^ 1;
+            if (next_done < nb) {                                       // prefetch next chunk
+                uint64_t const nc = std::min<uint64_t>(SpillEngine::kStageBytes, nb - next_done);
+                eng->enqueue(SpillEngine::Op::Read, next_slot, &file, base + next_done, nc);
+            }
+            eng->wait_slot(slot);                                       // this chunk's pread done
+            eng->q->memcpy(dst + done, eng->win[slot], c).wait();       // H2D
+            done = next_done;
+            slot = next_slot;
+        }
+    }
+
+    // C-callback view onto the shared engine for the streaming-partition
+    // primitive (different TU). Only the u64 h_t1_meta table uses this,
+    // so the windows are reinterpreted as u64. See StreamingPartition.cuh.
+    static void thunk_submit(void* ctx, int slot, uint64_t off_bytes, uint64_t bytes) {
+        auto* b = static_cast<SpillBuffer*>(ctx);
+        b->eng->enqueue(SpillEngine::Op::Read, slot, &b->file, off_bytes,
+                        static_cast<size_t>(bytes));
+    }
+    static void thunk_wait(void* ctx, int slot) {
+        static_cast<SpillBuffer*>(ctx)->eng->wait_slot(slot);
+    }
+    SpillTileReader tile_reader() {
+        SpillTileReader r;
+        r.ctx         = this;
+        r.win[0]      = reinterpret_cast<uint64_t*>(eng->win[0]);
+        r.win[1]      = reinterpret_cast<uint64_t*>(eng->win[1]);
+        r.win_entries = SpillEngine::kStageBytes / sizeof(uint64_t);
+        r.overlap     = eng->overlap;
+        r.submit      = &thunk_submit;
+        r.wait        = &thunk_wait;
+        return r;
+    }
+};
 
 // Sanity-check t1_count after T1 match. Healthy plots produce ~2^k
 // entries; anything below total_xs/64 (= 2^(k-6)) — let alone literal
@@ -872,6 +1136,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // and stop_after_t1_sort can hand them back to the caller.
     uint64_t* h_t1_meta        = nullptr;
     uint32_t* h_t1_keys_merged = nullptr;
+    // Host-RAM disk-offload: the shared background I/O engine (created
+    // lazily on the first spilled table) plus one SpillBuffer per spilled
+    // table. While a table's SpillBuffer is set its host pointer stays
+    // null and every access routes through the SpillBuffer. Declared here
+    // (function scope) so the engine outlives every SpillBuffer and the
+    // h_t3 spill survives from T3 match into T3 sort. See SpillEngine.
+    std::unique_ptr<SpillEngine> spill_engine;
+    std::unique_ptr<SpillBuffer> t1_meta_spill;   // h_t1_meta (~2 GiB, tiny)
+    std::unique_ptr<SpillBuffer> t3_spill;        // h_t3 (~2 GiB, compact/minimal/tiny)
+    std::unique_ptr<SpillBuffer> t2_xbits_spill;  // h_t2_xbits (~1 GiB, compact / minimal)
+    // Lazily create the one shared engine the first time any table spills.
+    auto ensure_spill_engine = [&]() -> SpillEngine& {
+        if (!spill_engine) spill_engine = std::make_unique<SpillEngine>(stats, q);
+        return *spill_engine;
+    };
 
     // Phase 2.2 split: device buffers that cross the Xs+T1 / T2-match
     // scope boundary. Lifted from inner phase blocks so the if-skip
@@ -1560,10 +1839,39 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         }
 
         // Host pinned full-cap accumulators for meta + mi.
-        h_t1_meta = h_meta_owned
-            ? s_malloc_host<uint64_t>(stats, cap * sizeof(uint64_t), "h_t1_meta", q)
-            : scratch.h_meta;
-        if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
+        //
+        // Host-RAM disk-offload (docs/host-ram-disk-offload.md): when the
+        // budget policy selected h_t1_meta for spill (scratch.spill.h_t1_meta,
+        // or the legacy XCHPLOT2_SPILL_T1META=1 flag) and we own the buffer
+        // in tiny mode, redirect h_t1_meta (~2 GiB at k=28) to a TempFile on
+        // disk, streamed through the shared 64 MiB SpillEngine instead of a
+        // full pinned alloc. h_t1_meta stays null; the SpillBuffer services
+        // every access. Default takes the exact original pinned path below.
+        if (h_meta_owned && scratch.tiny_mode) {
+            bool const want_spill = scratch.spill.h_t1_meta ||
+                [] { char const* sv = std::getenv("XCHPLOT2_SPILL_T1META");
+                     return sv && sv[0] == '1'; }();
+            if (want_spill) {
+                t1_meta_spill = std::make_unique<SpillBuffer>(
+                    ensure_spill_engine(), sizeof(uint64_t));
+                h_t1_meta = nullptr;
+                std::fprintf(stderr,
+                    "[spill] h_t1_meta -> disk %s (shared staging %llu MiB in %d windows, "
+                    "overlap=%s, cap %.2f GiB spilled)\n",
+                    t1_meta_spill->file.path().c_str(),
+                    (unsigned long long)(SpillEngine::kNumWindows *
+                        SpillEngine::kStageBytes / 1048576),
+                    SpillEngine::kNumWindows,
+                    spill_engine->overlap ? "on" : "off",
+                    cap * sizeof(uint64_t) / 1073741824.0);
+            }
+        }
+        if (!t1_meta_spill) {
+            h_t1_meta = h_meta_owned
+                ? s_malloc_host<uint64_t>(stats, cap * sizeof(uint64_t), "h_t1_meta", q)
+                : scratch.h_meta;
+            if (!h_t1_meta) throw std::runtime_error("sycl::malloc_host(h_t1_meta) failed");
+        }
         if (scratch.pool) {
             // Pool path: amortise across plots in a batch. The pool
             // owns the buffer and frees it on its own destruction; the
@@ -1750,8 +2058,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     if (host_offset + pass_count > cap) {
                         throw std::runtime_error("T1 overflow (sliced accumulation)");
                     }
-                    q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
-                             pass_count * sizeof(uint64_t)).wait();
+                    if (t1_meta_spill) {
+                        t1_meta_spill->write_from_device(
+                            d_t1_meta_stage, host_offset, pass_count);
+                    } else {
+                        q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
+                                 pass_count * sizeof(uint64_t)).wait();
+                    }
                     q.memcpy(h_t1_mi   + host_offset, d_t1_mi_stage,
                              pass_count * sizeof(uint32_t)).wait();
                     host_offset += pass_count;
@@ -1983,13 +2296,29 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // Run streaming partition. Output: (h_t1_keys_merged,
         // h_part_vals) bucketed by top_num_top_bits of mi, with
         // h_bucket_starts giving the exclusive-scan offsets.
+        // P1.5 spill: when h_t1_meta lives on disk, feed the partition's
+        // per-tile source-value reads from the TempFile through the
+        // double-buffered SpillTileReader (h_vals_in stays null). First
+        // land all T1-match write-backs (the A->B barrier), then hand the
+        // primitive the reader. tile_count is fixed so each tile fits a
+        // window; BOTH calls pass the same tile_count so the scratch-size
+        // query matches the exec pass (the query returns before any read).
+        if (t1_meta_spill) t1_meta_spill->drain();
+        SpillTileReader        sp_reader;
+        SpillTileReader const* sp_reader_p = nullptr;
+        uint64_t const         sp_tiles    = t1_meta_spill
+            ? t1_meta_spill->tile_count_for(t1_count) : 0;
+        if (t1_meta_spill) {
+            sp_reader   = t1_meta_spill->tile_reader();
+            sp_reader_p = &sp_reader;
+        }
         size_t partition_scratch_bytes = 0;
         launch_streaming_partition_u32_u64(
             nullptr, partition_scratch_bytes,
             d_t1_mi, h_t1_meta,
             h_t1_keys_merged, h_part_vals, h_bucket_starts,
             t1_count, top_bit_offset, num_top_bits,
-            /*tile_count=*/0, q);
+            sp_tiles, q, sp_reader_p);
         void* d_partition_scratch = nullptr;
         if (partition_scratch_bytes) {
             s_malloc(stats, d_partition_scratch,
@@ -2000,7 +2329,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             d_t1_mi, h_t1_meta,
             h_t1_keys_merged, h_part_vals, h_bucket_starts,
             t1_count, top_bit_offset, num_top_bits,
-            /*tile_count=*/0, q);
+            sp_tiles, q, sp_reader_p);
         if (d_partition_scratch) s_free(stats, d_partition_scratch);
 
         // d_t1_mi is no longer needed after partition.
@@ -2061,8 +2390,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // sorted-meta destination directly (in place overwrite).
             q.memcpy(h_t1_keys_merged + bstart, d_bk_out,
                      bsz * sizeof(uint32_t));
-            q.memcpy(h_t1_meta + bstart, d_bv_out,
-                     bsz * sizeof(uint64_t)).wait();
+            // In-order queue: the keys copy above drains before the
+            // spill's first D2H .wait() (or the else-branch .wait()).
+            if (t1_meta_spill) {
+                t1_meta_spill->write_from_device(d_bv_out, bstart, bsz);
+            } else {
+                q.memcpy(h_t1_meta + bstart, d_bv_out,
+                         bsz * sizeof(uint64_t)).wait();
+            }
         }
 
         if (d_bucket_sort_scratch) s_free(stats, d_bucket_sort_scratch);
@@ -2569,9 +2904,28 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             ? scratch.pool->acquire_as<uint32_t>("h_t2_mi", cap, q)
             : static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_mi"));
         h_xbits_owned = (scratch.h_t2_xbits == nullptr);
-        h_t2_xbits = h_xbits_owned
-            ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
-            : scratch.h_t2_xbits;
+        if (scratch.spill.h_t2_xbits) {
+            // Host-RAM disk-offload: redirect the ~1 GiB h_t2_xbits
+            // (Compact/Minimal only — the budget policy never sets this
+            // bit for Tiny, whose T2-sort partition reads it USM-host) to
+            // a TempFile via the shared SpillEngine. Same class as h_t3 —
+            // pure GPU-DMA through the shared 64 MiB window. h_t2_xbits
+            // stays null; h_xbits_owned is forced false so the pinned-free
+            // guards below skip it (the SpillBuffer is reset at the tier-
+            // appropriate last-use site).
+            t2_xbits_spill = std::make_unique<SpillBuffer>(
+                ensure_spill_engine(), sizeof(uint32_t));
+            h_t2_xbits    = nullptr;
+            h_xbits_owned = false;
+            std::fprintf(stderr,
+                "[spill] h_t2_xbits -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                t2_xbits_spill->file.path().c_str(),
+                double(cap) * sizeof(uint32_t) / 1073741824.0);
+        } else {
+            h_t2_xbits = h_xbits_owned
+                ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
+                : scratch.h_t2_xbits;
+        }
 
         // Compute bucket + fine-bucket offsets once; both passes share
         // them. Also zeroes d_counter.
@@ -2717,8 +3071,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
             if (section_l_count > 0) {
                 s_malloc(stats, d_t2_meta_l_slice, section_l_count * sizeof(uint64_t), "d_t2_meta_l_slice");
-                q.memcpy(d_t2_meta_l_slice, h_t1_meta + cur_section_l_row_start,
-                         section_l_count * sizeof(uint64_t)).wait();
+                if (t1_meta_spill) {
+                    t1_meta_spill->read_to_device(
+                        d_t2_meta_l_slice, cur_section_l_row_start, section_l_count);
+                } else {
+                    q.memcpy(d_t2_meta_l_slice, h_t1_meta + cur_section_l_row_start,
+                             section_l_count * sizeof(uint64_t)).wait();
+                }
             }
             cur_section_l = static_cast<int32_t>(section_l);
         };
@@ -2735,8 +3094,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             uint64_t const r_count = r_end - r_start;
             cur_r_slice_row_start = r_start;
             if (r_count == 0) return r_start;
-            q.memcpy(d_t2_meta_r_slice, h_t1_meta + r_start,
-                     r_count * sizeof(uint64_t)).wait();
+            if (t1_meta_spill) {
+                t1_meta_spill->read_to_device(d_t2_meta_r_slice, r_start, r_count);
+            } else {
+                q.memcpy(d_t2_meta_r_slice, h_t1_meta + r_start,
+                         r_count * sizeof(uint64_t)).wait();
+            }
             q.memcpy(d_t2_mi_r_slice, h_t1_keys_merged + r_start,
                      r_count * sizeof(uint32_t)).wait();
             return r_start;
@@ -2771,7 +3134,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             }
             q.memcpy(h_t2_meta  + host_offset, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
             q.memcpy(h_t2_mi    + host_offset, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
-            q.memcpy(h_t2_xbits + host_offset, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
+            if (t2_xbits_spill)  // compact/minimal spill (h_t2_meta stays pinned/aliased here)
+                t2_xbits_spill->write_from_device(d_t2_xbits_stage, host_offset, pass_count);
+            else
+                q.memcpy(h_t2_xbits + host_offset, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
             q.wait();
             q.memset(d_counter, 0, sizeof(uint64_t)).wait();
             return pass_count;
@@ -2817,6 +3183,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     if (t2_count + pass_count > cap) {
                         throw std::runtime_error("T2 overflow (staged accumulation)");
                     }
+                    // Tiny T2 match keeps h_t2_meta / h_t2_xbits pinned:
+                    // its Phase-1.5b T2 sort partitions them via a USM-host
+                    // kernel, so they cannot live on disk. (Compact/Minimal
+                    // route h_t2_xbits through t2_xbits_spill above/below.)
                     q.memcpy(h_t2_meta  + t2_count, d_t2_meta_stage,  pass_count * sizeof(uint64_t));
                     q.memcpy(h_t2_mi    + t2_count, d_t2_mi_stage,    pass_count * sizeof(uint32_t));
                     q.memcpy(h_t2_xbits + t2_count, d_t2_xbits_stage, pass_count * sizeof(uint32_t));
@@ -2854,6 +3224,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // build its inputs from h_t2_meta/h_t2_mi/h_t2_xbits.
         if (scratch.tiny_mode) {
             if (h_meta_owned) s_free_host(stats, h_t1_meta, q);
+            t1_meta_spill.reset();  // P1: free staging window + close/unlink temp file
             h_t1_meta = nullptr;
             if (h_keys_owned && !scratch.pool) s_free_host(stats, h_t1_keys_merged, q);
             h_t1_keys_merged = nullptr;
@@ -3335,9 +3706,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         if (!scratch.plain_mode) {
             s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
-            q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
-            q.wait();
-            if (h_xbits_owned) s_free_host(stats, h_t2_xbits, q);
+            if (t2_xbits_spill) {  // compact spill: disk -> device, then release
+                t2_xbits_spill->read_to_device(d_t2_xbits, 0, t2_count);
+                t2_xbits_spill.reset();
+            } else {
+                q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t));
+                q.wait();
+                if (h_xbits_owned) s_free_host(stats, h_t2_xbits, q);
+            }
             h_t2_xbits = nullptr;
         }
 
@@ -3416,7 +3792,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // --- Xbits gather (tiled output → h_t2_xbits) ---
         s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
-        q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
+        if (t2_xbits_spill)  // minimal/tiny spill: whole unsorted xbits disk -> device
+            t2_xbits_spill->read_to_device(d_t2_xbits, 0, t2_count);
+        else
+            q.memcpy(d_t2_xbits, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
         {
             uint32_t* d_xbits_tile = nullptr;
             s_malloc(stats, d_xbits_tile, tile_max * sizeof(uint32_t), "d_t2_xbits_sorted_tile");
@@ -3435,8 +3814,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 launch_gather_u32(
                     d_t2_xbits, idx_src,
                     d_xbits_tile, tile_n, q);
-                q.memcpy(h_t2_xbits + tile_off, d_xbits_tile,
-                         tile_n * sizeof(uint32_t)).wait();
+                if (t2_xbits_spill)
+                    t2_xbits_spill->write_from_device(d_xbits_tile, tile_off, tile_n);
+                else
+                    q.memcpy(h_t2_xbits + tile_off, d_xbits_tile,
+                             tile_n * sizeof(uint32_t)).wait();
             }
             s_free(stats, d_xbits_tile);
         }
@@ -3467,8 +3849,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // when running in minimal mode.
         if (!scratch.tiny_mode && !scratch.stop_after_t2_sort) {
             s_malloc(stats, d_t2_xbits_sorted, cap * sizeof(uint32_t), "d_t2_xbits_sorted");
-            q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
-            if (h_xbits_owned) s_free_host(stats, h_t2_xbits, q);
+            if (t2_xbits_spill) {  // minimal spill: sorted xbits disk -> device, then release
+                t2_xbits_spill->read_to_device(d_t2_xbits_sorted, 0, t2_count);
+                t2_xbits_spill.reset();
+            } else {
+                q.memcpy(d_t2_xbits_sorted, h_t2_xbits, t2_count * sizeof(uint32_t)).wait();
+                if (h_xbits_owned) s_free_host(stats, h_t2_xbits, q);
+            }
             h_t2_xbits = nullptr;
         }
 
@@ -3667,9 +4054,20 @@ t3_match_entry:
         }
         s_malloc(stats, d_t3_match_temp, t3_temp_bytes,                          "d_t3_match_temp");
 
-        bool const h_t3_owned = (scratch.h_t3 == nullptr);
+        bool const h_t3_owned   = (scratch.h_t3 == nullptr);
+        // Host-RAM disk-offload: when the budget policy selected h_t3 and we
+        // own it, redirect this ~2 GiB table to a TempFile via the shared
+        // SpillEngine. h_t3 stays null; t3_spill services every access.
+        bool const h_t3_spilled = h_t3_owned && scratch.spill.h_t3;
         T3PairingGpu* h_t3 = nullptr;
-        if (h_t3_owned) {
+        if (h_t3_spilled) {
+            t3_spill = std::make_unique<SpillBuffer>(
+                ensure_spill_engine(), sizeof(T3PairingGpu));
+            std::fprintf(stderr,
+                "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                t3_spill->file.path().c_str(),
+                cap * sizeof(T3PairingGpu) / 1073741824.0);
+        } else if (h_t3_owned) {
             h_t3 = scratch.pool
                 ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
                 : s_malloc_host<T3PairingGpu>(stats, cap * sizeof(T3PairingGpu),
@@ -3677,7 +4075,7 @@ t3_match_entry:
         } else {
             h_t3 = reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
         }
-        if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
+        if (!h_t3 && !t3_spill) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
         // Compute bucket + fine-bucket offsets in d_t3_match_temp; also
         // zero d_counter. Same call shape as compact path.
@@ -3866,8 +4264,11 @@ t3_match_entry:
                     if (host_offset + pass_count > cap) {
                         throw std::runtime_error("T3 overflow (staged accumulation)");
                     }
-                    q.memcpy(h_t3 + host_offset, d_t3_stage,
-                             pass_count * sizeof(T3PairingGpu)).wait();
+                    if (t3_spill)
+                        t3_spill->write_from_device(d_t3_stage, host_offset, pass_count);
+                    else
+                        q.memcpy(h_t3 + host_offset, d_t3_stage,
+                                 pass_count * sizeof(T3PairingGpu)).wait();
                     host_offset += pass_count;
                     q.memset(d_counter, 0, sizeof(uint64_t)).wait();
                 }
@@ -3926,8 +4327,11 @@ t3_match_entry:
                 if (host_offset + pass_count > cap) {
                     throw std::runtime_error("T3 overflow (staged accumulation)");
                 }
-                q.memcpy(h_t3 + host_offset, d_t3_stage,
-                         pass_count * sizeof(T3PairingGpu)).wait();
+                if (t3_spill)
+                    t3_spill->write_from_device(d_t3_stage, host_offset, pass_count);
+                else
+                    q.memcpy(h_t3 + host_offset, d_t3_stage,
+                             pass_count * sizeof(T3PairingGpu)).wait();
                 host_offset += pass_count;
                 q.memset(d_counter, 0, sizeof(uint64_t)).wait();
 
@@ -3952,6 +4356,7 @@ t3_match_entry:
         // Tiny: d_t2_xbits_sorted and d_t2_keys_merged are null (parked
         // on host pinned). Free the host buffers instead.
         if (scratch.tiny_mode) {
+            // Tiny keeps h_t2_xbits pinned (T2-sort partition is USM-host).
             if (h_xbits_owned) s_free_host(stats, h_t2_xbits, q);
             h_t2_xbits = nullptr;
             if (h_keys_owned && !scratch.pool) s_free_host(stats, h_t2_keys_merged, q);
@@ -3975,11 +4380,18 @@ t3_match_entry:
         // T3 sort.
         if (!scratch.tiny_mode) {
             s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
-            q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
-            if (h_t3_owned && !scratch.pool) s_free_host(stats, h_t3, q);
+            if (t3_spill) {
+                // Minimal: pull the spilled table back to the device in one
+                // double-buffered pass, then release its disk file.
+                t3_spill->read_to_device(d_t3, 0, t3_count);
+                t3_spill.reset();
+            } else {
+                q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
+                if (h_t3_owned && !scratch.pool) s_free_host(stats, h_t3, q);
+            }
         }
         // Stash h_t3 ownership for T3 sort cleanup. d_t3 stays nullptr
-        // in tiny mode; the T3 sort phase reads h_t3 directly.
+        // in tiny mode; the T3 sort phase reads h_t3 (or t3_spill) directly.
         scratch_tiny_h_t3        = scratch.tiny_mode ? h_t3 : nullptr;
         scratch_tiny_h_t3_owned  = (scratch.tiny_mode && h_t3_owned && !scratch.pool);
     } else {
@@ -3995,9 +4407,19 @@ t3_match_entry:
         // Stage 4f: reuse scratch.h_t3 when provided (amortised across
         // batch). T3PairingGpu is just a uint64 proof_fragment, so the
         // scratch buffer is declared as uint64_t* and reinterpret-cast.
-        bool const h_t3_owned = (scratch.h_t3 == nullptr);
+        bool const h_t3_owned   = (scratch.h_t3 == nullptr);
+        bool const h_t3_spilled = h_t3_owned && scratch.spill.h_t3;
         T3PairingGpu* h_t3 = nullptr;
-        if (h_t3_owned) {
+        if (h_t3_spilled) {
+            // Host-RAM disk-offload: redirect the ~2 GiB h_t3 accumulator to
+            // a TempFile via the shared SpillEngine (compact tier).
+            t3_spill = std::make_unique<SpillBuffer>(
+                ensure_spill_engine(), sizeof(T3PairingGpu));
+            std::fprintf(stderr,
+                "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                t3_spill->file.path().c_str(),
+                cap * sizeof(T3PairingGpu) / 1073741824.0);
+        } else if (h_t3_owned) {
             h_t3 = scratch.pool
                 ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
                 : s_malloc_host<T3PairingGpu>(stats, cap * sizeof(T3PairingGpu),
@@ -4005,7 +4427,7 @@ t3_match_entry:
         } else {
             h_t3 = reinterpret_cast<T3PairingGpu*>(scratch.h_t3);
         }
-        if (!h_t3) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
+        if (!h_t3 && !t3_spill) throw std::runtime_error("sycl::malloc_host(h_t3) failed");
 
         // Compute bucket + fine-bucket offsets once; both match passes
         // share them. Also zeroes d_counter.
@@ -4038,8 +4460,11 @@ t3_match_entry:
             if (host_offset + pass_count > cap) {
                 throw std::runtime_error("T3 overflow (staged accumulation)");
             }
-            q.memcpy(h_t3 + host_offset, d_t3_stage,
-                     pass_count * sizeof(T3PairingGpu)).wait();
+            if (t3_spill)
+                t3_spill->write_from_device(d_t3_stage, host_offset, pass_count);
+            else
+                q.memcpy(h_t3 + host_offset, d_t3_stage,
+                         pass_count * sizeof(T3PairingGpu)).wait();
             // Reset counter so the next pass writes at stage index 0.
             q.memset(d_counter, 0, sizeof(uint64_t)).wait();
             return pass_count;
@@ -4063,8 +4488,13 @@ t3_match_entry:
 
         // Re-hydrate full-cap d_t3 on device for T3 sort.
         s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
-        q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
-        if (h_t3_owned) s_free_host(stats, h_t3, q);
+        if (t3_spill) {
+            t3_spill->read_to_device(d_t3, 0, t3_count);
+            t3_spill.reset();
+        } else {
+            q.memcpy(d_t3, h_t3, t3_count * sizeof(T3PairingGpu)).wait();
+            if (h_t3_owned) s_free_host(stats, h_t3, q);
+        }
     }
 
     // ---------- Phase T3 sort ----------
@@ -4180,6 +4610,11 @@ t3_match_entry:
         // cap-sized host pinned (one for h_frags + one for h_pinned
         // in D2H).
         uint64_t* h_frags = nullptr;
+        // Host-RAM disk-offload: mmap-backed home for the non-tiny h_frags
+        // when the budget policy selected it (CPU inplace_merge target, so
+        // NOT the device-staging SpillBuffer). Held here so the mapping
+        // outlives the merge + final D2H below.
+        std::unique_ptr<pos2gpu::TempFile> frags_spill_file;
         if (scratch.tiny_mode && pinned_dst && pinned_capacity >= cap) {
             h_frags = pinned_dst;
             d_frags_out_on_host = true;
@@ -4188,6 +4623,18 @@ t3_match_entry:
                 stats, cap * sizeof(uint64_t), "h_frags_oneshot", q);
             h_frags = h_frags_owned_oneshot;
             d_frags_out_on_host = true;
+        } else if (scratch.spill.h_frags) {
+            // ~2 GiB pageable, file-backed drop-in. q.memcpy D2H into it
+            // (line ~4614) and std::inplace_merge both work on a plain
+            // host pointer; under pressure the kernel reclaims its pages
+            // to THIS temp file instead of holding them pinned.
+            frags_spill_file = std::make_unique<pos2gpu::TempFile>();
+            h_frags = static_cast<uint64_t*>(
+                frags_spill_file->map(cap * sizeof(uint64_t)));
+            std::fprintf(stderr,
+                "[spill] h_frags -> mmap %s (pageable, %.2f GiB file-backed)\n",
+                frags_spill_file->path().c_str(),
+                double(cap) * sizeof(uint64_t) / 1073741824.0);
         } else {
             h_frags = s_malloc_host<uint64_t>(
                 stats, cap * sizeof(uint64_t), "h_frags", q);
@@ -4210,8 +4657,13 @@ t3_match_entry:
 
             uint64_t const* sort_in = nullptr;
             if (scratch.tiny_mode) {
-                q.memcpy(d_frags_in_tile, h_t3_src + tile_off,
-                         tile_n * sizeof(uint64_t)).wait();
+                if (t3_spill)
+                    // Tiny: pull this tile of the spilled h_t3 from disk,
+                    // double-buffered through the shared staging windows.
+                    t3_spill->read_to_device(d_frags_in_tile, tile_off, tile_n);
+                else
+                    q.memcpy(d_frags_in_tile, h_t3_src + tile_off,
+                             tile_n * sizeof(uint64_t)).wait();
                 sort_in = d_frags_in_tile;
             } else {
                 sort_in = d_frags_in + tile_off;
@@ -4231,7 +4683,8 @@ t3_match_entry:
         if (scratch.tiny_mode) {
             // h_t3 was kept alive into T3 sort; free now that all tiles
             // have been sorted + D2H'd.
-            if (scratch_tiny_h_t3_owned) s_free_host(stats, scratch_tiny_h_t3, q);
+            if (t3_spill) t3_spill.reset();
+            else if (scratch_tiny_h_t3_owned) s_free_host(stats, scratch_tiny_h_t3, q);
             scratch_tiny_h_t3 = nullptr;
         } else {
             s_free(stats, d_t3);
@@ -4288,7 +4741,8 @@ t3_match_entry:
             if (t3_count > 0) {
                 q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
             }
-            s_free_host(stats, h_frags, q);
+            if (frags_spill_file) frags_spill_file.reset();  // munmap + drop temp file
+            else s_free_host(stats, h_frags, q);
         }
     }
 

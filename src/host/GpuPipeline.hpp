@@ -306,6 +306,38 @@ struct StreamingPinnedScratch {
     // allocation, ~5-9% slower on plain/compact and ~10% FASTER on
     // minimal, where the scratch was a net pessimisation).
     uint64_t twophase_budget_bytes = 0;
+
+    // Host-RAM disk-offload plan: which cold, spillable tables to redirect
+    // to a TempFile-backed disk home (streamed through the shared
+    // SpillEngine's 64 MiB of pinned staging) instead of a full pinned
+    // allocation. Chosen largest-first by BatchPlotter's budget policy
+    // from --max-host-ram / XCHPLOT2_MAX_HOST_RAM. Default (all false) =
+    // no spill, byte-identical to the historical all-pinned path.
+    // Two redirect classes (see docs/host-ram-disk-offload.md):
+    //   - DMA tables (SpillBuffer, device<->disk via the shared 64 MiB
+    //     staging): h_t1_meta, h_t3, h_t2_xbits. The full buffer never
+    //     resides in host RAM, so the RSS win is real even without
+    //     memory pressure.
+    //   - CPU-touched tables (mmap'd TempFile, pageable drop-in):
+    //     h_frags. Reclaimable only under pressure.
+    // Some large tables are deliberately NOT routable because a device
+    // KERNEL accesses them through a USM-host pointer, which a disk file
+    // or mmap cannot satisfy: h_keys_merged (streaming-partition kernel
+    // writes it) and h_t2_meta (Tiny's Phase-1.5b T2-sort partition reads
+    // it USM-host; it aliases h_meta in Compact/Minimal). h_t2_xbits is
+    // routable in Compact/Minimal only for the same reason (Tiny's T2-sort
+    // partition reads it USM-host). Lifting either would need a disk-aware
+    // T2-sort-partition rewrite, out of scope here.
+    struct SpillPlan {
+        bool h_t1_meta  = false;  // ~cap·8 B, tiny tier only            (DMA)
+        bool h_t3       = false;  // ~cap·8 B, compact / minimal / tiny  (DMA)
+        bool h_t2_xbits = false;  // ~cap·4 B, compact / minimal only    (DMA)
+        bool h_frags    = false;  // ~cap·8 B, compact / minimal only    (mmap)
+        bool any() const {
+            return h_t1_meta || h_t3 || h_t2_xbits || h_frags;
+        }
+    };
+    SpillPlan spill;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

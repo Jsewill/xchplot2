@@ -11,6 +11,7 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace pos2gpu {
@@ -48,6 +49,7 @@ TempFile::TempFile(std::string_view dir)
 
 TempFile::~TempFile()
 {
+    unmap();
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -58,22 +60,69 @@ TempFile::TempFile(TempFile&& other) noexcept
     : fd_(other.fd_)
     , path_(std::move(other.path_))
     , high_water_(other.high_water_)
+    , map_(other.map_)
+    , map_bytes_(other.map_bytes_)
 {
     other.fd_ = -1;
     other.high_water_ = 0;
+    other.map_ = nullptr;
+    other.map_bytes_ = 0;
 }
 
 TempFile& TempFile::operator=(TempFile&& other) noexcept
 {
     if (this != &other) {
+        unmap();
         if (fd_ >= 0) ::close(fd_);
         fd_         = other.fd_;
         path_       = std::move(other.path_);
         high_water_ = other.high_water_;
+        map_        = other.map_;
+        map_bytes_  = other.map_bytes_;
         other.fd_ = -1;
         other.high_water_ = 0;
+        other.map_ = nullptr;
+        other.map_bytes_ = 0;
     }
     return *this;
+}
+
+void* TempFile::map(std::size_t bytes)
+{
+    if (map_) {
+        throw std::runtime_error(
+            "TempFile::map: already mapped (one mapping per TempFile)");
+    }
+    if (bytes == 0) return nullptr;
+    // Size the file so the whole mapping is backed — touching a mapped
+    // page past EOF would raise SIGBUS otherwise.
+    if (::ftruncate(fd_, static_cast<off_t>(bytes)) != 0) {
+        int const e = errno;
+        throw std::runtime_error(
+            "TempFile::ftruncate(" + std::to_string(bytes) + ") failed: " +
+            std::strerror(e));
+    }
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd_, 0);
+    if (p == MAP_FAILED) {
+        int const e = errno;
+        throw std::runtime_error(
+            "TempFile::mmap(" + std::to_string(bytes) + ") failed: " +
+            std::strerror(e));
+    }
+    map_       = p;
+    map_bytes_ = bytes;
+    if (bytes > high_water_) high_water_ = bytes;
+    return p;
+}
+
+void TempFile::unmap() noexcept
+{
+    if (map_) {
+        ::munmap(map_, map_bytes_);
+        map_       = nullptr;
+        map_bytes_ = 0;
+    }
 }
 
 void TempFile::pwrite_at(std::uint64_t offset, void const* data, std::size_t bytes)

@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -42,6 +43,53 @@
 #include <unistd.h>  // isatty — progress defaults to on for interactive runs
 
 namespace {
+
+// Parse a --max-host-ram value: "8G"/"8GiB"/"8g", "8192M"/"8192MiB",
+// "512K", "4T", a raw byte count, or "min"/"0" (== spill everything
+// routable, lowest floor). Binary units (G == GiB). Returns false on a
+// malformed value; on success sets `out_bytes` (0 for min).
+bool parse_host_ram_arg(std::string const& raw, std::uint64_t& out_bytes)
+{
+    std::string s = raw;
+    for (auto& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+    if (s == "min") { out_bytes = 0; return true; }
+    if (s.empty()) return false;
+
+    // Split trailing unit suffix (k/m/g/t, optional 'i', optional 'b').
+    std::size_t pos = 0;
+    long double value = 0.0L;
+    try { value = std::stold(s, &pos); }
+    catch (...) { return false; }
+    if (value < 0.0L) return false;
+
+    std::string unit = s.substr(pos);
+    std::uint64_t mult = 1;
+    if (!unit.empty()) {
+        char u = unit[0];
+        if      (u == 'k') mult = 1ULL << 10;
+        else if (u == 'm') mult = 1ULL << 20;
+        else if (u == 'g') mult = 1ULL << 30;
+        else if (u == 't') mult = 1ULL << 40;
+        else if (u == 'b') mult = 1;
+        else return false;
+        // Allow "gib"/"gb"/"g"; reject anything else.
+        std::string rest = unit.substr(1);
+        if (!(rest.empty() || rest == "b" || rest == "ib")) return false;
+    }
+    out_bytes = static_cast<std::uint64_t>(value * static_cast<long double>(mult));
+    return true;
+}
+
+// Apply the XCHPLOT2_MAX_HOST_RAM env fallback when --max-host-ram was not
+// passed on the command line. The flag always wins.
+void resolve_host_ram_env(pos2gpu::BatchOptions& o)
+{
+    if (o.has_max_host_ram) return;
+    if (char const* v = std::getenv("XCHPLOT2_MAX_HOST_RAM"); v && v[0]) {
+        std::uint64_t b = 0;
+        if (parse_host_ram_arg(v, b)) { o.has_max_host_ram = true; o.max_host_ram = b; }
+    }
+}
 
 // Tri-state --progress resolution: explicit --progress/--no-progress
 // wins; otherwise default to on when stderr is a TTY (where the line
@@ -201,6 +249,17 @@ void print_usage(char const* prog)
         << "                                      tier that fits. Equivalent to\n"
         << "                                      XCHPLOT2_STREAMING_TIER env var;\n"
         << "                                      CLI flag wins if both set.\n"
+        << "    --max-host-ram 8G|8192M|<bytes>|min : cap the streaming path's pinned\n"
+        << "                                      host footprint by spilling its large\n"
+        << "                                      cold tables (h_t1_meta, h_t3, ...) to\n"
+        << "                                      a temp-dir file, largest-first, until\n"
+        << "                                      the modelled resident host peak fits.\n"
+        << "                                      'min' = spill everything routable\n"
+        << "                                      (lowest floor). Unset = no spill\n"
+        << "                                      (byte-identical to today). Env:\n"
+        << "                                      XCHPLOT2_MAX_HOST_RAM (flag wins).\n"
+        << "    --temp-dir PATH               : where spilled tables live (sets\n"
+        << "                                      XCHPLOT2_TEMP_DIR). Prefer fast NVMe.\n"
         << "  " << prog << " verify <plotfile> [--trials N]\n"
         << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
         << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
@@ -1051,6 +1110,7 @@ BenchMeasurement run_bench_pass(
     // throughput number for a configuration that will OOM on a smaller card.
     // The 0 flag leaves an explicit POS2GPU_ASSERT_VRAM=0 from the user alone.
     setenv("POS2GPU_ASSERT_VRAM", "1", 0);
+    resolve_host_ram_env(run_opts);
     try {
         auto const res = pos2gpu::run_batch(entries, run_opts);
         if (res.plots_failed > 0 || res.plots_written == 0) {
@@ -1360,6 +1420,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
+            }
+            else if (a == "--max-host-ram" && need(1)) {
+                std::uint64_t b = 0;
+                if (!parse_host_ram_arg(argv[++i], b)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "8G / 8192M / <bytes>, or 'min' (got '"
+                              << argv[i] << "')\n";
+                    return 1;
+                }
+                opts.has_max_host_ram = true;
+                opts.max_host_ram     = b;
+            }
+            else if (a == "--temp-dir" && need(1)) {
+                setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
             }
             else if (a == "--devices" && need(1)) {
                 if (!parse_devices_arg(argv[++i], opts)) {
@@ -1701,6 +1775,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
             }
+            else if (a == "--max-host-ram" && i + 1 < argc) {
+                std::uint64_t b = 0;
+                if (!parse_host_ram_arg(argv[++i], b)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "8G / 8192M / <bytes>, or 'min' (got '"
+                              << argv[i] << "')\n";
+                    return 1;
+                }
+                opts.has_max_host_ram = true;
+                opts.max_host_ram     = b;
+            }
+            else if (a == "--temp-dir" && i + 1 < argc) {
+                setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
+            }
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: --devices expects 'all', 'cpu', or a "
@@ -1726,6 +1814,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if (!opts.quiet) {
                 std::cerr << "[batch] " << entries.size() << " plots queued\n";
             }
+            resolve_host_ram_env(opts);
             auto res = pos2gpu::run_batch(entries, opts);
             if (!opts.quiet) print_run_summary("[batch]", res);
             return (res.plots_failed > 0) ? 3 : 0;
@@ -1879,6 +1968,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string plot_streaming_tier;
         std::map<int, std::string> plot_per_device_tier;
         std::string plot_all_gpus_tier;
+        bool          plot_has_max_host_ram = false;
+        std::uint64_t plot_max_host_ram     = 0;
         std::vector<pos2gpu::PipelineStageTier> plot_pipeline_tiers;
 
         for (int i = 2; i < argc; ++i) {
@@ -1995,6 +2086,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;
+            }
+            else if  (a == "--max-host-ram" && need(1)) {
+                std::uint64_t b = 0;
+                if (!parse_host_ram_arg(argv[++i], b)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "8G / 8192M / <bytes>, or 'min' (got '"
+                              << argv[i] << "')\n";
+                    return 1;
+                }
+                plot_has_max_host_ram = true;
+                plot_max_host_ram     = b;
+            }
+            else if  (a == "--temp-dir" && need(1)) {
+                setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
             }
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
@@ -2189,8 +2294,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.streaming_tier    = plot_streaming_tier;
             opts.per_device_tier   = plot_per_device_tier;
             opts.all_gpus_tier     = plot_all_gpus_tier;
+            opts.has_max_host_ram  = plot_has_max_host_ram;
+            opts.max_host_ram      = plot_max_host_ram;
             opts.quiet             = plot_quiet;
             opts.progress          = resolve_progress(plot_progress_tri, plot_quiet);
+            resolve_host_ram_env(opts);
             auto res = pos2gpu::run_batch(entries, opts);
             if (!plot_quiet) print_run_summary("[plot]", res);
             // stdout path listing is the machine-readable result — kept

@@ -23,8 +23,11 @@
 #include "gpu/SyclBackend.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <stdexcept>
 #include <vector>
+
+#include <unistd.h>   // pread (P1 host-RAM disk-offload)
 
 #include <sycl/sycl.hpp>
 
@@ -81,7 +84,8 @@ void launch_streaming_partition_u32_u64(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q)
+    sycl::queue& q,
+    SpillTileReader const* spill_reader)
 {
     if (num_top_bits < 1 || num_top_bits > 16) {
         throw std::invalid_argument(
@@ -176,13 +180,62 @@ void launch_streaming_partition_u32_u64(
     // that's a Phase 1.3c optimization to attempt if measured
     // throughput on real target hardware demands it. First cut:
     // straight serial.
+    // P1.5 spill: prime tile 0's disk pread before the loop so the
+    // first wait() below has something in flight. Every subsequent tile
+    // is prefetched during the prior tile's kernel (double-buffered).
+    // (XCHPLOT2_SPILL_NO_OVERLAP forces the synchronous per-tile path
+    // below — measurement only.)
+    if (spill_reader && spill_reader->overlap && tiles > 0) {
+        uint64_t const n0 = std::min(tile_size, count);
+        if (n0 > spill_reader->win_entries) {
+            throw std::runtime_error(
+                "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+        }
+        spill_reader->submit(spill_reader->ctx, 0, 0, n0 * sizeof(uint64_t));
+    }
     for (uint64_t t = 0; t < tiles; ++t) {
         uint64_t const tile_off = t * tile_size;
         if (tile_off >= count) break;
         uint64_t const tile_n   = std::min(tile_size, count - tile_off);
 
-        q.memcpy(d_vals_tile, h_vals_in + tile_off,
-                 tile_n * sizeof(uint64_t)).wait();
+        if (spill_reader && spill_reader->overlap) {
+            // Double-buffered disk read: tile t was prefetched into
+            // window (t&1). Kick off tile t+1's pread into the OTHER
+            // window first, then consume this tile — so tile t+1's disk
+            // read overlaps this tile's H2D + partition kernel. FIFO on
+            // the one worker keeps the two windows race-free.
+            int const slot = static_cast<int>(t & 1u);
+            uint64_t const next_off = tile_off + tile_size;
+            if (next_off < count) {
+                uint64_t const next_n = std::min(tile_size, count - next_off);
+                if (next_n > spill_reader->win_entries) {
+                    throw std::runtime_error(
+                        "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+                }
+                spill_reader->submit(spill_reader->ctx, slot ^ 1,
+                                     next_off * sizeof(uint64_t),
+                                     next_n * sizeof(uint64_t));
+            }
+            spill_reader->wait(spill_reader->ctx, slot);        // tile t's pread landed
+            q.memcpy(d_vals_tile, spill_reader->win[slot],
+                     tile_n * sizeof(uint64_t)).wait();          // H2D from window
+        } else if (spill_reader) {
+            // Synchronous per-tile disk read (XCHPLOT2_SPILL_NO_OVERLAP,
+            // measurement only): pread tile t, then H2D, no prefetch.
+            if (tile_n > spill_reader->win_entries) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+            }
+            spill_reader->submit(spill_reader->ctx, 0,
+                                 tile_off * sizeof(uint64_t),
+                                 tile_n * sizeof(uint64_t));
+            spill_reader->wait(spill_reader->ctx, 0);
+            q.memcpy(d_vals_tile, spill_reader->win[0],
+                     tile_n * sizeof(uint64_t)).wait();
+        } else {
+            q.memcpy(d_vals_tile, h_vals_in + tile_off,
+                     tile_n * sizeof(uint64_t)).wait();
+        }
 
         // Capture-by-value: the kernel writes through h_part_keys /
         // h_part_vals which are USM-host pointers. SYCL guarantees

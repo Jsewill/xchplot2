@@ -62,6 +62,29 @@
 
 namespace pos2gpu {
 
+// P1.5 host-RAM disk-offload (XCHPLOT2_SPILL_T1META): overlapped
+// source-tile reader for the streaming-partition spill path. When a
+// non-null SpillTileReader is passed, pass-2 does NOT read from
+// h_vals_in (which is then null); instead each source-values tile is
+// pread from disk by a background I/O worker into one of TWO ping-pong
+// windows, double-buffered so tile t+1's pread overlaps tile t's
+// partition kernel. The primitive drives it:
+//   submit(ctx, slot, off_bytes, bytes)  — enqueue an async pread of
+//       `bytes` at file offset `off_bytes` into window `slot` (0/1).
+//   wait(ctx, slot)                      — block until window `slot`'s
+//       most recent submit has completed.
+// win[slot] is the pinned destination window; each tile must be
+// <= win_entries u64 entries (caller sizes tile_count to guarantee it).
+// Null reader keeps the in-memory h_vals_in path, byte-identical.
+struct SpillTileReader {
+    void*     ctx         = nullptr;
+    uint64_t* win[2]      = {nullptr, nullptr};
+    uint64_t  win_entries = 0;
+    bool      overlap     = true;   // false => synchronous per-tile (measurement only)
+    void (*submit)(void* ctx, int slot, uint64_t off_bytes, uint64_t bytes) = nullptr;
+    void (*wait)(void* ctx, int slot)                                       = nullptr;
+};
+
 void launch_streaming_partition_u32_u64(
     void* d_scratch,
     size_t& scratch_bytes,
@@ -74,7 +97,11 @@ void launch_streaming_partition_u32_u64(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q);
+    sycl::queue& q,
+    // P1.5 host-RAM disk-offload: non-null routes pass-2's source-values
+    // tiles through the double-buffered disk reader instead of h_vals_in
+    // (which is then null). Null = in-memory path, byte-identical.
+    SpillTileReader const* spill_reader = nullptr);
 
 // Triple-val variant: same shape as launch_streaming_partition_u32_u64
 // but also carries a u32 second-value array alongside the u64 first
