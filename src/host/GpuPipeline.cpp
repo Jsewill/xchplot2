@@ -1677,6 +1677,47 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         int p_t1 = begin_phase("T1 match");
         uint64_t host_offset = 0;
+        // POS2GPU_T1_PASS_TRACE=1: one line per tiny sub-section pass with
+        // both the INPUT slice (l_n / r_buck_n, computed on the host by
+        // binary search over h_xs_pinned) and the OUTPUT pair count. A
+        // corrupt tiny+spill plot loses exactly 1/16 of T1, i.e. one pass
+        // of the sixteen; diffing this trace against a good run says which
+        // pass, and — decisively — whether that pass was FED wrong (bad
+        // slice bounds) or fed right and MATCHED wrong.
+        bool const t1_pass_trace = [] {
+            char const* v = std::getenv("POS2GPU_T1_PASS_TRACE");
+            return v && v[0] == '1';
+        }();
+        // POS2GPU_T1_DROP_R=<section_l>,<mk>: fault injection — skip the R
+        // half of that pass's tile H2D, reproducing exactly what an
+        // unwaited copy leaves behind. This exists to prove causation
+        // rather than infer it: the race is ~1-in-8 and nothing about
+        // observing it says the missing copy is what caused the bad plot.
+        // Dropping the copy on purpose and getting the SAME plot hash does.
+        // Add POS2GPU_T1_DROP_R_NOTHROW=1 to suppress the zero-yield guard
+        // below, so the run produces the corrupt plot instead of the error.
+        int drop_r_sec = -1, drop_r_mk = -1;
+        if (char const* v = std::getenv("POS2GPU_T1_DROP_R"); v && v[0]) {
+            std::sscanf(v, "%d,%d", &drop_r_sec, &drop_r_mk);
+        }
+        bool const drop_r_nothrow = [] {
+            char const* v = std::getenv("POS2GPU_T1_DROP_R_NOTHROW");
+            return v && v[0] == '1';
+        }();
+        // This switch deliberately corrupts the plot. Say so, loudly and
+        // unconditionally — a plotter must never damage output on the
+        // strength of a stray environment variable without leaving a trace
+        // in the log that explains the bad plot.
+        if (drop_r_sec >= 0) {
+            std::fprintf(stderr,
+                "[t1-inject] *** POS2GPU_T1_DROP_R=%d,%d IS SET: deliberately "
+                "skipping that pass's R tile copy. THIS CORRUPTS THE PLOT. %s ***\n",
+                drop_r_sec, drop_r_mk,
+                drop_r_nothrow
+                    ? "POS2GPU_T1_DROP_R_NOTHROW=1 also suppresses the zero-yield "
+                      "guard, so a SILENTLY WRONG plot WILL be written."
+                    : "The zero-yield guard will abort the plot.");
+        }
         for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
             if (scratch.tiny_mode) {
                 // N = num_match_keys sub-passes per section_l. Each
@@ -1705,21 +1746,44 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     // bucket_id section_r*nmk + mk. The single-R-bucket
                     // bucket_id is uniformly above or below all L
                     // bucket_ids based on section_l vs section_r.
+                    //
+                    // BOTH halves must be waited, not just the second.
+                    // These are two independent USM copies with no data
+                    // dependency between them, so on an out-of-order queue
+                    // waiting the second says nothing about the first; the
+                    // "issue N, wait the last" shorthand is only safe when
+                    // the ops are ordered by something else. Losing the R
+                    // half here is silent and severe: launch_t1_match_range
+                    // finds its R candidates through d_fine_offsets[r_bucket],
+                    // and a tile whose head still holds the PREVIOUS pass's
+                    // R bucket contains no entries for this one — so every L
+                    // thread reads an empty range and the pass yields exactly
+                    // zero pairs. That drops 1/16 of T1 and, through pairing,
+                    // (15/16)^2 of T2 and (15/16)^4 of T3, for a plot that is
+                    // ~78% the right size and completely wrong. Waiting both
+                    // events keeps the copies concurrent and costs nothing.
+                    bool const drop_r = (int(section_l) == drop_r_sec &&
+                                         int(mk)        == drop_r_mk);
+                    sycl::event e_l, e_r;
                     if (section_l < section_r) {
-                        q.memcpy(d_xs_tile,
-                                 h_xs_pinned + l_off,
-                                 l_n * sizeof(XsCandidateGpu));
-                        q.memcpy(d_xs_tile + l_n,
-                                 h_xs_pinned + r_buck_abs_off,
-                                 r_buck_n * sizeof(XsCandidateGpu)).wait();
+                        e_l = q.memcpy(d_xs_tile,
+                                       h_xs_pinned + l_off,
+                                       l_n * sizeof(XsCandidateGpu));
+                        if (!drop_r)
+                            e_r = q.memcpy(d_xs_tile + l_n,
+                                           h_xs_pinned + r_buck_abs_off,
+                                           r_buck_n * sizeof(XsCandidateGpu));
                     } else {
-                        q.memcpy(d_xs_tile,
-                                 h_xs_pinned + r_buck_abs_off,
-                                 r_buck_n * sizeof(XsCandidateGpu));
-                        q.memcpy(d_xs_tile + r_buck_n,
-                                 h_xs_pinned + l_off,
-                                 l_n * sizeof(XsCandidateGpu)).wait();
+                        if (!drop_r)
+                            e_r = q.memcpy(d_xs_tile,
+                                           h_xs_pinned + r_buck_abs_off,
+                                           r_buck_n * sizeof(XsCandidateGpu));
+                        e_l = q.memcpy(d_xs_tile + r_buck_n,
+                                       h_xs_pinned + l_off,
+                                       l_n * sizeof(XsCandidateGpu));
                     }
+                    e_l.wait();
+                    if (!drop_r) e_r.wait();
 
                     launch_t1_match_prepare(
                         cfg.plot_id.data(), t1p, d_xs_tile, total_for_pass,
@@ -1749,6 +1813,42 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     // corruption.
                     if (host_offset + pass_count > cap) {
                         throw std::runtime_error("T1 overflow (sliced accumulation)");
+                    }
+                    if (t1_pass_trace) {
+                        std::fprintf(stderr,
+                            "[t1-pass] s_l=%u mk=%u  l_off=%llu l_n=%llu  "
+                            "r_off=%llu r_n=%llu  total=%llu  -> count=%llu "
+                            "host_off=%llu\n",
+                            section_l, mk,
+                            (unsigned long long)l_off, (unsigned long long)l_n,
+                            (unsigned long long)r_buck_abs_off,
+                            (unsigned long long)r_buck_n,
+                            (unsigned long long)total_for_pass,
+                            (unsigned long long)pass_count,
+                            (unsigned long long)host_offset);
+                    }
+                    // A pass fed a non-empty L section AND a non-empty R
+                    // bucket cannot legitimately match nothing: the smallest
+                    // k this tier supports puts thousands of entries on each
+                    // side, so the expected yield is thousands and P(exactly
+                    // zero) is not a number that occurs. A zero here means
+                    // the pass was fed a tile that does not contain its R
+                    // bucket — the failure that silently drops 1/16 of T1 and
+                    // produces a ~78%-sized plot that still passes every
+                    // structural check. Refuse to write that plot.
+                    if (pass_count == 0 && l_n > 0 && r_buck_n > 0
+                        && !drop_r_nothrow) {
+                        throw std::runtime_error(
+                            "T1 match (tiny sub-section) section_l=" +
+                            std::to_string(section_l) + " mk=" + std::to_string(mk) +
+                            " matched ZERO pairs from l_n=" + std::to_string(l_n) +
+                            " r_n=" + std::to_string(r_buck_n) + " (tile of " +
+                            std::to_string(total_for_pass) + "). Both inputs are "
+                            "non-empty, so this is not a real result — the "
+                            "staged tile did not contain R bucket " +
+                            std::to_string(section_r * t1_num_match_keys + mk) +
+                            ". Continuing would drop 1/16 of T1 and write a "
+                            "short, silently wrong plot.");
                     }
                     q.memcpy(h_t1_meta + host_offset, d_t1_meta_stage,
                              pass_count * sizeof(uint64_t)).wait();
