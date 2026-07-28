@@ -74,9 +74,12 @@ bool run_case(uint32_t seed, uint64_t count)
     uint32_t* d_dst_xbits_g   = sycl::malloc_device<uint32_t>(count, q);
     uint32_t* d_dst_xbits_s   = sycl::malloc_device<uint32_t>(count, q);
 
+    // q.wait() (not .wait() on the last copy): out-of-order queue — these
+    // three all feed the kernels below.
     q.memcpy(d_src_u64, h_src_u64.data(), sizeof(uint64_t) * count);
     q.memcpy(d_src_u32, h_src_u32.data(), sizeof(uint32_t) * count);
-    q.memcpy(d_indices, h_indices.data(), sizeof(uint32_t) * count).wait();
+    q.memcpy(d_indices, h_indices.data(), sizeof(uint32_t) * count);
+    q.wait();
 
     // Pre-compute inverse permutation. This is the new helper kernel —
     // its correctness is implicit in the byte-identical scatter result
@@ -126,7 +129,12 @@ bool run_case(uint32_t seed, uint64_t count)
     q.memcpy(h_dst_meta_g.data(),  d_dst_meta_g,  sizeof(uint64_t) * count);
     q.memcpy(h_dst_meta_s.data(),  d_dst_meta_s,  sizeof(uint64_t) * count);
     q.memcpy(h_dst_xbits_g.data(), d_dst_xbits_g, sizeof(uint32_t) * count);
-    q.memcpy(h_dst_xbits_s.data(), d_dst_xbits_s, sizeof(uint32_t) * count).wait();
+    q.memcpy(h_dst_xbits_s.data(), d_dst_xbits_s, sizeof(uint32_t) * count);
+    // ALL EIGHT, before the frees below: waiting only the last left seven
+    // copies possibly in flight while their device sources were freed and
+    // the host memcmp'd the results — this test could pass or fail on
+    // uninitialised memory.
+    q.wait();
 
     sycl::free(d_src_u64, q);     sycl::free(d_src_u32, q);
     sycl::free(d_indices, q);     sycl::free(d_inv_indices, q);

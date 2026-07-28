@@ -55,8 +55,12 @@ bool run_pairs(uint32_t seed, uint64_t count)
     uint32_t* d_keys_out = sycl::malloc_device<uint32_t>(count, q);
     uint32_t* d_vals_in  = sycl::malloc_device<uint32_t>(count, q);
     uint32_t* d_vals_out = sycl::malloc_device<uint32_t>(count, q);
+    // q.wait() (not .wait() on the last copy): the queue is out-of-order,
+    // so waiting one event says nothing about the others. A harness that
+    // gets this wrong can report a false PASS on stale data.
     q.memcpy(d_keys_in, h_keys.data(), sizeof(uint32_t) * count);
-    q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count).wait();
+    q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count);
+    q.wait();
 
     size_t scratch_bytes = 0;
     pos2gpu::launch_sort_pairs_u32_u32(
@@ -79,7 +83,8 @@ bool run_pairs(uint32_t seed, uint64_t count)
 
     std::vector<uint32_t> h_sorted_keys(count), h_sorted_vals(count);
     q.memcpy(h_sorted_keys.data(), d_keys_out, sizeof(uint32_t) * count);
-    q.memcpy(h_sorted_vals.data(), d_vals_out, sizeof(uint32_t) * count).wait();
+    q.memcpy(h_sorted_vals.data(), d_vals_out, sizeof(uint32_t) * count);
+    q.wait();   // both, before the frees below and the host compare
 
     if (d_scratch) sycl::free(d_scratch, q);
     sycl::free(d_keys_in,  q);

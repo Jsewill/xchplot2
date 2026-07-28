@@ -2471,10 +2471,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             uint32_t const bsz    = h_bucket_starts[b + 1] - bstart;
             if (bsz == 0) continue;
 
-            q.memcpy(d_bk_in, h_t1_keys_merged + bstart,
-                     bsz * sizeof(uint32_t));
-            q.memcpy(d_bv_in, h_part_vals + bstart,
-                     bsz * sizeof(uint64_t)).wait();
+            // Both copies feed launch_sort_pairs_u32_u64 below; on an
+            // out-of-order queue waiting only the second lets the sort
+            // race the first. See StreamingPartitionSycl.cpp:374.
+            auto e_bk = q.memcpy(d_bk_in, h_t1_keys_merged + bstart,
+                                 bsz * sizeof(uint32_t));
+            auto e_bv = q.memcpy(d_bv_in, h_part_vals + bstart,
+                                 bsz * sizeof(uint64_t));
+            e_bk.wait();
+            e_bv.wait();
 
             size_t bsb = bucket_sort_bytes;
             launch_sort_pairs_u32_u64(
@@ -2488,16 +2493,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // was the SOURCE of streaming_partition — its unsorted
             // contents are no longer needed, so we use it as the final
             // sorted-meta destination directly (in place overwrite).
-            q.memcpy(h_t1_keys_merged + bstart, d_bk_out,
-                     bsz * sizeof(uint32_t));
-            // In-order queue: the keys copy above drains before the
-            // spill's first D2H .wait() (or the else-branch .wait()).
+            // The queue is NOT in-order (an earlier comment here claimed
+            // it was). Nothing else drains this copy: the spill branch
+            // waits on the SpillEngine's own queue handle, and the next
+            // iteration's sort overwrites d_bk_out — a write-after-read
+            // hazard on a buffer whose contents are consumed after the
+            // loop. Wait for it explicitly.
+            auto e_keys_back = q.memcpy(h_t1_keys_merged + bstart, d_bk_out,
+                                        bsz * sizeof(uint32_t));
             if (t1_meta_spill) {
                 t1_meta_spill->write_from_device(d_bv_out, bstart, bsz);
             } else {
                 q.memcpy(h_t1_meta + bstart, d_bv_out,
                          bsz * sizeof(uint64_t)).wait();
             }
+            e_keys_back.wait();
         }
 
         if (d_bucket_sort_scratch) s_free(stats, d_bucket_sort_scratch);
@@ -3529,12 +3539,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
             // H2D bucket's triple (keys, meta, xbits) — bucketed,
             // not yet sorted within bucket.
-            q.memcpy(d_bk_in,  h_t2_keys_merged + bstart,
-                     bsz * sizeof(uint32_t));
-            q.memcpy(d_bmeta,  h_part_meta + bstart,
-                     bsz * sizeof(uint64_t));
-            q.memcpy(d_bxbits, h_part_xbits + bstart,
-                     bsz * sizeof(uint32_t)).wait();
+            // All three feed kernels below (d_bk_in -> sort, d_bmeta and
+            // d_bxbits -> the gathers). Out-of-order queue: wait each.
+            auto e_bk    = q.memcpy(d_bk_in,  h_t2_keys_merged + bstart,
+                                    bsz * sizeof(uint32_t));
+            auto e_bmeta = q.memcpy(d_bmeta,  h_part_meta + bstart,
+                                    bsz * sizeof(uint64_t));
+            auto e_bxb   = q.memcpy(d_bxbits, h_part_xbits + bstart,
+                                    bsz * sizeof(uint32_t));
+            e_bk.wait();
+            e_bmeta.wait();
+            e_bxb.wait();
 
             // Init identity idx so we can recover the sort
             // permutation as d_bidx_out after sorting (keys, idx).
@@ -3555,12 +3570,19 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // D2H sorted triple. h_t2_keys_merged + h_t2_meta +
             // h_t2_xbits are overwritten in place — the unsorted
             // contents at [bstart..bend) are no longer needed.
-            q.memcpy(h_t2_keys_merged + bstart, d_bk_out,
-                     bsz * sizeof(uint32_t));
-            q.memcpy(h_t2_meta        + bstart, d_bmeta_out,
-                     bsz * sizeof(uint64_t));
-            q.memcpy(h_t2_xbits       + bstart, d_bxbits_out,
-                     bsz * sizeof(uint32_t)).wait();
+            // Wait all three: the next iteration's sort and gathers
+            // overwrite d_bk_out / d_bmeta_out / d_bxbits_out, so an
+            // un-waited D2H here is a write-after-read hazard on data
+            // that is consumed after the loop.
+            auto e_kb = q.memcpy(h_t2_keys_merged + bstart, d_bk_out,
+                                 bsz * sizeof(uint32_t));
+            auto e_mb = q.memcpy(h_t2_meta        + bstart, d_bmeta_out,
+                                 bsz * sizeof(uint64_t));
+            auto e_xb = q.memcpy(h_t2_xbits       + bstart, d_bxbits_out,
+                                 bsz * sizeof(uint32_t));
+            e_kb.wait();
+            e_mb.wait();
+            e_xb.wait();
         }
 
         if (d_bucket_sort_scratch) s_free(stats, d_bucket_sort_scratch);
@@ -3699,8 +3721,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         h_AB_keys = s_malloc_host<uint32_t>(stats, ab_count * sizeof(uint32_t), "h_AB_keys", q);
         h_AB_vals = s_malloc_host<uint32_t>(stats, ab_count * sizeof(uint32_t), "h_AB_vals", q);
         if (ab_count > 0) {
-            q.memcpy(h_AB_keys, d_AB_keys, ab_count * sizeof(uint32_t));
-            q.memcpy(h_AB_vals, d_AB_vals, ab_count * sizeof(uint32_t)).wait();
+            // Wait both — the s_free below releases these copies' SOURCE
+            // buffers, so an un-waited copy is a use-after-free.
+            auto e_abk = q.memcpy(h_AB_keys, d_AB_keys, ab_count * sizeof(uint32_t));
+            auto e_abv = q.memcpy(h_AB_vals, d_AB_vals, ab_count * sizeof(uint32_t));
+            e_abk.wait();
+            e_abv.wait();
         }
         s_free(stats, d_AB_vals);
         s_free(stats, d_AB_keys);
@@ -3717,8 +3743,11 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         h_CD_keys = s_malloc_host<uint32_t>(stats, cd_count * sizeof(uint32_t), "h_CD_keys", q);
         h_CD_vals = s_malloc_host<uint32_t>(stats, cd_count * sizeof(uint32_t), "h_CD_vals", q);
         if (cd_count > 0) {
-            q.memcpy(h_CD_keys, d_CD_keys, cd_count * sizeof(uint32_t));
-            q.memcpy(h_CD_vals, d_CD_vals, cd_count * sizeof(uint32_t)).wait();
+            // Wait both — s_free below frees the sources (see AB above).
+            auto e_cdk = q.memcpy(h_CD_keys, d_CD_keys, cd_count * sizeof(uint32_t));
+            auto e_cdv = q.memcpy(h_CD_vals, d_CD_vals, cd_count * sizeof(uint32_t));
+            e_cdk.wait();
+            e_cdv.wait();
         }
         s_free(stats, d_CD_vals);
         s_free(stats, d_CD_keys);

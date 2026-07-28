@@ -47,10 +47,12 @@ bool run_case(uint32_t seed, uint64_t count, int begin_bit, int end_bit)
     uint64_t* d_vals_b       = sycl::malloc_device<uint64_t>(count, q);
     uint64_t* d_vals_out_ref = sycl::malloc_device<uint64_t>(count, q);
     uint64_t* d_vals_out_uut = sycl::malloc_device<uint64_t>(count, q);
+    // q.wait() (not .wait() on the last copy): out-of-order queue.
     q.memcpy(d_keys_a, h_keys.data(), sizeof(uint32_t) * count);
     q.memcpy(d_keys_b, h_keys.data(), sizeof(uint32_t) * count);
     q.memcpy(d_vals_a, h_vals.data(), sizeof(uint64_t) * count);
-    q.memcpy(d_vals_b, h_vals.data(), sizeof(uint64_t) * count).wait();
+    q.memcpy(d_vals_b, h_vals.data(), sizeof(uint64_t) * count);
+    q.wait();
 
     // Reference: u32_u32 sort with identity vals + gather_u64.
     pos2gpu::launch_init_u32_identity(d_idx_in, count, q);
@@ -99,7 +101,8 @@ bool run_case(uint32_t seed, uint64_t count, int begin_bit, int end_bit)
     q.memcpy(h_ref_keys.data(), d_keys_out_ref, sizeof(uint32_t) * count);
     q.memcpy(h_uut_keys.data(), d_keys_out_uut, sizeof(uint32_t) * count);
     q.memcpy(h_ref_vals.data(), d_vals_out_ref, sizeof(uint64_t) * count);
-    q.memcpy(h_uut_vals.data(), d_vals_out_uut, sizeof(uint64_t) * count).wait();
+    q.memcpy(h_uut_vals.data(), d_vals_out_uut, sizeof(uint64_t) * count);
+    q.wait();   // all four, before the frees below and the host compare
 
     if (d_ref_scratch) sycl::free(d_ref_scratch, q);
     if (d_uut_scratch) sycl::free(d_uut_scratch, q);

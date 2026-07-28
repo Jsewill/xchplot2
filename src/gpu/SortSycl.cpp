@@ -584,8 +584,11 @@ void launch_sort_pairs_u32_u32_sycl(
     // dst becomes the input for the next pass). If that's not keys_out,
     // copy the result over.
     if (cur_keys != keys_out) {
-        q.memcpy(keys_out, cur_keys, sizeof(uint32_t) * count);
-        q.memcpy(vals_out, cur_vals, sizeof(uint32_t) * count).wait();
+        // Function outputs, no barrier after — wait each (out-of-order queue).
+        auto e_ko = q.memcpy(keys_out, cur_keys, sizeof(uint32_t) * count);
+        auto e_vo = q.memcpy(vals_out, cur_vals, sizeof(uint32_t) * count);
+        e_ko.wait();
+        e_vo.wait();
     }
 }
 
@@ -730,8 +733,15 @@ void launch_segmented_sort_pairs_u32_u32_sycl(
     // Pull offsets to host once — num_segments is small (≤65536
     // in practice) so D2H is sub-millisecond.
     std::vector<uint32_t> h_begin(num_segments), h_end(num_segments);
-    q.memcpy(h_begin.data(), d_begin_offsets, num_segments * sizeof(uint32_t));
-    q.memcpy(h_end.data(),   d_end_offsets,   num_segments * sizeof(uint32_t)).wait();
+    // Wait BOTH: the host loop below dereferences h_begin[s] directly, and
+    // the queue is out-of-order — waiting only the h_end copy would let the
+    // loop read uninitialised vector memory and use it as a segment offset.
+    auto e_begin = q.memcpy(h_begin.data(), d_begin_offsets,
+                            num_segments * sizeof(uint32_t));
+    auto e_end   = q.memcpy(h_end.data(),   d_end_offsets,
+                            num_segments * sizeof(uint32_t));
+    e_begin.wait();
+    e_end.wait();
 
     // The single-level fallback's input is clobbered as scratch.
     // For segmented mode we copy each segment's slice from keys_in
@@ -754,8 +764,11 @@ void launch_segmented_sort_pairs_u32_u32_sycl(
         // route through OCL — malloc per call is fine perf-wise.)
         uint32_t* scratch_keys = sycl::malloc_device<uint32_t>(n, q);
         uint32_t* scratch_vals = sycl::malloc_device<uint32_t>(n, q);
-        q.memcpy(scratch_keys, keys_in + start, n * sizeof(uint32_t));
-        q.memcpy(scratch_vals, vals_in + start, n * sizeof(uint32_t)).wait();
+        // Both are inputs to the sort below; wait each (out-of-order queue).
+        auto e_sk = q.memcpy(scratch_keys, keys_in + start, n * sizeof(uint32_t));
+        auto e_sv = q.memcpy(scratch_vals, vals_in + start, n * sizeof(uint32_t));
+        e_sk.wait();
+        e_sv.wait();
 
         size_t scratch_bytes = temp_bytes;
         launch_sort_pairs_u32_u32_sycl(

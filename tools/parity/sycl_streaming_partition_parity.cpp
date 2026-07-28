@@ -57,7 +57,8 @@ bool run_case(uint32_t seed, uint64_t count, int num_top_bits,
     uint32_t* h_bucket_starts = sycl::malloc_host<uint32_t>(num_buckets + 1, q);
 
     q.memcpy(d_keys_in,     h_keys.data(), sizeof(uint32_t) * count);
-    q.memcpy(h_pinned_vals, h_vals.data(), sizeof(uint64_t) * count).wait();
+    q.memcpy(h_pinned_vals, h_vals.data(), sizeof(uint64_t) * count);
+    q.wait();
 
     // Query + allocate scratch.
     size_t scratch_bytes = 0;

@@ -64,10 +64,13 @@ bool run_case(uint32_t seed, uint64_t count, int num_top_bits,
     uint32_t* d_vals_out_ref = sycl::malloc_device<uint32_t>(count, q);
     uint32_t* d_vals_out_tl  = sycl::malloc_device<uint32_t>(count, q);
     uint32_t* d_bucket_starts = sycl::malloc_device<uint32_t>(num_buckets + 1, q);
+    // q.wait() (not .wait() on the last copy): out-of-order queue — waiting
+    // one event leaves the other three possibly still in flight.
     q.memcpy(d_keys_a, h_keys.data(), sizeof(uint32_t) * count);
     q.memcpy(d_keys_b, h_keys.data(), sizeof(uint32_t) * count);
     q.memcpy(d_vals_a, h_vals.data(), sizeof(uint32_t) * count);
-    q.memcpy(d_vals_b, h_vals.data(), sizeof(uint32_t) * count).wait();
+    q.memcpy(d_vals_b, h_vals.data(), sizeof(uint32_t) * count);
+    q.wait();
 
     // Reference: single-level launch_sort_pairs_u32_u32.
     size_t ref_scratch = 0;
@@ -119,7 +122,8 @@ bool run_case(uint32_t seed, uint64_t count, int num_top_bits,
     q.memcpy(h_ref_vals.data(), d_vals_out_ref, sizeof(uint32_t) * count);
     q.memcpy(h_tl_vals.data(),  d_vals_out_tl,  sizeof(uint32_t) * count);
     q.memcpy(h_bucket_starts.data(), d_bucket_starts,
-             (num_buckets + 1) * sizeof(uint32_t)).wait();
+             (num_buckets + 1) * sizeof(uint32_t));
+    q.wait();   // all five, before the frees below and the host compare
 
     if (d_ref_scratch) sycl::free(d_ref_scratch, q);
     if (d_tl_scratch)  sycl::free(d_tl_scratch, q);
