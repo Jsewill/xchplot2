@@ -490,6 +490,21 @@ inline bool tail_guard_enabled()
     return !(v && v[0] == '0');
 }
 
+// XCHPLOT2_DRAIN_SLOTS=N pins the rotating pinned D2H drain to N slots,
+// overriding both the default (kNumPinnedBuffers) and the budget policy's
+// demand-driven reduction. Returns 0 when unset or out of [1,
+// kNumPinnedBuffers]. It exists so the RAM-vs-overlap trade can be
+// A/B-measured, and so someone under a budget on a host that can afford the
+// slots can buy the overlap back. See the B1 note in run_batch_slice.
+inline int drain_slots_env()
+{
+    char const* v = std::getenv("XCHPLOT2_DRAIN_SLOTS");
+    if (!v || !v[0]) return 0;
+    int const parsed = std::atoi(v);
+    if (parsed < 1 || parsed > GpuBufferPool::kNumPinnedBuffers) return 0;
+    return parsed;
+}
+
 // Seconds/plot the tail guard assumes for a worker that has not measured its own
 // rate yet, seeded by device class so a known-slow CPU worker can stand down on a
 // batch too short to help before it has finished even one plot. Replaced by the
@@ -1173,11 +1188,14 @@ std::size_t record_plot_completion(BatchResult& res,
 
 // Bounded SPSC queue + end-of-stream signal.
 //
-// Depth = kNumPinnedBuffers - 1 so the producer never overtakes the
-// consumer by more than (num_pinned - 1) plots. The pinned slot the
-// producer writes is slot (i % kNumPinnedBuffers); with depth-(N-1)
-// the consumer is guaranteed to have popped plot (i - N) before the
-// producer overwrites its slot.
+// Depth = num_pinned_slots - 1 (floored at 1) so the producer never
+// overtakes the consumer by more than (N - 1) plots, where N is the run's
+// slot count — kNumPinnedBuffers normally, 1 under a --max-host-ram budget
+// (see resolve_drain_slots). The pinned slot the producer writes is
+// slot (i % N); with depth (N-1) the consumer is guaranteed to have popped
+// plot (i - N) before the producer overwrites its slot. At N = 1 the depth
+// floor makes that guarantee vacuous, which is fine: the SlotGate below,
+// not the depth, is what actually makes reuse safe.
 class Channel {
 public:
     explicit Channel(std::size_t capacity) : capacity_(capacity) {}
@@ -1224,7 +1242,7 @@ private:
 // Consumption acknowledgment for the rotating pinned slots.
 //
 // The Channel's depth alone is NOT enough to make slot reuse safe: a
-// depth of (kNumPinnedBuffers - 1) only guarantees the consumer has
+// depth of (num_pinned_slots - 1) only guarantees the consumer has
 // POPPED plot (i - N) before the producer starts plot i — the consumer
 // may still be reading that slot's fragments inside
 // write_plot_file_parallel (FSE compression + disk write borrow the
@@ -1773,6 +1791,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // once instead of per plot is a significant win on long batches.
     uint64_t* stream_pinned[GpuBufferPool::kNumPinnedBuffers] = {};
     size_t    stream_pinned_cap = 0;
+    // B1 (host-RAM disk-offload): how many of those rotating slots this run
+    // actually uses. The slots buy ONE thing — overlapping plot K's D2H with
+    // the file writer draining K-1/K-2. They are not a correctness
+    // requirement: slot_gate (below) already blocks reuse until the consumer
+    // has finished with a slot, so a single slot is correct, merely less
+    // overlapped. Each slot given up hands back cap * 8 B of pinned host
+    // memory (2.03 GiB at k=28).
+    //
+    // The win lands even for a one-plot run, unlike the pool path's lazy
+    // ensure_pinned(): the streaming branch allocates every slot UP FRONT
+    // (see the loop below), which is why compact measured the same host peak
+    // at n=1 and n=3.
+    //
+    // Finalised by the budget policy below, which cuts slots only as far as
+    // the budget actually demands — see the "last resort" note there.
+    int num_pinned_slots = GpuBufferPool::kNumPinnedBuffers;
+    int const forced_drain_slots = drain_slots_env();      // 0 when unset
+    if (forced_drain_slots) num_pinned_slots = forced_drain_slots;
     // Stage 4f: amortised streaming-path pinned-host scratch. Populated
     // in the streaming-fallback branch below; nullptr fields when the
     // pool path is active (pool_ptr != null).
@@ -2103,8 +2139,37 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 consider(table8, tier_streams && !tier_tiny, plan.h_frags);
                 consider(table4, tier_streams && !tier_tiny, plan.h_t2_xbits);
 
+                // Drain slots are the LAST resort, deliberately. Spilling a
+                // table costs disk I/O per plot; giving up a drain slot costs
+                // producer/consumer overlap, which is the more expensive of
+                // the two once a batch is deeper than one plot. Measured at
+                // k=28 compact, n=3: the full spill set is 1.29x baseline
+                // wall, a 1-slot drain is 2.91x. At n=1 the slots buy nothing
+                // (there is no next plot to overlap with) and cutting them is
+                // free — but the policy cannot see the batch depth here, so it
+                // just takes the cheaper lever first and stops as soon as the
+                // budget is met. "min" (B == 0) still drives to one slot.
+                if (!forced_drain_slots) {
+                    while ((B == 0 || est > B) && num_pinned_slots > 1) {
+                        --num_pinned_slots;
+                        est -= std::min<uint64_t>(table8, est);
+                    }
+                } else {
+                    est -= std::min<uint64_t>(
+                        uint64_t(GpuBufferPool::kNumPinnedBuffers - num_pinned_slots)
+                            * table8, est);
+                }
+                uint64_t const drain_freed =
+                    uint64_t(GpuBufferPool::kNumPinnedBuffers - num_pinned_slots)
+                    * table8;
+
+                // The reachable floor spills every routable table AND keeps a
+                // single drain slot — that is the most this policy can do.
+                uint64_t const reachable =
+                    routable_total
+                    + uint64_t(GpuBufferPool::kNumPinnedBuffers - 1) * table8;
                 uint64_t const floor_bytes =
-                    host_required - std::min(routable_total, host_required);
+                    host_required - std::min(reachable, host_required);
 
                 if (B != 0 && est > B) {
                     throw std::runtime_error(
@@ -2129,10 +2194,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (plan.h_t2_xbits) spilled += " h_t2_xbits";
                 if (spilled.empty()) spilled = " (none)";
                 std::fprintf(stderr,
-                    "%s host-RAM budget %s (tier %s, k=%d): spilling%s -> "
-                    "modelled resident host peak ~%.2f GiB (routable floor "
-                    "~%.2f GiB)\n",
+                    "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
+                    "slot%s (-%.2f GiB), spilling%s -> modelled resident host "
+                    "peak ~%.2f GiB (routable floor ~%.2f GiB)\n",
                     log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
+                    GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
+                    num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
                     spilled.c_str(),
                     to_gib(est), to_gib(floor_bytes));
             }
@@ -2240,8 +2307,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // It now sits with the tier pick above (measured per-tier estimates),
         // and host_pinned_reserve_check() guards each allocation for real.
 
+        // Only the slots this run will actually rotate through (B1: one under
+        // a host-RAM budget). The rest stay null; every free path below is
+        // null-guarded and the array is zero-initialised.
         bool any_fail = false;
-        for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+        for (int s = 0; s < num_pinned_slots; ++s) {
             stream_pinned[s] = streaming_alloc_pinned_uint64(stream_pinned_cap);
             if (!stream_pinned[s]) { any_fail = true; break; }
         }
@@ -2368,8 +2438,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             pool_ptr->pinned_bytes       * gb);
     }
 
-    // Depth = kNumPinnedBuffers - 1. See Channel's comment block above.
-    Channel chan(static_cast<std::size_t>(GpuBufferPool::kNumPinnedBuffers - 1));
+    // Depth = num_pinned_slots - 1. See Channel's comment block above.
+    // Floored at 1: with a single slot (B1) the arithmetic depth is 0, and a
+    // zero-capacity Channel can never accept a push — the producer would
+    // block forever on the first plot. Depth 1 is safe because slot_gate,
+    // not the channel depth, is what actually serialises slot reuse.
+    Channel chan(static_cast<std::size_t>(
+        std::max(1, num_pinned_slots - 1)));
     // Slot-reuse acknowledgment — see SlotGate's comment block. The
     // channel depth bounds queue growth; the gate is what actually
     // makes pinned-slot reuse safe when the consumer is slower than
@@ -2554,14 +2629,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             item.entry  = entries[i];
             item.index  = i;
             int const slot = static_cast<int>(
-                local_count % GpuBufferPool::kNumPinnedBuffers);
+                local_count % std::size_t(num_pinned_slots));
             // Slot-reuse gate: the previous occupant of this slot was
-            // push number (local_count - kNumPinnedBuffers); wait until
+            // push number (local_count - num_pinned_slots); wait until
             // the consumer has fully finished it (not merely popped it)
             // before the pipeline's D2H writes into the slot.
-            if (local_count >= std::size_t(GpuBufferPool::kNumPinnedBuffers)) {
+            if (local_count >= std::size_t(num_pinned_slots)) {
                 std::size_t const need =
-                    local_count - GpuBufferPool::kNumPinnedBuffers + 1;
+                    local_count - std::size_t(num_pinned_slots) + 1;
                 if (!slot_gate.wait_consumed(need)) break;  // consumer died
             }
             try {

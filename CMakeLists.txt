@@ -1149,7 +1149,16 @@ add_executable(sycl_bucket_offsets_parity tools/parity/sycl_bucket_offsets_parit
 x2_add_sycl_to_target(TARGET sycl_bucket_offsets_parity
                    SOURCES tools/parity/sycl_bucket_offsets_parity.cpp)
 
-add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
+# host_pinned_pool_test links pos2_gpu_host, which drags in pos2_gpu's
+# SortSyclCub.cpp.o (the CUB adapter). That references cub_sort_* from the
+# CUDA OBJECT lib, so this leaf executable pulls the .o files in directly —
+# same reason as plot_file_parity above.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
+endif()
 x2_add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
@@ -1157,6 +1166,27 @@ target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 add_executable(temp_file_test tools/parity/temp_file_test.cpp)
 target_link_libraries(temp_file_test PRIVATE pos2_gpu_host)
 target_compile_features(temp_file_test PRIVATE cxx_std_20)
+
+# spill_coverage_test — the spill path's read guard. SpillCoverage.hpp is
+# header-only and free of SYCL/GPU deps precisely so this builds and runs
+# anywhere with no device present: it is pure interval arithmetic, and it is
+# the only thing standing between a spill bug and a silently short .plot2.
+add_executable(spill_coverage_test tools/parity/spill_coverage_test.cpp)
+target_include_directories(spill_coverage_test PRIVATE src)
+target_compile_features(spill_coverage_test PRIVATE cxx_std_20)
+set_target_properties(spill_coverage_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# host_guard_test — the pinned-host redzone canaries. Same argument as
+# spill_coverage_test: HostGuard.hpp is header-only and device-free, and a
+# canary that silently never fires is indistinguishable from a clean run in
+# any end-to-end plot test. The deliberate-overrun cases here are what makes
+# a quiet soak under XCHPLOT2_HOST_GUARD mean anything.
+add_executable(host_guard_test tools/parity/host_guard_test.cpp)
+target_include_directories(host_guard_test PRIVATE src)
+target_compile_features(host_guard_test PRIVATE cxx_std_20)
+set_target_properties(host_guard_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # bench_stats_test — the multi-worker bench arithmetic (per-worker warmup
 # exclusion, drain-tail truncation, sum-of-rates aggregate). BenchStats.hpp is

@@ -14,6 +14,8 @@
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 #include "host/TempFile.hpp"   // P1 host-RAM disk-offload (XCHPLOT2_SPILL_T1META)
+#include "host/SpillCoverage.hpp"  // spill read guard — see header
+#include "host/HostGuard.hpp"      // pinned-host redzones — see header
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/XsKernel.cuh"
@@ -35,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -99,7 +102,7 @@ struct StreamingStats {
         }
         sizes.clear();
         for (void* ptr : host_ptrs) {
-            if (ptr) sycl::free(ptr, q);
+            if (ptr) sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), q);
         }
         host_ptrs.clear();
     }
@@ -185,11 +188,17 @@ inline void* s_malloc_host_raw(StreamingStats& s, size_t bytes,
                                char const* what, sycl::queue& q)
 {
     host_pinned_reserve_check(bytes, what);
-    void* p = sycl::malloc_host(bytes, q);
+    // XCHPLOT2_HOST_GUARD: over-allocate and paint redzones either side, so
+    // a kernel writing past this buffer is caught here instead of silently
+    // damaging whichever allocation follows it. Off by default and then
+    // pad is 0, i.e. byte-for-byte the original request. See HostGuard.hpp.
+    size_t const pad = pos2gpu::host_guard_pad();
+    void* p = sycl::malloc_host(bytes + 2 * pad, q);
     if (!p) {
         throw std::runtime_error(
             std::string("sycl::malloc_host(") + what + ") failed");
     }
+    p = pos2gpu::host_guard_arm(p, bytes, what);
     s.host_ptrs.insert(p);
     return p;
 }
@@ -207,7 +216,9 @@ inline void s_free_host(StreamingStats& s, void* p, sycl::queue& q)
 {
     if (!p) return;
     s.host_ptrs.erase(p);
-    sycl::free(p, q);
+    // Checks the redzones and hands back the real base to free. A no-op
+    // returning `p` unchanged when the guard is off or never armed it.
+    sycl::free(pos2gpu::host_guard_disarm(p, "s_free_host"), q);
 }
 
 template <typename T>
@@ -289,10 +300,38 @@ struct SpillEngine {
     std::deque<Job>         jobs;
     uint64_t                next_ticket = 0;         // last enqueued
     uint64_t                done_ticket = 0;         // last completed (FIFO => monotonic)
-    uint64_t                slot_ticket[kNumWindows] = {0, 0};  // last job touching each window
+    uint64_t                slot_ticket[kNumWindows] = {0, 0};  // last job ENQUEUED against each window
+    // Last job the worker actually COMPLETED into each window, and the
+    // ticket a reader is waiting to consume from it. These exist because
+    // wait_slot() waits on slot_ticket[slot] — the LATEST job queued for
+    // that window, not the one the caller is about to read. The two are
+    // the same only while callers consume each window before resubmitting
+    // to it. If that discipline ever breaks, wait_slot() returns happily
+    // and hands back a DIFFERENT chunk's bytes: the range is fully written,
+    // so SpillCoverage sees nothing wrong, and the result is a silently
+    // wrong plot. wait_ticket() below turns that into a hard error for one
+    // integer compare, so it stays on in release builds.
+    uint64_t                win_last_done[kNumWindows]   = {0, 0};
+    uint64_t                pending_ticket[kNumWindows]  = {0, 0};
     int                     write_slot = 0;          // ping-pong cursor for writes (SHARED across tables)
     std::string             io_error;                // first worker error, re-raised on wait/drain
     bool                    overlap = true;          // XCHPLOT2_SPILL_NO_OVERLAP=1 => synchronous (A/B measure only)
+    // XCHPLOT2_SPILL_VERIFY=1: round-trip every written chunk (pread it back
+    // into the other window and memcmp) before moving on. Debug only — it
+    // serialises the pipeline. This exists to split "the spill I/O itself
+    // corrupts data" from "the spill only perturbs the timing of a bug that
+    // lives elsewhere", which no amount of end-to-end plot hashing can
+    // distinguish. Throws on the first mismatch, naming file+offset.
+    bool                    verify  = false;
+    uint64_t                verified_chunks = 0;
+    // XCHPLOT2_SPILL_IO_DELAY_US=N: the worker sleeps N microseconds before
+    // each job. Race amplification, debug only. Every ordering rule in here is
+    // "the main thread must not touch a window / a file range until the I/O
+    // thread has finished with it"; stretching each I/O turns any violation of
+    // that from a rare timing coincidence into a near-certain one. A fault
+    // that reproduces under delay and stops reproducing after a fix is much
+    // stronger evidence than a soak at the natural ~5% rate.
+    unsigned                io_delay_us = 0;
     uint64_t                blocked_ns = 0;          // wall the main thread spent stalled on disk I/O (this plot)
 
     SpillEngine(StreamingStats& s, sycl::queue& queue)
@@ -300,6 +339,10 @@ struct SpillEngine {
     {
         if (char const* v = std::getenv("XCHPLOT2_SPILL_NO_OVERLAP"); v && v[0] == '1')
             overlap = false;
+        if (char const* v = std::getenv("XCHPLOT2_SPILL_VERIFY"); v && v[0] == '1')
+            verify = true;
+        if (char const* v = std::getenv("XCHPLOT2_SPILL_IO_DELAY_US"); v && v[0])
+            io_delay_us = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
         for (int i = 0; i < kNumWindows; ++i) {
             win[i] = static_cast<uint8_t*>(s_malloc_host_raw(
                 s, kStageBytes, "h_spill_stage_window", queue));
@@ -318,6 +361,10 @@ struct SpillEngine {
         std::fprintf(stderr,
             "[spill] pipeline stalled %.2f s on disk I/O this plot (overlap=%s)\n",
             blocked_ns / 1e9, overlap ? "on" : "off");
+        if (verify)
+            std::fprintf(stderr,
+                "[spill] verify: %llu chunks round-tripped clean\n",
+                (unsigned long long)verified_chunks);
         for (int i = 0; i < kNumWindows; ++i)
             if (win[i]) s_free_host(*stats, win[i], *q);
     }
@@ -336,6 +383,8 @@ struct SpillEngine {
                 jobs.pop_front();
             }
             if (j.op == Op::Stop) return;
+            if (io_delay_us)   // debug race amplification; see io_delay_us
+                std::this_thread::sleep_for(std::chrono::microseconds(io_delay_us));
             try {
                 if (j.op == Op::Write) j.file->pwrite_at(j.off_bytes, win[j.slot], j.bytes);
                 else                   j.file->pread_at (j.off_bytes, win[j.slot], j.bytes);
@@ -345,7 +394,8 @@ struct SpillEngine {
             }
             {
                 std::lock_guard<std::mutex> lk(mtx);
-                done_ticket = j.ticket;              // FIFO => monotonic
+                done_ticket           = j.ticket;    // FIFO => monotonic
+                win_last_done[j.slot] = j.ticket;    // whose bytes win[slot] holds now
                 cv_done.notify_all();
             }
         }
@@ -380,6 +430,27 @@ struct SpillEngine {
         rethrow_locked();
     }
 
+    // Block until the SPECIFIC job `ticket` has completed, and verify that
+    // window `slot` still holds ITS bytes rather than a later job's. Use
+    // this, not wait_slot, whenever the point of the wait is to consume
+    // what a particular read produced. See win_last_done above.
+    void wait_ticket(int slot, uint64_t ticket, char const* what) {
+        auto const t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_done.wait(lk, [this, ticket] { return done_ticket >= ticket; });
+        blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+        rethrow_locked();
+        if (win_last_done[slot] == ticket) return;
+        throw std::runtime_error(
+            std::string("SpillEngine::") + what + ": staging window " +
+            std::to_string(slot) + " was refilled before its contents were "
+            "consumed — waited for job " + std::to_string(ticket) +
+            " but the window now holds job " + std::to_string(win_last_done[slot]) +
+            ". Reading it would substitute one chunk's bytes for another's and "
+            "silently corrupt the plot; failing loudly instead.");
+    }
+
     // Block until every enqueued op has completed (write-back barrier).
     void drain() {
         auto const t0 = std::chrono::steady_clock::now();
@@ -404,6 +475,36 @@ struct SpillBuffer {
     SpillBuffer(SpillBuffer const&)            = delete;
     SpillBuffer& operator=(SpillBuffer const&) = delete;
 
+    // Queued jobs hold a RAW pointer to `file`. Destroying this buffer with a
+    // deferred pwrite still in the queue would hand the I/O thread a dangling
+    // TempFile — a use-after-free that would read as data corruption. Every
+    // present call site happens to drain first (the reads do it implicitly);
+    // draining here makes that a property of the type instead of an unwritten
+    // rule the next caller has to know.
+    ~SpillBuffer() {
+        if (!eng) return;
+        try { eng->drain(); } catch (...) { /* dtor: late I/O errors are lost */ }
+    }
+
+    // Which byte ranges of `file` have been written. See SpillCoverage.hpp for
+    // why a read of an unwritten range is the dangerous case (sparse hole ->
+    // zeros -> silently short plot, not an error).
+    pos2gpu::SpillCoverage coverage;
+
+    void note_written(uint64_t off, uint64_t len) { coverage.note_written(off, len); }
+
+    // Throws unless [off, off+len) is fully covered by prior writes.
+    void require_written(uint64_t off, uint64_t len, char const* what) const {
+        if (coverage.covered(off, len)) return;
+        throw std::runtime_error(
+            std::string("SpillBuffer::") + what + ": read of NEVER-WRITTEN range in " +
+            file.path() + " — want [" + std::to_string(off) + ", " +
+            std::to_string(off + len) + "), covered only to " +
+            std::to_string(coverage.covered_to(off)) +
+            ". A sparse-hole read returns zeros and would silently corrupt the "
+            "plot; failing loudly instead.");
+    }
+
     // Entries that fit one window, and the tile count for the streaming-
     // partition read so each tile fits a window (see SpillTileReader).
     uint64_t win_entries() const { return SpillEngine::kStageBytes / elem; }
@@ -424,10 +525,32 @@ struct SpillBuffer {
             eng->wait_slot(slot);                                       // prior op on this window done
             eng->q->memcpy(eng->win[slot], src + done, c).wait();       // D2H into window
             eng->enqueue(SpillEngine::Op::Write, slot, &file, base + done, c);  // async pwrite
+            note_written(base + done, c);
             if (!eng->overlap) eng->wait_slot(slot);                    // A/B measure: block on the pwrite
+            if (eng->verify) verify_chunk(slot, base + done, c);        // debug: round-trip check
             eng->write_slot ^= 1;
             done += c;
         }
+    }
+
+    // Debug (XCHPLOT2_SPILL_VERIFY=1): confirm the chunk just written to
+    // `off_bytes` reads back byte-identical. win[slot] still holds the source
+    // bytes, so pread the range into the other window and memcmp the two.
+    // Serialising by construction — the point is a verdict, not throughput.
+    void verify_chunk(int slot, uint64_t off_bytes, size_t bytes) {
+        int const vslot = slot ^ 1;
+        eng->wait_slot(slot);                       // the pwrite has landed
+        eng->wait_slot(vslot);                      // the other window is idle
+        eng->enqueue(SpillEngine::Op::Read, vslot, &file, off_bytes, bytes);
+        eng->wait_slot(vslot);
+        if (std::memcmp(eng->win[slot], eng->win[vslot], bytes) != 0) {
+            throw std::runtime_error(
+                "SpillBuffer verify: readback mismatch in " + file.path() +
+                " at byte offset " + std::to_string(off_bytes) +
+                " (" + std::to_string(bytes) + " B) after " +
+                std::to_string(eng->verified_chunks) + " good chunks");
+        }
+        ++eng->verified_chunks;
     }
 
     // ---- READ: disk -> device buffer, double-buffered ----
@@ -437,28 +560,35 @@ struct SpillBuffer {
         uint64_t const nb   = n * elem;
         uint64_t const base = entry_off * elem;
         eng->drain();                                                   // pending writes must land first
+        require_written(base, nb, "read_to_device");
         if (!eng->overlap) {                                           // A/B measure: serial pread -> H2D
             for (uint64_t done = 0; done < nb; ) {
                 uint64_t const c = std::min<uint64_t>(SpillEngine::kStageBytes, nb - done);
-                eng->enqueue(SpillEngine::Op::Read, 0, &file, base + done, c);
-                eng->wait_slot(0);
+                uint64_t const t =
+                    eng->enqueue(SpillEngine::Op::Read, 0, &file, base + done, c);
+                eng->wait_ticket(0, t, "read_to_device");
                 eng->q->memcpy(dst + done, eng->win[0], c).wait();
                 done += c;
             }
             return;
         }
+        // tk[slot] = the read whose bytes that window is holding for us.
+        // Waiting on the ticket rather than the window is what makes a
+        // double-submit an error instead of a wrong chunk (see wait_ticket).
+        uint64_t tk[SpillEngine::kNumWindows] = {0, 0};
         int slot = 0;
         uint64_t const c0 = std::min<uint64_t>(SpillEngine::kStageBytes, nb);
-        eng->enqueue(SpillEngine::Op::Read, slot, &file, base, c0);
+        tk[slot] = eng->enqueue(SpillEngine::Op::Read, slot, &file, base, c0);
         for (uint64_t done = 0; done < nb; ) {
             uint64_t const c         = std::min<uint64_t>(SpillEngine::kStageBytes, nb - done);
             uint64_t const next_done = done + c;
             int const      next_slot = slot ^ 1;
             if (next_done < nb) {                                       // prefetch next chunk
                 uint64_t const nc = std::min<uint64_t>(SpillEngine::kStageBytes, nb - next_done);
-                eng->enqueue(SpillEngine::Op::Read, next_slot, &file, base + next_done, nc);
+                tk[next_slot] = eng->enqueue(SpillEngine::Op::Read, next_slot, &file,
+                                             base + next_done, nc);
             }
-            eng->wait_slot(slot);                                       // this chunk's pread done
+            eng->wait_ticket(slot, tk[slot], "read_to_device");         // this chunk's pread done
             eng->q->memcpy(dst + done, eng->win[slot], c).wait();       // H2D
             done = next_done;
             slot = next_slot;
@@ -470,13 +600,23 @@ struct SpillBuffer {
     // so the windows are reinterpreted as u64. See StreamingPartition.cuh.
     static void thunk_submit(void* ctx, int slot, uint64_t off_bytes, uint64_t bytes) {
         auto* b = static_cast<SpillBuffer*>(ctx);
-        b->eng->enqueue(SpillEngine::Op::Read, slot, &b->file, off_bytes,
-                        static_cast<size_t>(bytes));
+        b->require_written(off_bytes, bytes, "tile_reader");
+        // Remember which job owns this window so thunk_wait can confirm the
+        // partition consumes THAT tile and not a later prefetch.
+        b->eng->pending_ticket[slot] =
+            b->eng->enqueue(SpillEngine::Op::Read, slot, &b->file, off_bytes,
+                            static_cast<size_t>(bytes));
     }
     static void thunk_wait(void* ctx, int slot) {
-        static_cast<SpillBuffer*>(ctx)->eng->wait_slot(slot);
+        auto* e = static_cast<SpillBuffer*>(ctx)->eng;
+        e->wait_ticket(slot, e->pending_ticket[slot], "tile_reader");
     }
     SpillTileReader tile_reader() {
+        // The partition is about to stream the table we just finished writing,
+        // and thunk_submit (unlike read_to_device) has no drain of its own.
+        // Land every deferred pwrite here so the contract belongs to the type
+        // rather than to a drain the one call site remembers to make.
+        eng->drain();
         SpillTileReader r;
         r.ctx         = this;
         r.win[0]      = reinterpret_cast<uint64_t*>(eng->win[0]);
@@ -671,13 +811,24 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     using phase_clock = std::chrono::steady_clock;
     std::vector<std::pair<char const*, phase_clock::time_point>> phase_starts;
     std::vector<std::pair<char const*, double>>                  phase_records;
+    // XCHPLOT2_HOST_GUARD: track the current phase label whether or not
+    // phase timing is on, so a redzone report names the phase that broke
+    // the buffer and not just the buffer. See HostGuard.hpp.
+    char const* guard_phase = "(pipeline start)";
     auto begin_phase = [&](char const* label) -> int {
+        if (pos2gpu::host_guard_on()) guard_phase = label;
         if (!phase_timing) return -1;
         q.wait();
         phase_starts.emplace_back(label, phase_clock::now());
         return static_cast<int>(phase_starts.size() - 1);
     };
     auto end_phase = [&](int idx) {
+        // Drain before checking: a kernel still in flight has not done its
+        // damage yet, and a guard that samples too early reads clean.
+        if (pos2gpu::host_guard_on()) {
+            q.wait();
+            pos2gpu::host_guard_check(guard_phase);
+        }
         if (idx < 0) return;
         q.wait();
         auto const t1 = phase_clock::now();
@@ -1074,13 +1225,24 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     using phase_clock = std::chrono::steady_clock;
     std::vector<std::pair<char const*, phase_clock::time_point>> phase_starts;
     std::vector<std::pair<char const*, double>>                  phase_records;
+    // XCHPLOT2_HOST_GUARD: track the current phase label whether or not
+    // phase timing is on, so a redzone report names the phase that broke
+    // the buffer and not just the buffer. See HostGuard.hpp.
+    char const* guard_phase = "(pipeline start)";
     auto begin_phase = [&](char const* label) -> int {
+        if (pos2gpu::host_guard_on()) guard_phase = label;
         if (!phase_timing) return -1;
         q.wait();
         phase_starts.emplace_back(label, phase_clock::now());
         return static_cast<int>(phase_starts.size() - 1);
     };
     auto end_phase = [&](int idx) {
+        // Drain before checking: a kernel still in flight has not done its
+        // damage yet, and a guard that samples too early reads clean.
+        if (pos2gpu::host_guard_on()) {
+            q.wait();
+            pos2gpu::host_guard_check(guard_phase);
+        }
         if (idx < 0) return;
         q.wait();
         auto const t1 = phase_clock::now();
@@ -4965,20 +5127,28 @@ uint64_t* streaming_alloc_pinned_uint64(size_t count)
     // failed, fall back", but a host that is out of RAM has nothing to fall
     // back TO — every lower tier wants more host memory, not less. Failing
     // here with the reason beats failing later without one.
-    host_pinned_reserve_check(count * sizeof(uint64_t), "streaming pinned u64");
-    uint64_t* p = nullptr;
-    p = static_cast<uint64_t*>(
-        sycl::malloc_host(count * sizeof(uint64_t), sycl_backend::queue()));
+    size_t const bytes = count * sizeof(uint64_t);
+    host_pinned_reserve_check(bytes, "streaming pinned u64");
+    // See s_malloc_host_raw for the redzone rationale. These are the D2H
+    // drain slots and the caller-provided scratch tables — the buffers
+    // device kernels write into through a cursor, so the ones most worth
+    // guarding.
+    void* p = sycl::malloc_host(bytes + 2 * pos2gpu::host_guard_pad(),
+                                sycl_backend::queue());
     if (!p) return nullptr;
-    return p;
+    return static_cast<uint64_t*>(
+        pos2gpu::host_guard_arm(p, bytes, "streaming pinned u64"));
 }
 
 uint32_t* streaming_alloc_pinned_uint32(size_t count)
 {
-    host_pinned_reserve_check(count * sizeof(uint32_t), "streaming pinned u32");
-    uint32_t* p = static_cast<uint32_t*>(
-        sycl::malloc_host(count * sizeof(uint32_t), sycl_backend::queue()));
-    return p;  // nullptr on failure
+    size_t const bytes = count * sizeof(uint32_t);
+    host_pinned_reserve_check(bytes, "streaming pinned u32");
+    void* p = sycl::malloc_host(bytes + 2 * pos2gpu::host_guard_pad(),
+                                sycl_backend::queue());
+    if (!p) return nullptr;  // nullptr on failure
+    return static_cast<uint32_t*>(
+        pos2gpu::host_guard_arm(p, bytes, "streaming pinned u32"));
 }
 
 uint64_t twophase_bytes_held()
@@ -4988,12 +5158,19 @@ uint64_t twophase_bytes_held()
 
 void streaming_free_pinned_uint32(uint32_t* ptr)
 {
-    if (ptr) sycl::free(ptr, sycl_backend::queue());
+    if (ptr) sycl::free(pos2gpu::host_guard_disarm(ptr, "free pinned u32"),
+                        sycl_backend::queue());
 }
 
 void streaming_free_pinned_uint64(uint64_t* ptr)
 {
-    if (ptr) sycl::free(ptr, sycl_backend::queue());
+    if (ptr) sycl::free(pos2gpu::host_guard_disarm(ptr, "free pinned u64"),
+                        sycl_backend::queue());
+}
+
+void streaming_host_guard_check(char const* where)
+{
+    pos2gpu::host_guard_check(where);
 }
 
 void bind_current_device(int device_id)

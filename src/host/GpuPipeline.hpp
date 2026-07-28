@@ -363,6 +363,14 @@ void      streaming_free_pinned_uint64(uint64_t* ptr);
 uint32_t* streaming_alloc_pinned_uint32(size_t count);
 void      streaming_free_pinned_uint32(uint32_t* ptr);
 
+// Verify the XCHPLOT2_HOST_GUARD redzones on every live pinned-host
+// allocation, reporting any damage to stderr with the buffer name and the
+// overrun distance. No-op unless the guard is enabled. The pipeline calls
+// this at each phase boundary; consumers that hold pinned buffers across
+// plots (the D2H drain slots) can call it at plot boundaries too, which
+// covers the window after the pipeline's last phase.
+void streaming_host_guard_check(char const* where);
+
 // Multi-GPU device binding. bind_current_device() sets a thread-local
 // target device id that sycl_backend::queue() reads when lazily
 // constructing the worker thread's queue. Must be called on the worker
