@@ -1525,6 +1525,26 @@ target_link_options(sycl_phase_split_parity PRIVATE LINKER:--allow-multiple-defi
 set_target_properties(sycl_phase_split_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# sycl_tier_parity — every streaming tier must emit the SAME plot. The other
+# parity targets validate kernels and primitives in isolation, so a defect in
+# a tier's surrounding host orchestration (slicing, parking, tile staging) had
+# no oracle at all — each tier stayed self-consistent while being wrong. This
+# is that oracle. See the file header for the concrete miss it closes.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(sycl_tier_parity tools/parity/sycl_tier_parity.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(sycl_tier_parity tools/parity/sycl_tier_parity.cpp)
+endif()
+x2_add_sycl_to_target(TARGET sycl_tier_parity
+                   SOURCES tools/parity/sycl_tier_parity.cpp)
+target_link_libraries(sycl_tier_parity PRIVATE pos2_gpu_host)
+target_include_directories(sycl_tier_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_tier_parity PRIVATE cxx_std_20)
+target_link_options(sycl_tier_parity PRIVATE LINKER:--allow-multiple-definition)
+set_target_properties(sycl_tier_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Phase 2.1c — pipeline-parallel orchestrator parity. Drives
 # run_pipeline_parallel_split with both halves pointing at device 0
 # (single-GPU virtual two-device test). Real two-GPU validation runs
