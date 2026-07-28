@@ -2126,17 +2126,37 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 bool const tier_tiny    = (tier == Tier::Tiny || tier == Tier::Pinned);
                 bool const tier_streams = (tier != Tier::Plain);
 
+                // `est` tracks the UNSWAPPABLE class only — pinned plus
+                // anonymous. That is the budget the knob enforces, because it
+                // is the class that can get the process OOM-killed.
+                //
+                // The mmap class does NOT belong in it. h_frags spills to a
+                // MAP_SHARED file: its dirty pages are written back and
+                // evicted under memory pressure instead of killing anything,
+                // so routing it genuinely removes those bytes from the
+                // dangerous class. But they stay RESIDENT while there is no
+                // pressure, so they still show up in RSS — which is the number
+                // the user actually watches. Track them separately and report
+                // both, or a user who measures 7.26 GiB against a modelled
+                // "5.33 GiB" concludes the tool lied to them.
                 uint64_t est            = host_required;
                 uint64_t routable_total = 0;
+                uint64_t reclaimable    = 0;   // routed to file-backed mmap
                 StreamingPinnedScratch::SpillPlan plan;
-                auto consider = [&](uint64_t table, bool available, bool& bit) {
+                auto consider = [&](uint64_t table, bool available, bool& bit,
+                                    bool mmap_class = false) {
                     if (!available) return;
                     routable_total += table;
-                    if (B == 0 || est > B) { bit = true; est -= std::min(table, est); }
+                    if (B == 0 || est > B) {
+                        bit = true;
+                        est -= std::min(table, est);
+                        if (mmap_class) reclaimable += table;
+                    }
                 };
                 consider(table8, tier_tiny,                  plan.h_t1_meta);
                 consider(table8, tier_streams,               plan.h_t3);
-                consider(table8, tier_streams && !tier_tiny, plan.h_frags);
+                consider(table8, tier_streams && !tier_tiny, plan.h_frags,
+                         /*mmap_class=*/true);
                 consider(table4, tier_streams && !tier_tiny, plan.h_t2_xbits);
 
                 // Drain slots are the LAST resort, deliberately. Spilling a
@@ -2193,15 +2213,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 if (plan.h_frags)    spilled += " h_frags";
                 if (plan.h_t2_xbits) spilled += " h_t2_xbits";
                 if (spilled.empty()) spilled = " (none)";
+                // Only mention RSS when the two figures actually differ —
+                // otherwise the extra clause is noise on every line.
+                char rss_note[128] = "";
+                if (reclaimable) {
+                    std::snprintf(rss_note, sizeof(rss_note),
+                        " (~%.2f GiB RSS; %.2f GiB of that is file-backed and "
+                        "reclaimable under pressure)",
+                        to_gib(est + reclaimable), to_gib(reclaimable));
+                }
                 std::fprintf(stderr,
                     "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
-                    "slot%s (-%.2f GiB), spilling%s -> modelled resident host "
-                    "peak ~%.2f GiB (routable floor ~%.2f GiB)\n",
+                    "slot%s (-%.2f GiB), spilling%s -> modelled unswappable "
+                    "host peak ~%.2f GiB%s (routable floor ~%.2f GiB)\n",
                     log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
                     GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
                     num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
                     spilled.c_str(),
-                    to_gib(est), to_gib(floor_bytes));
+                    to_gib(est), rss_note, to_gib(floor_bytes));
             }
 
             size_t host_free = 0, host_total = 0;
