@@ -116,7 +116,19 @@ void launch_streaming_partition_u32_u64(
 // original entries. Carrying both vals through a single partition
 // preserves the meta-xbits pairing.
 //
-// API mirrors u32_u64 with an extra (h_vals2_in, h_part_vals2) pair.
+// API mirrors u32_u64 with an extra (h_vals2_in, h_part_vals2) pair,
+// including the optional spill readers: pass a reader for either value
+// stream to feed that stream's per-tile source from a TempFile instead of
+// the host array (which is then null). Both null = in-memory path,
+// byte-identical.
+//
+// The two readers share the engine's window pair, one window each — the
+// u64 stream reads into window 0, the u32 stream into window 1 — so a tile
+// of BOTH streams is resident at once. That costs the cross-tile prefetch
+// the single-stream u32_u64 variant gets (which needs both windows for one
+// stream), so this path is unoverlapped by construction. Deliberate: the
+// simplest correct mechanism first, and whether overlap is worth another
+// window pair is a question for measurement, not assumption.
 // Both vals are written at the same atomic-claim slot, so the i-th
 // output triple always corresponds to a single input position.
 void launch_streaming_partition_u32_u64_u32(
@@ -133,6 +145,11 @@ void launch_streaming_partition_u32_u64_u32(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q);
+    sycl::queue& q,
+    // Non-null routes that value stream's per-tile source through the
+    // double-buffered disk reader instead of its h_*_in array (which is
+    // then null). Independent: either, both, or neither.
+    SpillTileReader const* vals_reader  = nullptr,
+    SpillTileReader const* vals2_reader = nullptr);
 
 } // namespace pos2gpu

@@ -286,7 +286,9 @@ void launch_streaming_partition_u32_u64_u32(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q)
+    sycl::queue& q,
+    SpillTileReader const* vals_reader,
+    SpillTileReader const* vals2_reader)
 {
     if (num_top_bits < 1 || num_top_bits > 16) {
         throw std::invalid_argument(
@@ -371,14 +373,60 @@ void launch_streaming_partition_u32_u64_u32(
         if (tile_off >= count) break;
         uint64_t const tile_n   = std::min(tile_size, count - tile_off);
 
+        // Spill: this tile's source bytes live on disk. Issue BOTH preads
+        // before waiting on either — the engine's single worker runs them
+        // back to back, so the second is already in flight while the first
+        // is being H2D'd. The u64 stream owns window 0 and the u32 stream
+        // window 1, so a tile of both is resident at once (see the header
+        // for why this path has no cross-tile prefetch).
+        constexpr int kValsSlot  = 0;
+        constexpr int kVals2Slot = 1;
+        if (vals_reader) {
+            if (tile_n > vals_reader->win_entries) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64_u32: spill tile exceeds "
+                    "staging window (u64 stream)");
+            }
+            vals_reader->submit(vals_reader->ctx, kValsSlot,
+                                tile_off * sizeof(uint64_t),
+                                tile_n   * sizeof(uint64_t));
+        }
+        if (vals2_reader) {
+            // win_entries is quoted in u64 units; the u32 stream fits twice
+            // as many entries in the same window.
+            if (tile_n > vals2_reader->win_entries * 2) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64_u32: spill tile exceeds "
+                    "staging window (u32 stream)");
+            }
+            vals2_reader->submit(vals2_reader->ctx, kVals2Slot,
+                                 tile_off * sizeof(uint32_t),
+                                 tile_n   * sizeof(uint32_t));
+        }
+
         // The queue is out-of-order: both H2D copies must complete
         // before the partition kernel reads the tiles, so wait on each
         // event (waiting only on the second would let the kernel race
         // the first copy).
-        auto e_vals  = q.memcpy(d_vals_tile,  h_vals_in  + tile_off,
-                                tile_n * sizeof(uint64_t));
-        auto e_vals2 = q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
-                                tile_n * sizeof(uint32_t));
+        sycl::event e_vals, e_vals2;
+        if (vals_reader) {
+            vals_reader->wait(vals_reader->ctx, kValsSlot);
+            e_vals = q.memcpy(d_vals_tile, vals_reader->win[kValsSlot],
+                              tile_n * sizeof(uint64_t));
+        } else {
+            e_vals = q.memcpy(d_vals_tile, h_vals_in + tile_off,
+                              tile_n * sizeof(uint64_t));
+        }
+        if (vals2_reader) {
+            vals2_reader->wait(vals2_reader->ctx, kVals2Slot);
+            e_vals2 = q.memcpy(
+                d_vals2_tile,
+                reinterpret_cast<uint32_t const*>(vals2_reader->win[kVals2Slot]),
+                tile_n * sizeof(uint32_t));
+        } else {
+            e_vals2 = q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
+                               tile_n * sizeof(uint32_t));
+        }
         e_vals.wait();
         e_vals2.wait();
 
