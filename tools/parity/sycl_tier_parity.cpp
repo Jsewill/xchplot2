@@ -67,11 +67,17 @@ struct TierSpec {
 // contract, so it belongs here rather than in an ad-hoc run: a spill that
 // drops or reorders entries produces a valid-looking plot, same as the T1
 // race did.
+//
+// Every tier that CAN spill gets a spilled variant. Compact and minimal route
+// the same three tables but at different tile counts (2/1 vs 8/4), and tiling
+// is the axis the T1 lost-tile race lived on — a spill reader that gets a tile
+// boundary wrong is invisible at one tile count and wrong at the other.
 constexpr TierSpec kTiers[] = {
     {"plain",       true,  false, 2, 1, false},
     {"compact",     false, false, 2, 1, false},
     {"minimal",     false, false, 8, 4, false},
     {"tiny",        false, true,  8, 4, false},
+    {"compact+dsk", false, false, 2, 1, true},
     {"minimal+dsk", false, false, 8, 4, true},
     {"tiny+disk",   false, true,  8, 4, true},
 };
