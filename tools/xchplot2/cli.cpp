@@ -1529,12 +1529,64 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     compute_label = "tmpfs";
                     tmpfs_scratch = compute_dir;  // remove the dir, not just its plots
                 }
+                // Pin the second pass to the pipeline the first one actually
+                // ran. The tier is auto-picked per worker from free VRAM at the
+                // moment that worker starts, so nothing guarantees two passes
+                // of the same binary on the same idle card agree — and when
+                // they don't, the wall-time difference is the tier's, not the
+                // disk's. Measured on a 4090 squeezed to ~9 GiB free at k=28:
+                // pass 1 plain, pass 2 compact, and the "disk overhead" line
+                // then reported the plain->compact gap with a straight face.
+                //
+                // Only GPU workers carry a tier, and only a streaming tier is
+                // forceable (there is no --tier pool), so this pins what it can
+                // and the check after the pass catches whatever it could not.
+                pos2gpu::BatchOptions compute_opts = opts;
+                {
+                    std::string tier;
+                    bool uniform = true;
+                    for (auto const& w : e2e.result.workers) {
+                        if (w.pipeline.empty() || w.pipeline == "cpu") continue;
+                        if (w.pipeline == "pool") { uniform = false; break; }
+                        if (tier.empty())          tier = w.pipeline;
+                        else if (tier != w.pipeline) { uniform = false; break; }
+                    }
+                    if (uniform && !tier.empty()) {
+                        compute_opts.streaming_tier = tier;
+                        compute_opts.per_device_tier.clear();
+                        compute_opts.all_gpus_tier.clear();
+                    }
+                }
                 compute = run_bench_pass(
-                    k, strength, testnet, plot_count, compute_dir, opts,
+                    k, strength, testnet, plot_count, compute_dir, compute_opts,
                     warmup_per_worker, keep);
                 print_bench_measurement("compute-only", compute, k,
                                         compute_label.c_str());
-                if (e2e.s_per_plot > 0.0 && compute.s_per_plot > 0.0) {
+
+                // Did the pin hold? A pool/streaming split cannot be pinned at
+                // all, and a forced tier can still be overridden by its own
+                // floor check. Compare per device rather than as a set: two
+                // workers swapping tiers between passes is still a difference.
+                std::string mismatch;
+                {
+                    std::map<int, std::string> before;
+                    for (auto const& w : e2e.result.workers) before[w.device_id] = w.pipeline;
+                    for (auto const& w : compute.result.workers) {
+                        auto it = before.find(w.device_id);
+                        if (it == before.end() || it->second == w.pipeline) continue;
+                        if (!mismatch.empty()) mismatch += ", ";
+                        mismatch += "dev " + std::to_string(w.device_id) + " " +
+                                    (it->second.empty() ? "?" : it->second) + "->" +
+                                    (w.pipeline.empty() ? "?" : w.pipeline);
+                    }
+                }
+                if (!mismatch.empty()) {
+                    std::fprintf(stderr,
+                        "[bench]   disk overhead: NOT COMPARABLE — the two passes "
+                        "ran different pipelines (%s), so their wall-time "
+                        "difference is that change, not the disk\n",
+                        mismatch.c_str());
+                } else if (e2e.s_per_plot > 0.0 && compute.s_per_plot > 0.0) {
                     // From the two s/plot figures directly, NOT from the two
                     // rates. rate = mean_plot_bytes / s_per_plot, and the passes
                     // mint fresh random plot_ids, so a rate ratio carries a

@@ -1485,6 +1485,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // needs an explicit flag and a RAM gate, not a bool.
     if (is_cpu_device(device_id)) {
         BatchResult res;
+        res.pipeline = "cpu";  // no tier to pick; see WorkerTimeline::pipeline
         if (entries.empty()) return res;
 
         // Confine this worker to its own NUMA node — and, because Linux copies
@@ -1840,6 +1841,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         }
         pool_ptr = std::make_unique<GpuBufferPool>(
             pool_k, pool_strength, pool_testnet);
+        // The pool fit — record it, same reason as the streaming tier below.
+        // Pool-vs-streaming is the LARGER of the two differences a two-pass
+        // caller can accidentally straddle, so it has to be distinguishable
+        // from a tier name, not folded into one.
+        res.pipeline = "pool";
     } catch (InsufficientVramError const& e) {
         if (opts.quiet) {
             // info-level: which pipeline was picked and why
@@ -2027,6 +2033,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 free_bytes / double(1ULL << 30),
                 kMinimalFloorBytes / double(1ULL << 30));
         }
+
+        // Record what was actually picked, so a two-pass caller can tell
+        // whether its two passes are comparable. See WorkerTimeline.
+        res.pipeline = (tier == Tier::Plain)   ? "plain"
+                     : (tier == Tier::Compact) ? "compact"
+                     : (tier == Tier::Minimal) ? "minimal"
+                     : (tier == Tier::Tiny)    ? "tiny"
+                                               : "";
 
         if (tier == Tier::Plain) {
             // Plain: zero PCIe overhead, all parks skipped.
@@ -2652,6 +2666,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         w.device_id          = dev;
         w.work_start_seconds = r.work_start_seconds;
         w.completion_seconds = r.completion_seconds;
+        w.pipeline           = r.pipeline;
         r.workers.assign(1, std::move(w));
     };
 
@@ -2820,6 +2835,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         w.device_id          = device_ids[i];
         w.work_start_seconds = r.work_start_seconds;
         w.completion_seconds = r.completion_seconds;  // already ascending
+        w.pipeline           = r.pipeline;
         agg.workers.push_back(std::move(w));
     }
     std::sort(agg.completion_seconds.begin(), agg.completion_seconds.end());
