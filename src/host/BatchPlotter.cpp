@@ -2106,23 +2106,23 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // GpuPipeline.cpp):
                 //   h_t1_meta  (8 B, Tiny only,            DMA/SpillBuffer)
                 //   h_t3       (8 B, Compact/Minimal/Tiny, DMA/SpillBuffer)
+                //   h_t2_meta  (8 B, Tiny only,            DMA/SpillBuffer)
                 //   h_frags    (8 B, Compact/Minimal only, mmap/pageable)
-                //   h_t2_xbits (4 B, Compact/Minimal only, DMA/SpillBuffer)
+                //   h_t2_xbits (4 B, Compact/Minimal/Tiny, DMA/SpillBuffer)
                 //
                 // Deliberately NOT routable (device KERNELS read/write them
                 // through USM-host pointers, so they must stay device-
                 // accessible pinned memory — a disk file or mmap would
                 // corrupt or crash the kernel access):
                 //   h_keys_merged — the streaming-partition kernel writes it.
-                //   h_t2_meta     — distinct from h_meta only in Tiny, and
-                //                   Tiny's T2 sort (Phase 1.5b partition,
-                //                   GpuPipeline.cpp ~3348) reads it as a
-                //                   USM-host value input. Aliased to h_meta
-                //                   in Compact/Minimal, so not independently
-                //                   routable there either.
-                //   h_t2_xbits in Tiny — same Tiny T2-sort partition reads
-                //                   it USM-host; only Compact/Minimal route
-                //                   it (their gather paths use q.memcpy).
+                //   h_t2_meta in Compact/Minimal — it ALIASES h_meta there, so
+                //                   routing it would strand the alias. Tiny
+                //                   gives it its own buffer, which is what
+                //                   makes it routable in that tier (A2).
+                //
+                // A2 lifted the Tiny restriction on h_t2_meta / h_t2_xbits:
+                // the T2-sort partition used to read both USM-host, and now
+                // pulls each through its own SpillTileReader.
                 bool const tier_tiny    = (tier == Tier::Tiny || tier == Tier::Pinned);
                 bool const tier_streams = (tier != Tier::Plain);
 
@@ -2155,9 +2155,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 };
                 consider(table8, tier_tiny,                  plan.h_t1_meta);
                 consider(table8, tier_streams,               plan.h_t3);
+                consider(table8, tier_tiny,                  plan.h_t2_meta);
                 consider(table8, tier_streams && !tier_tiny, plan.h_frags,
                          /*mmap_class=*/true);
-                consider(table4, tier_streams && !tier_tiny, plan.h_t2_xbits);
+                consider(table4, tier_streams,               plan.h_t2_xbits);
 
                 // Drain slots are the LAST resort, deliberately. Spilling a
                 // table costs disk I/O per plot; giving up a drain slot costs
@@ -2210,6 +2211,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 std::string spilled;
                 if (plan.h_t1_meta)  spilled += " h_t1_meta";
                 if (plan.h_t3)       spilled += " h_t3";
+                if (plan.h_t2_meta)  spilled += " h_t2_meta";
                 if (plan.h_frags)    spilled += " h_frags";
                 if (plan.h_t2_xbits) spilled += " h_t2_xbits";
                 if (spilled.empty()) spilled = " (none)";
@@ -2384,10 +2386,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                       return v && v[0] == '1'; }());
             stream_scratch.spill.h_t1_meta = spill_t1meta;  // reconcile with legacy env
             bool const spill_t3 = stream_scratch.spill.h_t3;
-            // h_t2_xbits is routed to disk only in Compact/Minimal (Tiny's
-            // T2-sort partition reads it via a USM-host kernel, so it must
-            // stay pinned — the budget policy never sets the bit for Tiny).
+            // h_t2_xbits routes in every streaming tier since A2 taught the
+            // T2-sort partition to pull its source streams off disk; h_t2_meta
+            // routes in Tiny only (elsewhere it aliases h_meta).
             bool const spill_t2xbits = stream_scratch.spill.h_t2_xbits;
+            bool const spill_t2meta  = stream_scratch.tiny_mode &&
+                                       stream_scratch.spill.h_t2_meta;
+            stream_scratch.spill.h_t2_meta = spill_t2meta;
             if (!spill_t1meta) {
                 stream_scratch.h_meta    = streaming_alloc_pinned_uint64(stream_pinned_cap);
             }
@@ -2404,13 +2409,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // race (they read d_t1_meta_sorted on device, not h_t1_meta
             // on host) so leave h_t2_meta null and the streaming
             // pipeline reuses h_meta as before.
-            if (stream_scratch.tiny_mode) {
+            if (stream_scratch.tiny_mode && !spill_t2meta) {
                 stream_scratch.h_t2_meta = streaming_alloc_pinned_uint64(stream_pinned_cap);
             }
             if ((!spill_t1meta && !stream_scratch.h_meta) || !stream_scratch.h_keys_merged ||
                 (!spill_t2xbits && !stream_scratch.h_t2_xbits) ||
                 (!spill_t3 && !stream_scratch.h_t3) ||
-                (stream_scratch.tiny_mode && !stream_scratch.h_t2_meta))
+                (stream_scratch.tiny_mode && !spill_t2meta && !stream_scratch.h_t2_meta))
             {
                 if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
                 if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);

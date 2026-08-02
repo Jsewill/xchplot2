@@ -53,16 +53,27 @@ struct TierSpec {
     bool        tiny_mode;
     int         t2_tile_count;
     int         gather_tile_count;
+    bool        spill;   // route every table this tier can spill to disk
 };
 
 // Mirrors BatchPlotter's tier configuration (BatchPlotter.cpp ~2298). Keep in
 // step with it — if the two drift, this test silently stops covering a tier
 // that ships.
+//
+// The trailing spilled variants are the host-RAM disk-offload path. They are
+// not tiers the picker can choose; they are the same tier with its cold tables
+// redirected to a TempFile, which is exactly the kind of change that stays
+// invisible until a plot is farmed. Byte parity against plain is the whole
+// contract, so it belongs here rather than in an ad-hoc run: a spill that
+// drops or reorders entries produces a valid-looking plot, same as the T1
+// race did.
 constexpr TierSpec kTiers[] = {
-    {"plain",   true,  false, 2, 1},
-    {"compact", false, false, 2, 1},
-    {"minimal", false, false, 8, 4},
-    {"tiny",    false, true,  8, 4},
+    {"plain",       true,  false, 2, 1, false},
+    {"compact",     false, false, 2, 1, false},
+    {"minimal",     false, false, 8, 4, false},
+    {"tiny",        false, true,  8, 4, false},
+    {"minimal+dsk", false, false, 8, 4, true},
+    {"tiny+disk",   false, true,  8, 4, true},
 };
 
 void derive_plot_id(std::array<uint8_t, 32>& out, uint8_t seed)
@@ -108,6 +119,18 @@ Run run_tier(TierSpec const& spec, int k, int strength, uint8_t seed)
     scratch.tiny_mode         = spec.tiny_mode;
     scratch.t2_tile_count     = spec.t2_tile_count;
     scratch.gather_tile_count = spec.gather_tile_count;
+    if (spec.spill) {
+        // Mirrors BatchPlotter's routable set (BatchPlotter.cpp ~2156), which
+        // is tier-dependent: h_t1_meta and h_t2_meta exist as separate buffers
+        // only in Tiny, and h_frags is Compact/Minimal only. Setting a bit the
+        // tier cannot honour is not a no-op — it nulls a buffer nothing will
+        // redirect — so gate them the same way the policy does.
+        scratch.spill.h_t3       = true;
+        scratch.spill.h_t2_xbits = true;
+        scratch.spill.h_t1_meta  = spec.tiny_mode;
+        scratch.spill.h_t2_meta  = spec.tiny_mode;
+        scratch.spill.h_frags    = !spec.tiny_mode;
+    }
 
     try {
         auto res  = pos2gpu::run_gpu_pipeline_streaming(cfg, pinned_dst, cap, scratch);

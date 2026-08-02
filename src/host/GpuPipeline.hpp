@@ -322,19 +322,25 @@ struct StreamingPinnedScratch {
     //     h_frags. Reclaimable only under pressure.
     // Some large tables are deliberately NOT routable because a device
     // KERNEL accesses them through a USM-host pointer, which a disk file
-    // or mmap cannot satisfy: h_keys_merged (streaming-partition kernel
-    // writes it) and h_t2_meta (Tiny's Phase-1.5b T2-sort partition reads
-    // it USM-host; it aliases h_meta in Compact/Minimal). h_t2_xbits is
-    // routable in Compact/Minimal only for the same reason (Tiny's T2-sort
-    // partition reads it USM-host). Lifting either would need a disk-aware
-    // T2-sort-partition rewrite, out of scope here.
+    // or mmap cannot satisfy: h_keys_merged and the partition's h_part_*
+    // arenas (the streaming-partition kernel WRITES them via zero-copy
+    // device-side scatter, so they must stay host-USM).
+    //
+    // The partition's SOURCE streams are a different matter and are routable:
+    // launch_streaming_partition_u32_u64_u32 takes a SpillTileReader per value
+    // stream, so Tiny's Phase-1.5b T2 sort can pull h_t2_meta / h_t2_xbits
+    // tile-by-tile off disk instead of reading them USM-host. That is what
+    // makes h_t2_meta routable in Tiny and lifts h_t2_xbits's Compact/Minimal-
+    // only restriction. In Compact/Minimal h_t2_meta still ALIASES h_meta, so
+    // it stays un-routable there — spilling it would strand the alias.
     struct SpillPlan {
         bool h_t1_meta  = false;  // ~cap·8 B, tiny tier only            (DMA)
         bool h_t3       = false;  // ~cap·8 B, compact / minimal / tiny  (DMA)
-        bool h_t2_xbits = false;  // ~cap·4 B, compact / minimal only    (DMA)
+        bool h_t2_xbits = false;  // ~cap·4 B, compact / minimal / tiny  (DMA)
+        bool h_t2_meta  = false;  // ~cap·8 B, tiny tier only            (DMA)
         bool h_frags    = false;  // ~cap·8 B, compact / minimal only    (mmap)
         bool any() const {
-            return h_t1_meta || h_t3 || h_t2_xbits || h_frags;
+            return h_t1_meta || h_t3 || h_t2_xbits || h_t2_meta || h_frags;
         }
     };
     SpillPlan spill;
