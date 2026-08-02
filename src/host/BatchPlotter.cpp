@@ -1463,6 +1463,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     }();
     if (is_cpu_device(device_id) && !sycl_cpu_bench) {
         BatchResult res;
+        res.pipeline = "cpu";  // no tier to pick; see WorkerTimeline::pipeline
         if (entries.empty()) return res;
 
         // Confine this worker to its own NUMA node — and, because Linux copies
@@ -1845,6 +1846,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             (mem_before_pool.free_bytes > declared_base_bytes + vram_safety_margin())
                 ? mem_before_pool.free_bytes - declared_base_bytes - vram_safety_margin()
                 : 0;
+        // The pool fit — record it, same reason as the streaming tier below.
+        // Pool-vs-streaming is the LARGER of the two differences a two-pass
+        // caller can accidentally straddle, so it has to be distinguishable
+        // from a tier name, not folded into one.
+        res.pipeline = "pool";
     } catch (InsufficientVramError const& e) {
         if (opts.quiet) {
             // info-level: which pipeline was picked and why
@@ -2082,6 +2088,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 stream_scratch.t2_tile_count     = 8;
                 stream_scratch.gather_tile_count = 4;
             }
+
+            // Record what was actually picked, so a two-pass caller can tell
+            // whether its two passes are comparable. See WorkerTimeline.
+            res.pipeline = tier_name(tier);
 
             if (!opts.quiet) {
                 std::fprintf(stderr,
@@ -3902,6 +3912,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         w.device_id            = dev;
         w.work_start_seconds   = r.work_start_seconds;
         w.completion_seconds   = r.completion_seconds;
+        w.pipeline             = r.pipeline;
         r.workers.assign(1, std::move(w));
     };
 
@@ -4077,6 +4088,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         w.device_id          = device_ids[i];
         w.work_start_seconds = r.work_start_seconds;
         w.completion_seconds = r.completion_seconds;  // already ascending
+        w.pipeline           = r.pipeline;
         agg.workers.push_back(std::move(w));
     }
     std::sort(agg.completion_seconds.begin(), agg.completion_seconds.end());
