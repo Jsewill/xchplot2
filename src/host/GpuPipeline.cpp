@@ -287,7 +287,7 @@ struct SpillEngine {
 
     StreamingStats*   stats = nullptr;
     sycl::queue*      q     = nullptr;
-    uint8_t*          win[kNumWindows] = {nullptr, nullptr};   // byte windows; typed by SpillBuffer
+    uint8_t*          win[kNumWindows] = {};   // byte windows; typed by SpillBuffer
 
     enum class Op { Write, Read, Stop };
     struct Job { Op op; int slot; pos2gpu::TempFile* file;
@@ -300,7 +300,7 @@ struct SpillEngine {
     std::deque<Job>         jobs;
     uint64_t                next_ticket = 0;         // last enqueued
     uint64_t                done_ticket = 0;         // last completed (FIFO => monotonic)
-    uint64_t                slot_ticket[kNumWindows] = {0, 0};  // last job ENQUEUED against each window
+    uint64_t                slot_ticket[kNumWindows] = {};  // last job ENQUEUED against each window
     // Last job the worker actually COMPLETED into each window, and the
     // ticket a reader is waiting to consume from it. These exist because
     // wait_slot() waits on slot_ticket[slot] — the LATEST job queued for
@@ -311,8 +311,8 @@ struct SpillEngine {
     // so SpillCoverage sees nothing wrong, and the result is a silently
     // wrong plot. wait_ticket() below turns that into a hard error for one
     // integer compare, so it stays on in release builds.
-    uint64_t                win_last_done[kNumWindows]   = {0, 0};
-    uint64_t                pending_ticket[kNumWindows]  = {0, 0};
+    uint64_t                win_last_done[kNumWindows]   = {};
+    uint64_t                pending_ticket[kNumWindows]  = {};
     int                     write_slot = 0;          // ping-pong cursor for writes (SHARED across tables)
     std::string             io_error;                // first worker error, re-raised on wait/drain
     bool                    overlap = true;          // XCHPLOT2_SPILL_NO_OVERLAP=1 => synchronous (A/B measure only)
@@ -2693,6 +2693,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
        // contains the existing CUB-sort + 2-way-merge + gather code
        // (with its own local variable declarations) which goto must
        // not appear to "skip past" at function scope.
+       //
+       // Tiny and Pinned never get here: both set scratch.tiny_mode, and the
+       // tiny_mode branch above ends in that unconditional goto, jumping this
+       // whole wrapper. State the invariant instead of leaving it implied —
+       // this block used to carry a full set of tiny_mode branches (an early
+       // h_merged_vals host park, a fallback park, a tiled index H2D and their
+       // frees) that had been unreachable long enough for a scoping note to
+       // still list the park as a live ~1 GiB spill candidate, and for its
+       // comment to still advertise a 264 MB saving that no tier was taking.
+       // If the goto above ever becomes conditional, this fires instead of
+       // silently resurrecting a path nothing has exercised in a long time.
+    if (scratch.tiny_mode)
+        throw std::runtime_error(
+            "internal: tiny/pinned reached the non-tiny T1 sort path");
+
     if (!t1_match_sliced) {
         // Compact / plain — existing full-cap path.
         s_malloc(stats, d_keys_out,     cap * sizeof(uint32_t), "d_keys_out");
@@ -2833,34 +2848,6 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Plain mode: d_t1_meta is already live (never parked).
     int const t1_gather_N = scratch.plain_mode ? 1 : scratch.gather_tile_count;
 
-    // Cheap-win reorder (k=26 saves ~72 MB / k=28 ~288 MB): for tiny
-    // (and pinned-mode which inherits tiny=true), park d_t1_merged_vals
-    // to host BEFORE allocating d_t1_meta. The previous order had both
-    // co-resident at the H2D moment, contributing 264 + 528 = 792 MB
-    // to the T1 sort phase peak at k=26 (this was the dominant Tiny
-    // floor). After the reorder, d_t1_merged_vals is gone when
-    // d_t1_meta is allocated, so the peak drops to d_t1_meta (528 MB)
-    // + per-tile staging (~192 MB). Saves ~264 MB at k=26.
-    //
-    // The park is duplicated below (inside the multi-tile gather
-    // branch) for backward-compat-without-this-reorder code paths;
-    // the duplicated branch is guarded so it's a no-op when we've
-    // already parked here.
-    uint32_t* h_t1_merged_vals_pre = nullptr;  // populated by the early-park
-    if (!scratch.plain_mode && t1_gather_N > 1 && scratch.tiny_mode
-        && d_t1_merged_vals != nullptr) {
-        h_t1_merged_vals_pre = scratch.pool
-            ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
-            : s_malloc_host<uint32_t>(stats, t1_count * sizeof(uint32_t),
-                                      "h_t1_merged_vals_pre", q);
-        if (!h_t1_merged_vals_pre) throw std::runtime_error(
-            "sycl::malloc_host(h_t1_merged_vals_pre) failed");
-        q.memcpy(h_t1_merged_vals_pre, d_t1_merged_vals,
-                 t1_count * sizeof(uint32_t)).wait();
-        s_free(stats, d_t1_merged_vals);
-        d_t1_merged_vals = nullptr;
-    }
-
     if (!scratch.plain_mode) {
         s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
         q.memcpy(d_t1_meta, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
@@ -2901,72 +2888,30 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         uint64_t const tile_max =
             (t1_count + uint64_t(t1_gather_N) - 1) / uint64_t(t1_gather_N);
         uint64_t* d_tile = nullptr;
-        uint32_t* h_t1_merged_vals = h_t1_merged_vals_pre;  // from early park
-        uint32_t* d_idx_tile       = nullptr;
-        if (scratch.tiny_mode) {
-            // Cheap-win reorder: the early-park above (before d_t1_meta
-            // alloc) handled the host park. If we got here without one
-            // (e.g., the early-park branch was skipped because
-            // d_t1_merged_vals was already nullptr), fall back to the
-            // original park-here logic.
-            if (h_t1_merged_vals == nullptr) {
-                h_t1_merged_vals = scratch.pool
-                    ? scratch.pool->acquire_as<uint32_t>("h_merged_vals", cap, q)
-                    : s_malloc_host<uint32_t>(stats, t1_count * sizeof(uint32_t),
-                                              "h_t1_merged_vals", q);
-                if (!h_t1_merged_vals)
-                    throw std::runtime_error("sycl::malloc_host(h_t1_merged_vals) failed");
-                q.memcpy(h_t1_merged_vals, d_t1_merged_vals,
-                         t1_count * sizeof(uint32_t)).wait();
-                s_free(stats, d_t1_merged_vals);
-                d_t1_merged_vals = nullptr;
-            }
-            s_malloc(stats, d_idx_tile, tile_max * sizeof(uint32_t), "d_t1_merged_vals_tile");
-        }
         s_malloc(stats, d_tile, tile_max * sizeof(uint64_t), "d_t1_meta_sorted_tile");
         for (int n = 0; n < t1_gather_N; ++n) {
             uint64_t const tile_off = uint64_t(n) * tile_max;
             if (tile_off >= t1_count) break;
             uint64_t const tile_n = std::min(tile_max, t1_count - tile_off);
-            uint32_t const* src_idx = nullptr;
-            if (scratch.tiny_mode) {
-                q.memcpy(d_idx_tile, h_t1_merged_vals + tile_off,
-                         tile_n * sizeof(uint32_t)).wait();
-                src_idx = d_idx_tile;
-            } else {
-                src_idx = d_t1_merged_vals + tile_off;
-            }
             launch_gather_u64(
-                d_t1_meta, src_idx,
+                d_t1_meta, d_t1_merged_vals + tile_off,
                 d_tile, tile_n, q);
             q.memcpy(h_t1_meta + tile_off, d_tile,
                      tile_n * sizeof(uint64_t)).wait();
         }
         s_free(stats, d_tile);
-        if (scratch.tiny_mode) {
-            s_free(stats, d_idx_tile);
-            if (!scratch.pool) s_free_host(stats, h_t1_merged_vals, q);
-        }
         s_free(stats, d_t1_meta);
         if (d_t1_merged_vals) s_free(stats, d_t1_merged_vals);
-        // Tiny tier: skip the full-cap d_t1_meta_sorted rehydration. The
-        // sliced T2 match path (per-section meta_l/meta_r H2D) reads
-        // section-sized slices from h_t1_meta directly. Saves 2080 MB of
-        // device VRAM at k=28 across T2 match.
-        if (!scratch.tiny_mode) {
-            s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
-            q.memcpy(d_t1_meta_sorted, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
-        }
+        s_malloc(stats, d_t1_meta_sorted, cap * sizeof(uint64_t), "d_t1_meta_sorted");
+        q.memcpy(d_t1_meta_sorted, h_t1_meta, t1_count * sizeof(uint64_t)).wait();
         end_phase(p_t1_sort);
-        // Tiny: keep h_t1_meta alive across T2 match for slicing. Free
-        // happens inside the tiny T2 match block.
         // stop_after_t1_sort (Phase 2.2): keep h_t1_meta alive so the
         // caller can read sorted T1 metadata. h_meta_owned is already
         // false for the stop_after_t1_sort path (caller provides the
         // buffer), so the free below is a no-op — but the unconditional
         // h_t1_meta = nullptr would still disconnect it from the
         // caller's pointer, hence the explicit guard.
-        if (!scratch.tiny_mode && !scratch.stop_after_t1_sort) {
+        if (!scratch.stop_after_t1_sort) {
             if (h_meta_owned) s_free_host(stats, h_t1_meta, q);
             h_t1_meta = nullptr;
         }
