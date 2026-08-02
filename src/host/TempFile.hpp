@@ -14,9 +14,9 @@
 // On crash the kernel reclaims the inode at process exit because the
 // directory entry is already unlinked at construction.
 //
-// Not yet wired into any tier — future low-VRAM streaming work will
-// use this to spill cap-sized intermediate buffers (e.g. d_t1_meta in
-// the source-tile gather rewrite) when host pinned can't grow further.
+// Backs the host-RAM disk-offload path: SpillEngine/SpillBuffer stream the
+// cold cap-sized tables (h_t1_meta, h_t3, h_t2_meta, h_t2_xbits) through one
+// of these, and h_frags takes a map() instead.
 
 #pragma once
 
@@ -82,8 +82,20 @@ public:
     // only the mount's own fs magic is inspected, so files that actually live
     // on btrfs/ext4 pass even when the system swaps to compressed RAM.
     // Returns false if statfs() fails — an unprobeable fs must not block
-    // spilling.
+    // spilling. That includes a dir that does not exist, so this is NOT a
+    // usability check; pair it with dir_problem().
     static bool dir_is_ram_backed(std::string const& dir);
+
+    // "" when a spill file can actually be created in `dir` (after
+    // resolve_dir), otherwise a human-readable reason.
+    //
+    // Probes by doing the real thing — create a temp file and delete it —
+    // rather than stat/access, which miss read-only mounts, full
+    // filesystems and ACLs, and would hand back a pass that fails minutes
+    // later. Without this, a mistyped --temp-dir (the flag the tmpfs error
+    // tells users to reach for) sails past the guard and dies deep in the
+    // pipeline with a raw mkstemp errno, after the batch has begun.
+    static std::string dir_problem(std::string const& dir);
 
 private:
     int           fd_         = -1;

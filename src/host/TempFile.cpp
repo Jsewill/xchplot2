@@ -46,6 +46,22 @@ bool TempFile::dir_is_ram_backed(std::string const& dir)
         || fsmagic == kHugetlbfsMagic;
 }
 
+std::string TempFile::dir_problem(std::string const& dir)
+{
+    std::string const resolved = resolve_dir(dir);
+    try {
+        // Construct-and-destroy is the probe: it exercises exactly the
+        // mkstemp the spill will do later, so a read-only mount, a full
+        // filesystem or an ACL that stat/access would wave through is caught
+        // here instead of mid-plot. The file is unlinked at construction and
+        // closed by the destructor, so nothing is left behind.
+        TempFile probe(resolved);
+        return {};
+    } catch (std::exception const& e) {
+        return e.what();
+    }
+}
+
 TempFile::TempFile(std::string_view dir)
 {
     std::string base = resolve_dir(dir);

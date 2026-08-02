@@ -124,5 +124,50 @@ int main()
         ::unsetenv("XCHPLOT2_TEMP_DIR");
     }
 
+    // Test 8: dir_problem — the spill guard's usability probe.
+    //
+    // dir_is_ram_backed() answers false for a dir it cannot even statfs, so
+    // it passes a mistyped --temp-dir straight through; this is what catches
+    // that, and a version of it that returns "" for an unusable dir would
+    // silently restore the original failure — a raw mkstemp errno thrown deep
+    // in the pipeline, minutes into a batch.
+    {
+        all_ok = check(pos2gpu::TempFile::dir_problem("/tmp").empty(),
+                       "dir_problem: usable dir reports no problem") && all_ok;
+
+        std::string const missing =
+            pos2gpu::TempFile::dir_problem("/nonexistent-xchplot2-probe");
+        all_ok = check(!missing.empty(),
+                       "dir_problem: missing dir reports a problem") && all_ok;
+
+        // Exists but not writable. Skipped as root, where write permission
+        // is not enforced and the probe would (correctly) succeed.
+        if (::geteuid() != 0) {
+            char tmpl[] = "/tmp/xchplot2-ro-XXXXXX";
+            if (char const* d = ::mkdtemp(tmpl); d) {
+                ::chmod(d, 0555);
+                std::string const ro = pos2gpu::TempFile::dir_problem(d);
+                all_ok = check(!ro.empty(),
+                               "dir_problem: read-only dir reports a problem")
+                         && all_ok;
+                ::chmod(d, 0755);
+                ::rmdir(d);
+            }
+        }
+
+        // The probe must not leave its own file behind — it creates one and
+        // relies on TempFile unlinking at construction.
+        {
+            char tmpl2[] = "/tmp/xchplot2-probe-XXXXXX";
+            if (char const* d = ::mkdtemp(tmpl2); d) {
+                (void) pos2gpu::TempFile::dir_problem(d);
+                bool const empty_after = (::rmdir(d) == 0);  // fails if non-empty
+                all_ok = check(empty_after,
+                               "dir_problem: leaves nothing behind") && all_ok;
+                ::rmdir(d);
+            }
+        }
+    }
+
     return all_ok ? 0 : 1;
 }

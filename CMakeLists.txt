@@ -971,6 +971,9 @@ add_library(pos2_gpu_host STATIC
     src/host/GpuPlotter.cpp
     src/host/PlotFileWriterParallel.cpp
     src/host/BatchPlotter.cpp
+    # Pure integer policy, no SYCL/CUDA/device probe — see the header. Kept a
+    # separate TU so host_spill_policy_test can link it on its own.
+    src/host/HostRamPolicy.cpp
     src/host/CpuPlotter.cpp
     src/host/NumaTopology.cpp
     src/host/Cancel.cpp
@@ -1186,6 +1189,19 @@ add_executable(host_guard_test tools/parity/host_guard_test.cpp)
 target_include_directories(host_guard_test PRIVATE src)
 target_compile_features(host_guard_test PRIVATE cxx_std_20)
 set_target_properties(host_guard_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# host_spill_policy_test — the host-RAM disk-offload budget policy. Same
+# argument as the two above: HostRamPolicy is pure integer arithmetic with no
+# SYCL/CUDA/device probe, so every branch is reachable here on any machine.
+# Reaching them for real needs a GPU, a k=28-sized host and a specific free-RAM
+# reading, which is why this policy shipped with no test until now — and it is
+# the code that decides whether this process gets OOM-killed or plots.
+add_executable(host_spill_policy_test tools/parity/host_spill_policy_test.cpp
+                                      src/host/HostRamPolicy.cpp)
+target_include_directories(host_spill_policy_test PRIVATE src)
+target_compile_features(host_spill_policy_test PRIVATE cxx_std_20)
+set_target_properties(host_spill_policy_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # bench_stats_test — the multi-worker bench arithmetic (per-worker warmup

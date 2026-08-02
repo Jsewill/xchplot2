@@ -6,6 +6,7 @@
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/HostPinnedPool.hpp"
+#include "host/HostRamPolicy.hpp"  // plan_host_ram_spill — the spill budget policy
 #include "host/MultiGpuPlotPipeline.hpp"        // --shard-plot path (Phase 2.2+)
 #include "host/MultiGpuPipelineParallel.hpp"   // --pipeline-plot path (Phase 2.1d)
 #include "host/MultiGpuShardBufferPool.hpp"  // batch-amortised buffer reuse
@@ -2097,6 +2098,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             bool        do_spill    = opts.has_max_host_ram;
             uint64_t    budget      = opts.max_host_ram;   // 0 == "min"
             bool        auto_blocked_ram_dir = false;
+            bool        auto_blocked_bad_dir = false;
+            std::string auto_dir_problem;
             std::string auto_ram_dir;
             uint64_t    auto_floor_bytes = 0;
             bool        auto_unreachable = false;
@@ -2158,6 +2161,33 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
             }
 
+            // Second half of the same guard: the dir must actually be
+            // usable. dir_is_ram_backed() above returns false when it cannot
+            // probe at all — a mistyped path, an unmounted drive — so a bad
+            // --temp-dir passes that check and then dies deep in the pipeline
+            // with a raw mkstemp errno, minutes into a batch. Since the tmpfs
+            // message tells users to reach for --temp-dir, mistyping it is
+            // the expected next failure and belongs here, before any work.
+            if (do_spill) {
+                std::string const spill_dir = TempFile::resolve_dir("");
+                std::string const problem   = TempFile::dir_problem(spill_dir);
+                if (!problem.empty()) {
+                    if (spill_auto) {
+                        do_spill             = false;
+                        auto_blocked_bad_dir = true;
+                        auto_dir_problem     = problem;
+                        auto_ram_dir         = spill_dir;
+                    } else {
+                        throw std::runtime_error(
+                            "--max-host-ram is set but no spill file can be "
+                            "created in the temp dir '" + spill_dir +
+                            "': " + problem +
+                            ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at an "
+                            "existing, writable directory on real disk.");
+                    }
+                }
+            }
+
             if (do_spill) {
 
                 // cap entries, from the public estimators: each is
@@ -2166,9 +2196,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 uint64_t const cap_entries =
                     (streaming_compact_host_bytes(pool_k)
                        - streaming_plain_host_bytes(pool_k)) / 28;
-                uint64_t const table8 = uint64_t(8) * cap_entries;  // an 8-B/entry table
-                uint64_t const table4 = uint64_t(4) * cap_entries;  // a 4-B/entry table
-                uint64_t const B      = budget;                    // 0 == "min"
+                uint64_t const B = budget;   // 0 == "min"
 
                 // Routable tables for this tier, LARGEST-FIRST (all 8-B
                 // tables before the 4-B one). Only those whose spill path
@@ -2196,7 +2224,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 bool const tier_tiny    = (tier == Tier::Tiny || tier == Tier::Pinned);
                 bool const tier_streams = (tier != Tier::Plain);
 
-                // `est` tracks the UNSWAPPABLE class only — pinned plus
+                // The arithmetic itself lives in HostRamPolicy.cpp, as a pure
+                // function, so host_spill_policy_test can reach every branch
+                // without a GPU or a k=28-sized host. Everything below is
+                // reporting and the two ways this can fail.
+                //
+                // `resident` tracks the UNSWAPPABLE class only — pinned plus
                 // anonymous. That is the budget the knob enforces, because it
                 // is the class that can get the process OOM-killed.
                 //
@@ -2209,62 +2242,27 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // the user actually watches. Track them separately and report
                 // both, or a user who measures 7.26 GiB against a modelled
                 // "5.33 GiB" concludes the tool lied to them.
-                uint64_t est            = host_required;
-                uint64_t routable_total = 0;
-                uint64_t reclaimable    = 0;   // routed to file-backed mmap
-                uint64_t spilled_bytes  = 0;   // actually routed, for the I/O estimate
-                StreamingPinnedScratch::SpillPlan plan;
-                auto consider = [&](uint64_t table, bool available, bool& bit,
-                                    bool mmap_class = false) {
-                    if (!available) return;
-                    routable_total += table;
-                    if (B == 0 || est > B) {
-                        bit = true;
-                        est -= std::min(table, est);
-                        spilled_bytes += table;
-                        if (mmap_class) reclaimable += table;
-                    }
-                };
-                consider(table8, tier_tiny,                  plan.h_t1_meta);
-                consider(table8, tier_streams,               plan.h_t3);
-                consider(table8, tier_tiny,                  plan.h_t2_meta);
-                consider(table8, tier_streams && !tier_tiny, plan.h_frags,
-                         /*mmap_class=*/true);
-                consider(table4, tier_streams,               plan.h_t2_xbits);
+                HostRamSpillInputs pin;
+                pin.host_required  = host_required;
+                pin.cap_entries    = cap_entries;
+                pin.budget         = B;
+                pin.tier_tiny      = tier_tiny;
+                pin.tier_streams   = tier_streams;
+                pin.pinned_slots   = num_pinned_slots;
+                pin.forced_slots   = (forced_drain_slots != 0);
+                pin.baseline_slots = GpuBufferPool::kNumPinnedBuffers;
 
-                // Drain slots are the LAST resort, deliberately. Spilling a
-                // table costs disk I/O per plot; giving up a drain slot costs
-                // producer/consumer overlap, which is the more expensive of
-                // the two once a batch is deeper than one plot. Measured at
-                // k=28 compact, n=3: the full spill set is 1.29x baseline
-                // wall, a 1-slot drain is 2.91x. At n=1 the slots buy nothing
-                // (there is no next plot to overlap with) and cutting them is
-                // free — but the policy cannot see the batch depth here, so it
-                // just takes the cheaper lever first and stops as soon as the
-                // budget is met. "min" (B == 0) still drives to one slot.
-                if (!forced_drain_slots) {
-                    while ((B == 0 || est > B) && num_pinned_slots > 1) {
-                        --num_pinned_slots;
-                        est -= std::min<uint64_t>(table8, est);
-                    }
-                } else {
-                    est -= std::min<uint64_t>(
-                        uint64_t(GpuBufferPool::kNumPinnedBuffers - num_pinned_slots)
-                            * table8, est);
-                }
-                uint64_t const drain_freed =
-                    uint64_t(GpuBufferPool::kNumPinnedBuffers - num_pinned_slots)
-                    * table8;
+                HostRamSpillPlan const sp = plan_host_ram_spill(pin);
 
-                // The reachable floor spills every routable table AND keeps a
-                // single drain slot — that is the most this policy can do.
-                uint64_t const reachable =
-                    routable_total
-                    + uint64_t(GpuBufferPool::kNumPinnedBuffers - 1) * table8;
-                uint64_t const floor_bytes =
-                    host_required - std::min(reachable, host_required);
+                num_pinned_slots                         = sp.pinned_slots;
+                StreamingPinnedScratch::SpillPlan const& plan = sp.tables;
+                uint64_t const est           = sp.resident;
+                uint64_t const reclaimable   = sp.reclaimable;
+                uint64_t const spilled_bytes = sp.spilled_bytes;
+                uint64_t const drain_freed   = sp.drain_freed;
+                uint64_t const floor_bytes   = sp.floor_bytes;
 
-                if (B != 0 && est > B) {
+                if (!sp.meets_budget) {
                     // AUTO cannot reach the host's own free RAM even with
                     // everything routed. Do not throw here — the user never
                     // asked for a spill, so the honest error is the host-RAM
@@ -2327,7 +2325,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "%s tier %s needs ~%.2f GiB of host RAM but only "
                             "~%.2f GiB is available: automatically spilling the "
                             "cold tables to '%s' to plot anyway. Expect roughly "
-                            "10-30%% slower plots and ~%.0f GiB of temp-dir "
+                            "10-30%% slower plots and ~%.1f GiB of temp-dir "
                             "traffic per plot. Pass --max-host-ram to control "
                             "this, --temp-dir to move it, or --no-auto-spill "
                             "to be refused instead.\n",
@@ -2350,6 +2348,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                           "filesystem (tmpfs), where spilling would consume the "
                           "very RAM that is short; point --temp-dir (or "
                           "XCHPLOT2_TEMP_DIR) at real disk to enable it.";
+                } else if (auto_blocked_bad_dir) {
+                    why = " Automatic disk-offload could have run this, but no "
+                          "spill file can be created in the temp dir '" +
+                          auto_ram_dir + "': " + auto_dir_problem +
+                          ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at an "
+                          "existing, writable directory on real disk to "
+                          "enable it.";
                 } else if (auto_unreachable) {
                     why = " Automatic disk-offload cannot close this gap: with "
                           "every routable table spilled and the D2H drain cut to "
