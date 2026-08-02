@@ -76,6 +76,16 @@ namespace pos2gpu {
 // win[slot] is the pinned destination window; each tile must be
 // <= win_entries u64 entries (caller sizes tile_count to guarantee it).
 // Null reader keeps the in-memory h_vals_in path, byte-identical.
+//
+// Slot discipline differs by variant, and the engine only guarantees that a
+// window holds what its LAST submit put there:
+//   single-value (u32_u64): one stream ping-pongs slots 0/1 via `slot ^ 1`,
+//                           so tile t+1 loads while tile t partitions.
+//   triple (u32_u64_u32):   a tile needs BOTH streams resident at once, so it
+//                           holds both windows and has no cross-tile
+//                           prefetch. Widening to four windows to buy one was
+//                           measured and did not pay — see kNumWindows in
+//                           GpuPipeline.cpp.
 struct SpillTileReader {
     void*     ctx         = nullptr;
     uint64_t* win[2]      = {nullptr, nullptr};

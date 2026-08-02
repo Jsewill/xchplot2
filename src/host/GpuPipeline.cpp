@@ -283,6 +283,19 @@ struct SpillEngine {
     // all spilled tables. Each window also bounds the streaming-partition
     // source tile (32 MiB / 8 B = 4M u64 entries), see SpillBuffer.
     static constexpr uint64_t kStageBytes = 32ULL << 20;
+    // TWO windows, and four was MEASURED not to be worth it (2026-08-02).
+    // The triple partition needs a u64 and a u32 tile resident together, so it
+    // consumes both windows and has no cross-tile prefetch; four windows would
+    // let tile t+1 load while tile t partitions. Built, byte-parity clean,
+    // A/B'd at k=28 Tiny over 3 reps: spill stall 8.08 s (4 windows) vs 8.45 s
+    // (2) — a 0.37 s difference against a 0.81-1.43 s spread, i.e. nothing.
+    // The mechanism explains it: ONE I/O worker thread serves the engine, and
+    // both preads of a pair are already submitted before either is waited on,
+    // so the queue is 2 deep and the worker never idles. A deeper queue cannot
+    // make a serial worker faster. The lever for the ~17%-of-wall spill stall
+    // is I/O PARALLELISM (more workers / io_uring), not more windows — and 64
+    // MiB of extra pinned staging is the wrong thing to spend on the tier that
+    // exists because RAM is scarce.
     static constexpr int      kNumWindows = 2;
 
     StreamingStats*   stats = nullptr;
