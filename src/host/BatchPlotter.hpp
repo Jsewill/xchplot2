@@ -60,6 +60,10 @@ struct BatchResult {
     // warmup exclusion and the drain tail are invisible once merged. See
     // BenchStats.hpp.
     std::vector<WorkerTimeline> workers;
+    // Which pipeline this slice ran — "pool", a streaming tier name, or "cpu".
+    // Set by run_batch_slice and copied into the WorkerTimeline above; see the
+    // field there for why a caller needs it.
+    std::string pipeline;
 };
 
 // Options controlling batch behavior.

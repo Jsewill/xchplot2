@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace pos2gpu {
@@ -56,6 +57,17 @@ struct WorkerTimeline {
     // completion is the epoch and init is excluded by construction.
     double work_start_seconds = 0.0;
     std::vector<double> completion_seconds;  // ascending, one per finished plot
+    // Which pipeline this worker actually ran: "pool", a streaming tier name
+    // ("plain" / "compact" / "minimal" / "tiny" / "pinned"), or "cpu". Empty
+    // when a strategy did not record one.
+    //
+    // This exists so a caller that runs two passes can tell whether it compared
+    // like with like. The tier is chosen per worker from free VRAM at the
+    // moment that worker starts, so two passes of the same binary on the same
+    // idle card can legitimately run different pipelines — and their wall times
+    // are then not comparable, however carefully everything else was matched.
+    // bench's --compute-only A/B is exactly that shape.
+    std::string pipeline;
 };
 
 // Which question the rates answer. The two differ only in where a worker's
