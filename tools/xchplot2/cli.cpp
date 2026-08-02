@@ -84,6 +84,13 @@ bool parse_host_ram_arg(std::string const& raw, std::uint64_t& out_bytes)
 // passed on the command line. The flag always wins.
 void resolve_host_ram_env(pos2gpu::BatchOptions& o)
 {
+    // XCHPLOT2_NO_AUTO_SPILL turns off the automatic rescue. Read it first and
+    // unconditionally: it is meaningful with or without an explicit budget.
+    if (char const* v = std::getenv("XCHPLOT2_NO_AUTO_SPILL"); v && v[0]) {
+        std::string const s = v;
+        if (s == "1" || s == "true" || s == "yes" || s == "on")
+            o.auto_host_ram_spill = false;
+    }
     if (o.has_max_host_ram) return;
     if (char const* v = std::getenv("XCHPLOT2_MAX_HOST_RAM"); v && v[0]) {
         std::uint64_t b = 0;
@@ -255,11 +262,19 @@ void print_usage(char const* prog)
         << "                                      a temp-dir file, largest-first, until\n"
         << "                                      the modelled resident host peak fits.\n"
         << "                                      'min' = spill everything routable\n"
-        << "                                      (lowest floor). Unset = no spill\n"
-        << "                                      (byte-identical to today). Env:\n"
+        << "                                      (lowest floor). Unset = spill only\n"
+        << "                                      if the tier does not fit host RAM\n"
+        << "                                      (see --no-auto-spill). Env:\n"
         << "                                      XCHPLOT2_MAX_HOST_RAM (flag wins).\n"
         << "    --temp-dir PATH               : where spilled tables live (sets\n"
         << "                                      XCHPLOT2_TEMP_DIR). Prefer fast NVMe.\n"
+        << "    --no-auto-spill               : refuse to plot when the tier does not\n"
+        << "                                      fit host RAM, instead of spilling to\n"
+        << "                                      --temp-dir automatically. Auto only\n"
+        << "                                      fires where the run would otherwise\n"
+        << "                                      be a hard error, so it never slows a\n"
+        << "                                      run that already works. Env:\n"
+        << "                                      XCHPLOT2_NO_AUTO_SPILL=1.\n"
         << "  " << prog << " verify <plotfile> [--trials N]\n"
         << "    Open <plotfile> and run N random challenges through the CPU prover.\n"
         << "    Zero proofs across a sensible sample (>=100) strongly indicates a\n"
@@ -1435,6 +1450,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--temp-dir" && need(1)) {
                 setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
             }
+            else if (a == "--no-auto-spill") {
+                opts.auto_host_ram_spill = false;
+            }
             else if (a == "--devices" && need(1)) {
                 if (!parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: invalid --devices value\n";
@@ -1841,6 +1859,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--temp-dir" && i + 1 < argc) {
                 setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
             }
+            else if (a == "--no-auto-spill") {
+                opts.auto_host_ram_spill = false;
+            }
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: --devices expects 'all', 'cpu', or a "
@@ -2022,6 +2043,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string plot_all_gpus_tier;
         bool          plot_has_max_host_ram = false;
         std::uint64_t plot_max_host_ram     = 0;
+        bool          plot_no_auto_spill    = false;
         std::vector<pos2gpu::PipelineStageTier> plot_pipeline_tiers;
 
         for (int i = 2; i < argc; ++i) {
@@ -2152,6 +2174,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if  (a == "--temp-dir" && need(1)) {
                 setenv("XCHPLOT2_TEMP_DIR", argv[++i], 1);
+            }
+            else if  (a == "--no-auto-spill") {
+                plot_no_auto_spill = true;
             }
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
@@ -2346,6 +2371,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.streaming_tier    = plot_streaming_tier;
             opts.per_device_tier   = plot_per_device_tier;
             opts.all_gpus_tier     = plot_all_gpus_tier;
+            if (plot_no_auto_spill) opts.auto_host_ram_spill = false;
             opts.has_max_host_ram  = plot_has_max_host_ram;
             opts.max_host_ram      = plot_max_host_ram;
             opts.quiet             = plot_quiet;

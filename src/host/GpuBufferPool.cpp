@@ -419,6 +419,27 @@ bool hip_query_device_memory(int device_ordinal,
 // tier for no reason. This box: MemFree 13 GiB, MemAvailable 77 GiB.
 namespace {
 
+// Testing knob: XCHPLOT2_HOST_FREE_MB makes the host look SMALLER than it is,
+// so the host-RAM gate and the disk-offload rescue can be exercised on a box
+// that has plenty. It CLAMPS — it can only ever lower the figure, never raise
+// it — so no setting of it can talk the plotter past a real shortage and into
+// the OOM killer. Because every consumer sees the reduced number, including
+// host_pinned_reserve_check() at each allocation, a run under this knob is a
+// faithful simulation and not just a way to steer the tier picker: the spill
+// really does have to fit under the pretend ceiling or the run fails the same
+// way it would on the small host.
+void apply_host_free_override(size_t& free_bytes)
+{
+    static size_t const cap = [] () -> size_t {
+        if (char const* v = std::getenv("XCHPLOT2_HOST_FREE_MB"); v && v[0]) {
+            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        return 0;   // 0 == no override
+    }();
+    if (cap && cap < free_bytes) free_bytes = cap;
+}
+
 bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
 {
 #if defined(_WIN32)
@@ -427,6 +448,7 @@ bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
     if (!::GlobalMemoryStatusEx(&st)) return false;
     free_bytes  = static_cast<size_t>(st.ullAvailPhys);
     total_bytes = static_cast<size_t>(st.ullTotalPhys);
+    apply_host_free_override(free_bytes);
     return true;
 #else
     std::FILE* fp = std::fopen("/proc/meminfo", "re");
@@ -446,6 +468,7 @@ bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
     // allocation failures be the backstop, rather than silently choosing Tiny.
     free_bytes  = static_cast<size_t>(avail_kb ? avail_kb : total_kb) << 10;
     total_bytes = static_cast<size_t>(total_kb) << 10;
+    apply_host_free_override(free_bytes);
     return true;
 #endif
 }

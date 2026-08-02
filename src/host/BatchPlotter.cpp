@@ -2050,51 +2050,115 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             size_t const host_required = host_need(tier);
             size_t const host_reserve  = host_memory_reserve();
 
+            size_t host_free = 0, host_total = 0;
+            bool const have_host =
+                device_memory_probe(kCpuDeviceId, host_free, host_total);
+
+            // A forced tier that costs MORE host RAM than the auto-pick is
+            // worth saying out loud: --tier tiny is the obvious reach for "use
+            // less memory", and it is the single worst choice for host RAM.
+            if (!auto_picked && have_host) {
+                Tier const auto_tier =
+                    (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
+                    (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
+                    (mem.free_bytes >= minimal_peak + margin) ? Tier::Minimal :
+                                                                Tier::Tiny;
+                size_t const auto_host = host_need(auto_tier);
+                if (tier != auto_tier && host_required > auto_host) {
+                    std::fprintf(stderr,
+                        "%s --tier %s needs ~%.2f GiB of HOST RAM; %s also fits "
+                        "this GPU and needs ~%.2f GiB. Lower tiers buy VRAM WITH "
+                        "host memory — they do not reduce memory overall.\n",
+                        log_prefix.c_str(),
+                        tier_name(tier), to_gib(host_required),
+                        tier_name(auto_tier), to_gib(auto_host));
+                }
+            }
+
             // Host-RAM disk-offload budget policy
-            // (docs/host-ram-disk-offload.md). When --max-host-ram is set,
-            // turn the guard's "refuse" (below) into "spill enough, then
-            // proceed": redirect the large cold pinned tables to a
-            // TempFile-backed home, LARGEST-FIRST, until the modelled
-            // resident host peak fits under the budget. The chosen set is
-            // threaded to the streaming pipeline via stream_scratch.spill;
-            // the matching scratch fields are left null in the allocation
-            // block further down so the pipeline OWNS and spills them.
-            if (opts.has_max_host_ram) {
-                // Guard (fail-fast, before any allocation or plotting): refuse
-                // to "spill" onto a RAM-backed temp dir. On most systemd/Arch
-                // boxes /tmp is tmpfs — i.e. RAM — so writing the spill tables
-                // there consumes the very RAM this budget is meant to cap and
-                // invites the OOM killer, defeating the feature. The spill
-                // TempFiles resolve their dir from XCHPLOT2_TEMP_DIR / TMPDIR /
-                // /tmp (--temp-dir feeds XCHPLOT2_TEMP_DIR), so probe that same
-                // resolved dir. XCHPLOT2_ALLOW_RAM_TEMP_DIR (1/true/yes/on)
-                // downgrades the refusal to a warning for the rare disk-backed
-                // /tmp.
-                {
-                    std::string const spill_dir = TempFile::resolve_dir("");
-                    if (TempFile::dir_is_ram_backed(spill_dir)) {
-                        char const* ov =
-                            std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
-                        std::string const ovs = ov ? ov : "";
-                        bool const allow = (ovs == "1" || ovs == "true" ||
-                                            ovs == "yes" || ovs == "on");
-                        if (allow) {
-                            std::fprintf(stderr,
-                                "%s WARNING: --max-host-ram spill temp dir '%s' "
-                                "is on a RAM-backed filesystem (tmpfs); "
-                                "proceeding anyway because "
-                                "XCHPLOT2_ALLOW_RAM_TEMP_DIR is set.\n",
-                                log_prefix.c_str(), spill_dir.c_str());
-                        } else {
-                            throw std::runtime_error(
-                                "--max-host-ram is set but the spill temp dir '" +
-                                spill_dir + "' is on a RAM-backed filesystem "
-                                "(tmpfs); spilling there consumes RAM and "
-                                "defeats the budget. Point --temp-dir (or "
-                                "XCHPLOT2_TEMP_DIR) at real disk.");
-                        }
+            // (docs/host-ram-disk-offload.md). Turn the guard's "refuse"
+            // (below) into "spill enough, then proceed": redirect the large
+            // cold pinned tables to a TempFile-backed home, LARGEST-FIRST,
+            // until the modelled resident host peak fits under the budget.
+            // The chosen set is threaded to the streaming pipeline via
+            // stream_scratch.spill; the matching scratch fields are left null
+            // in the allocation block further down so the pipeline OWNS and
+            // spills them.
+            //
+            // Two ways in. EXPLICIT: --max-host-ram names the budget. AUTO:
+            // nobody named one, but the tier does not fit host RAM and the
+            // guard below would throw — so adopt the budget the host actually
+            // has and spill into it. AUTO fires only where the alternative is
+            // refusing to plot at all, so it can never slow down a run that
+            // works today; that asymmetry is what makes it safe to have on by
+            // default. --no-auto-spill / XCHPLOT2_NO_AUTO_SPILL=1 opts out,
+            // for anyone who would rather be told no than plot slowly.
+            bool        spill_auto  = false;
+            bool        do_spill    = opts.has_max_host_ram;
+            uint64_t    budget      = opts.max_host_ram;   // 0 == "min"
+            bool        auto_blocked_ram_dir = false;
+            std::string auto_ram_dir;
+            uint64_t    auto_floor_bytes = 0;
+            bool        auto_unreachable = false;
+
+            if (!do_spill && opts.auto_host_ram_spill && have_host
+                && host_free < host_required + host_reserve) {
+                budget     = (host_free > host_reserve)
+                                 ? uint64_t(host_free) - uint64_t(host_reserve)
+                                 : 0;   // nothing to spare -> "min"
+                do_spill   = true;
+                spill_auto = true;
+            }
+
+            // Guard (fail-fast, before any allocation or plotting): refuse
+            // to "spill" onto a RAM-backed temp dir. On most systemd/Arch
+            // boxes /tmp is tmpfs — i.e. RAM — so writing the spill tables
+            // there consumes the very RAM this budget is meant to cap and
+            // invites the OOM killer, defeating the feature. The spill
+            // TempFiles resolve their dir from XCHPLOT2_TEMP_DIR / TMPDIR /
+            // /tmp (--temp-dir feeds XCHPLOT2_TEMP_DIR), so probe that same
+            // resolved dir. XCHPLOT2_ALLOW_RAM_TEMP_DIR (1/true/yes/on)
+            // downgrades the refusal to a warning for the rare disk-backed
+            // /tmp.
+            //
+            // An EXPLICIT budget throws here: the user asked for a spill and
+            // needs to know it would have been a lie. AUTO must not — the user
+            // asked for a plot, not a spill, so a tmpfs temp dir simply means
+            // this rescue is unavailable. Record why and let the host-RAM
+            // guard below deliver the verdict with that clause attached, which
+            // tells them both facts at once instead of trading one confusing
+            // error for another.
+            if (do_spill) {
+                std::string const spill_dir = TempFile::resolve_dir("");
+                if (TempFile::dir_is_ram_backed(spill_dir)) {
+                    char const* ov =
+                        std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
+                    std::string const ovs = ov ? ov : "";
+                    bool const allow = (ovs == "1" || ovs == "true" ||
+                                        ovs == "yes" || ovs == "on");
+                    if (allow) {
+                        std::fprintf(stderr,
+                            "%s WARNING: host-RAM spill temp dir '%s' "
+                            "is on a RAM-backed filesystem (tmpfs); "
+                            "proceeding anyway because "
+                            "XCHPLOT2_ALLOW_RAM_TEMP_DIR is set.\n",
+                            log_prefix.c_str(), spill_dir.c_str());
+                    } else if (spill_auto) {
+                        do_spill              = false;
+                        auto_blocked_ram_dir  = true;
+                        auto_ram_dir          = spill_dir;
+                    } else {
+                        throw std::runtime_error(
+                            "--max-host-ram is set but the spill temp dir '" +
+                            spill_dir + "' is on a RAM-backed filesystem "
+                            "(tmpfs); spilling there consumes RAM and "
+                            "defeats the budget. Point --temp-dir (or "
+                            "XCHPLOT2_TEMP_DIR) at real disk.");
                     }
                 }
+            }
+
+            if (do_spill) {
 
                 // cap entries, from the public estimators: each is
                 // cap·bpe + fixed, so the difference over the bpe delta
@@ -2104,7 +2168,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                        - streaming_plain_host_bytes(pool_k)) / 28;
                 uint64_t const table8 = uint64_t(8) * cap_entries;  // an 8-B/entry table
                 uint64_t const table4 = uint64_t(4) * cap_entries;  // a 4-B/entry table
-                uint64_t const B      = opts.max_host_ram;          // 0 == "min"
+                uint64_t const B      = budget;                    // 0 == "min"
 
                 // Routable tables for this tier, LARGEST-FIRST (all 8-B
                 // tables before the 4-B one). Only those whose spill path
@@ -2148,6 +2212,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 uint64_t est            = host_required;
                 uint64_t routable_total = 0;
                 uint64_t reclaimable    = 0;   // routed to file-backed mmap
+                uint64_t spilled_bytes  = 0;   // actually routed, for the I/O estimate
                 StreamingPinnedScratch::SpillPlan plan;
                 auto consider = [&](uint64_t table, bool available, bool& bit,
                                     bool mmap_class = false) {
@@ -2156,6 +2221,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     if (B == 0 || est > B) {
                         bit = true;
                         est -= std::min(table, est);
+                        spilled_bytes += table;
                         if (mmap_class) reclaimable += table;
                     }
                 };
@@ -2199,75 +2265,103 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     host_required - std::min(reachable, host_required);
 
                 if (B != 0 && est > B) {
-                    throw std::runtime_error(
-                        log_prefix + " host-RAM budget " +
-                        std::to_string(to_gib(B)).substr(0, 5) +
-                        " GiB is unreachable for tier " + tier_name(tier) +
-                        " at k=" + std::to_string(pool_k) +
-                        ": the lowest floor with every routable table spilled "
-                        "is ~" + std::to_string(to_gib(floor_bytes)).substr(0, 5) +
-                        " GiB. Raise --max-host-ram, choose a higher --tier, or "
-                        "route more buffers.");
+                    // AUTO cannot reach the host's own free RAM even with
+                    // everything routed. Do not throw here — the user never
+                    // asked for a spill, so the honest error is the host-RAM
+                    // one below, carrying the floor we could have reached.
+                    if (spill_auto) {
+                        do_spill         = false;
+                        auto_unreachable = true;
+                        auto_floor_bytes = floor_bytes;
+                    } else {
+                        throw std::runtime_error(
+                            log_prefix + " host-RAM budget " +
+                            std::to_string(to_gib(B)).substr(0, 5) +
+                            " GiB is unreachable for tier " + tier_name(tier) +
+                            " at k=" + std::to_string(pool_k) +
+                            ": the lowest floor with every routable table "
+                            "spilled is ~" +
+                            std::to_string(to_gib(floor_bytes)).substr(0, 5) +
+                            " GiB. Raise --max-host-ram, choose a higher "
+                            "--tier, or route more buffers.");
+                    }
                 }
-                stream_scratch.spill = plan;
-                char budget_label[32];
-                if (B == 0) std::snprintf(budget_label, sizeof(budget_label), "min");
-                else        std::snprintf(budget_label, sizeof(budget_label),
-                                          "%.2f GiB", to_gib(B));
-                std::string spilled;
-                if (plan.h_t1_meta)  spilled += " h_t1_meta";
-                if (plan.h_t3)       spilled += " h_t3";
-                if (plan.h_t2_meta)  spilled += " h_t2_meta";
-                if (plan.h_frags)    spilled += " h_frags";
-                if (plan.h_t2_xbits) spilled += " h_t2_xbits";
-                if (spilled.empty()) spilled = " (none)";
-                // Only mention RSS when the two figures actually differ —
-                // otherwise the extra clause is noise on every line.
-                char rss_note[128] = "";
-                if (reclaimable) {
-                    std::snprintf(rss_note, sizeof(rss_note),
-                        " (~%.2f GiB RSS; %.2f GiB of that is file-backed and "
-                        "reclaimable under pressure)",
-                        to_gib(est + reclaimable), to_gib(reclaimable));
-                }
-                std::fprintf(stderr,
-                    "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
-                    "slot%s (-%.2f GiB), spilling%s -> modelled unswappable "
-                    "host peak ~%.2f GiB%s (routable floor ~%.2f GiB)\n",
-                    log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
-                    GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
-                    num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
-                    spilled.c_str(),
-                    to_gib(est), rss_note, to_gib(floor_bytes));
-            }
 
-            size_t host_free = 0, host_total = 0;
-            bool const have_host =
-                device_memory_probe(kCpuDeviceId, host_free, host_total);
-
-            // A forced tier that costs MORE host RAM than the auto-pick is
-            // worth saying out loud: --tier tiny is the obvious reach for "use
-            // less memory", and it is the single worst choice for host RAM.
-            if (!auto_picked && have_host) {
-                Tier const auto_tier =
-                    (mem.free_bytes >= plain_peak   + margin) ? Tier::Plain   :
-                    (mem.free_bytes >= compact_peak + margin) ? Tier::Compact :
-                    (mem.free_bytes >= minimal_peak + margin) ? Tier::Minimal :
-                                                                Tier::Tiny;
-                size_t const auto_host = host_need(auto_tier);
-                if (tier != auto_tier && host_required > auto_host) {
+                if (do_spill) {
+                    stream_scratch.spill = plan;
+                    char budget_label[32];
+                    if (B == 0) std::snprintf(budget_label, sizeof(budget_label), "min");
+                    else        std::snprintf(budget_label, sizeof(budget_label),
+                                              "%.2f GiB", to_gib(B));
+                    std::string spilled;
+                    if (plan.h_t1_meta)  spilled += " h_t1_meta";
+                    if (plan.h_t3)       spilled += " h_t3";
+                    if (plan.h_t2_meta)  spilled += " h_t2_meta";
+                    if (plan.h_frags)    spilled += " h_frags";
+                    if (plan.h_t2_xbits) spilled += " h_t2_xbits";
+                    if (spilled.empty()) spilled = " (none)";
+                    // Only mention RSS when the two figures actually differ —
+                    // otherwise the extra clause is noise on every line.
+                    char rss_note[128] = "";
+                    if (reclaimable) {
+                        std::snprintf(rss_note, sizeof(rss_note),
+                            " (~%.2f GiB RSS; %.2f GiB of that is file-backed and "
+                            "reclaimable under pressure)",
+                            to_gib(est + reclaimable), to_gib(reclaimable));
+                    }
                     std::fprintf(stderr,
-                        "%s --tier %s needs ~%.2f GiB of HOST RAM; %s also fits "
-                        "this GPU and needs ~%.2f GiB. Lower tiers buy VRAM WITH "
-                        "host memory — they do not reduce memory overall.\n",
-                        log_prefix.c_str(),
-                        tier_name(tier), to_gib(host_required),
-                        tier_name(auto_tier), to_gib(auto_host));
+                        "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
+                        "slot%s (-%.2f GiB), spilling%s -> modelled unswappable "
+                        "host peak ~%.2f GiB%s (routable floor ~%.2f GiB)\n",
+                        log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
+                        GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
+                        num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
+                        spilled.c_str(),
+                        to_gib(est), rss_note, to_gib(floor_bytes));
+
+                    // AUTO was not asked for, so it must announce itself. A
+                    // user who never passed a flag still needs to know why
+                    // this run touches the disk and got slower.
+                    if (spill_auto) {
+                        std::fprintf(stderr,
+                            "%s tier %s needs ~%.2f GiB of host RAM but only "
+                            "~%.2f GiB is available: automatically spilling the "
+                            "cold tables to '%s' to plot anyway. Expect roughly "
+                            "10-30%% slower plots and ~%.0f GiB of temp-dir "
+                            "traffic per plot. Pass --max-host-ram to control "
+                            "this, --temp-dir to move it, or --no-auto-spill "
+                            "to be refused instead.\n",
+                            log_prefix.c_str(), tier_name(tier),
+                            to_gib(host_required), to_gib(budget),
+                            TempFile::resolve_dir("").c_str(),
+                            2.0 * to_gib(spilled_bytes));
+                    }
                 }
             }
 
-            if (!opts.has_max_host_ram
+            // The host-RAM guard. Reached only when no spill is in play —
+            // either none was needed, or the rescue above was unavailable.
+            if (!do_spill
                 && have_host && host_free < host_required + host_reserve) {
+                std::string why;
+                if (auto_blocked_ram_dir) {
+                    why = " Automatic disk-offload could have run this, but the "
+                          "temp dir '" + auto_ram_dir + "' is on a RAM-backed "
+                          "filesystem (tmpfs), where spilling would consume the "
+                          "very RAM that is short; point --temp-dir (or "
+                          "XCHPLOT2_TEMP_DIR) at real disk to enable it.";
+                } else if (auto_unreachable) {
+                    why = " Automatic disk-offload cannot close this gap: with "
+                          "every routable table spilled and the D2H drain cut to "
+                          "one slot, tier " + std::string(tier_name(tier)) +
+                          " still needs ~" +
+                          std::to_string(to_gib(auto_floor_bytes)).substr(0, 5) +
+                          " GiB.";
+                } else if (!opts.auto_host_ram_spill) {
+                    why = " Automatic disk-offload could have run this; it is "
+                          "off because --no-auto-spill / XCHPLOT2_NO_AUTO_SPILL "
+                          "is set.";
+                }
                 throw std::runtime_error(
                     log_prefix + " tier " + tier_name(tier) + " needs ~" +
                     std::to_string(to_gib(host_required)).substr(0, 5) +
@@ -2284,9 +2378,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     std::to_string(to_gib(streaming_plain_host_bytes(pool_k))).substr(0, 5) +
                     " GiB), tiny the most (~" +
                     std::to_string(to_gib(streaming_tiny_host_bytes(pool_k))).substr(0, 5) +
-                    " GiB). The requirement is fixed for PoS2's k=28. Close "
-                    "what else is holding RAM, or plot on a host with more. "
-                    "(XCHPLOT2_HOST_RESERVE_MB tunes the reserve.)");
+                    " GiB). The requirement is fixed for PoS2's k=28." + why +
+                    " Otherwise close what else is holding RAM, or plot on a "
+                    "host with more. (XCHPLOT2_HOST_RESERVE_MB tunes the "
+                    "reserve.)");
             }
 
             // Two-phase match candidate scratch (see SyclBackend.hpp): grant
