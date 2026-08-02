@@ -2484,6 +2484,24 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     res.plots_written = plots_done.load();
     res.total_wall_seconds = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_start).count();
+
+    // Give the stream-ordered allocator's cache back to the driver before this
+    // slice reports done. Every streaming device allocation is already freed —
+    // logically. Physically the pool keeps holding those pages, because its
+    // release threshold only acts at the next synchronization point, and the
+    // next thing a caller does may well be to READ free VRAM: bench's second
+    // pass, or a supervisor sizing the next job. It then measures the card
+    // minus our cache and sizes down accordingly. Measured on a 4090 at k=28
+    // squeezed to 9 GiB free: pass 1 saw 9.06 GiB and picked plain, pass 2 saw
+    // 6.97 GiB and picked compact — a tier apart, on an idle unchanged card.
+    //
+    // This runs on the slice's own thread, which bind_current_device() bound to
+    // this slice's device (~line 1752), so a multi-device run trims each card
+    // from the worker that filled it. Not in a scope guard on purpose: on the
+    // throwing path the batch has failed and nobody is about to size anything
+    // from its leftovers, and the guard would have to outlive the pool object
+    // to be correct for the pooled path too.
+    streaming_release_cached_vram();
     return res;
 }
 

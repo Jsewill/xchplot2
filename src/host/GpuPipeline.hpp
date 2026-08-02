@@ -208,6 +208,25 @@ void      streaming_free_pinned_uint32(uint32_t* ptr);
 // Used by BatchPlotter to pick between plain and compact streaming.
 size_t streaming_query_free_vram_bytes();
 
+// Hand every block the stream-ordered allocator is caching back to the driver,
+// on the CALLING thread's device (the pool is per-device and the enable flag is
+// thread_local, so call this from the worker that did the allocating).
+//
+// Why this is public rather than an internal detail: the pool's release
+// threshold only takes effect at the NEXT synchronization point, so a caller
+// that finishes a batch and then reads free VRAM — bench's second pass, a
+// supervisor sizing the next job — measures the card while the pool still holds
+// the previous batch's blocks. Measured on a 4090 at k=28 with the card
+// squeezed to ~9 GiB free: 9.06 GiB before, 6.97 GiB after, which is enough to
+// drop the tier picker from plain to compact. Setting the release threshold to
+// 0 does NOT fix it — the release still waits for a sync that has not happened
+// yet. Only an explicit trim does.
+//
+// No-op when the async pool is off (POS2GPU_NO_ASYNC_ALLOC=1, or a device with
+// no memory-pool support). Synchronizes the device, so call it at a batch
+// boundary, never inside a plot.
+void streaming_release_cached_vram();
+
 // Raw cudaMemGetInfo for the given device ordinal. False when the query fails.
 //
 // Deliberately does NOT honour POS2GPU_MAX_VRAM_MB, unlike the query above: this

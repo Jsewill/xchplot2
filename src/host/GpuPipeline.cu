@@ -4407,6 +4407,16 @@ size_t streaming_query_free_vram_bytes()
     return free_b;
 }
 
+void streaming_release_cached_vram()
+{
+    // Same call s_malloc makes on an OOM retry; the only difference is WHEN.
+    // Here it runs at a batch boundary, where the device sync it costs is free
+    // and the caller's next free-VRAM reading is about to be believed by a tier
+    // picker. It returns early on a device without pool support, and trims an
+    // empty pool (harmlessly) under POS2GPU_NO_ASYNC_ALLOC=1.
+    s_trim_async_pool();
+}
+
 bool streaming_device_memory_probe(int ordinal, size_t& free_b, size_t& total_b)
 {
     // Bind this thread to the target device. The watchdog polls from its own
