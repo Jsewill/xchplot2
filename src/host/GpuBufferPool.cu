@@ -20,6 +20,43 @@
 
 namespace pos2gpu {
 
+namespace {
+
+// See the table and provenance in the header. Bytes that do NOT scale with cap:
+// CUDA context, binary, writer heap.
+constexpr size_t kHostFixedBytes = size_t(1300) << 20;
+
+size_t streaming_host_bytes(int k, unsigned bytes_per_entry)
+{
+    int const num_section_bits = (k < 28) ? 2 : (k - 26);
+    std::uint64_t const cap =
+        std::uint64_t(max_pairs_per_section(k, num_section_bits))
+        * (std::uint64_t{1} << num_section_bits);
+    return size_t(cap) * bytes_per_entry + kHostFixedBytes;
+}
+
+}  // namespace
+
+size_t streaming_plain_host_bytes(int k)   { return streaming_host_bytes(k, 24); }
+size_t streaming_compact_host_bytes(int k) { return streaming_host_bytes(k, 44); }
+size_t streaming_minimal_host_bytes(int k) { return streaming_host_bytes(k, 48); }
+size_t streaming_tiny_host_bytes(int k)    { return streaming_host_bytes(k, 52); }
+
+size_t streaming_host_reserve()
+{
+    static size_t const reserve = [] () -> size_t {
+        if (char const* v = std::getenv("XCHPLOT2_HOST_RESERVE_MB"); v && v[0]) {
+            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        // Enough for the OS, a shell, and the writer's own heap growth after
+        // the last pinned buffer lands. Not enough to protect a desktop
+        // session — raise it if the plotting host is also driving one.
+        return size_t(512) << 20;
+    }();
+    return reserve;
+}
+
 size_t vram_safety_margin()
 {
     static size_t const margin = [] () -> size_t {

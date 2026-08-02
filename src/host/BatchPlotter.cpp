@@ -217,6 +217,24 @@ constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 // MemFree on a box that has been plotting reads near zero (the cache is holding
 // the plots just written), which would starve every CPU worker for no reason.
 // This box: MemFree 13 GiB, MemAvailable 77 GiB.
+// Testing knob: XCHPLOT2_HOST_FREE_MB makes the host look SMALLER than it is,
+// so the streaming tiers' host-RAM gate can be exercised on a box that has
+// plenty. It CLAMPS — it can only ever lower the figure, never raise it — so no
+// setting of it can talk the plotter past a real shortage and into the OOM
+// killer. Every consumer sees the reduced number, which is what makes a run
+// under it a faithful simulation rather than just a way to steer a decision.
+void apply_host_free_override(std::size_t& free_bytes)
+{
+    static std::size_t const cap = [] () -> std::size_t {
+        if (char const* v = std::getenv("XCHPLOT2_HOST_FREE_MB"); v && v[0]) {
+            std::size_t const mb = std::size_t(std::strtoull(v, nullptr, 10));
+            if (mb > 0) return mb << 20;
+        }
+        return 0;   // 0 == no override
+    }();
+    if (cap && cap < free_bytes) free_bytes = cap;
+}
+
 bool host_memory_probe(std::size_t& free_bytes, std::size_t& total_bytes)
 {
 #if defined(_WIN32)
@@ -225,6 +243,7 @@ bool host_memory_probe(std::size_t& free_bytes, std::size_t& total_bytes)
     if (!::GlobalMemoryStatusEx(&st)) return false;
     free_bytes  = static_cast<std::size_t>(st.ullAvailPhys);
     total_bytes = static_cast<std::size_t>(st.ullTotalPhys);
+    apply_host_free_override(free_bytes);
     return true;
 #else
     std::FILE* fp = std::fopen("/proc/meminfo", "re");
@@ -244,6 +263,7 @@ bool host_memory_probe(std::size_t& free_bytes, std::size_t& total_bytes)
     // be the backstop, rather than silently refusing to start any CPU worker.
     free_bytes  = static_cast<std::size_t>(avail_kb ? avail_kb : total_kb) << 10;
     total_bytes = static_cast<std::size_t>(total_kb) << 10;
+    apply_host_free_override(free_bytes);
     return true;
 #endif
 }
@@ -1996,6 +2016,85 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                    (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
                    (free_bytes >= kMinimalFloorBytes) ? Tier::Minimal :
                                                         Tier::Tiny;
+        }
+
+        // HOST-RAM gate. Every check above weighs VRAM, and host RAM runs the
+        // other way: the lower the tier, the more full-cap tables it parks in
+        // pinned host memory. So the card small enough to need Tiny usually
+        // sits in the box that can least afford Tiny's host staging, and
+        // weighing VRAM alone is how a modest machine ends up inviting the OOM
+        // killer instead of being told no. Fail here, before the setup cost,
+        // rather than part-way through the first plot.
+        auto const tier_label = [](Tier t) -> char const* {
+            switch (t) {
+                case Tier::Plain:   return "plain";
+                case Tier::Compact: return "compact";
+                case Tier::Minimal: return "minimal";
+                case Tier::Tiny:    break;
+            }
+            return "tiny";
+        };
+        auto const host_need = [pool_k](Tier t) -> std::size_t {
+            switch (t) {
+                case Tier::Plain:   return streaming_plain_host_bytes(pool_k);
+                case Tier::Compact: return streaming_compact_host_bytes(pool_k);
+                case Tier::Minimal: return streaming_minimal_host_bytes(pool_k);
+                case Tier::Tiny:    break;
+            }
+            return streaming_tiny_host_bytes(pool_k);
+        };
+        {
+            std::size_t const host_required = host_need(tier);
+            std::size_t const host_reserve  = streaming_host_reserve();
+            std::size_t host_free = 0, host_total = 0;
+            if (host_memory_probe(host_free, host_total)) {
+                auto const gib = [](std::size_t b) {
+                    return b / double(1ULL << 30);
+                };
+                // Worth saying out loud when a FORCED tier costs more host RAM
+                // than the auto-pick would have: --tier tiny is the obvious
+                // reach for "use less memory" and is the single worst choice
+                // for host memory.
+                bool const tier_forced =
+                    (tier_pref == "plain" || tier_pref == "compact" ||
+                     tier_pref == "minimal" || tier_pref == "tiny");
+                if (tier_forced) {
+                    Tier const auto_tier =
+                        (free_bytes >= kPlainFloorBytes)   ? Tier::Plain   :
+                        (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
+                        (free_bytes >= kMinimalFloorBytes) ? Tier::Minimal :
+                                                             Tier::Tiny;
+                    std::size_t const auto_host = host_need(auto_tier);
+                    if (tier != auto_tier && host_required > auto_host) {
+                        std::fprintf(stderr,
+                            "%s --tier %s needs ~%.2f GiB of HOST RAM; %s also "
+                            "fits this GPU and needs ~%.2f GiB. Lower tiers buy "
+                            "VRAM WITH host memory — they do not reduce memory "
+                            "overall.\n",
+                            log_prefix.c_str(), tier_label(tier),
+                            gib(host_required), tier_label(auto_tier),
+                            gib(auto_host));
+                    }
+                }
+                if (host_free < host_required + host_reserve) {
+                    char msg[1024];
+                    std::snprintf(msg, sizeof(msg),
+                        "%s streaming tier %s needs ~%.2f GiB of HOST RAM at "
+                        "k=%d plus a %.2f GiB reserve; host reports %.2f GiB "
+                        "available of %.2f GiB total. This is host memory, not "
+                        "VRAM — and a LOWER --tier costs MORE of it, not less: "
+                        "plain needs the least (~%.2f GiB), tiny the most "
+                        "(~%.2f GiB). Close what else is holding RAM, or plot "
+                        "on a host with more. (XCHPLOT2_HOST_RESERVE_MB tunes "
+                        "the reserve.)",
+                        log_prefix.c_str(), tier_label(tier),
+                        gib(host_required), pool_k, gib(host_reserve),
+                        gib(host_free), gib(host_total),
+                        gib(streaming_plain_host_bytes(pool_k)),
+                        gib(streaming_tiny_host_bytes(pool_k)));
+                    throw std::runtime_error(msg);
+                }
+            }
         }
 
         // Hand the chosen tier's working set to the streaming allocator. It

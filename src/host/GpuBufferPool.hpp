@@ -94,6 +94,54 @@ struct InsufficientVramError : std::runtime_error {
 // and no such holdback, which is why it can run on the thinner margin.
 size_t vram_safety_margin();
 
+// Modelled HOST-RAM peak of each streaming tier, in bytes.
+//
+// Host RAM moves OPPOSITE to VRAM here: the lower the tier, the more full-cap
+// tables it parks in pinned host memory, so the card that is forced down the
+// ladder is the one whose box can least afford it. Reaching for --tier tiny to
+// "use less memory" therefore makes host memory worse, not better. Without a
+// model the picker weighs VRAM only, and a small card on a modest host walks
+// straight into the OOM killer with no diagnostic.
+//
+// | tier    | B/entry | k=28 modelled | k=28 measured |
+// |---------|--------:|--------------:|--------------:|
+// | plain   |      24 |     7.36 GiB  |     7.210     |
+// | compact |      44 |    12.44 GiB  |    12.288     |
+// | minimal |      48 |    13.46 GiB  |    13.304     |
+// | tiny    |      52 |    14.47 GiB  |    14.361     |
+//
+// Measured on this branch, k=28, n=3, peak RSS from VmHWM, 2026-08-02. Every
+// reconstruction lands 0.11-0.16 GiB ABOVE its reading, which is the safe
+// direction for a gate.
+//
+// These are NOT the SYCL branch's constants and must never be copied from it.
+// That branch measures 24/52/68/80 for the same four tiers — its tiny needs
+// 21.45 GiB where this one needs 14.36. Taking its numbers would over-state
+// this branch's tiny by 7 GiB and refuse hosts that plot fine.
+//
+// CALIBRATE AT n>=3, NOT n=1. Tiny is the only tier whose peak grows with batch
+// depth, because the producer runs ahead of the file writer and tiny also
+// aliases the rotating D2H slots as device-visible working buffers. A one-plot
+// calibration understates exactly one tier, and it is the tier whose users have
+// the least RAM to spare.
+//
+// The fixed term is what does not scale with cap: the CUDA context, the binary,
+// and the file writer's compressed-chunk heap. Keeping it separate matters at
+// small k, where it dominates — a pure per-entry model would predict tens of MB
+// at k=20 against an actual ~1.3 GiB, i.e. wrong in the unsafe direction.
+size_t streaming_plain_host_bytes(int k);
+size_t streaming_compact_host_bytes(int k);
+size_t streaming_minimal_host_bytes(int k);
+size_t streaming_tiny_host_bytes(int k);
+
+// Host RAM to leave for the rest of the box when admitting a streaming tier.
+// XCHPLOT2_HOST_RESERVE_MB overrides; default 512 MiB.
+//
+// Distinct from host_reserve_bytes() in BatchPlotter.cpp, which is the CPU
+// workers' XCHPLOT2_CPU_RESERVE_MB and defaults to zero. Same shape, different
+// question, different knob — do not unify them.
+size_t streaming_host_reserve();
+
 struct GpuBufferPool {
     // Allocates all buffers sized for (k, strength, testnet). Throws
     // InsufficientVramError when the sized pool will not fit in free
