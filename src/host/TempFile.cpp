@@ -63,6 +63,21 @@ std::string TempFile::dir_problem(std::string const& dir)
     }
 }
 
+void TempFile::bump_high_water(std::uint64_t end) noexcept
+{
+    // Relaxed is enough: nothing is published through this value — it is a
+    // diagnostic ceiling, not a handshake. The loop is what matters, because
+    // several workers can be raising it at once.
+    std::uint64_t cur = high_water_.load(std::memory_order_relaxed);
+    while (end > cur &&
+           !high_water_.compare_exchange_weak(cur, end,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+        // cur was reloaded by compare_exchange_weak; retry unless someone
+        // else already pushed the mark past `end`.
+    }
+}
+
 TempFile::TempFile(std::string_view dir)
 {
     std::string base = resolve_dir(dir);
@@ -98,12 +113,12 @@ TempFile::~TempFile()
 TempFile::TempFile(TempFile&& other) noexcept
     : fd_(other.fd_)
     , path_(std::move(other.path_))
-    , high_water_(other.high_water_)
+    , high_water_(other.high_water_.load(std::memory_order_relaxed))
     , map_(other.map_)
     , map_bytes_(other.map_bytes_)
 {
     other.fd_ = -1;
-    other.high_water_ = 0;
+    other.high_water_.store(0, std::memory_order_relaxed);
     other.map_ = nullptr;
     other.map_bytes_ = 0;
 }
@@ -115,11 +130,12 @@ TempFile& TempFile::operator=(TempFile&& other) noexcept
         if (fd_ >= 0) ::close(fd_);
         fd_         = other.fd_;
         path_       = std::move(other.path_);
-        high_water_ = other.high_water_;
+        high_water_.store(other.high_water_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
         map_        = other.map_;
         map_bytes_  = other.map_bytes_;
         other.fd_ = -1;
-        other.high_water_ = 0;
+        other.high_water_.store(0, std::memory_order_relaxed);
         other.map_ = nullptr;
         other.map_bytes_ = 0;
     }
@@ -191,7 +207,7 @@ void* TempFile::map(std::size_t bytes)
     }
     map_       = p;
     map_bytes_ = bytes;
-    if (bytes > high_water_) high_water_ = bytes;
+    bump_high_water(bytes);
     return p;
 }
 
@@ -226,8 +242,7 @@ void TempFile::pwrite_at(std::uint64_t offset, void const* data, std::size_t byt
         cur       += static_cast<std::uint64_t>(n);
         remaining -= static_cast<std::size_t>(n);
     }
-    std::uint64_t const end = offset + bytes;
-    if (end > high_water_) high_water_ = end;
+    bump_high_water(offset + bytes);
 }
 
 void TempFile::pread_at(std::uint64_t offset, void* data, std::size_t bytes)
@@ -248,7 +263,7 @@ void TempFile::pread_at(std::uint64_t offset, void* data, std::size_t bytes)
             throw std::runtime_error(
                 "TempFile::pread_at: short read at offset " +
                 std::to_string(cur) + " (file size " +
-                std::to_string(high_water_) + ")");
+                std::to_string(high_water_.load(std::memory_order_relaxed)) + ")");
         }
         p         += n;
         cur       += static_cast<std::uint64_t>(n);

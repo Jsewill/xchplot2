@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -39,11 +40,17 @@ public:
     TempFile(TempFile&& other) noexcept;
     TempFile& operator=(TempFile&& other) noexcept;
 
-    // Thread-safe positional write. Throws on short writes or errors.
+    // Positional write, safe to call CONCURRENTLY on one TempFile: pwrite
+    // carries its own offset, so parallel writers to disjoint ranges need no
+    // lock. SpillEngine relies on exactly that — it splits one 32 MiB chunk
+    // across its worker pool by byte range, so several threads are inside this
+    // function on the same object at once. `high_water_` is the only shared
+    // state and is updated atomically for that reason. Throws on short writes
+    // or errors.
     void pwrite_at(std::uint64_t offset, void const* data, std::size_t bytes);
 
-    // Thread-safe positional read. Throws on short reads (EOF before
-    // `bytes` consumed) or errors.
+    // Positional read, concurrency-safe on the same terms as pwrite_at.
+    // Throws on short reads (EOF before `bytes` consumed) or errors.
     void pread_at(std::uint64_t offset, void* data, std::size_t bytes);
 
     // Pageable, file-backed home for a CPU-touched buffer (the host-RAM
@@ -92,7 +99,10 @@ public:
     static std::uint64_t free_space(std::string const& dir);
 
     // High-water mark — max(end-offset) ever written.
-    std::uint64_t size() const noexcept { return high_water_; }
+    std::uint64_t size() const noexcept
+    {
+        return high_water_.load(std::memory_order_relaxed);
+    }
 
     // Underlying file path (unlinked already; useful for diagnostics
     // via /proc/<pid>/fd/<fd> on Linux).
@@ -127,9 +137,16 @@ public:
     static std::string dir_problem(std::string const& dir);
 
 private:
+    // Raise high_water_ to `end` if it is above the current mark. Concurrent
+    // pwrite_at callers all run this, so the plain `if (end > hw) hw = end`
+    // it replaces was a read-modify-write race the moment the spill engine
+    // grew a worker pool — ThreadSanitizer flags it, and a lost update
+    // understates the file size a pread error message then quotes.
+    void bump_high_water(std::uint64_t end) noexcept;
+
     int           fd_         = -1;
     std::string   path_;
-    std::uint64_t high_water_ = 0;
+    std::atomic<std::uint64_t> high_water_{0};
     void*         map_        = nullptr;   // MAP_SHARED region, if map() was called
     std::size_t   map_bytes_  = 0;
 };
