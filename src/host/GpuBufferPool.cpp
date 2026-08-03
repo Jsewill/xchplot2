@@ -16,6 +16,7 @@
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/VramProbe.hpp"  // validate_sysman_reading — Level Zero probe sanity
 
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -885,29 +886,26 @@ bool device_memory_probe(int device_ordinal,
                 target.global_mem / 1048576.0);
         }
         if (got) {
-            // Validate before trusting it. The Sysman ABI above is hand-declared
-            // and cannot be compile-checked, and `size` is deprecated upstream
-            // ("can no longer track the allocatable memory reliably"), so a
-            // reading that disagrees with the device's own global_mem_size is
-            // rejected rather than acted on. Getting this wrong in the
-            // optimistic direction sends a tier past what the card has, which
-            // is the failure we are here to prevent — so an implausible answer
-            // must degrade to "no probe", never to a plausible-looking number.
-            std::uint64_t const cap = target.global_mem;
-            bool const free_sane = cap == 0 || (f > 0 && f <= cap);
-            // The deprecated total is a hint. Believe it only when it lands
-            // near global_mem_size; otherwise keep global_mem_size as total.
-            bool const total_sane =
-                cap != 0 && t >= cap - cap / 4 && t <= cap + cap / 4;
-            if (free_sane) {
-                free_bytes  = f;
-                total_bytes = total_sane ? t : size_t(cap);
+            // Validation lives in VramProbe.hpp, header-only and device-free,
+            // so vram_probe_test can reach every branch on any machine — this
+            // code path exists only on Intel hardware and consumes a
+            // hand-declared ABI, which is the worst combination for getting it
+            // right by inspection. It already went wrong once: the first
+            // version bounded free by global_mem_size and rejected every
+            // reading on the B580, where sysman correctly reports free against
+            // PHYSICAL memory (12216 MiB) rather than allocatable (11605).
+            VramReading reading;
+            if (validate_sysman_reading(f, t, target.global_mem, reading)) {
+                free_bytes  = size_t(reading.free);
+                total_bytes = size_t(reading.total);
                 return true;
             }
-            ZDBG("REJECTED: free=%llu MiB is not in (0, %llu MiB] — refusing to "
-                 "act on an implausible reading (ABI mismatch?)",
+            ZDBG("REJECTED: free=%llu MiB / sysman_total=%llu MiB are not "
+                 "self-consistent, or the total is nowhere near the device's "
+                 "%llu MiB — refusing to act on it (ABI mismatch?)",
                  (unsigned long long)(f >> 20),
-                 (unsigned long long)(cap >> 20));
+                 (unsigned long long)(t >> 20),
+                 (unsigned long long)(target.global_mem >> 20));
         }
     }
 #endif

@@ -1191,6 +1191,19 @@ target_compile_features(host_guard_test PRIVATE cxx_std_20)
 set_target_properties(host_guard_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# vram_probe_test — validation of a Level Zero Sysman memory reading.
+# VramProbe.hpp is header-only and device-free so this runs anywhere, which is
+# the entire point: the code it guards executes only on Intel hardware and
+# parses a hand-declared ABI, so on any other box "it compiles" is the only
+# feedback available. That is how the first version shipped a bound that
+# rejected every reading on the target card. The B580 case is the real
+# measurement from that host.
+add_executable(vram_probe_test tools/parity/vram_probe_test.cpp)
+target_include_directories(vram_probe_test PRIVATE src)
+target_compile_features(vram_probe_test PRIVATE cxx_std_20)
+set_target_properties(vram_probe_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # host_spill_policy_test — the host-RAM disk-offload budget policy. Same
 # argument as the two above: HostRamPolicy is pure integer arithmetic with no
 # SYCL/CUDA/device probe, so every branch is reachable here on any machine.
