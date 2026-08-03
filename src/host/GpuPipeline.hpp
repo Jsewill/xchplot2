@@ -344,6 +344,15 @@ struct StreamingPinnedScratch {
         }
     };
     SpillPlan spill;
+
+    // Suppress the pipeline's own [spill] chatter (BatchOptions::quiet). The
+    // spill is the only thing in here that logs per plot, and on a long batch
+    // that is several hundred lines nobody asked for. Note the authoritative
+    // announcement is BatchPlotter's one-per-slice budget line, which names
+    // every table being routed — these are a redundant second copy, so
+    // dropping them costs no information. Default false = log, matching the
+    // pre-spill behaviour of every other caller.
+    bool quiet = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,

@@ -1822,6 +1822,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // in the streaming-fallback branch below; nullptr fields when the
     // pool path is active (pool_ptr != null).
     StreamingPinnedScratch stream_scratch{};
+    // The pipeline's [spill] lines are per plot; -q silences them. The budget
+    // line below still prints (it is one per slice and names every routed
+    // table), so -q loses no information about what the spill is doing.
+    stream_scratch.quiet = opts.quiet;
     // Phase 2-26: per-batch host-pinned pool for the per-plot allocs
     // that stream_scratch fields don't already amortise (h_t1_mi,
     // h_t2_mi, and h_keys_merged when stream_scratch.h_keys_merged is

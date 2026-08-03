@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -348,9 +349,14 @@ struct SpillEngine {
     // stronger evidence than a soak at the natural ~5% rate.
     unsigned                io_delay_us = 0;
     uint64_t                blocked_ns = 0;          // wall the main thread spent stalled on disk I/O (this plot)
+    // StreamingPinnedScratch::quiet — the stall line below is per PLOT, so on
+    // a long batch it is the noisiest thing the pipeline emits. Suppressed
+    // under -q; XCHPLOT2_SPILL_VERIFY's tally is not, because asking for the
+    // verify pass IS asking for its verdict.
+    bool                    quiet   = false;
 
-    SpillEngine(StreamingStats& s, sycl::queue& queue)
-        : stats(&s), q(&queue)
+    SpillEngine(StreamingStats& s, sycl::queue& queue, bool quiet_)
+        : stats(&s), q(&queue), quiet(quiet_)
     {
         if (char const* v = std::getenv("XCHPLOT2_SPILL_NO_OVERLAP"); v && v[0] == '1')
             overlap = false;
@@ -373,9 +379,10 @@ struct SpillEngine {
             cv_work.notify_all();
         }
         if (io_thread.joinable()) io_thread.join();
-        std::fprintf(stderr,
-            "[spill] pipeline stalled %.2f s on disk I/O this plot (overlap=%s)\n",
-            blocked_ns / 1e9, overlap ? "on" : "off");
+        if (!quiet)
+            std::fprintf(stderr,
+                "[spill] pipeline stalled %.2f s on disk I/O this plot (overlap=%s)\n",
+                blocked_ns / 1e9, overlap ? "on" : "off");
         if (verify)
             std::fprintf(stderr,
                 "[spill] verify: %llu chunks round-tripped clean\n",
@@ -643,6 +650,24 @@ struct SpillBuffer {
         return r;
     }
 };
+
+// Should this "<table> -> disk" line be printed?
+//
+// Two filters, because the line has two problems. It is per PLOT, and a batch
+// runs hundreds — so `announced` limits each table to its first plot. And it
+// says the same thing every time: WHICH tables are on disk is a property of
+// the tier and the budget, not of the plot, and BatchPlotter already prints
+// exactly that once per slice as the authoritative budget line. These are a
+// second, redundant copy, which is why suppressing them under -q loses
+// nothing. Kept at all because they are the only place the resolved temp-dir
+// path appears under an explicit --max-host-ram.
+//
+// `announced` is process-wide (each call site owns a function-local static) on
+// purpose: multi-GPU workers would otherwise print N identical lines.
+inline bool spill_announce(bool quiet, std::atomic<bool>& announced)
+{
+    return !quiet && !announced.exchange(true, std::memory_order_relaxed);
+}
 
 // Sanity-check t1_count after T1 match. Healthy plots produce ~2^k
 // entries; anything below total_xs/64 (= 2^(k-6)) — let alone literal
@@ -1326,7 +1351,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     std::unique_ptr<SpillBuffer> t2_meta_spill;   // h_t2_meta (~2 GiB, tiny)
     // Lazily create the one shared engine the first time any table spills.
     auto ensure_spill_engine = [&]() -> SpillEngine& {
-        if (!spill_engine) spill_engine = std::make_unique<SpillEngine>(stats, q);
+        if (!spill_engine)
+            spill_engine = std::make_unique<SpillEngine>(stats, q, scratch.quiet);
         return *spill_engine;
     };
 
@@ -2033,15 +2059,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 t1_meta_spill = std::make_unique<SpillBuffer>(
                     ensure_spill_engine(), sizeof(uint64_t));
                 h_t1_meta = nullptr;
-                std::fprintf(stderr,
-                    "[spill] h_t1_meta -> disk %s (shared staging %llu MiB in %d windows, "
-                    "overlap=%s, cap %.2f GiB spilled)\n",
-                    t1_meta_spill->file.path().c_str(),
-                    (unsigned long long)(SpillEngine::kNumWindows *
-                        SpillEngine::kStageBytes / 1048576),
-                    SpillEngine::kNumWindows,
-                    spill_engine->overlap ? "on" : "off",
-                    cap * sizeof(uint64_t) / 1073741824.0);
+                static std::atomic<bool> said{false};
+                if (spill_announce(scratch.quiet, said))
+                    std::fprintf(stderr,
+                        "[spill] h_t1_meta -> disk %s (shared staging %llu MiB in %d windows, "
+                        "overlap=%s, cap %.2f GiB spilled)\n",
+                        t1_meta_spill->file.path().c_str(),
+                        (unsigned long long)(SpillEngine::kNumWindows *
+                            SpillEngine::kStageBytes / 1048576),
+                        SpillEngine::kNumWindows,
+                        spill_engine->overlap ? "on" : "off",
+                        cap * sizeof(uint64_t) / 1073741824.0);
             }
         }
         if (!t1_meta_spill) {
@@ -3115,10 +3143,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     ensure_spill_engine(), sizeof(uint64_t));
                 h_t2_meta       = nullptr;
                 h_t2_meta_owned = false;
-                std::fprintf(stderr,
-                    "[spill] h_t2_meta -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
-                    t2_meta_spill->file.path().c_str(),
-                    double(cap) * sizeof(uint64_t) / 1073741824.0);
+                static std::atomic<bool> said{false};
+                if (spill_announce(scratch.quiet, said))
+                    std::fprintf(stderr,
+                        "[spill] h_t2_meta -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                        t2_meta_spill->file.path().c_str(),
+                        double(cap) * sizeof(uint64_t) / 1073741824.0);
             } else if (scratch.h_t2_meta) {
                 h_t2_meta = scratch.h_t2_meta;
                 h_t2_meta_owned = false;
@@ -3170,10 +3200,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 ensure_spill_engine(), sizeof(uint32_t));
             h_t2_xbits    = nullptr;
             h_xbits_owned = false;
-            std::fprintf(stderr,
-                "[spill] h_t2_xbits -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
-                t2_xbits_spill->file.path().c_str(),
-                double(cap) * sizeof(uint32_t) / 1073741824.0);
+            static std::atomic<bool> said{false};
+            if (spill_announce(scratch.quiet, said))
+                std::fprintf(stderr,
+                    "[spill] h_t2_xbits -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                    t2_xbits_spill->file.path().c_str(),
+                    double(cap) * sizeof(uint32_t) / 1073741824.0);
         } else {
             h_t2_xbits = h_xbits_owned
                 ? static_cast<uint32_t*>(alloc_pinned_or_throw(cap * sizeof(uint32_t), "h_t2_xbits"))
@@ -4395,10 +4427,12 @@ t3_match_entry:
         if (h_t3_spilled) {
             t3_spill = std::make_unique<SpillBuffer>(
                 ensure_spill_engine(), sizeof(T3PairingGpu));
-            std::fprintf(stderr,
-                "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
-                t3_spill->file.path().c_str(),
-                cap * sizeof(T3PairingGpu) / 1073741824.0);
+            static std::atomic<bool> said{false};
+            if (spill_announce(scratch.quiet, said))
+                std::fprintf(stderr,
+                    "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                    t3_spill->file.path().c_str(),
+                    cap * sizeof(T3PairingGpu) / 1073741824.0);
         } else if (h_t3_owned) {
             h_t3 = scratch.pool
                 ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
@@ -4777,10 +4811,12 @@ t3_match_entry:
             // a TempFile via the shared SpillEngine (compact tier).
             t3_spill = std::make_unique<SpillBuffer>(
                 ensure_spill_engine(), sizeof(T3PairingGpu));
-            std::fprintf(stderr,
-                "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
-                t3_spill->file.path().c_str(),
-                cap * sizeof(T3PairingGpu) / 1073741824.0);
+            static std::atomic<bool> said{false};
+            if (spill_announce(scratch.quiet, said))
+                std::fprintf(stderr,
+                    "[spill] h_t3 -> disk %s (shared 64 MiB staging, %.2f GiB spilled)\n",
+                    t3_spill->file.path().c_str(),
+                    cap * sizeof(T3PairingGpu) / 1073741824.0);
         } else if (h_t3_owned) {
             h_t3 = scratch.pool
                 ? scratch.pool->acquire_as<T3PairingGpu>("h_t3", cap, q)
@@ -4993,10 +5029,12 @@ t3_match_entry:
             frags_spill_file = std::make_unique<pos2gpu::TempFile>();
             h_frags = static_cast<uint64_t*>(
                 frags_spill_file->map(cap * sizeof(uint64_t)));
-            std::fprintf(stderr,
-                "[spill] h_frags -> mmap %s (pageable, %.2f GiB file-backed)\n",
-                frags_spill_file->path().c_str(),
-                double(cap) * sizeof(uint64_t) / 1073741824.0);
+            static std::atomic<bool> said{false};
+            if (spill_announce(scratch.quiet, said))
+                std::fprintf(stderr,
+                    "[spill] h_frags -> mmap %s (pageable, %.2f GiB file-backed)\n",
+                    frags_spill_file->path().c_str(),
+                    double(cap) * sizeof(uint64_t) / 1073741824.0);
         } else {
             h_frags = s_malloc_host<uint64_t>(
                 stats, cap * sizeof(uint64_t), "h_frags", q);
