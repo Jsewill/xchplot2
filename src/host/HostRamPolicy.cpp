@@ -21,15 +21,13 @@ namespace {
 // h_t2_meta (Tiny only)                                        2 W + 3 R = 5
 //   Same five, one table later: T2 match / T2 sort / T3 match.
 //
-// h_t2_xbits, tiled gather (Minimal, Tiny)                     3 W + 3 R = 6
-//   W  T2 match append; R partition source; W per-bucket sorted
-//   R  T2-sort gather rehydrate; W gather's sorted output tiles
-//   R  release to d_t2_xbits_sorted (Minimal)
-//   Tiny replaces that last read with TWO — T3 match's L and R — so it is 7;
-//   see kXbitsPassesTiny.
-//
-// h_t2_xbits, single-shot gather (Compact)                     2 W + 2 R = 4
-//   W append; R partition source; W per-bucket sorted; R release.
+// h_t2_xbits, single-shot gather (Compact)                     1 W + 1 R = 2
+// h_t2_xbits, tiled gather (Minimal)                           2 W + 2 R = 4
+// h_t2_xbits (Tiny)                                            2 W + 3 R = 5
+//   Compact releases it to the device before the per-bucket sort writes
+//   anything back, so it really is write-once-read-once. Minimal adds the
+//   tiled gather's rehydrate and sorted-tile write. Tiny keeps it live across
+//   T3 match, whose L and R slices are the third read.
 //
 // h_t3 (Compact, Minimal, Tiny)                                1 W + 1 R = 2
 //   W  T3 match, append per pass
@@ -38,14 +36,25 @@ namespace {
 // These are the ONLY numbers here that can go stale silently, because they
 // mirror control flow in another translation unit rather than deriving from
 // it. host_spill_policy_test pins them; the SpillEngine's measured counters
-// are the cross-check that says whether they are still true.
+// are the cross-check that says whether they are still true — and that check
+// has already earned its keep. The first version of this table over-counted
+// h_t2_xbits by a write in every tier and by a read in Tiny, purely from
+// reading the call sites; the measured line disagreed within hours. Against
+// the measured k=28 figures (--max-host-ram min) the corrected table is:
+//
+//   compact   modelled  6.09 GiB   measured  6.00 GiB
+//   minimal   modelled  8.13 GiB   measured  8.00 GiB
+//   tiny      modelled 29.45 GiB   measured 29.00 GiB
+//
+// The residual is cap-versus-actual-count slack (cap is ~1.5% above 2^k), and
+// it errs high, which is the safe direction for someone sizing a drive.
 struct Passes { int writes; int reads; };
 
 constexpr Passes kT1MetaPasses     {2, 3};
 constexpr Passes kT2MetaPasses     {2, 3};
-constexpr Passes kXbitsPassesTiny  {3, 4};
-constexpr Passes kXbitsPassesTiled {3, 3};
-constexpr Passes kXbitsPassesFlat  {2, 2};
+constexpr Passes kXbitsPassesTiny  {2, 3};
+constexpr Passes kXbitsPassesTiled {2, 2};
+constexpr Passes kXbitsPassesFlat  {1, 1};
 constexpr Passes kT3Passes         {1, 1};
 
 }  // namespace

@@ -1204,17 +1204,20 @@ Notes:
 
   | tier | total | of which writes |
   |------|------:|----------------:|
-  | compact | 8.1 GiB | 4.1 GiB |
-  | minimal | 10.2 GiB | 5.1 GiB |
-  | tiny | 31.5 GiB | 13.2 GiB |
+  | compact | 6.0 GiB | 3.0 GiB |
+  | minimal | 8.0 GiB | 4.0 GiB |
+  | tiny | 29.0 GiB | 12.0 GiB |
+
+  (Measured, `--max-host-ram min`. Each run reports its own figure on
+  the `[spill] this plot:` line, so you never have to trust this table
+  for your own configuration.)
 
   The **writes** column is the one that sizes a drive's endurance: at
-  100 plots/day, tiny writes ~1.3 TiB/day, which consumes a 600 TBW
-  consumer NVMe in about 15 months. Across a batch this is continuous,
-  so point `--temp-dir` at something you are willing to wear out — and
-  prefer a higher tier if the card can take it, since compact costs a
-  quarter of tiny's writes. Each run reports its own measured figure on
-  the `[spill] this plot:` line.
+  100 plots/day, tiny writes ~1.2 TiB/day, which consumes a 600 TB TBW
+  rating in about 15 months. Across a batch this is continuous, so point
+  `--temp-dir` at something you are willing to wear out — and prefer a
+  higher tier if the card can take it, since compact costs a quarter of
+  tiny's writes for the same plot.
 - **`--max-host-ram` bounds the unswappable class** — pinned plus
   anonymous, the class that gets a process OOM-killed. One table
   (`h_frags`, on compact/minimal) is spilled as a file-backed mapping
