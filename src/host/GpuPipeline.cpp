@@ -47,6 +47,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <set>          // SpillEngine's out-of-order completion set
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -296,26 +297,68 @@ struct SpillEngine {
     // both preads of a pair are already submitted before either is waited on,
     // so the queue is 2 deep and the worker never idles. A deeper queue cannot
     // make a serial worker faster. The lever for the ~17%-of-wall spill stall
-    // is I/O PARALLELISM (more workers / io_uring), not more windows — and 64
-    // MiB of extra pinned staging is the wrong thing to spend on the tier that
-    // exists because RAM is scarce.
+    // is I/O PARALLELISM, not more windows — and 64 MiB of extra pinned
+    // staging is the wrong thing to spend on the tier that exists because RAM
+    // is scarce.
+    //
+    // That parallelism is now here, and it deliberately did NOT come from more
+    // worker threads pulling whole jobs off the queue. The number of jobs that
+    // can be in flight is bounded by kNumWindows, not by the worker count:
+    // every caller waits for a window before reusing it, so with two windows
+    // at most two jobs exist at once and a pool of eight threads would leave
+    // six idle. Splitting each JOB across the workers by byte range is not
+    // bounded that way — see kPartBytes and worker_loop.
     static constexpr int      kNumWindows = 2;
+
+    // Smallest slice of a job worth handing to its own thread. One 32 MiB
+    // chunk becomes up to kStageBytes/kPartBytes = 8 concurrent pwrites at
+    // consecutive file offsets, all reading the SAME window at disjoint byte
+    // ranges — which is safe without any extra staging memory, and is the
+    // whole reason this beats adding windows. Below a few MiB the syscall and
+    // wake-up overhead stops being worth it, and the tail chunk of a table
+    // should not be shredded into slivers.
+    static constexpr size_t   kPartBytes = 4ull << 20;
 
     StreamingStats*   stats = nullptr;
     sycl::queue*      q     = nullptr;
     uint8_t*          win[kNumWindows] = {};   // byte windows; typed by SpillBuffer
 
     enum class Op { Write, Read, Stop };
+    // One caller-visible unit of I/O: window `slot` <-> `file` at `off_bytes`.
+    // Atomic from the caller's point of view — the ticket completes only when
+    // every part of it has.
     struct Job { Op op; int slot; pos2gpu::TempFile* file;
                  uint64_t off_bytes; size_t bytes; uint64_t ticket; };
+    // A byte range of one job, which is what a worker actually executes.
+    // `win_off` is the offset inside the window; the file offset is the job's
+    // plus the same amount, so parts are disjoint in both spaces.
+    struct Part { Op op; int slot; pos2gpu::TempFile* file;
+                  uint64_t file_off; size_t win_off; size_t bytes;
+                  uint64_t ticket; };
 
-    std::thread             io_thread;
+    std::vector<std::thread> io_threads;
     std::mutex              mtx;
-    std::condition_variable cv_work;                 // worker waits for jobs
+    std::condition_variable cv_work;                 // workers wait for parts
     std::condition_variable cv_done;                 // producers wait for completion
-    std::deque<Job>         jobs;
+    std::deque<Part>        parts;
+    bool                    stopping = false;
+    // Parts of each still-incomplete job that have not finished yet. A job's
+    // ticket completes when its entry reaches zero.
+    std::unordered_map<uint64_t, unsigned> parts_left;
     uint64_t                next_ticket = 0;         // last enqueued
-    uint64_t                done_ticket = 0;         // last completed (FIFO => monotonic)
+    // Completion is no longer monotonic in ticket order: N workers finish
+    // parts of different jobs in whatever order the kernel schedules them, so
+    // job 7 can land before job 6. `done_upto` is the watermark below which
+    // EVERY ticket is complete, and `done_above` holds the completed tickets
+    // that are still above it. is_done() answers for any single ticket.
+    //
+    // Getting this wrong is not a performance bug. The old code's
+    // `done_ticket >= target` meant "my job is done" only because one FIFO
+    // worker made completion order equal enqueue order; with a pool it would
+    // mean "some LATER job is done", a wait that returns before its own data
+    // has landed, and a silently wrong plot.
+    uint64_t                done_upto = 0;
+    std::set<uint64_t>      done_above;
     uint64_t                slot_ticket[kNumWindows] = {};  // last job ENQUEUED against each window
     // Last job the worker actually COMPLETED into each window, and the
     // ticket a reader is waiting to consume from it. These exist because
@@ -367,6 +410,29 @@ struct SpillEngine {
     // under -q; XCHPLOT2_SPILL_VERIFY's tally is not, because asking for the
     // verify pass IS asking for its verdict.
     bool                    quiet   = false;
+    // Workers in the pool. XCHPLOT2_SPILL_IO_THREADS overrides; 1 restores the
+    // single serial worker exactly (one part per job, FIFO), which is the A/B
+    // arm for any measurement here.
+    int                     num_io_threads = kDefaultIoThreads;
+
+    // TWO, and four was measured not to beat it. k=28 Tiny, --max-host-ram
+    // min, 6 reps per arm, spill stall in seconds:
+    //
+    //   1 thread   mean 7.925   sigma 0.607   (7.22 .. 8.60)
+    //   2 threads  mean 6.620   sigma 0.562   (5.95 .. 7.64)
+    //   4 threads  mean 6.858   sigma 0.407   (6.41 .. 7.58)
+    //
+    // 1 -> 2 is -1.305 s, -16.5%, about 2.2 sigma, and every 2-thread rep but
+    // one sits below every 1-thread rep. 2 -> 4 is 0.238 s in the WRONG
+    // direction at 0.42 sigma, i.e. nothing.
+    //
+    // That ceiling is the same one the four-window experiment hit (see
+    // kNumWindows), and it is consistent: this NVMe stops rewarding
+    // concurrency somewhere around two outstanding operations, so neither
+    // more windows nor more threads buys a third. Anyone testing on a device
+    // with a deeper sweet spot — a RAID, a datacentre drive — should try
+    // XCHPLOT2_SPILL_IO_THREADS higher and measure before assuming it helps.
+    static constexpr int    kDefaultIoThreads = 2;
 
     SpillEngine(StreamingStats& s, sycl::queue& queue, bool quiet_)
         : stats(&s), q(&queue), quiet(quiet_)
@@ -377,21 +443,26 @@ struct SpillEngine {
             verify = true;
         if (char const* v = std::getenv("XCHPLOT2_SPILL_IO_DELAY_US"); v && v[0])
             io_delay_us = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
+        if (char const* v = std::getenv("XCHPLOT2_SPILL_IO_THREADS"); v && v[0]) {
+            int const n = std::atoi(v);
+            if (n >= 1 && n <= 32) num_io_threads = n;
+        }
         for (int i = 0; i < kNumWindows; ++i) {
             win[i] = static_cast<uint8_t*>(s_malloc_host_raw(
                 s, kStageBytes, "h_spill_stage_window", queue));
         }
-        io_thread = std::thread([this] { worker_loop(); });
+        for (int i = 0; i < num_io_threads; ++i)
+            io_threads.emplace_back([this] { worker_loop(); });
     }
 
     ~SpillEngine() {
         try { drain(); } catch (...) { /* destructor: swallow late I/O errors */ }
         {
             std::lock_guard<std::mutex> lk(mtx);
-            jobs.push_back({Op::Stop, 0, nullptr, 0, 0, 0});
+            stopping = true;
             cv_work.notify_all();
         }
-        if (io_thread.joinable()) io_thread.join();
+        for (auto& t : io_threads) if (t.joinable()) t.join();
         if (!quiet) {
             double const gib = 1.0 / (1024.0 * 1024.0 * 1024.0);
             uint64_t const w = bytes_written.load(std::memory_order_relaxed);
@@ -413,35 +484,62 @@ struct SpillEngine {
     SpillEngine(SpillEngine const&)            = delete;
     SpillEngine& operator=(SpillEngine const&) = delete;
 
-    // ---- background worker + ticket bookkeeping ----
+    // ---- completion bookkeeping (call with `mtx` held) ----
+
+    // Has this specific ticket completed? Not "has anything at least this
+    // recent completed" — with a worker pool those are different questions,
+    // and only this one is safe to consume data on.
+    bool is_done_locked(uint64_t ticket) const {
+        return ticket <= done_upto || done_above.count(ticket) != 0;
+    }
+
+    // Record a completed ticket and slide the watermark over any run of
+    // completions that now sits directly above it. Keeps `done_above` bounded
+    // by the number of jobs actually in flight, which is at most kNumWindows.
+    void mark_done_locked(uint64_t ticket) {
+        done_above.insert(ticket);
+        while (done_above.erase(done_upto + 1) != 0) ++done_upto;
+    }
+
+    // ---- background workers ----
     void worker_loop() {
         for (;;) {
-            Job j;
+            Part p;
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv_work.wait(lk, [this] { return !jobs.empty(); });
-                j = jobs.front();
-                jobs.pop_front();
+                cv_work.wait(lk, [this] { return stopping || !parts.empty(); });
+                if (parts.empty()) return;          // stopping and drained
+                p = parts.front();
+                parts.pop_front();
             }
-            if (j.op == Op::Stop) return;
             if (io_delay_us)   // debug race amplification; see io_delay_us
                 std::this_thread::sleep_for(std::chrono::microseconds(io_delay_us));
             try {
-                if (j.op == Op::Write) {
-                    j.file->pwrite_at(j.off_bytes, win[j.slot], j.bytes);
-                    bytes_written.fetch_add(j.bytes, std::memory_order_relaxed);
+                if (p.op == Op::Write) {
+                    p.file->pwrite_at(p.file_off, win[p.slot] + p.win_off, p.bytes);
+                    bytes_written.fetch_add(p.bytes, std::memory_order_relaxed);
                 } else {
-                    j.file->pread_at (j.off_bytes, win[j.slot], j.bytes);
-                    bytes_read.fetch_add(j.bytes, std::memory_order_relaxed);
+                    p.file->pread_at (p.file_off, win[p.slot] + p.win_off, p.bytes);
+                    bytes_read.fetch_add(p.bytes, std::memory_order_relaxed);
                 }
             } catch (std::exception const& e) {
                 std::lock_guard<std::mutex> lk(mtx);
                 if (io_error.empty()) io_error = e.what();
             }
             {
+                // The counter must be decremented on the failure path too, or
+                // one bad part leaves its ticket forever incomplete and every
+                // waiter on it deadlocks instead of seeing io_error.
                 std::lock_guard<std::mutex> lk(mtx);
-                done_ticket           = j.ticket;    // FIFO => monotonic
-                win_last_done[j.slot] = j.ticket;    // whose bytes win[slot] holds now
+                auto it = parts_left.find(p.ticket);
+                if (it != parts_left.end() && --it->second == 0) {
+                    parts_left.erase(it);
+                    mark_done_locked(p.ticket);
+                    // Whose bytes win[slot] holds now. Set only when the LAST
+                    // part lands, so a half-filled window is never advertised
+                    // as ready.
+                    win_last_done[p.slot] = p.ticket;
+                }
                 cv_done.notify_all();
             }
         }
@@ -451,13 +549,34 @@ struct SpillEngine {
     // window MUST already be safe to touch (caller did wait_slot + D2H
     // for writes; the read path enqueues only into a window whose last
     // H2D has completed).
+    //
+    // Split across the pool by byte range. The parts touch disjoint ranges of
+    // both the window and the file, so they need no coordination with each
+    // other — the only thing that has to be atomic is the TICKET, which
+    // completes when the last part does.
     uint64_t enqueue(Op op, int slot, pos2gpu::TempFile* file,
                      uint64_t off_bytes, size_t bytes) {
         std::lock_guard<std::mutex> lk(mtx);
         uint64_t const t = ++next_ticket;
-        jobs.push_back({op, slot, file, off_bytes, bytes, t});
+        // At least one part even for a zero-byte job, so the ticket always has
+        // something to complete it.
+        size_t const per   = std::max<size_t>(kPartBytes,
+                                              (bytes + num_io_threads - 1) /
+                                              std::max(1, num_io_threads));
+        unsigned     count = 0;
+        for (size_t off = 0; off < bytes; off += per) {
+            size_t const n = std::min(per, bytes - off);
+            parts.push_back({op, slot, file, off_bytes + off, off, n, t});
+            ++count;
+        }
+        if (count == 0) {                       // bytes == 0
+            parts.push_back({op, slot, file, off_bytes, 0, 0, t});
+            count = 1;
+        }
+        parts_left[t] = count;
         slot_ticket[slot] = t;
-        cv_work.notify_one();
+        if (count == 1) cv_work.notify_one();
+        else            cv_work.notify_all();
         return t;
     }
 
@@ -470,7 +589,7 @@ struct SpillEngine {
         auto const t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(mtx);
         uint64_t const target = slot_ticket[slot];
-        cv_done.wait(lk, [this, target] { return done_ticket >= target; });
+        cv_done.wait(lk, [this, target] { return is_done_locked(target); });
         blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0).count();
         rethrow_locked();
@@ -483,7 +602,7 @@ struct SpillEngine {
     void wait_ticket(int slot, uint64_t ticket, char const* what) {
         auto const t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [this, ticket] { return done_ticket >= ticket; });
+        cv_done.wait(lk, [this, ticket] { return is_done_locked(ticket); });
         blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0).count();
         rethrow_locked();
@@ -498,11 +617,14 @@ struct SpillEngine {
     }
 
     // Block until every enqueued op has completed (write-back barrier).
+    // `done_upto >= target` and not is_done_locked(target): this has to mean
+    // EVERY ticket up to the barrier, not just the newest one, and with a pool
+    // the newest can land first.
     void drain() {
         auto const t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(mtx);
         uint64_t const target = next_ticket;
-        cv_done.wait(lk, [this, target] { return done_ticket >= target; });
+        cv_done.wait(lk, [this, target] { return done_upto >= target; });
         blocked_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::steady_clock::now() - t0).count();
         rethrow_locked();
