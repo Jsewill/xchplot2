@@ -443,6 +443,29 @@ struct ZesMemState {
 };
 constexpr std::uint32_t kZesStructureTypeMemState = 0x1e;
 
+// POS2GPU_VRAM_PROBE_DEBUG=1 traces exactly where the probe gives up. There are
+// six places it can decline (no loader, no zesInit symbol, zesInit failure, no
+// sysman drivers/devices, no memory modules, validation reject) and they are
+// indistinguishable from the outside — the only outward sign is a missing
+// "vram: peak" line. Diagnosing that by guesswork costs a round trip per guess.
+inline bool zes_debug()
+{
+    static bool const on = [] {
+        char const* v = std::getenv("POS2GPU_VRAM_PROBE_DEBUG");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
+#define ZDBG(...)                                                             \
+    do {                                                                      \
+        if (zes_debug()) {                                                    \
+            std::fprintf(stderr, "[vram-probe] ");                            \
+            std::fprintf(stderr, __VA_ARGS__);                                \
+            std::fprintf(stderr, "\n");                                       \
+        }                                                                     \
+    } while (0)
+
 struct ZesApi {
     void* handle = nullptr;
     ZeResult (*init)(std::uint32_t)                                        = nullptr;
@@ -457,10 +480,23 @@ ZesApi const& zes_api()
 {
     static ZesApi const api = [] {
         ZesApi a;
-        for (char const* soname : {"libze_loader.so.1", "libze_loader.so"}) {
-            if ((a.handle = dlopen(soname, RTLD_LAZY | RTLD_LOCAL))) break;
+        // Try the already-loaded image first: the SYCL runtime has L0 open
+        // before we get here, so this succeeds even where the bare soname is
+        // not on the search path (containers, non-standard prefixes).
+        if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
+            if (dlsym(self, "zesInit")) {
+                a.handle = self;
+                ZDBG("using already-loaded Level Zero (zesInit found in image)");
+            } else {
+                dlclose(self);
+            }
         }
-        if (!a.handle) return a;
+        for (char const* soname : {"libze_loader.so.1", "libze_loader.so"}) {
+            if (a.handle) break;
+            a.handle = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
+            ZDBG("dlopen(%s) -> %s", soname, a.handle ? "ok" : dlerror());
+        }
+        if (!a.handle) { ZDBG("no Level Zero loader — probe unavailable"); return a; }
         auto sym = [&](char const* n) { return dlsym(a.handle, n); };
         a.init        = reinterpret_cast<decltype(a.init)>(sym("zesInit"));
         a.driver_get  = reinterpret_cast<decltype(a.driver_get)>(sym("zesDriverGet"));
@@ -468,9 +504,19 @@ ZesApi const& zes_api()
         a.enum_memory = reinterpret_cast<decltype(a.enum_memory)>(
                             sym("zesDeviceEnumMemoryModules"));
         a.mem_state   = reinterpret_cast<decltype(a.mem_state)>(sym("zesMemoryGetState"));
-        if (!a.init || !a.driver_get || !a.device_get || !a.enum_memory || !a.mem_state)
+        if (!a.init || !a.driver_get || !a.device_get || !a.enum_memory || !a.mem_state) {
+            ZDBG("missing symbols: zesInit=%d zesDriverGet=%d zesDeviceGet=%d "
+                 "zesDeviceEnumMemoryModules=%d zesMemoryGetState=%d "
+                 "(loader too old for the sysman-init API?)",
+                 a.init != nullptr, a.driver_get != nullptr, a.device_get != nullptr,
+                 a.enum_memory != nullptr, a.mem_state != nullptr);
             return a;
-        a.ready = (a.init(0) == 0);
+        }
+        int const rc = a.init(0);
+        a.ready = (rc == 0);
+        ZDBG("zesInit(0) -> 0x%x (%s)", unsigned(rc),
+             a.ready ? "ok" : "failed — sysman may be unavailable or "
+                              "restricted in this environment");
         return a;
     }();
     return api;
@@ -485,16 +531,21 @@ std::vector<ZesDeviceHandle> const& zes_devices()
         ZesApi const& api = zes_api();
         if (!api.ready) return out;
         std::uint32_t n_drv = 0;
-        if (api.driver_get(&n_drv, nullptr) != 0 || n_drv == 0) return out;
+        int const rc = api.driver_get(&n_drv, nullptr);
+        ZDBG("zesDriverGet -> rc=0x%x drivers=%u", unsigned(rc), n_drv);
+        if (rc != 0 || n_drv == 0) return out;
         std::vector<ZesDriverHandle> drivers(n_drv);
         if (api.driver_get(&n_drv, drivers.data()) != 0) return out;
         for (auto d : drivers) {
             std::uint32_t n_dev = 0;
-            if (api.device_get(d, &n_dev, nullptr) != 0 || n_dev == 0) continue;
+            int const drc = api.device_get(d, &n_dev, nullptr);
+            ZDBG("zesDeviceGet -> rc=0x%x devices=%u", unsigned(drc), n_dev);
+            if (drc != 0 || n_dev == 0) continue;
             std::vector<ZesDeviceHandle> devs_of(n_dev);
             if (api.device_get(d, &n_dev, devs_of.data()) != 0) continue;
             out.insert(out.end(), devs_of.begin(), devs_of.end());
         }
+        ZDBG("sysman devices total=%zu", out.size());
         return out;
     }();
     return devs;
@@ -514,11 +565,17 @@ std::vector<ZesMemHandle> const& zes_memory_modules(int rank)
     auto const&   devs = zes_devices();
     if (api.ready && rank >= 0 && std::size_t(rank) < devs.size()) {
         std::uint32_t n = 0;
-        if (api.enum_memory(devs[std::size_t(rank)], &n, nullptr) == 0 && n > 0) {
+        int const rc = api.enum_memory(devs[std::size_t(rank)], &n, nullptr);
+        ZDBG("zesDeviceEnumMemoryModules(rank=%d) -> rc=0x%x modules=%u",
+             rank, unsigned(rc), n);
+        if (rc == 0 && n > 0) {
             mods.resize(n);
             if (api.enum_memory(devs[std::size_t(rank)], &n, mods.data()) != 0)
                 mods.clear();
         }
+    } else {
+        ZDBG("no sysman device for rank=%d (sysman devices=%zu, api ready=%d)",
+             rank, devs.size(), int(api.ready));
     }
     std::lock_guard<std::mutex> lk(m);
     return cache.emplace(rank, std::move(mods)).first->second;
@@ -533,12 +590,26 @@ bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes)
     auto const& mods = zes_memory_modules(rank);
     if (mods.empty()) return false;
 
+    // Per-module logging fires once: the watchdog polls every 20 ms and this
+    // is a diagnostic, not a trace.
+    static std::atomic<bool> logged_modules{false};
+    bool const log_now = zes_debug()
+                       && !logged_modules.exchange(true, std::memory_order_relaxed);
+
     std::uint64_t f = 0, t = 0;
     bool any = false;
     for (auto h : mods) {
         ZesMemState st{};
         st.stype = kZesStructureTypeMemState;
-        if (api.mem_state(h, &st) != 0) continue;
+        int const rc = api.mem_state(h, &st);
+        if (log_now) {
+            std::fprintf(stderr,
+                "[vram-probe] zesMemoryGetState -> rc=0x%x free=%llu MiB "
+                "size=%llu MiB\n", unsigned(rc),
+                (unsigned long long)(st.free >> 20),
+                (unsigned long long)(st.size >> 20));
+        }
+        if (rc != 0) continue;
         f += st.free;
         t += st.size;
         any = true;
@@ -803,7 +874,17 @@ bool device_memory_probe(int device_ordinal,
 
     if (target.runtime == ProbeRuntime::LevelZero) {
         size_t f = 0, t = 0;
-        if (ze_query_device_memory(target.ordinal, f, t)) {
+        bool const got = ze_query_device_memory(target.ordinal, f, t);
+        static std::atomic<bool> logged_l0{false};
+        if (zes_debug() && !logged_l0.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                "[vram-probe] level_zero rank=%d -> %s free=%.0f MiB "
+                "sysman_total=%.0f MiB global_mem_size=%.0f MiB\n",
+                target.ordinal, got ? "ok" : "DECLINED",
+                f / 1048576.0, t / 1048576.0,
+                target.global_mem / 1048576.0);
+        }
+        if (got) {
             // Validate before trusting it. The Sysman ABI above is hand-declared
             // and cannot be compile-checked, and `size` is deprecated upstream
             // ("can no longer track the allocatable memory reliably"), so a
@@ -823,6 +904,10 @@ bool device_memory_probe(int device_ordinal,
                 total_bytes = total_sane ? t : size_t(cap);
                 return true;
             }
+            ZDBG("REJECTED: free=%llu MiB is not in (0, %llu MiB] — refusing to "
+                 "act on an implausible reading (ABI mismatch?)",
+                 (unsigned long long)(f >> 20),
+                 (unsigned long long)(cap >> 20));
         }
     }
 #endif
