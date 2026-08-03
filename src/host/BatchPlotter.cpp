@@ -1900,6 +1900,18 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             std::fprintf(stderr, "%s XCHPLOT2_STREAMING=1 — using "
                                  "streaming pipeline per plot\n",
                                  log_prefix.c_str());
+        } else if (e.from_allocation) {
+            // The gate said yes and the driver said no. Worth its own line:
+            // the free-VRAM figure the gate trusted was wrong, which on a
+            // backend without a real free-memory query (Level Zero before the
+            // Sysman probe) is expected, and elsewhere means another process
+            // took VRAM in between. Quoting a "free" number here would be
+            // quoting the very figure that just proved untrue.
+            std::fprintf(stderr,
+                "%s pool allocation of %.2f GiB failed despite the gate "
+                "allowing it — using streaming pipeline per plot. (%s)\n",
+                log_prefix.c_str(),
+                e.required_bytes / double(1ULL << 30), e.what());
         } else {
             std::fprintf(stderr,
                 "%s pool needs %.2f GiB, only %.2f GiB free — using "

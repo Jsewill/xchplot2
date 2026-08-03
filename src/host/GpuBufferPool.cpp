@@ -28,8 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <cstdint>
 #include <map>      // probe_target_for cache
 #include <mutex>    // ditto — the VRAM watchdog polls it from its own thread
+#include <vector>   // Level Zero Sysman handle lists
 #include <stdexcept>
 #include <string>
 
@@ -64,25 +67,59 @@ inline std::string fmt_alloc_bytes(size_t bytes)
 inline void* sycl_alloc_device_or_throw(size_t bytes, sycl::queue& q,
                                         char const* what)
 {
+    // Throws InsufficientVramError, NOT a plain runtime_error, so a pool that
+    // does not fit FALLS BACK to the streaming pipeline instead of killing the
+    // run. It used to be fatal, which quietly made the whole graceful-
+    // degradation design conditional on the free-VRAM estimate being right.
+    //
+    // It cannot be right in general. On Level Zero there was no free-memory
+    // query at all until the Sysman probe below, so the picker sized against
+    // the device TOTAL; and even a perfect reading is stale the moment another
+    // process allocates. The estimate steers the choice; the allocation is the
+    // only thing that actually knows. Being wrong has to be survivable rather
+    // than prevented, or every backend without a memory counter is one
+    // compositor away from a fatal run.
+    //
+    // Caveat: only the pool's EAGER buffers get this treatment for free. A
+    // failure in ensure_pair_a() / ensure_pinned() happens mid-plot, past the
+    // point where switching pipelines is possible, and stays an error — just a
+    // better-typed one.
+    auto fail = [&](std::string detail) -> InsufficientVramError {
+        InsufficientVramError e(
+            std::string("sycl::malloc_device(") + what + ", " +
+            fmt_alloc_bytes(bytes) + ") " + std::move(detail) +
+            ". Likely transient OOM — check for other GPU consumers, or set "
+            "POS2GPU_MAX_VRAM_MB lower if VRAM is shared with a "
+            "display/compositor.");
+        e.required_bytes  = bytes;
+        e.from_allocation = true;
+        return e;
+    };
+    // Fault injection. A real "gate said yes, allocation said no" needs another
+    // process to take VRAM in the window between the two, which cannot be
+    // staged reliably — so without this the fallback above is code nobody ever
+    // runs until a user's compositor triggers it for real. POS2GPU_FAIL_ALLOC_AFTER=N
+    // fails the (N+1)th pool allocation of the process. Test-only.
+    {
+        static int const fail_after = [] {
+            char const* v = std::getenv("POS2GPU_FAIL_ALLOC_AFTER");
+            return (v && v[0]) ? std::atoi(v) : -1;
+        }();
+        if (fail_after >= 0) {
+            static std::atomic<int> seen{0};
+            if (seen.fetch_add(1, std::memory_order_relaxed) == fail_after)
+                throw fail("returned null (out of device memory) "
+                           "[POS2GPU_FAIL_ALLOC_AFTER]");
+        }
+    }
+
     void* p = nullptr;
     try {
         p = sycl::malloc_device(bytes, q);
     } catch (sycl::exception const& e) {
-        throw std::runtime_error(
-            std::string("sycl::malloc_device(") + what + ", " +
-            fmt_alloc_bytes(bytes) + ") failed: " + e.what() +
-            ". Likely transient OOM — check `nvidia-smi` for other GPU "
-            "consumers, or set POS2GPU_MAX_VRAM_MB lower if VRAM is "
-            "shared with display/compositor.");
+        throw fail(std::string("failed: ") + e.what());
     }
-    if (!p) {
-        throw std::runtime_error(
-            std::string("sycl::malloc_device(") + what + ", " +
-            fmt_alloc_bytes(bytes) + ") returned null (out of device "
-            "memory). Likely transient OOM — check `nvidia-smi` for "
-            "other GPU consumers, or set POS2GPU_MAX_VRAM_MB lower if "
-            "VRAM is shared with display/compositor.");
-    }
+    if (!p) throw fail("returned null (out of device memory)");
     return p;
 }
 
@@ -360,6 +397,161 @@ bool cuda_query_device_memory(int device_ordinal,
 #ifndef _WIN32
 namespace {
 
+// Free VRAM on Level Zero (Intel), via Sysman.
+//
+// Needed because AdaptiveCpp 25.10 exposes NO free-memory query of any kind, so
+// query_device_memory() falls back to global_mem_size — the device TOTAL. On an
+// Arc B580 that hands the picker 11605 MiB and pretends the Level Zero context,
+// the compositor and every other tenant do not exist. The CUDA path does not
+// have this problem: cudaMemGetInfo runs after context creation, so its number
+// is genuinely free.
+//
+// SYSMAN, not the core API, is the only place free memory lives.
+// zeDeviceGetMemoryProperties reports physical size and nothing about usage.
+// zesMemoryGetState is the one that carries `free`.
+//
+// zesInit() rather than ZES_ENABLE_SYSMAN=1: the env var must be set before the
+// L0 driver initialises, and by the time anything here runs the SYCL runtime
+// has long since done that. zesInit is a separate sysman init with no such
+// ordering constraint. A loader too old to export it simply fails the dlsym and
+// we fall back to the total, which is the pre-existing behaviour.
+//
+// The ABI below is declared locally, NOT included, so the build never depends
+// on level_zero headers being installed — same reason hip_query_device_memory
+// dlopens libamdhip64 instead of linking it. The layout was checked against
+// /usr/include/level_zero/zes_api.h; it is validated again at runtime by the
+// caller, which rejects a reading that does not agree with global_mem_size. A
+// struct-layout mistake therefore degrades to "no probe" rather than to a
+// garbage free-VRAM figure that would send a tier past what the card has.
+#ifndef _WIN32
+namespace {
+
+using ZeResult          = int;                      // ZE_RESULT_SUCCESS == 0
+using ZesDriverHandle   = void*;
+using ZesDeviceHandle   = void*;
+using ZesMemHandle      = void*;
+
+// zes_mem_state_t, zes_api.h. stype must be ZES_STRUCTURE_TYPE_MEM_STATE.
+struct ZesMemState {
+    std::uint32_t stype;
+    void const*   pNext;
+    std::uint32_t health;
+    std::uint64_t free;
+    std::uint64_t size;     // deprecated upstream: "can no longer track the
+                            // allocatable memory reliably" — treated as a hint
+                            // only, never as the total.
+};
+constexpr std::uint32_t kZesStructureTypeMemState = 0x1e;
+
+struct ZesApi {
+    void* handle = nullptr;
+    ZeResult (*init)(std::uint32_t)                                        = nullptr;
+    ZeResult (*driver_get)(std::uint32_t*, ZesDriverHandle*)               = nullptr;
+    ZeResult (*device_get)(ZesDriverHandle, std::uint32_t*, ZesDeviceHandle*) = nullptr;
+    ZeResult (*enum_memory)(ZesDeviceHandle, std::uint32_t*, ZesMemHandle*)   = nullptr;
+    ZeResult (*mem_state)(ZesMemHandle, ZesMemState*)                      = nullptr;
+    bool     ready = false;
+};
+
+ZesApi const& zes_api()
+{
+    static ZesApi const api = [] {
+        ZesApi a;
+        for (char const* soname : {"libze_loader.so.1", "libze_loader.so"}) {
+            if ((a.handle = dlopen(soname, RTLD_LAZY | RTLD_LOCAL))) break;
+        }
+        if (!a.handle) return a;
+        auto sym = [&](char const* n) { return dlsym(a.handle, n); };
+        a.init        = reinterpret_cast<decltype(a.init)>(sym("zesInit"));
+        a.driver_get  = reinterpret_cast<decltype(a.driver_get)>(sym("zesDriverGet"));
+        a.device_get  = reinterpret_cast<decltype(a.device_get)>(sym("zesDeviceGet"));
+        a.enum_memory = reinterpret_cast<decltype(a.enum_memory)>(
+                            sym("zesDeviceEnumMemoryModules"));
+        a.mem_state   = reinterpret_cast<decltype(a.mem_state)>(sym("zesMemoryGetState"));
+        if (!a.init || !a.driver_get || !a.device_get || !a.enum_memory || !a.mem_state)
+            return a;
+        a.ready = (a.init(0) == 0);
+        return a;
+    }();
+    return api;
+}
+
+// Sysman devices in enumeration order, flattened across drivers. Cached: the
+// VRAM watchdog polls every 20 ms and re-enumerating per tick would be absurd.
+std::vector<ZesDeviceHandle> const& zes_devices()
+{
+    static std::vector<ZesDeviceHandle> const devs = [] {
+        std::vector<ZesDeviceHandle> out;
+        ZesApi const& api = zes_api();
+        if (!api.ready) return out;
+        std::uint32_t n_drv = 0;
+        if (api.driver_get(&n_drv, nullptr) != 0 || n_drv == 0) return out;
+        std::vector<ZesDriverHandle> drivers(n_drv);
+        if (api.driver_get(&n_drv, drivers.data()) != 0) return out;
+        for (auto d : drivers) {
+            std::uint32_t n_dev = 0;
+            if (api.device_get(d, &n_dev, nullptr) != 0 || n_dev == 0) continue;
+            std::vector<ZesDeviceHandle> devs_of(n_dev);
+            if (api.device_get(d, &n_dev, devs_of.data()) != 0) continue;
+            out.insert(out.end(), devs_of.begin(), devs_of.end());
+        }
+        return out;
+    }();
+    return devs;
+}
+
+// Memory-module handles for one sysman device. Cached per rank, same reason.
+std::vector<ZesMemHandle> const& zes_memory_modules(int rank)
+{
+    static std::mutex                                m;
+    static std::map<int, std::vector<ZesMemHandle>>  cache;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (auto it = cache.find(rank); it != cache.end()) return it->second;
+    }
+    std::vector<ZesMemHandle> mods;
+    ZesApi const& api = zes_api();
+    auto const&   devs = zes_devices();
+    if (api.ready && rank >= 0 && std::size_t(rank) < devs.size()) {
+        std::uint32_t n = 0;
+        if (api.enum_memory(devs[std::size_t(rank)], &n, nullptr) == 0 && n > 0) {
+            mods.resize(n);
+            if (api.enum_memory(devs[std::size_t(rank)], &n, mods.data()) != 0)
+                mods.clear();
+        }
+    }
+    std::lock_guard<std::mutex> lk(m);
+    return cache.emplace(rank, std::move(mods)).first->second;
+}
+
+// Sums every memory module on the device — a multi-tile part reports one per
+// tile. Returns false unless at least one module answered.
+bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes)
+{
+    ZesApi const& api = zes_api();
+    if (!api.ready) return false;
+    auto const& mods = zes_memory_modules(rank);
+    if (mods.empty()) return false;
+
+    std::uint64_t f = 0, t = 0;
+    bool any = false;
+    for (auto h : mods) {
+        ZesMemState st{};
+        st.stype = kZesStructureTypeMemState;
+        if (api.mem_state(h, &st) != 0) continue;
+        f += st.free;
+        t += st.size;
+        any = true;
+    }
+    if (!any) return false;
+    free_bytes  = size_t(f);
+    total_bytes = size_t(t);
+    return true;
+}
+
+} // namespace
+#endif  // !_WIN32
+
 bool hip_query_device_memory(int device_ordinal,
                              size_t& free_bytes,
                              size_t& total_bytes)
@@ -500,11 +692,13 @@ bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
 // vendor in it. SYCL index 1 here is the Arc, and HIP device 1 does not exist.
 namespace {
 
-enum class ProbeRuntime { None, Cuda, Hip };
+enum class ProbeRuntime { None, Cuda, Hip, LevelZero };
 
 struct ProbeTarget {
-    ProbeRuntime runtime = ProbeRuntime::None;
-    int          ordinal = 0;   // index within that runtime, not the SYCL index
+    ProbeRuntime  runtime = ProbeRuntime::None;
+    int           ordinal = 0;   // index within that runtime, not the SYCL index
+    std::uint64_t global_mem = 0;  // the device's own global_mem_size, for
+                                   // sanity-checking whatever the runtime says
 };
 
 ProbeTarget probe_target_for(int device_ordinal)
@@ -538,9 +732,13 @@ ProbeTarget probe_target_for(int device_ordinal)
         }
         if (found) {
             auto const backend = devs[idx].get_backend();
-            ProbeRuntime const rt = (backend == sycl::backend::cuda) ? ProbeRuntime::Cuda
-                                  : (backend == sycl::backend::hip)  ? ProbeRuntime::Hip
-                                                                     : ProbeRuntime::None;
+            ProbeRuntime const rt =
+                (backend == sycl::backend::cuda)       ? ProbeRuntime::Cuda
+              : (backend == sycl::backend::hip)        ? ProbeRuntime::Hip
+              : (backend == sycl::backend::level_zero) ? ProbeRuntime::LevelZero
+                                                       : ProbeRuntime::None;
+            t.global_mem =
+                devs[idx].get_info<sycl::info::device::global_mem_size>();
             if (rt != ProbeRuntime::None) {
                 // Rank among devices sharing this backend — that IS the
                 // runtime's own ordinal, whereas idx counts every vendor.
@@ -601,6 +799,31 @@ bool device_memory_probe(int device_ordinal,
     if (target.runtime == ProbeRuntime::Hip
         && hip_query_device_memory(target.ordinal, free_bytes, total_bytes)) {
         return true;
+    }
+
+    if (target.runtime == ProbeRuntime::LevelZero) {
+        size_t f = 0, t = 0;
+        if (ze_query_device_memory(target.ordinal, f, t)) {
+            // Validate before trusting it. The Sysman ABI above is hand-declared
+            // and cannot be compile-checked, and `size` is deprecated upstream
+            // ("can no longer track the allocatable memory reliably"), so a
+            // reading that disagrees with the device's own global_mem_size is
+            // rejected rather than acted on. Getting this wrong in the
+            // optimistic direction sends a tier past what the card has, which
+            // is the failure we are here to prevent — so an implausible answer
+            // must degrade to "no probe", never to a plausible-looking number.
+            std::uint64_t const cap = target.global_mem;
+            bool const free_sane = cap == 0 || (f > 0 && f <= cap);
+            // The deprecated total is a hint. Believe it only when it lands
+            // near global_mem_size; otherwise keep global_mem_size as total.
+            bool const total_sane =
+                cap != 0 && t >= cap - cap / 4 && t <= cap + cap / 4;
+            if (free_sane) {
+                free_bytes  = f;
+                total_bytes = total_sane ? t : size_t(cap);
+                return true;
+            }
+        }
     }
 #endif
     (void)target;

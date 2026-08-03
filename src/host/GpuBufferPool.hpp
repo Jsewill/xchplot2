@@ -63,6 +63,12 @@ struct InsufficientVramError : std::runtime_error {
     size_t required_bytes = 0;
     size_t free_bytes     = 0;
     size_t total_bytes    = 0;
+    // True when a real allocation failed rather than the gate declining up
+    // front. free_bytes/total_bytes are then unset — there is no "free" figure
+    // to quote, because the driver disagreed with the one we had. Callers must
+    // report this case differently or they print "only 0.00 GiB free", which
+    // reads as a broken probe rather than as what happened.
+    bool   from_allocation = false;
 };
 
 struct GpuBufferPool {
