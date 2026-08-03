@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>      // probe_target_for cache
+#include <mutex>    // ditto — the VRAM watchdog polls it from its own thread
 #include <stdexcept>
 #include <string>
 
@@ -475,6 +477,93 @@ bool host_memory_probe(size_t& free_bytes, size_t& total_bytes)
 
 }  // namespace
 
+// Which vendor runtime, if any, owns the SYCL device behind `device_ordinal`,
+// and that device's ordinal WITHIN that runtime.
+//
+// A mixed-vendor host forces this. Observed on an AMD APU (ROCm iGPU) plus a
+// discrete Intel Arc: hipMemGetInfo answers whenever libamdhip64 is loaded, no
+// matter which device SYCL is actually running on. With kDefaultGpuId the HIP
+// probe never even calls hipSetDevice, so it reported the iGPU's system-RAM
+// carve-out — 7.35 GiB — while the kernels ran on the Arc. The tier picker
+// sized the Arc against that figure, refused the pool path it had room for,
+// and dropped to plain streaming: 15.18 s/plot where the same card does 13.53.
+// The VRAM watchdog then polled a device nothing was allocated on and reported
+// a peak of 0, so the check that exists to catch exactly this was blind to it.
+//
+// That failure happened to be SAFE (under-reported memory only costs speed).
+// The same bug over-reports whenever the iGPU's share of system RAM exceeds
+// the discrete card's VRAM, and then the picker hands out a tier that cannot
+// fit and the card OOMs mid-plot.
+//
+// The ordinal matters as much as the runtime: a SYCL device index has no
+// relationship to a HIP or CUDA device index once the box has more than one
+// vendor in it. SYCL index 1 here is the Arc, and HIP device 1 does not exist.
+namespace {
+
+enum class ProbeRuntime { None, Cuda, Hip };
+
+struct ProbeTarget {
+    ProbeRuntime runtime = ProbeRuntime::None;
+    int          ordinal = 0;   // index within that runtime, not the SYCL index
+};
+
+ProbeTarget probe_target_for(int device_ordinal)
+{
+    // Cached: the watchdog calls this every 20 ms, and the answer cannot
+    // change during a run. Resolving it repeatedly would also mean touching
+    // SYCL device enumeration from the polling thread on every tick.
+    static std::mutex             m;
+    static std::map<int, ProbeTarget> cache;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (auto it = cache.find(device_ordinal); it != cache.end())
+            return it->second;
+    }
+
+    ProbeTarget t;
+    try {
+        auto const devs = sycl_backend::usable_gpu_devices();
+        std::size_t idx = 0;
+        bool        found = false;
+        if (device_ordinal >= 0) {
+            idx   = static_cast<std::size_t>(device_ordinal);
+            found = idx < devs.size();
+        } else {
+            // kDefaultGpuId — whatever the default selector picks. Match it
+            // back to an index so the per-runtime ordinal below is right.
+            sycl::device const d{sycl::gpu_selector_v};
+            for (std::size_t i = 0; i < devs.size(); ++i) {
+                if (devs[i] == d) { idx = i; found = true; break; }
+            }
+        }
+        if (found) {
+            auto const backend = devs[idx].get_backend();
+            ProbeRuntime const rt = (backend == sycl::backend::cuda) ? ProbeRuntime::Cuda
+                                  : (backend == sycl::backend::hip)  ? ProbeRuntime::Hip
+                                                                     : ProbeRuntime::None;
+            if (rt != ProbeRuntime::None) {
+                // Rank among devices sharing this backend — that IS the
+                // runtime's own ordinal, whereas idx counts every vendor.
+                int rank = 0;
+                for (std::size_t i = 0; i < idx; ++i)
+                    if (devs[i].get_backend() == backend) ++rank;
+                t.runtime = rt;
+                t.ordinal = rank;
+            }
+        }
+    } catch (...) {
+        // Device enumeration can throw on a half-broken driver. An
+        // unprobeable device falls back to the device total, which is what
+        // this function returning None means.
+    }
+
+    std::lock_guard<std::mutex> lk(m);
+    cache[device_ordinal] = t;
+    return t;
+}
+
+} // namespace
+
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes)
@@ -492,26 +581,36 @@ bool device_memory_probe(int device_ordinal,
         return host_memory_probe(free_bytes, total_bytes);
     }
 
+    // Ask only the runtime that actually owns this device. Asking both and
+    // taking the first answer is what let the AMD probe speak for an Intel
+    // card; see probe_target_for().
+    ProbeTarget const target = probe_target_for(device_ordinal);
+
 #ifdef XCHPLOT2_HAVE_CUB
-    std::size_t f = 0;
-    std::size_t t = 0;
-    if (cuda_query_device_memory(device_ordinal < 0 ? 0 : device_ordinal,
-                                 f, t)) {
-        free_bytes  = f;
-        total_bytes = t;
-        return true;
+    if (target.runtime == ProbeRuntime::Cuda) {
+        std::size_t f = 0;
+        std::size_t t = 0;
+        if (cuda_query_device_memory(target.ordinal, f, t)) {
+            free_bytes  = f;
+            total_bytes = t;
+            return true;
+        }
     }
 #endif
 #ifndef _WIN32
-    // NVIDIA build with no CUDA device, or an AMD build: try HIP.
-    if (hip_query_device_memory(device_ordinal, free_bytes, total_bytes)) {
+    if (target.runtime == ProbeRuntime::Hip
+        && hip_query_device_memory(target.ordinal, free_bytes, total_bytes)) {
         return true;
     }
 #endif
+    (void)target;
     (void)device_ordinal;
     (void)free_bytes;
     (void)total_bytes;
-    return false;   // neither runtime answered — caller falls back to total
+    // No runtime owns this device (Level Zero / OpenCL), or the owning one
+    // declined. Caller falls back to the device total — an upper bound, and
+    // honest about being one, which the wrong device's figure was not.
+    return false;
 }
 
 size_t vram_safety_margin()
