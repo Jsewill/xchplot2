@@ -54,6 +54,34 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets
 
+  host-tests:
+    name: C++ host tests (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    # Until this job existed CI compiled no C++ at all: arch-matrix builds only
+    # pos2_gpu_cuda_obj (the .cu TUs), so GpuPipeline.cpp, BatchPlotter.cpp and
+    # HostRamPolicy.cpp had never been through a compiler on a runner, and the
+    # host test binaries were built only when someone typed their names. The
+    # spill path in particular shipped ~4700 lines with no automated check.
+    #
+    # These targets need a C++20 compiler and nothing else — no SYCL, no CUDA,
+    # no GPU. The sanitizer arms are not decoration: the spill I/O engine is a
+    # worker pool over a ticket protocol, and TSan is what caught the
+    # unsynchronised high-water update in TempFile::pwrite_at that the pool
+    # introduced.
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plain, thread, address]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run host tests
+        run: |
+          if [ "${{ matrix.mode }}" = "plain" ]; then
+            scripts/test/host-tests.sh
+          else
+            scripts/test/host-tests.sh "${{ matrix.mode }}"
+          fi
+
   hadolint:
     name: hadolint Containerfile
     runs-on: ubuntu-latest
