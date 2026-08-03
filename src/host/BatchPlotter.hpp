@@ -248,6 +248,26 @@ struct BatchOptions {
     // `<id>:<tier>` override above. Wins over the global
     // `streaming_tier` for those devices.
     std::string all_gpus_tier;
+
+    // Host-RAM disk-offload budget (--max-host-ram / XCHPLOT2_MAX_HOST_RAM).
+    // When `has_max_host_ram` is set, the streaming pipeline's large cold
+    // pinned tables are spilled to a TempFile-backed disk home, chosen
+    // largest-first until the modelled resident host peak fits under
+    // `max_host_ram` bytes. 0 = "min" (spill everything routable, lowest
+    // floor). Unset (has_max_host_ram == false) = current behaviour, no
+    // spill. --temp-dir feeds XCHPLOT2_TEMP_DIR (honoured by TempFile).
+    bool     has_max_host_ram = false;
+    uint64_t max_host_ram     = 0;   // bytes; 0 = min when has_max_host_ram
+
+    // Automatic disk-offload (--no-auto-spill / XCHPLOT2_NO_AUTO_SPILL=1 turn
+    // it off). When no budget was named AND the tier does not fit host RAM,
+    // adopt the host's own free RAM as the budget and spill into it rather
+    // than refusing to plot. It fires only where the alternative is a hard
+    // error, so it cannot slow a run that already works — which is why the
+    // default is on. Off restores the "refuse" behaviour for anyone who would
+    // rather be told no than plot at disk speed.
+    bool     auto_host_ram_spill = true;
+
     // Phase 2.4: explicit strategy (Auto = picker decides). Legacy
     // shard_plot / pipeline_plot bool fields below are still honoured
     // for backward compatibility and act as explicit overrides if

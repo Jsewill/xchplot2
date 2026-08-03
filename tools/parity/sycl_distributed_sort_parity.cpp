@@ -46,7 +46,8 @@ bool run_pairs(uint32_t seed, uint64_t count)
         uint32_t* d_vals_in  = sycl::malloc_device<uint32_t>(count, q);
         uint32_t* d_vals_out = sycl::malloc_device<uint32_t>(count, q);
         q.memcpy(d_keys_in, h_keys.data(), sizeof(uint32_t) * count);
-        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count).wait();
+        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count);
+        q.wait();
 
         size_t scratch_bytes = 0;
         pos2gpu::launch_sort_pairs_u32_u32(
@@ -63,7 +64,8 @@ bool run_pairs(uint32_t seed, uint64_t count)
         q.wait();
 
         q.memcpy(ref_keys.data(), d_keys_out, sizeof(uint32_t) * count);
-        q.memcpy(ref_vals.data(), d_vals_out, sizeof(uint32_t) * count).wait();
+        q.memcpy(ref_vals.data(), d_vals_out, sizeof(uint32_t) * count);
+        q.wait();
 
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_keys_in,  q);
@@ -81,7 +83,8 @@ bool run_pairs(uint32_t seed, uint64_t count)
         uint32_t* d_vals_in  = sycl::malloc_device<uint32_t>(count, q);
         uint32_t* d_vals_out = sycl::malloc_device<uint32_t>(count, q);
         q.memcpy(d_keys_in, h_keys.data(), sizeof(uint32_t) * count);
-        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count).wait();
+        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * count);
+        q.wait();
 
         std::vector<pos2gpu::DistributedSortPairsShard> shards(1);
         shards[0].queue = &q;
@@ -111,7 +114,8 @@ bool run_pairs(uint32_t seed, uint64_t count)
         dist_out_count = shards[0].out_count;
 
         q.memcpy(dist_keys.data(), d_keys_out, sizeof(uint32_t) * count);
-        q.memcpy(dist_vals.data(), d_vals_out, sizeof(uint32_t) * count).wait();
+        q.memcpy(dist_vals.data(), d_vals_out, sizeof(uint32_t) * count);
+        q.wait();
 
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_keys_in,  q);
@@ -147,7 +151,8 @@ bool run_keys(uint32_t seed, uint64_t count)
     {
         uint64_t* d_in  = sycl::malloc_device<uint64_t>(count, q);
         uint64_t* d_out = sycl::malloc_device<uint64_t>(count, q);
-        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * count).wait();
+        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * count);
+        q.wait();
 
         size_t scratch_bytes = 0;
         pos2gpu::launch_sort_keys_u64(
@@ -161,7 +166,8 @@ bool run_keys(uint32_t seed, uint64_t count)
             scratch_bytes, d_in, d_out, count, 0, 64, q);
         q.wait();
 
-        q.memcpy(ref_keys.data(), d_out, sizeof(uint64_t) * count).wait();
+        q.memcpy(ref_keys.data(), d_out, sizeof(uint64_t) * count);
+        q.wait();
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_in,  q);
         sycl::free(d_out, q);
@@ -173,7 +179,8 @@ bool run_keys(uint32_t seed, uint64_t count)
     {
         uint64_t* d_in  = sycl::malloc_device<uint64_t>(count, q);
         uint64_t* d_out = sycl::malloc_device<uint64_t>(count, q);
-        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * count).wait();
+        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * count);
+        q.wait();
 
         std::vector<pos2gpu::DistributedSortKeysU64Shard> shards(1);
         shards[0].queue = &q;
@@ -195,7 +202,8 @@ bool run_keys(uint32_t seed, uint64_t count)
         q.wait();
 
         dist_out_count = shards[0].out_count;
-        q.memcpy(dist_keys.data(), d_out, sizeof(uint64_t) * count).wait();
+        q.memcpy(dist_keys.data(), d_out, sizeof(uint64_t) * count);
+        q.wait();
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_in,  q);
         sycl::free(d_out, q);
@@ -239,7 +247,8 @@ bool run_pairs_n2(uint32_t seed, uint64_t total)
         uint32_t* d_vals_in  = sycl::malloc_device<uint32_t>(total, q);
         uint32_t* d_vals_out = sycl::malloc_device<uint32_t>(total, q);
         q.memcpy(d_keys_in, h_keys.data(), sizeof(uint32_t) * total);
-        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * total).wait();
+        q.memcpy(d_vals_in, h_vals.data(), sizeof(uint32_t) * total);
+        q.wait();
 
         size_t scratch_bytes = 0;
         pos2gpu::launch_sort_pairs_u32_u32(
@@ -254,7 +263,8 @@ bool run_pairs_n2(uint32_t seed, uint64_t total)
             total, 0, 32, q);
         q.wait();
         q.memcpy(ref_keys.data(), d_keys_out, sizeof(uint32_t) * total);
-        q.memcpy(ref_vals.data(), d_vals_out, sizeof(uint32_t) * total).wait();
+        q.memcpy(ref_vals.data(), d_vals_out, sizeof(uint32_t) * total);
+        q.wait();
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_keys_in,  q);
         sycl::free(d_keys_out, q);
@@ -287,7 +297,8 @@ bool run_pairs_n2(uint32_t seed, uint64_t total)
         q.memcpy(d_keys_in_0, h_keys.data(),      sizeof(uint32_t) * c0);
         q.memcpy(d_keys_in_1, h_keys.data() + c0, sizeof(uint32_t) * c1);
         q.memcpy(d_vals_in_0, h_vals.data(),      sizeof(uint32_t) * c0);
-        q.memcpy(d_vals_in_1, h_vals.data() + c0, sizeof(uint32_t) * c1).wait();
+        q.memcpy(d_vals_in_1, h_vals.data() + c0, sizeof(uint32_t) * c1);
+        q.wait();
 
         std::vector<pos2gpu::DistributedSortPairsShard> shards(2);
         shards[0].queue = &q;
@@ -376,7 +387,8 @@ bool run_keys_n2(uint32_t seed, uint64_t total)
     {
         uint64_t* d_in  = sycl::malloc_device<uint64_t>(total, q);
         uint64_t* d_out = sycl::malloc_device<uint64_t>(total, q);
-        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * total).wait();
+        q.memcpy(d_in, h_keys.data(), sizeof(uint64_t) * total);
+        q.wait();
         size_t scratch_bytes = 0;
         pos2gpu::launch_sort_keys_u64(
             nullptr, scratch_bytes, nullptr, nullptr, total, 0, 64, q);
@@ -386,7 +398,8 @@ bool run_keys_n2(uint32_t seed, uint64_t total)
             d_scratch ? d_scratch : reinterpret_cast<void*>(uintptr_t{1}),
             scratch_bytes, d_in, d_out, total, 0, 64, q);
         q.wait();
-        q.memcpy(ref_keys.data(), d_out, sizeof(uint64_t) * total).wait();
+        q.memcpy(ref_keys.data(), d_out, sizeof(uint64_t) * total);
+        q.wait();
         if (d_scratch) sycl::free(d_scratch, q);
         sycl::free(d_in,  q); sycl::free(d_out, q);
     }
@@ -402,7 +415,8 @@ bool run_keys_n2(uint32_t seed, uint64_t total)
         uint64_t* d_out_0 = sycl::malloc_device<uint64_t>(total, q);
         uint64_t* d_out_1 = sycl::malloc_device<uint64_t>(total, q);
         q.memcpy(d_in_0, h_keys.data(),      sizeof(uint64_t) * c0);
-        q.memcpy(d_in_1, h_keys.data() + c0, sizeof(uint64_t) * c1).wait();
+        q.memcpy(d_in_1, h_keys.data() + c0, sizeof(uint64_t) * c1);
+        q.wait();
 
         std::vector<pos2gpu::DistributedSortKeysU64Shard> shards(2);
         shards[0].queue = &q;

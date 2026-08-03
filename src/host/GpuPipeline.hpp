@@ -306,6 +306,53 @@ struct StreamingPinnedScratch {
     // allocation, ~5-9% slower on plain/compact and ~10% FASTER on
     // minimal, where the scratch was a net pessimisation).
     uint64_t twophase_budget_bytes = 0;
+
+    // Host-RAM disk-offload plan: which cold, spillable tables to redirect
+    // to a TempFile-backed disk home (streamed through the shared
+    // SpillEngine's 64 MiB of pinned staging) instead of a full pinned
+    // allocation. Chosen largest-first by BatchPlotter's budget policy
+    // from --max-host-ram / XCHPLOT2_MAX_HOST_RAM. Default (all false) =
+    // no spill, byte-identical to the historical all-pinned path.
+    // Two redirect classes:
+    //   - DMA tables (SpillBuffer, device<->disk via the shared 64 MiB
+    //     staging): h_t1_meta, h_t3, h_t2_xbits. The full buffer never
+    //     resides in host RAM, so the RSS win is real even without
+    //     memory pressure.
+    //   - CPU-touched tables (mmap'd TempFile, pageable drop-in):
+    //     h_frags. Reclaimable only under pressure.
+    // Some large tables are deliberately NOT routable because a device
+    // KERNEL accesses them through a USM-host pointer, which a disk file
+    // or mmap cannot satisfy: h_keys_merged and the partition's h_part_*
+    // arenas (the streaming-partition kernel WRITES them via zero-copy
+    // device-side scatter, so they must stay host-USM).
+    //
+    // The partition's SOURCE streams are a different matter and are routable:
+    // launch_streaming_partition_u32_u64_u32 takes a SpillTileReader per value
+    // stream, so Tiny's Phase-1.5b T2 sort can pull h_t2_meta / h_t2_xbits
+    // tile-by-tile off disk instead of reading them USM-host. That is what
+    // makes h_t2_meta routable in Tiny and lifts h_t2_xbits's Compact/Minimal-
+    // only restriction. In Compact/Minimal h_t2_meta still ALIASES h_meta, so
+    // it stays un-routable there — spilling it would strand the alias.
+    struct SpillPlan {
+        bool h_t1_meta  = false;  // ~cap·8 B, tiny tier only            (DMA)
+        bool h_t3       = false;  // ~cap·8 B, compact / minimal / tiny  (DMA)
+        bool h_t2_xbits = false;  // ~cap·4 B, compact / minimal / tiny  (DMA)
+        bool h_t2_meta  = false;  // ~cap·8 B, tiny tier only            (DMA)
+        bool h_frags    = false;  // ~cap·8 B, compact / minimal only    (mmap)
+        bool any() const {
+            return h_t1_meta || h_t3 || h_t2_xbits || h_t2_meta || h_frags;
+        }
+    };
+    SpillPlan spill;
+
+    // Suppress the pipeline's own [spill] chatter (BatchOptions::quiet). The
+    // spill is the only thing in here that logs per plot, and on a long batch
+    // that is several hundred lines nobody asked for. Note the authoritative
+    // announcement is BatchPlotter's one-per-slice budget line, which names
+    // every table being routed — these are a redundant second copy, so
+    // dropping them costs no information. Default false = log, matching the
+    // pre-spill behaviour of every other caller.
+    bool quiet = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
@@ -330,6 +377,14 @@ void      streaming_free_pinned_uint64(uint64_t* ptr);
 
 uint32_t* streaming_alloc_pinned_uint32(size_t count);
 void      streaming_free_pinned_uint32(uint32_t* ptr);
+
+// Verify the XCHPLOT2_HOST_GUARD redzones on every live pinned-host
+// allocation, reporting any damage to stderr with the buffer name and the
+// overrun distance. No-op unless the guard is enabled. The pipeline calls
+// this at each phase boundary; consumers that hold pinned buffers across
+// plots (the D2H drain slots) can call it at plot boundaries too, which
+// covers the window after the pipeline's last phase.
+void streaming_host_guard_check(char const* where);
 
 // Multi-GPU device binding. bind_current_device() sets a thread-local
 // target device id that sycl_backend::queue() reads when lazily

@@ -74,7 +74,8 @@ bool run_case(uint32_t seed, uint64_t count, int num_top_bits,
 
     q.memcpy(d_keys_in,      h_keys.data(),  sizeof(uint32_t) * count);
     q.memcpy(h_pinned_vals,  h_vals.data(),  sizeof(uint64_t) * count);
-    q.memcpy(h_pinned_vals2, h_vals2.data(), sizeof(uint32_t) * count).wait();
+    q.memcpy(h_pinned_vals2, h_vals2.data(), sizeof(uint32_t) * count);
+    q.wait();
 
     size_t scratch_bytes = 0;
     pos2gpu::launch_streaming_partition_u32_u64_u32(

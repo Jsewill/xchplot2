@@ -62,6 +62,39 @@
 
 namespace pos2gpu {
 
+// P1.5 host-RAM disk-offload (XCHPLOT2_SPILL_T1META): overlapped
+// source-tile reader for the streaming-partition spill path. When a
+// non-null SpillTileReader is passed, pass-2 does NOT read from
+// h_vals_in (which is then null); instead each source-values tile is
+// pread from disk by a background I/O worker into one of TWO ping-pong
+// windows, double-buffered so tile t+1's pread overlaps tile t's
+// partition kernel. The primitive drives it:
+//   submit(ctx, slot, off_bytes, bytes)  — enqueue an async pread of
+//       `bytes` at file offset `off_bytes` into window `slot` (0/1).
+//   wait(ctx, slot)                      — block until window `slot`'s
+//       most recent submit has completed.
+// win[slot] is the pinned destination window; each tile must be
+// <= win_entries u64 entries (caller sizes tile_count to guarantee it).
+// Null reader keeps the in-memory h_vals_in path, byte-identical.
+//
+// Slot discipline differs by variant, and the engine only guarantees that a
+// window holds what its LAST submit put there:
+//   single-value (u32_u64): one stream ping-pongs slots 0/1 via `slot ^ 1`,
+//                           so tile t+1 loads while tile t partitions.
+//   triple (u32_u64_u32):   a tile needs BOTH streams resident at once, so it
+//                           holds both windows and has no cross-tile
+//                           prefetch. Widening to four windows to buy one was
+//                           measured and did not pay — see kNumWindows in
+//                           GpuPipeline.cpp.
+struct SpillTileReader {
+    void*     ctx         = nullptr;
+    uint64_t* win[2]      = {nullptr, nullptr};
+    uint64_t  win_entries = 0;
+    bool      overlap     = true;   // false => synchronous per-tile (measurement only)
+    void (*submit)(void* ctx, int slot, uint64_t off_bytes, uint64_t bytes) = nullptr;
+    void (*wait)(void* ctx, int slot)                                       = nullptr;
+};
+
 void launch_streaming_partition_u32_u64(
     void* d_scratch,
     size_t& scratch_bytes,
@@ -74,7 +107,11 @@ void launch_streaming_partition_u32_u64(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q);
+    sycl::queue& q,
+    // P1.5 host-RAM disk-offload: non-null routes pass-2's source-values
+    // tiles through the double-buffered disk reader instead of h_vals_in
+    // (which is then null). Null = in-memory path, byte-identical.
+    SpillTileReader const* spill_reader = nullptr);
 
 // Triple-val variant: same shape as launch_streaming_partition_u32_u64
 // but also carries a u32 second-value array alongside the u64 first
@@ -89,7 +126,19 @@ void launch_streaming_partition_u32_u64(
 // original entries. Carrying both vals through a single partition
 // preserves the meta-xbits pairing.
 //
-// API mirrors u32_u64 with an extra (h_vals2_in, h_part_vals2) pair.
+// API mirrors u32_u64 with an extra (h_vals2_in, h_part_vals2) pair,
+// including the optional spill readers: pass a reader for either value
+// stream to feed that stream's per-tile source from a TempFile instead of
+// the host array (which is then null). Both null = in-memory path,
+// byte-identical.
+//
+// The two readers share the engine's window pair, one window each — the
+// u64 stream reads into window 0, the u32 stream into window 1 — so a tile
+// of BOTH streams is resident at once. That costs the cross-tile prefetch
+// the single-stream u32_u64 variant gets (which needs both windows for one
+// stream), so this path is unoverlapped by construction. Deliberate: the
+// simplest correct mechanism first, and whether overlap is worth another
+// window pair is a question for measurement, not assumption.
 // Both vals are written at the same atomic-claim slot, so the i-th
 // output triple always corresponds to a single input position.
 void launch_streaming_partition_u32_u64_u32(
@@ -106,6 +155,11 @@ void launch_streaming_partition_u32_u64_u32(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q);
+    sycl::queue& q,
+    // Non-null routes that value stream's per-tile source through the
+    // double-buffered disk reader instead of its h_*_in array (which is
+    // then null). Independent: either, both, or neither.
+    SpillTileReader const* vals_reader  = nullptr,
+    SpillTileReader const* vals2_reader = nullptr);
 
 } // namespace pos2gpu

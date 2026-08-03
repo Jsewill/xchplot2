@@ -219,8 +219,13 @@ void launch_two_level_sort_pairs_u32_u32(
     // (begin_bit == top_bit_offset), the partition output is
     // already in final order — just copy.
     if (begin_bit == top_bit_offset) {
-        q.memcpy(keys_out, d_keys_part, count * sizeof(uint32_t));
-        q.memcpy(vals_out, d_vals_part, count * sizeof(uint32_t)).wait();
+        // These are the function's OUTPUTS and there is no barrier after
+        // this branch, so the caller could observe keys_out before the
+        // copy lands. Out-of-order queue: wait each.
+        auto e_ko = q.memcpy(keys_out, d_keys_part, count * sizeof(uint32_t));
+        auto e_vo = q.memcpy(vals_out, d_vals_part, count * sizeof(uint32_t));
+        e_ko.wait();
+        e_vo.wait();
     } else {
         size_t inner_bytes_actual = inner_bytes;
         // d_bucket_starts holds num_buckets+1 entries; segment i

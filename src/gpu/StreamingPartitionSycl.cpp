@@ -23,8 +23,12 @@
 #include "gpu/SyclBackend.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
+
+#include <unistd.h>   // pread (P1 host-RAM disk-offload)
 
 #include <sycl/sycl.hpp>
 
@@ -81,7 +85,8 @@ void launch_streaming_partition_u32_u64(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q)
+    sycl::queue& q,
+    SpillTileReader const* spill_reader)
 {
     if (num_top_bits < 1 || num_top_bits > 16) {
         throw std::invalid_argument(
@@ -176,13 +181,62 @@ void launch_streaming_partition_u32_u64(
     // that's a Phase 1.3c optimization to attempt if measured
     // throughput on real target hardware demands it. First cut:
     // straight serial.
+    // P1.5 spill: prime tile 0's disk pread before the loop so the
+    // first wait() below has something in flight. Every subsequent tile
+    // is prefetched during the prior tile's kernel (double-buffered).
+    // (XCHPLOT2_SPILL_NO_OVERLAP forces the synchronous per-tile path
+    // below — measurement only.)
+    if (spill_reader && spill_reader->overlap && tiles > 0) {
+        uint64_t const n0 = std::min(tile_size, count);
+        if (n0 > spill_reader->win_entries) {
+            throw std::runtime_error(
+                "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+        }
+        spill_reader->submit(spill_reader->ctx, 0, 0, n0 * sizeof(uint64_t));
+    }
     for (uint64_t t = 0; t < tiles; ++t) {
         uint64_t const tile_off = t * tile_size;
         if (tile_off >= count) break;
         uint64_t const tile_n   = std::min(tile_size, count - tile_off);
 
-        q.memcpy(d_vals_tile, h_vals_in + tile_off,
-                 tile_n * sizeof(uint64_t)).wait();
+        if (spill_reader && spill_reader->overlap) {
+            // Double-buffered disk read: tile t was prefetched into
+            // window (t&1). Kick off tile t+1's pread into the OTHER
+            // window first, then consume this tile — so tile t+1's disk
+            // read overlaps this tile's H2D + partition kernel. FIFO on
+            // the one worker keeps the two windows race-free.
+            int const slot = static_cast<int>(t & 1u);
+            uint64_t const next_off = tile_off + tile_size;
+            if (next_off < count) {
+                uint64_t const next_n = std::min(tile_size, count - next_off);
+                if (next_n > spill_reader->win_entries) {
+                    throw std::runtime_error(
+                        "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+                }
+                spill_reader->submit(spill_reader->ctx, slot ^ 1,
+                                     next_off * sizeof(uint64_t),
+                                     next_n * sizeof(uint64_t));
+            }
+            spill_reader->wait(spill_reader->ctx, slot);        // tile t's pread landed
+            q.memcpy(d_vals_tile, spill_reader->win[slot],
+                     tile_n * sizeof(uint64_t)).wait();          // H2D from window
+        } else if (spill_reader) {
+            // Synchronous per-tile disk read (XCHPLOT2_SPILL_NO_OVERLAP,
+            // measurement only): pread tile t, then H2D, no prefetch.
+            if (tile_n > spill_reader->win_entries) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64: spill tile exceeds staging window");
+            }
+            spill_reader->submit(spill_reader->ctx, 0,
+                                 tile_off * sizeof(uint64_t),
+                                 tile_n * sizeof(uint64_t));
+            spill_reader->wait(spill_reader->ctx, 0);
+            q.memcpy(d_vals_tile, spill_reader->win[0],
+                     tile_n * sizeof(uint64_t)).wait();
+        } else {
+            q.memcpy(d_vals_tile, h_vals_in + tile_off,
+                     tile_n * sizeof(uint64_t)).wait();
+        }
 
         // Capture-by-value: the kernel writes through h_part_keys /
         // h_part_vals which are USM-host pointers. SYCL guarantees
@@ -233,7 +287,9 @@ void launch_streaming_partition_u32_u64_u32(
     int top_bit_offset,
     int num_top_bits,
     uint64_t tile_count,
-    sycl::queue& q)
+    sycl::queue& q,
+    SpillTileReader const* vals_reader,
+    SpillTileReader const* vals2_reader)
 {
     if (num_top_bits < 1 || num_top_bits > 16) {
         throw std::invalid_argument(
@@ -312,20 +368,77 @@ void launch_streaming_partition_u32_u64_u32(
     }
     q.memcpy(d_hist_cursors, h_bucket_starts, num_buckets * sizeof(uint32_t)).wait();
 
+    // Spill: this tile's source bytes live on disk, and a tile needs the u64
+    // and the u32 stream resident TOGETHER, so it occupies BOTH staging
+    // windows — the u64 stream window 0, the u32 stream window 1. That leaves
+    // no window free for a cross-tile prefetch, which is why this path has
+    // none. Four windows were built and measured (2026-08-02) and bought
+    // nothing: see the kNumWindows comment in GpuPipeline.cpp for the numbers
+    // and for why the single I/O worker, not the window count, is the limit.
+    // Both preads still go in before either is waited on, so the worker runs
+    // them back to back instead of idling between them.
+    auto submit_pair = [&](uint64_t tt) {
+        if (tt >= tiles) return;
+        uint64_t const off = tt * tile_size;
+        if (off >= count) return;
+        uint64_t const n    = std::min(tile_size, count - off);
+        constexpr int  base = 0;
+        if (vals_reader) {
+            if (n > vals_reader->win_entries) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64_u32: spill tile exceeds "
+                    "staging window (u64 stream)");
+            }
+            vals_reader->submit(vals_reader->ctx, base,
+                                off * sizeof(uint64_t),
+                                n   * sizeof(uint64_t));
+        }
+        if (vals2_reader) {
+            // win_entries is quoted in u64 units; the u32 stream fits twice
+            // as many entries in the same window.
+            if (n > vals2_reader->win_entries * 2) {
+                throw std::runtime_error(
+                    "launch_streaming_partition_u32_u64_u32: spill tile exceeds "
+                    "staging window (u32 stream)");
+            }
+            vals2_reader->submit(vals2_reader->ctx, base + 1,
+                                 off * sizeof(uint32_t),
+                                 n   * sizeof(uint32_t));
+        }
+    };
+
     // Pass 2: per-tile partition with two parallel val streams.
     for (uint64_t t = 0; t < tiles; ++t) {
         uint64_t const tile_off = t * tile_size;
         if (tile_off >= count) break;
         uint64_t const tile_n   = std::min(tile_size, count - tile_off);
+        constexpr int  base     = 0;
+
+        submit_pair(t);
 
         // The queue is out-of-order: both H2D copies must complete
         // before the partition kernel reads the tiles, so wait on each
         // event (waiting only on the second would let the kernel race
         // the first copy).
-        auto e_vals  = q.memcpy(d_vals_tile,  h_vals_in  + tile_off,
-                                tile_n * sizeof(uint64_t));
-        auto e_vals2 = q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
-                                tile_n * sizeof(uint32_t));
+        sycl::event e_vals, e_vals2;
+        if (vals_reader) {
+            vals_reader->wait(vals_reader->ctx, base);
+            e_vals = q.memcpy(d_vals_tile, vals_reader->win[base],
+                              tile_n * sizeof(uint64_t));
+        } else {
+            e_vals = q.memcpy(d_vals_tile, h_vals_in + tile_off,
+                              tile_n * sizeof(uint64_t));
+        }
+        if (vals2_reader) {
+            vals2_reader->wait(vals2_reader->ctx, base + 1);
+            e_vals2 = q.memcpy(
+                d_vals2_tile,
+                reinterpret_cast<uint32_t const*>(vals2_reader->win[base + 1]),
+                tile_n * sizeof(uint32_t));
+        } else {
+            e_vals2 = q.memcpy(d_vals2_tile, h_vals2_in + tile_off,
+                               tile_n * sizeof(uint32_t));
+        }
         e_vals.wait();
         e_vals2.wait();
 

@@ -774,7 +774,11 @@ set(POS2_GPU_SYCL_SRC
     src/gpu/T3Kernel.cpp
     src/host/GpuBufferPool.cpp
     src/host/GpuPipeline.cpp
-    src/host/HostPinnedPool.cpp)
+    src/host/HostPinnedPool.cpp
+    # P1 host-RAM disk-offload: GpuPipeline.cpp's h_t1_meta spill path
+    # consumes TempFile, so it must live in this (lowest-level) archive.
+    # pos2_gpu_host still gets it transitively via its pos2_gpu dep.
+    src/host/TempFile.cpp)
 
 # Sort path: SortSycl.cpp (hand-rolled LSD radix in pure SYCL) is now
 # always compiled — it's the runtime fallback for non-CUDA backends on
@@ -967,13 +971,16 @@ add_library(pos2_gpu_host STATIC
     src/host/GpuPlotter.cpp
     src/host/PlotFileWriterParallel.cpp
     src/host/BatchPlotter.cpp
+    # Pure integer policy, no SYCL/CUDA/device probe — see the header. Kept a
+    # separate TU so host_spill_policy_test can link it on its own.
+    src/host/HostRamPolicy.cpp
     src/host/CpuPlotter.cpp
     src/host/NumaTopology.cpp
     src/host/Cancel.cpp
     src/host/ConfigFile.cpp
     src/host/MultiGpuPlotPipeline.cpp
     src/host/MultiGpuPipelineParallel.cpp
-    src/host/TempFile.cpp
+    # TempFile.cpp moved to pos2_gpu (POS2_GPU_SYCL_SRC) — see note there.
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -1145,7 +1152,16 @@ add_executable(sycl_bucket_offsets_parity tools/parity/sycl_bucket_offsets_parit
 x2_add_sycl_to_target(TARGET sycl_bucket_offsets_parity
                    SOURCES tools/parity/sycl_bucket_offsets_parity.cpp)
 
-add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
+# host_pinned_pool_test links pos2_gpu_host, which drags in pos2_gpu's
+# SortSyclCub.cpp.o (the CUB adapter). That references cub_sort_* from the
+# CUDA OBJECT lib, so this leaf executable pulls the .o files in directly —
+# same reason as plot_file_parity above.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(host_pinned_pool_test tools/parity/host_pinned_pool_test.cpp)
+endif()
 x2_add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
@@ -1153,6 +1169,53 @@ target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 add_executable(temp_file_test tools/parity/temp_file_test.cpp)
 target_link_libraries(temp_file_test PRIVATE pos2_gpu_host)
 target_compile_features(temp_file_test PRIVATE cxx_std_20)
+
+# spill_coverage_test — the spill path's read guard. SpillCoverage.hpp is
+# header-only and free of SYCL/GPU deps precisely so this builds and runs
+# anywhere with no device present: it is pure interval arithmetic, and it is
+# the only thing standing between a spill bug and a silently short .plot2.
+add_executable(spill_coverage_test tools/parity/spill_coverage_test.cpp)
+target_include_directories(spill_coverage_test PRIVATE src)
+target_compile_features(spill_coverage_test PRIVATE cxx_std_20)
+set_target_properties(spill_coverage_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# host_guard_test — the pinned-host redzone canaries. Same argument as
+# spill_coverage_test: HostGuard.hpp is header-only and device-free, and a
+# canary that silently never fires is indistinguishable from a clean run in
+# any end-to-end plot test. The deliberate-overrun cases here are what makes
+# a quiet soak under XCHPLOT2_HOST_GUARD mean anything.
+add_executable(host_guard_test tools/parity/host_guard_test.cpp)
+target_include_directories(host_guard_test PRIVATE src)
+target_compile_features(host_guard_test PRIVATE cxx_std_20)
+set_target_properties(host_guard_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# vram_probe_test — validation of a Level Zero Sysman memory reading.
+# VramProbe.hpp is header-only and device-free so this runs anywhere, which is
+# the entire point: the code it guards executes only on Intel hardware and
+# parses a hand-declared ABI, so on any other box "it compiles" is the only
+# feedback available. That is how the first version shipped a bound that
+# rejected every reading on the target card. The B580 case is the real
+# measurement from that host.
+add_executable(vram_probe_test tools/parity/vram_probe_test.cpp)
+target_include_directories(vram_probe_test PRIVATE src)
+target_compile_features(vram_probe_test PRIVATE cxx_std_20)
+set_target_properties(vram_probe_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# host_spill_policy_test — the host-RAM disk-offload budget policy. Same
+# argument as the two above: HostRamPolicy is pure integer arithmetic with no
+# SYCL/CUDA/device probe, so every branch is reachable here on any machine.
+# Reaching them for real needs a GPU, a k=28-sized host and a specific free-RAM
+# reading, which is why this policy shipped with no test until now — and it is
+# the code that decides whether this process gets OOM-killed or plots.
+add_executable(host_spill_policy_test tools/parity/host_spill_policy_test.cpp
+                                      src/host/HostRamPolicy.cpp)
+target_include_directories(host_spill_policy_test PRIVATE src)
+target_compile_features(host_spill_policy_test PRIVATE cxx_std_20)
+set_target_properties(host_spill_policy_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # bench_stats_test — the multi-worker bench arithmetic (per-worker warmup
 # exclusion, drain-tail truncation, sum-of-rates aggregate). BenchStats.hpp is
@@ -1489,6 +1552,26 @@ target_include_directories(sycl_phase_split_parity PRIVATE ${_xchplot2_cuda_incl
 target_compile_features(sycl_phase_split_parity PRIVATE cxx_std_20)
 target_link_options(sycl_phase_split_parity PRIVATE LINKER:--allow-multiple-definition)
 set_target_properties(sycl_phase_split_parity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# sycl_tier_parity — every streaming tier must emit the SAME plot. The other
+# parity targets validate kernels and primitives in isolation, so a defect in
+# a tier's surrounding host orchestration (slicing, parking, tile staging) had
+# no oracle at all — each tier stayed self-consistent while being wrong. This
+# is that oracle. See the file header for the concrete miss it closes.
+if(XCHPLOT2_BUILD_CUDA)
+    add_executable(sycl_tier_parity tools/parity/sycl_tier_parity.cpp
+        $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+else()
+    add_executable(sycl_tier_parity tools/parity/sycl_tier_parity.cpp)
+endif()
+x2_add_sycl_to_target(TARGET sycl_tier_parity
+                   SOURCES tools/parity/sycl_tier_parity.cpp)
+target_link_libraries(sycl_tier_parity PRIVATE pos2_gpu_host)
+target_include_directories(sycl_tier_parity PRIVATE ${_xchplot2_cuda_include})
+target_compile_features(sycl_tier_parity PRIVATE cxx_std_20)
+target_link_options(sycl_tier_parity PRIVATE LINKER:--allow-multiple-definition)
+set_target_properties(sycl_tier_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # Phase 2.1c — pipeline-parallel orchestrator parity. Drives
