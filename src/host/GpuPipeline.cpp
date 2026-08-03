@@ -243,7 +243,9 @@ inline void s_free(StreamingStats& s, T*& ptr)
 
 // ---------------------------------------------------------------------
 // Host-RAM disk-offload — generalized overlapped/double-buffered spill.
-// See docs/host-ram-disk-offload.md. Two cooperating pieces:
+// (User-facing shape: the README's "Host RAM and disk-offload"; the budget
+// policy that selects what lands here is HostRamPolicy.hpp.) Two cooperating
+// pieces:
 //
 //   SpillEngine — ONE per pipeline invocation. Owns the background I/O
 //     worker thread, the TWO ping-pong staging windows (64 MiB pinned
@@ -2016,10 +2018,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
         // Host pinned full-cap accumulators for meta + mi.
         //
-        // Host-RAM disk-offload (docs/host-ram-disk-offload.md): when the
-        // budget policy selected h_t1_meta for spill (scratch.spill.h_t1_meta,
-        // or the legacy XCHPLOT2_SPILL_T1META=1 flag) and we own the buffer
-        // in tiny mode, redirect h_t1_meta (~2 GiB at k=28) to a TempFile on
+        // Host-RAM disk-offload: when the budget policy selected h_t1_meta
+        // for spill (scratch.spill.h_t1_meta, or the legacy
+        // XCHPLOT2_SPILL_T1META=1 flag) and we own the buffer in tiny
+        // mode, redirect h_t1_meta (~2 GiB at k=28) to a TempFile on
         // disk, streamed through the shared 64 MiB SpillEngine instead of a
         // full pinned alloc. h_t1_meta stays null; the SpillBuffer services
         // every access. Default takes the exact original pinned path below.

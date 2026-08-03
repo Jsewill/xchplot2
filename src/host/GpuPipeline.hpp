@@ -313,7 +313,7 @@ struct StreamingPinnedScratch {
     // allocation. Chosen largest-first by BatchPlotter's budget policy
     // from --max-host-ram / XCHPLOT2_MAX_HOST_RAM. Default (all false) =
     // no spill, byte-identical to the historical all-pinned path.
-    // Two redirect classes (see docs/host-ram-disk-offload.md):
+    // Two redirect classes:
     //   - DMA tables (SpillBuffer, device<->disk via the shared 64 MiB
     //     staging): h_t1_meta, h_t3, h_t2_xbits. The full buffer never
     //     resides in host RAM, so the RSS win is real even without

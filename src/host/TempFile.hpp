@@ -46,9 +46,9 @@ public:
     // `bytes` consumed) or errors.
     void pread_at(std::uint64_t offset, void* data, std::size_t bytes);
 
-    // Pageable, file-backed home for a CPU-touched buffer (host-RAM
-    // disk-offload, docs/host-ram-disk-offload.md). ftruncate()s the
-    // file to `bytes` and MAP_SHARED-maps it, returning a normal host
+    // Pageable, file-backed home for a CPU-touched buffer (the host-RAM
+    // disk-offload; see the README's "Host RAM and disk-offload").
+    // ftruncate()s the file to `bytes` and MAP_SHARED-maps it, returning a host
     // pointer the CPU (and pageable-host DMA) can use as a drop-in
     // replacement for a pinned allocation. Unlike pinned pages, these
     // are reclaimable: under memory pressure the kernel writes dirty

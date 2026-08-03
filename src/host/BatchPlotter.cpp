@@ -2095,8 +2095,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
             }
 
-            // Host-RAM disk-offload budget policy
-            // (docs/host-ram-disk-offload.md). Turn the guard's "refuse"
+            // Host-RAM disk-offload budget policy (the arithmetic is
+            // HostRamPolicy.hpp). Turn the guard's "refuse"
             // (below) into "spill enough, then proceed": redirect the large
             // cold pinned tables to a TempFile-backed home, LARGEST-FIRST,
             // until the modelled resident host peak fits under the budget.
@@ -2499,10 +2499,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // of round-tripping malloc_host on every plot.
         stream_scratch.pool = &stream_pool;
         if (!stream_scratch.plain_mode) {
-            // Host-RAM disk-offload (docs/host-ram-disk-offload.md): for a
-            // table the budget policy (stream_scratch.spill, set above) or
-            // the legacy XCHPLOT2_SPILL_T1META flag selected for spill, do
-            // NOT pre-allocate its shared pinned buffer. Leaving it null
+            // Host-RAM disk-offload: for a table the budget policy
+            // (stream_scratch.spill, set above) or the legacy
+            // XCHPLOT2_SPILL_T1META flag selected for spill, do NOT
+            // pre-allocate its shared pinned buffer. Leaving it null
             // makes the streaming pipeline OWN the table and redirect it to
             // a TempFile via the shared SpillEngine instead of a full
             // pinned alloc.
