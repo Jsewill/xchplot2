@@ -4040,12 +4040,22 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
     // explaining why), instead of being dropped to CPU-only or spuriously
     // refused. No CPU leaves the list empty, so the zero-config GPU fast path is
     // byte-for-byte unchanged.
-    if (opts.cpu_selected() && gpu_implicit && default_gpu_available) {
+    if (gpu_implicit && default_gpu_available) {
         // The default GPU is the first AUTO-DISPATCHABLE one, not blindly index
-        // 0 -- index 0 may be a tiny iGPU that a CPU-plus-implicit-GPU run would
-        // otherwise pin plots to.
-        auto const dispatchable = sycl_backend::auto_dispatchable_indices();
-        device_ids.push_back(dispatchable.empty() ? 0 : dispatchable.front());
+        // 0 -- index 0 may be a tiny iGPU that would otherwise get the plots.
+        //
+        // This used to fire ONLY when CPU workers joined an implicit selection;
+        // plain zero-config left the list empty and rode kDefaultGpuId, where
+        // AdaptiveCpp's own gpu_selector_v chose with NO compute-unit filter at
+        // all. So the filter that exists to keep plots off a 1-CU iGPU did not
+        // cover the single most common invocation -- `xchplot2 plot` with no
+        // flags. Materialising the id here applies it uniformly, and gives the
+        // run a concrete `[batch:gpuN]` prefix instead of an ambiguous
+        // `[batch]` that hides which device was picked.
+        //
+        // Downstream is unaffected: one id still takes the single-worker fast
+        // path at `device_ids.size() <= 1`.
+        device_ids.push_back(sycl_backend::default_dispatch_index());
     }
     // Round-robin across the selected nodes rather than filling one at a time:
     // the RAM trim is host-wide, so when it cuts the total the survivors should

@@ -160,6 +160,33 @@ inline std::vector<int> auto_dispatchable_indices()
     return out;
 }
 
+// The single GPU an implicit (zero-config) run should use: the BIGGEST
+// auto-dispatchable one by compute units, ties going to the lowest index.
+//
+// Deliberately not "the first dispatchable index". min_auto_dispatch_cus() is a
+// threshold, and a threshold can be wrong for a device nobody has tested --
+// report an iGPU that claims 4+ CUs and the filter waves it through, so "first"
+// would hand every zero-config plot to an integrated GPU sitting at index 0
+// ahead of a discrete card. Picking the largest cannot make that mistake: with
+// no flags, the biggest visible GPU is what the user meant, and on a mixed box
+// the discrete card wins by one to two orders of magnitude (an AMD Raphael iGPU
+// is 1-2 CUs against an Arc B580's 160). The threshold still does its job for
+// --devices gpu/all, where every device is a candidate rather than just one.
+inline int default_dispatch_index()
+{
+    auto const devs = usable_gpu_devices();
+    auto const idx  = auto_dispatchable_indices();
+    if (idx.empty()) return 0;
+    int      best    = idx.front();
+    unsigned best_cu = 0;
+    for (int i : idx) {
+        auto const cu = devs[static_cast<std::size_t>(i)]
+                            .get_info<sycl::info::device::max_compute_units>();
+        if (cu > best_cu) { best_cu = cu; best = i; }
+    }
+    return best;
+}
+
 // Per-thread SYCL queue. Bound to the thread's current device id (see
 // the kDefaultGpuId / kCpuDeviceId sentinels above). A unique_ptr wrapper
 // lets us defer construction until the thread has had a chance to set
