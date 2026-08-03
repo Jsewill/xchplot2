@@ -1166,9 +1166,36 @@ x2_add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 
-add_executable(temp_file_test tools/parity/temp_file_test.cpp)
-target_link_libraries(temp_file_test PRIVATE pos2_gpu_host)
+# temp_file_test — TempFile is pure POSIX (mkstemp/pread/pwrite/fallocate/
+# statfs) with no SYCL in it. It used to reach the class by linking the whole
+# pos2_gpu_host library, which dragged AdaptiveCpp in and put the test out of
+# reach of any environment without a SYCL toolchain — CI included. Compiling
+# the one TU it actually needs keeps it runnable everywhere.
+add_executable(temp_file_test tools/parity/temp_file_test.cpp
+                              src/host/TempFile.cpp)
+target_include_directories(temp_file_test PRIVATE src)
 target_compile_features(temp_file_test PRIVATE cxx_std_20)
+set_target_properties(temp_file_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# spill_engine_test — the disk-offload I/O engine's ticket protocol.
+#
+# The engine is the spill path's silent-corruption surface: a wait that returns
+# one job early substitutes another chunk's bytes over a range SpillCoverage
+# considers written, so nothing downstream can tell. It was untestable while it
+# lived in an anonymous namespace inside GpuPipeline.cpp; SpillEngine.hpp now
+# injects the two staging allocations and the one blocking copy it needed from
+# SYCL (SpillHostOps), so the protocol runs here over malloc + memcpy with no
+# GPU, no driver and no AdaptiveCpp. Threads and real temp-dir I/O, nothing
+# else.
+add_executable(spill_engine_test tools/parity/spill_engine_test.cpp
+                                 src/host/TempFile.cpp)
+target_include_directories(spill_engine_test PRIVATE src)
+target_compile_features(spill_engine_test PRIVATE cxx_std_20)
+find_package(Threads REQUIRED)
+target_link_libraries(spill_engine_test PRIVATE Threads::Threads)
+set_target_properties(spill_engine_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
 # spill_coverage_test — the spill path's read guard. SpillCoverage.hpp is
 # header-only and free of SYCL/GPU deps precisely so this builds and runs
