@@ -335,12 +335,14 @@ void test_k28_tiny_ladder()
 void test_traffic_estimate()
 {
     // Tiny, min: h_t1_meta 2W+3R, h_t2_meta 2W+3R, h_t3 1W+1R (all 8-B),
-    // h_t2_xbits 3W+4R (4-B). h_frags is not routable in Tiny.
+    // h_t2_xbits 2W+3R (4-B). h_frags is not routable in Tiny.
+    // These match the MEASURED k=28 figures (12.00 W / 17.00 R GiB) to within
+    // cap-versus-count slack; see the derivation in HostRamPolicy.cpp.
     auto const t = pos2gpu::plan_host_ram_spill(tiny_at(0));
-    check_eq(t.traffic_written, (2 + 2 + 1) * kTable8 + 3 * kTable4,
-             "traffic: tiny writes 5x8-B + 3x4-B");
-    check_eq(t.traffic_read, (3 + 3 + 1) * kTable8 + 4 * kTable4,
-             "traffic: tiny reads 7x8-B + 4x4-B");
+    check_eq(t.traffic_written, (2 + 2 + 1) * kTable8 + 2 * kTable4,
+             "traffic: tiny writes 5x8-B + 2x4-B");
+    check_eq(t.traffic_read, (3 + 3 + 1) * kTable8 + 3 * kTable4,
+             "traffic: tiny reads 7x8-B + 3x4-B");
 
     // The claim that motivated the fix: it is NOT 2x the spilled bytes.
     check(t.traffic_written + t.traffic_read > 2 * t.spilled_bytes,
@@ -351,18 +353,18 @@ void test_traffic_estimate()
     auto min_in = minimal_at(0);
     min_in.tier_tiled_gather = true;
     auto const m = pos2gpu::plan_host_ram_spill(min_in);
-    check_eq(m.traffic_written, 1 * kTable8 + 3 * kTable4,
-             "traffic: minimal writes h_t3 once + xbits 3x");
-    check_eq(m.traffic_read, 1 * kTable8 + 3 * kTable4,
-             "traffic: minimal reads h_t3 once + xbits 3x");
+    check_eq(m.traffic_written, 1 * kTable8 + 2 * kTable4,
+             "traffic: minimal writes h_t3 once + xbits 2x");
+    check_eq(m.traffic_read, 1 * kTable8 + 2 * kTable4,
+             "traffic: minimal reads h_t3 once + xbits 2x");
 
     // Compact — same routable set as minimal, but its single-shot T2-sort
     // gather saves xbits two passes.
     auto cmp_in = minimal_at(0);
     cmp_in.tier_tiled_gather = false;
     auto const c = pos2gpu::plan_host_ram_spill(cmp_in);
-    check_eq(c.traffic_written, 1 * kTable8 + 2 * kTable4,
-             "traffic: compact writes h_t3 once + xbits 2x");
+    check_eq(c.traffic_written, 1 * kTable8 + 1 * kTable4,
+             "traffic: compact writes h_t3 once + xbits once");
     check(c.traffic_read < m.traffic_read,
           "traffic: compact's flat gather reads less than minimal's tiled one");
 
