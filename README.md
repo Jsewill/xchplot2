@@ -1190,8 +1190,12 @@ Notes:
   distributions, i.e. RAM — spilling there consumes the memory the
   budget exists to bound. xchplot2 refuses a RAM-backed temp dir up
   front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` for the rare
-  disk-backed `/tmp`), and also checks the dir actually exists and is
-  writable before starting, rather than failing mid-batch.
+  disk-backed `/tmp`), and also checks the dir exists, is writable, and
+  has room for the whole spill before starting, rather than failing
+  mid-batch. Budget ~7.1 GiB of free space for tiny at k=28, ~3.0 GiB
+  for compact. Each spill file is reserved with `fallocate` as it is
+  created, so a disk that fills anyway fails at once with its size
+  rather than part-way through a table.
 - **The temp dir sees a lot more traffic than "one write, one read".**
   Only `h_t3` works that way. The T1 and T2 sorts read their table as
   the partition source and then write the *sorted* result back over it,

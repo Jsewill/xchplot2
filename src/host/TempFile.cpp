@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>  // statvfs — free_space
 #include <sys/vfs.h>    // statfs / struct statfs — dir_is_ram_backed
 #include <unistd.h>
 
@@ -125,6 +126,39 @@ TempFile& TempFile::operator=(TempFile&& other) noexcept
     return *this;
 }
 
+std::uint64_t TempFile::free_space(std::string const& dir)
+{
+    std::string const resolved = resolve_dir(dir);
+    struct statvfs st {};
+    if (::statvfs(resolved.c_str(), &st) != 0) return 0;   // unknown
+    // f_bavail, not f_bfree: the latter counts blocks reserved for root,
+    // which this process cannot have. Quoting those would let the check pass
+    // on a filesystem that is already full for everyone but root.
+    return std::uint64_t(st.f_bavail) * std::uint64_t(st.f_frsize);
+}
+
+void TempFile::preallocate(std::uint64_t bytes)
+{
+    if (bytes == 0 || fd_ < 0) return;
+#if defined(__linux__)
+    if (::fallocate(fd_, 0, 0, static_cast<off_t>(bytes)) == 0) return;
+    int const e = errno;
+    // Not every filesystem implements it (network mounts, some FUSE, older
+    // kernels). That is not an error — the file just grows on demand as it
+    // always did, so degrade quietly rather than refusing to spill.
+    if (e == EOPNOTSUPP || e == ENOSYS || e == EINVAL) return;
+    throw std::runtime_error(
+        "TempFile::preallocate(" + std::to_string(bytes) + ") failed on " +
+        path_ + ": " + std::strerror(e) +
+        (e == ENOSPC
+            ? ". The temp dir cannot hold this spill table — point --temp-dir "
+              "(or XCHPLOT2_TEMP_DIR) at a filesystem with more free space."
+            : ""));
+#else
+    (void)bytes;   // no portable non-zeroing preallocation; grow on demand
+#endif
+}
+
 void* TempFile::map(std::size_t bytes)
 {
     if (map_) {
@@ -132,6 +166,13 @@ void* TempFile::map(std::size_t bytes)
             "TempFile::map: already mapped (one mapping per TempFile)");
     }
     if (bytes == 0) return nullptr;
+    // Reserve the blocks before mapping. ftruncate alone gives a SPARSE file,
+    // and writing to a mapped page that the filesystem then cannot back
+    // raises SIGBUS — a bare crash, mid-plot, with nothing in the log to say
+    // the disk filled up. Reserving up front turns that into a plain ENOSPC
+    // error here, before the mapping exists. Quietly does nothing where
+    // fallocate is unsupported, which is the old (sparse) behaviour.
+    preallocate(bytes);
     // Size the file so the whole mapping is backed — touching a mapped
     // page past EOF would raise SIGBUS otherwise.
     if (::ftruncate(fd_, static_cast<off_t>(bytes)) != 0) {

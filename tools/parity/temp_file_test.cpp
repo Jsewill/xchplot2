@@ -169,5 +169,62 @@ int main()
         }
     }
 
+    // ---- preallocate + free_space ----
+    //
+    // These exist so a temp dir that cannot hold the spill says so at setup
+    // instead of on a pwrite inside T2, minutes into a batch. The failure
+    // mode worth testing is the quiet one: a preallocate that silently does
+    // nothing still "passes" every plot run, and nothing downstream notices
+    // until a disk fills.
+    {
+        pos2gpu::TempFile f;
+        f.preallocate(4u << 20);           // 4 MiB
+        struct stat st {};
+        bool const ok = (::fstat(f.fd(), &st) == 0);
+        // fallocate reserves blocks AND extends i_size (no KEEP_SIZE), so on
+        // any filesystem that implements it the file is now 4 MiB with blocks
+        // behind it. st_blocks is in 512-B units. Where it is unsupported the
+        // call is a documented no-op, and the file stays empty — accept that
+        // rather than fail on, say, a network mount, but do not accept a
+        // half-done job.
+        bool const reserved = (st.st_size == (4 << 20)) &&
+                              (std::uint64_t(st.st_blocks) * 512 >= (4u << 20));
+        bool const noop     = (st.st_size == 0) && (st.st_blocks == 0);
+        all_ok = check(ok && (reserved || noop),
+                       "preallocate: reserves blocks, or is a clean no-op")
+                 && all_ok;
+
+        // Whatever it did, the file must still behave: preallocate must not
+        // make a range count as written. A sparse read still returns zeros,
+        // which is exactly why SpillCoverage cannot be retired.
+        std::uint64_t v = 0xDEADBEEFu;
+        f.pread_at(1u << 20, &v, sizeof(v));
+        all_ok = check(v == 0, "preallocate: unwritten range still reads zeros")
+                 && all_ok;
+
+        // And it must not disturb real I/O.
+        std::uint64_t const w = 0x0123456789ABCDEFull;
+        f.pwrite_at(1u << 20, &w, sizeof(w));
+        std::uint64_t r = 0;
+        f.pread_at(1u << 20, &r, sizeof(r));
+        all_ok = check(r == w, "preallocate: round-trip still works") && all_ok;
+
+        // Zero is a no-op, not an error.
+        f.preallocate(0);
+        all_ok = check(true, "preallocate: zero bytes is a no-op") && all_ok;
+    }
+    {
+        // free_space answers for a real dir, and returns the documented 0 for
+        // one that cannot be probed. 0 means "unknown" to callers, so a bogus
+        // path must not come back looking like a full disk.
+        std::uint64_t const here = pos2gpu::TempFile::free_space("/tmp");
+        all_ok = check(here > 0, "free_space: reports something for /tmp")
+                 && all_ok;
+        std::uint64_t const nowhere =
+            pos2gpu::TempFile::free_space("/nonexistent-xchplot2-probe");
+        all_ok = check(nowhere == 0, "free_space: unprobeable dir reports 0")
+                 && all_ok;
+    }
+
     return all_ok ? 0 : 1;
 }

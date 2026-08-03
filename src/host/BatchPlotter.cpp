@@ -2311,6 +2311,54 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     }
                 }
 
+                // Is there room for it? Same fail-fast argument as the temp-dir
+                // usability probe above, one step further on: that one proves a
+                // file can be CREATED, this one that the tables will FIT. Every
+                // spill file is now reserved with fallocate at setup, so a
+                // short temp dir already fails early rather than mid-T2 — but
+                // it fails one table at a time, deep in the pipeline, naming
+                // only that table's size. Checking the whole set here reports
+                // the real requirement in one line, before any GPU work.
+                //
+                // Concurrency is not modelled: not every routed table is alive
+                // at once (h_t1_meta is gone before h_t3 exists), so the sum is
+                // an over-estimate. Deliberately — the tables that ARE
+                // concurrent vary by tier, and a spill that fits only because
+                // of lifetime overlap is one bad batch away from ENOSPC.
+                if (do_spill) {
+                    uint64_t const need = sp.spilled_bytes;
+                    std::string const spill_dir = TempFile::resolve_dir("");
+                    uint64_t const avail = TempFile::free_space(spill_dir);
+                    // 0 == statvfs could not answer; treat as unknown and let
+                    // the per-table fallocate be the backstop, rather than
+                    // refusing a spill that would have worked.
+                    if (avail != 0 && avail < need) {
+                        std::string const detail =
+                            " needs ~" + std::to_string(to_gib(need)).substr(0, 5) +
+                            " GiB in the temp dir '" + spill_dir + "' but only ~" +
+                            std::to_string(to_gib(avail)).substr(0, 5) +
+                            " GiB is free";
+                        if (spill_auto) {
+                            do_spill             = false;
+                            auto_blocked_bad_dir = true;
+                            auto_ram_dir         = spill_dir;
+                            auto_dir_problem     =
+                                "not enough free space (needs ~" +
+                                std::to_string(to_gib(need)).substr(0, 5) +
+                                " GiB, has ~" +
+                                std::to_string(to_gib(avail)).substr(0, 5) + " GiB)";
+                        } else {
+                            throw std::runtime_error(
+                                log_prefix + " the host-RAM spill for tier " +
+                                tier_name(tier) + " at k=" +
+                                std::to_string(pool_k) + detail +
+                                ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at a "
+                                "filesystem with more room, free space there, or "
+                                "raise --max-host-ram so fewer tables spill.");
+                        }
+                    }
+                }
+
                 if (do_spill) {
                     stream_scratch.spill = plan;
                     char budget_label[32];
@@ -2382,12 +2430,15 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                           "very RAM that is short; point --temp-dir (or "
                           "XCHPLOT2_TEMP_DIR) at real disk to enable it.";
                 } else if (auto_blocked_bad_dir) {
-                    why = " Automatic disk-offload could have run this, but no "
-                          "spill file can be created in the temp dir '" +
-                          auto_ram_dir + "': " + auto_dir_problem +
+                    // Covers two causes — the dir cannot hold a file at all,
+                    // and it cannot hold ENOUGH — so the wording has to fit
+                    // both. auto_dir_problem carries the specific reason.
+                    why = " Automatic disk-offload could have run this, but the "
+                          "temp dir '" + auto_ram_dir + "' cannot take the "
+                          "spill: " + auto_dir_problem +
                           ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at an "
-                          "existing, writable directory on real disk to "
-                          "enable it.";
+                          "existing, writable directory on real disk with room "
+                          "to spare to enable it.";
                 } else if (auto_unreachable) {
                     why = " Automatic disk-offload cannot close this gap: with "
                           "every routable table spilled and the D2H drain cut to "

@@ -62,6 +62,35 @@ public:
     // Release the mapping created by map(). Idempotent.
     void unmap() noexcept;
 
+    // Reserve `bytes` of blocks for this file NOW, before anything is
+    // written. Two reasons, and the second is the one that matters:
+    //
+    //  - EXTENTS. A spill file is created, grown to a couple of GiB and
+    //    deleted once per plot. Growing it a 32 MiB pwrite at a time makes
+    //    the allocator find room over and over, on a filesystem that is
+    //    simultaneously being churned by the previous plot's deletion.
+    //    Reserving the whole range in one call gives it the chance to place
+    //    the file contiguously.
+    //
+    //  - ENOSPC WHEN IT IS STILL CHEAP. Without this, a temp dir that cannot
+    //    hold the spill fails on some pwrite deep inside T2, minutes into a
+    //    batch, as "zero-byte write (disk full?)". With it, the failure lands
+    //    at table setup with the size that could not be reserved.
+    //
+    // Does NOT make the file non-sparse: unwritten ranges still read as
+    // zeros, so SpillCoverage stays load-bearing. Silently does nothing on a
+    // filesystem without fallocate support (the file simply grows on demand,
+    // which is the old behaviour); throws only on a real failure such as
+    // ENOSPC.
+    void preallocate(std::uint64_t bytes);
+
+    // Bytes available in `dir` (after resolve_dir) to an unprivileged
+    // writer, or 0 when statvfs cannot answer. Callers treat 0 as "unknown,
+    // do not block on it" — the same stance dir_is_ram_backed takes, and for
+    // the same reason: an unprobeable filesystem must not veto a spill that
+    // would have worked.
+    static std::uint64_t free_space(std::string const& dir);
+
     // High-water mark — max(end-offset) ever written.
     std::uint64_t size() const noexcept { return high_water_; }
 

@@ -517,7 +517,16 @@ struct SpillBuffer {
     pos2gpu::TempFile file;                          // mkstemp+unlink; honors XCHPLOT2_TEMP_DIR
     size_t            elem = 1;                       // element width in bytes
 
-    SpillBuffer(SpillEngine& e, size_t elem_bytes) : eng(&e), elem(elem_bytes) {}
+    // `max_entries` is the table's full capacity, not the count it will end
+    // up holding — the file is reserved for the worst case so a disk that
+    // cannot hold this table says so HERE, at setup, rather than on a pwrite
+    // somewhere inside T2 with the batch already running. See
+    // TempFile::preallocate.
+    SpillBuffer(SpillEngine& e, size_t elem_bytes, uint64_t max_entries)
+        : eng(&e), elem(elem_bytes)
+    {
+        file.preallocate(max_entries * uint64_t(elem_bytes));
+    }
     SpillBuffer(SpillBuffer const&)            = delete;
     SpillBuffer& operator=(SpillBuffer const&) = delete;
 
@@ -2081,7 +2090,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                      return sv && sv[0] == '1'; }();
             if (want_spill) {
                 t1_meta_spill = std::make_unique<SpillBuffer>(
-                    ensure_spill_engine(), sizeof(uint64_t));
+                    ensure_spill_engine(), sizeof(uint64_t), cap);
                 h_t1_meta = nullptr;
                 static std::atomic<bool> said{false};
                 if (spill_announce(scratch.quiet, said))
@@ -3171,7 +3180,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 // h_t2_meta stays null so a missed site is a null deref at the
                 // first plot, not a silent read of a stale pinned buffer.
                 t2_meta_spill = std::make_unique<SpillBuffer>(
-                    ensure_spill_engine(), sizeof(uint64_t));
+                    ensure_spill_engine(), sizeof(uint64_t), cap);
                 h_t2_meta       = nullptr;
                 h_t2_meta_owned = false;
                 static std::atomic<bool> said{false};
@@ -3228,7 +3237,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // Tiny's T2-sort partition used to read it USM-host, and now
             // pulls it through the partition's second SpillTileReader.
             t2_xbits_spill = std::make_unique<SpillBuffer>(
-                ensure_spill_engine(), sizeof(uint32_t));
+                ensure_spill_engine(), sizeof(uint32_t), cap);
             h_t2_xbits    = nullptr;
             h_xbits_owned = false;
             static std::atomic<bool> said{false};
@@ -4457,7 +4466,7 @@ t3_match_entry:
         T3PairingGpu* h_t3 = nullptr;
         if (h_t3_spilled) {
             t3_spill = std::make_unique<SpillBuffer>(
-                ensure_spill_engine(), sizeof(T3PairingGpu));
+                ensure_spill_engine(), sizeof(T3PairingGpu), cap);
             static std::atomic<bool> said{false};
             if (spill_announce(scratch.quiet, said))
                 std::fprintf(stderr,
@@ -4841,7 +4850,7 @@ t3_match_entry:
             // Host-RAM disk-offload: redirect the ~2 GiB h_t3 accumulator to
             // a TempFile via the shared SpillEngine (compact tier).
             t3_spill = std::make_unique<SpillBuffer>(
-                ensure_spill_engine(), sizeof(T3PairingGpu));
+                ensure_spill_engine(), sizeof(T3PairingGpu), cap);
             static std::atomic<bool> said{false};
             if (spill_announce(scratch.quiet, said))
                 std::fprintf(stderr,
