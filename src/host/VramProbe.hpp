@@ -25,8 +25,22 @@
 namespace pos2gpu {
 
 struct VramReading {
+    // In the ALLOCATABLE space: what the runtime will actually hand out.
+    // `free` is clamped to `total`. Use for admission decisions.
     std::uint64_t free  = 0;
     std::uint64_t total = 0;
+
+    // Sysman's raw reading, against PHYSICAL memory. Use for DELTAS.
+    //
+    // Clamping saturates at the top, so it distorts differences taken from an
+    // idle baseline: on the B580 an idle card reads 11688 physical against an
+    // 11605 allocatable ceiling, and a peak computed from the clamped baseline
+    // under-reports by that 83 MiB gap. The VRAM watchdog measures exactly such
+    // a delta, and under-reporting is its unsafe direction — it exists to catch
+    // a tier using more than it declared. The reserved region is constant, so
+    // raw-minus-raw is exact regardless of the offset.
+    std::uint64_t free_physical  = 0;
+    std::uint64_t total_physical = 0;
 };
 
 // Validate a sysman (free, total) pair against the device's own global memory
@@ -63,6 +77,8 @@ inline bool validate_sysman_reading(std::uint64_t sysman_free,
     // number still tracks real usage downward, which is what was missing.
     out.total = (global_mem != 0) ? global_mem : sysman_total;
     out.free  = std::min(sysman_free, out.total);
+    out.free_physical  = sysman_free;
+    out.total_physical = sysman_total;
     return true;
 }
 

@@ -190,9 +190,18 @@ DeviceMemInfo query_device_memory();
 // Returns false when no driver-level query is available (non-CUDA build or
 // host), leaving the caller to skip the measurement rather than report a
 // fabricated one.
+//
+// `physical_space` selects which number the Level Zero path reports. Default
+// (false) is the ALLOCATABLE space — free clamped to what the runtime will
+// actually hand out — which is what an admission decision needs. Pass true for
+// DELTAS: sysman measures against physical memory, the clamp saturates at the
+// top, and a difference taken from an idle baseline therefore under-reports.
+// The VRAM watchdog passes true so its peak is exact. No effect on CUDA/HIP,
+// where the driver already reports in one space.
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
-                         size_t& total_bytes);
+                         size_t& total_bytes,
+                         bool    physical_space = false);
 
 // VRAM the picker holds back beyond a path's model peak, shared by the pool
 // gate and the streaming tier picker.

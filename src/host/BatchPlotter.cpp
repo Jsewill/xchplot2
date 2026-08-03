@@ -1340,7 +1340,13 @@ public:
     {
         size_t f = 0;
         size_t t = 0;
-        if (!device_memory_probe(ordinal_, f, t)) return;  // unsupported → inert
+        // physical_space=true: this measures a DELTA from an idle baseline,
+        // and the allocatable clamp saturates at the top, so a clamped baseline
+        // under-reports the peak by the physical-minus-allocatable gap (83 MiB
+        // on an Arc B580). Under-reporting is the unsafe direction for a check
+        // whose job is catching a tier that uses more than it declared.
+        if (!device_memory_probe(ordinal_, f, t, /*physical_space=*/true))
+            return;  // unsupported → inert
         baseline_free_ = f;
         min_free_.store(f, std::memory_order_relaxed);
         started_ = true;
@@ -1348,7 +1354,8 @@ public:
             while (!stop_.load(std::memory_order_relaxed)) {
                 size_t f = 0;
                 size_t t = 0;
-                if (device_memory_probe(ordinal_, f, t)) {
+                if (device_memory_probe(ordinal_, f, t,
+                                        /*physical_space=*/true)) {
                     size_t cur = min_free_.load(std::memory_order_relaxed);
                     while (f < cur &&
                            !min_free_.compare_exchange_weak(

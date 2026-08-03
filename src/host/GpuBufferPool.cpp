@@ -836,7 +836,8 @@ ProbeTarget probe_target_for(int device_ordinal)
 
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
-                         size_t& total_bytes)
+                         size_t& total_bytes,
+                         bool    physical_space)
 {
     // The CPU device is the host. Ask the host.
     //
@@ -896,8 +897,10 @@ bool device_memory_probe(int device_ordinal,
             // PHYSICAL memory (12216 MiB) rather than allocatable (11605).
             VramReading reading;
             if (validate_sysman_reading(f, t, target.global_mem, reading)) {
-                free_bytes  = size_t(reading.free);
-                total_bytes = size_t(reading.total);
+                free_bytes  = size_t(physical_space ? reading.free_physical
+                                                    : reading.free);
+                total_bytes = size_t(physical_space ? reading.total_physical
+                                                    : reading.total);
                 return true;
             }
             ZDBG("REJECTED: free=%llu MiB / sysman_total=%llu MiB are not "

@@ -61,6 +61,35 @@ void test_arc_b580_idle()
     check_eq(r2.free, 11605 * MiB, "B580 second sample: clamped");
 }
 
+// ---- allocatable vs physical: deltas must not use the clamped figure -------
+
+void test_physical_space_for_deltas()
+{
+    // The VRAM watchdog measures peak = baseline_free - min_free. Both samples
+    // go through the same transform, but the clamp SATURATES at the top, so an
+    // idle baseline is clamped while a mid-plot sample is not — and the
+    // difference silently shrinks by the physical-minus-allocatable gap.
+    // Under-reporting is the unsafe direction for a check that exists to catch
+    // a tier using more than it declared.
+    pos2gpu::VramReading idle, busy;
+    (void) pos2gpu::validate_sysman_reading(11688 * MiB, 12216 * MiB,
+                                            11605 * MiB, idle);
+    (void) pos2gpu::validate_sysman_reading(400 * MiB, 12216 * MiB,
+                                            11605 * MiB, busy);
+
+    check_eq(idle.free - busy.free, 11205 * MiB,
+             "clamped delta UNDER-reports the peak");
+    check_eq(idle.free_physical - busy.free_physical, 11288 * MiB,
+             "physical delta is exact");
+    check_eq((idle.free_physical - busy.free_physical)
+                 - (idle.free - busy.free),
+             83 * MiB, "the gap is exactly physical minus allocatable");
+
+    // Raw values must be passed through untouched — that is the whole point.
+    check_eq(idle.free_physical,  11688 * MiB, "raw free preserved");
+    check_eq(idle.total_physical, 12216 * MiB, "raw total preserved");
+}
+
 // ---- the case the probe exists for -----------------------------------------
 
 void test_tracks_real_usage()
@@ -155,6 +184,7 @@ void test_unknown_global_mem()
 int main()
 {
     test_arc_b580_idle();
+    test_physical_space_for_deltas();
     test_tracks_real_usage();
     test_rejects_misparse();
     test_tolerance_window();
