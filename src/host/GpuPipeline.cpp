@@ -349,6 +349,19 @@ struct SpillEngine {
     // stronger evidence than a soak at the natural ~5% rate.
     unsigned                io_delay_us = 0;
     uint64_t                blocked_ns = 0;          // wall the main thread spent stalled on disk I/O (this plot)
+    // Bytes this plot actually moved to and from the temp dir. Counted in the
+    // worker after the syscall returns, so they are I/O that happened, not
+    // I/O that was planned.
+    //
+    // They exist because the modelled figure was wrong and nothing caught it:
+    // the budget message assumed every spilled table is written once and read
+    // once, when the meta tables are sorted IN PLACE and make five passes. A
+    // user sizing an NVMe's endurance from that was told about half the truth.
+    // HostRamPolicy now models the passes per table, but a model that mirrors
+    // control flow in another TU can drift silently — so the run reports what
+    // it really did, and the two can be compared.
+    std::atomic<uint64_t>   bytes_written{0};
+    std::atomic<uint64_t>   bytes_read{0};
     // StreamingPinnedScratch::quiet — the stall line below is per PLOT, so on
     // a long batch it is the noisiest thing the pipeline emits. Suppressed
     // under -q; XCHPLOT2_SPILL_VERIFY's tally is not, because asking for the
@@ -379,10 +392,16 @@ struct SpillEngine {
             cv_work.notify_all();
         }
         if (io_thread.joinable()) io_thread.join();
-        if (!quiet)
+        if (!quiet) {
+            double const gib = 1.0 / (1024.0 * 1024.0 * 1024.0);
+            uint64_t const w = bytes_written.load(std::memory_order_relaxed);
+            uint64_t const r = bytes_read.load(std::memory_order_relaxed);
             std::fprintf(stderr,
-                "[spill] pipeline stalled %.2f s on disk I/O this plot (overlap=%s)\n",
+                "[spill] this plot: %.2f GiB temp-dir traffic (%.2f W / %.2f R), "
+                "pipeline stalled %.2f s on disk I/O (overlap=%s)\n",
+                double(w + r) * gib, double(w) * gib, double(r) * gib,
                 blocked_ns / 1e9, overlap ? "on" : "off");
+        }
         if (verify)
             std::fprintf(stderr,
                 "[spill] verify: %llu chunks round-tripped clean\n",
@@ -408,8 +427,13 @@ struct SpillEngine {
             if (io_delay_us)   // debug race amplification; see io_delay_us
                 std::this_thread::sleep_for(std::chrono::microseconds(io_delay_us));
             try {
-                if (j.op == Op::Write) j.file->pwrite_at(j.off_bytes, win[j.slot], j.bytes);
-                else                   j.file->pread_at (j.off_bytes, win[j.slot], j.bytes);
+                if (j.op == Op::Write) {
+                    j.file->pwrite_at(j.off_bytes, win[j.slot], j.bytes);
+                    bytes_written.fetch_add(j.bytes, std::memory_order_relaxed);
+                } else {
+                    j.file->pread_at (j.off_bytes, win[j.slot], j.bytes);
+                    bytes_read.fetch_add(j.bytes, std::memory_order_relaxed);
+                }
             } catch (std::exception const& e) {
                 std::lock_guard<std::mutex> lk(mtx);
                 if (io_error.empty()) io_error = e.what();

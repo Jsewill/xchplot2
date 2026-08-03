@@ -2271,6 +2271,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 pin.budget         = B;
                 pin.tier_tiny      = tier_tiny;
                 pin.tier_streams   = tier_streams;
+                // Minimal joins Tiny in gathering T2 sort in tiles, which
+                // costs h_t2_xbits two extra passes over the temp dir that
+                // Compact does not pay. Traffic estimate only.
+                pin.tier_tiled_gather = (tier == Tier::Minimal) || tier_tiny;
                 pin.pinned_slots   = num_pinned_slots;
                 pin.forced_slots   = (forced_drain_slots != 0);
                 pin.baseline_slots = GpuBufferPool::kNumPinnedBuffers;
@@ -2281,7 +2285,6 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 StreamingPinnedScratch::SpillPlan const& plan = sp.tables;
                 uint64_t const est           = sp.resident;
                 uint64_t const reclaimable   = sp.reclaimable;
-                uint64_t const spilled_bytes = sp.spilled_bytes;
                 uint64_t const drain_freed   = sp.drain_freed;
                 uint64_t const floor_bytes   = sp.floor_bytes;
 
@@ -2333,12 +2336,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     std::fprintf(stderr,
                         "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
                         "slot%s (-%.2f GiB), spilling%s -> modelled unswappable "
-                        "host peak ~%.2f GiB%s (routable floor ~%.2f GiB)\n",
+                        "host peak ~%.2f GiB%s (routable floor ~%.2f GiB); "
+                        "~%.1f GiB/plot of temp-dir traffic, ~%.1f GiB of it "
+                        "writes\n",
                         log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
                         GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
                         num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
                         spilled.c_str(),
-                        to_gib(est), rss_note, to_gib(floor_bytes));
+                        to_gib(est), rss_note, to_gib(floor_bytes),
+                        to_gib(sp.traffic_written + sp.traffic_read),
+                        to_gib(sp.traffic_written));
 
                     // AUTO was not asked for, so it must announce itself. A
                     // user who never passed a flag still needs to know why
@@ -2349,13 +2356,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "~%.2f GiB is available: automatically spilling the "
                             "cold tables to '%s' to plot anyway. Expect roughly "
                             "10-30%% slower plots and ~%.1f GiB of temp-dir "
-                            "traffic per plot. Pass --max-host-ram to control "
-                            "this, --temp-dir to move it, or --no-auto-spill "
-                            "to be refused instead.\n",
+                            "traffic per plot (~%.1f GiB of it WRITES — size "
+                            "the drive's endurance from that). Pass "
+                            "--max-host-ram to control this, --temp-dir to "
+                            "move it, or --no-auto-spill to be refused "
+                            "instead.\n",
                             log_prefix.c_str(), tier_name(tier),
                             to_gib(host_required), to_gib(budget),
                             TempFile::resolve_dir("").c_str(),
-                            2.0 * to_gib(spilled_bytes));
+                            to_gib(sp.traffic_written + sp.traffic_read),
+                            to_gib(sp.traffic_written));
                     }
                 }
             }

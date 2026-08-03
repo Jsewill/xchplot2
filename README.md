@@ -1192,10 +1192,25 @@ Notes:
   front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` for the rare
   disk-backed `/tmp`), and also checks the dir actually exists and is
   writable before starting, rather than failing mid-batch.
-- **Budget ~4 GiB of temp-dir traffic per spilled table per plot** at
-  k=28 — a cap-sized table is ~2 GiB, written once and read back once.
-  Across a batch that is continuous, so point `--temp-dir` at
-  something you do not mind writing to.
+- **The temp dir sees a lot more traffic than "one write, one read".**
+  Only `h_t3` works that way. The T1 and T2 sorts read their table as
+  the partition source and then write the *sorted* result back over it,
+  so each meta table makes five passes, not two. Per plot at k=28, with
+  everything routed:
+
+  | tier | total | of which writes |
+  |------|------:|----------------:|
+  | compact | 8.1 GiB | 4.1 GiB |
+  | minimal | 10.2 GiB | 5.1 GiB |
+  | tiny | 31.5 GiB | 13.2 GiB |
+
+  The **writes** column is the one that sizes a drive's endurance: at
+  100 plots/day, tiny writes ~1.3 TiB/day, which consumes a 600 TBW
+  consumer NVMe in about 15 months. Across a batch this is continuous,
+  so point `--temp-dir` at something you are willing to wear out — and
+  prefer a higher tier if the card can take it, since compact costs a
+  quarter of tiny's writes. Each run reports its own measured figure on
+  the `[spill] this plot:` line.
 - **`--max-host-ram` bounds the unswappable class** — pinned plus
   anonymous, the class that gets a process OOM-killed. One table
   (`h_frags`, on compact/minimal) is spilled as a file-backed mapping

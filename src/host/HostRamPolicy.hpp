@@ -48,6 +48,12 @@ struct HostRamSpillInputs {
     bool tier_tiny    = false;   // Tiny or Pinned
     bool tier_streams = false;   // anything but Plain
 
+    // Minimal or Tiny — the tiers whose T2 sort gathers in tiles. Needed
+    // only for the disk-traffic estimate: the tiled gather re-reads and
+    // rewrites h_t2_xbits, which Compact's single-shot gather does not, and
+    // that is a 6-vs-4 difference in passes over a ~1 GiB table.
+    bool tier_tiled_gather = false;
+
     // D2H drain slots to start from, and whether the user pinned that
     // count themselves (XCHPLOT2_DRAIN_SLOTS). A forced count is honoured
     // even when it leaves the budget unmet — the user's explicit number
@@ -72,6 +78,23 @@ struct HostRamSpillPlan {
     uint64_t reclaimable   = 0;  // of which file-backed mmap (add for RSS)
     uint64_t spilled_bytes = 0;  // total routed to disk, for the I/O estimate
     uint64_t drain_freed   = 0;  // bytes given up by cutting drain slots
+
+    // Estimated temp-dir traffic for ONE plot, split by direction. A spilled
+    // table is NOT written once and read once — the meta tables are sorted IN
+    // PLACE, so each makes five passes, and Tiny's h_t2_xbits makes seven.
+    // See kSpillPasses in the .cpp for the per-table derivation.
+    //
+    // `traffic_written` is the number that sizes a drive's endurance; the sum
+    // of the two is what sizes its throughput. Both EXCLUDE h_frags, which is
+    // an mmap rather than engine I/O — the kernel writes those pages back on
+    // its own schedule and only under pressure, so attributing a fixed
+    // per-plot figure to it would be a guess.
+    //
+    // Modelled, not measured. The SpillEngine counts the real bytes and
+    // reports them at the end of each plot; if the two disagree, one of them
+    // is wrong and that is worth knowing.
+    uint64_t traffic_written = 0;
+    uint64_t traffic_read    = 0;
 
     // Lowest peak this policy can reach for these inputs: every routable
     // table spilled AND the drain cut to one slot. Independent of `budget`,

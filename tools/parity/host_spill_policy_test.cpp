@@ -325,6 +325,59 @@ void test_k28_tiny_ladder()
     check_eq(r3.resident, 11177820160ull, "ladder: floor is 10.41 GiB");
 }
 
+// Temp-dir traffic. These numbers size a drive's endurance, and the figure
+// they replaced was a flat 2x — "written once, read back once" — which is true
+// only of h_t3. The meta tables are sorted IN PLACE, so each makes five
+// passes. Pinning the per-table counts here is the point: they mirror control
+// flow in GpuPipeline.cpp rather than deriving from it, so nothing else can
+// notice when a new call site makes them stale. If one of these fails, go and
+// recount the sites before changing the constant.
+void test_traffic_estimate()
+{
+    // Tiny, min: h_t1_meta 2W+3R, h_t2_meta 2W+3R, h_t3 1W+1R (all 8-B),
+    // h_t2_xbits 3W+4R (4-B). h_frags is not routable in Tiny.
+    auto const t = pos2gpu::plan_host_ram_spill(tiny_at(0));
+    check_eq(t.traffic_written, (2 + 2 + 1) * kTable8 + 3 * kTable4,
+             "traffic: tiny writes 5x8-B + 3x4-B");
+    check_eq(t.traffic_read, (3 + 3 + 1) * kTable8 + 4 * kTable4,
+             "traffic: tiny reads 7x8-B + 4x4-B");
+
+    // The claim that motivated the fix: it is NOT 2x the spilled bytes.
+    check(t.traffic_written + t.traffic_read > 2 * t.spilled_bytes,
+          "traffic: tiny exceeds the old flat 2x model");
+
+    // Minimal — no h_t1_meta / h_t2_meta (not routable), h_frags is mmap and
+    // contributes no engine traffic, and the tiled gather puts xbits at 3W+3R.
+    auto min_in = minimal_at(0);
+    min_in.tier_tiled_gather = true;
+    auto const m = pos2gpu::plan_host_ram_spill(min_in);
+    check_eq(m.traffic_written, 1 * kTable8 + 3 * kTable4,
+             "traffic: minimal writes h_t3 once + xbits 3x");
+    check_eq(m.traffic_read, 1 * kTable8 + 3 * kTable4,
+             "traffic: minimal reads h_t3 once + xbits 3x");
+
+    // Compact — same routable set as minimal, but its single-shot T2-sort
+    // gather saves xbits two passes.
+    auto cmp_in = minimal_at(0);
+    cmp_in.tier_tiled_gather = false;
+    auto const c = pos2gpu::plan_host_ram_spill(cmp_in);
+    check_eq(c.traffic_written, 1 * kTable8 + 2 * kTable4,
+             "traffic: compact writes h_t3 once + xbits 2x");
+    check(c.traffic_read < m.traffic_read,
+          "traffic: compact's flat gather reads less than minimal's tiled one");
+
+    // A table that stays pinned costs no disk I/O — a budget that needs no
+    // spill must estimate zero, not "the tables it would have routed".
+    auto const none = pos2gpu::plan_host_ram_spill(tiny_at(kTinyNeed + kGiB));
+    check_eq(none.traffic_written, 0, "traffic: no spill means no writes");
+    check_eq(none.traffic_read,    0, "traffic: no spill means no reads");
+
+    // h_frags is the mmap class: routed, counted in reclaimable, but it moves
+    // no bytes through the engine, so it must not inflate the estimate.
+    check(m.tables.h_frags, "traffic: minimal does route h_frags");
+    check(m.reclaimable > 0, "traffic: h_frags lands in the mmap class");
+}
+
 } // namespace
 
 int main()
@@ -340,6 +393,7 @@ int main()
     test_forced_slots();
     test_no_underflow();
     test_k28_tiny_ladder();
+    test_traffic_estimate();
 
     if (failures) {
         std::printf("\n%d FAILURE(S)\n", failures);
