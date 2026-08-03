@@ -2203,34 +2203,39 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             return v && v[0] == '1';
         }();
         // POS2GPU_T1_DROP_R=<section_l>,<mk>: fault injection — skip the R
-        // half of that pass's tile H2D, reproducing exactly what an
-        // unwaited copy leaves behind. This exists to prove causation
-        // rather than infer it: the race is ~1-in-8 and nothing about
-        // observing it says the missing copy is what caused the bad plot.
-        // Dropping the copy on purpose and getting the SAME plot hash does.
-        // Add POS2GPU_T1_DROP_R_NOTHROW=1 to suppress the zero-yield guard
-        // below, so the run produces the corrupt plot instead of the error.
+        // half of that pass's tile H2D, which is exactly what an unwaited
+        // copy leaves behind.
+        //
+        // Its ONGOING job is to test the zero-yield guard below. That guard
+        // is always on and, in a healthy run, never fires — which is
+        // indistinguishable from a guard that has quietly stopped working
+        // (the same argument HostGuard.hpp makes about its canaries). No
+        // parity test can cover it, because the fault it catches is a race.
+        // `POS2GPU_T1_DROP_R=0,0` on a --tier tiny run must abort with the
+        // "matched ZERO pairs" error; if it ever completes instead, the
+        // guard is broken and the tier's worst failure mode is unpoliced.
+        //
+        // It ALSO reproduces the historical fault byte-for-byte, which is
+        // how that bug was proven rather than inferred (the race was ~1-in-8,
+        // so observing it said nothing about the cause). Doing that now needs
+        // the guard patched out by hand, deliberately: the switch that used to
+        // do it from the environment is gone. A plotter should not carry a
+        // knob whose only output is a farmable-looking, silently wrong plot —
+        // every other debug knob here either adds a check or forces a
+        // failure, and none can make bad output look good.
         int drop_r_sec = -1, drop_r_mk = -1;
         if (char const* v = std::getenv("POS2GPU_T1_DROP_R"); v && v[0]) {
             std::sscanf(v, "%d,%d", &drop_r_sec, &drop_r_mk);
         }
-        bool const drop_r_nothrow = [] {
-            char const* v = std::getenv("POS2GPU_T1_DROP_R_NOTHROW");
-            return v && v[0] == '1';
-        }();
-        // This switch deliberately corrupts the plot. Say so, loudly and
-        // unconditionally — a plotter must never damage output on the
-        // strength of a stray environment variable without leaving a trace
-        // in the log that explains the bad plot.
+        // Say so loudly and unconditionally — a plotter must never damage
+        // output on the strength of a stray environment variable without
+        // leaving a trace in the log that explains the failure.
         if (drop_r_sec >= 0) {
             std::fprintf(stderr,
                 "[t1-inject] *** POS2GPU_T1_DROP_R=%d,%d IS SET: deliberately "
-                "skipping that pass's R tile copy. THIS CORRUPTS THE PLOT. %s ***\n",
-                drop_r_sec, drop_r_mk,
-                drop_r_nothrow
-                    ? "POS2GPU_T1_DROP_R_NOTHROW=1 also suppresses the zero-yield "
-                      "guard, so a SILENTLY WRONG plot WILL be written."
-                    : "The zero-yield guard will abort the plot.");
+                "skipping that pass's R tile copy. The zero-yield guard will "
+                "abort this plot — that abort IS the expected result. ***\n",
+                drop_r_sec, drop_r_mk);
         }
         for (uint32_t section_l = 0; section_l < t1_num_sections; ++section_l) {
             if (scratch.tiny_mode) {
@@ -2350,8 +2355,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     // bucket — the failure that silently drops 1/16 of T1 and
                     // produces a ~78%-sized plot that still passes every
                     // structural check. Refuse to write that plot.
-                    if (pass_count == 0 && l_n > 0 && r_buck_n > 0
-                        && !drop_r_nothrow) {
+                    //
+                    // Unconditional: nothing in the environment can turn this
+                    // off. POS2GPU_T1_DROP_R above exists to make it fire.
+                    if (pass_count == 0 && l_n > 0 && r_buck_n > 0) {
                         throw std::runtime_error(
                             "T1 match (tiny sub-section) section_l=" +
                             std::to_string(section_l) + " mk=" + std::to_string(mk) +
