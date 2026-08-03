@@ -1499,6 +1499,28 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // null and every access routes through the SpillBuffer. Declared here
     // (function scope) so the engine outlives every SpillBuffer and the
     // h_t3 spill survives from T3 match into T3 sort. See SpillEngine.
+    //
+    // PER PLOT, and it should stay that way. Hoisting these to batch lifetime
+    // — reuse the staging windows and the temp files across a slice instead of
+    // building them per plot — looks like an obvious win and is not one.
+    // MEASURED at k=28 Tiny (tmp/spill_setup_cost.cpp, since deleted):
+    //
+    //   4x (mkstemp + unlink + fallocate a cap-sized table + close)   2.5 ms
+    //   64 MiB of staging, allocated and faulted in                  20.3 ms
+    //   TOTAL per plot                                              ~22.5 ms
+    //
+    // That is 0.045% of a ~50 s plot, or 2.25 s across a 100-plot batch. The
+    // fallocate figure also says the filesystem is not struggling to place
+    // these files, which was the other half of the argument for reuse.
+    //
+    // What it would cost is not 0.045%. SpillCoverage is per SpillBuffer, so
+    // today a fresh buffer per plot CANNOT carry stale coverage; reuse makes
+    // an explicit per-plot reset load-bearing. Miss it once and a range plot N
+    // never wrote reads back as plot N-1's bytes at that offset — real-looking
+    // entries rather than the sparse hole's zeros, so the resulting plot is
+    // full-size and wrong instead of short and wrong. That is strictly harder
+    // to notice than the failure this guard was built for, bought for 45
+    // milliseconds. Don't.
     std::unique_ptr<SpillEngine> spill_engine;
     std::unique_ptr<SpillBuffer> t1_meta_spill;   // h_t1_meta (~2 GiB, tiny)
     std::unique_ptr<SpillBuffer> t3_spill;        // h_t3 (~2 GiB, compact/minimal/tiny)
