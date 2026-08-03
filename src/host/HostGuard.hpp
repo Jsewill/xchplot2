@@ -2,31 +2,38 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// The tiny tier plus --max-host-ram produced exactly one corrupt plot in
-// ~50 runs: same manifest, same binary, 78% of the expected bytes, wrong
-// hash. It has never reproduced — not under I/O-delay amplification, not
-// under disk contention, not at either drain-slot count.
+// HISTORICAL NOTE FIRST, because it changes how to read the rest: this file
+// was written while the tiny tier's intermittent corrupt plot (78% of the
+// expected bytes, right manifest, wrong hash, ~8% of k=28 runs) was still
+// unattributed, and an out-of-bounds device write was the leading theory.
+// That is NO LONGER an open question. The cause was the T1 sub-section
+// match staging its tile as two USM copies and waiting only the second on
+// an out-of-order queue; losing the R half made a whole pass match exactly
+// zero pairs, and the compounding 15/16 -> (15/16)^2 -> (15/16)^4 through
+// T1/T2/T3 is precisely the 78%. POS2GPU_T1_DROP_R reproduced it
+// byte-for-byte, which is proof rather than inference. Fixed, with an
+// always-on zero-yield guard behind it.
 //
-// A race is the obvious suspect and the hard one to catch. But there is a
-// second family that fits the evidence better, and it is NOT rare at all:
-// a device kernel writing past the end of a USM-host buffer. Every
-// streaming kernel writes to host memory through a cursor
-// (`part_vals[pos] = v`, fragment drains, sort scatter), and a cursor that
-// runs one entry long lands in whatever allocation happens to sit next in
-// the address space. Under spill, `h_meta` and `h_t3` are never allocated
-// at all, so every later buffer moves — same overrun, different victim.
-//
-// That asymmetry is the whole point of this file:
+// So nothing below is chasing a live mystery. What survives that fix is a
+// narrower and still-good reason to keep the canaries:
 //
 //     an out-of-bounds write is DETERMINISTIC.
 //     whether it lands somewhere that changes the plot is LAYOUT-DEPENDENT.
 //
-// Soaking samples the second question and needs ~50 runs per observation.
-// Canaries answer the first one directly, on every run, in the buffer that
-// was actually overrun rather than in the innocent one downstream of it.
-// If nothing here ever fires, that is real evidence against the whole
-// family — which is worth as much as a hit, and is why the guard is
-// deliberately cheap enough to leave on for a long soak.
+// Every streaming kernel writes to host memory through a cursor
+// (`part_vals[pos] = v`, fragment drains, sort scatter), and a cursor that
+// runs one entry long lands in whatever allocation happens to sit next in
+// the address space. Under spill, `h_meta` and `h_t3` are never allocated
+// at all, so every later buffer moves — same overrun, different victim.
+// That means a soak samples the SECOND question and can pass ~50 times
+// while the first has been true all along. Canaries answer the first one
+// directly, on every run, in the buffer that was actually overrun rather
+// than in the innocent one downstream of it.
+//
+// A clean run is therefore a real result, not a null one — which is why the
+// guard is deliberately cheap enough to leave on for a long soak, and why
+// its own arithmetic is unit-tested (see USAGE): a canary that has quietly
+// stopped firing is indistinguishable from a healthy tree.
 //
 // USAGE
 //   XCHPLOT2_HOST_GUARD=1    enable, 1 MiB redzone either side
