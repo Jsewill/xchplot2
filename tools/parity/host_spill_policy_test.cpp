@@ -297,6 +297,43 @@ void test_no_underflow()
     auto const r2 = pos2gpu::plan_host_ram_spill(in2);
     check(r2.resident <= kTable8, "saturate: bounded peak with a real budget");
     check(r2.meets_budget, "saturate: budget met once everything is routed");
+
+    // INVERTED SLOT COUNTS. BatchPlotter cannot produce these — drain_slots_env
+    // returns 0 or a value already clamped to [1, kNumPinnedBuffers] — but this
+    // is a public pure function with its own test binary, and the whole reason
+    // it was pulled out of BatchPlotter is that callers can now reach it. The
+    // slot credit is an int subtraction cast to uint64_t; unfloored, kept >
+    // baseline wraps to ~1.8e19, saturates `est` to zero and reports a modelled
+    // peak of ZERO for a plan that frees nothing. That is the one direction a
+    // budget bug must never fail in: it looks like success.
+    {
+        pos2gpu::HostRamSpillInputs bad = tiny_at(kGiB);
+        bad.host_required  = 40 * kGiB;   // far above anything routable
+        bad.forced_slots   = true;        // takes the credit branch directly
+        bad.pinned_slots   = 8;
+        bad.baseline_slots = 4;           // kept > baseline: inverted
+        auto const r3 = pos2gpu::plan_host_ram_spill(bad);
+        check(r3.resident > 0,
+              "inverted slots: peak does not collapse to zero");
+        check_eq(r3.drain_freed, 0,
+                 "inverted slots: no drain credit is claimed");
+        check(!r3.meets_budget,
+              "inverted slots: an unreachable budget still reports unmet");
+    }
+
+    // baseline_slots = 0 is the other end of the same hazard: `baseline - 1`
+    // would wrap and make `reachable` colossal, so floor_bytes would come back
+    // as 0 — "you can get this to nothing" — for a tier that cannot.
+    {
+        pos2gpu::HostRamSpillInputs bad = tiny_at(0);
+        bad.host_required  = 40 * kGiB;
+        bad.pinned_slots   = 0;
+        bad.baseline_slots = 0;
+        auto const r4 = pos2gpu::plan_host_ram_spill(bad);
+        check(r4.floor_bytes > 0,
+              "zero baseline: floor stays honest instead of wrapping to zero");
+        check_eq(r4.drain_freed, 0, "zero baseline: no drain credit");
+    }
 }
 
 // ---- the ladder this feature shipped for ----------------------------------

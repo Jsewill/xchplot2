@@ -50,6 +50,21 @@ namespace {
 // it errs high, which is the safe direction for someone sizing a drive.
 struct Passes { int writes; int reads; };
 
+// Drain slots given up, floored at zero.
+//
+// `baseline_slots < pinned_slots` cannot happen through BatchPlotter —
+// drain_slots_env() returns either 0 or a count already clamped to
+// [1, kNumPinnedBuffers]. But this is a pure function with a public header and
+// its own test binary, and the whole point of pulling it out of BatchPlotter
+// was that a caller can now reach it without owning a GPU. An inverted pair
+// would wrap on the cast to uint64_t, saturate the `est` subtraction, and
+// report a modelled peak of ZERO for a plan that frees nothing — the budget
+// arithmetic failing in the one direction that looks like success.
+constexpr uint64_t slots_freed(int baseline, int kept)
+{
+    return baseline > kept ? uint64_t(baseline - kept) : uint64_t(0);
+}
+
 constexpr Passes kT1MetaPasses     {2, 3};
 constexpr Passes kT2MetaPasses     {2, 3};
 constexpr Passes kXbitsPassesTiny  {2, 3};
@@ -127,16 +142,16 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
         }
     } else {
         est -= std::min<uint64_t>(
-            uint64_t(in.baseline_slots - out.pinned_slots) * table8, est);
+            slots_freed(in.baseline_slots, out.pinned_slots) * table8, est);
     }
     out.drain_freed =
-        uint64_t(in.baseline_slots - out.pinned_slots) * table8;
+        slots_freed(in.baseline_slots, out.pinned_slots) * table8;
 
     // The reachable floor spills every routable table AND keeps a single
     // drain slot — that is the most this policy can do. Independent of the
     // budget, so it is meaningful even when the budget is unreachable.
     uint64_t const reachable =
-        routable_total + uint64_t(in.baseline_slots - 1) * table8;
+        routable_total + slots_freed(in.baseline_slots, 1) * table8;
     out.floor_bytes =
         in.host_required - std::min(reachable, in.host_required);
 
