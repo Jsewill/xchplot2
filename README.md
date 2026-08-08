@@ -1169,8 +1169,9 @@ What gets spilled, in order, largest first — and only as far as the
 budget requires:
 
 1. the cold cap-sized tables (`h_t1_meta`, `h_t3`, `h_t2_meta`,
-   `h_t2_xbits`), streamed through a shared 32 MiB staging window so
-   the disk I/O overlaps compute;
+   `h_t2_xbits`), streamed through two shared 32 MiB staging windows
+   (64 MiB in total, however many tables spill) so the disk I/O
+   overlaps compute;
 2. the D2H drain slots, 3 → 1, **last**. Spilling a table costs disk
    I/O per plot; a drain slot costs producer/consumer overlap across
    plots, which is the more expensive of the two in a batch.
@@ -1200,15 +1201,21 @@ Notes:
   front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` for the rare
   disk-backed `/tmp`), and also checks the dir exists, is writable, and
   has room for the whole spill before starting, rather than failing
-  mid-batch. Budget ~7.1 GiB of free space for tiny at k=28, ~3.0 GiB
-  for compact. Each spill file is reserved with `fallocate` as it is
-  created, so a disk that fills anyway fails at once with its size
-  rather than part-way through a table.
+  mid-batch. Budget ~7.1 GiB of free space for tiny at k=28 and ~5.1
+  GiB for compact or minimal — the latter two route `h_frags` as well,
+  which is a full 2.03 GiB table even though it makes no engine I/O.
+  That is per *worker*: each GPU in a multi-GPU run spills into its own
+  files, so size the dir for the number of cards you are plotting with.
+  Each spill file is reserved with `fallocate` as it is created, so a
+  disk that fills anyway fails at once with its size rather than
+  part-way through a table.
 - **The temp dir sees a lot more traffic than "one write, one read".**
-  Only `h_t3` works that way. The T1 and T2 sorts read their table as
-  the partition source and then write the *sorted* result back over it,
-  so each meta table makes five passes, not two. Per plot at k=28, with
-  everything routed:
+  Only `h_t3` works that way in every tier — compact's `h_t2_xbits` is
+  the one other table that manages it. The T1 and T2 sorts read their
+  table as the partition source and then write the *sorted* result back
+  over it, so each meta table makes five passes, not two, and
+  `h_t2_xbits` makes four on minimal and five on tiny. Per plot at
+  k=28, with everything routed:
 
   | tier | total | of which writes |
   |------|------:|----------------:|

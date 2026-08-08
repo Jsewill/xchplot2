@@ -81,8 +81,13 @@ struct HostRamSpillPlan {
 
     // Estimated temp-dir traffic for ONE plot, split by direction. A spilled
     // table is NOT written once and read once — the meta tables are sorted IN
-    // PLACE, so each makes five passes, and Tiny's h_t2_xbits makes seven.
-    // See kSpillPasses in the .cpp for the per-table derivation.
+    // PLACE, so h_t1_meta and h_t2_meta each make FIVE passes rather than two.
+    // h_t2_xbits follows the tier's T2-sort gather: two passes on Compact
+    // (single-shot), four on Minimal (tiled), five on Tiny (held live across
+    // T3 match). Only h_t3 is write-once-read-once in every tier, and Compact's
+    // h_t2_xbits is the one other table that manages it. See the
+    // kT1MetaPasses / kXbitsPasses* / kT3Passes constants in the .cpp for the
+    // per-table derivation.
     //
     // `traffic_written` is the number that sizes a drive's endurance; the sum
     // of the two is what sizes its throughput. Both EXCLUDE h_frags, which is
