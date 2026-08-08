@@ -297,17 +297,32 @@ size_t streaming_pinned_peak_bytes(int k);
 // the host is what buys the VRAM back. Measured on an RTX 4090, k=28, peak RSS
 // sampled from /proc/PID/status over `bench -n 3 --warmup 0`:
 //
-//   path/tier   host RSS    VRAM peak   s/plot
+//   path/tier   host RSS    VRAM used   s/plot
 //   pool         7.32 GiB   11.00 GiB    4.91   <- default when VRAM allows
 //   plain        7.35 GiB    7.94 GiB    4.23
 //   compact     14.44 GiB    5.86 GiB    5.89
 //   minimal     18.52 GiB    5.00 GiB   25.57
 //   tiny        21.48 GiB    1.08 GiB   38.30
 //
-// So compact buys 2.08 GiB of VRAM for 7.09 GiB of host, and tiny buys 6.86
-// for 14.13 — plus 9x the wall clock. Reaching for a lower --tier to "use less
-// memory" makes host RAM worse, which is the single most confusing thing about
-// the ladder and the reason these numbers are in the header.
+// DO NOT SIZE A CARD FROM THE VRAM COLUMN. It is what that 24 GiB card USED,
+// not what the tier NEEDS, and the two differ by up to 1.2 GiB. The gap is the
+// two-phase match's candidate scratch, whose grant is free - peak - margin
+// (BatchPlotter), so it expands into whatever the card has spare: measured
+// here at +841 MiB on plain, +801 on compact, +1220 on minimal and +6 on tiny
+// over each tier's declared anchor. On a card actually tight for its tier that
+// grant collapses to zero and the match falls back to the single-kernel path,
+// so the tier still fits — which is why this column cannot be read as a floor.
+// The floors are the anchors on streaming_*_peak_bytes above (minimal: 3900
+// MiB at k=28) plus the ~390 MiB CUDA context, i.e. the "measured true peaks"
+// line in that block. Note the overstatement is WORST on minimal, the tier
+// whose users have the least headroom to spare.
+//
+// So compact buys 2.04 GiB of declared VRAM for 7.09 GiB of host, and tiny
+// buys 6.05 for 14.13 — plus 9x the wall clock. (VRAM deltas from the anchors
+// for the reason above; host deltas from the measured column.) Reaching for a
+// lower --tier to "use less memory" makes host RAM worse, which is the single
+// most confusing thing about the ladder and the reason these numbers are in
+// the header.
 //
 // Note the cliff is between plain and compact: the two cheapest paths in host
 // RAM are also the two fastest, and they differ by 50 MiB of host. There is no

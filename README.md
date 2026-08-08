@@ -185,15 +185,23 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
   tables in pinned host memory — that *is* the mechanism — so the card
   that gets pushed down the ladder is the one whose box can least
   afford it. Reaching for `--tier tiny` to "use less memory" makes
-  memory worse overall, not better. Measured peak RSS at k=28:
+  memory worse overall, not better. Measured peak RSS at k=28, against
+  each tier's declared VRAM peak:
 
-  | path | host RAM | VRAM |
-  |------|---------:|-----:|
-  | pool | 7.3 GiB | 11.0 GiB |
-  | plain | 7.4 GiB | 7.9 GiB |
-  | compact | 14.4 GiB | 5.9 GiB |
-  | minimal | 18.5 GiB | 5.0 GiB |
+  | path | host RAM | VRAM (declared peak) |
+  |------|---------:|---------------------:|
+  | pool | 7.3 GiB | 10.2 GiB |
+  | plain | 7.4 GiB | 7.1 GiB |
+  | compact | 14.4 GiB | 5.1 GiB |
+  | minimal | 18.5 GiB | 3.8 GiB |
   | tiny | 21.5 GiB | 1.1 GiB |
+
+  The VRAM column is what the picker sizes against, matching the
+  per-tier figures above. A card with room to spare will be *measured*
+  using more than this — the two-phase match's scratch grant is
+  whatever VRAM is left over (up to ~1.2 GiB on minimal), and it
+  collapses to zero on a card that is tight for its tier, so it never
+  changes what the tier needs.
 
   So ≥ 16 GB is fine for the pool and plain paths, but a 2 GiB card
   driven to tiny wants ~24 GB of host RAM to go with it. xchplot2
