@@ -8,7 +8,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-chia = "0.45"
+chia = "0.47"
 bech32 = "0.12"
 sha2 = "0.11"
 

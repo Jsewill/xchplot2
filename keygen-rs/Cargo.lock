@@ -163,11 +163,11 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chia"
-version = "0.45.1"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a51f5992fb4987321ee37a11bb686e41a4ab4a2f874efa3a057ce22ff666ee4"
+checksum = "aa251d68527d3be353d25b0c3a8c2c62b021fbb0abdf15a154ed0fb77e7aa6dd"
 dependencies = [
- "chia-bls 0.45.0",
+ "chia-bls 0.47.0",
  "chia-client",
  "chia-consensus",
  "chia-datalayer",
@@ -175,9 +175,9 @@ dependencies = [
  "chia-puzzle-types",
  "chia-secp",
  "chia-serde",
- "chia-sha2 0.45.0",
+ "chia-sha2 0.47.0",
  "chia-ssl",
- "chia-traits 0.45.0",
+ "chia-traits 0.47.0",
  "clvm-traits",
  "clvm-utils",
  "clvmr",
@@ -201,14 +201,14 @@ dependencies = [
 
 [[package]]
 name = "chia-bls"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edf90111a4cbe2e0f6fe73e5e1323d0c1c87ba9cad0bb0a11447b5a886570796"
+checksum = "a7bfdc56dd7187b9c9671eeb52000610886003837a6ec423dc5ae4675116fac7"
 dependencies = [
  "blst",
  "chia-serde",
- "chia-sha2 0.45.0",
- "chia-traits 0.45.0",
+ "chia-sha2 0.47.0",
+ "chia-traits 0.47.0",
  "hex",
  "hkdf",
  "linked-hash-map",
@@ -219,12 +219,12 @@ dependencies = [
 
 [[package]]
 name = "chia-client"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38beeb90fc30f1b049163bd1671dc559fd9db88613819c6be167cde7c94d18ed"
+checksum = "9a296181498f58b417de7965936d1127b1a3c7b6a0d8e28a6ceca2382224354f"
 dependencies = [
  "chia-protocol",
- "chia-traits 0.45.0",
+ "chia-traits 0.47.0",
  "futures-util",
  "thiserror 2.0.18",
  "tokio",
@@ -234,18 +234,18 @@ dependencies = [
 
 [[package]]
 name = "chia-consensus"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1d4d2ff65806694e8d9503a13da3994d5cffe2d5dc0eb9300a382384da9c43"
+checksum = "df6054ee79275042da8543fd0a899197ce6633750a7d061adaf3101451de11eb"
 dependencies = [
  "bitflags",
- "chia-bls 0.45.0",
+ "chia-bls 0.47.0",
  "chia-protocol",
  "chia-puzzle-types",
  "chia-puzzles",
- "chia-sha2 0.45.0",
- "chia-traits 0.45.0",
- "chia_streamable_macro 0.45.0",
+ "chia-sha2 0.47.0",
+ "chia-traits 0.47.0",
+ "chia_streamable_macro 0.47.0",
  "clvm-traits",
  "clvm-utils",
  "clvmr",
@@ -256,16 +256,16 @@ dependencies = [
 
 [[package]]
 name = "chia-datalayer"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec2a6af5b93fc1eed7dcd19f3abd71d5afe7b952e24274f102ac12b2576ffdbb"
+checksum = "483af1b61104d3e6ef9aa15f747735b4ecc852b404ce64db99ba593692032f05"
 dependencies = [
  "bitvec",
  "chia-datalayer-macro",
  "chia-protocol",
- "chia-sha2 0.45.0",
- "chia-traits 0.45.0",
- "chia_streamable_macro 0.45.0",
+ "chia-sha2 0.47.0",
+ "chia-traits 0.47.0",
+ "chia_streamable_macro 0.47.0",
  "indexmap",
  "num-traits",
  "rayon",
@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "chia-datalayer-macro"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18cf0547fb3c0e3dc6e986da4ec949d4fd7488c6469f4c1e522a463a7d82918c"
+checksum = "0ba397ff88fd8a35a801e6837ee7a76dc194489459664c5addfc38adb3bc372a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -297,16 +297,16 @@ dependencies = [
 
 [[package]]
 name = "chia-protocol"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdaf16f27f82ff650ddad18e01a16138c20dad9039f138a6cb608b188d789e90"
+checksum = "0290bb1040772254a177ca927deb87dca7779d2c1aed178d9cba889d4d3f6dab"
 dependencies = [
- "chia-bls 0.45.0",
+ "chia-bls 0.47.0",
  "chia-pos2",
  "chia-serde",
- "chia-sha2 0.45.0",
- "chia-traits 0.45.0",
- "chia_streamable_macro 0.45.0",
+ "chia-sha2 0.47.0",
+ "chia-traits 0.47.0",
+ "chia_streamable_macro 0.47.0",
  "clvm-traits",
  "clvm-utils",
  "clvmr",
@@ -317,14 +317,14 @@ dependencies = [
 
 [[package]]
 name = "chia-puzzle-types"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714322197b02701ff11fb7850046ef67a07c4ad165efcbd045ef792d19d13800"
+checksum = "2897e21fc34c70370b990c69c28ceae21c8eb26f5e87aa25fca0bc974e4f240b"
 dependencies = [
- "chia-bls 0.45.0",
+ "chia-bls 0.47.0",
  "chia-protocol",
  "chia-puzzles",
- "chia-sha2 0.45.0",
+ "chia-sha2 0.47.0",
  "clvm-traits",
  "clvm-utils",
  "clvmr",
@@ -344,11 +344,11 @@ dependencies = [
 
 [[package]]
 name = "chia-secp"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7dc8e7b960772b7b9b4f7870d158b7f8202415f800c605c369f7ca4cb4f3380"
+checksum = "f7c71bfecbfc1f5a15a987d69e950f1229db414a020837de254264d1fefb352f"
 dependencies = [
- "chia-sha2 0.45.0",
+ "chia-sha2 0.47.0",
  "hex",
  "k256",
  "p256",
@@ -356,9 +356,9 @@ dependencies = [
 
 [[package]]
 name = "chia-serde"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8def1f7449023d95362986c3060b9ebb44e42029169aa8c2c30778f4652aef8b"
+checksum = "9ae5741490dce35c61cfdc6fc6f4366f3f7bece22ad9a1cd18a8374bcd05e347"
 dependencies = [
  "hex",
  "serde",
@@ -375,18 +375,18 @@ dependencies = [
 
 [[package]]
 name = "chia-sha2"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff33f5dc89bc32f723d48d5bfa2aff0bf4e94b8a51c1c5bd0ec0a86a96db5e6d"
+checksum = "70c00d494c90c0c7375b83ac85cafc6f63be847b5430e3ebc5dd539a7be5b92d"
 dependencies = [
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "chia-ssl"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53588efa756723fc0927932514a67b79d14ef7f60539708d4efe98a12cd063f8"
+checksum = "e2a53367593493885be582ebf2308efb70f2f4cbcd9be35e760c672a752b7032"
 dependencies = [
  "getrandom 0.4.2",
  "rcgen",
@@ -408,12 +408,12 @@ dependencies = [
 
 [[package]]
 name = "chia-traits"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4db3c5a598309697d3a971ae7f981028b75cfea60ee0a18f23f934930193f411"
+checksum = "6c8c2b4a0bf7df1d3c1393e00feee65b0a71e80fbe63d3bd7e7b529439357e49"
 dependencies = [
- "chia-sha2 0.45.0",
- "chia_streamable_macro 0.45.0",
+ "chia-sha2 0.47.0",
+ "chia_streamable_macro 0.47.0",
  "thiserror 2.0.18",
 ]
 
@@ -431,9 +431,9 @@ dependencies = [
 
 [[package]]
 name = "chia_streamable_macro"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b533d9e1446ffb79c02cb38e225626c7473ed11c095dfb0b1ac15c06eba8e9af"
+checksum = "a77e9eb71146602e298880c3a0f5985c897bd49898a25202567945832c039d13"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -443,9 +443,9 @@ dependencies = [
 
 [[package]]
 name = "clvm-derive"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f45a474a990d95619de87be6d281f5ed72a285219919bb008cab1e17230beca"
+checksum = "e70c7a28114d6f0fe3e3f0c89982e84c460cc23ead24b25aa488cc3cbe5a60d9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -454,11 +454,11 @@ dependencies = [
 
 [[package]]
 name = "clvm-traits"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "454dc465680d482b0b21f0695b7a08bf945443bf030a4e19971aa37735d13ea3"
+checksum = "e0080935a9cebfaf4cba835c2b93766bcfd59cd58c0c639ce713cd1f58faff45"
 dependencies = [
- "chia-bls 0.45.0",
+ "chia-bls 0.47.0",
  "chia-secp",
  "clvm-derive",
  "clvmr",
@@ -468,11 +468,11 @@ dependencies = [
 
 [[package]]
 name = "clvm-utils"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b0e9c758e917bcb80890ceb5cff8a03805edc606e728143a80d034399099a9"
+checksum = "8b092d5444261450d60f308e59f57998c7a5179090433a53b5446c271a0ef87a"
 dependencies = [
- "chia-sha2 0.45.0",
+ "chia-sha2 0.47.0",
  "clvm-traits",
  "clvmr",
  "hex",
@@ -481,9 +481,9 @@ dependencies = [
 
 [[package]]
 name = "clvmr"
-version = "0.17.7"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3060bcd64cb8cf2b32fe6ee3a82698835c03361c8e1da446d2e9d058fbfffd5f"
+checksum = "3a9d2342687e3210c4b7f8556966ee80e4106d451dd4d8b14b1e446412c640a4"
 dependencies = [
  "bitflags",
  "bitvec",
@@ -568,9 +568,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a0d26b245348befa0c121944541476763dcc46ede886c88f9d12e1697d27c3"
+checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -701,9 +701,9 @@ dependencies = [
 
 [[package]]
 name = "ecdsa"
-version = "0.17.0-rc.18"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54fb064faabbee66e1fc8e5c5a9458d4269dc2d8b638fe86a425adb2510d1a96"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
 dependencies = [
  "der",
  "digest 0.11.2",
@@ -722,9 +722,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elliptic-curve"
-version = "0.14.0-rc.33"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "102d3643d30dd8b559613c5cced68317199597fffb278cdc88daa2ef7fafc935"
+checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct",
  "crypto-bigint",
@@ -733,7 +733,6 @@ dependencies = [
  "ff",
  "group",
  "hybrid-array",
- "once_cell",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.10.1",
@@ -982,9 +981,9 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.11"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d46837a0ed51fe95bd3b05de33cd64a1ee88fc797477ca48446872504507c5"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "subtle",
  "typenum",
@@ -1036,15 +1035,17 @@ dependencies = [
 
 [[package]]
 name = "k256"
-version = "0.14.0-rc.10"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ea8e2b331bd02ab4a6342a78246a0a32096900951ea21aa4c768171ede67b5f"
+checksum = "93f50113171a713f4a4231ef82eb26703607139b35dcb56241f0ceab2ae1f7d8"
 dependencies = [
  "cpubits",
  "ecdsa",
  "elliptic-curve",
+ "primeorder",
  "sha2 0.11.0",
  "signature",
+ "wnaf",
 ]
 
 [[package]]
@@ -1223,9 +1224,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "p256"
-version = "0.14.0-rc.10"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41adc63effe99d48837a8cc0e6d7a77e32ae6a07f6000df466178dbc2193093e"
+checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -1328,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "primefield"
-version = "0.14.0-rc.10"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f845ec3240cd5ed5e1e31cf3ff633a5bf47c698dc4092ba9e767415b3d393406"
+checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
  "crypto-bigint",
  "crypto-common 0.2.1",
@@ -1342,11 +1343,15 @@ dependencies = [
 
 [[package]]
 name = "primeorder"
-version = "0.14.0-rc.10"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d2793f22b9b6fd11ef3ac1d59bf003c2573593e4968702341605c2748fd90bf"
+checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
 dependencies = [
  "elliptic-curve",
+ "once_cell",
+ "primefield",
+ "serdect",
+ "wnaf",
 ]
 
 [[package]]
@@ -1466,12 +1471,12 @@ dependencies = [
 
 [[package]]
 name = "rfc6979"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5236ce872cac07e0fb3969b0cbf468c7d2f37d432f1b627dcb7b8d34563fb0c3"
+checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
+ "crypto-bigint",
  "hmac 0.13.0",
- "subtle",
 ]
 
 [[package]]
@@ -2176,6 +2181,17 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wnaf"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab12e7090f27e2ffd9322651492942d50c2926094af30601e1964337db39daf1"
+dependencies = [
+ "ff",
+ "group",
+ "hybrid-array",
 ]
 
 [[package]]
