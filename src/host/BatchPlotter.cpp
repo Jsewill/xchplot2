@@ -5,6 +5,8 @@
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
+#include "host/HostRamPolicy.hpp"  // plan_host_ram_spill — the budget policy
+#include "host/TempFile.hpp"       // --temp-dir plumbing
 #include "host/PlotFileWriterParallel.hpp"
 #include "gpu/DeviceIds.hpp"  // kCpuDeviceId for the --cpu device-list mixin
 #include "host/NumaTopology.hpp"  // CPU-node enumeration + per-worker pinning
@@ -2116,6 +2118,89 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             gib(auto_host));
                     }
                 }
+                // ---- Host-RAM disk-offload: spill rather than refuse ----
+                //
+                // An explicit --max-host-ram always runs the policy. Otherwise
+                // it engages ONLY when the tier does not fit, which is the
+                // asymmetry that makes auto-spill safe on by default: it fires
+                // exactly where the alternative is a hard error today, so it
+                // cannot slow down a run that already works.
+                //
+                // Compact is the only tier that can route a table (Minimal and
+                // Tiny CPU-touch both of them), so on the others this reduces
+                // to the drain-slot lever and then stands down.
+                bool const short_on_ram =
+                    host_free < host_required + host_reserve;
+                bool const want_policy =
+                    opts.max_host_ram_bytes > 0 ||
+                    (short_on_ram && !opts.no_auto_spill);
+                if (want_policy) {
+                    // Sentinel translation. BatchOptions uses 0 for "not set"
+                    // and 1 for "min"; the policy uses 0 for "min". Without
+                    // this, --max-host-ram min reads as a 1-byte budget, the
+                    // policy correctly reports it as unreachable, and the run
+                    // fails having just built the exact plan the user asked
+                    // for.
+                    bool const budget_is_min = (opts.max_host_ram_bytes == 1);
+
+                    HostRamSpillInputs pin;
+                    pin.host_required  = host_required;
+                    pin.cap_entries    = stream_pinned_cap;
+                    pin.budget         = budget_is_min
+                        ? 0 : opts.max_host_ram_bytes;
+                    pin.tier_compact   = (tier == Tier::Compact);
+                    pin.pinned_slots   = num_pinned_slots;
+                    pin.forced_slots   = (forced_drain_slots != 0);
+                    pin.baseline_slots = GpuBufferPool::kNumPinnedBuffers;
+
+                    // Auto adopts the host's own free RAM as the budget.
+                    if (opts.max_host_ram_bytes == 0 && short_on_ram) {
+                        pin.budget = (host_free > host_reserve)
+                            ? std::uint64_t(host_free - host_reserve) : 0;
+                    }
+
+                    HostRamSpillPlan const sp = plan_host_ram_spill(pin);
+
+                    // An EXPLICIT budget that cannot be met is the user's
+                    // error and throws below with the floor quoted. An
+                    // automatic one just stands down and lets the host-RAM
+                    // guard speak, unchanged.
+                    if (sp.meets_budget || opts.max_host_ram_bytes > 0) {
+                        stream_scratch.spill = sp.tables;
+                        num_pinned_slots     = sp.pinned_slots;
+                        if (sp.tables.any() || sp.drain_freed) {
+                            std::fprintf(stderr,
+                                "%s host-RAM budget: modelled peak %.2f -> "
+                                "%.2f GiB (floor %.2f) — %s%s%s%d drain slot%s; "
+                                "~%.2f GiB temp-dir traffic per plot "
+                                "(%.2f W / %.2f R)\n",
+                                log_prefix.c_str(), gib(host_required),
+                                gib(sp.resident), gib(sp.floor_bytes),
+                                sp.tables.h_meta ? "h_meta " : "",
+                                sp.tables.h_t2_xbits ? "h_t2_xbits " : "",
+                                sp.tables.any() ? "-> disk, " : "",
+                                sp.pinned_slots,
+                                sp.pinned_slots == 1 ? "" : "s",
+                                gib(sp.traffic_written + sp.traffic_read),
+                                gib(sp.traffic_written), gib(sp.traffic_read));
+                        }
+                        if (!sp.meets_budget) {
+                            char m2[512];
+                            std::snprintf(m2, sizeof(m2),
+                                "%s --max-host-ram %.2f GiB is below what this "
+                                "tier can reach: the floor is %.2f GiB at k=%d "
+                                "with every routable table on disk and a single "
+                                "drain slot.",
+                                log_prefix.c_str(),
+                                gib(opts.max_host_ram_bytes),
+                                gib(sp.floor_bytes), pool_k);
+                            throw std::runtime_error(m2);
+                        }
+                        // The spill covers the shortfall; skip the refusal.
+                        if (short_on_ram) goto host_ram_ok;
+                    }
+                }
+
                 if (host_free < host_required + host_reserve) {
                     char msg[1024];
                     std::snprintf(msg, sizeof(msg),
@@ -2134,6 +2219,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         gib(streaming_tiny_host_bytes(pool_k)));
                     throw std::runtime_error(msg);
                 }
+host_ram_ok:;
             }
         }
 
@@ -2734,6 +2820,24 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts)
 {
     if (entries.empty()) return BatchResult{};
+
+    // --temp-dir reaches TempFile through the environment rather than a
+    // parameter: TempFile already resolves XCHPLOT2_TEMP_DIR first, it is
+    // reached from call sites that have no BatchOptions in scope, and this runs
+    // once on the entry thread before any worker exists. setenv copies the
+    // string, so passing c_str() of a member is safe.
+    //
+    // Validated UP FRONT, not at first use. dir_is_ram_backed() returns false
+    // when it cannot even statfs, so a mistyped path would sail through the
+    // tmpfs guard and die on a raw mkstemp errno minutes into a batch — and the
+    // tmpfs message is exactly what tells a user to reach for this flag.
+    if (!opts.temp_dir.empty()) {
+        ::setenv("XCHPLOT2_TEMP_DIR", opts.temp_dir.c_str(), /*overwrite=*/1);
+        std::string const problem = TempFile::dir_problem(opts.temp_dir);
+        if (!problem.empty()) {
+            throw std::runtime_error("--temp-dir " + opts.temp_dir + ": " + problem);
+        }
+    }
 
     // Pin WHO builds the shared FSE pool: this thread, before any worker exists.
     //

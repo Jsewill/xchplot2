@@ -353,8 +353,10 @@ add_library(pos2_gpu_host STATIC
     # in xchplot2_cli via $<TARGET_OBJECTS:pos2_gpu_cuda_obj>, which links this
     # library — so the definitions have to be reachable from here or the
     # executable fails to link. The standalone spill tests compile TempFile.cpp
-    # directly and do NOT link pos2_gpu_host, so this is not a duplicate.
+    # and HostRamPolicy.cpp directly and do NOT link pos2_gpu_host, so these are
+    # not duplicates.
     src/host/TempFile.cpp
+    src/host/HostRamPolicy.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
@@ -553,6 +555,15 @@ set_target_properties(host_guard_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMA
 # where pinned was intended, or a copy that has not landed when copy_blocking
 # returns. This needs a GPU but NOT a plot, so it is unaffected by the k=28
 # streaming non-determinism blocking byte-parity on this branch.
+# host_spill_policy_test — the budget policy, as integers. It used to be inline
+# in BatchPlotter::run() where reaching a branch needed a GPU, a k=28-sized host
+# AND a specific free-RAM reading, so most paths were unreachable by any test.
+add_executable(host_spill_policy_test tools/parity/host_spill_policy_test.cpp
+                                      src/host/HostRamPolicy.cpp)
+target_include_directories(host_spill_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(host_spill_policy_test PRIVATE cxx_std_20)
+set_target_properties(host_spill_policy_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 add_executable(cuda_spill_ops_test tools/parity/cuda_spill_ops_test.cu
                                    src/host/TempFile.cpp)
 target_include_directories(cuda_spill_ops_test PRIVATE ${CMAKE_SOURCE_DIR}/src)

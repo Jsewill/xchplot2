@@ -157,6 +157,21 @@ inline constexpr int kCpuWorkersAuto = -1;  // knee (~4), RAM-trimmed — the de
 inline constexpr int kCpuWorkersMax  = -2;  // as many as fit in RAM, capped at cores
 
 struct BatchOptions {
+    // Host-RAM disk-offload (see host/HostRamPolicy.hpp).
+    //
+    // max_host_ram_bytes: target for the UNSWAPPABLE host peak, in bytes. 0
+    // means "not set" — so `--max-host-ram min`, which asks for the lowest
+    // reachable peak, maps to 1 rather than 0 and the policy treats any
+    // sub-floor budget the same way.
+    //
+    // no_auto_spill: restore the old behaviour of REFUSING when a tier does not
+    // fit host RAM, instead of spilling and plotting anyway. Auto-spill is on
+    // by default because of an asymmetry — it fires only where the alternative
+    // is a hard error today, so it cannot slow a run that already works.
+    std::uint64_t    max_host_ram_bytes = 0;
+    bool             no_auto_spill      = false;
+    std::string      temp_dir;   // empty = TempFile's own resolution order
+
     bool             verbose         = false;
     std::vector<int> device_ids;
     bool             use_all_devices = false;

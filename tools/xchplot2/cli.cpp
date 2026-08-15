@@ -285,6 +285,42 @@ void read_urandom(uint8_t* out, size_t n)
 // (12.1 GiB per worker at k=28) and says so when it does.
 //
 // Returns false on malformed input (caller prints usage + exits 1).
+// --max-host-ram: a byte budget for the UNSWAPPABLE host peak.
+//
+// Accepts "8G" / "8GiB" / "8192M" / a raw byte count, and "min" for "spill
+// everything routable and keep one drain slot". Binary units throughout (G is
+// GiB), because every other memory figure this tool prints is binary and a
+// decimal G here would silently under-budget by 7%.
+//
+// "min" maps to 1 rather than 0 because 0 is BatchOptions' "not set" sentinel;
+// the policy treats any sub-floor budget identically, so 1 and 0 mean the same
+// thing to it.
+bool parse_host_ram_arg(std::string const& s, std::uint64_t& out)
+{
+    if (s == "min") { out = 1; return true; }
+    if (s.empty()) return false;
+
+    std::size_t idx = 0;
+    unsigned long long v = 0;
+    try { v = std::stoull(s, &idx); } catch (...) { return false; }
+
+    std::string suffix = s.substr(idx);
+    for (auto& c : suffix) c = char(std::tolower(static_cast<unsigned char>(c)));
+
+    std::uint64_t mult = 1;
+    if      (suffix.empty() || suffix == "b")            mult = 1;
+    else if (suffix == "k" || suffix == "kib" || suffix == "kb") mult = 1ull << 10;
+    else if (suffix == "m" || suffix == "mib" || suffix == "mb") mult = 1ull << 20;
+    else if (suffix == "g" || suffix == "gib" || suffix == "gb") mult = 1ull << 30;
+    else if (suffix == "t" || suffix == "tib" || suffix == "tb") mult = 1ull << 40;
+    else return false;
+
+    if (v == 0) return false;                     // 0 would read as "not set"
+    if (v > (~0ull) / mult) return false;          // overflow
+    out = std::uint64_t(v) * mult;
+    return true;
+}
+
 bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 {
     // Selecting the CPU here, rather than in the --devices parser, is what lets
@@ -1352,6 +1388,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
             }
+            else if (a == "--max-host-ram" && need(1)) {
+                if (!parse_host_ram_arg(argv[++i], opts.max_host_ram_bytes)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "8G / 8GiB / 8192M / a byte count, or "
+                                 "\"min\"\n";
+                    return 1;
+                }
+            }
+            else if (a == "--temp-dir" && need(1)) {
+                opts.temp_dir = argv[++i];
+            }
+            else if (a == "--no-auto-spill") {
+                opts.no_auto_spill = true;
+            }
             else if (a == "--devices" && need(1)) {
                 if (!parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: invalid --devices value\n";
@@ -1692,6 +1742,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     return 1;
                 }
                 opts.streaming_tier = (t == "auto") ? "" : t;
+            }
+            else if (a == "--max-host-ram" && i + 1 < argc) {
+                if (!parse_host_ram_arg(argv[++i], opts.max_host_ram_bytes)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "'8G', '8GiB', '8192M', a byte count, or 'min' "
+                                 "(got '" << argv[i] << "')\n";
+                    return 1;
+                }
+            }
+            else if (a == "--temp-dir" && i + 1 < argc) {
+                opts.temp_dir = argv[++i];
+            }
+            else if (a == "--no-auto-spill") {
+                opts.no_auto_spill = true;
             }
             else if (a == "--devices" && i + 1 < argc) {
                 if (!parse_devices_arg(argv[++i], opts)) {
