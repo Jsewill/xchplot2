@@ -496,6 +496,64 @@ target_include_directories(numa_topology_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(numa_topology_test PRIVATE cxx_std_20)
 set_target_properties(numa_topology_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
+# ---------------------------------------------------------------------------
+# Host-RAM disk-offload core, ported from the SYCL branch.
+#
+# These five headers/TUs are the parts of that feature with NO backend in them
+# at all: TempFile is pure POSIX, SpillCoverage is interval arithmetic,
+# SpillTileReader is a POD of two function pointers, HostGuard is redzone
+# arithmetic, and SpillEngine reaches the GPU only through SpillHostOps —
+# three virtuals (two staging allocations and one blocking copy). That is why
+# they could be copied across verbatim rather than reimplemented on CUDA.
+#
+# The four tests below are the reason to land them ahead of any call-site
+# wiring: they exercise the engine's ticket protocol, the read guard, the temp
+# files and the canaries with NO device present, so they are unaffected by the
+# k=28 streaming non-determinism that currently blocks byte-parity on this
+# branch. The ticket protocol is the spill's silent-corruption surface — a wait
+# that returns one job early hands back another chunk's bytes over a range
+# SpillCoverage considers written, which no end-to-end plot hash can attribute.
+find_package(Threads REQUIRED)
+
+add_executable(temp_file_test tools/parity/temp_file_test.cpp
+                              src/host/TempFile.cpp)
+target_include_directories(temp_file_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(temp_file_test PRIVATE cxx_std_20)
+set_target_properties(temp_file_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+add_executable(spill_engine_test tools/parity/spill_engine_test.cpp
+                                 src/host/TempFile.cpp)
+target_include_directories(spill_engine_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(spill_engine_test PRIVATE cxx_std_20)
+target_link_libraries(spill_engine_test PRIVATE Threads::Threads)
+set_target_properties(spill_engine_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+add_executable(spill_coverage_test tools/parity/spill_coverage_test.cpp)
+target_include_directories(spill_coverage_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(spill_coverage_test PRIVATE cxx_std_20)
+set_target_properties(spill_coverage_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+add_executable(host_guard_test tools/parity/host_guard_test.cpp)
+target_include_directories(host_guard_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(host_guard_test PRIVATE cxx_std_20)
+set_target_properties(host_guard_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
+# cuda_spill_ops_test — the engine driven over REAL device memory.
+#
+# The four tests above are device-free, which is what makes them trustworthy
+# right now, but it also means none of them touches the CUDA backing. That
+# backing is the half of a port that actually goes wrong: a direction inferred
+# correctly on the write path and wrongly on the read path, pageable staging
+# where pinned was intended, or a copy that has not landed when copy_blocking
+# returns. This needs a GPU but NOT a plot, so it is unaffected by the k=28
+# streaming non-determinism blocking byte-parity on this branch.
+add_executable(cuda_spill_ops_test tools/parity/cuda_spill_ops_test.cu
+                                   src/host/TempFile.cpp)
+target_include_directories(cuda_spill_ops_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(cuda_spill_ops_test PRIVATE cxx_std_20)
+target_link_libraries(cuda_spill_ops_test PRIVATE Threads::Threads)
+set_target_properties(cuda_spill_ops_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+
 # Group binaries under build/tools/...
 set_target_properties(xchplot2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/xchplot2")
 foreach(t aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench xs_parity xs_bench t1_parity t1_debug t2_parity t3_parity)
