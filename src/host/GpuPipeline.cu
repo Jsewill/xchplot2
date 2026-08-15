@@ -2185,6 +2185,100 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     debug_stage_hash("t1_match.mi_raw", d_t1_mi,
                      t1_count * sizeof(uint32_t), stream);
 
+    // ---- Deterministic T1 order (XCHPLOT2_DETERMINISTIC_T1=1) ----
+    //
+    // T1 match emits through a single global atomicAdd, so the SET of rows is
+    // fixed but their ORDER is not: the same plot_id lands the same rows at
+    // different indices from run to run. The T1 sort keys on mi alone, and mi
+    // HAS DUPLICATES, so equal-mi rows keep that arbitrary relative order and
+    // the meta gathered alongside them comes out permuted. T2 then matches over
+    // permuted meta and finds a slightly different number of pairs. That is the
+    // whole k=28 non-determinism (see 755d1dd).
+    //
+    // The fix does not require a deterministic match. meta is
+    // (x_l << k) | x_r, which is UNIQUE per emitted row, so (mi, meta) is a
+    // STRICT total order with no ties left to break. CUB's radix sort is
+    // STABLE, so ordering the input by meta and then sorting by mi yields
+    // exactly (mi, meta) — no comparator, no segmented sort.
+    //
+    // Cheap form: do NOT physically reorder meta. Sort (key=meta,
+    // value=identity) for the meta-order permutation and gather only the u32
+    // keys through it; the permutation then seeds the T1 sort's values in place
+    // of the identity, so the indices still point into the ORIGINAL meta array
+    // and every downstream gather is untouched.
+    //
+    // This must run HERE, not at the sort: Compact parks d_t1_meta on pinned
+    // host and FREES it before the sort phase, so by then the meta this needs
+    // is gone from the device.
+    static bool const deterministic_t1 = [] {
+        char const* v = std::getenv("XCHPLOT2_DETERMINISTIC_T1");
+        return v && v[0] == '1';
+    }();
+    uint32_t* d_t1_canon_perm = nullptr;   // rows in meta order; seeds the sort
+
+    if (deterministic_t1 && d_t1_meta && d_t1_mi && t1_count > 0) {
+        uint32_t* d_perm_alt = nullptr;
+        uint64_t* d_meta_a   = nullptr;    // scratch copies — the real
+        uint64_t* d_meta_b   = nullptr;    // d_t1_meta must NOT move
+        uint32_t* d_mi_perm  = nullptr;
+        s_malloc(stats, d_t1_canon_perm, cap * sizeof(uint32_t), "d_t1_canon_perm");
+        s_malloc(stats, d_perm_alt,      cap * sizeof(uint32_t), "d_t1_canon_perm_alt");
+        s_malloc(stats, d_meta_a,        cap * sizeof(uint64_t), "d_t1_canon_meta_a");
+        s_malloc(stats, d_meta_b,        cap * sizeof(uint64_t), "d_t1_canon_meta_b");
+        s_malloc(stats, d_mi_perm,       cap * sizeof(uint32_t), "d_t1_canon_mi");
+
+        init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_t1_canon_perm, t1_count);
+        CHECK(cudaGetLastError());
+
+        // 2*k bits is the full width of (x_l << k) | x_r. Sorting fewer would
+        // leave ties, which would put the non-determinism straight back.
+        int const meta_end_bit = (cfg.k * 2 > 64) ? 64 : cfg.k * 2;
+        size_t meta_sort_bytes = 0;
+        {
+            cub::DoubleBuffer<uint64_t> pk(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> pv(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, meta_sort_bytes, pk, pv, t1_count, 0, meta_end_bit, stream));
+        }
+        void* d_canon_scratch = nullptr;
+        s_malloc(stats, d_canon_scratch, meta_sort_bytes, "d_sort_scratch(t1_canon)");
+
+        CHECK(cudaMemcpyAsync(d_meta_a, d_t1_meta, t1_count * sizeof(uint64_t),
+                              cudaMemcpyDeviceToDevice, stream));
+        {
+            cub::DoubleBuffer<uint64_t> dk(d_meta_a, d_meta_b);
+            cub::DoubleBuffer<uint32_t> dv(d_t1_canon_perm, d_perm_alt);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                d_canon_scratch, meta_sort_bytes, dk, dv, t1_count,
+                0, meta_end_bit, stream));
+            if (dv.Current() != d_t1_canon_perm) {
+                CHECK(cudaMemcpyAsync(d_t1_canon_perm, dv.Current(),
+                                      t1_count * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+
+        // Keys follow the permutation. meta does NOT move — the permutation
+        // indexes it, and the T1 sort will carry those indices through.
+        gather_u32<<<blocks(t1_count), kThreads, 0, stream>>>(
+            d_t1_mi, d_t1_canon_perm, d_mi_perm, t1_count);
+        CHECK(cudaGetLastError());
+        CHECK(cudaMemcpyAsync(d_t1_mi, d_mi_perm, t1_count * sizeof(uint32_t),
+                              cudaMemcpyDeviceToDevice, stream));
+        CHECK(cudaStreamSynchronize(stream));
+
+        s_free(stats, d_canon_scratch);
+        s_free(stats, d_mi_perm);
+        s_free(stats, d_meta_b);
+        s_free(stats, d_meta_a);
+        s_free(stats, d_perm_alt);
+
+        debug_stage_hash("t1_canon.mi", d_t1_mi, t1_count * sizeof(uint32_t), stream);
+        debug_stage_hash("t1_canon.perm", d_t1_canon_perm,
+                         t1_count * sizeof(uint32_t), stream);
+    }
+
     if (scratch.h_meta && d_t1_meta) {
         CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
                               t1_count * sizeof(uint64_t),
@@ -2473,9 +2567,23 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_vals_out,     cap * sizeof(uint32_t), "d_vals_out");
         s_malloc(stats, d_sort_scratch, t1_sort_bytes,          "d_sort_scratch(t1)");
 
-        init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
-            d_vals_in, t1_count);
-        CHECK(cudaGetLastError());
+        // Seed the sort's values. Normally the identity; under
+        // XCHPLOT2_DETERMINISTIC_T1 the meta-order permutation computed back at
+        // T1 match, which is what turns this stable mi sort into a stable
+        // (mi, meta) sort. Compact frees d_t1_meta at the park before we get
+        // here, which is exactly why that work happens up there and only its
+        // permutation survives to this point.
+        if (d_t1_canon_perm) {
+            CHECK(cudaMemcpyAsync(d_vals_in, d_t1_canon_perm,
+                                  t1_count * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToDevice, stream));
+            CHECK(cudaStreamSynchronize(stream));
+            s_free(stats, d_t1_canon_perm);
+        } else {
+            init_u32_identity<<<blocks(t1_count), kThreads, 0, stream>>>(
+                d_vals_in, t1_count);
+            CHECK(cudaGetLastError());
+        }
 
         auto sort_t1_tile = [&](uint64_t off, uint64_t n) {
             if (n == 0) return;
@@ -2921,6 +3029,29 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                                       d_t2_match_temp, &t2_temp_bytes,
                                       stream));
 
+        // Scratch for the per-pass T2 canonicalisation below. Allocated once
+        // and reused across passes, and only when the flag is on — this sits
+        // inside T2 match, whose staging the streaming tiers exist to bound.
+        uint64_t* d_t2_canon_meta_a   = nullptr;
+        uint64_t* d_t2_canon_meta_b   = nullptr;   // doubles as the u32 gather temp
+        uint32_t* d_t2_canon_perm     = nullptr;
+        uint32_t* d_t2_canon_perm_alt = nullptr;
+        void*     d_t2_canon_scratch  = nullptr;
+        size_t    t2_canon_bytes      = 0;
+        int const t2_canon_end_bit    = (cfg.k * 2 > 64) ? 64 : cfg.k * 2;
+        if (deterministic_t1) {
+            cub::DoubleBuffer<uint64_t> pk(nullptr, nullptr);
+            cub::DoubleBuffer<uint32_t> pv(nullptr, nullptr);
+            CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, t2_canon_bytes, pk, pv, t2_tile_cap,
+                0, t2_canon_end_bit, stream));
+            s_malloc(stats, d_t2_canon_meta_a,   t2_tile_cap * sizeof(uint64_t), "d_t2_canon_a");
+            s_malloc(stats, d_t2_canon_meta_b,   t2_tile_cap * sizeof(uint64_t), "d_t2_canon_b");
+            s_malloc(stats, d_t2_canon_perm,     t2_tile_cap * sizeof(uint32_t), "d_t2_canon_perm");
+            s_malloc(stats, d_t2_canon_perm_alt, t2_tile_cap * sizeof(uint32_t), "d_t2_canon_perm_alt");
+            s_malloc(stats, d_t2_canon_scratch,  t2_canon_bytes, "d_sort_scratch(t2_canon)");
+        }
+
         auto run_pass = [&](uint32_t b_begin, uint32_t b_end,
                             uint64_t host_offset) -> uint64_t {
             CHECK(launch_t2_match_range(cfg.plot_id.data(), t2p,
@@ -2941,6 +3072,61 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     " pairs, staging holds " + std::to_string(t2_tile_cap) +
                     " (consider lower N or fall back to compact tier)");
             }
+            // Deterministic T2 order — the same defect as T1, one stage down.
+            // T2 match also emits through a global atomicAdd, so this pass's
+            // staged rows are the right SET in an arbitrary ORDER, and the T2
+            // sort keys on mi alone (duplicates, no tiebreak) so the permutation
+            // survives into T3.
+            //
+            // Canonicalising per PASS rather than over the whole table is both
+            // cheaper and sufficient: the passes cover disjoint, deterministic
+            // bucket ranges and append at deterministic offsets, so making each
+            // pass's block canonical makes the whole array canonical. It also
+            // has to be done here — by the T2 sort the meta lives on host and
+            // d_t2_meta is out of scope entirely.
+            //
+            // t2 meta is likewise unique per row, so sorting on it is a strict
+            // total order. All three staged arrays are permuted together, which
+            // is what keeps meta/mi/xbits describing the same row.
+            if (deterministic_t1 && pass_count > 0) {
+                cub::DoubleBuffer<uint64_t> dk(d_t2_canon_meta_a, d_t2_canon_meta_b);
+                cub::DoubleBuffer<uint32_t> dv(d_t2_canon_perm, d_t2_canon_perm_alt);
+                CHECK(cudaMemcpyAsync(d_t2_canon_meta_a, d_t2_meta_stage,
+                                      pass_count * sizeof(uint64_t),
+                                      cudaMemcpyDeviceToDevice, stream));
+                init_u32_identity<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_canon_perm, pass_count);
+                CHECK(cudaGetLastError());
+                CHECK(cub::DeviceRadixSort::SortPairs(
+                    d_t2_canon_scratch, t2_canon_bytes, dk, dv, pass_count,
+                    0, t2_canon_end_bit, stream));
+                uint32_t* const perm = dv.Current();
+
+                gather_u64<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_meta_stage, perm, d_t2_canon_meta_a, pass_count);
+                CHECK(cudaGetLastError());
+                CHECK(cudaMemcpyAsync(d_t2_meta_stage, d_t2_canon_meta_a,
+                                      pass_count * sizeof(uint64_t),
+                                      cudaMemcpyDeviceToDevice, stream));
+
+                uint32_t* const u32_tmp =
+                    reinterpret_cast<uint32_t*>(d_t2_canon_meta_b);
+                gather_u32<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_mi_stage, perm, u32_tmp, pass_count);
+                CHECK(cudaGetLastError());
+                CHECK(cudaMemcpyAsync(d_t2_mi_stage, u32_tmp,
+                                      pass_count * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToDevice, stream));
+
+                gather_u32<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_xbits_stage, perm, u32_tmp, pass_count);
+                CHECK(cudaGetLastError());
+                CHECK(cudaMemcpyAsync(d_t2_xbits_stage, u32_tmp,
+                                      pass_count * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToDevice, stream));
+                CHECK(cudaStreamSynchronize(stream));
+            }
+
             CHECK(cudaMemcpyAsync(h_t2_meta + host_offset, d_t2_meta_stage,
                                   pass_count * sizeof(uint64_t),
                                   cudaMemcpyDeviceToHost, stream));
@@ -2975,6 +3161,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             t2_count += run_pass(b_begin, b_end, /*host_offset=*/t2_count);
         }
         if (t2_count > cap) throw std::runtime_error("T2 overflow");
+
+        if (d_t2_canon_scratch)  s_free(stats, d_t2_canon_scratch);
+        if (d_t2_canon_perm_alt) s_free(stats, d_t2_canon_perm_alt);
+        if (d_t2_canon_perm)     s_free(stats, d_t2_canon_perm);
+        if (d_t2_canon_meta_b)   s_free(stats, d_t2_canon_meta_b);
+        if (d_t2_canon_meta_a)   s_free(stats, d_t2_canon_meta_a);
 
         s_free(stats, d_t2_match_temp);
         s_free(stats, d_t2_meta_stage);
@@ -3605,6 +3797,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     stats.phase = "T3 match";
     auto t3p = make_t3_params(cfg.k, cfg.strength);
     size_t t3_temp_bytes = 0;
+    // T3's entire input. If these are identical across runs but t3_count is
+    // not, T3 match turned identical input into different output; if they
+    // differ, the T2 stage is still handing T3 a permuted table.
+    debug_stage_hash("t3_in.t2_meta_sorted", d_t2_meta_sorted,
+                     t2_count * sizeof(uint64_t), stream);
+    debug_stage_hash("t3_in.t2_xbits_sorted", d_t2_xbits_sorted,
+                     t2_count * sizeof(uint32_t), stream);
+    debug_stage_hash("t3_in.t2_keys_merged", d_t2_keys_merged,
+                     t2_count * sizeof(uint32_t), stream);
     CHECK(launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           nullptr, t2_count,
@@ -3644,6 +3845,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     bool const t3_stage_path =
         !tiny_t3_match && !t3_input_slice_path &&
         scratch.t3_tile_count >= 2 && scratch.h_meta != nullptr;
+
+    // T3's entire input, before any T3 path runs. Identical here with a moving
+    // t3_count means T3 match turned identical input into different output;
+    // differing here means T2 is still handing T3 a permuted table.
+    debug_stage_hash("t3_in.t2_meta_sorted", d_t2_meta_sorted,
+                     t2_count * sizeof(uint64_t), stream);
+    debug_stage_hash("t3_in.t2_xbits_sorted", d_t2_xbits_sorted,
+                     t2_count * sizeof(uint32_t), stream);
 
     if (tiny_t3_match) {
         uint32_t const num_sections_t3   = 1u << t3p.num_section_bits;
