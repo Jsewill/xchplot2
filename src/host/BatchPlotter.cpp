@@ -2212,15 +2212,26 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 stream_scratch.spill.h_t2_xbits ||
                 [] { char const* v = std::getenv("XCHPLOT2_SPILL_T2XBITS");
                      return v && v[0] == '1'; }();
+            // h_meta is the big one — cap*8, 2.03 GiB at k=28 — and the
+            // pipeline routes all three of its Compact roles (T1 meta park, T2
+            // meta park, T3 accumulator) through one SpillBuffer each.
+            bool const spill_h_meta =
+                stream_scratch.spill.h_meta ||
+                [] { char const* v = std::getenv("XCHPLOT2_SPILL_HMETA");
+                     return v && v[0] == '1'; }();
             stream_scratch.spill.h_t2_xbits = spill_t2_xbits;
+            stream_scratch.spill.h_meta     = spill_h_meta;
             stream_scratch.quiet            = opts.quiet;
 
-            stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            stream_scratch.h_meta        = spill_h_meta
+                ? nullptr
+                : streaming_alloc_pinned_uint64(stream_pinned_cap);
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
             stream_scratch.h_t2_xbits    = spill_t2_xbits
                 ? nullptr
                 : streaming_alloc_pinned_uint32(stream_pinned_cap);
-            if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
+            if ((!spill_h_meta && !stream_scratch.h_meta) ||
+                !stream_scratch.h_keys_merged ||
                 (!spill_t2_xbits && !stream_scratch.h_t2_xbits))
             {
                 if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);

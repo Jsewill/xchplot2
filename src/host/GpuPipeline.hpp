@@ -219,7 +219,21 @@ struct StreamingPinnedScratch {
     struct SpillPlan {
         bool h_t2_xbits = false;   // ~cap*4 B, Compact only (DMA)
 
-        bool any() const { return h_t2_xbits; }
+        // ~cap*8 B, Compact only (DMA) — the big one. h_meta is a single
+        // allocation playing THREE roles in Compact, in sequence: the T1 meta
+        // park, then the T2 meta park, then the T3 pairing accumulator. (A
+        // fourth role, Xs staging via a u32 reinterpret, is gated on
+        // gather_tile_count >= 2 and so exists only in Minimal/Tiny.)
+        //
+        // Those roles are LIFETIME-DISJOINT, which is what makes this
+        // tractable: each gets its OWN SpillBuffer, created and destroyed at
+        // the role boundary. Fresh buffer means fresh SpillCoverage, so the
+        // "same range rewritten with different content" problem never arises
+        // and no coverage-epoch concept is needed. One shared SpillEngine
+        // serves all of them, so staging stays at 64 MiB.
+        bool h_meta = false;
+
+        bool any() const { return h_t2_xbits || h_meta; }
     };
     SpillPlan spill;
 

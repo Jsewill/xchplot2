@@ -1416,6 +1416,36 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // tier to a different code path instead of relocating the buffer.
     bool const have_t2_xbits = (scratch.h_t2_xbits != nullptr) || t2_xbits_spill;
 
+    // h_meta: one allocation, three lifetime-disjoint roles in Compact, so one
+    // SpillBuffer PER ROLE rather than per allocation. Each is created at its
+    // role's first write and released after its last read, which gives each a
+    // fresh SpillCoverage — that is what makes a buffer whose contents are
+    // rewritten three times per plot safe without any coverage-epoch machinery.
+    bool const want_h_meta_spill =
+        scratch.spill.h_meta ||
+        [] { char const* v = std::getenv("XCHPLOT2_SPILL_HMETA");
+             return v && v[0] == '1'; }();
+    if (want_h_meta_spill) {
+        if (scratch.tiny_mode)
+            throw std::runtime_error(
+                "spill(h_meta) is not supported in the Tiny tier: it feeds "
+                "h_meta to the streaming partition as USM-host and CPU-merges "
+                "through it");
+        if (scratch.gather_tile_count >= 2)
+            throw std::runtime_error(
+                "spill(h_meta) is not supported with a tiled gather (Minimal): "
+                "it also reuses h_meta for Xs staging and CPU-side merges");
+    }
+    std::unique_ptr<pos2gpu::SpillBuffer> t1_meta_spill;  // role 1: T1 meta park
+    std::unique_ptr<pos2gpu::SpillBuffer> t2_meta_spill;  // role 2: T2 meta park
+    std::unique_ptr<pos2gpu::SpillBuffer> t3_acc_spill;   // role 3: T3 accumulator
+    bool const have_h_meta = (scratch.h_meta != nullptr) || want_h_meta_spill;
+    if (want_h_meta_spill && !scratch.quiet) {
+        std::fprintf(stderr,
+            "[spill] h_meta -> disk (3 roles: T1 meta, T2 meta, T3 acc; "
+            "cap %.2f GiB each)\n", cap * sizeof(uint64_t) / 1073741824.0);
+    }
+
     StreamingStats stats;
     s_init_from_env(stats);
     s_pool_reset_highwater();
@@ -2279,10 +2309,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                          t1_count * sizeof(uint32_t), stream);
     }
 
-    if (scratch.h_meta && d_t1_meta) {
-        CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
-                              t1_count * sizeof(uint64_t),
-                              cudaMemcpyDeviceToHost, stream));
+    if (have_h_meta && d_t1_meta) {
+        // Role 1 of 3: the T1 meta park. Released after the rehydrate below,
+        // so its coverage never outlives the role.
+        if (want_h_meta_spill) {
+            t1_meta_spill = std::make_unique<pos2gpu::SpillBuffer>(
+                ensure_spill_engine(), sizeof(uint64_t), cap);
+            t1_meta_spill->write_from_device(d_t1_meta, 0, t1_count);
+        } else {
+            CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
+                                  t1_count * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, stream));
+        }
         s_free(stats, d_t1_meta);
         d_t1_meta = nullptr;
     }
@@ -2634,11 +2672,21 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // Tiny skips the JIT-H2D: scratch.h_meta already holds SORTED meta
     // (Phase 1.3c-ii streaming partition + per-bucket sort produced
     // sorted (key, meta) pairs in scratch.h_keys_merged + scratch.h_meta).
-    if (scratch.h_meta && !scratch.tiny_mode) {
+    if (have_h_meta && !scratch.tiny_mode) {
         s_malloc(stats, d_t1_meta, cap * sizeof(uint64_t), "d_t1_meta");
-        CHECK(cudaMemcpyAsync(d_t1_meta, scratch.h_meta,
-                              t1_count * sizeof(uint64_t),
-                              cudaMemcpyHostToDevice, stream));
+        if (t1_meta_spill) {
+            // drain() first: the park above is a DEFERRED write, so reading
+            // without it would race the engine's own staging window.
+            t1_meta_spill->drain();
+            t1_meta_spill->read_to_device(d_t1_meta, 0, t1_count);
+            // Role 1 is over — release it here so its temp file and coverage
+            // do not outlive the role they describe.
+            t1_meta_spill.reset();
+        } else {
+            CHECK(cudaMemcpyAsync(d_t1_meta, scratch.h_meta,
+                                  t1_count * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream));
+        }
     }
 
     uint64_t* d_t1_meta_sorted = nullptr;
@@ -2730,7 +2778,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     uint32_t* d_t2_xbits = nullptr;
     void*     d_t2_match_temp = nullptr;
     uint64_t  t2_count   = 0;
-    bool const t2_compact_path = (scratch.h_meta != nullptr &&
+    bool const t2_compact_path = (have_h_meta &&
                                   have_t2_xbits &&
                                   !scratch.tiny_mode);
     bool const tiny_t2_match = scratch.tiny_mode;
@@ -3010,6 +3058,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // after hydrating into d_t2_mi before T2 sort.
         uint64_t* const h_t2_meta  = scratch.h_meta;
         uint32_t* const h_t2_xbits = scratch.h_t2_xbits;
+        // Role 2 of 3: the T2 meta park. Role 1's buffer was already released
+        // at the T1 rehydrate, so this is a fresh SpillBuffer with fresh
+        // coverage over the same logical allocation.
+        if (want_h_meta_spill) {
+            t2_meta_spill = std::make_unique<pos2gpu::SpillBuffer>(
+                ensure_spill_engine(), sizeof(uint64_t), cap);
+        }
         uint32_t* h_t2_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_mi) throw std::runtime_error("pinned alloc for h_t2_mi failed");
 
@@ -3127,9 +3182,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 CHECK(cudaStreamSynchronize(stream));
             }
 
-            CHECK(cudaMemcpyAsync(h_t2_meta + host_offset, d_t2_meta_stage,
-                                  pass_count * sizeof(uint64_t),
-                                  cudaMemcpyDeviceToHost, stream));
+            if (t2_meta_spill) {
+                t2_meta_spill->write_from_device(d_t2_meta_stage,
+                                                 host_offset, pass_count);
+            } else {
+                CHECK(cudaMemcpyAsync(h_t2_meta + host_offset, d_t2_meta_stage,
+                                      pass_count * sizeof(uint64_t),
+                                      cudaMemcpyDeviceToHost, stream));
+            }
             CHECK(cudaMemcpyAsync(h_t2_mi + host_offset, d_t2_mi_stage,
                                   pass_count * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost, stream));
@@ -3756,11 +3816,17 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                               cudaMemcpyHostToDevice, stream));
     } else if (!scratch.tiny_mode) {
         // Compact-streaming: JIT H2D d_t2_meta back for gather_u64.
-        if (scratch.h_meta) {
+        if (have_h_meta) {
             s_malloc(stats, d_t2_meta, cap * sizeof(uint64_t), "d_t2_meta");
-            CHECK(cudaMemcpyAsync(d_t2_meta, scratch.h_meta,
-                                  t2_count * sizeof(uint64_t),
-                                  cudaMemcpyHostToDevice, stream));
+            if (t2_meta_spill) {
+                t2_meta_spill->drain();
+                t2_meta_spill->read_to_device(d_t2_meta, 0, t2_count);
+                t2_meta_spill.reset();   // role 2 over
+            } else {
+                CHECK(cudaMemcpyAsync(d_t2_meta, scratch.h_meta,
+                                      t2_count * sizeof(uint64_t),
+                                      cudaMemcpyHostToDevice, stream));
+            }
         }
 
         s_malloc(stats, d_t2_meta_sorted, cap * sizeof(uint64_t), "d_t2_meta_sorted");
@@ -3844,7 +3910,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     bool const t3_stage_path =
         !tiny_t3_match && !t3_input_slice_path &&
-        scratch.t3_tile_count >= 2 && scratch.h_meta != nullptr;
+        scratch.t3_tile_count >= 2 && have_h_meta;
 
     // T3's entire input, before any T3 path runs. Identical here with a moving
     // t3_count means T3 match turned identical input into different output;
@@ -4286,6 +4352,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         // for any trivially-copyable POD of compatible alignment.
         T3PairingGpu* const h_t3 =
             reinterpret_cast<T3PairingGpu*>(scratch.h_meta);
+        // Role 3 of 3: the T3 pairing accumulator. T3PairingGpu is 8 bytes, so
+        // this is the same cap*8 extent as the two meta parks before it, and
+        // role 2's buffer was released at the T2 rehydrate.
+        if (want_h_meta_spill) {
+            t3_acc_spill = std::make_unique<pos2gpu::SpillBuffer>(
+                ensure_spill_engine(), sizeof(T3PairingGpu), cap);
+        }
 
         CHECK(launch_t3_match_prepare(cfg.plot_id.data(), t3p,
                                       d_t2_keys_merged, t2_count,
@@ -4316,9 +4389,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                     " pairs, staging holds " + std::to_string(t3_tile_cap) +
                     " (consider lower t3_tile_count)");
             }
-            CHECK(cudaMemcpyAsync(h_t3 + t3_count, d_t3_stage,
-                                  pass_count * sizeof(T3PairingGpu),
-                                  cudaMemcpyDeviceToHost, stream));
+            if (t3_acc_spill) {
+                t3_acc_spill->write_from_device(d_t3_stage, t3_count, pass_count);
+            } else {
+                CHECK(cudaMemcpyAsync(h_t3 + t3_count, d_t3_stage,
+                                      pass_count * sizeof(T3PairingGpu),
+                                      cudaMemcpyDeviceToHost, stream));
+            }
             CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
             CHECK(cudaStreamSynchronize(stream));
             t3_count += pass_count;
@@ -4334,9 +4411,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t2_keys_merged);
 
         s_malloc(stats, d_t3, cap * sizeof(T3PairingGpu), "d_t3");
-        CHECK(cudaMemcpyAsync(d_t3, h_t3,
-                              t3_count * sizeof(T3PairingGpu),
-                              cudaMemcpyHostToDevice, stream));
+        if (t3_acc_spill) {
+            t3_acc_spill->drain();
+            t3_acc_spill->read_to_device(d_t3, 0, t3_count);
+            t3_acc_spill.reset();   // role 3 over; h_meta is now dead entirely
+        } else {
+            CHECK(cudaMemcpyAsync(d_t3, h_t3,
+                                  t3_count * sizeof(T3PairingGpu),
+                                  cudaMemcpyHostToDevice, stream));
+        }
         CHECK(cudaStreamSynchronize(stream));
     } else if (!tiny_t3_match) {
         s_malloc(stats, d_t3,            cap * sizeof(T3PairingGpu), "d_t3");
