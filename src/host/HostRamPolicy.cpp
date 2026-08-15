@@ -50,21 +50,37 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
     //
     // `passes` is per-table temp-dir traffic, accumulated only for the tables
     // this plan actually routes — a table left pinned costs no disk I/O.
+    // `mmap_class` tables leave the UNSWAPPABLE class (the kernel writes those
+    // pages back and evicts them under pressure) but stay resident while there
+    // is no pressure, so they are counted in `reclaimable` and carry NO
+    // modelled temp-dir traffic — the writeback schedule is the kernel's, and a
+    // fixed per-plot figure would be a guess dressed as a measurement.
     auto consider = [&](uint64_t table, bool available, bool& bit,
-                        Passes passes) {
+                        Passes passes, bool mmap_class = false) {
         if (!available) return;
         routable_total += table;
         if (B == 0 || est > B) {
             bit = true;
             est -= std::min(table, est);
             out.spilled_bytes  += table;
-            out.traffic_written += uint64_t(passes.writes) * table;
-            out.traffic_read    += uint64_t(passes.reads)  * table;
+            if (mmap_class) {
+                out.reclaimable += table;
+            } else {
+                out.traffic_written += uint64_t(passes.writes) * table;
+                out.traffic_read    += uint64_t(passes.reads)  * table;
+            }
         }
     };
 
+    // Compact routes through the engine; Minimal takes the same tables as
+    // mappings. They are mutually exclusive by construction — a tier is one or
+    // the other — so the largest-first walk sees each table exactly once.
     consider(table8, in.tier_compact, out.tables.h_meta,     kMetaPasses);
     consider(table4, in.tier_compact, out.tables.h_t2_xbits, kXbitsPasses);
+    consider(table8, in.tier_minimal, out.mmap_h_meta,
+             Passes{0, 0}, /*mmap_class=*/true);
+    consider(table4, in.tier_minimal, out.mmap_h_t2_xbits,
+             Passes{0, 0}, /*mmap_class=*/true);
 
     // Drain slots are the LAST resort, deliberately. Spilling a table costs
     // disk I/O per plot; giving up a drain slot costs producer/consumer

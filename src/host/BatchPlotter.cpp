@@ -1851,6 +1851,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     int num_pinned_slots = GpuBufferPool::kNumPinnedBuffers;
     int const forced_drain_slots = drain_slots_env();      // 0 when unset
     if (forced_drain_slots) num_pinned_slots = forced_drain_slots;
+    // Minimal's half of the disk-offload: these two tables become MAP_SHARED
+    // file mappings rather than pinned allocations. Set by the budget policy
+    // below and consumed at the allocation site; the TempFiles are owned here
+    // so the mappings outlive every plot in the slice.
+    bool mmap_h_meta = false, mmap_h_t2_xbits = false;
+    std::unique_ptr<TempFile> h_meta_map_file, h_t2_xbits_map_file;
     // Tiered streaming scratch. Populated only if the compact tier is
     // selected — see the VRAM dispatch at the end of the catch block.
     StreamingPinnedScratch stream_scratch{};
@@ -2149,6 +2155,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     pin.budget         = budget_is_min
                         ? 0 : opts.max_host_ram_bytes;
                     pin.tier_compact   = (tier == Tier::Compact);
+                    pin.tier_minimal   = (tier == Tier::Minimal);
                     pin.pinned_slots   = num_pinned_slots;
                     pin.forced_slots   = (forced_drain_slots != 0);
                     pin.baseline_slots = GpuBufferPool::kNumPinnedBuffers;
@@ -2168,21 +2175,29 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     if (sp.meets_budget || opts.max_host_ram_bytes > 0) {
                         stream_scratch.spill = sp.tables;
                         num_pinned_slots     = sp.pinned_slots;
-                        if (sp.tables.any() || sp.drain_freed) {
+                        mmap_h_meta          = sp.mmap_h_meta;
+                        mmap_h_t2_xbits      = sp.mmap_h_t2_xbits;
+                        bool const any_mmap =
+                            sp.mmap_h_meta || sp.mmap_h_t2_xbits;
+                        if (sp.tables.any() || any_mmap || sp.drain_freed) {
                             std::fprintf(stderr,
                                 "%s host-RAM budget: modelled peak %.2f -> "
-                                "%.2f GiB (floor %.2f) — %s%s%s%d drain slot%s; "
-                                "~%.2f GiB temp-dir traffic per plot "
-                                "(%.2f W / %.2f R)\n",
+                                "%.2f GiB (floor %.2f) — %s%s%s%s%s%s%d drain "
+                                "slot%s; ~%.2f GiB temp-dir traffic per plot "
+                                "(%.2f W / %.2f R), %.2f GiB reclaimable\n",
                                 log_prefix.c_str(), gib(host_required),
                                 gib(sp.resident), gib(sp.floor_bytes),
                                 sp.tables.h_meta ? "h_meta " : "",
                                 sp.tables.h_t2_xbits ? "h_t2_xbits " : "",
                                 sp.tables.any() ? "-> disk, " : "",
+                                sp.mmap_h_meta ? "h_meta " : "",
+                                sp.mmap_h_t2_xbits ? "h_t2_xbits " : "",
+                                any_mmap ? "-> mmap, " : "",
                                 sp.pinned_slots,
                                 sp.pinned_slots == 1 ? "" : "s",
                                 gib(sp.traffic_written + sp.traffic_read),
-                                gib(sp.traffic_written), gib(sp.traffic_read));
+                                gib(sp.traffic_written), gib(sp.traffic_read),
+                                gib(sp.reclaimable));
                         }
                         if (!sp.meets_budget) {
                             char m2[512];
@@ -2309,20 +2324,41 @@ host_ram_ok:;
             stream_scratch.spill.h_meta     = spill_h_meta;
             stream_scratch.quiet            = opts.quiet;
 
-            stream_scratch.h_meta        = spill_h_meta
-                ? nullptr
-                : streaming_alloc_pinned_uint64(stream_pinned_cap);
+            // Three ways a table can be backed now: pinned (the default),
+            // absent because the pipeline routes it through a SpillBuffer
+            // (Compact), or a MAP_SHARED file mapping (Minimal). The mapping is
+            // just a host pointer, so nothing downstream changes — CPU indexing
+            // and cudaMemcpyAsync both work on it.
+            //
+            // NB the saving from a mapping does NOT show in ru_maxrss on a box
+            // with free RAM: the pages stay resident until something needs the
+            // memory. That is the point — they are RECLAIMABLE, not absent —
+            // but it means this arm has to be judged on a host under pressure,
+            // not on a 125 GiB dev box.
+            if (mmap_h_meta) {
+                h_meta_map_file = std::make_unique<TempFile>();
+                stream_scratch.h_meta = static_cast<std::uint64_t*>(
+                    h_meta_map_file->map(stream_pinned_cap * sizeof(std::uint64_t)));
+            } else if (!spill_h_meta) {
+                stream_scratch.h_meta = streaming_alloc_pinned_uint64(stream_pinned_cap);
+            }
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
-            stream_scratch.h_t2_xbits    = spill_t2_xbits
-                ? nullptr
-                : streaming_alloc_pinned_uint32(stream_pinned_cap);
+            if (mmap_h_t2_xbits) {
+                h_t2_xbits_map_file = std::make_unique<TempFile>();
+                stream_scratch.h_t2_xbits = static_cast<std::uint32_t*>(
+                    h_t2_xbits_map_file->map(stream_pinned_cap * sizeof(std::uint32_t)));
+            } else if (!spill_t2_xbits) {
+                stream_scratch.h_t2_xbits = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            }
             if ((!spill_h_meta && !stream_scratch.h_meta) ||
                 !stream_scratch.h_keys_merged ||
                 (!spill_t2_xbits && !stream_scratch.h_t2_xbits))
             {
-                if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+                if (stream_scratch.h_meta && !mmap_h_meta)
+                    streaming_free_pinned_uint64(stream_scratch.h_meta);
                 if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
-                if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+                if (stream_scratch.h_t2_xbits && !mmap_h_t2_xbits)
+                    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
                 for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                     if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
                 }
@@ -2403,9 +2439,11 @@ host_ram_ok:;
             for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                 if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
             }
-            if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
+            if (stream_scratch.h_meta && !mmap_h_meta)
+                    streaming_free_pinned_uint64(stream_scratch.h_meta);
             if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);
-            if (stream_scratch.h_t2_xbits)    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
+            if (stream_scratch.h_t2_xbits && !mmap_h_t2_xbits)
+                    streaming_free_pinned_uint32(stream_scratch.h_t2_xbits);
             throw std::runtime_error(
                 log_prefix + " card too small for k=" + std::to_string(pool_k) +
                 " streaming at any tier: " +

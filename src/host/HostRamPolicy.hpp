@@ -53,6 +53,21 @@ struct HostRamSpillInputs {
     // table here for a tier that cannot take it is a bug, not a no-op.
     bool tier_compact = false;
 
+    // Minimal takes the SAME two tables by a different mechanism. It touches
+    // them from the CPU — the tiled T1 gather merges through h_t2_xbits by
+    // direct indexing and h_meta doubles as Xs staging — which a sequential
+    // device<->disk SpillBuffer cannot serve. But it never hands either to a
+    // kernel as a dereferenceable pointer: every device access is a plain
+    // cudaMemcpyAsync, which works on pageable memory. So Minimal gets the
+    // MMAP class instead: a MAP_SHARED TempFile mapping, where CPU indexing
+    // works unchanged and the pages are RECLAIMABLE under pressure rather than
+    // pinned.
+    //
+    // Tiny gets neither, and that is not an oversight. It hands h_meta to the
+    // streaming partition as USM-HOST — the GPU dereferences it in place — and
+    // a file mapping is not device-accessible. Same wall the SYCL branch hit.
+    bool tier_minimal = false;
+
     // D2H drain slots to start from, and whether the user pinned that count
     // themselves (XCHPLOT2_DRAIN_SLOTS). A forced count is honoured even when
     // it leaves the budget unmet — the user's explicit number outranks the
@@ -69,7 +84,18 @@ struct HostRamSpillInputs {
 };
 
 struct HostRamSpillPlan {
+    // Tables the PIPELINE routes through a SpillBuffer (Compact only). These
+    // must stay clear for any other tier: the pipeline throws on a spill
+    // request it cannot service, deliberately, rather than silently returning a
+    // plot missing a table.
     StreamingPinnedScratch::SpillPlan tables;
+
+    // Tables the CALLER should allocate as a MAP_SHARED TempFile mapping
+    // instead of pinned host memory (Minimal only). The pipeline never learns
+    // about these — a mapping is just a host pointer, so every CPU index and
+    // every cudaMemcpyAsync in that path works unchanged.
+    bool mmap_h_meta     = false;
+    bool mmap_h_t2_xbits = false;
 
     int pinned_slots = 0;        // slots left after the walk
 
