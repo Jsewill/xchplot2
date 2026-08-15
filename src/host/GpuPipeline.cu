@@ -574,6 +574,44 @@ inline void s_free(StreamingStats& s, T*& ptr)
     ptr = nullptr;
 }
 
+// XCHPLOT2_DEBUG_STAGE_HASH=1 — order-sensitive checkpoint hash of a device
+// range, printed with a label.
+//
+// This exists to bisect run-to-run non-determinism, which end-to-end plot
+// hashing cannot localise: a plot hash tells you the run differed, not WHERE it
+// first differed. Comparing the same label across two processes says whether a
+// stage's input was already different (look upstream) or whether that stage
+// turned identical input into different output (look here).
+//
+// Order-sensitive on purpose — mixing the index in means a pure PERMUTATION of
+// equal keys shows up as a different hash, which is exactly the failure mode
+// suspected here and which a commutative checksum would hide.
+//
+// Off by default and free when off: no allocation, no copy, no sync.
+inline void debug_stage_hash(char const* label, void const* d_ptr,
+                             uint64_t bytes, cudaStream_t stream)
+{
+    static bool const on = [] {
+        char const* v = std::getenv("XCHPLOT2_DEBUG_STAGE_HASH");
+        return v && v[0] == '1';
+    }();
+    if (!on || !d_ptr || !bytes) return;
+
+    std::vector<uint8_t> host(bytes);
+    if (cudaMemcpyAsync(host.data(), d_ptr, bytes, cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) return;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return;
+
+    uint64_t h = 1469598103934665603ull;             // FNV-1a offset basis
+    uint64_t const* w = reinterpret_cast<uint64_t const*>(host.data());
+    uint64_t const  n = bytes / sizeof(uint64_t);
+    for (uint64_t i = 0; i < n; ++i) {
+        h = (h ^ (w[i] + i)) * 1099511628211ull;     // + i => order-sensitive
+    }
+    std::fprintf(stderr, "[stage-hash] %-22s bytes=%-12llu h=%016llx\n",
+                 label, (unsigned long long)bytes, (unsigned long long)h);
+}
+
 // Pairwise merge tree over n_tiles sorted runs whose boundaries are
 // tile_ends[0..n_tiles]. Merges within a level cover disjoint output
 // ranges, so they run concurrently — the GPU is idle during these
@@ -2081,6 +2119,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // the T1 sort live set by ~2 GB at k=28. No-op when scratch.h_meta
     // is nullptr (plain streaming) OR when cut #4 (tiled_t1_match)
     // wrote h_meta directly per-pass (d_t1_meta is null).
+    // Straight out of T1 match, BEFORE the sort and before the compact park.
+    // Non-determinism here means T1 match itself emitted its rows in a
+    // different order (it claims output slots with atomics); non-determinism
+    // that appears only downstream of this means the sort or the park
+    // introduced it.
+    debug_stage_hash("t1_match.meta_raw", d_t1_meta,
+                     t1_count * sizeof(uint64_t), stream);
+    debug_stage_hash("t1_match.mi_raw", d_t1_mi,
+                     t1_count * sizeof(uint32_t), stream);
+
     if (scratch.h_meta && d_t1_meta) {
         CHECK(cudaMemcpyAsync(scratch.h_meta, d_t1_meta,
                               t1_count * sizeof(uint64_t),
@@ -2800,6 +2848,16 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         uint32_t* const h_t2_xbits = scratch.h_t2_xbits;
         uint32_t* h_t2_mi = s_alloc_pinned_u32(stats, cap);
         if (!h_t2_mi) throw std::runtime_error("pinned alloc for h_t2_mi failed");
+
+        // T2's entire input, hashed before a single T2 kernel runs. If these
+        // two are identical across runs but t2_count is not, T2 match turns
+        // identical input into different output and the fault is below this
+        // line; if they already differ, T1 sort / the compact park handed T2
+        // different data and the fault is above it.
+        debug_stage_hash("t2_in.t1_meta_sorted", d_t1_meta_sorted,
+                         t1_count * sizeof(uint64_t), stream);
+        debug_stage_hash("t2_in.t1_keys_merged", d_t1_keys_merged,
+                         t1_count * sizeof(uint32_t), stream);
 
         CHECK(launch_t2_match_prepare(cfg.plot_id.data(), t2p,
                                       d_t1_keys_merged, t1_count,
