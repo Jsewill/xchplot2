@@ -153,6 +153,25 @@ __global__ void gather_u32(uint32_t const* __restrict__ src,
     dst[p] = src[indices[p]];
 }
 
+// key[i] = (hi[i] << 32) | lo[i] — packs two u32 columns into one u64 sort key.
+//
+// For the T2 canonicalisation. T2's meta is a MASKED HASH OUTPUT, not a row
+// identifier, so unlike T1's (x_l << k) | x_r it is NOT unique: sorting on it
+// alone leaves ties, and those ties fall back to the arbitrary atomicAdd
+// emission order, which is the bug. Packing (mi, xbits) here and then sorting
+// by meta gives the full (meta, mi, xbits) triple. Two rows agreeing on all
+// three carry identical downstream data — meta, mi and xbits are ALL that
+// propagates from T2 — so they are interchangeable and their relative order
+// cannot affect the plot.
+__global__ void pack_u32_pair_to_u64(uint32_t const* __restrict__ hi,
+                                     uint32_t const* __restrict__ lo,
+                                     uint64_t* __restrict__ dst, uint64_t count)
+{
+    uint64_t p = blockIdx.x * uint64_t(blockDim.x) + threadIdx.x;
+    if (p >= count) return;
+    dst[p] = (uint64_t(hi[p]) << 32) | uint64_t(lo[p]);
+}
+
 
 
 // =====================================================================
@@ -3144,19 +3163,44 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             // total order. All three staged arrays are permuted together, which
             // is what keeps meta/mi/xbits describing the same row.
             if (deterministic_t1 && pass_count > 0) {
-                cub::DoubleBuffer<uint64_t> dk(d_t2_canon_meta_a, d_t2_canon_meta_b);
-                cub::DoubleBuffer<uint32_t> dv(d_t2_canon_perm, d_t2_canon_perm_alt);
-                CHECK(cudaMemcpyAsync(d_t2_canon_meta_a, d_t2_meta_stage,
-                                      pass_count * sizeof(uint64_t),
-                                      cudaMemcpyDeviceToDevice, stream));
+                // PASS A (least significant): (mi, xbits) packed into one u64.
+                pack_u32_pair_to_u64<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_mi_stage, d_t2_xbits_stage, d_t2_canon_meta_a, pass_count);
+                CHECK(cudaGetLastError());
                 init_u32_identity<<<blocks(pass_count), kThreads, 0, stream>>>(
                     d_t2_canon_perm, pass_count);
                 CHECK(cudaGetLastError());
-                CHECK(cub::DeviceRadixSort::SortPairs(
-                    d_t2_canon_scratch, t2_canon_bytes, dk, dv, pass_count,
-                    0, t2_canon_end_bit, stream));
-                uint32_t* const perm = dv.Current();
+                uint32_t* perm = nullptr;
+                {
+                    cub::DoubleBuffer<uint64_t> dk(d_t2_canon_meta_a, d_t2_canon_meta_b);
+                    cub::DoubleBuffer<uint32_t> dv(d_t2_canon_perm, d_t2_canon_perm_alt);
+                    CHECK(cub::DeviceRadixSort::SortPairs(
+                        d_t2_canon_scratch, t2_canon_bytes, dk, dv, pass_count,
+                        0, 64, stream));
+                    perm = dv.Current();
+                }
 
+                // PASS B (most significant): meta, gathered through pass A's
+                // permutation. A STABLE sort leaves rows of equal meta in
+                // (mi, xbits) order, so the result is the full
+                // (meta, mi, xbits) lexicographic order — a TOTAL one, which
+                // sorting on meta alone was not.
+                gather_u64<<<blocks(pass_count), kThreads, 0, stream>>>(
+                    d_t2_meta_stage, perm, d_t2_canon_meta_a, pass_count);
+                CHECK(cudaGetLastError());
+                {
+                    uint32_t* const other = (perm == d_t2_canon_perm)
+                        ? d_t2_canon_perm_alt : d_t2_canon_perm;
+                    cub::DoubleBuffer<uint64_t> dk(d_t2_canon_meta_a, d_t2_canon_meta_b);
+                    cub::DoubleBuffer<uint32_t> dv(perm, other);
+                    CHECK(cub::DeviceRadixSort::SortPairs(
+                        d_t2_canon_scratch, t2_canon_bytes, dk, dv, pass_count,
+                        0, t2_canon_end_bit, stream));
+                    perm = dv.Current();
+                }
+
+                // Apply it to all three staged arrays together — that is what
+                // keeps meta/mi/xbits describing the same row.
                 gather_u64<<<blocks(pass_count), kThreads, 0, stream>>>(
                     d_t2_meta_stage, perm, d_t2_canon_meta_a, pass_count);
                 CHECK(cudaGetLastError());
