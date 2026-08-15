@@ -349,6 +349,12 @@ add_library(pos2_gpu_host STATIC
     src/host/NumaTopology.cpp
     src/host/Cancel.cpp
     src/host/ConfigFile.cpp
+    # GpuPipeline.cu's spill path calls into TempFile, and GpuPipeline.cu lands
+    # in xchplot2_cli via $<TARGET_OBJECTS:pos2_gpu_cuda_obj>, which links this
+    # library — so the definitions have to be reachable from here or the
+    # executable fails to link. The standalone spill tests compile TempFile.cpp
+    # directly and do NOT link pos2_gpu_host, so this is not a duplicate.
+    src/host/TempFile.cpp
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)

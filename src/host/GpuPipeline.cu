@@ -12,6 +12,8 @@
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/CudaSpillHostOps.hpp"   // SpillHostOps over cudaHostAlloc/cudaMemcpy
+#include "host/SpillEngine.hpp"        // SpillEngine / SpillBuffer — see header
 
 #include "gpu/AesGpu.cuh"
 #include "gpu/XsKernel.cuh"
@@ -1360,6 +1362,60 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     cudaStream_t stream = nullptr;  // default stream
 
+    // ---- Host-RAM disk-offload ----
+    //
+    // Declared at function scope so the engine outlives every SpillBuffer:
+    // these are destroyed in reverse, so each buffer drains its own pending
+    // I/O while the engine's worker pool is still alive.
+    //
+    // Compact only, and enforced rather than assumed. Minimal's tiled T1
+    // gather and Tiny's T2 sort gather both touch h_t2_xbits from the CPU
+    // (the latter at random positions), which a sequential device<->disk
+    // SpillBuffer cannot serve. Silently ignoring the request there would
+    // hand back a plot that is quietly missing a table's worth of data, so
+    // it throws instead.
+    bool const want_t2_xbits_spill =
+        scratch.spill.h_t2_xbits ||
+        [] { char const* v = std::getenv("XCHPLOT2_SPILL_T2XBITS");
+             return v && v[0] == '1'; }();
+    if (want_t2_xbits_spill) {
+        if (scratch.tiny_mode)
+            throw std::runtime_error(
+                "spill(h_t2_xbits) is not supported in the Tiny tier: its T2 "
+                "sort gather reads h_t2_xbits at random host positions");
+        if (scratch.gather_tile_count >= 2)
+            throw std::runtime_error(
+                "spill(h_t2_xbits) is not supported with a tiled gather "
+                "(Minimal): its T1 sort merge indexes h_t2_xbits on the host");
+    }
+    pos2gpu::CudaSpillHostOps            spill_ops{stream};
+    std::unique_ptr<pos2gpu::SpillEngine> spill_engine;
+    std::unique_ptr<pos2gpu::SpillBuffer> t2_xbits_spill;
+    auto ensure_spill_engine = [&]() -> pos2gpu::SpillEngine& {
+        if (!spill_engine)
+            spill_engine = std::make_unique<pos2gpu::SpillEngine>(
+                spill_ops, scratch.quiet);
+        return *spill_engine;
+    };
+    if (want_t2_xbits_spill) {
+        t2_xbits_spill = std::make_unique<pos2gpu::SpillBuffer>(
+            ensure_spill_engine(), sizeof(uint32_t), cap);
+        if (!scratch.quiet) {
+            std::fprintf(stderr,
+                "[spill] h_t2_xbits -> disk %s (shared staging %llu MiB in %d "
+                "windows, cap %.2f GiB)\n",
+                t2_xbits_spill->file.path().c_str(),
+                (unsigned long long)(pos2gpu::SpillEngine::kNumWindows *
+                    pos2gpu::SpillEngine::kStageBytes / 1048576),
+                pos2gpu::SpillEngine::kNumWindows,
+                cap * sizeof(uint32_t) / 1073741824.0);
+        }
+    }
+    // Every tier guard that asks "do I have an h_t2_xbits slot?" must answer
+    // yes when the table lives on disk, or the spill would silently demote the
+    // tier to a different code path instead of relocating the buffer.
+    bool const have_t2_xbits = (scratch.h_t2_xbits != nullptr) || t2_xbits_spill;
+
     StreamingStats stats;
     s_init_from_env(stats);
     s_pool_reset_highwater();
@@ -2567,7 +2623,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     void*     d_t2_match_temp = nullptr;
     uint64_t  t2_count   = 0;
     bool const t2_compact_path = (scratch.h_meta != nullptr &&
-                                  scratch.h_t2_xbits != nullptr &&
+                                  have_t2_xbits &&
                                   !scratch.tiny_mode);
     bool const tiny_t2_match = scratch.tiny_mode;
 
@@ -2891,9 +2947,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             CHECK(cudaMemcpyAsync(h_t2_mi + host_offset, d_t2_mi_stage,
                                   pass_count * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost, stream));
-            CHECK(cudaMemcpyAsync(h_t2_xbits + host_offset, d_t2_xbits_stage,
-                                  pass_count * sizeof(uint32_t),
-                                  cudaMemcpyDeviceToHost, stream));
+            if (t2_xbits_spill) {
+                // Straight from the staging buffer to the temp file, through
+                // the engine's shared windows. Appends at this pass's entry
+                // offset, so the on-disk layout matches the pinned one the
+                // read below expects.
+                t2_xbits_spill->write_from_device(d_t2_xbits_stage,
+                                                  host_offset, pass_count);
+            } else {
+                CHECK(cudaMemcpyAsync(h_t2_xbits + host_offset, d_t2_xbits_stage,
+                                      pass_count * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToHost, stream));
+            }
             // Reset counter so the next pass writes at index 0 of the
             // tile-cap staging buffers.
             CHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
@@ -3513,7 +3578,15 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_t2_meta);
 
         // Compact-streaming: JIT H2D d_t2_xbits back for gather_u32.
-        if (scratch.h_t2_xbits) {
+        if (t2_xbits_spill) {
+            s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
+            // drain() first: the T2-match appends above are DEFERRED writes,
+            // so without this the read races its own data and SpillCoverage
+            // would see the range as written while the bytes were still in a
+            // staging window.
+            t2_xbits_spill->drain();
+            t2_xbits_spill->read_to_device(d_t2_xbits, 0, t2_count);
+        } else if (scratch.h_t2_xbits) {
             s_malloc(stats, d_t2_xbits, cap * sizeof(uint32_t), "d_t2_xbits");
             CHECK(cudaMemcpyAsync(d_t2_xbits, scratch.h_t2_xbits,
                                   t2_count * sizeof(uint32_t),

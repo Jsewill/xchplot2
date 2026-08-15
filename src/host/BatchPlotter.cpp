@@ -2202,11 +2202,26 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // target. Minimal additionally sets t2_tile_count = 8 (vs
             // compact's default 2) so T2 match staging shrinks from
             // ~2.3 GB to ~570 MB.
+            // Host-RAM disk-offload: when h_t2_xbits is routed to a temp dir
+            // the pipeline services every access through its SpillBuffer, so
+            // the cap-sized pinned buffer must NOT be allocated — allocating
+            // it anyway would route correctly and save nothing, which is the
+            // whole point of the feature. Compact only; the pipeline throws on
+            // the tiers that would CPU-touch the table.
+            bool const spill_t2_xbits =
+                stream_scratch.spill.h_t2_xbits ||
+                [] { char const* v = std::getenv("XCHPLOT2_SPILL_T2XBITS");
+                     return v && v[0] == '1'; }();
+            stream_scratch.spill.h_t2_xbits = spill_t2_xbits;
+            stream_scratch.quiet            = opts.quiet;
+
             stream_scratch.h_meta        = streaming_alloc_pinned_uint64(stream_pinned_cap);
             stream_scratch.h_keys_merged = streaming_alloc_pinned_uint32(stream_pinned_cap);
-            stream_scratch.h_t2_xbits    = streaming_alloc_pinned_uint32(stream_pinned_cap);
+            stream_scratch.h_t2_xbits    = spill_t2_xbits
+                ? nullptr
+                : streaming_alloc_pinned_uint32(stream_pinned_cap);
             if (!stream_scratch.h_meta || !stream_scratch.h_keys_merged ||
-                !stream_scratch.h_t2_xbits)
+                (!spill_t2_xbits && !stream_scratch.h_t2_xbits))
             {
                 if (stream_scratch.h_meta)        streaming_free_pinned_uint64(stream_scratch.h_meta);
                 if (stream_scratch.h_keys_merged) streaming_free_pinned_uint32(stream_scratch.h_keys_merged);

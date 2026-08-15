@@ -188,6 +188,43 @@ struct StreamingPinnedScratch {
     // allowed to cache up to the whole budget (correct only on a card with room
     // to spare). See s_init_budget in GpuPipeline.cu.
     uint64_t expected_peak_bytes = 0;
+
+    // ---- Host-RAM disk-offload (see host/SpillEngine.hpp) ----
+    //
+    // Which full-cap host tables to redirect to a temp dir instead of pinned
+    // RAM. All false (the default) is no spill and is byte-identical to the
+    // historical all-pinned path.
+    //
+    // Only h_t2_xbits so far, and only in Compact, which is a deliberate floor
+    // rather than a stopping point:
+    //
+    //   - h_meta is NOT here because on this branch it is ONE allocation
+    //     playing four roles in sequence — T1 meta, then T2 meta, then the T3
+    //     accumulator, then Xs staging via a u32 reinterpret. main spills its
+    //     equivalents as four INDEPENDENT tables with disjoint access phases;
+    //     that shape does not exist here, and choosing between splitting the
+    //     buffer (which raises the un-spilled peak) and spilling it whole
+    //     (which needs a per-phase coverage epoch the engine does not have) is
+    //     an open design question, not a transcription.
+    //
+    //   - Minimal and Tiny touch h_t2_xbits from the CPU: Minimal's tiled T1
+    //     gather merges through it by direct indexing, and Tiny's T2 sort
+    //     gather reads h_t2_xbits[orig_idx] at RANDOM positions. A SpillBuffer
+    //     serves sequential device<->disk ranges; a random-access host read
+    //     needs the mmap class instead. Compact touches it only through
+    //     sequential cudaMemcpyAsync — one append per T2 match pass, one full
+    //     read before T2 sort — which is precisely what the engine is for.
+    //     run_gpu_pipeline_streaming THROWS rather than silently ignoring a
+    //     spill request on a tier that would CPU-touch the table.
+    struct SpillPlan {
+        bool h_t2_xbits = false;   // ~cap*4 B, Compact only (DMA)
+
+        bool any() const { return h_t2_xbits; }
+    };
+    SpillPlan spill;
+
+    // Suppress the pipeline's per-plot [spill] chatter (BatchOptions::quiet).
+    bool quiet = false;
 };
 
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
