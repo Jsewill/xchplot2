@@ -372,7 +372,19 @@ void resolve_host_ram_env(pos2gpu::BatchOptions& o)
     if (o.max_host_ram_bytes != 0) return;   // --max-host-ram wins
     if (char const* v = std::getenv("XCHPLOT2_MAX_HOST_RAM"); v && v[0]) {
         std::uint64_t b = 0;
-        if (parse_host_ram_arg(v, b)) o.max_host_ram_bytes = b;
+        if (parse_host_ram_arg(v, b)) {
+            o.max_host_ram_bytes = b;
+        } else {
+            // Do NOT fail the run over an env var — but do not swallow it
+            // either. Silently ignoring this leaves the user believing they
+            // capped the host peak, and the first sign otherwise is the OOM
+            // the cap existed to prevent. The flag form exits 1 here; the env
+            // form warns and plots uncapped.
+            std::fprintf(stderr,
+                "WARNING: XCHPLOT2_MAX_HOST_RAM='%s' is not a valid size "
+                "(want 8G / 8GiB / 8192M / a byte count / 'min') — IGNORED, "
+                "running with no host-RAM cap.\n", v);
+        }
     }
 }
 
