@@ -70,7 +70,11 @@ prereqs (Windows SDK, `LIB` setup, LNK1181 troubleshooting).
   copy; check `cat /sys/bus/pci/devices/*/current_link_width`
   under load if throughput looks off.
 - **Host RAM:** ≥ 16 GB recommended; `batch` mode pins ~4 GB of host
-  memory for D2H double-buffering (pool or streaming).
+  memory for D2H double-buffering (pool or streaming). The streaming
+  tiers need considerably more, and *inversely* to VRAM — `tiny` is the
+  hungriest, not the leanest. A host short of RAM for its tier routes
+  cold tables to disk and plots anyway; see [Host RAM and
+  disk-offload](#host-ram-and-disk-offload).
 - **CUDA Toolkit:** 12+ required to build (tested on 13.x). The
   toolkit-vs-arch matrix:
   - `sm_50` – `sm_72` (Maxwell / Pascal / Volta): need CUDA **12.9**
@@ -296,6 +300,11 @@ xchplot2 plot -k 28 -n 10 \
 Pool variants: `-p <pool-pk>` or `--pool-ph <pool-ph>`. Other common
 flags: `-s <strength>`, `-T` testnet, `-S <seed>` for reproducible runs,
 `-v` verbose. Full help: `xchplot2 -h`.
+
+On a host that is short of RAM for the tier its GPU lands on, add
+`--temp-dir <path>` to choose where the automatic disk-offload writes
+(`--max-host-ram` to bound it explicitly, `--no-auto-spill` to turn it
+off) — see [Host RAM and disk-offload](#host-ram-and-disk-offload).
 
 #### Per-worker rates and the batch size that lands them together
 
@@ -632,6 +641,11 @@ xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression
 |-------------------------------|-------------------------------------------------------------------------|
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny` | Override the streaming-tier auto-pick (k=28 working sets / free-VRAM floors: plain 7290/7546 MB, compact 5200/5456, minimal 3640/3896, tiny 1064/1320). Equivalent CLI flag: `--tier`. Either form forces the streaming pipeline even on cards big enough to fit the pool, so `--tier tiny` works on a 4090 too. |
+| `XCHPLOT2_MAX_HOST_RAM=8G\|min` | Cap the streaming path's unswappable host peak by routing its cold tables to the temp dir. Equivalent CLI flag: `--max-host-ram`, which wins if both are set. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
+| `XCHPLOT2_TEMP_DIR=/path`     | Where routed tables live. Equivalent CLI flag: `--temp-dir`. Must be real disk — a RAM-backed dir is refused, since spilling there consumes the RAM the budget exists to cap. |
+| `XCHPLOT2_NO_AUTO_SPILL=1`    | Refuse to plot when the tier does not fit host RAM, instead of routing tables automatically. Equivalent CLI flag: `--no-auto-spill`. |
+| `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` | Downgrade the RAM-backed-temp-dir refusal to a warning, for the rare disk-backed `/tmp`. The reported host-RAM budget does not account for what the spill then writes into RAM. |
+| `XCHPLOT2_DRAIN_SLOTS=N`      | Pin the D2H drain slot count (1..3) instead of letting the host-RAM policy choose. Fewer slots cost producer/consumer overlap across plots. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback. Only caps what the *picker* sees; real allocation still succeeds on a big card, so it cannot validate that a tier fits. To rehearse a smaller card for real, hold the VRAM with a ballast process. |
 | `POS2GPU_VRAM_MARGIN_MB=N`    | Free VRAM the pool's gate leaves unclaimed. Default 128 MB. This is headroom against *other tenants* on the card, not an allowance for our own unmodelled allocations (the pooled path has none) — raise it if the GPU also drives a desktop, leave it alone on a headless rig. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path allocation, plus the CUDA memory pool's physical high-water and the plot's VRAM budget. The pool reserves more than it hands out — size a tier from the physical number, not the logical one. |
@@ -807,6 +821,119 @@ round up into.
 
 Plot output is bit-identical across all paths — streaming
 reorganises memory, not algorithms.
+
+## Host RAM and disk-offload
+
+The streaming tiers buy VRAM **with** host RAM, so the ladder runs
+backwards from what you would expect: `plain` needs the least host RAM
+and `tiny` the most. A small card therefore fails in a way that has
+nothing to do with the card — the tier fits the GPU, and then the box
+runs out of RAM.
+
+xchplot2 models each tier's host peak and checks it before allocating
+anything. When the tier does not fit, it **spills the cold tables to a
+temp dir and plots anyway** — the alternative is refusing outright, so
+this is on by default. It cannot slow down a run that already works:
+nothing spills unless the run would otherwise have been rejected.
+
+```bash
+# Nothing to do — this is the default. A host that is short on RAM
+# spills, announces it, and plots.
+xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-address>
+
+# Put the spill somewhere specific — real disk, and fast (see below).
+xchplot2 plot ... --temp-dir /mnt/nvme/xchplot2-spill
+
+# Cap the unswappable host peak yourself. Accepts 8G / 8GiB / 8192M /
+# raw bytes, or `min` for "route everything this tier can".
+xchplot2 plot ... --max-host-ram 8G
+xchplot2 plot ... --max-host-ram min
+
+# Prefer a clear refusal over a slower plot.
+xchplot2 plot ... --no-auto-spill
+```
+
+All three work on `plot`, `batch`, and `bench`. `XCHPLOT2_MAX_HOST_RAM`
+and `XCHPLOT2_NO_AUTO_SPILL=1` are env equivalents; the flag wins.
+
+What gets routed, in order, largest first — and only as far as the
+budget requires:
+
+1. `h_meta`, the 8-byte cap-sized table. It is **three** lifetime-disjoint
+   roles (the T1 meta park, the T2 meta park, and the T3 pairing
+   accumulator), each given its own buffer, so it crosses the temp dir
+   three times per direction per plot rather than once;
+2. `h_t2_xbits`, the 4-byte table — written during T2 match, read back
+   once before the T2 sort gather;
+3. the D2H drain slots, 3 → 1, **last**. Routing a table costs disk I/O
+   per plot; a drain slot costs producer/consumer overlap across plots,
+   which is the more expensive of the two in a batch.
+
+Measured at k=28 compact on an RTX 4090, one plot per rung — every rung
+produces a byte-identical plot (`sha256[:20] = 9e020867acd59d31164d`):
+
+| routed | host peak |
+|---|---:|
+| nothing | 11.29 GiB |
+| `h_meta` | 9.32 GiB |
+| + `h_t2_xbits` | 8.30 GiB |
+| + drain 3 → 1 (`--max-host-ram min`) | **4.24 GiB** |
+
+That is **2.66× less host RAM for the same plot**. The wall cost at the
+bottom rung, same card, temp dir on NVMe: **9.71 → 13.94 s/plot, ~44%**.
+4.24 GiB is the floor of this mechanism at k=28 — below it the remaining
+buffers are ones a GPU kernel writes directly through a device-visible
+pointer, which cannot live in a file.
+
+**Tier support is not uniform**, because what a tier does to a table
+decides whether the table can leave RAM at all:
+
+| tier | how tables are routed | k=28 peak, `min` |
+|---|---|---:|
+| `plain` | drain slots only — it parks nothing | — |
+| `compact` | both tables through the spill engine, to disk | 12.44 → 5.33 GiB |
+| `minimal` | both tables as file-backed **mappings** | 13.46 → 6.35 GiB |
+| `tiny` | drain slots only — no table can leave RAM | 14.47 → 10.41 GiB |
+
+`minimal` CPU-touches both tables, so they cannot go through the engine
+— but a `MAP_SHARED` mapping serves CPU indexing and `cudaMemcpyAsync`
+equally well. Those bytes leave the *unswappable* class (the kernel can
+write them back and evict them under pressure) but stay resident while
+there is no pressure, so they are reported as `reclaimable` (3.05 GiB at
+k=28) and carry no modelled temp-dir traffic. `tiny` hands the same
+buffers to kernels as USM-host, which a mapping cannot be, so only the
+drain-slot lever is available to it — which is the tier that needs the
+help most, and the honest answer is that this mechanism does not reach
+it.
+
+Notes:
+
+- **The temp dir must be real disk.** `/tmp` is tmpfs on most systemd
+  distributions, i.e. RAM — spilling there consumes the memory the budget
+  exists to bound, and it defeats the mapping route just as thoroughly
+  (a `MAP_SHARED` mapping over a tmpfs file is anonymous memory with
+  extra steps). xchplot2 refuses a RAM-backed temp dir: an explicit
+  `--max-host-ram` throws, and the automatic rescue stands down and says
+  so in the out-of-RAM message rather than trading one confusing error
+  for another. Override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` for the rare
+  disk-backed `/tmp`. `--temp-dir` is also checked up front — exists,
+  writable, and usable — so a mistyped path fails before the batch starts
+  instead of minutes in.
+- **Budget ~7.1 GiB of free space** for compact at k=28: three `h_meta`
+  files of 2.03 GiB plus one `h_t2_xbits` of 1.02 GiB. That is per
+  *worker* — each GPU in a multi-GPU run spills into its own files, so
+  size the dir for the number of cards you are plotting with.
+- **The temp dir sees more traffic than "one write, one read"**, because
+  `h_meta` is three roles. At k=28 compact with everything routed, each
+  plot moves **14.0 GiB (7.0 written, 7.0 read)**. Every run reports its
+  own figure on the `[spill] this plot:` line, so you never have to trust
+  this number for your own configuration. The **writes** column is what
+  sizes a drive's endurance: at 100 plots/day that is ~0.68 TiB/day,
+  which consumes a 600 TB TBW rating in a little over two years. Point
+  `--temp-dir` at something you are willing to wear out.
+- Files are unlinked at creation, so a crash cannot leave them behind,
+  and each is `fallocate`d as it is created — a disk that fills anyway
+  fails at once with its size rather than part-way through a table.
 
 ## Performance
 
