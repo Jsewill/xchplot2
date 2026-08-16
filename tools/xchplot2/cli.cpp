@@ -63,6 +63,7 @@ void print_usage(char const* prog)
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [--progress|--no-progress] [--devices SPEC]\n"
+        << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
         << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
@@ -70,12 +71,14 @@ void print_usage(char const* prog)
         << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
         << "         [--tier T] [--cpu] [--cpu-workers N] [--warmup W] [--keep] [-T|--testnet]\n"
         << "         [--target-size TiB] [--compute-only] [-q|--quiet]\n"
+        << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
         << "    synthetic unfarmable plots (default: 1 warmup + 10 measured\n"
         << "    plots/worker). Writes real .plot2 files unless --keep is set;\n"
         << "    deletes them on exit by default.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
         << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
+        << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
         << "    -f, --farmer-pk HEX             : 96 hex chars (48 B G1 public key).\n"
@@ -176,6 +179,34 @@ void print_usage(char const* prog)
         << "                                        auto    = pick largest that fits\n"
         << "                                      Equivalent to XCHPLOT2_STREAMING_TIER\n"
         << "                                      env var; CLI flag wins if both set.\n"
+        << "    --max-host-ram 8G|8192M|<bytes>|min\n"
+        << "                                    : cap the streaming path's UNSWAPPABLE\n"
+        << "                                      host footprint. Routes the large cold\n"
+        << "                                      tables (h_meta, then h_t2_xbits)\n"
+        << "                                      largest-first until the modelled\n"
+        << "                                      resident peak fits, then gives up\n"
+        << "                                      pinned drain slots. compact routes\n"
+        << "                                      them through a --temp-dir file;\n"
+        << "                                      minimal maps them instead (they leave\n"
+        << "                                      the unswappable class but cost no\n"
+        << "                                      temp-dir I/O); tiny is not supported\n"
+        << "                                      and asking for it is an error.\n"
+        << "                                      'min' = route everything routable and\n"
+        << "                                      keep one drain slot (lowest floor).\n"
+        << "                                      Unset = route only if the tier does\n"
+        << "                                      not fit host RAM at all (see\n"
+        << "                                      --no-auto-spill). Env:\n"
+        << "                                      XCHPLOT2_MAX_HOST_RAM (flag wins).\n"
+        << "    --temp-dir PATH                 : where spilled tables live (sets\n"
+        << "                                      XCHPLOT2_TEMP_DIR). Prefer fast NVMe,\n"
+        << "                                      and one you are willing to wear out.\n"
+        << "    --no-auto-spill                 : refuse to plot when the tier does not\n"
+        << "                                      fit host RAM, instead of spilling to\n"
+        << "                                      --temp-dir automatically. Auto only\n"
+        << "                                      fires where the run would otherwise\n"
+        << "                                      be a hard error, so it never slows a\n"
+        << "                                      run that already works. Env:\n"
+        << "                                      XCHPLOT2_NO_AUTO_SPILL=1.\n"
         << "  " << prog << " parity-check [--dir PATH]\n"
         << "    Run every *_parity binary in PATH (default: ./build/tools/parity)\n"
         << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
@@ -319,6 +350,30 @@ bool parse_host_ram_arg(std::string const& s, std::uint64_t& out)
     if (v > (~0ull) / mult) return false;          // overflow
     out = std::uint64_t(v) * mult;
     return true;
+}
+
+// Apply the XCHPLOT2_MAX_HOST_RAM / XCHPLOT2_NO_AUTO_SPILL env fallbacks for
+// the flags that were not passed on the command line. The flag always wins.
+//
+// The budget lives in ONE field: 0 == not set, 1 == "min", anything else == a
+// byte count. So "did the flag already set this?" is exactly `!= 0` — there is
+// no separate has_ bit to consult, and an env value of 0 is unrepresentable
+// (parse_host_ram_arg rejects it) rather than silently meaning "unset".
+void resolve_host_ram_env(pos2gpu::BatchOptions& o)
+{
+    // Read the auto-spill switch first and unconditionally: it is meaningful
+    // with or without an explicit budget, so an early return on the budget
+    // must not skip it.
+    if (char const* v = std::getenv("XCHPLOT2_NO_AUTO_SPILL"); v && v[0]) {
+        std::string const s = v;
+        if (s == "1" || s == "true" || s == "yes" || s == "on")
+            o.no_auto_spill = true;
+    }
+    if (o.max_host_ram_bytes != 0) return;   // --max-host-ram wins
+    if (char const* v = std::getenv("XCHPLOT2_MAX_HOST_RAM"); v && v[0]) {
+        std::uint64_t b = 0;
+        if (parse_host_ram_arg(v, b)) o.max_host_ram_bytes = b;
+    }
 }
 
 bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
@@ -1044,6 +1099,7 @@ BenchMeasurement run_bench_pass(
     pos2gpu::BatchOptions run_opts = opts;
     run_opts.progress = !opts.quiet;
     run_opts.skip_existing = false;
+    resolve_host_ram_env(run_opts);
     try {
         auto const res = pos2gpu::run_batch(entries, run_opts);
         if (res.plots_written == 0) {
@@ -1777,6 +1833,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             return 1;
         }
         opts.progress = resolve_progress(progress_tri, opts.quiet);
+        resolve_host_ram_env(opts);
         try {
             auto entries = pos2gpu::parse_manifest(manifest);
             if (!opts.quiet) {
@@ -1891,6 +1948,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string plot_streaming_tier;
         std::map<int, std::string> plot_per_device_tier;
         std::string plot_all_gpus_tier;
+        std::uint64_t plot_max_host_ram = 0;   // 0 unset, 1 "min" (BatchOptions')
+        std::string   plot_temp_dir;
+        bool          plot_no_auto_spill = false;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -1946,6 +2006,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     return 1;
                 }
                 plot_streaming_tier = (t == "auto") ? "" : t;
+            }
+            else if  (a == "--max-host-ram" && need(1)) {
+                if (!parse_host_ram_arg(argv[++i], plot_max_host_ram)) {
+                    std::cerr << "Error: --max-host-ram expects a size like "
+                                 "'8G', '8GiB', '8192M', a byte count, or 'min' "
+                                 "(got '" << argv[i] << "')\n";
+                    return 1;
+                }
+            }
+            else if  (a == "--temp-dir" && need(1)) {
+                plot_temp_dir = argv[++i];
+            }
+            else if  (a == "--no-auto-spill") {
+                plot_no_auto_spill = true;
             }
             else if  (a == "--devices" && need(1)) {
                 pos2gpu::BatchOptions tmp;
@@ -2135,6 +2209,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.streaming_tier   = plot_streaming_tier;
             opts.per_device_tier  = plot_per_device_tier;
             opts.all_gpus_tier    = plot_all_gpus_tier;
+            opts.max_host_ram_bytes = plot_max_host_ram;
+            opts.temp_dir         = plot_temp_dir;
+            opts.no_auto_spill    = plot_no_auto_spill;
+            resolve_host_ram_env(opts);
             auto res = pos2gpu::run_batch(entries, opts);
             if (!plot_quiet) print_run_summary("[plot]", res);
             // stdout path listing is the machine-readable result — kept
@@ -2177,6 +2255,8 @@ _xchplot2() {
         --tier)            COMPREPLY=( $(compgen -W "${tiers}" -- "$cur") ); return 0 ;;
         --devices)         COMPREPLY=( $(compgen -W "${devices_tokens}" -- "$cur") ); return 0 ;;
         -o|--out)          COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        --temp-dir)        COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        --max-host-ram)    COMPREPLY=( $(compgen -W "min 4G 8G 16G 32G" -- "$cur") ); return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
         completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
     esac
@@ -2185,7 +2265,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --config --max-host-ram --temp-dir --no-auto-spill -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -2216,6 +2296,9 @@ _xchplot2() {
         '--cpu[Add CPU worker]' \
         '--cpu-workers[CPU plots to run concurrently: auto|max|N|off (default auto, RAM-gated)]:count:(auto max off)' \
         '--shard-plot[Single-plot multi-GPU]' \
+        '--max-host-ram[Cap the unswappable host peak]:size:(min 4G 8G 16G 32G)' \
+        '--temp-dir[Where spilled tables live]:dir:_files -/' \
+        '--no-auto-spill[Refuse rather than spill when host RAM is short]' \
         '-o[Output dir]:dir:_files -/' \
         '*:: :->args'
 }
@@ -2242,6 +2325,9 @@ complete -c xchplot2 -s q -l quiet -d 'Quiet — suppress info-level output'
 complete -c xchplot2 -s v -l verbose -d 'Verbose'
 complete -c xchplot2 -l cpu       -d 'Add CPU worker'
 complete -c xchplot2 -l shard-plot -d 'Single-plot multi-GPU (experimental)'
+complete -c xchplot2 -l max-host-ram -x -a 'min 4G 8G 16G 32G'              -d 'Cap the unswappable host peak'
+complete -c xchplot2 -l temp-dir  -r -F                                     -d 'Where spilled tables live'
+complete -c xchplot2 -l no-auto-spill -d 'Refuse rather than spill when host RAM is short'
 complete -c xchplot2 -s o -l out  -r -d 'Output dir'
 complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
 )";
