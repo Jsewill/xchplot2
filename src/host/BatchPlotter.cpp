@@ -575,7 +575,18 @@ inline int drain_slots_env()
     char const* v = std::getenv("XCHPLOT2_DRAIN_SLOTS");
     if (!v || !v[0]) return 0;
     int const parsed = std::atoi(v);
-    if (parsed < 1 || parsed > GpuBufferPool::kNumPinnedBuffers) return 0;
+    if (parsed < 1 || parsed > GpuBufferPool::kNumPinnedBuffers) {
+        // Out of range falls back to the policy's choice rather than failing
+        // the run — but say so. Silently ignoring it means someone pinning the
+        // slot count for a measurement gets the policy's number instead and
+        // reads it as their own, which quietly invalidates the measurement.
+        // atoi also yields 0 for non-numeric input, so this covers typos too.
+        std::fprintf(stderr,
+            "WARNING: XCHPLOT2_DRAIN_SLOTS='%s' is out of range (want 1..%d) "
+            "— IGNORED, letting the host-RAM policy choose.\n",
+            v, GpuBufferPool::kNumPinnedBuffers);
+        return 0;
+    }
     return parsed;
 }
 
@@ -2157,11 +2168,44 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // means this rescue is unavailable. Record why and let the
                 // host-RAM guard below deliver the verdict with that clause
                 // attached, so they get both facts at once.
-                bool        ram_dir_blocked_auto = false;
-                std::string ram_dir_path;
+                // Empty unless the automatic rescue stood down; holds the
+                // reason clause verbatim so the refusal below can state WHICH
+                // problem it was rather than assuming tmpfs.
+                std::string spill_stood_down;
                 if (want_policy) {
                     std::string const spill_dir = TempFile::resolve_dir("");
-                    if (TempFile::dir_is_ram_backed(spill_dir)) {
+
+                    // Validate the RESOLVED dir, not just opts.temp_dir.
+                    // run_batch checks the --temp-dir form up front, but the
+                    // XCHPLOT2_TEMP_DIR form reaches TempFile without ever
+                    // passing through opts, so a bad path there used to sail
+                    // past both this guard (dir_is_ram_backed answers false
+                    // for anything it cannot statfs) and the up-front check,
+                    // then die on a raw mkstemp errno naming no setting —
+                    // after the budget line had already promised the traffic.
+                    // Checked HERE rather than unconditionally in run_batch so
+                    // a host with an unwritable /tmp that never spills is not
+                    // refused for a temp dir it was never going to use.
+                    std::string const problem = TempFile::dir_problem(spill_dir);
+                    if (!problem.empty()) {
+                        if (opts.max_host_ram_bytes > 0) {
+                            throw std::runtime_error(
+                                "--max-host-ram is set but the spill temp dir '"
+                                + spill_dir + "' is unusable: " + problem +
+                                ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at a "
+                                "writable directory on real disk.");
+                        }
+                        // Auto: same stance as the tmpfs case below — the user
+                        // asked for a plot, not a spill.
+                        want_policy      = false;
+                        spill_stood_down =
+                            " The automatic disk-offload could have covered "
+                            "this, but stood down because the temp dir '" +
+                            spill_dir + "' is unusable: " + problem +
+                            ". Point --temp-dir at a writable directory on "
+                            "real disk to enable it.";
+                    }
+                    else if (TempFile::dir_is_ram_backed(spill_dir)) {
                         char const* ov =
                             std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
                         std::string const ovs = ov ? ov : "";
@@ -2185,9 +2229,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                                 "XCHPLOT2_ALLOW_RAM_TEMP_DIR=1 if this path "
                                 "really is disk-backed.");
                         } else {
-                            want_policy          = false;
-                            ram_dir_blocked_auto = true;
-                            ram_dir_path         = spill_dir;
+                            want_policy      = false;
+                            spill_stood_down =
+                                " The automatic disk-offload could have "
+                                "covered this, but stood down because the temp "
+                                "dir '" + spill_dir + "' is on a RAM-backed "
+                                "filesystem (tmpfs) — spilling there would "
+                                "consume the RAM it is trying to save. Point "
+                                "--temp-dir at real disk to enable it.";
                         }
                     }
                 }
@@ -2272,17 +2321,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     // did not, or the user reads a plain out-of-RAM refusal on
                     // a build that advertises a disk-offload and concludes the
                     // feature is broken rather than misconfigured.
-                    char ramdir[512] = {0};
-                    if (ram_dir_blocked_auto) {
-                        std::snprintf(ramdir, sizeof(ramdir),
-                            " The automatic disk-offload could have covered "
-                            "this, but stood down because the temp dir '%s' is "
-                            "on a RAM-backed filesystem (tmpfs) — spilling "
-                            "there would consume the RAM it is trying to save. "
-                            "Point --temp-dir at real disk to enable it.",
-                            ram_dir_path.c_str());
-                    }
-                    char msg[1600];
+                    char msg[2048];
                     std::snprintf(msg, sizeof(msg),
                         "%s streaming tier %s needs ~%.2f GiB of HOST RAM at "
                         "k=%d plus a %.2f GiB reserve; host reports %.2f GiB "
@@ -2296,7 +2335,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         gib(host_required), pool_k, gib(host_reserve),
                         gib(host_free), gib(host_total),
                         gib(streaming_plain_host_bytes(pool_k)),
-                        gib(streaming_tiny_host_bytes(pool_k)), ramdir);
+                        gib(streaming_tiny_host_bytes(pool_k)),
+                        spill_stood_down.c_str());
                     throw std::runtime_error(msg);
                 }
 host_ram_ok:;
@@ -2525,22 +2565,40 @@ host_ram_ok:;
     // work-queue mode the peer workers keep running, so ~6-12 GB of
     // leaked pinned host memory would starve their allocations long
     // before process exit.
+    //
+    // The mmap flags are not optional here. A mapped table is owned by its
+    // TempFile, not by cudaHostAlloc, and cudaFreeHost() on it returns
+    // cudaErrorInvalidValue — which nothing checks, so it SITS IN THE STICKY
+    // ERROR SLOT until the next cudaGetLastError() reads it. That next reader
+    // is the first post-launch CHECK of whatever runs after, so a two-pass
+    // `bench --compute-only` on Minimal failed with "CUDA: invalid argument"
+    // in a pass that had done nothing wrong. Every other free site already
+    // guards on these; this one is reached on the success path, which is why
+    // it was the one that mattered.
     struct StreamBuffersGuard {
         uint64_t** pinned;
         StreamingPinnedScratch* scratch;
+        bool mmap_meta;
+        bool mmap_xbits;
         ~StreamBuffersGuard() {
             for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
                 if (pinned[s]) streaming_free_pinned_uint64(pinned[s]);
                 pinned[s] = nullptr;
             }
-            if (scratch->h_meta)        streaming_free_pinned_uint64(scratch->h_meta);
+            if (scratch->h_meta && !mmap_meta)
+                streaming_free_pinned_uint64(scratch->h_meta);
             if (scratch->h_keys_merged) streaming_free_pinned_uint32(scratch->h_keys_merged);
-            if (scratch->h_t2_xbits)    streaming_free_pinned_uint32(scratch->h_t2_xbits);
+            if (scratch->h_t2_xbits && !mmap_xbits)
+                streaming_free_pinned_uint32(scratch->h_t2_xbits);
+            // Cleared either way: the mapping's owner is the TempFile, which
+            // unmaps it after this guard runs (declared earlier, destroyed
+            // later), so dropping the alias here is correct, not a leak.
             scratch->h_meta = nullptr;
             scratch->h_keys_merged = nullptr;
             scratch->h_t2_xbits = nullptr;
         }
-    } stream_buffers_guard{stream_pinned, &stream_scratch};
+    } stream_buffers_guard{stream_pinned, &stream_scratch,
+                           mmap_h_meta, mmap_h_t2_xbits};
 
     if (verbose && pool_ptr) {
         double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
