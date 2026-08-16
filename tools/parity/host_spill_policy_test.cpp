@@ -174,6 +174,49 @@ int main()
                  "spilled_bytes counts each table's extent once, not per pass");
     }
 
+    // ---- disk_extent: what the temp dir must HOLD, not what RAM got back ----
+    //
+    // These two numbers diverge and the gap is the whole point. h_meta gives
+    // back ONE table's worth of host RAM but occupies THREE files, because
+    // Compact gives each role its own SpillBuffer and each is fallocate'd to
+    // the full extent. A free-space check sized from spilled_bytes under-books
+    // by 2x kTable8 (~4.06 GiB at k=28) and admits a temp dir that cannot hold
+    // the spill — which then fails on the second role, mid-plot.
+    {
+        auto const p = plan_host_ram_spill(base(0));
+        check_eq(p.disk_extent, 3ull * kTable8 + 1ull * kTable4,
+                 "disk_extent: h_meta occupies 3 files, xbits 1");
+        check(p.disk_extent > p.spilled_bytes,
+              "disk_extent exceeds spilled_bytes — different questions");
+        check_eq(p.disk_extent - p.spilled_bytes, 2ull * kTable8,
+                 "the gap is exactly the two extra h_meta role files");
+    }
+
+    // Minimal maps each table ONCE (a mapping is the buffer for every use), so
+    // its disk footprint is 1x per table even though the table is the same
+    // size. Same extent, different file count, because the ROUTE differs.
+    {
+        auto in = base(0);
+        in.tier_compact = false;
+        in.tier_minimal = true;
+        auto const p = plan_host_ram_spill(in);
+        check(p.mmap_h_meta && p.mmap_h_t2_xbits, "minimal: both mapped");
+        check_eq(p.disk_extent, kTable8 + kTable4,
+                 "minimal: one file per table, not three");
+        check_eq(p.traffic_written, 0, "minimal: mappings make no modelled I/O");
+    }
+
+    // A tier that routes nothing needs no temp dir at all — the caller keys the
+    // whole free-space check off disk_extent being non-zero, so a stray count
+    // here would demand space for a spill that never happens.
+    {
+        auto in = base(0);
+        in.tier_compact = false;
+        in.tier_minimal = false;
+        auto const p = plan_host_ram_spill(in);
+        check_eq(p.disk_extent, 0, "plain/tiny: no tables routed, no disk used");
+    }
+
     // ---- small k must not saturate into nonsense ----
     {
         auto in = base(0);

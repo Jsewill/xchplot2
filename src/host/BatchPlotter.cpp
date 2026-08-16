@@ -2268,11 +2268,58 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
 
                     HostRamSpillPlan const sp = plan_host_ram_spill(pin);
 
+                    // Does the temp dir have room for the WHOLE spill? Every
+                    // file is fallocate'd at construction, so a dir that is too
+                    // small does fail — but per table, once the plot is already
+                    // running, and only for whichever table happened to be
+                    // built first. Summing here turns "died on the second
+                    // h_meta role at 3 GiB free" into a refusal before any work.
+                    //
+                    // sp.disk_extent, NOT sp.spilled_bytes: h_meta occupies
+                    // three files in Compact and spilled_bytes counts it once.
+                    //
+                    // free_space() answers 0 when statvfs cannot, which is
+                    // "unknown", not "full" — fall through and let the
+                    // per-table fallocate be the backstop rather than refuse a
+                    // spill that would have worked.
+                    if (sp.disk_extent) {
+                        std::string const sdir = TempFile::resolve_dir("");
+                        std::uint64_t const avail = TempFile::free_space(sdir);
+                        if (avail != 0 && avail < sp.disk_extent) {
+                            char sp_msg[640];
+                            std::snprintf(sp_msg, sizeof(sp_msg),
+                                "the spill needs ~%.2f GiB in the temp dir "
+                                "'%s' but only ~%.2f GiB is free",
+                                gib(sp.disk_extent), sdir.c_str(), gib(avail));
+                            if (opts.max_host_ram_bytes > 0) {
+                                throw std::runtime_error(
+                                    std::string("--max-host-ram is set but ") +
+                                    sp_msg + ". Point --temp-dir (or "
+                                    "XCHPLOT2_TEMP_DIR) at a filesystem with "
+                                    "more room.");
+                            }
+                            want_policy      = false;
+                            spill_stood_down =
+                                std::string(" The automatic disk-offload could "
+                                            "have covered this, but stood down "
+                                            "because ") + sp_msg +
+                                ". Point --temp-dir at a filesystem with more "
+                                "room to enable it.";
+                        }
+                    }
+
                     // An EXPLICIT budget that cannot be met is the user's
                     // error and throws below with the floor quoted. An
                     // automatic one just stands down and lets the host-RAM
                     // guard speak, unchanged.
-                    if (sp.meets_budget || opts.max_host_ram_bytes > 0) {
+                    //
+                    // `want_policy` is re-tested because the free-space check
+                    // above can clear it AFTER the plan was built. Applying a
+                    // plan we just decided the temp dir cannot hold would
+                    // route the tables anyway and hit ENOSPC mid-plot — the
+                    // exact failure the check exists to pre-empt.
+                    if (want_policy &&
+                        (sp.meets_budget || opts.max_host_ram_bytes > 0)) {
                         stream_scratch.spill = sp.tables;
                         num_pinned_slots     = sp.pinned_slots;
                         mmap_h_meta          = sp.mmap_h_meta;

@@ -920,9 +920,13 @@ Notes:
   writable, and usable — so a mistyped path fails before the batch starts
   instead of minutes in.
 - **Budget ~7.1 GiB of free space** for compact at k=28: three `h_meta`
-  files of 2.03 GiB plus one `h_t2_xbits` of 1.02 GiB. That is per
-  *worker* — each GPU in a multi-GPU run spills into its own files, so
-  size the dir for the number of cards you are plotting with.
+  files of 2.03 GiB plus one `h_t2_xbits` of 1.02 GiB. Minimal needs
+  ~3.0 GiB — it maps each table once rather than once per role. This is
+  checked against the temp dir before the batch starts, so an undersized
+  dir is a refusal rather than an ENOSPC part-way through a table; note
+  the check is per *worker*, and each GPU in a multi-GPU run spills into
+  its own files, so size the dir for the number of cards you are
+  plotting with.
 - **The temp dir sees more traffic than "one write, one read"**, because
   `h_meta` is three roles. At k=28 compact with everything routed, each
   plot moves **14.0 GiB (7.0 written, 7.0 read)**. Every run reports its

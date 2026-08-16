@@ -104,6 +104,22 @@ struct HostRamSpillPlan {
     uint64_t spilled_bytes = 0;  // total routed to disk, for the I/O estimate
     uint64_t drain_freed   = 0;  // bytes given up by cutting drain slots
 
+    // Bytes the temp dir must actually HOLD — which is NOT spilled_bytes.
+    // spilled_bytes counts each table's extent ONCE, because it answers "how
+    // much host RAM did routing this table give back". The disk answers a
+    // different question: h_meta is routed as THREE roles, each its own
+    // SpillBuffer with its own file, so it occupies 3x its extent on disk
+    // while occupying 1x of the RAM saving. Sizing a free-space check from
+    // spilled_bytes would under-book by 2x table8 — 4.06 GiB at k=28 — and
+    // wave through a temp dir that cannot hold the spill.
+    //
+    // Deliberately NOT discounted for lifetime overlap. The roles are
+    // lifetime-disjoint and each SpillBuffer is destroyed when its role ends,
+    // so the true concurrent high-water is lower; but every file is reserved
+    // with fallocate at construction, and a spill that fits only because of
+    // lifetime overlap is one scheduling change away from ENOSPC mid-plot.
+    uint64_t disk_extent = 0;
+
     // Estimated temp-dir traffic for ONE plot, split by direction. A spilled
     // table is NOT simply written once and read once. h_meta is written and
     // read once per ROLE and it has three of them in Compact (T1 meta park, T2

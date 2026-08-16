@@ -10,6 +10,13 @@ namespace {
 // Per-plot temp-dir passes over a routed table, by direction.
 struct Passes { unsigned writes; unsigned reads; };
 
+// How many FILES a routed table occupies. h_meta's three roles each get their
+// own SpillBuffer, hence their own TempFile, each fallocate'd to the table's
+// full extent — so it needs 3x its extent of free space even though routing it
+// gives back only 1x of host RAM. See HostRamSpillPlan::disk_extent.
+constexpr unsigned kMetaFiles  = 3;
+constexpr unsigned kXbitsFiles = 1;
+
 // h_meta is routed as THREE independent roles in Compact — the T1 meta park,
 // the T2 meta park, and the T3 pairing accumulator — each of which is written
 // once and read back once. So the table's cap-sized extent crosses the temp dir
@@ -56,7 +63,8 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
     // modelled temp-dir traffic — the writeback schedule is the kernel's, and a
     // fixed per-plot figure would be a guess dressed as a measurement.
     auto consider = [&](uint64_t table, bool available, bool& bit,
-                        Passes passes, bool mmap_class = false) {
+                        Passes passes, unsigned files,
+                        bool mmap_class = false) {
         if (!available) return;
         routable_total += table;
         if (B == 0 || est > B) {
@@ -65,9 +73,16 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
             out.spilled_bytes  += table;
             if (mmap_class) {
                 out.reclaimable += table;
+                // A mapping is backed by a file too, and map() fallocates it
+                // before mapping (an unbacked mapped page raises SIGBUS on
+                // write, not ENOSPC). So it consumes temp-dir space exactly
+                // like an engine-routed table, even though it makes no
+                // modelled traffic.
+                out.disk_extent += uint64_t(files) * table;
             } else {
                 out.traffic_written += uint64_t(passes.writes) * table;
                 out.traffic_read    += uint64_t(passes.reads)  * table;
+                out.disk_extent     += uint64_t(files) * table;
             }
         }
     };
@@ -75,12 +90,20 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
     // Compact routes through the engine; Minimal takes the same tables as
     // mappings. They are mutually exclusive by construction — a tier is one or
     // the other — so the largest-first walk sees each table exactly once.
-    consider(table8, in.tier_compact, out.tables.h_meta,     kMetaPasses);
-    consider(table4, in.tier_compact, out.tables.h_t2_xbits, kXbitsPasses);
+    //
+    // The file counts differ by ROUTE, not by table. Compact's engine gives
+    // h_meta one SpillBuffer per role — three files. Minimal maps it once, as
+    // a single TempFile spanning the whole cap, because a mapping IS the
+    // buffer for all of its uses. Same table, same extent, different footprint
+    // on disk.
+    consider(table8, in.tier_compact, out.tables.h_meta,
+             kMetaPasses,  kMetaFiles);
+    consider(table4, in.tier_compact, out.tables.h_t2_xbits,
+             kXbitsPasses, kXbitsFiles);
     consider(table8, in.tier_minimal, out.mmap_h_meta,
-             Passes{0, 0}, /*mmap_class=*/true);
+             Passes{0, 0}, /*files=*/1, /*mmap_class=*/true);
     consider(table4, in.tier_minimal, out.mmap_h_t2_xbits,
-             Passes{0, 0}, /*mmap_class=*/true);
+             Passes{0, 0}, /*files=*/1, /*mmap_class=*/true);
 
     // Drain slots are the LAST resort, deliberately. Spilling a table costs
     // disk I/O per plot; giving up a drain slot costs producer/consumer
