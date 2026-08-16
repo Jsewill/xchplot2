@@ -208,7 +208,8 @@ void print_usage(char const* prog)
         << "                                      run that already works. Env:\n"
         << "                                      XCHPLOT2_NO_AUTO_SPILL=1.\n"
         << "  " << prog << " parity-check [--dir PATH]\n"
-        << "    Run every *_parity binary in PATH (default: ./build/tools/parity)\n"
+        << "    Run every *_parity and *_test binary in PATH (default:\n"
+        << "    ./build/tools/parity)\n"
         << "    and summarize PASS/FAIL. Build the tests with `cmake --build\n"
         << "    <build-dir>` first. Useful for post-refactor regression screening.\n"
         << "  " << prog << " devices\n"
@@ -1873,9 +1874,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
         }
 
-        // Glob every *_parity binary in `dir`. Same code path works for
-        // both branches — main ships sycl_*_parity extras that cuda-only
+        // Glob every *_parity AND *_test binary in `dir`. Same code path works
+        // for both branches — main ships sycl_*_parity extras that cuda-only
         // doesn't, and the wildcard picks up whichever actually exists.
+        //
+        // `_test` is not decoration. The suffix used to be `_parity` alone,
+        // which quietly excluded EIGHT binaries — the whole host-RAM spill
+        // suite among them. This command is what a user runs to answer "is
+        // this build good?", and it answered "7 passed, 0 failed" without
+        // executing a line of the spill path. A test runner that silently
+        // skips tests is worse than no test runner, because it is believed.
+        auto has_suffix = [](std::string const& s, char const* suf) {
+            size_t const n = std::strlen(suf);
+            return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+        };
         std::vector<std::filesystem::path> tests;
         std::error_code ec;
         if (std::filesystem::is_directory(dir, ec)) {
@@ -1883,18 +1895,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                  std::filesystem::directory_iterator(dir, ec))
             {
                 auto const name = entry.path().filename().string();
-                constexpr char const kSuffix[] = "_parity";
-                constexpr size_t kLen = sizeof(kSuffix) - 1;
-                bool const ends =
-                    name.size() >= kLen &&
-                    name.compare(name.size() - kLen, kLen, kSuffix) == 0;
-                if (ends && entry.is_regular_file(ec)) {
+                if ((has_suffix(name, "_parity") || has_suffix(name, "_test"))
+                    && entry.is_regular_file(ec)) {
                     tests.push_back(entry.path());
                 }
             }
         }
         if (tests.empty()) {
-            std::cerr << "No `*_parity` binaries found under " << dir << ".\n"
+            std::cerr << "No `*_parity` / `*_test` binaries found under " << dir << ".\n"
                          "Build them first:\n"
                          "  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release\n"
                          "  cmake --build build --parallel\n"
@@ -1904,7 +1912,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::sort(tests.begin(), tests.end());
 
         int pass = 0, fail = 0;
-        std::cerr << "==> parity tests (" << tests.size() << " found in "
+        std::cerr << "==> parity + host tests (" << tests.size() << " found in "
                   << dir << ")\n";
         for (auto const& test : tests) {
             auto const name = test.filename().string();
