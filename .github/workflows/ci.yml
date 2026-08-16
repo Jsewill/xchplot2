@@ -54,6 +54,33 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets
 
+  host-tests:
+    name: C++ host tests (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    # The cuda-build job below COMPILES the C++ but cannot run any of it — the
+    # runner has no GPU. So until this job existed, the host test binaries were
+    # built only when someone typed their names, and the host-RAM spill path
+    # shipped on this branch with no automated check.
+    #
+    # These targets need a C++20 compiler and nothing else — no CUDA, no GPU —
+    # so they run on a bare runner in seconds. The sanitizer arms are not
+    # decoration: the spill I/O engine is a worker pool over a ticket protocol,
+    # and a missing lock there is invisible to any interleaving the test
+    # happens to take.
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plain, thread, address]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run host tests
+        run: |
+          if [ "${{ matrix.mode }}" = "plain" ]; then
+            scripts/test/host-tests.sh
+          else
+            scripts/test/host-tests.sh "${{ matrix.mode }}"
+          fi
+
   cuda-build:
     # Compile-only smoke: catches CMakeLists / nvcc-arch / link-order
     # regressions without needing a real GPU on the runner. Targets
