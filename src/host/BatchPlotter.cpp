@@ -2137,9 +2137,60 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // to the drain-slot lever and then stands down.
                 bool const short_on_ram =
                     host_free < host_required + host_reserve;
-                bool const want_policy =
+                bool want_policy =
                     opts.max_host_ram_bytes > 0 ||
                     (short_on_ram && !opts.no_auto_spill);
+
+                // A RAM-backed temp dir makes the whole budget a lie: on most
+                // systemd distributions /tmp is tmpfs, so "spilling" there
+                // moves the tables from one part of RAM to another and invites
+                // the OOM killer the budget exists to avoid. It defeats BOTH
+                // classes — a MAP_SHARED mapping over a tmpfs file is
+                // anonymous memory with extra steps, so Minimal's mmap route
+                // is no safer than Compact's engine route. Probe the same dir
+                // the spill TempFiles will resolve (--temp-dir feeds
+                // XCHPLOT2_TEMP_DIR, already setenv'd by run_batch).
+                //
+                // An EXPLICIT budget throws: the user asked for a spill and
+                // needs to know it would not have been one. AUTO must not —
+                // they asked for a plot, not a spill, so a tmpfs temp dir just
+                // means this rescue is unavailable. Record why and let the
+                // host-RAM guard below deliver the verdict with that clause
+                // attached, so they get both facts at once.
+                bool        ram_dir_blocked_auto = false;
+                std::string ram_dir_path;
+                if (want_policy) {
+                    std::string const spill_dir = TempFile::resolve_dir("");
+                    if (TempFile::dir_is_ram_backed(spill_dir)) {
+                        char const* ov =
+                            std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
+                        std::string const ovs = ov ? ov : "";
+                        bool const allow = (ovs == "1" || ovs == "true" ||
+                                            ovs == "yes" || ovs == "on");
+                        if (allow) {
+                            std::fprintf(stderr,
+                                "%s WARNING: spill temp dir '%s' is on a "
+                                "RAM-backed filesystem (tmpfs); proceeding "
+                                "anyway because XCHPLOT2_ALLOW_RAM_TEMP_DIR "
+                                "is set. The host-RAM budget below does NOT "
+                                "account for what the spill writes there.\n",
+                                log_prefix.c_str(), spill_dir.c_str());
+                        } else if (opts.max_host_ram_bytes > 0) {
+                            throw std::runtime_error(
+                                "--max-host-ram is set but the spill temp dir "
+                                "'" + spill_dir + "' is on a RAM-backed "
+                                "filesystem (tmpfs); spilling there consumes "
+                                "the RAM the budget exists to cap. Point "
+                                "--temp-dir at real disk, or set "
+                                "XCHPLOT2_ALLOW_RAM_TEMP_DIR=1 if this path "
+                                "really is disk-backed.");
+                        } else {
+                            want_policy          = false;
+                            ram_dir_blocked_auto = true;
+                            ram_dir_path         = spill_dir;
+                        }
+                    }
+                }
                 if (want_policy) {
                     // Sentinel translation. BatchOptions uses 0 for "not set"
                     // and 1 for "min"; the policy uses 0 for "min". Without
@@ -2217,7 +2268,21 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 }
 
                 if (host_free < host_required + host_reserve) {
-                    char msg[1024];
+                    // The auto-spill would have rescued this run; say why it
+                    // did not, or the user reads a plain out-of-RAM refusal on
+                    // a build that advertises a disk-offload and concludes the
+                    // feature is broken rather than misconfigured.
+                    char ramdir[512] = {0};
+                    if (ram_dir_blocked_auto) {
+                        std::snprintf(ramdir, sizeof(ramdir),
+                            " The automatic disk-offload could have covered "
+                            "this, but stood down because the temp dir '%s' is "
+                            "on a RAM-backed filesystem (tmpfs) — spilling "
+                            "there would consume the RAM it is trying to save. "
+                            "Point --temp-dir at real disk to enable it.",
+                            ram_dir_path.c_str());
+                    }
+                    char msg[1600];
                     std::snprintf(msg, sizeof(msg),
                         "%s streaming tier %s needs ~%.2f GiB of HOST RAM at "
                         "k=%d plus a %.2f GiB reserve; host reports %.2f GiB "
@@ -2226,12 +2291,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         "plain needs the least (~%.2f GiB), tiny the most "
                         "(~%.2f GiB). Close what else is holding RAM, or plot "
                         "on a host with more. (XCHPLOT2_HOST_RESERVE_MB tunes "
-                        "the reserve.)",
+                        "the reserve.)%s",
                         log_prefix.c_str(), tier_label(tier),
                         gib(host_required), pool_k, gib(host_reserve),
                         gib(host_free), gib(host_total),
                         gib(streaming_plain_host_bytes(pool_k)),
-                        gib(streaming_tiny_host_bytes(pool_k)));
+                        gib(streaming_tiny_host_bytes(pool_k)), ramdir);
                     throw std::runtime_error(msg);
                 }
 host_ram_ok:;
