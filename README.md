@@ -1168,10 +1168,11 @@ xchplot2 plot ... --no-auto-spill
 What gets spilled, in order, largest first — and only as far as the
 budget requires:
 
-1. the cold cap-sized tables (`h_t1_meta`, `h_t3`, `h_t2_meta`,
-   `h_t2_xbits`), streamed through two shared 32 MiB staging windows
-   (64 MiB in total, however many tables spill) so the disk I/O
-   overlaps compute;
+1. the cold cap-sized tables, streamed through two shared 32 MiB staging
+   windows (64 MiB in total, however many tables spill) so the disk I/O
+   overlaps compute. Which tables depends on the tier: `tiny` routes
+   `h_t1_meta`, `h_t3`, `h_t2_meta`, `h_t2_xbits`; `compact` and
+   `minimal` route `h_t3`, `h_frags`, `h_t2_xbits`;
 2. the D2H drain slots, 3 → 1, **last**. Spilling a table costs disk
    I/O per plot; a drain slot costs producer/consumer overlap across
    plots, which is the more expensive of the two in a batch.
@@ -1179,7 +1180,7 @@ budget requires:
 Measured at k=28 tiny, batch of 3 — every rung produces byte-identical
 plots:
 
-| spilled | host peak |
+| spilled | peak RSS |
 |---------|----------:|
 | nothing | 21.5 GiB |
 | `h_t1_meta` + `h_t3` | 17.4 GiB |
@@ -1187,11 +1188,15 @@ plots:
 | + drain 3 → 1 (`--max-host-ram min`) | **9.3 GiB** |
 
 That is 2.3× less host RAM for the same plot. Wall cost measured on
-compact at k=28, n=3, walking the same ladder: 7.85 s/plot unspilled
-to 9.41 at `min`, i.e. **~20%**. 9.3 GiB is the floor of this
-mechanism at k=28 — below it the remaining buffers are ones a GPU
-kernel writes directly through a device-visible pointer, which cannot
-live in a file.
+compact at k=28, n=3: **6.4 → 8.7 s/plot, ~35%** (mean of 3). 9.3 GiB
+is the floor of this mechanism at k=28 — below it the remaining buffers
+are ones a GPU kernel writes directly through a device-visible pointer,
+which cannot live in a file.
+
+Note these are measured RSS, at `n=3`; one plot at a time peaks lower
+(19.5 → 8.4 GiB). The budget line prints something different — the
+*modelled* peak of the unswappable class alone, which is what
+`--max-host-ram` bounds.
 
 Notes:
 
@@ -1199,16 +1204,14 @@ Notes:
   distributions, i.e. RAM — spilling there consumes the memory the
   budget exists to bound. xchplot2 refuses a RAM-backed temp dir up
   front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` for the rare
-  disk-backed `/tmp`), and also checks the dir exists, is writable, and
-  has room for the whole spill before starting, rather than failing
-  mid-batch. Budget ~7.1 GiB of free space for tiny at k=28 and ~5.1
-  GiB for compact or minimal — the latter two route `h_frags` as well,
-  which is a full 2.03 GiB table even though it makes no engine I/O.
-  That is per *worker*: each GPU in a multi-GPU run spills into its own
-  files, so size the dir for the number of cards you are plotting with.
-  Each spill file is reserved with `fallocate` as it is created, so a
-  disk that fills anyway fails at once with its size rather than
-  part-way through a table.
+  disk-backed `/tmp`), and checks the dir exists and is writable before
+  starting rather than failing mid-batch.
+- **Budget ~7.1 GiB of free space** for tiny at k=28, ~5.1 GiB for
+  compact or minimal — the latter two route `h_frags` as well, a full
+  2.03 GiB table even though it makes no engine I/O. This is checked
+  against the temp dir before the batch starts, and it is per *worker*:
+  each GPU in a multi-GPU run spills into its own files, so size the dir
+  for the number of cards you are plotting with.
 - **The temp dir sees a lot more traffic than "one write, one read".**
   Only `h_t3` works that way in every tier — compact's `h_t2_xbits` is
   the one other table that manages it. The T1 and T2 sorts read their
@@ -1239,7 +1242,9 @@ Notes:
   instead: those bytes leave the dangerous class but stay resident
   until the kernel needs them back, so they still show in RSS. Where
   the two differ, the log reports both.
-- Files are unlinked at creation, so a crash cannot leave them behind.
+- Files are unlinked at creation, so a crash cannot leave them behind,
+  and each is `fallocate`d as it is created — a disk that fills anyway
+  fails at once with its size rather than part-way through a table.
 
 ### Lower-level subcommands
 
@@ -1253,10 +1258,27 @@ xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regressio
 ```
 
 `verify` opens a `.plot2` through pos2-chip's CPU prover and runs N
-(default 100) random challenges. Zero proofs across a reasonable sample
-strongly indicates a corrupt plot; the command exits non-zero in that
-case. Intended as a quick sanity check before farming a newly built
-batch — not a replacement for `chia plots check`.
+(default 100) random challenges. It exits non-zero only when the whole
+sample yields *no* proof, so treat it as a smoke test for gross
+corruption rather than proof a plot is right — a badly damaged plot can
+still answer some challenges. Not a replacement for `chia plots check`.
+
+To actually prove a plot correct, build the same one on the CPU and
+compare bytes. `test` without `--gpu-all` runs pos2-chip's own plotter,
+so the two must be byte-identical. The memo has to match — `batch` takes
+it from the manifest, `test` defaults to a 112-byte zero stub:
+
+```bash
+MEMO=$(printf '00%.0s' $(seq 1 112))
+xchplot2 test 28 $PLOT_ID 2 0 0 -T -m "$MEMO" -o ref -N ref.plot2
+echo "28 2 0 0 1 $PLOT_ID $MEMO $PWD/out gpu.plot2" > m.tsv
+xchplot2 batch m.tsv --tier tiny --max-host-ram min --temp-dir /mnt/nvme/spill
+sha256sum ref/ref.plot2 out/gpu.plot2
+```
+
+The CPU side costs about a minute at k=28. Matching hashes clear the
+whole path at once — tier, disk-offload and GPU pipeline all agree with
+the reference implementation.
 
 `parity-check` execs every `*_parity` binary in `--dir` (default
 `./build/tools/parity`) and summarizes PASS/FAIL with per-test wall
