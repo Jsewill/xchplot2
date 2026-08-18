@@ -1950,20 +1950,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             (1ULL << (pool_k - extra_margin_bits));
         uint64_t const cap = per_section * (1ULL << num_section_bits);
         stream_pinned_cap = size_t(cap);
-        bool any_fail = false;
-        // Only num_pinned_slots of them — the rest stay null, and every free
-        // loop below is already null-guarded, so a partial set is safe.
-        for (int s = 0; s < num_pinned_slots; ++s) {
-            stream_pinned[s] = streaming_alloc_pinned_uint64(stream_pinned_cap);
-            if (!stream_pinned[s]) { any_fail = true; break; }
-        }
-        if (any_fail) {
-            for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
-                if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
-            }
-            throw std::runtime_error(
-                log_prefix + " streaming-fallback: pinned D2H buffer allocation failed");
-        }
+        // NOTE: the drain buffers themselves are NOT allocated here — only
+        // their size is known here. The host-RAM policy below may cut the slot
+        // count 3 -> 1, and allocating first would make that cut worthless:
+        // peak RSS is a high-water mark, so the surplus slots would already
+        // have been charged (3 x 2.03 GiB at k=28) no matter how promptly they
+        // were freed afterwards. Allocation happens after the policy has
+        // settled the count — see "pinned D2H drain slots" below.
 
         // Tiered dispatch: pick plain vs compact streaming based on
         // free device VRAM. The plain path's peak at k=28 is ~7290 MB;
@@ -2387,6 +2380,35 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     throw std::runtime_error(msg);
                 }
 host_ram_ok:;
+            }
+        }
+
+        // Pinned D2H drain slots. Allocated HERE, not next to the cap formula
+        // that sizes them, because `num_pinned_slots` is only final once the
+        // host-RAM policy above has run: it is the policy's cheapest lever and
+        // it cuts 3 -> 1. Peak RSS is a high-water mark, so allocating three
+        // and releasing two would still be charged for three — the budget line
+        // would promise the saving and the process would not get it. Measured
+        // at k=28 compact: 8.30 GiB allocating first, 4.24 GiB allocating
+        // here, against a modelled 5.33.
+        //
+        // This is also the order the SYCL branch has always used. Placed after
+        // `host_ram_ok:` so the `goto` that skips the refusal cannot skip the
+        // allocation with it.
+        {
+            bool any_fail = false;
+            // Only num_pinned_slots of them — the rest stay null, and every
+            // free loop is null-guarded, so a partial set is safe.
+            for (int s = 0; s < num_pinned_slots; ++s) {
+                stream_pinned[s] = streaming_alloc_pinned_uint64(stream_pinned_cap);
+                if (!stream_pinned[s]) { any_fail = true; break; }
+            }
+            if (any_fail) {
+                for (int s = 0; s < GpuBufferPool::kNumPinnedBuffers; ++s) {
+                    if (stream_pinned[s]) streaming_free_pinned_uint64(stream_pinned[s]);
+                }
+                throw std::runtime_error(
+                    log_prefix + " streaming-fallback: pinned D2H buffer allocation failed");
             }
         }
 
