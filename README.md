@@ -635,6 +635,23 @@ xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only
 xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression screen
 ```
 
+To prove a plot correct, build the same one on the CPU and compare bytes.
+`test` without `--gpu-all` runs pos2-chip's own plotter, so the two must
+be byte-identical. The memo has to match — `batch` takes it from the
+manifest, `test` defaults to a 112-byte zero stub:
+
+```bash
+MEMO=$(printf '00%.0s' $(seq 1 112))
+xchplot2 test 28 $PLOT_ID 2 0 0 -T -m "$MEMO" -o ref -N ref.plot2
+echo "28 2 0 0 1 $PLOT_ID $MEMO $PWD/out gpu.plot2" > m.tsv
+xchplot2 batch m.tsv --tier compact --max-host-ram min --temp-dir /mnt/nvme/spill
+sha256sum ref/ref.plot2 out/gpu.plot2
+```
+
+The CPU side costs about a minute at k=28. Matching hashes clear the
+whole path at once — tier, disk-offload and GPU pipeline all agree with
+the reference implementation.
+
 ## Environment variables
 
 | Variable                      | Effect                                                                  |
@@ -872,7 +889,7 @@ budget requires:
 Measured at k=28 compact on an RTX 4090, one plot per rung — every rung
 produces a byte-identical plot (`sha256[:20] = 9e020867acd59d31164d`):
 
-| routed | host peak |
+| routed | peak RSS |
 |---|---:|
 | nothing | 11.29 GiB |
 | `h_meta` | 9.32 GiB |
@@ -880,20 +897,24 @@ produces a byte-identical plot (`sha256[:20] = 9e020867acd59d31164d`):
 | + drain 3 → 1 (`--max-host-ram min`) | **4.24 GiB** |
 
 That is **2.66× less host RAM for the same plot**. The wall cost at the
-bottom rung, same card, temp dir on NVMe: **9.71 → 13.94 s/plot, ~44%**.
-4.24 GiB is the floor of this mechanism at k=28 — below it the remaining
-buffers are ones a GPU kernel writes directly through a device-visible
-pointer, which cannot live in a file.
+bottom rung, same card, temp dir on NVMe: **9.6 → 12.6 s/plot, ~31%**
+(mean of 3). 4.24 GiB is the floor of this mechanism at k=28 — below it
+the remaining buffers are ones a GPU kernel writes directly through a
+device-visible pointer, which cannot live in a file.
+
+Note these are measured RSS. The budget line prints something different —
+the *modelled* peak of the unswappable class alone. Both are in the tier
+table below.
 
 **Tier support is not uniform**, because what a tier does to a table
 decides whether the table can leave RAM at all:
 
-| tier | how tables are routed | k=28 peak, `min` |
-|---|---|---:|
-| `plain` | drain slots only — it parks nothing | — |
-| `compact` | both tables through the spill engine, to disk | 12.44 → 5.33 GiB |
-| `minimal` | both tables as file-backed **mappings** | 13.46 → 6.35 GiB |
-| `tiny` | drain slots only — no table can leave RAM | 14.47 → 10.41 GiB |
+| tier | how tables are routed | k=28 modelled peak, `min` | measured RSS at `min` |
+|---|---|---:|---:|
+| `plain` | drain slots only — it parks nothing | — | 7.20 GiB |
+| `compact` | both tables through the spill engine, to disk | 12.44 → 5.33 GiB | 4.24 GiB |
+| `minimal` | both tables as file-backed **mappings** | 13.46 → 6.35 GiB | 9.19 GiB |
+| `tiny` | drain slots only — no table can leave RAM | 14.47 → 10.41 GiB | 10.28 GiB |
 
 `minimal` CPU-touches both tables, so they cannot go through the engine
 — but a `MAP_SHARED` mapping serves CPU indexing and `cudaMemcpyAsync`
@@ -935,6 +956,11 @@ Notes:
   sizes a drive's endurance: at 100 plots/day that is ~0.68 TiB/day,
   which consumes a 600 TB TBW rating in a little over two years. Point
   `--temp-dir` at something you are willing to wear out.
+- **`--max-host-ram` bounds the unswappable class** — pinned plus
+  anonymous, the class that gets a process OOM-killed. On `minimal` both
+  tables go as file-backed mappings instead: those bytes leave the
+  dangerous class but stay resident until the kernel needs them back, so
+  they still show in RSS. Where the two differ, the log reports both.
 - Files are unlinked at creation, so a crash cannot leave them behind,
   and each is `fallocate`d as it is created — a disk that fills anyway
   fails at once with its size rather than part-way through a table.
