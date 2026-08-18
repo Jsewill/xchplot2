@@ -124,6 +124,14 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
   pinned come in *under* their models). If the GPU also drives a desktop
   and you see mid-plot OOMs, raise it with `POS2GPU_VRAM_MARGIN_MB`.
 
+  Those are floor figures, so **a roomy card will show more in
+  `nvidia-smi` for the same tier** — the T2/T3 two-phase match scratch is
+  taken only when there is room for it (at k=28: 780 MB on plain and
+  compact, 1170 MB on minimal, none on tiny). Compact measures 5228 MB
+  ballasted to its floor and 6012 MB on an idle 24 GB card. Each run's
+  `vram:` line splits the total as `model + two-phase + margin`, so the
+  extra is visible as headroom in use rather than a larger requirement.
+
   `xchplot2 bench` samples the driver's counter for the whole run, fails
   if a path exceeds what it declared, and warns if a path declares far
   more than it uses (an over-declared model quietly denies the path to
