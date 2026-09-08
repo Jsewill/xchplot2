@@ -102,5 +102,6 @@ jobs:
           cmake --build build -j --target pos2_gpu_cuda_obj
           if [ "${{ matrix.arch }}" = "89" ]; then
             cmake --build build -j 2 --target xchplot2 plot_file_parity solver_filter_parity
-            ctest --test-dir build -R '^solver_filter_parity$' --output-on-failure
+            ctest --test-dir build --output-on-failure --no-tests=error \
+              -R '^(plot_file_parity|solver_filter_parity)$'
           fi

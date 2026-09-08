@@ -88,12 +88,12 @@ jobs:
             -e CUDA_ARCHITECTURES=75 \
             -v "$PWD":/src:ro,Z \
             xchplot2-ci:${{ matrix.distro }} \
-            bash -c '
+            bash -euo pipefail -c '
               cp -r /src /work
               cd /work
               rm -rf target/ keygen-rs/target/
               CARGO_TARGET_DIR=/tmp/cargo-target \
-                cargo install --path . --force 2>&1 | tail -20
-              test -x /root/.cargo/bin/xchplot2
+                cargo install --path . --force --locked 2>&1 | tail -20
+              /root/.cargo/bin/xchplot2 --help
               echo "OK: xchplot2 installed for ${{ matrix.distro }}"
             '

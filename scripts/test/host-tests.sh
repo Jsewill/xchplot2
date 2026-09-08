@@ -17,8 +17,9 @@
 # The target list is DERIVED from CMakeLists.txt rather than duplicated here.
 # A hardcoded list is the same trap one level down — someone adds a test, CMake
 # knows about it, this script does not, and it silently never runs. Anything
-# declared with add_executable() that pulls in no .cu and no pos2_gpu_* library
-# is picked up automatically. cuda_spill_ops_test is a .cu and drops out here
+# declared with add_executable() that pulls in no .cu and no pos2_* dependency
+# is picked up automatically. CPU reference header tests run through CMake,
+# which applies their required patches. cuda_spill_ops_test drops out here
 # by design: it drives the engine over real device memory, so it needs the GPU
 # job, not this one.
 #
@@ -70,7 +71,7 @@ for m in re.finditer(r'target_link_libraries\(\s*(\w+)\s+PRIVATE([^)]*)\)', src)
 
 for name, files in sorted(targets.items()):
     if any(f.endswith('.cu') for f in files):               continue
-    if any('pos2_gpu' in l for l in linked.get(name, [])):  continue
+    if any('pos2_' in l for l in linked.get(name, [])):      continue
     if not files:                                           continue
     print(name + '\t' + ' '.join(files))
 PY
