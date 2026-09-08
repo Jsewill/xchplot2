@@ -1,0 +1,173 @@
+--- a/solve/Solver.hpp
++++ b/solve/Solver.hpp
+@@ -12,6 +12,7 @@
+ #include <array>
+ #include <atomic>
+ #include <bitset>
++#include <exception>
+ #include <iomanip>
+ #include <iostream>
+ #include <numeric> // for iota
+@@ -1168,7 +1169,7 @@
+             = uint64_t(hit_probability * static_cast<double>(NUM_XS) * extra_margin);
+ 
+         // round down to multiple of 16
+-        size_t const MAX_RESULTS_PER_THREAD = (estimated_matches / num_threads) & ~size_t(0xf);
++        size_t const INITIAL_RESULTS_PER_THREAD = (estimated_matches / num_threads) & ~size_t(0xf);
+ 
+         if (false) {
+             std::cout << "num x pairs: " << num_x_pairs << std::endl;
+@@ -1181,28 +1182,30 @@
+                       << std::endl;
+         }
+ 
+-        // --- allocate output buffers just once ---
++        // Per-thread buffers grow independently when the estimate is exceeded.
+         Timer timer;
+         timer.start("Allocating local potential matches");
+-        x2_potential_match_xs.resize(num_threads * MAX_RESULTS_PER_THREAD);
+-        x2_potential_match_hashes.resize(num_threads * MAX_RESULTS_PER_THREAD);
++        // The estimate is a reserve hint, not a correctness limit. Hash
++        // distributions can exceed it in any one thread, including at k=28.
++        std::vector<std::vector<uint32_t>> local_xs(num_threads), local_hashes(num_threads);
++        std::vector<std::exception_ptr> errors(num_threads);
+         timings_.allocating += timer.stop();
+-
+-        // per-thread match counts
+-        std::vector<int> matches_per_thread(num_threads, 0);
+ 
+         // build [0,1,2…num_threads-1]
+         std::vector<int> thread_ids(num_threads);
+         std::iota(thread_ids.begin(), thread_ids.end(), 0);
+-        std::atomic<bool> failed = false;
+ 
+         use_prefetching_ = true;
+ 
+         {
+             timer.start("AES multi-threaded bitmask test");
+             parallel_for_range(thread_ids.begin(), thread_ids.end(), [&](int t) {
++                try {
+                 ProofCore proof_core(params_);
+-                int thread_matches = 0;
++                auto& xs = local_xs[t];
++                auto& hashes = local_hashes[t];
++                xs.reserve(INITIAL_RESULTS_PER_THREAD);
++                hashes.reserve(INITIAL_RESULTS_PER_THREAD);
+                 uint64_t start = uint64_t(t) * chunk_size;
+                 uint64_t end = (t + 1 == (int)num_threads) ? NUM_XS : start + chunk_size;
+ 
+@@ -1215,16 +1218,8 @@
+                         int slot = bitmask_hash >> 5;
+                         int bit = bitmask_hash & 31;
+                         if (x1_bitmask[slot] & (1u << bit)) {
+-                            assert(thread_matches < static_cast<int>(MAX_RESULTS_PER_THREAD));
+-                            size_t idx = size_t(t) * MAX_RESULTS_PER_THREAD + thread_matches;
+-                            x2_potential_match_xs[idx] = uint32_t(x);
+-                            x2_potential_match_hashes[idx] = g_hash;
+-                            ++thread_matches;
+-                            if (thread_matches == static_cast<int>(MAX_RESULTS_PER_THREAD))
+-                                [[unlikely]] {
+-                                failed.store(true);
+-                                goto done;
+-                            }
++                            xs.push_back(uint32_t(x));
++                            hashes.push_back(g_hash);
+                         }
+                     }
+                 }
+@@ -1233,7 +1228,7 @@
+                     constexpr int PREFETCH_DIST = 128; // must be a power of 2 for the mask below
+ 
+                     if (end <= start) {
+-                        goto done;
++                        return;
+                     }
+ 
+                     // --- Prefetching pipeline ---
+@@ -1280,16 +1275,8 @@
+                         int bit = bitmask_hash & 31;
+ 
+                         if (x1_bitmask[slot] & (1u << bit)) {
+-                            assert(thread_matches < static_cast<int>(MAX_RESULTS_PER_THREAD));
+-                            size_t idx = size_t(t) * MAX_RESULTS_PER_THREAD + thread_matches;
+-                            x2_potential_match_xs[idx] = uint32_t(x);
+-                            x2_potential_match_hashes[idx] = g_hash;
+-                            ++thread_matches;
+-                            if (thread_matches == static_cast<int>(MAX_RESULTS_PER_THREAD))
+-                                [[unlikely]] {
+-                                failed.store(true);
+-                                goto done;
+-                            }
++                            xs.push_back(uint32_t(x));
++                            hashes.push_back(g_hash);
+                         }
+ 
+                         // Now compute and prefetch for the future element at x_pref = x +
+@@ -1317,51 +1304,32 @@
+                         int bit = bitmask_hash & 31;
+ 
+                         if (x1_bitmask[slot] & (1u << bit)) {
+-                            assert(thread_matches < static_cast<int>(MAX_RESULTS_PER_THREAD));
+-                            size_t idx = size_t(t) * MAX_RESULTS_PER_THREAD + thread_matches;
+-                            x2_potential_match_xs[idx] = uint32_t(x);
+-                            x2_potential_match_hashes[idx] = g_hash;
+-                            ++thread_matches;
+-                            if (thread_matches == static_cast<int>(MAX_RESULTS_PER_THREAD))
+-                                [[unlikely]] {
+-                                failed.store(true);
+-                                goto done;
+-                            }
++                            xs.push_back(uint32_t(x));
++                            hashes.push_back(g_hash);
+                         }
+                     }
+                 }
+-            done:
+-                matches_per_thread[t] = thread_matches;
++                } catch (...) {
++                    errors[t] = std::current_exception();
++                }
+             });
++            for (auto const& error : errors) if (error) std::rethrow_exception(error);
+             timings_.chachafilterx2sbybitmask += timer.stop();
+         }
+ 
+-        if (failed.load()) {
+-            throw std::runtime_error(
+-                "Too many matches. This is unlikely to happen, so we won't be solving this");
+-        }
+-
+-        // now sum up, compact, and resize just as before…
+-        timer.start("Counting total matches across threads");
+-        int total = 0;
+-        for (int m: matches_per_thread)
+-            total += m;
+-        timings_.misc += timer.stop();
+-        // std::cout << "TOTAL x2 potential matches: " << total << std::endl;
+-
+         timer.start("Compacting x2 potential matches");
+-        int write_pos = matches_per_thread[0];
+-        for (unsigned t = 1; t < num_threads; ++t) {
+-            int cnt = matches_per_thread[t];
+-            auto src_x = x2_potential_match_xs.begin() + t * MAX_RESULTS_PER_THREAD;
+-            auto src_h = x2_potential_match_hashes.begin() + t * MAX_RESULTS_PER_THREAD;
+-            std::copy(src_x, src_x + cnt, x2_potential_match_xs.begin() + write_pos);
+-            std::copy(src_h, src_h + cnt, x2_potential_match_hashes.begin() + write_pos);
+-            write_pos += cnt;
+-        }
++        size_t total = 0;
++        for (auto const& xs : local_xs) total += xs.size();
+         x2_potential_match_xs.resize(total);
+         x2_potential_match_hashes.resize(total);
+-        // std::cout << "x2_potential_match_xs size: " << x2_potential_match_xs.size() << std::endl;
++        size_t offset = 0;
++        for (unsigned t = 0; t < num_threads; ++t) {
++            std::copy(local_xs[t].begin(), local_xs[t].end(),
++                x2_potential_match_xs.begin() + offset);
++            std::copy(local_hashes[t].begin(), local_hashes[t].end(),
++                x2_potential_match_hashes.begin() + offset);
++            offset += local_xs[t].size();
++        }
+         timings_.misc += timer.stop();
+     }
+ 

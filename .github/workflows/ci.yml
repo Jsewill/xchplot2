@@ -13,7 +13,7 @@ jobs:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts/
@@ -25,7 +25,7 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: reviewdog/action-actionlint@v1
         with:
           fail_level: error
@@ -37,7 +37,7 @@ jobs:
       run:
         working-directory: keygen-rs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -47,12 +47,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo check
-        run: cargo check --all-targets --locked || cargo check --all-targets
+        run: cargo check --all-targets --locked
       - name: cargo clippy (advisory)
-        run: cargo clippy --all-targets -- -W clippy::all
+        run: cargo clippy --all-targets --locked -- -W clippy::all
         continue-on-error: true
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
   host-tests:
     name: C++ host tests (${{ matrix.mode }})
@@ -72,7 +72,7 @@ jobs:
       matrix:
         mode: [plain, thread, address]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Run host tests
         run: |
           if [ "${{ matrix.mode }}" = "plain" ]; then
@@ -98,7 +98,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             cmake ninja-build curl ca-certificates pkg-config \
             git build-essential
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -112,7 +112,7 @@ jobs:
     name: install-container-deps.sh — dry-run fixtures
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Diff --dry-run output against fixtures
         # Runs --dry-run for every engine in arch / ubuntu / fedora
         # containers and diffs against the checked-in fixtures under
@@ -129,7 +129,7 @@ jobs:
     name: hadolint Containerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Containerfile
@@ -146,7 +146,7 @@ jobs:
     name: docker compose config validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: docker compose config --quiet
         # Catches typos in service names / build-arg keys / unresolvable
         # ${VAR} placeholders without ever pulling a base image. ~5s.
@@ -156,14 +156,14 @@ jobs:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: crate-ci/typos@master
 
   markdownlint:
     name: markdownlint README
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: DavidAnson/markdownlint-cli2-action@v18
         with:
           globs: README.md

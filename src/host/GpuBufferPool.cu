@@ -3,6 +3,7 @@
 
 #include "host/GpuBufferPool.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/VramBudget.hpp"
 
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -60,11 +61,10 @@ size_t streaming_host_reserve()
 size_t vram_safety_margin()
 {
     static size_t const margin = [] () -> size_t {
-        if (char const* v = std::getenv("POS2GPU_VRAM_MARGIN_MB"); v && v[0]) {
-            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
-            if (mb > 0) return mb << 20;
-        }
-        return 128ULL << 20;
+        if (char const* v = std::getenv("POS2GPU_VRAM_MARGIN_MB"); v && v[0])
+            return vram_mib_bytes(v, "POS2GPU_VRAM_MARGIN_MB");
+        // Includes the native CUDA pool's reservation granularity.
+        return 256ULL << 20;
     }();
     return margin;
 }
@@ -225,7 +225,9 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         required_device_bytes = required_device;
         size_t free_b = 0, total_b = 0;
         POOL_CHECK(cudaMemGetInfo(&free_b, &total_b));
-        if (free_b < required_device + margin) {
+        if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0])
+            free_b = std::min(free_b, vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB"));
+        if (!vram_fits(free_b, required_device, margin)) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
             InsufficientVramError e(
                 "GpuBufferPool: insufficient device VRAM for k=" +
@@ -246,7 +248,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         // sitting on the pool's floor takes the aliased path instead — the
         // overlap is a speed-up bought with spare VRAM, never a requirement.
         overlap_d2h = !force_no_overlap &&
-            (free_b >= required_device + frags_overlap_bytes + margin);
+            vram_fits(free_b, required_device + frags_overlap_bytes, margin);
         frags_dedicated_bytes = overlap_d2h ? frags_overlap_bytes : 0;
     }
 

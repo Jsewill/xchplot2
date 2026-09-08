@@ -18,6 +18,7 @@
 #include "host/ConfigFile.hpp"
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
+#include "host/PlotFileWriterParallel.hpp"
 #include "host/NumaTopology.hpp"  // host_numa_nodes() — one `devices` row per CPU node
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
@@ -34,6 +35,8 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <string_view>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -42,7 +45,51 @@
 
 #include <unistd.h>  // isatty — progress defaults to on for interactive runs
 
+#ifdef _WIN32
+#include <process.h>
+#include <io.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
+
 namespace {
+
+int run_parity_test(std::string const& path, std::FILE* log)
+{
+#ifdef _WIN32
+    int saved_out = _dup(1), saved_err = _dup(2);
+    if (saved_out < 0 || saved_err < 0) {
+        if (saved_out >= 0) _close(saved_out);
+        if (saved_err >= 0) _close(saved_err);
+        return 127;
+    }
+    std::fflush(nullptr);
+    bool const redirected = _dup2(_fileno(log), 1) == 0 && _dup2(_fileno(log), 2) == 0;
+    char const* args[] = {"parity-test", nullptr};
+    auto const rc = redirected ? _spawnv(_P_WAIT, path.c_str(), args) : -1;
+    _dup2(saved_out, 1); _dup2(saved_err, 2);
+    _close(saved_out); _close(saved_err);
+    return rc < 0 ? 127 : static_cast<int>(rc);
+#else
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return 127;
+    int rc = posix_spawn_file_actions_adddup2(&actions, fileno(log), STDOUT_FILENO);
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, fileno(log), STDERR_FILENO);
+    pid_t pid = 0;
+    char* args[] = {const_cast<char*>(path.c_str()), nullptr};
+    if (rc == 0) rc = posix_spawn(&pid, path.c_str(), &actions, nullptr, args, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) return 127;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return 127;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
+}
+
 
 // Tri-state --progress resolution: explicit --progress/--no-progress
 // wins; otherwise default to on when stderr is a TTY (where the line
@@ -207,6 +254,8 @@ void print_usage(char const* prog)
         << "                                      be a hard error, so it never slows a\n"
         << "                                      run that already works. Env:\n"
         << "                                      XCHPLOT2_NO_AUTO_SPILL=1.\n"
+        << "  " << prog << " verify <plotfile> [--trials N] [--full]\n"
+        << "    Sample quality chains; --full reconstructs and validates full proofs.\n"
         << "  " << prog << " parity-check [--dir PATH]\n"
         << "    Run every *_parity and *_test binary in PATH (default:\n"
         << "    ./build/tools/parity)\n"
@@ -1241,30 +1290,29 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string subcmd = (strip_argc >= 2) ? std::string(argv_stripped[1]) : "";
         auto emit_section = [&](std::string const& name) {
             for (auto const& [k, v] : cfg.section_view(name)) {
-                // Bool true  → bare flag (`--progress`).
-                // Bool false → `--no-progress` so the parser flips the
-                //              same opts.progress bit. Important for
-                //              config-set defaults the user wants to
-                //              override on CLI: without the `--no-`
-                //              path a config-set bool was permanently
-                //              on (the only way to "negate" a flag is
-                //              to not pass it, but config-injection
-                //              forces it in every invocation).
-                // Other      → flag + value pair.
-                auto const as_bool = cfg.get_bool(name, k);
                 std::string const flag =
                     (k.size() > 0 && k[0] == '-') ? k : ("--" + k);
+                // Values such as devices="0", trials=1 and cpu-workers=off
+                // are arguments. Coerce only options that actually take a bool.
+                static constexpr std::string_view bool_flags[] = {
+                    "--verbose", "-v", "--quiet", "-q", "--progress",
+                    "--testnet", "-T", "--skip-existing", "--resume",
+                    "--continue-on-error", "--cpu", "--shard-plot",
+                    "--pipeline-plot", "--host-bounce", "--auto-spill",
+                    "--no-auto-spill", "--keep", "--compute-only", "--full"
+                };
+                std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
+                auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
+                    != std::end(bool_flags) ? cfg.get_bool(name, k) : std::nullopt;
                 if (as_bool) {
                     if (*as_bool) {
                         config_tokens.push_back(flag);
-                    } else {
-                        // Emit `--no-XXX`. Only works for the `--`
-                        // (long) form — short flags (`-v`) don't have
-                        // a canonical negation, so skip the emit and
-                        // rely on default-off behaviour.
-                        if (flag.size() > 2 && flag.substr(0, 2) == "--") {
-                            config_tokens.push_back("--no-" + flag.substr(2));
-                        }
+                    } else if (flag.size() > 2 && flag.substr(0, 2) == "--") {
+                        // false → --no-XXX so the CLI can re-enable
+                        // via --XXX (last-wins). Short flags don't
+                        // have a canonical negation form; skip them.
+                        config_tokens.push_back(flag.starts_with("--no-")
+                            ? "--" + flag.substr(5) : "--no-" + flag.substr(2));
                     }
                     continue;
                 }
@@ -1428,10 +1476,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--warmup" && need(1)) warmup = std::atoi(argv[++i]);
             else if ((a == "--out" || a == "-o") && need(1)) out_dir = argv[++i];
             else if (a == "--keep") keep = true;
+            else if (a == "--no-keep") keep = false;
             else if (a == "--compute-only") compute_only = true;
+            else if (a == "--no-compute-only") compute_only = false;
             else if (a == "--quiet" || a == "-q") opts.quiet = true;
             else if (a == "--no-quiet") opts.quiet = false;
             else if (a == "--testnet" || a == "-T") testnet = true;
+            else if (a == "--no-testnet") testnet = false;
             else if (a == "--target-size" && need(1)) {
                 target_size_tib = std::atof(argv[++i]);
                 if (target_size_tib <= 0.0) {
@@ -1440,14 +1491,17 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
             }
             else if (a == "-v" || a == "--verbose") opts.verbose = true;
+            else if (a == "--no-verbose") opts.verbose = false;
             // CPU is opt-in. --cpu asks for it on every node without naming
             // --devices; it says nothing about HOW MANY, so it never disturbs an
             // explicit --cpu-workers N in either direction.
-            else if (a == "--cpu") opts.cpu_opt_in = true;
+            else if (a == "--cpu") { opts.cpu_opt_in = true; if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
+            else if (a == "--no-cpu") { opts.cpu_opt_in = false; opts.cpu_workers = 0; }
             else if (a == "--cpu-workers" && need(1)) {
                 if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
             }
             else if (a == "--shard-plot") opts.shard_plot = true;
+            else if (a == "--no-shard-plot") opts.shard_plot = false;
             else if (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"
@@ -1468,6 +1522,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--temp-dir" && need(1)) {
                 opts.temp_dir = argv[++i];
             }
+            else if (a == "--auto-spill") opts.no_auto_spill = false;
             else if (a == "--no-auto-spill") {
                 opts.no_auto_spill = true;
             }
@@ -1795,7 +1850,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                   || a == "--resume")               opts.skip_existing = true;
             else if (a == "--no-skip-existing"
                   || a == "--no-resume")            opts.skip_existing = false;
-            else if (a == "--cpu")                  opts.cpu_opt_in = true;
+            else if (a == "--cpu")                  { opts.cpu_opt_in = true; if (opts.cpu_workers == 0) opts.cpu_workers = pos2gpu::kCpuWorkersAuto; }
+            else if (a == "--no-cpu") { opts.cpu_opt_in = false; opts.cpu_workers = 0; }
             else if (a == "--cpu-workers" && i + 1 < argc) {
                 if (!parse_cpu_workers_arg(argv[++i], opts)) return 1;
             }
@@ -1823,6 +1879,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--temp-dir" && i + 1 < argc) {
                 opts.temp_dir = argv[++i];
             }
+            else if (a == "--auto-spill") opts.no_auto_spill = false;
             else if (a == "--no-auto-spill") {
                 opts.no_auto_spill = true;
             }
@@ -1857,6 +1914,50 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             return 0;
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    if (mode == "verify") {
+        if (argc < 3) { print_usage(argv[0]); return 1; }
+        std::string plotfile = argv[2];
+        size_t trials = 100;
+        bool full = false;
+        for (int i = 3; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--trials" || a == "-n") && i + 1 < argc) {
+                long v = std::atol(argv[++i]);
+                if (v <= 0) {
+                    std::cerr << "Error: --trials must be > 0\n";
+                    return 1;
+                }
+                trials = static_cast<size_t>(v);
+            } else if (a == "--full") full = true;
+            else if (a == "--no-full") full = false;
+            else {
+                std::cerr << "Error: unknown argument: " << a << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        try {
+            std::cerr << "[verify] " << plotfile << ": running " << trials
+                      << " random challenges\n";
+            auto res = pos2gpu::verify_plot_file(plotfile, trials, full);
+            std::cerr << "[verify] " << res.trials << " trials, "
+                      << res.challenges_with_proof << " with >=1 quality chain, "
+                      << res.proofs_found << " quality chains total\n";
+            if (res.proofs_found == 0) {
+                std::cerr << "[verify] FAIL: no proofs produced — plot is "
+                             "likely corrupt\n";
+                return 4;
+            }
+            if (full) std::cerr << "[verify] " << res.full_proofs_validated << " full proofs validated\n";
+            std::cerr << (full ? "[verify] OK (full proof validation)\n"
+                              : "[verify] OK (quality-chain sample; use --full to solve and validate)\n");
+            return 0;
+        } catch (std::exception const& e) {
+            std::cerr << "[verify] FAILED: " << e.what() << "\n";
             return 2;
         }
     }
@@ -1916,15 +2017,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                   << dir << ")\n";
         for (auto const& test : tests) {
             auto const name = test.filename().string();
-            std::string const log_path =
-                "/tmp/xchplot2-parity-" + name + ".log";
-            // Redirecting through the shell: `test` is a path we
-            // generated ourselves from a directory listing — no user-
-            // controlled shell metachars reach this string.
-            std::string const cmd =
-                test.string() + " >" + log_path + " 2>&1";
+            // tmpfile creates a private, exclusively opened log; paths never
+            // pass through a shell, even when they contain spaces/metacharacters.
+            auto close_log = [](std::FILE* f) { std::fclose(f); };
+            std::unique_ptr<std::FILE, decltype(close_log)> log(std::tmpfile(), close_log);
+            if (!log) { std::perror("parity log"); return 1; }
             auto const t0 = std::chrono::steady_clock::now();
-            int const rc = std::system(cmd.c_str());
+            int const rc = run_parity_test(test.string(), log.get());
             auto const ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t0).count();
             if (rc == 0) {
@@ -1933,8 +2032,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 ++pass;
             } else {
                 std::fprintf(stderr,
-                             "  FAIL  %-32s  (exit %d; log: %s)\n",
-                             name.c_str(), rc, log_path.c_str());
+                             "  FAIL  %-32s  (exit %d)\n", name.c_str(), rc);
+                std::rewind(log.get());
+                char output[4096];
+                while (auto n = std::fread(output, 1, sizeof(output), log.get()))
+                    std::fwrite(output, 1, n, stderr);
                 ++fail;
             }
         }
@@ -2004,7 +2106,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                    || a == "--resume")                  plot_skip_existing = true;
             else if  (a == "--no-skip-existing"
                    || a == "--no-resume")               plot_skip_existing = false;
-            else if  (a == "--cpu")                     plot_cpu_opt_in = true;
+            else if  (a == "--cpu")                     { plot_cpu_opt_in = true; if (plot_cpu_workers == 0) plot_cpu_workers = pos2gpu::kCpuWorkersAuto; }
+            else if (a == "--no-cpu") { plot_cpu_opt_in = false; plot_cpu_workers = 0; }
             else if  (a == "--cpu-workers" && need(1)) {
                 pos2gpu::BatchOptions tmp;
                 if (!parse_cpu_workers_arg(argv[++i], tmp)) return 1;
@@ -2038,6 +2141,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--temp-dir" && need(1)) {
                 plot_temp_dir = argv[++i];
             }
+            else if  (a == "--auto-spill") plot_no_auto_spill = false;
             else if  (a == "--no-auto-spill") {
                 plot_no_auto_spill = true;
             }

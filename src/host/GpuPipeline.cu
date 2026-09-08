@@ -12,6 +12,7 @@
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/VramBudget.hpp"
 #include "host/CudaSpillHostOps.hpp"   // SpillHostOps over cudaHostAlloc/cudaMemcpy
 #include "host/SpillEngine.hpp"        // SpillEngine / SpillBuffer — see header
 
@@ -286,7 +287,7 @@ inline bool s_assert_vram()
 inline void s_init_from_env(StreamingStats& s)
 {
     if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
-        s.cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        s.cap = vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB");
     }
     if (char const* v = std::getenv("POS2GPU_STREAMING_STATS"); v && v[0] == '1') {
         s.verbose = true;
@@ -435,15 +436,18 @@ constexpr uint64_t kStreamSafetyBytes = 128ULL << 20;
 inline void s_init_budget(StreamingStats& s, uint64_t expected_peak)
 {
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
-    uint64_t const have = uint64_t(free_b) + s_pool_reserved_now();
-    s.budget = have > kStreamSafetyBytes ? have - kStreamSafetyBytes : 0;
-
-    // Arm the per-allocation budget check only on a card that could actually
-    // hit the ceiling. 2x the working set is well clear of the worst measured
-    // pool bloat (1.62x), and an unknown peak (0) stays armed.
-    s.enforce_budget = (expected_peak == 0) || (s.budget < 2 * expected_peak);
-    s.sample_phys    = s.verbose || s.enforce_budget;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
+        throw std::runtime_error("Cannot query free device memory; refusing an unverified VRAM budget");
+    uint64_t have = std::min(uint64_t(total_b), uint64_t(free_b) + s_pool_reserved_now());
+    if (s.cap) have = std::min(have, uint64_t(s.cap));
+    uint64_t const buffer = vram_safety_margin();
+    if (!vram_fits(have, expected_peak, buffer))
+        throw std::runtime_error("streaming tier cannot fit including the VRAM buffer");
+    s.cap = expected_peak + buffer;
+    // Bound both live allocations and the CUDA pool's physical reservation.
+    s.budget = s.cap - std::min(buffer, kStreamSafetyBytes);
+    s.enforce_budget = true;
+    s.sample_phys = true;
 
     if (!s_use_async_pool()) return;
     int dev = 0;
@@ -452,7 +456,7 @@ inline void s_init_budget(StreamingStats& s, uint64_t expected_peak)
     if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return;
     uint64_t spare = (s.budget > expected_peak) ? s.budget - expected_peak : 0;
     if (char const* v = std::getenv("POS2GPU_POOL_CACHE_MB"); v && v[0]) {
-        spare = std::strtoull(v, nullptr, 10) * (1ULL << 20);
+        spare = std::min(spare, uint64_t(std::strcmp(v, "0") == 0 ? 0 : vram_mib_bytes(v, "POS2GPU_POOL_CACHE_MB")));
     }
     cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &spare);
 }
@@ -487,7 +491,7 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             "Run the parity tests on this device to localise the kernel "
             "that produced no output.");
     }
-    if (s.cap && s.live + bytes > s.cap) {
+    if (s.cap && !vram_fits(s.cap, s.live, bytes)) {
         throw std::runtime_error(
             std::string("streaming VRAM cap: phase=") + s.phase +
             " alloc=" + reason +
@@ -511,12 +515,15 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
     // the chunk). So do not try to bound the pool — just decline to use it
     // once it no longer fits, and take the exact memory instead.
     if (use_async && s.enforce_budget && s.budget
-        && s_pool_reserved_now() + s.raw_live + bytes > s.budget) {
+        && !vram_fits(s.budget, s_pool_reserved_now() + s.raw_live, bytes)) {
         s_trim_async_pool();
-        if (s_pool_reserved_now() + s.raw_live + bytes > s.budget) {
+        if (!vram_fits(s.budget, s_pool_reserved_now() + s.raw_live, bytes)) {
             use_async = false;
         }
     }
+
+    if (s.enforce_budget && !vram_fits(s.budget, s_pool_reserved_now() + s.raw_live, bytes))
+        throw std::runtime_error("CUDA pool reservation plus allocation exceeds the tier budget");
 
     cudaError_t err = use_async
         ? cudaMallocAsync(&p, bytes, /*stream=*/nullptr)
@@ -556,6 +563,8 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
     s.live += bytes;
     if (s.live > s.peak) s.peak = s.live;
     s.sizes[p] = bytes;
+    if (s.enforce_budget && s.phys_peak > s.budget)
+        throw std::runtime_error("CUDA allocation reservation exceeded the tier budget");
     if (s.verbose) {
         std::fprintf(stderr,
             "[stream %-8s] +%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
@@ -1468,7 +1477,10 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     StreamingStats stats;
     s_init_from_env(stats);
     s_pool_reset_highwater();
-    s_init_budget(stats, scratch.expected_peak_bytes);
+    auto const tier = scratch.tiny_mode ? StreamingTier::Tiny :
+        scratch.gather_tile_count > 1 ? StreamingTier::Minimal :
+        have_h_meta ? StreamingTier::Compact : StreamingTier::Plain;
+    s_init_budget(stats, streaming_base_peak_bytes(cfg.k, tier));
 
     // --- pipeline-wide tiny allocations ---
     // d_counter: per-phase uint64 count output (reused).
@@ -4863,12 +4875,13 @@ void streaming_free_pinned_uint32(uint32_t* ptr)
 size_t streaming_query_free_vram_bytes()
 {
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
+        throw std::runtime_error("Cannot query free device memory; refusing an unverified VRAM budget");
     // Honour POS2GPU_MAX_VRAM_MB so the tier dispatch can be tested on
     // a high-VRAM card by capping the reported free memory, matching
     // how the streaming-path s_malloc tracker also caps.
     if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
-        size_t const cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        size_t const cap = vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB");
         if (cap > 0 && cap < free_b) free_b = cap;
     }
     return free_b;

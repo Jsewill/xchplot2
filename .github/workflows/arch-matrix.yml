@@ -92,7 +92,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: cmake configure + build (arch=${{ matrix.arch }})
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
@@ -100,3 +100,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
           cmake --build build -j --target pos2_gpu_cuda_obj
+          if [ "${{ matrix.arch }}" = "89" ]; then
+            cmake --build build -j 2 --target xchplot2 plot_file_parity solver_filter_parity
+            ctest --test-dir build -R '^solver_filter_parity$' --output-on-failure
+          fi

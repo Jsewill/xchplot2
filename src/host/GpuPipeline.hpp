@@ -180,13 +180,8 @@ struct StreamingPinnedScratch {
     // GpuPipeline still routes Tiny through the Minimal code path until
     // the per-Phase wiring lands).
     bool tiny_mode = false;
-    // The chosen tier's logical peak device VRAM at this k — BatchPlotter's
-    // per-tier peak constant, the same one its floor is derived from. The
-    // streaming allocator uses it to decide how much the stream-ordered pool
-    // may cache: everything the card has beyond this working set is spare, and
-    // only that much may be hoarded. 0 = unknown, in which case the pool is
-    // allowed to cache up to the whole budget (correct only on a card with room
-    // to spare). See s_init_budget in GpuPipeline.cu.
+    // Expected logical peak for the optional regression assertion. Zero skips
+    // that assertion; allocation admission still derives its cap from the tier.
     uint64_t expected_peak_bytes = 0;
 
     // ---- Host-RAM disk-offload (see host/SpillEngine.hpp) ----

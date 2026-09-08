@@ -42,7 +42,7 @@ out_dir="$(mktemp -d)"
 trap 'rm -rf "$out_dir"' EXIT
 
 CXX="${CXX:-g++}"
-cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -pthread)
+cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -Ikeygen-rs/include -pthread)
 ldflags=(-pthread)
 
 case "$sanitizer" in

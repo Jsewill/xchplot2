@@ -4,6 +4,7 @@
 #include "host/Cancel.hpp"
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
+#include "host/VramBudget.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/HostRamPolicy.hpp"  // plan_host_ram_spill — the budget policy
 #include "host/TempFile.hpp"       // --temp-dir plumbing
@@ -28,6 +29,7 @@
 #include <optional>    // std::optional — CpuMemoryGate's starvation clock
 #include <queue>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -50,94 +52,11 @@ void initialize_aes_tables(); // forward decl from AesGpu.cu
 
 namespace {
 
-bool parse_hex(std::string const& s, std::vector<uint8_t>& out)
-{
-    if (s.size() % 2) return false;
-    auto val = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    out.clear();
-    out.reserve(s.size() / 2);
-    for (size_t i = 0; i < s.size(); i += 2) {
-        int hi = val(s[i]), lo = val(s[i + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out.push_back(uint8_t((hi << 4) | lo));
-    }
-    return true;
-}
-
-bool parse_hex_array32(std::string const& s, std::array<uint8_t, 32>& out)
-{
-    std::vector<uint8_t> tmp;
-    if (!parse_hex(s, tmp) || tmp.size() != 32) return false;
-    std::copy(tmp.begin(), tmp.end(), out.begin());
-    return true;
-}
-
-} // namespace
-
-std::vector<BatchEntry> parse_manifest(std::string const& path)
-{
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("cannot open manifest: " + path);
-
-    std::vector<BatchEntry> out;
-    std::string line;
-    size_t line_no = 0;
-    while (std::getline(in, line)) {
-        ++line_no;
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream is(line);
-        BatchEntry e;
-        std::string testnet_s, plot_id_s, memo_s;
-        if (!(is >> e.k >> e.strength >> e.plot_index >> e.meta_group
-                 >> testnet_s >> plot_id_s >> memo_s >> e.out_dir >> e.out_name)) {
-            throw std::runtime_error("manifest line " + std::to_string(line_no) +
-                                     ": expected 9 whitespace-separated fields "
-                                     "(k strength plot_index meta_group testnet "
-                                     "plot_id_hex memo_hex out_dir out_name)");
-        }
-        e.testnet = (testnet_s == "1" || testnet_s == "true" || testnet_s == "True");
-        if (!parse_hex_array32(plot_id_s, e.plot_id)) {
-            throw std::runtime_error("manifest line " + std::to_string(line_no) +
-                                     ": plot_id must be 64 hex chars");
-        }
-        if (!parse_hex(memo_s, e.memo) || e.memo.size() > 255) {
-            throw std::runtime_error("manifest line " + std::to_string(line_no) +
-                                     ": memo invalid hex or > 255 bytes");
-        }
-        out.push_back(std::move(e));
-    }
-    return out;
-}
-
-namespace {
-
 struct WorkItem {
     BatchEntry        entry;
     GpuPipelineResult result;
     size_t            index = 0;
 };
-
-// Check `.plot2` is present at path AND looks like a valid plot file
-// (magic bytes "pos2" + nonzero size). Used for skip_existing so we
-// don't silently skip a zero-byte or crash-truncated leftover.
-bool looks_like_complete_plot(std::filesystem::path const& path)
-{
-    std::error_code ec;
-    auto const sz = std::filesystem::file_size(path, ec);
-    if (ec || sz < 64) return false;  // header alone is >64 B
-
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
-    char magic[4]{};
-    in.read(magic, 4);
-    return in.good() && magic[0] == 'p' && magic[1] == 'o'
-                     && magic[2] == 's' && magic[3] == '2';
-}
 
 // Rough per-plot upper-bound estimate for the disk preflight. The
 // actual compressed .plot2 is smaller (FSE over proof-fragment stubs);
@@ -1758,7 +1677,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             if (opts.skip_existing) {
                 auto out_path = std::filesystem::path(entries[i].out_dir)
                                 / entries[i].out_name;
-                if (looks_like_complete_plot(out_path)) {
+                if (plot_file_matches(out_path.string(), entries[i])) {
                     if (opts.verbose) {
                         std::fprintf(stderr,
                             "%s skipping plot %zu: %s (already exists)\n",
@@ -1958,98 +1877,19 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // were freed afterwards. Allocation happens after the policy has
         // settled the count — see "pinned D2H drain slots" below.
 
-        // Tiered dispatch: pick plain vs compact streaming based on
-        // free device VRAM. The plain path's peak at k=28 is ~7290 MB;
-        // compact drops to ~5200 MB by combining two techniques:
-        //   (a) Park/rehydrate on pinned host across idle windows
-        //       (d_t1_meta, d_t1_keys_merged, d_t2_meta, d_t2_xbits,
-        //        d_t2_keys_merged).
-        //   (b) N=2 T2 match tiling: emit T2 into half-cap device
-        //       staging + pinned host accumulators, skipping the
-        //       full-cap d_t2_meta/mi/xbits peak entirely. Saves
-        //       ~2168 MB at k=28 where T2 match is the overall peak.
-        // Compact pays ~1-2 s/plot of PCIe round-trips, so we only opt
-        // into it when the card can't fit plain.
-        //
-        // Every floor below is (logical peak at k=28) + 128 MB, where 128 MB is
-        // kStreamSafetyBytes in GpuPipeline.cu — the headroom the streaming
-        // allocator holds back for the CUDA context's growth after this point.
-        // A tier fits iff free >= its logical peak + that margin, so the two
-        // constants must agree; the allocator budgets against the driver's real
-        // reservation to keep it that way.
-        //
-        // The peaks are what StreamingStats::peak reports, which is only the
-        // truth because the allocator is now budgeted. It did not used to be:
-        // the stream-ordered pool reserved 3174 MB beyond the logical peak on
-        // plain and 3184 MB on compact (it cannot recycle a cached block for a
-        // differently-sized request, and these tiers churn 2080/1040 MB
-        // buffers), which no tier floor accounted for and no VRAM trace could
-        // see. Cards sized to these floors OOM'd with GBs reserved-but-idle.
-        // Do not re-derive a floor from stats.peak without checking it against
-        // the pool's reserved_high (POS2GPU_STREAMING_STATS=1 prints both).
-        //
-        // Each tier's logical peak is the single source of truth: the floor is
-        // derived from it, and it is handed to the streaming allocator (as
-        // cfg.expected_peak_bytes) to bound how much the CUDA memory pool may
-        // cache. Change a peak here and both follow.
-        //
-        // Peaks measured on sm_89 at k=28 via StreamingStats::peak, each one
-        // cross-checked against the pool's reserved_high — see the note above.
-        // The margin has to cover two things at once, or a card sitting exactly
-        // on a floor does not actually fit:
-        //   - kStreamSafetyBytes (128 MB), which the streaming allocator holds
-        //     back from its budget for the CUDA context's growth; and
-        //   - the allocator's own granularity surplus (physical reservation
-        //     over logical bytes), ~30-50 MB at k=28.
-        // 128 MB covered only the first, which left compact with 7 MB of slack
-        // at its floor and made it fail intermittently. 256 MB covers both with
-        // ~78 MB to spare. POS2GPU_STREAMING_STATS=1 prints the physical
-        // high-water and the budget, which is how to re-derive this.
-        constexpr uint64_t kFloorMarginBytes  = 256ULL * 1024 * 1024;
-        constexpr uint64_t kPlainPeakBytes    = 7290ULL * 1024 * 1024;
-        constexpr uint64_t kCompactPeakBytes  = 5200ULL * 1024 * 1024;
-        constexpr uint64_t kPlainFloorBytes   = kPlainPeakBytes   + kFloorMarginBytes;  // 7546
-        constexpr uint64_t kCompactFloorBytes = kCompactPeakBytes + kFloorMarginBytes;  // 5456
-        // Minimal tier: compact's pinned-host parking + N=8 T2 match
-        // staging (cap/8 vs compact's cap/2). Saves ~1.5 GiB of T2-match
-        // peak VRAM at the cost of 6 extra PCIe round-trips during T2
-        // match. Targets 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050 4GB,
-        // MX450).
-        //   minimal: peak 3640 + 256 = 3896 MB floor
-        // (3640 is measured; an earlier comment estimated 3760, which left the
-        // old 3768 floor an 8 MB margin it only survived by luck.)
-        constexpr uint64_t kMinimalPeakBytes  = 3640ULL * 1024 * 1024;
-        constexpr uint64_t kMinimalFloorBytes = kMinimalPeakBytes + kFloorMarginBytes;  // 3896
-        // Tiny tier: full Phase 1.4 + 1.5 + 1.6 algorithm port,
-        // capped off with the Xs gen+sort tiling, T3 sort streaming,
-        // and host-pinned d_t3_stage that brought cuda-only Tiny to
-        // BYTE-FOR-BYTE PEAK PARITY with the SYCL Tiny tier.
-        // Measured at k=28 on RTX 4090: 1064 MB plot peak — EXACTLY
-        // matches SYCL Tiny's measured 1064 MB on the same plot_id.
-        // Per-phase peaks at k=28: Xs 1030, T1 match 1040, T1 sort
-        // 1056, T2 match 1040, T2 sort 1064 (floor), T3 match 1024,
-        // T3 sort 1047. All phases ≤ 1064 MB.
-        //
-        //   tiny: peak 1064 + 256 = 1320 MB floor
-        // Was 1100 MB, a 36 MB margin — thinner than the 128 MB the streaming
-        // allocator holds back, so Tiny could not in fact run on a card at its
-        // own floor: it OOM'd in T2 sort asking for 24 MB. Auto-picker selects
-        // Tiny from ~1.3 GB free up to Minimal's 3.9 GB floor. Targets sub-2
-        // GiB NVIDIA cards (Quadro P620 2 GB, GTX 1050 2 GB, laptop dGPUs),
-        // all of which clear 1320 MB.
-        constexpr uint64_t kTinyPeakBytes     = 1064ULL * 1024 * 1024;
-        constexpr uint64_t kTinyFloorBytes    = kTinyPeakBytes + kFloorMarginBytes;  // 1320
+        // Native CUDA peaks plus one configurable buffer, scaled to this k.
+        uint64_t const kFloorMarginBytes = vram_safety_margin();
+        uint64_t const kPlainPeakBytes = streaming_base_peak_bytes(pool_k, StreamingTier::Plain);
+        uint64_t const kCompactPeakBytes = streaming_base_peak_bytes(pool_k, StreamingTier::Compact);
+        uint64_t const kMinimalPeakBytes = streaming_base_peak_bytes(pool_k, StreamingTier::Minimal);
+        uint64_t const kTinyPeakBytes = streaming_base_peak_bytes(pool_k, StreamingTier::Tiny);
+        uint64_t const kPlainFloorBytes = kPlainPeakBytes + kFloorMarginBytes;
+        uint64_t const kCompactFloorBytes = kCompactPeakBytes + kFloorMarginBytes;
+        uint64_t const kMinimalFloorBytes = kMinimalPeakBytes + kFloorMarginBytes;
+        uint64_t const kTinyFloorBytes = kTinyPeakBytes + kFloorMarginBytes;
         size_t const free_bytes = streaming_query_free_vram_bytes();
 
-        // Tier selection: use the effective_tier resolved at the top
-        // of run_batch_slice (per-device override > gpu:tier shorthand
-        // > global --tier > env), falling back to auto-pick by free
-        // VRAM when no override is in effect. The manual overrides
-        // bypass the auto-pick threshold but still bail out cleanly
-        // if the chosen tier definitely won't fit (Tiny's floor is
-        // the hard lower bound — there is no smaller tier; a forced
-        // higher tier on a card below that tier's floor warns and
-        // proceeds — caller asked).
+        // Forced tiers pass the same admission check as automatic selection.
         std::string const& tier_pref = effective_tier;
 
         enum class Tier { Plain, Compact, Minimal, Tiny };
@@ -2064,11 +1904,20 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             tier = Tier::Tiny;
         } else {
             // Auto: pick the largest tier that fits.
-            tier = (free_bytes >= kPlainFloorBytes)   ? Tier::Plain   :
-                   (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
-                   (free_bytes >= kMinimalFloorBytes) ? Tier::Minimal :
+            tier = (vram_fits(free_bytes, kPlainPeakBytes, kFloorMarginBytes))   ? Tier::Plain   :
+                   (vram_fits(free_bytes, kCompactPeakBytes, kFloorMarginBytes)) ? Tier::Compact :
+                   (vram_fits(free_bytes, kMinimalPeakBytes, kFloorMarginBytes)) ? Tier::Minimal :
                                                         Tier::Tiny;
         }
+
+        uint64_t const required_peak =
+            tier == Tier::Plain ? kPlainPeakBytes :
+            tier == Tier::Compact ? kCompactPeakBytes :
+            tier == Tier::Minimal ? kMinimalPeakBytes : kTinyPeakBytes;
+        if (!vram_fits(free_bytes, required_peak, kFloorMarginBytes))
+            throw std::runtime_error("streaming tier needs " +
+                std::to_string((required_peak + kFloorMarginBytes) >> 20) +
+                " MiB including the VRAM buffer; only " + std::to_string(free_bytes >> 20) + " MiB free");
 
         // HOST-RAM gate. Every check above weighs VRAM, and host RAM runs the
         // other way: the lower the tier, the more full-cap tables it parks in
@@ -2112,9 +1961,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                      tier_pref == "minimal" || tier_pref == "tiny");
                 if (tier_forced) {
                     Tier const auto_tier =
-                        (free_bytes >= kPlainFloorBytes)   ? Tier::Plain   :
-                        (free_bytes >= kCompactFloorBytes) ? Tier::Compact :
-                        (free_bytes >= kMinimalFloorBytes) ? Tier::Minimal :
+                        (vram_fits(free_bytes, kPlainPeakBytes, kFloorMarginBytes))   ? Tier::Plain   :
+                        (vram_fits(free_bytes, kCompactPeakBytes, kFloorMarginBytes)) ? Tier::Compact :
+                        (vram_fits(free_bytes, kMinimalPeakBytes, kFloorMarginBytes)) ? Tier::Minimal :
                                                              Tier::Tiny;
                     std::size_t const auto_host = host_need(auto_tier);
                     if (tier != auto_tier && host_required > auto_host) {
@@ -2421,32 +2270,6 @@ host_ram_ok:;
             (tier == Tier::Compact) ? kCompactPeakBytes :
             (tier == Tier::Minimal) ? kMinimalPeakBytes :
                                       kTinyPeakBytes;
-
-        // Forced-tier fit warnings. Forced tiers below their floor are
-        // allowed (caller's risk) — except Tiny below its floor still
-        // throws because there's no smaller tier to fall back to.
-        if (tier == Tier::Plain && free_bytes < kPlainFloorBytes) {
-            std::fprintf(stderr,
-                "%s streaming tier: plain forced (%.2f GiB free < %.2f GiB "
-                "plain floor) — proceeding, may OOM mid-plot\n",
-                log_prefix.c_str(),
-                free_bytes / double(1ULL << 30),
-                kPlainFloorBytes / double(1ULL << 30));
-        } else if (tier == Tier::Compact && free_bytes < kCompactFloorBytes) {
-            std::fprintf(stderr,
-                "%s streaming tier: compact forced (%.2f GiB free < %.2f GiB "
-                "compact floor) — proceeding, may OOM mid-plot\n",
-                log_prefix.c_str(),
-                free_bytes / double(1ULL << 30),
-                kCompactFloorBytes / double(1ULL << 30));
-        } else if (tier == Tier::Minimal && free_bytes < kMinimalFloorBytes) {
-            std::fprintf(stderr,
-                "%s streaming tier: minimal forced (%.2f GiB free < %.2f GiB "
-                "minimal floor) — proceeding, may OOM mid-plot\n",
-                log_prefix.c_str(),
-                free_bytes / double(1ULL << 30),
-                kMinimalFloorBytes / double(1ULL << 30));
-        }
 
         // Record what was actually picked, so a two-pass caller can tell
         // whether its two passes are comparable. See WorkerTimeline.
@@ -2822,7 +2645,7 @@ host_ram_ok:;
             if (opts.skip_existing) {
                 auto out_path = std::filesystem::path(entries[i].out_dir)
                                 / entries[i].out_name;
-                if (looks_like_complete_plot(out_path)) {
+                if (plot_file_matches(out_path.string(), entries[i])) {
                     if (opts.verbose) {
                         std::fprintf(stderr,
                             "%s skipping plot %zu: %s (already exists)\n",
@@ -2956,8 +2779,7 @@ host_ram_ok:;
             // bench sets POS2GPU_ASSERT_VRAM (cli.cpp), so this check doubles as the
             // regression test — with the slack it fires on real drift, not runtime
             // jitter.
-            uint64_t const slack = vram_safety_margin();
-            if (peak > declared + slack) {
+            if (peak > declared) {
                 std::fprintf(stderr,
                     "%s vram: %s — pooled path peaked at %.0f MiB, %.0f MiB over the "
                     "%.0f MiB declared (pool + frags + margin) — past the margin, so "
@@ -3050,6 +2872,30 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts)
 {
     if (entries.empty()) return BatchResult{};
+    std::set<std::filesystem::path> outputs;
+    for (auto const& entry : entries) {
+        validate_batch_entry(entry);
+        auto const output = std::filesystem::weakly_canonical(
+            std::filesystem::path(entry.out_dir) / entry.out_name);
+        if (!outputs.insert(output).second)
+            throw std::invalid_argument("duplicate batch output: " + output.string());
+    }
+
+    if (cancel_requested()) return BatchResult{};
+    if (opts.skip_existing) {
+        std::vector<BatchEntry> pending;
+        for (auto const& entry : entries) {
+            auto const path = std::filesystem::path(entry.out_dir) / entry.out_name;
+            if (!plot_file_matches(path.string(), entry)) pending.push_back(entry);
+        }
+        if (pending.size() != entries.size()) {
+            auto pending_opts = opts;
+            pending_opts.skip_existing = false;
+            auto result = run_batch(pending, pending_opts);
+            result.plots_skipped += entries.size() - pending.size();
+            return result;
+        }
+    }
 
     // --temp-dir reaches TempFile through the environment rather than a
     // parameter: TempFile already resolves XCHPLOT2_TEMP_DIR first, it is
@@ -3115,6 +2961,10 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     std::string gate_note;
     std::vector<int> const device_ids =
         resolve_batch_devices(opts, pool_k, &gate_note);
+    std::set<int> gpu_ids;
+    for (int id : device_ids)
+        if (!is_cpu_device(id) && !gpu_ids.insert(id).second)
+            throw std::invalid_argument("duplicate GPU id would share an unreserved VRAM budget");
     if (!gate_note.empty() && !opts.quiet) {
         // Once per distinct message. bench drives two passes (warmup + measured)
         // through run_batch back to back, and the CPU auto/gate line is identical

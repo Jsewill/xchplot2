@@ -241,7 +241,7 @@ struct BatchOptions {
 
     // Resume support: if an output .plot2 already exists at the
     // target path AND passes a quick "looks like a complete plot"
-    // check (pos2 magic header), skip the entry. Lets a long batch
+    // check (header identity, memo, and chunk bounds), skip the entry. Lets a long batch
     // resume after partial completion without re-plotting finished
     // entries. Doubles as a manifest-level idempotency knob — re-
     // running the same manifest is a no-op once every plot is on disk.
@@ -250,6 +250,7 @@ struct BatchOptions {
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
+void validate_batch_entry(BatchEntry const& entry);
 std::vector<BatchEntry> parse_manifest(std::string const& path);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.

@@ -632,8 +632,18 @@ of the output directory's free space.
 xchplot2 test          <k> <plot-id-hex> [strength] ...   # single plot, raw inputs
 xchplot2 batch         <manifest.tsv> [-v] [--devices <SPEC>]
 xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
+xchplot2 verify        <file.plot2> [--trials N] [--full]  # quality chains / full proofs
 xchplot2 parity-check  [--dir PATH]                       # CPU↔GPU regression screen
 ```
+
+`verify` checks file bounds and samples quality chains. `--full` reconstructs
+and validates a full proof for each chain; an invalid chain or empty sample
+fails the command. Sampling does not check every part of the file.
+
+Writers use exclusive `.partial.XXXXXX` files and flush the original descriptor
+before atomic rename; the last completed writer wins. Resume checks identity,
+memo, chunk offsets, and file bounds. `parity-check` executes paths directly
+and prints captured failure output, including paths with shell punctuation.
 
 To prove a plot correct, build the same one on the CPU and compare bytes.
 `test` without `--gpu-all` runs pos2-chip's own plotter, so the two must
@@ -664,10 +674,10 @@ the reference implementation.
 | `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` | Downgrade the RAM-backed-temp-dir refusal to a warning, for the rare disk-backed `/tmp`. The reported host-RAM budget does not account for what the spill then writes into RAM. |
 | `XCHPLOT2_DRAIN_SLOTS=N`      | Pin the D2H drain slot count (1..3) instead of letting the host-RAM policy choose. Fewer slots cost producer/consumer overlap across plots. |
 | `POS2GPU_MAX_VRAM_MB=N`       | Cap the VRAM query to N MB — exercises the streaming fallback. Only caps what the *picker* sees; real allocation still succeeds on a big card, so it cannot validate that a tier fits. To rehearse a smaller card for real, hold the VRAM with a ballast process. |
-| `POS2GPU_VRAM_MARGIN_MB=N`    | Free VRAM the pool's gate leaves unclaimed. Default 128 MB. This is headroom against *other tenants* on the card, not an allowance for our own unmodelled allocations (the pooled path has none) — raise it if the GPU also drives a desktop, leave it alone on a headless rig. |
+| `POS2GPU_VRAM_MARGIN_MB=N`    | Free VRAM held beyond the selected peak. Default 256 MiB for native CUDA, including allocator granularity. This is headroom against *other tenants* on the card, not an allowance for our own unmodelled allocations (the pooled path has none) — raise it if the GPU also drives a desktop, leave it alone on a headless rig. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path allocation, plus the CUDA memory pool's physical high-water and the plot's VRAM budget. The pool reserves more than it hands out — size a tier from the physical number, not the logical one. |
 | `POS2GPU_ASSERT_VRAM=1`       | Fail a plot if a streaming tier's working set outgrows the peak its floor is derived from, or if the pooled path exceeds the buffers it declared. Armed by `bench`. |
-| `POS2GPU_POOL_CACHE_MB=N`     | Override how much the CUDA memory pool may keep cached. Default: whatever the card has spare beyond the tier's working set — generous on a big card (cross-plot reuse), near zero on a card at its floor. Only for measurement. |
+| `POS2GPU_POOL_CACHE_MB=N`     | Override how much the CUDA memory pool may keep cached. Clamped to the allowance within the selected tier's peak plus buffer. The allocator checks physical reservations as well as live bytes. |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
 | `POS2GPU_NO_ASYNC_ALLOC=1`    | Disable stream-ordered `cudaMallocAsync` pooling (audit kill switch).   |
@@ -721,21 +731,15 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 PoS2 plots are k=28 by spec. Four code paths, dispatched automatically
 based on available VRAM:
 
-- **Pool path (11612 MB floor; 12 GB+ cards).** The persistent buffer
+- **Pool path (11740 MiB floor; 12 GB+ cards).** The persistent buffer
   pool is sized worst-case and reused across plots in `batch` mode for
   amortised allocator cost and double-buffered D2H. 11484 MB of buffers
-  + a 128 MB margin. Above 13692 MB free it also takes a dedicated 2080 MB
+  + a 256 MiB buffer. Above 13820 MiB free it also takes a dedicated 2080 MB
   fragment buffer to overlap the final D2H with the next plot's Xs phase —
   a speed-up bought with spare VRAM, never a requirement, so a card at the
   floor simply aliases it. Targets for steady-state: RTX 4080 / 4090 /
   5080 / 5090, A6000, etc.
 
-  The floor was 11996 MB until the gate's margin was corrected from 512 MB
-  to 128 MB. That 512 double-counted the ~390 MB CUDA context, which
-  `cudaMemGetInfo` has already deducted from the free figure it reports —
-  and it cost exactly the 12 GB cards this path was documented to serve.
-  Measured: the pooled path allocates nothing at runtime, so those buffers
-  are its whole device footprint, and the driver puts it 18 MB over them.
 Every streaming floor below is that tier's measured working set at k=28
 plus a 256 MB margin. The margin covers the 128 MB the streaming
 allocator holds back for the CUDA context's growth, plus the allocator's
@@ -826,15 +830,16 @@ overrides the auto-pick — useful for testing or to step down from
 a tight margin (e.g. an 8 GiB card OOMing mid-plot can
 `--tier compact`).
 
-The two margins are different numbers on purpose. The pool's gate leaves
-128 MB (`POS2GPU_VRAM_MARGIN_MB`) — pure headroom against other tenants on
-the card, since the pooled path allocates nothing beyond the buffers it
-sizes up front. A streaming tier leaves 256 MB, because it runs under the
-budgeted allocator, which holds 128 MB back from its own budget: a floor of
-`working set + 256` yields a working budget of `working set + 128`, and that
-128 is what absorbs allocation granularity. Cut the streaming margin to 128
-and the budget collapses to exactly the working set, with nothing left to
-round up into.
+Every forced tier now passes the same `peak + buffer <= free` check as the
+automatic picker. Peaks scale with k; invalid budget settings and duplicate
+GPU workers fail before allocation. The CUDA allocator also caps its physical
+pool reservation and cached memory within the tier allowance. Its 128 MiB
+internal reserve is part of the configured buffer, counted once.
+
+Run `scripts/test/vram-tiers.sh /path/to/xchplot2 DEVICE` on real hardware to
+check each default k=28 floor and the rejection just below it. The GPU must
+have enough free memory for the requested cap; a software cap does not emulate
+another card's driver or allocator.
 
 Plot output is bit-identical across all paths — streaming
 reorganises memory, not algorithms.

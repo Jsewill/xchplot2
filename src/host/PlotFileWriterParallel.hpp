@@ -25,6 +25,10 @@
 
 namespace pos2gpu {
 
+struct BatchEntry;
+// Bounded header/chunk-index validation; checks identity when resuming a batch.
+bool plot_file_matches(std::string const& filename, BatchEntry const& expected);
+
 // Writes a v2 .plot2 file. Returns total bytes written.
 //
 // `t3_fragments` must already be sorted by proof_fragment (low 2k bits) —
@@ -81,5 +85,20 @@ std::vector<uint64_t> run_cpu_plotter_to_fragments(
 // verify write + read round-trip without exposing pos2-chip's
 // plot/PlotFile.hpp to other TUs.
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename);
+
+// Result of a `verify_plot_file` call.
+//   trials                 — how many random challenges were tried
+//   challenges_with_proof  — challenges that produced ≥ 1 proof
+//   proofs_found           — total proofs summed across all trials
+struct VerifyResult {
+    size_t trials                = 0;
+    size_t challenges_with_proof = 0;
+    size_t proofs_found          = 0;
+    size_t full_proofs_validated  = 0;
+};
+
+// Samples quality chains. With full=true, solve and validate a full proof for
+// every returned chain; a chain without a valid full proof throws.
+VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full = false);
 
 } // namespace pos2gpu
