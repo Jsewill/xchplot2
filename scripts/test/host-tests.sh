@@ -14,7 +14,8 @@
 # A hardcoded list is the same trap one level down — someone adds a test, CMake
 # knows about it, this script does not, and it silently never runs. Anything
 # declared with add_executable() that pulls in no .cu, no SYCL and no
-# pos2_gpu_* library is picked up automatically.
+# pos2_* dependency is picked up automatically. Tests using the fetched CPU
+# reference headers run through CMake, which applies their required patches.
 #
 # Usage:
 #   scripts/test/host-tests.sh              # build + run all of them
@@ -67,7 +68,7 @@ for m in re.finditer(r'target_link_libraries\(\s*(\w+)\s+PRIVATE([^)]*)\)', src)
 for name, files in sorted(targets.items()):
     if name in sycl:                                        continue
     if any(f.endswith('.cu') for f in files):               continue
-    if any('pos2_gpu' in l for l in linked.get(name, [])):  continue
+    if any('pos2_' in l for l in linked.get(name, [])):      continue
     if not files:                                           continue
     print(name + '\t' + ' '.join(files))
 PY

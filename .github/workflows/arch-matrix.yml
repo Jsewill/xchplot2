@@ -153,9 +153,8 @@ jobs:
       - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # XCHPLOT2_BUILD_CUDA=ON exercises the CUDA path even though
-          # we're not building the full SYCL binary here; the arch
-          # matrix is about confirming nvcc accepts the target.
+          # Compile CUDA for every architecture and the complete SYCL binary
+          # for the representative sm_89 target.
           # AdaptiveCpp is already installed at /opt/adaptivecpp by
           # install-deps.sh — CMake's probe picks it up automatically.
           cmake -B build -S . \
@@ -166,5 +165,6 @@ jobs:
           if [ "${{ matrix.arch }}" = "89" ]; then
             # Compile and link every host/SYCL TU as well as the CUDA objects.
             cmake --build build -j 2 --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
-            ctest --test-dir build -R '^solver_filter_parity$' --output-on-failure
+            ACPP_VISIBILITY_MASK=omp ctest --test-dir build --output-on-failure \
+              --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
           fi

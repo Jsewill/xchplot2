@@ -7,9 +7,9 @@ name: install-matrix
 #
 # No actual accelerator hardware needed for the build; nvcc / hipcc
 # / icx etc. all compile fine without a runtime device present. The
-# assertion is "the container builds clean and `xchplot2 --help`
-# returns 0" — the runtime path is exercised by the parity tests
-# under the existing CI workflow.
+# assertion is that the container builds, the installed binary starts, and
+# CPU plot/proof checks pass. GPU kernel execution needs GPU runners;
+# generic SYCL builds defer vendor device compilation until runtime.
 
 on:
   pull_request:
@@ -73,11 +73,13 @@ jobs:
           # NVIDIA — default base, CUDA 13.x for Turing+; sets sm_75 so
           # we don't trip the preflight that bans pre-Turing on 13.x.
           - name: nvidia-cuda13
+            backend: cuda
             extra_args: "--build-arg CUDA_ARCH=75"
           # NVIDIA Pascal (sm_61) — must use the 12.9 base because
           # CUDA 13.x dropped Pascal codegen. Catches preflight
           # regressions.
           - name: nvidia-cuda12-pascal
+            backend: cuda
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
               --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
@@ -86,6 +88,7 @@ jobs:
           # the runtime image; build still wants cuda_fp16.h headers,
           # supplied by INSTALL_CUDA_HEADERS=1.
           - name: cpu-omp
+            backend: omp
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/ubuntu:24.04
               --build-arg BASE_RUNTIME=docker.io/ubuntu:24.04
@@ -111,6 +114,7 @@ jobs:
           # Same pattern the README recommends for RDNA1 cards
           # (gfx101x) and matches the Intel oneAPI entry below.
           - name: amd-rocm
+            backend: hip
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/rocm/dev-ubuntu-24.04:latest
               --build-arg BASE_RUNTIME=docker.io/rocm/dev-ubuntu-24.04:latest
@@ -121,6 +125,7 @@ jobs:
           # README flags this path as experimental / not perf-tested;
           # CI's role is "the build still works", not "it runs well".
           - name: intel-oneapi
+            backend: ze
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/intel/oneapi-basekit:latest
               --build-arg BASE_RUNTIME=docker.io/intel/oneapi-runtime:latest
@@ -134,13 +139,10 @@ jobs:
           podman build -t xchplot2-ci:${{ matrix.target.name }} \
             ${{ matrix.target.extra_args }} \
             -f Containerfile .
-      - name: xchplot2 --help inside image
+      - name: Required backend, installed CLI, and CPU plot/proof checks
         run: |
-          podman run --rm xchplot2-ci:${{ matrix.target.name }} \
-            xchplot2 devices 2>&1 | head -10 || true
-          # `devices` may fail without a real GPU; that's fine — what
-          # we check is the binary runs at all (no library-load errors
-          # like missing libcudart, missing libacpp-rt, etc.)
-          podman run --rm --entrypoint /bin/sh \
-            xchplot2-ci:${{ matrix.target.name }} \
-            -c 'which xchplot2 && ldd $(which xchplot2) | head -20'
+          podman run --rm --entrypoint test xchplot2-ci:${{ matrix.target.name }} \
+            -f /opt/adaptivecpp/lib/hipSYCL/librt-backend-${{ matrix.target.backend }}.so
+          podman run --rm xchplot2-ci:${{ matrix.target.name }} --help
+          podman run --rm -e ACPP_VISIBILITY_MASK=omp \
+            --entrypoint plot_file_parity xchplot2-ci:${{ matrix.target.name }}

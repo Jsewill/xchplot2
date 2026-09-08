@@ -2,7 +2,7 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// The tiers (plain / compact / minimal / tiny) are four different routes to
+// The tiers (plain / compact / minimal / tiny / pinned) are different routes to
 // one answer: they trade VRAM for host RAM and PCIe traffic, but the fragment
 // stream they emit is defined to be byte-identical. Nothing in the suite
 // checked that. Every other parity test validates a KERNEL or a PRIMITIVE in
@@ -54,6 +54,7 @@ struct TierSpec {
     int         t2_tile_count;
     int         gather_tile_count;
     bool        spill;   // route every table this tier can spill to disk
+    bool        pinned = false;
 };
 
 // Mirrors BatchPlotter's tier configuration (BatchPlotter.cpp ~2298). Keep in
@@ -77,9 +78,11 @@ constexpr TierSpec kTiers[] = {
     {"compact",     false, false, 2, 1, false},
     {"minimal",     false, false, 8, 4, false},
     {"tiny",        false, true,  8, 4, false},
+    {"pinned",      false, true,  8, 4, false, true},
     {"compact+dsk", false, false, 2, 1, true},
     {"minimal+dsk", false, false, 8, 4, true},
     {"tiny+disk",   false, true,  8, 4, true},
+    {"pinned+disk", false, true,  8, 4, true, true},
 };
 
 void derive_plot_id(std::array<uint8_t, 32>& out, uint8_t seed)
@@ -123,6 +126,7 @@ Run run_tier(TierSpec const& spec, int k, int strength, uint8_t seed)
     pos2gpu::StreamingPinnedScratch scratch{};
     scratch.plain_mode        = spec.plain_mode;
     scratch.tiny_mode         = spec.tiny_mode;
+    scratch.pinned_mode       = spec.pinned;
     scratch.t2_tile_count     = spec.t2_tile_count;
     scratch.gather_tile_count = spec.gather_tile_count;
     if (spec.spill) {
