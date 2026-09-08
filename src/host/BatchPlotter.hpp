@@ -69,7 +69,7 @@ struct BatchResult {
 // Options controlling batch behavior.
 //   verbose           — per-plot progress on stderr
 //   skip_existing     — if an output .plot2 already exists (and passes a
-//                       lightweight magic/size check), skip the plot
+//                       header, identity, and chunk-bound checks), skip the plot
 //                       instead of overwriting it
 //   continue_on_error — catch per-plot exceptions and log rather than
 //                       aborting the batch; plots_failed in the result
@@ -332,6 +332,7 @@ struct BatchOptions {
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
+void validate_batch_entry(BatchEntry const& entry);
 std::vector<BatchEntry> parse_manifest(std::string const& path);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.

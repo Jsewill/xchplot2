@@ -11,6 +11,7 @@
 // pos2-chip.
 
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/BatchPlotter.hpp"
 
 #include "gpu/AsyncErrorLog.hpp"   // async_error_count / first_async_error
 #include "gpu/DeviceIds.hpp"       // kCpuDeviceId
@@ -24,6 +25,7 @@
 #include "pos/ProofParams.hpp"
 #include "pos/ProofValidator.hpp"
 #include "prove/Prover.hpp"
+#include "solve/Solver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -39,11 +41,13 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <sys/stat.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -146,28 +150,6 @@ void wait_all_rethrow_first(std::vector<std::future<void>>& tasks)
     if (first) std::rethrow_exception(first);
 }
 
-// Flush the file at `path` to stable storage; throws on failure.
-void fsync_path_or_throw(std::string const& path)
-{
-#ifdef _WIN32
-    int fd = ::_open(path.c_str(), _O_RDWR | _O_BINARY);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to reopen for flush: " + path);
-    }
-    int const rc = ::_commit(fd);
-    ::_close(fd);
-    if (rc != 0) throw std::runtime_error("Failed to flush " + path);
-#else
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to reopen for fsync: " + path);
-    }
-    int const rc = ::fsync(fd);
-    ::close(fd);
-    if (rc != 0) throw std::runtime_error("Failed to fsync " + path);
-#endif
-}
-
 // Flush the directory entry after a rename so the new name survives a
 // crash. Best-effort: some filesystems reject directory fsync, and the
 // data itself was already fsynced.
@@ -212,6 +194,8 @@ std::vector<std::size_t> chunk_boundaries_span(
     uint64_t    chunk_end   = range_per_chunk;
     std::size_t const N     = t3_fragments.size();
     for (std::size_t i = 0; i < N; ++i) {
+        if (t3_fragments[i] > max_value || (i && t3_fragments[i] < t3_fragments[i - 1]))
+            throw std::invalid_argument("proof fragments must be sorted");
         while (t3_fragments[i] >= chunk_end) {
             boundaries[++ci] = i;
             chunk_end += range_per_chunk;
@@ -219,6 +203,51 @@ std::vector<std::size_t> chunk_boundaries_span(
     }
     for (std::size_t c = ci + 1; c <= num_spans; ++c) boundaries[c] = N;
     return boundaries;
+}
+
+// Check structure before a reader can allocate from file-controlled lengths.
+// This scans the small index and length prefixes, not every compressed payload.
+bool valid_plot_structure(std::string const& filename, BatchEntry const* expected)
+{
+    std::error_code ec;
+    uint64_t const size = std::filesystem::file_size(filename, ec);
+    if (ec || size < 51) return false;
+    std::ifstream in(filename, std::ios::binary);
+    auto read = [&](void* data, size_t bytes) {
+        in.read(static_cast<char*>(data), static_cast<std::streamsize>(bytes));
+        return bool(in);
+    };
+    char magic[4];
+    uint8_t version = 0, k = 0, strength = 0, group = 0, memo_size = 0;
+    uint16_t index = 0;
+    std::array<uint8_t, 32> id{};
+    if (!read(magic, 4) || std::memcmp(magic, "pos2", 4) != 0 ||
+        !read(&version, 1) || version != PlotFile::FORMAT_VERSION ||
+        !read(id.data(), id.size()) || !read(&k, 1) || !read(&strength, 1) ||
+        !read(&index, sizeof(index)) || !read(&group, 1) || !read(&memo_size, 1)) return false;
+    if (k < 18 || k > 32 || (k & 1) || strength < 2 ||
+        strength > k - (k < 28 ? 2 : k - 26) - 1) return false;
+    std::vector<uint8_t> memo(memo_size);
+    if (memo_size && !read(memo.data(), memo.size())) return false;
+    if (expected && (id != expected->plot_id || k != expected->k ||
+        strength != expected->strength || index != expected->plot_index ||
+        group != expected->meta_group || memo != expected->memo)) return false;
+    uint64_t count = 0;
+    if (!read(&count, sizeof(count)) || count == 0 || count > (1ULL << (k - PlotFile::CHUNK_SPAN_RANGE_BITS)))
+        return false;
+    uint64_t const header_end = 51 + memo_size + count * sizeof(uint64_t);
+    if (header_end > size) return false;
+    std::vector<uint64_t> offsets(count);
+    if (!read(offsets.data(), offsets.size() * sizeof(uint64_t))) return false;
+    uint64_t end = header_end;
+    for (auto offset : offsets) {
+        if (offset != end || offset > size || size - offset < sizeof(uint64_t)) return false;
+        in.seekg(static_cast<std::streamoff>(offset));
+        uint64_t length = 0;
+        if (!read(&length, sizeof(length)) || length > size - offset - sizeof(length)) return false;
+        end = offset + sizeof(length) + length;
+    }
+    return end == size;
 }
 
 } // namespace
@@ -233,6 +262,11 @@ void warm_writer_pool()
     (void)WriterThreadPool::instance();
 }
 
+bool plot_file_matches(std::string const& filename, BatchEntry const& expected)
+{
+    return valid_plot_structure(filename, &expected);
+}
+
 size_t write_plot_file_parallel(
     std::string const& filename,
     std::span<uint64_t const> t3_fragments,
@@ -245,6 +279,10 @@ size_t write_plot_file_parallel(
     std::span<uint8_t const> const memo,
     unsigned thread_count)
 {
+    if (k < 18 || k > 32 || (k & 1)) throw std::invalid_argument("k must be even in [18, 32]");
+    if (memo.size() > 255) throw std::invalid_argument("memo exceeds 255 bytes");
+    if (k < 32 && !t3_fragments.empty() && (t3_fragments.back() >> (2 * k)))
+        throw std::invalid_argument("proof fragment exceeds the plot's bit width");
     ProofParams params(plot_id_32, k, strength, testnet);
 
     // thread_count is the task-split granularity, not a thread count:
@@ -330,110 +368,106 @@ size_t write_plot_file_parallel(
         }
     }
 
-    // Serial write phase — file I/O is sequential anyway. Write to
-    // <filename>.partial and rename on success so SIGINT / crash / ENOSPC
-    // never leaves a malformed .plot2 at the destination. The guard
-    // unlinks the partial on early exit.
-    std::string const partial = filename + ".partial";
+    // Exclusive temporary file in the destination directory. Keep its open
+    // descriptor through the durability barrier; never reopen a pathname.
+    std::vector<char> iobuf(size_t{4} << 20);
+    std::string partial = filename + ".partial.XXXXXX";
+#ifdef _WIN32
+    if (_mktemp_s(partial.data(), partial.size() + 1) != 0)
+        throw std::runtime_error("Failed to create temporary name for " + filename);
+    int const fd = ::_open(partial.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
+                          _S_IREAD | _S_IWRITE);
+#else
+    int const fd = ::mkstemp(partial.data());
+#endif
+    if (fd < 0) throw std::runtime_error("Failed to create temporary file for " + filename);
     struct PartialGuard {
         std::string const& path;
+        std::FILE* out = nullptr;
         bool committed = false;
         ~PartialGuard() {
+            if (out) std::fclose(out);
             if (!committed) {
                 std::error_code ec;
                 std::filesystem::remove(path, ec);
             }
         }
     } guard{partial};
-
-    // Multi-MB stream buffer instead of the default ~8 KB: chunk
-    // payloads otherwise go to the kernel in thousands of small
-    // write(2)s. Must be installed before open() for libstdc++ to
-    // honour it.
-    std::vector<char> iobuf(size_t{4} << 20);
-    std::ofstream out;
-    out.rdbuf()->pubsetbuf(iobuf.data(),
-                           static_cast<std::streamsize>(iobuf.size()));
-    out.open(partial, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("Failed to open " + filename);
-
-    out.write("pos2", 4);
+#ifdef _WIN32
+    guard.out = ::_fdopen(fd, "wb");
+    if (!guard.out) ::_close(fd);
+#else
+    guard.out = ::fdopen(fd, "wb");
+    if (!guard.out) ::close(fd);
+#endif
+    if (!guard.out) throw std::runtime_error("Failed to open stream for " + partial);
+    if (std::setvbuf(guard.out, iobuf.data(), _IOFBF, iobuf.size()) != 0)
+        throw std::runtime_error("Failed to buffer " + partial);
+    size_t bytes_written = 0;
+    auto write = [&](void const* data, size_t bytes) {
+        if (bytes && std::fwrite(data, 1, bytes, guard.out) != bytes)
+            throw std::runtime_error("Failed to write " + partial);
+        bytes_written += bytes;
+    };
+    write("pos2", 4);
     uint8_t const ver = PlotFile::FORMAT_VERSION;
-    out.write(reinterpret_cast<char const*>(&ver), 1);
-    out.write(reinterpret_cast<char const*>(params.get_plot_id_bytes()), 32);
-
-    uint8_t const k_byte = static_cast<uint8_t>(params.get_k());
-    uint8_t const mkb    = static_cast<uint8_t>(params.get_match_key_bits());
-    out.write(reinterpret_cast<char const*>(&k_byte), 1);
-    out.write(reinterpret_cast<char const*>(&mkb),    1);
-    out.write(reinterpret_cast<char const*>(&index), 2);
-    out.write(reinterpret_cast<char const*>(&meta_group), 1);
-
+    write(&ver, 1);
+    write(params.get_plot_id_bytes(), 32);
+    uint8_t const k_byte = params.get_k();
+    uint8_t const mkb = params.get_match_key_bits();
+    write(&k_byte, 1);
+    write(&mkb, 1);
+    write(&index, sizeof(index));
+    write(&meta_group, 1);
     uint8_t const memo_size = static_cast<uint8_t>(memo.size());
-    out.write(reinterpret_cast<char const*>(&memo_size), 1);
-    out.write(reinterpret_cast<char const*>(memo.data()), memo.size());
+    write(&memo_size, 1);
+    write(memo.data(), memo.size());
+    write(&num_chunks, sizeof(num_chunks));
 
-    out.write(reinterpret_cast<char const*>(&num_chunks), sizeof(num_chunks));
-    if (!out) throw std::runtime_error("Failed to write chunk count to " + filename);
-
-    std::streampos offsets_start_pos = out.tellp();
-    uint64_t zero = 0;
-    for (uint64_t i = 0; i < num_chunks; ++i) {
-        out.write(reinterpret_cast<char const*>(&zero), sizeof(zero));
+    // Compression already determined every chunk length, so write the final
+    // offsets directly instead of seeking back to patch placeholders.
+    uint64_t offset = bytes_written + num_chunks * sizeof(uint64_t);
+    for (auto const& chunk : compressed) {
+        write(&offset, sizeof(offset));
+        offset += sizeof(uint64_t) + chunk.size();
     }
-    if (!out) throw std::runtime_error("Failed to write chunk offset placeholders to " + filename);
-
-    std::vector<uint64_t> offsets(num_chunks);
-    for (uint64_t i = 0; i < num_chunks; ++i) {
-        offsets[i] = static_cast<uint64_t>(out.tellp());
-        writeVector(out, compressed[i]);
-        if (!out) {
-            throw std::runtime_error(
-                "Failed to write chunk " + std::to_string(i) + " to " + filename);
-        }
+    for (auto const& chunk : compressed) {
+        uint64_t const size = chunk.size();
+        write(&size, sizeof(size));
+        write(chunk.data(), chunk.size());
     }
+    if (std::fflush(guard.out) != 0)
+        throw std::runtime_error("Failed to flush " + partial);
+#ifdef _WIN32
+    if (::_commit(fd) != 0)
+#else
+    if (::fsync(fd) != 0)
+#endif
+        throw std::runtime_error("Failed to sync " + partial);
+    if (std::fclose(std::exchange(guard.out, nullptr)) != 0)
+        throw std::runtime_error("Failed to close " + partial);
 
-    size_t bytes_written = static_cast<size_t>(out.tellp());
-
-    out.seekp(offsets_start_pos);
-    if (!out) throw std::runtime_error("Failed to seek to chunk offsets in " + filename);
-    for (uint64_t i = 0; i < num_chunks; ++i) {
-        out.write(reinterpret_cast<char const*>(&offsets[i]), sizeof(offsets[i]));
-    }
-    if (!out) throw std::runtime_error("Failed to write chunk offsets to " + filename);
-    out.seekp(0, std::ios::end);
-
-    // Close before rename so buffered writes are flushed and the destination
-    // sees the final byte image.
-    out.close();
-    if (!out) throw std::runtime_error("Failed to close " + partial);
-
-    // Durability barrier before the atomic rename. close() only pushes
-    // the bytes to the page cache; without an fsync a power loss after
-    // the rename can leave a truncated file at the FINAL name — which
-    // looks_like_complete_plot() then accepts, so --skip-existing never
-    // replots it. fsync the data, rename, then fsync the directory so
-    // the name change itself is durable.
-    fsync_path_or_throw(partial);
-
+    // Preserve the existing replace policy: concurrent successful writers may
+    // replace the destination, but each publishes its own complete file.
     std::error_code ec;
     std::filesystem::rename(partial, filename, ec);
-    if (ec) {
-        throw std::runtime_error(
-            "Failed to rename " + partial + " -> " + filename + ": " + ec.message());
-    }
+    if (ec) throw std::runtime_error("Failed to publish " + filename + ": " + ec.message());
     guard.committed = true;
     fsync_parent_dir_best_effort(filename);
-
     return bytes_written;
 }
 
-VerifyResult verify_plot_file(std::string const& filename, size_t n_trials)
+
+VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full)
 {
     VerifyResult res;
     if (n_trials == 0) return res;
 
+    if (!valid_plot_structure(filename, nullptr))
+        throw std::runtime_error("Invalid or truncated plot header/chunk layout: " + filename);
     Prover prover(filename);
+    std::unique_ptr<Solver> solver;
+    if (full) solver = std::make_unique<Solver>(prover.getProofParams());
 
     // Fresh entropy per call; the result only depends on the plot content,
     // not the specific challenges, beyond being a uniform sample.
@@ -452,6 +486,24 @@ VerifyResult verify_plot_file(std::string const& filename, size_t n_trials)
         res.trials++;
         res.proofs_found += chains.size();
         if (!chains.empty()) res.challenges_with_proof++;
+        if (solver) {
+            ProofFragmentCodec codec(prover.getProofParams());
+            ProofValidator validator(prover.getProofParams());
+            for (auto const& chain : chains) {
+                std::array<uint32_t, TOTAL_T1_PAIRS_IN_PROOF> x_bits{};
+                size_t index = 0;
+                for (auto fragment : chain.chain_links)
+                    for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits[index++] = x;
+                auto proofs = solver->solve(x_bits);
+                bool valid = false;
+                for (auto const& proof : proofs) {
+                    auto const links = validator.validate_full_proof(proof, challenge);
+                    if (links && *links == chain.chain_links) { valid = true; break; }
+                }
+                if (!valid) throw std::runtime_error("Quality chain has no valid full proof");
+                ++res.full_proofs_validated;
+            }
+        }
     }
     return res;
 }

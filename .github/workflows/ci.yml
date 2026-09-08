@@ -47,12 +47,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo check
-        run: cargo check --all-targets --locked || cargo check --all-targets
+        run: cargo check --all-targets --locked
       - name: cargo clippy (advisory)
-        run: cargo clippy --all-targets -- -W clippy::all
+        run: cargo clippy --all-targets --locked -- -W clippy::all
         continue-on-error: true
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
   host-tests:
     name: C++ host tests (${{ matrix.mode }})
@@ -73,7 +73,7 @@ jobs:
       matrix:
         mode: [plain, thread, address]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run host tests
         run: |
           if [ "${{ matrix.mode }}" = "plain" ]; then

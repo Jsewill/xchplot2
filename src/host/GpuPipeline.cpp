@@ -11,6 +11,7 @@
 
 #include "host/GpuPipeline.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/VramBudget.hpp"
 #include "host/HostPinnedPool.hpp"
 #include "host/PoolSizing.hpp"
 #include "host/TempFile.hpp"   // P1 host-RAM disk-offload (XCHPLOT2_SPILL_T1META)
@@ -114,7 +115,7 @@ struct StreamingStats {
 inline void s_init_from_env(StreamingStats& s)
 {
     if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
-        s.cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        s.cap = vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB");
     }
     if (char const* v = std::getenv("POS2GPU_STREAMING_STATS"); v && v[0] == '1') {
         s.verbose = true;
@@ -154,7 +155,7 @@ inline void s_malloc(StreamingStats& s, T*& out, size_t bytes, char const* reaso
             "to localise: sycl_g_x_parity, sycl_sort_parity, "
             "sycl_bucket_offsets_parity, sycl_t1_parity.");
     }
-    if (s.cap && s.live + bytes > s.cap) {
+    if (s.cap && !vram_fits(s.cap, s.live, bytes)) {
         throw std::runtime_error(
             std::string("streaming VRAM cap: phase=") + s.phase +
             " alloc=" + reason +
@@ -875,6 +876,27 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     StreamingStats stats;
     s_init_from_env(stats);
+
+    // Apply the same admission and allocation limit to standalone and split
+    // callers as batch plotting. Existing optional scratch is already resident.
+    size_t base = scratch.plain_mode ? streaming_plain_peak_bytes(cfg.k)
+                : scratch.pinned_mode ? streaming_pinned_peak_bytes(cfg.k)
+                : scratch.tiny_mode ? streaming_tiny_peak_bytes(cfg.k)
+                : scratch.gather_tile_count > 1 ? streaming_minimal_peak_bytes(cfg.k)
+                : streaming_peak_bytes(cfg.k);
+    if (scratch.t3_sort_full_cap) base = std::max(base, streaming_peak_bytes(cfg.k));
+    auto const mem = query_device_memory();
+    auto const held = sycl_backend::twophase_bytes_held(q);
+    size_t const available = mem.free_bytes + std::min<size_t>(
+        held, mem.total_bytes - std::min(mem.free_bytes, mem.total_bytes));
+    size_t const buffer = vram_safety_margin();
+    if (!vram_fits(available, base, buffer)) {
+        throw InsufficientVramError("streaming tier peak plus VRAM buffer exceeds free device memory");
+    }
+    sycl_backend::set_twophase_budget(q, std::min<uint64_t>(
+        scratch.twophase_budget_bytes, vram_scratch_budget(available, base, buffer)));
+    size_t const limit = base + buffer;
+    stats.cap = stats.cap ? std::min(stats.cap, limit) : limit;
 
     // ---- per-phase wall-time profiling ----
     // Identical shape to the pool path (run_gpu_pipeline above); the

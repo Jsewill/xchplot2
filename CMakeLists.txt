@@ -743,8 +743,27 @@ message(STATUS "pos2-chip: ${POS2_CHIP_DIR}")
 add_subdirectory("${POS2_CHIP_DIR}/lib/fse" "${CMAKE_BINARY_DIR}/fse" EXCLUDE_FROM_ALL)
 
 # Header-only pos2-chip include surface
+# Keep the upstream checkout intact. Its solver treats a statistical candidate
+# estimate as a hard cap; apply the growing-buffer fix to a build-local copy.
+set(_pos2_solver_dir "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver")
+foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
+    configure_file("${POS2_CHIP_DIR}/src/solve/${_header}"
+                   "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
+endforeach()
+find_package(Git REQUIRED)
+execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
+    WORKING_DIRECTORY "${_pos2_solver_dir}"
+    RESULT_VARIABLE _solver_patch_result
+    ERROR_VARIABLE _solver_patch_error)
+if(NOT _solver_patch_result EQUAL 0)
+    message(FATAL_ERROR "pos2-chip solver patch failed: ${_solver_patch_error}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch")
 add_library(pos2_chip_headers INTERFACE)
 target_include_directories(pos2_chip_headers INTERFACE
+    "${_pos2_solver_dir}"
     "${POS2_CHIP_DIR}/src"
 )
 target_link_libraries(pos2_chip_headers INTERFACE fse)
@@ -863,6 +882,10 @@ target_include_directories(pos2_gpu PUBLIC
     src
 )
 target_link_libraries(pos2_gpu PUBLIC pos2_chip_headers)
+if(ACPP_TARGETS MATCHES "(^|;)omp")
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(pos2_gpu PUBLIC OpenMP::OpenMP_CXX)
+endif()
 target_compile_features(pos2_gpu PUBLIC cxx_std_20)
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
@@ -970,6 +993,7 @@ set_target_properties(pos2_gpu PROPERTIES
 add_library(pos2_gpu_host STATIC
     src/host/GpuPlotter.cpp
     src/host/PlotFileWriterParallel.cpp
+    src/host/BatchManifest.cpp
     src/host/BatchPlotter.cpp
     # Pure integer policy, no SYCL/CUDA/device probe — see the header. Kept a
     # separate TU so host_spill_policy_test can link it on its own.
@@ -1029,7 +1053,7 @@ add_custom_command(
     OUTPUT "${POS2_KEYGEN_STATIC_LIB}"
     COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${POS2_KEYGEN_TARGET_DIR}
-            ${POS2_CARGO_EXECUTABLE} build --release --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
+            ${POS2_CARGO_EXECUTABLE} build --release --locked --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
     DEPENDS ${POS2_KEYGEN_SRCS}
     WORKING_DIRECTORY "${POS2_KEYGEN_CRATE_DIR}"
     COMMENT "cargo build --release (pos2_keygen Rust shim)"
@@ -1632,3 +1656,41 @@ x2_add_sycl_to_target(TARGET hellosycl SOURCES tools/sanity/hellosycl.cpp)
 target_compile_features(hellosycl PRIVATE cxx_std_20)
 set_target_properties(hellosycl PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
+
+
+add_executable(vram_budget_test tools/parity/vram_budget_test.cpp)
+target_include_directories(vram_budget_test PRIVATE src)
+target_compile_features(vram_budget_test PRIVATE cxx_std_20)
+
+add_executable(sycl_twophase_budget_test tools/parity/sycl_twophase_budget_test.cpp)
+target_include_directories(sycl_twophase_budget_test PRIVATE src)
+x2_add_sycl_to_target(TARGET sycl_twophase_budget_test
+                     SOURCES tools/parity/sycl_twophase_budget_test.cpp)
+
+add_executable(cli_host_test tools/parity/cli_host_test.cpp tools/xchplot2/cli.cpp
+    src/host/ConfigFile.cpp src/host/BatchManifest.cpp src/host/NumaTopology.cpp src/host/Cancel.cpp)
+target_include_directories(cli_host_test PRIVATE src keygen-rs/include)
+target_compile_features(cli_host_test PRIVATE cxx_std_20)
+target_link_libraries(cli_host_test PRIVATE Threads::Threads)
+
+add_executable(pipeline_control_test tools/parity/pipeline_control_test.cpp
+    src/host/MultiGpuPipelineParallel.cpp src/host/Cancel.cpp)
+target_include_directories(pipeline_control_test BEFORE PRIVATE tools/parity/pipeline_control_test src)
+target_compile_features(pipeline_control_test PRIVATE cxx_std_20)
+target_link_libraries(pipeline_control_test PRIVATE Threads::Threads)
+
+add_executable(solver_filter_parity tools/parity/solver_filter_parity.cpp)
+target_link_libraries(solver_filter_parity PRIVATE pos2_chip_headers Threads::Threads)
+
+# Keep interactive discovery and CTest on the same executable set.
+include(CTest)
+get_property(_xchplot2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_target IN LISTS _xchplot2_targets)
+    if(_target MATCHES "(_parity|_test)$")
+        set_target_properties(${_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+        if(BUILD_TESTING)
+            add_test(NAME ${_target} COMMAND $<TARGET_FILE:${_target}>)
+        endif()
+    endif()
+endforeach()

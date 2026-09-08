@@ -156,7 +156,7 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     3884 + 390 MB does not fit in it. Trade-off: ~6 extra cap-sized
     PCIe round-trips per plot. k=28 wall on sm_89: ~23 s/plot vs
     ~5 s for compact. Detailed breakdown in [VRAM](#vram).
-  - **Tiny streaming** (~1.07 GiB peak + 36 MB margin, k=28 measured
+  - **Tiny streaming** (~1.07 GiB peak + 128 MiB buffer, k=28 measured
     **1064 MB**): the smallest tier. Builds on minimal with full Phase
     1.4 + 1.5 + 1.6 algorithm work — per-section-pair T1/T2/T3 match
     with host-prepare offsets, streaming-partition T1/T2 sort
@@ -806,10 +806,13 @@ Bench deletes the files it creates unless `--keep` is set. Pass
 `--target-size TiB` to estimate time-to-fill a specific capacity instead
 of the output directory's free space.
 
-Plots are written to `<name>.plot2.partial` and atomically renamed on
+Plots are written to an exclusively created `<name>.plot2.partial.XXXXXX`
+file, flushed through its original file descriptor, and atomically renamed on
 completion, so a crash / `SIGINT` / `ENOSPC` mid-write never leaves a
 malformed plot at the destination. A first `Ctrl-C` asks the plotter to
-finish the plot in flight and stop; a second hard-kills.
+finish the plot in flight and stop; a second hard-kills. Concurrent writers
+use separate temporary files; the last completed rename wins. Resume checks
+the header identity, memo, chunk index, and file bounds before skipping a plot.
 
 #### Per-worker rates and the batch size that lands them together
 
@@ -1261,15 +1264,15 @@ xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw in
 xchplot2 batch         <manifest.tsv> [-v] [-q] [--skip-existing] [--continue-on-error]
                                              [--devices <SPEC>] [--progress|--no-progress]
 xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
-xchplot2 verify        <file.plot2> [--trials N]           # run N random challenges
+xchplot2 verify        <file.plot2> [--trials N] [--full]  # sample chains; optionally validate full proofs
 xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen
 ```
 
-`verify` opens a `.plot2` through pos2-chip's CPU prover and runs N
-(default 100) random challenges. It exits non-zero only when the whole
-sample yields *no* proof, so treat it as a smoke test for gross
-corruption rather than proof a plot is right — a badly damaged plot can
-still answer some challenges. Not a replacement for `chia plots check`.
+`verify` checks file structure, then samples quality chains for N random
+challenges (default 100). `--full` also reconstructs and cryptographically
+validates a full proof for every returned chain, failing if any cannot be
+validated. Both modes fail on an empty sample. Sampling does not validate
+every part of a plot; use byte comparison with a CPU reference for parity.
 
 To actually prove a plot correct, build the same one on the CPU and
 compare bytes. `test` without `--gpu-all` runs pos2-chip's own plotter,
@@ -1523,19 +1526,28 @@ based on available VRAM at batch start:
   s/plot (compact) to ~34 s/plot (minimal). Minimal is not the bottom of
   the ladder — tiny is, and a card below tiny's floor throws.
 
-At pool construction `xchplot2` queries `cudaMemGetInfo` on the
-CUDA-only build, or `global_mem_size` (device total) on the SYCL
-path — SYCL has no portable free-memory query, so the check
-effectively approximates "free == total" and lets the actual
-`malloc_device` failure trigger the fallback. If the pool doesn't
-fit, the streaming-tier dispatch picks the largest tier that fits
-with the 128 MB margin: plain if free ≥ 7.42 GiB, else compact if
-free ≥ 5.33 GiB, else minimal. `XCHPLOT2_STREAMING=1` forces
-streaming even when the pool would fit; `--tier
-plain|compact|minimal` (or `XCHPLOT2_STREAMING_TIER`) overrides the
-auto-pick. Forced plain or compact below their floor warns and
-proceeds (caller's risk); forced minimal below its floor throws
-because there is no smaller tier to fall back to.
+Admission uses the owning driver's free-memory counter after context creation.
+If that counter is unavailable, plotting fails rather than assuming the whole
+device is free. The streaming picker tries plain, compact, minimal, then tiny;
+every automatic or forced tier must fit `peak + buffer`. Pinned remains a
+manual tier. Peaks scale with k and include the backend's sort scratch.
+`POS2GPU_VRAM_MARGIN_MB` sets the buffer (default 128 MiB).
+Optional two-phase scratch receives only `free - peak - buffer`, and lowering
+its grant releases oversized cached allocations. The benchmark watchdog counts
+the buffer once and fails when measured use exceeds the declared allowance.
+
+Pipeline stages choose their tiers against each bound worker's free VRAM.
+Writer queues are bounded, and any stage or writer failure wakes all stages.
+Pipeline plotting rejects `--max-host-ram` because its spill policy is not
+implemented; use the work-queue strategy when a host-memory cap is required.
+GPU IDs must be distinct within a batch so workers cannot spend the same VRAM
+budget twice. `parity-check` executes test paths directly and prints captured
+output on failure, including when paths contain spaces or shell punctuation.
+
+Run `scripts/test/vram-tiers.sh /path/to/xchplot2 DEVICE` on a real GPU to
+exercise the tier boundaries and watchdog. The script needs enough physical
+free VRAM for each tested cap; a software cap does not emulate another GPU's
+driver, allocator, or sort implementation.
 
 Plot output is bit-identical across all five paths — streaming
 reorganises memory, not algorithms. Verified at k=22 (and k=28

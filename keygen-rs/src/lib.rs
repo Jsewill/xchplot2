@@ -1,4 +1,4 @@
-// pos2_keygen — C-callable shim around chia 0.42 (chia-bls + chia-protocol)
+// pos2_keygen — C-callable shim around chia (chia-bls + chia-protocol)
 // that derives a v2 plot's plot_id and memo from caller-supplied farmer +
 // pool keys plus a 32-byte master-SK seed. The GPU plotter uses the returned
 // plot_id / memo to drive the existing batch path.
@@ -211,15 +211,16 @@ pub unsafe extern "C" fn pos2_keygen_decode_address(
         Err(_) => return POS2_BAD_ADDRESS,
     };
 
-    // bech32 0.11: decode returns (Hrp, Vec<u8>) with the 8-bit payload.
-    let (hrp, data) = match bech32::decode(s) {
+    let decoded = match bech32::primitives::decode::CheckedHrpstring::new::<bech32::Bech32m>(s) {
         Ok(x) => x,
         Err(_) => return POS2_BAD_ADDRESS,
     };
+    let hrp = decoded.hrp();
     let h = hrp.as_str();
     if h != "xch" && h != "txch" {
         return POS2_BAD_HRP;
     }
+    let data: Vec<u8> = decoded.byte_iter().collect();
     if data.len() != 32 {
         return POS2_BAD_ADDRESS;
     }
@@ -353,5 +354,18 @@ mod tests {
         let mut dummy = [0u8; 32];
         let rc = unsafe { pos2_keygen_decode_address(bad.as_ptr(), dummy.as_mut_ptr()) };
         assert_ne!(rc, POS2_OK);
+    }
+    #[test]
+    fn decode_address_rejects_legacy_checksum() {
+        let address =
+            bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("xch").unwrap(), &[0x42; 32])
+                .unwrap();
+        let address = std::ffi::CString::new(address).unwrap();
+        let mut output = [0x55; 32];
+        assert_eq!(
+            unsafe { pos2_keygen_decode_address(address.as_ptr(), output.as_mut_ptr()) },
+            POS2_BAD_ADDRESS
+        );
+        assert_eq!(output, [0x55; 32]);
     }
 }

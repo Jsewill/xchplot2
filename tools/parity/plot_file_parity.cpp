@@ -9,6 +9,7 @@
 // CPU-side test; no GPU required.
 
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/BatchPlotter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,9 +17,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -106,6 +109,69 @@ bool run_one(char const* label, uint32_t seed, int k, int strength)
     return false;
 }
 
+bool file_safety()
+{
+    auto dir = std::filesystem::temp_directory_path();
+    std::random_device random;
+    do { dir = std::filesystem::temp_directory_path() / ("xch_safety_" + std::to_string(random())); }
+    while (!std::filesystem::create_directory(dir));
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+    } cleanup{dir};
+    auto const path = dir / "plot.plot2", victim = dir / "sentinel";
+    { std::ofstream out(victim); out << "preserve me"; }
+#ifndef _WIN32
+    std::filesystem::create_symlink(victim, path.string() + ".partial");
+#endif
+    pos2gpu::BatchEntry entry;
+    entry.k = 18; entry.plot_id = derive_plot_id(1); entry.memo = {1, 2, 3};
+    auto const fragments = real_fragments(entry.plot_id, entry.k, entry.strength);
+    auto write = [&] {
+        pos2gpu::write_plot_file_parallel(path.string(), fragments, entry.plot_id.data(),
+            18, 2, 0, 0, 0, entry.memo);
+    };
+    write();
+    std::ifstream in(victim);
+    std::string sentinel; std::getline(in, sentinel);
+    if (sentinel != "preserve me" || std::filesystem::is_symlink(path)) return false;
+    if (!pos2gpu::plot_file_matches(path.string(), entry)) return false;
+    auto wrong = entry; wrong.plot_id[0] ^= 1;
+    if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
+    wrong = entry; wrong.memo.push_back(4);
+    if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
+    wrong.memo.clear();
+    if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
+    std::exception_ptr errors[2];
+    std::thread writers[2];
+    for (int i = 0; i < 2; ++i) writers[i] = std::thread([&, i] {
+        try { write(); } catch (...) { errors[i] = std::current_exception(); }
+    });
+    for (auto& writer : writers) writer.join();
+    if (errors[0] || errors[1] || pos2gpu::read_plot_file_fragments(path.string()) != fragments) return false;
+    auto const verification = pos2gpu::verify_plot_file(path.string(), 100, true);
+    if (verification.proofs_found == 0 || verification.full_proofs_validated != verification.proofs_found) return false;
+    auto corrupt_u64 = [&](std::streamoff offset) {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        uint64_t const impossible = ~uint64_t{0};
+        file.seekp(offset); file.write(reinterpret_cast<char const*>(&impossible), sizeof(impossible));
+        file.close();
+        bool const rejected = !pos2gpu::plot_file_matches(path.string(), entry);
+        write();
+        return rejected;
+    };
+    // Attacker-controlled chunk count and offset must be rejected before use.
+    if (!corrupt_u64(43 + entry.memo.size()) || !corrupt_u64(51 + entry.memo.size())) return false;
+    auto const size = std::filesystem::file_size(path);
+    std::filesystem::resize_file(path, size - 1);
+    if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
+    { std::ofstream junk(path); junk << "pos2" << std::string(60, 'x'); }
+    if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
+    std::printf("  OK exclusive temp, concurrent writers, resume identity/bounds, and %zu full proofs\n",
+                verification.full_proofs_validated);
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -127,6 +193,7 @@ int main()
         all_ok = run_one("k18s4",   seed, 18, 4) && all_ok;
     }
 
+    all_ok = file_safety() && all_ok;
     std::printf("\n==> %s\n", all_ok ? "ALL OK" : "FAIL");
     return all_ok ? 0 : 1;
 }

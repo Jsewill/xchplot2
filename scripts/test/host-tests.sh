@@ -36,7 +36,7 @@ out_dir="$(mktemp -d)"
 trap 'rm -rf "$out_dir"' EXIT
 
 CXX="${CXX:-g++}"
-cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -pthread)
+cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -Ikeygen-rs/include -pthread)
 ldflags=(-pthread)
 
 case "$sanitizer" in
@@ -87,8 +87,11 @@ while IFS=$'\t' read -r name sources; do
     [ -n "$name" ] || continue
     count=$((count + 1))
     printf '\n--- %s ---\n' "$name"
+    test_includes=()
+    # A test-specific fake backend lets host coordinators run without a GPU.
+    if [ -d "tools/parity/$name" ]; then test_includes=(-I"tools/parity/$name"); fi
     # shellcheck disable=SC2086
-    if ! "$CXX" "${cxxflags[@]}" -o "$out_dir/$name" $sources "${ldflags[@]}"; then
+    if ! "$CXX" "${test_includes[@]}" "${cxxflags[@]}" -o "$out_dir/$name" $sources "${ldflags[@]}"; then
         echo "BUILD FAILED: $name" >&2
         failed+=("$name (build)")
         continue

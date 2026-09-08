@@ -5,6 +5,8 @@
 #include "gpu/SyclBackend.hpp"
 #include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
 #include "host/HostPinnedPool.hpp"
+#include "host/Cancel.hpp"
+#include "host/VramBudget.hpp"
 #include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
@@ -387,21 +389,24 @@ public:
     void send(int slot)
     {
         std::lock_guard<std::mutex> lk(m_);
+        if (closed_) return;
         q_.push(slot);
         cv_.notify_one();
     }
-    void close()
+    void close(bool discard = false)
     {
         std::lock_guard<std::mutex> lk(m_);
         closed_ = true;
+        if (discard) q_ = {};
         cv_.notify_all();
     }
     // Returns -1 when channel is closed and empty.
     int recv()
     {
         std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [&] { return closed_ || !q_.empty(); });
-        if (q_.empty()) return -1;
+        while (!closed_ && q_.empty() && !cancel_requested())
+            cv_.wait_for(lk, std::chrono::milliseconds(50));
+        if (cancel_requested() || q_.empty()) return -1;
         int s = q_.front();
         q_.pop();
         return s;
@@ -505,21 +510,6 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         roles[2].start_at_t3_match  = true;
     }
 
-    // Phase 2.5a: enable the full-cap on-device T3 sort for the final
-    // stage when its device has VRAM headroom. The minimal-tier tile-
-    // merge path (host std::inplace_merge) bloats T3 sort wall by 15-
-    // 30× in pipelined-batch mode under PCIe contention. Threshold is
-    // 6 GB (full-cap T3 sort peaks at ~4.2 GB at k=28; +40% safety).
-    // Tiny stages can't use this — their input is host-pinned, no
-    // device-resident d_t3.
-    constexpr std::uint64_t kT3FullCapVramFloor = 6ULL << 30; // 6 GB
-    int const final_stage = N - 1;
-    if (roles[final_stage].tier == PipelineStageTier::Minimal &&
-        roles[final_stage].vram_bytes >= kT3FullCapVramFloor)
-    {
-        roles[final_stage].t3_sort_full_cap = true;
-    }
-
     // Allocate `depth` boundary buffer sets. Default path: host-pinned
     // on stage-0's queue (portable on CUDA). Peer-copy path
     // (POS2GPU_PIPELINE_PEER_COPY=1, N=2 only for now): device memory
@@ -533,6 +523,18 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
     bind_current_device(roles[alloc_stage].device_id);
     sycl::queue& alloc_q = sycl_backend::queue();
     std::vector<BoundaryBuffers> bufs(depth);
+    struct BoundaryGuard {
+        std::vector<BoundaryBuffers>& buffers;
+        ~BoundaryGuard() { for (auto& b : buffers) free_boundary(b); }
+    } boundary_guard{bufs};
+    if (peer_copy) {
+        auto const mem = query_device_memory();
+        auto const peak = tiers.empty() || tiers.back() == PipelineStageTier::Tiny
+            ? streaming_tiny_peak_bytes(k0) : streaming_minimal_peak_bytes(k0);
+        uint64_t const boundary_bytes = uint64_t(depth) * cap * 16;
+        if (!vram_fits(mem.free_bytes, boundary_bytes + peak, vram_safety_margin()))
+            throw InsufficientVramError("pipeline peer buffers plus tier and VRAM buffer do not fit; disable POS2GPU_PIPELINE_PEER_COPY or reduce depth");
+    }
     // pinned_dst + h_meta always host-pinned (host-side use). The 3
     // T2-boundary buffers become device-on-consumer when peer_copy is
     // on (cross-device D2D via AdaptiveCpp's peer-copy routing).
@@ -619,11 +621,27 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
 
     std::vector<std::thread> stage_threads;
     stage_threads.reserve(N);
+    try {
     for (int s = 0; s < N; ++s) {
         stage_threads.emplace_back([&, s] {
             auto& st = stats[static_cast<std::size_t>(s)];
             try {
                 bind_current_device(roles[s].device_id);
+                auto const mem = query_device_memory();
+                auto const buffer = vram_safety_margin();
+                auto const minimal = streaming_minimal_peak_bytes(k0);
+                if (tiers.empty()) {
+                    roles[s].tier = vram_fits(mem.free_bytes, minimal, buffer)
+                        ? PipelineStageTier::Minimal : PipelineStageTier::Tiny;
+                }
+                auto const peak = roles[s].tier == PipelineStageTier::Minimal
+                    ? minimal : streaming_tiny_peak_bytes(k0);
+                if (!vram_fits(mem.free_bytes, peak, buffer))
+                    throw InsufficientVramError("pipeline stage tier plus VRAM buffer exceeds free memory");
+                roles[s].t3_sort_full_cap = s == N - 1 &&
+                    roles[s].tier == PipelineStageTier::Minimal &&
+                    vram_fits(mem.free_bytes, streaming_peak_bytes(k0), buffer);
+
                 // Per-thread host-pinned pool: amortises per-plot allocs
                 // (h_t1_mi, h_t2_mi, h_t3, h_keys_merged, h_merged_vals)
                 // across all plots this thread handles.
@@ -725,19 +743,24 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 }
             } catch (...) {
                 excs[s] = std::current_exception();
+                // Wake upstream too, including the recycled-slot channel.
+                for (auto& channel : channels) channel->close(true);
             }
             // Close downstream so the next stage can drain and exit.
-            // Last stage doesn't close channels[0] — channels[0] just
-            // becomes unreferenced when its thread exits.
+            // A normal close drains queued slots; failure discards them above.
             if (s + 1 < N) {
                 channels[s + 1]->close();
             }
         });
     }
 
-    for (auto& t : stage_threads) t.join();
+    } catch (...) {
+        for (auto& channel : channels) channel->close(true);
+        for (auto& t : stage_threads) t.join();
+        throw;
+    }
 
-    for (auto& b : bufs) free_boundary(b);
+    for (auto& t : stage_threads) t.join();
 
     // Publish before rethrowing: a stage that threw is exactly when the caller
     // most wants to see where the wall went.

@@ -163,3 +163,8 @@ jobs:
             -DXCHPLOT2_BUILD_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
           cmake --build build -j --target pos2_gpu_cuda_obj
+          if [ "${{ matrix.arch }}" = "89" ]; then
+            # Compile and link every host/SYCL TU as well as the CUDA objects.
+            cmake --build build -j 2 --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
+            ctest --test-dir build -R '^solver_filter_parity$' --output-on-failure
+          fi
