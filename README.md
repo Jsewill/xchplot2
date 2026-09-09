@@ -115,17 +115,13 @@ real writes, and durability barriers. Each non-auto tier was forced.
 | Minimal | 19.53 ± 0.23 | 3,926 | 13.30 |
 | Tiny | 32.65 ± 0.29 | 1,116 | 14.36 |
 
-All five configurations passed, with one output per run checked over
-100 full-proof challenges. Native CUDA has no separate Pinned tier.
-The auto path enabled D2H/Xs overlap. Driver peaks are deltas from initial
-free VRAM and may include desktop activity; they are not minimum capacity
-requirements. The local desktop test used the existing
-`POS2GPU_VRAM_MARGIN_MB=512` override; production defaults are unchanged.
+Native CUDA has no Pinned tier. Auto used D2H/Xs overlap; all runs used a
+512 MiB VRAM margin. Driver peaks can include desktop activity and are not
+minimum capacity requirements.
 
-The [benchmark report](BENCHMARKS.md) includes the exact
-method, source revisions, SYCL/AMD comparison, profiling, and correctness
-checks. Multi-GPU throughput also depends on shared PCIe bandwidth,
-CPU compression, and storage; these measurements use one GPU.
+The [benchmarks](BENCHMARKS.md) include configurations, variability, memory
+use, and SYCL comparisons. Multi-GPU throughput also depends on shared PCIe
+bandwidth, CPU compression, and storage; these measurements use one GPU.
 
 ## Documentation
 
@@ -133,7 +129,7 @@ CPU compression, and storage; these measurements use one GPU.
 |---|---|
 | [Installation](INSTALL.md) | Dependencies, containers, Cargo/CMake, Windows and WSL2 |
 | [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
-| [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, memory use, and validation |
+| [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, and memory use |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 
