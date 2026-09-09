@@ -75,9 +75,9 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
   - **AMD ROCm** via the SYCL / AdaptiveCpp path. Validated on RDNA2
     (`gfx1031`, RX 6700 XT, 12 GB) — bit-exact parity with the CUDA
     backend across the sort / bucket-offsets / g_x kernels, and
-    farmable plots end-to-end. ROCm 6.2 required (newer ROCm versions
-    have LLVM packaging breakage — see [`compose.yaml`](compose.yaml)
-    rocm-service comments). Build picks `ACPP_TARGETS=hip:gfxXXXX`
+    farmable plots end-to-end. The container recipe uses ROCm 6.2;
+    the September 2026 Fedora 44 tests use ROCm 7.1.1 with LLVM 20.
+    Build picks `ACPP_TARGETS=hip:gfxXXXX`
     from `rocminfo` automatically for RDNA2+. Other gfx targets
     (`gfx1030` / `gfx1100`) build cleanly but are untested on real
     hardware. **RDNA1 cards (`gfx1010`/`gfx1011`/`gfx1012`, e.g.
@@ -91,7 +91,8 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     AOT spoof, `XCHPLOT2_NO_GFX_SPOOF=1` to AOT-target the actual
     ISA natively (build will fail clearly if AdaptiveCpp doesn't
     accept it).
-  - **Intel oneAPI** is wired up but untested.
+  - **Intel oneAPI** is supported by the build but is outside the current
+    hardware benchmark set.
   - **CPU** via pos2-chip's hand-tuned CPU plotter — not our SYCL kernels
     on AdaptiveCpp's OpenMP backend, which are written for tens of
     thousands of GPU threads and are 4.3x slower on a CPU. CPU plotting is
@@ -139,9 +140,8 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
   - **Pool** (~10.5 GB device + ~4 GB pinned host): fastest steady-state,
     used on 12 GB+ cards.
   - **Plain streaming** (~7.3 GB peak + 128 MB margin): per-plot
-    allocations, no pinned-host parks, single-pass T2 match. ~400 ms/
-    plot faster than compact. Used on 8-11 GB cards that can't fit
-    the pool but have headroom above compact.
+    allocations, no pinned-host parks, single-pass T2 match. Used on
+    8-11 GB cards that can't fit the pool but have headroom above compact.
   - **Compact streaming** (~5.2 GB peak + 128 MB margin): full
     park/rehydrate + N=2 T2 match tiling. Used on 6-8 GB cards where
     plain won't fit — including 8 GB datacenter parts like the Tesla P4.
@@ -152,30 +152,24 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     per-tile CUB outputs in T1/T2/T3 sort with USM-host merges, and
     tiled Xs gen+sort+pack with host-pinned accumulation. Bottleneck
     moves from compact's T1 sort (5200 MB) to T3 match (3884 MB).
-    Serves ~5 GiB+ cards — a real 4 GiB card lands on tiny, since
-    3884 + 390 MB does not fit in it. Trade-off: ~6 extra cap-sized
-    PCIe round-trips per plot. k=28 wall on sm_89: ~23 s/plot vs
-    ~5 s for compact. Detailed breakdown in [VRAM](#vram).
-  - **Tiny streaming** (~1.07 GiB peak + 128 MiB buffer, k=28 measured
-    **1064 MB**): the smallest tier. Builds on minimal with full Phase
+    Serves ~5 GiB+ cards; a 4 GiB card with less than the required
+    3.93 GiB free lands on Tiny. It uses more host memory and PCIe
+    traffic than Compact. See [VRAM](#vram) and [Performance](#performance).
+  - **Tiny streaming** (~1.07 GiB base peak + 128 MiB buffer): the
+    smallest tier. Builds on minimal with full Phase
     1.4 + 1.5 + 1.6 algorithm work — per-section-pair T1/T2/T3 match
     with host-prepare offsets, streaming-partition T1/T2 sort
     (atomic-claim per-bucket + global_idx stable tiebreak), tile-and-
     merge T3 sort from host, Xs gen+sort tiling, and host-pinned
-    d_t3_stage + d_frags_out aliases. Per-phase peaks at k=28 ≤ 1064
-    MB (Xs 1030, T1 match 1040, T1 sort 1056, T2 match 1040, T2 sort
-    1064, T3 match 1024, T3 sort 1047). Targets sub-2 GiB NVIDIA
+    d_t3_stage + d_frags_out aliases. Targets 2 GiB NVIDIA
     cards (Quadro P620 2 GB, GTX 1050 2 GB, GT 1030 2 GB, older
     laptop dGPUs); 4 GiB cards (GTX 1050 Ti, RTX 3050 4GB, MX450)
-    auto-select Tiny too since real 4 GiB hardware reports ~3.5 GiB
-    free post-CUDA-context, well under minimal's 4.31 GiB floor.
-    Trade-off: ~13 s/plot extra PCIe vs minimal at k=28 (sm_89
-    ~36 s/plot). Tiny is the floor of the auto-pick ladder — a card
-    below it throws. (`--tier pinned` is a manual label, not a rung
-    below tiny: measured at k=28 it peaks at **1128 MB** against tiny's
-    1118 MB — the same footprint, a few percent faster. It is not in the
-    auto ladder because it is not *smaller* than tiny, so it cannot be
-    the fallback below it.)
+    select Tiny when their free VRAM after context creation is below
+    Minimal's 3.93 GiB floor.
+    See [Performance](#performance) for measured plotting times.
+    Tiny is the floor of the auto-pick ladder — a card below it throws.
+    `--tier pinned` is a separate manual tier with a 1150 MiB base peak;
+    it does not provide a smaller automatic fallback.
 
   With [`--devices`](#multi-gpu---devices), each worker picks its own
   tier from its own GPU's free VRAM — heterogeneous rigs (e.g. one
@@ -1470,7 +1464,7 @@ keygen-rs/               Rust staticlib: plot_id_v2, BLS HD, bech32m
 
 ## VRAM
 
-PoS2 plots are k=28 by spec. Four code paths, dispatched automatically
+PoS2 plots are k=28 by spec. Five code paths, dispatched automatically
 based on available VRAM at batch start:
 
 - **Pool path (~11 GB device + ~4 GB pinned host; 12 GB+ cards
@@ -1487,8 +1481,8 @@ based on available VRAM at batch start:
   `d_t2_xbits`, `d_t2_keys_merged`) alive across their idle windows
   instead of parking them on pinned host. T2 match runs as a single
   full-cap pass (N=1). Used on 10-11 GB cards that can't fit the pool
-  but have headroom above the compact floor. ~400 ms/plot faster than
-  compact at k=28 because there are no park/rehydrate PCIe round-trips.
+  but have headroom above the compact floor. Avoids Compact's
+  park/rehydrate PCIe round-trips; see [Performance](#performance).
 - **Compact streaming (~5.2 GB peak + 128 MB margin; ≥ 5.20 GiB free
   at k=28).** All three match phases (T1/T2/T3) are tiled N=2 across
   disjoint bucket ranges with half-cap device staging and
@@ -1511,7 +1505,7 @@ based on available VRAM at batch start:
   | T3 sort   | 4228 |
 
   A BatchPlotter preflight rejects cards reporting less than
-  `streaming_peak_bytes(k) + 512 MB` free — read from the driver, not
+  `streaming_peak_bytes(k) + 128 MiB` free by default — read from the driver, not
   from the card's total — before any queue work. Practical targets:
   6 GB cards on the edge, 8 GB comfortable, 10 GB and up ample.
   Log the full alloc trace with `POS2GPU_STREAMING_STATS=1`.
@@ -1552,20 +1546,28 @@ based on available VRAM at batch start:
     `std::inplace_merge`. CUB sub-phase peaks: 4170-4228 MB →
     3155-3640 MB.
   - **Tiled Xs gen+sort+pack.** N=2 position halves through cap/2
-    ping-pong buffers + USM-host accumulator + 2-way merge, then
-    pack runs in cap/2 halves with D2H per tile to a host-pinned
-    `XsCandidateGpu` accumulator (final d_xs rehydrated H2D).
-    Xs phase peak: 4128 MB → 3072 MB.
+    ping-pong buffers, then D2H to pinned host memory. A stable CPU
+    merge packs directly into `XsCandidateGpu` before the final H2D.
+    In batches, Xs and T1/T2 sort reuse the existing pinned MI slots
+    after their previous inputs have been consumed; Xs also borrows
+    the metadata buffer before T1 writes it.
 
   Bottleneck after all six cuts is the T3 match phase at 3754 MB.
   Targets 5 GiB+ cards comfortably (RTX 2060, RX 6600 XT, RX 7600
   with ~1.7+ GiB headroom). 4 GiB cards (GTX 1050 Ti / 1650, RTX 3050
-  4GB, MX450) are an edge case — real 4 GiB physical hardware
-  reports ~3.5 GiB free post-CUDA-context, just under the 3.93 GiB
-  required floor, so they auto-select tiny instead. Trade-off: ~6 extra
-  cap-sized PCIe round-trips per plot push k=28 wall on sm_89 from ~13
-  s/plot (compact) to ~34 s/plot (minimal). Minimal is not the bottom of
-  the ladder — tiny is, and a card below tiny's floor throws.
+  4GB, MX450) are an edge case — cards reporting less than the 3.93 GiB
+  required floor after context creation auto-select Tiny. The extra staging
+  and host-memory traffic cost throughput; see [Performance](#performance).
+  Minimal is not the bottom of the ladder — Tiny is, and a card below
+  Tiny's floor throws.
+
+- **Tiny (~1.07 GiB peak + 128 MiB buffer; ≥ 1.20 GiB free at k=28).**
+  Stages match inputs by section and bucket, partitions T1/T2 sorts into
+  small device buffers, and keeps larger tables on the host. Xs uses four
+  sorted tiles with a stable CPU merge and pack. This lowers the device
+  requirement at the cost of host RAM and transfer time. Pinned is a
+  separate manual tier with a 1150 MiB base peak; it is not an automatic
+  fallback below Tiny.
 
 Admission uses the owning driver's free-memory counter after context creation.
 If that counter is unavailable, plotting fails rather than assuming the whole
@@ -1590,42 +1592,36 @@ exercise the tier boundaries and watchdog. The script needs enough physical
 free VRAM for each tested cap; a software cap does not emulate another GPU's
 driver, allocator, or sort implementation.
 
-Plot output is bit-identical across all five paths — streaming
-reorganises memory, not algorithms. Verified at k=22 (and k=28
-for tiny vs minimal) by byte comparison.
+Plot output must be bit-identical across every tier. Tier comparisons,
+CPU-reference byte checks, and full-proof tests are described in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Performance
 
-k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16. Steady-state per-plot
-wall from `xchplot2 batch` (10-plot manifest, mean):
+Measured September 9, 2026, at k=28, strength=2, using real file writes,
+FSE compression, and durability barriers. Times are mean completion intervals
+with warmup plots excluded; the tiers were forced on each single GPU.
 
-| Build | Per plot | Notes |
-|---|---|---|
-| pos2-chip CPU baseline | ~50 s | reference |
-| `cuda-only` branch | **2.15 s** | original CUDA-only path |
-| `main`, `XCHPLOT2_BUILD_CUDA=ON` (CUB sort) | 2.41 s | NVIDIA fast path on the SYCL/AdaptiveCpp port |
-| `main`, `XCHPLOT2_BUILD_CUDA=OFF` (hand-rolled SYCL radix) | 3.79 s | cross-vendor fallback (AMD/Intel) on AdaptiveCpp |
-| plain streaming tier (10-11 GB cards) | ~5.7 s | no parks, single-pass T2 match; ~400 ms/plot faster than compact |
-| compact streaming tier (6-8 GB cards) | ~7.3 s | full parks + N=2 T2 match |
-| minimal streaming tier (5 GiB cards) | TBD | full parks + N=8 T2 match; ~3.7 GB peak |
-| tiny streaming tier (4 GB cards)     | TBD | minimal + park d_t1_meta_sorted/d_t1_keys_merged across T2 match, d_t2_xbits/d_t2_keys across T3 match, merged_vals across sort gathers, d_t3 across T3 sort; ~3.2 GB peak |
-| `main` on RX 6700 XT (gfx1031 / ROCm 6.2 / AdaptiveCpp HIP) | **9.97 s** | AMD batch steady-state at k=28; T-table AES near-optimal on RDNA2 via this compiler stack |
+| Tier (`main`) | RTX 4090, CUDA/CUB | RX 6700 XT, AdaptiveCpp HIP |
+|---|---:|---:|
+| Auto (pool) | 2.55 s | 9.84 s |
+| Plain | 2.64 s | 9.60 s |
+| Compact | 3.85 s | 10.53 s |
+| Minimal | 16.37 s | 22.03 s |
+| Tiny | 27.08 s | 29.80 s |
 
-The `main`/CUB row is +12% over `cuda-only` from extra AdaptiveCpp
-scheduling overhead. The SYCL row is +57% over CUB on the same NVIDIA
-hardware; ~88% of GPU compute is identical between the two paths
-(`nsys` per-kernel breakdown), and the gap is dominated by host-side
-runtime overhead in AdaptiveCpp's DAG manager rather than kernel
-performance. AMD and Intel runtimes are untested; expect roughly the
-SYCL-row latency adjusted for relative GPU throughput.
+The native `cuda-only` auto path measured **2.21 s/plot** on the same RTX
+4090, with its optional D2H/Xs overlap enabled. These runs do not isolate the
+cause of the difference between the native and SYCL runtimes.
 
-Numbers above are single-GPU. With `--devices 0,1,...` N worker threads
-(one per device) race for plots off a shared queue, so each device takes
-work at its own rate and throughput is the SUM of their rates — ≈ linear
-scaling on matched cards, and mismatched cards still each contribute
-fully rather than being held to the slowest. Live multi-GPU plots were
-confirmed end-to-end on NVIDIA; per-device numbers will vary with PCIe
-bandwidth sharing on the host root complex.
+The [benchmark report](BENCHMARKS.md) records hardware,
+toolchains, sample counts, variability, host RAM, driver VRAM, the before/after
+comparison, profiling, and correctness checks. The forced tiers can use
+additional match scratch on these roomy GPUs; their timings do not predict
+performance on a card restricted to a tier's minimum VRAM.
+
+Multi-GPU throughput also depends on shared PCIe bandwidth, CPU compression,
+and storage. This benchmark set uses one GPU per host.
 
 `--shard-plot` is a separate mode that splits one plot across every
 selected GPU instead of running independent plots in parallel. On
@@ -1634,8 +1630,8 @@ work-queue mode because each shard still does full reads of the
 replicated streams between phases — measured 10×k=28 batches on
 2× RTX 4000 Ada (PCIe-only): work-queue 3.75 s/plot vs sharded peer
 9.02 s/plot vs sharded `--host-bounce` ~14 s/plot. PoS 2 is k=28
-only and the minimal-streaming tier already fits on ~4 GB cards
-solo, so `--shard-plot` is niche: pairs of cards too small to plot
+only and Tiny needs about 1.20 GiB of free VRAM at its default floor,
+so `--shard-plot` is niche: pairs of cards too small to plot
 k=28 alone, or NVLink hosts where the peer transport can become
 competitive. For ordinary throughput plotting on PCIe-only multi-GPU,
 prefer the work-queue path (`--devices` alone, no `--shard-plot`).
