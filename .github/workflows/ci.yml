@@ -163,10 +163,22 @@ jobs:
       - uses: crate-ci/typos@master
 
   markdownlint:
-    name: markdownlint README
+    name: Markdown documentation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: List tracked Markdown
+        id: docs
+        run: |
+          {
+            echo 'files<<EOF'
+            git ls-files '*.md'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
       - uses: DavidAnson/markdownlint-cli2-action@v24
         with:
-          globs: README.md
+          globs: ${{ steps.docs.outputs.files }}
+      - name: Check local documentation links
+        run: |
+          python3 scripts/test/docs.py --self-test
+          python3 scripts/test/docs.py

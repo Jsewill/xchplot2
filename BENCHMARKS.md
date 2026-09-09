@@ -32,7 +32,7 @@ build uses `XCHPLOT2_BUILD_CUDA=OFF` and `ACPP_TARGETS=hip:gfx1031`.
 
 ## Method
 
-All throughput runs use `bench -k 28 -s 2 --devices 0` and write real synthetic
+The paired and full tier throughput runs use `bench -k 28 -s 2 --devices 0` and write real synthetic
 `.plot2` files. FSE compression, output writes, fsync, and the existing overlap
 between GPU production and CPU writing are included. The reported seconds
 are completion intervals after warmup, not single-plot latency from a cold start.
@@ -194,3 +194,91 @@ and errors. It passes in all three builds. Native CUDA's GPU pipeline was
 unchanged; all five k=28 configurations above and its CLI checks passed.
 Multi-GPU execution, Intel, and Windows were not retested. All hardware work
 was invoked directly; neither machine was registered or used as a CI runner.
+
+## Earlier CPU and spill measurements
+
+The following results were retained from the README snapshots on September
+9, 2026 (`main` `20f6b67`, `cuda-only` `db2eee7`). Their measurement dates
+and source build revisions were not recorded with the tables. They are
+historical observations, not reruns of the current full tier matrix or
+current minimum-RAM guarantees. No new spill timings were taken for this
+documentation cleanup.
+
+### CPU worker concurrency
+
+Ryzen 9 5950X, 32 threads, CPU-only aggregate steady-state throughput:
+
+| Workers | k=28 aggregate, s/plot | k=28 per worker, s/plot | k=26 aggregate, s/plot |
+|---|---:|---:|---:|
+| 1 | 52.28 | 52.3 | 13.57 |
+| 2 | 43.85 | 87.7 | 10.59 |
+| 4 | 41.69 | 166.8 | 9.63 |
+
+A separate mixed CPU/GPU observation on an RTX 4090 reported GPU completion
+intervals of 2.56 → 4.23 s/plot with four CPU workers and a 55-plot batch
+taking 2.39 times as long as GPU-only. One CPU worker was approximately a
+wash. These results motivated the separate CPU-only and GPU-plus-CPU
+defaults; they do not establish the best count for other hosts.
+
+### SYCL spill
+
+Earlier k=28 Tiny batch, three plots. The original record did not name the
+GPU or measurement date:
+
+| Spilled storage | Peak RSS, GiB |
+|---|---:|
+| None | 21.5 |
+| T1 metadata and T3 | 17.4 |
+| Also T2 metadata and T2 X-bits | 14.3 |
+| Also reduce drain slots from three to one | 9.3 |
+
+The single-plot observation was 19.5 → 8.4 GiB. These precede the pinned
+scratch reuse measured above; use the current table for unspilled RSS.
+An earlier Compact comparison reported 6.4 → 8.7 s/plot with spill, means
+of three plots. The historical fully routed I/O counts at k=28 were:
+
+| Tier | Total I/O, GiB/plot | Writes, GiB/plot |
+|---|---:|---:|
+| Compact | 6.0 | 3.0 |
+| Minimal | 8.0 | 4.0 |
+| Tiny | 29.0 | 12.0 |
+
+### Native CUDA spill
+
+Earlier k=28 Compact measurements on an RTX 4090, one plot per reduction:
+
+| Routed storage | Peak RSS, GiB |
+|---|---:|
+| None | 11.29 |
+| Metadata | 9.32 |
+| Also T2 X-bits | 8.30 |
+| Also reduce drain slots from three to one | 4.24 |
+
+With NVMe temporary storage, the earlier timing was 9.6 → 12.6 s/plot,
+means of three plots. Fully routed Compact I/O was 14.0 GiB/plot, including
+7.0 GiB of writes. The earlier `--max-host-ram min` table was:
+
+| Tier | Modeled unswappable peak before → after, GiB | Measured RSS, GiB |
+|---|---:|---:|
+| Plain | Not recorded | 7.20 |
+| Compact | 12.44 → 5.33 | 4.24 |
+| Minimal | 13.46 → 6.35 | 9.19 |
+| Tiny | 14.47 → 10.41 | 10.28 |
+
+Minimal's file-backed mappings can remain resident, so RSS and the
+unswappable-memory model measure different quantities. Tiny's GPU-visible
+host tables cannot be mapped to disk; only its drain slots can be reduced.
+
+## Earlier multi-GPU measurements
+
+The earlier `main` README recorded 10-plot k=28 batches on two RTX 4000 Ada
+GPUs connected over PCIe, without NVLink:
+
+| Strategy | Seconds/plot |
+|---|---:|
+| Independent plots through the work queue | 3.75 |
+| One sharded plot using peer transport | 9.02 |
+| One sharded plot using explicit host bounce | About 14 |
+
+The source build and measurement date were not recorded with these values.
+Multi-GPU plotting was not rerun in the September 9 full tier matrix.
