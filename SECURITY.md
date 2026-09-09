@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email **abraham.sewill@proton.me** with a description of the issue and
+Email **<abraham.sewill@proton.me>** with a description of the issue and
 steps to reproduce. Please do not open a public GitHub issue for
 security-sensitive reports.
 
@@ -17,17 +17,30 @@ xchplot2 is a client-side plot builder. It handles:
 - BLS key parsing via the
   [`chia` Rust crate](https://crates.io/crates/chia) through
   `keygen-rs`.
+- Per-plot private keys, included in plot memos and saved job manifests.
 - Large file writes into caller-supplied output directories.
+
+`plot` saves identities before starting, including for unseeded jobs. The
+`xchplot2-job-*.tsv` files contain the memo and its private plot key material;
+they are intended persistent recovery data. `--manifest` selects another
+path, and `batch` can read the same format. Keep manifests and plot memos
+private; redact them before sharing logs or reproductions. Retain a manifest
+while recovery may be needed. Deleting it can prevent recovery of an unseeded
+job's identities.
+
+New manifests and their publication temporaries use owner-only permissions
+on Linux and are not allowed to replace another job's manifest. Report
+permission, disclosure, or publication failures through the channel above.
+See [plotting and recovery](REFERENCE.md#plotting-and-recovery) for behavior.
 
 Relevant threat model items we want to hear about:
 
 - **Key handling:** any path where farmer/pool key bytes or the
-  master seed leak into logs, temporary files, crash dumps, or
-  the plot file itself beyond the documented memo payload.
+  master seed or private plot keys leak beyond their intended memo/manifest
+  storage, including through logs, temporary-file permissions, or crash dumps.
 - **File-path handling:** any way a crafted `-o` / `out_dir` / memo
   string escapes the intended output directory or overwrites files
-  outside it (path traversal, symlink races). The atomic
-  `.partial` + rename is safe by design; report if you can break it.
+  outside it (path traversal, symlink races). This includes races around temporary files and atomic publication.
 - **Manifest parsing:** malformed `batch` manifests that cause
   out-of-bounds reads, arbitrary allocation, or unchecked sign
   conversion.

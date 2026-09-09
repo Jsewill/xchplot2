@@ -245,21 +245,14 @@ void print_usage(char const* prog)
         << "    --cpu-workers auto|max|N|off    : how many CPU plots run concurrently\n"
         << "                                      ON EACH selected node. Naming any count\n"
         << "                                      but 0 also opts the CPU in.\n"
-        << "                                        auto (default) — the throughput knee\n"
-        << "                                            (~4), then trimmed to host RAM.\n"
+        << "                                        auto (default) — 4 per node CPU-only,\n"
+        << "                                            1 beside a GPU, trimmed to host RAM.\n"
         << "                                        max            — as many as fit in RAM,\n"
         << "                                                         capped at core count.\n"
         << "                                        N              — exactly N per node.\n"
         << "                                        off            — none, overriding\n"
         << "                                                         --devices cpu.\n"
-        << "                                      The CPU plotter is memory-latency-bound,\n"
-        << "                                      so concurrent plots interleave each\n"
-        << "                                      other's stalls — but each already uses\n"
-        << "                                      every core, so it plateaus by ~4 (k=28:\n"
-        << "                                      N=2 +19%, N=4 +25%, flat after). Each\n"
-        << "                                      needs its own working set (12.1 GiB at\n"
-        << "                                      k=28), so the count is RAM-trimmed and\n"
-        << "                                      it tells you what it picked.\n"
+        << "                                      Each worker needs its own host working set.\n"
         << "    --shard-plot                    : EXPERIMENTAL — opt in to single-plot\n"
         << "                                      multi-GPU. Each plot is processed by\n"
         << "                                      ALL --devices cooperatively (one plot\n"
@@ -283,27 +276,14 @@ void print_usage(char const* prog)
         << "    --prefer-peer-copy              : deprecated alias; Peer is the default\n"
         << "                                      now, this flag is a no-op kept for\n"
         << "                                      backward-compat with existing scripts.\n"
-        << "    --tier plain|compact|minimal|tiny|auto : force streaming pipeline tier\n"
-        << "                                      when GPU pool doesn't fit. plain =\n"
-        << "                                      ~7.24 GB floor (k=28), faster.\n"
-        << "                                      compact = ~5.33 GB floor, fits on\n"
-        << "                                      tight 8 GB cards. minimal = ~3.83 GB\n"
-        << "                                      floor, fits on 4 GiB cards (extra\n"
-        << "                                      PCIe round-trips during T2 match).\n"
-        << "                                      tiny = ~3.2 GB floor at k=28, fits\n"
-        << "                                      4 GB cards comfortably. Parks every\n"
-        << "                                      cap-sized intermediate (T1 meta /\n"
-        << "                                      T1 keys / T2 meta / T2 xbits / T2\n"
-        << "                                      keys / d_t3) on host pinned and\n"
-        << "                                      reads section-sized slices into\n"
-        << "                                      device for each match/sort pass.\n"
-        << "                                      Slower than minimal due to extra\n"
-        << "                                      cap-sized PCIe round-trips.\n"
-        << "                                      auto (default) = pick the largest\n"
-        << "                                      tier that fits. Equivalent to\n"
-        << "                                      XCHPLOT2_STREAMING_TIER env var;\n"
-        << "                                      CLI flag wins if both set.\n"
-        << "    --max-host-ram 8G|8192M|<bytes>|min : cap the streaming path's pinned\n"
+        << "    --tier plain|compact|minimal|tiny|pinned|auto\n"
+        << "                                    : force a streaming tier even if the pool fits.\n"
+        << "                                      Every tier must fit its peak plus VRAM buffer.\n"
+        << "                                      Lower VRAM tiers use more host RAM.\n"
+        << "                                      Pinned is manual; Tiny is the automatic floor.\n"
+        << "                                      auto leaves environment/default selection in effect.\n"
+        << "                                      A non-auto CLI tier overrides XCHPLOT2_STREAMING_TIER.\n"
+        << "    --max-host-ram 8G|8192M|<bytes>|min : cap the streaming path's pinned + anonymous\n"
         << "                                      host footprint by spilling its large\n"
         << "                                      cold tables (h_t1_meta, h_t3, ...) to\n"
         << "                                      a temp-dir file, largest-first, until\n"
@@ -359,13 +339,13 @@ void print_usage(char const* prog)
         << "  Environment variables:\n"
         << "    XCHPLOT2_STREAMING=1          force the low-VRAM streaming pipeline even\n"
         << "                                  when the persistent pool would fit.\n"
-        << "    POS2GPU_MAX_VRAM_MB=N         cap the pool/streaming VRAM query to N MB\n"
-        << "                                  (useful for testing the streaming fallback).\n"
+        << "    POS2GPU_MAX_VRAM_MB=N         cap free VRAM and enforce the selected budget\n"
+        << "                                  (MiB; tests this GPU, not another card).\n"
         << "    POS2GPU_STREAMING_STATS=1     log every streaming-path alloc / free.\n"
         << "    POS2GPU_POOL_DEBUG=1          log pool allocation sizes at construction.\n"
         << "    POS2GPU_PHASE_TIMING=1        per-phase wall-time breakdown on stderr.\n"
-        << "    ACPP_GFX=gfxXXXX              AMD only — required at build time to AOT\n"
-        << "                                  for the right amdgcn ISA (see README).\n";
+        << "    ACPP_GFX=gfxXXXX              AMD container AOT target; Cargo detects the\n"
+        << "                                  GPU separately (see INSTALL.md).\n";
 }
 
 bool parse_hex_bytes(std::string const& s, std::vector<uint8_t>& out)
@@ -488,7 +468,7 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     //   "all:<tier>"      → all GPUs default to <tier>, plus CPU worker
     //   "<int>:<tier>"    → explicit GPU id + per-GPU tier override
     //
-    // <tier> is one of plain/compact/minimal/tiny/auto. The "auto"
+    // <tier> is one of plain/compact/minimal/tiny/pinned/auto. The "auto"
     // sentinel explicitly opts back into auto-pick — useful for
     // overriding `gpu:<tier>` or global `--tier` on one specific GPU.
     //
@@ -534,7 +514,7 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             tier_suffix = tok.substr(colon + 1);
             if (tier_suffix.empty())  return bad("empty tier after `:`");
             if (!is_valid_tier(tier_suffix)) {
-                return bad("invalid tier (expect plain|compact|minimal|tiny|auto)");
+                return bad("invalid tier (expect plain|compact|minimal|tiny|pinned|auto)");
             }
         }
 

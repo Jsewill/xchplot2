@@ -2,30 +2,87 @@
 
 Thanks for taking the time. A few notes to keep review loops short.
 
-## Building + running the tests
+## Building and running tests
 
-Build and run the parity tests following the
-[Build](https://github.com/Jsewill/xchplot2#build) section of the
-README. The parity binaries under `tools/parity/` are the correctness
-gate:
+Install the branch's [build dependencies](INSTALL.md), then configure and
+build all CMake targets:
 
-- `aes_parity`, `xs_parity`, `t1_parity`, `t2_parity`, `t3_parity` —
-  bit-exact CPU vs GPU per-phase agreement with pos2-chip's reference.
-- `sycl_sort_parity`, `sycl_g_x_parity`, `sycl_bucket_offsets_parity` —
-  portable kernel parity on the selected SYCL backend. Vendor-specific
-  compilation and driver behavior require a GPU from that vendor.
-- `plot_file_parity` — writer + reader round-trip on the final
-  `.plot2`.
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
 
-Any change that touches a kernel, the sort path, or the plot file
-format **must** keep the parity tests passing at k=22 (quick) and at
-k=28 (slow — the realistic production k). Output bytes are specified
-to be identical to the pos2-chip CPU reference; this is the hard
-invariant.
+The full test set requires the matching GPU backend. For host checks with
+no GPU or GPU toolchain, run `scripts/test/host-tests.sh`.
+`xchplot2 parity-check --dir build/tools/parity` runs the available
+`*_parity` and `*_test` executables and reports each failure's output.
 
-After a functional change, spot-check one real batch end-to-end with
-`xchplot2 verify <plot>` — zero proofs over 100 random challenges is
-a regression even if all parity tests pass.
+The parity binaries under `tools/parity/` are the correctness gate:
+
+- AES, Xs, T1, T2, and T3 tests check agreement with pos2-chip's CPU reference.
+- Backend-specific sort and bucket tests cover vendor kernels and scratch.
+- `plot_file_parity` covers the writer/reader round-trip.
+- Host tests cover memory budgets, spill storage, recovery, and reporting.
+
+Kernel, sort, and plot-format changes must pass parity at k=22 and k=28.
+Output bytes must remain identical to the pinned CPU reference. The
+[GPU suites](#gpu-ci) cover tiers, spill variants, and capacity boundaries;
+passing a build or a software cap does not certify other physical hardware.
+
+After a functional change, spot-check a real output with full proofs:
+
+```bash
+xchplot2 verify /path/to/output.plot2 --full --trials 100
+```
+
+Default `verify` samples quality chains; `--full` also reconstructs and
+validates full proofs. An empty sample fails. Sampling does not inspect every
+part of a file, so use a matching CPU output for byte parity. For example,
+this synthetic testnet fixture uses the same ID, memo, and plot parameters:
+
+```bash
+PLOT_ID=$(printf 'ab%.0s' {1..32})
+MEMO=$(printf '00%.0s' {1..112})
+xchplot2 test 28 "$PLOT_ID" 2 0 0 -T -m "$MEMO" -o ref -N ref.plot2
+printf '28 2 0 0 1 %s %s out gpu.plot2\n' "$PLOT_ID" "$MEMO" > m.tsv
+xchplot2 batch m.tsv --tier tiny
+sha256sum ref/ref.plot2 out/gpu.plot2
+```
+
+The hashes must match. Use a tier and spill configuration appropriate to
+the changed path, and a real disk with `--temp-dir` for spill checks.
+These synthetic fixtures are not farmable plots.
+
+## Architecture
+
+```text
+src/gpu/                  GPU kernels and sort backends
+src/host/
+├── GpuPipeline           Xs → T1 → T2 → T3 orchestration
+├── GpuBufferPool         persistent device buffers and host drain slots
+├── BatchPlotter          workers, memory admission, and writer queues
+├── BatchManifest         saved identities and recovery manifests
+└── PlotFileWriterParallel  CPU reference boundary, writer, and verification
+tools/xchplot2/           CLI and shell completions
+tools/parity/             parity and host tests
+keygen-rs/                BLS key derivation, plot IDs, and memo encoding
+```
+
+Memory responsibilities are split between [VramBudget.hpp](src/host/VramBudget.hpp)
+for base tier peaks, `GpuBufferPool` for backend allocation requirements,
+and `BatchPlotter` for worker admission and host spill policy. Each worker
+must fit its own budget. Keep the driver watchdog and allocation accounting
+consistent; an allocation trace alone is not a physical VRAM measurement.
+
+Pool buffers persist across plots. Streaming tiers progressively tile work
+and keep more intermediate data on the host. Pinned scratch can be reused
+only after its previous consumer is finished. Writer/drain queues bound
+the number of in-flight plots and prevent early buffer reuse.
+
+The user-facing tier models are in [REFERENCE.md](REFERENCE.md#memory-requirements).
+Implementation measurements and the scratch-reuse comparison are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Install CI
 
@@ -108,7 +165,7 @@ GPU cannot pass a 2 GiB lane. A physical card with no fitting k=28 tier fails.
 Install the project's build dependencies before registering runners: CMake
 3.24+, a supported C++ compiler, Rust, Python 3.11+, and the matching GPU
 toolchain. `scripts/install-deps.sh --gpu nvidia|amd|intel` covers the SYCL
-build; follow the README for vendor driver setup. Pin runner images and
+build; follow [INSTALL.md](INSTALL.md) for vendor driver setup. Pin runner images and
 toolchain versions, and update them deliberately. Put custom toolchain paths
 in the runner service environment (`PATH`, `CMAKE_PREFIX_PATH`, `CUDACXX`,
 `CXX`, `CUDAHOSTCXX`, `LD_LIBRARY_PATH` as needed).
@@ -148,6 +205,44 @@ Actions retain build logs, device inventory, CTest JUnit results, per-tier
 boundary/rejection logs, proof logs, and a JSON summary for 14 days. Generated
 plots are temporary; byte comparisons and reference hashes are recorded.
 
+## Pinned testnet farming fixture
+
+`contrib/testnet-farming.patch` targets chia-blockchain commit `39f8bec88`
+(2.7.0 Checkpoint Merge). It fixes the v2 service wiring, proof challenge,
+and dependency issues present at that revision. This fixture is not a claim
+about the current state of upstream farming support.
+
+```bash
+git clone https://github.com/Chia-Network/chia-blockchain
+cd chia-blockchain
+git checkout 39f8bec88
+git apply /path/to/xchplot2/contrib/testnet-farming.patch
+```
+
+The patch header explains its changes. The separate
+[pos2-chip PR #118 compatibility notes](contrib/pos2-pr118/README.md) record
+the proposed grouped format and the pinned revision checked for it.
+
+## Documentation checks
+
+README is the short entry point. Keep installation recipes in `INSTALL.md`,
+operating options in `REFERENCE.md`, and dated measurements in `BENCHMARKS.md`.
+Document each branch's actual behavior; native CUDA and SYCL have different
+memory budgets and spill support. Record GPU, source revision, sample count,
+warmup, units, and measurement date with new results. Label older results
+whose provenance is incomplete.
+
+The existing Markdown job lints tracked documentation, including section
+fragments. Local links are checked without contacting external websites:
+
+```bash
+python3 scripts/test/docs.py
+```
+
+When moving sections, update incoming links and keep the useful README
+entry headings. `docs/` is ignored local material; do not publish it as part
+of a documentation move.
+
 ## Commit style
 
 Short imperative subjects, lowercase scope prefix, no trailing period:
@@ -167,9 +262,8 @@ rejected). The *what* is in the diff.
 - Keep unrelated refactors out of correctness or performance commits.
 - Performance changes should cite before/after numbers on a named GPU
   at a specified `k`.
-- New runtime knobs go in `README.md`'s
-  [Environment variables](https://github.com/Jsewill/xchplot2#environment-variables)
-  table so users can discover them.
+- New runtime knobs go in `REFERENCE.md`'s
+  [environment table](REFERENCE.md#environment-variables) so users can discover them.
 
 ## PRs
 
