@@ -552,9 +552,17 @@ struct SpillBuffer {
         eng->enqueue(SpillEngine::Op::Read, vslot, &file, off_bytes, bytes);
         eng->wait_slot(vslot);
         if (std::memcmp(eng->win[slot], eng->win[vslot], bytes) != 0) {
+            auto const mismatch = std::mismatch(eng->win[slot], eng->win[slot] + bytes,
+                                                eng->win[vslot]);
+            auto const bad_offset = off_bytes + (mismatch.first - eng->win[slot]);
+            uint8_t reread = 0;
+            file.pread_at(bad_offset, &reread, 1);
             throw std::runtime_error(
                 "SpillBuffer verify: readback mismatch in " + file.path() +
-                " at byte offset " + std::to_string(off_bytes) +
+                " at byte offset " + std::to_string(bad_offset) +
+                ": staging " + std::to_string(*mismatch.first) +
+                ", readback " + std::to_string(*mismatch.second) +
+                ", direct reread " + std::to_string(reread) +
                 " (" + std::to_string(bytes) + " B) after " +
                 std::to_string(eng->verified_chunks) + " good chunks");
         }

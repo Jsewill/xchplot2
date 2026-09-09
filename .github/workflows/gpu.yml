@@ -1,0 +1,62 @@
+name: GPU hardware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: GPU test suite
+        type: choice
+        options: [quick, vram, physical]
+        default: quick
+  schedule:
+    - cron: '17 4 * * *'
+    - cron: '47 7 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    if: >-
+      inputs.suite != 'physical' &&
+      github.event.schedule != '47 7 * * 0'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cuda
+            ref: main
+            runner: gpu-cuda
+          - backend: hip
+            ref: main
+            runner: gpu-hip
+          - backend: level_zero
+            ref: main
+            runner: gpu-level-zero
+          # GitHub schedules only the default branch; include the native branch here.
+          - backend: cuda
+            ref: cuda-only
+            runner: gpu-cuda
+    uses: ./.github/workflows/gpu-run.yml
+    with:
+      backend: ${{ matrix.backend }}
+      runner: ${{ matrix.runner }}
+      ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}
+      suite: ${{ github.event_name == 'schedule' && 'vram' || inputs.suite || 'quick' }}
+
+  physical:
+    if: inputs.suite == 'physical' || github.event.schedule == '47 7 * * 0'
+    strategy:
+      fail-fast: false
+      # Replace this matrix with the installed fleet via a repository variable.
+      # Each entry needs backend, ref, runner, and vram_mib. AMD/Intel are supported.
+      matrix: ${{ fromJSON(vars.GPU_PHYSICAL_MATRIX || '{"include":[{"backend":"cuda","ref":"main","runner":"gpu-cuda-2gb","vram_mib":2048},{"backend":"cuda","ref":"main","runner":"gpu-cuda-4gb","vram_mib":4096},{"backend":"cuda","ref":"main","runner":"gpu-cuda-6gb","vram_mib":6144},{"backend":"cuda","ref":"main","runner":"gpu-cuda-8gb","vram_mib":8192},{"backend":"hip","ref":"main","runner":"gpu-hip-4gb","vram_mib":4096},{"backend":"level_zero","ref":"main","runner":"gpu-level-zero-8gb","vram_mib":8192},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-2gb","vram_mib":2048},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-4gb","vram_mib":4096},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-6gb","vram_mib":6144},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-8gb","vram_mib":8192}]}') }}
+    uses: ./.github/workflows/gpu-run.yml
+    with:
+      backend: ${{ matrix.backend }}
+      runner: ${{ matrix.runner }}
+      ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}
+      suite: physical
+      physical-vram-mib: ${{ matrix.vram_mib }}

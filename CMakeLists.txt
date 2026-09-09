@@ -1657,6 +1657,15 @@ target_compile_features(hellosycl PRIVATE cxx_std_20)
 set_target_properties(hellosycl PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
 
+add_executable(gpu_ci_info tools/sanity/gpu_ci_info.cpp)
+if(XCHPLOT2_BUILD_CUDA)
+    target_sources(gpu_ci_info PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+endif()
+target_compile_definitions(gpu_ci_info PRIVATE XCHPLOT2_GPU_CI_SYCL=1)
+target_link_libraries(gpu_ci_info PRIVATE pos2_gpu_host)
+set_target_properties(gpu_ci_info PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
+
 
 add_executable(vram_budget_test tools/parity/vram_budget_test.cpp)
 target_include_directories(vram_budget_test PRIVATE src)

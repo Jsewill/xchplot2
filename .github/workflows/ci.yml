@@ -81,6 +81,9 @@ jobs:
           else
             scripts/test/host-tests.sh "${{ matrix.mode }}"
           fi
+      - name: Check GPU CI admission logic
+        if: matrix.mode == 'plain'
+        run: python3 scripts/test/gpu-ci-test.py
 
   hadolint:
     name: hadolint Containerfile
