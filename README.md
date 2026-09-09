@@ -8,11 +8,12 @@ This is the **`main` branch**, using SYCL/AdaptiveCpp with a CUB fast path
 on NVIDIA. The [`cuda-only` branch](https://github.com/Jsewill/xchplot2/tree/cuda-only)
 provides the native CUDA implementation for NVIDIA.
 
-This is a work in progress. Current output and the proposed grouped format
-are described in the [compatibility and migration notes](contrib/pos2-pr118/README.md).
+This is a work in progress. Future changes to the plot format, including
+grouping, may require replotting.
 
 [Quick start](#quick-start) · [Hardware](#hardware-compatibility) ·
-[Build](#build) · [Use](#use) · [Performance](#performance)
+[Build](#build) · [Commands](#use) · [Performance](#performance) ·
+[Documentation](#documentation)
 
 ## Quick start
 
@@ -64,6 +65,20 @@ architecture selection, and Windows/WSL2. CMake also builds the parity and
 host test binaries.
 
 ## Use
+
+| Command | Purpose and guide |
+|---|---|
+| [xchplot2 plot](REFERENCE.md#plotting-and-recovery) | Create plots from farmer and pool keys |
+| [xchplot2 batch](REFERENCE.md#batch-manifests) | Run or resume a saved plot manifest |
+| [xchplot2 bench](REFERENCE.md#benchmarking) | Measure throughput and estimate time to fill storage |
+| [xchplot2 devices](REFERENCE.md#devices-and-cpu-workers) | List GPUs and CPU NUMA nodes |
+| [xchplot2 verify](REFERENCE.md#verification) | Check an existing plot, including full proofs with `--full` |
+| [xchplot2 test](REFERENCE.md#single-test-plot) | Build a test plot from a raw plot ID and memo |
+| [xchplot2 parity-check](REFERENCE.md#parity-checks) | Run the built parity and host tests |
+| [xchplot2 completions](REFERENCE.md#shell-completions) | Generate Bash, zsh, or fish completions |
+
+See [configuration and argument files](REFERENCE.md#configuration-and-argument-files)
+for reusable options. `xchplot2 --help` prints command syntax.
 
 Ordinary plotting uses one GPU. Select all GPUs with `--devices gpu`; add
 CPU workers with `--cpu`, or select both with `--devices all`. Each GPU
@@ -124,8 +139,8 @@ and storage. This benchmark set uses one GPU per host.
 | Guide | Contents |
 |---|---|
 | [Installation](INSTALL.md) | Dependencies, containers, Cargo/CMake, Windows and WSL2 |
-| [Reference](REFERENCE.md) | Devices, tiers, memory, environment variables, troubleshooting |
-| [Benchmarks](BENCHMARKS.md) | Dated measurements, methodology, memory use, and validation |
+| [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
+| [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, memory use, and validation |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 

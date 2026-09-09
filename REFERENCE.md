@@ -2,9 +2,11 @@
 
 [README](README.md) · [Installation](INSTALL.md) · [Benchmarks](BENCHMARKS.md)
 
-[Plotting and recovery](#plotting-and-recovery) · [Devices](#devices-and-cpu-workers) ·
+[Plotting and recovery](#plotting-and-recovery) · [Configuration](#configuration-and-argument-files) ·
+[Devices](#devices-and-cpu-workers) ·
 [Benchmarking](#benchmarking) · [Memory](#memory-requirements) ·
-[Disk-offload](#host-ram-and-disk-offload) · [Environment variables](#environment-variables)
+[Disk-offload](#host-ram-and-disk-offload) · [Other commands](#lower-level-subcommands) ·
+[Environment variables](#environment-variables)
 
 ## Plotting and recovery
 
@@ -15,9 +17,25 @@ xchplot2 plot -k 28 -n 10 \
     -o <output-dir>
 ```
 
-Pool variants: `-p <pool-pk>` or `--pool-ph <pool-ph>`. Other common
-flags: `-s <strength>`, `-T` testnet, `-S <seed>` for reproducible runs,
-`-v` verbose. Full help: `xchplot2 -h`.
+| Option | Meaning |
+|---|---|
+| `-k`, `--k K` | Plot size; default 28 |
+| `-n`, `--num N` | Number of plots; default 1 |
+| `-s`, `--strength S` | Proof strength; default 2 |
+| `-f`, `--farmer-pk HEX` | Farmer public key, 96 hex characters |
+| `-p`, `--pool-pk HEX` | Pool public key, 96 hex characters |
+| `--pool-ph HEX` | Pool puzzle hash, 64 hex characters |
+| `-c`, `--pool-contract-address ADDRESS` | Pool contract address, `xch1...` or `txch1...` |
+| `-o`, `--out DIR` | Output directory; default current directory |
+| `-i`, `--plot-index N` | Starting plot index; default 0, incremented per plot |
+| `-g`, `--meta-group N` | Meta-group field; default 0 |
+| `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
+| `-T`, `--testnet` | Use testnet proof parameters |
+| `-v`, `--verbose` | Print additional worker and plotting details |
+
+Supply the farmer key and one of the pool key, puzzle hash, or contract
+address forms. See [plot indices and meta groups](#plot-indices-and-meta-groups)
+for the grouping distinction. Full help: `xchplot2 --help`.
 
 On a host that is short of RAM for the tier its GPU lands on, add
 `--temp-dir <path>` to choose where the automatic disk-offload writes
@@ -78,6 +96,87 @@ A first `Ctrl-C` asks the plotter to
 finish the plot in flight and stop; a second hard-kills. Concurrent writers
 use separate temporary files; the last completed rename wins. Resume checks
 the header identity, memo, chunk index, and file bounds before skipping a plot.
+
+### Batch manifests
+
+`batch` consumes the manifest saved by `plot`, or one prepared with existing
+plot identities. Device, tier, memory, progress, and recovery options work
+as they do for `plot`:
+
+```bash
+xchplot2 batch /path/to/job.tsv --devices gpu --resume
+```
+
+Each non-comment line has nine whitespace-separated fields in this order:
+
+```text
+k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name
+```
+
+`plot_id_hex` is 64 hex characters; `memo_hex` encodes up to 255 bytes
+(`""` represents an empty memo). `testnet` accepts `0`, `1`, `false`, or
+`true`. Memo and path fields accept double quotes, with backslash escapes
+for quotes and backslashes. `out_name` must be a filename, not a path;
+relative `out_dir` paths resolve from the working directory. Blank lines
+and `#` comments are ignored. Invalid rows are rejected before plotting.
+Prefer the automatically saved manifest for recovery; see
+[Security](SECURITY.md) before sharing manifests containing private keys.
+
+## Configuration and argument files
+
+`--config FILE` loads a configuration file. Without it, xchplot2 looks for
+`$HOME/.config/xchplot2/config.toml`. The supported syntax is a small TOML
+subset: named sections and scalar `key = value` entries, with double-quoted
+strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
+are unsupported.
+
+Use long option names without `--`. `[defaults]` applies to every command;
+a section such as `[plot]` or `[bench]` overrides those defaults. Explicit
+command-line flags override the same options from the file. Put options
+that only apply to one command in that command's section:
+
+```toml
+[plot]
+out = "/mnt/plots"
+num = 10
+
+[bench]
+k = 28
+num = 10
+warmup = 2
+devices = "gpu"
+keep = false
+```
+
+Save this as `plotter.toml`, then supply the remaining arguments normally:
+
+```bash
+xchplot2 plot --config plotter.toml -f <farmer-pk> -c <pool-contract-address>
+xchplot2 bench --config plotter.toml -o /scratch --num 3
+```
+
+### Argument files
+
+`@FILE` inserts whitespace-separated arguments from a file. For example,
+save these lines in `bench.args`:
+
+```text
+# Reusable benchmark options
+--k 28
+--num 10
+--warmup 2
+--devices gpu
+```
+
+```bash
+xchplot2 bench @bench.args -o /scratch --num 3
+```
+
+Later flags override earlier values. `@~/bench.args` expands the leading
+`~/` in the argument-file path. Inside the file, `#` starts a comment;
+shell quoting, variable expansion, and nested argument files are unsupported.
+Use the configuration file or directly quoted CLI arguments for paths with
+spaces. Pass `--config` directly on the command line, not inside an argument file.
 
 ## Plot indices and meta groups
 
@@ -216,6 +315,10 @@ them. `--pipeline-plot` opts in directly, and
 `--pipeline-stage-tiers tiny:minimal` sets one tier per stage (two or three
 colon-separated `tiny` or `minimal` values). Pipeline plotting rejects
 `--max-host-ram`; select `--strategy work-queue` when a host-memory cap is needed.
+`--pipeline-depth N` controls the preallocated boundary-buffer count
+(default 2); increasing it uses more pinned host RAM. These strategy and
+stage controls apply to `plot` and `batch`. `--prefer-peer-copy` is a
+deprecated no-op alias because peer transport is already the default.
 
 ## Benchmarking
 
@@ -228,16 +331,42 @@ steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
 # Quick smoke (k=18 finishes in seconds on most GPUs)
 xchplot2 bench -k 18 -n 3 -o /tmp
 
-# Full measurement at k=28 (default: 1 warmup + 10 measured plots/worker)
-xchplot2 bench -k 28 -o /scratch
+# Measure one GPU at k=28 after two warmup plots
+xchplot2 bench -k 28 -n 10 --warmup 2 --devices 0 -o /scratch
 
 # Also run a tmpfs pass to isolate compute from disk I/O
 xchplot2 bench -k 28 -o /scratch --compute-only
 ```
 
-Bench deletes the files it creates unless `--keep` is set. Pass
-`--target-size TiB` to estimate time-to-fill a specific capacity instead
-of the output directory's free space.
+| Option | Meaning |
+|---|---|
+| `-k K`, `-s S`, `-T` | Plot size, strength, and testnet parameters; defaults 28, 2, and mainnet |
+| `-n N`, `--num N` | Measured plot count used to size the queue; default 10 |
+| `--warmup W` | Initial completions excluded per worker; default 1 |
+| `-o DIR`, `--out DIR` | Directory for real output writes; default current directory |
+| `--devices SPEC`, `--cpu`, `--cpu-workers N` | Select the [devices and CPU workers](#devices-and-cpu-workers) to measure |
+| `--tier T` | Force a [streaming tier](#memory-requirements), even when the pool fits |
+| `--max-host-ram SIZE`, `--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
+| `--keep` | Retain synthetic output files on disk for inspection |
+| `--compute-only` | Add a second pass using RAM-backed output when available |
+| `--target-size TiB` | Estimate time to fill this capacity instead of the output directory's free space |
+| `-v`, `-q` | More worker detail, or quieter informational output |
+
+The queue contains `(warmup + num) × workers` plots. Faster workers can
+complete more of that queue; `-n` does not guarantee equal per-worker counts.
+Each worker's warmup is excluded separately, and the report shows the
+steady-state window and per-worker rates. Increase `-n` if a short run
+cannot measure a slower worker.
+
+Every pass includes FSE compression and real file writes. The second
+`--compute-only` pass uses tmpfs if there is enough room; otherwise it warns
+and reports a `compute+cache` pass in the output directory. Inspect that label
+before interpreting the difference as disk overhead.
+
+Bench removes its generated files by default. `--keep` retains disk output;
+temporary tmpfs output is always removed to release the RAM. Results and
+time-to-fill estimates are printed to stderr. See [BENCHMARKS.md](BENCHMARKS.md)
+for the project's recorded measurements and comparison methodology.
 
 ## Memory requirements
 
@@ -307,6 +436,10 @@ xchplot2 plot ... --max-host-ram min
 xchplot2 plot ... --no-auto-spill
 ```
 
+`--auto-spill` re-enables automatic spilling after an earlier
+`--no-auto-spill` flag or configuration setting. The environment override
+`XCHPLOT2_NO_AUTO_SPILL=1` still disables it; unset that variable to re-enable it.
+
 What gets spilled, in order, largest first — and only as far as the
 budget requires:
 
@@ -352,13 +485,25 @@ Notes:
 
 ## Lower-level subcommands
 
+### Single test plot
+
 ```bash
-xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw inputs
-xchplot2 batch         <manifest.tsv> [-v] [-q] [--skip-existing] [--continue-on-error]
-                                             [--devices <SPEC>] [--progress|--no-progress]
-xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
-xchplot2 verify        <file.plot2> [--trials N] [--full]  # sample chains; optionally validate full proofs
-xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen
+xchplot2 test <k> <plot-id-hex> [strength] [plot-index] [meta-group] [verbose]
+```
+
+This accepts a raw 64-character hex plot ID. It uses CPU phases by default;
+`-G` / `--gpu-all` selects all available GPU phases, while `--gpu-t1`,
+`--gpu-t2`, and `--gpu-t3` select individual phases. `-P` / `--profile`
+prints phase timings. Use `-m` / `--memo HEX`, `-o` / `--out DIR`,
+`-N` / `--out-name NAME`, and `-T` / `--testnet` for output and test parameters.
+The [CPU-reference fixture](CONTRIBUTING.md#building-and-running-tests)
+shows a matching raw-ID test and GPU batch. Arbitrary IDs and memos do not
+produce farmable plots.
+
+### Verification
+
+```bash
+xchplot2 verify /path/to/NAME.plot2 --full --trials 100
 ```
 
 `verify` checks file structure, then samples quality chains for N random
@@ -367,8 +512,47 @@ validates a full proof for every returned chain, failing if any cannot be
 validated. Both modes fail on an empty sample. Sampling does not validate
 every part of a plot; use byte comparison with a CPU reference for parity.
 
-For CPU-reference byte comparisons, CTest, and the `parity-check` command,
-see [CONTRIBUTING.md](CONTRIBUTING.md#building-and-running-tests).
+### Parity checks
+
+```bash
+xchplot2 parity-check --dir build/tools/parity
+```
+
+Runs the available `*_parity` and `*_test` executables, prints each result
+and failure output, and returns nonzero if a test fails. The default
+directory is `./build/tools/parity`. Build the tests first; see
+[CONTRIBUTING.md](CONTRIBUTING.md#building-and-running-tests) for CMake,
+CTest, hardware requirements, and CPU-reference byte comparisons.
+
+### Shell completions
+
+`xchplot2 completions bash|zsh|fish` writes a completion script to stdout.
+For Bash, load it in the current shell or add this line to `~/.bashrc`:
+
+```bash
+source <(xchplot2 completions bash)
+```
+
+For zsh, save the output as `_xchplot2` in a completion directory:
+
+```zsh
+mkdir -p ~/.zsh/completions
+xchplot2 completions zsh > ~/.zsh/completions/_xchplot2
+```
+
+Add `fpath=(~/.zsh/completions $fpath)` to `~/.zshrc` before its `compinit`
+call. If completion is not initialized there, follow it with
+`autoload -Uz compinit` and `compinit`.
+
+For fish, install the generated script in its completion directory:
+
+```fish
+mkdir -p ~/.config/fish/completions
+xchplot2 completions fish > ~/.config/fish/completions/xchplot2.fish
+```
+
+Regenerate saved scripts after upgrading. Completion suggestions cover
+common commands and options; use this reference for the complete command guide.
 
 ## Troubleshooting
 
