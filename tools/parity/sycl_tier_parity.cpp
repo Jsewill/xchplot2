@@ -22,7 +22,7 @@
 // defect above was a race, so this test would only have caught it on the runs
 // where it fired (~8%). The always-on zero-yield guard in the T1 match is what
 // catches that one reliably; this is the complementary net for the whole
-// class of tier-specific regressions that are deterministic — a mis-sliced
+// class of tier-specific regressions that are deterministic — an incorrectly sliced
 // range, an off-by-one park, a tile boundary that drops entries.
 //
 // Runs at a small k by default so it is cheap enough to sit in the routine

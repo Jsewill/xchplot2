@@ -1357,6 +1357,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
     std::string mode = argv[1];
 
+    if (mode == "--help" || mode == "-h") {
+        print_usage(argv[0]);
+        return 0;
+    }
+
     if (mode == "devices") {
         // Enumerate every visible SYCL GPU device + the CPU plotter
         // (always available via AdaptiveCpp's OpenMP host backend).

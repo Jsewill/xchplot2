@@ -130,6 +130,7 @@ jobs:
               --build-arg BASE_DEVEL=docker.io/intel/oneapi-basekit:latest
               --build-arg BASE_RUNTIME=docker.io/intel/oneapi-runtime:latest
               --build-arg ACPP_TARGETS=generic
+              --build-arg WITH_LEVEL_ZERO_BACKEND=ON
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
     steps:

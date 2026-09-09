@@ -26,6 +26,7 @@ jobs:
   test:
     # GPU hosts execute only trusted branch workflows, never PR code.
     if: >-
+      (github.event_name == 'workflow_dispatch' || vars.GPU_RUNNERS_READY == 'true') &&
       (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cuda-only')
     runs-on: [self-hosted, linux, x64, '${{ inputs.runner }}']

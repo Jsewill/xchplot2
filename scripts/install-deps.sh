@@ -573,7 +573,7 @@ LLVM_CMAKE_DIR=$(llvm_cmake_dir "$LLVM_ROOT")
 echo "[install-deps] Using LLVM $(llvm_prefix_version "$LLVM_ROOT") at $LLVM_ROOT for AdaptiveCpp build."
 
 # AdaptiveCpp hunts for clang's resource dir only under
-# ${LLVM_PREFIX_DIR}/{include,lib,lib64}/clang/<major>/include and SEND_ERRORs
+# ${LLVM_PREFIX_DIR}/{include,lib,lib64}/clang/<major>/include and reports SEND_ERROR
 # ("CLANG_INCLUDE_PATH does not exist") when every hint misses. Fedora's
 # compat clang answers /usr/lib/clang/20 — outside the LLVM prefix entirely —
 # so it always misses there. Ask clang: -print-resource-dir names the

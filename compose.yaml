@@ -154,6 +154,7 @@ services:
         BASE_DEVEL:           docker.io/intel/oneapi-basekit:latest
         BASE_RUNTIME:         docker.io/intel/oneapi-runtime:latest
         ACPP_TARGETS:         "generic"
+        WITH_LEVEL_ZERO_BACKEND: "ON"
         XCHPLOT2_BUILD_CUDA:  "OFF"
         INSTALL_CUDA_HEADERS: "1"
     image: xchplot2:intel
