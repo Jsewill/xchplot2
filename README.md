@@ -820,9 +820,8 @@ its floor was derived from.
   3640, T2 sort 3640, T3 match 3640, T3 sort 3640. Targets 4 GiB
   cards (GTX 1050 Ti / 1650, RTX 3050 4GB, MX450) and fits
   comfortably on 5 GiB+ cards with ~2 GiB headroom. Trade-off:
-  ~6 extra cap-sized PCIe round-trips per plot + ~6 sec/plot of
-  host-CPU merge work — k=28 wall on sm_89: ~31 s/plot vs ~12 s
-  for compact (~2.6×). 4 GiB cards remain an edge case since
+  extra PCIe transfers and host-CPU merge work. The current timing
+  measurements are in [Performance](#performance). 4 GiB cards remain an edge case since
   real 4 GiB hardware reports ~3.5 GiB free post-CUDA-context;
   please report actual fit.
 - **Tiny streaming (1320 MB floor; 1064 MB working set).** Full Phase 1.4 + 1.5 + 1.6
@@ -1005,22 +1004,19 @@ Notes:
 
 ## Performance
 
-k=28, strength=2, RTX 4090 (sm_89), PCIe Gen4 x16:
+Measured September 9, 2026: **2.21 s/plot** (standard deviation 0.02 s)
+for k=28, strength=2 on an RTX 4090 with a Ryzen 9 5950X. This is the
+mean completion interval over six measured plots after two warmups,
+including FSE compression, real writes, and durability barriers.
 
-| Mode | Per plot |
-|---|---|
-| pos2-chip CPU baseline | ~50 s |
-| `xchplot2 batch` steady-state wall (pool path) | **2.15 s** |
-| `xchplot2 batch` steady-state wall (streaming path, ≤8 GB cards) | ~3.7 s |
-| Producer GPU time, steady-state | 1.96 s |
-| Device-kernel floor (single-plot nsys) | 1.91 s |
+The auto path enabled D2H/Xs overlap and peaked at 13,584 MiB of driver
+VRAM and 7.20 GiB host RSS. The local desktop test used the existing
+`POS2GPU_VRAM_MARGIN_MB=512` override; production defaults are unchanged.
 
-Numbers above are single-GPU. With `--devices 0,1,...` N worker threads
-(one per device) race for plots off a shared queue, so each device takes
-work at its own rate and throughput is the SUM of their rates — ≈ linear
-scaling on matched cards, and mismatched cards still each contribute
-fully rather than being held to the slowest. Live multi-GPU plots were
-confirmed end-to-end on NVIDIA.
+The [benchmark report](BENCHMARKS.md) includes the exact
+method, source revisions, SYCL/AMD comparison, profiling, and correctness
+checks. Multi-GPU throughput also depends on shared PCIe bandwidth,
+CPU compression, and storage; this measurement uses one GPU.
 
 ## License
 
