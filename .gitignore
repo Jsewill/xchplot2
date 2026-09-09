@@ -1,6 +1,8 @@
 build/
 build-*/
 *.plot2
+# Saved jobs contain private plot keys, including interrupted temporary files.
+xchplot2-job-*.tsv*
 
 # Diagnostic bundles from scripts/collect-gpu-diag.sh, and the logs people
 # drop in the repo root while debugging. These carry hostnames, device
