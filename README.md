@@ -860,14 +860,14 @@ produces plots with `plot_index` 0..999).
 different meta_group values are guaranteed never to pass the same
 challenge.
 
-The PoS2 spec defines a grouped-plot file layout (multiple plots
-interleaved into one container per storage device, for harvester
-seek amortization), but the on-disk format is not yet defined
-upstream in `pos2-chip` / `chia-rs`. xchplot2 currently produces one
-`.plot2` file per plot — this is in lieu of those upstream
-decisions. When the grouped layout lands, the auto-incrementing
-`<plot-index>` above is the per-plot within-group identifier it
-will expect.
+The grouped-plot format is proposed in
+[pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118).
+xchplot2 currently produces one `.plot2` file per plot using its existing
+dependency pin. A group must share its group ID and memo; `plot -n N`
+currently generates independent keys for each plot, so incrementing the
+index alone does not form a group. The
+[opt-in compatibility check and migration plan](contrib/pos2-pr118/README.md)
+track preparation for the proposed format.
 
 #### Multi-device: `--devices` and `--cpu`
 
