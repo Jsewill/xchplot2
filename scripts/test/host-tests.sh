@@ -14,7 +14,8 @@
 # A hardcoded list is the same trap one level down — someone adds a test, CMake
 # knows about it, this script does not, and it silently never runs. Anything
 # declared with add_executable() that pulls in no .cu, no SYCL and no
-# pos2_gpu_* library is picked up automatically.
+# pos2_* dependency is picked up automatically. Tests using the fetched CPU
+# reference headers run through CMake, which applies their required patches.
 #
 # Usage:
 #   scripts/test/host-tests.sh              # build + run all of them
@@ -36,7 +37,7 @@ out_dir="$(mktemp -d)"
 trap 'rm -rf "$out_dir"' EXIT
 
 CXX="${CXX:-g++}"
-cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -pthread)
+cxxflags=(-std=c++20 -O2 -g -Wall -Wextra -Isrc -Ikeygen-rs/include -pthread)
 ldflags=(-pthread)
 
 case "$sanitizer" in
@@ -67,7 +68,7 @@ for m in re.finditer(r'target_link_libraries\(\s*(\w+)\s+PRIVATE([^)]*)\)', src)
 for name, files in sorted(targets.items()):
     if name in sycl:                                        continue
     if any(f.endswith('.cu') for f in files):               continue
-    if any('pos2_gpu' in l for l in linked.get(name, [])):  continue
+    if any('pos2_' in l for l in linked.get(name, [])):      continue
     if not files:                                           continue
     print(name + '\t' + ' '.join(files))
 PY
@@ -87,8 +88,11 @@ while IFS=$'\t' read -r name sources; do
     [ -n "$name" ] || continue
     count=$((count + 1))
     printf '\n--- %s ---\n' "$name"
+    test_includes=()
+    # A test-specific fake backend lets host coordinators run without a GPU.
+    if [ -d "tools/parity/$name" ]; then test_includes=(-I"tools/parity/$name"); fi
     # shellcheck disable=SC2086
-    if ! "$CXX" "${cxxflags[@]}" -o "$out_dir/$name" $sources "${ldflags[@]}"; then
+    if ! "$CXX" "${test_includes[@]}" "${cxxflags[@]}" -o "$out_dir/$name" $sources "${ldflags[@]}"; then
         echo "BUILD FAILED: $name" >&2
         failed+=("$name (build)")
         continue

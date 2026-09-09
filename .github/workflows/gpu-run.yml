@@ -1,0 +1,86 @@
+name: GPU test runner
+
+on:
+  workflow_call:
+    inputs:
+      backend:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+      suite:
+        required: true
+        type: string
+      physical-vram-mib:
+        default: 0
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # GPU hosts execute only trusted branch workflows, never PR code.
+    if: >-
+      (github.event_name == 'workflow_dispatch' || vars.GPU_RUNNERS_READY == 'true') &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cuda-only')
+    runs-on: [self-hosted, linux, x64, '${{ inputs.runner }}']
+    timeout-minutes: 360
+    env:
+      GPU_BACKEND: ${{ inputs.backend }}
+      GPU_SUITE: ${{ inputs.suite }}
+      PHYSICAL_VRAM_MIB: ${{ inputs.physical-vram-mib }}
+    steps:
+      - name: Allocate an isolated build and log directory
+        shell: bash
+        run: |
+          work_dir=$(mktemp -d "$RUNNER_TEMP/xchplot2-gpu.XXXXXX")
+          mkdir "$work_dir/logs"
+          {
+            echo "WORK_DIR=$work_dir"
+            echo "BUILD_DIR=$work_dir/build"
+            echo "LOG_DIR=$work_dir/logs"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Configure and build the installed GPU toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+          args=(-DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON)
+          case "$GPU_BACKEND" in
+            cuda) args+=(-DXCHPLOT2_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native) ;;
+            hip|level_zero) args+=(-DXCHPLOT2_BUILD_CUDA=OFF -DACPP_TARGETS=generic) ;;
+            *) echo "Unsupported GPU backend: $GPU_BACKEND" >&2; exit 1 ;;
+          esac
+          cmake -S . -B "$BUILD_DIR" "${args[@]}" 2>&1 | tee "$LOG_DIR/configure.log"
+          cmake --build "$BUILD_DIR" --parallel 4 2>&1 | tee "$LOG_DIR/build.log"
+          cp "$BUILD_DIR/CMakeCache.txt" "$LOG_DIR/CMakeCache.txt"
+      - name: Run GPU correctness and VRAM checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test/gpu-ci.py "$BUILD_DIR" \
+            --backend "$GPU_BACKEND" --suite "$GPU_SUITE" \
+            --physical-vram-mib "$PHYSICAL_VRAM_MIB" --logs "$LOG_DIR" \
+            2>&1 | tee "$LOG_DIR/suite.log"
+      - name: Retain test results and memory measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-${{ inputs.ref }}-${{ inputs.backend }}-${{ inputs.suite }}-${{ inputs.physical-vram-mib }}-${{ github.run_attempt }}
+          path: ${{ env.LOG_DIR }}
+          retention-days: 14
+          if-no-files-found: error
+      - name: Remove this job's temporary files
+        if: always() && env.WORK_DIR != ''
+        shell: bash
+        run: rm -rf -- "$WORK_DIR"

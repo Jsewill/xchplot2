@@ -37,6 +37,7 @@
 #       --build-arg BASE_DEVEL=docker.io/intel/oneapi-basekit:latest \
 #       --build-arg BASE_RUNTIME=docker.io/intel/oneapi-runtime:latest \
 #       --build-arg ACPP_TARGETS=generic \
+#       --build-arg WITH_LEVEL_ZERO_BACKEND=ON \
 #       --build-arg XCHPLOT2_BUILD_CUDA=OFF \
 #       --build-arg INSTALL_CUDA_HEADERS=1 \
 #       .
@@ -67,6 +68,7 @@ ARG ACPP_REF=v25.10.0
 ARG ACPP_TARGETS=
 ARG XCHPLOT2_BUILD_CUDA=ON
 ARG INSTALL_CUDA_HEADERS=0
+ARG WITH_LEVEL_ZERO_BACKEND=OFF
 ARG CUDA_ARCH=89
 # LLVM/clang root used to build AdaptiveCpp. Pinned to Ubuntu's llvm-18
 # for every compose service (cuda / rocm / intel / cpu) — none of them
@@ -87,6 +89,7 @@ ARG ACPP_REF
 ARG ACPP_TARGETS
 ARG XCHPLOT2_BUILD_CUDA
 ARG INSTALL_CUDA_HEADERS
+ARG WITH_LEVEL_ZERO_BACKEND
 ARG CUDA_ARCH
 ARG LLVM_ROOT
 ARG LLVM_CMAKE_DIR
@@ -113,6 +116,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         apt-get install -y --no-install-recommends \
             llvm-18 llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev \
             lld-18 libomp-18-dev libclang-rt-18-dev; \
+    fi \
+ && if [ "${WITH_LEVEL_ZERO_BACKEND}" = "ON" ]; then \
+        apt-get install -y --no-install-recommends libze-dev; \
     fi \
  && if [ "${INSTALL_CUDA_HEADERS}" = "1" ]; then \
         apt-get install -y --no-install-recommends nvidia-cuda-toolkit-headers \
@@ -169,6 +175,7 @@ RUN git clone --depth 1 --branch ${ACPP_REF} \
         -DCMAKE_CXX_COMPILER=${LLVM_ROOT}/bin/clang++ \
         -DLLVM_DIR=${LLVM_CMAKE_DIR} \
         -DACPP_LLD_PATH=${LLVM_ROOT}/bin/ld.lld \
+        -DWITH_LEVEL_ZERO_BACKEND=${WITH_LEVEL_ZERO_BACKEND} \
  && cmake --build /tmp/acpp-build --parallel \
  && cmake --install /tmp/acpp-build \
  && echo "=== AdaptiveCpp LLVM linkage ===" \
@@ -211,6 +218,8 @@ RUN cmake -S . -B build-tests -G Ninja \
 # ─── runtime ────────────────────────────────────────────────────────────────
 FROM ${BASE_RUNTIME}
 
+ARG WITH_LEVEL_ZERO_BACKEND
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # AdaptiveCpp's runtime backend loaders dlopen libLLVM (for SSCP runtime
@@ -220,6 +229,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # (binaries + lib), not just libllvm18.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
+    && if [ "${WITH_LEVEL_ZERO_BACKEND}" = "ON" ]; then \
+        apt-get install -y --no-install-recommends libze1; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/xchplot2                    /usr/local/bin/xchplot2

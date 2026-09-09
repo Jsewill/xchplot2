@@ -23,6 +23,8 @@
 
 #pragma once
 
+// Load libstdc++'s format attributes before HIP/CUDA defines __noinline__.
+#include <chrono>
 #include <cstdint>
 
 #if !defined(XCHPLOT2_SKIP_CUDA_RUNTIME) && __has_include(<cuda_runtime.h>)

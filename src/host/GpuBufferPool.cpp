@@ -16,6 +16,7 @@
 #include "gpu/Sort.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "host/PoolSizing.hpp"
+#include "host/VramBudget.hpp"
 #include "host/VramProbe.hpp"  // validate_sysman_reading — Level Zero probe sanity
 
 #include "gpu/XsKernel.cuh"
@@ -254,7 +255,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         DeviceMemInfo const mem = query_device_memory();
         size_t const total_b = mem.total_bytes;
         size_t const free_b  = mem.free_bytes;
-        if (free_b < required_device + margin) {
+        if (!vram_fits(free_b, required_device, margin)) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
             InsufficientVramError e(
                 "GpuBufferPool: insufficient device VRAM for k=" +
@@ -917,8 +918,7 @@ bool device_memory_probe(int device_ordinal,
     (void)free_bytes;
     (void)total_bytes;
     // No runtime owns this device (Level Zero / OpenCL), or the owning one
-    // declined. Caller falls back to the device total — an upper bound, and
-    // honest about being one, which the wrong device's figure was not.
+    // declined. Budget admission must fail rather than assume the total is free.
     return false;
 }
 
@@ -926,8 +926,7 @@ size_t vram_safety_margin()
 {
     static size_t const margin = [] () -> size_t {
         if (char const* v = std::getenv("POS2GPU_VRAM_MARGIN_MB"); v && v[0]) {
-            size_t const mb = size_t(std::strtoull(v, nullptr, 10));
-            if (mb > 0) return mb << 20;
+            return vram_mib_bytes(v, "POS2GPU_VRAM_MARGIN_MB");
         }
         return 128ULL << 20;
     }();
@@ -940,12 +939,6 @@ DeviceMemInfo query_device_memory()
     DeviceMemInfo info;
     info.total_bytes =
         q.get_device().get_info<sycl::info::device::global_mem_size>();
-    // Fallback: SYCL has no portable free-memory query and AdaptiveCpp exposes
-    // none, so absent the driver probe below all we have is the device total.
-    // Treat it as an upper bound; sycl::malloc_device remains the source of
-    // truth.
-    info.free_bytes = info.total_bytes;
-
     // Real free-memory query on the NVIDIA path. Without it free_bytes is just
     // the device total, so the tier picker sizes against memory the CUDA
     // context (~390 MB), the display server, and every other process on the
@@ -958,14 +951,14 @@ DeviceMemInfo query_device_memory()
         size_t f = 0;
         size_t t = 0;
         int const ord = sycl_backend::current_device_id();
-        if (device_memory_probe(ord, f, t)) {
-            info.free_bytes  = f;
-            info.total_bytes = t;
-        }
+        if (!device_memory_probe(ord, f, t))
+            throw std::runtime_error("Cannot query free device memory; refusing an unverified VRAM budget");
+        info.free_bytes = std::min(f, t);
+        info.total_bytes = t;
     }
 
     if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0]) {
-        size_t const cap = size_t(std::strtoull(v, nullptr, 10)) * (1ULL << 20);
+        size_t const cap = vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB");
         info.free_bytes  = std::min(info.free_bytes,  cap);
         info.total_bytes = std::min(info.total_bytes, cap);
     }
@@ -995,6 +988,8 @@ namespace {
 // predicted peak.
 inline size_t streaming_sort_scratch_adjustment(int k)
 {
+    if (k < 18 || k > 32 || (k & 1))
+        throw std::invalid_argument("k must be even in [18, 32]");
     constexpr size_t cub_baseline_at_k28_bytes = 256ULL << 20;
 
     sycl::queue& q = sycl_backend::queue();
@@ -1027,192 +1022,32 @@ inline size_t streaming_sort_scratch_adjustment(int k)
 
 size_t streaming_peak_bytes(int k)
 {
-    // Anchor: 5200 MB at k=28 (measured post-stage-4e on sm_89).
-    // After the full T1/T2/T3 match/sort work (stages 1-4d) + Xs
-    // gen+sort+pack inlining (4e), all match + sort phases cap out at
-    // cap·sizeof(uint64_t) × ~2.5 aliases = ~5200 MB. Xs peak is 4128,
-    // T3 sort 4228, all others ≤ 5200. Dominant terms scale with 2^k.
-    constexpr size_t anchor_mb = 5200;
-    size_t const adj = streaming_sort_scratch_adjustment(k);
-    if (k == 28) return (anchor_mb << 20) + adj;
-    if (k <  18) return (size_t(16) << 20) + adj;       // floor for tiny test plots
-    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
-
-    if (k < 28) {
-        int const shift = 28 - k;  // cap halves per −1 in k → 2× smaller
-        return ((size_t(anchor_mb) << 20) >> shift) + adj;
-    }
-    int const shift = k - 28;
-    return ((size_t(anchor_mb) << 20) << shift) + adj;
+    return streaming_base_peak_bytes(k, StreamingTier::Compact)
+         + streaming_sort_scratch_adjustment(k);
 }
 
 size_t streaming_plain_peak_bytes(int k)
 {
-    // Anchor: 7290 MB at k=28 (pre-stage-1-4 peak — d_t1_meta +
-    // d_t1_keys_merged + d_t2_meta + d_t2_mi + d_t2_xbits all live
-    // concurrently during T2 match, no parks). Plain tier skips all
-    // park/rehydrate round-trips for ~400 ms/plot over compact at the
-    // cost of this higher peak. Scales the same way as compact.
-    constexpr size_t anchor_mb = 7290;
-    size_t const adj = streaming_sort_scratch_adjustment(k);
-    if (k == 28) return (anchor_mb << 20) + adj;
-    if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
-
-    if (k < 28) {
-        int const shift = 28 - k;
-        return ((size_t(anchor_mb) << 20) >> shift) + adj;
-    }
-    int const shift = k - 28;
-    return ((size_t(anchor_mb) << 20) << shift) + adj;
+    return streaming_base_peak_bytes(k, StreamingTier::Plain)
+         + streaming_sort_scratch_adjustment(k);
 }
 
 size_t streaming_minimal_peak_bytes(int k)
 {
-    // Anchor: 3900 MB at k=28 (streaming-stats trace reads 3884 MB on sm_89;
-    // rounded up for safety). Bottleneck is T3 match where d_t2_keys_merged +
-    // d_t2_xbits_sorted + meta-l/r slices + d_t3_stage are co-resident.
-    //
-    // Was 3760, from a 3754 MB trace taken when the anchor was first set. The
-    // tracked peak has since drifted up to 3884 MB and the anchor was never
-    // re-measured, so minimal had been quietly over its own budget by ~124 MB
-    // independent of the two-phase scratch bug. See the warning on the
-    // streaming_*_peak_bytes block in GpuBufferPool.hpp about calibrating
-    // against the s_malloc trace.
-    //
-    // Minimal layers cumulative cuts on top of compact:
-    //   1. N=8 T2 match staging (cap/8 ≈ 570 MB vs compact's cap/2).
-    //   2. T1 sort gather, T2 sort meta+xbits gathers — tiled output,
-    //      D2H per tile to host pinned, rebuild on device after free.
-    //   3. T3 match — d_t2_meta_sorted parked on host pinned, sliced
-    //      device buffers H2D'd per (section_l, section_r) pass.
-    //   4. T1 match — sliced into N passes per section_l, output
-    //      accumulated to host pinned.
-    //   5. T1, T2, T3 sort CUB sub-phases — per-tile cap/N output
-    //      buffers, USM-host accumulation, merges with USM-host inputs.
-    //   6. Xs phase — gen+sort tiled in N=2 position halves with
-    //      USM-host accumulators; pack tiled with D2H per tile.
-    //
-    // Cumulative effect at k=28: peak drops from 5200 MB (compact) →
-    // 3884 MB (minimal). Trade-off: ~6 extra cap-sized PCIe round-
-    // trips per plot (~2.5× wall on NVIDIA — 13 s/plot → 34 s/plot
-    // at k=28). Same k-scaling as compact / plain.
-    constexpr size_t anchor_mb = 3900;
-    size_t const adj = streaming_sort_scratch_adjustment(k);
-    if (k == 28) return (anchor_mb << 20) + adj;
-    if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
-
-    if (k < 28) {
-        int const shift = 28 - k;
-        return ((size_t(anchor_mb) << 20) >> shift) + adj;
-    }
-    int const shift = k - 28;
-    return ((size_t(anchor_mb) << 20) << shift) + adj;
+    return streaming_base_peak_bytes(k, StreamingTier::Minimal)
+         + streaming_sort_scratch_adjustment(k);
 }
 
 size_t streaming_tiny_peak_bytes(int k)
 {
-    // Anchor: 1100 MB at k=28. Tiny absorbed the Phase 1.4 + 1.5
-    // algorithms that were originally developed under the "Pinned"
-    // tier name. After Phase 1.6 sub-section attacks (per-bucket-pair
-    // T1/T2/T3 match + host-side T2/T3 prepare offsets), measured
-    // direct on RTX 4090:
-    //   k=22:  ~22 MB
-    //   k=24:   92 MB
-    //   k=26:  288 MB
-    //   k=28: 1064 MB (direct measurement, not extrapolated)
-    // Set anchor to 1100 MB — 3.4% safety margin above the measured
-    // k=28 peak. The k=28 scaling came in 8% under the linear
-    // k=26→k=28 extrapolation because fixed-size CUB scratch and
-    // staging caps don't fully 4× with cap. The current floor is
-    // T2 sort scratch (CUB tile_max-sized workspace).
-    //
-    // What Tiny now does (all the host-park + streaming techniques):
-    //   - Xs: CPU merge+pack to host h_xs, no device d_xs_keys_b/vals_b
-    //     intermediate (Phase 1.4a+b)
-    //   - T1 match: per-section-pair tile H2D from h_xs, no full-cap
-    //     d_xs on device (Phase 1.4c)
-    //   - T1 sort: streaming partition (top-bits bucket) + per-bucket
-    //     u32_u64 sort, no full-cap d_t1_meta on device (Phase 1.3c-ii)
-    //   - T2 sort: streaming partition with triple-val (key/meta/xbits
-    //     paired through duplicate keys) + per-bucket sort, no
-    //     full-cap d_t2_meta on device (Phase 1.5b)
-    //   - T3 match: d_t3_stage allocated as USM-host so device peak
-    //     drops by ~200 MB at k=26 / ~800 MB at k=28 (Phase 1.5c-a)
-    //   - T3 sort: N=4 tile + multi-way host merge (vs N=2 before)
-    //
-    // Wall trade vs the original (pre-promotion) Tiny implementation:
-    // approximately +16% at k=26 on RTX 4090. Acceptable on target
-    // hardware (2-3 GB GPUs) which couldn't run the original Tiny at
-    // all. Larger cards should use Plain/Compact/Minimal which are
-    // unchanged.
-    //
-    // Going below ~1.1 GB at k=28 requires attacking the T2 sort
-    // CUB scratch (the new floor — 288 MB at k=26 / ~1152 MB at
-    // k=28). Options: (a) finer per-bucket sort with smaller cub
-    // scratch, (b) host-side merge of pre-sorted partition tiles,
-    // (c) Phase 2 Disk tier for spill.
-    constexpr size_t anchor_mb = 1100;
-    size_t const adj = streaming_sort_scratch_adjustment(k);
-    if (k == 28) return (anchor_mb << 20) + adj;
-    if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
-
-    if (k < 28) {
-        int const shift = 28 - k;
-        return ((size_t(anchor_mb) << 20) >> shift) + adj;
-    }
-    int const shift = k - 28;
-    return ((size_t(anchor_mb) << 20) << shift) + adj;
+    return streaming_base_peak_bytes(k, StreamingTier::Tiny)
+         + streaming_sort_scratch_adjustment(k);
 }
 
 size_t streaming_pinned_peak_bytes(int k)
 {
-    // Anchor: 2900 MB at k=28. After Phase 1.3c-ii + 1.4a/b/c the
-    // Pinned tier eliminates the T1-sort-gather floor (d_t1_meta
-    // full-cap on device, ~2 GB at k=28) AND the Xs phase floor
-    // (d_xs_keys_b + d_xs_vals_b + d_xs_pack_tile, ~3 GB at k=28,
-    // plus the d_xs rehydrate ~2 GB). What remains is the T2 sort /
-    // T3 match phase peak. Measured at k=26: Pinned 720 MB / Tiny
-    // 792 MB → ~91% of Tiny. Extrapolated to k=28 (which scales
-    // ~4× from k=26 for the dominant terms): Pinned ≈ 2900 MB.
-    //
-    // The spec's original 1500 MB-at-k=28 target is unreachable
-    // without also streaming T2 sort and T3 match phases — those
-    // are now the floor (project_streaming_pinned_disk_spec
-    // memory documents the analysis). Phase 1.5+ would attack
-    // those; not currently scoped.
-    //
-    // MEASURED at k=28 on an RTX 4090 (bench VramWatchdog, true process VRAM):
-    // Pinned peaks at 1128 MB — against Tiny's 1118 MB on the same card. The
-    // two tiers have the same footprint; Pinned is not "2x Tiny", and it is not
-    // a rung above it.
-    //
-    // Every number in the paragraph above this one was derived, never measured
-    // at k=28: 2900 was extrapolated from a k=26 reading, then lowered to 2200
-    // as "3200 * 0.68" — where 3200 was Tiny's *old* anchor, itself ~3x Tiny's
-    // real peak. A ratio applied to a wrong base gave a peak that over-declared
-    // by 2x. Nothing caught it: the bench watchdog only fires when the true peak
-    // exceeds what the tier declared, so over-declaring sails through silently
-    // and merely costs the user card capability (a card that can run Pinned in
-    // ~1.6 GB was told it needed 2.7 GB).
-    //
-    // Anchor 1150 = measured 1128 + a small allowance, matching how Tiny's 1100
-    // sits over its measured 1064. Re-derive this ONLY from the watchdog's true
-    // peak, never from a ratio against another anchor.
-    constexpr size_t anchor_mb = 1150;
-    size_t const adj = streaming_sort_scratch_adjustment(k);
-    if (k == 28) return (anchor_mb << 20) + adj;
-    if (k <  18) return (size_t(16) << 20) + adj;
-    if (k >  32) return (size_t(anchor_mb) << (20 + (32 - 28))) + adj;
-
-    if (k < 28) {
-        int const shift = 28 - k;
-        return ((size_t(anchor_mb) << 20) >> shift) + adj;
-    }
-    int const shift = k - 28;
-    return ((size_t(anchor_mb) << 20) << shift) + adj;
+    return streaming_base_peak_bytes(k, StreamingTier::Pinned)
+         + streaming_sort_scratch_adjustment(k);
 }
 
 namespace {

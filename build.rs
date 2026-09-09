@@ -509,16 +509,18 @@ fn ld_lld_findable() -> bool {
 }
 
 /// True when AdaptiveCpp is already installed — at $ACPP_PREFIX if
-/// set, otherwise the install-deps.sh default of /opt/adaptivecpp.
+/// set, otherwise the install-deps.sh default of /opt/adaptivecpp; also
+/// recognize the per-user ~/.local install made by the CMake fallback.
 /// When this is true the FetchContent fallback won't fire and
 /// AdaptiveCpp's own build-time deps (notably ld.lld) aren't needed
 /// for our build.
 fn adaptivecpp_installed() -> bool {
     let prefix = env::var("ACPP_PREFIX")
         .unwrap_or_else(|_| "/opt/adaptivecpp".to_string());
-    std::path::Path::new(&format!(
-        "{prefix}/lib/cmake/AdaptiveCpp/AdaptiveCppConfig.cmake"
-    )).exists()
+    let local = format!("{}/.local", env::var("HOME").unwrap_or_default());
+    [prefix, local].iter().any(|root| std::path::Path::new(&format!(
+        "{root}/lib/cmake/AdaptiveCpp/adaptivecpp-config.cmake"
+    )).exists())
 }
 
 /// Detect a container engine on PATH, preferring podman (matches
@@ -728,30 +730,12 @@ fn main() {
         let build_container = build_container.display();
 
         // install-deps.sh auto-detects the vendor when --gpu is omitted,
-        // using the same PCI precedence we do, so the bare form is right
-        // for NVIDIA and AMD alike. Intel is the exception: that branch
-        // exits 1 (no Intel package path yet) and its own advice is to
-        // take the NVIDIA path for the LLVM toolchain + CUDA headers the
-        // SYCL TUs still #include — the Intel GPU itself is driven by
-        // AdaptiveCpp's generic SSCP target at runtime, not by CUDA.
-        let host_install = match vendor {
-            Some(("Intel", _)) => format!(
-                "- Install those packages on the host:\n      \
-                     {install_deps} --gpu nvidia\n    \
-                   install-deps.sh has no Intel package path yet; --gpu nvidia is its\n    \
-                   documented stand-in — it installs LLVM + the CUDA *headers* the SYCL\n    \
-                   TUs include, not a GPU driver. Your Intel GPU runs through\n    \
-                   AdaptiveCpp's generic SSCP target. The container path below ships\n    \
-                   Intel oneAPI instead and needs no host toolchain at all."
-            ),
-            // Comment on its own line, not trailing the command: the path
-            // is an absolute cargo checkout and the two together wrap.
-            _ => format!(
-                "- Install those packages on the host — it auto-detects your GPU\n    \
-                   vendor and builds AdaptiveCpp:\n      \
-                     {install_deps}"
-            ),
-        };
+        // using the same PCI precedence we do for all three vendors.
+        let host_install = format!(
+            "- Install those packages on the host — it auto-detects your GPU\n    \
+               vendor and builds AdaptiveCpp:\n      \
+                 {install_deps}"
+        );
 
         // Say plainly that this isn't an NVIDIA problem when we've already
         // routed the build away from CUDA. Without it, the arch line
@@ -1171,6 +1155,7 @@ fn main() {
     // never initialises, and the plotter runs on the OpenMP host device while
     // reporting success. That is the RDNA1 default path, so it was reachable.
     let amdhip_lib = [format!("{rocm_root}/lib"), format!("{rocm_root}/lib64"),
+                      "/usr/lib/x86_64-linux-gnu".to_string(),
                       "/usr/lib64".to_string(), "/usr/lib".to_string()]
         .into_iter()
         .map(|dir| format!("{dir}/libamdhip64.so"))

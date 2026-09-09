@@ -340,6 +340,23 @@ int main()
         check(ops.live == 0, "every staging window is returned on destruction");
     }
 
+    // The optional readback check must report the exact differing byte.
+    {
+        EngineWithThreads e(1);
+        SpillBuffer buf(*e, 1, 8);
+        unsigned char const src[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+        buf.write_from_device(src, 0, sizeof(src));
+        buf.drain();
+        int const slot = (*e).write_slot ^ 1;
+        (*e).win[slot][3] = 15;
+        bool detected = false;
+        try { buf.verify_chunk(slot, 0, sizeof(src)); }
+        catch (std::runtime_error const& error) {
+            detected = std::string(error.what()).find("at byte offset 3: staging 15, readback 13") != std::string::npos;
+        }
+        check(detected, "readback mismatch reports its byte offset and values");
+    }
+
     std::printf(failures ? "\n%d FAILURE(S)\n" : "\nall good\n", failures);
     return failures ? 1 : 0;
 }

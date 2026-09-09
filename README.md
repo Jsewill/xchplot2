@@ -156,7 +156,7 @@ native Windows or a non-WSL setup, jump to [Windows](#windows).
     3884 + 390 MB does not fit in it. Trade-off: ~6 extra cap-sized
     PCIe round-trips per plot. k=28 wall on sm_89: ~23 s/plot vs
     ~5 s for compact. Detailed breakdown in [VRAM](#vram).
-  - **Tiny streaming** (~1.07 GiB peak + 36 MB margin, k=28 measured
+  - **Tiny streaming** (~1.07 GiB peak + 128 MiB buffer, k=28 measured
     **1064 MB**): the smallest tier. Builds on minimal with full Phase
     1.4 + 1.5 + 1.6 algorithm work — per-section-pair T1/T2/T3 match
     with host-prepare offsets, streaming-partition T1/T2 sort
@@ -437,12 +437,25 @@ Debian, Fedora) plus AdaptiveCpp from source into `/opt/adaptivecpp`.
 GPU vendor is auto-detected: `nvidia-smi` / `rocminfo` first,
 `/sys/class/drm` PCI IDs as fallback (so fresh installs without driver
 tools still work). On a no-GPU host (CI / build box) the script
-errors out — pass `--gpu nvidia` to install the toolchain anyway.
-`--gpu amd` forces the AMD path on dual-vendor hosts. Intel detection
-currently errors with a hint pointing at `--gpu nvidia` (the SYCL
-toolchain JITs onto Intel via AdaptiveCpp's generic SSCP target) or
-the container. Pass `--no-acpp` to skip the AdaptiveCpp build and
-let CMake fall back to FetchContent.
+errors out — pass `--gpu nvidia`, `--gpu amd`, or `--gpu intel` to select
+the toolchain explicitly. Intel installs Level Zero and its compute
+runtime, then enables AdaptiveCpp's Level Zero backend and SPIR-V
+translator. Debian 13 does not package the Intel compute runtime;
+use the Intel container or a supported native distro instead.
+Pass `--no-acpp` to install only system packages. CMake's FetchContent
+fallback then builds and installs AdaptiveCpp to `~/.local` (or
+`ACPP_PREFIX`), so its runtime survives Cargo's temporary build directory.
+Cargo uses these system dependencies; it does not run
+the system package manager itself.
+On rolling distros, CMake probes nvcc and selects an installed compatible
+host compiler if the default is rejected. Explicit `CUDAHOSTCXX`,
+`NVCC_CCBIN`, and `CMAKE_CUDA_HOST_COMPILER` settings take precedence.
+
+The [native install CI matrix](CONTRIBUTING.md#install-ci) exercises
+fresh Ubuntu, Debian, Fedora, Arch, and Ubuntu WSL2 installs through
+both Cargo and CMake. NVIDIA installs on Ubuntu/Debian and Fedora
+use NVIDIA's toolkit repository when needed; WSL uses its toolkit-only
+repository. Existing CUDA installations are retained on apt systems.
 
 ### 3. Manual / FetchContent fallback
 
@@ -450,9 +463,11 @@ If you'd rather install dependencies yourself, the toolchain is:
 
 | Dep | Notes |
 |---|---|
-| **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches it via FetchContent if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
-| **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON`. Default is vendor-aware — `ON` for NVIDIA GPUs, `OFF` for AMD / Intel GPUs (even if `nvcc` is installed), falling through to `nvcc`-presence only when no GPU is probed (CI / container). Override with the env var. |
-| **LLVM / Clang ≥ 18** | `clang`, `lld` (AdaptiveCpp's CMake requires `ld.lld`), plus the libclang dev packages. `install-deps.sh` installs all of them; manual installs need to add `lld-18` (apt) / `lld` (dnf, pacman) explicitly. |
+| **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches and installs it to `~/.local` (or `ACPP_PREFIX`) if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
+| **CUDA Toolkit 12+** | NVIDIA only. `nvcc` runs when `XCHPLOT2_BUILD_CUDA=ON`; AMD and Intel builds do not require CUDA headers. The installer uses the current toolkit; Pascal/Volta require an existing CUDA 12.9 install because CUDA 13 dropped their code generation. |
+| **ROCm HIP headers, runtime, device libraries** | AMD only: apt `hipcc`, Fedora `rocm-hip-devel`, Arch `hip-runtime-amd` + `rocm-device-libs`; also install `rocminfo` for GPU detection. |
+| **Level Zero headers, loader, Intel compute runtime** | Intel only. AdaptiveCpp also needs `WITH_LEVEL_ZERO_BACKEND=ON` and its LLVM SPIR-V translator installed; `install-deps.sh` handles both. |
+| **LLVM / Clang 16–20** | AdaptiveCpp 25.10's supported LLVM range, including `lld`, libclang development files, and compiler-rt. The installer selects the newest complete compatible version available, alongside a newer system LLVM when necessary. |
 | **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
 | **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
 | **Boost.Context, libnuma, libomp** | AdaptiveCpp runtime deps. |
@@ -464,7 +479,7 @@ checkout.
 
 For non-NVIDIA targets, the build also probes:
 - **ROCm 6+** (`rocminfo`): if found, sets `ACPP_TARGETS=hip:gfxXXXX`.
-- **Intel oneAPI** (Level Zero / compute-runtime): manual `ACPP_TARGETS`.
+- **Intel** (Level Zero / compute-runtime): defaults to `ACPP_TARGETS=generic`.
 
 ### `cargo install`
 
@@ -478,11 +493,10 @@ Toolchain prerequisites for the NVIDIA build:
   24.04 apt cargo is 1.75) is too old for the `edition2024` feature
   required by `chia-client` 0.42.
 
-#### Verified install matrix (NVIDIA path)
+#### NVIDIA dependency sources (manual installs)
 
 | Distro                | CUDA source                         | CMake source            | Rust source       |
 |-----------------------|-------------------------------------|-------------------------|-------------------|
-| Ubuntu 24.04          | apt `nvidia-cuda-toolkit` (12.0)    | apt `cmake` (3.28)      | rustup `stable`   |
 | Ubuntu 24.04          | NVIDIA apt `cuda-toolkit-12-9`      | apt `cmake` (3.28)      | rustup `stable`   |
 | Ubuntu 22.04          | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
 | Debian 12 (Bookworm)  | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
@@ -491,6 +505,8 @@ Toolchain prerequisites for the NVIDIA build:
 | Arch / CachyOS        | pacman `cuda` (12.x)                | pacman `cmake`          | pacman `rust` or rustup |
 
 Combinations that **don't** work on a stock install:
+- **Ubuntu 24.04 + apt CUDA 12.0**: the old toolkit can fail against
+  current glibc headers. Use NVIDIA's repository, as `install-deps.sh` does.
 - **Ubuntu 22.04 + apt CUDA**: ships CUDA 11.5 — nvcc too old for the
   C++20 dialect, and `libcudart` predates the `_v2` ABI. Use NVIDIA's
   apt repo instead.
@@ -806,10 +822,13 @@ Bench deletes the files it creates unless `--keep` is set. Pass
 `--target-size TiB` to estimate time-to-fill a specific capacity instead
 of the output directory's free space.
 
-Plots are written to `<name>.plot2.partial` and atomically renamed on
+Plots are written to an exclusively created `<name>.plot2.partial.XXXXXX`
+file, flushed through its original file descriptor, and atomically renamed on
 completion, so a crash / `SIGINT` / `ENOSPC` mid-write never leaves a
 malformed plot at the destination. A first `Ctrl-C` asks the plotter to
-finish the plot in flight and stop; a second hard-kills.
+finish the plot in flight and stop; a second hard-kills. Concurrent writers
+use separate temporary files; the last completed rename wins. Resume checks
+the header identity, memo, chunk index, and file bounds before skipping a plot.
 
 #### Per-worker rates and the batch size that lands them together
 
@@ -857,14 +876,14 @@ produces plots with `plot_index` 0..999).
 different meta_group values are guaranteed never to pass the same
 challenge.
 
-The PoS2 spec defines a grouped-plot file layout (multiple plots
-interleaved into one container per storage device, for harvester
-seek amortization), but the on-disk format is not yet defined
-upstream in `pos2-chip` / `chia-rs`. xchplot2 currently produces one
-`.plot2` file per plot — this is in lieu of those upstream
-decisions. When the grouped layout lands, the auto-incrementing
-`<plot-index>` above is the per-plot within-group identifier it
-will expect.
+The grouped-plot format is proposed in
+[pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118).
+xchplot2 currently produces one `.plot2` file per plot using its existing
+dependency pin. A group must share its group ID and memo; `plot -n N`
+currently generates independent keys for each plot, so incrementing the
+index alone does not form a group. The
+[opt-in compatibility check and migration plan](contrib/pos2-pr118/README.md)
+track preparation for the proposed format.
 
 #### Multi-device: `--devices` and `--cpu`
 
@@ -1261,15 +1280,15 @@ xchplot2 test          <k> <plot-id-hex> [strength] ...    # single plot, raw in
 xchplot2 batch         <manifest.tsv> [-v] [-q] [--skip-existing] [--continue-on-error]
                                              [--devices <SPEC>] [--progress|--no-progress]
 xchplot2 bench         [-k K] [-n N] [-o DIR] [--devices <SPEC>] [--compute-only]
-xchplot2 verify        <file.plot2> [--trials N]           # run N random challenges
+xchplot2 verify        <file.plot2> [--trials N] [--full]  # sample chains; optionally validate full proofs
 xchplot2 parity-check  [--dir PATH]                        # CPU↔GPU regression screen
 ```
 
-`verify` opens a `.plot2` through pos2-chip's CPU prover and runs N
-(default 100) random challenges. It exits non-zero only when the whole
-sample yields *no* proof, so treat it as a smoke test for gross
-corruption rather than proof a plot is right — a badly damaged plot can
-still answer some challenges. Not a replacement for `chia plots check`.
+`verify` checks file structure, then samples quality chains for N random
+challenges (default 100). `--full` also reconstructs and cryptographically
+validates a full proof for every returned chain, failing if any cannot be
+validated. Both modes fail on an empty sample. Sampling does not validate
+every part of a plot; use byte comparison with a CPU reference for parity.
 
 To actually prove a plot correct, build the same one on the CPU and
 compare bytes. `test` without `--gpu-all` runs pos2-chip's own plotter,
@@ -1523,19 +1542,28 @@ based on available VRAM at batch start:
   s/plot (compact) to ~34 s/plot (minimal). Minimal is not the bottom of
   the ladder — tiny is, and a card below tiny's floor throws.
 
-At pool construction `xchplot2` queries `cudaMemGetInfo` on the
-CUDA-only build, or `global_mem_size` (device total) on the SYCL
-path — SYCL has no portable free-memory query, so the check
-effectively approximates "free == total" and lets the actual
-`malloc_device` failure trigger the fallback. If the pool doesn't
-fit, the streaming-tier dispatch picks the largest tier that fits
-with the 128 MB margin: plain if free ≥ 7.42 GiB, else compact if
-free ≥ 5.33 GiB, else minimal. `XCHPLOT2_STREAMING=1` forces
-streaming even when the pool would fit; `--tier
-plain|compact|minimal` (or `XCHPLOT2_STREAMING_TIER`) overrides the
-auto-pick. Forced plain or compact below their floor warns and
-proceeds (caller's risk); forced minimal below its floor throws
-because there is no smaller tier to fall back to.
+Admission uses the owning driver's free-memory counter after context creation.
+If that counter is unavailable, plotting fails rather than assuming the whole
+device is free. The streaming picker tries plain, compact, minimal, then tiny;
+every automatic or forced tier must fit `peak + buffer`. Pinned remains a
+manual tier. Peaks scale with k and include the backend's sort scratch.
+`POS2GPU_VRAM_MARGIN_MB` sets the buffer (default 128 MiB).
+Optional two-phase scratch receives only `free - peak - buffer`, and lowering
+its grant releases oversized cached allocations. The benchmark watchdog counts
+the buffer once and fails when measured use exceeds the declared allowance.
+
+Pipeline stages choose their tiers against each bound worker's free VRAM.
+Writer queues are bounded, and any stage or writer failure wakes all stages.
+Pipeline plotting rejects `--max-host-ram` because its spill policy is not
+implemented; use the work-queue strategy when a host-memory cap is required.
+GPU IDs must be distinct within a batch so workers cannot spend the same VRAM
+budget twice. `parity-check` executes test paths directly and prints captured
+output on failure, including when paths contain spaces or shell punctuation.
+
+Run `scripts/test/vram-tiers.sh /path/to/xchplot2 DEVICE` on a real GPU to
+exercise the tier boundaries and watchdog. The script needs enough physical
+free VRAM for each tested cap; a software cap does not emulate another GPU's
+driver, allocator, or sort implementation.
 
 Plot output is bit-identical across all five paths — streaming
 reorganises memory, not algorithms. Verified at k=22 (and k=28

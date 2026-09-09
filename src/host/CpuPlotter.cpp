@@ -48,6 +48,7 @@ namespace pos2gpu {
 
 std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts)
 {
+    validate_batch_entry(entry);
     // pos2-chip's PlotFile writes the memo behind a 1-byte length prefix, so
     // any size in [0, 255] is on-disk valid. keygen-rs emits two layouts:
     //   - pool-PH mode: 32-byte pool_ph + 48-byte farmer_pk + 32-byte master_sk
