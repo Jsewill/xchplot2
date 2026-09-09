@@ -273,6 +273,9 @@ struct SyclSpillHostOps final : SpillHostOps {
     // .wait() is load-bearing, not defensive: the queue is out-of-order, and
     // the caller hands this window straight to an I/O thread.
     void copy_blocking(void* dst, void const* src, std::size_t bytes) override {
+        // B580 (AdaptiveCpp 25.10, NEO 26.22) corrupts spill staging when
+        // another D2H copy is in flight. Serialize at the shared boundary.
+        if (q->get_device().get_backend() == sycl::backend::level_zero) q->wait();
         q->memcpy(dst, src, bytes).wait();
     }
 };
