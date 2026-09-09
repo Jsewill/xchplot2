@@ -5,6 +5,7 @@ version: 2
 #     The build.rs at repo root only references env state and has no
 #     runtime crate deps, so it doesn't need its own entry.
 #   - github-actions: action versions in .github/workflows/.
+# Version updates cover both main and cuda-only.
 # Weekly cadence keeps PR volume low; bump to daily if security
 # advisories pile up.
 updates:
@@ -16,6 +17,20 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /keygen-rs
+    target-branch: cuda-only
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: cuda-only
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
