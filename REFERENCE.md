@@ -572,6 +572,19 @@ common commands and options; use this reference for the complete command guide.
   closed, the box genuinely needs more RAM for that card. See [Host RAM
   and disk-offload](#host-ram-and-disk-offload).
 
+- **Intel Arc B580 sort hangs**: on Fedora 44 with AdaptiveCpp 25.10 and
+  Intel compute-runtime 26.22, disable direct submission. Apply the workaround to the plotting process:
+
+  ```bash
+  ACPP_VISIBILITY_MASK=ze NEOReadDebugKeys=1 EnableDirectSubmission=0 \
+      xchplot2 bench -k 28 --devices 0 -o /scratch
+  ```
+
+  These Intel driver settings are not set automatically. Use an up-to-date
+  build for the Level Zero disk-spill synchronization fix.
+  With Tiny/Pinned on this stack, set `POS2GPU_VRAM_MARGIN_MB=1024` to
+  accommodate the additional driver-reported VRAM use.
+
 - **Hybrid hosts (NVIDIA + AMD/Intel on the same box)**: a single
   binary handles all visible GPUs. `xchplot2 plot --devices gpu`
   spawns a worker per GPU (use `--devices all` to also add a CPU
@@ -619,6 +632,7 @@ common commands and options; use this reference for the complete command guide.
 
 | Variable                      | Effect                                                                  |
 |-------------------------------|-------------------------------------------------------------------------|
+| `NEOReadDebugKeys=1`, `EnableDirectSubmission=0` | Intel driver workaround for B580 submission hangs. See [troubleshooting](#troubleshooting). |
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny\|pinned` | Force a streaming tier even when the pool fits. A non-auto `--tier` takes precedence. See [memory requirements](#memory-requirements). |

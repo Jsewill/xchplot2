@@ -47,7 +47,7 @@ for CPU-reference comparisons.
 |---|---|
 | NVIDIA | Maxwell or newer via CUDA/CUB. Pre-Turing GPUs require a CUDA 12.x build. RTX 4090 is in the current hardware benchmark set. |
 | AMD | AdaptiveCpp HIP; RX 6700 XT (`gfx1031`) is in the current hardware benchmark set. RDNA1 needs the [installation-path guidance](INSTALL.md#amd-target-selection). |
-| Intel | AdaptiveCpp Level Zero build support; outside the current hardware benchmark set. |
+| Intel | Arc B580 with AdaptiveCpp Level Zero; see the [runtime workaround](REFERENCE.md#troubleshooting). |
 | VRAM | Tiny's base k=28 floor is 1,228 MiB free after context creation, including the default 128 MiB buffer. Backend sort scratch can raise it. |
 | Host RAM | Depends on tier and worker count. Lower VRAM tiers generally use more host RAM; see [memory requirements](REFERENCE.md#memory-requirements). |
 | CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses pos2-chip's CPU plotter. |
@@ -118,18 +118,19 @@ non-auto tier was forced.
 | Tiny | 27.74 s | 29.77 s |
 | Pinned | 27.42 s | 29.73 s |
 
-RTX 4090 Plain was repeated after the full matrix. Both runs passed; the
-cause of the timing difference was not established.
+The two RTX 4090 Plain timings differ for an undetermined reason.
+
+Arc B580 / Level Zero: **13.75 s/plot** with Auto, **14.17 s/plot** with Plain;
+see the [Intel configuration](BENCHMARKS.md#intel-arc-b580).
 
 The native `cuda-only` auto path measured **2.20 s/plot** on the same RTX
 4090, with its optional D2H/Xs overlap enabled. These runs do not isolate the
 cause of the difference between the native and SYCL runtimes.
 
-The [benchmark report](BENCHMARKS.md) records hardware,
-toolchains, sample counts, variability, host RAM, driver VRAM, the before/after
-comparison, profiling, and correctness checks. The forced tiers can use
-additional match scratch on these roomy GPUs; their timings do not predict
-performance on a card restricted to a tier's minimum VRAM.
+The [benchmarks](BENCHMARKS.md) include configurations, variability, and
+memory use. Forced tiers can use additional match scratch on these roomy GPUs;
+their timings do not predict performance on a card restricted to a tier's
+minimum VRAM.
 
 Multi-GPU throughput also depends on shared PCIe bandwidth, CPU compression,
 and storage. This benchmark set uses one GPU per host.
@@ -140,7 +141,7 @@ and storage. This benchmark set uses one GPU per host.
 |---|---|
 | [Installation](INSTALL.md) | Dependencies, containers, Cargo/CMake, Windows and WSL2 |
 | [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
-| [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, memory use, and validation |
+| [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, and memory use |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 
