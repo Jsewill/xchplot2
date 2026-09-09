@@ -161,8 +161,12 @@ RUN set -eux; \
     fi
 
 # Rust toolchain (for keygen-rs and the `cargo install` entry point).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain stable --profile minimal
+# Finish the download before running it; a pipe hides curl failures.
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+        --retry 5 --retry-delay 10 --retry-all-errors \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal \
+ && rm /tmp/rustup-init.sh
 ENV PATH=/root/.cargo/bin:${PATH}
 
 # AdaptiveCpp from source, pinned. Installs to /opt/adaptivecpp.

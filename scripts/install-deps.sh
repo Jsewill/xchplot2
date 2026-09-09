@@ -554,8 +554,12 @@ fi
 # ── Rust toolchain via rustup ───────────────────────────────────────────────
 if ! command -v cargo >/dev/null; then
     echo "[install-deps] Installing Rust toolchain via rustup"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain stable --profile minimal
+    rustup_script=$(mktemp)
+    curl --proto '=https' --tlsv1.2 -sSfL \
+        --retry 5 --retry-delay 10 --retry-all-errors \
+        https://sh.rustup.rs -o "$rustup_script"
+    sh "$rustup_script" -y --default-toolchain stable --profile minimal
+    rm "$rustup_script"
     export PATH=$HOME/.cargo/bin:$PATH
 fi
 
