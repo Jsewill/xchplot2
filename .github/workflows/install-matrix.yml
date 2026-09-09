@@ -75,7 +75,7 @@ jobs:
           - fedora41-nvidia-apt      # NVIDIA dnf repo
           - rocky9-nvidia-apt        # NVIDIA dnf repo (RHEL 9 family)
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build base image
         run: |
           podman build \
