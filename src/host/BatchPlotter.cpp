@@ -1169,7 +1169,9 @@ std::size_t record_plot_completion(BatchResult& res,
                                    std::uint64_t plot_bytes,
                                    double completion_offset_s,
                                    BatchProgress& live,
-                                   int slot)
+                                   int slot,
+                                   BatchEntry const& entry,
+                                   BatchOptions const& opts)
 {
     res.bytes_written += plot_bytes;
     res.completion_seconds.push_back(completion_offset_s);
@@ -1182,6 +1184,7 @@ std::size_t record_plot_completion(BatchResult& res,
 
     live.bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
     live.written.fetch_add(1, std::memory_order_relaxed);
+    if (opts.on_plot_ready) opts.on_plot_ready(entry);
     return live.retired.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
@@ -1684,6 +1687,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             log_prefix.c_str(), i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
+                    if (opts.on_plot_ready) opts.on_plot_ready(entries[i]);
                     std::size_t const done_now = live_skip(live, worker_id);
                     if (opts.progress) {
                         emit_progress_line(
@@ -1701,7 +1705,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
                 std::size_t const done_now = record_plot_completion(
-                    res, plot_bytes, completion_offset, live, worker_id);
+                    res, plot_bytes, completion_offset, live, worker_id, entries[i], opts);
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "%s plot %zu done: %s\n",
@@ -1718,6 +1722,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     "%s plot %zu FAILED: %s\n",
                     log_prefix.c_str(), i, ex.what());
                 live_fail(live, worker_id);
+                ++res.plots_failed;
                 // cuda-only's BatchOptions doesn't have continue_on_error
                 // — match the GPU path's behavior of returning early on
                 // a per-plot failure (caller decides whether to retry).
@@ -2566,7 +2571,7 @@ host_ram_ok:;
                 // and publishes this worker's rate for the ETA. The line it feeds
                 // is aggregate across every worker, hence progress_prefix.
                 std::size_t const done_now = record_plot_completion(
-                    res, plot_bytes, completion_offset, live, worker_id);
+                    res, plot_bytes, completion_offset, live, worker_id, item.entry, opts);
                 if (verbose) {
                     std::fprintf(stderr, "%s consumer wrote plot %zu: %s\n",
                                  log_prefix.c_str(), item.index, full_path.string().c_str());
@@ -2652,6 +2657,7 @@ host_ram_ok:;
                             log_prefix.c_str(), i, out_path.string().c_str());
                     }
                     ++res.plots_skipped;
+                    if (opts.on_plot_ready) opts.on_plot_ready(entries[i]);
                     std::size_t const done_now = live_skip(live, worker_id);
                     if (opts.progress) {
                         emit_progress_line(
@@ -2887,6 +2893,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         for (auto const& entry : entries) {
             auto const path = std::filesystem::path(entry.out_dir) / entry.out_name;
             if (!plot_file_matches(path.string(), entry)) pending.push_back(entry);
+            else if (opts.on_plot_ready) opts.on_plot_ready(entry);
         }
         if (pending.size() != entries.size()) {
             auto pending_opts = opts;
@@ -3175,6 +3182,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         BatchResult const& r = per_worker[i];
         agg.plots_written += r.plots_written;
         agg.plots_skipped += r.plots_skipped;
+        agg.plots_failed += r.plots_failed;
         agg.bytes_written += r.bytes_written;
         agg.completion_seconds.insert(
             agg.completion_seconds.end(),

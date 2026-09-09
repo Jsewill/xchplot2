@@ -36,6 +36,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <sstream>
 #include <stdexcept>
@@ -125,6 +126,7 @@ void print_usage(char const* prog)
         << "    deletes them on exit by default.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
         << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
+        << "         [--resume] [--manifest FILE]\n"
         << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
@@ -137,6 +139,10 @@ void print_usage(char const* prog)
         << "    -n, --num N                     : number of plots to create.\n"
         << "    -s, --strength S                : v2 PoS strength (default 2).\n"
         << "    -o, --out DIR                   : output directory.\n"
+        << "    --manifest FILE                 : save/reuse this job manifest (default: unique\n"
+        << "                                      xchplot2-job-*.tsv in the output directory).\n"
+        << "    --resume, --skip-existing       : recover the saved plot job and skip files\n"
+        << "                                      with matching identity, memo, and valid bounds.\n"
         << "    -i, --plot-index N              : base v2 PoS plot_index (default 0); increments per plot.\n"
         << "    -g, --meta-group N              : v2 PoS meta_group field (default 0).\n"
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
@@ -840,6 +846,12 @@ void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
     // progress_prefix).
     std::cerr.flush();
     print_run_workers(prefix, res);
+}
+
+int batch_exit_code(pos2gpu::BatchResult const& res, std::size_t requested)
+{
+    if (res.plots_failed) return 3;
+    return res.plots_written + res.plots_skipped < requested ? 4 : 0;
 }
 
 // Pick the roomiest tmpfs, not the first one that happens to exist. The old
@@ -1916,7 +1928,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             auto res = pos2gpu::run_batch(entries, opts);
             if (!opts.quiet) print_run_summary("[batch]", res);
-            return 0;
+            return batch_exit_code(res, entries.size());
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
             return 2;
@@ -2061,6 +2073,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string out_dir = ".";
         std::string farmer_pk_hex, pool_pk_hex, pool_ph_hex, pool_addr;
         std::string seed_hex;
+        std::string manifest_path;
         std::vector<int> plot_device_ids;
         bool plot_use_all_devices = false;
         bool plot_devices_specified = false;
@@ -2099,6 +2112,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--plot-index" || a == "-i") && need(1)) plot_index_base = std::atoi(argv[++i]);
             else if ((a == "--meta-group" || a == "-g") && need(1)) meta_group      = std::atoi(argv[++i]);
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
+            else if  (a == "--manifest" && need(1)) manifest_path = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
             else if  (a == "--no-testnet")              testnet = false;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
@@ -2205,7 +2219,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
         // plot_index auto-increments across `-n N`; reject upfront if the
         // final plot's plot_index would exceed the u16 range.
-        if (plot_index_base + num - 1 > 0xFFFF) {
+        if (num > 65536 - plot_index_base) {
             std::cerr << "Error: --plot-index + (--num - 1) exceeds 65535 "
                          "(base=" << plot_index_base << ", num=" << num << ")\n";
             return 1;
@@ -2263,9 +2277,54 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
 
         try {
+            out_dir = std::filesystem::absolute(out_dir).lexically_normal().string();
+            std::filesystem::create_directories(out_dir);
+            std::filesystem::path job_path = manifest_path;
             std::vector<pos2gpu::BatchEntry> entries;
+            auto memo_prefix = pool_key;
+            memo_prefix.insert(memo_prefix.end(), farmer_pk.begin(), farmer_pk.end());
+            auto matches_request = [&](std::vector<pos2gpu::BatchEntry> const& job) {
+                if (job.size() != static_cast<std::size_t>(num)) return false;
+                for (std::size_t i = 0; i < job.size(); ++i) {
+                    auto const& e = job[i];
+                    if (e.k != k || e.strength != strength || e.testnet != testnet ||
+                        e.plot_index != plot_index_base + static_cast<int>(i) ||
+                        e.meta_group != meta_group ||
+                        std::filesystem::weakly_canonical(e.out_dir) !=
+                            std::filesystem::weakly_canonical(out_dir) ||
+                        e.memo.size() != memo_prefix.size() + 32 ||
+                        !std::equal(memo_prefix.begin(), memo_prefix.end(), e.memo.begin()))
+                        return false;
+                }
+                return true;
+            };
+            // A seed already reconstructs the job exactly. Random jobs must
+            // recover their saved identities before any new keys are made.
+            if (plot_skip_existing && !have_base_seed) {
+                if (!job_path.empty() && std::filesystem::exists(job_path)) {
+                    entries = pos2gpu::parse_manifest(job_path.string());
+                    if (!matches_request(entries))
+                        throw std::invalid_argument("manifest does not match the requested keys, plot parameters, or output directory");
+                } else if (job_path.empty()) {
+                    bool found_job = false;
+                    for (auto const& file : std::filesystem::directory_iterator(out_dir)) {
+                        auto const name = file.path().filename().string();
+                        if (!name.starts_with("xchplot2-job-") || !name.ends_with(".tsv")) continue;
+                        found_job = true;
+                        auto candidate = pos2gpu::parse_manifest(file.path().string());
+                        if (!matches_request(candidate)) continue;
+                        if (!entries.empty())
+                            throw std::invalid_argument("multiple matching jobs; select --manifest FILE or run batch FILE --resume");
+                        entries = std::move(candidate);
+                        job_path = file.path();
+                    }
+                    if (found_job && entries.empty())
+                        throw std::invalid_argument("no saved job matches this request; use the original plot parameters or start a new job without --resume");
+                }
+            }
+            bool const recovered = !entries.empty();
             entries.reserve(static_cast<size_t>(num));
-            for (int i = 0; i < num; ++i) {
+            for (int i = 0; !recovered && i < num; ++i) {
                 uint8_t seed[32];
                 if (have_base_seed) {
                     int rc = pos2_keygen_derive_subseed(
@@ -2318,9 +2377,21 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
                 if (verbose) {
                     std::cerr << "[plot] prepared " << (i + 1) << "/" << num
-                              << " " << e.out_name << "\n";
+                              << " " << entries.back().out_name << "\n";
                 }
             }
+
+            if (job_path.empty()) {
+                job_path = std::filesystem::path(out_dir) /
+                    ("xchplot2-job-" + bytes_to_hex(entries.front().plot_id)
+                     + "-k" + std::to_string(k) + "-n" + std::to_string(num)
+                     + (testnet ? "-testnet" : "") + ".tsv");
+            }
+            pos2gpu::write_manifest(job_path.string(), entries);
+            if (!plot_quiet)
+                std::cerr << "[plot] " << (recovered ? "resuming" : "saved")
+                          << " job: " << job_path.string()
+                          << " (reuse with batch FILE --resume)\n";
 
             pos2gpu::BatchOptions opts{};
             opts.verbose          = verbose;
@@ -2342,14 +2413,15 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.temp_dir         = plot_temp_dir;
             opts.no_auto_spill    = plot_no_auto_spill;
             resolve_host_ram_env(opts);
+            std::mutex output_mutex;
+            opts.on_plot_ready = [&](pos2gpu::BatchEntry const& entry) {
+                std::lock_guard lock(output_mutex);
+                std::cout << (std::filesystem::path(entry.out_dir) / entry.out_name).string()
+                          << '\n' << std::flush;
+            };
             auto res = pos2gpu::run_batch(entries, opts);
             if (!plot_quiet) print_run_summary("[plot]", res);
-            // stdout path listing is the machine-readable result — kept
-            // under -q so scripts can still consume it.
-            for (auto const& e : entries) {
-                std::cout << out_dir << "/" << e.out_name << "\n";
-            }
-            return 0;
+            return batch_exit_code(res, entries.size());
         } catch (std::exception const& e) {
             std::cerr << "[plot] FAILED: " << e.what() << "\n";
             return 2;
@@ -2384,6 +2456,7 @@ _xchplot2() {
         --tier)            COMPREPLY=( $(compgen -W "${tiers}" -- "$cur") ); return 0 ;;
         --devices)         COMPREPLY=( $(compgen -W "${devices_tokens}" -- "$cur") ); return 0 ;;
         -o|--out)          COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        --manifest)        COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
         --temp-dir)        COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
         --max-host-ram)    COMPREPLY=( $(compgen -W "min 4G 8G 16G 32G" -- "$cur") ); return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
@@ -2394,7 +2467,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --config --max-host-ram --temp-dir --no-auto-spill -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --manifest --config --max-host-ram --temp-dir --no-auto-spill -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -2426,6 +2499,7 @@ _xchplot2() {
         '--cpu-workers[CPU plots to run concurrently: auto|max|N|off (default auto, RAM-gated)]:count:(auto max off)' \
         '--shard-plot[Single-plot multi-GPU]' \
         '--max-host-ram[Cap the unswappable host peak]:size:(min 4G 8G 16G 32G)' \
+        '--manifest[Saved plot job]:file:_files' \
         '--temp-dir[Where spilled tables live]:dir:_files -/' \
         '--no-auto-spill[Refuse rather than spill when host RAM is short]' \
         '-o[Output dir]:dir:_files -/' \
@@ -2448,6 +2522,7 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shel
 # Flags
 complete -c xchplot2 -l tier      -x -a 'plain compact minimal tiny auto'  -d 'Streaming tier'
 complete -c xchplot2 -l devices   -x -a 'all gpu cpu 0 1 2 3'              -d 'Device selector'
+complete -c xchplot2 -l manifest  -r -d 'Saved plot job'
 complete -c xchplot2 -l progress  -d 'Force aggregate progress line on'
 complete -c xchplot2 -l no-progress -d 'Force aggregate progress line off'
 complete -c xchplot2 -s q -l quiet -d 'Quiet — suppress info-level output'

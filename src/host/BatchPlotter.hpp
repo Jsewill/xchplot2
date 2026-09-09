@@ -15,6 +15,7 @@
 #include "host/GpuPlotter.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -31,11 +32,14 @@ struct BatchEntry {
     std::vector<uint8_t> memo;
     std::string out_dir;
     std::string out_name;
+
+    bool operator==(BatchEntry const&) const = default;
 };
 
 struct BatchResult {
     size_t plots_written = 0;
     size_t plots_skipped = 0;  // present + skipped via BatchOptions::skip_existing
+    size_t plots_failed = 0;
     double total_wall_seconds = 0.0;
     std::uint64_t bytes_written = 0;
     // Per-finished-plot wall offset in completion order, in seconds from the
@@ -246,12 +250,18 @@ struct BatchOptions {
     // entries. Doubles as a manifest-level idempotency knob — re-
     // running the same manifest is a no-op once every plot is on disk.
     bool             skip_existing   = false;
+    // Called after publication or a successful resume check, including before
+    // a later batch failure. Workers may call concurrently.
+    std::function<void(BatchEntry const&)> on_plot_ready;
 };
 
 // Parse a manifest file in the format described in tools/xchplot2/main.cpp
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
 void validate_batch_entry(BatchEntry const& entry);
 std::vector<BatchEntry> parse_manifest(std::string const& path);
+// Publish a job manifest before plotting (owner-only on POSIX). Never replaces a
+// different job; an identical existing manifest is safe to reuse.
+void write_manifest(std::string const& path, std::vector<BatchEntry> const& entries);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.
 // The first plot pays the full GPU+FSE cost; subsequent plots overlap.

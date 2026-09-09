@@ -1,10 +1,28 @@
 #include "host/BatchPlotter.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <span>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace pos2gpu {
 
@@ -74,7 +92,8 @@ std::vector<BatchEntry> parse_manifest(std::string const& path)
         BatchEntry e;
         std::string testnet_s, plot_id_s, memo_s;
         if (!(is >> e.k >> e.strength >> e.plot_index >> e.meta_group
-                 >> testnet_s >> plot_id_s >> memo_s >> e.out_dir >> e.out_name)) {
+                 >> testnet_s >> plot_id_s >> std::quoted(memo_s)
+                 >> std::quoted(e.out_dir) >> std::quoted(e.out_name))) {
             throw std::runtime_error("manifest line " + std::to_string(line_no) +
                                      ": expected 9 whitespace-separated fields "
                                      "(k strength plot_index meta_group testnet "
@@ -105,5 +124,89 @@ std::vector<BatchEntry> parse_manifest(std::string const& path)
     return out;
 }
 
+void write_manifest(std::string const& path, std::vector<BatchEntry> const& entries)
+{
+    if (entries.empty()) throw std::invalid_argument("cannot save an empty plot job");
+    auto hex = [](std::span<uint8_t const> bytes) {
+        std::string text;
+        for (auto b : bytes) {
+            text += "0123456789abcdef"[b >> 4];
+            text += "0123456789abcdef"[b & 15];
+        }
+        return text;
+    };
+    std::ostringstream data;
+    data << "# xchplot2 job manifest; contains private plot keys\n";
+    for (auto const& e : entries) {
+        validate_batch_entry(e);
+        if (e.out_dir.find_first_of("\r\n") != std::string::npos ||
+            e.out_name.find_first_of("\r\n") != std::string::npos)
+            throw std::invalid_argument("manifest paths cannot contain line breaks");
+        data << e.k << ' ' << e.strength << ' ' << e.plot_index << ' ' << e.meta_group
+             << ' ' << e.testnet << ' ' << hex(e.plot_id) << ' ' << std::quoted(hex(e.memo))
+             << ' ' << std::quoted(e.out_dir) << ' ' << std::quoted(e.out_name) << '\n';
+    }
+    auto const text = data.str();
+    // Follow the plot writer's exclusive temporary-file + durability barrier.
+    // Publication must not replace a concurrently saved job.
+    std::string partial = path + ".partial.XXXXXX";
+#ifdef _WIN32
+    if (_mktemp_s(partial.data(), partial.size() + 1) != 0)
+        throw std::runtime_error("cannot create temporary manifest: " + path);
+    int const fd = ::_open(partial.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+                          _S_IREAD | _S_IWRITE);
+#else
+    int const fd = ::mkstemp(partial.data());
+#endif
+    if (fd < 0) throw std::runtime_error("cannot create manifest: " + path);
+    struct Cleanup {
+        std::string const& path;
+        std::FILE* file;
+        ~Cleanup() {
+            if (file) std::fclose(file);
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{partial, nullptr};
+#ifdef _WIN32
+    cleanup.file = ::_fdopen(fd, "wb");
+    if (!cleanup.file) ::_close(fd);
+#else
+    cleanup.file = ::fdopen(fd, "wb");
+    if (!cleanup.file) ::close(fd);
+#endif
+    if (!cleanup.file || std::fwrite(text.data(), 1, text.size(), cleanup.file) != text.size()
+        || std::fflush(cleanup.file) != 0)
+        throw std::runtime_error("cannot write manifest: " + path);
+#ifdef _WIN32
+    if (::_commit(fd) != 0)
+#else
+    if (::fsync(fd) != 0)
+#endif
+        throw std::runtime_error("cannot sync manifest: " + path);
+    if (std::fclose(std::exchange(cleanup.file, nullptr)) != 0)
+        throw std::runtime_error("cannot close manifest: " + path);
+    std::error_code ec;
+#ifdef _WIN32
+    if (!::MoveFileExW(std::filesystem::path(partial).c_str(),
+                       std::filesystem::path(path).c_str(), MOVEFILE_WRITE_THROUGH))
+        ec = std::error_code(static_cast<int>(::GetLastError()), std::system_category());
+#elif defined(__linux__)
+    if (::renameat2(AT_FDCWD, partial.c_str(), AT_FDCWD, path.c_str(), RENAME_NOREPLACE) != 0)
+        ec = std::error_code(errno, std::generic_category());
+#else
+    std::filesystem::create_hard_link(partial, path, ec);
+#endif
+    if (ec && (ec != std::errc::file_exists || parse_manifest(path) != entries)) {
+        throw std::runtime_error("cannot publish manifest " + path + ": " + ec.message()
+                                 + "; use --resume or choose another --manifest path");
+    }
+#ifndef _WIN32
+    auto dir = std::filesystem::path(path).parent_path();
+    if (dir.empty()) dir = ".";
+    int const parent = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (parent >= 0) { ::fsync(parent); ::close(parent); }
+#endif
+}
 
 } // namespace pos2gpu

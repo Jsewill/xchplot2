@@ -306,6 +306,39 @@ On a host that is short of RAM for the tier its GPU lands on, add
 (`--max-host-ram` to bound it explicitly, `--no-auto-spill` to turn it
 off) — see [Host RAM and disk-offload](#host-ram-and-disk-offload).
 
+Before plotting starts, `plot` saves the prepared identities and keys in an
+`xchplot2-job-*.tsv` manifest in the output directory. Use `--manifest FILE`
+to choose its location. Each new job keeps its own manifest; another job
+cannot overwrite it. Manifests contain private plot keys and are created
+with owner-only permissions on Linux.
+
+Repeat the same `plot` command with `--resume` (or `--skip-existing`) to
+recover its saved job, including when no `--seed` was supplied. If several
+saved jobs match, select one with `--manifest FILE`. The original keys,
+plot parameters, count, and output directory must match; devices and memory
+settings can change. A fixed `--seed` still reconstructs the same identities.
+An ordinary run without `--resume` starts a new job.
+
+Alternatively, resume directly from the saved manifest without repeating
+the key or plot arguments:
+
+```bash
+xchplot2 batch /path/to/job.tsv --resume
+```
+
+Resume skips files only after checking their header identity, memo, chunk
+index, and file bounds. Manifest paths may be double-quoted to include
+spaces, quotes, or backslashes; line breaks in paths are unsupported.
+
+`-q`/`--quiet` suppresses info-level stderr output — the progress line,
+end-of-run summaries, and streaming-tier notes. Warnings and errors
+still print. `plot` writes each absolute output path to stdout after that
+file is published or validated by resume, in completion order. Failed or
+unstarted plots are never listed, and completed paths remain available if
+a later plot fails. Exit status is 0 for completion, 1 for argument errors,
+2 for an exception, 3 for per-plot failures, or 4 for unfinished work.
+`-q` and `-v` are mutually exclusive.
+
 #### Per-worker rates and the batch size that lands them together
 
 Any multi-worker run — `bench`, `plot`, or `batch` — reports what each
