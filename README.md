@@ -109,19 +109,18 @@ FSE compression, and durability barriers. Times are mean completion intervals
 over ten measured plots after two warmups, using one GPU per host. Each
 non-auto tier was forced.
 
-| Tier (`main`) | RTX 4090, CUDA/CUB | RX 6700 XT, AdaptiveCpp HIP |
-|---|---:|---:|
-| Auto (pool) | 2.50 s | 9.63 s |
-| Plain | 3.91 s; 2.66 s repeat | 9.76 s |
-| Compact | 3.84 s | 10.51 s |
-| Minimal | 16.40 s | 22.19 s |
-| Tiny | 27.74 s | 29.77 s |
-| Pinned | 27.42 s | 29.73 s |
+| Tier (`main`) | RTX 4090, CUDA/CUB | RX 6700 XT, AdaptiveCpp HIP | Arc B580, AdaptiveCpp Level Zero |
+|---|---:|---:|---:|
+| Auto (pool) | 2.50 s | 9.63 s | 13.75 s |
+| Plain | 3.91 s; 2.66 s repeat | 9.76 s | 14.17 s |
+| Compact | 3.84 s | 10.51 s | — |
+| Minimal | 16.40 s | 22.19 s | — |
+| Tiny | 27.74 s | 29.77 s | — |
+| Pinned | 27.42 s | 29.73 s | — |
+
+— means not benchmarked. See the [Intel configuration](BENCHMARKS.md#intel-arc-b580).
 
 The two RTX 4090 Plain timings differ for an undetermined reason.
-
-Arc B580 / Level Zero: **13.75 s/plot** with Auto, **14.17 s/plot** with Plain;
-see the [Intel configuration](BENCHMARKS.md#intel-arc-b580).
 
 The native `cuda-only` auto path measured **2.20 s/plot** on the same RTX
 4090, with its optional D2H/Xs overlap enabled. These runs do not isolate the
