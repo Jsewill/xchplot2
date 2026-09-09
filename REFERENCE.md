@@ -250,9 +250,8 @@ For a running plotter, inspect all thread masks with:
 grep -h Cpus_allowed_list /proc/$(pgrep -n xchplot2)/task/*/status | sort | uniq -c
 ```
 
-`XCHPLOT2_CPU_NO_PIN=1` disables pinning for comparison. Measure on the actual
-machine before raising concurrency; historical CPU and mixed GPU/CPU results
-are retained in [BENCHMARKS.md](BENCHMARKS.md#earlier-cpu-and-spill-measurements).
+`XCHPLOT2_CPU_NO_PIN=1` disables pinning for comparison. Use
+[`bench`](#benchmarking) on your machine before increasing worker counts.
 
 ### Batch completion and worker rates
 
@@ -355,7 +354,7 @@ reading or insufficient `peak + buffer` causes refusal before allocation.
 
 The streaming base peaks below come from [VramBudget.hpp](src/host/VramBudget.hpp).
 They are allocation models, not the desktop driver deltas or host RSS in
-[BENCHMARKS.md](BENCHMARKS.md#current-throughput-and-memory).
+[BENCHMARKS.md](BENCHMARKS.md#gpu-results).
 
 | Tier | Base peak, MiB | Base + default 256 MiB buffer |
 |---|---:|---:|
@@ -375,7 +374,7 @@ memory throughout the run and fails if use exceeds the budget.
 than the default. Models scale with k.
 
 Lower VRAM tiers generally need more host RAM. Use the current per-tier
-[host RSS measurements](BENCHMARKS.md#current-throughput-and-memory) for
+[host RSS measurements](BENCHMARKS.md#gpu-results) for
 planning, with room for the OS and other workers. Host admission uses a
 separate model of pinned and anonymous memory, plus a reserve. Eligible
 storage can be moved to disk when that model does not fit.
@@ -432,9 +431,6 @@ budget requires:
    per plot; a drain slot costs producer/consumer overlap across plots,
    which is the more expensive of the two in a batch.
 
-Earlier spill measurements are retained in
-[BENCHMARKS.md](BENCHMARKS.md#earlier-cpu-and-spill-measurements).
-
 **Tier support is not uniform**, because what a tier does to a table
 decides whether the table can leave RAM at all:
 
@@ -473,8 +469,7 @@ Notes:
   plotting with.
 - **Repeated metadata passes increase temporary I/O.** Inspect the
   `[spill] this plot:` line for your configuration and size the drive's
-  endurance from its write volume. Historical I/O counts are in
-  [BENCHMARKS.md](BENCHMARKS.md#native-cuda-spill).
+  endurance from its write volume.
 - **`--max-host-ram` bounds the unswappable class** — pinned plus
   anonymous, the class that gets a process OOM-killed. On `minimal` both
   tables go as file-backed mappings instead: those bytes leave the
