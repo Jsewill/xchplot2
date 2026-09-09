@@ -1,5 +1,7 @@
 build/
 *.plot2
+# Saved jobs contain private plot keys, including interrupted temporary files.
+xchplot2-job-*.tsv*
 .cache/
 compile_commands.json
 .vscode/
