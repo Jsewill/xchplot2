@@ -14,7 +14,7 @@
 # Usage:
 #   scripts/install-deps.sh                # auto-detect distro + GPU
 #   scripts/install-deps.sh --no-acpp      # skip AdaptiveCpp build (use FetchContent)
-#   scripts/install-deps.sh --gpu amd      # force AMD path (CUDA headers only)
+#   scripts/install-deps.sh --gpu amd      # force AMD path (ROCm HIP SDK)
 #   scripts/install-deps.sh --gpu nvidia   # force NVIDIA path (full CUDA Toolkit)
 #   scripts/install-deps.sh --rebuild-acpp # wipe + rebuild AdaptiveCpp even if
 #                                          # $ACPP_PREFIX already has an install
@@ -127,7 +127,7 @@ fi
 if [[ -z "$GPU" ]]; then
     echo "[install-deps] Could not auto-detect a GPU (no nvidia-smi / rocminfo," >&2
     echo "[install-deps] no usable PCI device under /sys/class/drm)." >&2
-    echo "[install-deps] Pass --gpu nvidia or --gpu amd explicitly to override." >&2
+    echo "[install-deps] Pass --gpu nvidia, --gpu amd, or --gpu intel explicitly." >&2
     echo "[install-deps] Headless / CI builds: --gpu nvidia installs the LLVM" >&2
     echo "[install-deps] toolchain + CUDA Toolkit headers used by the SYCL path." >&2
     exit 1
@@ -336,17 +336,17 @@ install_arch() {
                 openmp)
     case "$GPU" in
         nvidia) pkgs+=(cuda) ;;
-        # rocminfo: needed by build-container.sh + scripts/install-deps.sh
-        # autodetection (rocm-hip-sdk doesn't pull it transitively).
+        # HIP runtime includes the headers; the full SDK also pulls in
+        # tens of GB of math libraries that the plotter does not use.
         # No CUDA pkg on the AMD path — CudaHalfShim.hpp guards the CUDA
         # headers via __has_include, and pulling CUDA alongside HIP causes
         # uchar1/char1 typedef redefinitions.
-        amd)    pkgs+=(rocm-hip-sdk rocm-device-libs rocminfo) ;;
+        amd)    pkgs+=(hip-runtime-amd rocm-device-libs rocminfo) ;;
     esac
     # Appended, not an arm of the case: see WANT_INTEL.
     [[ -n "$WANT_INTEL" ]] && pkgs+=(level-zero-headers level-zero-loader
                                      intel-compute-runtime)
-    sudo pacman -S --needed --noconfirm "${pkgs[@]}"
+    sudo pacman -Syu --needed --noconfirm "${pkgs[@]}"
 
     # The side-by-side compat LLVM that rolling Arch needs (system llvm is
     # 22) is handled generically after the dispatch — every family has the
@@ -360,6 +360,7 @@ install_apt() {
     # releases on an old toolchain even where they package 19 or 20.
     local pkgs=(cmake git ninja-build build-essential python3 pkg-config
                 libboost-context-dev libnuma-dev curl ca-certificates)
+    sudo apt-get update
     case "$GPU" in
         nvidia)
             # Detect a pre-existing /usr/local/cuda-X.Y install (RunPod /
@@ -384,12 +385,36 @@ install_apt() {
             if [[ -n "$existing_cuda" ]]; then
                 echo "[install-deps] Found existing CUDA at $existing_cuda — skipping apt nvidia-cuda-toolkit"
             else
-                pkgs+=(nvidia-cuda-toolkit)
+                # Ubuntu's CUDA 12.0 package cannot compile against its
+                # current glibc. Debian's clean image lacks non-free. Use
+                # NVIDIA's signed toolkit repository on these platforms.
+                # WSL must use toolkit-only packages, never Linux drivers.
+                local cuda_distro=""
+                case "$DISTRO" in
+                    ubuntu) cuda_distro="ubuntu${VERSION_ID//./}" ;;
+                    debian) cuda_distro="debian${VERSION_ID%%.*}" ;;
+                esac
+                if grep -qi microsoft /proc/sys/kernel/osrelease; then
+                    cuda_distro=wsl-ubuntu
+                fi
+                if [[ -n "$cuda_distro" ]]; then
+                    sudo apt-get install -y --no-install-recommends curl ca-certificates
+                    local keyring
+                    keyring=$(mktemp -d -t xchplot2-cuda-keyring-XXXXXX)
+                    curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/$cuda_distro/x86_64/cuda-keyring_1.1-1_all.deb" \
+                        -o "$keyring/cuda-keyring.deb"
+                    sudo dpkg -i "$keyring/cuda-keyring.deb"
+                    rm -rf "$keyring"
+                    sudo apt-get update
+                    pkgs+=(cuda-toolkit)
+                else
+                    pkgs+=(nvidia-cuda-toolkit)
+                fi
             fi
             ;;
-        amd)    pkgs+=(rocm-hip-sdk rocm-libs rocminfo)
+        amd)    pkgs+=(hipcc rocminfo)
                 # rocminfo is the discovery tool build-container.sh probes;
-                # not pulled in transitively by rocm-hip-sdk.
+                # hipcc pulls in the HIP headers and ROCm device libraries.
                 # No nvidia-cuda-toolkit-headers on the AMD path —
                 # CudaHalfShim.hpp guards the CUDA headers via
                 # __has_include, and pulling CUDA alongside HIP causes
@@ -397,9 +422,17 @@ install_apt() {
                 ;;
     esac
     # Appended, not an arm of the case: see WANT_INTEL.
-    [[ -n "$WANT_INTEL" ]] && pkgs+=(libze-dev libze1 libze-intel-gpu1
-                                     intel-opencl-icd)
-    sudo apt-get update
+    if [[ -n "$WANT_INTEL" ]]; then
+        # Debian 13 omits compute-runtime, including from backports.
+        # Do not report a usable Intel install with only the loader present.
+        if [[ "$(apt-cache policy libze-intel-gpu1 2>/dev/null \
+                   | awk '/Candidate:/{print $2}')" != [0-9]* ]]; then
+            echo "[install-deps] $DISTRO $VERSION_ID has no Intel compute runtime (libze-intel-gpu1) in its enabled repositories." >&2
+            echo "[install-deps] Use the Intel container path or Ubuntu 24.04 (including WSL2) for the native Intel installer." >&2
+            exit 1
+        fi
+        pkgs+=(libze-dev libze1 libze-intel-gpu1 intel-opencl-icd)
+    fi
     sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
@@ -408,7 +441,17 @@ install_dnf() {
     local pkgs=(cmake git ninja-build gcc-c++ python3 pkg-config
                 boost-devel numactl-devel curl)
     case "$GPU" in
-        nvidia) pkgs+=(cuda-toolkit) ;;
+        nvidia)
+            # cuda-toolkit is supplied by NVIDIA, not Fedora/RHEL's repos.
+            if ! dnf -q list cuda-toolkit &>/dev/null; then
+                local cuda_distro="rhel${VERSION_ID%%.*}"
+                [[ "$DISTRO" == fedora ]] && cuda_distro="fedora${VERSION_ID%%.*}"
+                sudo dnf install -y curl ca-certificates
+                curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/$cuda_distro/x86_64/cuda-$cuda_distro.repo" \
+                    | sudo tee "/etc/yum.repos.d/cuda-$cuda_distro.repo" >/dev/null
+            fi
+            pkgs+=(cuda-toolkit)
+            ;;
         # No cuda-toolkit on the AMD path — CudaHalfShim.hpp guards the
         # CUDA headers via __has_include, and pulling CUDA alongside HIP
         # causes uchar1/char1 typedef redefinitions.
@@ -523,7 +566,7 @@ if [[ $SKIP_ACPP -eq 1 ]]; then
     exit 0
 fi
 
-if [[ -d "$ACPP_PREFIX" ]] && [[ -f "$ACPP_PREFIX/lib/cmake/AdaptiveCpp/AdaptiveCppConfig.cmake" ]]; then
+if [[ -f "$ACPP_PREFIX/lib/cmake/AdaptiveCpp/adaptivecpp-config.cmake" ]]; then
     if [[ $REBUILD_ACPP -eq 1 ]]; then
         echo "[install-deps] --rebuild-acpp: wiping existing $ACPP_PREFIX and rebuilding."
         # $ACPP_PREFIX usually lives under /opt or another root-owned tree, so
@@ -624,6 +667,11 @@ fi
 
 ACPP_ROCM_FLAGS=()
 if [[ "$GPU" == "amd" ]]; then
+    # /opt/rocm/bin is not on PATH in a fresh Arch shell. AdaptiveCpp
+    # probes HIP before assigning its own /opt/rocm default.
+    if [[ -d "${ROCM_PATH:-/opt/rocm}" ]]; then
+        ACPP_ROCM_FLAGS+=(-DROCM_PATH="${ROCM_PATH:-/opt/rocm}")
+    fi
     rocm_bc=""
     while IFS= read -r d; do
         rocm_bc="$d"
@@ -634,6 +682,7 @@ if [[ "$GPU" == "amd" ]]; then
             /opt/rocm*/share/amdgcn/bitcode \
             /usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode \
             /usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode \
+            /usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode \
             /usr/lib64/amdgcn/bitcode \
             /usr/lib/amdgcn/bitcode \
             /usr/share/amdgcn/bitcode; do
@@ -765,39 +814,3 @@ if [[ -n "${CUDA_ROOT:-}" ]]; then
 fi
 echo "    cargo install --path .                  # or:"
 echo "    cmake -B build -S . && cmake --build build -j"
-
-# Warn about the nvcc/host-compiler mismatch ONLY when it actually bites.
-# nvcc pins a maximum supported GCC in crt/host_config.h and refuses to
-# compile against anything newer — but the ceiling moves every point release
-# (CUDA 12.8 → gcc 14, 13.x → gcc 15+), so a hardcoded "your gcc is too new"
-# note is a false alarm as often as not. Probe instead: compile a trivial .cu
-# with nvcc's default ccbin and only speak up if it genuinely fails. Note the
-# probe deliberately runs with whatever NVCC_CCBIN this shell has, which is
-# exactly what the real build will see.
-if [[ "$GPU" == "nvidia" ]] && [[ -n "${CUDA_ROOT:-}" ]]; then
-    # Cleaned up inline, NOT via `trap ... EXIT` — an EXIT trap here would
-    # silently replace the one guarding $ACPP_BUILD_DIR above and leak a
-    # multi-GB AdaptiveCpp build tree.
-    probe_dir=$(mktemp -d -t xchplot2-ccbin-XXXXXX)
-    printf '#include <type_traits>\n__global__ void k(){}\nint main(){return 0;}\n' \
-        > "$probe_dir/probe.cu"
-    if ! "$CUDA_ROOT/bin/nvcc" -c "$probe_dir/probe.cu" -o "$probe_dir/probe.o" \
-         >/dev/null 2>&1; then
-        sys_gcc_major=$(gcc -dumpversion 2>/dev/null | grep -oE '^[0-9]+' || true)
-        echo
-        echo "[install-deps] Note: nvcc ${nvcc_release:-?} rejects its default host compiler"
-        echo "[install-deps] (system gcc ${sys_gcc_major:-?} is newer than this toolkit supports)."
-        echo "[install-deps] Pass an older ccbin — first of these that works:"
-        for ccbin in /usr/bin/g++-15 /usr/bin/g++-14 /usr/bin/g++-13 \
-                     "${LLVM_ROOT:-/nonexistent}/bin/clang++"; do
-            [[ -x "$ccbin" ]] || continue
-            if "$CUDA_ROOT/bin/nvcc" -ccbin "$ccbin" -c "$probe_dir/probe.cu" \
-               -o "$probe_dir/probe.o" >/dev/null 2>&1; then
-                echo "    export NVCC_CCBIN=$ccbin                 # picked up by cargo + cmake"
-                echo "    # or, for a direct cmake build:  -DCMAKE_CUDA_HOST_COMPILER=$ccbin"
-                break
-            fi
-        done
-    fi
-    rm -rf "$probe_dir"
-fi

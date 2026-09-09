@@ -1,6 +1,8 @@
 name: install-matrix
 
-# Verifies the SYCL Containerfile builds across its documented
+# Verifies clean native installs as well as SYCL Containerfile builds.
+# Linux and WSL2 run the public dependency installer, Cargo install, and
+# CMake build with no cached toolchains. Container builds cover the documented
 # backend matrix (NVIDIA / AMD / Intel / CPU). Each job exercises a
 # different ACPP_TARGETS configuration via the existing production
 # Containerfile — the same one users build via scripts/build-container.sh.
@@ -26,9 +28,6 @@ on:
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
       # Runtime scripts not exercised by the install matrix.
-      # scripts/install-deps.sh IS used inside Containerfile RUNs,
-      # so it's NOT in this list.
-      - 'scripts/test/**'
       - 'scripts/test-multi-gpu.sh'
       - 'scripts/build-container.sh'
       - 'scripts/install-container-deps.sh'
@@ -51,18 +50,125 @@ on:
       - '.github/dependabot.yml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
-      - 'scripts/test/**'
       - 'scripts/test-multi-gpu.sh'
       - 'scripts/build-container.sh'
       - 'scripts/install-container-deps.sh'
       - 'compose.yaml'
       - '.github/workflows/ci.yml'
       - '.github/workflows/arch-matrix.yml'
+  workflow_dispatch:
+  schedule:
+    # Package repositories can break a fresh install without source changes.
+    - cron: '31 9 * * 1'
 
 permissions:
   contents: read
 
 jobs:
+  native:
+    name: native / ${{ matrix.os.name }} / ${{ matrix.gpu }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ${{ matrix.os.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
+          - name: debian-13
+            image: debian:13
+          - name: fedora-44
+            image: fedora:44
+          - name: arch
+            image: archlinux:base-devel
+        gpu: [nvidia, amd, intel]
+        exclude:
+          # Debian 13 has no Intel compute-runtime package, even in backports.
+          # Intel native installs are covered on Ubuntu, Fedora, Arch, and WSL2.
+          - os:
+              name: debian-13
+              image: debian:13
+            gpu: intel
+        include:
+          # Cargo must also build AdaptiveCpp when only system packages exist.
+          - os:
+              name: fedora-44-fetch
+              image: fedora:44
+            gpu: amd
+            fetch: true
+          - os:
+              name: ubuntu-24.04-fetch
+              image: ubuntu:24.04
+            gpu: nvidia
+            fetch: true
+          - os:
+              name: ubuntu-24.04-fetch
+              image: ubuntu:24.04
+            gpu: intel
+            fetch: true
+    steps:
+      - name: Bootstrap checkout and sudo
+        shell: bash
+        run: |
+          . /etc/os-release
+          case "$ID" in
+            ubuntu|debian)
+              apt-get update
+              apt-get install -y --no-install-recommends git sudo ca-certificates
+              ;;
+            fedora) dnf install -y git sudo ca-certificates ;;
+            # base-devel has sudo; leave the fresh package database for
+            # install-deps.sh to initialize. Checkout can use its archive fallback.
+            arch) ;;
+          esac
+      - uses: actions/checkout@v7
+      - name: Install dependencies, Cargo binary, and CMake binary
+        shell: bash
+        run: bash scripts/test/native-install.sh '${{ matrix.gpu }}' ${{ matrix.fetch && '--no-acpp' || '' }} 2>&1 | tee native-install.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-${{ matrix.os.name }}-${{ matrix.gpu }}
+          path: native-install.log
+          retention-days: 14
+
+  wsl:
+    name: WSL2 / ubuntu-24.04 / ${{ matrix.gpu }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [nvidia, amd, intel]
+    steps:
+      - name: Preserve Linux script line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          use-cache: 'false'
+      - name: Install and build in a fresh WSL2 filesystem
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          uname -r | grep -i microsoft
+          log="$PWD/native-install.log"
+          # Build on WSL's Linux filesystem, as in a normal Linux checkout.
+          source_dir=$(mktemp -d -p "$HOME" xchplot2-ci-XXXXXX)
+          cp -a . "$source_dir/"
+          cd "$source_dir"
+          bash scripts/test/native-install.sh '${{ matrix.gpu }}' 2>&1 | tee "$log"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: wsl-ubuntu-24.04-${{ matrix.gpu }}
+          path: native-install.log
+          retention-days: 14
+
   build:
     name: build / ${{ matrix.target.name }}
     runs-on: ubuntu-latest

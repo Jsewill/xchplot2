@@ -437,12 +437,25 @@ Debian, Fedora) plus AdaptiveCpp from source into `/opt/adaptivecpp`.
 GPU vendor is auto-detected: `nvidia-smi` / `rocminfo` first,
 `/sys/class/drm` PCI IDs as fallback (so fresh installs without driver
 tools still work). On a no-GPU host (CI / build box) the script
-errors out — pass `--gpu nvidia` to install the toolchain anyway.
-`--gpu amd` forces the AMD path on dual-vendor hosts. Intel detection
-currently errors with a hint pointing at `--gpu nvidia` (the SYCL
-toolchain JITs onto Intel via AdaptiveCpp's generic SSCP target) or
-the container. Pass `--no-acpp` to skip the AdaptiveCpp build and
-let CMake fall back to FetchContent.
+errors out — pass `--gpu nvidia`, `--gpu amd`, or `--gpu intel` to select
+the toolchain explicitly. Intel installs Level Zero and its compute
+runtime, then enables AdaptiveCpp's Level Zero backend and SPIR-V
+translator. Debian 13 does not package the Intel compute runtime;
+use the Intel container or a supported native distro instead.
+Pass `--no-acpp` to install only system packages. CMake's FetchContent
+fallback then builds and installs AdaptiveCpp to `~/.local` (or
+`ACPP_PREFIX`), so its runtime survives Cargo's temporary build directory.
+Cargo uses these system dependencies; it does not run
+the system package manager itself.
+On rolling distros, CMake probes nvcc and selects an installed compatible
+host compiler if the default is rejected. Explicit `CUDAHOSTCXX`,
+`NVCC_CCBIN`, and `CMAKE_CUDA_HOST_COMPILER` settings take precedence.
+
+The [native install CI matrix](CONTRIBUTING.md#install-ci) exercises
+fresh Ubuntu, Debian, Fedora, Arch, and Ubuntu WSL2 installs through
+both Cargo and CMake. NVIDIA installs on Ubuntu/Debian and Fedora
+use NVIDIA's toolkit repository when needed; WSL uses its toolkit-only
+repository. Existing CUDA installations are retained on apt systems.
 
 ### 3. Manual / FetchContent fallback
 
@@ -450,9 +463,11 @@ If you'd rather install dependencies yourself, the toolchain is:
 
 | Dep | Notes |
 |---|---|
-| **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches it via FetchContent if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
-| **CUDA Toolkit 12+** (headers) | Required on **every** build path because AdaptiveCpp's `half.hpp` includes `cuda_fp16.h`. `nvcc` itself only runs when `XCHPLOT2_BUILD_CUDA=ON`. Default is vendor-aware — `ON` for NVIDIA GPUs, `OFF` for AMD / Intel GPUs (even if `nvcc` is installed), falling through to `nvcc`-presence only when no GPU is probed (CI / container). Override with the env var. |
-| **LLVM / Clang ≥ 18** | `clang`, `lld` (AdaptiveCpp's CMake requires `ld.lld`), plus the libclang dev packages. `install-deps.sh` installs all of them; manual installs need to add `lld-18` (apt) / `lld` (dnf, pacman) explicitly. |
+| **AdaptiveCpp 25.10+** | SYCL implementation. CMake auto-fetches and installs it to `~/.local` (or `ACPP_PREFIX`) if `find_package(AdaptiveCpp)` fails — first build adds ~15-30 min. Disable with `-DXCHPLOT2_FETCH_ADAPTIVECPP=OFF` if you want a hard error. |
+| **CUDA Toolkit 12+** | NVIDIA only. `nvcc` runs when `XCHPLOT2_BUILD_CUDA=ON`; AMD and Intel builds do not require CUDA headers. The installer uses the current toolkit; Pascal/Volta require an existing CUDA 12.9 install because CUDA 13 dropped their code generation. |
+| **ROCm HIP headers, runtime, device libraries** | AMD only: apt `hipcc`, Fedora `rocm-hip-devel`, Arch `hip-runtime-amd` + `rocm-device-libs`; also install `rocminfo` for GPU detection. |
+| **Level Zero headers, loader, Intel compute runtime** | Intel only. AdaptiveCpp also needs `WITH_LEVEL_ZERO_BACKEND=ON` and its LLVM SPIR-V translator installed; `install-deps.sh` handles both. |
+| **LLVM / Clang 16–20** | AdaptiveCpp 25.10's supported LLVM range, including `lld`, libclang development files, and compiler-rt. The installer selects the newest complete compatible version available, alongside a newer system LLVM when necessary. |
 | **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
 | **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
 | **Boost.Context, libnuma, libomp** | AdaptiveCpp runtime deps. |
@@ -464,7 +479,7 @@ checkout.
 
 For non-NVIDIA targets, the build also probes:
 - **ROCm 6+** (`rocminfo`): if found, sets `ACPP_TARGETS=hip:gfxXXXX`.
-- **Intel oneAPI** (Level Zero / compute-runtime): manual `ACPP_TARGETS`.
+- **Intel** (Level Zero / compute-runtime): defaults to `ACPP_TARGETS=generic`.
 
 ### `cargo install`
 
@@ -478,11 +493,10 @@ Toolchain prerequisites for the NVIDIA build:
   24.04 apt cargo is 1.75) is too old for the `edition2024` feature
   required by `chia-client` 0.42.
 
-#### Verified install matrix (NVIDIA path)
+#### NVIDIA dependency sources (manual installs)
 
 | Distro                | CUDA source                         | CMake source            | Rust source       |
 |-----------------------|-------------------------------------|-------------------------|-------------------|
-| Ubuntu 24.04          | apt `nvidia-cuda-toolkit` (12.0)    | apt `cmake` (3.28)      | rustup `stable`   |
 | Ubuntu 24.04          | NVIDIA apt `cuda-toolkit-12-9`      | apt `cmake` (3.28)      | rustup `stable`   |
 | Ubuntu 22.04          | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
 | Debian 12 (Bookworm)  | NVIDIA apt `cuda-toolkit-12-9`      | Kitware apt `cmake`     | rustup `stable`   |
@@ -491,6 +505,8 @@ Toolchain prerequisites for the NVIDIA build:
 | Arch / CachyOS        | pacman `cuda` (12.x)                | pacman `cmake`          | pacman `rust` or rustup |
 
 Combinations that **don't** work on a stock install:
+- **Ubuntu 24.04 + apt CUDA 12.0**: the old toolkit can fail against
+  current glibc headers. Use NVIDIA's repository, as `install-deps.sh` does.
 - **Ubuntu 22.04 + apt CUDA**: ships CUDA 11.5 — nvcc too old for the
   C++20 dialect, and `libcudart` predates the `_v2` ABI. Use NVIDIA's
   apt repo instead.

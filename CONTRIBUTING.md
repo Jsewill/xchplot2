@@ -27,6 +27,36 @@ After a functional change, spot-check one real batch end-to-end with
 `xchplot2 verify <plot>` — zero proofs over 100 random challenges is
 a regression even if all parity tests pass.
 
+## Install CI
+
+`install-matrix` runs the dependency installer on fresh OS images, followed
+by `cargo install --path . --locked`, a complete CMake CLI build, and the
+existing CPU-safe plot/proof tests. It checks that the requested AdaptiveCpp
+backend exists and that Intel's SPIR-V translator runs. No installed
+toolchains are restored from cache in these jobs.
+
+| Platform | NVIDIA | AMD | Intel |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 | Yes | Yes | Yes |
+| Debian 13 | Yes | Yes | No compute-runtime package in stable or backports |
+| Fedora 44 | Yes | Yes | Yes |
+| Arch rolling | Yes | Yes | Yes |
+| Ubuntu 24.04 on WSL2 / Windows Server 2025 | Yes | Yes | Yes |
+
+The same check is runnable locally with
+`bash scripts/test/native-install.sh nvidia` (or `amd` / `intel`). It installs
+system packages and builds AdaptiveCpp, just like the public installer.
+Additional Fedora AMD and Ubuntu NVIDIA/Intel jobs pass `--no-acpp` and
+exercise Cargo's automatic AdaptiveCpp build and install to `~/.local`.
+CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
+repository changes. The existing container and CUDA architecture matrices
+remain separate coverage. Native Windows builds are not part of this matrix.
+
+These are build and install checks, not GPU driver or hardware certification.
+Hosted WSL2 jobs also lack GPUs; actual WSL GPU support depends on the card
+and its Windows driver. Vendor kernel execution and production plotting use
+the GPU suites below.
+
 ## GPU CI
 
 Hosted PR jobs lint and build without GPU hardware. `GPU hardware` runs only

@@ -250,6 +250,39 @@ if(XCHPLOT2_BUILD_CUDA)
     endif()
     unset(_xchplot2_nvcc CACHE)
 
+    # Rolling distros can ship a GCC newer than nvcc supports. Probe the
+    # actual toolkit, then try installed compilers (including the compatible
+    # LLVM installed for AdaptiveCpp). Honor explicit compiler overrides.
+    if(CMAKE_CUDA_COMPILER AND NOT CMAKE_CUDA_HOST_COMPILER AND "$ENV{CUDAHOSTCXX}" STREQUAL ""
+       AND "$ENV{NVCC_CCBIN}" STREQUAL "")
+        set(_x2_cuda_probe "${CMAKE_BINARY_DIR}/CMakeFiles/xchplot2-cuda-host")
+        file(WRITE "${_x2_cuda_probe}.cu"
+            "#include <type_traits>\n__global__ void k(){}\nint main(){return 0;}\n")
+        execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" -std=c++20
+            -c "${_x2_cuda_probe}.cu" -o "${_x2_cuda_probe}.o"
+            RESULT_VARIABLE _x2_ccbin_rc OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _x2_ccbin_rc EQUAL 0)
+            file(GLOB _x2_ccbins
+                "/usr/bin/g++-[0-9]*" "/usr/bin/clang++-[0-9]*"
+                "/usr/lib/llvm*/bin/clang++" "/usr/lib64/llvm*/bin/clang++"
+                "/opt/llvm*/bin/clang++")
+            list(SORT _x2_ccbins COMPARE NATURAL ORDER DESCENDING)
+            foreach(_x2_ccbin IN LISTS _x2_ccbins)
+                execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" -std=c++20
+                    -ccbin "${_x2_ccbin}" -c "${_x2_cuda_probe}.cu"
+                    -o "${_x2_cuda_probe}.o"
+                    RESULT_VARIABLE _x2_ccbin_rc OUTPUT_QUIET ERROR_QUIET)
+                if(_x2_ccbin_rc EQUAL 0)
+                    set(CMAKE_CUDA_HOST_COMPILER "${_x2_ccbin}"
+                        CACHE FILEPATH "Host compiler accepted by nvcc" FORCE)
+                    message(STATUS "xchplot2: nvcc rejects the default host compiler; using ${_x2_ccbin}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        file(REMOVE "${_x2_cuda_probe}.cu" "${_x2_cuda_probe}.o")
+    endif()
+
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -384,6 +417,7 @@ if(NOT ROCM_DEVICE_LIBS_PATH)
         "/opt/rocm*/share/amdgcn/bitcode"
         "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
         "/usr/lib/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode"
+        "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode"
         "/usr/lib64/amdgcn/bitcode"
         "/usr/lib/amdgcn/bitcode"
         "/usr/share/amdgcn/bitcode")
@@ -411,9 +445,9 @@ endif()
 # Lookup precedence:
 #   1. find_package(AdaptiveCpp) — system or local install (e.g. /opt/adaptivecpp).
 #      This is what scripts/install-deps.sh and the Containerfile produce.
-#   2. FetchContent fallback — clones AdaptiveCpp at v25.10.0 and adds it as
-#      a CMake subproject. Slow first build (LLVM compilation, ~15-30 min) but
-#      removes the manual install step. Opt out with -DXCHPLOT2_FETCH_ADAPTIVECPP=OFF.
+#   2. FetchContent fallback — builds and installs AdaptiveCpp v25.10.0 to
+#      ~/.local (or ACPP_PREFIX). Runtime libraries must survive Cargo's
+#      temporary build directory. Opt out with -DXCHPLOT2_FETCH_ADAPTIVECPP=OFF.
 option(XCHPLOT2_FETCH_ADAPTIVECPP "Fall back to FetchContent if AdaptiveCpp not found" ON)
 
 # HINTS /opt/adaptivecpp matches scripts/install-deps.sh's default install
@@ -423,7 +457,7 @@ option(XCHPLOT2_FETCH_ADAPTIVECPP "Fall back to FetchContent if AdaptiveCpp not 
 # user would have to remember to `export CMAKE_PREFIX_PATH=/opt/adaptivecpp`
 # between running install-deps.sh and the build (the script can't set env
 # vars in the parent shell), and FetchContent would fire pointlessly.
-find_package(AdaptiveCpp QUIET HINTS /opt/adaptivecpp ENV ACPP_PREFIX)
+find_package(AdaptiveCpp QUIET HINTS /opt/adaptivecpp ENV ACPP_PREFIX "$ENV{HOME}/.local")
 if(NOT AdaptiveCpp_FOUND)
     if(XCHPLOT2_FETCH_ADAPTIVECPP)
         message(STATUS "xchplot2: AdaptiveCpp not found — fetching v25.10.0 via FetchContent")
@@ -564,20 +598,61 @@ if(NOT AdaptiveCpp_FOUND)
         # ROCM_DEVICE_LIBS_PATH is probed once near the top of this file — it
         # is needed for an already-installed AdaptiveCpp too, so it cannot
         # live in this branch.
+        # AdaptiveCpp probes HIP before setting its /opt/rocm default;
+        # Arch's hipcc is not on PATH until a new login shell.
+        if(XCHPLOT2_HIP_RUNTIME_H AND NOT ROCM_PATH)
+            get_filename_component(ROCM_PATH "${XCHPLOT2_HIP_RUNTIME_H}/.." ABSOLUTE)
+        endif()
 
+        # AdaptiveCpp does not export add_sycl_to_target from add_subdirectory.
+        # Populate only, then use its normal standalone build/install flow.
+        # The full-argument Populate form does not create a dummy package
+        # redirect that would shadow the installed consumer config.
         include(FetchContent)
-        FetchContent_Declare(
+        FetchContent_Populate(
             adaptivecpp
             GIT_REPOSITORY https://github.com/AdaptiveCpp/AdaptiveCpp.git
             GIT_TAG        v25.10.0
+            SOURCE_DIR    "${CMAKE_BINARY_DIR}/_deps/adaptivecpp-src"
+            BINARY_DIR    "${CMAKE_BINARY_DIR}/_deps/adaptivecpp-build"
         )
-        FetchContent_MakeAvailable(adaptivecpp)
-        if(NOT COMMAND add_sycl_to_target)
-            message(FATAL_ERROR
-                "xchplot2: FetchContent built AdaptiveCpp but add_sycl_to_target "
-                "wasn't exported. Install AdaptiveCpp via scripts/install-deps.sh "
-                "or use the Containerfile.")
+        set(_x2_acpp_prefix "$ENV{ACPP_PREFIX}")
+        if(NOT _x2_acpp_prefix)
+            set(_x2_acpp_prefix "$ENV{HOME}/.local")
         endif()
+        set(_x2_acpp_flags
+            "-DCMAKE_INSTALL_PREFIX=${_x2_acpp_prefix}"
+            "-DCMAKE_C_COMPILER=${_x2_llvm_root}/bin/clang"
+            "-DCMAKE_CXX_COMPILER=${_x2_llvm_root}/bin/clang++"
+            "-DLLVM_DIR=${LLVM_DIR}" "-DClang_DIR=${Clang_DIR}"
+            "-DACPP_LLD_PATH=${ACPP_LLD_PATH}" "-DCLANG_INCLUDE_PATH=${CLANG_INCLUDE_PATH}")
+        find_library(_x2_ze_loader ze_loader)
+        if(_x2_ze_loader AND NOT DEFINED WITH_LEVEL_ZERO_BACKEND)
+            set(WITH_LEVEL_ZERO_BACKEND ON)
+        endif()
+        foreach(_x2_var ROCM_PATH ROCM_DEVICE_LIBS_PATH WITH_LEVEL_ZERO_BACKEND)
+            if(DEFINED ${_x2_var})
+                list(APPEND _x2_acpp_flags "-D${_x2_var}=${${_x2_var}}")
+            endif()
+        endforeach()
+        if(CUDAToolkit_ROOT)
+            list(APPEND _x2_acpp_flags "-DCUDA_TOOLKIT_ROOT_DIR=${CUDAToolkit_ROOT}")
+        elseif(XCHPLOT2_HIP_RUNTIME_H)
+            list(APPEND _x2_acpp_flags -DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE)
+        endif()
+        execute_process(COMMAND "${CMAKE_COMMAND}"
+            -S "${adaptivecpp_SOURCE_DIR}" -B "${adaptivecpp_BINARY_DIR}" -G Ninja
+            -DCMAKE_BUILD_TYPE=Release ${_x2_acpp_flags}
+            COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${adaptivecpp_BINARY_DIR}" --parallel
+            COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND "${CMAKE_COMMAND}" --install "${adaptivecpp_BINARY_DIR}"
+            COMMAND_ERROR_IS_FATAL ANY)
+        if(WITH_LEVEL_ZERO_BACKEND)
+            execute_process(COMMAND "${CMAKE_COMMAND}" --build "${adaptivecpp_BINARY_DIR}"
+                --target InstallLLVMSpirvTranslator COMMAND_ERROR_IS_FATAL ANY)
+        endif()
+        find_package(AdaptiveCpp REQUIRED PATHS "${_x2_acpp_prefix}" NO_DEFAULT_PATH)
     else()
         message(FATAL_ERROR
             "xchplot2: AdaptiveCpp not found. Install it via scripts/install-deps.sh, "
@@ -610,11 +685,11 @@ endfunction()
 # Export the AdaptiveCpp lib directory to a file so build.rs knows where
 # to add -L for libacpp-rt / libacpp-common at link time. Without this,
 # the Rust binary fails to link on machines where AdaptiveCpp lives
-# anywhere other than /opt/adaptivecpp or /usr/local (and on FetchContent
-# builds, which leave the artifacts in CMake's _deps/ build tree).
+# anywhere other than /opt/adaptivecpp or /usr/local, including the
+# automatic per-user install to ~/.local.
 set(_xchplot2_acpp_lib_dir "")
 if(TARGET acpp-rt)
-    # FetchContent-built target: ask CMake where it'll land.
+    # Parent-provided target: ask CMake where it'll land.
     set(_xchplot2_acpp_lib_dir "$<TARGET_FILE_DIR:acpp-rt>")
 elseif(AdaptiveCpp_DIR)
     # Installed AdaptiveCpp: AdaptiveCpp_DIR is <prefix>/lib/cmake/AdaptiveCpp,
@@ -638,7 +713,7 @@ endif()
 # "No matching device" at SYCL queue construction because
 # librt-backend-hip.so can't dynamically link libamdhip64.so.
 #
-# The FetchContent path leaves _xchplot2_acpp_lib_dir as a generator
+# A parent-provided target leaves _xchplot2_acpp_lib_dir as a generator
 # expression ("$<TARGET_FILE_DIR:acpp-rt>") which can't go into the
 # RPATH variables at config time — CMake's BUILD_WITH_INSTALL_RPATH=OFF
 # default already handles in-tree targets in that case.
