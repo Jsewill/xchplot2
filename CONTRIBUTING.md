@@ -3,6 +3,11 @@
 Hosted PR jobs lint and build without GPU hardware. `GPU hardware` runs only
 on trusted `main` / `cuda-only` pushes, schedules, and manual dispatches:
 
+After registering the runners below, set the Actions repository variable
+`GPU_RUNNERS_READY` to `true` to enable automatic push and scheduled runs.
+Until then, automatic GPU jobs are skipped. Manual dispatch remains available
+and requires the matching runners.
+
 | Suite | When | Checks |
 | --- | --- | --- |
 | `quick` | Branch pushes; manual | All CTest tests, then k=18 CPU byte parity and 100 full-proof challenges for every tier and disk-spill variant |

@@ -1377,6 +1377,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
     std::string mode = argv[1];
 
+    if (mode == "--help" || mode == "-h") {
+        print_usage(argv[0]);
+        return 0;
+    }
+
     if (mode == "devices") {
         // Enumerate every visible CUDA device + the host CPU plotter
         // (always available via --cpu / --devices cpu). Reports id,

@@ -67,6 +67,11 @@ int main()
         return fields + " " + std::string(64, 'a') + " 00 " + dir.string() + " " + name + "\n";
     };
     put(manifest, line("18 2 0 0 false"));
+    put(config, "");
+    assert(cli({"--help", "--config", config.string()}) == 0);
+    assert(cli({"-h", "--config", config.string()}) == 0);
+    assert(cli({"--config", config.string()}) != 0);
+    assert(cli({"--unknown", "--config", config.string()}) != 0);
     put(config, "[verify]\ntrials=1\nfull=true\n");
     assert(cli({"verify", "unused.plot2", "--config", config.string()}) == 0);
     assert(verified_trials == 1 && verified_full);
