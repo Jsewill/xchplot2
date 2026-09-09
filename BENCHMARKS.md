@@ -1,16 +1,20 @@
 # Plotter benchmarks — September 9, 2026
 
-The measured change reduces pinned allocation churn in the SYCL streaming
-pipeline and merges/packs Minimal's host-resident Xs runs on the CPU.
+The full tier retest covers every supported GPU tier on both hosts and both
+branches on NVIDIA. The earlier paired comparison measures a SYCL change that
+reduces pinned allocation churn and merges/packs Minimal's host-resident Xs
+runs on the CPU.
 Ordinary `plot` jobs also persist their identities before work starts and
 report output paths only after publication or a successful resume check.
 
 ## Sources and hardware
 
-- Baseline: `main` v0.11.0 (`1079b9e`; local SHA-256 checkout `ff164ba`).
-- Candidate: `main` `c4f0af6` (local SHA-256 checkout `78ab809`).
-- Native CUDA: `cuda-only` `becab6c`, with GPU code unchanged from `2107292`.
-  Its existing CPU merge and scratch reuse are unchanged.
+- Full tier retest: `main` `b00ff1b` (local SHA-256 checkout `0a8d3cc`)
+  and `cuda-only` `3545835`.
+- Earlier paired comparison and profile: baseline `main` v0.11.0 (`1079b9e`;
+  local SHA-256 checkout `ff164ba`), candidate `c4f0af6` (local `78ab809`).
+- Native CUDA's GPU code is unchanged from `2107292`, including its existing
+  CPU merge and scratch reuse.
 - All builds use pos2-chip `b0da7aa` and Release optimizations.
 
 The SYCL NVIDIA build enables CUB (`XCHPLOT2_BUILD_CUDA=ON`), targets
@@ -35,53 +39,73 @@ are completion intervals after warmup, not single-plot latency from a cold start
 Typical output size is 0.921 GiB. No CPU builds or other plotter tests ran
 concurrently with a benchmark on the same host.
 
-NVIDIA uses six measured plots after two warmups (eight actual plots per run).
-AMD uses four measured plots after one warmup (five actual plots). `σ` is the
-per-plot interval spread reported by `bench`; host peak is Linux `ru_maxrss`.
+The full tier retest uses ten measured plots after two warmups on both hosts
+(12 actual plots per run). `σ` is the per-plot interval spread reported by
+`bench`; host peak is Linux `ru_maxrss`, measured separately from verification.
+Each run retained its outputs with `--keep`, then checked one output using
+`verify --full --trials 100 --config /dev/null` before removing the temporary
+plots. Runs were sequential on each host; the two hosts ran concurrently.
 For example, with `binary` pointing at either build and `plots` at a disk directory:
 
 ```bash
-POS2GPU_VRAM_MARGIN_MB=512 "$binary" bench -k 28 -s 2 -n 6 --warmup 2 \
-    --devices 0 --tier minimal --out "$plots" --config /dev/null
+POS2GPU_VRAM_MARGIN_MB=512 "$binary" bench -k 28 -s 2 -n 10 --warmup 2 \
+    --devices 0 --tier minimal --out "$plots" --keep --config /dev/null
 ```
 
-On AMD, use `-n 4 --warmup 1` and the default 128 MiB margin. The NVIDIA
-machine also drives a desktop: a browser's GPU allocation grew by 239 MiB
-and tripped the 128 MiB watchdog on both baseline and candidate runs. Those
-failed runs are excluded below. A repeat measured the same 5,450 MiB process
-peak (including its 388 MiB initial context) for both versions. Subsequent
-local runs use the existing 512 MiB margin override; production defaults and
-peak models are unchanged.
+On AMD, use the default 128 MiB margin. The NVIDIA machine also drives a
+desktop: during the earlier paired comparison, a browser's GPU allocation
+grew by 239 MiB and tripped the 128 MiB watchdog on both baseline and candidate
+runs. Those failed runs are excluded below. A repeat measured the same
+5,450 MiB process peak (including its 388 MiB initial context) for both
+versions. Subsequent local runs use the existing 512 MiB margin override;
+production defaults and peak models are unchanged.
 
 Driver peaks are deltas from the run's initial free-memory reading and can
 include other desktop activity. They are not required free-VRAM floors.
-Forced tiers on these roomy cards also receive optional two-phase match
+Forced SYCL tiers on these roomy cards also receive optional two-phase match
 scratch (Minimal: 1,170 MiB; Plain/Compact: 780 MiB). Floor-limited cards
 have different throughput. Intel and physical low-VRAM cards are outside
 this test set.
 
 ## Current throughput and memory
 
+Full tier retest, September 9, 2026, 17:23–18:01 UTC, including the Plain repeat:
+
 | GPU / build | Tier | Seconds/plot, mean ± σ | Driver peak, MiB | Host peak RSS, GiB |
 |---|---|---:|---:|---:|
-| RTX 4090 / SYCL-CUB | auto | 2.55 ± 0.19 | 11,282 | 7.30 |
-| RTX 4090 / SYCL-CUB | plain | 2.64 ± 0.04 | 8,087 | 7.31 |
-| RTX 4090 / SYCL-CUB | compact | 3.85 ± 0.02 | 6,013 | 14.39 |
-| RTX 4090 / SYCL-CUB | minimal | 16.37 ± 0.05 | 5,130 | 17.45 |
-| RTX 4090 / SYCL-CUB | tiny | 27.08 ± 0.45 | 1,149 | 19.53 |
-| RX 6700 XT / SYCL-HIP | auto | 9.84 ± 0.66 | 11,232 | 7.30 |
-| RX 6700 XT / SYCL-HIP | plain | 9.60 ± 0.71 | 8,088 | 7.30 |
-| RX 6700 XT / SYCL-HIP | compact | 10.53 ± 0.58 | 5,998 | 14.40 |
-| RX 6700 XT / SYCL-HIP | minimal | 22.03 ± 0.09 | 5,076 | 17.48 |
-| RX 6700 XT / SYCL-HIP | tiny | 29.80 ± 0.34 | 1,082 | 19.56 |
-| RTX 4090 / native CUDA | auto, overlap enabled | 2.21 ± 0.02 | 13,584 | 7.20 |
+| RTX 4090 / SYCL-CUB | auto | 2.50 ± 0.10 | 11,268 | 7.30 |
+| RTX 4090 / SYCL-CUB | plain, initial | 3.91 ± 0.30 | 8,088 | 7.30 |
+| RTX 4090 / SYCL-CUB | plain, repeat | 2.66 ± 0.10 | 8,057 | 7.31 |
+| RTX 4090 / SYCL-CUB | compact | 3.84 ± 0.04 | 6,012 | 14.38 |
+| RTX 4090 / SYCL-CUB | minimal | 16.40 ± 0.18 | 5,090 | 17.46 |
+| RTX 4090 / SYCL-CUB | tiny | 27.74 ± 0.55 | 1,275 | 19.53 |
+| RTX 4090 / SYCL-CUB | pinned | 27.42 ± 0.35 | 1,309 | 19.49 |
+| RX 6700 XT / SYCL-HIP | auto | 9.63 ± 0.76 | 11,232 | 7.30 |
+| RX 6700 XT / SYCL-HIP | plain | 9.76 ± 0.32 | 8,088 | 7.30 |
+| RX 6700 XT / SYCL-HIP | compact | 10.51 ± 0.63 | 5,998 | 14.41 |
+| RX 6700 XT / SYCL-HIP | minimal | 22.19 ± 0.70 | 5,076 | 17.49 |
+| RX 6700 XT / SYCL-HIP | tiny | 29.77 ± 0.34 | 1,082 | 19.58 |
+| RX 6700 XT / SYCL-HIP | pinned | 29.73 ± 0.37 | 1,082 | 19.58 |
+| RTX 4090 / native CUDA | auto, overlap enabled | 2.20 ± 0.03 | 13,582 | 7.19 |
+| RTX 4090 / native CUDA | plain | 2.89 ± 0.05 | 7,372 | 7.21 |
+| RTX 4090 / native CUDA | compact | 4.59 ± 0.05 | 5,302 | 11.31 |
+| RTX 4090 / native CUDA | minimal | 19.53 ± 0.23 | 3,926 | 13.30 |
+| RTX 4090 / native CUDA | tiny | 32.65 ± 0.29 | 1,116 | 14.36 |
 
-Auto and Plain are close enough that these small samples do not establish a
-consistent ordering. The native-vs-SYCL comparison does not isolate the cause
-of their runtime difference; the native auto run also enables its optional
-D2H/Xs overlap, which retains another 2,080 MiB of device fragments.
+SYCL-CUB Plain was repeated after the full matrix because its initial timing
+was slower than the earlier measurement. Both runs passed; the cause of the
+difference was not established, so both measurements are retained.
+
+Native CUDA has no separate Pinned tier. The native-vs-SYCL comparison does
+not isolate the cause of their runtime differences: their memory footprints
+differ, and the native auto run enables optional D2H/Xs overlap, which retains
+another 2,080 MiB of device fragments.
 
 ## Before and after
+
+These are the earlier paired runs: six measured plots after two warmups on
+NVIDIA, four after one warmup on AMD. Their original after values are retained
+so the comparison uses the same sample counts and method for both versions.
 
 | GPU / tier | Before, s/plot | After, s/plot | Time reduction | Host RSS before → after, GiB |
 |---|---:|---:|---:|---:|
@@ -124,10 +148,15 @@ CPU FSE time is not separately attributed by this trace.
 
 ## Correctness and recovery checks
 
-Both GPU hosts passed CPU-reference byte comparisons at k=22 and k=28 for
-Plain, Minimal, Tiny, and Pinned, including disk-spill variants of the last
-three: 14 plot comparisons per host. Each GPU output also passed 100
-full-proof challenges. The CPU-reference SHA-256 values were identical on
+All 17 supported GPU configurations on these two hosts fit and passed the
+full tier retest, as did the Plain repeat: 216 plots created, including 180
+measured plots. One output per run passed 100 random full-proof challenges,
+for 1,800 challenges and 1,789 validated full proofs across 18 runs.
+
+The earlier correctness checks on both GPU hosts passed CPU-reference byte
+comparisons at k=22 and k=28 for Plain, Minimal, Tiny, and Pinned, including
+disk-spill variants of the last three: 14 plot comparisons per host. Each GPU
+output also passed 100 full-proof challenges. The CPU-reference SHA-256 values were identical on
 both hosts. These comparisons used strength 2, plot index/meta group 0,
 mainnet parameters, a plot ID of 32 `ab` bytes, and a memo of 112 zero bytes:
 
@@ -162,6 +191,6 @@ The expanded `cli_host_test` covers manifest quoting, private permissions,
 concurrent publication, refusal to replace another job, ambiguous/mismatched
 recovery, seeded recovery, and completed output reporting through cancellation
 and errors. It passes in all three builds. Native CUDA's GPU pipeline was
-unchanged; its k=28 auto benchmark and the CLI checks above were rerun.
+unchanged; all five k=28 configurations above and its CLI checks passed.
 Multi-GPU execution, Intel, and Windows were not retested. All hardware work
 was invoked directly; neither machine was registered or used as a CI runner.

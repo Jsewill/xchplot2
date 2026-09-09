@@ -1600,17 +1600,22 @@ CPU-reference byte checks, and full-proof tests are described in
 
 Measured September 9, 2026, at k=28, strength=2, using real file writes,
 FSE compression, and durability barriers. Times are mean completion intervals
-with warmup plots excluded; the tiers were forced on each single GPU.
+over ten measured plots after two warmups, using one GPU per host. Each
+non-auto tier was forced.
 
 | Tier (`main`) | RTX 4090, CUDA/CUB | RX 6700 XT, AdaptiveCpp HIP |
 |---|---:|---:|
-| Auto (pool) | 2.55 s | 9.84 s |
-| Plain | 2.64 s | 9.60 s |
-| Compact | 3.85 s | 10.53 s |
-| Minimal | 16.37 s | 22.03 s |
-| Tiny | 27.08 s | 29.80 s |
+| Auto (pool) | 2.50 s | 9.63 s |
+| Plain | 3.91 s; 2.66 s repeat | 9.76 s |
+| Compact | 3.84 s | 10.51 s |
+| Minimal | 16.40 s | 22.19 s |
+| Tiny | 27.74 s | 29.77 s |
+| Pinned | 27.42 s | 29.73 s |
 
-The native `cuda-only` auto path measured **2.21 s/plot** on the same RTX
+RTX 4090 Plain was repeated after the full matrix. Both runs passed; the
+cause of the timing difference was not established.
+
+The native `cuda-only` auto path measured **2.20 s/plot** on the same RTX
 4090, with its optional D2H/Xs overlap enabled. These runs do not isolate the
 cause of the difference between the native and SYCL runtimes.
 
