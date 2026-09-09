@@ -50,8 +50,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # Rust toolchain (for keygen-rs and the cargo install entry point).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain stable --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+        --retry 5 --retry-delay 10 --retry-all-errors \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal \
+ && rm /tmp/rustup-init.sh
 ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /xchplot2

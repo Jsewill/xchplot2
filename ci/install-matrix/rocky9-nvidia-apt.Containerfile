@@ -13,7 +13,10 @@ RUN dnf config-manager --add-repo https://developer.download.nvidia.com/compute/
 
 ENV PATH="/usr/local/cuda/bin:/root/.cargo/bin:${PATH}"
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+        --retry 5 --retry-delay 10 --retry-all-errors \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal \
+ && rm /tmp/rustup-init.sh
 
 ENV CUDA_ARCHITECTURES=75

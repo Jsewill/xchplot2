@@ -22,8 +22,11 @@ RUN curl -sSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu24
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+        --retry 5 --retry-delay 10 --retry-all-errors \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal \
+ && rm /tmp/rustup-init.sh
 ENV PATH="/root/.cargo/bin:/usr/local/cuda/bin:${PATH}"
 
 ENV CUDA_ARCHITECTURES=75
