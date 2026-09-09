@@ -614,6 +614,13 @@ target_link_libraries(cli_host_test PRIVATE Threads::Threads)
 add_executable(solver_filter_parity tools/parity/solver_filter_parity.cpp)
 target_link_libraries(solver_filter_parity PRIVATE pos2_chip_headers Threads::Threads)
 
+add_executable(gpu_ci_info tools/sanity/gpu_ci_info.cpp
+    $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+target_include_directories(gpu_ci_info PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+target_link_libraries(gpu_ci_info PRIVATE pos2_gpu_host)
+set_target_properties(gpu_ci_info PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
+
 # Keep interactive discovery and CTest on the same executable set.
 include(CTest)
 get_property(_xchplot2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)

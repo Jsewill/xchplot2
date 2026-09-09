@@ -1476,6 +1476,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
 
     StreamingStats stats;
     s_init_from_env(stats);
+    // A small live allocation can pin cached pages from the previous plot.
+    // Release that cache before allocating the counter for this plot.
+    if (s_use_async_pool()) s_trim_async_pool();
     s_pool_reset_highwater();
     auto const tier = scratch.tiny_mode ? StreamingTier::Tiny :
         scratch.gather_tile_count > 1 ? StreamingTier::Minimal :

@@ -1,0 +1,48 @@
+name: GPU hardware
+
+on:
+  push:
+    branches: [cuda-only]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: GPU test suite
+        type: choice
+        options: [quick, vram, physical]
+        default: quick
+
+# Scheduled runs for this branch are dispatched by main's GPU workflow.
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    if: inputs.suite != 'physical'
+    uses: ./.github/workflows/gpu-run.yml
+    with:
+      backend: cuda
+      runner: gpu-cuda
+      ref: ${{ github.sha }}
+      suite: ${{ inputs.suite || 'quick' }}
+
+  physical:
+    if: inputs.suite == 'physical'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: gpu-cuda-2gb
+            vram_mib: 2048
+          - runner: gpu-cuda-4gb
+            vram_mib: 4096
+          - runner: gpu-cuda-6gb
+            vram_mib: 6144
+          - runner: gpu-cuda-8gb
+            vram_mib: 8192
+    uses: ./.github/workflows/gpu-run.yml
+    with:
+      backend: cuda
+      runner: ${{ matrix.runner }}
+      ref: ${{ github.sha }}
+      suite: physical
+      physical-vram-mib: ${{ matrix.vram_mib }}

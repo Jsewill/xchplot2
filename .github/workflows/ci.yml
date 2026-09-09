@@ -80,6 +80,9 @@ jobs:
           else
             scripts/test/host-tests.sh "${{ matrix.mode }}"
           fi
+      - name: Check GPU CI admission logic
+        if: matrix.mode == 'plain'
+        run: python3 scripts/test/gpu-ci-test.py
 
   cuda-build:
     # Compile-only smoke: catches CMakeLists / nvcc-arch / link-order
@@ -106,7 +109,7 @@ jobs:
       - name: Configure
         run: cmake -B build -S . -GNinja -DCMAKE_CUDA_ARCHITECTURES=75
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build --parallel "$(nproc)"
 
   install-container-deps-dryrun:
     name: install-container-deps.sh — dry-run fixtures
