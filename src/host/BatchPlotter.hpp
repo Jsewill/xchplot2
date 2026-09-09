@@ -33,6 +33,8 @@ struct BatchEntry {
     std::vector<uint8_t> memo;
     std::string out_dir;
     std::string out_name;
+
+    bool operator==(BatchEntry const&) const = default;
 };
 
 struct BatchResult {
@@ -199,6 +201,9 @@ struct BatchOptions {
     bool verbose           = false;
     bool skip_existing     = false;
     bool continue_on_error = false;
+    // Called after publication or a successful resume check, including before
+    // a later batch failure. Workers may call concurrently.
+    std::function<void(BatchEntry const&)> on_plot_ready;
     std::vector<int> device_ids;
     bool use_all_devices   = false;
     // Set by the CLI whenever --devices was given at all — even --devices cpu,
@@ -334,6 +339,9 @@ struct BatchOptions {
 // (tab-separated, one plot per line). Throws std::runtime_error on bad input.
 void validate_batch_entry(BatchEntry const& entry);
 std::vector<BatchEntry> parse_manifest(std::string const& path);
+// Publish a job manifest before plotting (owner-only on POSIX). Never replaces a
+// different job; an identical existing manifest is safe to reuse.
+void write_manifest(std::string const& path, std::vector<BatchEntry> const& entries);
 
 // Run the staggered pipeline. Producer/consumer share a queue of depth 1.
 // The first plot pays the full GPU+FSE cost; subsequent plots overlap.
