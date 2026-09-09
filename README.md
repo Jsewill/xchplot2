@@ -1004,19 +1004,30 @@ Notes:
 
 ## Performance
 
-Measured September 9, 2026: **2.21 s/plot** (standard deviation 0.02 s)
-for k=28, strength=2 on an RTX 4090 with a Ryzen 9 5950X. This is the
-mean completion interval over six measured plots after two warmups,
-including FSE compression, real writes, and durability barriers.
+Measured September 9, 2026, at k=28, strength=2 on an RTX 4090 with a
+Ryzen 9 5950X. Times are mean completion intervals and standard deviations
+over ten measured plots after two warmups, including FSE compression,
+real writes, and durability barriers. Each non-auto tier was forced.
 
-The auto path enabled D2H/Xs overlap and peaked at 13,584 MiB of driver
-VRAM and 7.20 GiB host RSS. The local desktop test used the existing
+| Tier (`cuda-only`) | Seconds/plot, mean ± σ | Driver peak, MiB | Host peak RSS, GiB |
+|---|---:|---:|---:|
+| Auto (pool) | 2.20 ± 0.03 | 13,582 | 7.19 |
+| Plain | 2.89 ± 0.05 | 7,372 | 7.21 |
+| Compact | 4.59 ± 0.05 | 5,302 | 11.31 |
+| Minimal | 19.53 ± 0.23 | 3,926 | 13.30 |
+| Tiny | 32.65 ± 0.29 | 1,116 | 14.36 |
+
+All five configurations passed, with one output per run checked over
+100 full-proof challenges. Native CUDA has no separate Pinned tier.
+The auto path enabled D2H/Xs overlap. Driver peaks are deltas from initial
+free VRAM and may include desktop activity; they are not minimum capacity
+requirements. The local desktop test used the existing
 `POS2GPU_VRAM_MARGIN_MB=512` override; production defaults are unchanged.
 
 The [benchmark report](BENCHMARKS.md) includes the exact
 method, source revisions, SYCL/AMD comparison, profiling, and correctness
 checks. Multi-GPU throughput also depends on shared PCIe bandwidth,
-CPU compression, and storage; this measurement uses one GPU.
+CPU compression, and storage; these measurements use one GPU.
 
 ## License
 
