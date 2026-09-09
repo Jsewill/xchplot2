@@ -121,7 +121,7 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
 // stages 4b-4e streaming runs). Lifetime analysis shows that phases
 // using these buffers do not overlap, so two pairs can share a single
 // allocation each:
-//   h_meta        (cap × u64): T1 meta park → T2 meta park
+//   h_meta        (cap × u64): Minimal Xs pack → T1 meta park → T2 meta park
 //   h_keys_merged (cap × u32): T1 keys_merged park → T2 keys_merged park
 //   h_t2_xbits    (cap × u32): T2 xbits park (distinct)
 //   h_t3          (cap × T3PairingGpu = u64): T3 staging (distinct)
@@ -291,8 +291,8 @@ struct StreamingPinnedScratch {
 
     // Optional host-pinned pool for amortising per-plot malloc_host
     // calls across a batch. When non-null, the streaming pipeline
-    // routes its per-plot pinned-host allocations (currently h_t1_mi)
-    // through pool->acquire(name, ...) instead of sycl::malloc_host.
+    // reuses the h_t1_mi / h_t2_mi slots for Xs and sliced-sort inputs,
+    // and caches merged keys through pool->acquire(name, ...).
     // The pool keeps the buffers alive across plots; the pipeline
     // does NOT free pool-owned buffers at function exit. nullptr
     // preserves the historical per-plot malloc_host + free behaviour.

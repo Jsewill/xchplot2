@@ -1346,39 +1346,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_xs_keys_b);
         s_free(stats, d_xs_vals_b);
     } else {
-        // Sliced (minimal/tiny/pinned). Tile gen+sort in N=2 position
-        // halves into cap/2 device buffers, D2H per tile to USM-host.
-        //
-        // From here, two sub-paths:
-        //   - Minimal/Tiny: merge host-pinned tile outputs into device
-        //     d_xs_keys_b + d_xs_vals_b (full cap). Pack in N=2 halves
-        //     with D2H per tile to a host-pinned XsCandidateGpu
-        //     accumulator. Drops sort peak from 4128 MB → 2056 MB and
-        //     pack peak from 4096 MB → 3072 MB at k=28. (Existing.)
-        //   - Pinned (Phase 1.4a+b): merge on host (CPU std::merge-style
-        //     loop — the GPU merge kernel does per-thread binary search
-        //     with random reads, pathological on USM-host source). Then
-        //     pack reads/writes with all-host USM pointers — pack's
-        //     access is sequential per thread so PCIe bursts are
-        //     efficient. Eliminates d_xs_keys_b / d_xs_vals_b /
-        //     d_xs_pack_tile from device entirely (~3 GB saving at
-        //     k=28). The d_xs rehydrate at the bottom of this block
-        //     still happens; eliminating it is Phase 1.4c.
-        //
-        // The Pinned sub-path is gated on scratch.tiny_mode below;
-        // Minimal/Tiny stay on the existing flow unchanged.
-        //
-        // Phase 1.5d (after d_frags_out alias) — Tiny tier bumps tile
-        // count from N=2 → N=4 to shrink each device tile buffer from
-        // cap/2 × u32 (128 MB at k=26 / 512 MB at k=28) to cap/4 ×
-        // u32 (64 MB at k=26 / 256 MB at k=28). With 4 buffers
-        // (keys_a, vals_a, keys_b, vals_b) + cub scratch in flight,
-        // saves 256 MB at k=26 / 1 GB at k=28 on the Xs gen+sort
-        // phase peak. Minimal stays at N=2 to keep the
-        // launch_merge_pairs_stable_2way_u32_u32 path unchanged
-        // (Minimal's merge primitive is 2-way; an N-way GPU merge
-        // would be a separate kernel rewrite). Tiny's merge+pack
-        // already runs on CPU so N-way generalizes trivially.
+        // Sort two tiles for Minimal, four for Tiny/Pinned. Merge and pack
+        // on the CPU: the GPU merge's per-element binary search makes random
+        // PCIe reads from these host-resident runs.
         constexpr int kXsTinyTiles = 4;
         constexpr int kXsMinTiles  = 2;
         int const kXsTiles = scratch.tiny_mode ? kXsTinyTiles : kXsMinTiles;
@@ -1391,13 +1361,6 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
             xs_tile_offsets[t + 1] =
                 std::min(xs_tile_offsets[t] + xs_tile_max, total_xs);
         }
-        // Legacy two-half names — only used by the Minimal merge
-        // primitive below (N=2 path).
-        uint64_t const xs_tile_n0 =
-            scratch.tiny_mode ? 0 : xs_tile_offsets[1];
-        uint64_t const xs_tile_n1 =
-            scratch.tiny_mode ? 0 : (total_xs - xs_tile_offsets[1]);
-
         size_t xs_cub_tile_bytes = 0;
         launch_sort_pairs_u32_u32(
             nullptr, xs_cub_tile_bytes,
@@ -1416,10 +1379,14 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_xs_vals_b_tile, xs_tile_max * sizeof(uint32_t), "d_xs_vals_b_tile");
         s_malloc(stats, d_xs_cub_scratch, xs_cub_tile_bytes,              "d_xs_cub");
 
-        uint32_t* h_xs_keys = s_malloc_host<uint32_t>(
-            stats, total_xs * sizeof(uint32_t), "h_xs_keys", q);
-        uint32_t* h_xs_vals = s_malloc_host<uint32_t>(
-            stats, total_xs * sizeof(uint32_t), "h_xs_vals", q);
+        // Xs finishes before either MI stream is produced. Borrow the
+        // existing slots so batch plotting retains no additional pinned RAM.
+        uint32_t* h_xs_keys = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t1_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, total_xs * sizeof(uint32_t), "h_xs_keys", q);
+        uint32_t* h_xs_vals = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t2_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, total_xs * sizeof(uint32_t), "h_xs_vals", q);
 
         int p_xs = begin_phase("Xs gen+sort");
         auto run_tile = [&](uint64_t pos_begin, uint64_t pos_end, uint64_t out_offset) {
@@ -1450,159 +1417,70 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_xs_vals_a_tile);
         s_free(stats, d_xs_keys_a_tile);
 
-        XsCandidateGpu* h_xs = nullptr;
+        // Minimal finishes the H2D before T1 writes its metadata. Tiny keeps
+        // h_xs throughout T1 match, so its input must remain separate.
+        bool const h_xs_owned = scratch.tiny_mode || !scratch.h_meta;
+        XsCandidateGpu* h_xs = h_xs_owned
+            ? s_malloc_host<XsCandidateGpu>(stats, total_xs * sizeof(XsCandidateGpu), "h_xs", q)
+            : reinterpret_cast<XsCandidateGpu*>(scratch.h_meta);
 
-        if (scratch.tiny_mode) {
-            // Phase 1.4a + 1.4b — Pinned tier only.
-            //
-            // Both merge AND pack run on the CPU as a single fused
-            // loop that writes directly to the host-pinned h_xs output.
-            //
-            // Why CPU rather than GPU-on-host-pointers: AdaptiveCpp's
-            // CUDA backend doesn't issue burst PCIe transfers when a
-            // SYCL kernel dereferences malloc_host pointers — each
-            // thread's read becomes an individual transaction, ~1 µs
-            // latency. Measured: kernel pack on all-USM-host pointers
-            // at k=26 ran 4434 ms (vs 27 ms for the device-input
-            // tiled-pack of the existing path). A CPU loop that
-            // streams the same data hits ~30 GB/s memory bandwidth,
-            // which works out to ~30 ms at k=26 / ~134 ms at k=28.
-            //
-            // Why fuse merge + pack: pack is trivially
-            // `out[i] = {keys[i], vals[i]}` — combining it with the
-            // merge's "pick lower of two heads" loop adds no work but
-            // saves the intermediate h_xs_keys_merged + h_xs_vals_merged
-            // arrays (~2 GB host at k=28).
-            //
-            // Net device-peak saving: skips d_xs_keys_b + d_xs_vals_b +
-            // d_xs_pack_tile entirely (~3 GB device at k=28). The
-            // d_xs rehydrate at the bottom of the block is unchanged —
-            // that's Phase 1.4c's lever.
-            h_xs = s_malloc_host<XsCandidateGpu>(
-                stats, total_xs * sizeof(XsCandidateGpu), "h_xs(pinned)", q);
+        // Tiny also consumes the section offsets during tiled T1 match.
+        int      const xs_num_section_bits =
+            (cfg.k < 28) ? 2 : (cfg.k - 26);
+        uint32_t const xs_num_sections     = 1u << xs_num_section_bits;
+        int      const xs_section_shift    = cfg.k - xs_num_section_bits;
+        std::vector<uint64_t> section_count(xs_num_sections, 0);
 
-            // Phase 1.4c also needs section-start offsets so T1 match
-            // can find each section's range in h_xs without re-scanning.
-            // Sections are top num_section_bits of match_info; h_xs is
-            // sorted by match_info so each section is contiguous.
-            int      const xs_num_section_bits =
-                (cfg.k < 28) ? 2 : (cfg.k - 26);
-            uint32_t const xs_num_sections     = 1u << xs_num_section_bits;
-            int      const xs_section_shift    = cfg.k - xs_num_section_bits;
-            std::vector<uint64_t> section_count(xs_num_sections, 0);
-
-            int p_xs_pack = begin_phase("Xs pack");
-            {
-                // N-way merge over kXsTiles sorted runs. Tiebreak:
-                // lowest tile index wins, which generalizes the
-                // 2-way "A wins on equal keys" stability that the
-                // existing minimal-path launch_merge_pairs_stable_2way_u32_u32
-                // provides. Fused with pack (no intermediate
-                // h_xs_keys_merged / h_xs_vals_merged allocation).
-                //
-                // Hot loop is N=4 → 4 compares per output element.
-                // At k=26 / total_xs ≈ 64M, that's ~256M compares;
-                // measured ~150 ms (about 5x the 2-way path's 30 ms),
-                // amortized across a multi-second plot wall is noise.
-                uint64_t idx[kXsTinyTiles];
+        int p_xs_pack = begin_phase("Xs pack");
+        {
+            // Stable N-way merge, fused with pack. Earlier tiles win
+            // ties, preserving the original position order.
+            uint64_t idx[kXsTinyTiles];
+            for (int s = 0; s < kXsTiles; ++s) {
+                idx[s] = xs_tile_offsets[s];
+            }
+            uint64_t out = 0;
+            while (true) {
+                int best = -1;
+                uint32_t best_k = 0;
                 for (int s = 0; s < kXsTiles; ++s) {
-                    idx[s] = xs_tile_offsets[s];
-                }
-                uint64_t out = 0;
-                while (true) {
-                    int best = -1;
-                    uint32_t best_k = 0;
-                    for (int s = 0; s < kXsTiles; ++s) {
-                        if (idx[s] < xs_tile_offsets[s + 1]) {
-                            uint32_t const kk = h_xs_keys[idx[s]];
-                            if (best == -1 || kk < best_k) {
-                                best_k = kk;
-                                best   = s;
-                            }
+                    if (idx[s] < xs_tile_offsets[s + 1]) {
+                        uint32_t const kk = h_xs_keys[idx[s]];
+                        if (best == -1 || kk < best_k) {
+                            best_k = kk;
+                            best   = s;
                         }
                     }
-                    if (best < 0) break;
-                    uint32_t const k_out = h_xs_keys[idx[best]];
-                    uint32_t const v_out = h_xs_vals[idx[best]];
-                    h_xs[out] = XsCandidateGpu{ k_out, v_out };
-                    ++section_count[k_out >> xs_section_shift];
-                    ++idx[best];
-                    ++out;
                 }
+                if (best < 0) break;
+                uint32_t const k_out = h_xs_keys[idx[best]];
+                uint32_t const v_out = h_xs_vals[idx[best]];
+                h_xs[out] = XsCandidateGpu{ k_out, v_out };
+                ++section_count[k_out >> xs_section_shift];
+                ++idx[best];
+                ++out;
             }
-            end_phase(p_xs_pack);
+        }
+        end_phase(p_xs_pack);
 
-            // Prefix-sum into the function-scope offsets array.
-            h_xs_section_starts.assign(xs_num_sections + 1, 0);
-            for (uint32_t s = 0; s < xs_num_sections; ++s) {
-                h_xs_section_starts[s + 1] = h_xs_section_starts[s] + section_count[s];
-            }
-
-            s_free_host(stats, h_xs_keys, q);
-            s_free_host(stats, h_xs_vals, q);
-        } else {
-            // Minimal/Tiny path — unchanged from before Phase 1.4.
-
-            // Full-cap merge outputs on device. Merge from USM-host inputs.
-            s_malloc(stats, d_xs_keys_b, total_xs * sizeof(uint32_t), "d_xs_keys_b");
-            s_malloc(stats, d_xs_vals_b, total_xs * sizeof(uint32_t), "d_xs_vals_b");
-            launch_merge_pairs_stable_2way_u32_u32(
-                h_xs_keys + 0,           h_xs_vals + 0,           xs_tile_n0,
-                h_xs_keys + xs_tile_n0,  h_xs_vals + xs_tile_n0,  xs_tile_n1,
-                d_xs_keys_b, d_xs_vals_b, total_xs, q);
-            s_free_host(stats, h_xs_keys, q);
-            s_free_host(stats, h_xs_vals, q);
-
-            // Tiled pack. d_xs_pack_tile reuses across tiles; the
-            // packed output collects on host pinned h_xs (cap ×
-            // XsCandidate = 2048 MB host at k=28).
-            //
-            // Cheap-win bump from N=2 to N=4: shrinks d_xs_pack_tile
-            // from cap/2 × XsCandidate (1024 MB at k=28) to cap/4
-            // × XsCandidate (512 MB at k=28). Saves 512 MB at k=28
-            // / 128 MB at k=26 on the Xs pack phase peak.
-            // The d_xs_keys_b + d_xs_vals_b co-residency (the bigger
-            // pack contributors) is unchanged — that requires
-            // Pinned-style algorithm to attack.
-            constexpr int kXsPackTiles = 4;
-            uint64_t const pack_tile_max =
-                (total_xs + uint64_t(kXsPackTiles) - 1) / uint64_t(kXsPackTiles);
-
-            XsCandidateGpu* d_xs_pack_tile = nullptr;
-            s_malloc(stats, d_xs_pack_tile, pack_tile_max * sizeof(XsCandidateGpu), "d_xs_pack_tile");
-
-            h_xs = s_malloc_host<XsCandidateGpu>(
-                stats, total_xs * sizeof(XsCandidateGpu), "h_xs", q);
-
-            int p_xs_pack = begin_phase("Xs pack");
-            for (int n = 0; n < kXsPackTiles; ++n) {
-                uint64_t const tile_off = uint64_t(n) * pack_tile_max;
-                if (tile_off >= total_xs) break;
-                uint64_t const tile_n = std::min(pack_tile_max, total_xs - tile_off);
-                launch_xs_pack_range(d_xs_keys_b + tile_off,
-                                     d_xs_vals_b + tile_off,
-                                     d_xs_pack_tile, tile_n, q);
-                q.memcpy(h_xs + tile_off, d_xs_pack_tile,
-                         tile_n * sizeof(XsCandidateGpu)).wait();
-            }
-            end_phase(p_xs_pack);
-
-            s_free(stats, d_xs_pack_tile);
-            s_free(stats, d_xs_keys_b);
-            s_free(stats, d_xs_vals_b);
-            d_xs_keys_b = nullptr;
-            d_xs_vals_b = nullptr;
+        // Prefix-sum into the function-scope offsets array.
+        h_xs_section_starts.assign(xs_num_sections + 1, 0);
+        for (uint32_t s = 0; s < xs_num_sections; ++s) {
+            h_xs_section_starts[s + 1] = h_xs_section_starts[s] + section_count[s];
         }
 
-        // Re-hydrate full d_xs on device from host pinned (Minimal/Tiny).
-        // Pinned (Phase 1.4c): skip — h_xs survives to T1 match, which
-        // consumes it via per-section-pair tile H2D.
+        if (!scratch.pool) {
+            s_free_host(stats, h_xs_keys, q);
+            s_free_host(stats, h_xs_vals, q);
+        }
+
+        // Minimal consumes the full device array; Tiny/Pinned stage sections.
         if (scratch.tiny_mode) {
             h_xs_pinned = h_xs;
         } else {
             s_malloc(stats, d_xs, total_xs * sizeof(XsCandidateGpu), "d_xs");
             q.memcpy(d_xs, h_xs, total_xs * sizeof(XsCandidateGpu)).wait();
-            s_free_host(stats, h_xs, q);
+            if (h_xs_owned) s_free_host(stats, h_xs, q);
         }
     }
 
@@ -2472,8 +2350,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_vals_out_tile, t1_tile_max * sizeof(uint32_t), "d_t1_vals_out_tile");
         s_malloc(stats, d_sort_scratch,  t1_sort_bytes,                  "d_sort_scratch(t1)");
 
-        h_keys = s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_keys(t1)", q);
-        h_vals = s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_vals(t1)", q);
+        // The MI input has been hydrated to device; its pinned slots are idle.
+        h_keys = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t1_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_keys(t1)", q);
+        h_vals = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t2_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_vals(t1)", q);
 
         auto run_tile = [&](uint64_t tile_off, uint64_t tile_n) {
             if (tile_n == 0) return;
@@ -2519,16 +2402,18 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_keys_out);
         s_free(stats, d_vals_out);
     } else {
-        // Merge inputs are USM-host; the kernel reads via PCIe (sequential
-        // 2-way merge → bandwidth-bound, ~3.27 GB at k=28 / ~25 GB/s ≈
-        // 130 ms). Live device set during merge is just the two cap-sized
-        // output buffers (d_t1_keys_merged + d_t1_merged_vals = 2080 MB).
+        // Merge the host-resident runs into device outputs. The kernel
+        // waits before these input buffers can be released or reused.
         launch_merge_pairs_stable_2way_u32_u32(
             h_keys + 0,            h_vals + 0,            t1_tile_n0,
             h_keys + t1_tile_n0,   h_vals + t1_tile_n0,   t1_tile_n1,
             d_t1_keys_merged, d_t1_merged_vals, t1_count, q);
-        s_free_host(stats, h_keys, q); h_keys = nullptr;
-        s_free_host(stats, h_vals, q); h_vals = nullptr;
+        if (!scratch.pool) {
+            s_free_host(stats, h_keys, q);
+            s_free_host(stats, h_vals, q);
+        }
+        h_keys = nullptr;
+        h_vals = nullptr;
     }
 
     // Stage 4c (compact only): d_t1_keys_merged is not used by the
@@ -3545,8 +3430,13 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_malloc(stats, d_vals_out_tile, t2_tile_max * sizeof(uint32_t), "d_t2_vals_out_tile");
         s_malloc(stats, d_sort_scratch,  t2_sort_bytes,                  "d_sort_scratch(t2)");
 
-        h_keys = s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_keys(t2)", q);
-        h_vals = s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_vals(t2)", q);
+        // The MI input has been hydrated to device; its pinned slots are idle.
+        h_keys = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t1_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_keys(t2)", q);
+        h_vals = scratch.pool
+            ? scratch.pool->acquire_as<uint32_t>("h_t2_mi", cap, q)
+            : s_malloc_host<uint32_t>(stats, cap * sizeof(uint32_t), "h_vals(t2)", q);
 
         for (int t = 0; t < kNumT2Tiles; ++t) {
             uint64_t const tile_n = t2_tile_n[t];
@@ -3659,8 +3549,12 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
         s_free(stats, d_CD_keys);
 
         // h_keys + h_vals consumed by AB/CD merges — free.
-        s_free_host(stats, h_keys, q); h_keys = nullptr;
-        s_free_host(stats, h_vals, q); h_vals = nullptr;
+        if (!scratch.pool) {
+            s_free_host(stats, h_keys, q);
+            s_free_host(stats, h_vals, q);
+        }
+        h_keys = nullptr;
+        h_vals = nullptr;
     }
 
     // d_t2_keys_merged: merged sorted MI for T3 (declared at function top).

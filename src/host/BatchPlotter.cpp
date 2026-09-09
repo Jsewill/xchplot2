@@ -1753,7 +1753,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // Phase 2-26: per-batch host-pinned pool for the per-plot allocs
     // that stream_scratch fields don't already amortise (h_t1_mi,
     // h_t2_mi, and h_keys_merged when stream_scratch.h_keys_merged is
-    // null). Wired into stream_scratch.pool below in the streaming-
+    // null). The MI slots also cover the nonoverlapping Xs and sliced-sort
+    // inputs. Wired into stream_scratch.pool below in the streaming-
     // fallback branch only — the GpuBufferPool path doesn't hit the
     // streaming code at all.
     HostPinnedPool stream_pool;
