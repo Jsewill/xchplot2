@@ -250,9 +250,8 @@ For a running plotter, inspect all thread masks with:
 grep -h Cpus_allowed_list /proc/$(pgrep -n xchplot2)/task/*/status | sort | uniq -c
 ```
 
-`XCHPLOT2_CPU_NO_PIN=1` disables pinning for comparison. Measure on the actual
-machine before raising concurrency; historical CPU and mixed GPU/CPU results
-are retained in [BENCHMARKS.md](BENCHMARKS.md#earlier-cpu-and-spill-measurements).
+`XCHPLOT2_CPU_NO_PIN=1` disables pinning for comparison. Use
+[`bench`](#benchmarking) on your machine before increasing worker counts.
 
 ### Batch completion and worker rates
 
@@ -302,9 +301,8 @@ xchplot2 plot ... --devices 0,1 --shard-plot
 xchplot2 plot ... --devices 0,1 --shard-plot --host-bounce
 ```
 
-Sharding is experimental and GPU-only. The independent work queue was faster
-on the previously measured PCIe host; see the
-[earlier multi-GPU results](BENCHMARKS.md#earlier-multi-gpu-measurements).
+Sharding is experimental and GPU-only. Compare it with the independent work
+queue using [`bench`](#benchmarking) on your hardware.
 
 `--strategy auto|work-queue|pipeline|shard` explicitly selects the strategy.
 Auto normally chooses the work queue; with multiple devices it chooses a
@@ -377,7 +375,7 @@ reading or insufficient `peak + buffer` causes refusal before allocation.
 
 The streaming base peaks below come from [VramBudget.hpp](src/host/VramBudget.hpp).
 They are allocation models, not the desktop driver deltas or host RSS in
-[BENCHMARKS.md](BENCHMARKS.md#current-throughput-and-memory).
+[BENCHMARKS.md](BENCHMARKS.md#gpu-results).
 
 | Tier | Base peak, MiB | Base + default 128 MiB buffer |
 |---|---:|---:|
@@ -399,7 +397,7 @@ memory throughout the run and fails if use exceeds the budget.
 than the default. Models scale with k.
 
 Lower VRAM tiers generally need more host RAM. Use the current per-tier
-[host RSS measurements](BENCHMARKS.md#current-throughput-and-memory) for
+[host RSS measurements](BENCHMARKS.md#gpu-results) for
 planning, with room for the OS and other workers. Host admission uses a
 separate model of pinned and anonymous memory, plus a reserve. Eligible
 storage can be moved to disk when that model does not fit.
@@ -452,10 +450,6 @@ budget requires:
    I/O per plot; a drain slot costs producer/consumer overlap across
    plots, which is the more expensive of the two in a batch.
 
-Earlier spill RSS and timing measurements are retained in
-[BENCHMARKS.md](BENCHMARKS.md#earlier-cpu-and-spill-measurements). They predate
-the current pinned scratch reuse and are not current minimum-RAM guarantees.
-
 Notes:
 
 - **The temp dir must be real disk.** `/tmp` is tmpfs on most systemd
@@ -471,8 +465,7 @@ Notes:
   for the number of cards you are plotting with.
 - **Repeated sort passes increase temporary I/O.** Inspect the
   `[spill] this plot:` line for your configuration and size the drive's
-  endurance from its write volume. Historical I/O counts are in
-  [BENCHMARKS.md](BENCHMARKS.md#sycl-spill).
+  endurance from its write volume.
 - **`--max-host-ram` bounds the unswappable class** — pinned plus
   anonymous, the class that gets a process OOM-killed. One table
   (`h_frags`, on compact/minimal) is spilled as a file-backed mapping

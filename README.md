@@ -118,7 +118,7 @@ non-auto tier was forced.
 | Tiny | 27.74 s | 29.77 s | — |
 | Pinned | 27.42 s | 29.73 s | — |
 
-— means not benchmarked. See the [Intel configuration](BENCHMARKS.md#intel-arc-b580).
+— means not benchmarked. See the [benchmark configurations](BENCHMARKS.md#hardware-and-builds).
 
 The two RTX 4090 Plain timings differ for an undetermined reason.
 

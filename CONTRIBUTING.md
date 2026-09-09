@@ -81,7 +81,7 @@ only after its previous consumer is finished. Writer/drain queues bound
 the number of in-flight plots and prevent early buffer reuse.
 
 The user-facing tier models are in [REFERENCE.md](REFERENCE.md#memory-requirements).
-Implementation measurements and the scratch-reuse comparison are in
+Measured throughput and memory use are in
 [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Install CI
