@@ -9,6 +9,27 @@ git clone --branch cuda-only https://github.com/Jsewill/xchplot2
 cd xchplot2
 ```
 
+## Binary archives
+
+Download the Linux x86-64 CUDA archive and its `.sha256` file from
+[GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
+Verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
+with the downloaded filename without `.tar.gz`. Extract it, then run
+`./bin/xchplot2 devices` from the extracted directory. Add that `bin`
+directory to `PATH` to use `xchplot2` elsewhere.
+
+The archive requires glibc 2.35+, `libstdc++.so.6` with `GLIBCXX_3.4.30`
+(available on updated Ubuntu 22.04), and an x86-64 CPU with AES, SSSE3,
+and SSE4.1. It includes native GPU code for
+Maxwell through Blackwell and the CUDA runtime; no development toolkit is
+needed. Use a compatible NVIDIA driver; 575.57.08+ is recommended for the
+pinned CUDA 12.9.1 build. Compiled architecture coverage does not imply that
+every card has been tested. Check the release notes for hardware qualification.
+
+Each archive includes `BUILDINFO.txt` with source and toolchain versions,
+and `licenses/` with dependency notices. Releases without an archive require
+a source build using the instructions below.
+
 ## Requirements
 
 Requires CUDA Toolkit **12.0+** (12.0 is the floor — `cudaGetDeviceProperties_v2`,

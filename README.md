@@ -17,7 +17,8 @@ grouping, may require replotting.
 
 ## Quick start
 
-Install the [build dependencies](INSTALL.md#requirements) first.
+For prebuilt release archives, follow [binary installation](INSTALL.md#binary-archives).
+To build from source, install the [build dependencies](INSTALL.md#requirements) first.
 For containers or Windows, follow [INSTALL.md](INSTALL.md).
 
 ```bash
