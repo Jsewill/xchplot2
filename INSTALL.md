@@ -14,9 +14,34 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 | Path | Use it for |
 |---|---|
+| [Binary archives](#binary-archives) | Prebuilt CLI and runtime for one GPU vendor |
 | [Container](#container) | Toolchains inside the image; GPU driver and container engine on the host |
 | [Native install](#native-install) | System dependencies and AdaptiveCpp installed by the existing script |
 | [Manual dependencies](#manual-dependencies) | An existing toolchain or a development setup |
+
+## Binary archives
+
+Download the Linux x86-64 `sycl-nvidia`, `sycl-amd`, or `sycl-intel` archive
+and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
+Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
+`./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
+add that `bin` directory to `PATH` to run the CLI elsewhere.
+
+These archives target glibc 2.39+ (Ubuntu 24.04 or a compatible system), an
+x86-64 CPU with AES, SSSE3, and SSE4.1, and a compatible GPU driver. On Ubuntu,
+install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
+and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, and one GPU
+backend. No development toolkit is needed. Mixed-vendor builds use the
+source or container instructions below.
+
+The NVIDIA bundle uses CUDA 12.9.1; driver 575.57.08+ is recommended. The AMD
+bundle uses ROCm 6.2 and supports hardware covered by that runtime. The Intel
+bundle uses Level Zero and requires the Intel GPU compute driver. See
+[troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
+settings and the release notes for hardware qualification.
+
+`BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
+dependency notices. Releases without binary assets require a source build.
 
 ## Container
 

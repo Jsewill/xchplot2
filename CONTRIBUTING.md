@@ -243,6 +243,41 @@ When moving sections, update incoming links and keep the useful README
 entry headings. `docs/` is ignored local material; do not publish it as part
 of a documentation move.
 
+## Binary releases
+
+The release workflow builds one Linux archive per GPU vendor through the
+standalone CMake executable and CPack. Build images pin Ubuntu 24.04,
+AdaptiveCpp 25.10, and Rust 1.98.1. NVIDIA uses CUDA 12.9.1 and LLVM 20;
+AMD follows the existing ROCm 6.2 / LLVM 18 pairing; Intel uses LLVM 20 and
+Level Zero. Keep `INSTALL.md` and the archive README in sync with these pins.
+
+For example, build the Intel archive locally:
+
+```bash
+podman build -t xchplot2-release-intel -f ci/release/Containerfile ci/release
+podman run --rm -v "$PWD:/src" xchplot2-release-intel bash scripts/build-release.sh
+```
+
+Use the workflow's build arguments for AMD or NVIDIA. Artifacts are written
+to `build/release-VENDOR/dist/`. `acpp --acpp-deploy` collects runtime and
+JIT dependencies; the build script adds Level Zero, checks the selected
+backend, collects license notices, and makes library paths relative.
+
+PR and manual runs retain workflow artifacts. A `vVERSION` tag creates a
+draft GitHub release; publish it after qualifying the extracted archives on
+the supported GPUs. Do not rebuild between qualification and publication.
+The workflow checks extraction, the packaged SYCL JIT through `hellosycl`,
+CPU plotting, and full proofs in an image without development toolchains.
+
+Run `scripts/test/release.py ARCHIVE.tar.gz` for the archive and CPU checks.
+Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test the JIT.
+For GPU qualification, use the extracted executable for the k=22/k=28 byte
+comparisons, full proofs, tiers, spill, and recovery checks described above.
+`gpu-ci.py --binary /path/to/extracted/bin/xchplot2` retains the matching
+build's parity and inventory tools. Build and package must have the same
+source revision and toolchain. Record qualification in release notes; keep
+plots and detailed logs out of the tree.
+
 ## Commit style
 
 Short imperative subjects, lowercase scope prefix, no trailing period:

@@ -1,0 +1,92 @@
+name: Binary release
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - CMakeLists.txt
+      - cmake/**
+      - ci/release/**
+      - keygen-rs/**
+      - src/**
+      - tools/**
+      - contrib/**
+      - scripts/build-release.sh
+      - scripts/test/release.py
+  push:
+    tags: ['v*', '!v*-cuda-only']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-sycl:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: nvidia
+            image: docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
+            llvm: 20
+          - gpu: amd
+            image: docker.io/rocm/dev-ubuntu-24.04:6.2-complete
+            llvm: 18
+          - gpu: intel
+            image: docker.io/library/ubuntu:24.04
+            llvm: 20
+    env:
+      RELEASE_GPU: ${{ matrix.gpu }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build release image
+        run: |
+          docker build -t xchplot2-release -f ci/release/Containerfile ci/release \
+            --build-arg GPU="$RELEASE_GPU" \
+            --build-arg LLVM_VERSION='${{ matrix.llvm }}' \
+            --build-arg BASE_DEVEL='${{ matrix.image }}'
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          docker run --rm -e RELEASE_TAG -v "$PWD:/src" xchplot2-release \
+            bash scripts/build-release.sh
+      - name: Check the extracted runtime and CPU proofs
+        run: |
+          docker run --rm -e RELEASE_GPU -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD:/src:ro" -w /src ubuntu:24.04 bash -euc '
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              python3 libstdc++6 libnuma1 libelf1t64 libdrm2 libdrm-amdgpu1
+            python3 scripts/test/release.py build/release-"$RELEASE_GPU"/dist/*.tar.gz \
+              --sycl-probe build/release-"$RELEASE_GPU"/tools/sanity/hellosycl
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-sycl-${{ matrix.gpu }}
+          path: |
+            build/release-${{ matrix.gpu }}/dist/*.tar.gz
+            build/release-${{ matrix.gpu }}/dist/*.sha256
+          if-no-files-found: error
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: linux-sycl
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-x86_64-sycl-*
+          merge-multiple: true
+          path: dist
+      - name: Attach archives to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --draft --title "$RELEASE_TAG" --generate-notes

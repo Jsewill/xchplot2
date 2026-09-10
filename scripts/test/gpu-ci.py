@@ -64,6 +64,7 @@ def tier_caps(info, physical_mib=0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build", type=Path)
+    parser.add_argument("--binary", type=Path, help="Test an extracted release executable")
     parser.add_argument("--backend", choices=MASKS, required=True)
     parser.add_argument("--suite", choices=("quick", "vram", "physical"), default="quick")
     parser.add_argument("--physical-vram-mib", type=int, default=0)
@@ -80,7 +81,7 @@ def main():
     if not scratch.is_dir():
         parser.error("--scratch must be an existing directory on real disk")
     env["TMPDIR"] = str(scratch)
-    binary = build / "tools/xchplot2/xchplot2"
+    binary = args.binary.resolve() if args.binary else build / "tools/xchplot2/xchplot2"
 
     def run(label, command, run_env=None, cwd=None):
         print(f"Running {label}", flush=True)

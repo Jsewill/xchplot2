@@ -1,0 +1,54 @@
+# Build tools for the relocatable SYCL archives. See the release workflow for bases.
+ARG BASE_DEVEL=docker.io/library/ubuntu:24.04
+FROM ${BASE_DEVEL}
+ARG GPU=intel
+ARG LLVM_VERSION=20
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git ninja-build cmake python3 patchelf \
+        libboost-context-dev libnuma-dev llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev clang-${LLVM_VERSION} \
+        libclang-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION}-dev lld-${LLVM_VERSION} \
+        libomp-${LLVM_VERSION}-dev libclang-rt-${LLVM_VERSION}-dev \
+    && if [ "$GPU" = intel ]; then apt-get install -y --no-install-recommends libze-dev; fi \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-all-errors \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --default-toolchain 1.98.1 --profile minimal \
+    && rm /tmp/rustup-init.sh
+ENV PATH=/root/.cargo/bin:/opt/adaptivecpp/bin:${PATH}
+RUN cargo install --locked --features cli cargo-about --version 0.9.2
+RUN git clone --depth 1 --branch v25.10.0 \
+        https://github.com/AdaptiveCpp/AdaptiveCpp.git /tmp/acpp-src \
+    && case "$GPU" in \
+        nvidia) backend_flags='-DWITH_CUDA_BACKEND=ON -DWITH_ROCM_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda' ;; \
+        amd) backend_flags='-DWITH_CUDA_BACKEND=OFF -DWITH_ROCM_BACKEND=ON -DWITH_LEVEL_ZERO_BACKEND=OFF -DROCM_PATH=/opt/rocm -DROCM_DEVICE_LIBS_PATH=/opt/rocm/amdgcn/bitcode' ;; \
+        intel) backend_flags='-DWITH_CUDA_BACKEND=OFF -DWITH_ROCM_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=ON' ;; \
+        *) exit 1 ;; \
+       esac \
+    && cmake -S /tmp/acpp-src -B /tmp/acpp-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/adaptivecpp \
+        -DCMAKE_C_COMPILER=/usr/lib/llvm-${LLVM_VERSION}/bin/clang \
+        -DCMAKE_CXX_COMPILER=/usr/lib/llvm-${LLVM_VERSION}/bin/clang++ \
+        -DLLVM_DIR=/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/llvm \
+        -DClang_DIR=/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/clang \
+        -DACPP_LLD_PATH=/usr/lib/llvm-${LLVM_VERSION}/bin/ld.lld \
+        -DCLANG_INCLUDE_PATH=/usr/lib/llvm-${LLVM_VERSION}/lib/clang/${LLVM_VERSION} \
+        -DWITH_OPENCL_BACKEND=OFF -DACPP_SUBPROJECT_PARALLEL_JOBS=2 $backend_flags \
+    && cmake --build /tmp/acpp-build \
+    && cmake --install /tmp/acpp-build \
+    && mkdir -p /opt/release-licenses \
+    && cp /tmp/acpp-src/LICENSE /opt/release-licenses/adaptivecpp.txt \
+    && git -C /tmp/acpp-src rev-parse HEAD > /opt/release-licenses/adaptivecpp-revision.txt \
+    && if [ "$GPU" = intel ]; then \
+        cmake --build /tmp/acpp-build --target InstallLLVMSpirvTranslator \
+        && translator=$(find /tmp/acpp-build -type d -name LLVMSpirvTranslator) \
+        && cp "$translator/LICENSE.TXT" /opt/release-licenses/llvm-spirv.txt \
+        && git -C "$translator" rev-parse HEAD > /opt/release-licenses/llvm-spirv-revision.txt; \
+       fi \
+    && rm -rf /tmp/acpp-src /tmp/acpp-build
+RUN git config --system --add safe.directory /src
+ENV CMAKE_PREFIX_PATH=/opt/adaptivecpp
+ENV XCHPLOT2_RELEASE_GPU=${GPU}
+ENV XCHPLOT2_RELEASE_LLVM=${LLVM_VERSION}
+WORKDIR /src

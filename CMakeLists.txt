@@ -129,6 +129,7 @@ if(XCHPLOT2_BUILD_CUDA)
             foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
                 # Strip sm_ / compute_ prefixes some users pass through
                 string(REGEX REPLACE "^(sm_|compute_)" "" _a "${_a}")
+                string(REGEX REPLACE "-(real|virtual)$" "" _a "${_a}")
                 if(_a MATCHES "^[0-9]+$" AND _a LESS _min_arch)
                     set(_min_arch ${_a})
                 endif()
@@ -1785,3 +1786,9 @@ foreach(_target IN LISTS _xchplot2_targets)
         endif()
     endif()
 endforeach()
+
+# Archive packaging is opt-in; ordinary builds need no release tooling.
+option(XCHPLOT2_PACKAGE "Configure binary release packaging" OFF)
+if(XCHPLOT2_PACKAGE)
+    include(cmake/Packaging.cmake)
+endif()

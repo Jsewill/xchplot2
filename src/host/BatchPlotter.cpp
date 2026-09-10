@@ -3403,7 +3403,6 @@ BatchStrategy select_strategy(
         return BatchStrategy::WorkQueue;
     }
 
-    std::uint64_t const tiny_peak  = streaming_tiny_peak_bytes(inputs.k);
     std::uint64_t       min_vram   = UINT64_MAX;
     int                 min_dev    = -1;
     for (int id : inputs.device_ids) {
@@ -3419,6 +3418,7 @@ BatchStrategy select_strategy(
         return BatchStrategy::WorkQueue;
     }
 
+    std::uint64_t const tiny_peak = streaming_tiny_peak_bytes(inputs.k);
     if (min_vram < tiny_peak) {
         if (reason_out) {
             *reason_out =
