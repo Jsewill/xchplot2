@@ -237,10 +237,16 @@ void TempFile::preallocate(std::uint64_t bytes)
     if (bytes > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
         throw std::runtime_error("TempFile::preallocate: size exceeds the file offset range");
     HANDLE const file = reinterpret_cast<HANDLE>(::_get_osfhandle(fd_));
+    FILE_STANDARD_INFO current{};
+    if (!::GetFileInformationByHandleEx(file, FileStandardInfo, &current, sizeof(current)))
+        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                               "TempFile::preallocate: " + path_);
+    // FileAllocationInfo can truncate EOF. Reservation must preserve existing data.
     FILE_ALLOCATION_INFO allocation{};
-    allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(bytes);
+    allocation.AllocationSize.QuadPart = std::max({static_cast<LONGLONG>(bytes),
+        current.AllocationSize.QuadPart, current.EndOfFile.QuadPart});
     FILE_END_OF_FILE_INFO end{};
-    end.EndOfFile.QuadPart = static_cast<LONGLONG>(bytes);
+    end.EndOfFile.QuadPart = std::max(static_cast<LONGLONG>(bytes), current.EndOfFile.QuadPart);
     if (!::SetFileInformationByHandle(file, FileAllocationInfo, &allocation, sizeof(allocation))
         || !::SetFileInformationByHandle(file, FileEndOfFileInfo, &end, sizeof(end)))
         throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),

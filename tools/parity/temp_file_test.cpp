@@ -236,6 +236,11 @@ int main()
         f.pread_at(1u << 20, &r, sizeof(r));
         all_ok = check(r == w, "preallocate: round-trip still works") && all_ok;
 
+        f.preallocate(512u << 10);
+        r = 0;
+        f.pread_at(1u << 20, &r, sizeof(r));
+        all_ok = check(r == w, "preallocate: smaller reservation preserves existing data") && all_ok;
+
         // Zero is a no-op, not an error.
         f.preallocate(0);
         all_ok = check(true, "preallocate: zero bytes is a no-op") && all_ok;
