@@ -406,3 +406,36 @@ Native Windows plotting is outside the current hardware test set.
 Native Windows SYCL is not supported by the current `main` build. Its
 AdaptiveCpp setup and host code require Linux/POSIX facilities; the earlier
 unvalidated source-build outline was not a tested installation path.
+
+### Native AMD and Intel evaluation
+
+The Linux archives pin AdaptiveCpp 25.10. Its
+[installation guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/doc/installing.md)
+describes Windows CPU/CUDA support through an LLVM-integrated build using
+LLVM 18 or newer. Its
+[Windows build workflow](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/.github/workflows/windows-acppllvm.yml)
+tests that CUDA toolchain. This does not establish Windows HIP or Level Zero
+support for xchplot2. Nightly binaries from `develop` are a separate toolchain
+candidate, not the pinned release compiler.
+
+| Backend | Work required before a native Windows release |
+|---|---|
+| AMD HIP | Qualify an AdaptiveCpp Windows build with the selected HIP SDK and GPU; port the driver-backed `hipMemGetInfo` query and package the matching redistributable runtime. |
+| Intel | Qualify Level Zero or OpenCL with the Windows driver, including device/shared allocations, integer atomics, sorting, and JIT compilation; provide a free-memory query for that backend. |
+
+AMD's [Windows HIP SDK component matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)
+differs from Linux ROCm. A Linux ROCm installation or a successful Linux
+archive build does not qualify the corresponding Windows combination.
+
+The project's HIP and Level Zero probes in `src/host/GpuBufferPool.cpp`
+currently use POSIX dynamic loading and are excluded on Windows. OpenCL has
+no free-memory probe. Admission deliberately rejects an unverified GPU
+budget; reporting device capacity as free memory would weaken that check.
+The native CUDA host/file port also needs to be carried into the SYCL build,
+with a matching MSVC/Rust runtime and Windows DLL deployment.
+
+Before adding a Windows SYCL archive, run the existing allocation and kernel
+parity checks, then k=22/k=28 CPU byte comparisons, full proofs, every fitting
+tier and disk-spill variant, memory-pressure rejection, cancellation, and
+recovery using the extracted package on Windows hardware. A native Windows
+AMD/Intel compiler build and GPU run have not yet been qualified.
