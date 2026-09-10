@@ -239,7 +239,7 @@ rustup toolchain install 1.98.1 --profile minimal
 rustup default 1.98.1
 cargo install --locked --features cli cargo-about --version 0.9.2
 ./scripts/build-release.ps1
-python scripts/test/release.py build/release-windows/dist/xchplot2-0.11.0-windows-x86_64-cuda.zip
+python scripts/test/release.py build/release-windows/dist/xchplot2-0.12.0-windows-x86_64-cuda.zip
 ```
 
 The PowerShell script loads the Visual Studio 2022 x64 environment when
