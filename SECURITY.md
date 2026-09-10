@@ -15,7 +15,7 @@ xchplot2 is a client-side plot builder. It handles:
   or reused seed lets an attacker who observes plot IDs correlate
   plots to the same master key.
 - BLS key parsing via the
-  [`chia` Rust crate](https://crates.io/crates/chia) through
+  [`chia-bls` Rust crate](https://crates.io/crates/chia-bls) through
   `keygen-rs`.
 - Per-plot private keys, included in plot memos and saved job manifests.
 - Large file writes into caller-supplied output directories.

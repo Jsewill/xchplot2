@@ -287,9 +287,8 @@ Toolchain prerequisites for the NVIDIA build:
   link, plus C++20 CUDA dialect, both require 12.0).
 - **CMake ≥ 3.26** for nvcc 12.5+ (Debian 12's stock 3.25 doesn't know
   the dialect flags; install Kitware's repo).
-- **rustc ≥ 1.85** (rustup `stable`). Distro-packaged Rust (Ubuntu
-  24.04 apt cargo is 1.75) is too old for the `edition2024` feature
-  required by `chia-client` 0.42.
+- **Rust via rustup `stable`**. Release builds use Rust 1.98.1.
+  Older distro-packaged Rust may not support the locked dependencies.
 
 ### NVIDIA dependency sources
 
