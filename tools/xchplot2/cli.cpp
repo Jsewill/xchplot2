@@ -45,6 +45,8 @@
 #include <vector>
 
 #ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
 #include <process.h>
 #include <io.h>
 #else
@@ -151,7 +153,7 @@ void print_usage(char const* prog)
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
         << "                                      entropy. Per-plot seed = SHA256(seed || i).\n"
         << "                                      Reproducible across runs. Defaults to\n"
-        << "                                      fresh /dev/urandom per plot.\n"
+        << "                                      a fresh random seed per plot.\n"
         << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
         << "    -q, --quiet                     : suppress info-level stderr output\n"
@@ -328,15 +330,22 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
     return true;
 }
 
-// Read exactly `n` bytes of entropy from /dev/urandom. Throws on failure.
-void read_urandom(uint8_t* out, size_t n)
+// Read exactly `n` bytes from the OS cryptographic RNG. Throws on failure.
+void read_random_bytes(uint8_t* out, size_t n)
 {
+#ifdef _WIN32
+    if (n > MAXULONG) throw std::invalid_argument("entropy request exceeds the Windows buffer limit");
+    auto const status = ::BCryptGenRandom(nullptr, out, static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status != 0)
+        throw std::runtime_error("BCryptGenRandom failed: " + std::to_string(status));
+#else
     std::ifstream f("/dev/urandom", std::ios::binary);
     if (!f) throw std::runtime_error("cannot open /dev/urandom");
     f.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
     if (f.gcount() != static_cast<std::streamsize>(n)) {
         throw std::runtime_error("short read from /dev/urandom");
     }
+#endif
 }
 
 // Parse a --devices value into BatchOptions.
@@ -1148,7 +1157,7 @@ std::vector<pos2gpu::BatchEntry> build_bench_entries(
         e.plot_index = 0;
         e.meta_group = 0;
         e.testnet = testnet;
-        read_urandom(e.plot_id.data(), e.plot_id.size());
+        read_random_bytes(e.plot_id.data(), e.plot_id.size());
         e.out_dir = out_dir;
         e.out_name = "bench-" + bytes_to_hex(e.plot_id) + ".plot2";
         entries.push_back(std::move(e));
@@ -2361,7 +2370,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         return 2;
                     }
                 } else {
-                    read_urandom(seed, sizeof(seed));
+                    read_random_bytes(seed, sizeof(seed));
                 }
 
                 uint8_t plot_id[32];

@@ -41,6 +41,20 @@ int main()
     bool all_ok = true;
     std::string const temp = std::filesystem::temp_directory_path().string();
 
+#ifdef _WIN32
+    {
+        auto path = std::filesystem::absolute(temp).wstring();
+        if (!path.starts_with(L"\\\\?\\"))
+            path = path.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + path.substr(2) : L"\\\\?\\" + path;
+        pos2gpu::TempFile file(std::filesystem::path(path).string());
+        std::uint64_t const expected = 12345;
+        file.pwrite_at(0, &expected, sizeof(expected));
+        std::uint64_t actual = 0;
+        file.pread_at(0, &actual, sizeof(actual));
+        all_ok = check(actual == expected, "extended Windows temp directory path") && all_ok;
+    }
+#endif
+
     // Test 1: basic open + write + read round-trip.
     {
         pos2gpu::TempFile tf;

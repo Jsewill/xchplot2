@@ -683,7 +683,7 @@ foreach(_target IN LISTS _xchplot2_targets)
     get_target_property(_type ${_target} TYPE)
     if(WIN32 AND _type STREQUAL "EXECUTABLE")
         target_sources(${_target} PRIVATE tools/xchplot2/windows.manifest)
-        target_link_libraries(${_target} PRIVATE advapi32)
+        target_link_libraries(${_target} PRIVATE advapi32 bcrypt)
     endif()
     if(_target MATCHES "(_parity|_test)$")
         set_target_properties(${_target} PROPERTIES

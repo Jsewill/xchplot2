@@ -20,6 +20,9 @@ xchplot2 is a client-side plot builder. It handles:
 - Per-plot private keys, included in plot memos and saved job manifests.
 - Large file writes into caller-supplied output directories.
 
+Without `--seed`, plot seeds come from the operating system's cryptographic
+RNG: `/dev/urandom` on Linux and `BCryptGenRandom` on Windows.
+
 `plot` saves identities before starting, including for unseeded jobs. The
 `xchplot2-job-*.tsv` files contain the memo and its private plot key material;
 they are intended persistent recovery data. `--manifest` selects another

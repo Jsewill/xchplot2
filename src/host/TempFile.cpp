@@ -137,8 +137,12 @@ void TempFile::bump_high_water(std::uint64_t end) noexcept
 TempFile::TempFile(std::string_view dir)
 {
     std::string base = resolve_dir(dir);
+#ifdef _WIN32
+    std::string templ = (std::filesystem::path(base) / "xchplot2-spill-XXXXXX").string();
+#else
     if (base.back() == '/') base.pop_back();
     std::string templ = base + "/xchplot2-spill-XXXXXX";
+#endif
     std::string buf(templ);
 #ifdef _WIN32
     fd_ = create_private_temp(buf, FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE);
