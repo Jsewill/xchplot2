@@ -1,0 +1,87 @@
+name: Windows SYCL toolchain
+
+on:
+  push:
+    branches: [feature/windows-sycl]
+    paths:
+      - .github/workflows/windows-sycl.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  toolchain:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - name: Install CUDA 12.9.1
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe' -OutFile $installer
+          $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
+          "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
+      - uses: actions/cache@v6
+        id: toolchain
+        with:
+          path: build/windows-toolchain/install
+          key: windows-acpp25.10-llvm20.1.8-cuda12.9.1-v1
+      - name: Configure Visual Studio
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $visualStudio = & $vswhere -latest -version '[17.0,18.0)' -products '*' `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $visualStudio) { throw 'Visual Studio 2022 C++ build tools are required' }
+          $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvars64.bat'
+          cmd /c "call `"$vcvars`" >nul && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;" + $env:PATH
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
+          }
+          clang-cl --version
+      - name: Build AdaptiveCpp with LLVM
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git clone --depth 1 --branch llvmorg-20.1.8 https://github.com/llvm/llvm-project.git build/windows-toolchain/llvm
+          git clone --depth 1 --branch v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git build/windows-toolchain/acpp
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'build/windows-toolchain/install'
+          $acpp = Join-Path $env:GITHUB_WORKSPACE 'build/windows-toolchain/acpp'
+          cmake -S build/windows-toolchain/llvm/llvm -B build/windows-toolchain/build -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$prefix" `
+              -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+              '-DLLVM_TARGETS_TO_BUILD=X86;NVPTX' `
+              '-DLLVM_ENABLE_PROJECTS=clang;openmp;lld;compiler-rt' `
+              -DLLVM_PARALLEL_LINK_JOBS=1 -DLLVM_EXTERNAL_PROJECTS=AdaptiveCpp `
+              "-DLLVM_EXTERNAL_ADAPTIVECPP_SOURCE_DIR=$acpp" `
+              -DLLVM_ADAPTIVECPP_LINK_INTO_TOOLS=ON `
+              -DWITH_CUDA_BACKEND=ON -DWITH_ROCM_BACKEND=OFF `
+              -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF `
+              -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
+              -DLLVM_INCLUDE_TESTS=OFF
+          cmake --build build/windows-toolchain/build --target install --parallel 2
+          Copy-Item "$acpp/LICENSE" "$prefix/adaptivecpp-license.txt"
+          Copy-Item ci/release/adaptivecpp-third-party.txt $prefix
+          Copy-Item build/windows-toolchain/llvm/llvm/LICENSE.TXT "$prefix/llvm-license.txt"
+      - name: Run the existing SYCL kernel probe on the CPU backend
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'build/windows-toolchain/install'
+          $env:PATH = "$prefix/bin;" + $env:PATH
+          $env:ACPP_VISIBILITY_MASK = 'omp'
+          python "$prefix/bin/acpp" --acpp-targets=generic -std=c++20 `
+              tools/sanity/hellosycl.cpp -o build/windows-toolchain/hellosycl.exe
+          ./build/windows-toolchain/hellosycl.exe
