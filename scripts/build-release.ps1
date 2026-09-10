@@ -21,7 +21,14 @@ New-Item -ItemType Directory -Force $BuildDir | Out-Null
 $BuildDir = (Resolve-Path $BuildDir).Path
 $licenses = Join-Path $BuildDir 'licenses'
 New-Item -ItemType Directory -Force $licenses | Out-Null
-Copy-Item (Join-Path $env:CUDA_PATH 'EULA.txt') (Join-Path $licenses 'cuda.txt')
+# The minimal Windows installer omits the license; use the matching runtime archive.
+$cudart = Join-Path $BuildDir 'cuda-cudart.zip'
+Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip' -OutFile $cudart
+if ((Get-FileHash $cudart -Algorithm SHA256).Hash -ne '179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8') {
+    throw 'CUDA runtime archive checksum mismatch'
+}
+Expand-Archive $cudart -DestinationPath (Join-Path $BuildDir 'cudart') -Force
+Copy-Item (Join-Path $BuildDir 'cudart/cuda_cudart-windows-x86_64-12.9.79-archive/LICENSE') (Join-Path $licenses 'cuda.txt')
 Invoke-WebRequest 'https://raw.githubusercontent.com/NVIDIA/cccl/v2.8.2/LICENSE' `
     -OutFile (Join-Path $licenses 'cuda-cccl.txt')
 $rustDocs = Join-Path (rustc --print sysroot) 'share/doc/rust'

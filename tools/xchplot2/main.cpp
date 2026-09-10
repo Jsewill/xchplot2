@@ -11,7 +11,12 @@
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
+    auto const code_page = ::GetConsoleOutputCP();
     ::SetConsoleOutputCP(CP_UTF8);
 #endif
-    return xchplot2_main(argc, argv);
+    int const result = xchplot2_main(argc, argv);
+#ifdef _WIN32
+    if (code_page) ::SetConsoleOutputCP(code_page);
+#endif
+    return result;
 }
