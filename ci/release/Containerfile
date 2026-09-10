@@ -47,6 +47,7 @@ RUN git clone --depth 1 --branch v25.10.0 \
         && git -C "$translator" rev-parse HEAD > /opt/release-licenses/llvm-spirv-revision.txt; \
        fi \
     && rm -rf /tmp/acpp-src /tmp/acpp-build
+COPY adaptivecpp-third-party.txt /opt/release-licenses/
 RUN git config --system --add safe.directory /src
 ENV CMAKE_PREFIX_PATH=/opt/adaptivecpp
 ENV XCHPLOT2_RELEASE_GPU=${GPU}
