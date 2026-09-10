@@ -981,8 +981,8 @@ namespace {
 //
 // Baseline set at 256 MB at k=28 (a touch over CUB's typical scratch
 // on sm_89 to keep headroom on NVIDIA cards near the threshold) and
-// scaled 2× per +k step (linear in cap, matching how CUB's actual
-// DeviceRadixSort scratch grows). The returned adjustment is
+// scaled by match capacity (including overflow), matching how CUB's actual
+// DeviceRadixSort scratch grows. The returned adjustment is
 // `max(0, runtime_sort_scratch - baseline)`, so NVIDIA hosts whose
 // runtime scratch is at or below the baseline see no change in
 // predicted peak.
@@ -1010,10 +1010,8 @@ inline size_t streaming_sort_scratch_adjustment(int k)
         cap_for_k, 0, 2 * k, q);
     size_t const actual = std::max(s_pairs, s_keys);
 
-    int const dk = k - 28;
-    size_t baseline = cub_baseline_at_k28_bytes;
-    if (dk > 0)      baseline <<= dk;
-    else if (dk < 0) baseline >>= -dk;
+    size_t const baseline = (cub_baseline_at_k28_bytes >> 20) * cap_for_k
+        / (match_phase_capacity(28, 2) >> 20);
 
     return (actual > baseline) ? (actual - baseline) : 0;
 }
