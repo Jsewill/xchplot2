@@ -1,17 +1,16 @@
-// pos2_keygen — C-callable shim around chia (chia-bls + chia-protocol)
+// pos2_keygen — C-callable shim around chia-bls
 // that derives a v2 plot's plot_id and memo from caller-supplied farmer +
 // pool keys plus a 32-byte master-SK seed. The GPU plotter uses the returned
 // plot_id / memo to drive the existing batch path.
 //
 // The heavy lifting (BLS12-381 arithmetic, EIP-2333 HD derivation, Chia's
-// taproot construction, compute_plot_id_v2 hashing) lives in chia-rs; this
+// taproot construction) uses chia-rs; this
 // crate just sequences the calls and lays out the memo bytes the same way
 // chia-blockchain's create_v2_plots does, so the resulting plots are
 // byte-identical to `chia plots create --v2`.
 
-use chia::bls::{PublicKey, SecretKey};
-use chia::protocol::{compute_plot_id_v2, Bytes32};
-use chia::sha2::Sha256;
+use chia_bls::{PublicKey, SecretKey};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Result codes returned across the FFI boundary.
@@ -70,6 +69,27 @@ fn generate_plot_public_key(
     }
 }
 
+// Chia's protocol crate also requires the CLVM runtime. Keep only the plot-ID
+// encoding here and compare it with that crate in tests. Integers in Chia's
+// streamable format are big-endian, unlike the subseed index below.
+fn compute_plot_id_v2(
+    strength: u8,
+    plot_pk: &PublicKey,
+    pool_key: &[u8],
+    plot_index: u16,
+    meta_group: u8,
+) -> [u8; 32] {
+    let mut group = Sha256::new();
+    group.update([strength]);
+    group.update(plot_pk.to_bytes());
+    group.update(pool_key);
+    let mut id = Sha256::new();
+    id.update(group.finalize());
+    id.update(plot_index.to_be_bytes());
+    id.update([meta_group]);
+    id.finalize().into()
+}
+
 /// Derives a v2 plot's plot_id and memo from caller-supplied keys.
 ///
 /// Inputs:
@@ -126,45 +146,34 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
         Err(_) => return POS2_BAD_FARMER_PK,
     };
 
-    let (pool_pk_opt, pool_ph_opt, pool_key_slice): (Option<PublicKey>, Option<Bytes32>, &[u8]) =
-        match pool_kind {
-            x if x == POS2_POOL_PK => {
-                let bytes: &[u8; 48] = match unsafe { (pool_key_ptr as *const [u8; 48]).as_ref() } {
-                    Some(b) => b,
-                    None => return POS2_BAD_POOL_KEY,
-                };
-                let pk = match PublicKey::from_bytes(bytes) {
-                    Ok(pk) => pk,
-                    Err(_) => return POS2_BAD_POOL_KEY,
-                };
-                (Some(pk), None, &bytes[..])
+    let (include_taproot, pool_key_slice): (bool, &[u8]) = match pool_kind {
+        x if x == POS2_POOL_PK => {
+            let bytes: &[u8; 48] = match unsafe { (pool_key_ptr as *const [u8; 48]).as_ref() } {
+                Some(b) => b,
+                None => return POS2_BAD_POOL_KEY,
+            };
+            if PublicKey::from_bytes(bytes).is_err() {
+                return POS2_BAD_POOL_KEY;
             }
-            x if x == POS2_POOL_PH => {
-                let bytes: &[u8; 32] = match unsafe { (pool_key_ptr as *const [u8; 32]).as_ref() } {
-                    Some(b) => b,
-                    None => return POS2_BAD_POOL_KEY,
-                };
-                let ph: Bytes32 = (*bytes).into();
-                (None, Some(ph), &bytes[..])
-            }
-            _ => return POS2_BAD_POOL_KIND,
-        };
+            (false, &bytes[..])
+        }
+        x if x == POS2_POOL_PH => {
+            let bytes: &[u8; 32] = match unsafe { (pool_key_ptr as *const [u8; 32]).as_ref() } {
+                Some(b) => b,
+                None => return POS2_BAD_POOL_KEY,
+            };
+            (true, &bytes[..])
+        }
+        _ => return POS2_BAD_POOL_KIND,
+    };
 
     let master_sk = SecretKey::from_seed(seed);
     let local_sk = master_sk_to_local_sk(&master_sk);
     let local_pk = local_sk.public_key();
 
-    let include_taproot = pool_ph_opt.is_some();
     let plot_pk = generate_plot_public_key(&local_pk, &farmer_pk, include_taproot);
 
-    let plot_id: Bytes32 = compute_plot_id_v2(
-        strength,
-        &plot_pk,
-        pool_pk_opt.as_ref(),
-        pool_ph_opt.as_ref(),
-        plot_index,
-        meta_group,
-    );
+    let plot_id = compute_plot_id_v2(strength, &plot_pk, pool_key_slice, plot_index, meta_group);
 
     let master_sk_bytes = master_sk.to_bytes();
     let memo_len = pool_key_slice.len() + 48 /* farmer_pk */ + master_sk_bytes.len();
@@ -176,7 +185,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     }
 
     unsafe {
-        std::ptr::copy_nonoverlapping(plot_id.as_ref().as_ptr(), out_plot_id, 32);
+        std::ptr::copy_nonoverlapping(plot_id.as_ptr(), out_plot_id, 32);
         let dst = out_memo_buf;
         std::ptr::copy_nonoverlapping(pool_key_slice.as_ptr(), dst, pool_key_slice.len());
         std::ptr::copy_nonoverlapping(farmer_pk_bytes.as_ptr(), dst.add(pool_key_slice.len()), 48);
@@ -244,7 +253,6 @@ pub unsafe extern "C" fn pos2_keygen_derive_subseed(
     idx: u64,
     out_seed: *mut u8, // 32 bytes
 ) -> i32 {
-    use sha2::{Digest, Sha256};
     if base_seed.is_null() || out_seed.is_null() {
         return POS2_BAD_SEED;
     }
@@ -262,6 +270,35 @@ pub unsafe extern "C" fn pos2_keygen_derive_subseed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plot_ids_match_chia_protocol() {
+        let plot_pk = SecretKey::from_seed(&[0x11; 32]).public_key();
+        let pool_pk = SecretKey::from_seed(&[0x22; 32]).public_key();
+        let contract = chia_protocol::Bytes32::new([0x33; 32]);
+        for strength in [1, 2, 32, 63] {
+            for index in [0, 1, 255, 256, u16::MAX] {
+                for group in [0, 1, u8::MAX] {
+                    for pool in [false, true] {
+                        let bytes = pool_pk.to_bytes();
+                        let key: &[u8] = if pool { &bytes } else { contract.as_ref() };
+                        let expected = chia_protocol::compute_plot_id_v2(
+                            strength,
+                            &plot_pk,
+                            pool.then_some(&pool_pk),
+                            (!pool).then_some(&contract),
+                            index,
+                            group,
+                        );
+                        assert_eq!(
+                            compute_plot_id_v2(strength, &plot_pk, key, index, group),
+                            expected.to_bytes()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Same inputs must produce identical plot_id + memo.
     #[test]
