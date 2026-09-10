@@ -31,6 +31,10 @@ file(WRITE "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
     "CUDA: ${CMAKE_CUDA_COMPILER_VERSION}\n"
     "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}\n"
     "Rust: ${_release_rust}\n")
+if(_cccl_patch_applied)
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "CCCL: contrib/cccl-windows-ptx.patch applied to toolkit headers\n")
+endif()
 
 install(TARGETS xchplot2 RUNTIME DESTINATION bin)
 install(FILES "${CMAKE_BINARY_DIR}/BUILDINFO.txt" DESTINATION .)

@@ -292,6 +292,33 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# CCCL 2.x uses long2 for 64-bit PTX operands; Windows long is only 32 bits.
+# Backport NVIDIA's fix to a build-local header, as with the solver below.
+if(WIN32)
+    set(_cccl_header_name "cuda/__ptx/instructions/generated/clusterlaunchcontrol.h")
+    find_file(_cccl_header "${_cccl_header_name}"
+        PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH NO_CACHE)
+    if(_cccl_header)
+        file(READ "${_cccl_header}" _cccl_text)
+        if(_cccl_text MATCHES "reinterpret_cast<long2")
+            message(STATUS "Applying CCCL Windows PTX operand fix")
+            set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-windows")
+            configure_file("${_cccl_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch"
+                WORKING_DIRECTORY "${_cccl_dir}"
+                RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
+            if(NOT _cccl_patch_result EQUAL 0)
+                message(FATAL_ERROR "CCCL Windows PTX patch failed: ${_cccl_patch_error}")
+            endif()
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch")
+            include_directories(BEFORE "${_cccl_dir}")
+            set(_cccl_patch_applied TRUE)
+        endif()
+    endif()
+endif()
 execute_process(
     COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"

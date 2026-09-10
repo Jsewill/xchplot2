@@ -249,6 +249,10 @@ Windows check also exercises Unicode paths, real key generation, Ctrl-Break,
 resume, and publication failure. CI runs it with toolkit libraries removed
 from `PATH`. Windows GPU plotting and spill behavior need qualification on
 Windows hardware before the archive is advertised for those devices.
+For affected CUDA 12.x headers, CMake applies NVIDIA's
+[64-bit PTX operand fix](https://github.com/NVIDIA/cccl/commit/270f4100dceeb6345f74fd374695e78bb0a48082)
+to a build-local copy; `BUILDINFO.txt` records the backport. The installed
+toolkit stays intact.
 
 PR and manual runs retain both platforms' archives as workflow artifacts. Pushing a
 `vVERSION-cuda-only` tag creates a draft GitHub release; publish it after
