@@ -44,12 +44,11 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>  // isatty — progress defaults to on for interactive runs
-
 #ifdef _WIN32
 #include <process.h>
 #include <io.h>
 #else
+#include <unistd.h>  // isatty — progress defaults to on for interactive runs
 #include <spawn.h>
 #include <sys/wait.h>
 extern char** environ;
@@ -99,7 +98,11 @@ int run_parity_test(std::string const& path, std::FILE* log)
 bool resolve_progress(int tri, bool quiet)
 {
     if (tri >= 0) return tri != 0;
+#ifdef _WIN32
+    return !quiet && ::_isatty(::_fileno(stderr)) != 0;
+#else
     return !quiet && ::isatty(::fileno(stderr)) != 0;
+#endif
 }
 
 void print_usage(char const* prog)
@@ -263,7 +266,11 @@ void print_usage(char const* prog)
         << "\n"
         << "  Reusable options:\n"
         << "    --config FILE  load settings from named command sections. Default:\n"
+#ifdef _WIN32
+        << "                   %APPDATA%/xchplot2/config.toml\n"
+#else
         << "                   $HOME/.config/xchplot2/config.toml\n"
+#endif
         << "    @FILE          insert whitespace-separated arguments (no shell quoting).\n"
         << "\n"
         << "  test-mode positional args:\n"
@@ -1207,6 +1214,9 @@ std::vector<std::string> expand_argfiles(int argc, char* argv[])
     std::vector<std::string> out;
     out.reserve(argc);
     char const* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = std::getenv("USERPROFILE");
+#endif
     auto resolve_path = [&](std::string p) -> std::string {
         if (home && p.size() >= 2 && p[0] == '~' && p[1] == '/') {
             return std::string(home) + p.substr(1);
@@ -1273,12 +1283,19 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         strip_argc = static_cast<int>(argv_stripped.size());
     }
     if (config_path.empty()) {
+#ifdef _WIN32
+        if (char const* data = std::getenv("APPDATA")) {
+            auto const default_path = std::filesystem::path(data) / "xchplot2/config.toml";
+            if (std::filesystem::exists(default_path)) config_path = default_path.string();
+        }
+#else
         if (char const* home = std::getenv("HOME")) {
             std::string const default_path =
                 std::string(home) + "/.config/xchplot2/config.toml";
             std::ifstream probe(default_path);
             if (probe) config_path = default_path;
         }
+#endif
     }
     std::vector<std::string> config_tokens;
     if (!config_path.empty()) {
@@ -1606,7 +1623,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             // Fail the bench if a streaming tier outgrows the peak its floor is
             // derived from — the floors are only honest while that holds. Costs
             // nothing (no driver calls); setenv does not clobber an explicit 0.
+#ifdef _WIN32
+            if (!std::getenv("POS2GPU_ASSERT_VRAM")) ::_putenv_s("POS2GPU_ASSERT_VRAM", "1");
+#else
             setenv("POS2GPU_ASSERT_VRAM", "1", 0);
+#endif
 
             if (!opts.quiet) {
                 if (worker_count == 1) {
@@ -2006,7 +2027,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             for (auto const& entry :
                  std::filesystem::directory_iterator(dir, ec))
             {
-                auto const name = entry.path().filename().string();
+                auto name = entry.path().filename().string();
+#ifdef _WIN32
+                if (entry.path().extension() != ".exe") continue;
+                name = entry.path().stem().string();
+#endif
                 if ((has_suffix(name, "_parity") || has_suffix(name, "_test"))
                     && entry.is_regular_file(ec)) {
                     tests.push_back(entry.path());

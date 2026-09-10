@@ -34,7 +34,11 @@
 #include <vector>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -82,9 +86,17 @@ struct EngineWithThreads
     explicit EngineWithThreads(int threads)
     {
         std::string const n = std::to_string(threads);
+#ifdef _WIN32
+        ::_putenv_s("XCHPLOT2_SPILL_IO_THREADS", n.c_str());
+#else
         ::setenv("XCHPLOT2_SPILL_IO_THREADS", n.c_str(), 1);
+#endif
         eng = std::make_unique<pos2gpu::SpillEngine>(ops, /*quiet=*/true);
+#ifdef _WIN32
+        ::_putenv_s("XCHPLOT2_SPILL_IO_THREADS", "");
+#else
         ::unsetenv("XCHPLOT2_SPILL_IO_THREADS");
+#endif
     }
     pos2gpu::SpillEngine& operator*() { return *eng; }
 };
@@ -294,13 +306,22 @@ int main()
         auto const src = ramp(n, 0x66ull);
         SpillBuffer buf(*e, sizeof(std::uint64_t), n);
 
+#ifdef _WIN32
+        int const full = ::_open("NUL", _O_RDONLY | _O_BINARY);
+#else
         int const full = ::open("/dev/full", O_WRONLY);
+#endif
         bool threw = false;
         if (full < 0) {
             std::printf("SKIP  (no /dev/full) a failing part surfaces as an error\n");
         } else {
+#ifdef _WIN32
+            ::_dup2(full, buf.file.fd()); // writes fail on this read-only handle
+            ::_close(full);
+#else
             ::dup2(full, buf.file.fd());   // every pwrite now fails
             ::close(full);
+#endif
             try {
                 buf.write_from_device(src.data(), 0, n);
                 eng.drain();

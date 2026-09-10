@@ -10,13 +10,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <winioctl.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -31,6 +39,7 @@ bool check(bool cond, char const* what)
 int main()
 {
     bool all_ok = true;
+    std::string const temp = std::filesystem::temp_directory_path().string();
 
     // Test 1: basic open + write + read round-trip.
     {
@@ -92,11 +101,15 @@ int main()
 
     // Test 5: file is unlinked on construction (path no longer in dir).
     {
-        pos2gpu::TempFile tf;
-        std::string const p = tf.path();
-        struct stat st{};
-        bool const stat_fails = (::stat(p.c_str(), &st) != 0);
-        all_ok = check(stat_fails, "file unlinked on construction") && all_ok;
+        std::string path;
+        {
+            pos2gpu::TempFile tf;
+            path = tf.path();
+#ifndef _WIN32
+            all_ok = check(!std::filesystem::exists(path), "file unlinked on construction") && all_ok;
+#endif
+        }
+        all_ok = check(!std::filesystem::exists(path), "file removed on close") && all_ok;
     }
 
     // Test 6: move construction transfers fd; source has -1 fd.
@@ -115,13 +128,21 @@ int main()
 
     // Test 7: env-based dir resolution.
     {
-        ::setenv("XCHPLOT2_TEMP_DIR", "/tmp", 1);
+#ifdef _WIN32
+        ::_putenv_s("XCHPLOT2_TEMP_DIR", temp.c_str());
+#else
+        ::setenv("XCHPLOT2_TEMP_DIR", temp.c_str(), 1);
+#endif
         std::string const d = pos2gpu::TempFile::resolve_dir("");
-        all_ok = check(d == "/tmp", "resolve_dir uses XCHPLOT2_TEMP_DIR") && all_ok;
+        all_ok = check(d == temp, "resolve_dir uses XCHPLOT2_TEMP_DIR") && all_ok;
         std::string const explicit_d = pos2gpu::TempFile::resolve_dir("/var/tmp");
         all_ok = check(explicit_d == "/var/tmp",
                        "explicit dir overrides env") && all_ok;
+#ifdef _WIN32
+        ::_putenv_s("XCHPLOT2_TEMP_DIR", "");
+#else
         ::unsetenv("XCHPLOT2_TEMP_DIR");
+#endif
     }
 
     // Test 8: dir_problem — the spill guard's usability probe.
@@ -132,7 +153,7 @@ int main()
     // silently restore the original failure — a raw mkstemp errno thrown deep
     // in the pipeline, minutes into a batch.
     {
-        all_ok = check(pos2gpu::TempFile::dir_problem("/tmp").empty(),
+        all_ok = check(pos2gpu::TempFile::dir_problem(temp).empty(),
                        "dir_problem: usable dir reports no problem") && all_ok;
 
         std::string const missing =
@@ -142,6 +163,7 @@ int main()
 
         // Exists but not writable. Skipped as root, where write permission
         // is not enforced and the probe would (correctly) succeed.
+#ifndef _WIN32
         if (::geteuid() != 0) {
             char tmpl[] = "/tmp/xchplot2-ro-XXXXXX";
             if (char const* d = ::mkdtemp(tmpl); d) {
@@ -154,18 +176,15 @@ int main()
                 ::rmdir(d);
             }
         }
+#endif
 
         // The probe must not leave its own file behind — it creates one and
         // relies on TempFile unlinking at construction.
         {
-            char tmpl2[] = "/tmp/xchplot2-probe-XXXXXX";
-            if (char const* d = ::mkdtemp(tmpl2); d) {
-                (void) pos2gpu::TempFile::dir_problem(d);
-                bool const empty_after = (::rmdir(d) == 0);  // fails if non-empty
-                all_ok = check(empty_after,
-                               "dir_problem: leaves nothing behind") && all_ok;
-                ::rmdir(d);
-            }
+            auto const dir = std::filesystem::path(temp) / ("xchplot2-probe-" + std::to_string(std::random_device{}()));
+            all_ok = check(std::filesystem::create_directory(dir), "create probe directory") && all_ok;
+            (void) pos2gpu::TempFile::dir_problem(dir.string());
+            all_ok = check(std::filesystem::remove(dir), "dir_problem: leaves nothing behind") && all_ok;
         }
     }
 
@@ -179,6 +198,13 @@ int main()
     {
         pos2gpu::TempFile f;
         f.preallocate(4u << 20);           // 4 MiB
+#ifdef _WIN32
+        FILE_STANDARD_INFO st{};
+        bool const ok = ::GetFileInformationByHandleEx(
+            reinterpret_cast<HANDLE>(::_get_osfhandle(f.fd())), FileStandardInfo, &st, sizeof(st));
+        bool const reserved = st.EndOfFile.QuadPart == (4 << 20) && st.AllocationSize.QuadPart >= (4 << 20);
+        bool const noop = false;
+#else
         struct stat st {};
         bool const ok = (::fstat(f.fd(), &st) == 0);
         // fallocate reserves blocks AND extends i_size (no KEEP_SIZE), so on
@@ -190,6 +216,7 @@ int main()
         bool const reserved = (st.st_size == (4 << 20)) &&
                               (std::uint64_t(st.st_blocks) * 512 >= (4u << 20));
         bool const noop     = (st.st_size == 0) && (st.st_blocks == 0);
+#endif
         all_ok = check(ok && (reserved || noop),
                        "preallocate: reserves blocks, or is a clean no-op")
                  && all_ok;
@@ -217,13 +244,45 @@ int main()
         // free_space answers for a real dir, and returns the documented 0 for
         // one that cannot be probed. 0 means "unknown" to callers, so a bogus
         // path must not come back looking like a full disk.
-        std::uint64_t const here = pos2gpu::TempFile::free_space("/tmp");
-        all_ok = check(here > 0, "free_space: reports something for /tmp")
+        std::uint64_t const here = pos2gpu::TempFile::free_space(temp);
+        all_ok = check(here > 0, "free_space: reports something for the temp directory")
                  && all_ok;
         std::uint64_t const nowhere =
             pos2gpu::TempFile::free_space("/nonexistent-xchplot2-probe");
         all_ok = check(nowhere == 0, "free_space: unprobeable dir reports 0")
                  && all_ok;
+    }
+
+    {
+        pos2gpu::TempFile file;
+        auto* mapped = static_cast<std::uint64_t*>(file.map(16384));
+        mapped[1023] = 0x123456789abcdef0ULL;
+        bool refused = false;
+        try { file.map(4096); } catch (std::runtime_error const&) { refused = true; }
+        all_ok = check(refused, "second live mapping is rejected") && all_ok;
+        pos2gpu::TempFile moved(std::move(file));
+        moved.unmap();
+        std::uint64_t value = 0;
+        moved.pread_at(1023 * sizeof(value), &value, sizeof(value));
+        all_ok = check(value == 0x123456789abcdef0ULL, "mapping survives move and unmap") && all_ok;
+    }
+    {
+        pos2gpu::TempFile file;
+#ifdef _WIN32
+        // Avoid allocating a 4 GiB hole just to exercise OffsetHigh.
+        DWORD returned = 0;
+        HANDLE const handle = reinterpret_cast<HANDLE>(::_get_osfhandle(file.fd()));
+        OVERLAPPED operation{};
+        BOOL sparse = ::DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, &operation);
+        if (!sparse && ::GetLastError() == ERROR_IO_PENDING)
+            sparse = ::GetOverlappedResult(handle, &operation, &returned, TRUE);
+        all_ok = check(sparse, "sparse offset test file") && all_ok;
+#endif
+        std::uint64_t const offset = (std::uint64_t{1} << 32) + 8, expected = 12345;
+        file.pwrite_at(offset, &expected, sizeof(expected));
+        std::uint64_t actual = 0;
+        file.pread_at(offset, &actual, sizeof(actual));
+        all_ok = check(actual == expected && file.size() == offset + sizeof(expected), "64-bit positional I/O") && all_ok;
     }
 
     return all_ok ? 0 : 1;

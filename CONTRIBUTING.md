@@ -230,8 +230,27 @@ podman build -t xchplot2-release -f ci/release/Containerfile ci/release
 podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
 ```
 
-The archive and its SHA-256 checksum are written to `build/release/dist/`.
-PR and manual runs retain them as workflow artifacts. Pushing a
+The Linux archive and its SHA-256 checksum are written to `build/release/dist/`.
+For native Windows, install the [Windows build tools](INSTALL.md#windows)
+and PowerShell 7.3+, then run:
+
+```powershell
+rustup toolchain install 1.98.1 --profile minimal
+rustup default 1.98.1
+cargo install --locked --features cli cargo-about --version 0.9.2
+./scripts/build-release.ps1
+python scripts/test/release.py build/release-windows/dist/xchplot2-0.11.0-windows-x86_64-cuda.zip
+```
+
+The PowerShell script loads the Visual Studio 2022 x64 environment when
+needed, builds all targets with CUDA 12.9.1, runs the host CTest subset, and
+writes a ZIP and checksum to `build/release-windows/dist/`. The extracted
+Windows check also exercises Unicode paths, real key generation, Ctrl-Break,
+resume, and publication failure. CI runs it with toolkit libraries removed
+from `PATH`. Windows GPU plotting and spill behavior need qualification on
+Windows hardware before the archive is advertised for those devices.
+
+PR and manual runs retain both platforms' archives as workflow artifacts. Pushing a
 `vVERSION-cuda-only` tag creates a draft GitHub release; publish it after
 qualifying the extracted archive on the supported GPUs. Do not rebuild
 between qualification and publication.

@@ -125,7 +125,8 @@ Prefer the automatically saved manifest for recovery; see
 ## Configuration and argument files
 
 `--config FILE` loads a configuration file. Without it, xchplot2 looks for
-`$HOME/.config/xchplot2/config.toml`. The supported syntax is a small TOML
+`$HOME/.config/xchplot2/config.toml` on Linux or
+`%APPDATA%\xchplot2\config.toml` on Windows. The supported syntax is a small TOML
 subset: named sections and scalar `key = value` entries, with double-quoted
 strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
 are unsupported.

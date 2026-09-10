@@ -20,7 +20,9 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -59,11 +61,16 @@ int main(int argc, char** argv)
 {
     // Re-exec once with the guard enabled (see file header).
     if (argc < 2 || std::string(argv[1]) != "--armed") {
+#ifdef _WIN32
+        // No guard instance exists yet, so Windows can enable it in-process.
+        _putenv_s("XCHPLOT2_HOST_GUARD", "1");
+#else
         setenv("XCHPLOT2_HOST_GUARD", "1", 1);
         std::vector<char*> av{argv[0], const_cast<char*>("--armed"), nullptr};
         execv(argv[0], av.data());
         std::perror("execv");
         return 1;
+#endif
     }
 
     auto& g = pos2gpu::HostGuard::instance();

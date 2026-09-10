@@ -5,8 +5,10 @@ import hashlib
 import os
 import pathlib
 import subprocess
+import sys
 import tarfile
 import tempfile
+import zipfile
 
 
 def main():
@@ -19,10 +21,14 @@ def main():
             digest.update(block)
     checksum = pathlib.Path(str(args.archive) + ".sha256").read_text().split()
     assert checksum == [digest.hexdigest(), args.archive.name], "Archive checksum mismatch"
-    with tempfile.TemporaryDirectory(prefix="xchplot2-release-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="xchplot2 release é-") as temporary:
         work = pathlib.Path(temporary)
-        with tarfile.open(args.archive) as archive:
-            archive.extractall(work, filter="data")
+        if args.archive.suffix == ".zip":
+            with zipfile.ZipFile(args.archive) as archive:
+                archive.extractall(work)
+        else:
+            with tarfile.open(args.archive) as archive:
+                archive.extractall(work, filter="data")
         packages = list(work.iterdir())
         assert len(packages) == 1 and packages[0].is_dir(), "Expected one package directory"
         package = packages[0]
@@ -30,16 +36,20 @@ def main():
                      "licenses/pos2-chip.txt", "licenses/fse.txt", "licenses/aes.txt", "licenses/cuda.txt",
                      "licenses/cuda-cccl.txt", "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"
-        binary = package / "bin/xchplot2"
+        binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         plot_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"
         manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . cpu.plot2\n")
-        subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--config", os.devnull],
+        subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "2", "--config", os.devnull],
                        cwd=work, check=True, timeout=180)
         subprocess.run([binary, "verify", work / "cpu.plot2", "--full", "--trials", "100",
                         "--config", os.devnull],
                        check=True, timeout=180)
+        if os.name == "nt":
+            assert (package / "licenses/microsoft-runtime.txt").stat().st_size > 0
+            subprocess.run([sys.executable, pathlib.Path(__file__).with_name("windows.py"), binary],
+                           check=True, timeout=360)
         print("Release archive: extraction, CLI, CPU plotting, and full proofs passed")
 
 

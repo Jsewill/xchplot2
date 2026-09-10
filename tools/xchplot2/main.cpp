@@ -4,7 +4,14 @@
 
 #include "xchplot2_cli.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 int main(int argc, char* argv[])
 {
+#ifdef _WIN32
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
     return xchplot2_main(argc, argv);
 }

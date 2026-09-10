@@ -1,14 +1,16 @@
-// TempFile.hpp — POSIX-anonymous temp file with positional read/write.
+// TempFile.hpp — automatically removed temp file with positional read/write.
 //
 // Task #26 disk-fallback foundation. Self-contained primitive: opens a
 // unique-named file at construction (mkstemp), unlinks it immediately
 // so it disappears on process exit even on crash, and supports
 // thread-safe positional I/O via pread/pwrite.
+// Windows uses an exclusive, owner-only file with delete-on-close and
+// overlapped I/O offsets; the OS also removes it after process termination.
 //
 // Path resolution order (when caller passes empty `dir`):
 //   1. $XCHPLOT2_TEMP_DIR
 //   2. $TMPDIR
-//   3. /tmp
+//   3. /tmp on Linux; the system temporary directory on Windows
 //
 // The file is automatically removed when the TempFile destructor runs.
 // On crash the kernel reclaims the inode at process exit because the
@@ -31,7 +33,7 @@ namespace pos2gpu {
 class TempFile {
 public:
     // Open a fresh anonymous temp file. `dir` overrides the env-based
-    // resolution; pass empty to use $XCHPLOT2_TEMP_DIR / $TMPDIR / /tmp.
+    // resolution; pass empty to use the environment or platform default above.
     explicit TempFile(std::string_view dir = "");
     ~TempFile();
 
@@ -104,8 +106,8 @@ public:
         return high_water_.load(std::memory_order_relaxed);
     }
 
-    // Underlying file path (unlinked already; useful for diagnostics
-    // via /proc/<pid>/fd/<fd> on Linux).
+    // Underlying file path (already unlinked on Linux; delete-on-close on
+    // Windows). Useful for diagnostics via /proc/<pid>/fd/<fd> on Linux.
     std::string const& path() const noexcept { return path_; }
 
     int fd() const noexcept { return fd_; }

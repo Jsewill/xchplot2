@@ -11,20 +11,24 @@ cd xchplot2
 
 ## Binary archives
 
-Download the Linux x86-64 CUDA archive and its `.sha256` file from
+Download the Linux or Windows x86-64 CUDA archive and its `.sha256` file from
 [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
-Verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
+On Linux, verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
 with the downloaded filename without `.tar.gz`. Extract it, then run
 `./bin/xchplot2 devices` from the extracted directory. Add that `bin`
 directory to `PATH` to use `xchplot2` elsewhere.
 
-The archive requires glibc 2.35+, `libstdc++.so.6` with `GLIBCXX_3.4.30`
+The Linux archive requires glibc 2.35+, `libstdc++.so.6` with `GLIBCXX_3.4.30`
 (available on updated Ubuntu 22.04), and an x86-64 CPU with AES, SSSE3,
 and SSE4.1. It includes native GPU code for
 Maxwell through Blackwell and the CUDA runtime; no development toolkit is
 needed. Use a compatible NVIDIA driver; 575.57.08+ is recommended for the
 pinned CUDA 12.9.1 build. Compiled architecture coverage does not imply that
 every card has been tested. Check the release notes for hardware qualification.
+
+On Windows, compare `(Get-FileHash ARCHIVE.zip -Algorithm SHA256).Hash`
+with the first field in `ARCHIVE.zip.sha256`, then extract the ZIP and run
+`.\bin\xchplot2.exe devices`. See [Windows](#windows) for its requirements.
 
 Each archive includes `BUILDINFO.txt` with source and toolchain versions,
 and `licenses/` with dependency notices. Releases without an archive require
@@ -166,68 +170,41 @@ run` step won't see the GPU.
 
 ## Windows
 
-Native Windows builds and plotting are experimental and outside the current
-hardware test set. WSL2 uses the Linux build instructions.
+Native Windows uses the standalone CMake executable. The release ZIP targets
+Windows 10 22H2, Windows 11, and Windows Server 2022/2025 on x64. It links
+CUDA and the Microsoft C/C++ runtime statically. Runtime use requires a
+compatible NVIDIA driver (576.57+ recommended for CUDA 12.9.1) and an
+AES/SSSE3/SSE4.1-capable CPU, without installing a development toolkit.
 
-Prerequisites:
+Use NTFS or ReFS for plots, recovery manifests, and spill files. These files
+contain private keys; creation requires filesystem support for access control
+lists. Select spill storage with `--temp-dir`. The default configuration is
+`%APPDATA%\xchplot2\config.toml`. Ctrl-C or Ctrl-Break drains the current
+plots; a second signal aborts. Resume with the automatically saved manifest.
+Consult the release notes for tested hardware and drivers. Hosted Windows
+checks exercise the CPU path; GPU qualification requires Windows hardware.
+WSL2 continues to use the Linux instructions.
 
-- Windows 10 21H2+ or Windows 11, x64
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) Community
-  with the **"Desktop development with C++"** workload. That workload
-  bundles MSVC + the Windows SDK; the SDK is non-optional because it
-  ships `kernel32.lib` / `user32.lib` / etc. that `link.exe`
-  consumes. If you've trimmed the installer to "C++ build tools"
-  only, open **Visual Studio Installer → Modify → Individual
-  components** and tick the latest **Windows 11 SDK** before
-  retrying.
-- [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads) —
-  install **after** Visual Studio so the CUDA installer wires up the
-  MSBuild integration. 12.8+ required for RTX 50-series (Blackwell,
-  `sm_120`).
-- [Rust](https://www.rust-lang.org/tools/install) using the MSVC
-  toolchain (`rustup default stable-x86_64-pc-windows-msvc`)
-- [CMake 3.26+](https://cmake.org/download/) and [Git for
-  Windows](https://gitforwindows.org/)
+To build from source, install:
 
-Launch the **x64 Native Tools Command Prompt for VS 2022** from the
-Start menu — there are several similarly-named prompts (x86 /
-x86_64 / 2019 / 2022); the one that matters is the x64 for 2022.
-That prompt is the one that sets `LIB`, `INCLUDE`, and `PATH` so
-`cl.exe`, `link.exe`, `nvcc`, and `cmake` all see each other plus
-the Windows SDK. A plain `cmd` / PowerShell / Windows Terminal tab
-does **not** do this — running `cargo install` from one of those
-produces `LNK1181: cannot open input file 'kernel32.lib'` at the
-first link step.
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) C++ build tools
+  with the **Desktop development with C++** workload and Windows SDK.
+- [CUDA Toolkit 12.9.1](https://developer.nvidia.com/cuda-12-9-1-download-archive).
+- [Rust](https://www.rust-lang.org/tools/install) with the
+  `stable-x86_64-pc-windows-msvc` toolchain.
+- [CMake 3.26+](https://cmake.org/download/), Ninja, and
+  [Git for Windows](https://gitforwindows.org/).
 
-Quick sanity check in the prompt:
+In the **x64 Native Tools Command Prompt for VS 2022**, run:
 
 ```cmd
-where link.exe
-echo %LIB%
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build --parallel 2
+.\build\tools\xchplot2\xchplot2.exe --help
+ctest --test-dir build --output-on-failure
 ```
 
-`%LIB%` should include a `...\Windows Kits\10\Lib\...\um\x64`
-entry. If it doesn't, you're in the wrong prompt or the Windows SDK
-component isn't installed.
-
-Build:
-
-```cmd
-set CUDA_ARCHITECTURES=89
-cargo install --git https://github.com/Jsewill/xchplot2 --branch cuda-only --locked
-```
-
-Or for a local checkout you can iterate on:
-
-```cmd
-git clone -b cuda-only https://github.com/Jsewill/xchplot2
-cd xchplot2
-set CUDA_ARCHITECTURES=89
-cargo install --path . --locked
-```
-
-Set `CUDA_ARCHITECTURES` to match your card (see the list above).
-PowerShell users: use `$env:CUDA_ARCHITECTURES = "89"` instead of
-`set`. The CMake path (`cmake -B build -S . && cmake --build build`)
-also works inside the same Native Tools prompt if you prefer that over
-`cargo install`.
+Change `89` to your GPU architecture from the table above. The full CTest
+suite needs a GPU. Use the [release recipe](CONTRIBUTING.md#binary-releases)
+for the supported archive build and its host-only checks. Windows Cargo
+installation is not supported by this release path.

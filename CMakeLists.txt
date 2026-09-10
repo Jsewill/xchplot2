@@ -161,6 +161,14 @@ unset(_xchplot2_nvcc CACHE)
 
 project(pos2-gpu VERSION 0.11.0 LANGUAGES C CXX CUDA)
 
+if(MSVC)
+    # Match the release Rust staticlib's CRT in every CMake configuration.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+endif()
+
 # Default to Release: a plain `cmake -B build -S .` otherwise builds
 # with EMPTY optimization flags — host C++ (FSE compression, writer,
 # host-side merges) at -O0 silently runs several times slower while
@@ -269,6 +277,11 @@ message(STATUS "pos2-chip: ${POS2_CHIP_DIR}")
 # pos2-chip vendors FSE under lib/fse with its own CMakeLists.txt.
 # Bring it in so we can link against the same static lib pos2-chip uses.
 add_subdirectory("${POS2_CHIP_DIR}/lib/fse" "${CMAKE_BINARY_DIR}/fse" EXCLUDE_FROM_ALL)
+if(MSVC)
+    # Upstream's MSVC list has argumentless /wd, /we, and /D options.
+    # CMake already supplies the optimization and debug flags per configuration.
+    set_property(TARGET fse PROPERTY COMPILE_OPTIONS /W4)
+endif()
 
 # Header-only pos2-chip include surface
 # Keep the upstream checkout intact. Its solver treats a statistical candidate
@@ -296,7 +309,7 @@ target_include_directories(pos2_chip_headers INTERFACE
 )
 target_link_libraries(pos2_chip_headers INTERFACE fse)
 # Match pos2-chip's CPU AES build flags so its AesHash compiles in CPU TUs.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
@@ -393,7 +406,11 @@ target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
 # ----------------------------------------------------------------------------
 set(POS2_KEYGEN_CRATE_DIR "${CMAKE_SOURCE_DIR}/keygen-rs")
 set(POS2_KEYGEN_TARGET_DIR "${CMAKE_BINARY_DIR}/keygen-rs-target")
-set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/libpos2_keygen.a")
+set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}pos2_keygen${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(_pos2_keygen_env "CARGO_TARGET_DIR=${POS2_KEYGEN_TARGET_DIR}")
+if(MSVC)
+    list(APPEND _pos2_keygen_env "RUSTFLAGS=$ENV{RUSTFLAGS} -C target-feature=+crt-static")
+endif()
 
 # Collect the sources so CMake knows when to rebuild.
 file(GLOB_RECURSE POS2_KEYGEN_SRCS
@@ -405,7 +422,7 @@ file(GLOB_RECURSE POS2_KEYGEN_SRCS
 add_custom_command(
     OUTPUT "${POS2_KEYGEN_STATIC_LIB}"
     COMMAND ${CMAKE_COMMAND} -E env
-            CARGO_TARGET_DIR=${POS2_KEYGEN_TARGET_DIR}
+            ${_pos2_keygen_env}
             cargo build --release --locked --manifest-path=${POS2_KEYGEN_CRATE_DIR}/Cargo.toml
     DEPENDS ${POS2_KEYGEN_SRCS}
     WORKING_DIRECTORY "${POS2_KEYGEN_CRATE_DIR}"
@@ -424,6 +441,8 @@ add_dependencies(pos2_keygen pos2_keygen_build)
 # Rust staticlibs link in std, which needs these system libs at final link.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
+elseif(WIN32)
+    target_link_libraries(pos2_keygen INTERFACE ws2_32 userenv bcrypt ntdll advapi32)
 endif()
 
 # xchplot2_cli: the CLI dispatch logic as a static library, with the
@@ -470,8 +489,12 @@ add_executable(xchplot2 tools/xchplot2/main.cpp)
 # the resolutions before it sees the unresolved references and bails.
 # Cargo install already passes --start-group via build.rs; the cmake
 # exe needs the same treatment.
-target_link_libraries(xchplot2 PRIVATE
-    "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+if(MSVC)
+    target_link_libraries(xchplot2 PRIVATE xchplot2_cli pos2_gpu_host)
+else()
+    target_link_libraries(xchplot2 PRIVATE
+        "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+endif()
 # pos2-chip's soft_aesenc / soft_aesdec are defined (not just declared)
 # in headers without `inline`, so any TU that includes the chain — both
 # PlotFileWriterParallel.cpp and CpuPlotter.cpp do, transitively via
@@ -481,7 +504,11 @@ target_link_libraries(xchplot2 PRIVATE
 # build.rs for an unrelated keygen-rs / libstd duplication; the cmake
 # exe needs it too once CpuPlotter joined PlotFileWriterParallel as a
 # pos2-chip-including TU.
-target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
+if(MSVC)
+    target_link_options(xchplot2 PRIVATE LINKER:/FORCE:MULTIPLE)
+else()
+    target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
+endif()
 
 # Parity tests. Each test gets $<TARGET_OBJECTS:pos2_gpu_cuda_obj>
 # explicitly: pos2_gpu (INTERFACE) doesn't carry the .o files, so
@@ -626,6 +653,11 @@ set_target_properties(gpu_ci_info PROPERTIES
 include(CTest)
 get_property(_xchplot2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(_target IN LISTS _xchplot2_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(WIN32 AND _type STREQUAL "EXECUTABLE")
+        target_sources(${_target} PRIVATE tools/xchplot2/windows.manifest)
+        target_link_libraries(${_target} PRIVATE advapi32)
+    endif()
     if(_target MATCHES "(_parity|_test)$")
         set_target_properties(${_target} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")

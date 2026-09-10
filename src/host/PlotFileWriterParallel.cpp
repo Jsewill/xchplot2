@@ -42,6 +42,7 @@
 #include <vector>
 
 #ifdef _WIN32
+#include "host/WindowsFile.hpp"
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
@@ -333,10 +334,7 @@ size_t write_plot_file_parallel(
     std::vector<char> iobuf(size_t{4} << 20);
     std::string partial = filename + ".partial.XXXXXX";
 #ifdef _WIN32
-    if (_mktemp_s(partial.data(), partial.size() + 1) != 0)
-        throw std::runtime_error("Failed to create temporary name for " + filename);
-    int const fd = ::_open(partial.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
-                          _S_IREAD | _S_IWRITE);
+    int const fd = create_private_temp(partial);
 #else
     int const fd = ::mkstemp(partial.data());
 #endif
@@ -410,7 +408,14 @@ size_t write_plot_file_parallel(
     // Preserve the existing replace policy: concurrent successful writers may
     // replace the destination, but each publishes its own complete file.
     std::error_code ec;
+#ifdef _WIN32
+    if (!::MoveFileExW(std::filesystem::path(partial).c_str(),
+                      std::filesystem::path(filename).c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        ec = std::error_code(static_cast<int>(::GetLastError()), std::system_category());
+#else
     std::filesystem::rename(partial, filename, ec);
+#endif
     if (ec) throw std::runtime_error("Failed to publish " + filename + ": " + ec.message());
     guard.committed = true;
     fsync_parent_dir_best_effort(filename);
