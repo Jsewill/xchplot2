@@ -81,6 +81,18 @@ def main():
                 for path in result.stdout.splitlines():
                     run([binary, "verify", path, "--full", "--trials", "100", "--config", os.devnull])
                 print("Windows keygen: pool public key memos and parallel CPU plotting passed")
+
+                bench = out / "benchmark é"
+                run([binary, "bench", "--config", os.devnull, "-k", "18", "-n", "1",
+                     "--warmup", "0", "--cpu", "--cpu-workers", "1", "--keep",
+                     "--compute-only", "-o", str(bench)])
+                log.flush()
+                output = (out / "check.log").read_text(encoding="utf-8")
+                kept = [line.removeprefix("[bench] kept ") for line in output.splitlines()
+                        if line.startswith("[bench] kept ")]
+                assert len(kept) == 2 and all(Path(p).is_file() for p in kept), kept
+                assert "no usable tmpfs" in output and "compute+cache" in output
+                print("Windows benchmark: cache fallback and Unicode kept paths passed")
     finally:
         if allocated_console:
             kernel.FreeConsole()

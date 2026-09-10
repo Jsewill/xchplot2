@@ -39,8 +39,8 @@ a source build using the instructions below.
 Requires CUDA Toolkit **12.0+** (12.0 is the floor — `cudaGetDeviceProperties_v2`,
 the v2 ABI we link, and CUDA C++20 dialect all need 12.0; the latest benchmark used 13.3.73), **C++20** host compiler, **CMake ≥ 3.26** (3.26+ knows
 how to drive nvcc 12.5+; lower works for older nvcc), and a Rust
-toolchain new enough to parse `edition2024` (**rustc ≥ 1.85**, i.e.
-rustup `stable`; most distro-packaged Rust is too old).
+toolchain from rustup `stable`. The release builds use **Rust 1.98.1**;
+older distro-packaged Rust may not support the locked dependencies.
 
 ### Historical dependency sources
 
@@ -66,7 +66,7 @@ Combinations that **don't** work on a stock install:
 - **Debian 12 + apt CUDA + apt CMake**: stock CMake 3.25 doesn't know
   how to drive nvcc 12.5+. Use Kitware's CMake apt repo.
 - **Ubuntu 22.04/24.04 + apt cargo**: distro-packaged Rust (1.75) can't
-  parse `edition2024` required by the `chia-client` 0.42 dep tree.
+  parse `edition2024` used by the locked dependency tree.
   Install rustup instead.
 - **WSL**: works the same as native — the only WSL-specific bits are
   the `libcuda.so` injection at `/usr/lib/wsl/lib` (driver, not

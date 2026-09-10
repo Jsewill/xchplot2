@@ -860,6 +860,7 @@ int batch_exit_code(pos2gpu::BatchResult const& res, std::size_t requested)
 // 10% of RAM and caps it, while /dev/shm gets 50%, so it reached for the smaller
 // of the two for a pass that writes the entire plot set at once and deletes
 // nothing until the end.
+#ifndef _WIN32
 std::string resolve_tmpfs_dir()
 {
     std::string    best;
@@ -878,6 +879,7 @@ std::string resolve_tmpfs_dir()
     consider("/dev/shm");
     return best;
 }
+#endif
 
 // A scratch dir on the roomiest tmpfs that we have actually proven we can write
 // to, or "" to say there isn't one.
@@ -892,6 +894,9 @@ std::string resolve_tmpfs_dir()
 // write before handing it back.
 std::string prepare_tmpfs_scratch()
 {
+#ifdef _WIN32
+    return {};  // The caller uses its existing compute+cache fallback without tmpfs.
+#else
     std::string const base = resolve_tmpfs_dir();
     if (base.empty()) return {};
 
@@ -913,6 +918,7 @@ std::string prepare_tmpfs_scratch()
     }
     std::filesystem::remove(probe, ec);
     return dir;
+#endif
 }
 
 struct BenchMeasurement {
@@ -1823,7 +1829,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             sweep();
             if (keep) {
                 for (auto const& p : e2e.paths) {
-                    std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                    std::fprintf(stderr, "[bench] kept %s\n", p.string().c_str());
                 }
                 // ...but only the ones sweep() actually left behind: the
                 // compute-only set is gone if it lived in the tmpfs scratch.
@@ -1831,7 +1837,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 for (auto const& p : compute.paths) {
                     std::error_code ec;
                     if (std::filesystem::exists(p, ec)) {
-                        std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                        std::fprintf(stderr, "[bench] kept %s\n", p.string().c_str());
                     } else {
                         ++dropped;
                     }
