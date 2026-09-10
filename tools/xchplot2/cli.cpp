@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -334,7 +335,8 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
 void read_random_bytes(uint8_t* out, size_t n)
 {
 #ifdef _WIN32
-    if (n > MAXULONG) throw std::invalid_argument("entropy request exceeds the Windows buffer limit");
+    if (n > std::numeric_limits<ULONG>::max())
+        throw std::invalid_argument("entropy request exceeds the Windows buffer limit");
     auto const status = ::BCryptGenRandom(nullptr, out, static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     if (status != 0)
         throw std::runtime_error("BCryptGenRandom failed: " + std::to_string(status));
