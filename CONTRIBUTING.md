@@ -214,6 +214,61 @@ When moving sections, update incoming links and keep the useful README
 entry headings. `docs/` is ignored local material; do not publish it as part
 of a documentation move.
 
+## Binary releases
+
+The release workflow builds the standalone CMake executable in
+`ci/release/Containerfile`: Ubuntu 22.04, CUDA 12.9.1, CMake 3.28.3, and
+Rust 1.98.1. CUDA targets are explicit in `scripts/build-release.sh`; keep
+the compatibility requirements in `INSTALL.md` and the archive README in
+sync when changing them. `cargo-about` collects the Rust dependency licenses
+and fails on unresolved licenses.
+
+Build the same archive locally with Docker or Podman:
+
+```bash
+podman build -t xchplot2-release -f ci/release/Containerfile ci/release
+podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
+```
+
+The Linux archive and its SHA-256 checksum are written to `build/release/dist/`.
+For native Windows, install the [Windows build tools](INSTALL.md#windows)
+and PowerShell 7.3+, then run:
+
+```powershell
+rustup toolchain install 1.98.1 --profile minimal
+rustup default 1.98.1
+cargo install --locked --features cli cargo-about --version 0.9.2
+./scripts/build-release.ps1
+python scripts/test/release.py build/release-windows/dist/xchplot2-0.11.0-windows-x86_64-cuda.zip
+```
+
+The PowerShell script loads the Visual Studio 2022 x64 environment when
+needed, builds all targets with CUDA 12.9.1, runs the host CTest subset, and
+writes a ZIP and checksum to `build/release-windows/dist/`. The extracted
+Windows check also exercises Unicode paths, real key generation, Ctrl-Break,
+resume, and publication failure. CI runs it with toolkit libraries removed
+from `PATH`. Windows GPU plotting and spill behavior need qualification on
+Windows hardware before the archive is advertised for those devices.
+For affected CUDA 12.x headers, CMake applies NVIDIA's
+[64-bit PTX operand fix](https://github.com/NVIDIA/cccl/commit/270f4100dceeb6345f74fd374695e78bb0a48082)
+to a build-local copy; `BUILDINFO.txt` records the backport. The installed
+toolkit stays intact.
+
+PR and manual runs retain both platforms' archives as workflow artifacts. Pushing a
+`vVERSION-cuda-only` tag creates a draft GitHub release; publish it after
+qualifying the extracted archive on the supported GPUs. Do not rebuild
+between qualification and publication.
+
+The workflow runs host tests and tests the extracted archive on Ubuntu 22.04
+without a GPU toolkit. Run `scripts/test/release.py ARCHIVE.tar.gz` to repeat
+the archive, CPU plotting, and full-proof check. For GPU qualification, use
+the packaged executable for k=22 and k=28 CPU byte comparisons, full proofs,
+and the tier, spill, and recovery checks described above. Record qualification
+in the release notes; keep generated plots and detailed logs out of the tree.
+`gpu-ci.py --binary /path/to/extracted/bin/xchplot2` uses the package for
+plotting and verification while retaining the build's parity and inventory
+tools. Both must come from the same source revision and toolchain.
+
 ## Commit style
 
 Short imperative subjects, lowercase scope prefix, no trailing period:

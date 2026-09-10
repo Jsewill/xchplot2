@@ -15,10 +15,13 @@ xchplot2 is a client-side plot builder. It handles:
   or reused seed lets an attacker who observes plot IDs correlate
   plots to the same master key.
 - BLS key parsing via the
-  [`chia` Rust crate](https://crates.io/crates/chia) through
+  [`chia-bls` Rust crate](https://crates.io/crates/chia-bls) through
   `keygen-rs`.
 - Per-plot private keys, included in plot memos and saved job manifests.
 - Large file writes into caller-supplied output directories.
+
+Without `--seed`, plot seeds come from the operating system's cryptographic
+RNG: `/dev/urandom` on Linux and `BCryptGenRandom` on Windows.
 
 `plot` saves identities before starting, including for unseeded jobs. The
 `xchplot2-job-*.tsv` files contain the memo and its private plot key material;
@@ -29,7 +32,9 @@ while recovery may be needed. Deleting it can prevent recovery of an unseeded
 job's identities.
 
 New manifests and their publication temporaries use owner-only permissions
-on Linux and are not allowed to replace another job's manifest. Report
+on Linux and a protected owner-only ACL on native Windows. Windows file
+creation requires an ACL-capable filesystem such as NTFS or ReFS.
+Manifests are not allowed to replace another job's manifest. Report
 permission, disclosure, or publication failures through the channel above.
 See [plotting and recovery](REFERENCE.md#plotting-and-recovery) for behavior.
 

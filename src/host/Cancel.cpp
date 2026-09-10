@@ -7,6 +7,8 @@
 
 #if defined(__unix__) || defined(__APPLE__)
 #  include <unistd.h>  // write(2)
+#elif defined(_WIN32)
+#  include <windows.h>
 #endif
 
 namespace pos2gpu {
@@ -35,6 +37,9 @@ void write_stderr_safe(char const* msg, std::size_t len) noexcept
     // write(2) is async-signal-safe; std::fprintf is not.
     ssize_t const rc = ::write(2, msg, len);
     (void)rc;  // nothing useful to do if stderr is gone
+#elif defined(_WIN32)
+    DWORD written = 0;
+    ::WriteFile(::GetStdHandle(STD_ERROR_HANDLE), msg, static_cast<DWORD>(len), &written, nullptr);
 #else
     (void)msg;
     (void)len;
@@ -57,12 +62,24 @@ extern "C" void cancel_handler(int sig) noexcept
     write_stderr_safe(msg, sizeof(msg) - 1);
 }
 
+#ifdef _WIN32
+BOOL WINAPI console_cancel_handler(DWORD event)
+{
+    if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return FALSE;
+    cancel_handler(SIGINT);
+    return TRUE;
+}
+#endif
+
 } // namespace
 
 void install_cancel_signal_handlers()
 {
     std::signal(SIGINT,  cancel_handler);
     std::signal(SIGTERM, cancel_handler);
+#ifdef _WIN32
+    ::SetConsoleCtrlHandler(console_cancel_handler, TRUE);
+#endif
     // SIGHUP — sent when the controlling terminal disappears (SSH
     // disconnect, terminal closed). Without explicit handling, the
     // default disposition kills the process immediately, leaving any

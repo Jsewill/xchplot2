@@ -35,7 +35,11 @@
 #include <thread>
 #include <utility>
 
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>  // isatty — in-place progress line only on a TTY
+#endif
 
 #ifdef __linux__
 #include <sys/resource.h>  // setpriority / PRIO_PROCESS — see nice_current_thread
@@ -44,6 +48,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>  // GlobalMemoryStatusEx — see host_memory_probe
+#include <psapi.h>
 #endif
 
 namespace pos2gpu {
@@ -201,7 +206,11 @@ std::uint64_t host_free_bytes_now()
 // CpuMemoryGate, which needs the SUM of the two.
 std::uint64_t self_rss_bytes()
 {
-#if defined(__linux__)
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (!::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters))) return 0;
+    return static_cast<std::uint64_t>(counters.WorkingSetSize);
+#elif defined(__linux__)
     std::FILE* fp = std::fopen("/proc/self/statm", "re");
     if (!fp) return 0;
     unsigned long long total_pages = 0;
@@ -887,7 +896,11 @@ void emit_progress_line(std::string const& log_prefix,
     // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
     // one-line-per-plot when redirected to a file/pipe or when verbose
     // logging would interleave and garble the in-place line.
+#ifdef _WIN32
+    static bool const stderr_tty = ::_isatty(::_fileno(stderr)) != 0;
+#else
     static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
+#endif
     bool const in_place = stderr_tty && !opts.verbose;
 
     // Only surfaces on a resume (--skip-existing). Without it the line counts
@@ -2915,7 +2928,12 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // tmpfs guard and die on a raw mkstemp errno minutes into a batch — and the
     // tmpfs message is exactly what tells a user to reach for this flag.
     if (!opts.temp_dir.empty()) {
-        ::setenv("XCHPLOT2_TEMP_DIR", opts.temp_dir.c_str(), /*overwrite=*/1);
+#ifdef _WIN32
+        int const env_error = ::_putenv_s("XCHPLOT2_TEMP_DIR", opts.temp_dir.c_str());
+#else
+        int const env_error = ::setenv("XCHPLOT2_TEMP_DIR", opts.temp_dir.c_str(), /*overwrite=*/1);
+#endif
+        if (env_error) throw std::runtime_error("cannot set XCHPLOT2_TEMP_DIR");
         std::string const problem = TempFile::dir_problem(opts.temp_dir);
         if (!problem.empty()) {
             throw std::runtime_error("--temp-dir " + opts.temp_dir + ": " + problem);

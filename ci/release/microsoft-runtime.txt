@@ -1,0 +1,7 @@
+Microsoft Visual C++ runtime
+Copyright Microsoft Corporation. All rights reserved.
+
+The native Windows executable statically links the release C/C++ runtime.
+Microsoft's license terms and redistribution documentation are available at:
+https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
+https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files

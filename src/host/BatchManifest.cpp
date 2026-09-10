@@ -12,6 +12,7 @@
 #include <utility>
 
 #ifdef _WIN32
+#include "host/WindowsFile.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -43,6 +44,11 @@ void validate_batch_entry(BatchEntry const& e)
         e.out_name.find_first_of("/\\") != std::string::npos ||
         std::filesystem::path(e.out_name).has_root_path())
         throw std::invalid_argument("output name must be a filename within the output directory");
+#ifdef _WIN32
+    if (e.out_name.find_first_of("<>:\"|?*") != std::string::npos
+        || e.out_name.back() == '.' || e.out_name.back() == ' ')
+        throw std::invalid_argument("output name contains characters unsupported by Windows");
+#endif
 }
 
 namespace {
@@ -151,10 +157,7 @@ void write_manifest(std::string const& path, std::vector<BatchEntry> const& entr
     // Publication must not replace a concurrently saved job.
     std::string partial = path + ".partial.XXXXXX";
 #ifdef _WIN32
-    if (_mktemp_s(partial.data(), partial.size() + 1) != 0)
-        throw std::runtime_error("cannot create temporary manifest: " + path);
-    int const fd = ::_open(partial.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
-                          _S_IREAD | _S_IWRITE);
+    int const fd = create_private_temp(partial);
 #else
     int const fd = ::mkstemp(partial.data());
 #endif

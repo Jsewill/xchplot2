@@ -4828,7 +4828,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                      : "") +
             ". The tier floor is derived from the declared peak, so it is now "
             "too low. Re-measure and update the per-tier peak constant in "
-            "BatchPlotter.cpp.");
+            "VramBudget.hpp.");
     }
 
     if (stats.verbose) {

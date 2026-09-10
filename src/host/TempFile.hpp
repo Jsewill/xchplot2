@@ -1,18 +1,16 @@
-// TempFile.hpp — POSIX-anonymous temp file with positional read/write.
+// TempFile.hpp — automatically removed temp file with positional read/write.
 //
-// Task #26 disk-fallback foundation. Self-contained primitive: opens a
+// Task #26 disk-fallback foundation. On Linux, opens a
 // unique-named file at construction (mkstemp), unlinks it immediately
 // so it disappears on process exit even on crash, and supports
 // thread-safe positional I/O via pread/pwrite.
+// Windows uses an exclusive, owner-only file with delete-on-close and
+// overlapped I/O offsets; the OS also removes it after process termination.
 //
 // Path resolution order (when caller passes empty `dir`):
 //   1. $XCHPLOT2_TEMP_DIR
 //   2. $TMPDIR
-//   3. /tmp
-//
-// The file is automatically removed when the TempFile destructor runs.
-// On crash the kernel reclaims the inode at process exit because the
-// directory entry is already unlinked at construction.
+//   3. /tmp on Linux; the system temporary directory on Windows
 //
 // Backs the host-RAM disk-offload path: SpillEngine/SpillBuffer stream the
 // cold cap-sized tables (h_t1_meta, h_t3, h_t2_meta, h_t2_xbits) through one
@@ -31,7 +29,7 @@ namespace pos2gpu {
 class TempFile {
 public:
     // Open a fresh anonymous temp file. `dir` overrides the env-based
-    // resolution; pass empty to use $XCHPLOT2_TEMP_DIR / $TMPDIR / /tmp.
+    // resolution; pass empty to use the environment or platform default above.
     explicit TempFile(std::string_view dir = "");
     ~TempFile();
 
@@ -40,7 +38,7 @@ public:
     TempFile(TempFile&& other) noexcept;
     TempFile& operator=(TempFile&& other) noexcept;
 
-    // Positional write, safe to call CONCURRENTLY on one TempFile: pwrite
+    // Positional write, safe to call CONCURRENTLY on one TempFile: each operation
     // carries its own offset, so parallel writers to disjoint ranges need no
     // lock. SpillEngine relies on exactly that — it splits one 32 MiB chunk
     // across its worker pool by byte range, so several threads are inside this
@@ -55,7 +53,7 @@ public:
 
     // Pageable, file-backed home for a CPU-touched buffer (the host-RAM
     // disk-offload; see the README's "Host RAM and disk-offload").
-    // ftruncate()s the file to `bytes` and MAP_SHARED-maps it, returning a host
+    // Sizes the file to `bytes` and maps it read/write and shared, returning a host
     // pointer the CPU (and pageable-host DMA) can use as a drop-in
     // replacement for a pinned allocation. Unlike pinned pages, these
     // are reclaimable: under memory pressure the kernel writes dirty
@@ -84,15 +82,14 @@ public:
     //    batch, as "zero-byte write (disk full?)". With it, the failure lands
     //    at table setup with the size that could not be reserved.
     //
-    // Does NOT make the file non-sparse: unwritten ranges still read as
-    // zeros, so SpillCoverage stays load-bearing. Silently does nothing on a
-    // filesystem without fallocate support (the file simply grows on demand,
-    // which is the old behaviour); throws only on a real failure such as
-    // ENOSPC.
+    // Unwritten ranges still read as zeros, so SpillCoverage stays load-bearing.
+    // Linux filesystems without fallocate support retain the grow-on-demand
+    // behavior. Windows reserves allocation space and sets the end of file.
+    // Real allocation failures throw before a mapping or write begins.
     void preallocate(std::uint64_t bytes);
 
     // Bytes available in `dir` (after resolve_dir) to an unprivileged
-    // writer, or 0 when statvfs cannot answer. Callers treat 0 as "unknown,
+    // writer, or 0 when the filesystem query cannot answer. Callers treat 0 as "unknown,
     // do not block on it" — the same stance dir_is_ram_backed takes, and for
     // the same reason: an unprobeable filesystem must not veto a spill that
     // would have worked.
@@ -104,8 +101,8 @@ public:
         return high_water_.load(std::memory_order_relaxed);
     }
 
-    // Underlying file path (unlinked already; useful for diagnostics
-    // via /proc/<pid>/fd/<fd> on Linux).
+    // Underlying file path (already unlinked on Linux; delete-on-close on
+    // Windows). Useful for diagnostics via /proc/<pid>/fd/<fd> on Linux.
     std::string const& path() const noexcept { return path_; }
 
     int fd() const noexcept { return fd_; }
@@ -114,13 +111,14 @@ public:
     static std::string resolve_dir(std::string_view explicit_dir);
 
     // True when the filesystem hosting `dir` (after resolve_dir) keeps file
-    // contents in RAM — tmpfs, ramfs, or hugetlbfs. Spilling there consumes
+    // contents in RAM — tmpfs, ramfs, or hugetlbfs on Linux; a RAM-disk volume
+    // on Windows. Spilling there consumes
     // the very RAM a --max-host-ram budget is meant to bound, so callers use
     // this to refuse a RAM-backed spill target before doing any heavy work.
-    // A zram/zswap SWAP device backing a real disk filesystem is NOT flagged:
+    // On Linux, a zram/zswap SWAP device backing a real filesystem is NOT flagged:
     // only the mount's own fs magic is inspected, so files that actually live
     // on btrfs/ext4 pass even when the system swaps to compressed RAM.
-    // Returns false if statfs() fails — an unprobeable fs must not block
+    // Returns false if the filesystem query fails — an unprobeable fs must not block
     // spilling. That includes a dir that does not exist, so this is NOT a
     // usability check; pair it with dir_problem().
     static bool dir_is_ram_backed(std::string const& dir);

@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -44,12 +45,13 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>  // isatty — progress defaults to on for interactive runs
-
 #ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
 #include <process.h>
 #include <io.h>
 #else
+#include <unistd.h>  // isatty — progress defaults to on for interactive runs
 #include <spawn.h>
 #include <sys/wait.h>
 extern char** environ;
@@ -99,7 +101,11 @@ int run_parity_test(std::string const& path, std::FILE* log)
 bool resolve_progress(int tri, bool quiet)
 {
     if (tri >= 0) return tri != 0;
+#ifdef _WIN32
+    return !quiet && ::_isatty(::_fileno(stderr)) != 0;
+#else
     return !quiet && ::isatty(::fileno(stderr)) != 0;
+#endif
 }
 
 void print_usage(char const* prog)
@@ -148,7 +154,7 @@ void print_usage(char const* prog)
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
         << "                                      entropy. Per-plot seed = SHA256(seed || i).\n"
         << "                                      Reproducible across runs. Defaults to\n"
-        << "                                      fresh /dev/urandom per plot.\n"
+        << "                                      a fresh random seed per plot.\n"
         << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
         << "    -q, --quiet                     : suppress info-level stderr output\n"
@@ -263,7 +269,11 @@ void print_usage(char const* prog)
         << "\n"
         << "  Reusable options:\n"
         << "    --config FILE  load settings from named command sections. Default:\n"
+#ifdef _WIN32
+        << "                   %APPDATA%/xchplot2/config.toml\n"
+#else
         << "                   $HOME/.config/xchplot2/config.toml\n"
+#endif
         << "    @FILE          insert whitespace-separated arguments (no shell quoting).\n"
         << "\n"
         << "  test-mode positional args:\n"
@@ -321,15 +331,23 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
     return true;
 }
 
-// Read exactly `n` bytes of entropy from /dev/urandom. Throws on failure.
-void read_urandom(uint8_t* out, size_t n)
+// Read exactly `n` bytes from the OS cryptographic RNG. Throws on failure.
+void read_random_bytes(uint8_t* out, size_t n)
 {
+#ifdef _WIN32
+    if (n > std::numeric_limits<ULONG>::max())
+        throw std::invalid_argument("entropy request exceeds the Windows buffer limit");
+    auto const status = ::BCryptGenRandom(nullptr, out, static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status != 0)
+        throw std::runtime_error("BCryptGenRandom failed: " + std::to_string(status));
+#else
     std::ifstream f("/dev/urandom", std::ios::binary);
     if (!f) throw std::runtime_error("cannot open /dev/urandom");
     f.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
     if (f.gcount() != static_cast<std::streamsize>(n)) {
         throw std::runtime_error("short read from /dev/urandom");
     }
+#endif
 }
 
 // Parse a --devices value into BatchOptions.
@@ -853,6 +871,7 @@ int batch_exit_code(pos2gpu::BatchResult const& res, std::size_t requested)
 // 10% of RAM and caps it, while /dev/shm gets 50%, so it reached for the smaller
 // of the two for a pass that writes the entire plot set at once and deletes
 // nothing until the end.
+#ifndef _WIN32
 std::string resolve_tmpfs_dir()
 {
     std::string    best;
@@ -871,6 +890,7 @@ std::string resolve_tmpfs_dir()
     consider("/dev/shm");
     return best;
 }
+#endif
 
 // A scratch dir on the roomiest tmpfs that we have actually proven we can write
 // to, or "" to say there isn't one.
@@ -885,6 +905,9 @@ std::string resolve_tmpfs_dir()
 // write before handing it back.
 std::string prepare_tmpfs_scratch()
 {
+#ifdef _WIN32
+    return {};  // The caller uses its existing compute+cache fallback without tmpfs.
+#else
     std::string const base = resolve_tmpfs_dir();
     if (base.empty()) return {};
 
@@ -906,6 +929,7 @@ std::string prepare_tmpfs_scratch()
     }
     std::filesystem::remove(probe, ec);
     return dir;
+#endif
 }
 
 struct BenchMeasurement {
@@ -1135,7 +1159,7 @@ std::vector<pos2gpu::BatchEntry> build_bench_entries(
         e.plot_index = 0;
         e.meta_group = 0;
         e.testnet = testnet;
-        read_urandom(e.plot_id.data(), e.plot_id.size());
+        read_random_bytes(e.plot_id.data(), e.plot_id.size());
         e.out_dir = out_dir;
         e.out_name = "bench-" + bytes_to_hex(e.plot_id) + ".plot2";
         entries.push_back(std::move(e));
@@ -1207,6 +1231,9 @@ std::vector<std::string> expand_argfiles(int argc, char* argv[])
     std::vector<std::string> out;
     out.reserve(argc);
     char const* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = std::getenv("USERPROFILE");
+#endif
     auto resolve_path = [&](std::string p) -> std::string {
         if (home && p.size() >= 2 && p[0] == '~' && p[1] == '/') {
             return std::string(home) + p.substr(1);
@@ -1273,12 +1300,19 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         strip_argc = static_cast<int>(argv_stripped.size());
     }
     if (config_path.empty()) {
+#ifdef _WIN32
+        if (char const* data = std::getenv("APPDATA")) {
+            auto const default_path = std::filesystem::path(data) / "xchplot2/config.toml";
+            if (std::filesystem::exists(default_path)) config_path = default_path.string();
+        }
+#else
         if (char const* home = std::getenv("HOME")) {
             std::string const default_path =
                 std::string(home) + "/.config/xchplot2/config.toml";
             std::ifstream probe(default_path);
             if (probe) config_path = default_path;
         }
+#endif
     }
     std::vector<std::string> config_tokens;
     if (!config_path.empty()) {
@@ -1606,7 +1640,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             // Fail the bench if a streaming tier outgrows the peak its floor is
             // derived from — the floors are only honest while that holds. Costs
             // nothing (no driver calls); setenv does not clobber an explicit 0.
+#ifdef _WIN32
+            if (!std::getenv("POS2GPU_ASSERT_VRAM")) ::_putenv_s("POS2GPU_ASSERT_VRAM", "1");
+#else
             setenv("POS2GPU_ASSERT_VRAM", "1", 0);
+#endif
 
             if (!opts.quiet) {
                 if (worker_count == 1) {
@@ -1802,7 +1840,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             sweep();
             if (keep) {
                 for (auto const& p : e2e.paths) {
-                    std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                    std::fprintf(stderr, "[bench] kept %s\n", p.string().c_str());
                 }
                 // ...but only the ones sweep() actually left behind: the
                 // compute-only set is gone if it lived in the tmpfs scratch.
@@ -1810,7 +1848,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 for (auto const& p : compute.paths) {
                     std::error_code ec;
                     if (std::filesystem::exists(p, ec)) {
-                        std::fprintf(stderr, "[bench] kept %s\n", p.c_str());
+                        std::fprintf(stderr, "[bench] kept %s\n", p.string().c_str());
                     } else {
                         ++dropped;
                     }
@@ -2006,7 +2044,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             for (auto const& entry :
                  std::filesystem::directory_iterator(dir, ec))
             {
-                auto const name = entry.path().filename().string();
+                auto name = entry.path().filename().string();
+#ifdef _WIN32
+                if (entry.path().extension() != ".exe") continue;
+                name = entry.path().stem().string();
+#endif
                 if ((has_suffix(name, "_parity") || has_suffix(name, "_test"))
                     && entry.is_regular_file(ec)) {
                     tests.push_back(entry.path());
@@ -2330,7 +2372,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         return 2;
                     }
                 } else {
-                    read_urandom(seed, sizeof(seed));
+                    read_random_bytes(seed, sizeof(seed));
                 }
 
                 uint8_t plot_id[32];

@@ -2,32 +2,87 @@
 
 #include "host/TempFile.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include "host/WindowsFile.hpp"
+#else
 #include <sys/mman.h>
 #include <sys/statvfs.h>  // statvfs — free_space
 #include <sys/vfs.h>    // statfs / struct statfs — dir_is_ram_backed
 #include <unistd.h>
+#endif
 
 namespace pos2gpu {
+
+#ifdef _WIN32
+namespace {
+
+// Each operation owns an event and offset. Sharing a seek position would race
+// when SpillEngine writes disjoint ranges from several worker threads.
+DWORD transfer_at(int fd, std::uint64_t offset, void* data, std::size_t bytes, bool write)
+{
+    OVERLAPPED operation{};
+    operation.Offset = static_cast<DWORD>(offset);
+    operation.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    operation.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!operation.hEvent)
+        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "TempFile event");
+    struct Cleanup {
+        HANDLE event;
+        ~Cleanup() { ::CloseHandle(event); }
+    } cleanup{operation.hEvent};
+    HANDLE const file = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+    DWORD transferred = 0;
+    DWORD const count = static_cast<DWORD>(std::min<std::size_t>(bytes, MAXDWORD));
+    BOOL ok = write ? ::WriteFile(file, data, count, &transferred, &operation)
+                    : ::ReadFile(file, data, count, &transferred, &operation);
+    if (!ok && ::GetLastError() == ERROR_IO_PENDING)
+        ok = ::GetOverlappedResult(file, &operation, &transferred, TRUE);
+    if (!ok) {
+        DWORD const error = ::GetLastError();
+        if (!write && error == ERROR_HANDLE_EOF) return 0;
+        throw std::system_error(static_cast<int>(error), std::system_category(),
+            write ? "TempFile::pwrite_at" : "TempFile::pread_at");
+    }
+    return transferred;
+}
+
+} // namespace
+#endif
 
 std::string TempFile::resolve_dir(std::string_view explicit_dir)
 {
     if (!explicit_dir.empty()) return std::string(explicit_dir);
     if (char const* p = std::getenv("XCHPLOT2_TEMP_DIR"); p && *p) return p;
     if (char const* p = std::getenv("TMPDIR");            p && *p) return p;
+#ifdef _WIN32
+    return std::filesystem::temp_directory_path().string();
+#else
     return "/tmp";
+#endif
 }
 
 bool TempFile::dir_is_ram_backed(std::string const& dir)
 {
+#ifdef _WIN32
+    std::error_code error;
+    auto const path = std::filesystem::absolute(std::filesystem::path(resolve_dir(dir)), error);
+    if (error) return false;
+    wchar_t volume[MAX_PATH]{};
+    if (!::GetVolumePathNameW(path.c_str(), volume, MAX_PATH)) return false;
+    return ::GetDriveTypeW(volume) == DRIVE_RAMDISK;
+#else
     std::string const resolved = resolve_dir(dir);
     struct statfs st {};
     if (::statfs(resolved.c_str(), &st) != 0) {
@@ -45,6 +100,7 @@ bool TempFile::dir_is_ram_backed(std::string const& dir)
     return fsmagic == kTmpfsMagic
         || fsmagic == kRamfsMagic
         || fsmagic == kHugetlbfsMagic;
+#endif
 }
 
 std::string TempFile::dir_problem(std::string const& dir)
@@ -81,9 +137,17 @@ void TempFile::bump_high_water(std::uint64_t end) noexcept
 TempFile::TempFile(std::string_view dir)
 {
     std::string base = resolve_dir(dir);
+#ifdef _WIN32
+    std::string templ = (std::filesystem::path(base) / "xchplot2-spill-XXXXXX").string();
+#else
     if (base.back() == '/') base.pop_back();
     std::string templ = base + "/xchplot2-spill-XXXXXX";
+#endif
     std::string buf(templ);
+#ifdef _WIN32
+    fd_ = create_private_temp(buf, FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE);
+    path_ = std::move(buf);
+#else
     fd_ = ::mkstemp(buf.data());
     if (fd_ < 0) {
         int const e = errno;
@@ -99,13 +163,18 @@ TempFile::TempFile(std::string_view dir)
         throw std::runtime_error(
             "TempFile: unlink(" + path_ + ") failed: " + std::strerror(e));
     }
+#endif
 }
 
 TempFile::~TempFile()
 {
     unmap();
     if (fd_ >= 0) {
+#ifdef _WIN32
+        ::_close(fd_);
+#else
         ::close(fd_);
+#endif
         fd_ = -1;
     }
 }
@@ -127,7 +196,13 @@ TempFile& TempFile::operator=(TempFile&& other) noexcept
 {
     if (this != &other) {
         unmap();
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0) {
+#ifdef _WIN32
+            ::_close(fd_);
+#else
+            ::close(fd_);
+#endif
+        }
         fd_         = other.fd_;
         path_       = std::move(other.path_);
         high_water_.store(other.high_water_.load(std::memory_order_relaxed),
@@ -145,18 +220,42 @@ TempFile& TempFile::operator=(TempFile&& other) noexcept
 std::uint64_t TempFile::free_space(std::string const& dir)
 {
     std::string const resolved = resolve_dir(dir);
+#ifdef _WIN32
+    ULARGE_INTEGER available{};
+    if (!::GetDiskFreeSpaceExW(std::filesystem::path(resolved).c_str(), &available, nullptr, nullptr)) return 0;
+    return available.QuadPart;
+#else
     struct statvfs st {};
     if (::statvfs(resolved.c_str(), &st) != 0) return 0;   // unknown
     // f_bavail, not f_bfree: the latter counts blocks reserved for root,
     // which this process cannot have. Quoting those would let the check pass
     // on a filesystem that is already full for everyone but root.
     return std::uint64_t(st.f_bavail) * std::uint64_t(st.f_frsize);
+#endif
 }
 
 void TempFile::preallocate(std::uint64_t bytes)
 {
     if (bytes == 0 || fd_ < 0) return;
-#if defined(__linux__)
+#if defined(_WIN32)
+    if (bytes > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
+        throw std::runtime_error("TempFile::preallocate: size exceeds the file offset range");
+    HANDLE const file = reinterpret_cast<HANDLE>(::_get_osfhandle(fd_));
+    FILE_STANDARD_INFO current{};
+    if (!::GetFileInformationByHandleEx(file, FileStandardInfo, &current, sizeof(current)))
+        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                               "TempFile::preallocate: " + path_);
+    // FileAllocationInfo can truncate EOF. Reservation must preserve existing data.
+    FILE_ALLOCATION_INFO allocation{};
+    allocation.AllocationSize.QuadPart = std::max({static_cast<LONGLONG>(bytes),
+        current.AllocationSize.QuadPart, current.EndOfFile.QuadPart});
+    FILE_END_OF_FILE_INFO end{};
+    end.EndOfFile.QuadPart = std::max(static_cast<LONGLONG>(bytes), current.EndOfFile.QuadPart);
+    if (!::SetFileInformationByHandle(file, FileAllocationInfo, &allocation, sizeof(allocation))
+        || !::SetFileInformationByHandle(file, FileEndOfFileInfo, &end, sizeof(end)))
+        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                               "TempFile::preallocate(" + std::to_string(bytes) + "): " + path_);
+#elif defined(__linux__)
     if (::fallocate(fd_, 0, 0, static_cast<off_t>(bytes)) == 0) return;
     int const e = errno;
     // Not every filesystem implements it (network mounts, some FUSE, older
@@ -189,6 +288,17 @@ void* TempFile::map(std::size_t bytes)
     // error here, before the mapping exists. Quietly does nothing where
     // fallocate is unsupported, which is the old (sparse) behaviour.
     preallocate(bytes);
+#ifdef _WIN32
+    HANDLE const file = reinterpret_cast<HANDLE>(::_get_osfhandle(fd_));
+    HANDLE const mapping = ::CreateFileMappingW(file, nullptr, PAGE_READWRITE,
+        static_cast<DWORD>(std::uint64_t(bytes) >> 32), static_cast<DWORD>(bytes), nullptr);
+    if (!mapping)
+        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "TempFile::map");
+    void* p = ::MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
+    DWORD const error = ::GetLastError();
+    ::CloseHandle(mapping); // the view retains the mapping until unmap()
+    if (!p) throw std::system_error(static_cast<int>(error), std::system_category(), "TempFile::map");
+#else
     // Size the file so the whole mapping is backed — touching a mapped
     // page past EOF would raise SIGBUS otherwise.
     if (::ftruncate(fd_, static_cast<off_t>(bytes)) != 0) {
@@ -205,6 +315,7 @@ void* TempFile::map(std::size_t bytes)
             "TempFile::mmap(" + std::to_string(bytes) + ") failed: " +
             std::strerror(e));
     }
+#endif
     map_       = p;
     map_bytes_ = bytes;
     bump_high_water(bytes);
@@ -214,7 +325,11 @@ void* TempFile::map(std::size_t bytes)
 void TempFile::unmap() noexcept
 {
     if (map_) {
+#ifdef _WIN32
+        ::UnmapViewOfFile(map_);
+#else
         ::munmap(map_, map_bytes_);
+#endif
         map_       = nullptr;
         map_bytes_ = 0;
     }
@@ -226,6 +341,9 @@ void TempFile::pwrite_at(std::uint64_t offset, void const* data, std::size_t byt
     std::size_t remaining = bytes;
     std::uint64_t cur = offset;
     while (remaining > 0) {
+#ifdef _WIN32
+        auto const n = transfer_at(fd_, cur, const_cast<unsigned char*>(p), remaining, true);
+#else
         ssize_t const n = ::pwrite(fd_, p, remaining, static_cast<off_t>(cur));
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -234,6 +352,7 @@ void TempFile::pwrite_at(std::uint64_t offset, void const* data, std::size_t byt
                 "TempFile::pwrite_at(" + std::to_string(offset) + ", " +
                 std::to_string(bytes) + ") failed: " + std::strerror(e));
         }
+#endif
         if (n == 0) {
             throw std::runtime_error(
                 "TempFile::pwrite_at: zero-byte write (disk full?)");
@@ -251,6 +370,9 @@ void TempFile::pread_at(std::uint64_t offset, void* data, std::size_t bytes)
     std::size_t remaining = bytes;
     std::uint64_t cur = offset;
     while (remaining > 0) {
+#ifdef _WIN32
+        auto const n = transfer_at(fd_, cur, p, remaining, false);
+#else
         ssize_t const n = ::pread(fd_, p, remaining, static_cast<off_t>(cur));
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -259,6 +381,7 @@ void TempFile::pread_at(std::uint64_t offset, void* data, std::size_t bytes)
                 "TempFile::pread_at(" + std::to_string(offset) + ", " +
                 std::to_string(bytes) + ") failed: " + std::strerror(e));
         }
+#endif
         if (n == 0) {
             throw std::runtime_error(
                 "TempFile::pread_at: short read at offset " +

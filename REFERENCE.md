@@ -46,7 +46,7 @@ Before plotting starts, `plot` saves the prepared identities and keys in an
 `xchplot2-job-*.tsv` manifest in the output directory. Use `--manifest FILE`
 to choose its location. Each new job keeps its own manifest; another job
 cannot overwrite it. Manifests contain private plot keys and are created
-with owner-only permissions on Linux.
+with owner-only permissions on Linux and a protected owner-only ACL on Windows.
 
 Repeat the same `plot` command with `--resume` (or `--skip-existing`) to
 recover its saved job, including when no `--seed` was supplied. If several
@@ -125,7 +125,8 @@ Prefer the automatically saved manifest for recovery; see
 ## Configuration and argument files
 
 `--config FILE` loads a configuration file. Without it, xchplot2 looks for
-`$HOME/.config/xchplot2/config.toml`. The supported syntax is a small TOML
+`$HOME/.config/xchplot2/config.toml` on Linux or
+`%APPDATA%\xchplot2\config.toml` on Windows. The supported syntax is a small TOML
 subset: named sections and scalar `key = value` entries, with double-quoted
 strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
 are unsupported.
