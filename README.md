@@ -17,6 +17,8 @@ grouping, may require replotting.
 
 ## Quick start
 
+For prebuilt archives, follow [binary installation](INSTALL.md#binary-archives).
+
 Install the [build dependencies](INSTALL.md#native-install) first.
 For containers or Windows, follow [INSTALL.md](INSTALL.md).
 

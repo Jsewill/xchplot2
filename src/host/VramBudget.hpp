@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PoolSizing.hpp"
+
 #include <cstdint>
 #include <charconv>
 #include <limits>
@@ -36,8 +38,15 @@ inline std::uint64_t streaming_base_peak_bytes(int k, StreamingTier tier)
         case StreamingTier::Tiny:    mib = 1100; break;
         case StreamingTier::Pinned:  mib = 1150; break;
     }
-    auto const bytes = mib << 20;
-    return k < 28 ? bytes >> (28 - k) : bytes << (k - 28);
+    // Capacity includes the section overflow allowance, which does not scale
+    // as 2^k. Tiny and Pinned also retain a fixed 24 MiB partition tile.
+    std::uint64_t const fixed_mib =
+        tier == StreamingTier::Tiny || tier == StreamingTier::Pinned ? 24 : 0;
+    int const section_bits = k < 28 ? 2 : k - 26;
+    auto const cap = match_phase_capacity(k, section_bits);
+    auto const reference_mib = match_phase_capacity(28, 2) >> 20;
+    return ((mib - fixed_mib) * cap + reference_mib - 1) / reference_mib
+        + (fixed_mib << 20);
 }
 
 inline bool vram_fits(std::uint64_t free, std::uint64_t peak,

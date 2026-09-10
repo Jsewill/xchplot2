@@ -15,3 +15,5 @@ nd = "nd"
 hge = "hge"
 # Yann Collet, author of LZ4 / zstd, attributed in NOTICE.
 Collet = "Collet"
+# POSIX / Windows CRT file-open mode.
+WRONLY = "WRONLY"

@@ -14,9 +14,34 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 | Path | Use it for |
 |---|---|
+| [Binary archives](#binary-archives) | Prebuilt CLI and runtime for one GPU vendor |
 | [Container](#container) | Toolchains inside the image; GPU driver and container engine on the host |
 | [Native install](#native-install) | System dependencies and AdaptiveCpp installed by the existing script |
 | [Manual dependencies](#manual-dependencies) | An existing toolchain or a development setup |
+
+## Binary archives
+
+Download the Linux x86-64 `sycl-nvidia`, `sycl-amd`, or `sycl-intel` archive
+and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
+Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
+`./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
+add that `bin` directory to `PATH` to run the CLI elsewhere.
+
+These archives target glibc 2.39+ (Ubuntu 24.04 or a compatible system), an
+x86-64 CPU with AES, SSSE3, and SSE4.1, and a compatible GPU driver. On Ubuntu,
+install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
+and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, and one GPU
+backend. No development toolkit is needed. Mixed-vendor builds use the
+source or container instructions below.
+
+The NVIDIA bundle uses CUDA 12.9.1; driver 575.57.08+ is recommended. The AMD
+bundle uses ROCm 6.2 and supports hardware covered by that runtime. The Intel
+bundle uses Level Zero and requires the Intel GPU compute driver. See
+[troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
+settings and the release notes for hardware qualification.
+
+`BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
+dependency notices. Releases without binary assets require a source build.
 
 ## Container
 
@@ -262,9 +287,8 @@ Toolchain prerequisites for the NVIDIA build:
   link, plus C++20 CUDA dialect, both require 12.0).
 - **CMake ≥ 3.26** for nvcc 12.5+ (Debian 12's stock 3.25 doesn't know
   the dialect flags; install Kitware's repo).
-- **rustc ≥ 1.85** (rustup `stable`). Distro-packaged Rust (Ubuntu
-  24.04 apt cargo is 1.75) is too old for the `edition2024` feature
-  required by `chia-client` 0.42.
+- **Rust via rustup `stable`**. Release builds use Rust 1.98.1.
+  Older distro-packaged Rust may not support the locked dependencies.
 
 ### NVIDIA dependency sources
 
@@ -381,3 +405,36 @@ Native Windows plotting is outside the current hardware test set.
 Native Windows SYCL is not supported by the current `main` build. Its
 AdaptiveCpp setup and host code require Linux/POSIX facilities; the earlier
 unvalidated source-build outline was not a tested installation path.
+
+### Native AMD and Intel evaluation
+
+The Linux archives pin AdaptiveCpp 25.10. Its
+[installation guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/doc/installing.md)
+describes Windows CPU/CUDA support through an LLVM-integrated build using
+LLVM 18 or newer. Its
+[Windows build workflow](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/.github/workflows/windows-acppllvm.yml)
+tests that CUDA toolchain. This does not establish Windows HIP or Level Zero
+support for xchplot2. Nightly binaries from `develop` are a separate toolchain
+candidate, not the pinned release compiler.
+
+| Backend | Work required before a native Windows release |
+|---|---|
+| AMD HIP | Qualify an AdaptiveCpp Windows build with the selected HIP SDK and GPU; port the driver-backed `hipMemGetInfo` query and package the matching redistributable runtime. |
+| Intel | Qualify Level Zero or OpenCL with the Windows driver, including device/shared allocations, integer atomics, sorting, and JIT compilation; provide a free-memory query for that backend. |
+
+AMD's [Windows HIP SDK component matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)
+differs from Linux ROCm. A Linux ROCm installation or a successful Linux
+archive build does not qualify the corresponding Windows combination.
+
+The project's HIP and Level Zero probes in `src/host/GpuBufferPool.cpp`
+currently use POSIX dynamic loading and are excluded on Windows. OpenCL has
+no free-memory probe. Admission deliberately rejects an unverified GPU
+budget; reporting device capacity as free memory would weaken that check.
+The native CUDA host/file port also needs to be carried into the SYCL build,
+with a matching MSVC/Rust runtime and Windows DLL deployment.
+
+Before adding a Windows SYCL archive, run the existing allocation and kernel
+parity checks, then k=22/k=28 CPU byte comparisons, full proofs, every fitting
+tier and disk-spill variant, memory-pressure rejection, cancellation, and
+recovery using the extracted package on Windows hardware. A native Windows
+AMD/Intel compiler build and GPU run have not yet been qualified.

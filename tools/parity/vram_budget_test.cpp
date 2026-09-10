@@ -23,6 +23,12 @@ int main()
             assert(vram_scratch_budget(peak + buffer + 812, peak, buffer) == 812);
         }
     }
+    // Small plots retain the full partition tile and proportionally more
+    // overflow capacity. Scaling the k=28 byte count alone underestimates both.
+    assert(streaming_base_peak_bytes(22, StreamingTier::Tiny) >= 42 * MiB);
+    assert(streaming_base_peak_bytes(22, StreamingTier::Pinned) >= 42 * MiB);
+    assert(streaming_base_peak_bytes(26, StreamingTier::Plain) >= 1848 * MiB);
+    assert(streaming_base_peak_bytes(28, StreamingTier::Tiny) == 1100 * MiB);
     // Target card capacities after a representative 390 MiB context. The
     // picker must include the buffer exactly once and stop at Tiny.
     for (auto [gib, expected] : std::array{
