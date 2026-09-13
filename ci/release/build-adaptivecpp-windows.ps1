@@ -1,5 +1,6 @@
 #requires -Version 7.3
 # Run from a VS 2022 developer shell with clang-cl 20.1.8, Ninja and CUDA 12.9.1.
+param([switch]$ReuseLLVM)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-Location (Join-Path $PSScriptRoot '../..')
@@ -30,6 +31,8 @@ if ($source.Contains('format_win32_error')) {
     $source.Replace('format_win32_error(errorCode)', 'std::system_category().message(errorCode)') |
         Set-Content $loader -NoNewline
 }
+# 25.10 does not propagate the common DLL name to its generated config on Windows.
+# Set it explicitly so runtime discovery follows the DLL after deployment.
 cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$prefix" `
     -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
@@ -38,16 +41,28 @@ cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     -DLLVM_PARALLEL_LINK_JOBS=1 -DLLVM_EXTERNAL_PROJECTS=AdaptiveCpp `
     "-DLLVM_EXTERNAL_ADAPTIVECPP_SOURCE_DIR=$acpp" `
     -DLLVM_ADAPTIVECPP_LINK_INTO_TOOLS=ON `
+    -DHIPSYCL_COMMON_LIBRARY_OUTPUT_NAME=acpp-common `
     -DWITH_CUDA_BACKEND=ON -DWITH_ROCM_BACKEND=OFF `
     -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF `
     -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
     -DLLVM_INCLUDE_TESTS=OFF
-cmake --build "$root/build" --target install --parallel 2
+if ($ReuseLLVM) {
+    # Only acpp-common consumes the changed DLL-name setting in this cache upgrade.
+    cmake --build "$root/build" --target acpp-common --parallel 2
+    Copy-Item "$root/build/bin/acpp-common.dll" "$prefix/bin"
+    Copy-Item "$root/build/lib/acpp-common.lib" "$prefix/lib"
+    foreach ($include in 'hipSYCL', 'AdaptiveCpp') {
+        Copy-Item "$root/build/tools/AdaptiveCpp/include/hipSYCL/common/config.hpp" "$prefix/include/AdaptiveCpp/$include/common"
+    }
+} else {
+    cmake --build "$root/build" --target install --parallel 2
+}
 Copy-Item "$acpp/LICENSE" "$prefix/adaptivecpp-license.txt"
 Copy-Item "$root/llvm/llvm/LICENSE.TXT" "$prefix/llvm-license.txt"
 @"
 AdaptiveCpp: $revision
 Windows modification: src/common/dylib_loader.cpp uses the C++ standard
 library to format system errors; the third-party format_win32_error helper
-is removed. Built by ci/release/build-adaptivecpp-windows.ps1.
+is removed. The build sets the common DLL name for relative runtime discovery.
+Built by ci/release/build-adaptivecpp-windows.ps1.
 "@ | Set-Content "$prefix/adaptivecpp-windows.txt"
