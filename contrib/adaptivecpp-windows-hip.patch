@@ -1,0 +1,114 @@
+Backport Windows HIP generic compilation fixes from AdaptiveCpp:
+  4d0fedff89df49bf30457f7dda15764cfaac5fbd (remove host wchar_size)
+  c69d230e497dd5cafcf9a7004f2c0aa3647acce4 (Windows AMDGPU short wchar)
+  256589708f6902c47bb8f80bb199012d0a32a321 (remove MSVC linker directives)
+Source: https://github.com/AdaptiveCpp/AdaptiveCpp/discussions/2078
+These changes retain AdaptiveCpp's BSD 2-Clause license.
+
+--- a/src/compiler/sscp/TargetSeparationPass.cpp
++++ b/src/compiler/sscp/TargetSeparationPass.cpp
+@@ -216,6 +216,68 @@
+ }
+ #endif
+ 
++void removeModuleFlag(llvm::Module& M, llvm::StringRef Name) {
++  llvm::SmallVector<llvm::Module::ModuleFlagEntry, 8> Flags;
++  M.getModuleFlagsMetadata(Flags);
++
++  if(Flags.empty())
++    return;
++
++  if(auto* NMD = M.getNamedMetadata("llvm.module.flags"))
++    M.eraseNamedMetadata(NMD);
++
++  for(const auto& Flag : Flags) {
++    if(Flag.Key->getString() == Name)
++      continue;
++
++    M.addModuleFlag(Flag.Behavior, Flag.Key->getString(), Flag.Val);
++  }
++}
++
++void removeLinkerOptionsByPrefixes(
++    llvm::Module& M,
++    llvm::ArrayRef<llvm::StringRef> Prefixes) {
++
++  llvm::NamedMDNode* NMD = M.getNamedMetadata("llvm.linker.options");
++  if(!NMD)
++    return;
++
++  auto StartsWithPrefix = [&](llvm::StringRef Option) {
++    for(auto Prefix : Prefixes) {
++      if(llvmutils::starts_with(Option, Prefix))
++        return true;
++    }
++
++    return false;
++  };
++
++  llvm::SmallVector<llvm::MDNode*, 8> RemainingOptions;
++
++  for(unsigned i = 0; i < NMD->getNumOperands(); ++i) {
++    llvm::MDNode* OptionNode = NMD->getOperand(i);
++
++    bool Remove = false;
++    if(OptionNode && OptionNode->getNumOperands() > 0) {
++      if(auto* Option = llvm::dyn_cast<llvm::MDString>(OptionNode->getOperand(0))) {
++        Remove = StartsWithPrefix(Option->getString());
++      }
++    }
++
++    if(!Remove)
++      RemainingOptions.push_back(OptionNode);
++  }
++
++  M.eraseNamedMetadata(NMD);
++
++  if(!RemainingOptions.empty()) {
++    llvm::NamedMDNode* NewNMD =
++        M.getOrInsertNamedMetadata("llvm.linker.options");
++
++    for(llvm::MDNode* OptionNode : RemainingOptions)
++      NewNMD->addOperand(OptionNode);
++  }
++}
++
+ std::unique_ptr<llvm::Module> generateDeviceIR(llvm::Module &M,
+                                                const std::vector<std::string>& DynamicFunctions,
+                                                std::vector<KernelInfo> &KernelInfoOutput,
+@@ -274,6 +336,14 @@
+   StringAttrsToRemove.push_back("target-cpu");
+   StringAttrsToRemove.push_back("target-features");
+   StringAttrsToRemove.push_back("tune-cpu");
++
++  // Remove host-specific module flags that should not leak into generic device IR
++  removeModuleFlag(*DeviceModule, "wchar_size");
++
++#ifdef _WIN32
++  // Remove MSVC host linker directives from generic device IR
++  removeLinkerOptionsByPrefixes(*DeviceModule, {"/"});
++#endif
+ 
+   llvm::SmallSet<llvm::Function *, 16> AcppNoInlineFunctions;
+   utils::findFunctionsWithStringAnnotations(
+--- a/src/libkernel/sscp/amdgpu/CMakeLists.txt
++++ b/src/libkernel/sscp/amdgpu/CMakeLists.txt
+@@ -1,4 +1,11 @@
+ if(WITH_LLVM_TO_AMDGPU_AMDHSA)
++  set(amdgpu_libkernel_additional_args -nogpulib)
++
++  if(WIN32)
++    list(APPEND amdgpu_libkernel_additional_args
++        -Xclang -fwchar-type=short)
++  endif()
++
+   libkernel_generate_bitcode_target(
+       TARGETNAME amdgpu-amdhsa 
+       TRIPLE amdgcn-amd-amdhsa
+@@ -21,5 +28,5 @@
+       broadcast.cpp
+       scan_inclusive.cpp
+       scan_exclusive.cpp
+-      ADDITIONAL_ARGS -nogpulib)
++      ADDITIONAL_ARGS ${amdgpu_libkernel_additional_args})
+ endif()

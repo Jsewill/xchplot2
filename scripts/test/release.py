@@ -17,6 +17,8 @@ def main():
     parser.add_argument("archive", type=pathlib.Path)
     parser.add_argument("--sycl-probe", type=pathlib.Path,
                         help="Matching build/tools/sanity/hellosycl executable")
+    parser.add_argument("--hip-sdk", type=pathlib.Path,
+                        help="Installed Windows HIP SDK 6.4.2; test the packaged dependency helper with it")
     args = parser.parse_args()
     digest = hashlib.sha256()
     with args.archive.open("rb") as archive:
@@ -53,9 +55,31 @@ def main():
                        "2019 Intel Corporation"):
             assert author in llvm_notices, f"Missing LLVM third-party notice: {author}"
         if os.name == "nt":
-            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
-                         "hipSYCL/rt-backend-omp.dll", "hipSYCL/rt-backend-cuda.dll"):
+            amd = "Backend: SYCL/AdaptiveCpp (amd)" in (package / "BUILDINFO.txt").read_text()
+            vendor_files = ("hipSYCL/rt-backend-hip.dll",) if amd else ("cudart64_12.dll", "hipSYCL/rt-backend-cuda.dll")
+            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "hipSYCL/rt-backend-omp.dll", *vendor_files):
                 assert (package / "bin" / name).stat().st_size > 0, f"Missing {name}"
+            helper = package / "install-dependencies.ps1"
+            assert helper.stat().st_size > 0
+            if amd:
+                assert (package / "licenses/amd-runtime.txt").stat().st_size > 0
+                assert (package / "licenses/hip-headers.txt").stat().st_size > 0
+                assert not list((package / "bin").glob("*hip*64*.dll")), "AMD SDK runtime must be installed separately"
+                assert not list((package / "bin").glob("hiprtc*.dll")), "AMD SDK RTC must be installed separately"
+                assert not list((package / "bin").glob("*comgr*.dll")), "AMD SDK compiler must be installed separately"
+                assert not (package / "bin/hipSYCL/ext/bitcode/amdgcn").exists(), "AMD SDK bitcode must be installed separately"
+            if not amd or args.hip_sdk:
+                powershell = pathlib.Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+                options = ["-HipPath", str(args.hip_sdk.resolve())] if args.hip_sdk else []
+                if args.hip_sdk:
+                    assert (args.hip_sdk / "bin/hiprtc0604.dll").is_file(), "Provide the already installed HIP SDK"
+                # The runner already has these prerequisites, so no installer UI is opened.
+                subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper, *options],
+                               check=True, timeout=120)
+                if amd:
+                    for name in ("amdhip64_6.dll", "hiprtc0604.dll", "hiprtc-builtins0604.dll", "amd_comgr0604.dll", "amd_comgr_2.dll"):
+                        assert (package / "bin" / name).is_file(), f"Dependency helper did not install {name}"
+                    assert (package / "bin/hipSYCL/ext/bitcode/amdgcn/oclc_isa_version_1031.bc").is_file()
             # ctypes keeps DLLs loaded; let a child exit before removing the archive.
             subprocess.run([sys.executable, "-c", """
 import ctypes, os, pathlib, sys
@@ -68,9 +92,13 @@ try:
 except FileNotFoundError:
     cuda_driver = False
     print("CUDA backend DLL load check requires an NVIDIA driver")
+hip_runtime = (directory / "hiprtc0604.dll").is_file()
+if not hip_runtime and (directory / "hipSYCL/rt-backend-hip.dll").is_file():
+    print("HIP backend DLL load check requires the AMD runtime; pass --hip-sdk to test installation")
 with os.add_dll_directory(str(directory)):
     libraries = [ctypes.WinDLL(str(path)) for path in directory.rglob("*.dll")
-                 if cuda_driver or path.name != "rt-backend-cuda.dll"]
+                 if (cuda_driver or path.name != "rt-backend-cuda.dll")
+                 and (hip_runtime or path.name != "rt-backend-hip.dll")]
     assert libraries, "No packaged Windows runtime DLLs"
 """, str(package / "bin")], check=True, timeout=60)
             for tool in ("opt.exe", "llc.exe", "lld-link.exe"):
@@ -78,6 +106,10 @@ with os.add_dll_directory(str(directory)):
                                check=True, timeout=30)
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
+        if os.name == "nt":
+            devices = subprocess.run([binary, "devices", "--config", os.devnull],
+                                     check=True, capture_output=True, text=True, timeout=30)
+            assert "nvidia-smi" not in devices.stdout and "rocminfo" not in devices.stdout
         # The existing probe runs a real SYCL kernel through the packaged runtime.
         # Linux uses SSCP JIT; Windows includes a precompiled OpenMP CPU path.
         # Its build-tree RPATH cannot resolve inside the clean runtime image.

@@ -1,0 +1,17 @@
+AMD Windows runtime prerequisites
+
+The AMD package uses HIP SDK 6.4.2's HIP runtime/compiler and device bitcode.
+These AMD SDK components are installed separately, not redistributed in this
+archive. Run install-dependencies.ps1 to obtain them from AMD. The helper
+copies the required DLLs and bitcode from your installation into bin/ for
+local use; those added files remain subject to AMD's terms.
+
+SDK download and license:
+https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
+https://www.amd.com/content/dam/amd/en/documents/developer/hip-sdk-installer-license-agreement.pdf
+
+Install a current AMD Adrenalin driver for your GPU. The RX 6700 XT (gfx1031)
+is listed for Windows HIP runtime support, but not the SDK's extra math
+libraries. xchplot2 does not use those math libraries. Windows GPU plotting
+still requires hardware qualification.
+https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/reference/system-requirements.html

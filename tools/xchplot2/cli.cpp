@@ -1467,8 +1467,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
         if (devices.empty()) {
             std::printf("\nNo GPU devices visible to AdaptiveCpp / SYCL.\n"
+#ifdef _WIN32
+                        "Use the Windows release for your GPU vendor (sycl-amd or sycl-nvidia).\n"
+                        "Run install-dependencies.ps1 from the extracted archive, check your\n"
+                        "GPU driver in Device Manager, and check ACPP_VISIBILITY_MASK.\n"
+#else
                         "Check rocminfo / nvidia-smi, ACPP_VISIBILITY_MASK, and that the\n"
                         "relevant SYCL backend was built into AdaptiveCpp.\n"
+#endif
                         "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
         } else {
             std::printf("\nUse `--devices gpu0` (or bare `0`) for a specific GPU,\n"

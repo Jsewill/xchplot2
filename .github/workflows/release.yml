@@ -83,6 +83,16 @@ jobs:
     if: inputs.platform != 'linux'
     runs-on: windows-2022
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: nvidia
+            toolchain: windows-acpp25.10-llvm20.1.8-cuda12.9.1-v3
+          - gpu: amd
+            toolchain: windows-acpp25.10-llvm20.1.8-hip6.4.2-v1
+    env:
+      RELEASE_GPU: ${{ matrix.gpu }}
     defaults:
       run:
         shell: pwsh
@@ -91,17 +101,37 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - name: Install CUDA 12.9.1
+        if: matrix.gpu == 'nvidia'
         run: |
           $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
           Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe' -OutFile $installer
           $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
           "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
+      - name: Install HIP SDK 6.4.2 compiler components
+        if: matrix.gpu == 'amd'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = Join-Path $env:RUNNER_TEMP 'hip-sdk.exe'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'hip-sdk'
+          Invoke-WebRequest 'https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-25.Q3-Win10-Win11-For-HIP.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne 'db474a0436edecbc2234a8d38402f1bae1cbf5a50c7e9b93eb6c0a7e0eb9c81a') {
+              throw 'HIP SDK installer checksum mismatch'
+          }
+          # Install the build tools without installing a GPU driver on the runner.
+          7z x -y "-o$unpacked" $installer 'Packages/Apps/ROCmSDKPackages/*' | Out-Null
+          foreach ($component in 'SDKCore/ROCm_SDK_Core', 'RTCDevelopment/ROCm_RTC_Dev', 'RTCRuntime/ROCm_RTC_RT') {
+              $msi = Join-Path $unpacked "Packages/Apps/ROCmSDKPackages/$component.msi"
+              $install = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+              if ($install.ExitCode -notin 0, 3010) { throw "HIP SDK component failed: $component ($($install.ExitCode))" }
+          }
+          "HIP_PATH=$env:ProgramFiles\AMD\ROCm\6.4" >> $env:GITHUB_ENV
       - uses: actions/cache/restore@v6
         id: toolchain
         with:
           path: build/windows-toolchain/install
-          key: windows-acpp25.10-llvm20.1.8-cuda12.9.1-v3
+          key: ${{ matrix.toolchain }}
       - name: Configure Visual Studio
         run: |
           $ErrorActionPreference = 'Stop'
@@ -114,14 +144,14 @@ jobs:
           cmd /c "call `"$vcvars`" >nul && set" | ForEach-Object {
               if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
           }
-          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;" + $env:PATH
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;" + $env:PATH
           foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
               "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
           }
           clang-cl --version
       - name: Build AdaptiveCpp with LLVM
         if: steps.toolchain.outputs.cache-hit != 'true'
-        run: ./ci/release/build-adaptivecpp-windows.ps1
+        run: ./ci/release/build-adaptivecpp-windows.ps1 -Gpu $env:RELEASE_GPU
       - uses: actions/cache/save@v6
         if: steps.toolchain.outputs.cache-hit != 'true'
         with:
@@ -137,7 +167,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
-        run: ./scripts/build-release.ps1
+        run: ./scripts/build-release.ps1 -Gpu $env:RELEASE_GPU
       - name: Check the extracted runtime and Windows CPU proofs
         run: |
           $ErrorActionPreference = 'Stop'
@@ -150,15 +180,21 @@ jobs:
           $archive = (Get-ChildItem build/release-windows/dist/*.zip).FullName
           # Hide the absolute fallback paths compiled into AdaptiveCpp, too.
           Rename-Item build/windows-toolchain/install install-hidden
+          $hipOptions = @()
+          if ($env:RELEASE_GPU -eq 'amd') {
+              Rename-Item $env:HIP_PATH '6.4-hidden'
+              $hipOptions = @('--hip-sdk', "$env:HIP_PATH-hidden")
+          }
           try {
               & $python scripts/test/release.py $archive `
-                  --sycl-probe build/release-windows/tools/sanity/hellosycl.exe
+                  --sycl-probe build/release-windows/tools/sanity/hellosycl.exe @hipOptions
           } finally {
+              if ($env:RELEASE_GPU -eq 'amd') { Rename-Item "$env:HIP_PATH-hidden" '6.4' }
               Rename-Item build/windows-toolchain/install-hidden install
           }
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64-sycl-nvidia
+          name: windows-x86_64-sycl-${{ matrix.gpu }}
           path: |
             build/release-windows/dist/*.zip
             build/release-windows/dist/*.sha256
