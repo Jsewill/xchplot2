@@ -126,6 +126,7 @@ jobs:
               $install = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
               if ($install.ExitCode -notin 0, 3010) { throw "HIP SDK component failed: $component ($($install.ExitCode))" }
           }
+          Remove-Item $installer, $unpacked -Recurse -Force
           "HIP_PATH=$env:ProgramFiles\AMD\ROCm\6.4" >> $env:GITHUB_ENV
       - uses: actions/cache/restore@v6
         id: toolchain

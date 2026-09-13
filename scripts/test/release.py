@@ -86,12 +86,13 @@ import ctypes, os, pathlib, sys
 directory = pathlib.Path(sys.argv[1])
 # The CUDA plugin imports nvcuda.dll from the user's driver. Hosted runners
 # have no driver; still load the bundled CUDA runtime there.
-try:
-    ctypes.WinDLL("nvcuda.dll")
-    cuda_driver = True
-except FileNotFoundError:
-    cuda_driver = False
-    print("CUDA backend DLL load check requires an NVIDIA driver")
+cuda_driver = True
+if (directory / "hipSYCL/rt-backend-cuda.dll").is_file():
+    try:
+        ctypes.WinDLL("nvcuda.dll")
+    except FileNotFoundError:
+        cuda_driver = False
+        print("CUDA backend DLL load check requires an NVIDIA driver")
 hip_runtime = (directory / "hiprtc0604.dll").is_file()
 if not hip_runtime and (directory / "hipSYCL/rt-backend-hip.dll").is_file():
     print("HIP backend DLL load check requires the AMD runtime; pass --hip-sdk to test installation")

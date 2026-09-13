@@ -2,6 +2,7 @@
 # Run from the extracted Windows release. Installers display their own UI/license.
 param([string]$HipPath = "$env:ProgramFiles\AMD\ROCm\6.4")
 $ErrorActionPreference = 'Stop'
+if (-not [Environment]::Is64BitProcess) { throw 'Run this x64 release helper in 64-bit PowerShell' }
 $bin = Join-Path $PSScriptRoot 'bin'
 $amd = Test-Path (Join-Path $bin 'hipSYCL/rt-backend-hip.dll')
 $nvidia = Test-Path (Join-Path $bin 'hipSYCL/rt-backend-cuda.dll')
@@ -61,9 +62,9 @@ if ($amd) {
             }
         }
         if (-not (Test-Path "$HipPath/amdgcn/bitcode/ockl.bc")) { throw "Missing device bitcode in $HipPath" }
-        foreach ($dll in $dlls) { Copy-Item (Join-Path "$HipPath/bin" $dll) $bin -Force }
         New-Item -ItemType Directory -Force $bitcode | Out-Null
         Copy-Item "$HipPath/amdgcn/bitcode/*.bc" $bitcode -Force
+        foreach ($dll in $dlls) { Copy-Item (Join-Path "$HipPath/bin" $dll) $bin -Force }
         Write-Host 'AMD runtime components copied from your SDK for local use under AMD terms (see licenses/amd-runtime.txt).'
     }
     Write-Host 'GPU execution also needs an AMD Adrenalin driver: https://www.amd.com/en/support/download/drivers.html'

@@ -62,7 +62,7 @@ if ($Gpu -eq 'nvidia') {
     # installs these components from AMD instead of including them in our ZIP.
     Remove-Item -Recurse -Force (Join-Path $runtime 'hipSYCL/ext/bitcode/amdgcn')
     Copy-Item ci/release/amd-runtime.txt $licenses
-    Invoke-WebRequest 'https://raw.githubusercontent.com/ROCm/HIP/rocm-6.4.2/LICENSE' `
+    Invoke-WebRequest 'https://raw.githubusercontent.com/ROCm/HIP/rocm-6.4.2/LICENSE.txt' `
         -OutFile (Join-Path $licenses 'hip-headers.txt')
     'HIP SDK: 6.4.2 (installed separately by install-dependencies.ps1)' |
         Add-Content (Join-Path $BuildDir 'runtime-info.txt')
