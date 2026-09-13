@@ -153,6 +153,14 @@ jobs:
       - name: Build AdaptiveCpp with LLVM
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: ./ci/release/build-adaptivecpp-windows.ps1 -Gpu $env:RELEASE_GPU
+      - name: Check Windows AMDGPU bitcode ABI
+        if: matrix.gpu == 'amd'
+        run: |
+          $ir = & build/windows-toolchain/install/bin/llvm-dis.exe `
+              build/windows-toolchain/install/lib/hipSYCL/bitcode/libkernel-sscp-amdgpu-amdhsa-full.bc -o -
+          if ($LASTEXITCODE -ne 0 -or -not ($ir -match '!"wchar_size", i32 2')) {
+              throw 'AMDGPU bitcode must use the Windows HIP wchar size'
+          }
       - uses: actions/cache/save@v6
         if: steps.toolchain.outputs.cache-hit != 'true'
         with:
