@@ -8,11 +8,16 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <thread>
-#include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#endif
 
 extern "C" int xchplot2_main(int, char**);
 namespace {
@@ -95,13 +100,26 @@ int pos2_keygen_derive_subseed(uint8_t const* seed, uint64_t index, uint8_t* out
     return POS2_OK;
 }
 }
-int main()
+int main(int argc, char** argv)
 {
-    char path[] = "/tmp/xchplot2-cli-test-XXXXXX";
-    assert(mkdtemp(path));
-    std::filesystem::path const dir(path), config = dir / "config.toml", manifest = dir / "manifest.tsv";
+#ifdef _WIN32
+    if (std::string(argv[0]) == "parity-test") {
+        put(std::getenv("XCHPLOT2_TEST_MARKER"), "executed");
+        return 17;
+    }
+#else
+    (void)argc; (void)argv;
+#endif
+    std::filesystem::path dir;
+    std::random_device random;
+    do { dir = std::filesystem::temp_directory_path() / ("xchplot2 cli é-" + std::to_string(random())); }
+    while (!std::filesystem::create_directory(dir));
+    auto const config = dir / "config.toml", manifest = dir / "manifest.tsv";
     auto line = [&](std::string const& fields, std::string const& name = "plot.plot2") {
-        return fields + " " + std::string(64, 'a') + " 00 " + dir.string() + " " + name + "\n";
+        std::ostringstream row;
+        row << fields << ' ' << std::string(64, 'a') << " 00 "
+            << std::quoted(dir.string()) << ' ' << std::quoted(name) << '\n';
+        return row.str();
     };
     put(manifest, line("18 2 0 0 false"));
     put(config, "");
@@ -115,13 +133,22 @@ int main()
     assert(cli({"verify", "unused.plot2", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
     assert(verified_trials == 2 && !verified_full);
     put(config, "[batch]\ndevices=\"0\"\nquiet=0\nprogress=false\ncpu=false\nauto-spill=false\n");
-    assert(cli({"batch", manifest.string(), "--config", config.string()}) == 0);
+    assert(cli({"batch", manifest.string(), "--config", config.string(), "--temp-dir", dir.string()}) == 0);
+    assert(std::string(std::getenv("XCHPLOT2_TEMP_DIR")) == dir.string());
     assert(last_options.device_ids == std::vector<int>{0} && !last_options.quiet);
     assert(last_options.cpu_workers == 0 && !last_options.auto_host_ram_spill);
     put(config, "[bench]\nwarmup=0\nnum=1\nkeep=false\nverbose=false\n");
     int const before = batch_calls;
     assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
     assert(batch_calls == before + 1);
+    assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "1");
+#ifdef _WIN32
+    _putenv_s("POS2GPU_ASSERT_VRAM", "0");
+#else
+    setenv("POS2GPU_ASSERT_VRAM", "0", 1);
+#endif
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
+    assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "0");
     for (auto const& fields : {"-1 2 0 0 0", "19 2 0 0 0", "18 999 0 0 0", "18 2 -1 0 0",
                                "18 2 65536 0 0", "18 2 0 256 0", "18 2 0 0 nonsense"}) {
         put(manifest, line(fields));
@@ -139,10 +166,16 @@ int main()
     }
     auto const tests = dir / "space;true # directory";
     std::filesystem::create_directory(tests);
-    auto const failing = tests / "quote'\"_test";
     auto const marker = dir / "executed";
+#ifdef _WIN32
+    auto const failing = tests / "quote'_test.exe";
+    std::filesystem::copy_file(argv[0], failing);
+    _putenv_s("XCHPLOT2_TEST_MARKER", marker.string().c_str());
+#else
+    auto const failing = tests / "quote'\"_test";
     put(failing, "#!/bin/sh\nprintf executed > '" + marker.string() + "'\nexit 17\n");
     std::filesystem::permissions(failing, std::filesystem::perms::owner_all);
+#endif
     put(config, "");
     assert(cli({"parity-check", "--config", config.string(), "--dir", tests.string()}) != 0);
     assert(std::filesystem::exists(marker));
@@ -155,9 +188,26 @@ int main()
     auto const saved = dir / "saved.tsv";
     pos2gpu::write_manifest(saved.string(), {entry});
     assert(pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+#ifdef _WIN32
+    PSID owner = nullptr;
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR security = nullptr;
+    assert(::GetNamedSecurityInfoW(saved.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, nullptr, &acl, nullptr, &security) == ERROR_SUCCESS);
+    SECURITY_DESCRIPTOR_CONTROL control{};
+    DWORD revision = 0;
+    assert(::GetSecurityDescriptorControl(security, &control, &revision));
+    assert((control & SE_DACL_PROTECTED) && acl && acl->AceCount == 1);
+    ACCESS_ALLOWED_ACE* ace = nullptr;
+    assert(::GetAce(acl, 0, reinterpret_cast<void**>(&ace)));
+    assert(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ::EqualSid(owner, &ace->SidStart));
+    assert((ace->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS);
+    ::LocalFree(security);
+#else
     assert((std::filesystem::status(saved).permissions() &
             (std::filesystem::perms::group_all | std::filesystem::perms::others_all))
            == std::filesystem::perms::none);
+#endif
     std::thread same([&] { pos2gpu::write_manifest(saved.string(), {entry}); });
     pos2gpu::write_manifest(saved.string(), {entry});
     same.join();
@@ -166,6 +216,19 @@ int main()
     try { pos2gpu::write_manifest(saved.string(), {different}); }
     catch (std::exception const&) { refused = true; }
     assert(refused && pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+#ifdef _WIN32
+    refused = false;
+    try { pos2gpu::write_manifest(saved.string() + ":keys", {entry}); }
+    catch (std::invalid_argument const&) { refused = true; }
+    assert(refused && pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+    for (auto const* name : {"plot:keys", "plot.", "plot ", "plot*"}) {
+        auto invalid = entry; invalid.out_name = name;
+        refused = false;
+        try { pos2gpu::validate_batch_entry(invalid); }
+        catch (std::invalid_argument const&) { refused = true; }
+        assert(refused);
+    }
+#endif
     auto const race = dir / "race.tsv";
     auto publish = [&](pos2gpu::BatchEntry const& e) {
         try { pos2gpu::write_manifest(race.string(), {e}); return true; }

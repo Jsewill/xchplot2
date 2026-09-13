@@ -28,8 +28,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include <unistd.h>   // pread (P1 host-RAM disk-offload)
-
 #include <sycl/sycl.hpp>
 
 namespace pos2gpu {

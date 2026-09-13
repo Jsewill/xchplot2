@@ -2,6 +2,16 @@ cmake_minimum_required(VERSION 3.24)
 
 project(pos2-gpu VERSION 0.12.0 LANGUAGES C CXX)
 
+if(WIN32)
+    # AdaptiveCpp's launcher passes GNU-style arguments to its Clang build.
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+       CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        message(FATAL_ERROR "Windows SYCL requires the AdaptiveCpp LLVM clang/clang++ compilers")
+    endif()
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -460,6 +470,9 @@ option(XCHPLOT2_FETCH_ADAPTIVECPP "Fall back to FetchContent if AdaptiveCpp not 
 # vars in the parent shell), and FetchContent would fire pointlessly.
 find_package(AdaptiveCpp QUIET HINTS /opt/adaptivecpp ENV ACPP_PREFIX "$ENV{HOME}/.local")
 if(NOT AdaptiveCpp_FOUND)
+    if(WIN32)
+        message(FATAL_ERROR "Install AdaptiveCpp with LLVM on Windows and set ACPP_PREFIX to its installation directory")
+    endif()
     if(XCHPLOT2_FETCH_ADAPTIVECPP)
         message(STATUS "xchplot2: AdaptiveCpp not found — fetching v25.10.0 via FetchContent")
         message(STATUS "xchplot2:   first build will take ~15-30 min while AdaptiveCpp compiles")
@@ -827,6 +840,33 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# CCCL 2.x uses long2 for 64-bit PTX operands; Windows long is only 32 bits.
+# Backport NVIDIA's fix to a build-local header, as with the solver below.
+if(WIN32 AND XCHPLOT2_BUILD_CUDA)
+    set(_cccl_header_name "cuda/__ptx/instructions/generated/clusterlaunchcontrol.h")
+    find_file(_cccl_header "${_cccl_header_name}"
+        PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH NO_CACHE)
+    if(_cccl_header)
+        file(READ "${_cccl_header}" _cccl_text)
+        if(_cccl_text MATCHES "reinterpret_cast<long2")
+            message(STATUS "Applying CCCL Windows PTX operand fix")
+            set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-windows")
+            configure_file("${_cccl_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch"
+                WORKING_DIRECTORY "${_cccl_dir}"
+                RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
+            if(NOT _cccl_patch_result EQUAL 0)
+                message(FATAL_ERROR "CCCL Windows PTX patch failed: ${_cccl_patch_error}")
+            endif()
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch")
+            include_directories(BEFORE "${_cccl_dir}")
+            set(_cccl_patch_applied TRUE)
+        endif()
+    endif()
+endif()
 execute_process(
     COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"
@@ -845,7 +885,12 @@ target_include_directories(pos2_chip_headers INTERFACE
 target_link_libraries(pos2_chip_headers INTERFACE fse)
 # Match pos2-chip's CPU AES build flags so its AesHash compiles in CPU TUs.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
+    if(WIN32)
+        target_compile_options(pos2_chip_headers INTERFACE
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-maes;-msse4.1;-mssse3;-msse2>")
+    else()
+        target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
 endif()
@@ -1092,7 +1137,7 @@ target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
 # ----------------------------------------------------------------------------
 set(POS2_KEYGEN_CRATE_DIR "${CMAKE_SOURCE_DIR}/keygen-rs")
 set(POS2_KEYGEN_TARGET_DIR "${CMAKE_BINARY_DIR}/keygen-rs-target")
-set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/libpos2_keygen.a")
+set(POS2_KEYGEN_STATIC_LIB "${POS2_KEYGEN_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}pos2_keygen${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
 # Resolve `cargo` once, with HINTS for the rustup default install
 # location ($HOME/.cargo/bin). rustup writes its PATH entry to
@@ -1143,6 +1188,8 @@ add_dependencies(pos2_keygen pos2_keygen_build)
 # Rust staticlibs link in std, which needs these system libs at final link.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
+elseif(WIN32)
+    target_link_libraries(pos2_keygen INTERFACE ws2_32 userenv bcrypt ntdll advapi32)
 endif()
 
 # xchplot2_cli: the CLI dispatch logic as a static library, with the
@@ -1192,12 +1239,20 @@ set_target_properties(xchplot2_cli PROPERTIES
 # archive scanning the references would land after xchplot2_cli was
 # already processed — rescan resolves the back-edge.
 add_executable(xchplot2 tools/xchplot2/main.cpp)
-target_link_libraries(xchplot2 PRIVATE
-    "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+if(WIN32)
+    target_link_libraries(xchplot2 PRIVATE xchplot2_cli pos2_gpu_host)
+else()
+    target_link_libraries(xchplot2 PRIVATE
+        "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+endif()
 # pos2-chip headers define non-inline soft_aesenc/soft_aesdec, which now
 # end up in two TUs (PlotFileWriterParallel.cpp and CpuPlotter.cpp) inside
 # pos2_gpu_host. Tolerate the duplicates at host link.
-target_link_options(xchplot2 PRIVATE LINKER:--allow-multiple-definition)
+set(_xchplot2_multiple_definitions LINKER:--allow-multiple-definition)
+if(WIN32)
+    set(_xchplot2_multiple_definitions LINKER:/FORCE:MULTIPLE)
+endif()
+target_link_options(xchplot2 PRIVATE ${_xchplot2_multiple_definitions})
 
 # Parity tests are nvcc-compiled (.cu) and reference __global__ kernels
 # from the bench-specific bitsliced AES path. They build only on the CUDA
@@ -1653,7 +1708,7 @@ target_compile_features(sycl_t1_parity PRIVATE cxx_std_20)
 # in non-inline soft_aesenc/soft_aesdec, which already exist in pos2_gpu_host
 # via PlotFileWriterParallel.cpp + CpuPlotter.cpp. Same mitigation as the
 # xchplot2 CLI link line — see the --allow-multiple-definition note above.
-target_link_options(sycl_t1_parity PRIVATE LINKER:--allow-multiple-definition)
+target_link_options(sycl_t1_parity PRIVATE ${_xchplot2_multiple_definitions})
 set_target_properties(sycl_t1_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
@@ -1673,7 +1728,7 @@ x2_add_sycl_to_target(TARGET sycl_phase_split_parity
 target_link_libraries(sycl_phase_split_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_phase_split_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_phase_split_parity PRIVATE cxx_std_20)
-target_link_options(sycl_phase_split_parity PRIVATE LINKER:--allow-multiple-definition)
+target_link_options(sycl_phase_split_parity PRIVATE ${_xchplot2_multiple_definitions})
 set_target_properties(sycl_phase_split_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
@@ -1693,7 +1748,7 @@ x2_add_sycl_to_target(TARGET sycl_tier_parity
 target_link_libraries(sycl_tier_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_tier_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_tier_parity PRIVATE cxx_std_20)
-target_link_options(sycl_tier_parity PRIVATE LINKER:--allow-multiple-definition)
+target_link_options(sycl_tier_parity PRIVATE ${_xchplot2_multiple_definitions})
 set_target_properties(sycl_tier_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
@@ -1712,7 +1767,7 @@ x2_add_sycl_to_target(TARGET sycl_pipeline_parallel_parity
 target_link_libraries(sycl_pipeline_parallel_parity PRIVATE pos2_gpu_host)
 target_include_directories(sycl_pipeline_parallel_parity PRIVATE ${_xchplot2_cuda_include})
 target_compile_features(sycl_pipeline_parallel_parity PRIVATE cxx_std_20)
-target_link_options(sycl_pipeline_parallel_parity PRIVATE LINKER:--allow-multiple-definition)
+target_link_options(sycl_pipeline_parallel_parity PRIVATE ${_xchplot2_multiple_definitions})
 set_target_properties(sycl_pipeline_parallel_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
 
@@ -1767,6 +1822,11 @@ target_link_libraries(solver_filter_parity PRIVATE pos2_chip_headers Threads::Th
 include(CTest)
 get_property(_xchplot2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(_target IN LISTS _xchplot2_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(WIN32 AND _type STREQUAL "EXECUTABLE")
+        target_sources(${_target} PRIVATE tools/xchplot2/windows.manifest)
+        target_link_libraries(${_target} PRIVATE advapi32 bcrypt psapi)
+    endif()
     # Plain C++ consumers need the same OpenMP runtime as the SYCL objects.
     # Let AdaptiveCpp choose it; FindOpenMP probes only CMAKE_CXX_COMPILER,
     # which can be GCC even when AdaptiveCpp compiles kernels with Clang.

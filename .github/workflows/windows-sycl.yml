@@ -85,3 +85,20 @@ jobs:
           python "$prefix/bin/acpp" --acpp-targets=generic -std=c++20 `
               tools/sanity/hellosycl.cpp -o build/windows-toolchain/hellosycl.exe
           ./build/windows-toolchain/hellosycl.exe
+      - name: Build xchplot2 and run host checks
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'build/windows-toolchain/install'
+          $env:PATH = "$prefix/bin;" + $env:PATH
+          $env:ACPP_PREFIX = $prefix
+          $env:ACPP_VISIBILITY_MASK = 'omp'
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+          cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              "-DCMAKE_C_COMPILER=$prefix/bin/clang.exe" "-DCMAKE_CXX_COMPILER=$prefix/bin/clang++.exe" `
+              -DXCHPLOT2_BUILD_CUDA=ON -DACPP_TARGETS=generic -DCMAKE_CUDA_ARCHITECTURES=89
+          cmake --build build/windows-sycl --parallel 2
+          ctest --test-dir build/windows-sycl --output-on-failure --no-tests=error `
+              -R '^(bench_stats_test|numa_topology_test|temp_file_test|spill_engine_test|spill_coverage_test|host_guard_test|host_spill_policy_test|vram_budget_test|cli_host_test|pipeline_control_test|plot_file_parity|sycl_twophase_budget_test|solver_filter_parity|vram_probe_test)$'
+          python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe

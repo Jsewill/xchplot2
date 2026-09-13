@@ -47,7 +47,13 @@
 #include <system_error>
 #include <thread>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#include <io.h>
+#else
 #include <unistd.h>  // isatty — in-place progress line only on a TTY
+#endif
 
 namespace pos2gpu {
 
@@ -136,7 +142,12 @@ constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 // CpuMemoryGate, which needs the SUM of the two.
 std::uint64_t self_rss_bytes()
 {
-#if defined(__linux__)
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters))) return 0;
+    return static_cast<std::uint64_t>(counters.WorkingSetSize);
+#elif defined(__linux__)
     std::FILE* fp = std::fopen("/proc/self/statm", "re");
     if (!fp) return 0;
     unsigned long long total_pages = 0;
@@ -803,7 +814,11 @@ void emit_progress_line(std::string const& log_prefix,
     // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
     // one-line-per-plot when redirected to a file/pipe or when verbose
     // logging would interleave and garble the in-place line.
+#ifdef _WIN32
+    static bool const stderr_tty = ::_isatty(::_fileno(stderr)) != 0;
+#else
     static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
+#endif
     bool const in_place = stderr_tty && !opts.verbose;
 
     // Only surfaces on a resume (--skip-existing). Without it the line counts

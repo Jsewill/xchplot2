@@ -396,8 +396,16 @@ bool cuda_query_device_memory(int device_ordinal,
 // else on the card have already taken — an 8 GB card reports 8192 MB free,
 // picks plain (needs 7802), actually has ~7400, and OOMs mid-plot. Same bug the
 // NVIDIA path had.
-#ifndef _WIN32
 namespace {
+
+auto runtime_symbol(void* handle, char const* name)
+{
+#ifdef _WIN32
+    return ::GetProcAddress(static_cast<HMODULE>(handle), name);
+#else
+    return ::dlsym(handle, name);
+#endif
+}
 
 // Free VRAM on Level Zero (Intel), via Sysman.
 //
@@ -425,7 +433,6 @@ namespace {
 // caller, which rejects a reading that does not agree with global_mem_size. A
 // struct-layout mistake therefore degrades to "no probe" rather than to a
 // garbage free-VRAM figure that would send a tier past what the card has.
-#ifndef _WIN32
 namespace {
 
 using ZeResult          = int;                      // ZE_RESULT_SUCCESS == 0
@@ -482,6 +489,9 @@ ZesApi const& zes_api()
 {
     static ZesApi const api = [] {
         ZesApi a;
+#ifdef _WIN32
+        a.handle = ::GetModuleHandleW(L"ze_loader.dll");
+#else
         // Try the already-loaded image first: the SYCL runtime has L0 open
         // before we get here, so this succeeds even where the bare soname is
         // not on the search path (containers, non-standard prefixes).
@@ -498,8 +508,9 @@ ZesApi const& zes_api()
             a.handle = dlopen(soname, RTLD_LAZY | RTLD_LOCAL);
             ZDBG("dlopen(%s) -> %s", soname, a.handle ? "ok" : dlerror());
         }
+#endif
         if (!a.handle) { ZDBG("no Level Zero loader — probe unavailable"); return a; }
-        auto sym = [&](char const* n) { return dlsym(a.handle, n); };
+        auto sym = [&](char const* n) { return runtime_symbol(a.handle, n); };
         a.init        = reinterpret_cast<decltype(a.init)>(sym("zesInit"));
         a.driver_get  = reinterpret_cast<decltype(a.driver_get)>(sym("zesDriverGet"));
         a.device_get  = reinterpret_cast<decltype(a.device_get)>(sym("zesDeviceGet"));
@@ -623,7 +634,6 @@ bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes)
 }
 
 } // namespace
-#endif  // !_WIN32
 
 bool hip_query_device_memory(int device_ordinal,
                              size_t& free_bytes,
@@ -634,6 +644,12 @@ bool hip_query_device_memory(int device_ordinal,
     using GetDeviceFn  = int (*)(int*);
 
     static void* const handle = [] () -> void* {
+#ifdef _WIN32
+        // Query the runtime AdaptiveCpp loaded, including versioned HIP SDK DLLs.
+        for (wchar_t const* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
+            if (auto handle = ::GetModuleHandleW(name)) return handle;
+        }
+#else
         // Already in-process? A ROCm build has it loaded before we get here.
         if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
             if (dlsym(self, "hipMemGetInfo")) return self;
@@ -643,16 +659,17 @@ bool hip_query_device_memory(int device_ordinal,
                                    "libamdhip64.so.5"}) {
             if (void* h = dlopen(soname, RTLD_LAZY | RTLD_LOCAL)) return h;
         }
+#endif
         return nullptr;
     }();
     if (!handle) return false;
 
     static auto const mem_get_info =
-        reinterpret_cast<MemGetInfoFn>(dlsym(handle, "hipMemGetInfo"));
+        reinterpret_cast<MemGetInfoFn>(runtime_symbol(handle, "hipMemGetInfo"));
     static auto const set_device =
-        reinterpret_cast<SetDeviceFn>(dlsym(handle, "hipSetDevice"));
+        reinterpret_cast<SetDeviceFn>(runtime_symbol(handle, "hipSetDevice"));
     static auto const get_device =
-        reinterpret_cast<GetDeviceFn>(dlsym(handle, "hipGetDevice"));
+        reinterpret_cast<GetDeviceFn>(runtime_symbol(handle, "hipGetDevice"));
     if (!mem_get_info) return false;
 
     int  prev     = 0;
@@ -673,7 +690,6 @@ bool hip_query_device_memory(int device_ordinal,
 }
 
 } // namespace
-#endif  // !_WIN32
 
 // Host RAM. The CPU "device" IS the host, so its streaming tier has to be
 // sized against host memory — asking a GPU runtime how much memory the CPU has
@@ -869,7 +885,6 @@ bool device_memory_probe(int device_ordinal,
         }
     }
 #endif
-#ifndef _WIN32
     if (target.runtime == ProbeRuntime::Hip
         && hip_query_device_memory(target.ordinal, free_bytes, total_bytes)) {
         return true;
@@ -912,7 +927,6 @@ bool device_memory_probe(int device_ordinal,
                  (unsigned long long)(target.global_mem >> 20));
         }
     }
-#endif
     (void)target;
     (void)device_ordinal;
     (void)free_bytes;
