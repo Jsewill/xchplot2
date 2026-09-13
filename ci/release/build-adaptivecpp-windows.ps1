@@ -36,7 +36,13 @@ if ((git -C $ze rev-parse HEAD) -ne '5c863340cab6631a31234653191b904f0028b93b') 
 cmake -S $ze -B "$root/level-zero-build" -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
     "-DCMAKE_INSTALL_PREFIX=$root/level-zero-install" -DBUILD_L0_LOADER_TESTS=OFF
-cmake --build "$root/level-zero-build" --target install --parallel 2
+# Only the loader is a runtime dependency; the validation/tracing layers
+# are development tools and are not part of this package.
+cmake --build "$root/level-zero-build" --target ze_loader --parallel 2
+cmake --install "$root/level-zero-build" --component level-zero
+New-Item -ItemType Directory -Force "$root/level-zero-install/include/level_zero", "$root/level-zero-install/lib" | Out-Null
+Copy-Item "$ze/include/*.h" "$root/level-zero-install/include/level_zero"
+Copy-Item "$root/level-zero-build/lib/ze_loader.lib" "$root/level-zero-install/lib"
 $spirv = Join-Path $root 'llvm-spirv'
 if (-not (Test-Path $spirv)) {
     git clone --depth 1 --branch llvm_release_200 https://github.com/AdaptiveCpp/SPIRV-LLVM-Translator.git $spirv
