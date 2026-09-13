@@ -1281,6 +1281,7 @@ if(XCHPLOT2_BUILD_CUDA)
             # These contain host calls only. MSVC/nvcc cannot parse SYCL headers.
             set_source_files_properties(tools/parity/${t}.cu PROPERTIES LANGUAGE CXX)
             x2_add_sycl_to_target(TARGET ${t} SOURCES tools/parity/${t}.cu)
+            target_include_directories(${t} PRIVATE ${_xchplot2_cuda_include})
         endif()
         target_link_libraries(${t} PRIVATE pos2_gpu_host)
         set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")

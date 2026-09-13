@@ -12,6 +12,8 @@ on:
       - tools/**
       - contrib/**
       - scripts/build-release.sh
+      - scripts/build-release.ps1
+      - scripts/test/windows.py
       - scripts/test/release.py
   push:
     tags: ['v*', '!v*-cuda-only']
@@ -70,9 +72,86 @@ jobs:
             build/release-${{ matrix.gpu }}/dist/*.sha256
           if-no-files-found: error
 
+  windows-sycl:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - name: Install CUDA 12.9.1
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe' -OutFile $installer
+          $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
+          "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
+      - uses: actions/cache@v6
+        id: toolchain
+        with:
+          path: build/windows-toolchain/install
+          key: windows-acpp25.10-llvm20.1.8-cuda12.9.1-v2
+          restore-keys: windows-acpp25.10-llvm20.1.8-cuda12.9.1-v1
+      - name: Configure Visual Studio
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $visualStudio = & $vswhere -latest -version '[17.0,18.0)' -products '*' `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $visualStudio) { throw 'Visual Studio 2022 C++ build tools are required' }
+          $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvars64.bat'
+          cmd /c "call `"$vcvars`" >nul && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;" + $env:PATH
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
+          }
+          clang-cl --version
+      - name: Build AdaptiveCpp with LLVM
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: ./ci/release/build-adaptivecpp-windows.ps1 -ReuseLLVM:(Test-Path build/windows-toolchain/install/bin/clang.exe)
+      - name: Install release Rust tooling
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          cargo install --locked --features cli cargo-about --version 0.9.2
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
+        run: ./scripts/build-release.ps1
+      - name: Check the extracted runtime and Windows CPU proofs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $python = (Get-Command python.exe).Source
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $archive = (Get-ChildItem build/release-windows/dist/*.zip).FullName
+          # Hide the absolute fallback paths compiled into AdaptiveCpp, too.
+          Rename-Item build/windows-toolchain/install install-hidden
+          try {
+              & $python scripts/test/release.py $archive `
+                  --sycl-probe build/release-windows/tools/sanity/hellosycl.exe
+          } finally {
+              Rename-Item build/windows-toolchain/install-hidden install
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-sycl-nvidia
+          path: |
+            build/release-windows/dist/*.zip
+            build/release-windows/dist/*.sha256
+          if-no-files-found: error
+
   draft:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: linux-sycl
+    needs: [linux-sycl, windows-sycl]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -80,7 +159,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: linux-x86_64-sycl-*
+          pattern: '*-x86_64-sycl-*'
           merge-multiple: true
           path: dist
       - name: Attach archives to a draft release
