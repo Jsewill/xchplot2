@@ -412,7 +412,7 @@ runners do not validate GPU execution.
 The native Windows build is experimental and uses the standalone CMake
 executable. Cargo's dependency bootstrap remains Linux-specific. The Windows
 release job builds all CMake targets, runs host tests, and exercises the
-packaged CPU JIT, plotting, full proofs, cancellation, and recovery. GPU
+packaged CPU kernels, plotting, full proofs, cancellation, and recovery. GPU
 plotting has not yet been qualified on Windows hardware.
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
@@ -429,7 +429,7 @@ $env:PATH = "$env:ACPP_PREFIX\bin;$env:PATH"
 cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" `
     "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" `
-    -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON
+    '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON
 cmake --build build/windows-sycl --parallel 2
 ./build/windows-sycl/tools/xchplot2/xchplot2.exe devices
 python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe
@@ -440,6 +440,9 @@ The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU/CUDA backends,
 and replaces the separately licensed Windows error formatter with the C++
 standard library. Use the installed `clang`/`clang++` for the application;
 AdaptiveCpp's CMake launcher expects their GNU-style command line.
+`generic;omp` keeps GPU kernels in the generic JIT and precompiles CPU kernels.
+The generic-only Windows CPU JIT requires Visual Studio's static CRT libraries
+at runtime; the packaged application avoids that dependency.
 
 Use an ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill.
 The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.

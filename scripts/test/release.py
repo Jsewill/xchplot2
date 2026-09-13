@@ -73,9 +73,13 @@ with os.add_dll_directory(str(directory)):
                  if cuda_driver or path.name != "rt-backend-cuda.dll"]
     assert libraries, "No packaged Windows runtime DLLs"
 """, str(package / "bin")], check=True, timeout=60)
+            for tool in ("opt.exe", "llc.exe", "lld-link.exe"):
+                subprocess.run([package / "bin/hipSYCL/ext/llvm/bin" / tool, "--version"],
+                               check=True, timeout=30)
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
-        # The existing probe runs a real SSCP kernel through the packaged JIT.
+        # The existing probe runs a real SYCL kernel through the packaged runtime.
+        # Linux uses SSCP JIT; Windows includes a precompiled OpenMP CPU path.
         # Its build-tree RPATH cannot resolve inside the clean runtime image.
         if args.sycl_probe:
             env = dict(os.environ, ACPP_VISIBILITY_MASK="omp", LD_LIBRARY_PATH=str(package / "lib"))
@@ -86,7 +90,8 @@ with os.add_dll_directory(str(directory)):
                 probe = package / "bin/hellosycl.exe"
                 shutil.copy2(args.sycl_probe, probe)
             subprocess.run([probe], cwd=work, env=env, check=True, timeout=180)
-            print("Packaged SYCL JIT check passed")
+            print("Packaged SYCL CPU kernel check passed" if os.name == "nt"
+                  else "Packaged SYCL JIT check passed")
         plot_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"
         manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . cpu.plot2\n")

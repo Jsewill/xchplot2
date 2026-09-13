@@ -340,7 +340,11 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 # tests a user builds to diagnose an Intel GPU are configured through THIS
 # path, so on an Intel+AMD host they were AOT-pinned to amdgcn and could not
 # dispatch to the GPU under investigation at all.
-if(NOT ACPP_TARGETS)
+if(NOT ACPP_TARGETS AND WIN32)
+    # Precompile CPU kernels; Windows CPU JIT otherwise needs Visual Studio's
+    # static CRT libraries at runtime. GPU kernels retain the generic JIT.
+    set(ACPP_TARGETS "generic;omp" CACHE STRING "AdaptiveCpp target list" FORCE)
+elseif(NOT ACPP_TARGETS)
     execute_process(
         COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
         OUTPUT_VARIABLE _xchplot2_cuda_cap

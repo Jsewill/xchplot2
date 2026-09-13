@@ -62,7 +62,7 @@ cargo about generate --locked --fail --manifest-path keygen-rs/Cargo.toml `
     --target x86_64-pc-windows-msvc --output-file (Join-Path $licenses 'rust.txt') ci/release/licenses.hbs
 cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$prefix/bin/clang.exe" "-DCMAKE_CXX_COMPILER=$prefix/bin/clang++.exe" `
-    -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON -DXCHPLOT2_PACKAGE_GPU=nvidia `
+    '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON -DXCHPLOT2_PACKAGE_GPU=nvidia `
     "-DXCHPLOT2_RUNTIME_DIR:PATH=$runtime" `
     '-DCMAKE_CUDA_ARCHITECTURES=50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120' `
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static -DXCHPLOT2_PACKAGE=ON "-DXCHPLOT2_LICENSE_DIR:PATH=$licenses"

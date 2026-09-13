@@ -269,7 +269,7 @@ PR and manual runs retain workflow artifacts. Manual runs can select one
 platform; PR and tag runs build both. A `vVERSION` tag creates a
 draft GitHub release; publish it after qualifying the extracted archives on
 the supported GPUs. Do not rebuild between qualification and publication.
-The workflow checks extraction, the packaged SYCL JIT through `hellosycl`,
+The Linux jobs check extraction, the packaged SYCL JIT through `hellosycl`,
 CPU plotting, and full proofs in an image without development toolchains.
 
 The Windows job uses VS 2022, LLVM/Clang 20.1.8, and CUDA 12.9.1. It builds
@@ -278,15 +278,18 @@ caches the installed toolchain. Bump the cache key when its sources or build
 flags change. `scripts/build-release.ps1` collects DLLs and notices, builds
 all targets, runs the host checks, and writes `build/release-windows/dist/`.
 It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
+Windows uses `generic;omp`: generic GPU kernels and precompiled CPU kernels,
+because the Windows CPU JIT needs Visual Studio static CRT libraries.
 The archive test hides the compiler installation, removes toolkit paths,
-loads bundled runtime DLLs, and runs the existing Windows CPU recovery check.
+clears SDK library paths, loads bundled DLLs and LLVM tools, dispatches a CPU
+kernel, and runs the existing Windows CPU recovery check.
 Loading the CUDA backend DLL additionally requires NVIDIA's driver, so that
 check runs only when the driver is installed.
 This does not qualify a Windows GPU, HIP SDK, or Intel driver.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
 for the archive and CPU checks.
-Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test the JIT
+Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test kernel execution
 (use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
 For GPU qualification, use the extracted executable for the k=22/k=28 byte
 comparisons, full proofs, tiers, spill, and recovery checks described above.
