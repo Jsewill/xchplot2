@@ -1260,10 +1260,9 @@ if(WIN32)
 endif()
 target_link_options(xchplot2 PRIVATE ${_xchplot2_multiple_definitions})
 
-# Parity tests are nvcc-compiled (.cu) and reference __global__ kernels
-# from the bench-specific bitsliced AES path. They build only on the CUDA
-# target. The two SYCL-native parity tests below (sycl_*_parity) stay
-# unconditional so AMD/Intel builds still have correctness coverage.
+# These parity tests use CUDA allocations; AES tests also define CUDA
+# kernels. The SYCL-native parity tests below stay unconditional so
+# AMD/Intel builds still have correctness coverage.
 #
 # Each test gets $<TARGET_OBJECTS:pos2_gpu_cuda_obj> explicitly:
 # pos2_gpu (STATIC) doesn't carry the CUDA .o files anymore — putting
@@ -1274,9 +1273,15 @@ target_link_options(xchplot2 PRIVATE ${_xchplot2_multiple_definitions})
 # kernel-wrapper functions in pos2_gpu_host) pull them in directly,
 # making the .o files appear exactly once in each link line.
 if(XCHPLOT2_BUILD_CUDA)
+    set(_xchplot2_sycl_cuda_tests xs_parity xs_bench t1_parity t2_parity t3_parity)
     foreach(t IN ITEMS aes_parity aes_bs_parity aes_bs_bench aes_tezcan_bench
                        xs_parity xs_bench t1_parity t1_debug t2_parity t3_parity)
         add_executable(${t} tools/parity/${t}.cu $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+        if(WIN32 AND t IN_LIST _xchplot2_sycl_cuda_tests)
+            # These contain host calls only. MSVC/nvcc cannot parse SYCL headers.
+            set_source_files_properties(tools/parity/${t}.cu PROPERTIES LANGUAGE CXX)
+            x2_add_sycl_to_target(TARGET ${t} SOURCES tools/parity/${t}.cu)
+        endif()
         target_link_libraries(${t} PRIVATE pos2_gpu_host)
         set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
     endforeach()

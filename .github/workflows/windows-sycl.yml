@@ -5,6 +5,7 @@ on:
     branches: [feature/windows-sycl]
     paths:
       - .github/workflows/windows-sycl.yml
+      - CMakeLists.txt
   workflow_dispatch:
 
 permissions:
