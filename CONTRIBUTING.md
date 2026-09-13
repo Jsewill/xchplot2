@@ -107,7 +107,8 @@ Additional Fedora AMD and Ubuntu NVIDIA/Intel jobs pass `--no-acpp` and
 exercise Cargo's automatic AdaptiveCpp build and install to `~/.local`.
 CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
 repository changes. The existing container and CUDA architecture matrices
-remain separate coverage. Native Windows builds are not part of this matrix.
+remain separate coverage. The [binary release job](#binary-releases) checks
+native Windows separately.
 
 These are build and install checks, not GPU driver or hardware certification.
 Hosted WSL2 jobs also lack GPUs; actual WSL GPU support depends on the card
@@ -245,8 +246,9 @@ of a documentation move.
 
 ## Binary releases
 
-The release workflow builds one Linux archive per GPU vendor through the
-standalone CMake executable and CPack. Build images pin Ubuntu 24.04,
+The release workflow builds one Linux archive per GPU vendor and an
+experimental Windows NVIDIA ZIP through the standalone CMake executable
+and CPack. Build images pin Ubuntu 24.04,
 AdaptiveCpp 25.10, and Rust 1.98.1. NVIDIA uses CUDA 12.9.1 and LLVM 20;
 AMD follows the existing ROCm 6.2 / LLVM 18 pairing; Intel uses LLVM 20 and
 Level Zero. Keep `INSTALL.md` and the archive README in sync with these pins.
@@ -269,8 +271,20 @@ the supported GPUs. Do not rebuild between qualification and publication.
 The workflow checks extraction, the packaged SYCL JIT through `hellosycl`,
 CPU plotting, and full proofs in an image without development toolchains.
 
-Run `scripts/test/release.py ARCHIVE.tar.gz` for the archive and CPU checks.
-Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test the JIT.
+The Windows job uses VS 2022, LLVM/Clang 20.1.8, and CUDA 12.9.1. It builds
+AdaptiveCpp into LLVM using `ci/release/build-adaptivecpp-windows.ps1` and
+caches the installed toolchain. Bump the cache key when its sources or build
+flags change. `scripts/build-release.ps1` collects DLLs and notices, builds
+all targets, runs the host checks, and writes `build/release-windows/dist/`.
+It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
+The archive test hides the compiler installation, removes toolkit paths,
+loads every bundled DLL, and runs the existing Windows CPU recovery check.
+This does not qualify a Windows GPU, HIP SDK, or Intel driver.
+
+Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
+for the archive and CPU checks.
+Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test the JIT
+(use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
 For GPU qualification, use the extracted executable for the k=22/k=28 byte
 comparisons, full proofs, tiers, spill, and recovery checks described above.
 `gpu-ci.py --binary /path/to/extracted/bin/xchplot2` retains the matching

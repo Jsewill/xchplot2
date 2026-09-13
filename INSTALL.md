@@ -40,6 +40,15 @@ bundle uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
 
+The experimental Windows x86-64 `sycl-nvidia` ZIP uses the same pinned
+AdaptiveCpp and CUDA versions. Extract it, install the
+[Microsoft Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe),
+and run `.\bin\xchplot2.exe devices`. Keep the entire `bin/` tree together.
+It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
+CPU, and NTFS/ReFS for plots and spill. NVIDIA driver 576.57+ is recommended.
+Hosted checks exercise CPU plotting and recovery; Windows GPU qualification
+is still pending. See [Windows](#windows) for source builds and backend scope.
+
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.
 
@@ -392,49 +401,67 @@ toolchain may reject. An explicit `ACPP_TARGETS` takes precedence.
 
 ## Windows
 
-Use WSL2 for `main`. Install the vendor's Windows driver and follow its WSL
-GPU setup, then install the Linux toolkit and build dependencies inside the
-WSL distro. WSL's injected driver library is not the CUDA Toolkit. The
-[install matrix](CONTRIBUTING.md#install-ci) checks WSL builds, but its hosted
+WSL2 uses the Linux build. Install the vendor's Windows driver and follow
+its WSL GPU setup, then install the Linux toolkit and build dependencies
+inside the WSL distro. WSL's injected driver library is not the CUDA Toolkit.
+The [install matrix](CONTRIBUTING.md#install-ci) checks WSL builds; its hosted
 runners do not validate GPU execution.
 
-For native Windows on NVIDIA, use the experimental
-[`cuda-only` Windows recipe](https://github.com/Jsewill/xchplot2/blob/cuda-only/INSTALL.md#windows).
-Native Windows plotting is outside the current hardware test set.
+### Native SYCL/NVIDIA
 
-Native Windows SYCL is not supported by the current `main` build. Its
-AdaptiveCpp setup and host code require Linux/POSIX facilities; the earlier
-unvalidated source-build outline was not a tested installation path.
+The native Windows build is experimental and uses the standalone CMake
+executable. Cargo's dependency bootstrap remains Linux-specific. The Windows
+release job builds all CMake targets, runs host tests, and exercises the
+packaged CPU JIT, plotting, full proofs, cancellation, and recovery. GPU
+plotting has not yet been qualified on Windows hardware.
+
+Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
+20.1.8, CUDA Toolkit 12.9.1, CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
+1.98.1. Use PowerShell 7.3+ with the VS 2022 developer environment loaded.
+Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:
+
+```powershell
+$env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:PATH"
+./ci/release/build-adaptivecpp-windows.ps1
+$env:ACPP_PREFIX = (Resolve-Path build/windows-toolchain/install).Path
+$env:PATH = "$env:ACPP_PREFIX\bin;$env:PATH"
+cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" `
+    "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" `
+    -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON
+cmake --build build/windows-sycl --parallel 2
+./build/windows-sycl/tools/xchplot2/xchplot2.exe devices
+python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe
+```
+
+The first toolchain build takes about 95 minutes on a two-core hosted runner.
+The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU/CUDA backends,
+and replaces the separately licensed Windows error formatter with the C++
+standard library. Use the installed `clang`/`clang++` for the application;
+AdaptiveCpp's CMake launcher expects their GNU-style command line.
+
+Use an ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill.
+The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.
+The default config is `%APPDATA%\xchplot2\config.toml`.
+For the original CUDA implementation, see the
+[`cuda-only` Windows recipe](https://github.com/Jsewill/xchplot2/blob/cuda-only/INSTALL.md#windows).
 
 ### Native AMD and Intel evaluation
 
-The Linux archives pin AdaptiveCpp 25.10. Its
-[installation guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/doc/installing.md)
-describes Windows CPU/CUDA support through an LLVM-integrated build using
-LLVM 18 or newer. Its
-[Windows build workflow](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/.github/workflows/windows-acppllvm.yml)
-tests that CUDA toolchain. This does not establish Windows HIP or Level Zero
-support for xchplot2. Nightly binaries from `develop` are a separate toolchain
-candidate, not the pinned release compiler.
+The packaged Windows toolchain enables CPU and NVIDIA only. AMD HIP and
+Intel Level Zero require a separate AdaptiveCpp build and hardware testing;
+they are not supported Windows release configurations. AdaptiveCpp's
+[pinned installation guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/doc/installing.md)
+describes the LLVM-integrated Windows CPU/CUDA build.
 
-| Backend | Work required before a native Windows release |
-|---|---|
-| AMD HIP | Qualify an AdaptiveCpp Windows build with the selected HIP SDK and GPU; port the driver-backed `hipMemGetInfo` query and package the matching redistributable runtime. |
-| Intel | Qualify Level Zero or OpenCL with the Windows driver, including device/shared allocations, integer atomics, sorting, and JIT compilation; provide a free-memory query for that backend. |
-
+The HIP and Level Zero free-memory probes now resolve symbols from their
+loaded Windows runtime DLLs. Their driver queries still need Windows
+hardware validation. OpenCL has no free-memory probe, so admission rejects
+its unverified budget. Device capacity is not treated as free memory.
 AMD's [Windows HIP SDK component matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)
-differs from Linux ROCm. A Linux ROCm installation or a successful Linux
-archive build does not qualify the corresponding Windows combination.
+differs from Linux ROCm; a Linux build does not qualify that Windows pairing.
 
-The project's HIP and Level Zero probes in `src/host/GpuBufferPool.cpp`
-currently use POSIX dynamic loading and are excluded on Windows. OpenCL has
-no free-memory probe. Admission deliberately rejects an unverified GPU
-budget; reporting device capacity as free memory would weaken that check.
-The native CUDA host/file port also needs to be carried into the SYCL build,
-with a matching MSVC/Rust runtime and Windows DLL deployment.
-
-Before adding a Windows SYCL archive, run the existing allocation and kernel
-parity checks, then k=22/k=28 CPU byte comparisons, full proofs, every fitting
-tier and disk-spill variant, memory-pressure rejection, cancellation, and
-recovery using the extracted package on Windows hardware. A native Windows
-AMD/Intel compiler build and GPU run have not yet been qualified.
+Before qualifying any Windows GPU backend, run allocation and kernel parity
+checks, k=22/k=28 CPU byte comparisons, full proofs, every fitting tier and
+disk-spill variant, memory-pressure rejection, cancellation, and recovery
+using the extracted package on Windows hardware.

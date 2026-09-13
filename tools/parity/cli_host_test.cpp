@@ -138,6 +138,11 @@ int main(int argc, char** argv)
     assert(last_options.device_ids == std::vector<int>{0} && !last_options.quiet);
     assert(last_options.cpu_workers == 0 && !last_options.auto_host_ram_spill);
     put(config, "[bench]\nwarmup=0\nnum=1\nkeep=false\nverbose=false\n");
+#ifdef _WIN32
+    _putenv_s("POS2GPU_ASSERT_VRAM", "");
+#else
+    unsetenv("POS2GPU_ASSERT_VRAM");
+#endif
     int const before = batch_calls;
     assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
     assert(batch_calls == before + 1);

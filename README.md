@@ -53,7 +53,7 @@ for CPU-reference comparisons.
 | VRAM | Tiny's base k=28 floor is 1,228 MiB free after context creation, including the default 128 MiB buffer. Backend sort scratch can raise it. |
 | Host RAM | Depends on tier and worker count. Lower VRAM tiers generally use more host RAM; see [memory requirements](REFERENCE.md#memory-requirements). |
 | CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses pos2-chip's CPU plotter. |
-| OS | Linux is tested. WSL2 requires support from the GPU vendor. Native Windows SYCL and macOS are unsupported by this build. |
+| OS | Linux is tested. WSL2 requires support from the GPU vendor. [Native Windows SYCL/NVIDIA](INSTALL.md#windows) is experimental, with GPU qualification pending. macOS is unsupported. |
 
 The [benchmark report](BENCHMARKS.md) records tested hardware and toolchains.
 Build checks and GPU hardware checks are described separately in

@@ -18,12 +18,19 @@ on:
   push:
     tags: ['v*', '!v*-cuda-only']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Release builds to check
+        type: choice
+        default: all
+        options: [all, linux, windows]
 
 permissions:
   contents: read
 
 jobs:
   linux-sycl:
+    if: inputs.platform != 'windows'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -73,6 +80,7 @@ jobs:
           if-no-files-found: error
 
   windows-sycl:
+    if: inputs.platform != 'linux'
     runs-on: windows-2022
     timeout-minutes: 180
     defaults:
