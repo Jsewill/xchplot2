@@ -10,6 +10,12 @@ if(WIN32)
     endif()
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+    # Enabling nvcc loads Windows-MSVC and replaces the global library flags.
+    # Keep Clang's lookup syntax for C/C++ links, including CUDA runtime libs.
+    foreach(_lang C CXX)
+        set(CMAKE_${_lang}_LINK_LIBRARY_FLAG "-l")
+        set(CMAKE_${_lang}_LIBRARY_PATH_FLAG "-L")
+    endforeach()
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -1195,7 +1201,7 @@ add_dependencies(pos2_keygen pos2_keygen_build)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
 elseif(WIN32)
-    target_link_libraries(pos2_keygen INTERFACE -lws2_32 -luserenv -lbcrypt -lntdll -ladvapi32)
+    target_link_libraries(pos2_keygen INTERFACE ws2_32 userenv bcrypt ntdll advapi32)
 endif()
 
 # xchplot2_cli: the CLI dispatch logic as a static library, with the
@@ -1837,7 +1843,7 @@ foreach(_target IN LISTS _xchplot2_targets)
     get_target_property(_type ${_target} TYPE)
     if(WIN32 AND _type STREQUAL "EXECUTABLE")
         target_sources(${_target} PRIVATE tools/xchplot2/windows.manifest)
-        target_link_libraries(${_target} PRIVATE -ladvapi32 -lbcrypt -lpsapi)
+        target_link_libraries(${_target} PRIVATE advapi32 bcrypt psapi)
     endif()
     # Plain C++ consumers need the same OpenMP runtime as the SYCL objects.
     # Let AdaptiveCpp choose it; FindOpenMP probes only CMAKE_CXX_COMPILER,
