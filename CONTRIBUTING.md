@@ -247,7 +247,7 @@ of a documentation move.
 ## Binary releases
 
 The release workflow builds one Linux archive per GPU vendor and
-experimental Windows NVIDIA and AMD ZIPs through the standalone CMake executable
+an experimental Windows ZIP containing NVIDIA, AMD, and Intel backends through the standalone CMake executable
 and CPack. Build images pin Ubuntu 24.04,
 AdaptiveCpp 25.10, and Rust 1.98.1. NVIDIA uses CUDA 12.9.1 and LLVM 20;
 AMD follows the existing ROCm 6.2 / LLVM 18 pairing; Intel uses LLVM 20 and
@@ -272,35 +272,32 @@ the supported GPUs. Do not rebuild between qualification and publication.
 The Linux jobs check extraction, the packaged SYCL JIT through `hellosycl`,
 CPU plotting, and full proofs in an image without development toolchains.
 
-The Windows jobs use VS 2022 and LLVM/Clang 20.1.8, with CUDA 12.9.1 for NVIDIA
-or HIP SDK 6.4.2 for AMD. Each builds
-AdaptiveCpp into LLVM using `ci/release/build-adaptivecpp-windows.ps1` and
-caches the installed toolchain. Bump the cache key when its sources or build
-flags change. `scripts/build-release.ps1` collects DLLs and notices, builds
-all targets, runs the host checks, and writes `build/release-windows/dist/`.
+The Windows job uses VS 2022, LLVM/Clang 20.1.8, CUDA 12.9.1, and HIP SDK
+6.4.2. It builds AdaptiveCpp into LLVM using
+`ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
+and LLVM-SPIRV translator. The cached install tree is invalidated when
+compiler sources or options change. `scripts/build-release.ps1` collects
+runtime DLLs and notices, builds all targets, runs the host checks, and
+writes one combined `build/release-windows/dist/*-windows-x86_64-sycl.zip`.
 It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
-Pass `-Gpu amd` to both PowerShell build scripts for AMD; NVIDIA is the default.
-The AMD toolchain applies `contrib/adaptivecpp-windows-hip.patch`, which
-backports the upstream device-IR and Windows AMDGPU bitcode fixes.
+The toolchain applies `contrib/adaptivecpp-windows-hip.patch` for upstream
+device-IR fixes and `contrib/adaptivecpp-windows-level-zero.patch` for
+Windows headers, linking, DLL installation, and integrated SPIR-V builds.
 Windows uses `generic;omp`: generic GPU kernels and precompiled CPU kernels,
 because the Windows CPU JIT needs Visual Studio static CRT libraries.
-The archive test hides the compiler installation, removes toolkit paths,
-clears SDK library paths, loads bundled DLLs and LLVM tools, dispatches a CPU
-kernel, and runs the existing Windows CPU recovery check.
-Loading the CUDA backend DLL additionally requires NVIDIA's driver, so that
-check runs only when the driver is installed.
-AMD's vendor SDK components are installed separately by the packaged
-`install-dependencies.ps1` helper. CI tests that helper with its installed
-SDK, then loads every resulting DLL, including the HIP backend. The SDK's
-original path is hidden so its absolute fallback cannot mask a missing file.
-These checks do not qualify Windows GPU execution or an Intel driver.
+The archive test hides the compiler and both GPU SDK installations, clears
+SDK paths, loads bundled DLLs and LLVM tools, compiles an AMD `gfx1031`
+kernel, translates Intel SPIR-V, dispatches a CPU kernel, and runs the
+existing Windows CPU recovery check. CUDA and HIP backend DLL loading
+additionally requires their graphics drivers, so those two checks run only
+when their drivers are installed. The ZIP includes the compiler and
+redistributable runtime dependencies; users need only their graphics driver.
+These checks do not qualify Windows GPU execution.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
 for the archive and CPU checks.
 Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test kernel execution
 (use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
-Use `--hip-sdk PATH` with an already installed Windows HIP SDK 6.4.2 to
-exercise the AMD dependency helper as well.
 For GPU qualification, use the extracted executable for the k=22/k=28 byte
 comparisons, full proofs, tiers, spill, and recovery checks described above.
 `gpu-ci.py --binary /path/to/extracted/bin/xchplot2` retains the matching

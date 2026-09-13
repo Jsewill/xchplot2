@@ -40,19 +40,17 @@ bundle uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
 
-Windows release builds produce experimental x86-64 `sycl-nvidia` and
-`sycl-amd` ZIPs. Choose the archive for your GPU, extract it, and run
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\install-dependencies.ps1`.
-The helper installs the Microsoft runtime if absent. AMD additionally uses
-HIP SDK 6.4.2's Core and Runtime Compiler components, installed directly from
-AMD under its license; the helper copies their DLLs and bitcode for local use.
-The NVIDIA package includes its CUDA runtime. Run `.\bin\xchplot2.exe devices`
-and keep the entire `bin/` tree together.
+The experimental Windows x86-64 `sycl.zip` includes NVIDIA, AMD, and Intel
+backends together. Extract it and run `.\bin\xchplot2.exe devices`; keep the
+entire `bin/` tree together. The CUDA runtime, HIP compiler libraries and
+device bitcode, Intel Level Zero loader and SPIR-V translator, and Microsoft
+runtime DLLs are bundled. No CUDA, HIP/ROCm, or oneAPI SDK installation is needed.
+Install the normal graphics driver: NVIDIA 576.57+, AMD Adrenalin with the
+HIP 6 runtime, or Intel's graphics driver with Level Zero support.
 It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
-CPU, and NTFS/ReFS for plots and spill. Use NVIDIA driver 576.57+ or a current
-AMD Adrenalin driver. Installing CUDA cannot enable an AMD GPU.
-Hosted checks exercise CPU plotting and recovery; Windows GPU qualification
-is still pending. See [Windows](#windows) for source builds and backend scope.
+CPU, and NTFS/ReFS for plots and spill. Hosted checks exercise CPU plotting,
+recovery, and offline GPU compilation; Windows GPU qualification is still
+pending. See [Windows](#windows) for source builds.
 
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.
@@ -412,7 +410,7 @@ inside the WSL distro. WSL's injected driver library is not the CUDA Toolkit.
 The [install matrix](CONTRIBUTING.md#install-ci) checks WSL builds; its hosted
 runners do not validate GPU execution.
 
-### Native SYCL/NVIDIA
+### Native SYCL
 
 The native Windows build is experimental and uses the standalone CMake
 executable. Cargo's dependency bootstrap remains Linux-specific. The Windows
@@ -421,13 +419,15 @@ packaged CPU kernels, plotting, full proofs, cancellation, and recovery. GPU
 plotting has not yet been qualified on Windows hardware.
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
-20.1.8, CUDA Toolkit 12.9.1, CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
+20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),
+CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
 1.98.1 for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
 developer environment loaded.
 Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:
 
 ```powershell
-$env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:PATH"
+$env:HIP_PATH = "$env:ProgramFiles\AMD\ROCm\6.4"
+$env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;$env:PATH"
 ./ci/release/build-adaptivecpp-windows.ps1
 $env:ACPP_PREFIX = (Resolve-Path build/windows-toolchain/install).Path
 $env:PATH = "$env:ACPP_PREFIX\bin;$env:PATH"
@@ -441,7 +441,8 @@ python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe
 ```
 
 The initial Windows CI toolchain build took about 95 minutes with two parallel jobs.
-The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU/CUDA backends,
+The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU, CUDA, HIP,
+and Level Zero backends, builds the Level Zero loader and SPIR-V translator,
 and replaces the separately licensed Windows error formatter with the C++
 standard library. Use the installed `clang`/`clang++` for the application;
 AdaptiveCpp's CMake launcher expects their GNU-style command line.
@@ -455,38 +456,29 @@ The default config is `%APPDATA%\xchplot2\config.toml`.
 For the original CUDA implementation, see the
 [`cuda-only` Windows recipe](https://github.com/Jsewill/xchplot2/blob/cuda-only/INSTALL.md#windows).
 
-### Native AMD and Intel evaluation
+### Windows release packaging
 
-For AMD, use the same VS 2022/LLVM 20.1.8 prerequisites above, with HIP SDK
-6.4.2's Core and Runtime Compiler components in place of CUDA. Build in a
-fresh `build/windows-toolchain` directory when switching vendors:
+With the toolchain above installed, build the combined archive:
 
 ```powershell
-$env:HIP_PATH = "$env:ProgramFiles\AMD\ROCm\6.4"
-$env:PATH = "$env:ProgramFiles\LLVM\bin;$env:HIP_PATH\bin;$env:PATH"
-./ci/release/build-adaptivecpp-windows.ps1 -Gpu amd
-$env:ACPP_PREFIX = (Resolve-Path build/windows-toolchain/install).Path
 cargo install --locked --features cli cargo-about --version 0.9.2
-./scripts/build-release.ps1 -Gpu amd
+./scripts/build-release.ps1
 ```
 
-This enables CPU/HIP, disables CUDA, and backports AdaptiveCpp's
+The toolchain backports AdaptiveCpp's
 [Windows HIP compiler fixes](https://github.com/AdaptiveCpp/AdaptiveCpp/discussions/2078)
-to the pinned 25.10.0 release. LLVM 20 matches HIP SDK 6.4.2's compiler.
-The dependency helper obtains AMD's SDK separately because its Windows
-binaries have different redistribution terms from Linux ROCm. It can use an
-existing installation with `-HipPath "C:\path\to\6.4"`.
+and supplies its missing Windows Level Zero build/install handling.
+LLVM 20 matches HIP SDK 6.4.2's compiler. The package includes compiler
+libraries; the AMD graphics driver supplies the HIP runtime, following
+[AMD's deployment guidance](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/conceptual/deployment-guidelines.html).
 The RX 6700 XT (`gfx1031`) is listed for
-[Windows HIP runtime support](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/reference/system-requirements.html),
-but its plotting path still needs hardware qualification. The SDK's extra
-math libraries are not required. Intel is not yet packaged for native Windows.
+[Windows HIP runtime support](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/reference/system-requirements.html).
+Its plotting path still needs hardware qualification. Extra ROCm math
+libraries are not required.
 
-The HIP and Level Zero free-memory probes now resolve symbols from their
-loaded Windows runtime DLLs. Their driver queries still need Windows
-hardware validation. OpenCL has no free-memory probe, so admission rejects
-its unverified budget. Device capacity is not treated as free memory.
-AMD's [Windows HIP SDK component matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)
-differs from Linux ROCm; a Linux build does not qualify that Windows pairing.
+The HIP and Level Zero VRAM probes resolve the loaded Windows runtime DLLs.
+Their driver queries still need Windows hardware qualification. Intel uses
+Level Zero; support depends on the GPU and its graphics driver.
 
 Before qualifying any Windows GPU backend, run allocation and kernel parity
 checks, k=22/k=28 CPU byte comparisons, full proofs, every fitting tier and

@@ -1,0 +1,60 @@
+# AdaptiveCpp 25.10.0 Windows Level Zero integration.
+# Upstream source is BSD-2-Clause; retain its notices in the patched files.
+# Use portable headers, install the backend DLL, and build the LLVM-SPIRV
+# translator in the same LLVM tree on Windows.
+--- a/src/runtime/ze/ze_code_object.cpp
++++ b/src/runtime/ze/ze_code_object.cpp
+@@ -16,7 +16,7 @@
+ #include "hipSYCL/runtime/ze/ze_queue.hpp"
+ #include "hipSYCL/runtime/error.hpp"
+ #include <algorithm>
+-#include <bits/stdint-uintn.h>
++#include <cstdint>
+ #include <level_zero/ze_api.h>
+ #include <cassert>
+ #include <string>
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -213,7 +213,10 @@
+     ze/ze_code_object.cpp)
+   
+   target_include_directories(rt-backend-ze PRIVATE ${HIPSYCL_SOURCE_DIR}/include)
+-  target_link_libraries(rt-backend-ze PRIVATE acpp-rt -lze_loader)
++  find_path(LEVEL_ZERO_INCLUDE_DIR level_zero/ze_api.h REQUIRED)
++  find_library(LEVEL_ZERO_LOADER ze_loader REQUIRED)
++  target_include_directories(rt-backend-ze PRIVATE ${LEVEL_ZERO_INCLUDE_DIR})
++  target_link_libraries(rt-backend-ze PRIVATE acpp-rt ${LEVEL_ZERO_LOADER})
+ 
+   target_compile_options(rt-backend-ze PRIVATE ${HIPSYCL_RT_EXTRA_CXX_FLAGS})
+   target_link_libraries(rt-backend-ze PRIVATE ${HIPSYCL_RT_EXTRA_LINKER_FLAGS})
+@@ -232,6 +235,7 @@
+   endif()
+ 
+   install(TARGETS rt-backend-ze
++        RUNTIME DESTINATION bin/hipSYCL
+         LIBRARY DESTINATION lib/hipSYCL
+         ARCHIVE DESTINATION lib/hipSYCL)
+ endif()
+--- a/src/compiler/llvm-to-backend/CMakeLists.txt
++++ b/src/compiler/llvm-to-backend/CMakeLists.txt
+@@ -172,6 +172,12 @@
+       LIBRARY spirv/LLVMToSpirv.cpp 
+       TOOL spirv/LLVMToSpirvTool.cpp)
+ 
++    if(WIN32 AND ACPP_LLVM_COMPONENT)
++      # Build the translator as an LLVM external project, using the same
++      # static LLVM libraries and CRT as the integrated Windows toolchain.
++      set(LLVMSPIRV_RELATIVE_PATH bin/hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe)
++      add_dependencies(llvm-to-spirv llvm-spirv)
++    else()
+     # Install LLVM-SPIRV translator for llvm-to-spirv
+     if(NOT LLVMSPIRV_BRANCH)
+       set(LLVMSPIRV_BRANCH llvm_release_${LLVM_VERSION_MAJOR}0)
+@@ -209,6 +215,7 @@
+     install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} --build . --target InstallLLVMSpirvTranslator)")
+ 
+     add_dependencies(llvm-to-spirv LLVMSpirvTranslator)
++    endif()
+     target_compile_definitions(llvm-to-spirv PRIVATE
+       -DHIPSYCL_RELATIVE_LLVMSPIRV_PATH="${LLVMSPIRV_RELATIVE_PATH}")
+     

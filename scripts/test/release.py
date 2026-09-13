@@ -17,8 +17,6 @@ def main():
     parser.add_argument("archive", type=pathlib.Path)
     parser.add_argument("--sycl-probe", type=pathlib.Path,
                         help="Matching build/tools/sanity/hellosycl executable")
-    parser.add_argument("--hip-sdk", type=pathlib.Path,
-                        help="Installed Windows HIP SDK 6.4.2; test the packaged dependency helper with it")
     args = parser.parse_args()
     digest = hashlib.sha256()
     with args.archive.open("rb") as archive:
@@ -55,56 +53,72 @@ def main():
                        "2019 Intel Corporation"):
             assert author in llvm_notices, f"Missing LLVM third-party notice: {author}"
         if os.name == "nt":
-            amd = "Backend: SYCL/AdaptiveCpp (amd)" in (package / "BUILDINFO.txt").read_text()
-            vendor_files = ("hipSYCL/rt-backend-hip.dll",) if amd else ("cudart64_12.dll", "hipSYCL/rt-backend-cuda.dll")
-            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "hipSYCL/rt-backend-omp.dll", *vendor_files):
+            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
+                         "hiprtc0604.dll", "hiprtc-builtins0604.dll", "amd_comgr0604.dll", "ze_loader.dll",
+                         "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+                         "hipSYCL/rt-backend-omp.dll", "hipSYCL/rt-backend-cuda.dll",
+                         "hipSYCL/rt-backend-hip.dll", "hipSYCL/rt-backend-ze.dll",
+                         "hipSYCL/ext/bitcode/amdgcn/oclc_isa_version_1031.bc",
+                         "hipSYCL/bitcode/libkernel-sscp-spirv-full.bc",
+                         "hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe"):
                 assert (package / "bin" / name).stat().st_size > 0, f"Missing {name}"
-            helper = package / "install-dependencies.ps1"
-            assert helper.stat().st_size > 0
-            if amd:
-                assert (package / "licenses/amd-runtime.txt").stat().st_size > 0
-                assert (package / "licenses/hip-headers.txt").stat().st_size > 0
-                assert not list((package / "bin").glob("*hip*64*.dll")), "AMD SDK runtime must be installed separately"
-                assert not list((package / "bin").glob("hiprtc*.dll")), "AMD SDK RTC must be installed separately"
-                assert not list((package / "bin").glob("*comgr*.dll")), "AMD SDK compiler must be installed separately"
-                assert not (package / "bin/hipSYCL/ext/bitcode/amdgcn").exists(), "AMD SDK bitcode must be installed separately"
-            if not amd or args.hip_sdk:
-                powershell = pathlib.Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-                options = ["-HipPath", str(args.hip_sdk.resolve())] if args.hip_sdk else []
-                if args.hip_sdk:
-                    assert (args.hip_sdk / "bin/hiprtc0604.dll").is_file(), "Provide the already installed HIP SDK"
-                # The runner already has these prerequisites, so no installer UI is opened.
-                subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper, *options],
-                               check=True, timeout=120)
-                if amd:
-                    for name in ("amdhip64_6.dll", "hiprtc0604.dll", "hiprtc-builtins0604.dll", "amd_comgr0604.dll", "amd_comgr_2.dll"):
-                        assert (package / "bin" / name).is_file(), f"Dependency helper did not install {name}"
-                    assert (package / "bin/hipSYCL/ext/bitcode/amdgcn/oclc_isa_version_1031.bc").is_file()
+            for name in ("amd-runtime.txt", "hip-headers.txt", "hiprtc.txt", "rocm-comgr.txt",
+                         "rocm-device-libs.txt", "level-zero-license.txt", "llvm-spirv-license.txt",
+                         "spirv-headers-license.txt", "cuda.txt", "cuda-cccl.txt"):
+                assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
+            for directory in (package / "bin", package / "bin/hipSYCL/ext/llvm/bin",
+                              package / "bin/hipSYCL/ext/llvm-spirv/bin"):
+                for name in ("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+                    assert (directory / name).is_file(), f"Missing app-local runtime: {directory / name}"
+            assert not list(package.rglob("*.lib")), "Import/static libraries are not runtime dependencies"
+            assert not list((package / "bin").glob("amdhip64*.dll")), "Use the HIP runtime supplied by the AMD driver"
             # ctypes keeps DLLs loaded; let a child exit before removing the archive.
             subprocess.run([sys.executable, "-c", """
 import ctypes, os, pathlib, sys
 directory = pathlib.Path(sys.argv[1])
-# The CUDA plugin imports nvcuda.dll from the user's driver. Hosted runners
-# have no driver; still load the bundled CUDA runtime there.
-cuda_driver = True
-if (directory / "hipSYCL/rt-backend-cuda.dll").is_file():
+# NVIDIA and AMD runtime plugins import DLLs supplied by their graphics
+# drivers. Hosted runners have neither; every bundled dependency still loads.
+skip = set()
+for driver, backend in (("nvcuda.dll", "cuda"), ("amdhip64_6.dll", "hip")):
     try:
-        ctypes.WinDLL("nvcuda.dll")
+        ctypes.WinDLL(driver)
     except FileNotFoundError:
-        cuda_driver = False
-        print("CUDA backend DLL load check requires an NVIDIA driver")
-hip_runtime = (directory / "hiprtc0604.dll").is_file()
-if not hip_runtime and (directory / "hipSYCL/rt-backend-hip.dll").is_file():
-    print("HIP backend DLL load check requires the AMD runtime; pass --hip-sdk to test installation")
+        skip.add(f"rt-backend-{backend}.dll")
+        print(f"{backend} backend DLL load check requires its graphics driver")
 with os.add_dll_directory(str(directory)):
-    libraries = [ctypes.WinDLL(str(path)) for path in directory.rglob("*.dll")
-                 if (cuda_driver or path.name != "rt-backend-cuda.dll")
-                 and (hip_runtime or path.name != "rt-backend-hip.dll")]
+    libraries = [ctypes.WinDLL(str(path)) for path in directory.rglob("*.dll") if path.name not in skip]
     assert libraries, "No packaged Windows runtime DLLs"
+    # Compile a kernel for the reported RX 6700 XT without any GPU or SDK.
+    rtc = ctypes.WinDLL(str(directory / "hiprtc0604.dll"))
+    rtc.hiprtcGetErrorString.restype = ctypes.c_char_p
+    def check(result):
+        assert result == 0, rtc.hiprtcGetErrorString(result).decode()
+    program = ctypes.c_void_p()
+    source = b'extern "C" __global__ void probe(int* out) { out[0] = 42; }'
+    check(rtc.hiprtcCreateProgram(ctypes.byref(program), source, b"probe.hip", 0, None, None))
+    try:
+        options = (ctypes.c_char_p * 1)(b"--gpu-architecture=gfx1031")
+        check(rtc.hiprtcCompileProgram(program, len(options), options))
+        size = ctypes.c_size_t()
+        check(rtc.hiprtcGetCodeSize(program, ctypes.byref(size)))
+        assert size.value > 0, "HIP RTC returned no GPU code"
+    finally:
+        check(rtc.hiprtcDestroyProgram(ctypes.byref(program)))
+    print("Packaged HIP RTC compiled gfx1031 kernel without an SDK")
 """, str(package / "bin")], check=True, timeout=60)
             for tool in ("opt.exe", "llc.exe", "lld-link.exe"):
                 subprocess.run([package / "bin/hipSYCL/ext/llvm/bin" / tool, "--version"],
                                check=True, timeout=30)
+            # Exercise Intel's translator with actual kernel IR, not only --version.
+            spirv_ir = work / "probe.ll"
+            spirv_ir.write_text('target triple = "spir64-unknown-unknown"\n'
+                                'define spir_kernel void @probe() { ret void }\n')
+            spirv_bc, spirv_out = work / "probe.bc", work / "probe.spv"
+            subprocess.run([package / "bin/hipSYCL/ext/llvm/bin/opt.exe", spirv_ir, "-o", spirv_bc],
+                           check=True, timeout=30)
+            subprocess.run([package / "bin/hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe", spirv_bc, "-o", spirv_out],
+                           check=True, timeout=30)
+            assert spirv_out.read_bytes()[:4] == b"\x03\x02\x23\x07", "Invalid SPIR-V output"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         if os.name == "nt":

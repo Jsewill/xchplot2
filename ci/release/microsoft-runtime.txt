@@ -1,8 +1,12 @@
 Microsoft Visual C++ runtime
 Copyright Microsoft Corporation. All rights reserved.
 
-The Windows SYCL executable uses the Microsoft Visual C++ release runtime.
-Install the x64 Redistributable from Microsoft; it is not included in this ZIP.
-Microsoft's license terms and redistribution documentation are available at:
+The Windows SYCL archive includes the x64 release runtime DLLs from
+Visual Studio 2022's Microsoft.VC143.CRT redistributable directory.
+These Microsoft components retain their own license terms; the xchplot2
+source license does not grant additional rights to them.
+
+Microsoft's license terms and redistribution documentation:
 https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
 https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
+https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
