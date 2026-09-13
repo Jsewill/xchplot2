@@ -53,24 +53,28 @@ def main():
                        "2019 Intel Corporation"):
             assert author in llvm_notices, f"Missing LLVM third-party notice: {author}"
         if os.name == "nt":
-            import ctypes
             for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
                          "hipSYCL/rt-backend-omp.dll", "hipSYCL/rt-backend-cuda.dll"):
                 assert (package / "bin" / name).stat().st_size > 0, f"Missing {name}"
-            # The CUDA plugin imports nvcuda.dll from the user's driver. Hosted
-            # runners have no driver; still load the bundled CUDA runtime there.
-            try:
-                ctypes.WinDLL("nvcuda.dll")
-                cuda_driver = True
-            except OSError as error:
-                if error.winerror != 126:
-                    raise
-                cuda_driver = False
-                print("CUDA backend DLL load check requires an NVIDIA driver")
-            with os.add_dll_directory(str(package / "bin")):
-                libraries = [ctypes.WinDLL(str(path)) for path in package.rglob("*.dll")
-                             if cuda_driver or path.name != "rt-backend-cuda.dll"]
-                assert libraries, "No packaged Windows runtime DLLs"
+            # ctypes keeps DLLs loaded; let a child exit before removing the archive.
+            subprocess.run([sys.executable, "-c", """
+import ctypes, os, pathlib, sys
+directory = pathlib.Path(sys.argv[1])
+# The CUDA plugin imports nvcuda.dll from the user's driver. Hosted runners
+# have no driver; still load the bundled CUDA runtime there.
+try:
+    ctypes.WinDLL("nvcuda.dll")
+    cuda_driver = True
+except OSError as error:
+    if error.winerror != 126:
+        raise
+    cuda_driver = False
+    print("CUDA backend DLL load check requires an NVIDIA driver")
+with os.add_dll_directory(str(directory)):
+    libraries = [ctypes.WinDLL(str(path)) for path in directory.rglob("*.dll")
+                 if cuda_driver or path.name != "rt-backend-cuda.dll"]
+    assert libraries, "No packaged Windows runtime DLLs"
+""", str(package / "bin")], check=True, timeout=60)
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         # The existing probe runs a real SSCP kernel through the packaged JIT.
