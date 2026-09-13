@@ -1,6 +1,5 @@
 #requires -Version 7.3
 # Run from a VS 2022 developer shell with clang-cl 20.1.8, Ninja and CUDA 12.9.1.
-param([switch]$ReuseLLVM)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-Location (Join-Path $PSScriptRoot '../..')
@@ -43,14 +42,7 @@ cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF `
     -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
     -DLLVM_INCLUDE_TESTS=OFF
-if ($ReuseLLVM) {
-    # Upgrade the existing, identically configured CI cache's common DLL.
-    cmake --build "$root/build" --target acpp-common --parallel 2
-    Copy-Item "$root/build/bin/acpp-common.dll" "$prefix/bin"
-    Copy-Item "$root/build/lib/acpp-common.lib" "$prefix/lib"
-} else {
-    cmake --build "$root/build" --target install --parallel 2
-}
+cmake --build "$root/build" --target install --parallel 2
 Copy-Item "$acpp/LICENSE" "$prefix/adaptivecpp-license.txt"
 Copy-Item "$root/llvm/llvm/LICENSE.TXT" "$prefix/llvm-license.txt"
 @"

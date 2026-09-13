@@ -40,8 +40,8 @@ bundle uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
 
-Windows release builds produce an experimental x86-64 `sycl-nvidia` ZIP with the same pinned
-AdaptiveCpp and CUDA versions. Extract it, install the
+Windows release builds produce an experimental x86-64 `sycl-nvidia` ZIP
+with the same pinned AdaptiveCpp and CUDA versions. Extract it, install the
 [Microsoft Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe),
 and run `.\bin\xchplot2.exe devices`. Keep the entire `bin/` tree together.
 It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
@@ -435,7 +435,7 @@ cmake --build build/windows-sycl --parallel 2
 python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe
 ```
 
-The first toolchain build takes about 95 minutes on a two-core hosted runner.
+The initial Windows CI toolchain build took about 95 minutes with two parallel jobs.
 The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU/CUDA backends,
 and replaces the separately licensed Windows error formatter with the C++
 standard library. Use the installed `clang`/`clang++` for the application;
