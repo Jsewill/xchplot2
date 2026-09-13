@@ -8,7 +8,7 @@ if(WIN32)
        CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         message(FATAL_ERROR "Windows SYCL requires the AdaptiveCpp LLVM clang/clang++ compilers")
     endif()
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
 endif()
 
@@ -1125,6 +1125,12 @@ add_library(pos2_gpu_host STATIC
 )
 target_include_directories(pos2_gpu_host PUBLIC src)
 target_link_libraries(pos2_gpu_host PUBLIC pos2_chip_headers pos2_gpu)
+if(WIN32)
+    # Use AdaptiveCpp's SYCL mode for host orchestration that includes its headers.
+    # Plain Clang instantiates the unsupported fallback host builtins instead.
+    get_target_property(_xchplot2_host_sources pos2_gpu_host SOURCES)
+    x2_add_sycl_to_target(TARGET pos2_gpu_host SOURCES ${_xchplot2_host_sources})
+endif()
 
 # ----------------------------------------------------------------------------
 # pos2_keygen — Rust staticlib that wraps chia-rs (BLS + compute_plot_id_v2)

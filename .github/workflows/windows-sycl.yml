@@ -1,4 +1,4 @@
-name: Windows SYCL toolchain
+name: Windows SYCL
 
 on:
   push:

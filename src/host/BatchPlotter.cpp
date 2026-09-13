@@ -3281,7 +3281,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "[pipeline-plot] wrote %s (%llu fragments)\n",
-                        full_path.c_str(),
+                        full_path.string().c_str(),
                         static_cast<unsigned long long>(frags.size()));
                 }
             } catch (std::exception const& e) {
