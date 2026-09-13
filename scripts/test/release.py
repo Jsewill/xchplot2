@@ -65,9 +65,7 @@ directory = pathlib.Path(sys.argv[1])
 try:
     ctypes.WinDLL("nvcuda.dll")
     cuda_driver = True
-except OSError as error:
-    if error.winerror != 126:
-        raise
+except FileNotFoundError:
     cuda_driver = False
     print("CUDA backend DLL load check requires an NVIDIA driver")
 with os.add_dll_directory(str(directory)):
