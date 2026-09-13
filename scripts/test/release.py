@@ -49,13 +49,27 @@ def main():
                        "Universidad Rey Juan Carlos", "Pekka Jääskeläinen"):
             assert author in notices, f"Missing AdaptiveCpp third-party notice: {author}"
         llvm_notices = (package / "licenses/llvm-third-party.txt").read_text(encoding="utf-8")
-        assert "Yann Collet" in llvm_notices and "Henry Spencer" in llvm_notices
+        for author in ("Yann Collet", "Henry Spencer", "Todd C. Miller", "Unicode, Inc.",
+                       "2019 Intel Corporation"):
+            assert author in llvm_notices, f"Missing LLVM third-party notice: {author}"
         if os.name == "nt":
             import ctypes
-            # Include the masked GPU backend: a CPU probe alone may ignore a
-            # plugin whose CUDA runtime DLL is missing.
+            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
+                         "hipSYCL/rt-backend-omp.dll", "hipSYCL/rt-backend-cuda.dll"):
+                assert (package / "bin" / name).stat().st_size > 0, f"Missing {name}"
+            # The CUDA plugin imports nvcuda.dll from the user's driver. Hosted
+            # runners have no driver; still load the bundled CUDA runtime there.
+            try:
+                ctypes.WinDLL("nvcuda.dll")
+                cuda_driver = True
+            except OSError as error:
+                if error.winerror != 126:
+                    raise
+                cuda_driver = False
+                print("CUDA backend DLL load check requires an NVIDIA driver")
             with os.add_dll_directory(str(package / "bin")):
-                libraries = [ctypes.WinDLL(str(path)) for path in package.rglob("*.dll")]
+                libraries = [ctypes.WinDLL(str(path)) for path in package.rglob("*.dll")
+                             if cuda_driver or path.name != "rt-backend-cuda.dll"]
                 assert libraries, "No packaged Windows runtime DLLs"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)

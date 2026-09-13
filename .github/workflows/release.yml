@@ -97,7 +97,7 @@ jobs:
           $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
           "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
         id: toolchain
         with:
           path: build/windows-toolchain/install
@@ -123,6 +123,11 @@ jobs:
       - name: Build AdaptiveCpp with LLVM
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: ./ci/release/build-adaptivecpp-windows.ps1 -ReuseLLVM:(Test-Path build/windows-toolchain/install/bin/clang.exe)
+      - uses: actions/cache/save@v6
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        with:
+          path: build/windows-toolchain/install
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
       - name: Install release Rust tooling
         run: |
           $PSNativeCommandUseErrorActionPreference = $true

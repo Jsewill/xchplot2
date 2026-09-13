@@ -265,7 +265,8 @@ to `build/release-VENDOR/dist/`. `acpp --acpp-deploy` collects runtime and
 JIT dependencies; the build script adds Level Zero, checks the selected
 backend, collects license notices, and makes library paths relative.
 
-PR and manual runs retain workflow artifacts. A `vVERSION` tag creates a
+PR and manual runs retain workflow artifacts. Manual runs can select one
+platform; PR and tag runs build both. A `vVERSION` tag creates a
 draft GitHub release; publish it after qualifying the extracted archives on
 the supported GPUs. Do not rebuild between qualification and publication.
 The workflow checks extraction, the packaged SYCL JIT through `hellosycl`,
@@ -278,7 +279,9 @@ flags change. `scripts/build-release.ps1` collects DLLs and notices, builds
 all targets, runs the host checks, and writes `build/release-windows/dist/`.
 It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
 The archive test hides the compiler installation, removes toolkit paths,
-loads every bundled DLL, and runs the existing Windows CPU recovery check.
+loads bundled runtime DLLs, and runs the existing Windows CPU recovery check.
+Loading the CUDA backend DLL additionally requires NVIDIA's driver, so that
+check runs only when the driver is installed.
 This does not qualify a Windows GPU, HIP SDK, or Intel driver.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)

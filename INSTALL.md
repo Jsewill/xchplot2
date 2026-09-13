@@ -40,7 +40,7 @@ bundle uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
 
-The experimental Windows x86-64 `sycl-nvidia` ZIP uses the same pinned
+Windows release builds produce an experimental x86-64 `sycl-nvidia` ZIP with the same pinned
 AdaptiveCpp and CUDA versions. Extract it, install the
 [Microsoft Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe),
 and run `.\bin\xchplot2.exe devices`. Keep the entire `bin/` tree together.
@@ -417,7 +417,8 @@ plotting has not yet been qualified on Windows hardware.
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
 20.1.8, CUDA Toolkit 12.9.1, CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
-1.98.1. Use PowerShell 7.3+ with the VS 2022 developer environment loaded.
+1.98.1 for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
+developer environment loaded.
 Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:
 
 ```powershell
