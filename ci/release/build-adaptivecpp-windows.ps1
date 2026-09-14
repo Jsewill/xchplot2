@@ -81,6 +81,8 @@ cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
     -DLLVM_INCLUDE_TESTS=OFF
 cmake --build "$root/build" --target install --parallel 2
+# The translator uses narrow argv/streams; match the application's UTF-8 paths.
+mt.exe -manifest tools/xchplot2/windows.manifest "-outputresource:$prefix/bin/llvm-spirv.exe;#1"
 New-Item -ItemType Directory -Force "$prefix/bin/hipSYCL/ext/llvm-spirv/bin" | Out-Null
 Copy-Item "$prefix/bin/llvm-spirv.exe" "$prefix/bin/hipSYCL/ext/llvm-spirv/bin"
 Copy-Item "$root/level-zero-build/bin/ze_loader.dll" "$prefix/bin"

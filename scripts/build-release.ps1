@@ -72,6 +72,8 @@ Invoke-WebRequest 'https://raw.githubusercontent.com/ROCm/llvm-project/d366fa84f
 Copy-Item "$prefix/bin/hipSYCL/rt-backend-ze.dll" "$runtime/hipSYCL"
 Copy-Item "$prefix/lib/hipSYCL/bitcode/libkernel-sscp-spirv-full.bc" "$runtime/hipSYCL/bitcode"
 Copy-Item -Recurse "$prefix/bin/hipSYCL/ext/llvm-spirv" "$runtime/hipSYCL/ext"
+# Also cover toolchain caches created before the translator's UTF-8 manifest.
+mt.exe -manifest tools/xchplot2/windows.manifest "-outputresource:$runtime/hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe;#1"
 Copy-Item "$prefix/bin/ze_loader.dll" $runtime
 Copy-Item "$prefix/level-zero-license.txt", "$prefix/llvm-spirv-license.txt", "$prefix/spirv-headers-license.txt" $licenses
 # Microsoft's documented app-local deployment avoids an installer at first run.
@@ -85,6 +87,7 @@ foreach ($directory in $runtime, "$runtime/hipSYCL/ext/llvm/bin", "$runtime/hipS
 HIP compiler libraries: 6.4.2 (AMD graphics driver supplies HIP runtime 6)
 Level Zero loader: 1.33.1
 LLVM-SPIRV: f0ae76f12c62ede090e57ece8c986f4c3c971a71
+LLVM-SPIRV Windows manifest: tools/xchplot2/windows.manifest
 Visual C++ runtime: $((Get-Item "$crt/vcruntime140.dll").VersionInfo.FileVersion)
 "@ | Add-Content (Join-Path $BuildDir 'runtime-info.txt')
 $rustDocs = Join-Path (rustc --print sysroot) 'share/doc/rust'
