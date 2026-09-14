@@ -19,7 +19,6 @@
 namespace pos2gpu {
 
 // Generate Xs_Candidate[2^k], sorted by match_info (low k bits, stable).
-// Caller must have called initialize_aes_tables() once before invocation.
 //
 //   plot_id_bytes  : 32 bytes
 //   k              : even, 18..32

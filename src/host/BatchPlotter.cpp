@@ -57,8 +57,6 @@
 
 namespace pos2gpu {
 
-void initialize_aes_tables(); // forward decl from AesGpu.cu
-
 namespace {
 
 struct WorkItem {
@@ -1685,7 +1683,6 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     }
 
     if (device_id >= 0 || is_cpu_device(device_id)) bind_current_device(device_id);
-    initialize_aes_tables();
 
     bool const verbose = opts.verbose;
 

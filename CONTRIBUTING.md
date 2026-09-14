@@ -295,7 +295,9 @@ redistributable runtime dependencies; users need only their graphics driver.
 These checks do not qualify Windows GPU execution.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
-for the archive and CPU checks.
+for the archive and CPU checks. It also compares the SYCL plotting pipeline
+on OpenMP against the CPU reference, covering CUDA-enabled builds without
+an NVIDIA driver.
 Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test kernel execution
 (use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
 For GPU qualification, use the extracted executable for the k=22/k=28 byte

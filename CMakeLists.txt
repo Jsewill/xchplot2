@@ -39,9 +39,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #   - AesGpu.cu (T-tables in __constant__ memory + cudaMemcpyToSymbol init)
 #   - AesGpuBitsliced.cu (bench-only bitsliced AES; needs nvcc)
 #   - The cuda-flavoured parity tests in tools/parity/
-# The non-CUDA path uses SortSycl.cpp + AesStub.cpp — runs on AMD/Intel via
-# AdaptiveCpp's HIP / Level Zero backends. Default ON to preserve the
-# existing NVIDIA workflow.
+# SYCL kernels use queue-local AES tables and SortSycl.cpp on AMD/Intel
+# through AdaptiveCpp's HIP / Level Zero backends.
 #
 # With XCHPLOT2_BUILD_CUDA=OFF neither nvcc nor the CUDA Toolkit headers are
 # required: CudaHalfShim.hpp gates every CUDA include behind __has_include and
@@ -962,14 +961,7 @@ if(XCHPLOT2_BUILD_CUDA)
     list(APPEND POS2_GPU_SYCL_SRC
         src/gpu/SortSyclCub.cpp)
 else()
-    # AesStub.cpp: no-op initialize_aes_tables on builds without the
-    # CUDA AOT path. AesGpu.cu provides the real implementation when
-    # BUILD_CUDA=ON; SYCL workers ignore initialize_aes_tables anyway
-    # (they upload AES T-tables lazily via SyclBackend.hpp's
-    # aes_tables_device(q)).
     set(POS2_GPU_CUDA_SRC)
-    list(APPEND POS2_GPU_SYCL_SRC
-        src/gpu/AesStub.cpp)
 endif()
 
 # CUDA OBJECT library: compiled once, referenced via $<TARGET_OBJECTS:>
@@ -1248,18 +1240,15 @@ set_target_properties(xchplot2_cli PROPERTIES
 
 # CLI: xchplot2  (the standalone plotter binary, formerly gpu_plotter)
 #
-# LINK_GROUP RESCAN wraps xchplot2_cli + pos2_gpu_host so the linker
-# rescans them as a unit. xchplot2_cli holds the CUDA OBJECT files
-# (initialize_aes_tables, cub_sort_*); pos2_gpu_host's BatchPlotter.cpp
-# and SortSyclCub.cpp reference those symbols. With single-pass static-
-# archive scanning the references would land after xchplot2_cli was
-# already processed — rescan resolves the back-edge.
+# Rescan the CLI, host, and SYCL archives together, as build.rs does.
+# SortSyclCub.cpp in pos2_gpu references cub_sort_* in xchplot2_cli;
+# a single-pass linker has already processed that archive at this point.
 add_executable(xchplot2 tools/xchplot2/main.cpp)
 if(WIN32)
     target_link_libraries(xchplot2 PRIVATE xchplot2_cli pos2_gpu_host)
 else()
     target_link_libraries(xchplot2 PRIVATE
-        "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host>")
+        "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host,pos2_gpu>")
 endif()
 # pos2-chip headers define non-inline soft_aesenc/soft_aesdec, which now
 # end up in two TUs (PlotFileWriterParallel.cpp and CpuPlotter.cpp) inside

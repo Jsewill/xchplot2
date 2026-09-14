@@ -18,7 +18,6 @@
 // and so the CPU reference completes in seconds. --k lets a triage
 // session push the matcher to the largest k that fits on the device.
 
-#include "gpu/AesGpu.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -262,8 +261,6 @@ bool parse_int_arg(std::string_view sv, int& out)
 
 int main(int argc, char** argv)
 {
-    pos2gpu::initialize_aes_tables();
-
     int k_override        = -1;
     int strength_override = -1;
     for (int i = 1; i + 1 < argc; ++i) {

@@ -148,12 +148,26 @@ with os.add_dll_directory(str(directory)):
         subprocess.run([binary, "verify", work / "cpu.plot2", "--full", "--trials", "100",
                         "--config", os.devnull],
                        check=True, timeout=180)
+        # Both single plotting and the SYCL batch pipeline must work without
+        # an NVIDIA driver, even when CUDA acceleration is compiled in.
+        subprocess.run([binary, "test", "18", plot_id, "2", "0", "0", "-m", memo,
+                        "-o", work, "-N", "reference.plot2", "--config", os.devnull],
+                       check=True, timeout=180)
+        reference = (work / "reference.plot2").read_bytes()
+        assert (work / "cpu.plot2").read_bytes() == reference, "CPU batch differs from single plot"
+        manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . sycl.plot2\n")
+        subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "1",
+                        "--no-progress", "--config", os.devnull],
+                       cwd=work, env=dict(os.environ, ACPP_VISIBILITY_MASK="omp",
+                                          XCHPLOT2_SYCL_CPU_BENCH="1"),
+                       check=True, timeout=180)
+        assert (work / "sycl.plot2").read_bytes() == reference, "SYCL plot differs from CPU reference"
         if os.name == "nt":
             assert (package / "licenses/microsoft-runtime.txt").stat().st_size > 0
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0
             subprocess.run([sys.executable, pathlib.Path(__file__).with_name("windows.py"), binary],
                            check=True, timeout=360)
-        print("Release archive: extraction, CLI, CPU plotting, and full proofs passed")
+        print("Release archive: extraction, CLI, CPU/SYCL plotting parity, and full proofs passed")
 
 
 if __name__ == "__main__":

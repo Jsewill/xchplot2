@@ -12,12 +12,6 @@
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 
-namespace pos2gpu {
-// Host-callable, defined in src/gpu/AesGpu.cu. We forward-declare here so
-// this TU doesn't pull in <cuda_runtime.h>.
-void initialize_aes_tables();
-}
-
 #include <filesystem>
 #include <iostream>
 #include <span>
@@ -49,8 +43,6 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
     if (opts.strength < 2 || opts.strength > 63) {
         throw std::runtime_error("strength must be in [2, 63]");
     }
-
-    initialize_aes_tables();
 
     bool const all_gpu = (opts.t1 == PhaseStrategy::Gpu)
                       && (opts.t2 == PhaseStrategy::Gpu)
