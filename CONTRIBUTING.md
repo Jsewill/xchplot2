@@ -246,31 +246,33 @@ of a documentation move.
 
 ## Binary releases
 
-The release workflow builds one Linux archive per GPU vendor and
-an experimental Windows ZIP containing NVIDIA, AMD, and Intel backends through the standalone CMake executable
-and CPack. Build images pin Ubuntu 24.04,
-AdaptiveCpp 25.10, and Rust 1.98.1. NVIDIA uses CUDA 12.9.1 and LLVM 20;
-AMD follows the existing ROCm 6.2 / LLVM 18 pairing; Intel uses LLVM 20 and
-Level Zero. Keep `INSTALL.md` and the archive README in sync with these pins.
+The release workflow builds one Linux archive and an experimental Windows
+ZIP, each containing NVIDIA, AMD, and Intel backends through the standalone
+CMake executable and CPack. The Linux image pins Ubuntu 24.04, AdaptiveCpp
+25.10, Rust 1.98.1, CUDA 12.9.1, ROCm 7.1.1, and LLVM 20, with Level Zero.
+ROCm 7.1.1 provides the LLVM 20 runtime compiler needed by the shared generic
+build; the former AMD-only archive used ROCm 6.2 with LLVM 18.
+Keep `INSTALL.md` and the archive README in sync with these pins.
 
-For example, build the Intel archive locally:
+Build the Linux archive locally:
 
 ```bash
-podman build -t xchplot2-release-intel -f ci/release/Containerfile ci/release
-podman run --rm -v "$PWD:/src" xchplot2-release-intel bash scripts/build-release.sh
+podman build -t xchplot2-release -f ci/release/Containerfile ci/release
+podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
 ```
 
-Use the workflow's build arguments for AMD or NVIDIA. Artifacts are written
-to `build/release-VENDOR/dist/`. `acpp --acpp-deploy` collects runtime and
-JIT dependencies; the build script adds Level Zero, checks the selected
-backend, collects license notices, and makes library paths relative.
+Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`
+collects CPU, CUDA, and HIP runtime/JIT dependencies; the build script adds
+Level Zero, checks all three GPU backends, collects license notices, and
+makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
 platform; PR and tag runs build both. A `vVERSION` tag creates a
 draft GitHub release; publish it after qualifying the extracted archives on
 the supported GPUs. Do not rebuild between qualification and publication.
-The Linux jobs check extraction, the packaged SYCL JIT through `hellosycl`,
-CPU plotting, and full proofs in an image without development toolchains.
+The Linux job checks extraction, bundled libraries, offline AMD and Intel
+kernel compilation, the packaged SYCL JIT through `hellosycl`, CPU/SYCL plot
+byte parity, and full proofs in an image without development toolchains.
 
 The Windows job uses VS 2022, LLVM/Clang 20.1.8, CUDA 12.9.1, and HIP SDK
 6.4.2. It builds AdaptiveCpp into LLVM using
@@ -298,7 +300,7 @@ Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
 for the archive and CPU checks. It also compares the SYCL plotting pipeline
 on OpenMP against the CPU reference, covering CUDA-enabled builds without
 an NVIDIA driver.
-Add `--sycl-probe build/release-VENDOR/tools/sanity/hellosycl` to test kernel execution
+Add `--sycl-probe build/release-linux/tools/sanity/hellosycl` to test kernel execution
 (use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
 For GPU qualification, use the extracted executable for the k=22/k=28 byte
 comparisons, full proofs, tiers, spill, and recovery checks described above.

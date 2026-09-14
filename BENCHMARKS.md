@@ -66,3 +66,20 @@ Intel commands use the environment prefix
 - Results use one GPU with no concurrent builds or plotting jobs. Tighter
   VRAM budgets, disk spilling, and shared CPU or storage resources can change
   throughput. See [memory requirements](REFERENCE.md#memory-requirements).
+
+## Windows RX 6700 XT report
+
+User-reported September 13, 2026, using the updated 0.12.0 Windows SYCL
+archive published from [`1fa46e9`](https://github.com/Jsewill/xchplot2/commit/1fa46e9691129d6d5b0bcabf066adad5a02311c0).
+`xchplot2.exe bench --devices gpu` completed all 11 plots on an RX 6700 XT
+(12 GiB, HIP backend), at k=28 and strength=2: one excluded warmup and ten
+measured plots, with automatic tier selection.
+
+| Completion interval, s/plot (mean ± σ) | Interval range, s | Peak driver VRAM, MiB | End-to-end throughput, TiB/hour |
+|---:|---:|---:|---:|
+| 11.73 ± 0.69 | 10.67–12.98 | 11,228 | 0.276 |
+
+The report did not specify the driver version, CPU model, storage, or Windows
+version. Full-proof and CPU byte-parity results were not provided. Treat this
+as a completed benchmark report; hardware qualification still needs those
+correctness checks.

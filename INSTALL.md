@@ -21,7 +21,7 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 ## Binary archives
 
-Download the Linux x86-64 `sycl-nvidia`, `sycl-amd`, or `sycl-intel` archive
+Download the combined Linux x86-64 `sycl.tar.gz` archive
 and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
 `./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
@@ -30,13 +30,14 @@ add that `bin` directory to `PATH` to run the CLI elsewhere.
 These archives target glibc 2.39+ (Ubuntu 24.04 or a compatible system), an
 x86-64 CPU with AES, SSSE3, and SSE4.1, and a compatible GPU driver. On Ubuntu,
 install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
-and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, and one GPU
-backend. No development toolkit is needed. Mixed-vendor builds use the
-source or container instructions below.
+and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, CUDA and HIP
+runtimes, the Level Zero loader, and its SPIR-V translator. NVIDIA, AMD,
+and Intel backends are available in the same binary, including on systems
+with GPUs from multiple vendors. No development toolkit is needed.
 
-The NVIDIA bundle uses CUDA 12.9.1; driver 575.57.08+ is recommended. The AMD
-bundle uses ROCm 6.2 and supports hardware covered by that runtime. The Intel
-bundle uses Level Zero and requires the Intel GPU compute driver. See
+The CUDA runtime is 12.9.1; NVIDIA driver 575.57.08+ is recommended. The HIP
+runtime is ROCm 7.1.1 and supports hardware covered by that runtime. Intel
+uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
 
@@ -49,8 +50,10 @@ Install the normal graphics driver: NVIDIA 576.57+, AMD Adrenalin with the
 HIP 6 runtime, or Intel's graphics driver with Level Zero support.
 It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
 CPU, and NTFS/ReFS for plots and spill. Hosted checks exercise CPU plotting,
-recovery, and offline GPU compilation; Windows GPU qualification is still
-pending. See [Windows](#windows) for source builds.
+recovery, and offline GPU compilation. An RX 6700 XT completed a
+[reported Windows benchmark](BENCHMARKS.md#windows-rx-6700-xt-report);
+full Windows GPU qualification is still pending. See [Windows](#windows)
+for source builds.
 
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.

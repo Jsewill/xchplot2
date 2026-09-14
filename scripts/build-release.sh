@@ -2,22 +2,15 @@
 # Build a SYCL archive inside ci/release/Containerfile.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-gpu=${XCHPLOT2_RELEASE_GPU:?Run this script in the release build image}
 llvm=${XCHPLOT2_RELEASE_LLVM:-20}
-case "$gpu" in
-    nvidia) backend=cuda; components=core,cuda; build_cuda=ON ;;
-    amd) backend=hip; components=core,hip; build_cuda=OFF ;;
-    intel) backend=ze; components=core; build_cuda=OFF ;;
-    *) echo "Unknown release GPU: $gpu" >&2; exit 1 ;;
-esac
-build_dir=${1:-build/release-$gpu}
+build_dir=${1:-build/release-linux}
 mkdir -p "$build_dir"
 build_dir=$(cd "$build_dir" && pwd)
 runtime="$build_dir/runtime"
 licenses="$build_dir/licenses"
 rm -rf "$runtime" "$licenses"
 mkdir -p "$runtime" "$licenses"
-acpp --acpp-deploy="$components:$runtime"
+acpp --acpp-deploy="core,cuda,hip:$runtime"
 cp /opt/release-licenses/*.txt "$licenses/"
 cp /usr/share/doc/libllvm"$llvm"/copyright "$licenses/llvm.txt"
 cp /usr/share/doc/libboost1.83-dev/copyright "$licenses/boost.txt"
@@ -38,34 +31,33 @@ printf 'AdaptiveCpp: %s\nLLVM: %s\n' \
 dpkg-query -W -f='${Package}: ${Version}\n' "libllvm$llvm" "libomp5-$llvm" libffi8 libedit2 \
     zlib1g libzstd1 libxml2 libtinfo6 libbsd0 libicu74 liblzma5 libmd0 >> "$build_dir/runtime-info.txt"
 
-case "$gpu" in
-    nvidia)
-        cp /usr/share/doc/cuda-cudart-12-9/copyright "$licenses/cuda.txt"
-        curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
-            https://raw.githubusercontent.com/NVIDIA/cccl/v2.8.2/LICENSE \
-            -o "$licenses/cuda-cccl.txt"
-        ;;
-    amd)
-        for component in hip amd_comgr hsa-runtime64 hsakmt rocprofiler-register ROCm-Device-Libs rocm-llvm; do
-            mkdir -p "$licenses/rocm/$component"
-            cp /opt/rocm/share/doc/"$component"/LICENSE* "$licenses/rocm/$component/"
-        done
-        printf 'ROCm: %s\n' "$(cat /opt/rocm/.info/version)" >> "$build_dir/runtime-info.txt"
-        ;;
-    intel)
-        # AdaptiveCpp 25.10 has no Level Zero deployment component.
-        cp /opt/adaptivecpp/lib/hipSYCL/librt-backend-ze.so "$runtime/hipSYCL/"
-        cp /opt/adaptivecpp/lib/hipSYCL/llvm-to-backend/libllvm-to-spirv.so "$runtime/hipSYCL/llvm-to-backend/"
-        cp /opt/adaptivecpp/lib/hipSYCL/bitcode/libkernel-sscp-spirv-full.bc "$runtime/hipSYCL/bitcode/"
-        mkdir -p "$runtime/hipSYCL/ext/llvm-spirv/bin"
-        cp /opt/adaptivecpp/lib/hipSYCL/ext/llvm-spirv/bin/llvm-spirv "$runtime/hipSYCL/ext/llvm-spirv/bin/"
-        cp -P /usr/lib/x86_64-linux-gnu/libze_loader.so* "$runtime/"
-        cp /usr/share/doc/libze1/copyright "$licenses/level-zero.txt"
-        printf 'LLVM-SPIRV: %s\n' "$(cat /opt/release-licenses/llvm-spirv-revision.txt)" >> "$build_dir/runtime-info.txt"
-        dpkg-query -W -f='Level Zero loader: ${Version}\n' libze1 >> "$build_dir/runtime-info.txt"
-        ;;
-esac
-test -f "$runtime/hipSYCL/librt-backend-$backend.so"
+cp /usr/share/doc/cuda-cudart-12-9/copyright "$licenses/cuda.txt"
+curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
+    https://raw.githubusercontent.com/NVIDIA/cccl/v2.8.2/LICENSE \
+    -o "$licenses/cuda-cccl.txt"
+for component in hip amd_comgr hsa-runtime64 rocprofiler-register ROCm-Device-Libs rocm-llvm; do
+    mkdir -p "$licenses/rocm/$component"
+    cp /opt/rocm/share/doc/"$component"/LICENSE* "$licenses/rocm/$component/"
+done
+# ROCm 7 merges the HSA thunk into ROCr; retain its separate notice.
+mkdir -p "$licenses/rocm/hsakmt"
+curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
+    https://raw.githubusercontent.com/ROCm/ROCR-Runtime/rocm-7.1.1/libhsakmt/LICENSE.md \
+    -o "$licenses/rocm/hsakmt/LICENSE.md"
+printf 'ROCm: %s\n' "$(cat /opt/rocm/.info/version)" >> "$build_dir/runtime-info.txt"
+# AdaptiveCpp 25.10 has no Level Zero deployment component.
+cp /opt/adaptivecpp/lib/hipSYCL/librt-backend-ze.so "$runtime/hipSYCL/"
+cp /opt/adaptivecpp/lib/hipSYCL/llvm-to-backend/libllvm-to-spirv.so "$runtime/hipSYCL/llvm-to-backend/"
+cp /opt/adaptivecpp/lib/hipSYCL/bitcode/libkernel-sscp-spirv-full.bc "$runtime/hipSYCL/bitcode/"
+mkdir -p "$runtime/hipSYCL/ext/llvm-spirv/bin"
+cp /opt/adaptivecpp/lib/hipSYCL/ext/llvm-spirv/bin/llvm-spirv "$runtime/hipSYCL/ext/llvm-spirv/bin/"
+cp -P /usr/lib/x86_64-linux-gnu/libze_loader.so* "$runtime/"
+cp /usr/share/doc/libze1/copyright "$licenses/level-zero.txt"
+printf 'LLVM-SPIRV: %s\n' "$(cat /opt/release-licenses/llvm-spirv-revision.txt)" >> "$build_dir/runtime-info.txt"
+dpkg-query -W -f='Level Zero loader: ${Version}\n' libze1 >> "$build_dir/runtime-info.txt"
+for backend in cuda hip ze; do
+    test -f "$runtime/hipSYCL/librt-backend-$backend.so"
+done
 # Core OS libraries remain system prerequisites, including libnuma.
 rm -f "$runtime"/libnuma.so*
 python3 - "$runtime" <<'PY'
@@ -99,10 +91,10 @@ cargo about generate --locked --fail \
     --output-file "$licenses/rust.txt" ci/release/licenses.hbs
 cmake -S . -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
-    -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA="$build_cuda" \
+    -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120' \
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
-    -DXCHPLOT2_PACKAGE=ON -DXCHPLOT2_PACKAGE_GPU="$gpu" \
+    -DXCHPLOT2_PACKAGE=ON -DXCHPLOT2_PACKAGE_GPU=all \
     -DXCHPLOT2_LICENSE_DIR="$licenses" -DXCHPLOT2_RUNTIME_DIR="$runtime"
 cmake --build "$build_dir" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 ACPP_VISIBILITY_MASK=omp ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \

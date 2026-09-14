@@ -52,6 +52,8 @@ def main():
         for author in ("Yann Collet", "Henry Spencer", "Todd C. Miller", "Unicode, Inc.",
                        "2019 Intel Corporation"):
             assert author in llvm_notices, f"Missing LLVM third-party notice: {author}"
+        runtime = package / ("bin" if os.name == "nt" else "lib")
+        executable_suffix = ".exe" if os.name == "nt" else ""
         if os.name == "nt":
             for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
                          "hiprtc0604.dll", "hiprtc-builtins0604.dll", "amd_comgr0604.dll", "ze_loader.dll",
@@ -72,24 +74,44 @@ def main():
                     assert (directory / name).is_file(), f"Missing app-local runtime: {directory / name}"
             assert not list(package.rglob("*.lib")), "Import/static libraries are not runtime dependencies"
             assert not list((package / "bin").glob("amdhip64*.dll")), "Use the HIP runtime supplied by the AMD driver"
-            # ctypes keeps DLLs loaded; let a child exit before removing the archive.
-            subprocess.run([sys.executable, "-c", """
-import ctypes, os, pathlib, sys
+        else:
+            for name in ("libacpp-rt.so", "libacpp-common.so", "libcudart.so.12",
+                         "libamdhip64.so.7", "libhiprtc.so.7", "libamd_comgr.so.3",
+                         "libhsa-runtime64.so.1", "libze_loader.so.1",
+                         "hipSYCL/librt-backend-omp.so", "hipSYCL/librt-backend-cuda.so",
+                         "hipSYCL/librt-backend-hip.so", "hipSYCL/librt-backend-ze.so",
+                         "hipSYCL/ext/bitcode/amdgcn/ocml.bc",
+                         "hipSYCL/bitcode/libkernel-sscp-spirv-full.bc",
+                         "hipSYCL/ext/llvm-spirv/bin/llvm-spirv"):
+                assert (runtime / name).stat().st_size > 0, f"Missing {name}"
+            for name in ("cuda.txt", "cuda-cccl.txt", "level-zero.txt", "llvm-spirv.txt",
+                         "rocm/hip/LICENSE.md", "rocm/amd_comgr/LICENSE.txt",
+                         "rocm/hsakmt/LICENSE.md",
+                         "rocm/ROCm-Device-Libs/LICENSE.TXT", "rocm/rocm-llvm/LICENSE.TXT"):
+                assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
+            assert not list(runtime.glob("libcuda.so*")), "Use the NVIDIA driver supplied by the system"
+        # ctypes keeps libraries loaded; let a child exit before removing the archive.
+        subprocess.run([sys.executable, "-c", """
+import contextlib, ctypes, os, pathlib, sys
 directory = pathlib.Path(sys.argv[1])
-# NVIDIA and AMD runtime plugins import DLLs supplied by their graphics
-# drivers. Hosted runners have neither; every bundled dependency still loads.
+load = ctypes.WinDLL if os.name == "nt" else ctypes.CDLL
+# Driver libraries remain system prerequisites. Linux bundles the HIP runtime;
+# Windows obtains it from the AMD graphics driver.
+drivers = (("nvcuda.dll", "rt-backend-cuda.dll"), ("amdhip64_6.dll", "rt-backend-hip.dll")) \
+    if os.name == "nt" else (("libcuda.so.1", "librt-backend-cuda.so"),)
 skip = set()
-for driver, backend in (("nvcuda.dll", "cuda"), ("amdhip64_6.dll", "hip")):
+for driver, backend in drivers:
     try:
-        ctypes.WinDLL(driver)
-    except FileNotFoundError:
-        skip.add(f"rt-backend-{backend}.dll")
-        print(f"{backend} backend DLL load check requires its graphics driver")
-with os.add_dll_directory(str(directory)):
-    libraries = [ctypes.WinDLL(str(path)) for path in directory.rglob("*.dll") if path.name not in skip]
-    assert libraries, "No packaged Windows runtime DLLs"
+        load(driver)
+    except (FileNotFoundError if os.name == "nt" else OSError):
+        skip.add(backend)
+        print(f"{backend} load check requires its graphics driver")
+with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nullcontext():
+    libraries = [load(str(path)) for path in directory.rglob("*.dll" if os.name == "nt" else "*.so*")
+                 if path.name not in skip]
+    assert libraries, "No packaged runtime libraries"
     # Compile a kernel for the reported RX 6700 XT without any GPU or SDK.
-    rtc = ctypes.WinDLL(str(directory / "hiprtc0604.dll"))
+    rtc = load(str(directory / ("hiprtc0604.dll" if os.name == "nt" else "libhiprtc.so.7")))
     rtc.hiprtcGetErrorString.restype = ctypes.c_char_p
     def check(result):
         assert result == 0, rtc.hiprtcGetErrorString(result).decode()
@@ -105,20 +127,20 @@ with os.add_dll_directory(str(directory)):
     finally:
         check(rtc.hiprtcDestroyProgram(ctypes.byref(program)))
     print("Packaged HIP RTC compiled gfx1031 kernel without an SDK")
-""", str(package / "bin")], check=True, timeout=60)
-            for tool in ("opt.exe", "llc.exe", "lld-link.exe"):
-                subprocess.run([package / "bin/hipSYCL/ext/llvm/bin" / tool, "--version"],
-                               check=True, timeout=30)
-            # Exercise Intel's translator with actual kernel IR, not only --version.
-            spirv_ir = work / "probe.ll"
-            spirv_ir.write_text('target triple = "spir64-unknown-unknown"\n'
-                                'define spir_kernel void @probe() { ret void }\n')
-            spirv_bc, spirv_out = work / "probe.bc", work / "probe.spv"
-            subprocess.run([package / "bin/hipSYCL/ext/llvm/bin/opt.exe", spirv_ir, "-o", spirv_bc],
+""", str(runtime)], check=True, timeout=60)
+        for tool in ("opt", "llc", "lld-link" if os.name == "nt" else "ld.lld"):
+            subprocess.run([runtime / "hipSYCL/ext/llvm/bin" / (tool + executable_suffix), "--version"],
                            check=True, timeout=30)
-            subprocess.run([package / "bin/hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe", spirv_bc, "-o", spirv_out],
-                           check=True, timeout=30)
-            assert spirv_out.read_bytes()[:4] == b"\x03\x02\x23\x07", "Invalid SPIR-V output"
+        # Exercise Intel's translator with actual kernel IR, not only --version.
+        spirv_ir = work / "probe.ll"
+        spirv_ir.write_text('target triple = "spir64-unknown-unknown"\n'
+                            'define spir_kernel void @probe() { ret void }\n')
+        spirv_bc, spirv_out = work / "probe.bc", work / "probe.spv"
+        subprocess.run([runtime / "hipSYCL/ext/llvm/bin" / ("opt" + executable_suffix), spirv_ir, "-o", spirv_bc],
+                       check=True, timeout=30)
+        subprocess.run([runtime / "hipSYCL/ext/llvm-spirv/bin" / ("llvm-spirv" + executable_suffix), spirv_bc, "-o", spirv_out],
+                       check=True, timeout=30)
+        assert spirv_out.read_bytes()[:4] == b"\x03\x02\x23\x07", "Invalid SPIR-V output"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         if os.name == "nt":
