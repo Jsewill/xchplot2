@@ -14,7 +14,7 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 | Path | Use it for |
 |---|---|
-| [Binary archives](#binary-archives) | Prebuilt CLI and runtime for one GPU vendor |
+| [Binary archives](#binary-archives) | Prebuilt CLI and bundled runtime |
 | [Container](#container) | Toolchains inside the image; GPU driver and container engine on the host |
 | [Native install](#native-install) | System dependencies and AdaptiveCpp installed by the existing script |
 | [Manual dependencies](#manual-dependencies) | An existing toolchain or a development setup |
