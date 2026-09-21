@@ -143,6 +143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "chia-bls"
+version = "0.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da954b393dcf51bf5f604475f1fb486df790d719e220d96e1c72c4d9fc41d0d3"
+dependencies = [
+ "blst",
+ "chia-sha2 0.49.0",
+ "chia-traits 0.49.0",
+ "hex",
+ "hkdf",
+ "linked-hash-map",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "chia-pos2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,6 +205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chia-sha2"
+version = "0.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38702e10dbe34e765ed15f4dad6e20a7d45bf596f22242000152375710fe1d4f"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "chia-traits"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,6 +236,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chia-traits"
+version = "0.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8d82f1acb4b7856f061b7bf483b815e8a4083fa43359518f46e48781581ddab"
+dependencies = [
+ "chia-sha2 0.49.0",
+ "chia_streamable_macro 0.49.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "chia_streamable_macro"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +263,18 @@ name = "chia_streamable_macro"
 version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c98bd0b5564fb5449821cf15700b5e83c7d45e95612a389043a94516aff8e516"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "chia_streamable_macro"
+version = "0.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "702d4fbbc98ccfd4b8162977d4c087b6c5c5b21972a53fc7f737031b04489410"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -867,7 +915,7 @@ name = "pos2_keygen"
 version = "0.1.0"
 dependencies = [
  "bech32",
- "chia-bls 0.48.0",
+ "chia-bls 0.49.0",
  "chia-protocol",
  "hex",
  "sha2 0.11.0",
