@@ -14,7 +14,16 @@ ctest --test-dir build --output-on-failure
 ```
 
 The full test set requires the matching GPU backend. For host checks with
-no GPU or GPU toolchain, run `scripts/test/host-tests.sh`.
+no GPU or GPU toolchain, configure the host-only CMake targets:
+
+```bash
+cmake -B build-host -S . -DXCHPLOT2_HOST_TESTS_ONLY=ON
+cmake --build build-host --parallel
+ctest --test-dir build-host --output-on-failure
+```
+
+`scripts/test/host-tests.sh` runs these same targets in a temporary build
+and accepts `thread` or `address` for sanitizer runs.
 `xchplot2 parity-check --dir build/tools/parity` runs the available
 `*_parity` and `*_test` executables and reports each failure's output.
 
@@ -105,6 +114,11 @@ The same check is runnable locally with
 system packages and builds AdaptiveCpp, just like the public installer.
 Additional Fedora AMD and Ubuntu NVIDIA/Intel jobs pass `--no-acpp` and
 exercise Cargo's automatic AdaptiveCpp build and install to `~/.local`.
+Both the installed Cargo executable and the CMake executable run
+`scripts/test/recovery.py`: real CPU plots interrupted by Linux SIGINT and
+SIGTERM, saved manifest and completed-file preservation on resume, forced
+publication failure, partial cleanup, and full proofs. Windows uses the same
+harness with Ctrl-Break and keeps its Unicode benchmark checks.
 CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
 repository changes. The existing container and CUDA architecture matrices
 remain separate coverage. The [binary release job](#binary-releases) checks
@@ -120,10 +134,14 @@ the GPU suites below.
 Hosted PR jobs lint and build without GPU hardware. `GPU hardware` runs only
 on trusted `main` / `cuda-only` pushes, schedules, and manual dispatches:
 
-After registering the runners below, set the Actions repository variable
-`GPU_RUNNERS_READY` to `true` to enable automatic push and scheduled runs.
-Until then, automatic GPU jobs are skipped. Manual dispatch remains available
-and requires the matching runners.
+Register runners and set `GPU_CORRECTNESS_MATRIX` to the installed fleet before
+setting the Actions repository variable `GPU_RUNNERS_READY` to `true`.
+That enables automatic push and daily runs. Without a correctness matrix,
+the original NVIDIA, AMD, Intel, and `cuda-only` lanes remain the default.
+Automatic weekly physical runs additionally require `GPU_PHYSICAL_MATRIX`;
+manual physical dispatch retains the default matrix below. Until readiness
+is enabled, automatic GPU jobs are skipped. Manual dispatch requires matching
+runners.
 
 | Suite | When | Checks |
 | --- | --- | --- |
@@ -131,10 +149,20 @@ and requires the matching runners.
 | `vram` | Daily, 04:17 UTC; manual | Quick CTest tests, three k=28 plots at each tier's budget, rejection 1 MiB below it, then k=28 CPU byte parity and full proofs for every tier and spill variant |
 | `physical` | Sunday, 07:47 UTC; manual | Actual 2/4/6/8 GiB capacity, every k=28 tier that fits, plus three uncapped auto-tier plots with full-proof verification |
 
-The default branch schedules both `main` and `cuda-only`, because
+Every suite also compares two k=18 mainnet vectors against CPU output on each
+selected tier and spill variant: strength 3 with an all-`ff` ID, maximum
+index/meta group (65535/255), and a patterned 255-byte memo; strength 4 with an
+ID containing bytes `00` through `1f` and index/meta group 1/1. Each path must
+report positive solved full proofs. The summary records vector parameters,
+reference hashes, and proof counts. Production k=28 checks and original log
+names remain intact. Existing kernel parity tests cover testnet; the legacy
+file header does not select testnet parameters for full-file verification.
+
+By default, the default branch schedules both `main` and `cuda-only`, because
 [GitHub schedules run only on the default branch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 Pushes to `cuda-only` also run that branch's quick suite directly.
-Both branches must contain the GPU CI changes before enabling the schedule.
+A configured fleet matrix can narrow this coverage. Both branches must contain
+the GPU CI changes before enabling a schedule that tests both.
 
 The SYCL branch tests five tiers and four disk variants. Native CUDA tests
 four tiers, Compact's spill engine, and Minimal's file mappings; native Tiny
@@ -150,9 +178,10 @@ Provide Linux x64 self-hosted runners with these additional labels:
 | `gpu-cuda-2gb`, `gpu-cuda-4gb`, `gpu-cuda-6gb`, `gpu-cuda-8gb` | Physical NVIDIA cards with those capacities; use CUDA 12.9 for Pascal cards |
 | `gpu-hip-4gb`, `gpu-level-zero-8gb` | Physical 4 GiB AMD and 8 GiB Intel cards with the same vendor toolchains as above |
 
-The weekly physical matrix covers these four NVIDIA capacities plus AMD 4 GiB
-and Intel 8 GiB on `main`, and all four NVIDIA capacities on `cuda-only`. Set the Actions variable
-`GPU_PHYSICAL_MATRIX` to match a different fleet, including AMD and Intel:
+The default physical matrix covers these four NVIDIA capacities plus AMD 4 GiB
+and Intel 8 GiB on `main`, and all four NVIDIA capacities on `cuda-only`.
+Set `GPU_PHYSICAL_MATRIX` to the installed fleet to enable weekly physical
+runs, including AMD and Intel:
 
 ```json
 {"include":[{"backend":"cuda","ref":"main","runner":"my-2gb-nvidia","vram_mib":2048},{"backend":"hip","ref":"main","runner":"my-4gb-amd","vram_mib":4096},{"backend":"level_zero","ref":"main","runner":"my-8gb-intel","vram_mib":8192},{"backend":"cuda","ref":"cuda-only","runner":"my-2gb-nvidia","vram_mib":2048}]}
@@ -180,6 +209,52 @@ if zero or multiple GPUs remain visible. No PR workflow targets these hosts.
 The harness serializes GPU tests per host; other GPU workloads, including a
 desktop, can still inflate driver memory measurements.
 
+For a fleet containing only an NVIDIA 24 GiB card with about 32 GiB host RAM,
+start with this `GPU_CORRECTNESS_MATRIX` value:
+
+```json
+{"include":[{"backend":"cuda","ref":"main","runner":"gpu-cuda","max_host_ram_gib":18}]}
+```
+
+This enables NVIDIA `main` coverage only. Add other branches and vendors after
+their runner toolchains and hardware pass; leave `GPU_PHYSICAL_MATRIX` unset
+until real small cards are installed. Each matrix entry can specify
+`max_host_ram_gib`; zero or omission uses the plotter's default host budget.
+The explicit budget survives the harness's environment cleanup and applies
+to boundary and normal plots; spill cases still use `min`.
+
+On a designated Linux GPU host, download and verify the runner using the
+repository's **Settings → Actions → Runners → New self-hosted runner**
+instructions. Install it in a separate directory owned by the runner user,
+with no personal credentials. For one supervised job, use the fresh
+registration token from that page and run from that directory:
+
+```bash
+./config.sh --url https://github.com/Jsewill/xchplot2 \
+    --token "$RUNNER_REGISTRATION_TOKEN" --unattended --ephemeral \
+    --name xchplot2-cuda --labels gpu-cuda --work work
+systemd-run --user --unit=xchplot2-gpu-runner --collect --wait --same-dir \
+    --property=MemoryMax=22G --property=MemorySwapMax=0 \
+    --property=CPUQuota=400% --setenv=CUDA_VISIBLE_DEVICES=0 \
+    --setenv=PATH="$PATH" "$PWD/run.sh"
+```
+
+The 18 GiB plot budget bounds modelled allocations; the 22 GiB cgroup limit
+separately bounds the whole runner and its child processes, with no swap.
+Keep `RUNNER_TEMP` on real disk with space for the build and at least 40 GiB
+of plotting scratch. The workflow places plots and spills in its isolated
+temporary directory. Stop this transient runner with
+`systemctl --user stop xchplot2-gpu-runner.service`.
+
+[Ephemeral runners](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling)
+accept one job and automatically deregister. Preserve their `_diag` logs,
+then provision a clean runner for the next job. A regular schedule needs that
+runner lifecycle supplied by the designated fleet operator; a single launch
+does not provide continuing capacity. Confirm a manual `quick` and `vram`
+run and retained artifacts before enabling `GPU_RUNNERS_READY`. Each job
+still checks its actual backend and capacity, and missing vendors remain
+uncertified.
+
 `gpu_ci_info` obtains each k=28 floor from the production backend, including
 sort scratch, and records physical/free VRAM and the safety margin. The
 boundary script requires a positive driver-reported peak within the allowed
@@ -191,6 +266,11 @@ removed by the harness.
 Run the same checks locally after building all CMake targets:
 
 Temporary plots and spill files use the checkout's filesystem by default.
+Use `--max-host-ram-gib 18` to budget 18 GiB for boundary and normal tier
+plots; explicit spill cases still use `min`. This limits modelled pinned and
+anonymous allocations, not total RSS. A container limit can separately bound
+total memory use.
+
 Use `--scratch /path/to/disk` to select another existing directory. RAM-backed
 filesystems such as tmpfs cannot validate disk spilling and are rejected by
 the plotter.
@@ -205,6 +285,14 @@ python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --phy
 Actions retain build logs, device inventory, CTest JUnit results, per-tier
 boundary/rejection logs, proof logs, and a JSON summary for 14 days. Generated
 plots are temporary; byte comparisons and reference hashes are recorded.
+The summary records failed stages, exception messages, and subprocess command
+and exit code when available, including archive and inventory failures.
+NVIDIA runs additionally retain best-effort driver XML snapshots at suite
+start and failure, including process-memory evidence. Watchdog measurements
+are sampled device-wide changes in free memory; they cannot attribute memory
+to this process, and endpoint snapshots can miss transient external usage.
+The VRAM guard remains strict; repeat on an idle GPU to distinguish model
+regressions from interference.
 
 ## Pinned testnet farming fixture
 
@@ -290,7 +378,7 @@ because the Windows CPU JIT needs Visual Studio static CRT libraries.
 The archive test hides the compiler and both GPU SDK installations, clears
 SDK paths, loads bundled DLLs and LLVM tools, compiles an AMD `gfx1031`
 kernel, translates Intel SPIR-V, dispatches a CPU kernel, and runs the
-existing Windows CPU recovery check. CUDA and HIP backend DLL loading
+shared CPU recovery check in `scripts/test/recovery.py`. CUDA and HIP backend DLL loading
 additionally requires their graphics drivers, so those two checks run only
 when their drivers are installed. The ZIP includes the compiler and
 redistributable runtime dependencies; users need only their graphics driver.
@@ -302,12 +390,32 @@ on OpenMP against the CPU reference, covering CUDA-enabled builds without
 an NVIDIA driver.
 Add `--sycl-probe build/release-linux/tools/sanity/hellosycl` to test kernel execution
 (use `build/release-windows/tools/sanity/hellosycl.exe` on Windows).
-For GPU qualification, use the extracted executable for the k=22/k=28 byte
-comparisons, full proofs, tiers, spill, and recovery checks described above.
-`gpu-ci.py --binary /path/to/extracted/bin/xchplot2` retains the matching
-build's parity and inventory tools. Build and package must have the same
-source revision and toolchain. Record qualification in release notes; keep
-plots and detailed logs out of the tree.
+For GPU qualification on Linux, run the existing GPU suite against the
+exact archive and its matching release build:
+
+```bash
+python3 scripts/test/gpu-ci.py build/release-linux --backend cuda --suite quick \
+    --archive build/release-linux/dist/ARCHIVE.tar.gz --logs /tmp/release-cuda
+```
+
+The adjacent `ARCHIVE.tar.gz.sha256` must match, and the archive's
+`BUILDINFO.txt` must equal the build's file before any inventory or test
+executable runs. Keep the original release build's inventory and parity tools;
+a separately compiled build with a different source revision or toolchain
+cannot qualify the archive. The packaged runtime libraries take precedence
+over installed toolchain libraries for these checks.
+Run the `vram` and `physical` suites on the supported GPUs as described above
+for k=28, every fitting tier, and spill variants. Perform the required k=22
+byte comparisons and full proofs with the same extracted archive as well.
+The `--binary` option remains
+available for an already extracted executable, but does not record archive
+identity or enforce the matching `BUILDINFO.txt` check.
+
+Attach `summary.json` and relevant inventory, parity, boundary, and proof logs
+to the release qualification notes. Archive runs record its name, SHA256,
+`BUILDINFO.txt`, UTC start time, host platform, and pass status in the summary.
+Keep generated plots out of the tree. These commands require GPU hardware;
+there is no automatic release GPU gate until the required runners are configured.
 
 ## Commit style
 

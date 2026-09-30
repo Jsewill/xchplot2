@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(pos2-gpu VERSION 0.12.0 LANGUAGES C CXX)
+project(pos2-gpu VERSION 0.13.0 LANGUAGES C CXX)
+
+if(WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+endif()
+
+option(XCHPLOT2_HOST_TESTS_ONLY "Build host tests without GPU toolchains or downloads" OFF)
+if(XCHPLOT2_HOST_TESTS_ONLY)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    include(cmake/HostTests.cmake)
+    include(cmake/RegisterTests.cmake)
+    return()
+endif()
 
 if(WIN32)
     # AdaptiveCpp's launcher passes GNU-style arguments to its Clang build.
@@ -8,7 +22,6 @@ if(WIN32)
        CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         message(FATAL_ERROR "Windows SYCL requires the AdaptiveCpp LLVM clang/clang++ compilers")
     endif()
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
     # Enabling nvcc loads Windows-MSVC and replaces the global library flags.
     # Keep Clang's lookup syntax for C/C++ links, including CUDA runtime libs.
@@ -48,33 +61,90 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # lines 28 and 52). An earlier caveat here claimed the headers were still
 # needed; that has not been true since the shim gained its final #else.
 #
-# The default is autodetected rather than a bare ON. build.rs already forces
-# OFF whenever an Intel or AMD GPU is the target, but a hand-run cmake got ON
-# and then died inside enable_language(CUDA) with "Failed to find nvcc" — on
-# hosts with no NVIDIA hardware, which neither have CUDA nor want it. That
-# turned "build the parity tests to diagnose my Intel GPU" into a configure
-# error with nothing to do with the GPU being diagnosed.
+# Defaults follow the GPU vendor before toolchain availability. AMD/Intel
+# hosts skip CUDA even when nvcc is installed; headless builds may use nvcc.
 #
 # An explicit -DXCHPLOT2_BUILD_CUDA=ON still fails loudly when nvcc is absent,
 # which is correct: if you asked for CUDA you want to hear that it is missing.
-if(NOT DEFINED XCHPLOT2_BUILD_CUDA)
-    find_program(_xchplot2_nvcc_probe nvcc
-        HINTS ENV CUDA_PATH ENV CUDA_HOME /opt/cuda /usr/local/cuda
-        PATH_SUFFIXES bin
-        DOC "nvcc probe for the XCHPLOT2_BUILD_CUDA default")
-    if(_xchplot2_nvcc_probe)
-        set(_xchplot2_cuda_default ON)
-    else()
-        set(_xchplot2_cuda_default OFF)
-        message(STATUS "xchplot2: no nvcc on this host — defaulting "
-                       "XCHPLOT2_BUILD_CUDA=OFF (SYCL-only build). Override "
-                       "with -DXCHPLOT2_BUILD_CUDA=ON.")
-    endif()
-    unset(_xchplot2_nvcc_probe CACHE)
-else()
-    set(_xchplot2_cuda_default ${XCHPLOT2_BUILD_CUDA})
+# Standalone probes feed the same policy used by Cargo's platform probes.
+execute_process(
+    COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
+    OUTPUT_VARIABLE _xchplot2_cuda_cap
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _xchplot2_nvsmi_rc
+    ERROR_QUIET)
+set(_xchplot2_have_nvidia FALSE)
+if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_cuda_cap)
+    set(_xchplot2_have_nvidia TRUE)
 endif()
-option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ${_xchplot2_cuda_default})
+
+execute_process(
+    COMMAND rocminfo
+    OUTPUT_VARIABLE _xchplot2_rocm_out
+    RESULT_VARIABLE _xchplot2_rocminfo_rc
+    ERROR_QUIET)
+set(_xchplot2_gfx "")
+if(_xchplot2_rocminfo_rc EQUAL 0)
+    string(REGEX MATCH "Name:[ \t]+gfx[0-9a-f]+" _xchplot2_gfx_match "${_xchplot2_rocm_out}")
+    string(REGEX REPLACE "Name:[ \t]+" "" _xchplot2_gfx "${_xchplot2_gfx_match}")
+endif()
+
+# PCI fallbacks count GPUs even when vendor utilities are unavailable.
+# Skip connector nodes, matching the Cargo probes.
+set(_xchplot2_have_intel FALSE)
+set(_xchplot2_have_amd FALSE)
+if(_xchplot2_gfx)
+    set(_xchplot2_have_amd TRUE)
+endif()
+file(GLOB _xchplot2_drm_cards LIST_DIRECTORIES TRUE "/sys/class/drm/card*")
+foreach(_xchplot2_card IN LISTS _xchplot2_drm_cards)
+    get_filename_component(_xchplot2_card_name "${_xchplot2_card}" NAME)
+    if(_xchplot2_card_name MATCHES "-")
+        continue()
+    endif()
+    if(EXISTS "${_xchplot2_card}/device/vendor")
+        file(READ "${_xchplot2_card}/device/vendor" _xchplot2_vid)
+        string(STRIP "${_xchplot2_vid}" _xchplot2_vid)
+        if(_xchplot2_vid STREQUAL "0x10de")
+            set(_xchplot2_have_nvidia TRUE)
+        elseif(_xchplot2_vid STREQUAL "0x1002")
+            set(_xchplot2_have_amd TRUE)
+        elseif(_xchplot2_vid STREQUAL "0x8086")
+            set(_xchplot2_have_intel TRUE)
+        endif()
+    endif()
+endforeach()
+
+if(CMAKE_CUDA_COMPILER)
+    set(_xchplot2_nvcc_probe "${CMAKE_CUDA_COMPILER}")
+else()
+    find_program(_xchplot2_nvcc_probe nvcc
+        HINTS "${CUDAToolkit_ROOT}/bin" "$ENV{CUDAToolkit_ROOT}/bin"
+              "$ENV{CUDA_PATH}/bin" "$ENV{CUDA_HOME}/bin" /opt/cuda/bin /usr/local/cuda/bin)
+endif()
+set(X2_HAVE_NVCC FALSE)
+if(_xchplot2_nvcc_probe)
+    execute_process(COMMAND "${_xchplot2_nvcc_probe}" --version
+        RESULT_VARIABLE _x2_nvcc_rc OUTPUT_VARIABLE _x2_nvcc_version ERROR_QUIET)
+    if(_x2_nvcc_rc EQUAL 0)
+        set(X2_HAVE_NVCC TRUE)
+    endif()
+endif()
+# Unusable NVIDIA hardware must not claim the CUDA path over AMD/Intel.
+if(_xchplot2_cuda_cap MATCHES "^([0-9]+)\\.([0-9]+)")
+    math(EXPR _x2_arch "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")
+    if(_x2_arch LESS 50 OR (_x2_arch LESS 75 AND _x2_nvcc_version MATCHES "release 1[3-9]\\."))
+        set(_xchplot2_have_nvidia FALSE)
+    endif()
+endif()
+set(X2_HAVE_NVIDIA ${_xchplot2_have_nvidia})
+set(X2_HAVE_AMD ${_xchplot2_have_amd})
+set(X2_HAVE_INTEL ${_xchplot2_have_intel})
+set(X2_AMD_GFX "${_xchplot2_gfx}")
+include(cmake/TargetSelection.cmake)
+set(ACPP_TARGETS "${ACPP_TARGETS}" CACHE STRING "AdaptiveCpp target list" FORCE)
+option(XCHPLOT2_BUILD_CUDA "Compile CUDA-only TUs (CUB sort, __constant__ AES init, bench tests)" ${XCHPLOT2_BUILD_CUDA})
+unset(_xchplot2_nvcc_probe CACHE)
 
 # On dual-toolchain hosts (CUDA Toolkit + ROCm both installed), the SYCL
 # TUs pull in CUDA's <cuda_runtime.h> via CudaHalfShim.hpp AND ROCm's
@@ -98,173 +168,7 @@ if(NOT XCHPLOT2_BUILD_CUDA)
 endif()
 
 if(XCHPLOT2_BUILD_CUDA)
-    # Default arch: `native` — CMake 3.24+ probes the locally-visible
-    # GPUs and emits SASS only for those compute capabilities. Falls
-    # back to sm_89 (RTX 4090) when no GPU is visible at configure
-    # time (e.g., container builds, headless CI). Override either via
-    # -DCMAKE_CUDA_ARCHITECTURES=89;86 (multi-arch fatbin) or a
-    # specific value when cross-compiling for hardware that's not
-    # plugged into the build host.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # Probe whether `native` resolves to anything; if no GPU is
-        # visible CMake will error out cryptically. Fall back to sm_89
-        # in that case.
-        execute_process(
-            COMMAND nvidia-smi -L
-            OUTPUT_VARIABLE _xchplot2_nvsmi_out
-            ERROR_QUIET
-            RESULT_VARIABLE _xchplot2_nvsmi_rc)
-        if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_nvsmi_out MATCHES "GPU")
-            set(CMAKE_CUDA_ARCHITECTURES native)
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES 89)
-        endif()
-    endif()
-
-    # Preflight nvcc-vs-arch compatibility BEFORE enable_language(CUDA),
-    # which is what triggers the cryptic "Unsupported gpu architecture
-    # 'compute_61'" TryCompile failure when Pascal/Volta meets CUDA 13.x.
-    # CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely.
-    # Skip the check if nvcc isn't findable yet — enable_language(CUDA)
-    # below will surface its own missing-toolchain message in that case.
-    find_program(_xchplot2_nvcc nvcc
-        HINTS ENV CUDA_PATH ENV CUDA_HOME /opt/cuda /usr/local/cuda
-        PATH_SUFFIXES bin
-        DOC "nvcc for arch-compat preflight")
-    if(_xchplot2_nvcc)
-        execute_process(
-            COMMAND "${_xchplot2_nvcc}" --version
-            OUTPUT_VARIABLE _nvcc_version_out
-            ERROR_QUIET
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        # Parse "Cuda compilation tools, release 13.0, V13.0.48" → 13
-        if(_nvcc_version_out MATCHES "release ([0-9]+)")
-            set(_nvcc_major "${CMAKE_MATCH_1}")
-            set(_min_arch 9999)
-            foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-                # Strip sm_ / compute_ prefixes some users pass through
-                string(REGEX REPLACE "^(sm_|compute_)" "" _a "${_a}")
-                string(REGEX REPLACE "-(real|virtual)$" "" _a "${_a}")
-                if(_a MATCHES "^[0-9]+$" AND _a LESS _min_arch)
-                    set(_min_arch ${_a})
-                endif()
-            endforeach()
-            if(_nvcc_major GREATER_EQUAL 13 AND _min_arch LESS 75)
-                # Container detection: Docker writes /.dockerenv, Podman writes
-                # /run/.containerenv. Either presence means the host-side fixes
-                # don't apply — the user needs to rebuild the image with a
-                # different BASE_DEVEL.
-                if(EXISTS "/.dockerenv" OR EXISTS "/run/.containerenv")
-                    set(_fix_block
-                        "You're building inside a container — the toolkit comes from\n"
-                        "the base image, not the host. Rebuild with a CUDA 12.x base:\n"
-                        "  - Recommended: rerun scripts/build-container.sh on the host;\n"
-                        "    it auto-pins nvidia/cuda:12.9.1 when CUDA_ARCH < 75.\n"
-                        "  - Or pass --build-arg explicitly:\n"
-                        "      podman build -t xchplot2:cuda \\\n"
-                        "        --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n"
-                        "        --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n"
-                        "        --build-arg CUDA_ARCH=${_min_arch} \\\n"
-                        "        .\n")
-                else()
-                    set(_fix_block
-                        "Fix one of:\n"
-                        "  - Install CUDA 12.9 (last toolkit with Pascal/Volta support) and re-run cmake:\n"
-                        "      sudo apt install cuda-toolkit-12-9     (Ubuntu/Debian)\n"
-                        "    Then point cmake at it:\n"
-                        "      cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -B build -S . [...]\n"
-                        "  - Or override the target arch (only valid if you actually have a Turing+ card):\n"
-                        "      cmake -DCMAKE_CUDA_ARCHITECTURES=75 -B build -S . [...]\n"
-                        "  - Or use the container path — scripts/build-container.sh auto-pins\n"
-                        "    the 12.9 base image when it detects a pre-Turing GPU.\n")
-                endif()
-                message(FATAL_ERROR
-                    "xchplot2: CUDA Toolkit ${_nvcc_major}.x dropped codegen for "
-                    "sm_${_min_arch} (Pascal / Volta / pre-Turing).\n"
-                    "\n"
-                    "Detected:\n"
-                    "  nvcc ${_nvcc_major}.x at ${_xchplot2_nvcc}\n"
-                    "  target arch: sm_${_min_arch} (from CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES})\n"
-                    "\n"
-                    ${_fix_block})
-            endif()
-        endif()
-    endif()
-    # Symmetric ceiling check: a target arch NEWER than this nvcc can
-    # codegen — e.g. a Blackwell GeForce RTX 50-series (compute_cap 12.0 ->
-    # sm_120) on a CUDA < 12.8 toolkit, where nvcc dies with "Unsupported
-    # gpu architecture 'compute_120'". PTX is forward-compatible, so fall
-    # back to PTX from the highest arch this nvcc supports (queried
-    # authoritatively via `nvcc --list-gpu-arch`); the driver JIT-compiles
-    # it to the real GPU at runtime. Mirrors build.rs's cargo-install path.
-    if(_xchplot2_nvcc)
-        execute_process(
-            COMMAND "${_xchplot2_nvcc}" --list-gpu-arch
-            OUTPUT_VARIABLE _nvcc_arch_out
-            ERROR_QUIET
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        # Highest compute_XX nvcc can emit. The list is NOT sorted on CUDA
-        # 13.x (compute_100, compute_110, compute_103, ...), so take the max.
-        set(_max_supported 0)
-        string(REGEX MATCHALL "compute_([0-9]+)" _arches "${_nvcc_arch_out}")
-        foreach(_m IN LISTS _arches)
-            string(REGEX REPLACE "compute_" "" _m "${_m}")
-            if(_m GREATER _max_supported)
-                set(_max_supported ${_m})
-            endif()
-        endforeach()
-        # Target arch: resolve `native`/`all` via the live GPU's compute_cap;
-        # otherwise take the max of the numeric CMAKE_CUDA_ARCHITECTURES list.
-        set(_want 0)
-        if(CMAKE_CUDA_ARCHITECTURES MATCHES "native|all")
-            execute_process(
-                COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
-                OUTPUT_VARIABLE _cap_out
-                ERROR_QUIET
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
-            if(_cap_out MATCHES "([0-9]+)\\.([0-9]+)")
-                math(EXPR _want "${CMAKE_MATCH_1} * 10 + ${CMAKE_MATCH_2}")
-            endif()
-        else()
-            foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-                string(REGEX REPLACE "^(sm_|compute_)" "" _a "${_a}")
-                string(REGEX REPLACE "-(real|virtual)$" "" _a "${_a}")
-                if(_a MATCHES "^[0-9]+$" AND _a GREATER _want)
-                    set(_want ${_a})
-                endif()
-            endforeach()
-        endif()
-        if(_max_supported GREATER 0 AND _want GREATER _max_supported)
-            message(WARNING
-                "xchplot2: target sm_${_want} is newer than this CUDA Toolkit can "
-                "codegen (nvcc tops out at compute_${_max_supported}; sm_100/sm_120 "
-                "Blackwell need CUDA 12.8+). Falling back to compute_${_max_supported} "
-                "PTX, which the driver JIT-compiles to your GPU at runtime. For native "
-                "SASS install CUDA 12.8+ and point cmake at it with "
-                "-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc.")
-            set(CMAKE_CUDA_ARCHITECTURES "${_max_supported}-virtual")
-        endif()
-    endif()
-    # Hand enable_language(CUDA) the nvcc the find_program above located.
-    # CMake's built-in toolkit search covers CUDAToolkit_ROOT / CUDA_PATH /
-    # $PATH / /usr/local/cuda — but NOT /opt/cuda, where Arch's `cuda` package
-    # installs it, and which only reaches PATH via /etc/profile.d/cuda.sh (a
-    # login-shell-only hook). Without this, configure dies with "Failed to find
-    # nvcc. Please set the CUDAToolkit_ROOT variable" on a host whose toolkit we
-    # found, ran, and version-checked seconds earlier.
-    if(_xchplot2_nvcc AND NOT DEFINED CMAKE_CUDA_COMPILER)
-        get_filename_component(_xchplot2_nvcc_bin  "${_xchplot2_nvcc}" DIRECTORY)
-        get_filename_component(_xchplot2_nvcc_root "${_xchplot2_nvcc_bin}" DIRECTORY)
-        set(CMAKE_CUDA_COMPILER "${_xchplot2_nvcc}"
-            CACHE FILEPATH "nvcc located by xchplot2")
-        if(NOT DEFINED CUDAToolkit_ROOT)
-            set(CUDAToolkit_ROOT "${_xchplot2_nvcc_root}"
-                CACHE PATH "CUDA toolkit root located by xchplot2")
-        endif()
-        message(STATUS "xchplot2: nvcc ${_xchplot2_nvcc} "
-                       "(CUDAToolkit_ROOT=${_xchplot2_nvcc_root})")
-    endif()
-    unset(_xchplot2_nvcc CACHE)
+    include(cmake/CudaArchitectures.cmake)
 
     # Rolling distros can ship a GCC newer than nvcc supports. Probe the
     # actual toolkit, then try installed compilers (including the compatible
@@ -339,78 +243,6 @@ option(XCHPLOT2_INSTRUMENT_MATCH "Instrument T3 match_all_buckets with clock64 b
 # tests a user builds to diagnose an Intel GPU are configured through THIS
 # path, so on an Intel+AMD host they were AOT-pinned to amdgcn and could not
 # dispatch to the GPU under investigation at all.
-if(NOT ACPP_TARGETS AND WIN32)
-    # Precompile CPU kernels; Windows CPU JIT otherwise needs Visual Studio's
-    # static CRT libraries at runtime. GPU kernels retain the generic JIT.
-    set(ACPP_TARGETS "generic;omp" CACHE STRING "AdaptiveCpp target list" FORCE)
-elseif(NOT ACPP_TARGETS)
-    execute_process(
-        COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
-        OUTPUT_VARIABLE _xchplot2_cuda_cap
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _xchplot2_nvsmi_rc
-        ERROR_QUIET)
-    set(_xchplot2_have_nvidia FALSE)
-    if(_xchplot2_nvsmi_rc EQUAL 0 AND _xchplot2_cuda_cap)
-        set(_xchplot2_have_nvidia TRUE)
-    endif()
-
-    execute_process(
-        COMMAND rocminfo
-        OUTPUT_VARIABLE _xchplot2_rocm_out
-        RESULT_VARIABLE _xchplot2_rocminfo_rc
-        ERROR_QUIET)
-    set(_xchplot2_gfx "")
-    if(_xchplot2_rocminfo_rc EQUAL 0)
-        string(REGEX MATCH "Name:[ \t]+gfx[0-9a-f]+" _xchplot2_gfx_match "${_xchplot2_rocm_out}")
-        string(REGEX REPLACE "Name:[ \t]+" "" _xchplot2_gfx "${_xchplot2_gfx_match}")
-    endif()
-
-    # Intel: PCI vendor 0x8086 on any DRM card node, matching build.rs's
-    # detect_intel_gpu(). Connector nodes (card0-DP-1) are skipped the same
-    # way. There is no Intel AOT arm below — Intel only ever reaches generic
-    # — but it still has to be counted here, or it is invisible.
-    set(_xchplot2_have_intel FALSE)
-    file(GLOB _xchplot2_drm_cards LIST_DIRECTORIES TRUE "/sys/class/drm/card*")
-    foreach(_xchplot2_card IN LISTS _xchplot2_drm_cards)
-        get_filename_component(_xchplot2_card_name "${_xchplot2_card}" NAME)
-        if(_xchplot2_card_name MATCHES "-")
-            continue()
-        endif()
-        if(EXISTS "${_xchplot2_card}/device/vendor")
-            file(READ "${_xchplot2_card}/device/vendor" _xchplot2_vid)
-            string(STRIP "${_xchplot2_vid}" _xchplot2_vid)
-            if(_xchplot2_vid STREQUAL "0x8086")
-                set(_xchplot2_have_intel TRUE)
-            endif()
-        endif()
-    endforeach()
-
-    set(_xchplot2_vendors 0)
-    if(_xchplot2_have_nvidia)
-        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
-    endif()
-    if(_xchplot2_gfx)
-        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
-    endif()
-    if(_xchplot2_have_intel)
-        math(EXPR _xchplot2_vendors "${_xchplot2_vendors} + 1")
-    endif()
-
-    if(_xchplot2_vendors GREATER 1)
-        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
-        message(STATUS "xchplot2: multi-vendor host; using ACPP_TARGETS=generic (SSCP)")
-    elseif(_xchplot2_have_nvidia)
-        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
-        message(STATUS "xchplot2: NVIDIA GPU detected; using ACPP_TARGETS=generic (SSCP)")
-    elseif(_xchplot2_gfx)
-        set(ACPP_TARGETS "hip:${_xchplot2_gfx}" CACHE STRING "AdaptiveCpp target list" FORCE)
-        message(STATUS "xchplot2: ACPP_TARGETS auto-detected via rocminfo: ${ACPP_TARGETS}")
-    else()
-        set(ACPP_TARGETS "generic" CACHE STRING "AdaptiveCpp target list" FORCE)
-        message(STATUS "xchplot2: ACPP_TARGETS fell back to generic (no nvidia-smi/rocminfo)")
-    endif()
-endif()
 message(STATUS "xchplot2: ACPP_TARGETS=${ACPP_TARGETS}")
 
 # ── ROCm device bitcode ─────────────────────────────────────────────────────
@@ -667,7 +499,11 @@ if(NOT AdaptiveCpp_FOUND)
             -S "${adaptivecpp_SOURCE_DIR}" -B "${adaptivecpp_BINARY_DIR}" -G Ninja
             -DCMAKE_BUILD_TYPE=Release ${_x2_acpp_flags}
             COMMAND_ERROR_IS_FATAL ANY)
-        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${adaptivecpp_BINARY_DIR}" --parallel
+        set(_x2_build_parallel --parallel)
+        if(NOT "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}" STREQUAL "")
+            list(APPEND _x2_build_parallel "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
+        endif()
+        execute_process(COMMAND "${CMAKE_COMMAND}" --build "${adaptivecpp_BINARY_DIR}" ${_x2_build_parallel}
             COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND "${CMAKE_COMMAND}" --install "${adaptivecpp_BINARY_DIR}"
             COMMAND_ERROR_IS_FATAL ANY)
@@ -1213,6 +1049,7 @@ endif()
 # than on `pos2_gpu` so the parity tests (which reference device symbols
 # externally) keep working unchanged.
 add_library(xchplot2_cli STATIC tools/xchplot2/cli.cpp)
+target_compile_definitions(xchplot2_cli PRIVATE XCHPLOT2_VERSION="${PROJECT_VERSION}")
 target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
 target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
 # CUDA_RESOLVE_DEVICE_SYMBOLS=ON triggers an nvcc --device-link step at
@@ -1328,104 +1165,6 @@ x2_add_sycl_to_target(TARGET host_pinned_pool_test
                    SOURCES tools/parity/host_pinned_pool_test.cpp)
 target_link_libraries(host_pinned_pool_test PRIVATE pos2_gpu_host)
 
-# temp_file_test — TempFile is pure POSIX (mkstemp/pread/pwrite/fallocate/
-# statfs) with no SYCL in it. It used to reach the class by linking the whole
-# pos2_gpu_host library, which dragged AdaptiveCpp in and put the test out of
-# reach of any environment without a SYCL toolchain — CI included. Compiling
-# the one TU it actually needs keeps it runnable everywhere.
-add_executable(temp_file_test tools/parity/temp_file_test.cpp
-                              src/host/TempFile.cpp)
-target_include_directories(temp_file_test PRIVATE src)
-target_compile_features(temp_file_test PRIVATE cxx_std_20)
-set_target_properties(temp_file_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# spill_engine_test — the disk-offload I/O engine's ticket protocol.
-#
-# The engine is the spill path's silent-corruption surface: a wait that returns
-# one job early substitutes another chunk's bytes over a range SpillCoverage
-# considers written, so nothing downstream can tell. It was untestable while it
-# lived in an anonymous namespace inside GpuPipeline.cpp; SpillEngine.hpp now
-# injects the two staging allocations and the one blocking copy it needed from
-# SYCL (SpillHostOps), so the protocol runs here over malloc + memcpy with no
-# GPU, no driver and no AdaptiveCpp. Threads and real temp-dir I/O, nothing
-# else.
-add_executable(spill_engine_test tools/parity/spill_engine_test.cpp
-                                 src/host/TempFile.cpp)
-target_include_directories(spill_engine_test PRIVATE src)
-target_compile_features(spill_engine_test PRIVATE cxx_std_20)
-find_package(Threads REQUIRED)
-target_link_libraries(spill_engine_test PRIVATE Threads::Threads)
-set_target_properties(spill_engine_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# spill_coverage_test — the spill path's read guard. SpillCoverage.hpp is
-# header-only and free of SYCL/GPU deps precisely so this builds and runs
-# anywhere with no device present: it is pure interval arithmetic, and it is
-# the only thing standing between a spill bug and a silently short .plot2.
-add_executable(spill_coverage_test tools/parity/spill_coverage_test.cpp)
-target_include_directories(spill_coverage_test PRIVATE src)
-target_compile_features(spill_coverage_test PRIVATE cxx_std_20)
-set_target_properties(spill_coverage_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# host_guard_test — the pinned-host redzone canaries. Same argument as
-# spill_coverage_test: HostGuard.hpp is header-only and device-free, and a
-# canary that silently never fires is indistinguishable from a clean run in
-# any end-to-end plot test. The deliberate-overrun cases here are what makes
-# a quiet soak under XCHPLOT2_HOST_GUARD mean anything.
-add_executable(host_guard_test tools/parity/host_guard_test.cpp)
-target_include_directories(host_guard_test PRIVATE src)
-target_compile_features(host_guard_test PRIVATE cxx_std_20)
-set_target_properties(host_guard_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# vram_probe_test — validation of a Level Zero Sysman memory reading.
-# VramProbe.hpp is header-only and device-free so this runs anywhere, which is
-# the entire point: the code it guards executes only on Intel hardware and
-# parses a hand-declared ABI, so on any other box "it compiles" is the only
-# feedback available. That is how the first version shipped a bound that
-# rejected every reading on the target card. The B580 case is the real
-# measurement from that host.
-add_executable(vram_probe_test tools/parity/vram_probe_test.cpp)
-target_include_directories(vram_probe_test PRIVATE src)
-target_compile_features(vram_probe_test PRIVATE cxx_std_20)
-set_target_properties(vram_probe_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# host_spill_policy_test — the host-RAM disk-offload budget policy. Same
-# argument as the two above: HostRamPolicy is pure integer arithmetic with no
-# SYCL/CUDA/device probe, so every branch is reachable here on any machine.
-# Reaching them for real needs a GPU, a k=28-sized host and a specific free-RAM
-# reading, which is why this policy shipped with no test until now — and it is
-# the code that decides whether this process gets OOM-killed or plots.
-add_executable(host_spill_policy_test tools/parity/host_spill_policy_test.cpp
-                                      src/host/HostRamPolicy.cpp)
-target_include_directories(host_spill_policy_test PRIVATE src)
-target_compile_features(host_spill_policy_test PRIVATE cxx_std_20)
-set_target_properties(host_spill_policy_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-
-# bench_stats_test — the multi-worker bench arithmetic (per-worker warmup
-# exclusion, drain-tail truncation, sum-of-rates aggregate). BenchStats.hpp is
-# header-only and free of SYCL/GPU deps precisely so this can be built and run
-# anywhere, with no device present: it is pure arithmetic over synthetic
-# timelines, and it is the only thing standing between a plausible-looking
-# throughput number and a wrong one.
-add_executable(bench_stats_test tools/parity/bench_stats_test.cpp)
-target_include_directories(bench_stats_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(bench_stats_test PRIVATE cxx_std_20)
-
-# numa_topology_test — the sysfs cpulist grammar that decides which cores a CPU
-# worker is pinned to. Same reasoning as bench_stats_test: NumaTopology is free
-# of SYCL/GPU deps so this runs on any host, and it covers the multi-socket
-# cpulist shapes ("0-15,32-47") that a single-socket dev box cannot produce and
-# therefore cannot catch by running the real thing.
-add_executable(numa_topology_test
-    tools/parity/numa_topology_test.cpp
-    src/host/NumaTopology.cpp)
-target_include_directories(numa_topology_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(numa_topology_test PRIVATE cxx_std_20)
 target_compile_features(sycl_bucket_offsets_parity PRIVATE cxx_std_20)
 set_target_properties(sycl_bucket_offsets_parity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
@@ -1805,58 +1544,16 @@ set_target_properties(gpu_ci_info PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/sanity")
 
 
-add_executable(vram_budget_test tools/parity/vram_budget_test.cpp)
-target_include_directories(vram_budget_test PRIVATE src)
-target_compile_features(vram_budget_test PRIVATE cxx_std_20)
-
 add_executable(sycl_twophase_budget_test tools/parity/sycl_twophase_budget_test.cpp)
 target_include_directories(sycl_twophase_budget_test PRIVATE src)
 x2_add_sycl_to_target(TARGET sycl_twophase_budget_test
                      SOURCES tools/parity/sycl_twophase_budget_test.cpp)
 
-add_executable(cli_host_test tools/parity/cli_host_test.cpp tools/xchplot2/cli.cpp
-    src/host/ConfigFile.cpp src/host/BatchManifest.cpp src/host/NumaTopology.cpp src/host/Cancel.cpp)
-target_include_directories(cli_host_test PRIVATE src keygen-rs/include)
-target_compile_features(cli_host_test PRIVATE cxx_std_20)
-target_link_libraries(cli_host_test PRIVATE Threads::Threads)
-
-add_executable(pipeline_control_test tools/parity/pipeline_control_test.cpp
-    src/host/MultiGpuPipelineParallel.cpp src/host/Cancel.cpp)
-target_include_directories(pipeline_control_test BEFORE PRIVATE tools/parity/pipeline_control_test src)
-target_compile_features(pipeline_control_test PRIVATE cxx_std_20)
-target_link_libraries(pipeline_control_test PRIVATE Threads::Threads)
-
 add_executable(solver_filter_parity tools/parity/solver_filter_parity.cpp)
 target_link_libraries(solver_filter_parity PRIVATE pos2_chip_headers Threads::Threads)
 
-# Keep interactive discovery and CTest on the same executable set.
-include(CTest)
-get_property(_xchplot2_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-foreach(_target IN LISTS _xchplot2_targets)
-    get_target_property(_type ${_target} TYPE)
-    if(WIN32 AND _type STREQUAL "EXECUTABLE")
-        target_sources(${_target} PRIVATE tools/xchplot2/windows.manifest)
-        target_link_libraries(${_target} PRIVATE advapi32 bcrypt psapi)
-    endif()
-    # Plain C++ consumers need the same OpenMP runtime as the SYCL objects.
-    # Let AdaptiveCpp choose it; FindOpenMP probes only CMAKE_CXX_COMPILER,
-    # which can be GCC even when AdaptiveCpp compiles kernels with Clang.
-    if(ACPP_TARGETS MATCHES "(^|;)omp")
-        get_target_property(_links ${_target} LINK_LIBRARIES)
-        get_target_property(_link_rule ${_target} RULE_LAUNCH_LINK)
-        if(_links MATCHES "pos2_gpu" AND NOT _link_rule)
-            set_property(TARGET ${_target} PROPERTY RULE_LAUNCH_LINK
-                "${ACPP_COMPILER_LAUNCH_RULE}")
-        endif()
-    endif()
-    if(_target MATCHES "(_parity|_test)$")
-        set_target_properties(${_target} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-        if(BUILD_TESTING)
-            add_test(NAME ${_target} COMMAND $<TARGET_FILE:${_target}>)
-        endif()
-    endif()
-endforeach()
+include(cmake/HostTests.cmake)
+include(cmake/RegisterTests.cmake)
 
 # Archive packaging is opt-in; ordinary builds need no release tooling.
 option(XCHPLOT2_PACKAGE "Configure binary release packaging" OFF)

@@ -63,7 +63,7 @@ jobs:
     # host test binaries were built only when someone typed their names. The
     # spill path in particular shipped ~4700 lines with no automated check.
     #
-    # These targets need a C++20 compiler and nothing else — no SYCL, no CUDA,
+    # These targets need CMake and a C++20 compiler — no SYCL, no CUDA,
     # no GPU. The sanitizer arms are not decoration: the spill I/O engine is a
     # worker pool over a ticket protocol, and TSan is what caught the
     # unsynchronised high-water update in TempFile::pwrite_at that the pool
@@ -81,6 +81,9 @@ jobs:
           else
             scripts/test/host-tests.sh "${{ matrix.mode }}"
           fi
+      - name: Check build target selection
+        if: matrix.mode == 'plain'
+        run: python3 scripts/test/build-selection.py
       - name: Check GPU CI admission logic
         if: matrix.mode == 'plain'
         run: python3 scripts/test/gpu-ci-test.py

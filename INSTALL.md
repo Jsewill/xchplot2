@@ -274,7 +274,7 @@ If you'd rather install dependencies yourself, the toolchain is:
 checkout.
 
 For non-NVIDIA targets, the build also probes:
-- **ROCm** (`rocminfo`): selects `hip:gfxXXXX`, except RDNA1 defaults to generic SSCP in Cargo. See [AMD target selection](#amd-target-selection).
+- **ROCm** (`rocminfo`): selects `hip:gfxXXXX`, except RDNA1 defaults to generic SSCP in Cargo and CMake. See [AMD target selection](#amd-target-selection).
 - **Intel** (Level Zero / compute-runtime): defaults to `ACPP_TARGETS=generic`.
 
 ### Toolkit and architecture selection
@@ -390,20 +390,20 @@ including the W5700 and RX 5700 series):
 
 | Build path | Default AMD target |
 |---|---|
-| Cargo / `build.rs` | Detects the GPU with `rocminfo`; RDNA1 selects `ACPP_TARGETS=generic`, other detected targets select `hip:gfxXXXX`. |
+| Cargo / direct CMake | Share target selection: RDNA1 and mixed-vendor hosts select `generic`; a sole AMD target selects `hip:gfxXXXX`. Explicit `ACPP_TARGETS` (Cargo) or `-DACPP_TARGETS` (CMake) takes precedence. |
 | `scripts/build-container.sh` | Detects `ACPP_GFX`; RDNA1 is still changed to the legacy `gfx1013` AOT spoof. An explicit `ACPP_GFX` is used unchanged. |
 | `podman compose build rocm` | AOT only: requires `ACPP_GFX`, then passes `hip:$ACPP_GFX`. A host `ACPP_TARGETS` value does not override this compose argument. |
-| Direct CMake | Set `-DACPP_TARGETS=generic` or the intended `hip:gfxXXXX` target explicitly. |
 
-For RDNA1, use the [native installation](#native-install) and Cargo's generic
+For RDNA1, use the [native installation](#native-install) and the generic
 SSCP path. The legacy spoof produced no-op kernels on a reported W5700 with
 ROCm 6 and AdaptiveCpp 25.10; generic SSCP passed that host's checks through
 k=24. This is separate from the current RX 6700 XT k=28 benchmark set.
 
-Cargo preserves two explicit overrides for already validated stacks:
+Cargo and direct CMake preserve two environment overrides for already validated stacks:
 `XCHPLOT2_FORCE_GFX_SPOOF=1` selects the legacy `gfx1013` spoof;
 `XCHPLOT2_NO_GFX_SPOOF=1` selects the GPU's actual AOT target, which the
-toolchain may reject. An explicit `ACPP_TARGETS` takes precedence.
+toolchain may reject. An explicit `ACPP_TARGETS` (Cargo) or
+`-DACPP_TARGETS` (CMake) takes precedence.
 
 ## Windows
 
@@ -440,7 +440,7 @@ cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
     '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON
 cmake --build build/windows-sycl --parallel 2
 ./build/windows-sycl/tools/xchplot2/xchplot2.exe devices
-python scripts/test/windows.py build/windows-sycl/tools/xchplot2/xchplot2.exe
+python scripts/test/recovery.py build/windows-sycl/tools/xchplot2/xchplot2.exe
 ```
 
 The initial Windows CI toolchain build took about 95 minutes with two parallel jobs.

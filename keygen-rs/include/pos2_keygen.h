@@ -1,6 +1,6 @@
 // pos2_keygen.h — C interface to the pos2_keygen Rust staticlib.
 //
-// Exposes a single function that derives the plot_id and memo for a v2
+// Derives the plot_id, shared group identity, and memo for a v2
 // Chia plot from caller-supplied farmer + pool keys. Wraps chia-rs
 // (chia-bls + chia-protocol) so the output is byte-equivalent to what
 // `chia plots create --v2` produces.
@@ -54,6 +54,16 @@ int pos2_keygen_derive_plot(
     const uint8_t* pool_key_ptr, int pool_kind,
     uint8_t strength, uint16_t plot_index, uint8_t meta_group,
     uint8_t* out_plot_id,
+    uint8_t* out_memo_buf, size_t* inout_memo_len);
+
+// Shared group identity and memo using the current key/taproot derivation.
+// Same inputs/outputs as derive_plot, without per-member index/meta_group.
+// This does not opt the production plotter into any new file format.
+int pos2_keygen_derive_group(
+    const uint8_t* seed_ptr, size_t seed_len,
+    const uint8_t* farmer_pk_ptr,
+    const uint8_t* pool_key_ptr, int pool_kind,
+    uint8_t strength, uint8_t out_group_id[32],
     uint8_t* out_memo_buf, size_t* inout_memo_len);
 
 // Decode a Chia bech32m address ("xch1..." mainnet or "txch1..." testnet)

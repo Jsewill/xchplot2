@@ -121,6 +121,13 @@ int main(int argc, char** argv)
             << std::quoted(dir.string()) << ' ' << std::quoted(name) << '\n';
         return row.str();
     };
+    auto capture = [&](std::vector<std::string> const& command) {
+        std::ostringstream output;
+        auto* previous = std::cout.rdbuf(output.rdbuf());
+        int const code = cli(command);
+        std::cout.rdbuf(previous);
+        return std::pair{code, output.str()};
+    };
     put(manifest, line("18 2 0 0 false"));
     put(config, "");
     assert(cli({"--help", "--config", config.string()}) == 0);
@@ -132,6 +139,40 @@ int main(int argc, char** argv)
     assert(verified_trials == 1 && verified_full);
     assert(cli({"verify", "unused.plot2", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
     assert(verified_trials == 2 && !verified_full);
+    // Strict conversion rejects prefixes/overflow without changing numeric
+    // signs, leading whitespace, config precedence, or verification aliases.
+    for (auto const* value : {"2junk", "", "9999999999999999999999999"}) {
+        assert(cli({"verify", "unused.plot2", "--config", config.string(), "-n", value}) == 1);
+        for (auto const* option : {"--k", "--num", "--strength", "--warmup"})
+            assert(cli({"bench", "--config", config.string(), option, value}) == 1);
+        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--meta-group", "--pipeline-depth"})
+            assert(cli({"plot", "--config", config.string(), option, value}) == 1);
+        assert(cli({"batch", manifest.string(), "--config", config.string(), "--pipeline-depth", value}) == 1);
+        assert(cli({"test", value, std::string(64, 'a'), "--config", config.string()}) == 1);
+    }
+    assert(cli({"verify", "unused.plot2", "--config", config.string(), "-n", " +002"}) == 0);
+    assert(verified_trials == 2);
+    put(config, "");
+    for (auto const* value : {"2junk", "nan", "inf", "1e999", "0", "-1"})
+        assert(cli({"bench", "--config", config.string(), "--target-size", value}) == 1);
+    for (auto const* value : {"nan", "inf", "1e999", "18446744073709551616", "-1G", "2GiBjunk"})
+        assert(cli({"bench", "--config", config.string(), "--max-host-ram", value}) == 1);
+    for (int position = 2; position <= 5; ++position) {
+        std::vector<std::string> test = {"test", "18", std::string(64, 'a'), "2", "0", "0", "1", "--config", config.string()};
+        test[position + 1] = "2junk";
+        assert(cli(test) == 1);
+    }
+    for (auto const* shell : {"bash", "zsh", "fish"}) {
+        auto const [code, script] = capture({"completions", shell, "--config", config.string()});
+        assert(code == 0 && script.find("verify") != std::string::npos);
+        if (std::string(shell) == "zsh") {
+            assert(script.find("'2:plot file:_files'") != std::string::npos);
+            assert(script.find("'--trials[Random challenges]:count:'") != std::string::npos);
+            assert(script.find("'-n[Random challenges]:count:'") != std::string::npos);
+        }
+        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers"})
+            assert(script.find(option) != std::string::npos);
+    }
     put(config, "[batch]\ndevices=\"0\"\nquiet=0\nprogress=false\ncpu=false\nauto-spill=false\n");
     assert(cli({"batch", manifest.string(), "--config", config.string(), "--temp-dir", dir.string()}) == 0);
     assert(std::string(std::getenv("XCHPLOT2_TEMP_DIR")) == dir.string());
@@ -146,6 +187,29 @@ int main(int argc, char** argv)
     int const before = batch_calls;
     assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
     assert(batch_calls == before + 1);
+    auto const [json_code, json_report] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json"});
+    assert(json_code == 0 && json_report.starts_with("{\"version\":"));
+    assert(json_report.find("\"queue_plots\":1") != std::string::npos);
+    assert(json_report.find("\"s_per_plot\":1") != std::string::npos);
+    assert(json_report.find("\"label\":\"end-to-end\"") != std::string::npos);
+    assert(json_report.find("\"pipeline\":\"\"") != std::string::npos);
+    auto const [plain_code, plain_output] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json", "--no-json"});
+    assert(plain_code == 0 && plain_output.empty());
+#ifndef _WIN32
+    std::ostringstream escaped;
+    auto* previous = std::cout.rdbuf(escaped.rdbuf());
+    // Exercise string escaping through an actual output directory.
+    auto const quoted = dir / "quote\"\\tab\t";
+    std::filesystem::create_directory(quoted);
+    assert(cli({"bench", "--config", config.string(), "--out", quoted.string(), "--json"}) == 0);
+    std::cout.rdbuf(previous);
+    assert(escaped.str().find("quote\\\"\\\\tab\\u0009") != std::string::npos);
+    auto const invalid_utf8 = dir / std::string("byte-\xff");
+    std::filesystem::create_directory(invalid_utf8);
+    auto const [bytes_code, bytes_report] = capture({"bench", "--config", config.string(), "--out", invalid_utf8.string(), "--json"});
+    assert(bytes_code == 0 && bytes_report.find("byte-\\u00ff") != std::string::npos);
+#endif
+
     assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "1");
 #ifdef _WIN32
     _putenv_s("POS2GPU_ASSERT_VRAM", "0");
@@ -255,13 +319,6 @@ int main(int argc, char** argv)
     std::vector<std::string> args = {"plot", "--config", config.string(), "-k", "18", "-n", "3",
         "-f", std::string(96, 'a'), "--pool-ph", std::string(64, 'b'), "-o", plots.string(),
         "--quiet", "--no-progress", "--continue-on-error"};
-    auto capture = [&](std::vector<std::string> const& command) {
-        std::ostringstream output;
-        auto* previous = std::cout.rdbuf(output.rdbuf());
-        int const code = cli(command);
-        std::cout.rdbuf(previous);
-        return std::pair{code, output.str()};
-    };
     write_limit = 1; fail_remaining = true;
     auto [failed_code, failed_output] = capture(args);
     assert(failed_code == 3 && std::count(failed_output.begin(), failed_output.end(), '\n') == 1);

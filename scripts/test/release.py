@@ -12,29 +12,35 @@ import tempfile
 import zipfile
 
 
+def extract_archive(archive_path, work):
+    digest = hashlib.sha256()
+    with archive_path.open("rb") as archive:
+        for block in iter(lambda: archive.read(1024 * 1024), b""):
+            digest.update(block)
+    checksum = pathlib.Path(str(archive_path) + ".sha256").read_text().split()
+    if checksum != [digest.hexdigest(), archive_path.name]:
+        raise ValueError("Archive checksum mismatch")
+    if archive_path.suffix == ".zip":
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(work)
+    else:
+        with tarfile.open(archive_path) as archive:
+            archive.extractall(work, filter="data")
+    packages = list(work.iterdir())
+    if len(packages) != 1 or not packages[0].is_dir():
+        raise ValueError("Expected one package directory")
+    return packages[0], digest.hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=pathlib.Path)
     parser.add_argument("--sycl-probe", type=pathlib.Path,
                         help="Matching build/tools/sanity/hellosycl executable")
     args = parser.parse_args()
-    digest = hashlib.sha256()
-    with args.archive.open("rb") as archive:
-        for block in iter(lambda: archive.read(1024 * 1024), b""):
-            digest.update(block)
-    checksum = pathlib.Path(str(args.archive) + ".sha256").read_text().split()
-    assert checksum == [digest.hexdigest(), args.archive.name], "Archive checksum mismatch"
     with tempfile.TemporaryDirectory(prefix="xchplot2 release é-") as temporary:
         work = pathlib.Path(temporary)
-        if args.archive.suffix == ".zip":
-            with zipfile.ZipFile(args.archive) as archive:
-                archive.extractall(work)
-        else:
-            with tarfile.open(args.archive) as archive:
-                archive.extractall(work, filter="data")
-        packages = list(work.iterdir())
-        assert len(packages) == 1 and packages[0].is_dir(), "Expected one package directory"
-        package = packages[0]
+        package, _ = extract_archive(args.archive, work)
         for name in ("BUILDINFO.txt", "README.txt", "licenses/LICENSE", "licenses/rust.txt",
                      "licenses/pos2-chip.txt", "licenses/fse.txt", "licenses/aes.txt",
                      "licenses/adaptivecpp.txt", "licenses/adaptivecpp-third-party.txt",
@@ -187,8 +193,8 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
         if os.name == "nt":
             assert (package / "licenses/microsoft-runtime.txt").stat().st_size > 0
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0
-            subprocess.run([sys.executable, pathlib.Path(__file__).with_name("windows.py"), binary],
-                           check=True, timeout=360)
+        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("recovery.py"), binary],
+                       check=True, timeout=720)
         print("Release archive: extraction, CLI, CPU/SYCL plotting parity, and full proofs passed")
 
 

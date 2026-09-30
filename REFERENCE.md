@@ -173,6 +173,10 @@ save these lines in `bench.args`:
 xchplot2 bench @bench.args -o /scratch --num 3
 ```
 
+Numeric arguments must consume the whole value: `28junk` is rejected rather
+than interpreted as `28`. Decimal integers retain optional signs and leading
+whitespace; size arguments retain their documented units and fractional forms.
+
 Later flags override earlier values. `@~/bench.args` expands the leading
 `~/` in the argument-file path. Inside the file, `#` starts a comment;
 shell quoting, variable expansion, and nested argument files are unsupported.
@@ -347,6 +351,7 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 | `--tier T` | Force a [streaming tier](#memory-requirements), even when the pool fits |
 | `--max-host-ram SIZE`, `--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
 | `--keep` | Retain synthetic output files on disk for inspection |
+| `--json` | Also emit a JSON report to stdout for saving or comparing runs |
 | `--compute-only` | Add a second pass using RAM-backed output when available |
 | `--target-size TiB` | Estimate time to fill this capacity instead of the output directory's free space |
 | `-v`, `-q` | More worker detail, or quieter informational output |
@@ -366,6 +371,21 @@ Bench removes its generated files by default. `--keep` retains disk output;
 temporary tmpfs output is always removed to release the RAM. Results and
 time-to-fill estimates are printed to stderr. See [BENCHMARKS.md](BENCHMARKS.md)
 for the project's recorded measurements and comparison methodology.
+
+Use `xchplot2 bench -k 28 -o /scratch --json > bench.json` to save the
+measurements. The report includes the build version, plot parameters, queue
+size and warmup, output directory, requested tier and host RAM policy, plus
+per-pass throughput, measurement windows, worker labels, actual recorded
+pipelines, and per-worker counts and interval spread. An empty pipeline means
+that the worker did not record one; the requested tier is not an assertion
+about the pipeline actually used. `workers_unmeasured` retains the human
+report's lower-bound warning. The second pass is labeled `tmpfs` or
+`compute+cache` as appropriate. Human output and progress remain on stderr;
+without `--json`, stdout stays unchanged. Valid UTF-8 is preserved; invalid
+filesystem bytes are represented individually as `\u00XX` escapes. Compare
+runs under similar device
+load: concurrent GPU use can change results, and this report does not diagnose
+why a rate changed.
 
 ## Memory requirements
 
@@ -639,8 +659,8 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_SPILL_IO_THREADS=N` | Worker threads per spill I/O job, 1-32. Default 2. Threads share the staging memory; measure on the target drive before increasing the count. `1` processes the job serially. |
 | `XCHPLOT2_HOST_FREE_MB=N`     | Testing only — make the host report at most N MB free, so the host-RAM guard and the automatic spill can be exercised on a box that is not actually short. Clamps only: it can never talk the plotter past a real shortage. |
 | `POS2GPU_MAX_VRAM_MB=N` | Cap the free-VRAM query and enforce the selected budget. This tests admission and the watchdog on the current GPU; it does not emulate another physical card. |
-| `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
-| `POS2GPU_ASSERT_VRAM=1`       | Fail (not just warn) when a path's true peak exceeds what it declared. Armed by `bench`. |
+| `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected modeled VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
+| `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |

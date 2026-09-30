@@ -1253,8 +1253,8 @@ namespace {
 namespace {
 
 // Polls the driver's own free-VRAM counter for the life of a batch slice and
-// records the low-water mark, giving us the peak device memory the process
-// ACTUALLY held — as opposed to what the s_malloc trace believes it held.
+// records the low-water mark, giving us the largest sampled device-wide
+// decrease in free memory, including allocations outside the s_malloc trace.
 //
 // This exists because the tier peak models are calibrated against that trace,
 // and the trace cannot see a raw sycl::malloc_device by construction. A
@@ -1265,8 +1265,9 @@ namespace {
 // the number the driver reports is the only check that cannot be fooled by an
 // allocation someone forgot to account for.
 //
-// Caveat: on a GPU shared with another process, that process allocating
-// mid-run inflates our measured peak. The check is therefore fatal only under
+// Caveat: this counter cannot attribute memory to a process. Other processes
+// allocating mid-run inflate the delta; freeing memory can hide our peak.
+// Short-lived allocations between polls can also be missed. The check is fatal only under
 // POS2GPU_ASSERT_VRAM=1 (which `bench` sets, being a controlled measurement)
 // and merely loud elsewhere.
 class VramWatchdog {
@@ -2811,11 +2812,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // stream_buffers_guard on every exit path (including the rethrows
     // above and the producer's catch).
 
-    // VRAM watchdog: compare the peak the driver actually saw against what we
-    // told the tier picker we would use. The peak models cannot see raw
-    // sycl::malloc_device allocations, so this is the only check that catches
-    // an unaccounted one — which is exactly the bug that made every 4-11 GB
-    // NVIDIA card OOM on every tier but tiny.
+    // Compare the sampled device-wide decrease in free memory against the
+    // declared budget. On an idle GPU this can catch unaccounted raw
+    // sycl::malloc_device allocations that the allocation trace misses.
     vram.stop();
     if (vram.available() && declared_base_bytes > 0) {
         uint64_t const held     = twophase_bytes_held();
@@ -2826,11 +2825,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         if (!opts.quiet) {
             std::fprintf(stderr,
                 "%s %s: peak %.0f MiB of %.0f free "
-                "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared)\n",
+                "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared; "
+                "device-wide free-memory delta, min free %.0f MiB)\n",
                 log_prefix.c_str(), mem_label,
                 to_mib(peak), to_mib(vram.baseline()),
                 to_mib(declared_base_bytes), to_mib(held),
-                to_mib(vram_safety_margin()), to_mib(declared));
+                to_mib(vram_safety_margin()), to_mib(declared),
+                to_mib(vram.baseline() - peak));
         }
         // The watchdog above only catches a model that under-declares — the OOM
         // direction. Over-declaring is silent and still wrong: the picker then
@@ -2843,10 +2844,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // bound.
         if (peak > 0 && declared_base_bytes > peak * 3 / 2) {
             std::fprintf(stderr,
-                "%s %s: WARNING — model declares %.0f MiB but the path only "
-                "peaked at %.0f MiB. An over-declared model denies this path to "
-                "cards that can run it. Re-derive the peak from this measured "
-                "number, not from a ratio against another tier's anchor.\n",
+                "%s %s: WARNING — model declares %.0f MiB but the sampled "
+                "device-wide free-memory delta was %.0f MiB. An over-declared "
+                "model can deny this path to cards that can run it. Repeat on "
+                "an idle GPU before reducing the model; other processes and "
+                "the polling interval can affect this measurement.\n",
                 log_prefix.c_str(), mem_label,
                 to_mib(declared_base_bytes), to_mib(peak));
         }
@@ -2855,17 +2857,22 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // regressions that overflow a card sized to exactly model + buffer.
         if (peak > declared) {
             std::fprintf(stderr,
-                "%s %s: ERROR — peak %.0f MiB exceeds the %.0f MiB declared for this "
-                "path by %.0f MiB, past the safety margin. A device allocation is "
-                "unaccounted in the peak model; a card sized from it will OOM. See "
-                "the two-phase budget notes in SyclBackend.hpp.\n",
+                "%s %s: ERROR — device-wide free-memory delta %.0f MiB exceeds "
+                "the %.0f MiB declared for this path by %.0f MiB, past the safety "
+                "margin (baseline free %.0f MiB, min free %.0f MiB). This can "
+                "indicate an unaccounted allocation or another process using "
+                "the GPU; the free-memory counter cannot distinguish them. "
+                "Check driver process-memory diagnostics and repeat on an idle "
+                "GPU before attributing this to the peak model. See the "
+                "two-phase budget notes in SyclBackend.hpp.\n",
                 log_prefix.c_str(), mem_label, to_mib(peak), to_mib(declared),
-                to_mib(peak - declared));
+                to_mib(peak - declared), to_mib(vram.baseline()),
+                to_mib(vram.baseline() - peak));
             if (char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
                 v && v[0] == '1')
             {
                 throw std::runtime_error(
-                    "VRAM assertion failed: peak " +
+                    "VRAM assertion failed: device-wide free-memory delta " +
                     std::to_string(uint64_t(to_mib(peak))) + " MiB > declared " +
                     std::to_string(uint64_t(to_mib(declared))) + " MiB");
             }

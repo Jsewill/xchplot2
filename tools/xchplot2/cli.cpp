@@ -103,6 +103,23 @@ int run_parity_test(std::string const& path, std::FILE* log)
 #endif
 }
 
+// Keep decimal signs/leading whitespace accepted by strtol, but consume the
+// entire argument and reject overflow before narrowing to the destination.
+template<class T>
+bool parse_integer_arg(std::string const& s, T& out, std::string const& name)
+{
+    char* end = nullptr;
+    errno = 0;
+    long long const value = std::strtoll(s.c_str(), &end, 10);
+    if (end == s.c_str() || end != s.c_str() + s.size() || errno == ERANGE ||
+        value < std::numeric_limits<T>::min() || value > std::numeric_limits<T>::max()) {
+        std::cerr << "Error: " << name << " expects an integer (got '" << s << "')\n";
+        return false;
+    }
+    out = static_cast<T>(value);
+    return true;
+}
+
 // Parse a --max-host-ram value: "8G"/"8GiB"/"8g", "8192M"/"8192MiB",
 // "512K", "4T", a raw byte count, or "min"/"0" (== spill everything
 // routable, lowest floor). Binary units (G == GiB). Returns false on a
@@ -119,7 +136,7 @@ bool parse_host_ram_arg(std::string const& raw, std::uint64_t& out_bytes)
     long double value = 0.0L;
     try { value = std::stold(s, &pos); }
     catch (...) { return false; }
-    if (value < 0.0L) return false;
+    if (!std::isfinite(value) || value < 0.0L) return false;
 
     std::string unit = s.substr(pos);
     std::uint64_t mult = 1;
@@ -135,7 +152,9 @@ bool parse_host_ram_arg(std::string const& raw, std::uint64_t& out_bytes)
         std::string rest = unit.substr(1);
         if (!(rest.empty() || rest == "b" || rest == "ib")) return false;
     }
-    out_bytes = static_cast<std::uint64_t>(value * static_cast<long double>(mult));
+    value *= static_cast<long double>(mult);
+    if (!std::isfinite(value) || value >= std::ldexp(1.0L, 64)) return false;
+    out_bytes = static_cast<std::uint64_t>(value);
     return true;
 }
 
@@ -187,7 +206,7 @@ void print_usage(char const* prog)
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
         << "         [--tier T] [--cpu] [--warmup W] [--keep] [-T|--testnet]\n"
-        << "         [--target-size TiB] [--compute-only] [-q|--quiet]\n"
+        << "         [--target-size TiB] [--compute-only] [--json] [-q|--quiet]\n"
         << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
         << "    synthetic unfarmable plots (default queue: 1 warmup + 10 measured\n"
         << "    plots/worker). Always writes real .plot2 files; deletes them\n"
@@ -479,8 +498,9 @@ bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     if (s == "off" || s == "none") { opts.cpu_workers = 0; return true; }
 
     char* endp = nullptr;
+    errno = 0;
     long const v = std::strtol(s.c_str(), &endp, 10);
-    if (endp == s.c_str() || *endp != '\0' || v < 0 || v > 64) {
+    if (endp == s.c_str() || endp != s.c_str() + s.size() || errno == ERANGE || v < 0 || v > 64) {
         std::cerr << "Error: --cpu-workers expects an integer in [0, 64], or "
                      "'auto' / 'max' / 'off' (got '" << s << "')\n";
         return false;
@@ -564,8 +584,9 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             }
             std::string const digits = tok.substr(prefix.size());
             char* endp = nullptr;
+            errno = 0;
             long const v = std::strtol(digits.c_str(), &endp, 10);
-            if (endp == digits.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+            if (endp == digits.c_str() || endp != digits.c_str() + digits.size() || errno == ERANGE || v < 0 || v > 1023) {
                 return std::nullopt;
             }
             return static_cast<int>(v);
@@ -607,8 +628,9 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             if (!add_gpu(*id)) return false;
         } else {
             char* endp = nullptr;
+            errno = 0;
             long const v = std::strtol(selector.c_str(), &endp, 10);
-            if (endp == selector.c_str() || *endp != '\0' || v < 0 || v > 1023) {
+            if (endp == selector.c_str() || endp != selector.c_str() + selector.size() || errno == ERANGE || v < 0 || v > 1023) {
                 return bad("unrecognised device token "
                            "(expect all|gpu|cpu|gpu<n>|cpu<n>|<id>)");
             }
@@ -1033,6 +1055,78 @@ BenchMeasurement analyze_bench_run(
     return out;
 }
 
+// JSON is opt-in on stdout; the human report remains on stderr.
+void write_json_string(std::ostream& out, std::string const& value)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    out << '"';
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        unsigned char const c = value[i];
+        if (c >= 0x80) {
+            // Preserve valid UTF-8; escape invalid filesystem bytes individually.
+            std::size_t const n = c >= 0xc2 && c <= 0xdf ? 2 :
+                c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+            bool valid = n != 0 && i + n <= value.size();
+            for (std::size_t j = 1; valid && j < n; ++j) {
+                unsigned char const next = value[i + j];
+                valid = next >= 0x80 && next <= 0xbf;
+                if (j == 1) valid = valid && !(c == 0xe0 && next < 0xa0) &&
+                    !(c == 0xed && next >= 0xa0) && !(c == 0xf0 && next < 0x90) &&
+                    !(c == 0xf4 && next >= 0x90);
+            }
+            if (valid) { out.write(value.data() + i, n); i += n - 1; }
+            else out << "\\u00" << hex[c >> 4] << hex[c & 15];
+            continue;
+        }
+        if (c == '"' || c == '\\') out << '\\' << c;
+        else if (c < 0x20) out << "\\u00" << hex[c >> 4] << hex[c & 15];
+        else out << c;
+    }
+    out << '"';
+}
+
+void write_bench_json_pass(std::ostream& out, BenchMeasurement const& m,
+                           std::string const& label)
+{
+    out << "{\"label\":";
+    write_json_string(out, label);
+    out << ",\"wall_seconds\":" << m.result.total_wall_seconds
+        << ",\"plots_written\":" << m.result.plots_written
+        << ",\"s_per_plot\":" << m.s_per_plot
+        << ",\"gib_per_plot\":" << m.gib_per_plot
+        << ",\"size_gib_min\":" << m.size_gib_min
+        << ",\"size_gib_max\":" << m.size_gib_max
+        << ",\"tib_per_second\":" << m.rate_tib_s
+        << ",\"window_begin_seconds\":" << m.stats.window_begin
+        << ",\"window_end_seconds\":" << m.stats.window_end
+        << ",\"plots_measured\":" << m.stats.plots_measured
+        << ",\"workers_unmeasured\":" << m.stats.workers_unmeasured
+        << ",\"workers\":[";
+    auto const labels = pos2gpu::worker_labels([&] {
+        std::vector<int> ids;
+        for (auto const& w : m.stats.workers) ids.push_back(w.device_id);
+        return ids;
+    }());
+    for (std::size_t i = 0; i < m.stats.workers.size(); ++i) {
+        auto const& w = m.stats.workers[i];
+        if (i) out << ',';
+        out << "{\"device\":";
+        write_json_string(out, labels[i]);
+        out << ",\"pipeline\":";
+        write_json_string(out, m.result.workers[i].pipeline);
+        out << ",\"plots_total\":" << w.plots_total
+            << ",\"warmup_dropped\":" << w.warmup_dropped
+            << ",\"past_window\":" << w.past_window
+            << ",\"plots_measured\":" << w.plots_measured
+            << ",\"measured\":" << (w.measured ? "true" : "false")
+            << ",\"s_per_plot\":" << w.s_per_plot
+            << ",\"interval_min_seconds\":" << w.interval_min
+            << ",\"interval_max_seconds\":" << w.interval_max
+            << ",\"interval_stddev_seconds\":" << w.interval_stddev << '}';
+    }
+    out << "]}";
+}
+
 void print_bench_measurement(char const* label,
                            BenchMeasurement const& m,
                            int k,
@@ -1337,7 +1431,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--testnet", "-T", "--skip-existing", "--resume",
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
-                    "--no-auto-spill", "--keep", "--compute-only", "--full"
+                    "--no-auto-spill", "--keep", "--compute-only", "--full", "--json"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
                 auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
@@ -1495,6 +1589,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         int measured = 10;
         int warmup = 1;
         bool keep = false;
+        bool json = false;
         bool compute_only = false;
         bool testnet = false;
         std::string out_dir = ".";
@@ -1510,11 +1605,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 return true;
             };
-            if      ((a == "--k" || a == "-k") && need(1)) k = std::atoi(argv[++i]);
-            else if ((a == "--strength" || a == "-s") && need(1)) strength = std::atoi(argv[++i]);
-            else if ((a == "--num" || a == "-n") && need(1)) measured = std::atoi(argv[++i]);
-            else if (a == "--warmup" && need(1)) warmup = std::atoi(argv[++i]);
+            if      ((a == "--k" || a == "-k") && need(1)) { if (!parse_integer_arg(argv[++i], k, a)) return 1; }
+            else if ((a == "--strength" || a == "-s") && need(1)) { if (!parse_integer_arg(argv[++i], strength, a)) return 1; }
+            else if ((a == "--num" || a == "-n") && need(1)) { if (!parse_integer_arg(argv[++i], measured, a)) return 1; }
+            else if (a == "--warmup" && need(1)) { if (!parse_integer_arg(argv[++i], warmup, a)) return 1; }
             else if ((a == "--out" || a == "-o") && need(1)) out_dir = argv[++i];
+            else if (a == "--json") json = true;
+            else if (a == "--no-json") json = false;
             else if (a == "--keep") keep = true;
             else if (a == "--no-keep") keep = false;
             else if (a == "--compute-only") compute_only = true;
@@ -1524,8 +1621,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--testnet" || a == "-T") testnet = true;
             else if (a == "--no-testnet") testnet = false;
             else if (a == "--target-size" && need(1)) {
-                target_size_tib = std::atof(argv[++i]);
-                if (target_size_tib <= 0.0) {
+                std::string const value = argv[++i];
+                char* end = nullptr;
+                errno = 0;
+                target_size_tib = std::strtod(value.c_str(), &end);
+                if (end == value.c_str() || end != value.c_str() + value.size() ||
+                    errno == ERANGE || !std::isfinite(target_size_tib) || target_size_tib <= 0.0) {
                     std::cerr << "Error: --target-size must be > 0 TiB\n";
                     return 1;
                 }
@@ -1602,6 +1703,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         // Per worker, not a global total: each worker has its own cold-start
         // plot to exclude. The queue size is still sized off the worker count.
         std::size_t const warmup_per_worker = static_cast<std::size_t>(warmup);
+        if (worker_count == 0 || worker_count > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            measured > std::numeric_limits<int>::max() / static_cast<int>(worker_count) - warmup) {
+            std::cerr << "Error: benchmark queue size exceeds the supported range\n";
+            return 1;
+        }
         int const plot_count = (warmup + measured) * static_cast<int>(worker_count);
 
         // Hoisted out of the try so the catch can still sweep them: once a pass
@@ -1862,6 +1968,38 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     target_size_tib > 0.0 ? "target" : "free",
                     format_duration_dh(fill_s).c_str());
             }
+            if (json) {
+                std::ostringstream report;
+                report.precision(std::numeric_limits<double>::max_digits10);
+                report << "{\"version\":";
+#ifdef XCHPLOT2_VERSION
+                write_json_string(report, XCHPLOT2_VERSION);
+#else
+                write_json_string(report, "unknown");
+#endif
+                report << ",\"k\":" << k << ",\"strength\":" << strength
+                       << ",\"testnet\":" << (testnet ? "true" : "false")
+                       << ",\"warmup_per_worker\":" << warmup
+                       << ",\"num\":" << measured << ",\"queue_plots\":" << plot_count
+                       << ",\"output_directory\":";
+                write_json_string(report, out_dir);
+                report << ",\"requested_tier\":";
+                write_json_string(report, opts.streaming_tier.empty() ? "auto" : opts.streaming_tier);
+                auto report_opts = opts;
+                resolve_host_ram_env(report_opts);
+                report << ",\"max_host_ram_bytes\":";
+                if (report_opts.has_max_host_ram) report << report_opts.max_host_ram;
+                else report << "null";
+                report << ",\"auto_host_ram_spill\":" << (report_opts.auto_host_ram_spill ? "true" : "false")
+                       << ",\"passes\":[";
+                write_bench_json_pass(report, e2e, "end-to-end");
+                if (compute_only) {
+                    report << ',';
+                    write_bench_json_pass(report, compute, compute_label);
+                }
+                report << "]}\n";
+                std::cout << report.str();
+            }
             return 0;
         } catch (std::exception const& e) {
             sweep();
@@ -1899,7 +2037,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--pipeline-plot")               opts.pipeline_plot = true;
             else if (a == "--no-pipeline-plot")            opts.pipeline_plot = false;
             else if (a == "--pipeline-depth" && i + 1 < argc) {
-                int const d = std::atoi(argv[++i]);
+                int d = 0;
+                if (!parse_integer_arg(argv[++i], d, a)) return 1;
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
                 opts.pipeline_depth = d;
             }
@@ -2027,7 +2166,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
             if ((a == "--trials" || a == "-n") && i + 1 < argc) {
-                long v = std::atol(argv[++i]);
+                long v = 0;
+                if (!parse_integer_arg(argv[++i], v, a)) return 1;
                 if (v <= 0) {
                     std::cerr << "Error: --trials must be > 0\n";
                     return 1;
@@ -2196,16 +2336,16 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 }
                 return true;
             };
-            if      ((a == "--k"          || a == "-k") && need(1)) k        = std::atoi(argv[++i]);
-            else if ((a == "--num"        || a == "-n") && need(1)) num      = std::atoi(argv[++i]);
-            else if ((a == "--strength"   || a == "-s") && need(1)) strength = std::atoi(argv[++i]);
+            if      ((a == "--k"          || a == "-k") && need(1)) { if (!parse_integer_arg(argv[++i], k, a)) return 1; }
+            else if ((a == "--num"        || a == "-n") && need(1)) { if (!parse_integer_arg(argv[++i], num, a)) return 1; }
+            else if ((a == "--strength"   || a == "-s") && need(1)) { if (!parse_integer_arg(argv[++i], strength, a)) return 1; }
             else if ((a == "--out"        || a == "-o") && need(1)) out_dir  = argv[++i];
             else if ((a == "--farmer-pk"  || a == "-f") && need(1)) farmer_pk_hex = argv[++i];
             else if ((a == "--pool-pk"    || a == "-p") && need(1)) pool_pk_hex   = argv[++i];
             else if  (a == "--pool-ph"                  && need(1)) pool_ph_hex   = argv[++i];
             else if ((a == "--pool-contract-address" || a == "-c") && need(1)) pool_addr = argv[++i];
-            else if ((a == "--plot-index" || a == "-i") && need(1)) plot_index_base = std::atoi(argv[++i]);
-            else if ((a == "--meta-group" || a == "-g") && need(1)) meta_group      = std::atoi(argv[++i]);
+            else if ((a == "--plot-index" || a == "-i") && need(1)) { if (!parse_integer_arg(argv[++i], plot_index_base, a)) return 1; }
+            else if ((a == "--meta-group" || a == "-g") && need(1)) { if (!parse_integer_arg(argv[++i], meta_group, a)) return 1; }
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--manifest" && need(1)) manifest_path = argv[++i];
             else if  (a == "--testnet"    || a == "-T") testnet = true;
@@ -2238,7 +2378,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--pipeline-plot")           plot_pipeline_plot = true;
             else if  (a == "--no-pipeline-plot")        plot_pipeline_plot = false;
             else if  (a == "--pipeline-depth" && need(1)) {
-                int const d = std::atoi(argv[++i]);
+                int d = 0;
+                if (!parse_integer_arg(argv[++i], d, a)) return 1;
                 if (d < 1) { std::cerr << "Error: --pipeline-depth must be >= 1\n"; return 1; }
                 plot_pipeline_depth = d;
             }
@@ -2611,14 +2752,14 @@ _xchplot2() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local subcmds="batch plot bench test devices parity-check completions"
+    local subcmds="batch plot bench test devices verify parity-check completions"
     local tiers="plain compact minimal tiny pinned auto"
     local devices_tokens="all gpu cpu 0 1 2 3"
     case "${prev}" in
         --tier)            COMPREPLY=( $(compgen -W "${tiers}" -- "$cur") ); return 0 ;;
         --devices)         COMPREPLY=( $(compgen -W "${devices_tokens}" -- "$cur") ); return 0 ;;
-        -o|--out)          COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
-        --manifest)        COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+        -o|--out|--temp-dir)          COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        --manifest|--config|--out-name|--dir) COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
         completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
     esac
@@ -2626,8 +2767,16 @@ _xchplot2() {
         COMPREPLY=( $(compgen -W "${subcmds}" -- "$cur") )
         return 0
     fi
+    if [[ "${COMP_WORDS[1]}" == verify ]]; then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--trials -n --full --no-full --config --help" -- "$cur") )
+        elif [[ "$prev" != --trials && "$prev" != -n ]]; then
+            COMPREPLY=( $(compgen -f -- "$cur") )
+        fi
+        return 0
+    fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --testnet --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir -k -n -s -f -p -c -o -T -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -2637,9 +2786,15 @@ complete -F _xchplot2 xchplot2
             std::cout << R"(#compdef xchplot2
 _xchplot2() {
     local -a subcmds
-    subcmds=(batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" parity-check:"Run parity tests" completions:"Emit shell completion script")
+    subcmds=(batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
     if (( CURRENT == 2 )); then
         _describe 'subcommand' subcmds
+        return
+    fi
+    if [[ "${words[2]}" == verify ]]; then
+        _arguments '--trials[Random challenges]:count:' '-n[Random challenges]:count:' \
+            '--full[Validate full proofs]' '--no-full[Quality-chain sample]' \
+            '--config[Configuration file]:file:_files' '2:plot file:_files'
         return
     fi
     _arguments \
@@ -2654,6 +2809,21 @@ _xchplot2() {
         '--shard-plot[Single-plot multi-GPU]' \
         '--pipeline-plot[Pipeline-parallel multi-stage]' \
         '--manifest[Saved plot job]:file:_files' \
+        '--config[Configuration file]:file:_files' \
+        '--strategy[Batch strategy]:strategy:(auto work-queue pipeline shard)' \
+        '--pipeline-depth[Pipeline depth]:count:' \
+        '--pipeline-stage-tiers[Pipeline stage tiers]:tiers:' \
+        '--max-host-ram[Host RAM budget]:size:' \
+        '--temp-dir[Spill directory]:dir:_files -/' \
+        '--no-auto-spill[Refuse automatic spill]' \
+        '--warmup[Warmup plots per worker]:count:' \
+        '--keep[Retain benchmark plots]' '--compute-only[Add RAM-backed pass]' \
+        '--target-size[Target size in TiB]:size:' '--json[Benchmark JSON on stdout]' \
+        '-k[Plot size]:k:' '-n[Plot count]:count:' '-s[Strength]:strength:' \
+        '-f[Farmer public key]:hex:' '-p[Pool public key]:hex:' \
+        '--pool-ph[Pool puzzle hash]:hex:' '-c[Pool contract address]:address:' \
+        '-i[Plot index]:index:' '-g[Meta group]:group:' '-S[Seed]:hex:' \
+        '-T[Testnet]' \
         '-o[Output dir]:dir:_files -/' \
         '*:: :->args'
 }
@@ -2667,20 +2837,52 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'batch'         -d 'Run a man
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plot'          -d 'Single-plot farmable mode'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'bench'         -d 'Measure plotting throughput'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'test'          -d 'Single test plot'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'verify'        -d 'Verify a plot file'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'devices'       -d 'List available GPU/CPU'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'parity-check'  -d 'Run parity tests'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shell completion script'
-complete -c xchplot2 -l tier      -x -a 'plain compact minimal tiny pinned auto'  -d 'Streaming tier'
-complete -c xchplot2 -l devices   -x -a 'all gpu cpu 0 1 2 3'                      -d 'Device selector'
-complete -c xchplot2 -l manifest  -r -d 'Saved plot job'
-complete -c xchplot2 -l progress  -d 'Force aggregate progress line on'
-complete -c xchplot2 -l no-progress -d 'Force aggregate progress line off'
-complete -c xchplot2 -s v -l verbose -d 'Verbose'
-complete -c xchplot2 -s q -l quiet -d 'Quiet — suppress info-level output'
-complete -c xchplot2 -l cpu       -d 'Add CPU worker'
-complete -c xchplot2 -l shard-plot     -d 'Single-plot multi-GPU (experimental)'
-complete -c xchplot2 -l pipeline-plot  -d 'Pipeline-parallel multi-stage'
-complete -c xchplot2 -s o -l out  -r -d 'Output dir'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l tier      -x -a 'plain compact minimal tiny pinned auto'  -d 'Streaming tier'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l devices   -x -a 'all gpu cpu 0 1 2 3'                      -d 'Device selector'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l manifest  -r -d 'Saved plot job'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l progress  -d 'Force aggregate progress line on'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l no-progress -d 'Force aggregate progress line off'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s v -l verbose -d 'Verbose'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s q -l quiet -d 'Quiet — suppress info-level output'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l cpu-workers -x -a 'auto max off' -d 'CPU workers per node'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l cpu       -d 'Add CPU worker'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l shard-plot     -d 'Single-plot multi-GPU (experimental)'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pipeline-plot  -d 'Pipeline-parallel multi-stage'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s o -l out  -r -d 'Output dir'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s k -l k -x -d 'Plot size'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s s -l strength -x -d 'Strength'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s f -l farmer-pk -x -d 'Farmer public key'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s p -l pool-pk -x -d 'Pool public key'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s c -l pool-contract-address -x -d 'Pool contract address'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s i -l plot-index -x -d 'Plot index'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s g -l meta-group -x -d 'Meta group'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s S -l seed -x -d 'Seed'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s n -l num -x -d 'Plot count'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pool-ph -x -d 'Pool puzzle hash'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s T -l testnet -d 'Testnet'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l resume -d 'Resume a saved job'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l skip-existing -d 'Skip completed plots'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l continue-on-error -d 'Continue after plot errors'
+complete -c xchplot2 -l config -r -d 'Configuration file'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l max-host-ram -x -d 'Host RAM budget'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l temp-dir -r -d 'Spill directory'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l no-auto-spill -d 'Refuse automatic spill'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l strategy -x -a 'auto work-queue pipeline shard' -d 'Batch strategy'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pipeline-depth -x -d 'Pipeline depth'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pipeline-stage-tiers -x -d 'Pipeline stage tiers'
+complete -c xchplot2 -n '__fish_seen_subcommand_from bench' -l warmup -x -d 'Warmup plots per worker'
+complete -c xchplot2 -n '__fish_seen_subcommand_from bench' -l keep -d 'Retain benchmark plots'
+complete -c xchplot2 -n '__fish_seen_subcommand_from bench' -l compute-only -d 'Add RAM-backed pass'
+complete -c xchplot2 -n '__fish_seen_subcommand_from bench' -l target-size -x -d 'Target size in TiB'
+complete -c xchplot2 -n '__fish_seen_subcommand_from bench' -l json -d 'Benchmark JSON on stdout'
+complete -c xchplot2 -n '__fish_seen_subcommand_from verify' -s n -l trials -x -d 'Random challenges'
+complete -c xchplot2 -n '__fish_seen_subcommand_from verify' -l full -d 'Validate full proofs'
+complete -c xchplot2 -n '__fish_seen_subcommand_from verify' -l no-full -d 'Quality-chain sample'
+complete -c xchplot2 -n '__fish_seen_subcommand_from verify' -F
 complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh fish'
 )";
         } else {
@@ -2734,15 +2936,19 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
         return 1;
     }
 
-    opts.k = std::atoi(pos[0].c_str());
+    if (!parse_integer_arg(pos[0], opts.k, "k")) return 1;
     if (!parse_hex(pos[1], opts.plot_id)) {
         std::cerr << "Error: plot_id must be 64 hex characters\n";
         return 1;
     }
-    if (pos.size() >= 3) opts.strength    = std::atoi(pos[2].c_str());
-    if (pos.size() >= 4) opts.plot_index  = std::atoi(pos[3].c_str());
-    if (pos.size() >= 5) opts.meta_group  = std::atoi(pos[4].c_str());
-    if (pos.size() >= 6) opts.verbose     = std::atoi(pos[5].c_str()) != 0;
+    if (pos.size() >= 3 && !parse_integer_arg(pos[2], opts.strength, "strength")) return 1;
+    if (pos.size() >= 4 && !parse_integer_arg(pos[3], opts.plot_index, "plot_index")) return 1;
+    if (pos.size() >= 5 && !parse_integer_arg(pos[4], opts.meta_group, "meta_group")) return 1;
+    if (pos.size() >= 6) {
+        int verbose = 0;
+        if (!parse_integer_arg(pos[5], verbose, "verbose")) return 1;
+        opts.verbose = verbose != 0;
+    }
 
     if (opts.testnet) {
         std::cout << "TESTNET plot — will NOT be valid on mainnet.\n";

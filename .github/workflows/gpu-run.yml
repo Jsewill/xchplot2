@@ -18,6 +18,9 @@ on:
       physical-vram-mib:
         default: 0
         type: number
+      max-host-ram-gib:
+        default: 0
+        type: number
 
 permissions:
   contents: read
@@ -35,6 +38,7 @@ jobs:
       GPU_BACKEND: ${{ inputs.backend }}
       GPU_SUITE: ${{ inputs.suite }}
       PHYSICAL_VRAM_MIB: ${{ inputs.physical-vram-mib }}
+      MAX_HOST_RAM_GIB: ${{ inputs.max-host-ram-gib }}
     steps:
       - name: Allocate an isolated build and log directory
         shell: bash
@@ -68,9 +72,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          args=()
+          if [[ "$MAX_HOST_RAM_GIB" != 0 ]]; then
+            args+=(--max-host-ram-gib "$MAX_HOST_RAM_GIB")
+          fi
           python3 scripts/test/gpu-ci.py "$BUILD_DIR" \
             --backend "$GPU_BACKEND" --suite "$GPU_SUITE" \
             --physical-vram-mib "$PHYSICAL_VRAM_MIB" --logs "$LOG_DIR" \
+            --scratch "$WORK_DIR" "${args[@]}" \
             2>&1 | tee "$LOG_DIR/suite.log"
       - name: Retain test results and memory measurements
         if: always()

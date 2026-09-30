@@ -72,6 +72,7 @@ fn generate_plot_public_key(
 // Chia's protocol crate also requires the CLVM runtime. Keep only the plot-ID
 // encoding here and compare it with that crate in tests. Integers in Chia's
 // streamable format are big-endian, unlike the subseed index below.
+#[cfg(test)]
 fn compute_plot_id_v2(
     strength: u8,
     plot_pk: &PublicKey,
@@ -79,15 +80,19 @@ fn compute_plot_id_v2(
     plot_index: u16,
     meta_group: u8,
 ) -> [u8; 32] {
+    let mut id = Sha256::new();
+    id.update(compute_plot_group_id_v2(strength, plot_pk, pool_key));
+    id.update(plot_index.to_be_bytes());
+    id.update([meta_group]);
+    id.finalize().into()
+}
+
+fn compute_plot_group_id_v2(strength: u8, plot_pk: &PublicKey, pool_key: &[u8]) -> [u8; 32] {
     let mut group = Sha256::new();
     group.update([strength]);
     group.update(plot_pk.to_bytes());
     group.update(pool_key);
-    let mut id = Sha256::new();
-    id.update(group.finalize());
-    id.update(plot_index.to_be_bytes());
-    id.update([meta_group]);
-    id.finalize().into()
+    group.finalize().into()
 }
 
 /// Derives a v2 plot's plot_id and memo from caller-supplied keys.
@@ -132,6 +137,50 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     out_memo_buf: *mut u8,      // caller-owned buffer
     inout_memo_len: *mut usize, // in: capacity; out: bytes written
 ) -> i32 {
+    let mut group_id = [0u8; 32];
+    let rc = unsafe {
+        pos2_keygen_derive_group(
+            seed_ptr,
+            seed_len,
+            farmer_pk_ptr,
+            pool_key_ptr,
+            pool_kind,
+            strength,
+            group_id.as_mut_ptr(),
+            out_memo_buf,
+            inout_memo_len,
+        )
+    };
+    if rc != POS2_OK {
+        return rc;
+    }
+    let mut id = Sha256::new();
+    id.update(group_id);
+    id.update(plot_index.to_be_bytes());
+    id.update([meta_group]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(id.finalize().as_ptr(), out_plot_id, 32);
+    }
+    POS2_OK
+}
+
+/// Derive shared keys, memo and group identity using the current protocol.
+///
+/// # Safety
+/// Pointers have the same requirements as `pos2_keygen_derive_plot`;
+/// `out_group_id` points to 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_keygen_derive_group(
+    seed_ptr: *const u8,
+    seed_len: usize,
+    farmer_pk_ptr: *const u8,
+    pool_key_ptr: *const u8,
+    pool_kind: i32,
+    strength: u8,
+    out_group_id: *mut u8,
+    out_memo_buf: *mut u8,
+    inout_memo_len: *mut usize,
+) -> i32 {
     if seed_len < 32 {
         return POS2_BAD_SEED;
     }
@@ -173,7 +222,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
 
     let plot_pk = generate_plot_public_key(&local_pk, &farmer_pk, include_taproot);
 
-    let plot_id = compute_plot_id_v2(strength, &plot_pk, pool_key_slice, plot_index, meta_group);
+    let group_id = compute_plot_group_id_v2(strength, &plot_pk, pool_key_slice);
 
     let master_sk_bytes = master_sk.to_bytes();
     let memo_len = pool_key_slice.len() + 48 /* farmer_pk */ + master_sk_bytes.len();
@@ -185,7 +234,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_plot(
     }
 
     unsafe {
-        std::ptr::copy_nonoverlapping(plot_id.as_ptr(), out_plot_id, 32);
+        std::ptr::copy_nonoverlapping(group_id.as_ptr(), out_group_id, 32);
         let dst = out_memo_buf;
         std::ptr::copy_nonoverlapping(pool_key_slice.as_ptr(), dst, pool_key_slice.len());
         std::ptr::copy_nonoverlapping(farmer_pk_bytes.as_ptr(), dst.add(pool_key_slice.len()), 48);
@@ -294,8 +343,95 @@ mod tests {
                             compute_plot_id_v2(strength, &plot_pk, key, index, group),
                             expected.to_bytes()
                         );
+                        assert_eq!(
+                            compute_plot_group_id_v2(strength, &plot_pk, key),
+                            chia_protocol::compute_plot_group_id_v2(
+                                strength,
+                                &plot_pk,
+                                pool.then_some(&pool_pk),
+                                (!pool).then_some(&contract),
+                            )
+                            .to_bytes()
+                        );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn group_ffi_shares_memo_and_derives_member_ids_for_both_pool_kinds() {
+        let seed = [0xaa; 32];
+        let farmer = SecretKey::from_seed(&[0xbb; 32]).public_key();
+        let pool = SecretKey::from_seed(&[0xcc; 32]).public_key();
+        let contract = [0xdd; 32];
+        for kind in [POS2_POOL_PK, POS2_POOL_PH] {
+            let pool_bytes = pool.to_bytes();
+            let pool_key = if kind == POS2_POOL_PK {
+                &pool_bytes[..]
+            } else {
+                &contract[..]
+            };
+            let mut group_id = [0; 32];
+            let mut group_memo = [0; 128];
+            let mut group_len = group_memo.len();
+            assert_eq!(
+                unsafe {
+                    pos2_keygen_derive_group(
+                        seed.as_ptr(),
+                        seed.len(),
+                        farmer.to_bytes().as_ptr(),
+                        pool_key.as_ptr(),
+                        kind,
+                        2,
+                        group_id.as_mut_ptr(),
+                        group_memo.as_mut_ptr(),
+                        &mut group_len,
+                    )
+                },
+                POS2_OK
+            );
+            let master = SecretKey::from_seed(&seed);
+            let plot_pk = generate_plot_public_key(
+                &master_sk_to_local_sk(&master).public_key(),
+                &farmer,
+                kind == POS2_POOL_PH,
+            );
+            assert_eq!(
+                group_id,
+                chia_protocol::compute_plot_group_id_v2(
+                    2,
+                    &plot_pk,
+                    (kind == POS2_POOL_PK).then_some(&pool),
+                    (kind == POS2_POOL_PH).then_some(&chia_protocol::Bytes32::new(contract))
+                )
+                .to_bytes()
+            );
+            for index in [0u16, 1, u16::MAX] {
+                let mut id = [0; 32];
+                let mut memo = [0; 128];
+                let mut len = memo.len();
+                assert_eq!(
+                    unsafe {
+                        pos2_keygen_derive_plot(
+                            seed.as_ptr(),
+                            seed.len(),
+                            farmer.to_bytes().as_ptr(),
+                            pool_key.as_ptr(),
+                            kind,
+                            2,
+                            index,
+                            7,
+                            id.as_mut_ptr(),
+                            memo.as_mut_ptr(),
+                            &mut len,
+                        )
+                    },
+                    POS2_OK
+                );
+                assert_eq!(len, group_len);
+                assert_eq!(memo, group_memo);
+                assert_eq!(id, compute_plot_id_v2(2, &plot_pk, pool_key, index, 7));
             }
         }
     }

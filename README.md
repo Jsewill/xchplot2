@@ -11,6 +11,10 @@ provides the native CUDA implementation for NVIDIA.
 This is a work in progress. Future changes to the plot format, including
 grouping, may require replotting.
 
+An opt-in [grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
+supports experimental multi-member groups, shared keys, and resumable assembly.
+It requires a separate build; normal commands still produce `.plot2` files.
+
 [Quick start](#quick-start) · [Hardware](#hardware-compatibility) ·
 [Build](#build) · [Commands](#use) · [Performance](#performance) ·
 [Documentation](#documentation)
@@ -144,6 +148,7 @@ and storage. This benchmark set uses one GPU per host.
 | [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
 | [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, and memory use |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
+| [Experimental grouping](contrib/pos2-pr118/README.md) | Grouped jobs, resume, memory limits, and upstream compatibility |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 
 ## License
