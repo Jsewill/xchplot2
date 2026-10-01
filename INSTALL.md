@@ -73,6 +73,10 @@ atomic requirements described above. AMD's Windows HIP SDK does not supply
 an ARM64 runtime, so this archive does not include HIP. GPU execution still
 requires hardware qualification.
 
+Apple Silicon GPU builds are not available. AdaptiveCpp's experimental
+[Metal backend](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/develop/doc/install-metal.md)
+lacks the 64-bit atomics used by the plotting kernels.
+
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.
 

@@ -377,8 +377,8 @@ OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.
 
 Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`
-collects CPU, CUDA, and HIP runtime/JIT dependencies; the build script adds
-Level Zero, checks all three GPU backends, collects license notices, and
+collects CPU, CUDA, HIP, and ARM64 OpenCL runtime/JIT dependencies; the build
+script adds Level Zero, checks the GPU backends, collects license notices, and
 makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
@@ -410,9 +410,10 @@ The ARM64 runner's side-by-side 14.44 toolset keeps its STL compatible with
 LLVM 20; the default Visual Studio 2026 STL needs a newer Clang.
 Windows uses `generic;omp`: generic GPU kernels and precompiled CPU kernels,
 because the Windows CPU JIT needs Visual Studio static CRT libraries.
-The archive test hides the compiler and both GPU SDK installations, clears
+The archive test hides the compiler and installed GPU SDKs, clears
 SDK paths, loads bundled DLLs and LLVM tools, compiles an AMD `gfx1031`
-kernel, translates Intel SPIR-V, dispatches a CPU kernel, and runs the
+kernel when HIP is bundled, translates Intel SPIR-V, dispatches a CPU
+kernel, and runs the
 shared CPU recovery check in `scripts/test/recovery.py`. CUDA and HIP backend DLL loading
 additionally requires their graphics drivers, so those two checks run only
 when their drivers are installed. The ZIP includes the compiler and
