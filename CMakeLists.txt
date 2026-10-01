@@ -686,14 +686,11 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
-# Keep Git discovery below the source checkout when patching build-local copies.
 # Remove an unused ARM header that collides with NVCC and enable MSVC ARM64 AES.
 # Relative includes require one complete header tree, without mixed originals.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     file(COPY "${POS2_CHIP_DIR}/src/" DESTINATION "${_pos2_solver_dir}")
-    execute_process(COMMAND "${CMAKE_COMMAND}" -E env
-        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-        "${GIT_EXECUTABLE}" apply --ignore-space-change
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
         "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch"
         WORKING_DIRECTORY "${_pos2_solver_dir}" COMMAND_ERROR_IS_FATAL ANY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -712,9 +709,7 @@ if(WIN32 AND XCHPLOT2_BUILD_CUDA)
             set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-windows")
             configure_file("${_cccl_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
             execute_process(
-                COMMAND "${CMAKE_COMMAND}" -E env
-                    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-                    "${GIT_EXECUTABLE}" apply --ignore-space-change
+                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
                     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch"
                 WORKING_DIRECTORY "${_cccl_dir}"
                 RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
@@ -729,9 +724,7 @@ if(WIN32 AND XCHPLOT2_BUILD_CUDA)
     endif()
 endif()
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env
-        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-        "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
+    COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"
     RESULT_VARIABLE _solver_patch_result
     ERROR_VARIABLE _solver_patch_error)
