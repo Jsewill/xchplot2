@@ -57,7 +57,7 @@ if ($arm64) {
 }
 cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_CUDA_ARCHITECTURES=$architectures" `
-    -DCMAKE_CUDA_RUNTIME_LIBRARY=Static -DXCHPLOT2_PACKAGE=ON "-DXCHPLOT2_LICENSE_DIR=$licenses"
+    -DCMAKE_CUDA_RUNTIME_LIBRARY=Static -DXCHPLOT2_PACKAGE=ON "-DXCHPLOT2_LICENSE_DIR:PATH=$licenses"
 # Catch host regressions before compiling CUDA for every supported architecture.
 $hostTests = 'bench_stats_test', 'numa_topology_test', 'temp_file_test', 'spill_engine_test', `
     'spill_coverage_test', 'host_guard_test', 'host_spill_policy_test', 'vram_budget_test', `
