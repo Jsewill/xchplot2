@@ -17,7 +17,7 @@ RUN if [ "$(dpkg --print-architecture)" = arm64 ]; then \
             -o /tmp/cuda-keyring.deb \
         && dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb \
         && apt-get update && apt-get install -y --no-install-recommends \
-            cuda-nvcc-12-9 cuda-cudart-dev-12-9 cuda-cccl-12-9 g++-14 \
+            cuda-nvcc-12-9 cuda-cudart-dev-12-9 cuda-cccl-12-9 g++-11 \
             libamdhip64-dev libhsakmt-dev rocm-device-libs-21 ocl-icd-opencl-dev \
         && sed -i -E '/^extern .* (rsqrt|sinpi|cospi)f?\(.*\);$/s/;$/ noexcept (true);/' \
             /usr/local/cuda/targets/sbsa-linux/include/crt/math_functions.h \

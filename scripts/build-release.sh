@@ -9,7 +9,7 @@ cxx=/usr/bin/g++
 components=core,cuda,hip
 architectures='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120'
 if [[ $arch == aarch64 ]]; then
-    cxx=/usr/bin/g++-14
+    cxx=/usr/bin/g++-11
     components+=,ocl
     architectures=$(nvcc --list-gpu-arch | awk '
         /^compute_[0-9]+$/ {
