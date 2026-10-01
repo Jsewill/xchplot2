@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Host-only checks for GPU CI's backend and capacity gates."""
 from pathlib import Path
+import json
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
 
 ci = runpy.run_path(str(Path(__file__).with_name("gpu-ci.py")))
@@ -51,6 +53,30 @@ assert env["ACPP_VISIBILITY_MASK"] == "ze" and env["POS2GPU_ASSERT_VRAM"] == "1"
 assert env["POS2GPU_VRAM_MARGIN_MB"] == "256"
 assert "POS2GPU_MAX_VRAM_MB" not in env and "POS2GPU_SKIP_SELFTEST" not in env
 assert "XCHPLOT2_SYCL_CPU_BENCH" not in env
+assert ci["test_environment"]({"POS2GPU_ASSERT_VRAM": "1"}, "cuda", False)["POS2GPU_ASSERT_VRAM"] == "0"
+
+# Stop at device discovery after checking each suite's measurement policy.
+with tempfile.TemporaryDirectory(prefix="xchplot2-suite-check-") as directory:
+    root = Path(directory)
+    inventory = root / "tools/sanity/gpu_ci_info"
+    inventory.parent.mkdir(parents=True)
+    inventory.write_text('#!/bin/sh\nprintf "%s" "$CI_INVENTORY"\n')
+    binary = root / "xchplot2"
+    binary.write_text('#!/bin/sh\n[ "$POS2GPU_ASSERT_VRAM" = "$CI_ASSERT_VRAM" ] || exit 18\nexit 17\n')
+    inventory.chmod(0o755)
+    binary.chmod(0o755)
+    for suite in ("quick", "correctness", "vram", "physical"):
+        strict = suite in ("vram", "physical")
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("gpu-ci.py")), str(root),
+                                 "--backend", "cuda", "--suite", suite, "--binary", str(binary),
+                                 "--logs", str(root / suite), "--scratch", str(root),
+                                 *(["--physical-vram-mib", "8192"] if suite == "physical" else [])],
+            env=dict(os.environ, CI_INVENTORY=text, CI_ASSERT_VRAM="1" if strict else "0"),
+            capture_output=True, text=True)
+        assert result.returncode != 0 and "exit status 17" in result.stderr, result.stderr
+        summary = json.loads((root / suite / "summary.json").read_text())
+        assert summary["memory_assertion"] == strict
+        assert summary["k"] == (18 if suite == "quick" else 28)
 
 # Exercise the actual boundary script: missing/oversized driver measurements
 # must fail even if the plot command itself succeeds.
@@ -63,6 +89,7 @@ assert sys.argv[1] == "bench" and sys.argv[sys.argv.index("--devices") + 1] == "
 if int(os.environ["POS2GPU_MAX_VRAM_MB"]) < 138:
     print("tier does not fit, including the VRAM buffer")
     sys.exit(1)
+assert os.environ["POS2GPU_ASSERT_VRAM"] == "1"
 assert sys.argv[sys.argv.index("-n") + 1] == "3"
 peak = os.environ["CI_FAKE_PEAK"]
 if peak != "missing":

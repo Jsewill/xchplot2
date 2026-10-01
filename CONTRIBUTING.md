@@ -97,8 +97,16 @@ and requires the matching runners.
 | Suite | When | Checks |
 | --- | --- | --- |
 | `quick` | Branch pushes; manual | All CTest tests, then k=18 CPU byte parity and 100 full-proof challenges for every tier and disk-spill variant |
+| `correctness` | Manual; shared GPU | All CTest tests, then k=28 CPU byte parity and full proofs for every tier and spill variant, with the production VRAM caps |
 | `vram` | Daily, 04:17 UTC; manual | Quick CTest tests, three k=28 plots at each tier's budget, rejection 1 MiB below it, then k=28 CPU byte parity and full proofs for every tier and spill variant |
 | `physical` | Sunday, 07:47 UTC; manual | Actual 2/4/6/8 GiB capacity, every k=28 tier that fits, plus three uncapped auto-tier plots with full-proof verification |
+
+`quick` and `correctness` record device-wide memory measurements as diagnostics.
+Other applications can change those counters, so they do not establish the
+plotter's memory use on a shared GPU. Allocation and admission guards remain
+active. `vram` and `physical` enforce the device-wide memory assertion and
+require an isolated GPU; the summary records which policy ran. A correctness
+pass does not qualify memory usage.
 
 The default branch schedules both `main` and `cuda-only`, because
 [GitHub schedules run only on the default branch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
@@ -168,6 +176,7 @@ the plotter.
 ```bash
 python3 scripts/test/gpu-ci-test.py
 python3 scripts/test/gpu-ci.py build --backend cuda --suite quick --logs /tmp/gpu-quick
+python3 scripts/test/gpu-ci.py build --backend cuda --suite correctness --logs /tmp/gpu-correctness
 python3 scripts/test/gpu-ci.py build --backend hip --suite vram --logs /tmp/gpu-vram
 python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --physical-vram-mib 8192 --logs /tmp/gpu-physical
 ```

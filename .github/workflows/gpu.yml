@@ -8,7 +8,7 @@ on:
       suite:
         description: GPU test suite
         type: choice
-        options: [quick, vram, physical]
+        options: [quick, correctness, vram, physical]
         default: quick
 
 # Scheduled runs for this branch are dispatched by main's GPU workflow.
