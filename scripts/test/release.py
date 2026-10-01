@@ -135,8 +135,13 @@ for driver, backend in drivers:
         skip.add(backend)
         print(f"{backend} load check requires its graphics driver")
 with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nullcontext():
-    libraries = [load(str(path)) for path in directory.rglob("*.dll" if os.name == "nt" else "*.so*")
-                 if path.name not in skip]
+    libraries = []
+    for path in directory.rglob("*.dll" if os.name == "nt" else "*.so*"):
+        if path.name not in skip:
+            try:
+                libraries.append(load(str(path)))
+            except OSError as error:
+                raise OSError(f"Cannot load packaged library {path}: {error}") from error
     assert libraries, "No packaged runtime libraries"
     if sys.argv[2] == "True":
         # Compile a kernel for the reported RX 6700 XT without any GPU or SDK.

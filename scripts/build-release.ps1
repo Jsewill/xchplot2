@@ -98,9 +98,9 @@ Copy-Item "$prefix/level-zero-license.txt", "$prefix/llvm-spirv-license.txt", "$
 # Microsoft's documented app-local deployment avoids an installer at first run.
 $crtArch = if ($arm64) { 'arm64' } else { 'x64' }
 $crt = (Get-ChildItem (Join-Path $env:VCToolsRedistDir $crtArch) -Directory -Filter 'Microsoft.VC*.CRT').FullName
-$crtLibraries = if ($arm64) { (Get-ChildItem "$crt/*.dll").Name } else {
-    'msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll'
-}
+$crtLibraries = 'msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll'
+# The ARM64 redist also contains an x64/ARM64EC DLL, unused by native ARM64.
+if (-not $arm64) { $crtLibraries += 'vcruntime140_1.dll' }
 foreach ($directory in $runtime, "$runtime/hipSYCL/ext/llvm/bin", "$runtime/hipSYCL/ext/llvm-spirv/bin") {
     foreach ($name in $crtLibraries) {
         Copy-Item (Join-Path $crt $name) $directory
