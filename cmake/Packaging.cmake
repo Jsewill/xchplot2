@@ -42,6 +42,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
         "pos2-chip: contrib/pos2-arm-cuda.patch applied (ARM CUDA/MSVC intrinsics)\n")
 endif()
+if(_cccl_arch_patch_applied)
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "CCCL: contrib/cccl-arch-list.patch applied to toolkit headers\n")
+endif()
 if(_cccl_patch_applied)
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
         "CCCL: contrib/cccl-windows-ptx.patch applied to toolkit headers\n")
