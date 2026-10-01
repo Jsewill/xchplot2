@@ -1,6 +1,6 @@
 --- a/pos/aes/intrin_portable.h
 +++ b/pos/aes/intrin_portable.h
-@@ -397,10 +397,15 @@
+@@ -397,10 +397,17 @@
 
  #define RANDOMX_DEFAULT_FENV
 
@@ -9,17 +9,19 @@
 -#include <arm_acle.h>
 +#elif defined(__aarch64__) || defined(_M_ARM64)
 +
-+#ifdef _MSC_VER
++#if defined(_MSC_VER) && !defined(__clang__)
 +#include <arm64_neon.h>
-+#include <intrin.h>
-+#include <malloc.h>
 +#else
  #include <arm_neon.h>
++#endif
++#ifdef _MSC_VER
++#include <intrin.h>
++#include <malloc.h>
 +#endif
  #include <stdlib.h>
 
  typedef uint8x16_t rx_vec_i128;
-@@ -408,18 +413,28 @@
+@@ -408,18 +415,28 @@
 
  inline void* rx_aligned_alloc(size_t size, size_t align)
  {
@@ -48,7 +50,7 @@
 
  FORCE_INLINE rx_vec_f128 rx_load_vec_f128(double const* pd)
  {
-@@ -471,18 +486,18 @@
+@@ -471,18 +488,18 @@
      return vreinterpretq_f64_u8(vorrq_u8(vreinterpretq_u8_f64(a), vreinterpretq_u8_f64(b)));
  }
 

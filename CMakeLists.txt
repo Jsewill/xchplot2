@@ -774,8 +774,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     else()
         target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
     endif()
-elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-    target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    if(WIN32)
+        target_compile_options(pos2_chip_headers INTERFACE
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-march=armv8-a+crypto>")
+    else()
+        target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
+    endif()
 endif()
 
 # Shared GPU support library (kernels). AesGpu.cu MUST come first — it
