@@ -1,4 +1,3 @@
-diff --git a/pos/aes/intrin_portable.h b/pos/aes/intrin_portable.h
 --- a/pos/aes/intrin_portable.h
 +++ b/pos/aes/intrin_portable.h
 @@ -397,10 +397,15 @@
