@@ -449,6 +449,10 @@ size_t write_plot_file_parallel(
     // replace the destination, but each publishes its own complete file.
     std::error_code ec;
 #ifdef _WIN32
+    // Concurrent Windows replacements can fail with ERROR_ACCESS_DENIED.
+    // ponytail: one publication lock; use per-path locks if it limits throughput.
+    static std::mutex publish_mutex;
+    std::lock_guard<std::mutex> publish_lock(publish_mutex);
     if (!::MoveFileExW(std::filesystem::path(partial).c_str(),
                       std::filesystem::path(filename).c_str(),
                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))

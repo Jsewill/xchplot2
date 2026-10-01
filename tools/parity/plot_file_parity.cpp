@@ -142,13 +142,22 @@ bool file_safety()
     if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
     wrong.memo.clear();
     if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
-    std::exception_ptr errors[2];
-    std::thread writers[2];
-    for (int i = 0; i < 2; ++i) writers[i] = std::thread([&, i] {
-        try { write(); } catch (...) { errors[i] = std::current_exception(); }
-    });
-    for (auto& writer : writers) writer.join();
-    if (errors[0] || errors[1] || pos2gpu::read_plot_file_fragments(path.string()) != fragments) return false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::exception_ptr errors[2];
+        std::thread writers[2];
+        for (int i = 0; i < 2; ++i) writers[i] = std::thread([&, i] {
+            try { write(); } catch (...) { errors[i] = std::current_exception(); }
+        });
+        for (auto& writer : writers) writer.join();
+        for (auto const& error : errors) if (error) {
+            try { std::rethrow_exception(error); }
+            catch (std::exception const& e) {
+                std::printf("  FAIL concurrent writer: %s\n", e.what());
+            }
+            return false;
+        }
+        if (pos2gpu::read_plot_file_fragments(path.string()) != fragments) return false;
+    }
     auto const verification = pos2gpu::verify_plot_file(path.string(), 100, true);
     if (verification.proofs_found == 0 || verification.full_proofs_validated != verification.proofs_found) return false;
     auto corrupt_u64 = [&](std::streamoff offset) {
