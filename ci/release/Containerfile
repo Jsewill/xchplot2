@@ -72,6 +72,10 @@ RUN git clone --depth 1 --branch v25.10.0 \
     && mkdir -p /opt/release-licenses \
     && cp /tmp/acpp-src/LICENSE /opt/release-licenses/adaptivecpp.txt \
     && git -C /tmp/acpp-src rev-parse HEAD > /opt/release-licenses/adaptivecpp-revision.txt \
+    && if [ "$opencl" = ON ]; then \
+        cp /tmp/acpp-build/_deps/ocl-headers-src/LICENSE /opt/release-licenses/opencl-backend-headers-license.txt \
+        && cp /tmp/acpp-build/_deps/ocl-cxx-headers-src/LICENSE.txt /opt/release-licenses/opencl-cxx-headers-license.txt; \
+        fi \
     && cmake --build /tmp/acpp-build --target InstallLLVMSpirvTranslator \
     && translator=$(find /tmp/acpp-build -type d -name LLVMSpirvTranslator) \
     && cp "$translator/LICENSE.TXT" /opt/release-licenses/llvm-spirv.txt \

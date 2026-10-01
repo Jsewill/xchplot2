@@ -7,9 +7,18 @@ arch=$(uname -m)
 libdir=/usr/lib/"$arch"-linux-gnu
 cxx=/usr/bin/g++
 components=core,cuda,hip
+architectures='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120'
 if [[ $arch == aarch64 ]]; then
     cxx=/usr/bin/g++-14
     components+=,ocl
+    architectures=$(nvcc --list-gpu-arch | awk '
+        /^compute_[0-9]+$/ {
+            sub(/^compute_/, "");
+            targets = targets $0 "-real;";
+            if ($0 + 0 > highest) highest = $0 + 0;
+        }
+        END { if (!highest) exit 1; print targets highest "-virtual" }
+    ')
 fi
 build_dir=${1:-build/release-linux}
 mkdir -p "$build_dir"
@@ -118,7 +127,7 @@ cargo about generate --locked --fail \
 cmake -S . -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx" -DCMAKE_CUDA_HOST_COMPILER="$cxx" \
     -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120' \
+    -DCMAKE_CUDA_ARCHITECTURES="$architectures" \
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
     -DXCHPLOT2_PACKAGE=ON -DXCHPLOT2_PACKAGE_GPU=all \
     -DXCHPLOT2_LICENSE_DIR="$licenses" -DXCHPLOT2_RUNTIME_DIR="$runtime"

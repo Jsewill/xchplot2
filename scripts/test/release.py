@@ -111,7 +111,8 @@ def main():
                 for name in ("libLLVM.so.21.1", "libhiprtc-builtins.so.7", "libOpenCL.so.1",
                              "libhsakmt.so.1", "hipSYCL/librt-backend-ocl.so"):
                     assert (runtime / name).stat().st_size > 0, f"Missing {name}"
-                for name in ("libllvm21.txt", "libhiprtc-builtins7.txt", "ocl-icd-libopencl1.txt"):
+                for name in ("libllvm21.txt", "libhiprtc-builtins7.txt", "ocl-icd-libopencl1.txt",
+                             "opencl-backend-headers-license.txt", "opencl-cxx-headers-license.txt"):
                     assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
             assert not list(runtime.glob("libcuda.so*")), "Use the NVIDIA driver supplied by the system"
         # ctypes keeps libraries loaded; let a child exit before removing the archive.
