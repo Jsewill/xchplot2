@@ -85,7 +85,7 @@ jobs:
             cache: windows-acpp25.10-llvm20.1.8-all-v1
           - arch: aarch64
             runner: windows-11-arm
-            cache: windows-arm64-acpp25.10-llvm20.1.8-cuda-ze-ocl-v1
+            cache: windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-v2
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     defaults:
@@ -137,12 +137,14 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
           $arm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64'
-          $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+          $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
           $visualStudio = & $vswhere -latest -products '*' -requires $component -property installationPath
           if (-not $visualStudio) { throw 'Visual Studio C++ build tools are required' }
           $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvarsall.bat'
           $target = if ($arm64) { 'arm64' } else { 'x64' }
-          cmd /c "call `"$vcvars`" $target >nul && set" | ForEach-Object {
+          # LLVM 20 needs the VS 2022 STL supplied by this side-by-side toolset.
+          $toolset = if ($arm64) { '-vcvars_ver=14.44' } else { '' }
+          cmd /c "call `"$vcvars`" $target $toolset >nul && set" | ForEach-Object {
               if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
           }
           $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;" + $env:PATH

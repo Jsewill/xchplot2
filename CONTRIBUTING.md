@@ -344,9 +344,9 @@ of a documentation move.
 
 ## Binary releases
 
-The release workflow builds one Linux archive and an experimental Windows
-ZIP, each containing NVIDIA, AMD, and Intel backends through the standalone
-CMake executable and CPack. The Linux image pins Ubuntu 24.04, AdaptiveCpp
+The release workflow builds Linux archives and experimental Windows ZIPs
+for x86-64 and ARM64 through the standalone CMake executable and CPack.
+The x86-64 Linux image pins Ubuntu 24.04, AdaptiveCpp
 25.10, Rust 1.98.1, CUDA 12.9.1, ROCm 7.1.1, and LLVM 20, with Level Zero.
 ROCm 7.1.1 provides the LLVM 20 runtime compiler needed by the shared generic
 build; the former AMD-only archive used ROCm 6.2 with LLVM 18.
@@ -381,7 +381,7 @@ kernel compilation, the packaged SYCL JIT through `hellosycl`, CPU/SYCL plot
 byte parity, and full proofs in an image without development toolchains.
 
 The Windows x86-64 job uses VS 2022, LLVM/Clang 20.1.8, CUDA 12.9.1, and HIP
-SDK 6.4.2. ARM64 uses native Visual Studio tools and CUDA 13.4.2, with CUDA,
+SDK 6.4.2. ARM64 uses Visual Studio's 14.44 tools and CUDA 13.4.2, with CUDA,
 Level Zero, and OpenCL backends; AMD's Windows HIP SDK has no ARM64 runtime.
 Both build AdaptiveCpp into LLVM using
 `ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
@@ -397,6 +397,8 @@ ARM64 also applies `contrib/adaptivecpp-windows-opencl.patch` for the backend
 DLL's install location and builds Khronos's OpenCL loader. Toolchain caches
 are separate for each host architecture. The archive tests check native
 executable architecture and run without the development SDKs.
+The ARM64 runner's side-by-side 14.44 toolset keeps its STL compatible with
+LLVM 20; the default Visual Studio 2026 STL needs a newer Clang.
 Windows uses `generic;omp`: generic GPU kernels and precompiled CPU kernels,
 because the Windows CPU JIT needs Visual Studio static CRT libraries.
 The archive test hides the compiler and both GPU SDK installations, clears

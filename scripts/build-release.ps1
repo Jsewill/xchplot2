@@ -8,14 +8,15 @@ Set-Location (Join-Path $PSScriptRoot '..')
 $arm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64'
 $rustTarget = if ($arm64) { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 
-if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+if ($arm64 -or -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-    $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+    $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
     $visualStudio = & $vswhere -latest -products '*' -requires $component -property installationPath
     if (-not $visualStudio) { throw 'Visual Studio C++ build tools are required' }
     $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvarsall.bat'
     $target = if ($arm64) { 'arm64' } else { 'x64' }
-    cmd /c "call `"$vcvars`" $target >nul && set" | ForEach-Object {
+    $toolset = if ($arm64) { '-vcvars_ver=14.44' } else { '' }
+    cmd /c "call `"$vcvars`" $target $toolset >nul && set" | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
     }
 }

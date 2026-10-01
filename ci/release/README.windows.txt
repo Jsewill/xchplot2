@@ -3,7 +3,7 @@ xchplot2 — Windows SYCL/AdaptiveCpp binary
 Run .\bin\xchplot2.exe --help or .\bin\xchplot2.exe devices.
 Add the extracted bin directory to PATH to run the CLI elsewhere.
 
-Requirements:
+x86_64 requirements:
   Windows 10 22H2, Windows 11, or Windows Server 2022/2025, x86_64.
   CPU with AES, SSSE3, and SSE4.1 instructions.
   NVIDIA: Maxwell or newer; driver 576.57+ recommended for CUDA 12.9.1.
@@ -25,8 +25,8 @@ OpenCL requires SPIR-V, Intel USM or fine-grained system SVM, and 64-bit
 atomics. There is no native Windows ARM64 HIP runtime in AMD's SDK.
 
 Windows SYCL is experimental. Hosted Windows checks cover CPU plotting,
-proofs, recovery, and offline SPIR-V compilation (also AMD on x86_64). GPU plotting
-requires separate qualification on Windows hardware, including RX 6700 XT.
+proofs, recovery, and offline SPIR-V compilation (also AMD on x86_64).
+GPU plotting requires separate qualification on Windows hardware.
 BUILDINFO.txt records the source and toolchain revisions;
 licenses/ contains dependency notices.
 

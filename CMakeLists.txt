@@ -22,7 +22,8 @@ if(WIN32)
        CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         message(FATAL_ERROR "Windows SYCL requires the AdaptiveCpp LLVM clang/clang++ compilers")
     endif()
-    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")
     # Enabling nvcc loads Windows-MSVC and replaces the global library flags.
     # Keep Clang's lookup syntax for C/C++ links, including CUDA runtime libs.
     foreach(_lang C CXX)
