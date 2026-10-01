@@ -1,0 +1,11 @@
+diff --git a/pos/aes/intrin_portable.h b/pos/aes/intrin_portable.h
+--- a/pos/aes/intrin_portable.h
++++ b/pos/aes/intrin_portable.h
+@@ -399,7 +399,6 @@
+ 
+ #elif defined(__aarch64__)
+ 
+-#include <arm_acle.h>
+ #include <arm_neon.h>
+ #include <stdlib.h>
+ 

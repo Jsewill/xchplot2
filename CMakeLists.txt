@@ -292,6 +292,19 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# arm_acle.h is unused here and collides with NVCC's __clz declarations.
+# Copy the relative include chain so every CPU-reference caller sees the fix.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    foreach(_header AesHash.hpp soft_aes.hpp intrin_portable.h endian.h)
+        configure_file("${POS2_CHIP_DIR}/src/pos/aes/${_header}"
+                       "${_pos2_solver_dir}/pos/aes/${_header}" COPYONLY)
+    endforeach()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch"
+        WORKING_DIRECTORY "${_pos2_solver_dir}" COMMAND_ERROR_IS_FATAL ANY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch")
+endif()
 # CCCL 2.x uses long2 for 64-bit PTX operands; Windows long is only 32 bits.
 # Backport NVIDIA's fix to a build-local header, as with the solver below.
 if(WIN32)
