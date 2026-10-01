@@ -66,6 +66,8 @@ assert "XCHPLOT2_SYCL_CPU_BENCH" not in env
 assert "XCHPLOT2_MAX_HOST_RAM" not in env
 bounded = ci["test_environment"]({"XCHPLOT2_MAX_HOST_RAM": "1G", "POS2GPU_ASSERT_VRAM": "0"}, "cuda", 18)
 assert bounded["XCHPLOT2_MAX_HOST_RAM"] == "18G" and bounded["POS2GPU_ASSERT_VRAM"] == "1"
+diagnostic = ci["test_environment"]({"POS2GPU_ASSERT_VRAM": "1"}, "cuda", strict_memory=False)
+assert diagnostic["POS2GPU_ASSERT_VRAM"] == "0"
 for budget in ("0", "-1", str(2**34)):
     result = subprocess.run([sys.executable, str(Path(__file__).with_name("gpu-ci.py")), ".",
                              "--backend", "cuda", "--logs", "/invalid-unused-log-path",
@@ -138,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix="xchplot2-result-check-") as directory:
     inventory = build / "tools/sanity/gpu_ci_info"
     inventory.write_text('''#!/usr/bin/env python3
 import os, sys
+assert os.environ["POS2GPU_ASSERT_VRAM"] == os.environ["CI_ASSERT_VRAM"]
 print(os.environ["CI_INVENTORY"], end="")
 sys.exit(7 if os.environ["CI_FAIL"] == "inventory" else 0)
 ''')
@@ -156,6 +159,11 @@ if kind == "test":
     assert "--testnet" not in sys.argv and "-T" not in sys.argv
     (Path(sys.argv[sys.argv.index("-o") + 1]) / "reference.plot2").write_bytes(json.dumps(params).encode())
 if kind == "batch":
+    # Simulate an external memory spike; correctness must still check the plot.
+    if os.environ["POS2GPU_ASSERT_VRAM"] == "1":
+        sys.exit(19)
+    if failure == "correctness":
+        assert int(os.environ["POS2GPU_MAX_VRAM_MB"]) > 0
     tier = sys.argv[sys.argv.index("--tier") + 1]
     print(f"streaming tier: {tier} (")
     print("-> disk")
@@ -198,21 +206,25 @@ if kind == "verify":
              ("zero-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("missing-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("vector-parity", "index-meta-max-tiny-parity", "RuntimeError", None),
-             ("none", "complete", None, None))
+             ("none", "complete", None, None),
+             ("correctness", "complete", None, None))
     for failure, stage, error_type, exit_code in cases:
         logs = root / failure
         fixture = text.replace("backend=cuda", "backend=hip" if failure == "invalid" else "backend=cuda")
         if failure == "capacity":
             fixture = fixture.replace(f"free_bytes={7900 * MIB}", f"free_bytes={500 * MIB}")
+        suite = "vram" if failure == "capacity" else "correctness" if failure == "correctness" else "quick"
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("gpu-ci.py")), str(build),
-                                 "--backend", "cuda", "--suite", "vram" if failure == "capacity" else "quick",
+                                 "--backend", "cuda", "--suite", suite,
                                  "--binary", str(binary), "--logs", str(logs), "--scratch", str(root)],
             env=dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
-                     CI_FAIL=failure, CI_INVENTORY=fixture, CI_CALLS=str(root / f"{failure}-calls.jsonl")),
+                     CI_FAIL=failure, CI_INVENTORY=fixture, CI_CALLS=str(root / f"{failure}-calls.jsonl"),
+                     CI_ASSERT_VRAM="1" if suite == "vram" else "0"),
             capture_output=True, text=True)
         summary = json.loads((logs / "summary.json").read_text())
         assert summary["stage"] == stage, result.stdout + result.stderr
         assert summary["status"] == ("failed" if error_type else "passed")
+        assert summary["memory_assertion"] == (suite == "vram")
         assert summary["started_at"] and summary["finished_at"]
         assert (result.returncode != 0) == bool(error_type)
         assert "3062 MiB" in (logs / "nvidia-smi-start.log").read_text()
@@ -227,10 +239,11 @@ if kind == "verify":
         if failure == "vector-parity":
             assert summary["failure"]["vector"] == "index-meta-max"
             assert [v["status"] for v in summary["vectors"]] == ["passed", "failed", "pending"]
-        if failure == "none":
+        if not error_type:
             assert "vector" not in summary and len(summary["vectors"]) == 3
+            assert summary["vectors"][0]["k"] == (28 if suite == "correctness" else 18)
             assert summary["reference_sha256"] == summary["vectors"][0]["reference_sha256"]
-            calls = [json.loads(line) for line in (root / "none-calls.jsonl").read_text().splitlines()]
+            calls = [json.loads(line) for line in (root / f"{failure}-calls.jsonl").read_text().splitlines()]
             assert sum(command[0] == "test" for command in calls) == 3
             assert sum(command[0] == "batch" for command in calls) == 27
             assert sum(command[0] == "verify" for command in calls) == 27
@@ -255,6 +268,7 @@ assert sys.argv[1] == "bench" and sys.argv[sys.argv.index("--devices") + 1] == "
 if int(os.environ["POS2GPU_MAX_VRAM_MB"]) < 138:
     print("tier does not fit, including the VRAM buffer")
     sys.exit(1)
+assert os.environ["POS2GPU_ASSERT_VRAM"] == "1"
 assert sys.argv[sys.argv.index("-n") + 1] == "3"
 peak = os.environ["CI_FAKE_PEAK"]
 if peak != "missing":

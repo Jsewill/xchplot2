@@ -146,8 +146,16 @@ runners.
 | Suite | When | Checks |
 | --- | --- | --- |
 | `quick` | Branch pushes; manual | All CTest tests, then k=18 CPU byte parity and 100 full-proof challenges for every tier and disk-spill variant |
+| `correctness` | Manual; shared GPU | All CTest tests, then k=28 CPU byte parity and full proofs for every tier and spill variant, with the production VRAM caps |
 | `vram` | Daily, 04:17 UTC; manual | Quick CTest tests, three k=28 plots at each tier's budget, rejection 1 MiB below it, then k=28 CPU byte parity and full proofs for every tier and spill variant |
 | `physical` | Sunday, 07:47 UTC; manual | Actual 2/4/6/8 GiB capacity, every k=28 tier that fits, plus three uncapped auto-tier plots with full-proof verification |
+
+`quick` and `correctness` record device-wide memory measurements as diagnostics.
+Other applications can change those counters, so they do not establish the
+plotter's memory use on a shared GPU. Allocation and admission guards remain
+active. `vram` and `physical` enforce the device-wide memory assertion and
+require an isolated GPU; the summary records which policy ran. A correctness
+pass does not qualify memory usage.
 
 Every suite also compares two k=18 mainnet vectors against CPU output on each
 selected tier and spill variant: strength 3 with an all-`ff` ID, maximum
@@ -278,6 +286,7 @@ the plotter.
 ```bash
 python3 scripts/test/gpu-ci-test.py
 python3 scripts/test/gpu-ci.py build --backend cuda --suite quick --logs /tmp/gpu-quick
+python3 scripts/test/gpu-ci.py build --backend cuda --suite correctness --logs /tmp/gpu-correctness
 python3 scripts/test/gpu-ci.py build --backend hip --suite vram --logs /tmp/gpu-vram
 python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --physical-vram-mib 8192 --logs /tmp/gpu-physical
 ```
@@ -291,8 +300,9 @@ NVIDIA runs additionally retain best-effort driver XML snapshots at suite
 start and failure, including process-memory evidence. Watchdog measurements
 are sampled device-wide changes in free memory; they cannot attribute memory
 to this process, and endpoint snapshots can miss transient external usage.
-The VRAM guard remains strict; repeat on an idle GPU to distinguish model
-regressions from interference.
+Use `correctness` on a shared desktop. Reserve strict `vram` and `physical`
+qualification for isolated GPUs; retrying until a shared-device counter passes
+does not establish memory attribution.
 
 ## Pinned testnet farming fixture
 
@@ -404,7 +414,9 @@ executable runs. Keep the original release build's inventory and parity tools;
 a separately compiled build with a different source revision or toolchain
 cannot qualify the archive. The packaged runtime libraries take precedence
 over installed toolchain libraries for these checks.
-Run the `vram` and `physical` suites on the supported GPUs as described above
+Use `correctness` for k=28 archive byte comparisons and proofs on a shared GPU,
+and record memory qualification separately. Run the `vram` and `physical` suites
+on isolated supported GPUs as described above
 for k=28, every fitting tier, and spill variants. Perform the required k=22
 byte comparisons and full proofs with the same extracted archive as well.
 The `--binary` option remains

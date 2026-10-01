@@ -8,7 +8,7 @@ on:
       suite:
         description: GPU test suite
         type: choice
-        options: [quick, vram, physical]
+        options: [quick, correctness, vram, physical]
         default: quick
   schedule:
     - cron: '17 4 * * *'
