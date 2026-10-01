@@ -359,6 +359,14 @@ podman build -t xchplot2-release -f ci/release/Containerfile ci/release
 podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
 ```
 
+The Linux release matrix builds natively on x86-64 and ARM64 and checks
+each extracted archive on its matching runtime. On ARM64, build the same
+Containerfile with `--build-arg BASE_IMAGE=ubuntu:26.04`; Ubuntu 26.04 supplies
+ARM64 HIP packages, and the image builds the Level Zero loader from source.
+Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
+OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
+checks do not qualify GPU drivers or hardware.
+
 Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`
 collects CPU, CUDA, and HIP runtime/JIT dependencies; the build script adds
 Level Zero, checks all three GPU backends, collects license notices, and

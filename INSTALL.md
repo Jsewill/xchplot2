@@ -21,14 +21,16 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 ## Binary archives
 
-Download the combined Linux x86-64 `sycl.tar.gz` archive
+Download the combined Linux x86-64 or ARM64 `sycl.tar.gz` archive
 and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
 `./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
 add that `bin` directory to `PATH` to run the CLI elsewhere.
 
-These archives target glibc 2.39+ (Ubuntu 24.04 or a compatible system), an
-x86-64 CPU with AES, SSSE3, and SSE4.1, and a compatible GPU driver. On Ubuntu,
+The x86-64 archive requires glibc 2.39+ (Ubuntu 24.04 or a compatible system)
+and a CPU with AES, SSSE3, and SSE4.1. The ARM64 archive requires Ubuntu 26.04
+or a compatible system with glibc 2.43+ and ARMv8-A crypto extensions.
+Both require a compatible GPU driver. On Ubuntu,
 install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
 and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, CUDA and HIP
 runtimes, the Level Zero loader, and its SPIR-V translator. NVIDIA, AMD,
@@ -36,10 +38,18 @@ and Intel backends are available in the same binary, including on systems
 with GPUs from multiple vendors. No development toolkit is needed.
 
 The CUDA runtime is 12.9.1; NVIDIA driver 575.57.08+ is recommended. The HIP
-runtime is ROCm 7.1.1 and supports hardware covered by that runtime. Intel
+runtime is ROCm 7.1.1 on x86-64; ARM64 uses Ubuntu's HIP 7.1.0 and compiler
+libraries 7.1.1. Hardware support follows those runtimes. Intel
 uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
+
+ARM64 includes CUDA (Linux SBSA), HIP, Level Zero, and OpenCL backends.
+OpenCL devices must support SPIR-V, Intel USM or fine-grained system SVM,
+and 64-bit atomics. A bundled backend does not supply a GPU driver: each
+device needs a driver for the host architecture. ARM64 GPU execution still
+requires hardware qualification; the hosted release checks cover native
+compilation, the bundled runtime, CPU/SYCL plotting parity, and full proofs.
 
 The experimental Windows x86-64 `sycl.zip` includes NVIDIA, AMD, and Intel
 backends together. Extract it and run `.\bin\xchplot2.exe devices`; keep the

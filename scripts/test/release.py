@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import platform
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="xchplot2 release é-") as temporary:
         work = pathlib.Path(temporary)
         package, _ = extract_archive(args.archive, work)
+        arm64 = platform.machine().lower() in ("aarch64", "arm64")
         for name in ("BUILDINFO.txt", "README.txt", "licenses/LICENSE", "licenses/rust.txt",
                      "licenses/pos2-chip.txt", "licenses/fse.txt", "licenses/aes.txt",
                      "licenses/adaptivecpp.txt", "licenses/adaptivecpp-third-party.txt",
@@ -90,11 +92,20 @@ def main():
                          "hipSYCL/bitcode/libkernel-sscp-spirv-full.bc",
                          "hipSYCL/ext/llvm-spirv/bin/llvm-spirv"):
                 assert (runtime / name).stat().st_size > 0, f"Missing {name}"
-            for name in ("cuda.txt", "cuda-cccl.txt", "level-zero.txt", "llvm-spirv.txt",
-                         "rocm/hip/LICENSE.md", "rocm/amd_comgr/LICENSE.txt",
-                         "rocm/hsakmt/LICENSE.md",
-                         "rocm/ROCm-Device-Libs/LICENSE.TXT", "rocm/rocm-llvm/LICENSE.TXT"):
+            rocm_notices = (tuple(f"rocm/{name}.txt" for name in
+                                 ("libamdhip64-7", "libhiprtc7", "libhsa-runtime64-1",
+                                  "libhsakmt1", "libamd-comgr3", "rocm-device-libs-21"))
+                            if arm64 else ("rocm/hip/LICENSE.md", "rocm/amd_comgr/LICENSE.txt",
+                                           "rocm/hsakmt/LICENSE.md", "rocm/ROCm-Device-Libs/LICENSE.TXT",
+                                           "rocm/rocm-llvm/LICENSE.TXT"))
+            for name in ("cuda.txt", "cuda-cccl.txt", "level-zero.txt", "llvm-spirv.txt", *rocm_notices):
                 assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
+            if arm64:
+                for name in ("libLLVM.so.21.1", "libhiprtc-builtins.so.7", "libOpenCL.so.1",
+                             "libhsakmt.so.1", "hipSYCL/librt-backend-ocl.so"):
+                    assert (runtime / name).stat().st_size > 0, f"Missing {name}"
+                for name in ("libllvm21.txt", "libhiprtc-builtins7.txt", "ocl-icd-libopencl1.txt"):
+                    assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
             assert not list(runtime.glob("libcuda.so*")), "Use the NVIDIA driver supplied by the system"
         # ctypes keeps libraries loaded; let a child exit before removing the archive.
         subprocess.run([sys.executable, "-c", """
@@ -148,6 +159,11 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
                        check=True, timeout=30)
         assert spirv_out.read_bytes()[:4] == b"\x03\x02\x23\x07", "Invalid SPIR-V output"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
+        if os.name != "nt":
+            with binary.open("rb") as executable:
+                header = executable.read(20)
+            assert header[:6] == b"\x7fELF\x02\x01", "Expected a 64-bit little-endian ELF executable"
+            assert int.from_bytes(header[18:20], "little") == (183 if arm64 else 62), "Archive CPU architecture mismatch"
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         if os.name == "nt":
             devices = subprocess.run([binary, "devices", "--config", os.devnull],
