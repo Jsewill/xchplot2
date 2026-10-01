@@ -25,6 +25,7 @@ if (-not $arm64 -and -not $env:HIP_PATH) { throw 'Set HIP_PATH to the HIP SDK 6.
 if (-not $env:ACPP_PREFIX) { throw 'Set ACPP_PREFIX to the LLVM-integrated AdaptiveCpp installation' }
 $prefix = (Resolve-Path $env:ACPP_PREFIX).Path
 $env:PATH = "$prefix/bin;$env:CUDA_PATH/bin;$env:HIP_PATH/bin;" + $env:PATH
+if ($arm64) { $env:PATH = "$env:CUDA_PATH/bin/arm64;" + $env:PATH }
 $env:ACPP_VISIBILITY_MASK = 'omp'
 New-Item -ItemType Directory -Force $BuildDir | Out-Null
 $BuildDir = (Resolve-Path $BuildDir).Path
@@ -56,7 +57,7 @@ if ($arm64) {
     Copy-Item "$env:CUDA_PATH/licenses/libnvvm.txt" $licenses
     Copy-Item "$env:CUDA_PATH/licenses/cuda_cudart.txt" (Join-Path $licenses 'cuda.txt')
     Copy-Item "$env:CUDA_PATH/licenses/cccl.txt" (Join-Path $licenses 'cuda-cccl.txt')
-    Copy-Item "$env:CUDA_PATH/bin/cudart64_13.dll" $runtime
+    Copy-Item "$env:CUDA_PATH/bin/arm64/cudart64_13.dll" $runtime
     Copy-Item "$prefix/bin/hipSYCL/rt-backend-ocl.dll" "$runtime/hipSYCL"
     Copy-Item "$prefix/bin/OpenCL.dll" $runtime
     Copy-Item "$prefix/opencl-*-license.txt" $licenses
