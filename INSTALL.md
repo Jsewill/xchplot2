@@ -65,6 +65,14 @@ recovery, and offline GPU compilation. An RX 6700 XT completed a
 full Windows GPU qualification is still pending. See [Windows](#windows)
 for source builds.
 
+The experimental Windows ARM64 ZIP requires Windows 11 ARM64. It includes
+CUDA 13.4.2 (Turing and newer), Level Zero, and OpenCL, with native ARM64
+runtime libraries and the same plotting features. Each backend requires a
+compatible ARM64 graphics driver. OpenCL has the SPIR-V, USM/SVM, and 64-bit
+atomic requirements described above. AMD's Windows HIP SDK does not supply
+an ARM64 runtime, so this archive does not include HIP. GPU execution still
+requires hardware qualification.
+
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.
 

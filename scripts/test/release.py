@@ -63,22 +63,29 @@ def main():
         runtime = package / ("bin" if os.name == "nt" else "lib")
         executable_suffix = ".exe" if os.name == "nt" else ""
         if os.name == "nt":
-            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "cudart64_12.dll",
-                         "hiprtc0604.dll", "hiprtc-builtins0604.dll", "amd_comgr0604.dll", "ze_loader.dll",
-                         "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+            gpu_libraries = (("cudart64_13.dll", "OpenCL.dll", "hipSYCL/rt-backend-ocl.dll") if arm64 else
+                             ("cudart64_12.dll", "hiprtc0604.dll", "hiprtc-builtins0604.dll",
+                              "amd_comgr0604.dll", "hipSYCL/rt-backend-hip.dll",
+                              "hipSYCL/ext/bitcode/amdgcn/oclc_isa_version_1031.bc"))
+            crt_libraries = ("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll")
+            if not arm64:
+                crt_libraries += ("vcruntime140_1.dll",)
+            for name in ("acpp-rt.dll", "acpp-common.dll", "libomp.dll", "ze_loader.dll",
+                         *crt_libraries, *gpu_libraries,
                          "hipSYCL/rt-backend-omp.dll", "hipSYCL/rt-backend-cuda.dll",
-                         "hipSYCL/rt-backend-hip.dll", "hipSYCL/rt-backend-ze.dll",
-                         "hipSYCL/ext/bitcode/amdgcn/oclc_isa_version_1031.bc",
+                         "hipSYCL/rt-backend-ze.dll",
                          "hipSYCL/bitcode/libkernel-sscp-spirv-full.bc",
                          "hipSYCL/ext/llvm-spirv/bin/llvm-spirv.exe"):
                 assert (package / "bin" / name).stat().st_size > 0, f"Missing {name}"
-            for name in ("amd-runtime.txt", "hip-headers.txt", "hiprtc.txt", "rocm-comgr.txt",
-                         "rocm-device-libs.txt", "level-zero-license.txt", "llvm-spirv-license.txt",
+            gpu_notices = (("opencl-loader-license.txt", "opencl-headers-license.txt",
+                            "opencl-backend-headers-license.txt", "opencl-cxx-headers-license.txt") if arm64 else
+                           ("amd-runtime.txt", "hip-headers.txt", "hiprtc.txt", "rocm-comgr.txt", "rocm-device-libs.txt"))
+            for name in (*gpu_notices, "level-zero-license.txt", "llvm-spirv-license.txt",
                          "spirv-headers-license.txt", "cuda.txt", "cuda-cccl.txt"):
                 assert (package / "licenses" / name).stat().st_size > 0, f"Missing {name}"
             for directory in (package / "bin", package / "bin/hipSYCL/ext/llvm/bin",
                               package / "bin/hipSYCL/ext/llvm-spirv/bin"):
-                for name in ("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+                for name in crt_libraries:
                     assert (directory / name).is_file(), f"Missing app-local runtime: {directory / name}"
             assert not list(package.rglob("*.lib")), "Import/static libraries are not runtime dependencies"
             assert not list((package / "bin").glob("amdhip64*.dll")), "Use the HIP runtime supplied by the AMD driver"
@@ -118,6 +125,8 @@ drivers = (("nvcuda.dll", "rt-backend-cuda.dll"), ("amdhip64_6.dll", "rt-backend
     if os.name == "nt" else (("libcuda.so.1", "librt-backend-cuda.so"),)
 skip = set()
 for driver, backend in drivers:
+    if not (directory / "hipSYCL" / backend).is_file():
+        continue
     try:
         load(driver)
     except (FileNotFoundError if os.name == "nt" else OSError):
@@ -127,24 +136,25 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
     libraries = [load(str(path)) for path in directory.rglob("*.dll" if os.name == "nt" else "*.so*")
                  if path.name not in skip]
     assert libraries, "No packaged runtime libraries"
-    # Compile a kernel for the reported RX 6700 XT without any GPU or SDK.
-    rtc = load(str(directory / ("hiprtc0604.dll" if os.name == "nt" else "libhiprtc.so.7")))
-    rtc.hiprtcGetErrorString.restype = ctypes.c_char_p
-    def check(result):
-        assert result == 0, rtc.hiprtcGetErrorString(result).decode()
-    program = ctypes.c_void_p()
-    source = b'extern "C" __global__ void probe(int* out) { out[0] = 42; }'
-    check(rtc.hiprtcCreateProgram(ctypes.byref(program), source, b"probe.hip", 0, None, None))
-    try:
-        options = (ctypes.c_char_p * 1)(b"--gpu-architecture=gfx1031")
-        check(rtc.hiprtcCompileProgram(program, len(options), options))
-        size = ctypes.c_size_t()
-        check(rtc.hiprtcGetCodeSize(program, ctypes.byref(size)))
-        assert size.value > 0, "HIP RTC returned no GPU code"
-    finally:
-        check(rtc.hiprtcDestroyProgram(ctypes.byref(program)))
-    print("Packaged HIP RTC compiled gfx1031 kernel without an SDK")
-""", str(runtime)], check=True, timeout=60)
+    if sys.argv[2] == "True":
+        # Compile a kernel for the reported RX 6700 XT without any GPU or SDK.
+        rtc = load(str(directory / ("hiprtc0604.dll" if os.name == "nt" else "libhiprtc.so.7")))
+        rtc.hiprtcGetErrorString.restype = ctypes.c_char_p
+        def check(result):
+            assert result == 0, rtc.hiprtcGetErrorString(result).decode()
+        program = ctypes.c_void_p()
+        source = b'extern "C" __global__ void probe(int* out) { out[0] = 42; }'
+        check(rtc.hiprtcCreateProgram(ctypes.byref(program), source, b"probe.hip", 0, None, None))
+        try:
+            options = (ctypes.c_char_p * 1)(b"--gpu-architecture=gfx1031")
+            check(rtc.hiprtcCompileProgram(program, len(options), options))
+            size = ctypes.c_size_t()
+            check(rtc.hiprtcGetCodeSize(program, ctypes.byref(size)))
+            assert size.value > 0, "HIP RTC returned no GPU code"
+        finally:
+            check(rtc.hiprtcDestroyProgram(ctypes.byref(program)))
+        print("Packaged HIP RTC compiled gfx1031 kernel without an SDK")
+""", str(runtime), str(not (os.name == "nt" and arm64))], check=True, timeout=60)
         for tool in ("opt", "llc", "lld-link" if os.name == "nt" else "ld.lld"):
             subprocess.run([runtime / "hipSYCL/ext/llvm/bin" / (tool + executable_suffix), "--version"],
                            check=True, timeout=30)
@@ -159,7 +169,14 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
                        check=True, timeout=30)
         assert spirv_out.read_bytes()[:4] == b"\x03\x02\x23\x07", "Invalid SPIR-V output"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
-        if os.name != "nt":
+        if os.name == "nt":
+            with binary.open("rb") as executable:
+                header = executable.read(64)
+                assert header[:2] == b"MZ", "Expected a Windows executable"
+                executable.seek(int.from_bytes(header[60:64], "little"))
+                pe = executable.read(6)
+            assert pe[:4] == b"PE\0\0" and int.from_bytes(pe[4:6], "little") == (0xAA64 if arm64 else 0x8664), "Archive CPU architecture mismatch"
+        else:
             with binary.open("rb") as executable:
                 header = executable.read(20)
             assert header[:6] == b"\x7fELF\x02\x01", "Expected a 64-bit little-endian ELF executable"

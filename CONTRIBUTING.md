@@ -380,17 +380,23 @@ The Linux job checks extraction, bundled libraries, offline AMD and Intel
 kernel compilation, the packaged SYCL JIT through `hellosycl`, CPU/SYCL plot
 byte parity, and full proofs in an image without development toolchains.
 
-The Windows job uses VS 2022, LLVM/Clang 20.1.8, CUDA 12.9.1, and HIP SDK
-6.4.2. It builds AdaptiveCpp into LLVM using
+The Windows x86-64 job uses VS 2022, LLVM/Clang 20.1.8, CUDA 12.9.1, and HIP
+SDK 6.4.2. ARM64 uses native Visual Studio tools and CUDA 13.4.2, with CUDA,
+Level Zero, and OpenCL backends; AMD's Windows HIP SDK has no ARM64 runtime.
+Both build AdaptiveCpp into LLVM using
 `ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
 and LLVM-SPIRV translator. The cached install tree is invalidated when
 compiler sources or options change. `scripts/build-release.ps1` collects
 runtime DLLs and notices, builds all targets, runs the host checks, and
-writes one combined `build/release-windows/dist/*-windows-x86_64-sycl.zip`.
+writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
 It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
 The toolchain applies `contrib/adaptivecpp-windows-hip.patch` for upstream
 device-IR fixes and `contrib/adaptivecpp-windows-level-zero.patch` for
 Windows headers, linking, DLL installation, and integrated SPIR-V builds.
+ARM64 also applies `contrib/adaptivecpp-windows-opencl.patch` for the backend
+DLL's install location and builds Khronos's OpenCL loader. Toolchain caches
+are separate for each host architecture. The archive tests check native
+executable architecture and run without the development SDKs.
 Windows uses `generic;omp`: generic GPU kernels and precompiled CPU kernels,
 because the Windows CPU JIT needs Visual Studio static CRT libraries.
 The archive test hides the compiler and both GPU SDK installations, clears

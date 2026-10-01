@@ -11,15 +11,21 @@ Requirements:
   Intel: a GPU and graphics driver supporting Level Zero.
   An ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill files.
 
-This ZIP includes all three GPU backends, AdaptiveCpp, LLVM, CUDA runtime,
+The x86_64 ZIP includes all three GPU backends, AdaptiveCpp, LLVM, CUDA runtime,
 HIP runtime compiler libraries and device bitcode, the Intel Level Zero
 loader and SPIR-V translator, and Microsoft Visual C++ runtime DLLs.
 No CUDA, HIP/ROCm, or oneAPI SDK installation is needed. Install your normal
 graphics driver and keep the complete bin/ tree together.
 AMD's graphics driver supplies the HIP runtime (amdhip64_6.dll).
 
+The ARM64 ZIP requires Windows 11 ARM64 with crypto extensions. It includes
+CUDA 13.4.2 (Turing and newer), Level Zero, and OpenCL, with native ARM64
+runtime libraries. Each backend needs a compatible ARM64 graphics driver.
+OpenCL requires SPIR-V, Intel USM or fine-grained system SVM, and 64-bit
+atomics. There is no native Windows ARM64 HIP runtime in AMD's SDK.
+
 Windows SYCL is experimental. Hosted Windows checks cover CPU plotting,
-proofs, recovery, and offline AMD/Intel kernel compilation. GPU plotting
+proofs, recovery, and offline SPIR-V compilation (also AMD on x86_64). GPU plotting
 requires separate qualification on Windows hardware, including RX 6700 XT.
 BUILDINFO.txt records the source and toolchain revisions;
 licenses/ contains dependency notices.

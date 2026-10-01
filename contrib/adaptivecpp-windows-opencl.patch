@@ -1,0 +1,11 @@
+# Install the OpenCL backend beside the other Windows backend DLLs.
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -294,6 +294,7 @@
+   endif()
+
+   install(TARGETS rt-backend-ocl
++        RUNTIME DESTINATION bin/hipSYCL
+         LIBRARY DESTINATION lib/hipSYCL
+         ARCHIVE DESTINATION lib/hipSYCL)
+ endif()
