@@ -382,9 +382,10 @@ script adds Level Zero, checks the GPU backends, collects license notices, and
 makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
-platform; PR and tag runs build both. A `vVERSION` tag creates a
-draft GitHub release; publish it after qualifying the extracted archives on
-the supported GPUs. Do not rebuild between qualification and publication.
+platform and host architecture; PR and tag runs build the full matrix.
+A `vVERSION` tag creates a draft GitHub release; publish it after qualifying
+the extracted archives on the supported GPUs. Do not rebuild between
+qualification and publication.
 The Linux job checks extraction, bundled libraries, offline AMD and Intel
 kernel compilation, the packaged SYCL JIT through `hellosycl`, CPU/SYCL plot
 byte parity, and full proofs in an image without development toolchains.

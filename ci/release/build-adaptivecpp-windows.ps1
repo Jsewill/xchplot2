@@ -21,7 +21,7 @@ if (-not $env:CUDA_PATH) { throw 'Set CUDA_PATH to the CUDA installation' }
 $targets = 'X86;NVPTX;AMDGPU'
 if ($arm64) {
     $targets = 'AArch64;NVPTX'
-    $backendArgs = @('-DWITH_ROCM_BACKEND=OFF', '-DWITH_OPENCL_BACKEND=ON',
+    $backendArgs = @('-DWITH_ROCM_BACKEND=OFF', '-DWITH_OPENCL_BACKEND=ON', '-DBUILD_EXAMPLES=OFF',
         "-DCUDA_cudart_LIBRARY:FILEPATH=$env:CUDA_PATH/lib/arm64/cudart.lib",
         "-DCUDA_CUDA_LIBRARY:FILEPATH=$env:CUDA_PATH/lib/arm64/cuda.lib")
 } else {

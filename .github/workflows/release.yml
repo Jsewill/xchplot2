@@ -24,6 +24,11 @@ on:
         type: choice
         default: all
         options: [all, linux, windows]
+      architecture:
+        description: Host CPU architecture
+        type: choice
+        default: all
+        options: [all, x86_64, aarch64]
 
 permissions:
   contents: read
@@ -34,21 +39,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-            base: nvidia/cuda:12.9.1-devel-ubuntu24.04
-            runtime: ubuntu:24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            base: ubuntu:26.04
-            runtime: ubuntu:26.04
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
         run: |
-          docker build --build-arg BASE_IMAGE=${{ matrix.base }} \
+          docker build --build-arg BASE_IMAGE=${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'nvidia/cuda:12.9.1-devel-ubuntu24.04' }} \
             -t xchplot2-release -f ci/release/Containerfile ci/release
       - name: Build and package
         env:
@@ -59,7 +56,7 @@ jobs:
       - name: Check the extracted runtime and CPU proofs
         run: |
           docker run --rm -e DEBIAN_FRONTEND=noninteractive \
-            -v "$PWD:/src:ro" -w /src ${{ matrix.runtime }} bash -euc '
+            -v "$PWD:/src:ro" -w /src ${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'ubuntu:24.04' }} bash -euc '
             apt-get update
             apt-get install -y --no-install-recommends \
               python3 libstdc++6 libnuma1 libelf1t64 libdrm2 libdrm-amdgpu1
@@ -79,14 +76,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            runner: windows-2022
-            cache: windows-acpp25.10-llvm20.1.8-all-ptx-v2
-          - arch: aarch64
-            runner: windows-11-arm
-            cache: windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'windows-11-arm' || 'windows-2022' }}
     timeout-minutes: 240
     defaults:
       run:
@@ -130,7 +121,7 @@ jobs:
         id: toolchain
         with:
           path: build/windows-toolchain/install
-          key: ${{ matrix.cache }}
+          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}
       - name: Configure Visual Studio
         run: |
           $ErrorActionPreference = 'Stop'
