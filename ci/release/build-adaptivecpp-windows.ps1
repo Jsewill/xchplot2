@@ -37,6 +37,9 @@ if (-not (Get-Content "$acpp/src/compiler/sscp/TargetSeparationPass.cpp" -Raw).C
 if (-not (Get-Content "$acpp/src/runtime/CMakeLists.txt" -Raw).Contains('LEVEL_ZERO_LOADER')) {
     git -C $acpp apply "$PWD/contrib/adaptivecpp-windows-level-zero.patch"
 }
+if (-not (Get-Content "$acpp/src/runtime/cuda/cuda_queue.cpp" -Raw).Contains('LLVM 20 targets')) {
+    git -C $acpp apply "$PWD/ci/release/adaptivecpp-cuda-llvm20.patch"
+}
 $ze = Join-Path $root 'level-zero'
 if (-not (Test-Path $ze)) {
     git clone --depth 1 --branch v1.33.1 https://github.com/oneapi-src/level-zero.git $ze
@@ -108,7 +111,10 @@ cmake -S "$root/llvm/llvm" -B "$root/build" -G Ninja `
     "-DCMAKE_PREFIX_PATH=$root/level-zero-install" `
     -DLLVM_TOOL_BUGPOINT_BUILD=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF `
     -DLLVM_INCLUDE_TESTS=OFF
-cmake --build "$root/build" --target install --parallel 2
+$jobs = if ($arm64) { 4 } else { 2 }
+cmake --build "$root/build" --target install --parallel $jobs
+python ci/release/check-cuda-ptx.py $acpp "$prefix/bin/clang++.exe" `
+    "$prefix/bin/llc.exe" "$env:CUDA_PATH/bin/nvcc.exe" "$env:CUDA_PATH/bin/ptxas.exe"
 # The translator uses narrow argv/streams; match the application's UTF-8 paths.
 mt.exe -manifest tools/xchplot2/windows.manifest "-outputresource:$prefix/bin/llvm-spirv.exe;#1"
 New-Item -ItemType Directory -Force "$prefix/bin/hipSYCL/ext/llvm-spirv/bin" | Out-Null
@@ -125,6 +131,7 @@ if ($arm64) {
     Copy-Item "$root/build/_deps/ocl-cxx-headers-src/LICENSE.txt" "$prefix/opencl-cxx-headers-license.txt"
 }
 Copy-Item "$acpp/LICENSE" "$prefix/adaptivecpp-license.txt"
+Copy-Item ci/release/adaptivecpp-cuda-llvm20.patch "$prefix/adaptivecpp-cuda-llvm20.txt"
 Copy-Item "$root/llvm/llvm/LICENSE.TXT" "$prefix/llvm-license.txt"
 @"
 AdaptiveCpp: $revision
@@ -139,6 +146,7 @@ Windows HIP backports: contrib/adaptivecpp-windows-hip.patch
 c69d230e497dd5cafcf9a7004f2c0aa3647acce4 (Windows AMDGPU short wchar)
 256589708f6902c47bb8f80bb199012d0a32a321 (remove MSVC linker directives)
 Windows Level Zero integration: contrib/adaptivecpp-windows-level-zero.patch
+CUDA PTX target selection: ci/release/adaptivecpp-cuda-llvm20.patch (LLVM 20)
 Level Zero: 1.33.1 (5c863340cab6631a31234653191b904f0028b93b)
 LLVM-SPIRV: f0ae76f12c62ede090e57ece8c986f4c3c971a71
 '@ | Add-Content "$prefix/adaptivecpp-windows.txt"

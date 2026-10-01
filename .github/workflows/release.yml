@@ -82,10 +82,10 @@ jobs:
         include:
           - arch: x86_64
             runner: windows-2022
-            cache: windows-acpp25.10-llvm20.1.8-all-v1
+            cache: windows-acpp25.10-llvm20.1.8-all-ptx-v2
           - arch: aarch64
             runner: windows-11-arm
-            cache: windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-v2
+            cache: windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     defaults:

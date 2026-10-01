@@ -41,6 +41,7 @@ Get-ChildItem $runtime -Filter '*.lib' | Remove-Item
 Copy-Item "$prefix/bin/libomp.dll" $runtime
 Copy-Item "$prefix/adaptivecpp-license.txt" (Join-Path $licenses 'adaptivecpp.txt')
 Copy-Item "$prefix/adaptivecpp-windows.txt" $licenses
+Copy-Item "$prefix/adaptivecpp-cuda-llvm20.txt" $licenses
 Copy-Item ci/release/adaptivecpp-third-party.txt, ci/release/llvm-third-party.txt $licenses
 Copy-Item "$prefix/llvm-license.txt" (Join-Path $licenses 'llvm.txt')
 '9f842c701a599107cc6d117d3539f971036363a1' | Set-Content (Join-Path $licenses 'adaptivecpp-revision.txt')

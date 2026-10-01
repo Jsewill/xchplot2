@@ -367,6 +367,11 @@ CUDA 12.9's math declarations are adjusted for the newer glibc so the
 release retains pre-Turing code generation. The ARM64 application uses
 GCC 11 because NVCC cannot parse GCC 14's NEON header.
 ARM64 includes every numeric CUDA GPU architecture reported by its compiler.
+The pinned LLVM 20 SYCL compiler uses compatible PTX targets for newer NVIDIA
+GPUs via `ci/release/adaptivecpp-cuda-llvm20.patch`. This release-only patch
+lives in the Docker build context and is shared with the Windows toolchain.
+`ci/release/check-cuda-ptx.py` checks the actual selector and assembles its PTX
+for every GPU target reported by NVCC, without needing GPU hardware.
 Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
 OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.

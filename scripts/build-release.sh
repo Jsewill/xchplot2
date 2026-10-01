@@ -53,6 +53,7 @@ done
 printf 'AdaptiveCpp: %s\nLLVM: %s\n' \
     "$(cat /opt/release-licenses/adaptivecpp-revision.txt)" \
     "$(/usr/lib/llvm-"$llvm"/bin/llvm-config --version)" > "$build_dir/runtime-info.txt"
+printf 'AdaptiveCpp CUDA targets: ci/release/adaptivecpp-cuda-llvm20.patch\n' >> "$build_dir/runtime-info.txt"
 dpkg-query -W -f='${Package}: ${Version}\n' "libllvm$llvm" \
     "${packages[@]}" >> "$build_dir/runtime-info.txt"
 
