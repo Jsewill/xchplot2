@@ -723,6 +723,33 @@ if(WIN32 AND XCHPLOT2_BUILD_CUDA)
         endif()
     endif()
 endif()
+if(XCHPLOT2_BUILD_CUDA)
+    # CCCL 2.8 omits a macro needed by CUDA 12.9's complete ARM GPU target list.
+    set(_cccl_header_name "cuda/std/__cccl/preprocessor.h")
+    find_file(_cccl_arch_header "${_cccl_header_name}"
+        PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH NO_CACHE)
+    if(_cccl_arch_header)
+        file(READ "${_cccl_arch_header}" _cccl_text)
+        if(_cccl_text MATCHES "#define _CCCL_PP_SPLICE_WITH_IMPL21" AND
+           NOT _cccl_text MATCHES "#define _CCCL_PP_SPLICE_WITH_IMPL20")
+            message(STATUS "Applying CCCL GPU architecture list fix")
+            set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-arch-list")
+            configure_file("${_cccl_arch_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-arch-list.patch"
+                WORKING_DIRECTORY "${_cccl_dir}"
+                RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
+            if(NOT _cccl_patch_result EQUAL 0)
+                message(FATAL_ERROR "CCCL architecture list patch failed: ${_cccl_patch_error}")
+            endif()
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-arch-list.patch")
+            include_directories(BEFORE "${_cccl_dir}")
+            set(_cccl_arch_patch_applied TRUE)
+        endif()
+    endif()
+endif()
 execute_process(
     COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"

@@ -79,6 +79,10 @@ if(NOT _aes_license)
 endif()
 file(WRITE "${CMAKE_BINARY_DIR}/aes-license.txt" "${_aes_license}\n")
 install(FILES "${CMAKE_BINARY_DIR}/aes-license.txt" DESTINATION licenses RENAME aes.txt)
+if(_cccl_arch_patch_applied)
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "CCCL: contrib/cccl-arch-list.patch applied to toolkit headers\n")
+endif()
 if(_cccl_patch_applied)
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
         "CCCL: contrib/cccl-windows-ptx.patch applied to toolkit headers\n")
