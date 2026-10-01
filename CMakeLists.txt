@@ -292,9 +292,9 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
-# arm_acle.h is unused here and collides with NVCC's __clz declarations.
+# Remove an unused ARM header that collides with NVCC and enable MSVC ARM64 AES.
 # Copy the relative include chain so every CPU-reference caller sees the fix.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     foreach(_header AesHash.hpp soft_aes.hpp intrin_portable.h endian.h)
         configure_file("${POS2_CHIP_DIR}/src/pos/aes/${_header}"
                        "${_pos2_solver_dir}/pos/aes/${_header}" COPYONLY)
@@ -351,7 +351,7 @@ target_link_libraries(pos2_chip_headers INTERFACE fse)
 # Match pos2-chip's CPU AES build flags so its AesHash compiles in CPU TUs.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
 endif()
 

@@ -38,7 +38,15 @@ def main():
                      "licenses/cuda-cccl.txt", "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
-        if os.name != "nt":
+        if os.name == "nt":
+            with binary.open("rb") as executable:
+                header = executable.read(64)
+                assert header[:2] == b"MZ", "Expected a Windows executable"
+                executable.seek(int.from_bytes(header[60:64], "little"))
+                pe = executable.read(6)
+            machine = 0xAA64 if platform.machine().lower() in ("aarch64", "arm64") else 0x8664
+            assert pe[:4] == b"PE\0\0" and int.from_bytes(pe[4:6], "little") == machine, "Archive CPU architecture mismatch"
+        else:
             with binary.open("rb") as executable:
                 header = executable.read(20)
             machine = 183 if platform.machine().lower() in ("aarch64", "arm64") else 62

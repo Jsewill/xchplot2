@@ -7,6 +7,9 @@ Requirements:
   Windows 10 22H2, Windows 11, or Windows Server 2022/2025, x86_64.
   CPU with AES, SSSE3, and SSE4.1 instructions.
   NVIDIA Maxwell or newer GPU; driver 576.57+ recommended for CUDA 12.9.1.
+  The ARM64 archive requires Windows 11 ARM64 and a compatible ARM64 NVIDIA
+  driver for CUDA 13.4.2. It includes every GPU architecture supported by
+  that toolkit (Turing and newer); consult BUILDINFO.txt for the exact list.
   An ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill files.
 
 CUDA and the Microsoft C/C++ runtime are linked statically. No development

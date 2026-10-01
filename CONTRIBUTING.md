@@ -251,15 +251,18 @@ rustup toolchain install 1.98.1 --profile minimal
 rustup default 1.98.1
 cargo install --locked --features cli cargo-about --version 0.9.2
 ./scripts/build-release.ps1
-python scripts/test/release.py build/release-windows/dist/xchplot2-0.12.0-windows-x86_64-cuda.zip
+python scripts/test/release.py (Get-ChildItem build/release-windows/dist/*.zip).FullName
 ```
 
-The PowerShell script loads the Visual Studio 2022 x64 environment when
-needed, builds all targets with CUDA 12.9.1, runs the host CTest subset, and
+The PowerShell script loads the matching Visual Studio environment when
+needed, builds all targets with CUDA 12.9.1 on x64 or 13.4.2 on ARM64,
+runs the host CTest subset, and
 writes a ZIP and checksum to `build/release-windows/dist/`. The extracted
 Windows check also exercises Unicode paths, real key generation, Ctrl-Break,
 resume, and publication failure. CI runs it with toolkit libraries removed
-from `PATH`. Windows GPU plotting and spill behavior need qualification on
+from `PATH` and checks the executable's CPU architecture. The ARM64 build
+uses NVIDIA's checksum-verified component archives and includes every GPU
+architecture reported by its compiler. Windows GPU plotting and spill behavior need qualification on
 Windows hardware before the archive is advertised for those devices.
 For affected CUDA 12.x headers, CMake applies NVIDIA's
 [64-bit PTX operand fix](https://github.com/NVIDIA/cccl/commit/270f4100dceeb6345f74fd374695e78bb0a48082)

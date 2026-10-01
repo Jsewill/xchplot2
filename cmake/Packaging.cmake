@@ -1,9 +1,9 @@
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     set(_release_arch x86_64)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(_release_arch aarch64)
 else()
-    message(FATAL_ERROR "Binary packaging supports Linux x86_64/ARM64 and Windows x86_64")
+    message(FATAL_ERROR "Binary packaging supports Linux and Windows x86_64/ARM64")
 endif()
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     message(FATAL_ERROR "Binary packaging supports Linux and Windows")
@@ -38,9 +38,9 @@ file(WRITE "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
     "CUDA: ${CMAKE_CUDA_COMPILER_VERSION}\n"
     "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}\n"
     "Rust: ${_release_rust}\n")
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
-        "pos2-chip: contrib/pos2-arm-cuda.patch applied (unused ARM header)\n")
+        "pos2-chip: contrib/pos2-arm-cuda.patch applied (ARM CUDA/MSVC intrinsics)\n")
 endif()
 if(_cccl_patch_applied)
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"

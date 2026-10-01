@@ -11,7 +11,7 @@ cd xchplot2
 
 ## Binary archives
 
-Download the Linux x86-64/ARM64 or Windows x86-64 CUDA archive and its `.sha256` file from
+Download the Linux or Windows x86-64/ARM64 CUDA archive and its `.sha256` file from
 [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 On Linux, verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
 with the downloaded filename without `.tar.gz`. Extract it, then run
@@ -177,6 +177,11 @@ CUDA and the Microsoft C/C++ runtime statically. Runtime use requires a
 compatible NVIDIA driver (576.57+ recommended for CUDA 12.9.1) and an
 AES/SSSE3/SSE4.1-capable CPU, without installing a development toolkit.
 
+The ARM64 ZIP requires Windows 11 ARM64 and an ARM64 NVIDIA driver compatible
+with CUDA 13.4.2. It contains native code for every GPU architecture reported
+by that toolkit, plus PTX for forward compatibility. CUDA 13 supports Turing
+and newer GPUs. ARM64 GPU execution still requires hardware qualification.
+
 Use NTFS or ReFS for plots, recovery manifests, and spill files. These files
 contain private keys; creation requires filesystem support for access control
 lists. Select spill storage with `--temp-dir`. The default configuration is
@@ -204,6 +209,10 @@ cmake --build build --parallel 2
 .\build\tools\xchplot2\xchplot2.exe --help
 ctest --test-dir build --output-on-failure
 ```
+
+For ARM64, use Visual Studio's ARM64 C++ tools and developer prompt,
+CUDA 13.4.2, CMake 4.4+, and Rust's `stable-aarch64-pc-windows-msvc` toolchain.
+Use the same CMake commands with a GPU architecture supported by that toolkit.
 
 Change `89` to your GPU architecture from the table above. The full CTest
 suite needs a GPU. Use the [release recipe](CONTRIBUTING.md#binary-releases)
