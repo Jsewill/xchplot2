@@ -166,7 +166,8 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
-                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")
 endif()
 
 # Default to Release: a plain `cmake -B build -S .` otherwise builds

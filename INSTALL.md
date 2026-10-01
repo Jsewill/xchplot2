@@ -211,7 +211,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 For ARM64, use Visual Studio's ARM64 C++ tools and developer prompt,
-CUDA 13.4.2, CMake 4.4+, and Rust's `stable-aarch64-pc-windows-msvc` toolchain.
+CUDA 13.4.2, and Rust's `stable-aarch64-pc-windows-msvc` toolchain.
+The release build uses CMake 4.4 and Rust 1.98.1.
 Use the same CMake commands with a GPU architecture supported by that toolkit.
 
 Change `89` to your GPU architecture from the table above. The full CTest
