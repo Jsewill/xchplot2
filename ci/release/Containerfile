@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION}-dev lld-${LLVM_VERSION} \
         libomp-${LLVM_VERSION}-dev libclang-rt-${LLVM_VERSION}-dev
 # Ubuntu 26.04 supplies native ARM64 HIP; AMD's own packages are x86-64 only.
+# Match glibc's six newer math exception specifications in CUDA 12.9 headers.
 RUN if [ "$(dpkg --print-architecture)" = arm64 ]; then \
         curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb \
@@ -18,6 +19,8 @@ RUN if [ "$(dpkg --print-architecture)" = arm64 ]; then \
         && apt-get update && apt-get install -y --no-install-recommends \
             cuda-nvcc-12-9 cuda-cudart-dev-12-9 cuda-cccl-12-9 g++-14 \
             libamdhip64-dev libhsakmt-dev rocm-device-libs-21 ocl-icd-opencl-dev \
+        && sed -i -E '/^extern .* (rsqrt|sinpi|cospi)f?\(.*\);$/s/;$/ noexcept (true);/' \
+            /usr/local/cuda/targets/sbsa-linux/include/crt/math_functions.h \
         && git clone --depth 1 --branch v1.33.1 https://github.com/oneapi-src/level-zero.git /tmp/level-zero \
         && cmake -S /tmp/level-zero -B /tmp/level-zero-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \

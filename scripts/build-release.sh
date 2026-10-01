@@ -52,6 +52,7 @@ curl --proto '=https' --tlsv1.2 -sSfL --retry 5 \
     https://raw.githubusercontent.com/NVIDIA/cccl/v2.8.2/LICENSE \
     -o "$licenses/cuda-cccl.txt"
 if [[ $arch == aarch64 ]]; then
+    printf 'CUDA headers: glibc math exception specifications backported\n' >> "$build_dir/runtime-info.txt"
     mkdir -p "$licenses/rocm"
     for package in libamdhip64-7 libhiprtc7 libhsa-runtime64-1 libhsakmt1 libamd-comgr3 rocm-device-libs-21; do
         cp /usr/share/doc/"$package"/copyright "$licenses/rocm/$package.txt"

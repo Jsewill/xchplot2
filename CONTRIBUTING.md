@@ -363,6 +363,8 @@ The Linux release matrix builds natively on x86-64 and ARM64 and checks
 each extracted archive on its matching runtime. On ARM64, build the same
 Containerfile with `--build-arg BASE_IMAGE=ubuntu:26.04`; Ubuntu 26.04 supplies
 ARM64 HIP packages, and the image builds the Level Zero loader from source.
+CUDA 12.9's math declarations are adjusted for the newer glibc so the
+release retains pre-Turing code generation.
 Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
 OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.
