@@ -18,13 +18,28 @@ on:
   push:
     tags: ['v*-cuda-only']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Release builds to check
+        type: choice
+        default: all
+        options: [all, linux, windows]
 
 permissions:
   contents: read
 
 jobs:
   linux-cuda:
-    runs-on: ubuntu-24.04
+    if: inputs.platform != 'windows'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
@@ -44,13 +59,14 @@ jobs:
           '
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-x86_64-cuda
+          name: linux-${{ matrix.arch }}-cuda
           path: |
             build/release/dist/*.tar.gz
             build/release/dist/*.sha256
           if-no-files-found: error
 
   windows-cuda:
+    if: inputs.platform != 'linux'
     runs-on: windows-2022
     timeout-minutes: 60
     defaults:
@@ -101,7 +117,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: '*-x86_64-cuda'
+          pattern: '*-cuda'
           merge-multiple: true
           path: dist
       - name: Attach archives to a draft release

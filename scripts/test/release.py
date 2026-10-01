@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import platform
 import subprocess
 import sys
 import tarfile
@@ -37,6 +38,12 @@ def main():
                      "licenses/cuda-cccl.txt", "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
+        if os.name != "nt":
+            with binary.open("rb") as executable:
+                header = executable.read(20)
+            machine = 183 if platform.machine().lower() in ("aarch64", "arm64") else 62
+            assert header[:6] == b"\x7fELF\x02\x01", "Expected a 64-bit little-endian ELF executable"
+            assert int.from_bytes(header[18:20], "little") == machine, "Archive CPU architecture mismatch"
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
         plot_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"

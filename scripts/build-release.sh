@@ -15,7 +15,7 @@ mkdir -p "$build_dir/licenses/rust-standard-library"
 cp "$rust_docs/COPYRIGHT-library.html" "$build_dir/licenses/rust-standard-library/"
 cp -r "$rust_docs/licenses" "$build_dir/licenses/rust-standard-library/"
 cargo about generate --locked --fail \
-    --manifest-path keygen-rs/Cargo.toml --target x86_64-unknown-linux-gnu \
+    --manifest-path keygen-rs/Cargo.toml --target "$(uname -m)-unknown-linux-gnu" \
     --output-file "$build_dir/licenses/rust.txt" ci/release/licenses.hbs
 cmake -S . -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \

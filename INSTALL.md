@@ -11,7 +11,7 @@ cd xchplot2
 
 ## Binary archives
 
-Download the Linux or Windows x86-64 CUDA archive and its `.sha256` file from
+Download the Linux x86-64/ARM64 or Windows x86-64 CUDA archive and its `.sha256` file from
 [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 On Linux, verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
 with the downloaded filename without `.tar.gz`. Extract it, then run
@@ -20,7 +20,8 @@ directory to `PATH` to use `xchplot2` elsewhere.
 
 The Linux archive requires glibc 2.35+, `libstdc++.so.6` with `GLIBCXX_3.4.30`
 (available on updated Ubuntu 22.04), and an x86-64 CPU with AES, SSSE3,
-and SSE4.1. It includes native GPU code for
+and SSE4.1, or an ARMv8-A CPU with crypto extensions. The ARM64 archive
+targets CUDA's Linux SBSA platform. It includes native GPU code for
 Maxwell through Blackwell and the CUDA runtime; no development toolkit is
 needed. Use a compatible NVIDIA driver; 575.57.08+ is recommended for the
 pinned CUDA 12.9.1 build. Compiled architecture coverage does not imply that
