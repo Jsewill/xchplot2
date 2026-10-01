@@ -241,6 +241,7 @@ podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
 
 The Linux archive and its SHA-256 checksum are written to `build/release/dist/`.
 The same image and script build natively on x86-64 and ARM64 (CUDA SBSA).
+ARM64 includes every numeric GPU architecture reported by its compiler.
 The release matrix runs both architectures and checks each extracted archive
 on its matching Ubuntu runtime. Manual runs can select Linux or Windows.
 For native Windows, install the [Windows build tools](INSTALL.md#windows)
