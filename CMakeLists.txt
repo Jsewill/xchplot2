@@ -685,6 +685,19 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# Remove an unused ARM header that collides with NVCC and enable MSVC ARM64 AES.
+# Copy the relative include chain so every CPU-reference caller sees the fix.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    foreach(_header AesHash.hpp soft_aes.hpp intrin_portable.h endian.h)
+        configure_file("${POS2_CHIP_DIR}/src/pos/aes/${_header}"
+                       "${_pos2_solver_dir}/pos/aes/${_header}" COPYONLY)
+    endforeach()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch"
+        WORKING_DIRECTORY "${_pos2_solver_dir}" COMMAND_ERROR_IS_FATAL ANY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch")
+endif()
 # CCCL 2.x uses long2 for 64-bit PTX operands; Windows long is only 32 bits.
 # Backport NVIDIA's fix to a build-local header, as with the solver below.
 if(WIN32 AND XCHPLOT2_BUILD_CUDA)
@@ -736,7 +749,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     else()
         target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
     endif()
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
 endif()
 

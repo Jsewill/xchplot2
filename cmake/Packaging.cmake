@@ -51,6 +51,10 @@ file(WRITE "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
     "${_release_cuda}"
     "Rust: ${_release_rust}\n"
     "${_release_runtime}")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "pos2-chip: contrib/pos2-arm-cuda.patch applied (ARM CUDA/MSVC intrinsics)\n")
+endif()
 
 set_target_properties(xchplot2 PROPERTIES
     INSTALL_RPATH "$ORIGIN/../lib" INSTALL_RPATH_USE_LINK_PATH FALSE)

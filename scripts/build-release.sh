@@ -30,10 +30,10 @@ libraries=(libffi.so.8 libedit.so.2 libz.so.1 libzstd.so.1 libtinfo.so.6 libbsd.
 packages=(libffi8 libedit2 zlib1g libzstd1 libtinfo6 libbsd0 liblzma5 libmd0)
 if [[ $arch == aarch64 ]]; then
     libraries+=(libxml2.so.16 libLLVM.so.21.1 libhiprtc-builtins.so.7)
-    packages+=(libxml2-16 libllvm21 libhiprtc-builtins7 ocl-icd-libopencl1)
+    packages+=(libxml2-16 libllvm21 libhiprtc-builtins7 ocl-icd-libopencl1 libomp5)
 else
     libraries+=(libxml2.so.2 libicuuc.so.74 libicudata.so.74)
-    packages+=(libxml2 libicu74)
+    packages+=(libxml2 libicu74 "libomp5-$llvm")
 fi
 for library in "${libraries[@]}"; do
     cp -L "$libdir/$library" "$runtime/$library"
@@ -44,7 +44,7 @@ done
 printf 'AdaptiveCpp: %s\nLLVM: %s\n' \
     "$(cat /opt/release-licenses/adaptivecpp-revision.txt)" \
     "$(/usr/lib/llvm-"$llvm"/bin/llvm-config --version)" > "$build_dir/runtime-info.txt"
-dpkg-query -W -f='${Package}: ${Version}\n' "libllvm$llvm" "libomp5-$llvm" \
+dpkg-query -W -f='${Package}: ${Version}\n' "libllvm$llvm" \
     "${packages[@]}" >> "$build_dir/runtime-info.txt"
 
 cp /usr/share/doc/cuda-cudart-12-9/copyright "$licenses/cuda.txt"
