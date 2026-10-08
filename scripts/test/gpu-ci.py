@@ -24,14 +24,13 @@ MASKS = {"cuda": "cuda", "hip": "hip", "level_zero": "ze"}
 
 
 def plot_vectors(k):
-    # The legacy file header cannot select testnet parameters for `verify`.
-    # Keep full-plot vectors mainnet; existing CTest kernels cover testnet.
+    # Official single-member groups plus raw members at index/meta boundaries.
     return [dict(name="baseline", k=k, strength=2, plot_index=0, meta_group=0,
-                 testnet=False, plot_id="ab" * 32, memo="00" * 112),
+                 raw=False, group_id="ab" * 32, memo="00" * 112),
             dict(name="index-meta-max", k=18, strength=3, plot_index=65535, meta_group=255,
-                 testnet=False, plot_id="ff" * 32, memo=bytes(range(255)).hex()),
+                 raw=True, group_id="ff" * 32, memo=bytes(range(255)).hex()),
             dict(name="strength4", k=18, strength=4, plot_index=1, meta_group=1,
-                 testnet=False, plot_id=bytes(range(32)).hex(), memo="00" * 112)]
+                 raw=True, group_id=bytes(range(32)).hex(), memo="00" * 112)]
 
 
 def gpu_process_snapshot(logs, label, backend):
@@ -234,11 +233,13 @@ def main():
                     summary["vector"] = vector["name"]
                     vector["status"] = "running"
                     prefix = "" if vector["name"] == "baseline" else vector["name"] + "-"
+                    extension = ".plot2" if vector["raw"] else ".gplot"
+                    reference = work / ("reference" + extension)
                     run(f"{prefix}cpu-reference",
-                        [binary, "test", vector["k"], vector["plot_id"], vector["strength"],
+                        [binary, "test", vector["k"], vector["group_id"], vector["strength"],
                          vector["plot_index"], vector["meta_group"], "-m", vector["memo"],
-                         "-o", work, "-N", "reference.plot2", "--config", "/dev/null"])
-                    reference = work / "reference.plot2"
+                         "-o", work, "-N", reference.name, "--config", "/dev/null"]
+                        + (["--raw"] if vector["raw"] else []))
                     summary["stage"] = f"{prefix}cpu-reference-hash"
                     with reference.open("rb") as source:
                         vector["reference_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
@@ -249,11 +250,12 @@ def main():
                     for tier in tiers:
                         for spill in (False, True) if tier in info["spill_tiers"] else (False,):
                             label = prefix + tier + ("-disk" if spill else "")
-                            plot = work / f"{label}.plot2"
+                            plot = work / (label + extension)
                             manifest = work / "manifest.tsv"
                             manifest.write_text(
                                 f"{vector['k']} {vector['strength']} {vector['plot_index']} "
-                                f"{vector['meta_group']} 0 {vector['plot_id']} {vector['memo']} . {plot.name}\n")
+                                f"{vector['meta_group']} {'raw-v2' if vector['raw'] else 'gplot-v2'} "
+                                f"{vector['group_id']} {vector['memo']} . {plot.name}\n")
                             command = [binary, "batch", manifest, "--devices", "0", "--tier", tier,
                                        "--no-progress", "--config", "/dev/null"]
                             if spill:
@@ -284,7 +286,7 @@ def main():
                     run("physical-auto", [binary, "bench", "--devices", "0", "-k", "28", "-n", "3",
                                           "--warmup", "0", "--keep", "--out", work, "--config", "/dev/null"])
                     summary["stage"] = "physical-auto-plots"
-                    plots = sorted(work.glob("bench-*.plot2"))
+                    plots = sorted(work.glob("bench-*.gplot"))
                     if len(plots) != 3:
                         raise RuntimeError("Physical auto-tier run did not produce three plots")
                     for i, plot in enumerate(plots):

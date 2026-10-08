@@ -3,11 +3,9 @@
 // pool keys plus a 32-byte master-SK seed. The GPU plotter uses the returned
 // plot_id / memo to drive the existing batch path.
 //
-// The heavy lifting (BLS12-381 arithmetic, EIP-2333 HD derivation, Chia's
-// taproot construction) uses chia-rs; this
-// crate just sequences the calls and lays out the memo bytes the same way
-// chia-blockchain's create_v2_plots does, so the resulting plots are
-// byte-identical to `chia plots create --v2`.
+// chia-bls supplies BLS12-381 arithmetic and EIP-2333 HD derivation.
+// This shim sequences PoS2 1.0 identity hashing, the V2 taproot contract in
+// chia-blockchain PR #21484, and the existing memo layout.
 
 use chia_bls::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
@@ -41,12 +39,11 @@ fn master_sk_to_local_sk(master: &SecretKey) -> SecretKey {
 }
 
 fn generate_taproot_sk(local_pk: &PublicKey, farmer_pk: &PublicKey) -> SecretKey {
-    // Same construction as chia-blockchain's _generate_taproot_sk: the seed is
-    // std_hash( (local_pk + farmer_pk) || local_pk || farmer_pk ).
+    // V2 taproot: SHA256((local_pk + farmer_pk) || farmer_pk).
+    // chia-blockchain PR #21484 deliberately omits the standalone local key.
     let sum = local_pk + farmer_pk;
-    let mut msg = Vec::with_capacity(48 * 3);
+    let mut msg = Vec::with_capacity(48 * 2);
     msg.extend_from_slice(&sum.to_bytes());
-    msg.extend_from_slice(&local_pk.to_bytes());
     msg.extend_from_slice(&farmer_pk.to_bytes());
 
     let mut hasher = Sha256::new();
@@ -55,18 +52,10 @@ fn generate_taproot_sk(local_pk: &PublicKey, farmer_pk: &PublicKey) -> SecretKey
     SecretKey::from_seed(&seed)
 }
 
-fn generate_plot_public_key(
-    local_pk: &PublicKey,
-    farmer_pk: &PublicKey,
-    include_taproot: bool,
-) -> PublicKey {
-    if include_taproot {
-        let taproot_sk = generate_taproot_sk(local_pk, farmer_pk);
-        let taproot_pk = taproot_sk.public_key();
-        local_pk + farmer_pk + &taproot_pk
-    } else {
-        local_pk + farmer_pk
-    }
+fn generate_plot_public_key(local_pk: &PublicKey, farmer_pk: &PublicKey) -> PublicKey {
+    // Every V2 plot includes taproot, including pool-public-key plots.
+    let taproot_pk = generate_taproot_sk(local_pk, farmer_pk).public_key();
+    local_pk + farmer_pk + &taproot_pk
 }
 
 // Chia's protocol crate also requires the CLVM runtime. Keep only the plot-ID
@@ -105,9 +94,7 @@ fn compute_plot_group_id_v2(strength: u8, plot_pk: &PublicKey, pool_key: &[u8]) 
 /// - `farmer_pk_ptr`: 48-byte G1 (compressed) public key of the farmer.
 /// - `pool_key_ptr` / `pool_kind`: either a 48-byte pool public key
 ///    (`pool_kind = POS2_POOL_PK`) or a 32-byte pool contract puzzle hash
-///    (`pool_kind = POS2_POOL_PH`). When a puzzle hash is used, the plot
-///    public key is constructed with the taproot term — matching
-///    chia-blockchain's include_taproot flag.
+///    (`pool_kind = POS2_POOL_PH`). Both forms use the V2 taproot term.
 /// - `strength`, `plot_index`, `meta_group`: v2 proof-of-space parameters
 ///    that feed compute_plot_id_v2.
 ///
@@ -195,7 +182,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_group(
         Err(_) => return POS2_BAD_FARMER_PK,
     };
 
-    let (include_taproot, pool_key_slice): (bool, &[u8]) = match pool_kind {
+    let pool_key_slice: &[u8] = match pool_kind {
         x if x == POS2_POOL_PK => {
             let bytes: &[u8; 48] = match unsafe { (pool_key_ptr as *const [u8; 48]).as_ref() } {
                 Some(b) => b,
@@ -204,14 +191,14 @@ pub unsafe extern "C" fn pos2_keygen_derive_group(
             if PublicKey::from_bytes(bytes).is_err() {
                 return POS2_BAD_POOL_KEY;
             }
-            (false, &bytes[..])
+            &bytes[..]
         }
         x if x == POS2_POOL_PH => {
             let bytes: &[u8; 32] = match unsafe { (pool_key_ptr as *const [u8; 32]).as_ref() } {
                 Some(b) => b,
                 None => return POS2_BAD_POOL_KEY,
             };
-            (true, &bytes[..])
+            &bytes[..]
         }
         _ => return POS2_BAD_POOL_KIND,
     };
@@ -220,7 +207,7 @@ pub unsafe extern "C" fn pos2_keygen_derive_group(
     let local_sk = master_sk_to_local_sk(&master_sk);
     let local_pk = local_sk.public_key();
 
-    let plot_pk = generate_plot_public_key(&local_pk, &farmer_pk, include_taproot);
+    let plot_pk = generate_plot_public_key(&local_pk, &farmer_pk);
 
     let group_id = compute_plot_group_id_v2(strength, &plot_pk, pool_key_slice);
 
@@ -360,6 +347,18 @@ mod tests {
     }
 
     #[test]
+    fn v2_taproot_matches_upstream_key_vector() {
+        // chia-blockchain PR #21484, test_v2_plot_loading.py.
+        let master = SecretKey::from_seed(&[b'1'; 32]);
+        let farmer = SecretKey::from_seed(&[b'2'; 32]).public_key();
+        let local = master_sk_to_local_sk(&master).public_key();
+        assert_eq!(
+            hex::encode(generate_plot_public_key(&local, &farmer).to_bytes()),
+            "8144c8ef9f89911efdc979145ef674978e5158d6afa818942aa48b183d9a863a6e7535258b3e95e34087598e3476c798"
+        );
+    }
+
+    #[test]
     fn group_ffi_shares_memo_and_derives_member_ids_for_both_pool_kinds() {
         let seed = [0xaa; 32];
         let farmer = SecretKey::from_seed(&[0xbb; 32]).public_key();
@@ -392,11 +391,8 @@ mod tests {
                 POS2_OK
             );
             let master = SecretKey::from_seed(&seed);
-            let plot_pk = generate_plot_public_key(
-                &master_sk_to_local_sk(&master).public_key(),
-                &farmer,
-                kind == POS2_POOL_PH,
-            );
+            let plot_pk =
+                generate_plot_public_key(&master_sk_to_local_sk(&master).public_key(), &farmer);
             assert_eq!(
                 group_id,
                 chia_protocol::compute_plot_group_id_v2(

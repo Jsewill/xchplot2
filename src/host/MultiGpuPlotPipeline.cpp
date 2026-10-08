@@ -291,6 +291,9 @@ MultiGpuPlotPipeline::MultiGpuPlotPipeline(
         std::vector<MultiGpuShardContext> shards)
     : entry_(entry), opts_(opts), shards_(std::move(shards))
 {
+    if (entry_.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (entry_.k < 18 || entry_.k > 28 || (entry_.k & 1))
+        throw std::invalid_argument("k must be even in [18, 28]");
     if (shards_.empty()) {
         throw std::runtime_error(
             "MultiGpuPlotPipeline: no shards — caller must provide at "

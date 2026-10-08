@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(pos2_pr118_compatibility LANGUAGES C CXX)
 
-# Separate build: the plotter continues using its production dependency pin.
+# Separate interoperability/assembly build, pinned to the production PoS2 version.
 if(NOT DEFINED POS2_PR118_DIR)
     include(FetchContent)
     FetchContent_Declare(pos2_pr118
         GIT_REPOSITORY https://github.com/Chia-Network/pos2-chip
-        GIT_TAG e27db9557ec611572ebec3526375e1789a708acc
+        GIT_TAG ff89d3e61f4315311a7f975409a6433e67f699ff
         SOURCE_SUBDIR .no-cmakelists-here)
     FetchContent_MakeAvailable(pos2_pr118)
     set(POS2_PR118_DIR "${pos2_pr118_SOURCE_DIR}")
@@ -50,6 +50,17 @@ add_custom_command(OUTPUT "${keygen_lib}"
     VERBATIM)
 add_custom_target(pos2_pr118_keygen DEPENDS "${keygen_lib}")
 add_executable(pos2_pr118_group group.cpp "${POS2_PR118_DIR}/src/pos/sha/sha256.c")
+# Only the grouped-job tool reads the experimental persisted member-index range.
+# Keep pos2_pr118_check on the unmodified upstream file format and reader.
+foreach(header plot/PlotFile.hpp plot/ChunkCompression.hpp plot/PlotData.hpp plot/PlotIO.hpp prove/Prover.hpp)
+    configure_file("${POS2_PR118_DIR}/src/${header}"
+        "${CMAKE_CURRENT_BINARY_DIR}/pos2-group/${header}" COPYONLY)
+endforeach()
+set(group_patch "${CMAKE_CURRENT_SOURCE_DIR}/plot-index-base.patch")
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${group_patch}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/pos2-group"
+    COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${group_patch}")
 # Record consumed source content as well as HEAD, including local edits and
 # source archives without Git metadata. A resume must use the same reference.
 file(GLOB_RECURSE upstream_identity_sources CONFIGURE_DEPENDS
@@ -64,6 +75,8 @@ foreach(source IN LISTS upstream_identity_sources)
 endforeach()
 file(SHA256 "${solver_patch}" solver_patch_hash)
 string(APPEND upstream_identity_text "pos2-solver-candidates.patch:${solver_patch_hash}\n")
+file(SHA256 "${group_patch}" group_patch_hash)
+string(APPEND upstream_identity_text "plot-index-base.patch:${group_patch_hash}\n")
 string(SHA256 upstream_content_id "${upstream_identity_text}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${upstream_identity_sources})
 set(upstream_git_result 1)
@@ -80,7 +93,8 @@ target_compile_definitions(pos2_pr118_group PRIVATE "POS2_PR118_IDENTITY=\"${ups
 add_dependencies(pos2_pr118_group pos2_pr118_keygen)
 target_compile_features(pos2_pr118_group PRIVATE cxx_std_20)
 target_include_directories(pos2_pr118_group PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver" "${POS2_PR118_DIR}/src" "${keygen_dir}/include")
+    "${CMAKE_CURRENT_BINARY_DIR}/pos2-group" "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver"
+    "${POS2_PR118_DIR}/src" "${keygen_dir}/include")
 target_link_libraries(pos2_pr118_group PRIVATE "${keygen_lib}" fse Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
     target_link_libraries(pos2_pr118_group PRIVATE ws2_32 userenv bcrypt ntdll advapi32)

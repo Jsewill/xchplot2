@@ -13,7 +13,7 @@ int main()
     constexpr std::uint64_t buffer = 128 * MiB;
     std::array tiers{StreamingTier::Plain, StreamingTier::Compact,
                      StreamingTier::Minimal, StreamingTier::Tiny, StreamingTier::Pinned};
-    for (int k = 18; k <= 32; k += 2) {
+    for (int k = 18; k <= 28; k += 2) {
         for (auto tier : tiers) {
             auto const peak = streaming_base_peak_bytes(k, tier);
             assert(vram_fits(peak + buffer, peak, buffer));
@@ -53,7 +53,7 @@ int main()
         catch (std::invalid_argument const&) { threw = true; }
         assert(threw);
     }
-    for (int k : {-1, 0, 17, 19, 33}) {
+    for (int k : {-1, 0, 17, 19, 30, 32, 33}) {
         bool threw = false;
         try { streaming_base_peak_bytes(k, StreamingTier::Tiny); }
         catch (std::invalid_argument const&) { threw = true; }

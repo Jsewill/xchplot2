@@ -330,7 +330,7 @@ int main()
 {
     bool all_ok = true;
     for (int k : {18, 20, 22}) {
-        for (bool testnet : {false, true}) {
+        for (bool testnet : {false}) {
             for (std::uint8_t seed : {7u, 31u}) {
                 all_ok = run_one(k, testnet, seed) && all_ok;
             }

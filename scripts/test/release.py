@@ -207,29 +207,29 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
             subprocess.run([probe], cwd=work, env=env, check=True, timeout=180)
             print("Packaged SYCL CPU kernel check passed" if os.name == "nt"
                   else "Packaged SYCL JIT check passed")
-        plot_id, memo = "ab" * 32, "00" * 112
+        group_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"
-        manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . cpu.plot2\n")
+        manifest.write_text(f"18 2 0 0 gplot-v2 {group_id} {memo} . cpu.gplot\n")
         subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "2",
                         "--config", os.devnull],
                        cwd=work, check=True, timeout=180)
-        subprocess.run([binary, "verify", work / "cpu.plot2", "--full", "--trials", "100",
+        subprocess.run([binary, "verify", work / "cpu.gplot", "--full", "--trials", "100",
                         "--config", os.devnull],
                        check=True, timeout=180)
         # Both single plotting and the SYCL batch pipeline must work without
         # an NVIDIA driver, even when CUDA acceleration is compiled in.
-        subprocess.run([binary, "test", "18", plot_id, "2", "0", "0", "-m", memo,
-                        "-o", work, "-N", "reference.plot2", "--config", os.devnull],
+        subprocess.run([binary, "test", "18", group_id, "2", "0", "0", "-m", memo,
+                        "-o", work, "-N", "reference.gplot", "--config", os.devnull],
                        check=True, timeout=180)
-        reference = (work / "reference.plot2").read_bytes()
-        assert (work / "cpu.plot2").read_bytes() == reference, "CPU batch differs from single plot"
-        manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . sycl.plot2\n")
+        reference = (work / "reference.gplot").read_bytes()
+        assert (work / "cpu.gplot").read_bytes() == reference, "CPU batch differs from single plot"
+        manifest.write_text(f"18 2 0 0 gplot-v2 {group_id} {memo} . sycl.gplot\n")
         subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "1",
                         "--no-progress", "--config", os.devnull],
                        cwd=work, env=dict(os.environ, ACPP_VISIBILITY_MASK="omp",
                                           XCHPLOT2_SYCL_CPU_BENCH="1"),
                        check=True, timeout=180)
-        assert (work / "sycl.plot2").read_bytes() == reference, "SYCL plot differs from CPU reference"
+        assert (work / "sycl.gplot").read_bytes() == reference, "SYCL plot differs from CPU reference"
         if os.name == "nt":
             assert (package / "licenses/microsoft-runtime.txt").stat().st_size > 0
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0

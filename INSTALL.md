@@ -209,7 +209,7 @@ sudo ./scripts/build-container.sh
 sudo podman run --rm --privileged \
     --device /dev/kfd --device /dev/dri \
     -v "$PWD/plots:/out" xchplot2:rocm \
-    test 22 <plot_id_hex> 2 0 0 -G -o /out
+    test 22 <group_id_hex> 2 0 0 -G -o /out
 
 # Run real plotting:
 sudo podman run --rm --privileged \

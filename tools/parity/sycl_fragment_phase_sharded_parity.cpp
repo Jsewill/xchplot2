@@ -290,7 +290,7 @@ int main()
     bool all_ok = true;
     // HostBounce + uniform weights — Phase 2.3d coverage.
     for (int k : {18, 20, 22}) {
-        for (bool testnet : {false, true}) {
+        for (bool testnet : {false}) {
             for (std::uint8_t seed : {7u, 31u}) {
                 all_ok = run_one(k, testnet, seed) && all_ok;
             }
@@ -310,7 +310,7 @@ int main()
     // multiset equivalence is the only correctness invariant — already
     // what this test checks (sort + memcmp).
     for (int k : {18, 20, 22}) {
-        for (bool testnet : {false, true}) {
+        for (bool testnet : {false}) {
             for (std::uint8_t seed : {7u, 31u}) {
                 all_ok = run_one(k, testnet, seed,
                                  /*w0=*/1.0, /*w1=*/1.0,

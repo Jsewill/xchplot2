@@ -28,8 +28,8 @@ inline std::size_t vram_mib_bytes(char const* value, char const* name)
 // Backend sort scratch and the configurable safety buffer are added separately.
 inline std::uint64_t streaming_base_peak_bytes(int k, StreamingTier tier)
 {
-    if (k < 18 || k > 32 || (k & 1))
-        throw std::invalid_argument("k must be even in [18, 32]");
+    if (k < 18 || k > 28 || (k & 1))
+        throw std::invalid_argument("k must be even in [18, 28]");
     std::uint64_t mib = 0;
     switch (tier) {
         case StreamingTier::Plain:   mib = 7290; break;

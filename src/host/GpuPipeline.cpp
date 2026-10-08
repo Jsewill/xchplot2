@@ -376,8 +376,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // any match runs. Nothing else bounds that allocation, and it is not
     // covered by the pool sizing — see SyclBackend.hpp.
     sycl_backend::set_twophase_budget(q, cfg.twophase_budget_bytes);
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -859,8 +860,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // no VRAM to spare, and the scratch is not part of any tier's peak
     // model — see SyclBackend.hpp.
     sycl_backend::set_twophase_budget(q, scratch.twophase_budget_bytes);
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");

@@ -16,11 +16,11 @@ MIB = ci["MIB"]
 parse = ci["parse_inventory"]
 select = ci["tier_caps"]
 vectors = ci["plot_vectors"](28)
-assert [(v["k"], v["strength"], v["plot_index"], v["meta_group"], v["testnet"])
-        for v in vectors] == [(28, 2, 0, 0, False), (18, 3, 65535, 255, False), (18, 4, 1, 1, False)]
-assert vectors[0]["plot_id"] == "ab" * 32 and vectors[0]["memo"] == "00" * 112
-assert vectors[1]["plot_id"] == "ff" * 32 and bytes.fromhex(vectors[1]["memo"]) == bytes(range(255))
-assert bytes.fromhex(vectors[2]["plot_id"]) == bytes(range(32))
+assert [(v["k"], v["strength"], v["plot_index"], v["meta_group"], v["raw"])
+        for v in vectors] == [(28, 2, 0, 0, False), (18, 3, 65535, 255, True), (18, 4, 1, 1, True)]
+assert vectors[0]["group_id"] == "ab" * 32 and vectors[0]["memo"] == "00" * 112
+assert vectors[1]["group_id"] == "ff" * 32 and bytes.fromhex(vectors[1]["memo"]) == bytes(range(255))
+assert bytes.fromhex(vectors[2]["group_id"]) == bytes(range(32))
 assert ci["plot_vectors"](18)[0]["k"] == 18
 
 
@@ -157,7 +157,7 @@ if failure == kind:
 if kind == "test":
     params = [*sys.argv[2:7], sys.argv[sys.argv.index("-m") + 1]]
     assert "--testnet" not in sys.argv and "-T" not in sys.argv
-    (Path(sys.argv[sys.argv.index("-o") + 1]) / "reference.plot2").write_bytes(json.dumps(params).encode())
+    (Path(sys.argv[sys.argv.index("-o") + 1]) / sys.argv[sys.argv.index("-N") + 1]).write_bytes(json.dumps(params).encode())
 if kind == "batch":
     # Simulate an external memory spike; correctness must still check the plot.
     if os.environ["POS2GPU_ASSERT_VRAM"] == "1":
@@ -167,9 +167,9 @@ if kind == "batch":
     tier = sys.argv[sys.argv.index("--tier") + 1]
     print(f"streaming tier: {tier} (")
     print("-> disk")
-    k, strength, index, meta, testnet, plot_id, memo, directory, name = Path(sys.argv[2]).read_text().split()
-    assert testnet == "0" and directory == "."
-    params = [k, plot_id, strength, index, meta, memo]
+    k, strength, index, meta, format, group_id, memo, directory, name = Path(sys.argv[2]).read_text().split()
+    assert format in ("gplot-v2", "raw-v2") and directory == "."
+    params = [k, group_id, strength, index, meta, memo]
     corrupt = failure == "parity" or (failure == "vector-parity" and name.startswith("index-meta-max-"))
     Path(name).write_bytes(b"different" if corrupt else json.dumps(params).encode())
 if kind == "verify":
@@ -253,7 +253,7 @@ if kind == "verify":
                           for suffix in (("", "-disk") if tier in info["spill_tiers"] else ("",))}
                 assert vector["status"] == "passed" and set(vector["full_proofs_validated"]) == labels
                 assert set(vector["full_proofs_validated"].values()) == {2}
-                params = [str(vector["k"]), vector["plot_id"], str(vector["strength"]),
+                params = [str(vector["k"]), vector["group_id"], str(vector["strength"]),
                           str(vector["plot_index"]), str(vector["meta_group"]), vector["memo"]]
                 assert vector["reference_sha256"] == hashlib.sha256(json.dumps(params).encode()).hexdigest()
 

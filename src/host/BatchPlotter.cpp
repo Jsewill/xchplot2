@@ -66,7 +66,7 @@ struct WorkItem {
 };
 
 // Rough per-plot upper-bound estimate for the disk preflight. The actual
-// compressed .plot2 is smaller (FSE over proof-fragment stubs); this
+// compressed plot file is smaller (FSE over proof-fragment stubs); this
 // uncompressed ceiling is deliberately pessimistic so we only WARN when
 // the disk is genuinely too small, not for boundary cases.
 //
@@ -2592,22 +2592,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 try {
                     std::filesystem::create_directories(item.entry.out_dir);
 
-                    std::vector<uint8_t> memo_bytes = item.entry.memo;
-                    if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
-
                     // Fragments are borrowed from the pool's pinned slot; the
                     // producer is synchronised via the depth-1 channel so that
                     // slot won't be reused until we're done here.
                     std::uint64_t const plot_bytes = write_plot_file_parallel(
                         full_path.string(),
                         item.result.fragments(),
-                        item.entry.plot_id.data(),
-                        static_cast<uint8_t>(item.entry.k),
-                        static_cast<uint8_t>(item.entry.strength),
-                        item.entry.testnet ? uint8_t{1} : uint8_t{0},
-                        static_cast<uint16_t>(item.entry.plot_index),
-                        static_cast<uint8_t>(item.entry.meta_group),
-                        std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+                        item.entry);
 
                     ++plots_done;
                     double const completion_offset = std::chrono::duration<double>(
@@ -2988,7 +2979,6 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
         std::unique_ptr<MultiGpuPlotPipeline> pipeline;
         std::filesystem::path                 full_path;
         BatchEntry                            entry;
-        std::vector<std::uint8_t>             memo_bytes;
     };
 
     std::mutex                   q_mu;
@@ -3022,14 +3012,7 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
                 std::uint64_t const plot_bytes = write_plot_file_parallel(
                     job.full_path.string(),
                     job.pipeline->fragments(),
-                    job.entry.plot_id.data(),
-                    static_cast<std::uint8_t>(job.entry.k),
-                    static_cast<std::uint8_t>(job.entry.strength),
-                    job.entry.testnet ? std::uint8_t{1} : std::uint8_t{0},
-                    static_cast<std::uint16_t>(job.entry.plot_index),
-                    static_cast<std::uint8_t>(job.entry.meta_group),
-                    std::span<std::uint8_t const>(
-                        job.memo_bytes.data(), job.memo_bytes.size()));
+                    job.entry);
                 ++plots_written_consumer;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
@@ -3090,8 +3073,6 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
             job.pipeline   = std::move(pipeline);
             job.full_path  = std::move(full_path);
             job.entry      = entry;
-            job.memo_bytes = entry.memo;
-            if (job.memo_bytes.empty()) job.memo_bytes.assign(32 + 48 + 32, 0);
 
             {
                 std::unique_lock<std::mutex> lock(q_mu);
@@ -3255,22 +3236,11 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                                  / entry.out_name;
                 std::filesystem::create_directories(entry.out_dir);
 
-                std::vector<uint8_t> memo_bytes = entry.memo;
-                if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
-
                 auto frags = job.result.fragments();
                 std::uint64_t const plot_bytes = write_plot_file_parallel(
                     full_path.string(),
                     frags,
-                    entry.plot_id.data(),
-                    static_cast<uint8_t>(entry.k),
-                    static_cast<uint8_t>(entry.strength),
-                    entry.testnet ? uint8_t{1} : uint8_t{0},
-                    static_cast<uint16_t>(entry.plot_index),
-                    static_cast<uint8_t>(entry.meta_group),
-                    std::span<uint8_t const>(memo_bytes.data(),
-                                             memo_bytes.size()),
-                    /*thread_count=*/0);
+                    entry, /*thread_count=*/0);
                 ++plots_written_ct;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
@@ -3509,7 +3479,9 @@ std::uint64_t gpu_worker_host_peak_bytes(int k)
     constexpr double kBytesPerEntry = 20.07;
     constexpr double kFixedBytes    = 262.0 * 1024.0 * 1024.0;
     double const entries = static_cast<double>(std::uint64_t{1} << k);
-    return static_cast<std::uint64_t>(kBytesPerEntry * entries + kFixedBytes);
+    // Add the grouped writer's boundaries, sizes, and bounded GSZ index to
+    // the historical raw-writer measurement (32 bytes per 2^(k-6) chunks).
+    return static_cast<std::uint64_t>(kBytesPerEntry * entries + kFixedBytes + entries / 2);
 }
 
 // Free host RAM, probed ONCE per process.

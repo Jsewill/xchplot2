@@ -28,7 +28,9 @@ struct BatchEntry {
     int strength = 2;
     int plot_index = 0;
     int meta_group = 0;
-    bool testnet = false;
+    bool testnet = false; // retained for explicit rejection of obsolete callers
+    bool raw = false; // raw v2 members are temporary inputs to group assembly
+    std::array<uint8_t, 32> group_id{};
     std::array<uint8_t, 32> plot_id{};
     std::vector<uint8_t> memo;
     std::string out_dir;
@@ -70,7 +72,7 @@ struct BatchResult {
 
 // Options controlling batch behavior.
 //   verbose           — per-plot progress on stderr
-//   skip_existing     — if an output .plot2 already exists (and passes a
+//   skip_existing     — if an output plot already exists (and passes a
 //                       header, identity, and chunk-bound checks), skip the plot
 //                       instead of overwriting it
 //   continue_on_error — catch per-plot exceptions and log rather than

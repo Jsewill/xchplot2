@@ -2,8 +2,8 @@
 //
 // Derives the plot_id, shared group identity, and memo for a v2
 // Chia plot from caller-supplied farmer + pool keys. Wraps chia-rs
-// (chia-bls + chia-protocol) so the output is byte-equivalent to what
-// `chia plots create --v2` produces.
+// (chia-bls + chia-protocol), using PoS2 1.0 identities and the V2 taproot
+// derivation in chia-blockchain PR #21484.
 
 #pragma once
 
@@ -35,8 +35,7 @@ extern "C" {
 //   farmer_pk_ptr              : 48 bytes (G1 compressed).
 //   pool_key_ptr + pool_kind   : 48B pool PK (POS2_POOL_PK) or 32B pool
 //                                contract puzzle hash (POS2_POOL_PH).
-//                                PH mode includes the taproot term in
-//                                plot_public_key.
+//                                Both pool modes include the V2 taproot term.
 //   strength, plot_index, meta_group : v2 proof-of-space parameters.
 //
 // Outputs:
@@ -58,7 +57,6 @@ int pos2_keygen_derive_plot(
 
 // Shared group identity and memo using the current key/taproot derivation.
 // Same inputs/outputs as derive_plot, without per-member index/meta_group.
-// This does not opt the production plotter into any new file format.
 int pos2_keygen_derive_group(
     const uint8_t* seed_ptr, size_t seed_len,
     const uint8_t* farmer_pk_ptr,

@@ -198,8 +198,9 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
     std::vector<int> const&               device_ids,
     std::vector<PipelineStageTier> const& tiers)
 {
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -460,8 +461,9 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
                 "run_pipeline_parallel_batch: heterogeneous k across "
                 "entries is not supported (would require per-slot caps)");
         }
-        if (c.k < 18 || c.k > 32 || (c.k & 1) != 0) {
-            throw std::runtime_error("k must be even in [18, 32]");
+        if (c.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+        if (c.k < 18 || c.k > 28 || (c.k & 1) != 0) {
+            throw std::runtime_error("k must be even in [18, 28]");
         }
         if (c.strength < 2) {
             throw std::runtime_error("strength must be >= 2");

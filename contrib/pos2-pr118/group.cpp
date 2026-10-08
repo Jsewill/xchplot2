@@ -12,9 +12,15 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 
 namespace
 {
+// Upstream also writes this structure into Rust's repr(C) PlotGroupInfo.
+static_assert(sizeof(PlotGroupFile::Info) == 64 &&
+              offsetof(PlotGroupFile::Info, version) == 58 &&
+              offsetof(PlotGroupFile::Info, memo_length) == 62);
+
 void require(bool condition, std::string const& message)
 {
     if (!condition)
@@ -73,6 +79,7 @@ struct Job
     PlotGroupParams params;
     std::vector<uint8_t> memo;
     std::vector<Raw> members;
+    uint16_t plot_index_base;
     uint64_t budget;
     uint64_t fixed;
     uint64_t cached_bytes = 0;
@@ -141,10 +148,21 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
     int k, strength, meta;
     std::string group_hex, memo_hex;
     in >> k >> strength >> meta >> group_hex >> memo_hex;
+    std::string tail, base_text, extra;
+    std::getline(in, tail);
+    std::istringstream range(tail);
+    uint64_t plot_index_base = 0;
+    if (range >> base_text)
+    {
+        plot_index_base = number(base_text.c_str());
+        require(!(range >> extra), "invalid group member index base");
+    }
     require(k >= 18 && k <= 28 && meta >= 0 && meta <= 255 && strength >= 2 && strength <= 63,
             "invalid experimental group parameters (k must be 18..28)");
+    require(plot_index_base <= 65535, "group member index base exceeds 65535");
     PlotGroupParams params{PlotGroupId(group_hex), uint8_t(k), uint8_t(strength), uint8_t(meta)};
-    Job job{params, hex(memo_hex), {}, budget, PlotGroupFile::getChunkCountForK(k) * 24};
+    Job job{params, hex(memo_hex), {}, uint16_t(plot_index_base), budget,
+            PlotGroupFile::getChunkCountForK(k) * 24};
     require(job.memo.size() <= 255, "memo too long");
     require(job.fixed < budget, "group index exceeds RAM budget");
     // The file-size cap above bounds text allocation before std::quoted parses.
@@ -157,6 +175,7 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
         job.members.push_back(Raw{name, {}, {}, std::numeric_limits<uint64_t>::max()});
     }
     require(in.eof() && !job.members.empty(), "invalid or empty member list");
+    require(plot_index_base + job.members.size() <= 65536, "group member index exceeds 65535");
     uint64_t const max_raw_count = 1ull << (k - PlotFile::CHUNK_SPAN_RANGE_BITS);
     job.fixed += job.members.size() * (max_raw_count * 8 + 4096);
     job.room(0);
@@ -168,13 +187,13 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
         auto file = input(raw.path);
         uint64_t const size = std::filesystem::file_size(raw.path);
         require(read<std::array<char, 4>>(file) == std::array<char, 4>{'p', 'o', 's', '2'} &&
-                    read<uint8_t>(file) == 1,
-                "expected current raw v1 plot");
+                    read<uint8_t>(file) == PlotFile::FORMAT_VERSION,
+                "expected PoS2 1.0 raw v2 member");
         auto const id = read<std::array<uint8_t, 32>>(file);
-        require(PlotId(id) == params.get_plot_params_for_index(uint16_t(member)).get_plot_id(),
-                "raw member ID mismatch");
+        auto const plot_index = uint16_t(plot_index_base + member);
+        require(PlotGroupId(id) == params.get_plot_group_id(), "raw member group ID mismatch");
         require(read<uint8_t>(file) == k && read<uint8_t>(file) == strength &&
-                    read<uint16_t>(file) == member && read<uint8_t>(file) == meta,
+                    read<uint16_t>(file) == plot_index && read<uint8_t>(file) == meta,
                 "raw member parameters/index mismatch");
         require(read<uint8_t>(file) == job.memo.size(), "raw memo length mismatch");
         std::vector<uint8_t> memo(job.memo.size());
@@ -230,7 +249,8 @@ void assemble(Job& job, std::string const& output_path)
     require(bool(out), "cannot create group temporary file");
     out.exceptions(std::ios::badbit | std::ios::failbit);
     PlotGroupFile::Header header{PlotGroupFile::MAGIC,
-                                 PlotGroupFile::FORMAT_VERSION,
+                                 job.plot_index_base ? PlotGroupFile::INDEXED_FORMAT_VERSION
+                                                     : PlotGroupFile::FORMAT_VERSION,
                                  job.params.get_plot_group_id(),
                                  uint8_t(job.params.get_k()),
                                  uint8_t(job.params.get_strength()),
@@ -239,6 +259,8 @@ void assemble(Job& job, std::string const& output_path)
                                  0,
                                  uint8_t(job.memo.size())};
     out.write(reinterpret_cast<char*>(&header), sizeof(header));
+    if (job.plot_index_base)
+        out.write(reinterpret_cast<char*>(&job.plot_index_base), sizeof(job.plot_index_base));
     out.write(reinterpret_cast<char*>(job.memo.data()), job.memo.size());
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
     uint64_t const range = 1ull << (header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
@@ -315,18 +337,22 @@ void verify(Job& job, std::string const& path)
     auto file = input(path);
     auto const header = read<PlotGroupFile::Header>(file);
     uint64_t const size = std::filesystem::file_size(path);
+    uint8_t const version = job.plot_index_base ? PlotGroupFile::INDEXED_FORMAT_VERSION
+                                                : PlotGroupFile::FORMAT_VERSION;
     require(header.magic == PlotGroupFile::MAGIC &&
-                header.version == PlotGroupFile::FORMAT_VERSION &&
+                header.version == version &&
                 header.group_id == job.params.get_plot_group_id() &&
                 header.k == job.params.get_k() && header.strength == job.params.get_strength() &&
                 header.meta_group == job.params.get_meta_group() &&
                 header.group_size == job.members.size() && header.memo_length == job.memo.size(),
             "group identity/membership mismatch");
+    if (job.plot_index_base)
+        require(read<uint16_t>(file) == job.plot_index_base, "group member index base mismatch");
     std::vector<uint8_t> memo(header.memo_length);
     file.read(reinterpret_cast<char*>(memo.data()), memo.size());
     require(memo == job.memo, "group memo mismatch");
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
-    uint64_t const begin = sizeof(header) + memo.size();
+    uint64_t const begin = uint64_t(file.tellg());
     require(header.chunk_index_offset >= begin && header.chunk_index_offset < size &&
                 size - header.chunk_index_offset <= chunks * 16,
             "invalid grouped index bounds");
@@ -343,7 +369,9 @@ void verify(Job& job, std::string const& path)
         require(bytes > 0 && bytes <= header.chunk_index_offset - end,
                 "invalid grouped chunk size");
         // Bound all allocations in upstream readChunk before calling it.
-        job.room(2 * bytes + uint64_t(header.group_size) * 64 * 64);
+        // The 1.0 reader sizes deltas from encoded bits, not the average
+        // entries/chunk. Bound its chunk, FSE, and fragment buffers accordingly.
+        job.room(24 * bytes + uint64_t(header.group_size) * sizeof(std::vector<ProofFragment>));
         end += bytes;
     }
     require(end == header.chunk_index_offset, "group chunk index does not cover payload");
@@ -387,12 +415,14 @@ void verify(Job& job, std::string const& path)
         challenge.back() = trial;
         for (auto const& qualities : prover.prove(challenge))
         {
-            require(qualities.plot_index < header.group_size, "proof member outside group");
-            size_t const member = qualities.plot_index;
-            auto params = job.params.get_plot_params_for_index(uint16_t(member));
+            require(qualities.plot_index >= job.plot_index_base &&
+                        qualities.plot_index - job.plot_index_base < header.group_size,
+                    "proof member outside group");
+            size_t const member = qualities.plot_index - job.plot_index_base;
+            auto params = job.params.get_plot_params_for_index(qualities.plot_index);
             Solver solver(params);
             ProofFragmentCodec codec(params);
-            ProofValidator validator(job.params, uint16_t(member));
+            ProofValidator validator(job.params, qualities.plot_index);
             for (auto const& quality : qualities.quality_chains)
             {
                 std::array<uint32_t, TOTAL_XS_IN_PROOF / 2> x_bits{};
@@ -422,19 +452,23 @@ void verify(Job& job, std::string const& path)
     for (size_t member = 0; member < job.members.size(); ++member)
     {
         require(validated[member] > 0, "member has no full proof in 32 challenges");
-        std::cout << "PASS group member=" << member << " full proofs=" << validated[member] << '\n';
+        std::cout << "PASS group member=" << job.plot_index_base + member
+                  << " full proofs=" << validated[member] << '\n';
     }
 }
 void prepare(int argc, char** argv)
 {
-    require(argc == 6, "prepare K STRENGTH META_GROUP COUNT (seed, farmer PK, pool key on stdin)");
+    require(argc == 6 || argc == 7,
+            "prepare K STRENGTH META_GROUP COUNT [INDEX_BASE] (seed, farmer PK, pool key on stdin)");
     std::string seed_hex, farmer_hex, pool_hex;
     require(bool(std::cin >> seed_hex >> farmer_hex >> pool_hex), "missing preparation keys");
     auto seed = hex(seed_hex), farmer = hex(farmer_hex), pool = hex(pool_hex);
     uint64_t const k = number(argv[2]), strength = number(argv[3]), meta = number(argv[4]),
                    count = number(argv[5]);
+    uint64_t const plot_index_base = argc == 7 ? number(argv[6]) : 0;
     require(seed.size() == 32 && farmer.size() == 48 && (pool.size() == 32 || pool.size() == 48) &&
-                strength <= 63 && meta <= 255 && count >= 1 && count <= 65535 && k >= 18 && k <= 28,
+                strength <= 63 && meta <= 255 && count >= 1 && count <= 65535 && k >= 18 && k <= 28 &&
+                plot_index_base <= 65535 && plot_index_base + count <= 65536,
             "invalid prepare parameters");
     std::array<uint8_t, 32> id{};
     std::array<uint8_t, 128> memo{};
@@ -446,7 +480,7 @@ void prepare(int argc, char** argv)
     PlotGroupParams params{PlotGroupId(id), uint8_t(k), uint8_t(strength), uint8_t(meta)};
     std::cout << hex(id) << ' ' << hex(std::span(memo).first(memo_size)) << '\n';
     for (uint64_t i = 0; i < count; ++i)
-        std::cout << params.get_plot_params_for_index(uint16_t(i)).get_plot_id().to_string()
+        std::cout << params.get_plot_params_for_index(uint16_t(plot_index_base + i)).get_plot_id().to_string()
                   << '\n';
 }
 } // namespace

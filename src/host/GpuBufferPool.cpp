@@ -150,6 +150,8 @@ inline void* sycl_alloc_host_or_throw(size_t bytes, sycl::queue& q,
 GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     : k(k_), strength(strength_), testnet(testnet_)
 {
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
     sycl::queue& q = sycl_backend::queue();
 
     int const num_section_bits = (k < 28) ? 2 : (k - 26);
@@ -1002,8 +1004,8 @@ namespace {
 // predicted peak.
 inline size_t streaming_sort_scratch_adjustment(int k)
 {
-    if (k < 18 || k > 32 || (k & 1))
-        throw std::invalid_argument("k must be even in [18, 32]");
+    if (k < 18 || k > 28 || (k & 1))
+        throw std::invalid_argument("k must be even in [18, 28]");
     constexpr size_t cub_baseline_at_k28_bytes = 256ULL << 20;
 
     sycl::queue& q = sycl_backend::queue();
@@ -1096,7 +1098,10 @@ size_t streaming_host_bytes(int k, unsigned bytes_per_entry)
 {
     int const num_section_bits = (k < 28) ? 2 : (k - 26);
     std::uint64_t const cap    = match_phase_capacity(k, num_section_bits);
-    return size_t(cap) * bytes_per_entry + kHostFixedBytes;
+    // PoS2 1.0 groups have 2^(k-6) chunks. Boundaries and lengths remain
+    // live alongside compression, plus the compact GSZ index (at most 16 B/chunk).
+    size_t const group_index_bytes = (size_t(1) << (k - 6)) * 32;
+    return size_t(cap) * bytes_per_entry + kHostFixedBytes + group_index_bytes;
 }
 
 }  // namespace

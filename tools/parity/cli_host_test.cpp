@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <set>
 #include <sstream>
 #include <thread>
 #ifdef _WIN32
@@ -43,6 +44,15 @@ void put(std::filesystem::path const& path, std::string const& data)
 }
 }
 namespace pos2gpu {
+std::array<uint8_t, 32> plot_id_for_group(
+    std::array<uint8_t, 32> const& group, uint16_t index, uint8_t meta)
+{
+    auto id = group;
+    id[29] ^= uint8_t(index >> 8);
+    id[30] ^= uint8_t(index);
+    id[31] ^= uint8_t(meta ^ 0xa5);
+    return id;
+}
 std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
 std::string plot_to_file(GpuPlotOptions const&, std::string const&) { return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
@@ -81,8 +91,8 @@ VerifyResult verify_plot_file(std::string const&, size_t trials, bool full)
 }
 extern "C" {
 int pos2_keygen_decode_address(char const*, uint8_t*) { return POS2_BAD_ADDRESS; }
-int pos2_keygen_derive_plot(uint8_t const* seed, size_t, uint8_t const* farmer, uint8_t const* pool,
-    int kind, uint8_t, uint16_t, uint8_t, uint8_t* id, uint8_t* memo, size_t* size)
+int pos2_keygen_derive_group(uint8_t const* seed, size_t, uint8_t const* farmer, uint8_t const* pool,
+    int kind, uint8_t, uint8_t* id, uint8_t* memo, size_t* size)
 {
     ++keygen_calls;
     std::copy_n(seed, 32, id);
@@ -115,7 +125,7 @@ int main(int argc, char** argv)
     do { dir = std::filesystem::temp_directory_path() / ("xchplot2 cli é-" + std::to_string(random())); }
     while (!std::filesystem::create_directory(dir));
     auto const config = dir / "config.toml", manifest = dir / "manifest.tsv";
-    auto line = [&](std::string const& fields, std::string const& name = "plot.plot2") {
+    auto line = [&](std::string const& fields, std::string const& name = "plot.gplot") {
         std::ostringstream row;
         row << fields << ' ' << std::string(64, 'a') << " 00 "
             << std::quoted(dir.string()) << ' ' << std::quoted(name) << '\n';
@@ -128,21 +138,21 @@ int main(int argc, char** argv)
         std::cout.rdbuf(previous);
         return std::pair{code, output.str()};
     };
-    put(manifest, line("18 2 0 0 false"));
+    put(manifest, line("18 2 0 0 gplot-v2"));
     put(config, "");
     assert(cli({"--help", "--config", config.string()}) == 0);
     assert(cli({"-h", "--config", config.string()}) == 0);
     assert(cli({"--config", config.string()}) != 0);
     assert(cli({"--unknown", "--config", config.string()}) != 0);
     put(config, "[verify]\ntrials=1\nfull=true\n");
-    assert(cli({"verify", "unused.plot2", "--config", config.string()}) == 0);
+    assert(cli({"verify", "unused.gplot", "--config", config.string()}) == 0);
     assert(verified_trials == 1 && verified_full);
-    assert(cli({"verify", "unused.plot2", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
+    assert(cli({"verify", "unused.gplot", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
     assert(verified_trials == 2 && !verified_full);
     // Strict conversion rejects prefixes/overflow without changing numeric
     // signs, leading whitespace, config precedence, or verification aliases.
     for (auto const* value : {"2junk", "", "9999999999999999999999999"}) {
-        assert(cli({"verify", "unused.plot2", "--config", config.string(), "-n", value}) == 1);
+        assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", value}) == 1);
         for (auto const* option : {"--k", "--num", "--strength", "--warmup"})
             assert(cli({"bench", "--config", config.string(), option, value}) == 1);
         for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--meta-group", "--pipeline-depth"})
@@ -150,7 +160,7 @@ int main(int argc, char** argv)
         assert(cli({"batch", manifest.string(), "--config", config.string(), "--pipeline-depth", value}) == 1);
         assert(cli({"test", value, std::string(64, 'a'), "--config", config.string()}) == 1);
     }
-    assert(cli({"verify", "unused.plot2", "--config", config.string(), "-n", " +002"}) == 0);
+    assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", " +002"}) == 0);
     assert(verified_trials == 2);
     put(config, "");
     for (auto const* value : {"2junk", "nan", "inf", "1e999", "0", "-1"})
@@ -218,16 +228,23 @@ int main(int argc, char** argv)
 #endif
     assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
     assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "0");
-    for (auto const& fields : {"-1 2 0 0 0", "19 2 0 0 0", "18 999 0 0 0", "18 2 -1 0 0",
-                               "18 2 65536 0 0", "18 2 0 256 0", "18 2 0 0 nonsense"}) {
+    for (auto const& fields : {"-1 2 0 0 gplot-v2", "19 2 0 0 gplot-v2", "30 2 0 0 gplot-v2",
+                               "18 999 0 0 gplot-v2", "18 2 -1 0 raw-v2", "18 2 1 0 gplot-v2",
+                               "18 2 65536 0 raw-v2", "18 2 0 256 gplot-v2", "18 2 0 0 nonsense",
+                               "18 2 0 0 false", "18 2 0 0 true", "18 2 0 0 0"}) {
         put(manifest, line(fields));
         bool threw = false;
         try { pos2gpu::parse_manifest(manifest.string()); }
         catch (std::exception const&) { threw = true; }
         assert(threw);
     }
-    for (auto name : {"../escape.plot2", "/absolute.plot2", "sub/file.plot2", "..\\escape.plot2"}) {
-        put(manifest, line("18 2 0 0 true", name));
+    put(manifest, line("18 2 65535 255 raw-v2"));
+    auto const raw_member = pos2gpu::parse_manifest(manifest.string()).front();
+    assert(raw_member.raw && raw_member.plot_index == 65535 && raw_member.meta_group == 255);
+    for (auto command : {"plot", "bench", "test"})
+        assert(cli({command, "--testnet", "--config", config.string()}) == 1);
+    for (auto name : {"../escape.gplot", "/absolute.gplot", "sub/file.gplot", "..\\escape.gplot"}) {
+        put(manifest, line("18 2 0 0 gplot-v2", name));
         bool threw = false;
         try { pos2gpu::parse_manifest(manifest.string()); }
         catch (std::exception const&) { threw = true; }
@@ -253,7 +270,8 @@ int main(int argc, char** argv)
     // cannot be replaced by another job (including concurrent publishers).
     pos2gpu::BatchEntry entry;
     entry.k = 18; entry.out_dir = (dir / "space and \"quote\"").string();
-    entry.out_name = "plot with spaces.plot2";
+    entry.plot_id = pos2gpu::plot_id_for_group(entry.group_id, 0, 0);
+    entry.out_name = "plot with spaces.gplot";
     auto const saved = dir / "saved.tsv";
     pos2gpu::write_manifest(saved.string(), {entry});
     assert(pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
@@ -280,7 +298,8 @@ int main(int argc, char** argv)
     std::thread same([&] { pos2gpu::write_manifest(saved.string(), {entry}); });
     pos2gpu::write_manifest(saved.string(), {entry});
     same.join();
-    auto different = entry; different.plot_id[0] = 1;
+    auto different = entry; different.group_id[0] = 1;
+    different.plot_id = pos2gpu::plot_id_for_group(different.group_id, 0, 0);
     bool refused = false;
     try { pos2gpu::write_manifest(saved.string(), {different}); }
     catch (std::exception const&) { refused = true; }
@@ -342,6 +361,15 @@ int main(int argc, char** argv)
     auto unmatched = resume; unmatched.insert(unmatched.end(), {"--strength", "4"});
     assert(capture(unmatched).first == 2 && keygen_calls == generated);
     assert(capture(args).first == 0);  // a new job preserves the old manifest
+    // Fresh identities within each unseeded job and across identical requests.
+    std::set<std::array<uint8_t, 32>> plot_ids;
+    std::set<std::vector<uint8_t>> memos;
+    for (auto const& entries : {original, last_entries}) {
+        for (auto const& e : entries) {
+            assert(plot_ids.insert(e.plot_id).second);
+            assert(memos.insert(e.memo).second);
+        }
+    }
     assert(capture(resume).first == 2);  // ambiguous recovery must be explicit
     resume.insert(resume.end(), {"--manifest", job.string()});
     assert(capture(resume).first == 0 && last_entries == original);
@@ -365,6 +393,19 @@ int main(int argc, char** argv)
     auto const seeded_entries = last_entries;
     seeded.push_back("--resume");
     assert(capture(seeded).first == 0 && last_entries == seeded_entries);
+    // A fixed seed shares group keys across meta groups, but their files and
+    // default job manifests must remain distinct.
+    auto seeded_meta = args;
+    seeded_meta.insert(seeded_meta.end(), {"--seed", std::string(64, 'd')});
+    assert(capture(seeded_meta).first == 0);
+    auto const meta_zero = last_entries;
+    seeded_meta.insert(seeded_meta.end(), {"--meta-group", "1"});
+    assert(capture(seeded_meta).first == 0);
+    for (std::size_t i = 0; i < last_entries.size(); ++i) {
+        assert(last_entries[i].group_id == meta_zero[i].group_id);
+        assert(last_entries[i].plot_id != meta_zero[i].plot_id);
+        assert(last_entries[i].out_name != meta_zero[i].out_name);
+    }
     for (auto const& file : std::filesystem::recursive_directory_iterator(dir))
         assert(file.path().filename().string().find(".partial.") == std::string::npos);
     std::filesystem::remove_all(dir);

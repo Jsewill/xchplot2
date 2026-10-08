@@ -94,7 +94,7 @@ void launch_t2_match_prepare(
     sycl::queue& q)
 {
     if (!plot_id_bytes || !temp_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
 
     T2Derived const d = derive_t2(params);
@@ -139,7 +139,7 @@ void launch_t2_match_range(
 {
     (void)t1_count;
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_meta || !d_sorted_mi ||
@@ -198,7 +198,7 @@ void launch_t2_match_section_pair_split_range(
     sycl::queue& q)
 {
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_meta_l_slice || !d_meta_r_slice || !d_mi_r_slice ||

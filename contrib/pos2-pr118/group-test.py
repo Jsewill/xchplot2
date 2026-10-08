@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,16 +34,16 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="xchplot2-groups-") as temporary:
         root = Path(temporary)
-        for mode, count, strength, meta in [("ph", 3, 4, 7), ("pk", 2, 2, 0)]:
+        for mode, count, strength, meta, base in [("ph", 3, 4, 7, 0), ("pk", 2, 2, 255, 65534)]:
             output = root / f"{mode}.gplot"
             command = [sys.executable, tool, args.plotter.resolve(), args.reference.resolve(),
                        "--out", output, "--farmer-pk", farmer,
                        f"--pool-{mode}", "42" * 32 if mode == "ph" else farmer,
                        "--seed", seed, "--k", 18, "--strength", strength,
-                       "--meta-group", meta, "--group-size", count,
+                       "--meta-group", meta, "--group-size", count, "--plot-index", base,
                        "--devices", args.devices, "--tier", args.tier]
             result = run(command)
-            assert all(f"PASS group member={i} " in result.stdout for i in range(count))
+            assert all(f"PASS group member={base + i} " in result.stdout for i in range(count))
             job_path = Path(str(output) + ".job.json")
             raw_dir = Path(str(output) + ".raw")
             job = json.loads(job_path.read_text())
@@ -60,7 +61,7 @@ def main():
             run(command + ["--testnet"], False)
             run(command + ["--seed", ""], False)
             run(command + ["--resume", "--seed", " ".join(["AA"] * 32)])
-            run(command + ["--resume", "--meta-group", 255], False)
+            run(command + ["--resume", "--meta-group", 1], False)
 
             # Recover a partially completed job with the original shared keys.
             output.unlink()
@@ -99,6 +100,80 @@ def main():
             result = run([args.reference.resolve(), "assemble", limited, partial, 16], False)
             assert "RAM budget" in result.stderr
             assert not partial.exists()
+        # Files share keys, but every member in both unseeded jobs is unique.
+        fresh = []
+        members = set()
+        for i in range(2):
+            output = root / f"random-{i}.gplot"
+            outputs = [output, root / f"random-{i}-001.gplot"]
+            command = [sys.executable, tool, args.plotter.resolve(), args.reference.resolve(),
+                       "--out", output, "--farmer-pk", farmer, "--pool-ph", "42" * 32,
+                       "--k", 18, "--group-size", 2, "--files", 2,
+                       "--devices", args.devices, "--tier", args.tier]
+            result = run(command)
+            assert all(f"PASS group member={member} " in result.stdout for member in range(4))
+            job_paths = [Path(str(path) + ".job.json") for path in outputs]
+            saved = [path.read_bytes() for path in job_paths]
+            jobs = [json.loads(data) for data in saved]
+            assert jobs[0]["request"]["files"] == 2
+            assert [job["request"]["meta_group"] for job in jobs] == [0, 0]
+            assert [job["request"].get("plot_index", 0) for job in jobs] == [0, 2]
+            assert jobs[0]["seed"] == jobs[1]["seed"]
+            assert jobs[0]["derived"]["group_id"] == jobs[1]["derived"]["group_id"]
+            assert jobs[0]["derived"]["memo"] == jobs[1]["derived"]["memo"]
+            identities = [identity for job in jobs for identity in job["derived"]["members"]]
+            assert len(set(identities)) == 4 and members.isdisjoint(identities)
+            members.update(identities)
+            before = {path: (digest(path), path.stat().st_mtime_ns) for path in outputs}
+            run(command + ["--resume"])
+            assert [path.read_bytes() for path in job_paths] == saved
+            assert all((digest(path), path.stat().st_mtime_ns) == before[path] for path in outputs)
+            fresh.append(jobs[0]["derived"])
+            run(command + ["--resume", "--files", 1], False)
+            for options in [["--files", 0], ["--files", 32769], ["--plot-index", 65533],
+                            ["--plot-index", -1], ["--plot-index", 65536], ["--meta-group", 256]]:
+                run(command + options, False)
+
+            # An interruption before the next file's job exists keeps the shared seed.
+            outputs[1].unlink()
+            job_paths[1].unlink()
+            shutil.rmtree(Path(str(outputs[1]) + ".raw"))
+            run(command + ["--resume"])
+            assert [path.read_bytes() for path in job_paths] == saved
+            assert all(digest(path) == before[path][0] for path in outputs)
+            assert (digest(output), output.stat().st_mtime_ns) == before[output]
+
+            # Never accept another group's saved keys or a different file's output.
+            edited = json.loads(saved[1])
+            edited["seed"] = "cc" * 32
+            job_paths[1].write_text(json.dumps(edited))
+            failed = run(command + ["--resume"], False)
+            assert jobs[0]["seed"] not in failed.stdout + failed.stderr
+            assert all(digest(path) == before[path][0] for path in outputs)
+            job_paths[1].write_bytes(saved[1])
+            original = outputs[1].read_bytes()
+            assert original[4] == 0x82 and int.from_bytes(original[51:53], "little") == 2
+            assert output.read_bytes()[4] == 2
+            for corrupt in [original[:51] + b"\x03\x00" + original[53:], original[:52]]:
+                outputs[1].write_bytes(corrupt)
+                run(command + ["--resume"], False)
+                assert outputs[1].read_bytes() == corrupt
+            outputs[1].write_bytes(output.read_bytes())
+            run(command + ["--resume"], False)
+            assert outputs[1].read_bytes() == output.read_bytes()
+            outputs[1].write_bytes(original)
+            job_paths[1].unlink()
+            run(command + ["--resume"], False)
+            assert digest(outputs[1]) == before[outputs[1]][0]
+            job_paths[1].write_bytes(saved[1])
+        assert fresh[0]["group_id"] != fresh[1]["group_id"]
+        assert fresh[0]["memo"] != fresh[1]["memo"]
+        # A later occupied destination is rejected before starting any file.
+        occupied = root / "occupied-001.gplot"
+        occupied.write_bytes(b"preserve existing output")
+        run(command + ["--out", root / "occupied.gplot"], False)
+        assert not (root / "occupied.gplot.job.json").exists()
+        assert occupied.read_bytes() == b"preserve existing output"
         if args.large_group:
             output = root / "cardinality.gplot"
             command = [sys.executable, tool, args.plotter.resolve(), args.reference.resolve(),
@@ -125,7 +200,7 @@ def main():
                  "--out", root / "empty.gplot", "--farmer-pk", farmer, option, "",
                  "--k", 18, "--group-size", 2], False)
             assert not (root / "empty.gplot.job.json").exists()
-    print("Multi-member groups, private jobs, completed/partial resume, corruption and RAM rejection passed.")
+    print("Multi-member/file groups, unique identities, private jobs, resume, corruption and RAM rejection passed.")
 
 
 if __name__ == "__main__":

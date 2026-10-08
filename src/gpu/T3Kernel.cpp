@@ -95,7 +95,7 @@ void launch_t3_match_prepare(
     sycl::queue& q)
 {
     if (!plot_id_bytes || !temp_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
 
     T3Derived const d = derive_t3(params);
@@ -140,7 +140,7 @@ void launch_t3_match_range(
 {
     (void)t2_count;
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_meta || !d_sorted_xbits || !d_sorted_mi
@@ -159,7 +159,7 @@ void launch_t3_match_range(
     auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
-    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
     launch_t3_match_all_buckets(
         keys, fk,
@@ -196,7 +196,7 @@ void launch_t3_match_section_pair_range(
 {
     (void)t2_count;
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_meta_l_slice || !d_meta_r_slice
@@ -216,7 +216,7 @@ void launch_t3_match_section_pair_range(
     auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
-    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
     launch_t3_match_section_pair(
         keys, fk,
@@ -254,7 +254,7 @@ void launch_t3_match_section_pair_split_range(
     sycl::queue& q)
 {
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_meta_l_slice || !d_xbits_l_slice
@@ -274,7 +274,7 @@ void launch_t3_match_section_pair_split_range(
     auto const* d_fine_offsets = d_offsets + (d.num_buckets + 1);
 
     AesHashKeys keys = make_keys(plot_id_bytes);
-    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    FeistelKey  fk   = make_feistel_key(plot_id_bytes, params.k);
 
     launch_t3_match_section_pair_split(
         keys, fk,
