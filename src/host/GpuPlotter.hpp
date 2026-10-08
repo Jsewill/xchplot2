@@ -22,17 +22,19 @@ struct GpuPlotOptions {
     int strength = 2;
     int plot_index = 0;
     int meta_group = 0;
-    bool testnet = false;
+    bool testnet = false; // retained for explicit rejection of obsolete callers
+    bool raw = false;
     bool verbose = false;
     bool profile = false;   // print GPU phase breakdown to stderr
     std::array<uint8_t, 32> plot_id{};
+    std::array<uint8_t, 32> group_id{};
 
     // Memo bytes to embed in the plot file. Empty → 112 bytes of zeros
     // (test-only; the harvester will reject this).
     std::vector<uint8_t> memo;
 
     // If non-empty, used as the output filename (basename only — joined to
-    // output_dir). Otherwise the legacy xchplot2 test naming is used.
+    // output_dir). Otherwise the group identity and parameters form the name.
     std::string out_name;
 
     PhaseStrategy t1 = PhaseStrategy::Cpu;
@@ -40,7 +42,7 @@ struct GpuPlotOptions {
     PhaseStrategy t3 = PhaseStrategy::Cpu;
 };
 
-// Run the full pipeline and write a .plot2 file. Returns the absolute
+// Run the full pipeline and write a .gplot (or temporary raw-v2 member). Returns the absolute
 // output path. Throws std::runtime_error on failure.
 std::string plot_to_file(
     GpuPlotOptions const& opts,

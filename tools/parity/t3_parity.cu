@@ -44,10 +44,8 @@ bool run_for_id(std::array<uint8_t, 32> const& plot_id, char const* label, int k
     std::printf("[%s  k=%d  strength=%d  N=%llu]\n",
                 label, k, strength, static_cast<unsigned long long>(total));
 
-    ProofParams params(plot_id.data(),
-                       static_cast<uint8_t>(k),
-                       static_cast<uint8_t>(strength),
-                       /*testnet=*/uint8_t{0});
+    auto const params = PlotProofParams::create_raw(PlotId(plot_id),
+        static_cast<uint8_t>(k), static_cast<uint8_t>(strength));
 
     // ---- CPU pipeline: Xs → T1 → T2 → T3 ----
     size_t max_section_pairs = max_pairs_per_section_possible(params);

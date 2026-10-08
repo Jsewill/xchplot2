@@ -6,24 +6,23 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "pos/FeistelCipher.hpp"
+
 #include <cstdint>
 
 namespace pos2gpu {
 
 struct FeistelKey {
-    uint8_t plot_id[32];
-    int k;
-    int rounds;
+    uint32_t k;
+    FeistelCipher::FullRoundKey round_key;
 };
 
-__host__ __device__ inline FeistelKey make_feistel_key(uint8_t const* plot_id, int k, int rounds = 4)
+// The SHA-256 schedule runs once per plot on the host. Kernels receive the
+// twelve mixing words, exactly as extracted by the pinned CPU reference.
+inline FeistelKey make_feistel_key(uint8_t const* plot_id, int k)
 {
-    FeistelKey fk;
-    fk.k = k;
-    fk.rounds = rounds;
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) fk.plot_id[i] = plot_id[i];
-    return fk;
+    FeistelCipher const cipher(plot_id, static_cast<uint32_t>(k));
+    return {cipher.k_, cipher.round_key_};
 }
 
 __host__ __device__ inline uint64_t feistel_rotate_left(uint64_t value, uint64_t shift, uint64_t bit_length)
@@ -33,43 +32,17 @@ __host__ __device__ inline uint64_t feistel_rotate_left(uint64_t value, uint64_t
     return ((value << shift) & mask) | (value >> (bit_length - shift));
 }
 
-__host__ __device__ inline uint64_t feistel_slice_key(FeistelKey const& fk, int start_bit, int num_bits)
-{
-    int start_byte    = start_bit / 8;
-    int bit_offset    = start_bit % 8;
-    int needed_bytes  = (bit_offset + num_bits + 7) / 8;
-    if (start_byte + needed_bytes > 32) return 0;
-
-    uint64_t key_segment = 0;
-    for (int i = 0; i < needed_bytes; ++i)
-        key_segment = (key_segment << 8) | uint64_t(fk.plot_id[start_byte + i]);
-    int total_bits   = needed_bytes * 8;
-    int shift_amount = total_bits - bit_offset - num_bits;
-    uint64_t mask = (num_bits >= 64 ? ~0ULL : ((1ULL << num_bits) - 1));
-    return (key_segment >> shift_amount) & mask;
-}
-
-__host__ __device__ inline uint64_t feistel_round_key(FeistelKey const& fk, int round_num)
-{
-    int half_length    = fk.k;
-    int bits_for_round = 3 * half_length;
-    int start_bit      = 0;
-    if (fk.rounds > 1)
-        start_bit = (round_num * (256 - 3 * half_length)) / (fk.rounds - 1);
-    return feistel_slice_key(fk, start_bit, bits_for_round);
-}
-
 struct FeistelResultGpu { uint64_t left, right; };
 
 __host__ __device__ inline FeistelResultGpu feistel_round(
-    FeistelKey const& fk, uint64_t left, uint64_t right, uint64_t round_key)
+    FeistelKey const& fk, uint64_t left, uint64_t right, FeistelCipher::RoundKey round_key)
 {
     int k = fk.k;
     uint64_t bitmask = (k == 64 ? ~0ULL : ((1ULL << k) - 1));
     uint64_t a = right;
-    uint64_t b = round_key & bitmask;
-    uint64_t c = (round_key >> k) & bitmask;
-    uint64_t d = (round_key >> (2 * k)) & bitmask;
+    uint64_t b = round_key.b;
+    uint64_t c = round_key.c;
+    uint64_t d = round_key.d;
 
     a = (a + b) & bitmask;
     d = feistel_rotate_left(d ^ a, 16, k);
@@ -93,8 +66,8 @@ __host__ __device__ inline uint64_t feistel_encrypt(FeistelKey const& fk, uint64
     uint64_t bitmask = (k == 64 ? ~0ULL : ((1ULL << k) - 1));
     uint64_t left  = (input_value >> k) & bitmask;
     uint64_t right = input_value & bitmask;
-    for (int r = 0; r < fk.rounds; ++r) {
-        uint64_t round_key = feistel_round_key(fk, r);
+    for (int r = 0; r < 4; ++r) {
+        auto const round_key = fk.round_key.round[r];
         FeistelResultGpu res = feistel_round(fk, left, right, round_key);
         left  = res.left;
         right = res.right;

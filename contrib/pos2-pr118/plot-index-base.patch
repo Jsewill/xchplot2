@@ -1,0 +1,100 @@
+--- a/plot/PlotFile.hpp
++++ b/plot/PlotFile.hpp
+@@ -416,6 +416,8 @@
+ class PlotGroupFile {
+ public:
+     static constexpr uint8_t          FORMAT_VERSION   = 2;
++    // xchplot2 experimental extension: u16 index base after Header, before memo.
++    static constexpr uint8_t          INDEXED_FORMAT_VERSION = 0x82;
+     static constexpr std::string_view MAGIC_STR        = "PoS2";
+     static constexpr uint32_t         MAGIC            = 0x32536f50;   // PoS2
+     static constexpr uint8_t          PROOFS_PER_CHUNK_BITS = 6;
+@@ -466,12 +468,20 @@
+         if (header.magic != MAGIC) {
+             throw std::runtime_error("Plot file invalid magic bytes, not a plot file");
+         }
+-        if (header.version != FORMAT_VERSION) {
++        if (header.version != FORMAT_VERSION && header.version != INDEXED_FORMAT_VERSION) {
+             throw std::runtime_error(
+                 "Plot file format version " + std::to_string(header.version) + " is not supported.");
+         }
+         if (header.group_size < 1) {
+             throw std::runtime_error("Plot group has no individual plots");
++        }
++
++        uint16_t plot_index_base = 0;
++        if (header.version == INDEXED_FORMAT_VERSION) {
++            in.read(reinterpret_cast<char*>(&plot_index_base), sizeof(plot_index_base));
++        }
++        if (uint32_t(plot_index_base) + header.group_size > 65536) {
++            throw std::runtime_error("Plot group member index exceeds 65535");
+         }
+
+         in.seekg(header.memo_length, std::ifstream::cur); // Skip memo for now
+@@ -504,7 +514,9 @@
+
+         info.chunk_index_compressed_size = file_size - info.chunk_index_offset;
+
+-        return PlotGroupFile(std::move(in), std::move(info));
++        PlotGroupFile group(std::move(in), std::move(info));
++        group.plot_index_base_ = plot_index_base;
++        return group;
+     }
+
+     std::vector<uint8_t> readMemo()
+@@ -1001,6 +1013,11 @@
+         return getGroupProofParams().get_plot_params_for_index(plot_index);
+     }
+
++    uint16_t getPlotIndexBase() const
++    {
++        return plot_index_base_;
++    }
++
+     Info const& getInfo() const
+     {
+         return info_;
+@@ -1144,5 +1161,7 @@
+ private:
+     std::ifstream file_;
+     Info info_;
++    // Keep Info's shared C/Rust FFI layout unchanged.
++    uint16_t plot_index_base_ = 0;
+     std::vector<uint64_t> chunk_offsets_;
+ };
+--- a/prove/Prover.hpp
++++ b/prove/Prover.hpp
+@@ -134,15 +134,17 @@
+     {}
+     ~GroupProver() = default;
+
+-    // NOTE: plot_index_base is only useful for testing single-plot groups of non-zero index.
+-    //       This effectively sets the PlotProofData at the expected index so that
+-    //       the proofs can validate properly.
+-    //       Normally plot groups are assumed to be packed and starting at index zero,
+-    //       so this is merely a workaround for testing.
++    // Indexed files carry their member-index base on disk. The optional argument
++    // remains a testing override for legacy single-plot groups only.
+     std::vector<PlotQualityChains> prove(std::span<uint8_t const, 32> const challenge, uint16_t plot_index_base = 0)
+     {
+-        // Since this is only meant for single-plot groups, we're enforcing it here
+-        if (plot_index_base != 0 && plot_group_.getInfo().group_size > 1) {
++        auto const& info = plot_group_.getInfo();
++        if (info.version == PlotGroupFile::INDEXED_FORMAT_VERSION) {
++            if (plot_index_base != 0) {
++                throw std::runtime_error("Cannot override a stored plot index base");
++            }
++            plot_index_base = plot_group_.getPlotIndexBase();
++        } else if (plot_index_base != 0 && info.group_size > 1) {
+             throw std::runtime_error("Non-zero plot index base for a multi-plot group");
+         }
+
+@@ -154,8 +156,6 @@
+             SelectedChallengeSets selected_sets = ChallengeSetSelector::selectChallengeSets(group_params, challenge);
+             proof_fragments_per_set_per_plot[i] = plot_group_.readProofsInRange(selected_sets.fragment_set_ranges[i]);
+         }
+-
+-        PlotGroupFile::Info info = plot_group_.getInfo();
+
+         // now Chainer to find quality chains from these proof fragments
+         std::vector<PlotQualityChains> quality_chains_per_plot(info.group_size);

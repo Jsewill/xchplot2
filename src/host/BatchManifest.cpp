@@ -1,4 +1,5 @@
 #include "host/BatchPlotter.hpp"
+#include "host/PlotFileWriterParallel.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -29,15 +30,21 @@ namespace pos2gpu {
 
 void validate_batch_entry(BatchEntry const& e)
 {
-    if (e.k < 18 || e.k > 32 || (e.k & 1))
-        throw std::invalid_argument("k must be even in [18, 32]");
+    if (e.k < 18 || e.k > 28 || (e.k & 1))
+        throw std::invalid_argument("k must be even in [18, 28]");
     int const sections = e.k < 28 ? 2 : e.k - 26;
     if (e.strength < 2 || e.strength > e.k - sections - 1)
         throw std::invalid_argument("strength must be in [2, k - section_bits - 1]");
     if (e.plot_index < 0 || e.plot_index > 65535)
         throw std::invalid_argument("plot index must be in [0, 65535]");
+    if (!e.raw && e.plot_index != 0)
+        throw std::invalid_argument("single-plot groups must start at plot index 0; use raw-v2 members for group assembly");
+    if (e.testnet)
+        throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots; omit --testnet");
     if (e.meta_group < 0 || e.meta_group > 255)
         throw std::invalid_argument("meta group must be in [0, 255]");
+    if (e.plot_id != plot_id_for_group(e.group_id, uint16_t(e.plot_index), uint8_t(e.meta_group)))
+        throw std::invalid_argument("plot ID does not match group/index/meta group");
     if (e.memo.size() > 255) throw std::invalid_argument("memo exceeds 255 bytes");
     if (e.out_dir.empty()) throw std::invalid_argument("output directory is empty");
     if (e.out_name.empty() || e.out_name == "." || e.out_name == ".." ||
@@ -96,31 +103,31 @@ std::vector<BatchEntry> parse_manifest(std::string const& path)
         if (first == std::string::npos || line[first] == '#') continue;
         std::istringstream is(line);
         BatchEntry e;
-        std::string testnet_s, plot_id_s, memo_s;
+        std::string format_s, group_id_s, memo_s;
         if (!(is >> e.k >> e.strength >> e.plot_index >> e.meta_group
-                 >> testnet_s >> plot_id_s >> std::quoted(memo_s)
+                 >> format_s >> group_id_s >> std::quoted(memo_s)
                  >> std::quoted(e.out_dir) >> std::quoted(e.out_name))) {
             throw std::runtime_error("manifest line " + std::to_string(line_no) +
                                      ": expected 9 whitespace-separated fields "
-                                     "(k strength plot_index meta_group testnet "
-                                     "plot_id_hex memo_hex out_dir out_name)");
+                                     "(k strength plot_index meta_group format "
+                                     "group_id_hex memo_hex out_dir out_name)");
         }
-        std::transform(testnet_s.begin(), testnet_s.end(), testnet_s.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (testnet_s != "0" && testnet_s != "1" && testnet_s != "true" && testnet_s != "false")
-            throw std::invalid_argument("manifest line " + std::to_string(line_no) + ": invalid testnet boolean");
-        e.testnet = testnet_s == "1" || testnet_s == "true";
+        if (format_s != "gplot-v2" && format_s != "raw-v2")
+            throw std::invalid_argument("manifest line " + std::to_string(line_no) +
+                ": expected gplot-v2 or raw-v2; legacy PoS2 manifests cannot be resumed");
+        e.raw = format_s == "raw-v2";
         is >> std::ws;
         if (is.peek() != std::char_traits<char>::eof() && is.peek() != '#')
             throw std::invalid_argument("manifest line " + std::to_string(line_no) + ": trailing fields");
-        if (!parse_hex_array32(plot_id_s, e.plot_id)) {
+        if (!parse_hex_array32(group_id_s, e.group_id)) {
             throw std::runtime_error("manifest line " + std::to_string(line_no) +
-                                     ": plot_id must be 64 hex chars");
+                                     ": group_id must be 64 hex chars");
         }
         if (!parse_hex(memo_s, e.memo) || e.memo.size() > 255) {
             throw std::runtime_error("manifest line " + std::to_string(line_no) +
                                      ": memo invalid hex or > 255 bytes");
         }
+        e.plot_id = plot_id_for_group(e.group_id, uint16_t(e.plot_index), uint8_t(e.meta_group));
         try { validate_batch_entry(e); }
         catch (std::exception const& ex) {
             throw std::invalid_argument("manifest line " + std::to_string(line_no) + ": " + ex.what());
@@ -142,14 +149,15 @@ void write_manifest(std::string const& path, std::vector<BatchEntry> const& entr
         return text;
     };
     std::ostringstream data;
-    data << "# xchplot2 job manifest; contains private plot keys\n";
+    data << "# xchplot2 PoS2 1.0 job manifest; contains private plot keys\n";
     for (auto const& e : entries) {
         validate_batch_entry(e);
         if (e.out_dir.find_first_of("\r\n") != std::string::npos ||
             e.out_name.find_first_of("\r\n") != std::string::npos)
             throw std::invalid_argument("manifest paths cannot contain line breaks");
         data << e.k << ' ' << e.strength << ' ' << e.plot_index << ' ' << e.meta_group
-             << ' ' << e.testnet << ' ' << hex(e.plot_id) << ' ' << std::quoted(hex(e.memo))
+             << ' ' << (e.raw ? "raw-v2" : "gplot-v2") << ' ' << hex(e.group_id)
+             << ' ' << std::quoted(hex(e.memo))
              << ' ' << std::quoted(e.out_dir) << ' ' << std::quoted(e.out_name) << '\n';
     }
     auto const text = data.str();

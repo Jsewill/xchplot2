@@ -26,9 +26,8 @@ static_assert(sizeof(XsCandidateGpu) == 8, "must match pos2-chip Xs_Candidate la
 // Caller must have called initialize_aes_tables() once before invocation.
 //
 //   plot_id_bytes  : 32 bytes
-//   k              : even, 18..32
-//   testnet        : matches ProofHashing::g semantics — XORs x with
-//                    TESTNET_G_XOR_CONST (0xA3B1C4D7) before hashing
+//   k              : even, 18..28
+//   testnet        : must be false; PoS2 1.0 rejects the obsolete hash mode
 //   d_out          : device buffer of at least (1ULL << k) XsCandidateGpu
 //   d_temp_storage : device scratch; pass nullptr first to query size
 //   temp_bytes     : in/out — when d_temp_storage is null, set to required size

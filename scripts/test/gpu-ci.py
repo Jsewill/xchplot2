@@ -116,19 +116,19 @@ def main():
 
         with tempfile.TemporaryDirectory(prefix=".gpu-ci-", dir=scratch) as directory:
             work = Path(directory)
-            plot_id, memo = "ab" * 32, "00" * 112
-            run("cpu-reference", [binary, "test", k, plot_id, "2", "0", "0", "-m", memo,
-                                  "-o", work, "-N", "reference.plot2", "--config", "/dev/null"])
-            reference = work / "reference.plot2"
+            group_id, memo = "ab" * 32, "00" * 112
+            run("cpu-reference", [binary, "test", k, group_id, "2", "0", "0", "-m", memo,
+                                  "-o", work, "-N", "reference.gplot", "--config", "/dev/null"])
+            reference = work / "reference.gplot"
             with reference.open("rb") as source:
                 summary["reference_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
             (logs / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             for tier in tiers:
                 for spill in (False, True) if tier in info["spill_tiers"] else (False,):
                     label = tier + ("-disk" if spill else "")
-                    plot = work / f"{label}.plot2"
+                    plot = work / f"{label}.gplot"
                     manifest = work / "manifest.tsv"
-                    manifest.write_text(f"{k} 2 0 0 0 {plot_id} {memo} . {plot.name}\n")
+                    manifest.write_text(f"{k} 2 0 0 gplot-v2 {group_id} {memo} . {plot.name}\n")
                     command = [binary, "batch", manifest, "--devices", "0", "--tier", tier,
                                "--no-progress", "--config", "/dev/null"]
                     if spill:
@@ -155,7 +155,7 @@ def main():
                 # No software cap: exercise automatic selection on the real card.
                 run("physical-auto", [binary, "bench", "--devices", "0", "-k", "28", "-n", "3",
                                       "--warmup", "0", "--keep", "--out", work, "--config", "/dev/null"])
-                plots = sorted(work.glob("bench-*.plot2"))
+                plots = sorted(work.glob("bench-*.gplot"))
                 if len(plots) != 3:
                     raise RuntimeError("Physical auto-tier run did not produce three plots")
                 for i, plot in enumerate(plots):

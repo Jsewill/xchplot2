@@ -544,6 +544,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=pos2_gpu_host");
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
+    println!("cargo:rustc-link-lib=static=pos2_sha256");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     // ---- CUDA runtime ----

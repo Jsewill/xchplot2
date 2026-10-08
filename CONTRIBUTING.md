@@ -33,21 +33,21 @@ passing a build or a software cap does not certify other physical hardware.
 After a functional change, spot-check a real output with full proofs:
 
 ```bash
-xchplot2 verify /path/to/output.plot2 --full --trials 100
+xchplot2 verify /path/to/output.gplot --full --trials 100
 ```
 
 Default `verify` samples quality chains; `--full` also reconstructs and
 validates full proofs. An empty sample fails. Sampling does not inspect every
 part of a file, so use a matching CPU output for byte parity. For example,
-this synthetic testnet fixture uses the same ID, memo, and plot parameters:
+this synthetic group fixture uses the same ID, memo, and plot parameters:
 
 ```bash
-PLOT_ID=$(printf 'ab%.0s' {1..32})
+GROUP_ID=$(printf 'ab%.0s' {1..32})
 MEMO=$(printf '00%.0s' {1..112})
-xchplot2 test 28 "$PLOT_ID" 2 0 0 -T -m "$MEMO" -o ref -N ref.plot2
-printf '28 2 0 0 1 %s %s out gpu.plot2\n' "$PLOT_ID" "$MEMO" > m.tsv
+xchplot2 test 28 "$GROUP_ID" 2 0 0 -m "$MEMO" -o ref -N ref.gplot
+printf '28 2 0 0 gplot-v2 %s %s out gpu.gplot\n' "$GROUP_ID" "$MEMO" > m.tsv
 xchplot2 batch m.tsv --tier tiny
-sha256sum ref/ref.plot2 out/gpu.plot2
+sha256sum ref/ref.gplot out/gpu.gplot
 ```
 
 The hashes must match. Use a tier and spill configuration appropriate to
@@ -189,8 +189,9 @@ plots are temporary; byte comparisons and reference hashes are recorded.
 
 `contrib/testnet-farming.patch` targets chia-blockchain commit `39f8bec88`
 (2.7.0 Checkpoint Merge). It fixes the v2 service wiring, proof challenge,
-and dependency issues present at that revision. This fixture is not a claim
-about the current state of upstream farming support.
+and dependency issues present at that revision. This historical fixture targets
+the pre-1.0 plot format and cannot farm plots from the current build. It is not
+a claim about current upstream support.
 
 ```bash
 git clone https://github.com/Chia-Network/chia-blockchain
@@ -201,7 +202,7 @@ git apply /path/to/xchplot2/contrib/testnet-farming.patch
 
 The patch header explains its changes. The separate
 [pos2-chip PR #118 compatibility notes](contrib/pos2-pr118/README.md) record
-the proposed grouped format and the pinned revision checked for it.
+the current PoS2 1.0 format and the experimental member-index extension.
 
 ## Documentation checks
 

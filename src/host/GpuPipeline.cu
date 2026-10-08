@@ -849,14 +849,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    int pinned_index)
 {
-    // k=32 is rejected until a 64-bit sort-index path exists: cap =
-    // 2^32 + 2^28 there, so the uint32_t identity/gather index streams
-    // (init_u32_identity, gather_u64/permute) wrap and the gathers read
-    // the wrong entries — no error, silently wrong plot.
-    if (cfg.k < 18 || cfg.k > 30 || (cfg.k & 1) != 0) {
-        throw std::runtime_error(
-            "k must be even in [18, 30] (k=32 exceeds the 32-bit "
-            "sort-index scheme and is not yet supported)");
+    // PoS2 1.0 supports even k in 18..28.
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -1365,13 +1361,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     size_t    pinned_capacity,
     StreamingPinnedScratch const& scratch)
 {
-    // See run_gpu_pipeline: k=32 overflows the uint32_t sort-index
-    // streams (cap > UINT32_MAX), so it is rejected until a 64-bit
-    // index path exists.
-    if (cfg.k < 18 || cfg.k > 30 || (cfg.k & 1) != 0) {
-        throw std::runtime_error(
-            "k must be even in [18, 30] (k=32 exceeds the 32-bit "
-            "sort-index scheme and is not yet supported)");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");

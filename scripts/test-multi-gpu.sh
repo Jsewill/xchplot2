@@ -81,31 +81,30 @@ fi
 if [[ "$GPU_COUNT" -lt 2 ]]; then
     skip "need >=2 GPUs (got $GPU_COUNT); set XCHPLOT2_TEST_GPU_COUNT=N to override"
 else
-    # k=22 is the smallest k the pipeline supports; two plots give each
-    # worker one entry to process under round-robin partition.
+    # Use k=22 and two plots to exercise both workers.
     #
-    # We build a MANIFEST with pre-computed plot_id_hex + memo_hex (the
-    # `batch` subcommand feeds these straight to run_gpu_pipeline) rather
+    # We build a MANIFEST with group_id_hex + memo_hex (`batch` derives
+    # member IDs from the group before running the GPU pipeline) rather
     # than invoking `plot` with synthetic BLS keys — pos2_keygen rejects
     # anything that isn't a real G1 public key with rc=-1 before the
     # pipeline ever sees it.
     LIVE_TSV="$TMP_OUT/live.tsv"
-    printf '22\t2\t0\t0\t0\tabababababababababababababababababababababababababababababababab\t00\t%s\tm1.plot2\n22\t2\t1\t0\t0\tcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\t00\t%s\tm2.plot2\n' \
+    printf '22\t2\t0\t0\tgplot-v2\tabababababababababababababababababababababababababababababababab\t00\t%s\tm1.gplot\n22\t2\t0\t0\tgplot-v2\tcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\t00\t%s\tm2.gplot\n' \
         "$TMP_OUT" "$TMP_OUT" > "$LIVE_TSV"
 
     if "$XCHPLOT2" batch "$LIVE_TSV" --devices 0,1 >"$TMP_OUT/log" 2>&1
     then
-        # Two output files expected, each starting with the 'pos2' magic.
+        # Two output files expected, each starting with the 'PoS2' magic.
         local_ok=1
         shopt -s nullglob
-        plots=("$TMP_OUT"/m?.plot2)
+        plots=("$TMP_OUT"/m?.gplot)
         if [[ "${#plots[@]}" -ne 2 ]]; then
             fail "expected 2 plots, got ${#plots[@]}"
             local_ok=0
         else
             for p in "${plots[@]}"; do
                 magic=$(head -c 4 "$p" | tr -d '\0')
-                if [[ "$magic" != "pos2" ]]; then
+                if [[ "$magic" != "PoS2" ]]; then
                     fail "bad magic in $(basename "$p"): '$magic'"
                     local_ok=0
                 fi
@@ -135,10 +134,10 @@ else
         b64=$(printf '%64s' '' | tr ' ' b)
         c64=$(printf '%64s' '' | tr ' ' c)
         d64=$(printf '%64s' '' | tr ' ' d)
-        printf '22\t2\t0\t0\t0\t%s\t00\t%s\tp0.plot2\n' "$a64" "$SD_DIR"
-        printf '22\t2\t1\t0\t0\t%s\t00\t%s\tp1.plot2\n' "$b64" "$SD_DIR"
-        printf '22\t2\t2\t0\t0\t%s\t00\t%s\tp2.plot2\n' "$c64" "$SD_DIR"
-        printf '22\t2\t3\t0\t0\t%s\t00\t%s\tp3.plot2\n' "$d64" "$SD_DIR"
+        printf '22\t2\t0\t0\tgplot-v2\t%s\t00\t%s\tp0.gplot\n' "$a64" "$SD_DIR"
+        printf '22\t2\t0\t0\tgplot-v2\t%s\t00\t%s\tp1.gplot\n' "$b64" "$SD_DIR"
+        printf '22\t2\t0\t0\tgplot-v2\t%s\t00\t%s\tp2.gplot\n' "$c64" "$SD_DIR"
+        printf '22\t2\t0\t0\tgplot-v2\t%s\t00\t%s\tp3.gplot\n' "$d64" "$SD_DIR"
     } > "$SD_TSV"
     sed "s|$SD_DIR|$MD_DIR|g" "$SD_TSV" > "$MD_TSV"
 
@@ -146,7 +145,7 @@ else
     && "$XCHPLOT2" batch "$MD_TSV" --devices 0,1 >"$TMP_OUT/md.log" 2>&1
     then
         parity_ok=1
-        for f in "$SD_DIR"/p?.plot2; do
+        for f in "$SD_DIR"/p?.gplot; do
             name=$(basename "$f")
             sd_sha=$(sha256sum "$f"          | awk '{print $1}')
             md_sha=$(sha256sum "$MD_DIR/$name" | awk '{print $1}')

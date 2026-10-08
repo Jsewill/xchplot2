@@ -33,7 +33,9 @@ size_t streaming_host_bytes(int k, unsigned bytes_per_entry)
     std::uint64_t const cap =
         std::uint64_t(max_pairs_per_section(k, num_section_bits))
         * (std::uint64_t{1} << num_section_bits);
-    return size_t(cap) * bytes_per_entry + kHostFixedBytes;
+    // Grouped writer boundaries, lengths, and bounded GSZ index.
+    size_t const group_index_bytes = (size_t(1) << (k - 6)) * 32;
+    return size_t(cap) * bytes_per_entry + kHostFixedBytes + group_index_bytes;
 }
 
 }  // namespace
@@ -135,6 +137,8 @@ inline void pool_alloc_host(void** out, size_t bytes, char const* what)
 GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     : k(k_), strength(strength_), testnet(testnet_)
 {
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
     int const num_section_bits = (k < 28) ? 2 : (k - 26);
     total_xs = 1ULL << k;
     cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);

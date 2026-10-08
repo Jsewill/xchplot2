@@ -53,12 +53,12 @@ def main():
             assert header[:6] == b"\x7fELF\x02\x01", "Expected a 64-bit little-endian ELF executable"
             assert int.from_bytes(header[18:20], "little") == machine, "Archive CPU architecture mismatch"
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
-        plot_id, memo = "ab" * 32, "00" * 112
+        group_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"
-        manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . cpu.plot2\n")
+        manifest.write_text(f"18 2 0 0 gplot-v2 {group_id} {memo} . cpu.gplot\n")
         subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "2", "--config", os.devnull],
                        cwd=work, check=True, timeout=180)
-        subprocess.run([binary, "verify", work / "cpu.plot2", "--full", "--trials", "100",
+        subprocess.run([binary, "verify", work / "cpu.gplot", "--full", "--trials", "100",
                         "--config", os.devnull],
                        check=True, timeout=180)
         if os.name == "nt":

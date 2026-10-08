@@ -251,7 +251,7 @@ message(STATUS "XCHPLOT2_AES_ROUND=${XCHPLOT2_AES_ROUND}")
 # pin. The `if(NOT DEFINED ...)` guard lets a plain edit take effect on
 # reconfigure while still honouring user -D overrides.
 if(NOT DEFINED POS2_CHIP_GIT_TAG)
-    set(POS2_CHIP_GIT_TAG "b0da7aa7bec3974833d651173a6d9953c21eb808")
+    set(POS2_CHIP_GIT_TAG "ff89d3e61f4315311a7f975409a6433e67f699ff")
 endif()
 
 if(NOT DEFINED POS2_CHIP_DIR)
@@ -365,12 +365,13 @@ if(NOT _solver_patch_result EQUAL 0)
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch")
+add_library(pos2_sha256 STATIC "${POS2_CHIP_DIR}/src/pos/sha/sha256.c")
 add_library(pos2_chip_headers INTERFACE)
 target_include_directories(pos2_chip_headers INTERFACE
     "${_pos2_solver_dir}"
     "${POS2_CHIP_DIR}/src"
 )
-target_link_libraries(pos2_chip_headers INTERFACE fse)
+target_link_libraries(pos2_chip_headers INTERFACE fse pos2_sha256)
 # Match pos2-chip's CPU AES build flags so its AesHash compiles in CPU TUs.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)

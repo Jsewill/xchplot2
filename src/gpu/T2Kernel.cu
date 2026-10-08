@@ -400,7 +400,7 @@ cudaError_t launch_t2_match_prepare(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28) return cudaErrorInvalidValue;
     if (params.strength < 2)            return cudaErrorInvalidValue;
     if (!t2_params_shift_safe(params))  return cudaErrorInvalidValue;
 
@@ -458,7 +458,7 @@ cudaError_t launch_t2_match_range(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
     if (!t2_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_sorted_meta || !d_sorted_mi ||
@@ -529,7 +529,7 @@ cudaError_t launch_t2_match_section_pair_split_range(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
     if (!t2_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_meta_l_slice || !d_meta_r_slice || !d_mi_r_slice ||
