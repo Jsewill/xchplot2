@@ -226,6 +226,15 @@ of a documentation move.
 
 ## Binary releases
 
+Public release notes describe user-visible changes, breaking changes, required
+user actions, and material limitations. Link to installation and compatibility
+guides instead of repeating them.
+
+Keep test results, qualification records, logs, CI links, build and machine
+details, and retry history in local records or CI artifacts. Exclude them from
+release notes and release attachments unless explicitly requested. Before
+publishing, review the final notes and asset list for relevance to users.
+
 The release workflow builds the standalone CMake executable in
 `ci/release/Containerfile`: Ubuntu 22.04, CUDA 12.9.1, CMake 3.28.3, and
 Rust 1.98.1. CUDA targets are explicit in `scripts/build-release.sh`; keep
@@ -280,8 +289,9 @@ The workflow runs host tests and tests the extracted archive on Ubuntu 22.04
 without a GPU toolkit. Run `scripts/test/release.py ARCHIVE.tar.gz` to repeat
 the archive, CPU plotting, and full-proof check. For GPU qualification, use
 the packaged executable for k=22 and k=28 CPU byte comparisons, full proofs,
-and the tier, spill, and recovery checks described above. Record qualification
-in the release notes; keep generated plots and detailed logs out of the tree.
+and the tier, spill, and recovery checks described above. Keep qualification
+results and detailed logs in local records or CI artifacts, and keep generated
+plots out of the tree.
 `gpu-ci.py --binary /path/to/extracted/bin/xchplot2` uses the package for
 plotting and verification while retaining the build's parity and inventory
 tools. Both must come from the same source revision and toolchain.
