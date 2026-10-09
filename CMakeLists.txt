@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(pos2-gpu VERSION 0.13.0 LANGUAGES C CXX)
+project(pos2-gpu VERSION 0.14.0 LANGUAGES C CXX)
 
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
