@@ -159,7 +159,7 @@ if(_xchplot2_nvcc AND NOT DEFINED CMAKE_CUDA_COMPILER)
 endif()
 unset(_xchplot2_nvcc CACHE)
 
-project(pos2-gpu VERSION 0.14.0 LANGUAGES C CXX CUDA)
+project(pos2-gpu VERSION 0.14.1 LANGUAGES C CXX CUDA)
 
 if(MSVC)
     # Match the release Rust staticlib's CRT in every CMake configuration.
