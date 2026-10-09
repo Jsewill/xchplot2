@@ -128,13 +128,13 @@ dependencies = [
 
 [[package]]
 name = "chia-bls"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e698e6c8cb9ce00f626d810fcbae6ded7fed8806c4b550a5f58e9b7bbee565a9"
+checksum = "13714271ac5b8e685eade644c8af9fb80be06410bd085d25c2c4efaece0382cc"
 dependencies = [
  "blst",
- "chia-sha2 0.48.0",
- "chia-traits 0.48.0",
+ "chia-sha2 0.50.0",
+ "chia-traits 0.50.0",
  "hex",
  "hkdf",
  "linked-hash-map",
@@ -155,15 +155,15 @@ dependencies = [
 
 [[package]]
 name = "chia-protocol"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b6b29c18eda3a4b4f882611e2227dde34345778c3e3bd3d3d8d84354b30208"
+checksum = "d443f8d206aef0b1dbc5baad17c561e7333a887b0ac0f9d986d46e2adb087ca3"
 dependencies = [
- "chia-bls 0.48.0",
+ "chia-bls 0.50.0",
  "chia-pos2",
- "chia-sha2 0.48.0",
- "chia-traits 0.48.0",
- "chia_streamable_macro 0.48.0",
+ "chia-sha2 0.50.0",
+ "chia-traits 0.50.0",
+ "chia_streamable_macro 0.50.0",
  "clvm-traits",
  "clvm-utils",
  "clvmr",
@@ -181,9 +181,9 @@ dependencies = [
 
 [[package]]
 name = "chia-sha2"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee35326425aed01e8663dc684dc481e874faa765310053f1a65588b89f825a6e"
+checksum = "0d6424c9c7932bc4998ad37443e2834ec4a8cb2c67a30726fbec17402e743d15"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -201,12 +201,12 @@ dependencies = [
 
 [[package]]
 name = "chia-traits"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6972053dd26eebb3e99ffb36ba8a9b137796cc9449f65baf1a6eabfc87f7df2e"
+checksum = "5a57f25b6a3859559af1d11048c8b3c3d8984b5dbb7f22b9ae73a24384b73956"
 dependencies = [
- "chia-sha2 0.48.0",
- "chia_streamable_macro 0.48.0",
+ "chia-sha2 0.50.0",
+ "chia_streamable_macro 0.50.0",
  "thiserror 2.0.18",
 ]
 
@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "chia_streamable_macro"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c98bd0b5564fb5449821cf15700b5e83c7d45e95612a389043a94516aff8e516"
+checksum = "a736ee873a90467023ff04ab8fb3f86d279607b7bb93627c6c9bfbc896e660d8"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -236,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "clvm-derive"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3034b613c080faf641a5941c4e2c4e600b9286f9db185a3106d85c2113a0b9f"
+checksum = "d842ec5f5f45d864ba37d7588f1d57ed570e5323f24433e0fa4ab90c344fb869"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -247,9 +247,9 @@ dependencies = [
 
 [[package]]
 name = "clvm-traits"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06d7b1b6e7a83e1d4a4864ac34ef3f7933ef87fcd3f2fa2ff09f9d38a19f61af"
+checksum = "00760211cde1d24f8362edfafc022a5394226ee04ea3748366a4cb42c890b77a"
 dependencies = [
  "clvm-derive",
  "clvmr",
@@ -259,11 +259,11 @@ dependencies = [
 
 [[package]]
 name = "clvm-utils"
-version = "0.48.0"
+version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e0097091430891e21aae51e3c170b989825b5f300787c05dddc81f7e52ad48c"
+checksum = "30b205de2c9a82fe0db2a816f6717bd5b865dcaff4d14b9f4a886388b6fb7fec"
 dependencies = [
- "chia-sha2 0.48.0",
+ "chia-sha2 0.50.0",
  "clvm-traits",
  "clvmr",
  "hex",
@@ -272,9 +272,9 @@ dependencies = [
 
 [[package]]
 name = "clvmr"
-version = "0.19.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a9d2342687e3210c4b7f8556966ee80e4106d451dd4d8b14b1e446412c640a4"
+checksum = "9e13f0990d3f7f4e88d8f8a49a0082ecdd42de4f2e5206d571c02fac9519c649"
 dependencies = [
  "bitflags",
  "bitvec",
@@ -867,7 +867,7 @@ name = "pos2_keygen"
 version = "0.1.0"
 dependencies = [
  "bech32",
- "chia-bls 0.48.0",
+ "chia-bls 0.50.0",
  "chia-protocol",
  "hex",
  "sha2 0.11.0",
