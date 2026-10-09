@@ -52,7 +52,7 @@ void show_one(uint32_t seed, int k, uint32_t x_l, uint32_t x_r, uint32_t match_k
     uint32_t target_mask = (1u << target_bits) - 1u;
 
     // CPU
-    AesHash cpu(plot_id.data(), k);
+    AesHash cpu(plot_id, k);
     uint32_t cpu_g_xl = cpu.g_x<true>(x_l, 16);
     uint32_t cpu_g_xr = cpu.g_x<true>(x_r, 16);
     uint32_t cpu_target_xl = cpu.matching_target<true>(1, match_key_r, uint64_t(x_l), 0) & target_mask;

@@ -8,11 +8,17 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <random>
+#include <set>
 #include <sstream>
 #include <thread>
-#include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#endif
 
 extern "C" int xchplot2_main(int, char**);
 namespace {
@@ -38,6 +44,15 @@ void put(std::filesystem::path const& path, std::string const& data)
 }
 }
 namespace pos2gpu {
+std::array<uint8_t, 32> plot_id_for_group(
+    std::array<uint8_t, 32> const& group, uint16_t index, uint8_t meta)
+{
+    auto id = group;
+    id[29] ^= uint8_t(index >> 8);
+    id[30] ^= uint8_t(index);
+    id[31] ^= uint8_t(meta ^ 0xa5);
+    return id;
+}
 std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
 std::string plot_to_file(GpuPlotOptions const&, std::string const&) { return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
@@ -76,8 +91,8 @@ VerifyResult verify_plot_file(std::string const&, size_t trials, bool full)
 }
 extern "C" {
 int pos2_keygen_decode_address(char const*, uint8_t*) { return POS2_BAD_ADDRESS; }
-int pos2_keygen_derive_plot(uint8_t const* seed, size_t, uint8_t const* farmer, uint8_t const* pool,
-    int kind, uint8_t, uint16_t, uint8_t, uint8_t* id, uint8_t* memo, size_t* size)
+int pos2_keygen_derive_group(uint8_t const* seed, size_t, uint8_t const* farmer, uint8_t const* pool,
+    int kind, uint8_t, uint8_t* id, uint8_t* memo, size_t* size)
 {
     ++keygen_calls;
     std::copy_n(seed, 32, id);
@@ -95,43 +110,141 @@ int pos2_keygen_derive_subseed(uint8_t const* seed, uint64_t index, uint8_t* out
     return POS2_OK;
 }
 }
-int main()
+int main(int argc, char** argv)
 {
-    char path[] = "/tmp/xchplot2-cli-test-XXXXXX";
-    assert(mkdtemp(path));
-    std::filesystem::path const dir(path), config = dir / "config.toml", manifest = dir / "manifest.tsv";
-    auto line = [&](std::string const& fields, std::string const& name = "plot.plot2") {
-        return fields + " " + std::string(64, 'a') + " 00 " + dir.string() + " " + name + "\n";
+#ifdef _WIN32
+    if (std::string(argv[0]) == "parity-test") {
+        put(std::getenv("XCHPLOT2_TEST_MARKER"), "executed");
+        return 17;
+    }
+#else
+    (void)argc; (void)argv;
+#endif
+    std::filesystem::path dir;
+    std::random_device random;
+    do { dir = std::filesystem::temp_directory_path() / ("xchplot2 cli é-" + std::to_string(random())); }
+    while (!std::filesystem::create_directory(dir));
+    auto const config = dir / "config.toml", manifest = dir / "manifest.tsv";
+    auto line = [&](std::string const& fields, std::string const& name = "plot.gplot") {
+        std::ostringstream row;
+        row << fields << ' ' << std::string(64, 'a') << " 00 "
+            << std::quoted(dir.string()) << ' ' << std::quoted(name) << '\n';
+        return row.str();
     };
-    put(manifest, line("18 2 0 0 false"));
+    auto capture = [&](std::vector<std::string> const& command) {
+        std::ostringstream output;
+        auto* previous = std::cout.rdbuf(output.rdbuf());
+        int const code = cli(command);
+        std::cout.rdbuf(previous);
+        return std::pair{code, output.str()};
+    };
+    put(manifest, line("18 2 0 0 gplot-v2"));
     put(config, "");
     assert(cli({"--help", "--config", config.string()}) == 0);
     assert(cli({"-h", "--config", config.string()}) == 0);
     assert(cli({"--config", config.string()}) != 0);
     assert(cli({"--unknown", "--config", config.string()}) != 0);
     put(config, "[verify]\ntrials=1\nfull=true\n");
-    assert(cli({"verify", "unused.plot2", "--config", config.string()}) == 0);
+    assert(cli({"verify", "unused.gplot", "--config", config.string()}) == 0);
     assert(verified_trials == 1 && verified_full);
-    assert(cli({"verify", "unused.plot2", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
+    assert(cli({"verify", "unused.gplot", "--config", config.string(), "--trials", "2", "--no-full"}) == 0);
     assert(verified_trials == 2 && !verified_full);
+    // Strict conversion rejects prefixes/overflow without changing numeric
+    // signs, leading whitespace, config precedence, or verification aliases.
+    for (auto const* value : {"2junk", "", "9999999999999999999999999"}) {
+        assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", value}) == 1);
+        for (auto const* option : {"--k", "--num", "--strength", "--warmup"})
+            assert(cli({"bench", "--config", config.string(), option, value}) == 1);
+        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--meta-group", "--pipeline-depth"})
+            assert(cli({"plot", "--config", config.string(), option, value}) == 1);
+        assert(cli({"batch", manifest.string(), "--config", config.string(), "--pipeline-depth", value}) == 1);
+        assert(cli({"test", value, std::string(64, 'a'), "--config", config.string()}) == 1);
+    }
+    assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", " +002"}) == 0);
+    assert(verified_trials == 2);
+    put(config, "");
+    for (auto const* value : {"2junk", "nan", "inf", "1e999", "0", "-1"})
+        assert(cli({"bench", "--config", config.string(), "--target-size", value}) == 1);
+    for (auto const* value : {"nan", "inf", "1e999", "18446744073709551616", "-1G", "2GiBjunk"})
+        assert(cli({"bench", "--config", config.string(), "--max-host-ram", value}) == 1);
+    for (int position = 2; position <= 5; ++position) {
+        std::vector<std::string> test = {"test", "18", std::string(64, 'a'), "2", "0", "0", "1", "--config", config.string()};
+        test[position + 1] = "2junk";
+        assert(cli(test) == 1);
+    }
+    for (auto const* shell : {"bash", "zsh", "fish"}) {
+        auto const [code, script] = capture({"completions", shell, "--config", config.string()});
+        assert(code == 0 && script.find("verify") != std::string::npos);
+        if (std::string(shell) == "zsh") {
+            assert(script.find("'2:plot file:_files'") != std::string::npos);
+            assert(script.find("'--trials[Random challenges]:count:'") != std::string::npos);
+            assert(script.find("'-n[Random challenges]:count:'") != std::string::npos);
+        }
+        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers"})
+            assert(script.find(option) != std::string::npos);
+    }
     put(config, "[batch]\ndevices=\"0\"\nquiet=0\nprogress=false\ncpu=false\nauto-spill=false\n");
-    assert(cli({"batch", manifest.string(), "--config", config.string()}) == 0);
+    assert(cli({"batch", manifest.string(), "--config", config.string(), "--temp-dir", dir.string()}) == 0);
+    assert(std::string(std::getenv("XCHPLOT2_TEMP_DIR")) == dir.string());
     assert(last_options.device_ids == std::vector<int>{0} && !last_options.quiet);
     assert(last_options.cpu_workers == 0 && !last_options.auto_host_ram_spill);
     put(config, "[bench]\nwarmup=0\nnum=1\nkeep=false\nverbose=false\n");
+#ifdef _WIN32
+    _putenv_s("POS2GPU_ASSERT_VRAM", "");
+#else
+    unsetenv("POS2GPU_ASSERT_VRAM");
+#endif
     int const before = batch_calls;
     assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
     assert(batch_calls == before + 1);
-    for (auto const& fields : {"-1 2 0 0 0", "19 2 0 0 0", "18 999 0 0 0", "18 2 -1 0 0",
-                               "18 2 65536 0 0", "18 2 0 256 0", "18 2 0 0 nonsense"}) {
+    auto const [json_code, json_report] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json"});
+    assert(json_code == 0 && json_report.starts_with("{\"version\":"));
+    assert(json_report.find("\"queue_plots\":1") != std::string::npos);
+    assert(json_report.find("\"s_per_plot\":1") != std::string::npos);
+    assert(json_report.find("\"label\":\"end-to-end\"") != std::string::npos);
+    assert(json_report.find("\"pipeline\":\"\"") != std::string::npos);
+    auto const [plain_code, plain_output] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json", "--no-json"});
+    assert(plain_code == 0 && plain_output.empty());
+#ifndef _WIN32
+    std::ostringstream escaped;
+    auto* previous = std::cout.rdbuf(escaped.rdbuf());
+    // Exercise string escaping through an actual output directory.
+    auto const quoted = dir / "quote\"\\tab\t";
+    std::filesystem::create_directory(quoted);
+    assert(cli({"bench", "--config", config.string(), "--out", quoted.string(), "--json"}) == 0);
+    std::cout.rdbuf(previous);
+    assert(escaped.str().find("quote\\\"\\\\tab\\u0009") != std::string::npos);
+    auto const invalid_utf8 = dir / std::string("byte-\xff");
+    std::filesystem::create_directory(invalid_utf8);
+    auto const [bytes_code, bytes_report] = capture({"bench", "--config", config.string(), "--out", invalid_utf8.string(), "--json"});
+    assert(bytes_code == 0 && bytes_report.find("byte-\\u00ff") != std::string::npos);
+#endif
+
+    assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "1");
+#ifdef _WIN32
+    _putenv_s("POS2GPU_ASSERT_VRAM", "0");
+#else
+    setenv("POS2GPU_ASSERT_VRAM", "0", 1);
+#endif
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
+    assert(std::string(std::getenv("POS2GPU_ASSERT_VRAM")) == "0");
+    for (auto const& fields : {"-1 2 0 0 gplot-v2", "19 2 0 0 gplot-v2", "30 2 0 0 gplot-v2",
+                               "18 999 0 0 gplot-v2", "18 2 -1 0 raw-v2", "18 2 1 0 gplot-v2",
+                               "18 2 65536 0 raw-v2", "18 2 0 256 gplot-v2", "18 2 0 0 nonsense",
+                               "18 2 0 0 false", "18 2 0 0 true", "18 2 0 0 0"}) {
         put(manifest, line(fields));
         bool threw = false;
         try { pos2gpu::parse_manifest(manifest.string()); }
         catch (std::exception const&) { threw = true; }
         assert(threw);
     }
-    for (auto name : {"../escape.plot2", "/absolute.plot2", "sub/file.plot2", "..\\escape.plot2"}) {
-        put(manifest, line("18 2 0 0 true", name));
+    put(manifest, line("18 2 65535 255 raw-v2"));
+    auto const raw_member = pos2gpu::parse_manifest(manifest.string()).front();
+    assert(raw_member.raw && raw_member.plot_index == 65535 && raw_member.meta_group == 255);
+    for (auto command : {"plot", "bench", "test"})
+        assert(cli({command, "--testnet", "--config", config.string()}) == 1);
+    for (auto name : {"../escape.gplot", "/absolute.gplot", "sub/file.gplot", "..\\escape.gplot"}) {
+        put(manifest, line("18 2 0 0 gplot-v2", name));
         bool threw = false;
         try { pos2gpu::parse_manifest(manifest.string()); }
         catch (std::exception const&) { threw = true; }
@@ -139,10 +252,16 @@ int main()
     }
     auto const tests = dir / "space;true # directory";
     std::filesystem::create_directory(tests);
-    auto const failing = tests / "quote'\"_test";
     auto const marker = dir / "executed";
+#ifdef _WIN32
+    auto const failing = tests / "quote'_test.exe";
+    std::filesystem::copy_file(argv[0], failing);
+    _putenv_s("XCHPLOT2_TEST_MARKER", marker.string().c_str());
+#else
+    auto const failing = tests / "quote'\"_test";
     put(failing, "#!/bin/sh\nprintf executed > '" + marker.string() + "'\nexit 17\n");
     std::filesystem::permissions(failing, std::filesystem::perms::owner_all);
+#endif
     put(config, "");
     assert(cli({"parity-check", "--config", config.string(), "--dir", tests.string()}) != 0);
     assert(std::filesystem::exists(marker));
@@ -151,21 +270,53 @@ int main()
     // cannot be replaced by another job (including concurrent publishers).
     pos2gpu::BatchEntry entry;
     entry.k = 18; entry.out_dir = (dir / "space and \"quote\"").string();
-    entry.out_name = "plot with spaces.plot2";
+    entry.plot_id = pos2gpu::plot_id_for_group(entry.group_id, 0, 0);
+    entry.out_name = "plot with spaces.gplot";
     auto const saved = dir / "saved.tsv";
     pos2gpu::write_manifest(saved.string(), {entry});
     assert(pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+#ifdef _WIN32
+    PSID owner = nullptr;
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR security = nullptr;
+    assert(::GetNamedSecurityInfoW(saved.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, nullptr, &acl, nullptr, &security) == ERROR_SUCCESS);
+    SECURITY_DESCRIPTOR_CONTROL control{};
+    DWORD revision = 0;
+    assert(::GetSecurityDescriptorControl(security, &control, &revision));
+    assert((control & SE_DACL_PROTECTED) && acl && acl->AceCount == 1);
+    ACCESS_ALLOWED_ACE* ace = nullptr;
+    assert(::GetAce(acl, 0, reinterpret_cast<void**>(&ace)));
+    assert(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ::EqualSid(owner, &ace->SidStart));
+    assert((ace->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS);
+    ::LocalFree(security);
+#else
     assert((std::filesystem::status(saved).permissions() &
             (std::filesystem::perms::group_all | std::filesystem::perms::others_all))
            == std::filesystem::perms::none);
+#endif
     std::thread same([&] { pos2gpu::write_manifest(saved.string(), {entry}); });
     pos2gpu::write_manifest(saved.string(), {entry});
     same.join();
-    auto different = entry; different.plot_id[0] = 1;
+    auto different = entry; different.group_id[0] = 1;
+    different.plot_id = pos2gpu::plot_id_for_group(different.group_id, 0, 0);
     bool refused = false;
     try { pos2gpu::write_manifest(saved.string(), {different}); }
     catch (std::exception const&) { refused = true; }
     assert(refused && pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+#ifdef _WIN32
+    refused = false;
+    try { pos2gpu::write_manifest(saved.string() + ":keys", {entry}); }
+    catch (std::invalid_argument const&) { refused = true; }
+    assert(refused && pos2gpu::parse_manifest(saved.string()) == std::vector{entry});
+    for (auto const* name : {"plot:keys", "plot.", "plot ", "plot*"}) {
+        auto invalid = entry; invalid.out_name = name;
+        refused = false;
+        try { pos2gpu::validate_batch_entry(invalid); }
+        catch (std::invalid_argument const&) { refused = true; }
+        assert(refused);
+    }
+#endif
     auto const race = dir / "race.tsv";
     auto publish = [&](pos2gpu::BatchEntry const& e) {
         try { pos2gpu::write_manifest(race.string(), {e}); return true; }
@@ -187,13 +338,6 @@ int main()
     std::vector<std::string> args = {"plot", "--config", config.string(), "-k", "18", "-n", "3",
         "-f", std::string(96, 'a'), "--pool-ph", std::string(64, 'b'), "-o", plots.string(),
         "--quiet", "--no-progress", "--continue-on-error"};
-    auto capture = [&](std::vector<std::string> const& command) {
-        std::ostringstream output;
-        auto* previous = std::cout.rdbuf(output.rdbuf());
-        int const code = cli(command);
-        std::cout.rdbuf(previous);
-        return std::pair{code, output.str()};
-    };
     write_limit = 1; fail_remaining = true;
     auto [failed_code, failed_output] = capture(args);
     assert(failed_code == 3 && std::count(failed_output.begin(), failed_output.end(), '\n') == 1);
@@ -217,6 +361,15 @@ int main()
     auto unmatched = resume; unmatched.insert(unmatched.end(), {"--strength", "4"});
     assert(capture(unmatched).first == 2 && keygen_calls == generated);
     assert(capture(args).first == 0);  // a new job preserves the old manifest
+    // Fresh identities within each unseeded job and across identical requests.
+    std::set<std::array<uint8_t, 32>> plot_ids;
+    std::set<std::vector<uint8_t>> memos;
+    for (auto const& entries : {original, last_entries}) {
+        for (auto const& e : entries) {
+            assert(plot_ids.insert(e.plot_id).second);
+            assert(memos.insert(e.memo).second);
+        }
+    }
     assert(capture(resume).first == 2);  // ambiguous recovery must be explicit
     resume.insert(resume.end(), {"--manifest", job.string()});
     assert(capture(resume).first == 0 && last_entries == original);
@@ -240,6 +393,19 @@ int main()
     auto const seeded_entries = last_entries;
     seeded.push_back("--resume");
     assert(capture(seeded).first == 0 && last_entries == seeded_entries);
+    // A fixed seed shares group keys across meta groups, but their files and
+    // default job manifests must remain distinct.
+    auto seeded_meta = args;
+    seeded_meta.insert(seeded_meta.end(), {"--seed", std::string(64, 'd')});
+    assert(capture(seeded_meta).first == 0);
+    auto const meta_zero = last_entries;
+    seeded_meta.insert(seeded_meta.end(), {"--meta-group", "1"});
+    assert(capture(seeded_meta).first == 0);
+    for (std::size_t i = 0; i < last_entries.size(); ++i) {
+        assert(last_entries[i].group_id == meta_zero[i].group_id);
+        assert(last_entries[i].plot_id != meta_zero[i].plot_id);
+        assert(last_entries[i].out_name != meta_zero[i].out_name);
+    }
     for (auto const& file : std::filesystem::recursive_directory_iterator(dir))
         assert(file.path().filename().string().find(".partial.") == std::string::npos);
     std::filesystem::remove_all(dir);

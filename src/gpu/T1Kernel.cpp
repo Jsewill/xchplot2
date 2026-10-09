@@ -91,7 +91,7 @@ void launch_t1_match_prepare(
     sycl::queue& q)
 {
     if (!plot_id_bytes || !temp_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
 
     T1Derived const d = derive_t1(params);
@@ -134,7 +134,7 @@ void launch_t1_match_range(
 {
     (void)total;
     if (!plot_id_bytes) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.k < 18 || params.k > 32) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (params.k < 18 || params.k > 28) throw std::invalid_argument("invalid argument to launch wrapper");
     if (params.strength < 2)            throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_temp_storage)                throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_xs || !d_out_meta || !d_out_mi || !d_out_count)

@@ -1,0 +1,17 @@
+AMD Windows compiler dependencies
+
+The archive includes the HIP 6.4.2 runtime compiler (hiprtc0604.dll and
+hiprtc-builtins0604.dll), amd_comgr0604.dll, and ROCm device bitcode.
+The compiler libraries are collected from AMD's HIP SDK 6.4.2 distribution.
+Their source licenses are reproduced in hiprtc.txt, hip-headers.txt,
+rocm-comgr.txt, and rocm-device-libs.txt; LLVM notices are in llvm.txt and
+llvm-third-party.txt.
+
+The AMD graphics driver provides the HIP runtime, amdhip64_6.dll, under
+AMD's driver terms. That driver component is not included in this archive.
+End users do not need the HIP SDK or its additional math libraries.
+
+Deployment guidance:
+https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/conceptual/deployment-guidelines.html
+Compiler source: https://github.com/ROCm/llvm-project/tree/d366fa84f3fdcbd4b10847ebd5db572ae12a34fb
+HIP RTC source: https://github.com/ROCm/clr/tree/123eb5128769ba30fda8f84414421bc858e8c695

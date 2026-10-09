@@ -47,11 +47,15 @@
 #include <system_error>
 #include <thread>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#include <io.h>
+#else
 #include <unistd.h>  // isatty — in-place progress line only on a TTY
+#endif
 
 namespace pos2gpu {
-
-void initialize_aes_tables(); // forward decl from AesGpu.cu
 
 namespace {
 
@@ -62,7 +66,7 @@ struct WorkItem {
 };
 
 // Rough per-plot upper-bound estimate for the disk preflight. The actual
-// compressed .plot2 is smaller (FSE over proof-fragment stubs); this
+// compressed plot file is smaller (FSE over proof-fragment stubs); this
 // uncompressed ceiling is deliberately pessimistic so we only WARN when
 // the disk is genuinely too small, not for boundary cases.
 //
@@ -136,7 +140,12 @@ constexpr double kTibBytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 // CpuMemoryGate, which needs the SUM of the two.
 std::uint64_t self_rss_bytes()
 {
-#if defined(__linux__)
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters))) return 0;
+    return static_cast<std::uint64_t>(counters.WorkingSetSize);
+#elif defined(__linux__)
     std::FILE* fp = std::fopen("/proc/self/statm", "re");
     if (!fp) return 0;
     unsigned long long total_pages = 0;
@@ -803,7 +812,11 @@ void emit_progress_line(std::string const& log_prefix,
     // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
     // one-line-per-plot when redirected to a file/pipe or when verbose
     // logging would interleave and garble the in-place line.
+#ifdef _WIN32
+    static bool const stderr_tty = ::_isatty(::_fileno(stderr)) != 0;
+#else
     static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
+#endif
     bool const in_place = stderr_tty && !opts.verbose;
 
     // Only surfaces on a resume (--skip-existing). Without it the line counts
@@ -1240,8 +1253,8 @@ namespace {
 namespace {
 
 // Polls the driver's own free-VRAM counter for the life of a batch slice and
-// records the low-water mark, giving us the peak device memory the process
-// ACTUALLY held — as opposed to what the s_malloc trace believes it held.
+// records the low-water mark, giving us the largest sampled device-wide
+// decrease in free memory, including allocations outside the s_malloc trace.
 //
 // This exists because the tier peak models are calibrated against that trace,
 // and the trace cannot see a raw sycl::malloc_device by construction. A
@@ -1252,8 +1265,9 @@ namespace {
 // the number the driver reports is the only check that cannot be fooled by an
 // allocation someone forgot to account for.
 //
-// Caveat: on a GPU shared with another process, that process allocating
-// mid-run inflates our measured peak. The check is therefore fatal only under
+// Caveat: this counter cannot attribute memory to a process. Other processes
+// allocating mid-run inflate the delta; freeing memory can hide our peak.
+// Short-lived allocations between polls can also be missed. The check is fatal only under
 // POS2GPU_ASSERT_VRAM=1 (which `bench` sets, being a controlled measurement)
 // and merely loud elsewhere.
 class VramWatchdog {
@@ -1670,7 +1684,6 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     }
 
     if (device_id >= 0 || is_cpu_device(device_id)) bind_current_device(device_id);
-    initialize_aes_tables();
 
     bool const verbose = opts.verbose;
 
@@ -2579,22 +2592,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 try {
                     std::filesystem::create_directories(item.entry.out_dir);
 
-                    std::vector<uint8_t> memo_bytes = item.entry.memo;
-                    if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
-
                     // Fragments are borrowed from the pool's pinned slot; the
                     // producer is synchronised via the depth-1 channel so that
                     // slot won't be reused until we're done here.
                     std::uint64_t const plot_bytes = write_plot_file_parallel(
                         full_path.string(),
                         item.result.fragments(),
-                        item.entry.plot_id.data(),
-                        static_cast<uint8_t>(item.entry.k),
-                        static_cast<uint8_t>(item.entry.strength),
-                        item.entry.testnet ? uint8_t{1} : uint8_t{0},
-                        static_cast<uint16_t>(item.entry.plot_index),
-                        static_cast<uint8_t>(item.entry.meta_group),
-                        std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+                        item.entry);
 
                     ++plots_done;
                     double const completion_offset = std::chrono::duration<double>(
@@ -2799,11 +2803,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     // stream_buffers_guard on every exit path (including the rethrows
     // above and the producer's catch).
 
-    // VRAM watchdog: compare the peak the driver actually saw against what we
-    // told the tier picker we would use. The peak models cannot see raw
-    // sycl::malloc_device allocations, so this is the only check that catches
-    // an unaccounted one — which is exactly the bug that made every 4-11 GB
-    // NVIDIA card OOM on every tier but tiny.
+    // Compare the sampled device-wide decrease in free memory against the
+    // declared budget. On an idle GPU this can catch unaccounted raw
+    // sycl::malloc_device allocations that the allocation trace misses.
     vram.stop();
     if (vram.available() && declared_base_bytes > 0) {
         uint64_t const held     = twophase_bytes_held();
@@ -2814,11 +2816,13 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         if (!opts.quiet) {
             std::fprintf(stderr,
                 "%s %s: peak %.0f MiB of %.0f free "
-                "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared)\n",
+                "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared; "
+                "device-wide free-memory delta, min free %.0f MiB)\n",
                 log_prefix.c_str(), mem_label,
                 to_mib(peak), to_mib(vram.baseline()),
                 to_mib(declared_base_bytes), to_mib(held),
-                to_mib(vram_safety_margin()), to_mib(declared));
+                to_mib(vram_safety_margin()), to_mib(declared),
+                to_mib(vram.baseline() - peak));
         }
         // The watchdog above only catches a model that under-declares — the OOM
         // direction. Over-declaring is silent and still wrong: the picker then
@@ -2831,10 +2835,11 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // bound.
         if (peak > 0 && declared_base_bytes > peak * 3 / 2) {
             std::fprintf(stderr,
-                "%s %s: WARNING — model declares %.0f MiB but the path only "
-                "peaked at %.0f MiB. An over-declared model denies this path to "
-                "cards that can run it. Re-derive the peak from this measured "
-                "number, not from a ratio against another tier's anchor.\n",
+                "%s %s: WARNING — model declares %.0f MiB but the sampled "
+                "device-wide free-memory delta was %.0f MiB. An over-declared "
+                "model can deny this path to cards that can run it. Repeat on "
+                "an idle GPU before reducing the model; other processes and "
+                "the polling interval can affect this measurement.\n",
                 log_prefix.c_str(), mem_label,
                 to_mib(declared_base_bytes), to_mib(peak));
         }
@@ -2843,17 +2848,22 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // regressions that overflow a card sized to exactly model + buffer.
         if (peak > declared) {
             std::fprintf(stderr,
-                "%s %s: ERROR — peak %.0f MiB exceeds the %.0f MiB declared for this "
-                "path by %.0f MiB, past the safety margin. A device allocation is "
-                "unaccounted in the peak model; a card sized from it will OOM. See "
-                "the two-phase budget notes in SyclBackend.hpp.\n",
+                "%s %s: ERROR — device-wide free-memory delta %.0f MiB exceeds "
+                "the %.0f MiB declared for this path by %.0f MiB, past the safety "
+                "margin (baseline free %.0f MiB, min free %.0f MiB). This can "
+                "indicate an unaccounted allocation or another process using "
+                "the GPU; the free-memory counter cannot distinguish them. "
+                "Check driver process-memory diagnostics and repeat on an idle "
+                "GPU before attributing this to the peak model. See the "
+                "two-phase budget notes in SyclBackend.hpp.\n",
                 log_prefix.c_str(), mem_label, to_mib(peak), to_mib(declared),
-                to_mib(peak - declared));
+                to_mib(peak - declared), to_mib(vram.baseline()),
+                to_mib(vram.baseline() - peak));
             if (char const* v = std::getenv("POS2GPU_ASSERT_VRAM");
                 v && v[0] == '1')
             {
                 throw std::runtime_error(
-                    "VRAM assertion failed: peak " +
+                    "VRAM assertion failed: device-wide free-memory delta " +
                     std::to_string(uint64_t(to_mib(peak))) + " MiB > declared " +
                     std::to_string(uint64_t(to_mib(declared))) + " MiB");
             }
@@ -2969,7 +2979,6 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
         std::unique_ptr<MultiGpuPlotPipeline> pipeline;
         std::filesystem::path                 full_path;
         BatchEntry                            entry;
-        std::vector<std::uint8_t>             memo_bytes;
     };
 
     std::mutex                   q_mu;
@@ -3003,14 +3012,7 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
                 std::uint64_t const plot_bytes = write_plot_file_parallel(
                     job.full_path.string(),
                     job.pipeline->fragments(),
-                    job.entry.plot_id.data(),
-                    static_cast<std::uint8_t>(job.entry.k),
-                    static_cast<std::uint8_t>(job.entry.strength),
-                    job.entry.testnet ? std::uint8_t{1} : std::uint8_t{0},
-                    static_cast<std::uint16_t>(job.entry.plot_index),
-                    static_cast<std::uint8_t>(job.entry.meta_group),
-                    std::span<std::uint8_t const>(
-                        job.memo_bytes.data(), job.memo_bytes.size()));
+                    job.entry);
                 ++plots_written_consumer;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
@@ -3071,8 +3073,6 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
             job.pipeline   = std::move(pipeline);
             job.full_path  = std::move(full_path);
             job.entry      = entry;
-            job.memo_bytes = entry.memo;
-            if (job.memo_bytes.empty()) job.memo_bytes.assign(32 + 48 + 32, 0);
 
             {
                 std::unique_lock<std::mutex> lock(q_mu);
@@ -3236,22 +3236,11 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                                  / entry.out_name;
                 std::filesystem::create_directories(entry.out_dir);
 
-                std::vector<uint8_t> memo_bytes = entry.memo;
-                if (memo_bytes.empty()) memo_bytes.assign(32 + 48 + 32, 0);
-
                 auto frags = job.result.fragments();
                 std::uint64_t const plot_bytes = write_plot_file_parallel(
                     full_path.string(),
                     frags,
-                    entry.plot_id.data(),
-                    static_cast<uint8_t>(entry.k),
-                    static_cast<uint8_t>(entry.strength),
-                    entry.testnet ? uint8_t{1} : uint8_t{0},
-                    static_cast<uint16_t>(entry.plot_index),
-                    static_cast<uint8_t>(entry.meta_group),
-                    std::span<uint8_t const>(memo_bytes.data(),
-                                             memo_bytes.size()),
-                    /*thread_count=*/0);
+                    entry, /*thread_count=*/0);
                 ++plots_written_ct;
                 double const completion_offset = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_start).count();
@@ -3266,7 +3255,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
                 if (opts.verbose) {
                     std::fprintf(stderr,
                         "[pipeline-plot] wrote %s (%llu fragments)\n",
-                        full_path.c_str(),
+                        full_path.string().c_str(),
                         static_cast<unsigned long long>(frags.size()));
                 }
             } catch (std::exception const& e) {
@@ -3490,7 +3479,9 @@ std::uint64_t gpu_worker_host_peak_bytes(int k)
     constexpr double kBytesPerEntry = 20.07;
     constexpr double kFixedBytes    = 262.0 * 1024.0 * 1024.0;
     double const entries = static_cast<double>(std::uint64_t{1} << k);
-    return static_cast<std::uint64_t>(kBytesPerEntry * entries + kFixedBytes);
+    // Add the grouped writer's boundaries, sizes, and bounded GSZ index to
+    // the historical raw-writer measurement (32 bytes per 2^(k-6) chunks).
+    return static_cast<std::uint64_t>(kBytesPerEntry * entries + kFixedBytes + entries / 2);
 }
 
 // Free host RAM, probed ONCE per process.

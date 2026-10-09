@@ -19,7 +19,7 @@ xchplot2 plot -k 28 -n 10 \
 
 | Option | Meaning |
 |---|---|
-| `-k`, `--k K` | Plot size; default 28 |
+| `-k`, `--k K` | Even plot size in 18..28; default 28 |
 | `-n`, `--num N` | Number of plots; default 1 |
 | `-s`, `--strength S` | Proof strength; default 2 |
 | `-f`, `--farmer-pk HEX` | Farmer public key, 96 hex characters |
@@ -27,10 +27,9 @@ xchplot2 plot -k 28 -n 10 \
 | `--pool-ph HEX` | Pool puzzle hash, 64 hex characters |
 | `-c`, `--pool-contract-address ADDRESS` | Pool contract address, `xch1...` or `txch1...` |
 | `-o`, `--out DIR` | Output directory; default current directory |
-| `-i`, `--plot-index N` | Starting plot index; default 0, incremented per plot |
+| `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
 | `-g`, `--meta-group N` | Meta-group field; default 0 |
 | `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
-| `-T`, `--testnet` | Use testnet proof parameters |
 | `-v`, `--verbose` | Print additional worker and plotting details |
 
 Supply the farmer key and one of the pool key, puzzle hash, or contract
@@ -89,7 +88,7 @@ a later plot fails. Exit status is 0 for completion, 1 for argument errors,
 2 for an exception, 3 for per-plot failures, or 4 for unfinished work.
 `-q` and `-v` are mutually exclusive.
 
-Plots are written to an exclusively created `<name>.plot2.partial.XXXXXX`
+Plots are written to an exclusively created `<name>.gplot.partial.XXXXXX`
 file, flushed through its original file descriptor, and atomically renamed on
 completion. The final name is published only after writing succeeds.
 A first `Ctrl-C` asks the plotter to
@@ -110,12 +109,15 @@ xchplot2 batch /path/to/job.tsv --devices gpu --resume
 Each non-comment line has nine whitespace-separated fields in this order:
 
 ```text
-k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name
+k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
 ```
 
-`plot_id_hex` is 64 hex characters; `memo_hex` encodes up to 255 bytes
-(`""` represents an empty memo). `testnet` accepts `0`, `1`, `false`, or
-`true`. Memo and path fields accept double quotes, with backslash escapes
+`format` is `gplot-v2` for a single-member group (index 0), or `raw-v2`
+for a temporary member consumed by the group assembler. `group_id_hex` is
+64 hex characters; the member ID is derived from it, the index, and meta group.
+`memo_hex` encodes up to 255 bytes (`""` represents an empty memo).
+Legacy manifests with a testnet boolean and per-plot ID are rejected.
+Memo and path fields accept double quotes, with backslash escapes
 for quotes and backslashes. `out_name` must be a filename, not a path;
 relative `out_dir` paths resolve from the working directory. Blank lines
 and `#` comments are ignored. Invalid rows are rejected before plotting.
@@ -125,7 +127,8 @@ Prefer the automatically saved manifest for recovery; see
 ## Configuration and argument files
 
 `--config FILE` loads a configuration file. Without it, xchplot2 looks for
-`$HOME/.config/xchplot2/config.toml`. The supported syntax is a small TOML
+`$HOME/.config/xchplot2/config.toml` (Windows: `%APPDATA%\xchplot2\config.toml`).
+The supported syntax is a small TOML
 subset: named sections and scalar `key = value` entries, with double-quoted
 strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
 are unsupported.
@@ -172,6 +175,10 @@ save these lines in `bench.args`:
 xchplot2 bench @bench.args -o /scratch --num 3
 ```
 
+Numeric arguments must consume the whole value: `28junk` is rejected rather
+than interpreted as `28`. Decimal integers retain optional signs and leading
+whitespace; size arguments retain their documented units and fractional forms.
+
 Later flags override earlier values. `@~/bench.args` expands the leading
 `~/` in the argument-file path. Inside the file, `#` starts a comment;
 shell quoting, variable expansion, and nested argument files are unsupported.
@@ -180,22 +187,28 @@ spaces. Pass `--config` directly on the command line, not inside an argument fil
 
 ## Plot indices and meta groups
 
-Both are v2 PoS fields and default to 0.
-`<plot-index>` (u16) is the within-group identifier; `plot -n N`
-uses it as the base and increments per plot (so `-i 0 -n 1000`
-produces plots with `plot_index` 0..999).
-`<meta-group>` (u8) is a challenge-isolation boundary — plots with
-different meta_group values are guaranteed never to pass the same
-challenge.
+Both are v2 PoS fields and default to 0. `plot -n N` writes N independent
+single-member `.gplot` groups with fresh keys, each at member index 0.
+`--seed` and saved-job resume preserve those identities. The meta group (u8)
+selects a challenge-isolation boundary. Every member of a group shares its
+group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || meta_group`.
 
-The grouped-plot format is proposed in
-[pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118).
-xchplot2 currently produces one `.plot2` file per plot using its existing
-dependency pin. A group must share its group ID and memo; `plot -n N`
-currently generates independent keys for each plot, so incrementing the
-index alone does not form a group. The
-[opt-in compatibility check and migration plan](contrib/pos2-pr118/README.md)
-track preparation for the proposed format.
+The official version 2 format from
+[pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118)
+stores a group size and assumes member indices start at zero. The
+[experimental grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
+assembles multiple members with shared keys. Its `--files` and nonzero
+`--plot-index` support still require the explicitly marked 0x82 reader
+extension, which unmodified upstream readers cannot read.
+
+PoS2 1.0 changes the Feistel cipher as well as the file format. Old raw plots,
+earlier experimental groups, and saved jobs require replotting; renaming or
+rewriting their headers is insufficient. `--testnet` / `-T` are rejected:
+PoS2 no longer has a separate testnet Xs hash. Both pool modes now use the
+V2 taproot derivation in
+[chia-blockchain PR #21484](https://github.com/Chia-Network/chia-blockchain/pull/21484).
+That farmer-side integration is pending, so format/proof interoperability
+does not establish compatibility with a released farmer.
 
 ## Devices and CPU workers
 
@@ -321,7 +334,7 @@ deprecated no-op alias because peer transport is already the default.
 ## Benchmarking
 
 `bench` measures how fast your hardware plots by writing synthetic
-unfarmable `.plot2` files (random plot_ids, no keys), then reports
+unfarmable `.gplot` files (random group IDs, no keys), then reports
 steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
 (30-day basis):
 
@@ -338,7 +351,7 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 
 | Option | Meaning |
 |---|---|
-| `-k K`, `-s S`, `-T` | Plot size, strength, and testnet parameters; defaults 28, 2, and mainnet |
+| `-k K`, `-s S` | Plot size and strength; defaults 28 and 2 |
 | `-n N`, `--num N` | Measured plot count used to size the queue; default 10 |
 | `--warmup W` | Initial completions excluded per worker; default 1 |
 | `-o DIR`, `--out DIR` | Directory for real output writes; default current directory |
@@ -346,6 +359,7 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 | `--tier T` | Force a [streaming tier](#memory-requirements), even when the pool fits |
 | `--max-host-ram SIZE`, `--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
 | `--keep` | Retain synthetic output files on disk for inspection |
+| `--json` | Also emit a JSON report to stdout for saving or comparing runs |
 | `--compute-only` | Add a second pass using RAM-backed output when available |
 | `--target-size TiB` | Estimate time to fill this capacity instead of the output directory's free space |
 | `-v`, `-q` | More worker detail, or quieter informational output |
@@ -365,6 +379,21 @@ Bench removes its generated files by default. `--keep` retains disk output;
 temporary tmpfs output is always removed to release the RAM. Results and
 time-to-fill estimates are printed to stderr. See [BENCHMARKS.md](BENCHMARKS.md)
 for the project's recorded measurements and comparison methodology.
+
+Use `xchplot2 bench -k 28 -o /scratch --json > bench.json` to save the
+measurements. The report includes the build version, plot parameters, queue
+size and warmup, output directory, requested tier and host RAM policy, plus
+per-pass throughput, measurement windows, worker labels, actual recorded
+pipelines, and per-worker counts and interval spread. An empty pipeline means
+that the worker did not record one; the requested tier is not an assertion
+about the pipeline actually used. `workers_unmeasured` retains the human
+report's lower-bound warning. The second pass is labeled `tmpfs` or
+`compute+cache` as appropriate. Human output and progress remain on stderr;
+without `--json`, stdout stays unchanged. Valid UTF-8 is preserved; invalid
+filesystem bytes are represented individually as `\u00XX` escapes. Compare
+runs under similar device
+load: concurrent GPU use can change results, and this report does not diagnose
+why a rate changed.
 
 ## Memory requirements
 
@@ -481,22 +510,23 @@ Notes:
 ### Single test plot
 
 ```bash
-xchplot2 test <k> <plot-id-hex> [strength] [plot-index] [meta-group] [verbose]
+xchplot2 test <k> <group-id-hex> [strength] [plot-index] [meta-group] [verbose]
 ```
 
-This accepts a raw 64-character hex plot ID. It uses CPU phases by default;
+This accepts a 64-character hex group ID and derives its member ID. It uses CPU phases by default;
 `-G` / `--gpu-all` selects all available GPU phases, while `--gpu-t1`,
 `--gpu-t2`, and `--gpu-t3` select individual phases. `-P` / `--profile`
 prints phase timings. Use `-m` / `--memo HEX`, `-o` / `--out DIR`,
-`-N` / `--out-name NAME`, and `-T` / `--testnet` for output and test parameters.
+`-N` / `--out-name NAME` for output parameters. `--raw` writes a temporary
+raw member and allows indices 0..65535; group output requires index 0.
 The [CPU-reference fixture](CONTRIBUTING.md#building-and-running-tests)
-shows a matching raw-ID test and GPU batch. Arbitrary IDs and memos do not
+shows a matching group-ID test and GPU batch. Arbitrary IDs and memos do not
 produce farmable plots.
 
 ### Verification
 
 ```bash
-xchplot2 verify /path/to/NAME.plot2 --full --trials 100
+xchplot2 verify /path/to/NAME.gplot --full --trials 100
 ```
 
 `verify` checks file structure, then samples quality chains for N random
@@ -638,8 +668,8 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_SPILL_IO_THREADS=N` | Worker threads per spill I/O job, 1-32. Default 2. Threads share the staging memory; measure on the target drive before increasing the count. `1` processes the job serially. |
 | `XCHPLOT2_HOST_FREE_MB=N`     | Testing only — make the host report at most N MB free, so the host-RAM guard and the automatic spill can be exercised on a box that is not actually short. Clamps only: it can never talk the plotter past a real shortage. |
 | `POS2GPU_MAX_VRAM_MB=N` | Cap the free-VRAM query and enforce the selected budget. This tests admission and the watchdog on the current GPU; it does not emulate another physical card. |
-| `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
-| `POS2GPU_ASSERT_VRAM=1`       | Fail (not just warn) when a path's true peak exceeds what it declared. Armed by `bench`. |
+| `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected modeled VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
+| `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |

@@ -46,10 +46,7 @@ bool run_for(uint32_t seed, int k, bool testnet)
                 seed, k, int(testnet), static_cast<unsigned long long>(total));
 
     // ---- CPU reference ----
-    ProofParams params(plot_id.data(),
-                       static_cast<uint8_t>(k),
-                       /*strength=*/uint8_t{2},
-                       testnet ? uint8_t{1} : uint8_t{0});
+    auto const params = PlotProofParams::create_raw(PlotId(plot_id), uint8_t(k), 2);
     XsConstructor xs_ctor(params);
 
     std::vector<Xs_Candidate> cpu_out_buf(total);
@@ -143,7 +140,7 @@ int main()
     for (uint32_t seed : {1u, 2u, 0xCAFE'BABEu}) {
         all_ok = run_for(seed, /*k=*/18, /*testnet=*/false) && all_ok;
     }
-    all_ok = run_for(/*seed=*/7u, /*k=*/18, /*testnet=*/true) && all_ok;
+    all_ok = run_for(/*seed=*/7u, /*k=*/18, /*testnet=*/false) && all_ok;
     all_ok = run_for(/*seed=*/9u, /*k=*/20, /*testnet=*/false) && all_ok;
 
     std::printf("\n==> %s\n", all_ok ? "ALL OK" : "FAIL");

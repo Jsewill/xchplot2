@@ -18,7 +18,6 @@
 // and so the CPU reference completes in seconds. --k lets a triage
 // session push the matcher to the largest k that fits on the device.
 
-#include "gpu/AesGpu.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/XsKernel.cuh"
 #include "gpu/T1Kernel.cuh"
@@ -83,10 +82,8 @@ bool run_for_id(sycl::queue& q,
     std::printf("[%s  k=%d  strength=%d  N=%llu]\n",
                 label, k, strength, static_cast<unsigned long long>(total));
 
-    ProofParams params(plot_id.data(),
-                       static_cast<uint8_t>(k),
-                       static_cast<uint8_t>(strength),
-                       /*testnet=*/uint8_t{0});
+    auto const params = PlotProofParams::create_raw(PlotId(plot_id),
+        static_cast<uint8_t>(k), static_cast<uint8_t>(strength));
 
     // ---- CPU reference (XsConstructor → Table1Constructor::construct) ----
     std::size_t max_section_pairs = max_pairs_per_section_possible(params);
@@ -262,8 +259,6 @@ bool parse_int_arg(std::string_view sv, int& out)
 
 int main(int argc, char** argv)
 {
-    pos2gpu::initialize_aes_tables();
-
     int k_override        = -1;
     int strength_override = -1;
     for (int i = 1; i + 1 < argc; ++i) {

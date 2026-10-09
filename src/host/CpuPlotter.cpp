@@ -84,14 +84,7 @@ std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts
     return write_plot_file_parallel(
         out_path.string(),
         std::span<std::uint64_t const>(frags.data(), frags.size()),
-        entry.plot_id.data(),
-        k,
-        strength,
-        testnet,
-        static_cast<std::uint16_t>(entry.plot_index),
-        static_cast<std::uint8_t>(entry.meta_group),
-        std::span<std::uint8_t const>(entry.memo.data(), entry.memo.size()),
-        /*thread_count=*/0);
+        entry, /*thread_count=*/0);
 }
 
 } // namespace pos2gpu

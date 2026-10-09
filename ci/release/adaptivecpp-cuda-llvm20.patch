@@ -1,0 +1,43 @@
+AdaptiveCpp 25.10 CUDA target selection for the pinned LLVM 20 release compiler.
+Only request SM/PTX pairs supported by LLVM 20, choosing a compatible lower
+target for newer GPUs. Unknown LLVM targets otherwise produce invalid PTX,
+and upstream's upward rounding can select a target newer than the GPU.
+
+--- a/src/runtime/cuda/cuda_queue.cpp
++++ b/src/runtime/cuda/cuda_queue.cpp
+@@ -68,17 +68,11 @@
+        {80, 70},
+        {86, 71},
+        {87, 74},
+-       {88, 90},
+        {89, 78},
+        {90, 80},
+-       // some variants of 100, 101 need 8.6, some 8.8
+-       // so require 8.8 for all to be on the safe side.
+-       {100, 88},
+-       {101, 88},
+-       {103, 88},
+-       {110, 90},
+-       {120, 88},
+-       {121, 88}};
++       // ponytail: LLVM 20 targets; refresh when the release compiler changes.
++       {100, 86},
++       {120, 87}};
+
+   if(sm_version < sm_min_ptx_version.front()[0]) {
+     ptx_target = sm_version;
+@@ -90,11 +84,11 @@
+     ptx_target = sm_min_ptx_version.back()[0];
+   } else {
+     for(const auto& entry : sm_min_ptx_version) {
+-      if(entry[0] >= sm_version) {
+-        ptx_version = entry[1];
+-        ptx_target = entry[0];
++      if(entry[0] > sm_version) {
+         break;
+       }
++      ptx_version = entry[1];
++      ptx_target = entry[0];
+     }
+   }
+   return ptx_version;

@@ -1,4 +1,4 @@
-// Real coordinator, fake GPU execution. An alarm turns a deadlock into failure.
+// Real coordinator, fake GPU execution. A timeout turns a deadlock into failure.
 #undef NDEBUG
 #include "host/MultiGpuPipelineParallel.hpp"
 #include "host/GpuBufferPool.hpp"
@@ -6,8 +6,10 @@
 #include "host/VramBudget.hpp"
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
-#include <unistd.h>
+#include <thread>
 
 namespace {
 thread_local int device = 0;
@@ -38,7 +40,10 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const&, uint64_t*
 int main()
 {
     using namespace pos2gpu;
-    alarm(15);
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+        std::_Exit(1);
+    }).detach();
     std::vector<GpuPipelineConfig> configs(5);
     for (auto& c : configs) c.k = 18;
     for (auto devices : {std::vector<int>{0, 1}, std::vector<int>{0, 1, 2}}) {
@@ -70,6 +75,5 @@ int main()
         assert(threw && calls == 0);
         free_vram = 8ULL << 30;
     }
-    alarm(0);
     std::cout << "Pipeline: stage/callback failures, cancellation, and VRAM rejection passed\n";
 }

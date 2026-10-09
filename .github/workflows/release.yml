@@ -12,40 +12,41 @@ on:
       - tools/**
       - contrib/**
       - scripts/build-release.sh
+      - scripts/build-release.ps1
+      - scripts/test/recovery.py
       - scripts/test/release.py
   push:
     tags: ['v*', '!v*-cuda-only']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Release builds to check
+        type: choice
+        default: all
+        options: [all, linux, windows]
+      architecture:
+        description: Host CPU architecture
+        type: choice
+        default: all
+        options: [all, x86_64, aarch64]
 
 permissions:
   contents: read
 
 jobs:
   linux-sycl:
-    runs-on: ubuntu-24.04
+    if: inputs.platform != 'windows'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - gpu: nvidia
-            image: docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
-            llvm: 20
-          - gpu: amd
-            image: docker.io/rocm/dev-ubuntu-24.04:6.2-complete
-            llvm: 18
-          - gpu: intel
-            image: docker.io/library/ubuntu:24.04
-            llvm: 20
-    env:
-      RELEASE_GPU: ${{ matrix.gpu }}
+        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
         run: |
-          docker build -t xchplot2-release -f ci/release/Containerfile ci/release \
-            --build-arg GPU="$RELEASE_GPU" \
-            --build-arg LLVM_VERSION='${{ matrix.llvm }}' \
-            --build-arg BASE_DEVEL='${{ matrix.image }}'
+          docker build --build-arg BASE_IMAGE=${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'nvidia/cuda:12.9.1-devel-ubuntu24.04' }} \
+            -t xchplot2-release -f ci/release/Containerfile ci/release
       - name: Build and package
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -54,25 +55,159 @@ jobs:
             bash scripts/build-release.sh
       - name: Check the extracted runtime and CPU proofs
         run: |
-          docker run --rm -e RELEASE_GPU -e DEBIAN_FRONTEND=noninteractive \
-            -v "$PWD:/src:ro" -w /src ubuntu:24.04 bash -euc '
+          docker run --rm -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD:/src:ro" -w /src ${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'ubuntu:24.04' }} bash -euc '
             apt-get update
             apt-get install -y --no-install-recommends \
               python3 libstdc++6 libnuma1 libelf1t64 libdrm2 libdrm-amdgpu1
-            python3 scripts/test/release.py build/release-"$RELEASE_GPU"/dist/*.tar.gz \
-              --sycl-probe build/release-"$RELEASE_GPU"/tools/sanity/hellosycl
+            python3 scripts/test/release.py build/release-linux/dist/*.tar.gz \
+              --sycl-probe build/release-linux/tools/sanity/hellosycl
           '
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-x86_64-sycl-${{ matrix.gpu }}
+          name: linux-${{ matrix.arch }}-sycl
           path: |
-            build/release-${{ matrix.gpu }}/dist/*.tar.gz
-            build/release-${{ matrix.gpu }}/dist/*.sha256
+            build/release-linux/dist/*.tar.gz
+            build/release-linux/dist/*.sha256
+          if-no-files-found: error
+
+  windows-sycl:
+    if: inputs.platform != 'linux'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'windows-11-arm' || 'windows-2022' }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - name: Install CUDA 12.9.1
+        if: matrix.arch == 'x86_64'
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe' -OutFile $installer
+          $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
+          "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
+      - name: Install CUDA 13.4.2 ARM64
+        if: matrix.arch == 'aarch64'
+        run: ./ci/release/install-cuda-arm64.ps1
+      - name: Install HIP SDK 6.4.2 compiler components
+        if: matrix.arch == 'x86_64'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = Join-Path $env:RUNNER_TEMP 'hip-sdk.exe'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'hip-sdk'
+          Invoke-WebRequest 'https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-25.Q3-Win10-Win11-For-HIP.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne 'db474a0436edecbc2234a8d38402f1bae1cbf5a50c7e9b93eb6c0a7e0eb9c81a') {
+              throw 'HIP SDK installer checksum mismatch'
+          }
+          # Install the build tools without installing a GPU driver on the runner.
+          7z x -y "-o$unpacked" $installer 'Packages/Apps/ROCmSDKPackages/*' | Out-Null
+          foreach ($component in 'SDKCore/ROCm_SDK_Core', 'RTCDevelopment/ROCm_RTC_Dev', 'RTCRuntime/ROCm_RTC_RT') {
+              $msi = Join-Path $unpacked "Packages/Apps/ROCmSDKPackages/$component.msi"
+              $install = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+              if ($install.ExitCode -notin 0, 3010) { throw "HIP SDK component failed: $component ($($install.ExitCode))" }
+          }
+          Remove-Item $installer, $unpacked -Recurse -Force
+          "HIP_PATH=$env:ProgramFiles\AMD\ROCm\6.4" >> $env:GITHUB_ENV
+      - uses: actions/cache/restore@v6
+        id: toolchain
+        with:
+          path: build/windows-toolchain/install
+          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}
+      - name: Configure Visual Studio
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $arm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64'
+          $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+          $visualStudio = & $vswhere -latest -products '*' -requires $component -property installationPath
+          if (-not $visualStudio) { throw 'Visual Studio C++ build tools are required' }
+          $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvarsall.bat'
+          $target = if ($arm64) { 'arm64' } else { 'x64' }
+          # LLVM 20 needs the VS 2022 STL supplied by this side-by-side toolset.
+          $toolset = if ($arm64) { '-vcvars_ver=14.44' } else { '' }
+          cmd /c "call `"$vcvars`" $target $toolset >nul && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;" + $env:PATH
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsRedistDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
+          }
+          clang-cl --version
+      - name: Build AdaptiveCpp with LLVM
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: ./ci/release/build-adaptivecpp-windows.ps1
+      - name: Check Windows AMDGPU bitcode ABI
+        if: matrix.arch == 'x86_64'
+        run: |
+          $ir = & build/windows-toolchain/install/bin/llvm-dis.exe `
+              build/windows-toolchain/install/lib/hipSYCL/bitcode/libkernel-sscp-amdgpu-amdhsa-full.bc -o -
+          if ($LASTEXITCODE -ne 0 -or -not ($ir -match '!"wchar_size", i32 2')) {
+              throw 'AMDGPU bitcode must use the Windows HIP wchar size'
+          }
+      - uses: actions/cache/save@v6
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        with:
+          path: build/windows-toolchain/install
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+      - name: Install release Rust tooling
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          cargo install --locked --features cli cargo-about --version 0.9.2
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
+        run: ./scripts/build-release.ps1
+      - name: Check the extracted runtime and Windows CPU proofs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $python = (Get-Command python.exe).Source
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          foreach ($name in 'LIB', 'LIBPATH', 'INCLUDE', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsRedistDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+          }
+          $archive = (Get-ChildItem build/release-windows/dist/*.zip).FullName
+          # Hide the absolute fallback paths compiled into AdaptiveCpp, too.
+          Rename-Item build/windows-toolchain/install install-hidden
+          $hip = $env:HIP_PATH
+          $cuda = $env:CUDA_PATH
+          if ($hip) { Rename-Item $hip ((Split-Path $hip -Leaf) + '-hidden') }
+          Rename-Item $cuda ((Split-Path $cuda -Leaf) + '-hidden')
+          foreach ($name in 'HIP_PATH', 'ROCM_PATH', 'CUDA_PATH', 'CUDA_PATH_V12_9', 'ACPP_PREFIX') {
+              [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+          }
+          try {
+              & $python scripts/test/release.py $archive `
+                  --sycl-probe build/release-windows/tools/sanity/hellosycl.exe
+          } finally {
+              if ($hip) { Rename-Item "$hip-hidden" (Split-Path $hip -Leaf) }
+              Rename-Item "$cuda-hidden" (Split-Path $cuda -Leaf)
+              Rename-Item build/windows-toolchain/install-hidden install
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}-sycl
+          path: |
+            build/release-windows/dist/*.zip
+            build/release-windows/dist/*.sha256
           if-no-files-found: error
 
   draft:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: linux-sycl
+    needs: [linux-sycl, windows-sycl]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -80,7 +215,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: linux-x86_64-sycl-*
+          pattern: '*-sycl*'
           merge-multiple: true
           path: dist
       - name: Attach archives to a draft release

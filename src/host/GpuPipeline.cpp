@@ -376,8 +376,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // any match runs. Nothing else bounds that allocation, and it is not
     // covered by the pool sizing — see SyclBackend.hpp.
     sycl_backend::set_twophase_budget(q, cfg.twophase_budget_bytes);
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -859,8 +860,9 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     // no VRAM to spare, and the scratch is not part of any tier's peak
     // model — see SyclBackend.hpp.
     sycl_backend::set_twophase_budget(q, scratch.twophase_budget_bytes);
-    if (cfg.k < 18 || cfg.k > 32 || (cfg.k & 1) != 0) {
-        throw std::runtime_error("k must be even in [18, 32]");
+    if (cfg.testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (cfg.k < 18 || cfg.k > 28 || (cfg.k & 1) != 0) {
+        throw std::runtime_error("k must be even in [18, 28]");
     }
     if (cfg.strength < 2) {
         throw std::runtime_error("strength must be >= 2");
@@ -4672,15 +4674,15 @@ t3_match_entry:
             s_free(stats, d_t3);
         }
 
-        // Multi-way stable merge of the N=4 sorted runs. Tree shape
-        // for N=4: (0+1)→A, (2+3)→B, (A+B)→final. 3 binary
-        // std::inplace_merges, depth 2. Stable, matches the original
-        // 2-way merge's byte-parity contract for downstream consumers.
+        // Stable merge of the four sorted runs: merge adjacent pairs,
+        // then split the final merge into two disjoint ranges. Both
+        // levels use the same two-thread pattern.
         //
         // The two depth-1 merges touch disjoint ranges, so run them
         // concurrently — at k=28 each is a ~1 GB memory-bound merge on
         // the critical path while the GPU sits idle; overlapping them
         // halves the depth-1 wall.
+        int p_t3_merge = begin_phase("T3 merge");
         if constexpr (kT3SortTiles == 4) {
             std::thread merge_ab([&] {
                 std::inplace_merge(h_frags + t3_offsets[0],
@@ -4691,9 +4693,22 @@ t3_match_entry:
                                h_frags + t3_offsets[3],
                                h_frags + t3_offsets[4]);
             merge_ab.join();
-            std::inplace_merge(h_frags + t3_offsets[0],
-                               h_frags + t3_offsets[2],
-                               h_frags + t3_offsets[4]);
+            auto* first = h_frags + t3_offsets[0];
+            auto* middle = h_frags + t3_offsets[2];
+            auto* last = h_frags + t3_offsets[4];
+            if (first != middle && middle != last) {
+                // Split the final merge into disjoint ranges without another
+                // buffer. lower_bound keeps equal left-run entries first;
+                // the two temporary requests sum to at most the serial one's.
+                auto* first_cut = first + (middle - first) / 2;
+                auto* second_cut = std::lower_bound(middle, last, *first_cut);
+                auto* new_middle = std::rotate(first_cut, middle, second_cut);
+                std::thread merge_left([&] {
+                    std::inplace_merge(first, first_cut, new_middle);
+                });
+                std::inplace_merge(new_middle, second_cut, last);
+                merge_left.join();
+            }
         } else {
             // Generic sequential fallback for other N.
             for (int t = 1; t < kT3SortTiles; ++t) {
@@ -4702,6 +4717,7 @@ t3_match_entry:
                                    h_frags + t3_offsets[t + 1]);
             }
         }
+        end_phase(p_t3_merge);
 
         if (d_frags_out_on_host) {
             // Tiny: h_frags already holds the sorted output in caller's

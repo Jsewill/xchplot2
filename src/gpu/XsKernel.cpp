@@ -97,7 +97,8 @@ void launch_construct_xs_profiled(
     // around launch_construct_xs to measure end-to-end wall time. A
     // sycl::event-based profiling overload is the natural follow-up.
 
-    if (k < 18 || k > 32 || (k & 1) != 0) throw std::invalid_argument("invalid argument to launch wrapper");
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (k < 18 || k > 28 || (k & 1) != 0) throw std::invalid_argument("invalid argument to launch wrapper");
     if (!plot_id_bytes || !temp_bytes)    throw std::invalid_argument("invalid argument to launch wrapper");
 
     uint64_t const total = 1ULL << k;

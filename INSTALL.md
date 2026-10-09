@@ -14,31 +14,68 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 | Path | Use it for |
 |---|---|
-| [Binary archives](#binary-archives) | Prebuilt CLI and runtime for one GPU vendor |
+| [Binary archives](#binary-archives) | Prebuilt CLI and bundled runtime |
 | [Container](#container) | Toolchains inside the image; GPU driver and container engine on the host |
 | [Native install](#native-install) | System dependencies and AdaptiveCpp installed by the existing script |
 | [Manual dependencies](#manual-dependencies) | An existing toolchain or a development setup |
 
 ## Binary archives
 
-Download the Linux x86-64 `sycl-nvidia`, `sycl-amd`, or `sycl-intel` archive
+Download the combined Linux x86-64 or ARM64 `sycl.tar.gz` archive
 and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
 `./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
 add that `bin` directory to `PATH` to run the CLI elsewhere.
 
-These archives target glibc 2.39+ (Ubuntu 24.04 or a compatible system), an
-x86-64 CPU with AES, SSSE3, and SSE4.1, and a compatible GPU driver. On Ubuntu,
+The x86-64 archive requires glibc 2.39+ (Ubuntu 24.04 or a compatible system)
+and a CPU with AES, SSSE3, and SSE4.1. The ARM64 archive requires Ubuntu 26.04
+or a compatible system with glibc 2.43+ and ARMv8-A crypto extensions.
+Both require a compatible GPU driver. On Ubuntu,
 install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
-and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, and one GPU
-backend. No development toolkit is needed. Mixed-vendor builds use the
-source or container instructions below.
+and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, CUDA and HIP
+runtimes, the Level Zero loader, and its SPIR-V translator. NVIDIA, AMD,
+and Intel backends are available in the same binary, including on systems
+with GPUs from multiple vendors. No development toolkit is needed.
 
-The NVIDIA bundle uses CUDA 12.9.1; driver 575.57.08+ is recommended. The AMD
-bundle uses ROCm 6.2 and supports hardware covered by that runtime. The Intel
-bundle uses Level Zero and requires the Intel GPU compute driver. See
+The CUDA runtime is 12.9.1; NVIDIA driver 575.57.08+ is recommended. The HIP
+runtime is ROCm 7.1.1 on x86-64; ARM64 uses Ubuntu's HIP 7.1.0 and compiler
+libraries 7.1.1. Hardware support follows those runtimes. Intel
+uses Level Zero and requires the Intel GPU compute driver. See
 [troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
 settings and the release notes for hardware qualification.
+
+ARM64 includes CUDA (Linux SBSA), HIP, Level Zero, and OpenCL backends.
+OpenCL devices must support SPIR-V, Intel USM or fine-grained system SVM,
+and 64-bit atomics. A bundled backend does not supply a GPU driver: each
+device needs a driver for the host architecture. ARM64 GPU execution still
+requires hardware qualification; the hosted release checks cover native
+compilation, the bundled runtime, CPU/SYCL plotting parity, and full proofs.
+
+The experimental Windows x86-64 `sycl.zip` includes NVIDIA, AMD, and Intel
+backends together. Extract it and run `.\bin\xchplot2.exe devices`; keep the
+entire `bin/` tree together. The CUDA runtime, HIP compiler libraries and
+device bitcode, Intel Level Zero loader and SPIR-V translator, and Microsoft
+runtime DLLs are bundled. No CUDA, HIP/ROCm, or oneAPI SDK installation is needed.
+Install the normal graphics driver: NVIDIA 576.57+, AMD Adrenalin with the
+HIP 6 runtime, or Intel's graphics driver with Level Zero support.
+It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
+CPU, and NTFS/ReFS for plots and spill. Hosted checks exercise CPU plotting,
+recovery, and offline GPU compilation. An RX 6700 XT completed a
+[reported Windows benchmark](BENCHMARKS.md#windows-rx-6700-xt-report);
+full Windows GPU qualification is still pending. See [Windows](#windows)
+for source builds.
+
+The experimental Windows ARM64 ZIP requires Windows 11 ARM64. It includes
+CUDA 13.4.2 (Turing and newer), Level Zero, and OpenCL, with native ARM64
+runtime libraries and the same plotting features. Each backend requires a
+compatible ARM64 graphics driver. OpenCL has the SPIR-V, USM/SVM, and 64-bit
+atomic requirements described above. AMD's Windows HIP SDK does not supply
+an ARM64 runtime, so this archive does not include HIP. GPU execution still
+requires hardware qualification.
+
+Apple Silicon GPU builds are not available. AdaptiveCpp's experimental
+[Metal backend](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/develop/doc/install-metal.md)
+lacks the 64-bit atomics used by the plotting kernels.
 
 `BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
 dependency notices. Releases without binary assets require a source build.
@@ -172,7 +209,7 @@ sudo ./scripts/build-container.sh
 sudo podman run --rm --privileged \
     --device /dev/kfd --device /dev/dri \
     -v "$PWD/plots:/out" xchplot2:rocm \
-    test 22 <plot_id_hex> 2 0 0 -G -o /out
+    test 22 <group_id_hex> 2 0 0 -G -o /out
 
 # Run real plotting:
 sudo podman run --rm --privileged \
@@ -259,7 +296,7 @@ If you'd rather install dependencies yourself, the toolchain is:
 checkout.
 
 For non-NVIDIA targets, the build also probes:
-- **ROCm** (`rocminfo`): selects `hip:gfxXXXX`, except RDNA1 defaults to generic SSCP in Cargo. See [AMD target selection](#amd-target-selection).
+- **ROCm** (`rocminfo`): selects `hip:gfxXXXX`, except RDNA1 defaults to generic SSCP in Cargo and CMake. See [AMD target selection](#amd-target-selection).
 - **Intel** (Level Zero / compute-runtime): defaults to `ACPP_TARGETS=generic`.
 
 ### Toolkit and architecture selection
@@ -375,66 +412,100 @@ including the W5700 and RX 5700 series):
 
 | Build path | Default AMD target |
 |---|---|
-| Cargo / `build.rs` | Detects the GPU with `rocminfo`; RDNA1 selects `ACPP_TARGETS=generic`, other detected targets select `hip:gfxXXXX`. |
+| Cargo / direct CMake | Share target selection: RDNA1 and mixed-vendor hosts select `generic`; a sole AMD target selects `hip:gfxXXXX`. Explicit `ACPP_TARGETS` (Cargo) or `-DACPP_TARGETS` (CMake) takes precedence. |
 | `scripts/build-container.sh` | Detects `ACPP_GFX`; RDNA1 is still changed to the legacy `gfx1013` AOT spoof. An explicit `ACPP_GFX` is used unchanged. |
 | `podman compose build rocm` | AOT only: requires `ACPP_GFX`, then passes `hip:$ACPP_GFX`. A host `ACPP_TARGETS` value does not override this compose argument. |
-| Direct CMake | Set `-DACPP_TARGETS=generic` or the intended `hip:gfxXXXX` target explicitly. |
 
-For RDNA1, use the [native installation](#native-install) and Cargo's generic
+For RDNA1, use the [native installation](#native-install) and the generic
 SSCP path. The legacy spoof produced no-op kernels on a reported W5700 with
 ROCm 6 and AdaptiveCpp 25.10; generic SSCP passed that host's checks through
 k=24. This is separate from the current RX 6700 XT k=28 benchmark set.
 
-Cargo preserves two explicit overrides for already validated stacks:
+Cargo and direct CMake preserve two environment overrides for already validated stacks:
 `XCHPLOT2_FORCE_GFX_SPOOF=1` selects the legacy `gfx1013` spoof;
 `XCHPLOT2_NO_GFX_SPOOF=1` selects the GPU's actual AOT target, which the
-toolchain may reject. An explicit `ACPP_TARGETS` takes precedence.
+toolchain may reject. An explicit `ACPP_TARGETS` (Cargo) or
+`-DACPP_TARGETS` (CMake) takes precedence.
 
 ## Windows
 
-Use WSL2 for `main`. Install the vendor's Windows driver and follow its WSL
-GPU setup, then install the Linux toolkit and build dependencies inside the
-WSL distro. WSL's injected driver library is not the CUDA Toolkit. The
-[install matrix](CONTRIBUTING.md#install-ci) checks WSL builds, but its hosted
+WSL2 uses the Linux build. Install the vendor's Windows driver and follow
+its WSL GPU setup, then install the Linux toolkit and build dependencies
+inside the WSL distro. WSL's injected driver library is not the CUDA Toolkit.
+The [install matrix](CONTRIBUTING.md#install-ci) checks WSL builds; its hosted
 runners do not validate GPU execution.
 
-For native Windows on NVIDIA, use the experimental
+### Native SYCL
+
+The native Windows build is experimental and uses the standalone CMake
+executable. Cargo's dependency bootstrap remains Linux-specific. The Windows
+release job builds all CMake targets, runs host tests, and exercises the
+packaged CPU kernels, plotting, full proofs, cancellation, and recovery. GPU
+plotting has not yet been qualified on Windows hardware.
+
+Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
+20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),
+CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
+1.98.1 for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
+developer environment loaded.
+Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:
+
+```powershell
+$env:HIP_PATH = "$env:ProgramFiles\AMD\ROCm\6.4"
+$env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;$env:PATH"
+./ci/release/build-adaptivecpp-windows.ps1
+$env:ACPP_PREFIX = (Resolve-Path build/windows-toolchain/install).Path
+$env:PATH = "$env:ACPP_PREFIX\bin;$env:PATH"
+cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" `
+    "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" `
+    '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON
+cmake --build build/windows-sycl --parallel 2
+./build/windows-sycl/tools/xchplot2/xchplot2.exe devices
+python scripts/test/recovery.py build/windows-sycl/tools/xchplot2/xchplot2.exe
+```
+
+The initial Windows CI toolchain build took about 95 minutes with two parallel jobs.
+The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU, CUDA, HIP,
+and Level Zero backends, builds the Level Zero loader and SPIR-V translator,
+and replaces the separately licensed Windows error formatter with the C++
+standard library. Use the installed `clang`/`clang++` for the application;
+AdaptiveCpp's CMake launcher expects their GNU-style command line.
+`generic;omp` keeps GPU kernels in the generic JIT and precompiles CPU kernels.
+The generic-only Windows CPU JIT requires Visual Studio's static CRT libraries
+at runtime; the packaged application avoids that dependency.
+
+Use an ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill.
+The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.
+The default config is `%APPDATA%\xchplot2\config.toml`.
+For the original CUDA implementation, see the
 [`cuda-only` Windows recipe](https://github.com/Jsewill/xchplot2/blob/cuda-only/INSTALL.md#windows).
-Native Windows plotting is outside the current hardware test set.
 
-Native Windows SYCL is not supported by the current `main` build. Its
-AdaptiveCpp setup and host code require Linux/POSIX facilities; the earlier
-unvalidated source-build outline was not a tested installation path.
+### Windows release packaging
 
-### Native AMD and Intel evaluation
+With the toolchain above installed, build the combined archive:
 
-The Linux archives pin AdaptiveCpp 25.10. Its
-[installation guide](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/doc/installing.md)
-describes Windows CPU/CUDA support through an LLVM-integrated build using
-LLVM 18 or newer. Its
-[Windows build workflow](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/v25.10.0/.github/workflows/windows-acppllvm.yml)
-tests that CUDA toolchain. This does not establish Windows HIP or Level Zero
-support for xchplot2. Nightly binaries from `develop` are a separate toolchain
-candidate, not the pinned release compiler.
+```powershell
+cargo install --locked --features cli cargo-about --version 0.9.2
+./scripts/build-release.ps1
+```
 
-| Backend | Work required before a native Windows release |
-|---|---|
-| AMD HIP | Qualify an AdaptiveCpp Windows build with the selected HIP SDK and GPU; port the driver-backed `hipMemGetInfo` query and package the matching redistributable runtime. |
-| Intel | Qualify Level Zero or OpenCL with the Windows driver, including device/shared allocations, integer atomics, sorting, and JIT compilation; provide a free-memory query for that backend. |
+The toolchain backports AdaptiveCpp's
+[Windows HIP compiler fixes](https://github.com/AdaptiveCpp/AdaptiveCpp/discussions/2078)
+and supplies its missing Windows Level Zero build/install handling.
+LLVM 20 matches HIP SDK 6.4.2's compiler. The package includes compiler
+libraries; the AMD graphics driver supplies the HIP runtime, following
+[AMD's deployment guidance](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/conceptual/deployment-guidelines.html).
+The RX 6700 XT (`gfx1031`) is listed for
+[Windows HIP runtime support](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.4.2/reference/system-requirements.html).
+Its plotting path still needs hardware qualification. Extra ROCm math
+libraries are not required.
 
-AMD's [Windows HIP SDK component matrix](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/conceptual/component-support.html)
-differs from Linux ROCm. A Linux ROCm installation or a successful Linux
-archive build does not qualify the corresponding Windows combination.
+The HIP and Level Zero VRAM probes resolve the loaded Windows runtime DLLs.
+Their driver queries still need Windows hardware qualification. Intel uses
+Level Zero; support depends on the GPU and its graphics driver.
 
-The project's HIP and Level Zero probes in `src/host/GpuBufferPool.cpp`
-currently use POSIX dynamic loading and are excluded on Windows. OpenCL has
-no free-memory probe. Admission deliberately rejects an unverified GPU
-budget; reporting device capacity as free memory would weaken that check.
-The native CUDA host/file port also needs to be carried into the SYCL build,
-with a matching MSVC/Rust runtime and Windows DLL deployment.
-
-Before adding a Windows SYCL archive, run the existing allocation and kernel
-parity checks, then k=22/k=28 CPU byte comparisons, full proofs, every fitting
-tier and disk-spill variant, memory-pressure rejection, cancellation, and
-recovery using the extracted package on Windows hardware. A native Windows
-AMD/Intel compiler build and GPU run have not yet been qualified.
+Before qualifying any Windows GPU backend, run allocation and kernel parity
+checks, k=22/k=28 CPU byte comparisons, full proofs, every fitting tier and
+disk-spill variant, memory-pressure rejection, cancellation, and recovery
+using the extracted package on Windows hardware.

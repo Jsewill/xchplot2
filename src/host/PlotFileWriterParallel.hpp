@@ -1,10 +1,7 @@
-// PlotFileWriterParallel.hpp — drop-in replacement for
-// pos2-chip/src/plot/PlotFile.hpp::PlotFile::writeData(PlotData, ...) but
-// compresses chunks in parallel via std::async.
+// PlotFileWriterParallel.hpp — parallel PoS2 1.0 group/raw writer and
+// CPU reference boundary. Single-member group bytes match upstream
+// PlotGroupFile::writeData; raw members match PlotFile::writeData.
 //
-// Output bytes are byte-identical to PlotFile::writeData.
-//
-// Two functions live here, both implemented in PlotFileWriterParallel.cpp.
 // That .cpp is the SOLE TU in pos2-gpu that includes pos2-chip's plot/* and
 // pos/ProofParams.hpp headers — keeping it that way avoids the multiple-
 // definition link errors caused by non-inline soft_aesenc / soft_aesdec
@@ -19,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <span>
 #include <string>
 #include <vector>
@@ -26,29 +24,24 @@
 namespace pos2gpu {
 
 struct BatchEntry;
+std::array<uint8_t, 32> plot_id_for_group(
+    std::array<uint8_t, 32> const& group_id, uint16_t index, uint8_t meta_group);
 // Bounded header/chunk-index validation; checks identity when resuming a batch.
 bool plot_file_matches(std::string const& filename, BatchEntry const& expected);
 
-// Writes a v2 .plot2 file. Returns total bytes written.
+// Writes a single-member .gplot, or a raw-v2 member for assembly. Returns bytes written.
 //
 // `t3_fragments` must already be sorted by proof_fragment (low 2k bits) —
 // matching what GpuPipeline / pos2-chip's CPU plotter produce.
 //
-// `plot_id_32` is a 32-byte plot id; (k, strength, testnet) are the v2
-// proof params. We accept raw bytes here (rather than a ProofParams ref)
-// so this header doesn't drag pos2-chip headers into our other TUs.
+// `entry` contains the group identity, derived member ID, parameters, and memo.
+// No upstream types cross this boundary.
 //
 // `thread_count == 0` uses std::thread::hardware_concurrency().
 size_t write_plot_file_parallel(
     std::string const& filename,
     std::span<uint64_t const> t3_fragments,
-    uint8_t const* plot_id_32,
-    uint8_t  k,
-    uint8_t  strength,
-    uint8_t  testnet,
-    uint16_t index,
-    uint8_t  meta_group,
-    std::span<uint8_t const> memo,
+    BatchEntry const& entry,
     unsigned thread_count = 0);
 
 // Construct the shared compression pool NOW, on the calling thread.
@@ -79,9 +72,9 @@ std::vector<uint64_t> run_cpu_plotter_to_fragments(
     uint8_t testnet,
     bool    verbose);
 
-// Reads a .plot2 file written by `write_plot_file_parallel` (or
+// Reads a raw member or single-member group written by this writer (or
 // pos2-chip's CPU writer) and returns the concatenated decompressed
-// T3 proof fragments in on-disk order. Used by plot_file_parity to
+// T3 proof fragments in on-disk order (groups deduplicate fragments). Used to
 // verify write + read round-trip without exposing pos2-chip's
 // plot/PlotFile.hpp to other TUs.
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename);

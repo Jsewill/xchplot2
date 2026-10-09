@@ -4,7 +4,19 @@
 
 #include "xchplot2_cli.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 int main(int argc, char* argv[])
 {
-    return xchplot2_main(argc, argv);
+#ifdef _WIN32
+    auto const code_page = ::GetConsoleOutputCP();
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
+    int const result = xchplot2_main(argc, argv);
+#ifdef _WIN32
+    if (code_page) ::SetConsoleOutputCP(code_page);
+#endif
+    return result;
 }

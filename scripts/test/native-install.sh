@@ -46,3 +46,6 @@ build-native-install/cmake/tools/xchplot2/xchplot2 --help
 ACPP_VISIBILITY_MASK=omp ctest --test-dir build-native-install/cmake \
     --output-on-failure --no-tests=error \
     -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
+
+python3 scripts/test/recovery.py build-native-install/cargo/bin/xchplot2
+python3 scripts/test/recovery.py build-native-install/cmake/tools/xchplot2/xchplot2

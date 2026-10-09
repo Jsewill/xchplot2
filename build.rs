@@ -236,27 +236,6 @@ fn detect_nvcc_major() -> Option<u32> {
     None
 }
 
-/// The virtual GPU architectures the installed nvcc can actually codegen,
-/// via `nvcc --list-gpu-arch` (CUDA 11.5+). Output is one `compute_XX`
-/// per line — and NOT sorted (CUDA 13.x prints
-/// `compute_100 compute_110 compute_103 compute_120 compute_121`), so the
-/// caller must take the numeric max, not the last line. Returns the parsed
-/// arches (e.g. [75,80,86,89,90]); None when nvcc is missing, predates the
-/// flag, or the output can't be parsed — callers then skip the ceiling
-/// check and let cmake try, preserving prior behaviour.
-fn nvcc_supported_arches() -> Option<Vec<u32>> {
-    let out = Command::new(find_nvcc()?).arg("--list-gpu-arch").output().ok()?;
-    if !out.status.success() { return None; }
-    let s = std::str::from_utf8(&out.stdout).ok()?;
-    let v: Vec<u32> = s.lines()
-        .filter_map(|l| l.trim().strip_prefix("compute_"))
-        // `compute_90a` and friends -> drop the arch-feature suffix
-        .filter_map(|n| n.split(|c: char| !c.is_ascii_digit()).next())
-        .filter_map(|n| n.parse().ok())
-        .collect();
-    if v.is_empty() { None } else { Some(v) }
-}
-
 /// Parse one CMake CUDA_ARCHITECTURES token to its integer arch,
 /// tolerating the `sm_`/`compute_` prefixes Cargo users pass through and
 /// the `-real`/`-virtual` suffixes CMake accepts ("sm_90" / "compute_90"
@@ -272,13 +251,6 @@ fn arch_num(tok: &str) -> Option<u32> {
 /// ("61", "61;86", "61;86;120"). None when nothing parses.
 fn min_arch(arch_list: &str) -> Option<u32> {
     arch_list.split(';').filter_map(arch_num).min()
-}
-
-/// Maximum integer arch from a CMake-style CUDA_ARCHITECTURES list.
-/// Used to catch a target arch NEWER than the installed nvcc can
-/// codegen (e.g. sm_120 Blackwell on a CUDA 12.4 toolkit).
-fn max_arch(arch_list: &str) -> Option<u32> {
-    arch_list.split(';').filter_map(arch_num).max()
 }
 
 /// Probe /sys/class/drm for a display-class PCI device with Intel's
@@ -337,9 +309,8 @@ fn nvidia_gpu_present() -> bool {
 }
 
 /// Does the host have any AMD GPU detectable by rocminfo? Independent
-/// of which ACPP_TARGETS string we'd pick for it — `detect_amd_gfx` may
-/// return None for AMD cards we choose to route through SSCP (RDNA1
-/// default), but the GPU is still present and BUILD_CUDA detection
+/// of which ACPP_TARGETS string we pick (including RDNA1 generic SSCP).
+/// The GPU is still present and BUILD_CUDA detection
 /// should still see it as "AMD host, skip CUDA TUs".
 ///
 /// Falls back to /sys/class/drm vendor-ID probe (0x1002) when rocminfo
@@ -387,92 +358,14 @@ fn amd_gpu_present() -> bool {
     false
 }
 
-/// Ask `rocminfo` for the first AMD GPU's architecture, e.g. "gfx1100" for
-/// an RX 7900 XTX. Returns None when rocminfo is missing or there's no AMD
-/// GPU, AND ALSO when we deliberately want the caller to fall through to
-/// ACPP_TARGETS=generic (currently for RDNA1 gfx1010/1011/1012). Use
-/// amd_gpu_present() to distinguish "no AMD GPU at all" from "AMD GPU
-/// present but routed through generic SSCP".
+/// Ask rocminfo for the first AMD GPU architecture. TargetSelection.cmake
+/// applies RDNA1 defaults and the legacy opt-in overrides.
 fn detect_amd_gfx() -> Option<String> {
     let out = Command::new("rocminfo").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = std::str::from_utf8(&out.stdout).ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Name:") {
-            let name = rest.trim();
-            if name.starts_with("gfx") {
-                // RDNA1 (gfx1010/1011/1012) isn't a direct AdaptiveCpp
-                // HIP AOT target. We previously defaulted to a community
-                // workaround that AOT-compiled for gfx1013 (close-ISA),
-                // but it has been observed to silently produce no-op
-                // kernels on at least one W5700 / ROCm 6 / AdaptiveCpp
-                // 25.10 setup — every kernel dispatch completes without
-                // writing, surfacing far downstream as "T1 match
-                // produced 0 entries". A separate-build experiment on
-                // the same host with ACPP_TARGETS=generic (SSCP JIT)
-                // dispatched and produced correct output through k=24.
-                //
-                // Default for RDNA1 is now ACPP_TARGETS=generic (signal
-                // by returning None — caller's None branch picks
-                // generic). Two opt-in escape hatches preserved for
-                // users who've validated their stack on the legacy
-                // path:
-                //   XCHPLOT2_FORCE_GFX_SPOOF=1 — gfx1013 AOT spoof
-                //   XCHPLOT2_NO_GFX_SPOOF=1    — native gfx1010 AOT
-                //                                (may fail to compile
-                //                                if AdaptiveCpp doesn't
-                //                                advertise it as a HIP
-                //                                target).
-                let spoofed = match name {
-                    "gfx1010" | "gfx1011" | "gfx1012" => {
-                        let force_spoof = env::var("XCHPLOT2_FORCE_GFX_SPOOF")
-                            .map(|v| !v.is_empty() && v != "0")
-                            .unwrap_or(false);
-                        let no_spoof = env::var("XCHPLOT2_NO_GFX_SPOOF")
-                            .map(|v| !v.is_empty() && v != "0")
-                            .unwrap_or(false);
-                        if force_spoof {
-                            println!(
-                                "cargo:warning=xchplot2: RDNA1 {name} detected, \
-                                 XCHPLOT2_FORCE_GFX_SPOOF set — building for \
-                                 gfx1013 (legacy community workaround). The \
-                                 default switched to ACPP_TARGETS=generic (SSCP \
-                                 JIT) after the spoof was observed to silently \
-                                 produce no-op kernels on some W5700 setups; \
-                                 unset XCHPLOT2_FORCE_GFX_SPOOF if your plots \
-                                 fail with 'T1 match produced 0 entries'.");
-                            "gfx1013".to_string()
-                        } else if no_spoof {
-                            println!(
-                                "cargo:warning=xchplot2: RDNA1 {name} detected, \
-                                 XCHPLOT2_NO_GFX_SPOOF set — AOT-targeting {name} \
-                                 natively. If AdaptiveCpp doesn't advertise {name} \
-                                 as a HIP target on your toolchain, the build will \
-                                 fail; unset XCHPLOT2_NO_GFX_SPOOF to fall back to \
-                                 the (working-on-most-cards) generic SSCP JIT.");
-                            name.to_string()
-                        } else {
-                            println!(
-                                "cargo:warning=xchplot2: RDNA1 {name} detected — \
-                                 defaulting to ACPP_TARGETS=generic (SSCP JIT). \
-                                 The previous gfx1013 community workaround was \
-                                 observed to silently produce no-op kernels on \
-                                 at least one W5700 / ROCm 6 setup. Override: \
-                                 XCHPLOT2_FORCE_GFX_SPOOF=1 (back to gfx1013 AOT) \
-                                 or XCHPLOT2_NO_GFX_SPOOF=1 (try native {name})."
-                            );
-                            return None;
-                        }
-                    }
-                    other => other.to_string(),
-                };
-                return Some(spoofed);
-            }
-        }
-    }
-    None
+    if !out.status.success() { return None; }
+    let text = std::str::from_utf8(&out.stdout).ok()?;
+    text.lines().filter_map(|line| line.trim().strip_prefix("Name:"))
+        .map(str::trim).find(|name| name.starts_with("gfx")).map(String::from)
 }
 
 /// Probe whether `cmd` is on PATH and runnable. Used by preflight()
@@ -583,7 +476,7 @@ fn main() {
     // decided BUILD_CUDA made a missing nvidia-smi look like the cause of
     // any later failure, and sent non-NVIDIA users hunting for a driver
     // they don't need.
-    let (mut cuda_arch, arch_source) = match env::var("CUDA_ARCHITECTURES") {
+    let (cuda_arch, arch_source) = match env::var("CUDA_ARCHITECTURES") {
         Ok(v) => (v, "$CUDA_ARCHITECTURES"),
         Err(_) => match detect_cuda_arch() {
             Some(v) => (v, "nvidia-smi probe"),
@@ -591,86 +484,39 @@ fn main() {
         },
     };
 
-    // AdaptiveCpp target precedence:
-    //   1. $ACPP_TARGETS if set.
-    //   2. NVIDIA: "generic" (LLVM SSCP). Empirically a few percent
-    //      faster than cuda:sm_<arch> on our kernels.
-    //   3. AMD:    hip:gfx<...> via rocminfo. SSCP's HIP path is less
-    //      mature, so AOT-compile for the gfx target.
-    //   4. generic (LLVM SSCP, JITs on first use).
-    let (acpp_targets, acpp_source) = match env::var("ACPP_TARGETS") {
-        // Treat an empty env var the same as unset — Containerfile build
-        // args propagate as `ACPP_TARGETS=` when the user doesn't override
-        // them, and acpp rejects an empty target string.
-        Ok(v) if !v.is_empty() => (v, "$ACPP_TARGETS"),
-        Ok(_) | Err(_) => {
-            // Multi-vendor hosts get generic SSCP, whatever the vendors are.
-            // An AOT target speaks one ISA: hip:gfx* emits amdgcn and nothing
-            // else, so every non-AMD GPU in the box becomes unusable — not
-            // merely unpreferred — because the binary holds no code they can
-            // run. That is reachable on ordinary desktops: an AMD APU (which
-            // rocminfo reports as a gfx agent just like a discrete card) next
-            // to an Intel or NVIDIA card would AOT-pin the whole build to the
-            // integrated GPU and hide the discrete one. Generic JITs per
-            // device at load time, which is what AdaptiveCpp recommends for
-            // exactly this case, at the cost of first-use JIT latency.
-            let vendors = [usable_nvidia_arch().is_some(),
-                           amd_gpu_present(),
-                           detect_intel_gpu()]
-                .into_iter()
-                .filter(|present| *present)
-                .count();
-            if vendors > 1 {
-                ("generic".to_string(), "multi-vendor host — using SSCP")
-            }
-            // Prefer a USABLE NVIDIA GPU (sm_61+) over AMD, otherwise fall
-            // through to AMD / fallback. `detect_cuda_arch` alone would
-            // trigger on an ancient secondary NVIDIA card even when AMD is
-            // the real plotting target (see usable_nvidia_arch).
-            else if usable_nvidia_arch().is_some() {
-                ("generic".to_string(), "NVIDIA detected — using SSCP")
-            } else if let Some(gfx) = detect_amd_gfx() {
-                (format!("hip:{gfx}"), "rocminfo probe")
-            } else {
-                ("generic".to_string(), "fallback (LLVM SSCP)")
-            }
-        }
-    };
-    println!("cargo:warning=xchplot2: ACPP_TARGETS={acpp_targets} ({acpp_source})");
-
-    // XCHPLOT2_BUILD_CUDA toggles whether the CUB sort + nvcc-compiled
-    // CUDA TUs (AesGpu.cu, SortCuda.cu, AesGpuBitsliced.cu) are built.
-    // Autodetect prefers actual GPU vendor over toolchain availability:
-    // dual-toolchain hosts (AMD / Intel GPU, CUDA Toolkit also installed)
-    // would otherwise try to compile SortCuda.cu through nvcc + AdaptiveCpp
-    // — which has triggered upstream `half.hpp` compile errors for at
-    // least one Radeon Pro W5700 user. Priority order:
-    //   NVIDIA GPU → ON      (CUB is the fast path)
-    //   AMD GPU    → OFF     (SYCL/HIP path; CUB unused anyway)
-    //   Intel GPU  → OFF     (SYCL/L0 path)
-    //   no GPU, nvcc present → ON  (CI / container build)
-    //   no GPU, no nvcc      → OFF
-    //
-    // The vendor probe is hoisted out of the selector below because the
-    // preflight failure message needs the same answer: it used to hardcode
-    // `install-deps.sh --gpu nvidia`, which on an AMD or Intel host sends
-    // the user off to install a full CUDA Toolkit their card can't use —
-    // and whose absence was never why the build failed.
-    //
-    // Precedence NVIDIA > AMD > Intel, matching scripts/install-deps.sh's
-    // detect_gpu_via_pci().
-    //
-    // usable_nvidia_arch(), NOT detect_cuda_arch(): an ancient secondary
-    // NVIDIA card (e.g. sm_52 alongside an AMD W5700) must not claim the
-    // CUB path, because AdaptiveCpp's half.hpp references sm_53+ FP16
-    // intrinsics that the old card's cuda_fp16.h guards out.
+    // Keep platform probes and prerequisite diagnostics here; CMake owns
+    // the target policy shared with standalone builds.
     let nvidia_gpu = usable_nvidia_arch().is_some();
-    // amd_gpu_present, NOT detect_amd_gfx().is_some() — the latter returns
-    // None for RDNA1 (we route those through SSCP instead of an AOT hip:*
-    // target), but the GPU is there and we MUST skip CUDA TUs to avoid
-    // running SortCuda.cu's CUB calls against AMD silicon.
-    let amd_gpu    = amd_gpu_present();
-    let intel_gpu  = detect_intel_gpu();
+    let amd_gpu = amd_gpu_present();
+    let intel_gpu = detect_intel_gpu();
+    let selection = cmake_build.join("target-selection.txt");
+    if !command_runs("cmake") {
+        let missing = preflight(false).join("\n  - ");
+        panic!("xchplot2: build prerequisites missing:\n  - {missing}\nInstall with {} or build with {}",
+            manifest_dir.join("scripts/install-deps.sh").display(),
+            manifest_dir.join("scripts/build-container.sh").display());
+    }
+    let mut select = Command::new("cmake");
+    select.arg(format!("-DX2_HAVE_NVIDIA={nvidia_gpu}"))
+        .arg(format!("-DX2_HAVE_AMD={amd_gpu}"))
+        .arg(format!("-DX2_HAVE_INTEL={intel_gpu}"))
+        .arg(format!("-DX2_HAVE_NVCC={}", detect_nvcc()))
+        .arg(format!("-DX2_AMD_GFX={}", detect_amd_gfx().unwrap_or_default()))
+        .arg(format!("-DX2_SELECTION_OUTPUT={}", selection.display()));
+    for var in ["ACPP_TARGETS", "XCHPLOT2_BUILD_CUDA"] {
+        if let Ok(value) = env::var(var) {
+            select.arg(format!("-D{var}={value}"));
+        }
+    }
+    let status = select.arg("-P").arg(manifest_dir.join("cmake/TargetSelection.cmake"))
+        .status().expect("failed to invoke cmake — is it installed?");
+    assert!(status.success(), "CMake target selection failed");
+    let selected = std::fs::read_to_string(selection).expect("read CMake target selection");
+    let mut values = selected.lines();
+    let acpp_targets = values.next().expect("AdaptiveCpp target selection").to_string();
+    let build_cuda = values.next().expect("CUDA build selection").to_string();
+    println!("cargo:warning=xchplot2: ACPP_TARGETS={acpp_targets}");
+    println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda}");
 
     // (prose label, matching service in compose.yaml). None = nothing
     // enumerable — headless CI, or a container without /sys/class/drm.
@@ -684,31 +530,13 @@ fn main() {
         None
     };
 
-    let (build_cuda, bc_source) = match env::var("XCHPLOT2_BUILD_CUDA") {
-        Ok(v) if !v.is_empty() => (v, "$XCHPLOT2_BUILD_CUDA"),
-        _ => {
-            if nvidia_gpu {
-                ("ON".to_string(), "NVIDIA GPU detected")
-            } else if amd_gpu {
-                ("OFF".to_string(), "AMD GPU detected — skipping CUDA TUs")
-            } else if intel_gpu {
-                ("OFF".to_string(), "Intel GPU detected — skipping CUDA TUs")
-            } else if detect_nvcc() {
-                ("ON".to_string(), "no GPU probe, nvcc present — assuming CI/container")
-            } else {
-                ("OFF".to_string(), "no GPU, no nvcc — skipping CUDA TUs")
-            }
-        },
-    };
-    println!("cargo:warning=xchplot2: XCHPLOT2_BUILD_CUDA={build_cuda} ({bc_source})");
-
     // Deferred from the arch block above: only meaningful once we know the
     // CUDA TUs are actually being compiled.
     if build_cuda == "ON" {
         println!("cargo:warning=xchplot2: building for CUDA arch {cuda_arch} ({arch_source})");
     }
 
-    // Preflight critical system deps BEFORE invoking cmake. Cargo
+    // Preflight critical system deps BEFORE configuring dependencies. Cargo
     // install users land here without reading README.md's Build
     // section; without preflight, missing deps surface as cryptic
     // CMake / AdaptiveCpp errors deep in the configure / build.
@@ -781,117 +609,16 @@ fn main() {
         panic!("\nxchplot2: build prerequisites missing:\n{bullets}\n\n{vendor_note}{next_steps}\n");
     }
 
-    // CUDA 13.0 dropped codegen for sm_50/52/53/60/61/62/70/72 entirely
-    // — its nvcc fails the CMake TryCompile probe with "Unsupported gpu
-    // architecture 'compute_61'" on Pascal, "compute_70" on Volta, etc.
-    // Catch that mismatch HERE so the failure surfaces with a clear fix
-    // path, not buried in a CMakeError.log 40 lines into a TryCompile.
-    // Skipped when nvcc version or arch list can't be parsed (treat as
-    // "preflight not actionable, let cmake try" — preserves prior
-    // behaviour for unusual setups).
-    if build_cuda == "ON" {
-        if let (Some(nvcc_major), Some(min)) = (detect_nvcc_major(), min_arch(&cuda_arch)) {
-            if nvcc_major >= 13 && min < 75 {
-                // Container detection: Docker writes /.dockerenv, Podman writes
-                // /run/.containerenv. Either presence means the host-side fixes
-                // (apt install cuda-toolkit, set CUDA_PATH) are not actionable
-                // from inside this build — the user needs to rebuild the image
-                // with a different BASE_DEVEL.
-                let in_container = std::path::Path::new("/.dockerenv").exists()
-                    || std::path::Path::new("/run/.containerenv").exists();
-                let fix_block = if in_container {
-                    format!(
-                        "You're building inside a container — the toolkit comes from the\n\
-                         base image, not the host. Rebuild the image with a CUDA 12.x base:\n  \
-                           - Recommended: rerun scripts/build-container.sh on the host;\n    \
-                             it auto-pins nvidia/cuda:12.9.1 when CUDA_ARCH < 75.\n  \
-                           - Or pass --build-arg explicitly:\n      \
-                               podman build -t xchplot2:cuda \\\n        \
-                                 --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
-                                 --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
-                                 --build-arg CUDA_ARCH={min} \\\n        \
-                                 .\n  \
-                           - Or via compose with env vars:\n      \
-                               CUDA_ARCH={min} \\\n        \
-                                 BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
-                                 BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04 \\\n        \
-                                 podman compose build cuda\n"
-                    )
-                } else {
-                    "Fix one of:\n  \
-                       - Install CUDA 12.9 (last toolkit with Pascal/Volta support):\n      \
-                           Ubuntu/Debian:  sudo apt install cuda-toolkit-12-9\n      \
-                           Arch:           pacman -S cuda  (or pin to a 12.x channel)\n    \
-                         then point the build at it:\n      \
-                           CUDA_PATH=/usr/local/cuda-12.9 cargo install \\\n      \
-                             --git https://github.com/Jsewill/xchplot2 --force\n  \
-                       - Or override the arch (only valid if you actually have a Turing+ card):\n      \
-                           CUDA_ARCHITECTURES=75 cargo install \\\n      \
-                             --git https://github.com/Jsewill/xchplot2 --force\n  \
-                       - Or use the container path — scripts/build-container.sh auto-pins\n    \
-                         the 12.9 base image when it detects a pre-Turing GPU.\n".to_string()
-                };
-                panic!(
-                    "\nxchplot2: CUDA Toolkit {nvcc_major}.x dropped codegen for sm_{min} \
-                     (Pascal / Volta / pre-Turing).\n\
-                     \n\
-                     Detected:\n  \
-                       nvcc {nvcc_major}.x\n  \
-                       target arch: sm_{min} (from CUDA_ARCHITECTURES={cuda_arch})\n\
-                     \n\
-                     {fix_block}"
-                );
-            }
-        }
-    }
+    // CMake performs nvcc floor/ceiling compatibility checks for both builds.
 
-    // Symmetric ceiling check: a target arch NEWER than this nvcc can
-    // codegen. A Blackwell GeForce RTX 50-series reports compute_cap 12.0,
-    // so autodetect targets sm_120 — but only CUDA 12.8+ added compute_120
-    // codegen. On an older toolkit nvcc dies with
-    //   "nvcc fatal: Unsupported gpu architecture 'compute_120'"
-    // deep inside a CMake TryCompile (exactly the cargo-install failure
-    // Blackwell users hit on CUDA 12.4). PTX is forward-compatible, so
-    // rather than fail we emit PTX for the highest arch THIS nvcc supports;
-    // the driver JIT-compiles it to the real GPU at runtime (the driver
-    // clearly knows the GPU — nvidia-smi just read its compute_cap). Native
-    // SASS for any already-supported arch in the list is preserved. We
-    // loudly recommend a 12.8+ toolkit for native codegen.
-    if build_cuda == "ON" {
-        if let (Some(supported), Some(want)) =
-            (nvcc_supported_arches(), max_arch(&cuda_arch))
-        {
-            let max_supported = supported.iter().copied().max().unwrap();
-            if want > max_supported {
-                // Keep every requested arch the toolkit CAN target as-is
-                // (real SASS); replace the too-new ones with one PTX entry
-                // from the highest supported arch.
-                let mut kept: Vec<String> = cuda_arch
-                    .split(';')
-                    .filter(|tok| arch_num(tok).map_or(true, |n| n <= max_supported))
-                    .map(|tok| tok.trim().to_string())
-                    .collect();
-                let ptx = format!("{max_supported}-virtual");
-                if !kept.iter().any(|k| *k == ptx) {
-                    kept.push(ptx);
-                }
-                let new_arch = kept.join(";");
-                println!(
-                    "cargo:warning=xchplot2: target sm_{want} is newer than this CUDA \
-                     Toolkit can codegen (nvcc tops out at compute_{max_supported}; \
-                     sm_100/sm_120 Blackwell need CUDA 12.8+). Falling back to \
-                     CUDA_ARCHITECTURES={new_arch} — PTX the driver JIT-compiles to your \
-                     GPU at runtime. For native SASS install CUDA 12.8+ and rebuild with \
-                     CUDA_PATH=/usr/local/cuda-12.8 (or set CUDA_ARCHITECTURES explicitly)."
-                );
-                cuda_arch = new_arch;
-            }
-        }
-    }
+    // Cargo's job budget applies to CMake and its dependency bootstrap too.
+    let jobs = env::var("CMAKE_BUILD_PARALLEL_LEVEL").ok().filter(|v| !v.is_empty())
+        .or_else(|| env::var("NUM_JOBS").ok()).unwrap_or_else(|| "1".to_string());
 
     // ---- configure ----
     let mut configure = Command::new("cmake");
     configure
+        .env("CMAKE_BUILD_PARALLEL_LEVEL", &jobs)
         .args([
             "-S", manifest_dir.to_str().unwrap(),
             "-B", cmake_build.to_str().unwrap(),
@@ -932,6 +659,7 @@ fn main() {
             "--target", "xchplot2_cli",
             "--parallel",
         ])
+        .arg(&jobs)
         .status()
         .expect("failed to invoke cmake --build");
     if !status.success() {
@@ -963,6 +691,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=pos2_gpu");
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
+    println!("cargo:rustc-link-lib=static=pos2_sha256");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     // ---- AdaptiveCpp runtime ----
@@ -1202,7 +931,7 @@ fn main() {
     // ---- rebuild triggers ----
     for p in &[
         "src", "tools", "keygen-rs/src", "keygen-rs/Cargo.toml",
-        "keygen-rs/Cargo.lock", "CMakeLists.txt", "build.rs",
+        "keygen-rs/Cargo.lock", "CMakeLists.txt", "cmake", "build.rs",
     ] {
         println!("cargo:rerun-if-changed={p}");
     }
@@ -1210,7 +939,10 @@ fn main() {
     // user flipping it (e.g. XCHPLOT2_BUILD_CUDA=OFF after a failed
     // build) silently keeps the stale configuration.
     for var in &[
+        "CMAKE_BUILD_PARALLEL_LEVEL",
         "CUDA_ARCHITECTURES",
+        "CUDAToolkit_ROOT",
+        "PATH",
         "CUDA_PATH",
         "CUDA_HOME",
         "ACPP_TARGETS",

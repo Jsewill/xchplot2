@@ -2,7 +2,7 @@
 // directly (no SYCL / no GPU code path involved).
 //
 // Format-compatible with the GPU output: same plot_id derivation, same
-// .plot2 file layout, byte-identical proofs. pos2-chip is the upstream
+// .gplot file layout, byte-identical proofs. pos2-chip is the upstream
 // PoS2 reference implementation, already in our build tree via
 // FetchContent (third_party/pos2-chip), so we link its CPU plotter
 // directly rather than routing SYCL kernels through AdaptiveCpp's
@@ -66,7 +66,7 @@ namespace pos2gpu {
 struct BatchEntry;
 struct BatchOptions;
 
-// Returns on-disk .plot2 size in bytes (via file_size post-write).
+// Returns the on-disk plot size in bytes (via file_size post-write).
 std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts);
 
 } // namespace pos2gpu

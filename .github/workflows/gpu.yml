@@ -8,7 +8,7 @@ on:
       suite:
         description: GPU test suite
         type: choice
-        options: [quick, vram, physical]
+        options: [quick, correctness, vram, physical]
         default: quick
   schedule:
     - cron: '17 4 * * *'
@@ -24,30 +24,21 @@ jobs:
       github.event.schedule != '47 7 * * 0'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - backend: cuda
-            ref: main
-            runner: gpu-cuda
-          - backend: hip
-            ref: main
-            runner: gpu-hip
-          - backend: level_zero
-            ref: main
-            runner: gpu-level-zero
-          # GitHub schedules only the default branch; include the native branch here.
-          - backend: cuda
-            ref: cuda-only
-            runner: gpu-cuda
+      # Override with the installed fleet; schedules can include cuda-only.
+      matrix: ${{ fromJSON(vars.GPU_CORRECTNESS_MATRIX || '{"include":[{"backend":"cuda","ref":"main","runner":"gpu-cuda"},{"backend":"hip","ref":"main","runner":"gpu-hip"},{"backend":"level_zero","ref":"main","runner":"gpu-level-zero"},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda"}]}') }}
     uses: ./.github/workflows/gpu-run.yml
     with:
       backend: ${{ matrix.backend }}
       runner: ${{ matrix.runner }}
       ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}
       suite: ${{ github.event_name == 'schedule' && 'vram' || inputs.suite || 'quick' }}
+      max-host-ram-gib: ${{ matrix.max_host_ram_gib || 0 }}
 
   physical:
-    if: inputs.suite == 'physical' || github.event.schedule == '47 7 * * 0'
+    # Automatic physical jobs require an explicitly provisioned small-card fleet.
+    if: >-
+      (inputs.suite == 'physical' || github.event.schedule == '47 7 * * 0') &&
+      (github.event_name == 'workflow_dispatch' || vars.GPU_PHYSICAL_MATRIX != '')
     strategy:
       fail-fast: false
       # Replace this matrix with the installed fleet via a repository variable.
@@ -60,3 +51,4 @@ jobs:
       ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}
       suite: physical
       physical-vram-mib: ${{ matrix.vram_mib }}
+      max-host-ram-gib: ${{ matrix.max_host_ram_gib || 0 }}

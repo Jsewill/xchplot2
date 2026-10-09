@@ -106,9 +106,9 @@ POS2_HOST_DEVICE_INLINE AesState set_int_vec_i128(int32_t i3, int32_t i2, int32_
     return s;
 }
 
-// Initialize the constant-memory T-tables on first use. Must be called once
-// per program from host code before any kernel that touches AesGpu runs.
-// Implemented in AesGpu.cu (CUDA TU only).
+// Initialize constant-memory T-tables before CUDA kernels use them.
+// Implemented in AesGpu.cu. SYCL kernels initialize their own tables lazily
+// through sycl_backend::aes_tables_device(q).
 void initialize_aes_tables();
 
 // =========================================================================
