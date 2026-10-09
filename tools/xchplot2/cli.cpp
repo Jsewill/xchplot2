@@ -112,29 +112,29 @@ void print_usage(char const* prog)
 {
     std::cerr
         << "Usage:\n"
-        << "  " << prog << " test <k> <plot_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
-        << "         [-T|--testnet] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
+        << "  " << prog << " test <k> <group_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
+        << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [--progress|--no-progress] [--devices SPEC]\n"
         << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
-        << "      k strength plot_index meta_group testnet plot_id_hex memo_hex out_dir out_name\n"
+        << "      k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
         << "  " << prog << " bench [-k K] [-s S] [-n N] [-o DIR] [--devices SPEC]\n"
-        << "         [--tier T] [--cpu] [--cpu-workers N] [--warmup W] [--keep] [-T|--testnet]\n"
+        << "         [--tier T] [--cpu] [--cpu-workers N] [--warmup W] [--keep]\n"
         << "         [--target-size TiB] [--compute-only] [-q|--quiet]\n"
         << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
         << "    Measure plotting throughput (TiB/hour, TiB/day, TiB/month) on\n"
         << "    synthetic unfarmable plots (default queue: 1 warmup + 10 measured\n"
-        << "    plots/worker). Always writes real .plot2 files; deletes them\n"
+        << "    plots/worker). Always writes real .gplot files; deletes them\n"
         << "    on exit unless --keep is set.\n"
         << "  " << prog << " plot -k K -n N -f HEX  ( -p HEX | --pool-ph HEX | -c xch1... )\n"
-        << "         [-s S] [-o DIR] [-T] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
+        << "         [-s S] [-o DIR] [-i N] [-g N] [-S HEX] [-v] [-q]\n"
         << "         [--resume] [--manifest FILE]\n"
         << "         [--max-host-ram SIZE] [--temp-dir PATH] [--no-auto-spill]\n"
-        << "    Standalone farmable plot(s): derives plot_id + memo internally\n"
+        << "    Single-member plot groups: derives group_id + memo internally\n"
         << "    from the keys via chia-rs, then batches through the GPU pipeline.\n"
         << "    -f, --farmer-pk HEX             : 96 hex chars (48 B G1 public key).\n"
         << "    -p, --pool-pk HEX               : 96 hex chars. Pool public key mode.\n"
@@ -149,13 +149,12 @@ void print_usage(char const* prog)
         << "                                      xchplot2-job-*.tsv in the output directory).\n"
         << "    --resume, --skip-existing       : recover the saved plot job and skip files\n"
         << "                                      with matching identity, memo, and valid bounds.\n"
-        << "    -i, --plot-index N              : base v2 PoS plot_index (default 0); increments per plot.\n"
+        << "    -i, --plot-index N              : member index (must be 0 for single-member groups).\n"
         << "    -g, --meta-group N              : v2 PoS meta_group field (default 0).\n"
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
         << "                                      entropy. Per-plot seed = SHA256(seed || i).\n"
         << "                                      Reproducible across runs. Defaults to\n"
         << "                                      a fresh random seed per plot.\n"
-        << "    -T, --testnet                   : testnet proof parameters.\n"
         << "    -v, --verbose                   : per-plot progress on stderr.\n"
         << "    -q, --quiet                     : suppress info-level stderr output\n"
         << "                                      (progress line, summaries, tier\n"
@@ -277,14 +276,14 @@ void print_usage(char const* prog)
         << "    @FILE          insert whitespace-separated arguments (no shell quoting).\n"
         << "\n"
         << "  test-mode positional args:\n"
-        << "    <k>            : even integer in [18, 30]\n"
-        << "    <plot_id_hex>  : 64 hex characters\n"
+        << "    <k>            : even integer in [18, 28]\n"
+        << "    <group_id_hex>  : 64 hex characters\n"
         << "    [strength]     : optional, defaults to 2\n"
         << "    [plot_index]   : optional, defaults to 0\n"
         << "    [meta_group]   : optional, defaults to 0\n"
         << "    [verbose]      : optional, 0/1, default 0\n"
         << "  test-mode flags:\n"
-        << "    -T, --testnet      : use testnet proof parameters\n"
+        << "        --raw         : write a temporary raw member for group assembly\n"
         << "    -o, --out DIR      : output directory, defaults to .\n"
         << "    -m, --memo HEX     : memo bytes (hex); required for farmable plots\n"
         << "    -N, --out-name NAME: override output filename (basename only)\n"
@@ -633,7 +632,7 @@ bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 
 std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 {
-    // Match chia plots create's v2 filename scheme: plot-k{size}-{id}.plot2
+    // The sole member ID includes meta_group as well as the group identity.
     static char const hex[] = "0123456789abcdef";
     std::string out = "plot-k" + std::to_string(k) + "-";
     out.reserve(out.size() + 64 + 6);
@@ -641,7 +640,7 @@ std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
         out += hex[b >> 4];
         out += hex[b & 0xF];
     }
-    out += ".plot2";
+    out += ".gplot";
     return out;
 }
 
@@ -1159,9 +1158,10 @@ std::vector<pos2gpu::BatchEntry> build_bench_entries(
         e.plot_index = 0;
         e.meta_group = 0;
         e.testnet = testnet;
-        read_random_bytes(e.plot_id.data(), e.plot_id.size());
+        read_random_bytes(e.group_id.data(), e.group_id.size());
+        e.plot_id = pos2gpu::plot_id_for_group(e.group_id, 0, 0);
         e.out_dir = out_dir;
-        e.out_name = "bench-" + bytes_to_hex(e.plot_id) + ".plot2";
+        e.out_name = "bench-" + bytes_to_hex(e.group_id) + ".gplot";
         entries.push_back(std::move(e));
     }
     return entries;
@@ -1526,7 +1526,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if (a == "--no-compute-only") compute_only = false;
             else if (a == "--quiet" || a == "-q") opts.quiet = true;
             else if (a == "--no-quiet") opts.quiet = false;
-            else if (a == "--testnet" || a == "-T") testnet = true;
+            else if (a == "--testnet" || a == "-T") {
+                std::cerr << "Error: PoS2 1.0 removes testnet-specific plots; omit --testnet\n";
+                return 1;
+            }
             else if (a == "--no-testnet") testnet = false;
             else if (a == "--target-size" && need(1)) {
                 target_size_tib = std::atof(argv[++i]);
@@ -1584,8 +1587,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
         }
 
-        if (k < 18 || k > 30 || (k % 2) != 0) {
-            std::cerr << "Error: -k must be an even integer in [18, 30]\n";
+        if (k < 18 || k > 28 || (k % 2) != 0) {
+            std::cerr << "Error: -k must be an even integer in [18, 28]\n";
             return 1;
         }
         if (strength < 2 || strength > 63) {
@@ -2149,7 +2152,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if ((a == "--meta-group" || a == "-g") && need(1)) meta_group      = std::atoi(argv[++i]);
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--manifest" && need(1)) manifest_path = argv[++i];
-            else if  (a == "--testnet"    || a == "-T") testnet = true;
+            else if (a == "--testnet" || a == "-T") {
+                std::cerr << "Error: PoS2 1.0 removes testnet-specific plots; omit --testnet\n";
+                return 1;
+            }
             else if  (a == "--no-testnet")              testnet = false;
             else if  (a == "-v" || a == "--verbose")    verbose = true;
             else if  (a == "--no-verbose")              verbose = false;
@@ -2249,15 +2255,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::cerr << "Error: --num must be >= 1\n";
             return 1;
         }
-        if (plot_index_base < 0 || plot_index_base > 0xFFFF) {
-            std::cerr << "Error: --plot-index must be in [0, 65535]\n";
-            return 1;
-        }
-        // plot_index auto-increments across `-n N`; reject upfront if the
-        // final plot's plot_index would exceed the u16 range.
-        if (num > 65536 - plot_index_base) {
-            std::cerr << "Error: --plot-index + (--num - 1) exceeds 65535 "
-                         "(base=" << plot_index_base << ", num=" << num << ")\n";
+        if (plot_index_base != 0) {
+            std::cerr << "Error: single-plot groups use --plot-index 0; use the grouped-job runner for multiple members\n";
             return 1;
         }
         if (meta_group < 0 || meta_group > 0xFF) {
@@ -2324,7 +2323,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 for (std::size_t i = 0; i < job.size(); ++i) {
                     auto const& e = job[i];
                     if (e.k != k || e.strength != strength || e.testnet != testnet ||
-                        e.plot_index != plot_index_base + static_cast<int>(i) ||
+                        e.raw || e.plot_index != 0 ||
                         e.meta_group != meta_group ||
                         std::filesystem::weakly_canonical(e.out_dir) !=
                             std::filesystem::weakly_canonical(out_dir) ||
@@ -2375,26 +2374,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     read_random_bytes(seed, sizeof(seed));
                 }
 
-                uint8_t plot_id[32];
+                uint8_t group_id[32];
                 std::vector<uint8_t> memo(128);
                 size_t memo_len = memo.size();
-                // plot_index increments per plot so a single `plot -n N`
-                // run produces plots with distinct plot_index values —
-                // this is the within-group identifier the grouped-file
-                // layout planned in pos2-chip will expect.
-                uint16_t const plot_index_i =
-                    static_cast<uint16_t>(plot_index_base + i);
-                int rc = pos2_keygen_derive_plot(
-                    seed, sizeof(seed),
-                    farmer_pk.data(),
-                    pool_key.data(), pool_kind,
-                    static_cast<uint8_t>(strength),
-                    plot_index_i,
-                    static_cast<uint8_t>(meta_group),
-                    plot_id,
-                    memo.data(), &memo_len);
+                int rc = pos2_keygen_derive_group(
+                    seed, sizeof(seed), farmer_pk.data(), pool_key.data(), pool_kind,
+                    static_cast<uint8_t>(strength), group_id, memo.data(), &memo_len);
                 if (rc != POS2_OK) {
-                    std::cerr << "Error: pos2_keygen_derive_plot failed (rc=" << rc << ")\n";
+                    std::cerr << "Error: pos2_keygen_derive_group failed (rc=" << rc << ")\n";
                     return 2;
                 }
                 memo.resize(memo_len);
@@ -2402,10 +2389,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 pos2gpu::BatchEntry e;
                 e.k          = k;
                 e.strength   = strength;
-                e.plot_index = plot_index_base + i;
+                e.plot_index = 0;
                 e.meta_group = meta_group;
                 e.testnet    = testnet;
-                std::copy(plot_id, plot_id + 32, e.plot_id.begin());
+                std::copy(group_id, group_id + 32, e.group_id.begin());
+                e.plot_id = pos2gpu::plot_id_for_group(e.group_id, 0, uint8_t(meta_group));
                 e.memo       = std::move(memo);
                 e.out_dir    = out_dir;
                 e.out_name   = plot_id_to_filename(k, e.plot_id);
@@ -2503,7 +2491,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --manifest --config --max-host-ram --temp-dir --no-auto-spill -k -n -f -p -c -o -T -i -g -S --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --skip-existing --resume --manifest --config --max-host-ram --temp-dir --no-auto-spill --raw -k -n -f -p -c -o -i -g -S --help" -- "$cur") )
         return 0
     fi
 }
@@ -2536,6 +2524,7 @@ _xchplot2() {
         '--shard-plot[Single-plot multi-GPU]' \
         '--max-host-ram[Cap the unswappable host peak]:size:(min 4G 8G 16G 32G)' \
         '--manifest[Saved plot job]:file:_files' \
+        '--raw[Temporary raw group member (test only)]' \
         '--temp-dir[Where spilled tables live]:dir:_files -/' \
         '--no-auto-spill[Refuse rather than spill when host RAM is short]' \
         '-o[Output dir]:dir:_files -/' \
@@ -2559,6 +2548,7 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shel
 complete -c xchplot2 -l tier      -x -a 'plain compact minimal tiny auto'  -d 'Streaming tier'
 complete -c xchplot2 -l devices   -x -a 'all gpu cpu 0 1 2 3'              -d 'Device selector'
 complete -c xchplot2 -l manifest  -r -d 'Saved plot job'
+complete -c xchplot2 -n '__fish_seen_subcommand_from test' -l raw -d 'Temporary raw group member'
 complete -c xchplot2 -l progress  -d 'Force aggregate progress line on'
 complete -c xchplot2 -l no-progress -d 'Force aggregate progress line off'
 complete -c xchplot2 -s q -l quiet -d 'Quiet — suppress info-level output'
@@ -2591,7 +2581,11 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
-        if      (a == "--testnet"    || a == "-T") opts.testnet = true;
+        if (a == "--testnet" || a == "-T") {
+            std::cerr << "Error: PoS2 1.0 removes testnet-specific plots; omit --testnet\n";
+            return 1;
+        }
+        else if (a == "--raw") opts.raw = true;
         else if  (a == "--gpu-t1") opts.t1 = pos2gpu::PhaseStrategy::Gpu;
         else if  (a == "--gpu-t2") opts.t2 = pos2gpu::PhaseStrategy::Gpu;
         else if  (a == "--gpu-t3") opts.t3 = pos2gpu::PhaseStrategy::Gpu;
@@ -2623,8 +2617,8 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     }
 
     opts.k = std::atoi(pos[0].c_str());
-    if (!parse_hex(pos[1], opts.plot_id)) {
-        std::cerr << "Error: plot_id must be 64 hex characters\n";
+    if (!parse_hex(pos[1], opts.group_id)) {
+        std::cerr << "Error: group_id must be 64 hex characters\n";
         return 1;
     }
     if (pos.size() >= 3) opts.strength    = std::atoi(pos[2].c_str());
@@ -2632,9 +2626,12 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     if (pos.size() >= 5) opts.meta_group  = std::atoi(pos[4].c_str());
     if (pos.size() >= 6) opts.verbose     = std::atoi(pos[5].c_str()) != 0;
 
-    if (opts.testnet) {
-        std::cout << "TESTNET plot — will NOT be valid on mainnet.\n";
+    if (opts.plot_index < 0 || opts.plot_index > 65535 ||
+        opts.meta_group < 0 || opts.meta_group > 255 || (!opts.raw && opts.plot_index != 0)) {
+        std::cerr << "Error: group files require index 0; raw member indices must be 0..65535 and meta group 0..255\n";
+        return 1;
     }
+    opts.plot_id = pos2gpu::plot_id_for_group(opts.group_id, uint16_t(opts.plot_index), uint8_t(opts.meta_group));
 
     try {
         std::string out = pos2gpu::plot_to_file(opts, output_dir);

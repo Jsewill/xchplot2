@@ -1,5 +1,12 @@
-if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-    message(FATAL_ERROR "Binary packaging supports Linux and Windows x86_64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(_release_arch x86_64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(_release_arch aarch64)
+else()
+    message(FATAL_ERROR "Binary packaging supports Linux and Windows x86_64/ARM64")
+endif()
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+    message(FATAL_ERROR "Binary packaging supports Linux and Windows")
 endif()
 if(NOT EXISTS "${XCHPLOT2_LICENSE_DIR}/rust.txt")
     message(FATAL_ERROR "Generate the release licenses first with scripts/build-release.sh or scripts/build-release.ps1")
@@ -31,6 +38,14 @@ file(WRITE "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
     "CUDA: ${CMAKE_CUDA_COMPILER_VERSION}\n"
     "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}\n"
     "Rust: ${_release_rust}\n")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "pos2-chip: contrib/pos2-arm-cuda.patch applied (ARM CUDA/MSVC intrinsics)\n")
+endif()
+if(_cccl_arch_patch_applied)
+    file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
+        "CCCL: contrib/cccl-arch-list.patch applied to toolkit headers\n")
+endif()
 if(_cccl_patch_applied)
     file(APPEND "${CMAKE_BINARY_DIR}/BUILDINFO.txt"
         "CCCL: contrib/cccl-windows-ptx.patch applied to toolkit headers\n")
@@ -64,7 +79,7 @@ else()
 endif()
 set(CPACK_PACKAGE_NAME xchplot2)
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_FILE_NAME "xchplot2-${PROJECT_VERSION}-${_release_system}-x86_64-cuda")
+set(CPACK_PACKAGE_FILE_NAME "xchplot2-${PROJECT_VERSION}-${_release_system}-${_release_arch}-cuda")
 set(CPACK_PACKAGE_CHECKSUM SHA256)
 if(NOT MSVC)
     set(CPACK_STRIP_FILES ON)

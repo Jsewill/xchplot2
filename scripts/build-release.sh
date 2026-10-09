@@ -2,6 +2,18 @@
 # Build the Linux CUDA archive inside ci/release/Containerfile.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+arch=$(uname -m)
+architectures='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120'
+if [[ $arch == aarch64 ]]; then
+    architectures=$(nvcc --list-gpu-arch | awk '
+        /^compute_[0-9]+$/ {
+            sub(/^compute_/, "");
+            targets = targets $0 "-real;";
+            if ($0 + 0 > highest) highest = $0 + 0;
+        }
+        END { if (!highest) exit 1; print targets highest "-virtual" }
+    ')
+fi
 build_dir="${1:-build/release}"
 mkdir -p "$build_dir/licenses"
 build_dir="$(cd "$build_dir" && pwd)"
@@ -15,11 +27,11 @@ mkdir -p "$build_dir/licenses/rust-standard-library"
 cp "$rust_docs/COPYRIGHT-library.html" "$build_dir/licenses/rust-standard-library/"
 cp -r "$rust_docs/licenses" "$build_dir/licenses/rust-standard-library/"
 cargo about generate --locked --fail \
-    --manifest-path keygen-rs/Cargo.toml --target x86_64-unknown-linux-gnu \
+    --manifest-path keygen-rs/Cargo.toml --target "$arch-unknown-linux-gnu" \
     --output-file "$build_dir/licenses/rust.txt" ci/release/licenses.hbs
 cmake -S . -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120' \
+    -DCMAKE_CUDA_ARCHITECTURES="$architectures" \
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
     -DXCHPLOT2_PACKAGE=ON -DXCHPLOT2_LICENSE_DIR="$build_dir/licenses"
 cmake --build "$build_dir" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"

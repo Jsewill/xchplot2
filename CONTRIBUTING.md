@@ -33,21 +33,21 @@ passing a build or a software cap does not certify other physical hardware.
 After a functional change, spot-check a real output with full proofs:
 
 ```bash
-xchplot2 verify /path/to/output.plot2 --full --trials 100
+xchplot2 verify /path/to/output.gplot --full --trials 100
 ```
 
 Default `verify` samples quality chains; `--full` also reconstructs and
 validates full proofs. An empty sample fails. Sampling does not inspect every
 part of a file, so use a matching CPU output for byte parity. For example,
-this synthetic testnet fixture uses the same ID, memo, and plot parameters:
+this synthetic group fixture uses the same ID, memo, and plot parameters:
 
 ```bash
-PLOT_ID=$(printf 'ab%.0s' {1..32})
+GROUP_ID=$(printf 'ab%.0s' {1..32})
 MEMO=$(printf '00%.0s' {1..112})
-xchplot2 test 28 "$PLOT_ID" 2 0 0 -T -m "$MEMO" -o ref -N ref.plot2
-printf '28 2 0 0 1 %s %s out gpu.plot2\n' "$PLOT_ID" "$MEMO" > m.tsv
+xchplot2 test 28 "$GROUP_ID" 2 0 0 -m "$MEMO" -o ref -N ref.gplot
+printf '28 2 0 0 gplot-v2 %s %s out gpu.gplot\n' "$GROUP_ID" "$MEMO" > m.tsv
 xchplot2 batch m.tsv --tier tiny
-sha256sum ref/ref.plot2 out/gpu.plot2
+sha256sum ref/ref.gplot out/gpu.gplot
 ```
 
 The hashes must match. Use a tier and spill configuration appropriate to
@@ -97,8 +97,16 @@ and requires the matching runners.
 | Suite | When | Checks |
 | --- | --- | --- |
 | `quick` | Branch pushes; manual | All CTest tests, then k=18 CPU byte parity and 100 full-proof challenges for every tier and disk-spill variant |
+| `correctness` | Manual; shared GPU | All CTest tests, then k=28 CPU byte parity and full proofs for every tier and spill variant, with the production VRAM caps |
 | `vram` | Daily, 04:17 UTC; manual | Quick CTest tests, three k=28 plots at each tier's budget, rejection 1 MiB below it, then k=28 CPU byte parity and full proofs for every tier and spill variant |
 | `physical` | Sunday, 07:47 UTC; manual | Actual 2/4/6/8 GiB capacity, every k=28 tier that fits, plus three uncapped auto-tier plots with full-proof verification |
+
+`quick` and `correctness` record device-wide memory measurements as diagnostics.
+Other applications can change those counters, so they do not establish the
+plotter's memory use on a shared GPU. Allocation and admission guards remain
+active. `vram` and `physical` enforce the device-wide memory assertion and
+require an isolated GPU; the summary records which policy ran. A correctness
+pass does not qualify memory usage.
 
 The default branch schedules both `main` and `cuda-only`, because
 [GitHub schedules run only on the default branch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
@@ -168,6 +176,7 @@ the plotter.
 ```bash
 python3 scripts/test/gpu-ci-test.py
 python3 scripts/test/gpu-ci.py build --backend cuda --suite quick --logs /tmp/gpu-quick
+python3 scripts/test/gpu-ci.py build --backend cuda --suite correctness --logs /tmp/gpu-correctness
 python3 scripts/test/gpu-ci.py build --backend hip --suite vram --logs /tmp/gpu-vram
 python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --physical-vram-mib 8192 --logs /tmp/gpu-physical
 ```
@@ -180,8 +189,9 @@ plots are temporary; byte comparisons and reference hashes are recorded.
 
 `contrib/testnet-farming.patch` targets chia-blockchain commit `39f8bec88`
 (2.7.0 Checkpoint Merge). It fixes the v2 service wiring, proof challenge,
-and dependency issues present at that revision. This fixture is not a claim
-about the current state of upstream farming support.
+and dependency issues present at that revision. This historical fixture targets
+the pre-1.0 plot format and cannot farm plots from the current build. It is not
+a claim about current upstream support.
 
 ```bash
 git clone https://github.com/Chia-Network/chia-blockchain
@@ -192,7 +202,7 @@ git apply /path/to/xchplot2/contrib/testnet-farming.patch
 
 The patch header explains its changes. The separate
 [pos2-chip PR #118 compatibility notes](contrib/pos2-pr118/README.md) record
-the proposed grouped format and the pinned revision checked for it.
+the current PoS2 1.0 format and the experimental member-index extension.
 
 ## Documentation checks
 
@@ -231,6 +241,10 @@ podman run --rm -v "$PWD:/src" xchplot2-release bash scripts/build-release.sh
 ```
 
 The Linux archive and its SHA-256 checksum are written to `build/release/dist/`.
+The same image and script build natively on x86-64 and ARM64 (CUDA SBSA).
+ARM64 includes every numeric GPU architecture reported by its compiler.
+The release matrix runs both architectures and checks each extracted archive
+on its matching Ubuntu runtime. Manual runs can select Linux or Windows.
 For native Windows, install the [Windows build tools](INSTALL.md#windows)
 and PowerShell 7.3+, then run:
 
@@ -239,15 +253,18 @@ rustup toolchain install 1.98.1 --profile minimal
 rustup default 1.98.1
 cargo install --locked --features cli cargo-about --version 0.9.2
 ./scripts/build-release.ps1
-python scripts/test/release.py build/release-windows/dist/xchplot2-0.12.0-windows-x86_64-cuda.zip
+python scripts/test/release.py (Get-ChildItem build/release-windows/dist/*.zip).FullName
 ```
 
-The PowerShell script loads the Visual Studio 2022 x64 environment when
-needed, builds all targets with CUDA 12.9.1, runs the host CTest subset, and
+The PowerShell script loads the matching Visual Studio environment when
+needed, builds all targets with CUDA 12.9.1 on x64 or 13.4.2 on ARM64,
+runs the host CTest subset, and
 writes a ZIP and checksum to `build/release-windows/dist/`. The extracted
 Windows check also exercises Unicode paths, real key generation, Ctrl-Break,
 resume, and publication failure. CI runs it with toolkit libraries removed
-from `PATH`. Windows GPU plotting and spill behavior need qualification on
+from `PATH` and checks the executable's CPU architecture. The ARM64 build
+uses NVIDIA's checksum-verified component archives and includes every GPU
+architecture reported by its compiler. Windows GPU plotting and spill behavior need qualification on
 Windows hardware before the archive is advertised for those devices.
 For affected CUDA 12.x headers, CMake applies NVIDIA's
 [64-bit PTX operand fix](https://github.com/NVIDIA/cccl/commit/270f4100dceeb6345f74fd374695e78bb0a48082)

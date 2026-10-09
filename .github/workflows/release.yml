@@ -18,13 +18,28 @@ on:
   push:
     tags: ['v*-cuda-only']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Release builds to check
+        type: choice
+        default: all
+        options: [all, linux, windows]
 
 permissions:
   contents: read
 
 jobs:
   linux-cuda:
-    runs-on: ubuntu-24.04
+    if: inputs.platform != 'windows'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
@@ -44,14 +59,23 @@ jobs:
           '
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-x86_64-cuda
+          name: linux-${{ matrix.arch }}-cuda
           path: |
             build/release/dist/*.tar.gz
             build/release/dist/*.sha256
           if-no-files-found: error
 
   windows-cuda:
-    runs-on: windows-2022
+    if: inputs.platform != 'linux'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2022
+          - arch: aarch64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
       run:
@@ -61,12 +85,16 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - name: Install CUDA 12.9.1 compiler and runtime headers
+        if: matrix.arch == 'x86_64'
         run: |
           $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
           Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe' -OutFile $installer
           $install = Start-Process $installer -ArgumentList '-s', '-n', 'nvcc_12.9', 'cudart_12.9', 'thrust_12.9' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "CUDA installer failed: $($install.ExitCode)" }
           "CUDA_PATH=$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.9" >> $env:GITHUB_ENV
+      - name: Install CUDA 13.4.2 ARM64 compiler and runtime headers
+        if: matrix.arch == 'aarch64'
+        run: ./ci/release/install-cuda-arm64.ps1
       - name: Install release Rust tooling
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
@@ -85,7 +113,7 @@ jobs:
           & $python scripts/test/release.py $archive
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64-cuda
+          name: windows-${{ matrix.arch }}-cuda
           path: |
             build/release-windows/dist/*.zip
             build/release-windows/dist/*.sha256
@@ -101,7 +129,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: '*-x86_64-cuda'
+          pattern: '*-cuda'
           merge-multiple: true
           path: dist
       - name: Attach archives to a draft release

@@ -48,7 +48,7 @@ def main():
                         process.wait()
                 paths = (first + rest).splitlines()
                 assert process.returncode == 4 and 0 < len(paths) < 12, (process.returncode, paths)
-                assert {Path(p) for p in paths} == set(out.glob("*.plot2"))
+                assert {Path(p) for p in paths} == set(out.glob("*.gplot"))
                 job, = out.glob("xchplot2-job-*.tsv")
                 saved = job.read_bytes()
                 entries = [shlex.split(line) for line in saved.decode("utf-8").splitlines()

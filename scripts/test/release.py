@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import platform
 import subprocess
 import sys
 import tarfile
@@ -37,13 +38,27 @@ def main():
                      "licenses/cuda-cccl.txt", "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"
         binary = package / ("bin/xchplot2.exe" if os.name == "nt" else "bin/xchplot2")
+        if os.name == "nt":
+            with binary.open("rb") as executable:
+                header = executable.read(64)
+                assert header[:2] == b"MZ", "Expected a Windows executable"
+                executable.seek(int.from_bytes(header[60:64], "little"))
+                pe = executable.read(6)
+            machine = 0xAA64 if platform.machine().lower() in ("aarch64", "arm64") else 0x8664
+            assert pe[:4] == b"PE\0\0" and int.from_bytes(pe[4:6], "little") == machine, "Archive CPU architecture mismatch"
+        else:
+            with binary.open("rb") as executable:
+                header = executable.read(20)
+            machine = 183 if platform.machine().lower() in ("aarch64", "arm64") else 62
+            assert header[:6] == b"\x7fELF\x02\x01", "Expected a 64-bit little-endian ELF executable"
+            assert int.from_bytes(header[18:20], "little") == machine, "Archive CPU architecture mismatch"
         subprocess.run([binary, "--help", "--config", os.devnull], check=True, timeout=30)
-        plot_id, memo = "ab" * 32, "00" * 112
+        group_id, memo = "ab" * 32, "00" * 112
         manifest = work / "cpu.tsv"
-        manifest.write_text(f"18 2 0 0 0 {plot_id} {memo} . cpu.plot2\n")
+        manifest.write_text(f"18 2 0 0 gplot-v2 {group_id} {memo} . cpu.gplot\n")
         subprocess.run([binary, "batch", manifest, "--devices", "cpu", "--cpu-workers", "2", "--config", os.devnull],
                        cwd=work, check=True, timeout=180)
-        subprocess.run([binary, "verify", work / "cpu.plot2", "--full", "--trials", "100",
+        subprocess.run([binary, "verify", work / "cpu.gplot", "--full", "--trials", "100",
                         "--config", os.devnull],
                        check=True, timeout=180)
         if os.name == "nt":

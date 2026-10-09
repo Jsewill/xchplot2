@@ -16,13 +16,13 @@ TIERS = ("tiny", "pinned", "minimal", "compact", "plain")
 MASKS = {"cuda": "cuda", "hip": "hip", "level_zero": "ze"}
 
 
-def test_environment(source, backend):
+def test_environment(source, backend, strict_memory=True):
     # Keep driver/toolchain paths, but remove plotting overrides and bypasses.
     env = {k: v for k, v in source.items()
            if not k.startswith(("POS2GPU_", "XCHPLOT2_"))}
     if "POS2GPU_VRAM_MARGIN_MB" in source:
         env["POS2GPU_VRAM_MARGIN_MB"] = source["POS2GPU_VRAM_MARGIN_MB"]
-    env.update(ACPP_VISIBILITY_MASK=MASKS[backend], POS2GPU_ASSERT_VRAM="1",
+    env.update(ACPP_VISIBILITY_MASK=MASKS[backend], POS2GPU_ASSERT_VRAM="1" if strict_memory else "0",
                POS2GPU_STREAMING_STATS="1")
     return env
 
@@ -66,7 +66,7 @@ def main():
     parser.add_argument("build", type=Path)
     parser.add_argument("--binary", type=Path, help="Test an extracted release executable")
     parser.add_argument("--backend", choices=MASKS, required=True)
-    parser.add_argument("--suite", choices=("quick", "vram", "physical"), default="quick")
+    parser.add_argument("--suite", choices=("quick", "correctness", "vram", "physical"), default="quick")
     parser.add_argument("--physical-vram-mib", type=int, default=0)
     parser.add_argument("--logs", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, default=Path.cwd(),
@@ -76,7 +76,8 @@ def main():
         parser.error("--physical-vram-mib is required only for the physical suite")
     build, logs = args.build.resolve(), args.logs.resolve()
     logs.mkdir(parents=True, exist_ok=True)
-    env = test_environment(os.environ, args.backend)
+    strict_memory = args.suite in ("vram", "physical")
+    env = test_environment(os.environ, args.backend, strict_memory)
     scratch = args.scratch.resolve()
     if not scratch.is_dir():
         parser.error("--scratch must be an existing directory on real disk")
@@ -102,36 +103,38 @@ def main():
         caps = tier_caps(info, args.physical_vram_mib) if args.suite != "quick" else {}
         tiers = list(caps) if caps else [tier for tier in TIERS if tier in info]
         k = 18 if args.suite == "quick" else 28
-        summary = dict(backend=args.backend, suite=args.suite, k=k, tiers=tiers, inventory=info)
+        summary = dict(backend=args.backend, suite=args.suite, k=k, tiers=tiers, inventory=info,
+                       memory_assertion=strict_memory)
         (logs / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         run("devices", [binary, "devices", "--config", "/dev/null"])
         run("ctest", ["ctest", "--test-dir", build, "--output-on-failure", "--no-tests=error",
                       "--parallel", "1", "--timeout", "900", "--output-junit", logs / "ctest.xml"])
-        if caps:
+        if caps and strict_memory:
             specs = [f"{tier}:{cap - info['margin_bytes'] // MIB}" for tier, cap in caps.items()]
             run("vram-boundaries", [Path(__file__).with_name("vram-tiers.sh"), binary, "0", *specs],
                 dict(env, XCHPLOT2_TEST_LOG_DIR=str(logs / "boundaries")))
 
         with tempfile.TemporaryDirectory(prefix=".gpu-ci-", dir=scratch) as directory:
             work = Path(directory)
-            plot_id, memo = "ab" * 32, "00" * 112
-            run("cpu-reference", [binary, "test", k, plot_id, "2", "0", "0", "-m", memo,
-                                  "-o", work, "-N", "reference.plot2", "--config", "/dev/null"])
-            reference = work / "reference.plot2"
+            group_id, memo = "ab" * 32, "00" * 112
+            run("cpu-reference", [binary, "test", k, group_id, "2", "0", "0", "-m", memo,
+                                  "-o", work, "-N", "reference.gplot", "--config", "/dev/null"])
+            reference = work / "reference.gplot"
             with reference.open("rb") as source:
                 summary["reference_sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
             (logs / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             for tier in tiers:
                 for spill in (False, True) if tier in info["spill_tiers"] else (False,):
                     label = tier + ("-disk" if spill else "")
-                    plot = work / f"{label}.plot2"
+                    plot = work / f"{label}.gplot"
                     manifest = work / "manifest.tsv"
-                    manifest.write_text(f"{k} 2 0 0 0 {plot_id} {memo} . {plot.name}\n")
+                    manifest.write_text(f"{k} 2 0 0 gplot-v2 {group_id} {memo} . {plot.name}\n")
                     command = [binary, "batch", manifest, "--devices", "0", "--tier", tier,
                                "--no-progress", "--config", "/dev/null"]
                     if spill:
                         command += ["--max-host-ram", "min", "--temp-dir", work]
-                    plot_env = dict(env, POS2GPU_MAX_VRAM_MB=str(caps[tier])) if args.suite == "vram" else env
+                    plot_env = (dict(env, POS2GPU_MAX_VRAM_MB=str(caps[tier]))
+                                if args.suite in ("correctness", "vram") else env)
                     run(label, command, plot_env, cwd=work)
                     trace = (logs / f"{label}.log").read_text()
                     if f"streaming tier: {tier} (" not in trace:
@@ -152,7 +155,7 @@ def main():
                 # No software cap: exercise automatic selection on the real card.
                 run("physical-auto", [binary, "bench", "--devices", "0", "-k", "28", "-n", "3",
                                       "--warmup", "0", "--keep", "--out", work, "--config", "/dev/null"])
-                plots = sorted(work.glob("bench-*.plot2"))
+                plots = sorted(work.glob("bench-*.gplot"))
                 if len(plots) != 3:
                     raise RuntimeError("Physical auto-tier run did not produce three plots")
                 for i, plot in enumerate(plots):

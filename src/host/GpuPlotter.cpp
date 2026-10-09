@@ -9,6 +9,7 @@
 // pulling soft_aes.hpp into the link.
 
 #include "host/GpuPlotter.hpp"
+#include "host/BatchPlotter.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 
@@ -43,15 +44,64 @@ void warn_if_gpu_requested_but_unimplemented(GpuPlotOptions const& o)
 
 std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_dir)
 {
-    if (opts.k < 18 || opts.k > 30 || (opts.k & 1) != 0) {
-        throw std::runtime_error(
-            "k must be even and in [18, 30] (k=32 exceeds the 32-bit "
-            "sort-index scheme and is not yet supported)");
+    if (opts.k < 18 || opts.k > 28 || (opts.k & 1) != 0) {
+        throw std::runtime_error("k must be even and in [18, 28]");
     }
     if (opts.strength < 2 || opts.strength > 63) {
         throw std::runtime_error("strength must be in [2, 63]");
     }
+    if (opts.testnet)
+        throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots; omit --testnet");
+    if (!opts.raw && opts.plot_index != 0)
+        throw std::invalid_argument("single-plot groups must start at plot index 0; use --raw for group members");
 
+    // Build output filename. Caller may override via opts.out_name (used
+    // by integrations). Default includes the group identity and parameters.
+    std::string filename;
+    if (!opts.out_name.empty()) {
+        filename = opts.out_name;
+    } else {
+        std::string group_id_hex;
+        group_id_hex.reserve(64);
+        static char const hex[] = "0123456789abcdef";
+        for (uint8_t b : opts.group_id) {
+            group_id_hex += hex[b >> 4];
+            group_id_hex += hex[b & 0xF];
+        }
+        filename = "plot_" + std::to_string(opts.k)
+                 + "_" + std::to_string(opts.strength)
+                 + "_" + std::to_string(opts.plot_index)
+                 + "_" + std::to_string(opts.meta_group)
+                 + "_" + group_id_hex
+                 + (opts.raw ? ".plot2" : ".gplot");
+    }
+
+    std::filesystem::create_directories(output_dir);
+    auto full_path = std::filesystem::path(output_dir) / filename;
+
+    // Memo: caller-supplied bytes if present (real farmable plots), else
+    // a 112-byte stub (test plots only — harvester will reject).
+    std::vector<uint8_t> memo_bytes;
+    if (!opts.memo.empty()) {
+        memo_bytes = opts.memo;
+    } else {
+        memo_bytes.assign(32 + 48 + 32, 0);
+    }
+    if (memo_bytes.size() > 255) {
+        throw std::runtime_error("memo too long (max 255 bytes; PlotFile uses uint8 length)");
+    }
+    BatchEntry entry;
+    entry.k = opts.k;
+    entry.strength = opts.strength;
+    entry.plot_index = opts.plot_index;
+    entry.meta_group = opts.meta_group;
+    entry.raw = opts.raw;
+    entry.group_id = opts.group_id;
+    entry.plot_id = opts.plot_id;
+    entry.memo = std::move(memo_bytes);
+    entry.out_dir = output_dir;
+    entry.out_name = filename;
+    validate_batch_entry(entry);
     initialize_aes_tables();
 
     bool const all_gpu = (opts.t1 == PhaseStrategy::Gpu)
@@ -96,52 +146,7 @@ std::string plot_to_file(GpuPlotOptions const& opts, std::string const& output_d
                                               cpu_fragments.size());
     }
 
-    // Build output filename. Caller may override via opts.out_name (used
-    // by chia plots create --gpu to match its naming convention). Default
-    // is the legacy xchplot2 test scheme.
-    std::string filename;
-    if (!opts.out_name.empty()) {
-        filename = opts.out_name;
-    } else {
-        std::string plot_id_hex;
-        plot_id_hex.reserve(64);
-        static char const hex[] = "0123456789abcdef";
-        for (uint8_t b : opts.plot_id) {
-            plot_id_hex += hex[b >> 4];
-            plot_id_hex += hex[b & 0xF];
-        }
-        filename = "plot_" + std::to_string(opts.k)
-                 + "_" + std::to_string(opts.strength)
-                 + "_" + std::to_string(opts.plot_index)
-                 + "_" + std::to_string(opts.meta_group)
-                 + (opts.testnet ? "_testnet" : "")
-                 + "_" + plot_id_hex
-                 + ".plot2";
-    }
-
-    std::filesystem::create_directories(output_dir);
-    auto full_path = std::filesystem::path(output_dir) / filename;
-
-    // Memo: caller-supplied bytes if present (real farmable plots), else
-    // a 112-byte stub (test plots only — harvester will reject).
-    std::vector<uint8_t> memo_bytes;
-    if (!opts.memo.empty()) {
-        memo_bytes = opts.memo;
-    } else {
-        memo_bytes.assign(32 + 48 + 32, 0);
-    }
-    if (memo_bytes.size() > 255) {
-        throw std::runtime_error("memo too long (max 255 bytes; PlotFile uses uint8 length)");
-    }
-    write_plot_file_parallel(full_path.string(),
-                             fragments,
-                             opts.plot_id.data(),
-                             static_cast<uint8_t>(opts.k),
-                             static_cast<uint8_t>(opts.strength),
-                             opts.testnet ? uint8_t{1} : uint8_t{0},
-                             static_cast<uint16_t>(opts.plot_index),
-                             static_cast<uint8_t>(opts.meta_group),
-                             std::span<uint8_t const>(memo_bytes.data(), memo_bytes.size()));
+    write_plot_file_parallel(full_path.string(), fragments, entry);
 
     return full_path.string();
 }

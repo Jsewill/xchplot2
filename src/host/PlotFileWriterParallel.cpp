@@ -13,8 +13,7 @@
 #include "host/PlotFileWriterParallel.hpp"
 #include "host/BatchPlotter.hpp"
 
-
-#include "plot/ChunkCompressor.hpp"
+#include "plot/ChunkCompression.hpp"
 #include "plot/PlotData.hpp"
 #include "plot/PlotFile.hpp"
 #include "plot/PlotIO.hpp"
@@ -27,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -205,7 +205,7 @@ std::vector<std::size_t> chunk_boundaries_span(
 
 // Check structure before a reader can allocate from file-controlled lengths.
 // This scans the small index and length prefixes, not every compressed payload.
-bool valid_plot_structure(std::string const& filename, BatchEntry const* expected)
+bool valid_raw_structure(std::string const& filename, BatchEntry const* expected)
 {
     std::error_code ec;
     uint64_t const size = std::filesystem::file_size(filename, ec);
@@ -223,11 +223,11 @@ bool valid_plot_structure(std::string const& filename, BatchEntry const* expecte
         !read(&version, 1) || version != PlotFile::FORMAT_VERSION ||
         !read(id.data(), id.size()) || !read(&k, 1) || !read(&strength, 1) ||
         !read(&index, sizeof(index)) || !read(&group, 1) || !read(&memo_size, 1)) return false;
-    if (k < 18 || k > 32 || (k & 1) || strength < 2 ||
+    if (k < 18 || k > 28 || (k & 1) || strength < 2 ||
         strength > k - (k < 28 ? 2 : k - 26) - 1) return false;
     std::vector<uint8_t> memo(memo_size);
     if (memo_size && !read(memo.data(), memo.size())) return false;
-    if (expected && (id != expected->plot_id || k != expected->k ||
+    if (expected && (!expected->raw || id != expected->group_id || k != expected->k ||
         strength != expected->strength || index != expected->plot_index ||
         group != expected->meta_group || memo != expected->memo)) return false;
     uint64_t count = 0;
@@ -248,6 +248,115 @@ bool valid_plot_structure(std::string const& filename, BatchEntry const* expecte
     return end == size;
 }
 
+bool valid_group_structure(std::string const& filename, BatchEntry const* expected)
+{
+    std::error_code ec;
+    uint64_t const size = std::filesystem::file_size(filename, ec);
+    if (ec || size < sizeof(PlotGroupFile::Header)) return false;
+    try {
+        std::ifstream in(filename, std::ios::binary);
+        in.exceptions(std::ios::failbit | std::ios::badbit);
+        PlotGroupFile::Header header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (header.magic != PlotGroupFile::MAGIC ||
+            header.version != PlotGroupFile::FORMAT_VERSION || header.group_size == 0)
+            return false;
+        PlotProofParams::validate_input_args(header.k, header.strength);
+        std::vector<uint8_t> memo(header.memo_length);
+        in.read(reinterpret_cast<char*>(memo.data()), memo.size());
+        if (expected && (expected->raw || header.group_size != 1 ||
+            header.group_id != PlotGroupId(expected->group_id) ||
+            header.k != expected->k || header.strength != expected->strength ||
+            header.meta_group != expected->meta_group || memo != expected->memo)) return false;
+        uint64_t const begin = sizeof(header) + memo.size();
+        uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
+        if (header.chunk_index_offset < begin || header.chunk_index_offset >= size ||
+            size - header.chunk_index_offset > chunks * 16) return false;
+        uint64_t const index_size = size - header.chunk_index_offset;
+        std::vector<uint64_t> packed((index_size + 7) / 8);
+        in.seekg(header.chunk_index_offset);
+        in.read(reinterpret_cast<char*>(packed.data()), index_size);
+        BitReader reader(packed, index_size * 8);
+        std::vector<uint64_t> sizes(chunks);
+        gsz_decode(sizes, header.group_size, reader);
+        uint64_t end = begin;
+        for (auto bytes : sizes) {
+            if (bytes == 0 || bytes > header.chunk_index_offset - end) return false;
+            end += bytes;
+        }
+        return end == header.chunk_index_offset;
+    } catch (std::exception const&) {
+        return false;
+    }
+}
+
+bool valid_plot_structure(std::string const& filename, BatchEntry const* expected)
+{
+    return valid_group_structure(filename, expected) || valid_raw_structure(filename, expected);
+}
+
+// Same table as upstream PlotGroupFile::createFSECTable and the existing
+// contrib group assembler. A compression task owns its table and buffers.
+auto group_compression_table()
+{
+    std::array<short, 256> norm{};
+    std::array<double, 178> weights{};
+    double total = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        weights[i] = std::exp(-double(i) / 256.0);
+        total += weights[i];
+    }
+    int assigned = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        norm[i] = std::max(short(1), short(weights[i] / total * 2048 + 0.5));
+        assigned += norm[i];
+    }
+    norm[0] += short(2048 - assigned);
+    std::unique_ptr<FSE_CTable, decltype(&POS2_FSE_freeCTable)> table(
+        POS2_FSE_createCTable(177, 11), POS2_FSE_freeCTable);
+    if (!table || POS2_FSE_isError(POS2_FSE_buildCTable(table.get(), norm.data(), 177, 11)))
+        throw std::runtime_error("cannot build group compression table");
+    return table;
+}
+
+void compress_group_chunk(std::vector<uint8_t>& output, std::span<uint64_t const> fragments,
+    uint64_t start, uint8_t k, FSE_CTable const* table,
+    std::vector<uint8_t>& high, std::vector<uint8_t>& ans, BitWriter& bits)
+{
+    if (fragments.empty()) throw std::invalid_argument("group chunk has no proof fragments");
+    high.clear();
+    bits.clear();
+    uint64_t const threshold = 178ull << (k - 8);
+    uint64_t previous = start;
+    bool first = true;
+    for (auto fragment : fragments) {
+        if (!first && fragment == previous) continue;
+        first = false;
+        auto const delta = fragment - previous;
+        previous = fragment;
+        auto const quotient = delta / threshold;
+        auto const remainder = delta % threshold;
+        if (quotient + 1 + k - 8 > 64)
+            throw std::invalid_argument("unencodable group fragment delta");
+        bits.append((((1ull << quotient) - 1) << (k - 8)) |
+            (remainder & ((1ull << (k - 8)) - 1)), uint32_t(quotient + 1 + k - 8));
+        high.push_back(uint8_t(remainder >> (k - 8)));
+    }
+    ans.resize(POS2_FSE_compressBound(high.size()));
+    size_t const size = POS2_FSE_compress_usingCTable(
+        ans.data(), ans.size(), high.data(), high.size(), table);
+    if (size == 0 || POS2_FSE_isError(size))
+        throw std::runtime_error("cannot compress group chunk");
+    uint64_t leb = size;
+    do {
+        output.push_back(uint8_t(leb & 0x7f) | (leb > 0x7f ? 0x80 : 0));
+        leb >>= 7;
+    } while (leb);
+    output.insert(output.end(), ans.begin(), ans.begin() + size);
+    auto const bytes = bits.asBytes();
+    output.insert(output.end(), bytes.begin(), bytes.end());
+}
+
 } // namespace
 
 // Construct the pool on the CALLING thread. See the header for why the caller's
@@ -260,71 +369,86 @@ void warm_writer_pool()
     (void)WriterThreadPool::instance();
 }
 
+std::array<uint8_t, 32> plot_id_for_group(
+    std::array<uint8_t, 32> const& group_id, uint16_t index, uint8_t meta_group)
+{
+    std::array<uint8_t, 32> id{};
+    posCalculatePlotIdForIndex(group_id, id, index, meta_group);
+    return id;
+}
+
 bool plot_file_matches(std::string const& filename, BatchEntry const& expected)
 {
+    try { validate_batch_entry(expected); }
+    catch (std::invalid_argument const&) { return false; }
     return valid_plot_structure(filename, &expected);
 }
 
 size_t write_plot_file_parallel(
     std::string const& filename,
     std::span<uint64_t const> t3_fragments,
-    uint8_t const* plot_id_32,
-    uint8_t const k,
-    uint8_t const strength,
-    uint8_t const testnet,
-    uint16_t const index,
-    uint8_t const meta_group,
-    std::span<uint8_t const> const memo,
+    BatchEntry const& entry,
     unsigned thread_count)
 {
-    if (k < 18 || k > 32 || (k & 1)) throw std::invalid_argument("k must be even in [18, 32]");
-    if (memo.size() > 255) throw std::invalid_argument("memo exceeds 255 bytes");
-    if (k < 32 && !t3_fragments.empty() && (t3_fragments.back() >> (2 * k)))
-        throw std::invalid_argument("proof fragment exceeds the plot's bit width");
-    ProofParams params(plot_id_32, k, strength, testnet);
+    validate_batch_entry(entry);
+    uint8_t const k = static_cast<uint8_t>(entry.k);
+    auto const& memo = entry.memo;
+    if (t3_fragments.empty() || (t3_fragments.back() >> (2 * k)))
+        throw std::invalid_argument("empty plot or proof fragment exceeds the plot's bit width");
 
-    // thread_count is the task-split granularity, not a thread count:
-    // every task routes through the shared WriterThreadPool, whose
-    // worker count is fixed at hardware_concurrency(). 0 ⇒ split into
-    // one task per pool worker. See WriterThreadPool above for why this
-    // matters in a multi-GPU work-queue batch.
-    if (thread_count == 0) {
-        thread_count =
-            static_cast<unsigned>(WriterThreadPool::instance().size());
-    }
-
-    // Chunk boundary table (cheap; single pass over fragments). Chunks
-    // are compressed directly from the source span — no per-chunk copy.
-    uint64_t const range_per_chunk = (1ULL << (params.get_k() + PlotFile::CHUNK_SPAN_RANGE_BITS));
-    std::vector<std::size_t> const boundaries =
-        chunk_boundaries_span(t3_fragments, range_per_chunk);
-
-    uint64_t const num_chunks =
-        boundaries.empty() ? 0 : static_cast<uint64_t>(boundaries.size() - 1);
-    int const stub_bits = params.get_k() - PlotFile::MINUS_STUB_BITS;
-
-    // Parallel chunk compression. Static partitioning: tasks_n tasks,
-    // each loops over a contiguous range of chunks, all routed through
-    // the shared WriterThreadPool.
-    std::vector<std::vector<uint8_t>> compressed(num_chunks);
-    if (num_chunks > 0) {
-        uint64_t const tasks_n       = std::min<uint64_t>(thread_count, num_chunks);
-        uint64_t const chunks_per_tk = (num_chunks + tasks_n - 1) / tasks_n;
+    // Compression tasks share the existing process-wide worker pool. A task
+    // coalesces its chunks into one buffer: grouped k28 has 2^22 chunks, so
+    // storing a separate vector per chunk would add millions of allocations.
+    if (thread_count == 0)
+        thread_count = static_cast<unsigned>(WriterThreadPool::instance().size());
+    uint64_t const range_per_chunk = 1ull << (k + (entry.raw
+        ? PlotFile::CHUNK_SPAN_RANGE_BITS : PlotGroupFile::PROOFS_PER_CHUNK_BITS));
+    auto const boundaries = chunk_boundaries_span(t3_fragments, range_per_chunk);
+    uint64_t const num_chunks = boundaries.size() - 1;
+    if (!entry.raw && num_chunks != PlotGroupFile::getChunkCountForK(k))
+        throw std::invalid_argument("incomplete group fragment range");
+    uint64_t const tasks_n = std::min<uint64_t>(thread_count, num_chunks);
+    uint64_t const chunks_per_task = (num_chunks + tasks_n - 1) / tasks_n;
+    std::vector<std::vector<uint8_t>> compressed(tasks_n);
+    std::vector<uint64_t> chunk_sizes(num_chunks);
+    {
         auto& pool = WriterThreadPool::instance();
         std::vector<std::future<void>> tasks;
         tasks.reserve(tasks_n);
-        for (uint64_t tstart = 0; tstart < num_chunks; tstart += chunks_per_tk) {
-            uint64_t const tend = std::min<uint64_t>(tstart + chunks_per_tk, num_chunks);
-            tasks.emplace_back(pool.submit(
-                [&, tstart, tend]() {
-                    for (uint64_t i = tstart; i < tend; ++i) {
-                        uint64_t start_range = i * range_per_chunk;
-                        compressed[i] = ChunkCompressor::compressProofFragments(
-                            t3_fragments.subspan(boundaries[i],
-                                                 boundaries[i + 1] - boundaries[i]),
-                            start_range, stub_bits);
+        // Also drain already-submitted work if a later submission throws.
+        struct Drain {
+            std::vector<std::future<void>>& tasks;
+            ~Drain() { for (auto& task : tasks) if (task.valid()) task.wait(); }
+        } drain{tasks};
+        for (uint64_t task = 0, begin = 0; begin < num_chunks;
+             ++task, begin += chunks_per_task) {
+            auto const end = std::min(begin + chunks_per_task, num_chunks);
+            tasks.emplace_back(pool.submit([&, task, begin, end] {
+                auto& output = compressed[task];
+                output.reserve((boundaries[end] - boundaries[begin]) * (k + 2) / 8
+                    + (end - begin) * 8);
+                auto table = entry.raw ? decltype(group_compression_table())(
+                    nullptr, POS2_FSE_freeCTable) : group_compression_table();
+                std::vector<uint8_t> high, ans;
+                BitWriter bits;
+                for (uint64_t i = begin; i < end; ++i) {
+                    auto const fragments = t3_fragments.subspan(boundaries[i],
+                        boundaries[i + 1] - boundaries[i]);
+                    auto const offset = output.size();
+                    if (entry.raw) {
+                        auto const chunk = ChunkCompressor::compressProofFragments(
+                            fragments, i * range_per_chunk, k - PlotFile::MINUS_STUB_BITS);
+                        uint64_t const size = chunk.size();
+                        auto const* bytes = reinterpret_cast<uint8_t const*>(&size);
+                        output.insert(output.end(), bytes, bytes + sizeof(size));
+                        output.insert(output.end(), chunk.begin(), chunk.end());
+                    } else {
+                        compress_group_chunk(output, fragments, i * range_per_chunk,
+                            k, table.get(), high, ans, bits);
                     }
-                }));
+                    chunk_sizes[i] = output.size() - offset;
+                }
+            }));
         }
         wait_all_rethrow_first(tasks);
     }
@@ -367,32 +491,42 @@ size_t write_plot_file_parallel(
             throw std::runtime_error("Failed to write " + partial);
         bytes_written += bytes;
     };
-    write("pos2", 4);
-    uint8_t const ver = PlotFile::FORMAT_VERSION;
-    write(&ver, 1);
-    write(params.get_plot_id_bytes(), 32);
-    uint8_t const k_byte = params.get_k();
-    uint8_t const mkb = params.get_match_key_bits();
-    write(&k_byte, 1);
-    write(&mkb, 1);
-    write(&index, sizeof(index));
-    write(&meta_group, 1);
-    uint8_t const memo_size = static_cast<uint8_t>(memo.size());
-    write(&memo_size, 1);
-    write(memo.data(), memo.size());
-    write(&num_chunks, sizeof(num_chunks));
-
-    // Compression already determined every chunk length, so write the final
-    // offsets directly instead of seeking back to patch placeholders.
-    uint64_t offset = bytes_written + num_chunks * sizeof(uint64_t);
-    for (auto const& chunk : compressed) {
-        write(&offset, sizeof(offset));
-        offset += sizeof(uint64_t) + chunk.size();
+    uint8_t const strength = uint8_t(entry.strength);
+    uint8_t const meta_group = uint8_t(entry.meta_group);
+    uint8_t const memo_size = uint8_t(memo.size());
+    BitWriter group_index;
+    if (entry.raw) {
+        write("pos2", 4);
+        uint8_t const version = PlotFile::FORMAT_VERSION;
+        write(&version, 1);
+        write(entry.group_id.data(), entry.group_id.size());
+        write(&k, 1);
+        write(&strength, 1);
+        uint16_t const index = uint16_t(entry.plot_index);
+        write(&index, sizeof(index));
+        write(&meta_group, 1);
+        write(&memo_size, 1);
+        write(memo.data(), memo.size());
+        write(&num_chunks, sizeof(num_chunks));
+        uint64_t offset = bytes_written + num_chunks * sizeof(uint64_t);
+        for (auto size : chunk_sizes) {
+            write(&offset, sizeof(offset));
+            offset += size;
+        }
+    } else {
+        uint64_t offset = sizeof(PlotGroupFile::Header) + memo.size();
+        for (auto size : chunk_sizes) offset += size;
+        PlotGroupFile::Header const header{PlotGroupFile::MAGIC,
+            PlotGroupFile::FORMAT_VERSION, PlotGroupId(entry.group_id),
+            k, strength, 1, meta_group, offset, memo_size};
+        gsz_encode(chunk_sizes, 1, group_index);
+        write(&header, sizeof(header));
+        write(memo.data(), memo.size());
     }
-    for (auto const& chunk : compressed) {
-        uint64_t const size = chunk.size();
-        write(&size, sizeof(size));
-        write(chunk.data(), chunk.size());
+    for (auto const& chunk : compressed) write(chunk.data(), chunk.size());
+    if (!entry.raw) {
+        auto const bytes = group_index.asBytes();
+        write(bytes.data(), bytes.size());
     }
     if (std::fflush(guard.out) != 0)
         throw std::runtime_error("Failed to flush " + partial);
@@ -409,6 +543,10 @@ size_t write_plot_file_parallel(
     // replace the destination, but each publishes its own complete file.
     std::error_code ec;
 #ifdef _WIN32
+    // Concurrent Windows replacements can fail with ERROR_ACCESS_DENIED.
+    // ponytail: one publication lock; use per-path locks if it limits throughput.
+    static std::mutex publish_mutex;
+    std::lock_guard<std::mutex> publish_lock(publish_mutex);
     if (!::MoveFileExW(std::filesystem::path(partial).c_str(),
                       std::filesystem::path(filename).c_str(),
                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
@@ -427,41 +565,47 @@ VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool
 {
     VerifyResult res;
     if (n_trials == 0) return res;
+    bool const grouped = valid_group_structure(filename, nullptr);
+    if (!grouped && !valid_raw_structure(filename, nullptr))
+        throw std::runtime_error("Invalid, obsolete, or truncated plot header/chunk layout: " + filename);
+    std::unique_ptr<GroupProver> group;
+    std::unique_ptr<Prover> raw;
+    if (grouped) group = std::make_unique<GroupProver>(filename);
+    else raw = std::make_unique<Prover>(filename);
+    auto const group_params = grouped
+        ? PlotGroupParams(group->getPlotGroup().getInfo().group_id,
+            group->getPlotGroup().getInfo().k, group->getPlotGroup().getInfo().strength,
+            group->getPlotGroup().getInfo().meta_group)
+        : raw->getGroupParams();
 
-    if (!valid_plot_structure(filename, nullptr))
-        throw std::runtime_error("Invalid or truncated plot header/chunk layout: " + filename);
-    Prover prover(filename);
-    std::unique_ptr<Solver> solver;
-    if (full) solver = std::make_unique<Solver>(prover.getProofParams());
-
-    // Fresh entropy per call; the result only depends on the plot content,
-    // not the specific challenges, beyond being a uniform sample.
     std::random_device rd;
-    std::mt19937_64    gen(rd());
+    std::mt19937_64 gen(rd());
     std::uniform_int_distribution<uint64_t> dist;
-
     for (size_t i = 0; i < n_trials; ++i) {
         std::array<uint8_t, 32> challenge{};
         for (size_t j = 0; j < 32; j += 8) {
             uint64_t const v = dist(gen);
             std::memcpy(challenge.data() + j, &v, 8);
         }
-        auto const chains = prover.prove(
-            std::span<uint8_t const, 32>(challenge.data(), 32));
-        res.trials++;
-        res.proofs_found += chains.size();
-        if (!chains.empty()) res.challenges_with_proof++;
-        if (solver) {
-            ProofFragmentCodec codec(prover.getProofParams());
-            ProofValidator validator(prover.getProofParams());
-            for (auto const& chain : chains) {
+        std::vector<PlotQualityChains> qualities;
+        if (grouped) qualities = group->prove(challenge);
+        else qualities.push_back({raw->prove(challenge), raw->getPlotProofParams().get_plot_index()});
+        ++res.trials;
+        size_t count = 0;
+        for (auto const& member : qualities) {
+            count += member.quality_chains.size();
+            if (!full || member.quality_chains.empty()) continue;
+            auto const params = group_params.get_plot_params_for_index(member.plot_index);
+            Solver solver(params);
+            ProofFragmentCodec codec(params);
+            ProofValidator validator(group_params, member.plot_index);
+            for (auto const& chain : member.quality_chains) {
                 std::array<uint32_t, TOTAL_T1_PAIRS_IN_PROOF> x_bits{};
                 size_t index = 0;
                 for (auto fragment : chain.chain_links)
-                    for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits[index++] = x;
-                auto proofs = solver->solve(x_bits);
+                    for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits.at(index++) = x;
                 bool valid = false;
-                for (auto const& proof : proofs) {
+                for (auto const& proof : solver.solve(x_bits)) {
                     auto const links = validator.validate_full_proof(proof, challenge);
                     if (links && *links == chain.chain_links) { valid = true; break; }
                 }
@@ -469,12 +613,23 @@ VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool
                 ++res.full_proofs_validated;
             }
         }
+        res.proofs_found += count;
+        if (count) ++res.challenges_with_proof;
     }
     return res;
 }
 
 std::vector<uint64_t> read_plot_file_fragments(std::string const& filename)
 {
+    if (valid_group_structure(filename, nullptr)) {
+        auto group = PlotGroupFile::open(filename);
+        if (group.getInfo().group_size != 1)
+            throw std::invalid_argument("flat fragment reads require a single-plot group");
+        auto data = group.readProofsInRange({0, (1ull << (2 * group.getInfo().k)) - 1});
+        return std::move(data.front());
+    }
+    if (!valid_raw_structure(filename, nullptr))
+        throw std::runtime_error("Invalid raw plot layout: " + filename);
     PlotFile::PlotFileContents contents = PlotFile::readAllChunkedData(filename);
     std::vector<uint64_t> flat;
     size_t total = 0;
@@ -493,7 +648,8 @@ std::vector<uint64_t> run_cpu_plotter_to_fragments(
     uint8_t testnet,
     bool    verbose)
 {
-    ProofParams params(plot_id_32, k, strength, testnet);
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    auto const params = PlotProofParams::create_raw(PlotId(plot_id_32), k, strength);
     Plotter::Options opts{};
     opts.validate = false;
     opts.verbose  = verbose;

@@ -33,7 +33,7 @@ using pos2gpu::parity::derive_plot_id;
 static double bench_cpu(uint8_t const* plot_id, int k)
 {
     uint64_t total = 1ULL << k;
-    ProofParams params(plot_id, static_cast<uint8_t>(k), uint8_t{2}, uint8_t{0});
+    auto const params = PlotProofParams::create_raw(PlotId(plot_id), uint8_t(k), 2);
     XsConstructor xs_ctor(params);
 
     std::vector<Xs_Candidate> out(total), tmp(total);

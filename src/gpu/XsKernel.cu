@@ -141,7 +141,7 @@ cudaError_t launch_xs_gen(
     uint32_t* d_keys_out, uint32_t* d_vals_out,
     cudaStream_t stream)
 {
-    if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
+    if (testnet || k < 18 || k > 28 || (k & 1) != 0) return cudaErrorInvalidValue;
     if (!plot_id_bytes || !d_keys_out || !d_vals_out) return cudaErrorInvalidValue;
 
     uint64_t const total = 1ULL << k;
@@ -171,7 +171,7 @@ cudaError_t launch_xs_gen_range(
     uint32_t* d_keys_out, uint32_t* d_vals_out,
     cudaStream_t stream)
 {
-    if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
+    if (testnet || k < 18 || k > 28 || (k & 1) != 0) return cudaErrorInvalidValue;
     if (!plot_id_bytes || !d_keys_out || !d_vals_out) return cudaErrorInvalidValue;
     if (pos_end <= pos_begin) return cudaSuccess;
     uint64_t const total = 1ULL << k;
@@ -219,7 +219,7 @@ cudaError_t launch_construct_xs_profiled(
     cudaEvent_t after_sort,
     cudaStream_t stream)
 {
-    if (k < 18 || k > 32 || (k & 1) != 0) return cudaErrorInvalidValue;
+    if (testnet || k < 18 || k > 28 || (k & 1) != 0) return cudaErrorInvalidValue;
     if (!plot_id_bytes || !temp_bytes)    return cudaErrorInvalidValue;
 
     uint64_t const total = 1ULL << k;

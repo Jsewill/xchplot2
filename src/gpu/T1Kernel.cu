@@ -257,7 +257,7 @@ cudaError_t launch_t1_match_prepare(
     cudaStream_t stream)
 {
     if (!temp_bytes)                     return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)  return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)  return cudaErrorInvalidValue;
     if (params.strength < 2)             return cudaErrorInvalidValue;
     if (params.num_match_target_bits <= kT1FineBits) return cudaErrorInvalidValue;
 

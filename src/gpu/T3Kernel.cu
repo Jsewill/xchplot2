@@ -425,7 +425,7 @@ cudaError_t launch_t3_match_prepare(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !temp_bytes) return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28) return cudaErrorInvalidValue;
     if (params.strength < 2)            return cudaErrorInvalidValue;
     if (!t3_params_shift_safe(params))  return cudaErrorInvalidValue;
 
@@ -444,7 +444,7 @@ cudaError_t launch_t3_match_prepare(
     // Upload Feistel key once per prepare. The staging caller may invoke
     // launch_t3_match_range repeatedly without re-preparing, so keep the
     // upload in prepare rather than range to avoid redundant H2D.
-    FeistelKey fk = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    FeistelKey fk = make_feistel_key(plot_id_bytes, params.k);
     cudaError_t fk_err = cudaMemcpyToSymbolAsync(
         g_t3_fk, &fk, sizeof(fk), 0, cudaMemcpyHostToDevice, stream);
     if (fk_err != cudaSuccess) return fk_err;
@@ -492,7 +492,7 @@ cudaError_t launch_t3_match_range(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
     if (!t3_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_sorted_meta || !d_sorted_xbits || !d_sorted_mi
@@ -559,7 +559,7 @@ cudaError_t launch_t3_match_section_pair_range(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
     if (!t3_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_sorted_meta_slice || !d_sorted_xbits || !d_sorted_mi
@@ -629,7 +629,7 @@ cudaError_t launch_t3_match_section_pair_split_range(
     cudaStream_t stream)
 {
     if (!plot_id_bytes || !d_temp_storage)  return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32)     return cudaErrorInvalidValue;
+    if (params.k < 18 || params.k > 28)     return cudaErrorInvalidValue;
     if (params.strength < 2)                return cudaErrorInvalidValue;
     if (!t3_params_shift_safe(params))      return cudaErrorInvalidValue;
     if (!d_meta_l_slice || !d_xbits_l_slice ||
@@ -681,8 +681,8 @@ cudaError_t launch_t3_upload_feistel_key(
     cudaStream_t stream)
 {
     if (!plot_id_bytes)             return cudaErrorInvalidValue;
-    if (params.k < 18 || params.k > 32) return cudaErrorInvalidValue;
-    FeistelKey fk = make_feistel_key(plot_id_bytes, params.k, /*rounds=*/4);
+    if (params.k < 18 || params.k > 28) return cudaErrorInvalidValue;
+    FeistelKey fk = make_feistel_key(plot_id_bytes, params.k);
     return cudaMemcpyToSymbolAsync(
         g_t3_fk, &fk, sizeof(fk), 0, cudaMemcpyHostToDevice, stream);
 }

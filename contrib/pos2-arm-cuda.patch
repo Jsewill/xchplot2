@@ -1,0 +1,72 @@
+--- a/pos/aes/intrin_portable.h
++++ b/pos/aes/intrin_portable.h
+@@ -397,10 +397,15 @@
+
+ #define RANDOMX_DEFAULT_FENV
+
+-#elif defined(__aarch64__)
+-
+-#include <arm_acle.h>
++#elif defined(__aarch64__) || defined(_M_ARM64)
++
++#ifdef _MSC_VER
++#include <arm64_neon.h>
++#include <intrin.h>
++#include <malloc.h>
++#else
+ #include <arm_neon.h>
++#endif
+ #include <stdlib.h>
+
+ typedef uint8x16_t rx_vec_i128;
+@@ -408,18 +413,28 @@
+
+ inline void* rx_aligned_alloc(size_t size, size_t align)
+ {
++#ifdef _MSC_VER
++    return _aligned_malloc(size, align);
++#else
+     void* p;
+     if (posix_memalign(&p, align, size) == 0)
+         return p;
+
+     return 0;
++#endif
+ };
+
++#ifdef _MSC_VER
++#define rx_aligned_free(a) _aligned_free(a)
++inline void rx_prefetch_nta(void* ptr) { __prefetch(ptr); }
++inline void rx_prefetch_t0(void const* ptr) { __prefetch(ptr); }
++#else
+ #define rx_aligned_free(a) free(a)
+
+ inline void rx_prefetch_nta(void* ptr) { asm volatile("prfm pldl1strm, [%0]\n" : : "r"(ptr)); }
+
+ inline void rx_prefetch_t0(void const* ptr) { asm volatile("prfm pldl1strm, [%0]\n" : : "r"(ptr)); }
++#endif
+
+ FORCE_INLINE rx_vec_f128 rx_load_vec_f128(double const* pd)
+ {
+@@ -471,18 +486,18 @@
+     return vreinterpretq_f64_u8(vorrq_u8(vreinterpretq_u8_f64(a), vreinterpretq_u8_f64(b)));
+ }
+
+-#ifdef __ARM_FEATURE_CRYPTO
++#if defined(__ARM_FEATURE_CRYPTO) || defined(_M_ARM64)
+
+ FORCE_INLINE rx_vec_i128 rx_aesenc_vec_i128(rx_vec_i128 a, rx_vec_i128 key)
+ {
+     uint8x16_t const zero = { 0 };
+-    return vaesmcq_u8(vaeseq_u8(a, zero)) ^ key;
++    return veorq_u8(vaesmcq_u8(vaeseq_u8(a, zero)), key);
+ }
+
+ FORCE_INLINE rx_vec_i128 rx_aesdec_vec_i128(rx_vec_i128 a, rx_vec_i128 key)
+ {
+     uint8x16_t const zero = { 0 };
+-    return vaesimcq_u8(vaesdq_u8(a, zero)) ^ key;
++    return veorq_u8(vaesimcq_u8(vaesdq_u8(a, zero)), key);
+ }
+
+ #define HAVE_AES 1

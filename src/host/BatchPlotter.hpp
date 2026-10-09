@@ -27,7 +27,9 @@ struct BatchEntry {
     int strength = 2;
     int plot_index = 0;
     int meta_group = 0;
-    bool testnet = false;
+    bool testnet = false; // retained for explicit rejection of obsolete callers
+    bool raw = false; // raw v2 members are temporary inputs to group assembly
+    std::array<uint8_t, 32> group_id{};
     std::array<uint8_t, 32> plot_id{};
     std::vector<uint8_t> memo;
     std::string out_dir;

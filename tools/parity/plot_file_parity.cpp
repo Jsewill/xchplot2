@@ -1,6 +1,6 @@
 // plot_file_parity — round-trip test for the parallel plot-file writer.
 //
-// Synthesises a sorted uint64 fragment stream, writes it via
+// Produces a sorted uint64 fragment stream, writes it via
 // `write_plot_file_parallel`, reads it back via `read_plot_file_fragments`,
 // and asserts bit-exact equality. Closes the correctness gap introduced
 // by the parallel chunkify + coarse-task fan-out in the writer, which
@@ -26,7 +26,7 @@
 
 namespace {
 
-std::array<uint8_t, 32> derive_plot_id(uint32_t seed)
+std::array<uint8_t, 32> derive_group_id(uint32_t seed)
 {
     std::array<uint8_t, 32> id{};
     uint64_t s = 0x9E3779B97F4A7C15ULL ^ uint64_t(seed) * 0x100000001B3ULL;
@@ -53,30 +53,27 @@ std::vector<uint64_t> real_fragments(std::array<uint8_t, 32> const& plot_id,
         /*verbose=*/false);
 }
 
-bool run_one(char const* label, uint32_t seed, int k, int strength)
+bool run_one(char const* label, uint32_t seed, int k, int strength, bool raw)
 {
-    auto const id        = derive_plot_id(seed);
-    auto const fragments = real_fragments(id, k, strength);
+    pos2gpu::BatchEntry entry;
+    entry.k = k; entry.strength = strength; entry.raw = raw;
+    entry.group_id = derive_group_id(seed);
+    entry.plot_index = raw ? 65535 : 0;
+    entry.meta_group = 255;
+    entry.plot_id = pos2gpu::plot_id_for_group(entry.group_id, entry.plot_index, entry.meta_group);
+    auto fragments = real_fragments(entry.plot_id, k, strength);
 
     std::printf("[%s seed=%u k=%d strength=%d count=%zu]\n",
                 label, seed, k, strength, fragments.size());
 
     std::filesystem::path tmp =
         std::filesystem::temp_directory_path() /
-        ("xch_rt_s" + std::to_string(seed) + "_s" + std::to_string(strength) + ".plot2");
+        ("xch_rt_s" + std::to_string(seed) + "_s" + std::to_string(strength) + (raw ? ".plot2" : ".gplot"));
 
-    std::vector<uint8_t> memo;  // empty
-    pos2gpu::write_plot_file_parallel(
-        tmp.string(),
-        std::span<uint64_t const>(fragments),
-        id.data(),
-        static_cast<uint8_t>(k),
-        static_cast<uint8_t>(strength),
-        /*testnet=*/uint8_t{0},
-        /*index=*/uint16_t{0},
-        /*meta_group=*/uint8_t{0},
-        std::span<uint8_t const>(memo),
-        /*thread_count=*/0);
+    entry.out_dir = tmp.parent_path().string();
+    entry.out_name = tmp.filename().string();
+    pos2gpu::write_plot_file_parallel(tmp.string(), fragments, entry);
+    if (!raw) fragments.erase(std::unique(fragments.begin(), fragments.end()), fragments.end());
 
     std::vector<uint64_t> roundtrip = pos2gpu::read_plot_file_fragments(tmp.string());
 
@@ -109,7 +106,7 @@ bool run_one(char const* label, uint32_t seed, int k, int strength)
     return false;
 }
 
-bool file_safety()
+bool file_safety(bool raw)
 {
     auto dir = std::filesystem::temp_directory_path();
     std::random_device random;
@@ -119,18 +116,20 @@ bool file_safety()
         std::filesystem::path path;
         ~Cleanup() { std::error_code ec; std::filesystem::remove_all(path, ec); }
     } cleanup{dir};
-    auto const path = dir / "plot.plot2", victim = dir / "sentinel";
+    auto const path = dir / (raw ? "plot.plot2" : "plot.gplot"), victim = dir / "sentinel";
     { std::ofstream out(victim); out << "preserve me"; }
 #ifndef _WIN32
     std::filesystem::create_symlink(victim, path.string() + ".partial");
 #endif
     pos2gpu::BatchEntry entry;
-    entry.k = 18; entry.plot_id = derive_plot_id(1); entry.memo = {1, 2, 3};
+    entry.k = 18; entry.group_id = derive_group_id(1); entry.memo = {1, 2, 3};
+    entry.raw = raw; entry.plot_index = raw ? 65535 : 0;
+    entry.plot_id = pos2gpu::plot_id_for_group(entry.group_id, entry.plot_index, entry.meta_group);
+    entry.out_dir = dir.string(); entry.out_name = path.filename().string();
     auto const fragments = real_fragments(entry.plot_id, entry.k, entry.strength);
-    auto write = [&] {
-        pos2gpu::write_plot_file_parallel(path.string(), fragments, entry.plot_id.data(),
-            18, 2, 0, 0, 0, entry.memo);
-    };
+    auto expected = fragments;
+    if (!raw) expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+    auto write = [&] { pos2gpu::write_plot_file_parallel(path.string(), fragments, entry); };
     write();
     std::ifstream in(victim);
     std::string sentinel; std::getline(in, sentinel);
@@ -142,13 +141,22 @@ bool file_safety()
     if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
     wrong.memo.clear();
     if (pos2gpu::plot_file_matches(path.string(), wrong)) return false;
-    std::exception_ptr errors[2];
-    std::thread writers[2];
-    for (int i = 0; i < 2; ++i) writers[i] = std::thread([&, i] {
-        try { write(); } catch (...) { errors[i] = std::current_exception(); }
-    });
-    for (auto& writer : writers) writer.join();
-    if (errors[0] || errors[1] || pos2gpu::read_plot_file_fragments(path.string()) != fragments) return false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::exception_ptr errors[2];
+        std::thread writers[2];
+        for (int i = 0; i < 2; ++i) writers[i] = std::thread([&, i] {
+            try { write(); } catch (...) { errors[i] = std::current_exception(); }
+        });
+        for (auto& writer : writers) writer.join();
+        for (auto const& error : errors) if (error) {
+            try { std::rethrow_exception(error); }
+            catch (std::exception const& e) {
+                std::printf("  FAIL concurrent writer: %s\n", e.what());
+            }
+            return false;
+        }
+        if (pos2gpu::read_plot_file_fragments(path.string()) != expected) return false;
+    }
     auto const verification = pos2gpu::verify_plot_file(path.string(), 100, true);
     if (verification.proofs_found == 0 || verification.full_proofs_validated != verification.proofs_found) return false;
     auto corrupt_u64 = [&](std::streamoff offset) {
@@ -160,8 +168,17 @@ bool file_safety()
         write();
         return rejected;
     };
-    // Attacker-controlled chunk count and offset must be rejected before use.
-    if (!corrupt_u64(43 + entry.memo.size()) || !corrupt_u64(51 + entry.memo.size())) return false;
+    // Raw chunk count/offsets and grouped chunk-index offsets are bounded before use.
+    if (raw) {
+        if (!corrupt_u64(43 + entry.memo.size()) || !corrupt_u64(51 + entry.memo.size())) return false;
+    } else if (!corrupt_u64(42)) return false;
+    // The previous raw format must never be mistaken for a current plot.
+    {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(4); file.put(1);
+    }
+    if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
+    write();
     auto const size = std::filesystem::file_size(path);
     std::filesystem::resize_file(path, size - 1);
     if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
@@ -182,18 +199,20 @@ int main()
     // CPU plotter to produce fragment streams that are guaranteed valid
     // inputs to the compression format.
     for (uint32_t seed : {1u, 2u, 17u, 42u, 0xCAFEBABEu, 0xDEADBEEFu}) {
-        all_ok = run_one("k18s2",   seed, 18, 2) && all_ok;
+        all_ok = run_one("k18s2",   seed, 18, 2, false) && all_ok;
     }
     // Boundary seeds.
     for (uint32_t seed : {0u, 0xFFFFFFFFu, 0x80000000u}) {
-        all_ok = run_one("boundary", seed, 18, 2) && all_ok;
+        all_ok = run_one("boundary", seed, 18, 2, false) && all_ok;
     }
     // Different strength, same k.
     for (uint32_t seed : {1u, 17u}) {
-        all_ok = run_one("k18s4",   seed, 18, 4) && all_ok;
+        all_ok = run_one("k18s4",   seed, 18, 4, false) && all_ok;
     }
 
-    all_ok = file_safety() && all_ok;
+    all_ok = run_one("raw-k18s2", 1, 18, 2, true) && all_ok;
+    all_ok = file_safety(false) && all_ok;
+    all_ok = file_safety(true) && all_ok;
     std::printf("\n==> %s\n", all_ok ? "ALL OK" : "FAIL");
     return all_ok ? 0 : 1;
 }

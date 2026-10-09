@@ -231,7 +231,7 @@ bool run_for_plot_id(uint32_t seed)
 {
     auto id = derive_plot_id(seed);
     auto gpu_keys = pos2gpu::make_keys(id.data());
-    AesHash cpu(id.data(), kK);
+    AesHash cpu(id, kK);
 
     std::printf("[plot_id seed=%u  bytes 0..7=", seed);
     for (int i = 0; i < 8; ++i) std::printf("%02x", id[i]);

@@ -1,11 +1,12 @@
 xchplot2 — native CUDA binary
 
 Requirements:
-  Linux x86_64 with glibc 2.35+ and libstdc++.so.6 with GLIBCXX_3.4.30.
+  Linux x86_64 or ARM64 with glibc 2.35+ and libstdc++.so.6 with GLIBCXX_3.4.30.
   Updated Ubuntu 22.04 or newer provides these runtime libraries.
-  CPU with AES, SSSE3, and SSE4.1 instructions.
+  x86_64 CPU with AES, SSSE3, and SSE4.1, or ARMv8-A CPU with crypto extensions.
   NVIDIA Maxwell or newer GPU with a compatible driver.
   NVIDIA driver 575.57.08 or newer is recommended for CUDA 12.9.1.
+  The ARM64 archive targets CUDA's Linux SBSA platform.
 
 Extract the archive, then run:
   ./bin/xchplot2 --help

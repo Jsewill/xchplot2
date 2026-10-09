@@ -1,15 +1,22 @@
 # xchplot2
 
-GPU plotter for Chia v2 proofs of space (CHIP-48). Produces `.plot2` files
-byte-identical to the pinned
+GPU plotter for Chia v2 proofs of space (CHIP-48). Produces single-member
+`.gplot` files for PoS2 1.0, byte-identical to the pinned
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
 This is the **`cuda-only` branch**, using native CUDA for NVIDIA GPUs.
 The [`main` branch](https://github.com/Jsewill/xchplot2) uses
 SYCL/AdaptiveCpp for NVIDIA, AMD, and Intel.
 
-This is a work in progress. Future changes to the plot format, including
-grouping, may require replotting.
+This build pins [pos2-chip 1.0.0](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.0).
+The new Feistel cipher and group format are incompatible with earlier plots;
+existing plots must be replotted and old job manifests cannot be resumed.
+Farmer integration is still in progress upstream; see the
+[compatibility notes](contrib/pos2-pr118/README.md).
+
+An opt-in [grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
+supports experimental multi-member groups, shared keys, and resumable assembly.
+It requires a separate build; normal commands produce independent single-member groups.
 
 [Quick start](#quick-start) · [Hardware](#hardware-compatibility) ·
 [Build](#build) · [Commands](#use) · [Performance](#performance) ·
@@ -35,7 +42,7 @@ xchplot2 plot -k 28 -n 10 \
 Each completed output path is printed to stdout. Check one output with:
 
 ```bash
-xchplot2 verify /mnt/plots/NAME.plot2 --full --trials 100
+xchplot2 verify /mnt/plots/NAME.gplot --full --trials 100
 ```
 
 `verify --full` samples challenges and validates the resulting full proofs;
@@ -72,7 +79,7 @@ host test binaries.
 | [xchplot2 bench](REFERENCE.md#benchmarking) | Measure throughput and estimate time to fill storage |
 | [xchplot2 devices](REFERENCE.md#devices-and-cpu-workers) | List GPUs and CPU NUMA nodes |
 | [xchplot2 verify](REFERENCE.md#verification) | Check an existing plot, including full proofs with `--full` |
-| [xchplot2 test](REFERENCE.md#single-test-plot) | Build a test plot from a raw plot ID and memo |
+| [xchplot2 test](REFERENCE.md#single-test-plot) | Build a test plot from a group ID and memo |
 | [xchplot2 parity-check](REFERENCE.md#parity-checks) | Run the built parity and host tests |
 | [xchplot2 completions](REFERENCE.md#shell-completions) | Generate Bash, zsh, or fish completions |
 
@@ -103,6 +110,8 @@ tier and branch; see [host RAM and disk-offload](REFERENCE.md#host-ram-and-disk-
 
 ## Performance
 
+These figures use the pre-1.0 cipher and raw plot format.
+
 Measured September 9, 2026, at k=28, strength=2 on an RTX 4090 with a
 Ryzen 9 5950X. Times are mean completion intervals and standard deviations
 over ten measured plots after two warmups, including FSE compression,
@@ -132,6 +141,7 @@ bandwidth, CPU compression, and storage; these measurements use one GPU.
 | [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
 | [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, and memory use |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
+| [Experimental grouping](contrib/pos2-pr118/README.md) | Grouped jobs, resume, memory limits, and upstream compatibility |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 
 ## License

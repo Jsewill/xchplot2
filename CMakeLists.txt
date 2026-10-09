@@ -159,14 +159,15 @@ if(_xchplot2_nvcc AND NOT DEFINED CMAKE_CUDA_COMPILER)
 endif()
 unset(_xchplot2_nvcc CACHE)
 
-project(pos2-gpu VERSION 0.12.0 LANGUAGES C CXX CUDA)
+project(pos2-gpu VERSION 0.14.1 LANGUAGES C CXX CUDA)
 
 if(MSVC)
     # Match the release Rust staticlib's CRT in every CMake configuration.
     set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
-                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")
 endif()
 
 # Default to Release: a plain `cmake -B build -S .` otherwise builds
@@ -250,7 +251,7 @@ message(STATUS "XCHPLOT2_AES_ROUND=${XCHPLOT2_AES_ROUND}")
 # pin. The `if(NOT DEFINED ...)` guard lets a plain edit take effect on
 # reconfigure while still honouring user -D overrides.
 if(NOT DEFINED POS2_CHIP_GIT_TAG)
-    set(POS2_CHIP_GIT_TAG "b0da7aa7bec3974833d651173a6d9953c21eb808")
+    set(POS2_CHIP_GIT_TAG "ff89d3e61f4315311a7f975409a6433e67f699ff")
 endif()
 
 if(NOT DEFINED POS2_CHIP_DIR)
@@ -292,6 +293,16 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# Remove an unused ARM header that collides with NVCC and enable MSVC ARM64 AES.
+# Relative includes require one complete header tree, without mixed originals.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    file(COPY "${POS2_CHIP_DIR}/src/" DESTINATION "${_pos2_solver_dir}")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch"
+        WORKING_DIRECTORY "${_pos2_solver_dir}" COMMAND_ERROR_IS_FATAL ANY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch")
+endif()
 # CCCL 2.x uses long2 for 64-bit PTX operands; Windows long is only 32 bits.
 # Backport NVIDIA's fix to a build-local header, as with the solver below.
 if(WIN32)
@@ -319,6 +330,31 @@ if(WIN32)
         endif()
     endif()
 endif()
+# CCCL 2.8 omits a macro needed by CUDA 12.9's complete ARM GPU target list.
+set(_cccl_header_name "cuda/std/__cccl/preprocessor.h")
+find_file(_cccl_arch_header "${_cccl_header_name}"
+    PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH NO_CACHE)
+if(_cccl_arch_header)
+    file(READ "${_cccl_arch_header}" _cccl_text)
+    if(_cccl_text MATCHES "#define _CCCL_PP_SPLICE_WITH_IMPL21" AND
+       NOT _cccl_text MATCHES "#define _CCCL_PP_SPLICE_WITH_IMPL20")
+        message(STATUS "Applying CCCL GPU architecture list fix")
+        set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-arch-list")
+        configure_file("${_cccl_arch_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-arch-list.patch"
+            WORKING_DIRECTORY "${_cccl_dir}"
+            RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
+        if(NOT _cccl_patch_result EQUAL 0)
+            message(FATAL_ERROR "CCCL architecture list patch failed: ${_cccl_patch_error}")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-arch-list.patch")
+        include_directories(BEFORE "${_cccl_dir}")
+        set(_cccl_arch_patch_applied TRUE)
+    endif()
+endif()
 execute_process(
     COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"
@@ -329,16 +365,17 @@ if(NOT _solver_patch_result EQUAL 0)
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch")
+add_library(pos2_sha256 STATIC "${POS2_CHIP_DIR}/src/pos/sha/sha256.c")
 add_library(pos2_chip_headers INTERFACE)
 target_include_directories(pos2_chip_headers INTERFACE
     "${_pos2_solver_dir}"
     "${POS2_CHIP_DIR}/src"
 )
-target_link_libraries(pos2_chip_headers INTERFACE fse)
+target_link_libraries(pos2_chip_headers INTERFACE fse pos2_sha256)
 # Match pos2-chip's CPU AES build flags so its AesHash compiles in CPU TUs.
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(pos2_chip_headers INTERFACE -maes -msse4.1 -mssse3 -msse2)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     target_compile_options(pos2_chip_headers INTERFACE -march=armv8-a+crypto)
 endif()
 

@@ -5,7 +5,7 @@
 int main()
 {
     std::array<uint8_t, 32> id{};
-    ProofParams params(id.data(), 18, 2, 0);
+    auto const params = PlotProofParams::create_raw(PlotId(id), 18, 2);
     Solver solver(params);
     ProofCore core(params);
     std::vector<uint32_t> bits((1u << 18) / 32, ~uint32_t{0});
