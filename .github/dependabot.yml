@@ -14,6 +14,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # The protocol test API uses chia-bls public-key types.
+    groups:
+      chia:
+        patterns:
+          - chia-bls
+          - chia-protocol
 
   - package-ecosystem: github-actions
     directory: /
@@ -27,6 +33,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # The protocol test API uses chia-bls public-key types.
+    groups:
+      chia:
+        patterns:
+          - chia-bls
+          - chia-protocol
 
   - package-ecosystem: github-actions
     directory: /
