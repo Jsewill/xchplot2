@@ -346,6 +346,15 @@ of a documentation move.
 
 ## Binary releases
 
+Public release notes describe user-visible changes, breaking changes, required
+user actions, and material limitations. Link to installation and compatibility
+guides instead of repeating them.
+
+Keep test results, qualification records, logs, CI links, build and machine
+details, and retry history in local records or CI artifacts. Exclude them from
+release notes and release attachments unless explicitly requested. Before
+publishing, review the final notes and asset list for relevance to users.
+
 The release workflow builds Linux archives and experimental Windows ZIPs
 for x86-64 and ARM64 through the standalone CMake executable and CPack.
 The x86-64 Linux image pins Ubuntu 24.04, AdaptiveCpp
@@ -452,9 +461,10 @@ The `--binary` option remains
 available for an already extracted executable, but does not record archive
 identity or enforce the matching `BUILDINFO.txt` check.
 
-Attach `summary.json` and relevant inventory, parity, boundary, and proof logs
-to the release qualification notes. Archive runs record its name, SHA256,
-`BUILDINFO.txt`, UTC start time, host platform, and pass status in the summary.
+Keep `summary.json` and relevant inventory, parity, boundary, and proof logs
+in local qualification records or CI artifacts. Archive runs record the archive
+name, SHA256, `BUILDINFO.txt`, UTC start time, host platform, and pass status in
+the summary.
 Keep generated plots out of the tree. These commands require GPU hardware;
 there is no automatic release GPU gate until the required runners are configured.
 
