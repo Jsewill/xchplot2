@@ -209,6 +209,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [linux-sycl, windows-sycl]
     runs-on: ubuntu-24.04
+    concurrency:
+      group: binary-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -218,10 +221,19 @@ jobs:
           pattern: '*-sycl*'
           merge-multiple: true
           path: dist
-      - name: Attach archives to a draft release
+      - name: Attach archives to the shared draft release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" dist/* \
-            --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          RELEASE_TAG="${RELEASE_TAG%-cuda-only}"
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [[ "$draft" != true ]]; then
+              echo "Release $RELEASE_TAG is already published" >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" dist/*
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          fi

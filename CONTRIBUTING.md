@@ -394,9 +394,14 @@ makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
 platform and host architecture; PR and tag runs build the full matrix.
-A `vVERSION` tag creates a draft GitHub release; publish it after qualifying
-the extracted archives on the supported GPUs. Do not rebuild between
-qualification and publication.
+Keep the version in `Cargo.toml`, `Cargo.lock`, and `CMakeLists.txt` identical
+on `main` and `cuda-only`. Tag `main` as `vVERSION` and native CUDA as
+`vVERSION-cuda-only`, and push both tags together. The CUDA tag identifies
+its source revision; both workflows attach their archives to the same
+`vVERSION` draft release. Publish after both backends' Linux and Windows
+archives and checksums are present and the extracted archives have been
+qualified on the supported GPUs. Do not rebuild between qualification and
+publication.
 The Linux job checks extraction, bundled libraries, offline AMD and Intel
 kernel compilation, the packaged SYCL JIT through `hellosycl`, CPU/SYCL plot
 byte parity, and full proofs in an image without development toolchains.

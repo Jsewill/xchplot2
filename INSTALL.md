@@ -23,6 +23,8 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 Download the combined Linux x86-64 or ARM64 `sycl.tar.gz` archive
 and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
+Each release contains SYCL and native CUDA packages with the same version;
+choose the `-sycl` package for this branch.
 Check `sha256sum -c ARCHIVE.tar.gz.sha256`, then extract the archive and run
 `./bin/xchplot2 devices` from its directory. Keep `bin/` and `lib/` together;
 add that `bin` directory to `PATH` to run the CLI elsewhere.
