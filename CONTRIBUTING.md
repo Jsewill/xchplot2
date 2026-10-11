@@ -280,10 +280,15 @@ For affected CUDA 12.x headers, CMake applies NVIDIA's
 to a build-local copy; `BUILDINFO.txt` records the backport. The installed
 toolkit stays intact.
 
-PR and manual runs retain both platforms' archives as workflow artifacts. Pushing a
-`vVERSION-cuda-only` tag creates a draft GitHub release; publish it after
-qualifying the extracted archive on the supported GPUs. Do not rebuild
-between qualification and publication.
+PR and manual runs retain both platforms' archives as workflow artifacts.
+Keep the version in `Cargo.toml`, `Cargo.lock`, and `CMakeLists.txt` identical
+on `main` and `cuda-only`. Tag `main` as `vVERSION` and native CUDA as
+`vVERSION-cuda-only`, and push both tags together. The CUDA tag identifies
+its source revision; both workflows attach their archives to the same
+`vVERSION` draft release. Publish after both backends' Linux and Windows
+archives and checksums are present and the extracted archives have been
+qualified on the supported GPUs. Do not rebuild between qualification and
+publication.
 
 The workflow runs host tests and tests the extracted archive on Ubuntu 22.04
 without a GPU toolkit. Run `scripts/test/release.py ARCHIVE.tar.gz` to repeat

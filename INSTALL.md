@@ -13,6 +13,8 @@ cd xchplot2
 
 Download the Linux or Windows x86-64/ARM64 CUDA archive and its `.sha256` file from
 [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
+Each release contains SYCL and native CUDA packages with the same version;
+choose the `-cuda` package for this branch.
 On Linux, verify it with `sha256sum -c ARCHIVE.tar.gz.sha256`, replacing `ARCHIVE`
 with the downloaded filename without `.tar.gz`. Extract it, then run
 `./bin/xchplot2 devices` from the extracted directory. Add that `bin`
