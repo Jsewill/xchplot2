@@ -5,7 +5,7 @@
 //
 // chia-bls supplies BLS12-381 arithmetic and EIP-2333 HD derivation.
 // This shim sequences PoS2 1.0 identity hashing, the V2 taproot contract in
-// chia-blockchain PR #21484, and the existing memo layout.
+// chia-blockchain PR #21500, and the existing memo layout.
 
 use chia_bls::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
@@ -40,7 +40,7 @@ fn master_sk_to_local_sk(master: &SecretKey) -> SecretKey {
 
 fn generate_taproot_sk(local_pk: &PublicKey, farmer_pk: &PublicKey) -> SecretKey {
     // V2 taproot: SHA256((local_pk + farmer_pk) || farmer_pk).
-    // chia-blockchain PR #21484 deliberately omits the standalone local key.
+    // chia-blockchain PR #21500 deliberately omits the standalone local key.
     let sum = local_pk + farmer_pk;
     let mut msg = Vec::with_capacity(48 * 2);
     msg.extend_from_slice(&sum.to_bytes());
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn v2_taproot_matches_upstream_key_vector() {
-        // chia-blockchain PR #21484, test_v2_plot_loading.py.
+        // chia-blockchain PR #21500, test_v2_plot_loading.py.
         let master = SecretKey::from_seed(&[b'1'; 32]);
         let farmer = SecretKey::from_seed(&[b'2'; 32]).public_key();
         let local = master_sk_to_local_sk(&master).public_key();
