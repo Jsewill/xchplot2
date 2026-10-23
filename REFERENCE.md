@@ -202,9 +202,10 @@ earlier experimental groups, and saved jobs require replotting; renaming or
 rewriting their headers is insufficient. `--testnet` / `-T` are rejected:
 PoS2 no longer has a separate testnet Xs hash. Both pool modes now use the
 V2 taproot derivation in
-[chia-blockchain PR #21484](https://github.com/Chia-Network/chia-blockchain/pull/21484).
-That farmer-side integration is pending, so format/proof interoperability
-does not establish compatibility with a released farmer.
+[chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
+[Farmer plot-group integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
+remains a draft as of 2026-10-22, so format/proof interoperability does not
+establish compatibility with a released farmer.
 
 ## Devices and CPU workers
 

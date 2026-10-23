@@ -12,10 +12,12 @@ one member at index zero. The experimental runner below assembles multiple
 members. Files starting at nonzero indices still use the 0x82 extension;
 normal xchplot2 and upstream readers reject that extension.
 
-The companion [chia-rs PR #1517](https://github.com/Chia-Network/chia_rs/pull/1517)
-and [chia-blockchain PR #21396](https://github.com/Chia-Network/chia-blockchain/pull/21396)
-remain drafts as of 2026-10-08. Key generation implements the V2 taproot change
-in [chia-blockchain PR #21484](https://github.com/Chia-Network/chia-blockchain/pull/21484),
+As of 2026-10-22, the companion
+[chia-rs PR #1517](https://github.com/Chia-Network/chia_rs/pull/1517) is merged,
+but its plot-group interface is not included in the released `chia_rs` 0.52.1.
+[Farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
+remains a draft. Key generation already implements the V2 taproot change
+merged in [chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500),
 including its independent public-key test vector. These checks establish
 format/proof interoperability, not released farmer compatibility.
 
@@ -119,7 +121,7 @@ python3 contrib/pos2-pr118/group.py \
 
 `--pool-pk` is supported instead of `--pool-ph`. The default device is CPU;
 GPU selection is explicit and never falls back to CPU. Key generation uses
-released chia-protocol/chia-bls 0.50 for BLS and identity hashing, with
+released chia-protocol/chia-bls 0.52 for BLS and identity hashing, with
 the V2 taproot hash SHA-256 of `(local_pk + farmer_pk) || farmer_pk` for both
 pool-public-key and pool-contract modes. It generates one seed and memo per group, exposes the group
 hash, and derives each member ID as SHA-256 of the group ID, big-endian u16
