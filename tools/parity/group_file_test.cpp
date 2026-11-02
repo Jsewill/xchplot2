@@ -12,8 +12,26 @@ struct File
 {
     int fd;
     explicit File(int value) : fd(value) { require(fd >= 0, "cannot open group file fixture"); }
-    ~File() { io::close_file(fd); }
+    ~File() { if (fd >= 0) io::close_file(fd); }
+    void close() { int const opened = fd; fd = -1; require(!io::close_file(opened), "cannot close group file fixture"); }
 };
+void same_metadata(io::Stat const& before, io::Stat const& after)
+{
+    bool same = true;
+    auto compare = [&](char const* name, auto a, auto b)
+    {
+        if (a == b) return;
+        std::cerr << name << " changed across close: " << a << " -> " << b << '\n'; same = false;
+    };
+    compare("device", before.st_dev, after.st_dev); compare("inode", before.st_ino, after.st_ino);
+    compare("links", before.st_nlink, after.st_nlink); compare("mode", before.st_mode, after.st_mode);
+    compare("size", before.st_size, after.st_size); compare("blocks", before.st_blocks, after.st_blocks);
+    compare("mtime seconds", before.st_mtim.tv_sec, after.st_mtim.tv_sec);
+    compare("mtime nanoseconds", before.st_mtim.tv_nsec, after.st_mtim.tv_nsec);
+    compare("ctime seconds", before.st_ctim.tv_sec, after.st_ctim.tv_sec);
+    compare("ctime nanoseconds", before.st_ctim.tv_nsec, after.st_ctim.tv_nsec);
+    require(same, "synced construction metadata changed when its writer closed");
+}
 struct Directory
 {
     fs::path path;
@@ -67,6 +85,11 @@ int main() try
     std::array<io::IoVec, 2> vectors{{{first.data(), first.size()}, {second.data(), second.size()}}};
     require(io::writev_at(file.fd, vectors.data(), int(vectors.size()), 0) == first.size() + second.size(), "native vector write changed content length");
     require(!io::resize_file(file.fd, first.size()) && !io::flush(file.fd), "native file resize/barrier failed");
+    io::Stat before_close{}, after_close{};
+    require(!io::inspect_link(target, &before_close), "cannot inspect synced construction metadata");
+    file.close();
+    require(!io::inspect_link(target, &after_close), "cannot inspect closed construction metadata");
+    same_metadata(before_close, after_close);
     auto const occupied = directory.path / "occupied";
     { File other(io::open_file(occupied, flags)); }
     require(io::rename_file(target, occupied, false) != 0 && !io::inspect_link(target, &written) && written.st_ino == initial.st_ino,

@@ -14,8 +14,7 @@ function(pos2_group_tests upstream_dir grow_include)
         add_executable(pos2_pr118_grow_merge_test "${repo_dir}/tools/parity/group_merge_test.cpp"
             "${upstream_dir}/src/pos/sha/sha256.c")
         target_compile_definitions(pos2_pr118_grow_merge_test PRIVATE GROW_TEST_CONSTRUCTION=1)
-        target_include_directories(pos2_pr118_grow_merge_test PRIVATE
-            "${grow_include}" "${upstream_dir}/src/plot")
+        target_include_directories(pos2_pr118_grow_merge_test PRIVATE "${upstream_dir}/src/plot")
     endif()
     add_executable(pos2_pr118_grow_scratch_test "${repo_dir}/tools/parity/group_scratch_test.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
@@ -31,6 +30,7 @@ function(pos2_group_tests upstream_dir grow_include)
             continue()
         endif()
         target_compile_features(${target} PRIVATE cxx_std_20)
+        target_include_directories(${target} BEFORE PRIVATE "${grow_include}")
         target_include_directories(${target} PRIVATE "${upstream_dir}/src")
         target_link_libraries(${target} PRIVATE fse Threads::Threads)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
