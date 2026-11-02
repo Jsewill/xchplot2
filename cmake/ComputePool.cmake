@@ -103,10 +103,10 @@ function(pos2_pool_targets upstream_dir grow_include)
     add_executable(pos2_pr118_grow_pool_owner_test "${repo_dir}/tools/parity/compute_pool_owner_test.cpp"
         $<TARGET_OBJECTS:pos2_pr118_grow_worker_reference>)
     target_compile_definitions(pos2_pr118_grow_pool_owner_test PRIVATE GROW_TEST_CONSTRUCTION=1 GROW_POOL_NETWORK=1)
-    target_include_directories(pos2_pr118_grow_pool_owner_test BEFORE PRIVATE
-        "${grow_include}" "${upstream_dir}/src/plot")
+    target_include_directories(pos2_pr118_grow_pool_owner_test PRIVATE "${upstream_dir}/src/plot")
     foreach(target pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test)
         target_compile_features(${target} PRIVATE cxx_std_20)
+        target_include_directories(${target} BEFORE PRIVATE "${grow_include}")
         target_include_directories(${target} PRIVATE "${upstream_dir}/src" "${repo_dir}/keygen-rs/include")
         target_link_libraries(${target} PRIVATE pos2_pr118_grow_worker_host)
         target_link_options(${target} PRIVATE ${multiple_definitions})
