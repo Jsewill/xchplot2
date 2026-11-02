@@ -109,6 +109,8 @@ int main() try
         require(!io::inspect_link(target, &after_close), "cannot inspect reopened construction metadata");
         same_metadata(before_close, after_close);
     }
+    File publication(io::open_file(target, io::read_write | io::no_follow));
+    require(!io::lock_file(publication.fd, io::lock_exclusive | io::lock_nonblocking), "cannot relock group file for publication");
     auto const occupied = directory.path / "occupied";
     { File other(io::open_file(occupied, flags)); }
     require(io::rename_file(target, occupied, false) != 0 && !io::inspect_link(target, &written) && written.st_ino == initial.st_ino,
