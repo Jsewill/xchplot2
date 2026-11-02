@@ -56,13 +56,16 @@ template <typename F> void stale_lease_rejects(F&& operation)
     try { operation(); } catch (StaleLease const&) { return; }
     throw std::runtime_error("fenced compute lease did not have a stale category");
 }
-template <typename F> void permanent_rejects(F&& operation)
+template <typename F> void permanent_rejects(F&& operation, char const* expected = nullptr)
 {
     try { operation(); }
-    catch (TransientTransport const&) { throw std::runtime_error("permanent failure was classified as transient transport"); }
-    catch (StaleLease const&) { throw std::runtime_error("permanent failure was classified as a stale lease"); }
-    catch (StaleDelivery const&) { throw std::runtime_error("permanent failure was classified as a stale delivery"); }
-    catch (std::runtime_error const&) { return; }
+    catch (TransientTransport const& error) { throw std::runtime_error("permanent failure was classified as transient transport: " + std::string(error.what())); }
+    catch (StaleLease const& error) { throw std::runtime_error("permanent failure was classified as a stale lease: " + std::string(error.what())); }
+    catch (StaleDelivery const& error) { throw std::runtime_error("permanent failure was classified as a stale delivery: " + std::string(error.what())); }
+    catch (std::runtime_error const& error)
+    {
+        require(!expected || error.what() == std::string(expected), "permanent failure had an unexpected cause"); return;
+    }
     throw std::runtime_error("permanent failure was accepted");
 }
 using pool_test::Directory;
@@ -202,8 +205,9 @@ void cn_only(TlsOptions const& server_tls, TlsOptions const& client_tls)
 {
     Listener listener({"127.0.0.1", 0}, server_tls);
     auto server = std::async(std::launch::async, [&] { try { auto incoming = listener.accept(1000); } catch (...) {} });
-    auto endpoint = listener.endpoint(); endpoint.host = "localhost";
-    permanent_rejects([&] { (void)Channel::connect(endpoint, client_tls); }); server.get();
+    // Verify the DNS name without depending on localhost's address-family order.
+    auto endpoint = listener.endpoint(); endpoint.server_name = "localhost";
+    permanent_rejects([&] { (void)Channel::connect(endpoint, client_tls); }, "network certificate verification failed"); server.get();
 }
 void task_deadlines(TlsOptions server_tls, TlsOptions client_tls)
 {
