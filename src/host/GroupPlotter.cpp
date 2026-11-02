@@ -2635,7 +2635,7 @@ uint16_t external_batch_size(ExternalBatchHistory& history,
     // An explicit small upper bound may already leave two full batches. Do
     // not halve it merely because the RAM admission ceiling is larger.
     if (prefetch(largest) == largest || prefetch(half) != half) return largest;
-    auto const& full = history.sizes[0]; auto const& small = history.sizes[1];
+    auto const& full = history.sizes[0]; auto const& half_samples = history.sizes[1];
     if (!full.planning.count || !full.encoding.count || !producer.backend.generated_members) return largest;
     auto median = [](group_grow::ConstructionSamples const& samples, auto value)
     {
@@ -2684,7 +2684,7 @@ uint16_t external_batch_size(ExternalBatchHistory& history,
         return std::max(0.0L, contribution - header) / size.members * remaining;
     };
     long double const full_bytes = resources.bytes + payload(full) + header * full_batches;
-    long double const half_bytes = resources.bytes + (small.encoding.count ? payload(small) : payload(full)) + header * half_batches;
+    long double const half_bytes = resources.bytes + (half_samples.encoding.count ? payload(half_samples) : payload(full)) + header * half_batches;
     auto reads = [&](uint64_t count, long double bytes)
     {
         uint64_t const runs = resources.runs + count;
@@ -2709,7 +2709,7 @@ uint16_t external_batch_size(ExternalBatchHistory& history,
     };
     long double const full_plan = elapsed(full.planning), full_encode = elapsed(full.encoding);
     long double const full_cost = cost(largest, full_plan, full_encode, 0);
-    if (!small.planning.count || !small.encoding.count)
+    if (!half_samples.planning.count || !half_samples.encoding.count)
     {
         if (history.half_attempted) return largest;
         long double const cpu = median(full.planning, [](auto const& sample)
@@ -2730,8 +2730,8 @@ uint16_t external_batch_size(ExternalBatchHistory& history,
         // not repeatedly probe. Its result must still beat the margin below.
         history.half_attempted = true; return half;
     }
-    long double const half_cost = cost(half, elapsed(small.planning), elapsed(small.encoding), extra_pack);
-    long double const margin = group_grow::construction_margin(std::min(full.planning.count, small.planning.count));
+    long double const half_cost = cost(half, elapsed(half_samples.planning), elapsed(half_samples.encoding), extra_pack);
+    long double const margin = group_grow::construction_margin(std::min(full.planning.count, half_samples.planning.count));
     // Retain the incumbent across small timing changes in either direction.
     if (history.selected == half)
     {
