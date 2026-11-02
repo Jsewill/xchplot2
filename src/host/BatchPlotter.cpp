@@ -1281,8 +1281,12 @@ public:
         // under-reports the peak by the physical-minus-allocatable gap (83 MiB
         // on an Arc B580). Under-reporting is the unsafe direction for a check
         // whose job is catching a tier that uses more than it declared.
-        if (!device_memory_probe(ordinal_, f, t, /*physical_space=*/true))
-            return;  // unsupported → inert
+        if (!device_memory_probe(ordinal_, f, t, /*physical_space=*/true)) {
+            if (char const* v = std::getenv("POS2GPU_ASSERT_VRAM"); v && v[0] == '1')
+                throw std::runtime_error("Memory assertion requires a measurable device memory counter; "
+                                         "shared host-memory readings cannot qualify GPU VRAM usage");
+            return;
+        }
         baseline_free_ = f;
         min_free_.store(f, std::memory_order_relaxed);
         started_ = true;

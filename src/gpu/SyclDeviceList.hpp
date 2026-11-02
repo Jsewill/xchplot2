@@ -22,6 +22,7 @@ struct GpuDeviceInfo {
     std::string   name;
     std::string   backend;          // "cuda" / "hip" / "level_zero" / "opencl" / "?"
     bool          is_cuda_backend;  // true iff backend == sycl::backend::cuda
+    bool          host_unified_memory; // device shares the host memory system
     std::uint64_t vram_bytes;
     unsigned      cu_count;         // max_compute_units
     bool          auto_dispatchable; // false = tiny iGPU, skipped by --devices gpu/all

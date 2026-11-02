@@ -31,8 +31,16 @@ int main(int argc, char** argv)
             throw std::runtime_error("GPU CI requires exactly one visible GPU; isolate the runner device");
 #ifdef XCHPLOT2_GPU_CI_SYCL
         std::string const backend = devices.front().backend;
+        bool const shared_memory = devices.front().host_unified_memory;
 #else
         std::string const backend = "cuda";
+        int device = 0;
+        auto status = cudaGetDevice(&device);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        cudaDeviceProp properties{};
+        status = cudaGetDeviceProperties(&properties, device);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        bool const shared_memory = properties.integrated != 0;
 #endif
         if (backend != argv[1])
             throw std::runtime_error("Expected " + std::string(argv[1]) + ", found " + backend);
@@ -40,14 +48,14 @@ int main(int argc, char** argv)
         size_t const free_bytes = pos2gpu::query_device_memory().free_bytes;
 #else
         size_t free_bytes = 0, total_bytes = 0;
-        auto const status = cudaMemGetInfo(&free_bytes, &total_bytes);
+        status = cudaMemGetInfo(&free_bytes, &total_bytes);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 #endif
         if (!free_bytes || !devices.front().vram_bytes)
             throw std::runtime_error("GPU memory inventory is empty");
         std::fprintf(stderr, "GPU: %s (%s)\n", devices.front().name.c_str(), backend.c_str());
-        std::printf("backend=%s\ntotal_bytes=%llu\nfree_bytes=%zu\nmargin_bytes=%zu\n",
-                    backend.c_str(),
+        std::printf("backend=%s\nmemory_kind=%s\ntotal_bytes=%llu\nfree_bytes=%zu\nmargin_bytes=%zu\n",
+                    backend.c_str(), shared_memory ? "shared" : "dedicated",
                     static_cast<unsigned long long>(devices.front().vram_bytes),
                     free_bytes, pos2gpu::vram_safety_margin());
 #ifdef XCHPLOT2_GPU_CI_SYCL

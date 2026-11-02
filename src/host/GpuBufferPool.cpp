@@ -420,11 +420,10 @@ bool cuda_query_device_memory(int device_ordinal,
 // asking CMake for HIP would add a build-time dependency and a libamdhip64 link
 // to every build, including the NVIDIA ones that will never call this. On a
 // ROCm build AdaptiveCpp has already loaded the HIP runtime into the process,
-// so the symbol is simply there; on any other build the lookup fails once and
-// we fall back exactly as before. Nothing about a non-AMD build changes.
+// so the symbol is simply there; on any other build the lookup fails once.
 //
-// Without this an AMD card gets free_bytes = total_bytes (see below), and the
-// tier picker sizes against VRAM the driver, the display server and everything
+// Using free_bytes = total_bytes would size the picker against VRAM the
+// driver, the display server and everything
 // else on the card have already taken — an 8 GB card reports 8192 MB free,
 // picks plain (needs 7802), actually has ~7400, and OOMs mid-plot. Same bug the
 // NVIDIA path had.
@@ -441,12 +440,9 @@ auto runtime_symbol(void* handle, char const* name)
 
 // Free VRAM on Level Zero (Intel), via Sysman.
 //
-// Needed because AdaptiveCpp 25.10 exposes NO free-memory query of any kind, so
-// query_device_memory() falls back to global_mem_size — the device TOTAL. On an
-// Arc B580 that hands the picker 11605 MiB and pretends the Level Zero context,
-// the compositor and every other tenant do not exist. The CUDA path does not
-// have this problem: cudaMemGetInfo runs after context creation, so its number
-// is genuinely free.
+// AdaptiveCpp 25.10 exposes no free-memory query. Its global_mem_size is the
+// allocation cap, which cannot account for context, display, or other users'
+// allocations. Admission therefore requires a valid driver reading.
 //
 // SYSMAN, not the core API, is the only place free memory lives.
 // zeDeviceGetMemoryProperties reports physical size and nothing about usage.
@@ -455,8 +451,8 @@ auto runtime_symbol(void* handle, char const* name)
 // zesInit() rather than ZES_ENABLE_SYSMAN=1: the env var must be set before the
 // L0 driver initialises, and by the time anything here runs the SYCL runtime
 // has long since done that. zesInit is a separate sysman init with no such
-// ordering constraint. A loader too old to export it simply fails the dlsym and
-// we fall back to the total, which is the pre-existing behaviour.
+// ordering constraint. A loader too old to export it leaves the probe
+// unavailable, so admission fails closed.
 //
 // The ABI below is declared locally, NOT included, so the build never depends
 // on level_zero headers being installed — same reason hip_query_device_memory
@@ -628,12 +624,16 @@ std::vector<ZesMemHandle> const& zes_memory_modules(int rank)
 
 // Sums every memory module on the device — a multi-tile part reports one per
 // tile. Returns false unless at least one module answered.
-bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes)
+bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes,
+                            bool host_unified_memory)
 {
     ZesApi const& api = zes_api();
     if (!api.ready) return false;
     auto const& mods = zes_memory_modules(rank);
     if (mods.empty()) return false;
+    // Integrated modules expose the same host counters. Never add duplicate
+    // system-memory readings as if they were independent device heaps.
+    if (host_unified_memory && mods.size() != 1) return false;
 
     // Per-module logging fires once: the watchdog polls every 20 ms and this
     // is a diagnostic, not a trace.
@@ -820,6 +820,7 @@ struct ProbeTarget {
     int           ordinal = 0;   // index within that runtime, not the SYCL index
     std::uint64_t global_mem = 0;  // the device's own global_mem_size, for
                                    // sanity-checking whatever the runtime says
+    bool          host_unified_memory = false;
 };
 
 ProbeTarget probe_target_for(int device_ordinal)
@@ -860,6 +861,8 @@ ProbeTarget probe_target_for(int device_ordinal)
                                                        : ProbeRuntime::None;
             t.global_mem =
                 devs[idx].get_info<sycl::info::device::global_mem_size>();
+            if (rt == ProbeRuntime::LevelZero)
+                t.host_unified_memory = devs[idx].get_info<sycl::info::device::host_unified_memory>();
             if (rt != ProbeRuntime::None) {
                 // Rank among devices sharing this backend — that IS the
                 // runtime's own ordinal, whereas idx counts every vendor.
@@ -871,9 +874,8 @@ ProbeTarget probe_target_for(int device_ordinal)
             }
         }
     } catch (...) {
-        // Device enumeration can throw on a half-broken driver. An
-        // unprobeable device falls back to the device total, which is what
-        // this function returning None means.
+        // Device enumeration can throw on a half-broken driver. Returning
+        // None leaves the probe unavailable, so admission fails closed.
     }
 
     std::lock_guard<std::mutex> lk(m);
@@ -923,8 +925,17 @@ bool device_memory_probe(int device_ordinal,
     }
 
     if (target.runtime == ProbeRuntime::LevelZero) {
+        // Integrated Sysman readings include host allocations and cache
+        // reclamation. They cannot establish a dedicated GPU memory peak.
+        if (physical_space && target.host_unified_memory) return false;
+        std::optional<std::uint64_t> shared_host_total;
+        if (target.host_unified_memory) {
+            size_t host_free = 0, host_total = 0;
+            if (!host_memory_probe(host_free, host_total)) return false;
+            shared_host_total = host_total;
+        }
         size_t f = 0, t = 0;
-        bool const got = ze_query_device_memory(target.ordinal, f, t);
+        bool const got = ze_query_device_memory(target.ordinal, f, t, target.host_unified_memory);
         static std::atomic<bool> logged_l0{false};
         if (zes_debug() && !logged_l0.exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
@@ -944,7 +955,7 @@ bool device_memory_probe(int device_ordinal,
             // reading on the B580, where sysman correctly reports free against
             // PHYSICAL memory (12216 MiB) rather than allocatable (11605).
             VramReading reading;
-            if (validate_sysman_reading(f, t, target.global_mem, reading)) {
+            if (validate_sysman_reading(f, t, target.global_mem, reading, shared_host_total)) {
                 free_bytes  = size_t(physical_space ? reading.free_physical
                                                     : reading.free);
                 total_bytes = size_t(physical_space ? reading.total_physical
@@ -952,8 +963,8 @@ bool device_memory_probe(int device_ordinal,
                 return true;
             }
             ZDBG("REJECTED: free=%llu MiB / sysman_total=%llu MiB are not "
-                 "self-consistent, or the total is nowhere near the device's "
-                 "%llu MiB — refusing to act on it (ABI mismatch?)",
+                 "consistent with the device's %llu MiB allocation cap "
+                 "and its memory domain — refusing to act on it",
                  (unsigned long long)(f >> 20),
                  (unsigned long long)(t >> 20),
                  (unsigned long long)(target.global_mem >> 20));

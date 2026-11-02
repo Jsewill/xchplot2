@@ -45,6 +45,7 @@ Copy-Item "$prefix/bin/libomp.dll" $runtime
 Copy-Item "$prefix/adaptivecpp-license.txt" (Join-Path $licenses 'adaptivecpp.txt')
 Copy-Item "$prefix/adaptivecpp-windows.txt" $licenses
 Copy-Item "$prefix/adaptivecpp-cuda-llvm20.txt" $licenses
+Copy-Item "$prefix/adaptivecpp-level-zero-events.txt" $licenses
 Copy-Item ci/release/adaptivecpp-third-party.txt, ci/release/llvm-third-party.txt $licenses
 Copy-Item "$prefix/llvm-license.txt" (Join-Path $licenses 'llvm.txt')
 Copy-Item (Join-Path $openssl 'openssl-license.txt') (Join-Path $licenses 'openssl.txt')

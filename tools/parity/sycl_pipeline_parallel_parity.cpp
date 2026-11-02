@@ -36,7 +36,8 @@ void derive_plot_id(std::array<uint8_t, 32>& out, std::uint8_t seed)
     }
 }
 
-std::vector<std::uint64_t> run_full(int k, std::uint8_t seed)
+std::vector<std::uint64_t> run_full(int k, std::uint8_t seed,
+                                  std::array<std::uint64_t, 3>* counts = nullptr)
 {
     pos2gpu::GpuPipelineConfig cfg;
     cfg.k        = k;
@@ -58,6 +59,7 @@ std::vector<std::uint64_t> run_full(int k, std::uint8_t seed)
     scratch.t2_tile_count     = 8;
     scratch.gather_tile_count = 4;
     auto r = pos2gpu::run_gpu_pipeline_streaming(cfg, pinned_dst, cap, scratch);
+    if (counts) *counts = {r.t1_count, r.t2_count, r.t3_count};
     auto frags = r.fragments();
     std::vector<std::uint64_t> out(frags.begin(), frags.end());
     sycl::free(pinned_dst, q);
@@ -229,11 +231,12 @@ bool run_batch_3stage(int k, int dev0, int dev1, int dev2,
 {
     std::vector<pos2gpu::GpuPipelineConfig> cfgs(plot_count);
     std::vector<std::vector<std::uint64_t>> refs(plot_count);
+    std::vector<std::array<std::uint64_t, 3>> reference_counts(plot_count);
     for (std::size_t i = 0; i < cfgs.size(); ++i) {
         cfgs[i].k = k;
         cfgs[i].strength = 2;
         derive_plot_id(cfgs[i].plot_id, static_cast<std::uint8_t>(7 + i));
-        refs[i] = run_full(k, static_cast<std::uint8_t>(7 + i));
+        refs[i] = run_full(k, static_cast<std::uint8_t>(7 + i), &reference_counts[i]);
         std::sort(refs[i].begin(), refs[i].end());
     }
 
@@ -256,7 +259,16 @@ bool run_batch_3stage(int k, int dev0, int dev1, int dev2,
             ok ? "PASS" : "FAIL", k, i, dev0, dev1, dev2,
             static_cast<unsigned long long>(refs[i].size()),
             static_cast<unsigned long long>(got.size()));
-        if (!ok) all_ok = false;
+        if (!ok) {
+            std::printf("  stage counts ref=[%llu,%llu,%llu] batch=[%llu,%llu,%llu]\n",
+                static_cast<unsigned long long>(reference_counts[i][0]),
+                static_cast<unsigned long long>(reference_counts[i][1]),
+                static_cast<unsigned long long>(reference_counts[i][2]),
+                static_cast<unsigned long long>(batch[i].t1_count),
+                static_cast<unsigned long long>(batch[i].t2_count),
+                static_cast<unsigned long long>(batch[i].t3_count));
+            all_ok = false;
+        }
     }
     std::printf("[wall] pipeline-batch-3stage k=%d N=%zu plots depth=%d wall=%.1fms (%.1fms/plot)\n",
                 k, cfgs.size(), depth, wall_ms, wall_ms / cfgs.size());

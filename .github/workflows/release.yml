@@ -121,7 +121,7 @@ jobs:
         id: toolchain
         with:
           path: build/windows-toolchain/install
-          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}
+          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Configure Visual Studio
         run: |
           $ErrorActionPreference = 'Stop'

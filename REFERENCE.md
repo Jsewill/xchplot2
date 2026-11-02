@@ -906,6 +906,13 @@ Minimal, and Tiny. Pinned is a separate manual tier, not a smaller automatic fal
 The owning driver supplies free VRAM after context creation. A missing
 reading or insufficient `peak + buffer` causes refusal before allocation.
 
+Integrated Intel GPUs share host memory. Admission uses the driver's free
+host-memory reading, bounded by physical host RAM and the runtime's allocation
+cap. CPU allocations and cache activity affect those counters, so they cannot
+measure dedicated GPU memory use. `POS2GPU_ASSERT_VRAM=1` is unavailable on
+these devices; use `POS2GPU_ASSERT_VRAM=0` for throughput benchmarks. CPU byte
+parity and full-proof checks still apply to plotting correctness.
+
 The streaming base peaks below come from [VramBudget.hpp](src/host/VramBudget.hpp).
 They are allocation models, not the desktop driver deltas or host RSS in
 [BENCHMARKS.md](BENCHMARKS.md#gpu-results).

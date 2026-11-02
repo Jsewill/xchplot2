@@ -707,6 +707,10 @@ fi
 echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
 git clone --depth 1 --branch "$ACPP_REF" \
     https://github.com/AdaptiveCpp/AdaptiveCpp.git "$ACPP_BUILD_DIR/src"
+ACPP_EVENT_PATCH=$(cd "$(dirname "${BASH_SOURCE[0]}")/../ci/release" && pwd)/adaptivecpp-level-zero-events.patch
+if ! git -C "$ACPP_BUILD_DIR/src" apply --reverse --check "$ACPP_EVENT_PATCH" 2>/dev/null; then
+    git -C "$ACPP_BUILD_DIR/src" apply "$ACPP_EVENT_PATCH"
+fi
 
 # GPU-specific knobs for AdaptiveCpp's `find_package(CUDA)` probe.
 #

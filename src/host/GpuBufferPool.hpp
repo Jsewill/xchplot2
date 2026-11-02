@@ -185,11 +185,10 @@ private:
     std::mutex pair_a_mu_;
 };
 
-// Free + total device VRAM at call time. On SYCL backends without a
-// portable free-memory query, free_bytes is approximated as
-// total_bytes (AdaptiveCpp's global_mem_size = device total). Used as
-// a preflight signal; sycl::malloc_device remains the source of
-// truth. POS2GPU_MAX_VRAM_MB caps both fields when set.
+// Free + allocatable device memory at call time. An unavailable or invalid
+// driver reading fails admission. Integrated Intel readings use measured
+// host free memory, bounded by physical host RAM and the runtime's allocation
+// cap. POS2GPU_MAX_VRAM_MB caps both fields when set.
 struct DeviceMemInfo {
     size_t free_bytes  = 0;
     size_t total_bytes = 0;
@@ -212,8 +211,10 @@ DeviceMemInfo query_device_memory();
 // actually hand out — which is what an admission decision needs. Pass true for
 // DELTAS: sysman measures against physical memory, the clamp saturates at the
 // top, and a difference taken from an idle baseline therefore under-reports.
-// The VRAM watchdog passes true so its peak is exact. No effect on CUDA/HIP,
-// where the driver already reports in one space.
+// The VRAM watchdog passes true to avoid that clamping distortion. Integrated
+// Intel GPUs return false for this mode: whole-host memory pressure cannot
+// establish a dedicated GPU allocation peak. No effect on CUDA/HIP, where
+// the driver already reports in one space.
 bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes,

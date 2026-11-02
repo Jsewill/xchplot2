@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 
 namespace pos2gpu {
 
@@ -30,7 +31,9 @@ struct VramReading {
     std::uint64_t free  = 0;
     std::uint64_t total = 0;
 
-    // Sysman's raw reading, against PHYSICAL memory. Use for DELTAS.
+    // Sysman's raw reading. Dedicated memory counters can be used for DELTAS.
+    // Integrated devices instead report whole-host memory pressure; cache
+    // reclamation and CPU allocations prevent attribution to GPU usage.
     //
     // Clamping saturates at the top, so it distorts differences taken from an
     // idle baseline: on the B580 an idle card reads 11688 physical against an
@@ -48,14 +51,17 @@ struct VramReading {
 //
 // `global_mem` may be 0 when the caller could not determine it, in which case
 // sysman's own figures are taken as-is.
+// For integrated GPUs, shared_host_total must contain the physical host RAM
+// bound. Their Sysman size can be available system memory, independent of the
+// device's allocation cap. An unavailable host bound must reject the reading.
 //
-// Returns false when the reading cannot be explained — that must degrade to
-// "no probe" (the caller falls back to the device total), never to a
-// plausible-looking number.
+// Returns false when the reading cannot be explained. The caller must refuse
+// admission rather than fabricate a free-memory estimate from the total.
 inline bool validate_sysman_reading(std::uint64_t sysman_free,
                                     std::uint64_t sysman_total,
                                     std::uint64_t global_mem,
-                                    VramReading&  out)
+                                    VramReading&  out,
+                                    std::optional<std::uint64_t> shared_host_total = std::nullopt)
 {
     // Internal consistency first: a misparsed struct gives garbage, and
     // garbage almost never satisfies free <= total with a non-zero total.
@@ -65,7 +71,10 @@ inline bool validate_sysman_reading(std::uint64_t sysman_free,
     // allocatable differ by a few percent in practice (B580: 1.05x), so 2x
     // either way is generous while still catching a field read from the wrong
     // offset, which lands orders of magnitude out.
-    if (global_mem != 0
+    if (shared_host_total) {
+        if (!*shared_host_total || !global_mem || global_mem > *shared_host_total
+            || sysman_total > *shared_host_total) return false;
+    } else if (global_mem != 0
         && (sysman_total < global_mem / 2 || sysman_total > global_mem * 2)) {
         return false;
     }

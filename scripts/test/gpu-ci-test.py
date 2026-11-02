@@ -35,9 +35,13 @@ def rejects(function, *args):
 info = dict(total_bytes=8192 * MIB, free_bytes=7900 * MIB, margin_bytes=128 * MIB,
             tiny=1100 * MIB, pinned=1150 * MIB, minimal=3900 * MIB,
             compact=5200 * MIB, plain=7290 * MIB)
-text = "backend=cuda\nspill_tiers=tiny,pinned,minimal,compact\n" + "".join(f"{key}={value}\n" for key, value in info.items())
+text = "backend=cuda\nmemory_kind=dedicated\nspill_tiers=tiny,pinned,minimal,compact\n" + "".join(f"{key}={value}\n" for key, value in info.items())
 info["spill_tiers"] = ["tiny", "pinned", "minimal", "compact"]
+info["memory_kind"] = "dedicated"
 assert parse(text, "cuda") == info
+assert parse(text.replace("memory_kind=dedicated", "memory_kind=shared"), "cuda") == dict(info, memory_kind="shared")
+rejects(parse, text.replace("memory_kind=dedicated\n", ""), "cuda")
+rejects(parse, text.replace("memory_kind=dedicated", "memory_kind=unknown"), "cuda")
 rejects(parse, text, "hip")
 rejects(parse, "backend=cuda\ntotal_bytes=0\n", "cuda")
 rejects(parse, text + "unknown=1\n", "cuda")
@@ -45,6 +49,7 @@ rejects(parse, text.replace("spill_tiers=tiny,pinned,minimal,compact", "spill_ti
 assert select(info)["tiny"] == 1228
 assert select(dict(info, tiny=1100 * MIB + 1))["tiny"] == 1229
 assert select(info, 8192) == select(info)
+rejects(select, dict(info, memory_kind="shared"), 8192)
 small = dict(info, total_bytes=2048 * MIB, free_bytes=1600 * MIB)
 assert set(select(small, 2048)) == {"tiny", "pinned"}
 rejects(select, small)  # A nightly lane cannot quietly omit larger tiers.
@@ -197,6 +202,8 @@ if kind == "verify":
     cases = (("inventory", "inventory", "CalledProcessError", 7),
              ("invalid", "inventory-validation", "ValueError", None),
              ("capacity", "capacity-validation", "ValueError", None),
+             ("shared-vram", "capacity-validation", "ValueError", None),
+             ("shared-physical", "capacity-validation", "ValueError", None),
              ("devices", "devices", "CalledProcessError", 17),
              ("ctest", "ctest", "CalledProcessError", 1),
              ("test", "cpu-reference", "CalledProcessError", 17),
@@ -207,24 +214,33 @@ if kind == "verify":
              ("missing-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("vector-parity", "index-meta-max-tiny-parity", "RuntimeError", None),
              ("none", "complete", None, None),
+             ("shared-quick", "complete", None, None),
              ("correctness", "complete", None, None))
     for failure, stage, error_type, exit_code in cases:
         logs = root / failure
         fixture = text.replace("backend=cuda", "backend=hip" if failure == "invalid" else "backend=cuda")
         if failure == "capacity":
             fixture = fixture.replace(f"free_bytes={7900 * MIB}", f"free_bytes={500 * MIB}")
-        suite = "vram" if failure == "capacity" else "correctness" if failure == "correctness" else "quick"
+        if failure.startswith("shared-"):
+            fixture = fixture.replace("memory_kind=dedicated", "memory_kind=shared")
+        suite = ("physical" if failure == "shared-physical" else
+                 "vram" if failure in ("capacity", "shared-vram") else
+                 "correctness" if failure == "correctness" else "quick")
+        physical_args = ["--physical-vram-mib", "8192"] if suite == "physical" else []
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("gpu-ci.py")), str(build),
                                  "--backend", "cuda", "--suite", suite,
-                                 "--binary", str(binary), "--logs", str(logs), "--scratch", str(root)],
+                                 "--binary", str(binary), "--logs", str(logs), "--scratch", str(root), *physical_args],
             env=dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
                      CI_FAIL=failure, CI_INVENTORY=fixture, CI_CALLS=str(root / f"{failure}-calls.jsonl"),
-                     CI_ASSERT_VRAM="1" if suite == "vram" else "0"),
+                     CI_ASSERT_VRAM="1" if suite in ("vram", "physical") else "0"),
             capture_output=True, text=True)
         summary = json.loads((logs / "summary.json").read_text())
         assert summary["stage"] == stage, result.stdout + result.stderr
         assert summary["status"] == ("failed" if error_type else "passed")
-        assert summary["memory_assertion"] == (suite == "vram")
+        assert summary["memory_assertion"] == (suite in ("vram", "physical"))
+        if failure.startswith("shared-"):
+            assert summary["inventory"]["memory_kind"] == "shared"
+            assert "cannot measure dedicated GPU allocation peaks" in summary["memory_measurement"]
         assert summary["started_at"] and summary["finished_at"]
         assert (result.returncode != 0) == bool(error_type)
         assert "3062 MiB" in (logs / "nvidia-smi-start.log").read_text()

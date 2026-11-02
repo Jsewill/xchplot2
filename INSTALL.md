@@ -267,6 +267,15 @@ fallback then builds and installs AdaptiveCpp to `~/.local` (or
 `ACPP_PREFIX`), so its runtime survives Cargo's temporary build directory.
 Cargo uses these system dependencies; it does not run
 the system package manager itself.
+
+Intel plotting requires AdaptiveCpp's
+[Level Zero event-pool fix](https://github.com/AdaptiveCpp/AdaptiveCpp/commit/7bb430d5e04e497ac6b0e5b56f0f5e46f646b3af)
+to prevent incorrect command completion during overlapping GPU work. The
+project's installer, automatic CMake build, containers, and Windows toolchain
+backport it to AdaptiveCpp 25.10. Existing unpatched 25.10 installations need
+`./scripts/install-deps.sh --gpu intel --rebuild-acpp` before rebuilding
+xchplot2. Manually managed toolchains need the same upstream fix.
+
 On rolling distros, CMake probes nvcc and selects an installed compatible
 host compiler if the default is rejected. Explicit `CUDAHOSTCXX`,
 `NVCC_CCBIN`, and `CMAKE_CUDA_HOST_COMPILER` settings take precedence.

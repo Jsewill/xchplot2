@@ -86,6 +86,9 @@ def parse_inventory(text, backend):
     info = dict(line.split("=", 1) for line in text.splitlines())
     if info.pop("backend") != backend:
         raise ValueError("GPU backend does not match this CI lane")
+    memory_kind = info.pop("memory_kind")
+    if memory_kind not in ("shared", "dedicated"):
+        raise ValueError("Invalid GPU memory kind")
     spill_tiers = info.pop("spill_tiers").split(",")
     info = {k: int(v) for k, v in info.items()}
     required = {"total_bytes", "free_bytes", "margin_bytes", "tiny", "minimal", "compact", "plain"}
@@ -98,11 +101,14 @@ def parse_inventory(text, backend):
     if not set(spill_tiers) <= info.keys() & (set(TIERS) - {"plain"}):
         raise ValueError("Invalid spill tier inventory")
     info["spill_tiers"] = spill_tiers
+    info["memory_kind"] = memory_kind
     return info
 
 
 def tier_caps(info, physical_mib=0):
     if physical_mib:
+        if info["memory_kind"] != "dedicated":
+            raise ValueError("Physical VRAM lanes require dedicated device memory")
         if physical_mib not in (2048, 4096, 6144, 8192):
             raise ValueError("Physical lanes require a 2, 4, 6, or 8 GiB card")
         # Allow driver-reserved memory; a capped large card cannot pass this.
@@ -213,6 +219,10 @@ def main():
             info = parse_inventory(result.stdout, args.backend)
             summary["inventory"] = info
             summary["stage"] = "capacity-validation"
+            if info["memory_kind"] == "shared":
+                summary["memory_measurement"] = "shared host-memory counters cannot measure dedicated GPU allocation peaks"
+                if strict_memory:
+                    raise ValueError("Strict VRAM suites require dedicated device memory; use quick or correctness for shared-memory GPUs")
             caps = tier_caps(info, args.physical_vram_mib) if args.suite != "quick" else {}
             tiers = list(caps) if caps else [tier for tier in TIERS if tier in info]
             k = 18 if args.suite == "quick" else 28

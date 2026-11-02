@@ -179,6 +179,38 @@ void test_unknown_global_mem()
           "unknown cap: free > total still rejected");
 }
 
+void test_integrated_memory()
+{
+    // Synthetic shared-memory cases: available host RAM is independent of
+    // the runtime's allocation cap and can move outside the discrete ratio.
+    constexpr auto cap = 4 * 1024 * MiB, host = 32 * 1024 * MiB;
+    pos2gpu::VramReading idle, busy;
+    check(pos2gpu::validate_sysman_reading(8 * 1024 * MiB, 16 * 1024 * MiB,
+                                          cap, idle, host), "integrated: host availability above device cap");
+    check_eq(idle.free, cap, "integrated: free clamped to allocation cap");
+    check_eq(idle.total, cap, "integrated: total remains allocation cap");
+    check_eq(idle.free_physical, 8 * 1024 * MiB, "integrated: raw host free retained");
+    check_eq(idle.total_physical, 16 * 1024 * MiB, "integrated: raw host availability retained");
+    check(pos2gpu::validate_sysman_reading(256 * MiB, 512 * MiB, cap, busy, host),
+          "integrated: host pressure below discrete ratio floor");
+    check_eq(busy.free, 256 * MiB, "integrated: measured free retained under pressure");
+    check(pos2gpu::validate_sysman_reading(0, 512 * MiB, cap, busy, host),
+          "integrated: zero free is a valid pressure reading");
+    check_eq(busy.free, 0, "integrated: zero free is not replaced by the device total");
+    check(!pos2gpu::validate_sysman_reading(MiB, host + MiB, cap, busy, host),
+          "integrated: reject availability beyond physical host RAM");
+    check(!pos2gpu::validate_sysman_reading(2 * MiB, MiB, cap, busy, host),
+          "integrated: reject free beyond availability");
+    check(!pos2gpu::validate_sysman_reading(MiB, 2 * MiB, host + MiB, busy, host),
+          "integrated: reject allocation cap beyond physical host RAM");
+    check(!pos2gpu::validate_sysman_reading(MiB, 2 * MiB, 0, busy, host),
+          "integrated: reject unknown allocation cap");
+    check(!pos2gpu::validate_sysman_reading(MiB, 2 * MiB, cap, busy, 0),
+          "integrated: missing host bound cannot select discrete validation");
+    check(!pos2gpu::validate_sysman_reading(MiB, 0, cap, busy, host),
+          "integrated: reject unavailable driver reading");
+}
+
 } // namespace
 
 int main()
@@ -189,6 +221,7 @@ int main()
     test_rejects_misparse();
     test_tolerance_window();
     test_unknown_global_mem();
+    test_integrated_memory();
 
     if (failures) {
         std::printf("\n%d FAILURE(S)\n", failures);

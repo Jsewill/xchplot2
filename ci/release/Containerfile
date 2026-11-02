@@ -50,10 +50,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-all-errors \
     && rm /tmp/rustup-init.sh
 ENV PATH=/root/.cargo/bin:/opt/adaptivecpp/bin:/usr/local/cuda/bin:${PATH}
 RUN cargo install --locked --features cli cargo-about --version 0.9.2
-COPY adaptivecpp-cuda-llvm20.patch check-cuda-ptx.py /tmp/
+COPY adaptivecpp-cuda-llvm20.patch adaptivecpp-level-zero-events.patch check-cuda-ptx.py /tmp/
 RUN git clone --depth 1 --branch v25.10.0 \
         https://github.com/AdaptiveCpp/AdaptiveCpp.git /tmp/acpp-src \
     && git -C /tmp/acpp-src apply /tmp/adaptivecpp-cuda-llvm20.patch \
+    && git -C /tmp/acpp-src apply /tmp/adaptivecpp-level-zero-events.patch \
     && python3 /tmp/check-cuda-ptx.py /tmp/acpp-src /usr/bin/g++ \
         /usr/lib/llvm-${LLVM_VERSION}/bin/llc /usr/local/cuda/bin/nvcc /usr/local/cuda/bin/ptxas \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
@@ -76,6 +77,7 @@ RUN git clone --depth 1 --branch v25.10.0 \
     && mkdir -p /opt/release-licenses \
     && cp /tmp/acpp-src/LICENSE /opt/release-licenses/adaptivecpp.txt \
     && cp /tmp/adaptivecpp-cuda-llvm20.patch /opt/release-licenses/adaptivecpp-cuda-llvm20.txt \
+    && cp /tmp/adaptivecpp-level-zero-events.patch /opt/release-licenses/adaptivecpp-level-zero-events.txt \
     && git -C /tmp/acpp-src rev-parse HEAD > /opt/release-licenses/adaptivecpp-revision.txt \
     && if [ "$opencl" = ON ]; then \
         cp /tmp/acpp-build/_deps/ocl-headers-src/LICENSE /opt/release-licenses/opencl-backend-headers-license.txt \

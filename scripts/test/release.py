@@ -47,6 +47,7 @@ def main():
                      "licenses/pos2-chip.txt", "licenses/fse.txt", "licenses/aes.txt",
                      "licenses/adaptivecpp.txt", "licenses/adaptivecpp-third-party.txt",
                      "licenses/adaptivecpp-cuda-llvm20.txt",
+                     "licenses/adaptivecpp-level-zero-events.txt",
                      "licenses/llvm.txt", "licenses/llvm-third-party.txt",
                      "licenses/rust-standard-library/COPYRIGHT-library.html"):
             assert (package / name).stat().st_size > 0, f"Missing or empty {name}"

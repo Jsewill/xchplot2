@@ -162,10 +162,13 @@ struct Socket
     Descriptor fd = invalid_socket;
 #ifdef _WIN32
     LPFN_WSARECVMSG receive_message = nullptr;
+    LPFN_WSASENDMSG send_message = nullptr;
 #endif
     Interface interface;
+    bool bound_source;
     mutable Clock::time_point next_response{};
-    Socket(Interface value) : interface(std::move(value))
+    Socket(Interface value, bool bind_source) : interface(std::move(value)),
+        bound_source(bind_source && interface.address.ss_family == AF_INET6)
     {
         auto const family = interface.address.ss_family;
 #ifdef _WIN32
@@ -179,6 +182,12 @@ struct Socket
             !::WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &identifier, sizeof(identifier),
                 &receive_message, sizeof(receive_message), &returned, nullptr, nullptr) &&
             option(SOL_SOCKET, SO_REUSEADDR, yes);
+        if (okay && bound_source)
+        {
+            GUID send_identifier = WSAID_WSASENDMSG;
+            okay = !::WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &send_identifier, sizeof(send_identifier),
+                &send_message, sizeof(send_message), &returned, nullptr, nullptr);
+        }
         if (family == AF_INET)
         {
             auto const& address = reinterpret_cast<sockaddr_in const&>(interface.address);
@@ -260,10 +269,43 @@ struct Socket
             }
             peer = &destination;
         }
+        // Discovery uses the datagram source as its route. A specifically
+        // bound IPv6 listener must send from that address for multicast and
+        // unicast replies, rather than the usual link-local source.
 #ifdef _WIN32
+        if (bound_source)
+        {
+            alignas(WSACMSGHDR) std::array<uint8_t, WSA_CMSG_SPACE(sizeof(IN6_PKTINFO))> control{};
+            WSABUF io{ULONG(bytes.size()), const_cast<char*>(reinterpret_cast<char const*>(bytes.data()))};
+            WSAMSG message{}; message.name = const_cast<sockaddr*>(reinterpret_cast<sockaddr const*>(peer));
+            message.namelen = peer_size; message.lpBuffers = &io; message.dwBufferCount = 1;
+            message.Control = {ULONG(control.size()), reinterpret_cast<char*>(control.data())};
+            auto item = WSA_CMSG_FIRSTHDR(&message);
+            item->cmsg_level = IPPROTO_IPV6; item->cmsg_type = IPV6_PKTINFO;
+            item->cmsg_len = WSA_CMSG_LEN(sizeof(IN6_PKTINFO));
+            auto info = reinterpret_cast<IN6_PKTINFO*>(WSA_CMSG_DATA(item));
+            info->ipi6_addr = reinterpret_cast<sockaddr_in6 const&>(interface.address).sin6_addr;
+            info->ipi6_ifindex = interface.index;
+            DWORD sent = 0; send_message(fd, &message, 0, &sent, nullptr, nullptr);
+            return;
+        }
         ::sendto(fd, reinterpret_cast<char const*>(bytes.data()), int(bytes.size()), 0,
             reinterpret_cast<sockaddr const*>(peer), peer_size);
 #else
+        if (bound_source)
+        {
+            alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(in6_pktinfo))> control{};
+            iovec io{const_cast<uint8_t*>(bytes.data()), bytes.size()};
+            msghdr message{}; message.msg_name = const_cast<sockaddr_storage*>(peer); message.msg_namelen = peer_size;
+            message.msg_iov = &io; message.msg_iovlen = 1; message.msg_control = control.data(); message.msg_controllen = control.size();
+            auto item = CMSG_FIRSTHDR(&message);
+            item->cmsg_level = IPPROTO_IPV6; item->cmsg_type = IPV6_PKTINFO; item->cmsg_len = CMSG_LEN(sizeof(in6_pktinfo));
+            auto info = reinterpret_cast<in6_pktinfo*>(CMSG_DATA(item));
+            info->ipi6_addr = reinterpret_cast<sockaddr_in6 const&>(interface.address).sin6_addr;
+            info->ipi6_ifindex = interface.index;
+            ::sendmsg(fd, &message, 0);
+            return;
+        }
         ::sendto(fd, bytes.data(), bytes.size(), 0, reinterpret_cast<sockaddr const*>(peer), peer_size);
 #endif
     }
@@ -381,9 +423,10 @@ struct ComputeDiscovery::Impl
         if (current == topology && !sockets.empty()) return false;
         for (auto const& socket : sockets) publish(*socket, true);
         sockets.clear(); topology = std::move(current);
+        bool const bound_source = !options.endpoint.host.empty() && options.endpoint.host != "::" && options.endpoint.host != "0.0.0.0";
         for (auto const& interface : available)
         {
-            auto socket = std::make_unique<Socket>(interface);
+            auto socket = std::make_unique<Socket>(interface, bound_source);
             if (socket->fd != invalid_socket) sockets.push_back(std::move(socket));
         }
         std::lock_guard lock(mutex); candidates.clear();

@@ -191,6 +191,11 @@ active. `vram` and `physical` enforce the device-wide memory assertion and
 require an isolated GPU; the summary records which policy ran. A correctness
 pass does not qualify memory usage.
 
+Integrated GPUs with shared host memory can run `quick` and `correctness`
+when their capacity permits. Their counters include CPU and cache activity,
+so `vram` and `physical` reject them. A runtime allocation cap does not qualify
+as a physical dedicated VRAM capacity.
+
 Every suite also compares two k=18 raw-member vectors against CPU output on each
 selected tier and spill variant: strength 3 with an all-`ff` group ID, maximum
 index/meta group (65535/255), and a patterned 255-byte memo; strength 4 with a
@@ -420,6 +425,12 @@ for every GPU target reported by NVCC, without needing GPU hardware.
 Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
 OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.
+
+All project-managed AdaptiveCpp builds apply
+`ci/release/adaptivecpp-level-zero-events.patch`, which backports upstream's
+event-pool rotation fix. The first event in a new pool must consume its slot
+before another command can allocate one. Existing Intel toolchains need the
+[rebuild described in INSTALL.md](INSTALL.md#native-install).
 
 Linux archives also include OpenSSL 3 and the mdns license.
 Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`

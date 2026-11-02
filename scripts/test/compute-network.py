@@ -572,6 +572,24 @@ def qualify(nodes, summary, network=None, hosts=None, forwarded=False):
     print("PASS concurrent owners discover a shared worker; CPU bytes and full proofs", flush=True)
 
     if network:
+        # A listener bound only to a routable IPv6 address cannot accept the
+        # kernel's usual link-local multicast source as its discovered route.
+        nodes[2].stop(worker)
+        ipv6_worker = nodes[2].start("bound-ipv6-worker", *worker_options(), "--listen", "[fd42:2::4]:18449")
+        status = json.loads(nodes[0].run("compute", "status", "--json"))
+        if not any(item["endpoint"] == "[fd42:2::4]:18449" and item.get("authenticated") for item in status["workers"]):
+            raise AssertionError("IPv6-bound worker advertised a route outside its listener address")
+        ipv6_broker = nodes[0].start("bound-ipv6-broker", "compute", "broker", "--listen", "[fd42:2::2]:18448")
+        status = json.loads(nodes[2].run("compute", "status", "--json"))
+        if not any(item["endpoint"] == "[fd42:2::2]:18448" and item.get("authenticated") for item in status["brokers"]):
+            raise AssertionError("IPv6-bound broker advertised a route outside its listener address")
+        nodes[1].run("compute", "configure", "--broker", "[fd42:2::2]:18448")
+        job = nodes[1].start("bound-ipv6", *plot_options(nodes[1], "bound-ipv6"), "--compute-local", "off")
+        compare(nodes[1], nodes[1].finish(job), 1, "IPv6-bound broker and worker discovery")
+        nodes[1].run("compute", "configure", "--broker", "auto")
+        nodes[0].stop(ipv6_broker)
+        nodes[2].stop(ipv6_worker)
+        worker = nodes[2].start("automatic-worker-restored", *worker_options())
         network.command(0, "ip", "addr", "add", "192.0.2.22/24", "dev", "lan0")
         secondary_broker = nodes[0].start("secondary-broker", "compute", "broker", "--listen", "192.0.2.22:18446")
         status = nodes[2].run("compute", "status")

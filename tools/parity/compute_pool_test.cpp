@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -415,15 +416,15 @@ void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
     for (unsigned limit = 0; limit < 3; ++limit)
     {
         RunningBroker running(options); auto endpoint = running.server.endpoint();
-        BrokerClient owner(endpoint, owner_tls), small(endpoint, small_tls), large(endpoint, large_tls);
+        BrokerClient owner(endpoint, owner_tls), small_worker(endpoint, small_tls), large(endpoint, large_tls);
         auto restricted = offer("codec-small", 45002); restricted.codec_limits = {64, 4096};
         auto invalid = restricted; invalid.codec_limits.max_chunks = 0;
-        rejects([&] { small.register_worker(invalid); });
+        rejects([&] { small_worker.register_worker(invalid); });
         invalid = restricted; invalid.codec_limits.max_task_bytes = 0;
-        rejects([&] { small.register_worker(invalid); });
+        rejects([&] { small_worker.register_worker(invalid); });
         invalid = restricted; invalid.codec_limits.max_task_bytes = UINT64_MAX;
-        rejects([&] { small.register_worker(invalid); });
-        small.register_worker(restricted); auto session = owner.open_owner("codec-limits");
+        rejects([&] { small_worker.register_worker(invalid); });
+        small_worker.register_worker(restricted); auto session = owner.open_owner("codec-limits");
         auto request = pack_task("codec-window");
         if (limit == 0)
         {
@@ -527,13 +528,13 @@ void automatic_generation_cpus(BrokerOptions options, TlsOptions const& owner_tl
                                TlsOptions const& small_tls, TlsOptions const& large_tls)
 {
     RunningBroker running(options); auto endpoint = running.server.endpoint();
-    BrokerClient owner(endpoint, owner_tls), small(endpoint, small_tls), large(endpoint, large_tls);
+    BrokerClient owner(endpoint, owner_tls), small_worker(endpoint, small_tls), large(endpoint, large_tls);
     auto small_offer = offer("small-cpu-policy", 49001); small_offer.capacity = {2, 2, 4096, 0}; small_offer.generation_threads = 2;
     auto large_offer = offer("large-cpu-policy", 49002); large_offer.capacity = {8, 1, 4096, 0}; large_offer.generation_threads = 6;
     auto invalid_offer = small_offer; invalid_offer.generation_threads = 0;
-    rejects([&] { small.register_worker(invalid_offer); }); invalid_offer.generation_threads = 3;
-    rejects([&] { small.register_worker(invalid_offer); });
-    small.register_worker(small_offer); large.register_worker(large_offer); auto session = owner.open_owner("automatic-cpus");
+    rejects([&] { small_worker.register_worker(invalid_offer); }); invalid_offer.generation_threads = 3;
+    rejects([&] { small_worker.register_worker(invalid_offer); });
+    small_worker.register_worker(small_offer); large.register_worker(large_offer); auto session = owner.open_owner("automatic-cpus");
     auto first_request = task("auto-first", 1); first_request.resources.cpu_threads = 0;
     auto second_request = task("auto-second", 2); second_request.resources.cpu_threads = 0;
     auto first = owner.acquire(session, first_request), second = owner.acquire(session, second_request);
@@ -544,12 +545,12 @@ void automatic_generation_cpus(BrokerOptions options, TlsOptions const& owner_tl
     require(small_lease.task.resources.cpu_threads == small_offer.generation_threads &&
         large_lease.task.resources.cpu_threads == large_offer.generation_threads,
         "automatic CPU grants did not honor each worker generation policy");
-    require(small.begin(small_lease, small_lease.owner_identity) && large.begin(large_lease, large_lease.owner_identity),
+    require(small_worker.begin(small_lease, small_lease.owner_identity) && large.begin(large_lease, large_lease.owner_identity),
             "automatic CPU leases did not begin");
-    small.finish(small_lease); owner.delivered(small_lease, {1000000000, 32, 1024});
+    small_worker.finish(small_lease); owner.delivered(small_lease, {1000000000, 32, 1024});
     auto explicit_request = task("explicit-small", 3); auto explicit_lease = owner.acquire(session, explicit_request);
     require(explicit_lease && explicit_lease->worker_identity == small_identity && explicit_lease->task.resources.cpu_threads == 1 &&
-        small.begin(*explicit_lease, explicit_lease->owner_identity), "explicit smaller CPU request was not preserved");
+        small_worker.begin(*explicit_lease, explicit_lease->owner_identity), "explicit smaller CPU request was not preserved");
     auto waiting_request = task("auto-waiting", 4); waiting_request.resources.cpu_threads = 0;
     require(!owner.acquire(session, waiting_request), "automatic CPU policy was silently reduced to available threads");
     auto pack_request = pack_task("single-codec", 5);
@@ -557,7 +558,7 @@ void automatic_generation_cpus(BrokerOptions options, TlsOptions const& owner_tl
     require(pack && pack->task.resources.cpu_threads == 1, "codec did not retain its single-thread grant");
     owner.cancel(session, "single-codec", 1);
     require(!owner.acquire(session, waiting_request), "automatic CPU job overlapped an incomplete policy grant");
-    small.finish(*explicit_lease); auto full_policy = owner.acquire(session, waiting_request);
+    small_worker.finish(*explicit_lease); auto full_policy = owner.acquire(session, waiting_request);
     require(full_policy && full_policy->task.resources.cpu_threads == small_offer.generation_threads,
             "automatic CPU job did not resume with its full worker policy");
     auto repeated = owner.acquire(session, waiting_request);
@@ -828,14 +829,14 @@ void persistent_control(BrokerOptions options, TlsOptions const& owner_tls, TlsO
     std::cout << "persistent control requests=" << metrics.requests << " connections=" << metrics.connections <<
         " request_bytes=" << metrics.request_bytes << " response_bytes=" << metrics.response_bytes << '\n';
     auto small_frames = worker_tls; small_frames.max_frame_bytes = 4096;
-    BrokerClient small(endpoint, small_frames);
+    BrokerClient small_worker(endpoint, small_frames);
     auto profiled = offer("persistent", 49504);
     for (uint8_t k = 18; k <= 28; k += 2)
         for (uint8_t strength = 0; strength <= 32; ++strength)
         { auto value = profile(Kind::GenerateCpu); value.k = k; value.strength = strength; profiled.generation_profiles.push_back(value); }
     profiled.capacity_revision = 2;
-    small.register_worker(profiled);
-    require(small.metrics().request_bytes > small_frames.max_frame_bytes,
+    small_worker.register_worker(profiled);
+    require(small_worker.metrics().request_bytes > small_frames.max_frame_bytes,
         "small data frames did not exercise independent control profile bounds");
 }
 void control_faults(BrokerOptions options, TlsOptions const& client_tls)

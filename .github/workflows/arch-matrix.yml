@@ -112,12 +112,13 @@ jobs:
           #                    for AdaptiveCpp's built-against-LLVM bits
           #   install-deps.sh  ACPP_REF default + apt package list live
           #                    here; any edit means rebuild
+          #   Level Zero patch Runtime event allocation must match the source
           # Restore is best-effort; install-deps.sh detects an existing
           # /opt/adaptivecpp and skips its build, so a partial / stale
           # cache that lands the dir but is corrupt would only show as
           # a downstream link error — at which point bumping
           # install-deps.sh's hash naturally re-keys the cache.
-          key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh') }}
+          key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh', 'ci/release/adaptivecpp-level-zero-events.patch') }}
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
           # Distro-aware bootstrap: apt-installs build-essential, cmake,

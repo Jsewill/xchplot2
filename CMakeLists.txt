@@ -472,6 +472,14 @@ if(NOT AdaptiveCpp_FOUND)
             SOURCE_DIR    "${CMAKE_BINARY_DIR}/_deps/adaptivecpp-src"
             BINARY_DIR    "${CMAKE_BINARY_DIR}/_deps/adaptivecpp-build"
         )
+        # Backport the Level Zero event-pool fix before building the runtime.
+        find_package(Git REQUIRED)
+        file(READ "${adaptivecpp_SOURCE_DIR}/src/runtime/ze/ze_hardware_manager.cpp" _x2_ze_source)
+        if(NOT _x2_ze_source MATCHES "if\\(_num_used_events >= _pool_size\\)")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" apply
+                "${CMAKE_CURRENT_SOURCE_DIR}/ci/release/adaptivecpp-level-zero-events.patch"
+                WORKING_DIRECTORY "${adaptivecpp_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+        endif()
         set(_x2_acpp_prefix "$ENV{ACPP_PREFIX}")
         if(NOT _x2_acpp_prefix)
             set(_x2_acpp_prefix "$ENV{HOME}/.local")

@@ -1,0 +1,28 @@
+AdaptiveCpp 25.10.0 Level Zero event-pool correction.
+Backport of upstream 7bb430d5e04e497ac6b0e5b56f0f5e46f646b3af:
+https://github.com/AdaptiveCpp/AdaptiveCpp/commit/7bb430d5e04e497ac6b0e5b56f0f5e46f646b3af
+
+Allocate each pool slot once, including the first slot after pool rotation.
+Upstream source is BSD-2-Clause; retain its notices in the patched file.
+
+--- a/src/runtime/ze/ze_hardware_manager.cpp
++++ b/src/runtime/ze/ze_hardware_manager.cpp
+@@ -144,13 +144,9 @@
+ ze_event_pool_manager::allocate_event(uint32_t& event_ordinal) {
+-  if(_num_used_events+1 >= _pool_size) {
++  if(_num_used_events >= _pool_size) {
+     // If pool is full, spawn a new pool
+     spawn_pool();
+-    event_ordinal = 0;
+-
+-  } else {
+-    uint32_t ordinal = _num_used_events;
+-    ++_num_used_events;
+-
+-    event_ordinal = ordinal;
+-  }
++  }
++  event_ordinal = _num_used_events;
++  ++_num_used_events;
++
+   return _pool;
