@@ -175,7 +175,7 @@ jobs:
             git ls-files '*.md'
             echo EOF
           } >> "$GITHUB_OUTPUT"
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           globs: ${{ steps.docs.outputs.files }}
       - name: Check local documentation links
