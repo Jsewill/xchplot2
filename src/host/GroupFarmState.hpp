@@ -92,11 +92,13 @@ inline std::filesystem::path stage_farming_state(std::filesystem::path const& pa
 {
     auto const text = farming_state_text(state);
     std::string temporary = file_io::path_text(path) + ".pending-XXXXXX";
-    stream_state::Descriptor owned(file_io::temp_file(temporary.data()));
+    // Reserve the private name, then close its placeholder before replacement.
+    // MoveFileEx cannot replace a destination that still has an open handle.
+    { stream_state::Descriptor owned(file_io::temp_file(temporary.data())); }
     try
     {
         // The private name belongs to this invocation. Final publication below
-        // uses the same exclusive hard-link operation as initial checkpoints.
+        // remains exclusive, as for initial checkpoints.
         stream_state::atomic_save(file_io::native_path(temporary), text + stream_state::digest(text) + '\n');
         grow_failpoint("farm-plan-before-publication");
         return file_io::native_path(temporary);
