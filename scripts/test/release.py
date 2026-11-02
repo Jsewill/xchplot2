@@ -235,6 +235,13 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0
         subprocess.run([sys.executable, pathlib.Path(__file__).with_name("recovery.py"), binary],
                        check=True, timeout=720)
+        assert (package / "licenses/mdns.txt").stat().st_size > 0
+        assert (package / ("licenses/openssl.txt" if os.name == "nt" else "licenses/libssl-dev.txt")).stat().st_size > 0
+        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("group-cli.py"), binary,
+                        "--automatic-compute", "--scratch", work], check=True, timeout=900)
+        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("compute-cli.py"), binary,
+                        "--scratch", work, *(["--service-manager"] if os.name == "nt" else [])],
+                       check=True, timeout=420)
         print("Release archive: extraction, CLI, CPU/SYCL plotting parity, and full proofs passed")
 
 

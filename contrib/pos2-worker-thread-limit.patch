@@ -1,0 +1,549 @@
+--- a/plot/Plotter.hpp
++++ b/plot/Plotter.hpp
+@@ -25,16 +25,16 @@
+ #define DEBUG_MEMORY_USAGE_PLOTTING 0
+ #define DEVELOPER_PERFORMANCE_TIMINGS 0
+ 
+-class Plotter {
++class WorkerReferencePlotter {
+ public:
+     struct Options {
+         bool validate = false;
+-        bool verbose = false; // (kept for API compatibility; Plotter no longer prints)
++        bool verbose = false; // (kept for API compatibility; WorkerReferencePlotter no longer prints)
+         IProgressSink* sink = &null_progress_sink(); // optional
+     };
+ 
+     // Construct with the parameters for one plot index in a plot group.
+-    Plotter(PlotProofParams const& proof_params)
++    WorkerReferencePlotter(PlotProofParams const& proof_params)
+         : proof_params_(proof_params)
+         , fragment_codec_(proof_params)
+     #if RETAIN_X_VALUES
+@@ -72,18 +72,18 @@
+         size_t max_pairs = max_section_pairs * num_sections;
+ 
+         size_t max_element_bytes = std::max(
+-            { sizeof(Xs_Candidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing) });
++            { sizeof(WorkerReferenceXsCandidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing) });
+ 
+         size_t minor_scratch_bytes = 2048 * 1024;
+ 
+-        // Allocate layout under a scoped progress event + timer, without making PlotLayout a
++        // Allocate layout under a scoped progress event + timer, without making WorkerReferencePlotLayout a
+         // pointer.
+-        auto layout = [&]() -> PlotLayout {
++        auto layout = [&]() -> WorkerReferencePlotLayout {
+             ScopedEvent alloc_scope(sink, ProgressEvent { .kind = EventKind::AllocationBegin });
+             if (alloc_scope.cancelled())
+-                return PlotLayout(0, 0, 0, 0); // or handle via exception/early return policy
+-
+-            PlotLayout l(max_section_pairs, num_sections, max_element_bytes, minor_scratch_bytes);
++                return WorkerReferencePlotLayout(0, 0, 0, 0); // or handle via exception/early return policy
++
++            WorkerReferencePlotLayout l(max_section_pairs, num_sections, max_element_bytes, minor_scratch_bytes);
+ 
+             ProgressEvent alloc_end_event {
+                 .kind = EventKind::Note,
+@@ -96,7 +96,7 @@
+         }();
+ 
+         auto xsV = layout.xs();
+-        XsConstructor xs_gen_ctor(proof_params_, sink);
++        WorkerReferenceXsConstructor xs_gen_ctor(proof_params_, sink);
+         auto xs_candidates = xs_gen_ctor.construct(xsV.out, xsV.post_sort_tmp, xsV.minor);
+ #if DEVELOPER_PERFORMANCE_TIMINGS
+         xs_gen_ctor.timings.show();
+@@ -113,7 +113,7 @@
+         }
+ 
+         auto t1V = layout.t1();
+-        Table1Constructor t1_ctor(proof_params_, t1V.target, t1V.minor, sink);
++        WorkerReferenceTable1Constructor t1_ctor(proof_params_, t1V.target, t1V.minor, sink);
+         auto t1_pairs = t1_ctor.construct(xs_candidates, t1V.out, t1V.post_sort_tmp);
+ #if DEVELOPER_PERFORMANCE_TIMINGS
+         t1_ctor.timings.show("Table 1 Timings");
+@@ -151,7 +151,7 @@
+ 
+         // Table 2
+         auto t2V = layout.t2();
+-        Table2Constructor t2_ctor(proof_params_, t2V.target, t2V.minor, sink);
++        WorkerReferenceTable2Constructor t2_ctor(proof_params_, t2V.target, t2V.minor, sink);
+         auto t2_pairs = t2_ctor.construct(t1_pairs, t2V.out, t2V.post_sort_tmp);
+ #if DEVELOPER_PERFORMANCE_TIMINGS
+         t2_ctor.timings.show("Table 2 Timings");
+@@ -186,7 +186,7 @@
+ 
+         // Table 3
+         auto t3V = layout.t3();
+-        Table3Constructor t3_ctor(proof_params_, t3V.target, t3V.minor, sink);
++        WorkerReferenceTable3Constructor t3_ctor(proof_params_, t3V.target, t3V.minor, sink);
+         auto t3_results = t3_ctor.construct(t2_pairs, t3V.out, t3V.post_sort_tmp);
+ #if DEVELOPER_PERFORMANCE_TIMINGS
+         t3_ctor.timings.show("Table 3 Timings:");
+--- a/plot/PlotLayout.hpp
++++ b/plot/PlotLayout.hpp
+@@ -11,7 +11,7 @@
+ #include "LayoutPlanner.hpp"
+ #include "TableConstructorGeneric.hpp"
+ 
+-struct PlotLayout {
++struct WorkerReferencePlotLayout {
+     std::size_t max_section_pairs = 0;
+     std::size_t num_sections = 0;
+     std::size_t max_pairs = 0;
+@@ -75,8 +75,8 @@
+     // Phase view structs
+     // ============================================================
+     struct XsViews {
+-        std::span<Xs_Candidate> out;
+-        std::span<Xs_Candidate> post_sort_tmp;
++        std::span<WorkerReferenceXsCandidate> out;
++        std::span<WorkerReferenceXsCandidate> post_sort_tmp;
+         ResettableArenaResource& minor;
+     };
+ 
+@@ -101,7 +101,7 @@
+         ResettableArenaResource& minor;
+     };
+ 
+-    PlotLayout(std::size_t max_section_pairs_,
++    WorkerReferencePlotLayout(std::size_t max_section_pairs_,
+         std::size_t num_sections_,
+         std::size_t max_element_bytes_,
+         std::size_t minor_scratch_bytes_,
+@@ -142,8 +142,8 @@
+     // ============================================================
+     XsViews xs()
+     {
+-        auto out = mem.span<Xs_Candidate>(slot_pos(BlockSlot::PrimaryOut), max_pairs);
+-        auto post_sort_tmp = mem.span<Xs_Candidate>(slot_pos(BlockSlot::XsPostSortTmp), max_pairs);
++        auto out = mem.span<WorkerReferenceXsCandidate>(slot_pos(BlockSlot::PrimaryOut), max_pairs);
++        auto post_sort_tmp = mem.span<WorkerReferenceXsCandidate>(slot_pos(BlockSlot::XsPostSortTmp), max_pairs);
+ 
+         minor_scratch.reset();
+         return { out, post_sort_tmp, minor_scratch };
+@@ -204,7 +204,7 @@
+             os << header << "\n";
+         }
+ 
+-        os << "PlotLayout memory stats:\n";
++        os << "WorkerReferencePlotLayout memory stats:\n";
+         os << "  block_size_bytes             : " << block_size_bytes << " bytes\n";
+         os << "  num_blocks                   : " << num_blocks << "\n";
+         os << "  minor_scratch_bytes          : " << minor_scratch_bytes << " bytes\n";
+--- a/plot/TableConstructorGeneric.hpp
++++ b/plot/TableConstructorGeneric.hpp
+@@ -36,9 +36,9 @@
+ }
+ 
+ template <typename PairingCandidate, typename T_Pairing, typename T_Result>
+-class TableConstructorGeneric {
++class WorkerReferenceTableConstructorGeneric {
+ public:
+-    TableConstructorGeneric(int table_id,
++    WorkerReferenceTableConstructorGeneric(int table_id,
+         PlotProofParams const& proof_params,
+         ResettableArenaResource& target_scratch,
+         ResettableArenaResource& minor_scratch,
+@@ -53,7 +53,7 @@
+     {
+     }
+ 
+-    virtual ~TableConstructorGeneric() = default;
++    virtual ~WorkerReferenceTableConstructorGeneric() = default;
+ 
+     // =========================
+     // Prefix (flat 2D) structure
+@@ -360,7 +360,7 @@
+                 std::span<PairingCandidate> l_candidates(l_ptr, l_count);
+ 
+                 timer_.start("Hash matching L candidates");
+-                parallel_for_range(uint64_t(0),
++                worker_reference_parallel_for_range(uint64_t(0),
+                     uint64_t(l_count),
+                     [this, l_ptr, prev = previous_table_pairs, l_start, match_key_r](uint64_t idx) {
+                         l_ptr[static_cast<std::size_t>(idx)] = matching_target(
+@@ -377,7 +377,7 @@
+                     = arena_alloc_n<PairingCandidate>(target_scratch_arena_, l_count);
+                 std::span<PairingCandidate> tmp(tmp_ptr, l_count);
+ 
+-                RadixSort<PairingCandidate, uint32_t> radix_sort;
++                WorkerReferenceRadixSort<PairingCandidate, uint32_t> radix_sort;
+ 
+                 timer_.start("Sorting L candidates");
+                 // only need to sort by matching_target bits, as match_info returned by
+@@ -388,7 +388,7 @@
+                     minor_scratch_arena_);
+                 timings.sort_time_ms += timer_.stop();
+ 
+-                unsigned num_threads = std::thread::hardware_concurrency();
++                unsigned num_threads = group_grow::worker_detail::cpu_threads();
+                 if (num_threads == 0)
+                     num_threads = 1;
+ 
+@@ -399,7 +399,7 @@
+                     timings.misc_time_ms += timer_.stop();
+ 
+                     timer_.start("Finding pairs (parallel)");
+-                    parallel_for_range(uint64_t(0),
++                    worker_reference_parallel_for_range(uint64_t(0),
+                         uint64_t(splits.size()),
+                         [this, &splits, &l_sorted, &r_candidates, out_pairs, &out_count](
+                             uint64_t split_idx) {
+@@ -440,7 +440,7 @@
+             = (100.0 * static_cast<double>(produced) / static_cast<double>(out_pairs.size()));
+         if (produced > out_pairs.size()) {
+             // This indicates the estimate was too small or handle_pair_into wrote past capacity.
+-            throw std::runtime_error("TableConstructorGeneric: output arena capacity exceeded (bad "
++            throw std::runtime_error("WorkerReferenceTableConstructorGeneric: output arena capacity exceeded (bad "
+                                      "max_pairs_per_table_possible)");
+         }
+         ScopedEvent post_sort(sink_,
+@@ -493,24 +493,24 @@
+     ProofCore proof_core_;
+ };
+ 
+-struct Xs_Candidate {
++struct WorkerReferenceXsCandidate {
+     uint32_t match_info; // k-bit match info.
+     uint32_t x; // k-bit x value.
+ };
+ 
+-class XsConstructor {
++class WorkerReferenceXsConstructor {
+ public:
+-    XsConstructor(PlotProofParams const& proof_params, IProgressSink& sink = null_progress_sink())
++    WorkerReferenceXsConstructor(PlotProofParams const& proof_params, IProgressSink& sink = null_progress_sink())
+         : params_(proof_params)
+         , proof_core_(proof_params)
+         , sink_(sink)
+     {
+     }
+ 
+-    virtual ~XsConstructor() = default;
+-
+-    std::span<Xs_Candidate> construct(std::span<Xs_Candidate> out_xs,
+-        std::span<Xs_Candidate> tmp_xs,
++    virtual ~WorkerReferenceXsConstructor() = default;
++
++    std::span<WorkerReferenceXsCandidate> construct(std::span<WorkerReferenceXsCandidate> out_xs,
++        std::span<WorkerReferenceXsCandidate> tmp_xs,
+         std::pmr::memory_resource& scratch_mr)
+     {
+         uint64_t const num_xs_u64 = (1ULL << params_.get_k());
+@@ -524,7 +524,7 @@
+ 
+         // Check buffers large enough
+         if (out_xs.size() < num_xs || tmp_xs.size() < num_xs) {
+-            throw std::runtime_error("XsConstructor: buffers too small");
++            throw std::runtime_error("WorkerReferenceXsConstructor: buffers too small");
+         }
+ 
+         // We only use the first num_xs elements
+@@ -532,23 +532,23 @@
+         auto tmp_span = tmp_xs.first(num_xs);
+ 
+         Timer timer;
+-        timer.start("Hashing Xs_Candidate");
+-
+-        parallel_for_range(uint64_t(0), num_xs_u64, [this, out_span](uint64_t x_val) mutable {
++        timer.start("Hashing WorkerReferenceXsCandidate");
++
++        worker_reference_parallel_for_range(uint64_t(0), num_xs_u64, [this, out_span](uint64_t x_val) mutable {
+             uint32_t x = static_cast<uint32_t>(x_val);
+             uint32_t match_info = this->proof_core_.hashing.g(x);
+-            out_span[static_cast<size_t>(x_val)] = Xs_Candidate { match_info, x };
++            out_span[static_cast<size_t>(x_val)] = WorkerReferenceXsCandidate { match_info, x };
+         });
+         timings.hash_time_ms = timer.stop();
+ 
+-        RadixSort<Xs_Candidate, uint32_t> radix_sort;
++        WorkerReferenceRadixSort<WorkerReferenceXsCandidate, uint32_t> radix_sort;
+ 
+         ScopedEvent sort_scope(sink_,
+             ProgressEvent {
+                 .kind = EventKind::PostSortBegin, .table_id = 0, .produced = num_xs_u64 });
+-        timer.start("Sorting Xs_Candidate");
++        timer.start("Sorting WorkerReferenceXsCandidate");
+         // auto sorted = radix_sort.sort_to(out, tmp);
+-        std::span<Xs_Candidate> sorted_span
++        std::span<WorkerReferenceXsCandidate> sorted_span
+             = radix_sort.sort(out_span, tmp_span, params_.get_k(), &scratch_mr);
+         timings.sort_time_ms = timer.stop();
+ 
+@@ -561,7 +561,7 @@
+ 
+         void show() const
+         {
+-            std::cout << "XsConstructor Timings:" << std::endl;
++            std::cout << "WorkerReferenceXsConstructor Timings:" << std::endl;
+             std::cout << "  Hash time: " << hash_time_ms << " ms" << std::endl;
+             std::cout << "  Sort time: " << sort_time_ms << " ms" << std::endl;
+             std::cout << "  ------------" << std::endl;
+@@ -576,30 +576,30 @@
+     IProgressSink& sink_;
+ };
+ 
+-class Table1Constructor : public TableConstructorGeneric<Xs_Candidate, T1Pairing, T1Pairing> {
++class WorkerReferenceTable1Constructor : public WorkerReferenceTableConstructorGeneric<WorkerReferenceXsCandidate, T1Pairing, T1Pairing> {
+ public:
+     // NOTE: this base now requires a scratch arena reference
+-    explicit Table1Constructor(PlotProofParams const& proof_params,
++    explicit WorkerReferenceTable1Constructor(PlotProofParams const& proof_params,
+         ResettableArenaResource& target_scratch,
+         ResettableArenaResource& minor_scratch,
+         IProgressSink& sink = null_progress_sink())
+-        : TableConstructorGeneric<Xs_Candidate, T1Pairing, T1Pairing>(
++        : WorkerReferenceTableConstructorGeneric<WorkerReferenceXsCandidate, T1Pairing, T1Pairing>(
+               1, proof_params, target_scratch, minor_scratch, sink)
+     {
+     }
+ 
+     // matching_target => (meta_l, r_match_target)
+-    Xs_Candidate matching_target(Xs_Candidate const& prev_table_pair, uint32_t match_key_r) override
++    WorkerReferenceXsCandidate matching_target(WorkerReferenceXsCandidate const& prev_table_pair, uint32_t match_key_r) override
+     {
+         uint32_t x = prev_table_pair.x;
+         uint32_t r_match_target = proof_core_.matching_target(1, x, match_key_r);
+ 
+         // note: match_info is only the lower match_target_bits, rest is not used.
+-        return Xs_Candidate { .match_info = r_match_target, .x = x };
+-    }
+-
+-    void handle_pair_into(Xs_Candidate const& l_candidate,
+-        Xs_Candidate const& r_candidate,
++        return WorkerReferenceXsCandidate { .match_info = r_match_target, .x = x };
++    }
++
++    void handle_pair_into(WorkerReferenceXsCandidate const& l_candidate,
++        WorkerReferenceXsCandidate const& r_candidate,
+         std::span<T1Pairing> out_pairs,
+         std::atomic<std::size_t>& out_count) override
+     {
+@@ -628,7 +628,7 @@
+     {
+         minor_scratch_arena_->reset();
+ 
+-        RadixSort<T1Pairing, uint32_t> radix_sort;
++        WorkerReferenceRadixSort<T1Pairing, uint32_t> radix_sort;
+ 
+         timer_.start("Sorting T1Pairing");
+         std::span<T1Pairing> sorted_span
+@@ -639,13 +639,13 @@
+     }
+ };
+ 
+-class Table2Constructor : public TableConstructorGeneric<T1Pairing, T2Pairing, T2Pairing> {
++class WorkerReferenceTable2Constructor : public WorkerReferenceTableConstructorGeneric<T1Pairing, T2Pairing, T2Pairing> {
+ public:
+-    explicit Table2Constructor(PlotProofParams const& proof_params,
++    explicit WorkerReferenceTable2Constructor(PlotProofParams const& proof_params,
+         ResettableArenaResource& target_scratch,
+         ResettableArenaResource& minor_scratch,
+         IProgressSink& sink = null_progress_sink())
+-        : TableConstructorGeneric<T1Pairing, T2Pairing, T2Pairing>(
++        : WorkerReferenceTableConstructorGeneric<T1Pairing, T2Pairing, T2Pairing>(
+               2, proof_params, target_scratch, minor_scratch, sink)
+     {
+     }
+@@ -708,7 +708,7 @@
+         // T2Pairing* tmp_ptr = arena_alloc_n<T2Pairing>(&previous_out_arena, pairings.size());
+         // std::span<T2Pairing> tmp(tmp_ptr, pairings.size());
+ 
+-        RadixSort<T2Pairing, uint32_t> radix_sort;
++        WorkerReferenceRadixSort<T2Pairing, uint32_t> radix_sort;
+ 
+         timer_.start("Sorting T2Pairing");
+         std::span<T2Pairing> sorted_span
+@@ -719,13 +719,13 @@
+     }
+ };
+ 
+-class Table3Constructor : public TableConstructorGeneric<T2Pairing, T3Pairing, T3Pairing> {
++class WorkerReferenceTable3Constructor : public WorkerReferenceTableConstructorGeneric<T2Pairing, T3Pairing, T3Pairing> {
+ public:
+-    explicit Table3Constructor(PlotProofParams const& proof_params,
++    explicit WorkerReferenceTable3Constructor(PlotProofParams const& proof_params,
+         ResettableArenaResource& target_scratch,
+         ResettableArenaResource& minor_scratch,
+         IProgressSink& sink = null_progress_sink())
+-        : TableConstructorGeneric<T2Pairing, T3Pairing, T3Pairing>(
++        : WorkerReferenceTableConstructorGeneric<T2Pairing, T3Pairing, T3Pairing>(
+               3, proof_params, target_scratch, minor_scratch, sink)
+     {
+     }
+@@ -782,7 +782,7 @@
+         minor_scratch_arena_->reset();
+ 
+         // do a radix sort on fragments
+-        RadixSort<T3Pairing, uint64_t, decltype(&T3Pairing::proof_fragment)> radix_sort(
++        WorkerReferenceRadixSort<T3Pairing, uint64_t, decltype(&T3Pairing::proof_fragment)> radix_sort(
+             &T3Pairing::proof_fragment);
+ 
+         timer_.start("Sorting T3Pairing");
+--- a/plot/RadixSort.hpp
++++ b/plot/RadixSort.hpp
+@@ -13,11 +13,11 @@
+ // A generic radix sort that works on objects of type T by extracting a key (uint32_t)
+ // using the provided KeyExtractor functor.
+ template <typename T, typename KeyType, typename KeyExtractor = decltype(&T::match_info)>
+-class RadixSort {
++class WorkerReferenceRadixSort {
+ public:
+-    explicit RadixSort(KeyExtractor extractor) : key_extractor_(extractor) {}
++    explicit WorkerReferenceRadixSort(KeyExtractor extractor) : key_extractor_(extractor) {}
+ 
+-    explicit RadixSort() : key_extractor_(&T::match_info) {}
++    explicit WorkerReferenceRadixSort() : key_extractor_(&T::match_info) {}
+ 
+     // Sort the vector 'data' in place, using 'buffer' as temporary storage.
+     // Sorting is based on the key extracted by key_extractor_.
+@@ -30,7 +30,7 @@
+         int const radix_mask = radix - 1;
+         int const num_passes = (num_bits + radix_bits - 1) / radix_bits; // Number of passes needed.
+ 
+-        size_t num_threads = std::thread::hardware_concurrency();
++        size_t num_threads = group_grow::worker_detail::cpu_threads();
+         if (num_threads == 0)
+             num_threads = 1;
+ 
+@@ -38,7 +38,7 @@
+ 
+         Timer timer;
+         if (verbose_) {
+-            std::cout << "RadixSort: Sorting " << num_elements << " elements with " << num_threads
++            std::cout << "WorkerReferenceRadixSort: Sorting " << num_elements << " elements with " << num_threads
+                       << " threads on " << num_bits << " bits" << std::endl;
+             timer.start();
+         }
+@@ -69,7 +69,7 @@
+                 countPhaseTimer.start("Count phase");
+ 
+             {
+-                std::vector<thread> threads;
++                std::vector<WorkerReferenceThread> threads;
+                 for (size_t t = 0; t < num_threads; ++t) {
+                     threads.emplace_back([&, t]() {
+                         // Reset counts
+@@ -126,7 +126,7 @@
+                 redistributionTimer.start("Redistribution phase");
+ 
+             {
+-                std::vector<thread> threads;
++                std::vector<WorkerReferenceThread> threads;
+                 for (size_t t = 0; t < num_threads; ++t) {
+                     threads.emplace_back([&, t]() {
+                         size_t start = num_elements_per_thread * t;
+@@ -136,7 +136,7 @@
+                             KeyType key = (data[i].*key_extractor_ >> shift) & radix_mask;
+                             size_t outpos = offsets_for_thread[t][key]++;
+                             if (outpos >= num_elements) {
+-                                throw std::runtime_error("RadixSort: outpos out of range");
++                                throw std::runtime_error("WorkerReferenceRadixSort: outpos out of range");
+                             }
+                             assert(outpos < num_elements);
+                             buffer[outpos] = data[i];
+--- a/common/ParallelForRange.hpp
++++ b/common/ParallelForRange.hpp
+@@ -11,21 +11,21 @@
+ 
+ #include "common/thread.hpp"
+ 
+-// A small, self-contained parallel_for_range utility.
++// A small, self-contained worker_reference_parallel_for_range utility.
+ // - Iterates over [first, last) and calls fn(element) for each element.
+ // - Provides overloads for iterator ranges and numeric index ranges.
+ 
+ // Iterator-based overloads
+ template <typename It, typename Fn>
+-std::enable_if_t<!std::is_integral<It>::value, void> parallel_for_range(It first, It last, Fn fn)
++std::enable_if_t<!std::is_integral<It>::value, void> worker_reference_parallel_for_range(It first, It last, Fn fn)
+ {
+-    unsigned hw = std::thread::hardware_concurrency();
++    unsigned hw = group_grow::worker_detail::cpu_threads();
+     unsigned num_threads = hw == 0 ? 4u : hw;
+-    parallel_for_range(first, last, fn, num_threads);
++    worker_reference_parallel_for_range(first, last, fn, num_threads);
+ }
+ 
+ template <typename It, typename Fn>
+-std::enable_if_t<!std::is_integral<It>::value, void> parallel_for_range(
++std::enable_if_t<!std::is_integral<It>::value, void> worker_reference_parallel_for_range(
+     It first, It last, Fn fn, unsigned max_threads)
+ {
+     using diff_t = typename std::iterator_traits<It>::difference_type;
+@@ -42,7 +42,7 @@
+         return;
+     }
+ 
+-    std::vector<thread> workers;
++    std::vector<WorkerReferenceThread> workers;
+     workers.reserve(num_threads);
+ 
+     for (unsigned t = 0; t < num_threads; ++t) {
+@@ -60,8 +60,8 @@
+ 
+ // Numeric index range [start, stop)
+ template <typename T, typename Fn>
+-std::enable_if_t<std::is_integral_v<T>, void> parallel_for_range(
+-    T start, T stop, Fn fn, unsigned max_threads = std::thread::hardware_concurrency())
++std::enable_if_t<std::is_integral_v<T>, void> worker_reference_parallel_for_range(
++    T start, T stop, Fn fn, unsigned max_threads = group_grow::worker_detail::cpu_threads())
+ {
+     using diff_t = T;
+     diff_t total = (stop > start) ? (stop - start) : 0;
+@@ -77,7 +77,7 @@
+         return;
+     }
+ 
+-    std::vector<thread> workers;
++    std::vector<WorkerReferenceThread> workers;
+     workers.reserve(num_threads);
+ 
+     for (unsigned t = 0; t < num_threads; ++t) {
+--- a/common/thread.hpp
++++ b/common/thread.hpp
+@@ -1,24 +1,27 @@
+ #pragma once
+ 
+ #include <thread>
++#include <tuple>
+ #include <utility>
++#include "common/grow-worker-threads.hpp"
+ 
+-// Use std::jthread when available; falls back to std::thread+join
+-#if defined(__cpp_lib_jthread)
+-using thread = std::jthread;
+-#else
+-struct thread : std::thread {
++// Private worker reference type: no altered inline symbol overlaps the owner.
++struct WorkerReferenceThread : std::thread {
+     template <typename F, typename... Args>
+-    explicit thread(F&& f, Args&&... args)
+-        : std::thread(std::forward<F>(f), std::forward<Args>(args)...)
++    explicit WorkerReferenceThread(F&& f, Args&&... args)
+     {
++        auto invoke = [limit = group_grow::worker_detail::cpu_limit,
++            function = std::forward<F>(f),
++            arguments = std::make_tuple(std::forward<Args>(args)...)]() mutable {
++            group_grow::worker_detail::CpuLimit scope(limit);
++            std::apply(std::move(function), std::move(arguments));
++        };
++        // A single admitted CPU executes on its caller, matching the serial
++        // parallel-for path and avoiding a separate runnable control thread.
++        if (group_grow::worker_detail::cpu_limit == 1) invoke();
++        else static_cast<std::thread&>(*this) = std::thread(std::move(invoke));
+     }
+-    thread(thread const&) = delete;
+-    thread(thread&&) = default;
+-    ~thread()
+-    {
+-        if (joinable())
+-            join();
+-    }
++    WorkerReferenceThread(WorkerReferenceThread const&) = delete;
++    WorkerReferenceThread(WorkerReferenceThread&&) = default;
++    ~WorkerReferenceThread() { if (joinable()) join(); }
+ };
+-#endif

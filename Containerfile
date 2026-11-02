@@ -111,7 +111,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake git ninja-build build-essential python3 pkg-config \
         curl ca-certificates \
-        libboost-context-dev libnuma-dev \
+        libboost-context-dev libnuma-dev libssl-dev \
  && if [ "${LLVM_ROOT}" = "/usr/lib/llvm-18" ]; then \
         apt-get install -y --no-install-recommends \
             llvm-18 llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev \
@@ -232,7 +232,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # generate PTX from the SSCP bitcode — install the full llvm-18 package
 # (binaries + lib), not just libllvm18.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 \
+        llvm-18 lld-18 libnuma1 libomp5-18 libboost-context1.83.0 libssl3t64 \
     && if [ "${WITH_LEVEL_ZERO_BACKEND}" = "ON" ]; then \
         apt-get install -y --no-install-recommends libze1; \
     fi \

@@ -72,11 +72,21 @@ struct InsufficientVramError : std::runtime_error {
 };
 
 struct GpuBufferPool {
+    struct Sizing {
+        uint64_t total_xs = 0, cap = 0;
+        size_t storage_bytes = 0, pair_a_bytes = 0, pair_b_bytes = 0;
+        size_t xs_temp_bytes = 0, sort_scratch_bytes = 0, pinned_bytes = 0;
+        uint64_t device_bytes() const noexcept
+        { return storage_bytes + pair_a_bytes + pair_b_bytes + sort_scratch_bytes + sizeof(uint64_t); }
+    };
+    // Queries backend sort scratch using the current device queue. This may
+    // initialize its runtime/context, but allocates no pool or pinned tables.
+    static Sizing sizing(int k, bool testnet = false);
     // Allocates all buffers sized for (k, strength, testnet). Throws
     // InsufficientVramError when the sized pool will not fit in free
     // device VRAM; throws std::runtime_error on any other CUDA
     // allocation or API failure.
-    GpuBufferPool(int k, int strength, bool testnet);
+    GpuBufferPool(int k, int strength, bool testnet, uint64_t max_device_bytes = 0);
     ~GpuBufferPool();
 
     GpuBufferPool(GpuBufferPool const&) = delete;
@@ -131,6 +141,12 @@ struct GpuBufferPool {
     // independently). Throws std::runtime_error on host alloc
     // failure.
     uint64_t* ensure_pinned(int idx);
+
+    // Release an idle output slot when switching to a bounded consumer. The
+    // caller must finish every host consumer and exclude concurrent slot use
+    // first. Waits for queued device work; leaves the slot accounted as live
+    // if waiting or freeing throws. Existing batch callers may keep all slots.
+    void release_pinned(int idx);
 
     // Returns pool.d_pair_a, allocating it on first use. Deferred
     // from ctor so run_gpu_pipeline can submit Xs gen *before*

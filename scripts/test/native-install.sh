@@ -49,3 +49,8 @@ ACPP_VISIBILITY_MASK=omp ctest --test-dir build-native-install/cmake \
 
 python3 scripts/test/recovery.py build-native-install/cargo/bin/xchplot2
 python3 scripts/test/recovery.py build-native-install/cmake/tools/xchplot2/xchplot2
+
+python3 scripts/test/group-cli.py build-native-install/cargo/bin/xchplot2 --automatic-compute
+python3 scripts/test/group-cli.py build-native-install/cmake/tools/xchplot2/xchplot2 --automatic-compute
+python3 scripts/test/compute-cli.py build-native-install/cargo/bin/xchplot2
+python3 scripts/test/compute-cli.py build-native-install/cmake/tools/xchplot2/xchplot2

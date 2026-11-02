@@ -29,6 +29,8 @@ if ($arm64) { $env:PATH = "$env:CUDA_PATH/bin/arm64;" + $env:PATH }
 $env:ACPP_VISIBILITY_MASK = 'omp'
 New-Item -ItemType Directory -Force $BuildDir | Out-Null
 $BuildDir = (Resolve-Path $BuildDir).Path
+$openssl = Join-Path $BuildDir 'openssl/install'
+& (Join-Path $PSScriptRoot '../ci/release/build-openssl-windows.ps1') -BuildDir (Join-Path $BuildDir 'openssl')
 $licenses = Join-Path $BuildDir 'licenses'
 $runtime = Join-Path $BuildDir 'runtime'
 foreach ($directory in $licenses, $runtime) {
@@ -45,6 +47,7 @@ Copy-Item "$prefix/adaptivecpp-windows.txt" $licenses
 Copy-Item "$prefix/adaptivecpp-cuda-llvm20.txt" $licenses
 Copy-Item ci/release/adaptivecpp-third-party.txt, ci/release/llvm-third-party.txt $licenses
 Copy-Item "$prefix/llvm-license.txt" (Join-Path $licenses 'llvm.txt')
+Copy-Item (Join-Path $openssl 'openssl-license.txt') (Join-Path $licenses 'openssl.txt')
 '9f842c701a599107cc6d117d3539f971036363a1' | Set-Content (Join-Path $licenses 'adaptivecpp-revision.txt')
 @"
 AdaptiveCpp: 9f842c701a599107cc6d117d3539f971036363a1
@@ -129,6 +132,7 @@ if ($arm64) {
 }
 cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$prefix/bin/clang.exe" "-DCMAKE_CXX_COMPILER=$prefix/bin/clang++.exe" `
+    "-DOPENSSL_ROOT_DIR:PATH=$openssl" -DOPENSSL_USE_STATIC_LIBS=ON `
     '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON -DXCHPLOT2_PACKAGE_GPU=all `
     "-DXCHPLOT2_RUNTIME_DIR:PATH=$runtime" `
     "-DCMAKE_CUDA_ARCHITECTURES=$architectures" `
@@ -136,10 +140,12 @@ cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
 # Catch host regressions before compiling CUDA for every supported architecture.
 $hostTests = 'bench_stats_test', 'numa_topology_test', 'temp_file_test', 'spill_engine_test', `
     'spill_coverage_test', 'host_guard_test', 'host_spill_policy_test', 'vram_budget_test', `
-    'cli_host_test', 'solver_filter_parity', 'pipeline_control_test', 'vram_probe_test'
+    'cli_host_test', 'solver_filter_parity', 'pipeline_control_test', 'vram_probe_test', 'group_file_test', `
+    'compute_identity_test', 'compute_membership_test', 'compute_discovery_test', 'pos2_pr118_grow_pool_test'
 cmake --build $BuildDir --parallel 2 --target $hostTests
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error `
     -R ('^(' + ($hostTests -join '|') + ')$')
+ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^compute_membership_network_test$'
 cmake --build $BuildDir --parallel 2
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test)$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

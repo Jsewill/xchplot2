@@ -687,12 +687,28 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-lib=static=xchplot2_cli");
+    let group_link = cmake_build.join("group-link.txt");
+    if group_link.exists() {
+        println!("cargo:rustc-link-lib=static=xchplot2_groups");
+        println!("cargo:rustc-link-lib=static=pos2_pr118_grow_worker_host");
+        println!("cargo:rustc-link-lib=static=pos2_pr118_grow_network");
+    }
     println!("cargo:rustc-link-lib=static=pos2_gpu_host");
     println!("cargo:rustc-link-lib=static=pos2_gpu");
     println!("cargo:rustc-link-lib=static=pos2_keygen");
     println!("cargo:rustc-link-lib=static=fse");
     println!("cargo:rustc-link-lib=static=pos2_sha256");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
+    if group_link.exists() {
+        for library in std::fs::read_to_string(&group_link)
+            .expect("read grouped CLI TLS libraries")
+            .lines()
+        {
+            if !library.is_empty() {
+                println!("cargo:rustc-link-arg={library}");
+            }
+        }
+    }
 
     // ---- AdaptiveCpp runtime ----
     // The static archives produced by CMake reference hipsycl::rt::* symbols
@@ -931,7 +947,7 @@ fn main() {
     // ---- rebuild triggers ----
     for p in &[
         "src", "tools", "keygen-rs/src", "keygen-rs/Cargo.toml",
-        "keygen-rs/Cargo.lock", "CMakeLists.txt", "cmake", "build.rs",
+        "keygen-rs/Cargo.lock", "CMakeLists.txt", "cmake", "contrib", "build.rs",
     ] {
         println!("cargo:rerun-if-changed={p}");
     }

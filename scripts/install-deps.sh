@@ -332,7 +332,7 @@ install_arch() {
     # No llvm/clang/lld here — install_llvm_target picks the version and
     # installs it, so we don't drag in a system LLVM that is past the cap.
     local pkgs=(cmake git base-devel python ninja
-                boost numactl curl
+                boost numactl curl openssl
                 openmp)
     case "$GPU" in
         nvidia) pkgs+=(cuda) ;;
@@ -359,7 +359,7 @@ install_apt() {
     # install_llvm_target. This list used to hardcode 18, which left newer
     # releases on an old toolchain even where they package 19 or 20.
     local pkgs=(cmake git ninja-build build-essential python3 pkg-config
-                libboost-context-dev libnuma-dev curl ca-certificates)
+                libboost-context-dev libnuma-dev libssl-dev curl ca-certificates)
     sudo apt-get update
     case "$GPU" in
         nvidia)
@@ -439,7 +439,7 @@ install_apt() {
 install_dnf() {
     # No llvm/clang/lld/libomp here — install_llvm_target picks the version.
     local pkgs=(cmake git ninja-build gcc-c++ python3 pkg-config
-                boost-devel numactl-devel curl)
+                boost-devel numactl-devel openssl openssl-devel curl)
     case "$GPU" in
         nvidia)
             # cuda-toolkit is supplied by NVIDIA, not Fedora/RHEL's repos.

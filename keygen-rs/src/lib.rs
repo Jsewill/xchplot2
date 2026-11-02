@@ -21,6 +21,7 @@ pub const POS2_MEMO_BUF_TOO_SMALL: i32 = -4;
 pub const POS2_BAD_SEED: i32 = -5;
 pub const POS2_BAD_ADDRESS: i32 = -6;
 pub const POS2_BAD_HRP: i32 = -7;
+pub const POS2_BAD_HASH_INPUT: i32 = -8;
 
 // pool_kind values.
 pub const POS2_POOL_PK: i32 = 0; // pool_key_or_ph points to 48 bytes (G1)
@@ -303,6 +304,238 @@ pub unsafe extern "C" fn pos2_keygen_derive_subseed(
     POS2_OK
 }
 
+/// Caller-owned bytes supplied to the general SHA-256 helper.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Pos2Sha256Segment {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// Hash the exact concatenation of byte segments, independent of key derivation.
+/// No lengths or separators are inserted, and input bytes are never coalesced.
+/// Metadata is validated before reading any segment data. On rejection, the
+/// output remains unchanged. A null array is accepted for an empty segment list,
+/// and a null data pointer is accepted for an empty segment.
+///
+/// # Safety
+/// For valid metadata, `segments` must point to an aligned, initialized array
+/// of `segment_count` descriptors. Every nonempty data region must be readable
+/// for its declared length, and `out_digest` must point to 32 writable bytes.
+/// All input regions must remain valid and unmodified throughout this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_segments(
+    segments: *const Pos2Sha256Segment,
+    segment_count: usize,
+    out_digest: *mut u8,
+) -> i32 {
+    if out_digest.is_null()
+        || segment_count > isize::MAX as usize / std::mem::size_of::<Pos2Sha256Segment>()
+        || (segment_count != 0 && (segments.is_null() || !segments.is_aligned()))
+    {
+        return POS2_BAD_HASH_INPUT;
+    }
+    let segments = if segment_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(segments, segment_count) }
+    };
+    let mut total_bytes = 0u64;
+    for segment in segments {
+        if segment.len > isize::MAX as usize || (segment.len != 0 && segment.data.is_null()) {
+            return POS2_BAD_HASH_INPUT;
+        }
+        let Ok(len) = u64::try_from(segment.len) else {
+            return POS2_BAD_HASH_INPUT;
+        };
+        total_bytes = match total_bytes.checked_add(len) {
+            Some(total) if total <= u64::MAX / 8 => total,
+            _ => return POS2_BAD_HASH_INPUT,
+        };
+    }
+    let mut hash = Sha256::new();
+    for segment in segments {
+        if segment.len != 0 {
+            hash.update(unsafe { std::slice::from_raw_parts(segment.data, segment.len) });
+        }
+    }
+    let digest = hash.finalize();
+    unsafe { std::ptr::copy_nonoverlapping(digest.as_ptr(), out_digest, 32) };
+    POS2_OK
+}
+
+/// Hash segments from a reader that may reuse its storage between calls.
+/// The reader returns 1 for a segment, 0 at EOF, and a negative value on failure.
+/// Invalid metadata or any other reader result leaves the output unchanged.
+///
+/// # Safety
+/// The reader must not unwind and must accept the supplied context and a writable
+/// descriptor. Each returned nonempty region must remain readable and unmodified
+/// until the next reader call. `out_digest` must point to 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_stream(
+    reader: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut Pos2Sha256Segment) -> i32>,
+    context: *mut std::ffi::c_void,
+    out_digest: *mut u8,
+) -> i32 {
+    let Some(reader) = reader else {
+        return POS2_BAD_HASH_INPUT;
+    };
+    if out_digest.is_null() {
+        return POS2_BAD_HASH_INPUT;
+    }
+    let mut hash = Sha256::new();
+    let mut total_bytes = 0u64;
+    loop {
+        let mut segment = Pos2Sha256Segment {
+            data: std::ptr::null(),
+            len: 0,
+        };
+        match unsafe { reader(context, &mut segment) } {
+            0 => break,
+            1 => {}
+            _ => return POS2_BAD_HASH_INPUT,
+        }
+        if segment.len > isize::MAX as usize || (segment.len != 0 && segment.data.is_null()) {
+            return POS2_BAD_HASH_INPUT;
+        }
+        let Ok(len) = u64::try_from(segment.len) else {
+            return POS2_BAD_HASH_INPUT;
+        };
+        total_bytes = match total_bytes.checked_add(len) {
+            Some(total) if total <= u64::MAX / 8 => total,
+            _ => return POS2_BAD_HASH_INPUT,
+        };
+        if segment.len != 0 {
+            hash.update(unsafe { std::slice::from_raw_parts(segment.data, segment.len) });
+        }
+    }
+    let digest = hash.finalize();
+    unsafe { std::ptr::copy_nonoverlapping(digest.as_ptr(), out_digest, 32) };
+    POS2_OK
+}
+
+// Opaque to C callers. The states never leave the current process, so the
+// accelerated sha2 implementation can keep its native representation.
+struct Sha256State {
+    hash: Sha256,
+    bytes: u64,
+}
+
+unsafe fn allocate_sha256_state(state: Sha256State) -> *mut std::ffi::c_void {
+    let layout = std::alloc::Layout::new::<Sha256State>();
+    let allocation = unsafe { std::alloc::alloc(layout) }.cast::<Sha256State>();
+    if allocation.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { allocation.write(state) };
+    allocation.cast()
+}
+
+/// Allocate a process-local SHA state, or return null on allocation failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn pos2_sha256_state_new() -> *mut std::ffi::c_void {
+    unsafe {
+        allocate_sha256_state(Sha256State {
+            hash: Sha256::new(),
+            bytes: 0,
+        })
+    }
+}
+
+/// Clone a valid live state; null input or allocation failure returns null.
+///
+/// # Safety
+/// A nonnull state must be a live handle from new/clone and must not be mutated
+/// or freed during this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_state_clone(
+    state: *const std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    if state.is_null() {
+        return std::ptr::null_mut();
+    }
+    let state = unsafe { &*state.cast::<Sha256State>() };
+    unsafe {
+        allocate_sha256_state(Sha256State {
+            hash: state.hash.clone(),
+            bytes: state.bytes,
+        })
+    }
+}
+
+/// Conservative state-allocation size including a fixed allocator allowance.
+#[unsafe(no_mangle)]
+pub extern "C" fn pos2_sha256_state_bytes() -> usize {
+    std::mem::size_of::<Sha256State>() + 64
+}
+
+/// Free an owned state once; null is accepted.
+///
+/// # Safety
+/// A nonnull state must be a live handle from new/clone with no concurrent users.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_state_free(state: *mut std::ffi::c_void) {
+    if !state.is_null() {
+        let state = state.cast::<Sha256State>();
+        unsafe {
+            std::ptr::drop_in_place(state);
+            std::alloc::dealloc(state.cast(), std::alloc::Layout::new::<Sha256State>());
+        }
+    }
+}
+
+/// Update a live state synchronously, preserving it on invalid metadata.
+///
+/// # Safety
+/// State must be a live new/clone handle with exclusive access. Every nonempty
+/// input must be readable for len bytes and must not overlap the state itself.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_state_update(
+    state: *mut std::ffi::c_void,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    if state.is_null() || len > isize::MAX as usize || (len != 0 && data.is_null()) {
+        return POS2_BAD_HASH_INPUT;
+    }
+    let Ok(length) = u64::try_from(len) else {
+        return POS2_BAD_HASH_INPUT;
+    };
+    let state = unsafe { &mut *state.cast::<Sha256State>() };
+    let bytes = match state.bytes.checked_add(length) {
+        Some(bytes) if bytes <= u64::MAX / 8 => bytes,
+        _ => return POS2_BAD_HASH_INPUT,
+    };
+    if len != 0 {
+        state
+            .hash
+            .update(unsafe { std::slice::from_raw_parts(data, len) });
+    }
+    state.bytes = bytes;
+    POS2_OK
+}
+
+/// Return a digest without consuming the state; errors preserve the output.
+///
+/// # Safety
+/// State must be a live new/clone handle and may not be mutated or freed during
+/// the call. A nonnull output must point to writable storage for the digest and
+/// must not overlap the opaque state allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pos2_sha256_state_digest(
+    state: *const std::ffi::c_void,
+    out_digest: *mut u8,
+) -> i32 {
+    if state.is_null() || out_digest.is_null() {
+        return POS2_BAD_HASH_INPUT;
+    }
+    let state = unsafe { &*state.cast::<Sha256State>() };
+    let digest = state.hash.clone().finalize();
+    unsafe { std::ptr::copy_nonoverlapping(digest.as_ptr(), out_digest, 32) };
+    POS2_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +769,398 @@ mod tests {
             POS2_BAD_ADDRESS
         );
         assert_eq!(output, [0x55; 32]);
+    }
+
+    #[test]
+    fn sha256_segments_matches_known_vectors() {
+        for (input, expected) in [
+            (
+                &b""[..],
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                &b"abc"[..],
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                &b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"[..],
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ] {
+            let segment = Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: input.len(),
+            };
+            let mut output = [0; 32];
+            assert_eq!(
+                unsafe { pos2_sha256_segments(&segment, 1, output.as_mut_ptr()) },
+                POS2_OK
+            );
+            assert_eq!(hex::encode(output), expected);
+        }
+        let input = vec![b'a'; 1_000_000];
+        let segment = Pos2Sha256Segment {
+            data: input.as_ptr(),
+            len: input.len(),
+        };
+        let mut output = [0; 32];
+        assert_eq!(
+            unsafe { pos2_sha256_segments(&segment, 1, output.as_mut_ptr()) },
+            POS2_OK
+        );
+        assert_eq!(
+            hex::encode(output),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn sha256_segments_preserves_boundaries_and_empty_segments() {
+        let input: Vec<u8> = (0..4096).map(|value| (value % 256) as u8).collect();
+        let expected = Sha256::digest(&input);
+        for split in [0, 1, 7, 55, 56, 63, 64, 65, input.len()] {
+            let segments = [
+                Pos2Sha256Segment {
+                    data: std::ptr::null(),
+                    len: 0,
+                },
+                Pos2Sha256Segment {
+                    data: input[..split].as_ptr(),
+                    len: split,
+                },
+                Pos2Sha256Segment {
+                    data: std::ptr::null(),
+                    len: 0,
+                },
+                Pos2Sha256Segment {
+                    data: input[split..].as_ptr(),
+                    len: input.len() - split,
+                },
+            ];
+            let mut output = [0; 32];
+            assert_eq!(
+                unsafe {
+                    pos2_sha256_segments(segments.as_ptr(), segments.len(), output.as_mut_ptr())
+                },
+                POS2_OK
+            );
+            assert_eq!(output.as_slice(), expected.as_slice());
+        }
+        let mut output = [0; 32];
+        assert_eq!(
+            unsafe { pos2_sha256_segments(std::ptr::null(), 0, output.as_mut_ptr()) },
+            POS2_OK
+        );
+        assert_eq!(
+            hex::encode(output),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_segments_rejects_invalid_metadata_without_changing_output() {
+        let input = b"abc";
+        let segment = Pos2Sha256Segment {
+            data: input.as_ptr(),
+            len: input.len(),
+        };
+        assert_eq!(
+            unsafe { pos2_sha256_segments(&segment, 1, std::ptr::null_mut()) },
+            POS2_BAD_HASH_INPUT
+        );
+        let misaligned = (&segment as *const Pos2Sha256Segment)
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<Pos2Sha256Segment>();
+        for (segments, count) in [
+            (std::ptr::null(), 1),
+            (&segment as *const Pos2Sha256Segment, usize::MAX),
+            (misaligned, 1),
+        ] {
+            let mut output = [0x55; 32];
+            assert_eq!(
+                unsafe { pos2_sha256_segments(segments, count, output.as_mut_ptr()) },
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(output, [0x55; 32]);
+        }
+        for invalid in [
+            Pos2Sha256Segment {
+                data: std::ptr::null(),
+                len: 1,
+            },
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: usize::MAX,
+            },
+        ] {
+            let segments = [segment, invalid];
+            let mut output = [0x55; 32];
+            assert_eq!(
+                unsafe {
+                    pos2_sha256_segments(segments.as_ptr(), segments.len(), output.as_mut_ptr())
+                },
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(output, [0x55; 32]);
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn sha256_segments_rejects_message_length_overflow_before_reading_data() {
+        let input = b"abc";
+        let segments = [
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: (u64::MAX / 8) as usize,
+            },
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: 1,
+            },
+        ];
+        let mut output = [0x55; 32];
+        assert_eq!(
+            unsafe { pos2_sha256_segments(segments.as_ptr(), segments.len(), output.as_mut_ptr()) },
+            POS2_BAD_HASH_INPUT
+        );
+        assert_eq!(output, [0x55; 32]);
+    }
+
+    #[test]
+    fn sha256_states_clone_prefixes_and_digest_without_consuming() {
+        let state = pos2_sha256_state_new();
+        assert!(!state.is_null());
+        assert!(pos2_sha256_state_bytes() >= std::mem::size_of::<Sha256State>());
+        unsafe {
+            assert_eq!(pos2_sha256_state_update(state, b"abc".as_ptr(), 3), POS2_OK);
+            let prefix = pos2_sha256_state_clone(state);
+            assert!(!prefix.is_null());
+            assert_eq!(pos2_sha256_state_update(state, b"def".as_ptr(), 3), POS2_OK);
+            assert_eq!(
+                pos2_sha256_state_update(prefix, b"xyz".as_ptr(), 3),
+                POS2_OK
+            );
+            for (handle, expected) in [(state, b"abcdef"), (prefix, b"abcxyz")] {
+                let mut output = [0x55; 32];
+                assert_eq!(
+                    pos2_sha256_state_digest(handle, output.as_mut_ptr()),
+                    POS2_OK
+                );
+                assert_eq!(output.as_slice(), Sha256::digest(expected).as_slice());
+                let mut repeated = [0x55; 32];
+                assert_eq!(
+                    pos2_sha256_state_digest(handle, repeated.as_mut_ptr()),
+                    POS2_OK
+                );
+                assert_eq!(repeated, output);
+                assert_eq!(
+                    pos2_sha256_state_update(handle, std::ptr::null(), 0),
+                    POS2_OK
+                );
+                assert_eq!(pos2_sha256_state_update(handle, b"!".as_ptr(), 1), POS2_OK);
+                let mut extended = expected.to_vec();
+                extended.push(b'!');
+                assert_eq!(
+                    pos2_sha256_state_digest(handle, output.as_mut_ptr()),
+                    POS2_OK
+                );
+                assert_eq!(output.as_slice(), Sha256::digest(extended).as_slice());
+            }
+            pos2_sha256_state_free(prefix);
+            pos2_sha256_state_free(state);
+            pos2_sha256_state_free(std::ptr::null_mut());
+            assert!(pos2_sha256_state_clone(std::ptr::null()).is_null());
+        }
+    }
+
+    #[test]
+    fn sha256_states_preserve_state_and_output_on_invalid_input() {
+        let state = pos2_sha256_state_new();
+        assert!(!state.is_null());
+        let mut output = [0x55; 32];
+        unsafe {
+            assert_eq!(
+                pos2_sha256_state_update(std::ptr::null_mut(), b"abc".as_ptr(), 3),
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(
+                pos2_sha256_state_digest(std::ptr::null(), output.as_mut_ptr()),
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(output, [0x55; 32]);
+            assert_eq!(
+                pos2_sha256_state_digest(state, std::ptr::null_mut()),
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(pos2_sha256_state_update(state, b"abc".as_ptr(), 3), POS2_OK);
+            let mut lengths = vec![usize::MAX];
+            if usize::BITS == 64 {
+                lengths.push((u64::MAX / 8) as usize);
+            }
+            assert_eq!(
+                pos2_sha256_state_update(state, std::ptr::null(), 1),
+                POS2_BAD_HASH_INPUT
+            );
+            for length in lengths {
+                assert_eq!(
+                    pos2_sha256_state_update(state, b"abc".as_ptr(), length),
+                    POS2_BAD_HASH_INPUT
+                );
+                assert_eq!(
+                    pos2_sha256_state_digest(state, output.as_mut_ptr()),
+                    POS2_OK
+                );
+                assert_eq!(output.as_slice(), Sha256::digest(b"abc").as_slice());
+            }
+            pos2_sha256_state_free(state);
+        }
+    }
+
+    struct HashReader {
+        segments: Vec<Vec<u8>>,
+        scratch: Vec<u8>,
+        next: usize,
+        end_status: i32,
+        invalid_tail: Option<Pos2Sha256Segment>,
+    }
+
+    unsafe extern "C" fn read_hash_segment(
+        context: *mut std::ffi::c_void,
+        next: *mut Pos2Sha256Segment,
+    ) -> i32 {
+        let reader = unsafe { &mut *context.cast::<HashReader>() };
+        if let Some(input) = reader.segments.get(reader.next) {
+            reader.scratch.clear();
+            reader.scratch.extend_from_slice(input);
+            unsafe {
+                *next = Pos2Sha256Segment {
+                    data: reader.scratch.as_ptr(),
+                    len: reader.scratch.len(),
+                };
+            }
+            reader.next += 1;
+            1
+        } else if let Some(invalid) = reader.invalid_tail.take() {
+            unsafe { *next = invalid };
+            1
+        } else {
+            reader.end_status
+        }
+    }
+
+    #[test]
+    fn sha256_stream_consumes_reused_buffers_and_empty_segments() {
+        let input: Vec<u8> = (0..4096).map(|value| (value % 256) as u8).collect();
+        for len in [0, 3, 55, 56, 63, 64, 65, input.len()] {
+            for chunk_size in [1, 7, 55, 64, 65, input.len()] {
+                let mut segments = vec![vec![]];
+                segments.extend(input[..len].chunks(chunk_size).map(Vec::from));
+                segments.push(vec![]);
+                let mut reader = HashReader {
+                    segments,
+                    scratch: Vec::with_capacity(chunk_size),
+                    next: 0,
+                    end_status: 0,
+                    invalid_tail: None,
+                };
+                let mut output = [0x55; 32];
+                assert_eq!(
+                    unsafe {
+                        pos2_sha256_stream(
+                            Some(read_hash_segment),
+                            (&mut reader as *mut HashReader).cast(),
+                            output.as_mut_ptr(),
+                        )
+                    },
+                    POS2_OK
+                );
+                assert_eq!(output.as_slice(), Sha256::digest(&input[..len]).as_slice());
+            }
+        }
+        unsafe extern "C" fn empty_reader(
+            _context: *mut std::ffi::c_void,
+            _next: *mut Pos2Sha256Segment,
+        ) -> i32 {
+            0
+        }
+        let mut output = [0x55; 32];
+        assert_eq!(
+            unsafe {
+                pos2_sha256_stream(
+                    Some(empty_reader),
+                    std::ptr::null_mut(),
+                    output.as_mut_ptr(),
+                )
+            },
+            POS2_OK
+        );
+        assert_eq!(output.as_slice(), Sha256::digest(b"").as_slice());
+    }
+
+    #[test]
+    fn sha256_stream_preserves_output_on_reader_and_metadata_errors() {
+        let mut output = [0x55; 32];
+        assert_eq!(
+            unsafe { pos2_sha256_stream(None, std::ptr::null_mut(), output.as_mut_ptr()) },
+            POS2_BAD_HASH_INPUT
+        );
+        assert_eq!(output, [0x55; 32]);
+        assert_eq!(
+            unsafe {
+                pos2_sha256_stream(
+                    Some(read_hash_segment),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            POS2_BAD_HASH_INPUT
+        );
+        let input = b"abc";
+        let invalid_segments = [
+            Pos2Sha256Segment {
+                data: std::ptr::null(),
+                len: 1,
+            },
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: usize::MAX,
+            },
+            #[cfg(target_pointer_width = "64")]
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: (u64::MAX / 8) as usize + 1,
+            },
+            #[cfg(target_pointer_width = "64")]
+            Pos2Sha256Segment {
+                data: input.as_ptr(),
+                len: (u64::MAX / 8) as usize,
+            },
+        ];
+        for (status, invalid) in [(-1, None), (2, None), (i32::MIN, None)].into_iter().chain(
+            invalid_segments
+                .into_iter()
+                .map(|segment| (0, Some(segment))),
+        ) {
+            let mut reader = HashReader {
+                segments: vec![input.to_vec()],
+                scratch: Vec::with_capacity(input.len()),
+                next: 0,
+                end_status: status,
+                invalid_tail: invalid,
+            };
+            assert_eq!(
+                unsafe {
+                    pos2_sha256_stream(
+                        Some(read_hash_segment),
+                        (&mut reader as *mut HashReader).cast(),
+                        output.as_mut_ptr(),
+                    )
+                },
+                POS2_BAD_HASH_INPUT
+            );
+            assert_eq!(output, [0x55; 32]);
+        }
     }
 }

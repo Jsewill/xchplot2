@@ -72,6 +72,12 @@ src/host/
 ├── GpuBufferPool         persistent device buffers and host drain slots
 ├── BatchPlotter          workers, memory admission, and writer queues
 ├── BatchManifest         saved identities and recovery manifests
+├── GroupPlotter          group construction, drive scheduling and recovery
+├── GroupFarming          farming layout and admission model
+├── ComputePool/Worker    broker leases and globally bounded executors
+├── ComputeSession        automatic job services and saved pool membership
+├── ComputeIdentity       enrollment, signed membership policy and renewal
+├── GroupFile             native allocation, positioned I/O and recovery locks
 └── PlotFileWriterParallel  CPU reference boundary, writer, and verification
 tools/xchplot2/           CLI and shell completions
 tools/parity/             parity and host tests
@@ -123,6 +129,34 @@ CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
 repository changes. The existing container and CUDA architecture matrices
 remain separate coverage. The [binary release job](#binary-releases) checks
 native Windows separately.
+
+Linux installs also run `scripts/test/group-cli.py --automatic-compute` and
+`scripts/test/compute-cli.py` against both installed binaries. The grouped
+suite covers full proofs, read-only plans, all construction engines' crash
+recovery, saved enrollment, several brokers sharing a worker, worker
+replacement and broker outages. The compute suite checks authenticated status,
+pause/drain/resume, renewal, revocation and background service commands.
+Linux service checks use an isolated test manager. Native Windows archive
+checks run the same suites on NTFS, including a temporary Task Scheduler task
+with `--service-manager`; the harness removes that task before returning.
+The same flag exercises a temporary systemd user service on Linux when a
+user manager is available.
+Discovery checks use loopback multicast and do not qualify a physical LAN.
+
+For network changes, `scripts/test/compute-network-test.py` checks the
+qualification harness, then run:
+
+```bash
+python3 scripts/test/compute-network.py /path/to/xchplot2 --logs /path/to/logs
+```
+
+This requires Linux user/network namespaces, `ip`, `nft`, `unshare` and
+`nsenter`. It tests IPv4/IPv6, multiple interfaces, routed dedicated brokers,
+firewall interruption and address changes inside disposable namespaces.
+`--hosts hosts.json` instead uses explicitly supplied SSH hosts; the script's
+header documents the host configuration and existing runtime requirements.
+SSH-host checks do not change their network or firewall settings. Keep
+namespace, forwarded SSH and direct physical LAN results distinct.
 
 These are build and install checks, not GPU driver or hardware certification.
 Hosted WSL2 jobs also lack GPUs; actual WSL GPU support depends on the card
@@ -387,6 +421,7 @@ Both architectures include CUDA, HIP, and Level Zero; ARM64 also includes
 OpenCL. The ARM64 archive therefore has a newer glibc baseline. Hosted
 checks do not qualify GPU drivers or hardware.
 
+Linux archives also include OpenSSL 3 and the mdns license.
 Artifacts are written to `build/release-linux/dist/`. `acpp --acpp-deploy`
 collects CPU, CUDA, HIP, and ARM64 OpenCL runtime/JIT dependencies; the build
 script adds Level Zero, checks the GPU backends, collects license notices, and
@@ -415,7 +450,10 @@ and LLVM-SPIRV translator. The cached install tree is invalidated when
 compiler sources or options change. `scripts/build-release.ps1` collects
 runtime DLLs and notices, builds all targets, runs the host checks, and
 writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
-It also requires `cargo-about` 0.9.2 and the toolchain in `ACPP_PREFIX`.
+It also requires `cargo-about` 0.9.2, native Windows Perl, and the toolchain
+in `ACPP_PREFIX`. `ci/release/build-openssl-windows.ps1` builds the pinned
+static OpenSSL libraries with the active Visual Studio tools; their license
+and the mdns license are included in the archive.
 The toolchain applies `contrib/adaptivecpp-windows-hip.patch` for upstream
 device-IR fixes and `contrib/adaptivecpp-windows-level-zero.patch` for
 Windows headers, linking, DLL installation, and integrated SPIR-V builds.

@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl gnupg git ninja-build cmake python3 patchelf \
-        libboost-context-dev libnuma-dev llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev clang-${LLVM_VERSION} \
+        libboost-context-dev libnuma-dev libssl-dev llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev clang-${LLVM_VERSION} \
         libclang-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION}-dev lld-${LLVM_VERSION} \
         libomp-${LLVM_VERSION}-dev libclang-rt-${LLVM_VERSION}-dev
 # Ubuntu 26.04 supplies native ARM64 HIP; AMD's own packages are x86-64 only.

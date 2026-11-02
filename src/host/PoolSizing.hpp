@@ -33,4 +33,20 @@ inline std::uint64_t match_phase_capacity(int k, int num_section_bits) noexcept
         * (std::uint64_t{1} << num_section_bits);
 }
 
+// T2 and T3 share one per-bucket candidate allocation. Keep admission and
+// kernel wrappers on the same sizing rule; overflow still falls back to the
+// allocation-free match path. Callers supply admitted match capacities.
+inline std::uint64_t twophase_candidate_capacity(std::uint64_t output_capacity,
+                                               std::uint64_t buckets) noexcept
+{
+    return (output_capacity / (buckets ? buckets : 1)) * 6 + 4096;
+}
+
+inline std::uint64_t twophase_scratch_bytes(std::uint64_t output_capacity,
+                                          std::uint64_t buckets) noexcept
+{
+    return twophase_candidate_capacity(output_capacity, buckets) * (2 * sizeof(std::uint32_t)) +
+        sizeof(std::uint64_t) + sizeof(std::uint32_t);
+}
+
 } // namespace pos2gpu

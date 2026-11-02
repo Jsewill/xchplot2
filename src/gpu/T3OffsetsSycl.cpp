@@ -8,6 +8,7 @@
 #include "gpu/MatchKernelCommon.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T3Offsets.cuh"
+#include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -22,7 +23,7 @@ namespace pos2gpu {
 
 namespace {
 
-// Candidate scratch is sized at kCandCapMultiplier x the average per-bucket
+// Candidate scratch is sized at 6 x the average per-bucket
 // output count. Candidates run ~4x outputs (the T3 test filter passes about
 // 1 in 4), so the multiplier is really "expected candidates x headroom". The
 // buffer itself is the ONE that T2 and T3 share — they are never live at the
@@ -42,7 +43,6 @@ namespace {
 // rewinds the output counter and redoes the range through the single-kernel
 // path, which is correct for any skew. That makes this a pure
 // speed/memory dial — the failure mode is "slower", never "wrong".
-constexpr uint64_t kCandCapMultiplier = 6;
 
 // ---- Phase 2 prototype: two-phase T3 match ----------------------------
 //
@@ -106,17 +106,13 @@ constexpr uint64_t kCandCapMultiplier = 6;
     }();
 
     // Per-bucket candidate scratch: {u32 l, u32 r} per pair. The T3 test
-    // filter passes ~1/4, so total candidates ≈ 4× outputs. Sized at 8×
-    // the average per-bucket output count → ~2× headroom over the
-    // expected per-bucket candidate count, absorbing inter-bucket
-    // variance. Allocated once, reused across all buckets in the range,
+    // filter passes ~1/4, so total candidates ≈ 4× outputs. The shared
+    // multiplier retains headroom over the expected candidate count and
+    // inter-bucket variance. Allocated once, reused across the bucket range,
     // and reused across calls on the same queue via the per-queue cache in
     // sycl_backend::acquire_twophase_scratch — which T2 shares — so the
     // per-plot ~500 MB device malloc/free is gone.
-    uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
-        * kCandCapMultiplier
-        + 4096;
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;
@@ -363,10 +359,7 @@ constexpr uint64_t kCandCapMultiplier = 6;
         return v && v[0] == '1';
     }();
 
-    uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
-        * kCandCapMultiplier
-        + 4096;
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;

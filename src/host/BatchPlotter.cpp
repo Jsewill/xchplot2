@@ -4066,6 +4066,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     std::set<std::filesystem::path> outputs;
     for (auto const& entry : entries) {
         validate_batch_entry(entry);
+        if (entry.grouped)
+            throw std::invalid_argument("grouped manifests require the group construction runner");
         auto const output = std::filesystem::weakly_canonical(
             std::filesystem::path(entry.out_dir) / entry.out_name);
         if (!outputs.insert(output).second)

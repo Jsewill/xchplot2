@@ -147,16 +147,15 @@ inline void* sycl_alloc_host_or_throw(size_t bytes, sycl::queue& q,
 
 } // namespace
 
-GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
-    : k(k_), strength(strength_), testnet(testnet_)
+GpuBufferPool::Sizing GpuBufferPool::sizing(int k, bool testnet)
 {
     if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
     if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
     sycl::queue& q = sycl_backend::queue();
-
+    Sizing result;
     int const num_section_bits = (k < 28) ? 2 : (k - 26);
-    total_xs = 1ULL << k;
-    cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
+    result.total_xs = 1ULL << k;
+    result.cap      = max_pairs_per_section(k, num_section_bits) * (1ULL << num_section_bits);
 
     // d_storage must hold EITHER total_xs XsCandidateGpu (8 B each) OR
     // THREE cap-sized uint32 key/val arrays during sort. Only three, not
@@ -166,19 +165,19 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // keys_in slot inside d_storage was never read. Dropping it saves
     // cap·4 B (~1.09 GiB at k=28) — enough to close the 0.71 GiB pool
     // shortfall on 12 GiB cards.
-    storage_bytes = std::max(
-        static_cast<size_t>(total_xs) * sizeof(XsCandidateGpu),
-        static_cast<size_t>(cap) * 3 * sizeof(uint32_t));
+    result.storage_bytes = std::max(
+        static_cast<size_t>(result.total_xs) * sizeof(XsCandidateGpu),
+        static_cast<size_t>(result.cap) * 3 * sizeof(uint32_t));
 
     // d_pair_a holds the *match output* of the current phase: T1 SoA
     // (meta·8 B + mi·4 B = 12 B), T2 SoA (meta·8 B + mi·4 B + xbits·4 B =
     // 16 B), then T3 (T3PairingGpu, 8 B). Worst case is T2 at 16 B/entry.
     // It does NOT alias the Xs construction scratch — that's d_pair_b.
-    pair_a_bytes = std::max({
-        static_cast<size_t>(cap) * sizeof(T1PairingGpu),
-        static_cast<size_t>(cap) * sizeof(T2PairingGpu),
-        static_cast<size_t>(cap) * sizeof(T3PairingGpu),
-        static_cast<size_t>(cap) * sizeof(uint64_t),
+    result.pair_a_bytes = std::max({
+        static_cast<size_t>(result.cap) * sizeof(T1PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(T2PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(T3PairingGpu),
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),
     });
 
     // d_pair_b holds the *sort output* of the current phase (sorted T1
@@ -201,13 +200,13 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
     // matters.
     void* const xs_split_sentinel = reinterpret_cast<void*>(uintptr_t{1});
     launch_construct_xs(dummy_plot_id, k, testnet,
-                                   nullptr, nullptr, &xs_temp_bytes, q,
+                                   nullptr, nullptr, &result.xs_temp_bytes, q,
                                    xs_split_sentinel);
-    pair_b_bytes = std::max({
-        static_cast<size_t>(cap) * sizeof(uint64_t),                          // sorted T1 meta
-        static_cast<size_t>(cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
-        static_cast<size_t>(cap) * sizeof(uint64_t),                          // T3 frags out
-        xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
+    result.pair_b_bytes = std::max({
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // sorted T1 meta
+        static_cast<size_t>(result.cap) * (sizeof(uint64_t) + sizeof(uint32_t)),     // sorted T2 meta+xbits
+        static_cast<size_t>(result.cap) * sizeof(uint64_t),                          // T3 frags out
+        result.xs_temp_bytes,                                                        // Xs aliased scratch (3·N·u32 + cub)
     });
 
     // Query CUB sort scratch sizes (largest across T1/T2/T3 sorts).
@@ -216,16 +215,35 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         nullptr, s_pairs,
         static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
         static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-        cap, 0, k, q);
+        result.cap, 0, k, q);
     size_t s_keys = 0;
     launch_sort_keys_u64(
         nullptr, s_keys,
         static_cast<uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
-        cap, 0, 2 * k, q);
-    sort_scratch_bytes = std::max(s_pairs, s_keys);
+        result.cap, 0, 2 * k, q);
+    result.sort_scratch_bytes = std::max(s_pairs, s_keys);
 
-    pinned_bytes = cap * sizeof(uint64_t);
+    result.pinned_bytes = result.cap * sizeof(uint64_t);
 
+    return result;
+}
+
+GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_device_bytes)
+    : k(k_), strength(strength_), testnet(testnet_)
+{
+    if (testnet) throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots");
+    if (k < 18 || k > 28 || (k & 1)) throw std::invalid_argument("k must be even in [18, 28]");
+    sycl::queue& q = sycl_backend::queue();
+    auto const sizes = sizing(k, testnet);
+
+    total_xs = sizes.total_xs;
+    cap = sizes.cap;
+    storage_bytes = sizes.storage_bytes;
+    pair_a_bytes = sizes.pair_a_bytes;
+    pair_b_bytes = sizes.pair_b_bytes;
+    xs_temp_bytes = sizes.xs_temp_bytes;
+    sort_scratch_bytes = sizes.sort_scratch_bytes;
+    pinned_bytes = sizes.pinned_bytes;
     // Check VRAM before attempting allocation so we can give a useful
     // diagnostic instead of a generic allocation failure. The margin covers
     // GPU driver/context state, sort scratch, AES T-tables, and other small
@@ -256,7 +274,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_)
         size_t const margin = vram_safety_margin();
         DeviceMemInfo const mem = query_device_memory();
         size_t const total_b = mem.total_bytes;
-        size_t const free_b  = mem.free_bytes;
+        size_t const free_b = max_device_bytes ? std::min<uint64_t>(mem.free_bytes, max_device_bytes) : mem.free_bytes;
         if (!vram_fits(free_b, required_device, margin)) {
             auto to_gib = [](size_t b) { return b / double(1ULL << 30); };
             InsufficientVramError e(
@@ -362,6 +380,18 @@ uint64_t* GpuBufferPool::ensure_pinned(int idx)
     h_pinned_t3[idx] = static_cast<uint64_t*>(
         sycl_alloc_host_or_throw(pinned_bytes, q, "h_pinned_t3"));
     return h_pinned_t3[idx];
+}
+
+void GpuBufferPool::release_pinned(int idx)
+{
+    if (idx < 0 || idx >= kNumPinnedBuffers)
+        throw std::runtime_error("GpuBufferPool::release_pinned: idx out of range");
+    std::lock_guard<std::mutex> lk(pinned_mu_[idx]);
+    if (!h_pinned_t3[idx]) return;
+    sycl::queue& q = sycl_backend::queue();
+    q.wait_and_throw();
+    sycl::free(h_pinned_t3[idx], q);
+    h_pinned_t3[idx] = nullptr;
 }
 
 GpuBufferPool::~GpuBufferPool()

@@ -19,6 +19,9 @@ xchplot2 is a client-side plot builder. It handles:
   `keygen-rs`.
 - Per-plot private keys, included in plot memos and saved job manifests.
 - Large file writes into caller-supplied output directories.
+- Optional compute pool identities, TLS connections and LAN discovery.
+  Enrolled workers can compute for several plotting hosts; trust is granted
+  to the pool, not to one exclusive host pair.
 
 `plot` saves identities before starting, including for unseeded jobs. The
 `xchplot2-job-*.tsv` files contain the memo and its private plot key material;
@@ -29,9 +32,23 @@ while recovery may be needed. Deleting it can prevent recovery of an unseeded
 job's identities.
 
 New manifests and their publication temporaries use owner-only permissions
-on Linux and are not allowed to replace another job's manifest. Report
+on Linux and protected owner-only ACLs on Windows, and are not allowed to replace another job's manifest. Report
 permission, disclosure, or publication failures through the channel above.
 See [plotting and recovery](REFERENCE.md#plotting-and-recovery) for behavior.
+
+Compute enrollment and invitations contain private TLS keys and must be kept
+private. Only the pool creator keeps the signing key. Each invitation assigns
+a distinct machine identity; do not clone it across workers. Discovered
+advertisements do not establish trust: work connections authenticate through
+the enrolled CA. Workers receive task identities and bounded fragment/codec
+data, not storage paths, seeds or private plot memos. Trust enrolled workers
+to compute correctly; bounded parsing is not verification of every result's
+mathematical provenance. See [shared compute](REFERENCE.md#shared-compute)
+for interface selection, credential renewal and signed revocation policies.
+Revocation is not instantaneous on disconnected machines: they must receive
+the newer signed policy by reconnecting to an updated peer or importing it.
+A renewed certificate preserves the stable node ID; a revoked node cannot
+renew itself back into the pool.
 
 Relevant threat model items we want to hear about:
 
@@ -44,9 +61,12 @@ Relevant threat model items we want to hear about:
 - **Manifest parsing:** malformed `batch` manifests that cause
   out-of-bounds reads, arbitrary allocation, or unchecked sign
   conversion.
+- **Shared compute:** authentication or lease-fencing bypasses, cross-owner
+  task substitution, unbounded network allocations, interface restrictions
+  bypassed, or private enrollment material disclosed.
 - **Build-time supply chain:** tampering paths in
   `scripts/install-deps.sh`, `Containerfile`, `compose.yaml`, or
-  the FetchContent targets (pos2-chip, AdaptiveCpp).
+  the FetchContent targets (pos2-chip, AdaptiveCpp, mdns).
 
 ## Explicitly out of scope
 

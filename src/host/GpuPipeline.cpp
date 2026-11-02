@@ -366,9 +366,35 @@ inline void validate_t1_count(uint64_t t1_count, int k)
 
 } // namespace
 
-GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
-                                   GpuBufferPool& pool,
-                                   int pinned_index)
+namespace {
+
+void drain_fragment_sink(sycl::queue& q, uint64_t const* source, uint64_t count,
+                         bool source_on_host, GpuFragmentSink const& sink)
+{
+    if (source_on_host)
+    {
+        sink.drain(count, [&](std::span<uint64_t> tile, uint64_t offset)
+        {
+            std::memcpy(tile.data(), source + offset, tile.size_bytes());
+        });
+        return;
+    }
+    // The queue is out of order. Finish the source's final sort once, then
+    // wait only on each transfer's event while CPU consumption uses the other
+    // half of the same pinned allocation. At most one D2H copy is in flight,
+    // preserving the Level Zero shared-copy boundary used by spill staging.
+    q.wait_and_throw();
+    sink.drain_overlapped(count, [&](std::span<uint64_t> tile, uint64_t offset)
+    {
+        return q.memcpy(tile.data(), source + offset, tile.size_bytes());
+    }, [&] { q.wait_and_throw(); });
+}
+
+GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
+                                        GpuBufferPool& pool,
+                                        int pinned_index,
+                                        GpuFragmentSink const* sink,
+                                        GpuDeviceFragmentOutput const* device_output)
 {
 
     sycl::queue& q = sycl_backend::queue();
@@ -448,7 +474,7 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // Lazy pinned-host alloc: skips ~600 ms × (kNumPinnedBuffers-1)
     // on single-plot runs (only slot 0 gets allocated). See
     // GpuBufferPool::ensure_pinned header comment for rationale.
-    uint64_t*       h_pinned_t3    = pool.ensure_pinned(pinned_index);
+    uint64_t*       h_pinned_t3    = sink || device_output ? nullptr : pool.ensure_pinned(pinned_index);
     // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
     // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
     // when bytes==0. Point them at d_sort_scratch (idle during match) to
@@ -668,6 +694,10 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     // Sort T3 by proof_fragment (low 2k bits). T3PairingGpu is just a
     // uint64_t, so reinterpret the d_pair_a slot directly.
     uint64_t* d_frags_in = reinterpret_cast<uint64_t*>(d_t3);
+    // This gate runs after the next member's match work, so its generation can
+    // overlap the prior member's CPU drain. The independent destination cannot
+    // alias pool tables: the next Xs phase immediately reuses d_pair_b.
+    if (device_output) d_frags_out = device_output->destination(t3_count).data();
     int p_t3_sort = begin_phase("T3 sort");
     {
         size_t sort_bytes = pool.sort_scratch_bytes;
@@ -685,13 +715,19 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
     result.t2_count = t2_count;
     result.t3_count = t3_count;
 
-    if (t3_count > 0) {
+    if (device_output) {
+        // The caller may submit copies on a distinct queue in this context.
+        // Establish source readiness before returning the device destination.
+        q.wait_and_throw();
+    } else if (sink) {
+        drain_fragment_sink(q, d_frags_out, t3_count, false, *sink);
+    } else if (t3_count > 0) {
         q.memcpy(h_pinned_t3, d_frags_out, sizeof(uint64_t) * t3_count);
         q.wait();
     }
     end_phase(p_d2h);
 
-    if (t3_count > 0) {
+    if (!sink && !device_output && t3_count > 0) {
         // Borrow: caller (batch producer) promises to finish consuming this
         // pinned slot before reusing it for another plot.
         result.external_fragments_ptr   = h_pinned_t3;
@@ -713,6 +749,31 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
 
     report_phases();
     return result;
+}
+
+} // namespace
+
+GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
+                                   GpuBufferPool& pool,
+                                   int pinned_index)
+{
+    return run_gpu_pipeline_impl(cfg, pool, pinned_index, nullptr, nullptr);
+}
+
+GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
+                                   GpuBufferPool& pool,
+                                   GpuFragmentSink const& sink)
+{
+    sink.validate();
+    return run_gpu_pipeline_impl(cfg, pool, 0, &sink, nullptr);
+}
+
+GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
+                                   GpuBufferPool& pool,
+                                   GpuDeviceFragmentOutput const& output)
+{
+    output.validate();
+    return run_gpu_pipeline_impl(cfg, pool, 0, nullptr, &output);
 }
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
@@ -781,7 +842,8 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
     uint64_t* pinned_dst,                       // nullable
     size_t    pinned_capacity,                  // count, not bytes; ignored if pinned_dst null
-    StreamingPinnedScratch const& scratch);     // any field nullptr → per-plot malloc_host fallback
+    StreamingPinnedScratch const& scratch,      // any field nullptr → per-plot malloc_host fallback
+    GpuFragmentSink const* sink = nullptr);
 
 } // namespace
 
@@ -845,13 +907,24 @@ GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
     return run_gpu_pipeline_streaming_impl(cfg, pinned_dst, pinned_capacity, scratch);
 }
 
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             GpuFragmentSink const& sink,
+                                             StreamingPinnedScratch const& scratch)
+{
+    sink.validate();
+    if (scratch.stop_after_t1_sort || scratch.stop_after_t2_sort)
+        throw std::invalid_argument("GPU fragment sink requires complete T3 output");
+    return run_gpu_pipeline_streaming_impl(cfg, nullptr, 0, scratch, &sink);
+}
+
 namespace {
 
 GpuPipelineResult run_gpu_pipeline_streaming_impl(
     GpuPipelineConfig const& cfg,
     uint64_t* pinned_dst,
     size_t    pinned_capacity,
-    StreamingPinnedScratch const& scratch)
+    StreamingPinnedScratch const& scratch,
+    GpuFragmentSink const* sink)
 {
 
     sycl::queue& q = sycl_backend::queue();
@@ -4683,7 +4756,13 @@ t3_match_entry:
         // the critical path while the GPU sits idle; overlapping them
         // halves the depth-1 wall.
         int p_t3_merge = begin_phase("T3 merge");
-        if constexpr (kT3SortTiles == 4) {
+        if (cfg.host_threads == 1) {
+            for (int t = 1; t < kT3SortTiles; ++t) {
+                std::inplace_merge(h_frags + t3_offsets[0],
+                                   h_frags + t3_offsets[t],
+                                   h_frags + t3_offsets[t + 1]);
+            }
+        } else if constexpr (kT3SortTiles == 4) {
             std::thread merge_ab([&] {
                 std::inplace_merge(h_frags + t3_offsets[0],
                                    h_frags + t3_offsets[1],
@@ -4758,7 +4837,9 @@ t3_match_entry:
     result.t3_count = t3_count;
 
     int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
-    if (t3_count > 0) {
+    if (sink) {
+        drain_fragment_sink(q, d_frags_out, t3_count, d_frags_out_on_host, *sink);
+    } else if (t3_count > 0) {
         if (d_frags_out_on_host) {
             // Tiny: sorted output already lives in pinned_dst (or in
             // h_frags_owned_oneshot). No device-to-host transfer needed.

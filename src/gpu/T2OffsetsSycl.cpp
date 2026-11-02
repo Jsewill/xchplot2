@@ -5,6 +5,7 @@
 #include "gpu/MatchKernelCommon.cuh"
 #include "gpu/SyclBackend.hpp"
 #include "gpu/T2Offsets.cuh"
+#include "host/PoolSizing.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -96,7 +97,7 @@ void launch_t2_compute_fine_bucket_offsets(
 
 namespace {
 
-// Candidate scratch is sized at kCandCapMultiplier x the average per-bucket
+// Candidate scratch is sized at 6 x the average per-bucket
 // output count, and comes from the ONE buffer that T2 and T3 share (see
 // sycl_backend::acquire_twophase_scratch in SyclBackend.hpp — they are never
 // live at the same time, so the peak is the max of the two, not their sum).
@@ -110,7 +111,6 @@ namespace {
 // plot-capacity 2080 MiB buffer in *every* tier — including the ones whose
 // entire purpose is to slice T2 staging down to 570 MiB. 6 keeps 1.5x headroom
 // over the measured worst bucket at a third of the memory.
-constexpr uint64_t kCandCapMultiplier = 6;
 
 // ---- Phase 2 prototype: two-phase T2 match ----------------------------
 //
@@ -165,7 +165,7 @@ constexpr uint64_t kCandCapMultiplier = 6;
         return v && v[0] == '1';
     }();
 
-    // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at kCandCapMultiplier
+    // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at the shared multiplier
     // (6) × the average per-bucket output count — headroom over the measured
     // candidate:output ratio (~4× for the T3 test filter) for bucket skew. It
     // was 16×, which is where ~3 GB of this buffer came from; overflow is safe
@@ -173,10 +173,7 @@ constexpr uint64_t kCandCapMultiplier = 6;
     // so the multiplier buys speed, not correctness. Allocated once, reused per
     // bucket, and reused across calls on the same queue via the per-queue cache
     // in sycl_backend::acquire_twophase_scratch — which T3 shares.
-    uint64_t const cand_cap =
-        (out_capacity / (num_buckets_in_range ? num_buckets_in_range : 1))
-        * kCandCapMultiplier
-        + 4096;
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;

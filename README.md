@@ -1,7 +1,7 @@
 # xchplot2
 
-GPU plotter for Chia v2 proofs of space (CHIP-48). Produces single-member
-`.gplot` files for PoS2 1.0, byte-identical to the pinned
+GPU plotter for Chia v2 proofs of space (CHIP-48). Produces ordinary
+PoS2 1.0 `.gplot` files using the pinned
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
 This is the **`main` branch**, using SYCL/AdaptiveCpp with a CUB fast path
@@ -14,9 +14,11 @@ existing plots must be replotted and old job manifests cannot be resumed.
 Farmer integration is still in progress upstream; see the
 [compatibility notes](contrib/pos2-pr118/README.md).
 
-An opt-in [grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
-supports experimental multi-member groups, shared keys, and resumable assembly.
-It requires a separate build; normal commands produce independent single-member groups.
+Linux and experimental native Windows builds include
+[grouped plotting, drive filling and growth](REFERENCE.md#grouped-plotting-and-drive-filling).
+Use `plot --group-members N` for several members per file, `plan` to preview
+a farming layout, and `fill` to build it. [Shared compute](REFERENCE.md#shared-compute)
+lets enrolled machines contribute CPU/GPU capacity to multiple plotting hosts.
 
 [Quick start](#quick-start) · [Hardware](#hardware-compatibility) ·
 [Build](#build) · [Commands](#use) · [Performance](#performance) ·
@@ -78,6 +80,10 @@ host test binaries.
 | Command | Purpose and guide |
 |---|---|
 | [xchplot2 plot](REFERENCE.md#plotting-and-recovery) | Create plots from farmer and pool keys |
+| [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout without writing files |
+| [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
+| [xchplot2 grow](REFERENCE.md#growing-an-existing-group) | Extend or recover an existing group file |
+| [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
 | [xchplot2 batch](REFERENCE.md#batch-manifests) | Run or resume a saved plot manifest |
 | [xchplot2 bench](REFERENCE.md#benchmarking) | Measure throughput and estimate time to fill storage |
 | [xchplot2 devices](REFERENCE.md#devices-and-cpu-workers) | List GPUs and CPU NUMA nodes |
@@ -89,7 +95,7 @@ host test binaries.
 See [configuration and argument files](REFERENCE.md#configuration-and-argument-files)
 for reusable options. `xchplot2 --help` prints command syntax.
 
-Ordinary plotting uses one GPU. Select all GPUs with `--devices gpu`; add
+Without shared compute, ordinary single-member plotting uses one GPU. Select all GPUs with `--devices gpu`; add
 CPU workers with `--cpu`, or select both with `--devices all`. Each GPU
 chooses a tier from its own free VRAM. See the
 [device reference](REFERENCE.md#devices-and-cpu-workers).
@@ -153,7 +159,7 @@ and storage. This benchmark set uses one GPU per host.
 | [Command reference](REFERENCE.md) | All commands, configuration, devices, memory, environment variables, troubleshooting |
 | [Benchmark results](BENCHMARKS.md) | Dated measurements, methodology, and memory use |
 | [Contributing](CONTRIBUTING.md) | Architecture, local tests, CI, and contribution conventions |
-| [Experimental grouping](contrib/pos2-pr118/README.md) | Grouped jobs, resume, memory limits, and upstream compatibility |
+| [Compatibility and reference tools](contrib/pos2-pr118/README.md) | Upstream compatibility, independent checks, and the experimental reader extension |
 | [Security](SECURITY.md) | Private key and manifest handling; vulnerability reporting |
 
 ## License

@@ -291,11 +291,16 @@ If you'd rather install dependencies yourself, the toolchain is:
 | **C++20 compiler** | clang ≥ 18 or gcc ≥ 13. |
 | **CMake ≥ 3.24**, **Ninja**, **Python 3** | build tools. |
 | **Boost.Context, libnuma, libomp** | AdaptiveCpp runtime deps. |
+| **OpenSSL 3 development headers** | Shared compute: `libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora, or `openssl` on Arch; installed by `install-deps.sh`. |
 | **Rust toolchain** (stable) | for `keygen-rs` and `cargo install`. |
 
 `pos2-chip` and `FSE` are auto-fetched at CMake configure time
 (`FetchContent`); override `-DPOS2_CHIP_DIR=/abs/path` for a local
-checkout.
+checkout. Linux and Windows builds also fetch the pinned, header-only `mdns` library for
+LAN discovery; `-DXCHPLOT2_MDNS_DIR=/abs/path` selects a local checkout. No
+Avahi daemon is required. Normal Linux and experimental Windows CMake builds
+include grouped construction and shared compute without extra build flags.
+Windows requires OpenSSL 3; the pinned helper below builds its static libraries.
 
 For non-NVIDIA targets, the build also probes:
 - **ROCm** (`rocminfo`): selects `hip:gfxXXXX`, except RDNA1 defaults to generic SSCP in Cargo and CMake. See [AMD target selection](#amd-target-selection).
@@ -449,7 +454,8 @@ Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
 20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),
 CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
 1.98.1 for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
-developer environment loaded.
+developer environment loaded, plus native Windows Perl such as Strawberry
+Perl for OpenSSL.
 Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:
 
 ```powershell
@@ -458,9 +464,12 @@ $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;$en
 ./ci/release/build-adaptivecpp-windows.ps1
 $env:ACPP_PREFIX = (Resolve-Path build/windows-toolchain/install).Path
 $env:PATH = "$env:ACPP_PREFIX\bin;$env:PATH"
+./ci/release/build-openssl-windows.ps1
+$openssl = (Resolve-Path build/windows-openssl/install).Path
 cmake -S . -B build/windows-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$env:ACPP_PREFIX/bin/clang.exe" `
     "-DCMAKE_CXX_COMPILER=$env:ACPP_PREFIX/bin/clang++.exe" `
+    "-DOPENSSL_ROOT_DIR:PATH=$openssl" -DOPENSSL_USE_STATIC_LIBS=ON `
     '-DACPP_TARGETS=generic;omp' -DXCHPLOT2_BUILD_CUDA=ON
 cmake --build build/windows-sycl --parallel 2
 ./build/windows-sycl/tools/xchplot2/xchplot2.exe devices
@@ -477,7 +486,13 @@ AdaptiveCpp's CMake launcher expects their GNU-style command line.
 The generic-only Windows CPU JIT requires Visual Studio's static CRT libraries
 at runtime; the packaged application avoids that dependency.
 
-Use an ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill.
+Use an ACL-capable filesystem (NTFS/ReFS) for ordinary plots, manifests and
+spill. Grouped construction and recovery require local NTFS; sparse,
+compressed, encrypted and network-backed group storage is rejected. The
+Windows group and background-service ports remain experimental, with native
+recovery and Task Scheduler qualification pending. See the
+[shared-compute reference](REFERENCE.md#shared-compute) for enrollment,
+services and firewall requirements.
 The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.
 The default config is `%APPDATA%\xchplot2\config.toml`.
 For the original CUDA implementation, see the

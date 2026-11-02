@@ -41,6 +41,9 @@ void validate_batch_entry(BatchEntry const& e)
         throw std::invalid_argument("single-plot groups must start at plot index 0; use raw-v2 members for group assembly");
     if (e.testnet)
         throw std::invalid_argument("PoS2 1.0 removes testnet-specific plots; omit --testnet");
+    if (e.group_members < 1 || e.group_members > 65535 ||
+        (!e.grouped && e.group_members != 1) || (e.raw && e.grouped))
+        throw std::invalid_argument("group membership must be in [1, 65535] and requires grouped output");
     if (e.meta_group < 0 || e.meta_group > 255)
         throw std::invalid_argument("meta group must be in [0, 255]");
     if (e.plot_id != plot_id_for_group(e.group_id, uint16_t(e.plot_index), uint8_t(e.meta_group)))
@@ -112,10 +115,13 @@ std::vector<BatchEntry> parse_manifest(std::string const& path)
                                      "(k strength plot_index meta_group format "
                                      "group_id_hex memo_hex out_dir out_name)");
         }
-        if (format_s != "gplot-v2" && format_s != "raw-v2")
+        if (format_s != "gplot-v2" && format_s != "raw-v2" && format_s != "gplot-v2-grouped")
             throw std::invalid_argument("manifest line " + std::to_string(line_no) +
-                ": expected gplot-v2 or raw-v2; legacy PoS2 manifests cannot be resumed");
+                ": expected gplot-v2, raw-v2 or gplot-v2-grouped; legacy PoS2 manifests cannot be resumed");
         e.raw = format_s == "raw-v2";
+        e.grouped = format_s == "gplot-v2-grouped";
+        if (e.grouped && !(is >> e.group_members))
+            throw std::invalid_argument("manifest line " + std::to_string(line_no) + ": grouped output requires a member count");
         is >> std::ws;
         if (is.peek() != std::char_traits<char>::eof() && is.peek() != '#')
             throw std::invalid_argument("manifest line " + std::to_string(line_no) + ": trailing fields");
@@ -156,9 +162,11 @@ void write_manifest(std::string const& path, std::vector<BatchEntry> const& entr
             e.out_name.find_first_of("\r\n") != std::string::npos)
             throw std::invalid_argument("manifest paths cannot contain line breaks");
         data << e.k << ' ' << e.strength << ' ' << e.plot_index << ' ' << e.meta_group
-             << ' ' << (e.raw ? "raw-v2" : "gplot-v2") << ' ' << hex(e.group_id)
+             << ' ' << (e.raw ? "raw-v2" : e.grouped ? "gplot-v2-grouped" : "gplot-v2") << ' ' << hex(e.group_id)
              << ' ' << std::quoted(hex(e.memo))
-             << ' ' << std::quoted(e.out_dir) << ' ' << std::quoted(e.out_name) << '\n';
+             << ' ' << std::quoted(e.out_dir) << ' ' << std::quoted(e.out_name);
+        if (e.grouped) data << ' ' << e.group_members;
+        data << '\n';
     }
     auto const text = data.str();
     // Follow the plot writer's exclusive temporary-file + durability barrier.

@@ -30,6 +30,8 @@ struct BatchEntry {
     int meta_group = 0;
     bool testnet = false; // retained for explicit rejection of obsolete callers
     bool raw = false; // raw v2 members are temporary inputs to group assembly
+    bool grouped = false; // recoverable group construction, including one-member jobs
+    int group_members = 1;
     std::array<uint8_t, 32> group_id{};
     std::array<uint8_t, 32> plot_id{};
     std::vector<uint8_t> memo;

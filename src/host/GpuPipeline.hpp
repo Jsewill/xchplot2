@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,9 @@ struct GpuPipelineConfig {
     int strength = 2;
     bool testnet = false;
     bool profile = false;   // print per-phase cudaEvent timing breakdown to stderr
+    // Optional application host-compute cap for streaming fragment merges.
+    // Zero retains the existing parallel merge policy.
+    unsigned host_threads = 0;
 
     // Device bytes the T2/T3 two-phase match may spend on its candidate
     // scratch. The match is a VRAM-for-speed trade that the peak models do
@@ -73,6 +77,135 @@ struct GpuPipelineResult {
     uint64_t t3_count = 0;
 };
 
+// Optional bounded handoff for consumers that retain a compact representation.
+// The caller owns a pinned transfer allocation and consumes each tile
+// synchronously before its window is reused. Device drains split the allocation
+// into alternating windows so the next transfer can overlap CPU consumption.
+// Tiles arrive in canonical fragment order;
+// total_count is constant across callbacks, including an empty callback when no
+// fragments were produced. Exceptions from consume propagate to the caller.
+// Sink overloads return counts only: result.fragments() is empty. Existing
+// host-sort tiers still need their full-size merge buffer internally. Streaming
+// sink calls must not stop at an intermediate table boundary.
+struct GpuFragmentSink {
+    std::span<uint64_t> pinned_window;
+    void* context = nullptr;
+    void (*consume)(void* context, std::span<uint64_t const> tile,
+                    uint64_t total_count) = nullptr;
+
+    void validate() const
+    {
+        if (pinned_window.empty() || !pinned_window.data() || !consume)
+            throw std::invalid_argument("GPU fragment sink requires a pinned window and consumer");
+    }
+
+    // The transfer operation fills a window slice from the given source offset
+    // and finishes before returning. Kept host-only so the bounded handoff and
+    // exception boundary can be checked without a GPU runtime.
+    template <typename Transfer>
+    void drain(uint64_t count, Transfer&& transfer) const
+    {
+        validate();
+        if (count == 0)
+        {
+            consume(context, {}, 0);
+            return;
+        }
+        for (uint64_t offset = 0; offset < count;)
+        {
+            auto const remaining = count - offset;
+            auto const size = remaining < pinned_window.size() ? remaining : pinned_window.size();
+            auto const tile = pinned_window.first(size);
+            transfer(tile, offset);
+            consume(context, tile, count);
+            offset += size;
+        }
+    }
+
+    // Submit returns an event with wait_and_throw(). Drain must complete every
+    // submitted transfer, including one whose submission throws before returning
+    // its event. These small operations keep the ownership protocol host-testable.
+    // Only one copy is in flight: wait for this tile, submit the next into the
+    // other window, then consume this tile before its window can be reused.
+    template <typename Submit, typename Drain>
+    void drain_overlapped(uint64_t count, Submit&& submit, Drain&& drain_pending) const
+    {
+        validate();
+        try
+        {
+            if (pinned_window.size() < 2)
+            {
+                drain(count, [&](std::span<uint64_t> tile, uint64_t offset)
+                { submit(tile, offset).wait_and_throw(); });
+                return;
+            }
+            if (count == 0)
+            {
+                consume(context, {}, 0);
+                return;
+            }
+            auto const first = pinned_window.size() / 2;
+            std::array<std::span<uint64_t>, 2> const windows{
+                pinned_window.first(first), pinned_window.subspan(first)};
+            auto tile_at = [&](unsigned slot, uint64_t offset)
+            {
+                auto const remaining = count - offset;
+                return windows[slot].first(remaining < windows[slot].size() ? remaining : windows[slot].size());
+            };
+            using Event = decltype(submit(std::span<uint64_t>{}, uint64_t{}));
+            std::optional<Event> pending;
+            uint64_t offset = 0;
+            unsigned slot = 0;
+            auto current = tile_at(slot, offset);
+            pending.emplace(submit(current, offset));
+            for (;;)
+            {
+                pending->wait_and_throw();
+                pending.reset();
+                offset += current.size();
+                auto next = offset < count ? tile_at(slot ^ 1, offset) : std::span<uint64_t>{};
+                if (!next.empty()) pending.emplace(submit(next, offset));
+                consume(context, current, count);
+                if (!pending) break;
+                current = next;
+                slot ^= 1;
+            }
+        }
+        catch (...)
+        {
+            // Keep the original callback/submission/event error, but finish any
+            // queued copy before its source or destination can leave this scope.
+            try { drain_pending(); } catch (...) {}
+            throw;
+        }
+    }
+};
+
+// Independent device destination for a pooled producer whose prior output is
+// still being drained. acquire runs once immediately before final T3 sort; it
+// must finish the destination's previous consumer before returning. The caller
+// owns this non-aliasing device allocation and its VRAM admission. The pipeline
+// finishes every write before returning counts, with no host fragments. A later
+// pipeline may reuse its pool while the caller drains this destination.
+struct GpuDeviceFragmentOutput {
+    void* context = nullptr;
+    std::span<uint64_t> (*acquire)(void* context, uint64_t count) = nullptr;
+
+    void validate() const
+    {
+        if (!acquire)
+            throw std::invalid_argument("GPU device output requires a destination callback");
+    }
+    std::span<uint64_t> destination(uint64_t count) const
+    {
+        validate();
+        auto const result = acquire(context, count);
+        if (!result.data() || result.size() < count)
+            throw std::runtime_error("GPU device output destination is smaller than the fragment count");
+        return result.first(count);
+    }
+};
+
 // One-shot path: allocates a transient pool, runs the pipeline, then copies
 // the pinned T3 fragments into t3_fragments_storage so the result is
 // self-contained after the pool is destroyed.
@@ -91,6 +224,12 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    int pinned_index);
+GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
+                                   GpuBufferPool& pool,
+                                   GpuFragmentSink const& sink);
+GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
+                                   GpuBufferPool& pool,
+                                   GpuDeviceFragmentOutput const& output);
 
 // Streaming path: per-phase cudaMalloc / cudaFree instead of a persistent
 // pool. Targets GPUs where the full pool (~15 GB at k=28) will not fit.
@@ -358,6 +497,9 @@ struct StreamingPinnedScratch {
 GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
                                              uint64_t* pinned_dst,
                                              size_t    pinned_capacity,
+                                             StreamingPinnedScratch const& scratch);
+GpuPipelineResult run_gpu_pipeline_streaming(GpuPipelineConfig const& cfg,
+                                             GpuFragmentSink const& sink,
                                              StreamingPinnedScratch const& scratch);
 
 // Device bytes the T2/T3 two-phase candidate scratch is currently holding on

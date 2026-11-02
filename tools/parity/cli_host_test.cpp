@@ -2,6 +2,7 @@
 #undef NDEBUG
 #include "gpu/SyclDeviceList.hpp"
 #include "host/BatchPlotter.hpp"
+#include "host/GroupPlotter.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h"
 #include <cassert>
@@ -26,6 +27,11 @@ size_t verified_trials = 0;
 bool verified_full = false;
 pos2gpu::BatchOptions last_options;
 int batch_calls = 0;
+#ifdef XCHPLOT2_GROUP_COMMANDS
+pos2gpu::GroupOptions last_group_options;
+int group_calls = 0;
+std::vector<std::string> last_compute;
+#endif
 std::vector<pos2gpu::BatchEntry> last_entries;
 std::size_t write_limit = std::numeric_limits<std::size_t>::max();
 bool fail_remaining = false;
@@ -83,6 +89,28 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries, BatchOptions const
     result.total_wall_seconds = entries.size(); result.workers.push_back(worker);
     return result;
 }
+#ifdef XCHPLOT2_GROUP_COMMANDS
+void prepare_group_compute(GroupOptions&) {}
+bool saved_compute_available(std::filesystem::path const&) { return false; }
+std::array<uint8_t, 32> compute_owner_seed(std::array<uint8_t, 32> const& seed, std::string_view owner)
+{ auto result = seed; for (size_t i = 0; i < owner.size(); ++i) result[i % result.size()] ^= uint8_t(owner[i]); return result; }
+int run_group(GroupOptions const& options)
+{ ++group_calls; last_group_options = options; return 0; }
+BatchResult run_group_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts, GroupOptions group)
+{ ++group_calls; last_group_options = group; return run_batch(entries, opts); }
+int run_compute_broker(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_worker(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_setup(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_membership(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_status(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_service(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+#endif
 VerifyResult verify_plot_file(std::string const&, size_t trials, bool full)
 {
     verified_trials = trials; verified_full = full;
@@ -180,7 +208,7 @@ int main(int argc, char** argv)
             assert(script.find("'--trials[Random challenges]:count:'") != std::string::npos);
             assert(script.find("'-n[Random challenges]:count:'") != std::string::npos);
         }
-        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers"})
+        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers", "plan", "fill", "grow", "broker", "worker", "group-members", "plan-only", "construction", "compute-broker", "compute-local", "compute-directory", "init", "invite", "join", "configure", "status", "host-bytes", "gpu-bytes", "max-frame-bytes", "members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import", "pause", "drain", "resume", "service", "restart", "remove", "max-brokers", "limit", "role"})
             assert(script.find(option) != std::string::npos);
     }
     put(config, "[batch]\ndevices=\"0\"\nquiet=0\nprogress=false\ncpu=false\nauto-spill=false\n");
@@ -406,6 +434,65 @@ int main(int argc, char** argv)
         assert(last_entries[i].plot_id != meta_zero[i].plot_id);
         assert(last_entries[i].out_name != meta_zero[i].out_name);
     }
+    // Grouped jobs retain membership in durable manifests, including one-member
+    // jobs, so an old batch runner cannot silently treat them as ordinary jobs.
+    auto grouped_entry = entry; grouped_entry.grouped = true; grouped_entry.group_members = 7;
+    auto const grouped_manifest = dir / "grouped.tsv";
+    pos2gpu::write_manifest(grouped_manifest.string(), {grouped_entry});
+    assert(pos2gpu::parse_manifest(grouped_manifest.string()) == std::vector{grouped_entry});
+    for (int count : {0, 65536}) {
+        auto invalid = grouped_entry; invalid.group_members = count;
+        refused = false;
+        try { pos2gpu::validate_batch_entry(invalid); } catch (std::exception const&) { refused = true; }
+        assert(refused);
+    }
+    for (auto const* suffix : {"", " 0", " 65536", " 2junk", " 2 extra"}) {
+        auto text = line("18 2 0 0 gplot-v2-grouped"); text.pop_back(); text += suffix; text += '\n';
+        put(manifest, text); refused = false;
+        try { (void)pos2gpu::parse_manifest(manifest.string()); } catch (std::exception const&) { refused = true; }
+        assert(refused);
+    }
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--devices", "cpu"}) == 0);
+    assert(last_group_options.plan_only && last_group_options.json && last_group_options.backend == "cpu");
+    assert(last_group_options.max_ram == 512ull * 1024 * 1024);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
+    assert(!last_group_options.plan_only && !last_group_options.json);
+    auto const argfile = dir / "group.args";
+    put(argfile, "--group-members 3\n--max-host-ram 768M\n");
+    assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.group_members == 3 && last_group_options.max_ram == 768ull * 1024 * 1024);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) != 0);
+    put(config, "[compute.worker]\nhost-bytes=\"1000000000\"\n");
+    assert(cli({"compute", "worker", "--config", config.string(), "--host-bytes", "2000000000"}) == 0);
+    assert((last_compute == std::vector<std::string>{"worker", "--host-bytes", "1000000000", "--host-bytes", "2000000000"}));
+    put(config, "");
+    for (auto const* command : {"members", "revoke", "renew-request", "renew-sign", "renew-import",
+                               "policy-export", "policy-import", "status", "pause", "drain", "resume", "service"}) {
+        assert(cli({"compute", command, "--config", config.string(), "--help"}) == 0);
+        assert((last_compute == std::vector<std::string>{command, "--help"}));
+    }
+    auto const group_dir = dir / "groups";
+    auto const group_job = dir / "group-job.tsv";
+    std::vector<std::string> group_args = {"plot", "--config", config.string(), "-k", "18", "-n", "2",
+        "-f", std::string(96, 'a'), "--pool-ph", std::string(64, 'b'), "-o", group_dir.string(),
+        "--group-members", "3", "--devices", "cpu", "--manifest", group_job.string(), "--quiet"};
+    auto const [group_code, group_paths] = capture(group_args);
+    assert(group_code == 0 && std::count(group_paths.begin(), group_paths.end(), '\n') == 2);
+    assert(last_entries.size() == 2 && last_entries.front().group_members == 3 && last_entries.front().grouped);
+    auto const group_entries = last_entries;
+    int const prior_derivations = keygen_calls;
+    group_args.emplace_back("--resume");
+    assert(capture(group_args).first == 0 && last_entries == group_entries && keygen_calls == prior_derivations);
+    assert(capture({"batch", group_job.string(), "--resume", "--devices", "cpu", "--config", config.string()}).first == 0);
+    assert(last_entries == group_entries);
+    group_args.insert(group_args.end(), {"--group-members", "4"});
+    assert(capture(group_args).first != 0);
+    auto const invalid_job = dir / "invalid-group.tsv";
+    group_args.insert(group_args.end(), {"--group-members", "0", "--manifest", invalid_job.string()});
+    assert(capture(group_args).first != 0 && !std::filesystem::exists(invalid_job));
+#endif
     for (auto const& file : std::filesystem::recursive_directory_iterator(dir))
         assert(file.path().filename().string().find(".partial.") == std::string::npos);
     std::filesystem::remove_all(dir);

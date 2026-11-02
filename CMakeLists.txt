@@ -686,11 +686,15 @@ foreach(_header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
                    "${_pos2_solver_dir}/solve/${_header}" COPYONLY)
 endforeach()
 find_package(Git REQUIRED)
+# Keep git apply in the copied header trees. Finding the source repository
+# through a parent directory can silently skip these build-local patch paths.
 # Remove an unused ARM header that collides with NVCC and enable MSVC ARM64 AES.
 # Relative includes require one complete header tree, without mixed originals.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     file(COPY "${POS2_CHIP_DIR}/src/" DESTINATION "${_pos2_solver_dir}")
-    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+        "${GIT_EXECUTABLE}" apply --ignore-space-change
         "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-arm-cuda.patch"
         WORKING_DIRECTORY "${_pos2_solver_dir}" COMMAND_ERROR_IS_FATAL ANY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -709,7 +713,9 @@ if(WIN32 AND XCHPLOT2_BUILD_CUDA)
             set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-windows")
             configure_file("${_cccl_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
             execute_process(
-                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+                    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+                    "${GIT_EXECUTABLE}" apply --ignore-space-change
                     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-windows-ptx.patch"
                 WORKING_DIRECTORY "${_cccl_dir}"
                 RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
@@ -736,7 +742,9 @@ if(XCHPLOT2_BUILD_CUDA)
             set(_cccl_dir "${CMAKE_CURRENT_BINARY_DIR}/cccl-arch-list")
             configure_file("${_cccl_arch_header}" "${_cccl_dir}/${_cccl_header_name}" COPYONLY)
             execute_process(
-                COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change
+                COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+                    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+                    "${GIT_EXECUTABLE}" apply --ignore-space-change
                     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/cccl-arch-list.patch"
                 WORKING_DIRECTORY "${_cccl_dir}"
                 RESULT_VARIABLE _cccl_patch_result ERROR_VARIABLE _cccl_patch_error)
@@ -751,7 +759,9 @@ if(XCHPLOT2_BUILD_CUDA)
     endif()
 endif()
 execute_process(
-    COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+        "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
     WORKING_DIRECTORY "${_pos2_solver_dir}"
     RESULT_VARIABLE _solver_patch_result
     ERROR_VARIABLE _solver_patch_error)
@@ -1127,6 +1137,9 @@ set_target_properties(xchplot2_cli PROPERTIES
 add_executable(xchplot2 tools/xchplot2/main.cpp)
 if(WIN32)
     target_link_libraries(xchplot2 PRIVATE xchplot2_cli pos2_gpu_host)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(xchplot2 PRIVATE
+        "$<LINK_GROUP:RESCAN,xchplot2_cli,xchplot2_groups,pos2_pr118_grow_worker_host,pos2_pr118_grow_network,pos2_gpu_host,pos2_gpu>")
 else()
     target_link_libraries(xchplot2 PRIVATE
         "$<LINK_GROUP:RESCAN,xchplot2_cli,pos2_gpu_host,pos2_gpu>")
@@ -1139,6 +1152,121 @@ if(WIN32)
     set(_xchplot2_multiple_definitions LINKER:/FORCE:MULTIPLE)
 endif()
 target_link_options(xchplot2 PRIVATE ${_xchplot2_multiple_definitions})
+
+# Ordinary grouped construction and shared compute are part of the installed
+# Linux and Windows CLI. Only the GPU adapter needs AdaptiveCpp; the controller, codecs and
+# network services use the native host compiler, like pos2_gpu_host.
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+    find_package(Threads REQUIRED)
+    include(cmake/GroupPlotter.cmake)
+    pos2_grow_prepare("${POS2_CHIP_DIR}" _pos2_grow_include)
+    include(cmake/ComputePool.cmake)
+    pos2_pool_targets("${POS2_CHIP_DIR}" "${_pos2_grow_include}")
+
+    add_library(xchplot2_group_gpu OBJECT src/host/GroupGpu.cpp)
+    x2_add_sycl_to_target(TARGET xchplot2_group_gpu SOURCES src/host/GroupGpu.cpp)
+    target_compile_features(xchplot2_group_gpu PRIVATE cxx_std_20)
+    target_link_libraries(xchplot2_group_gpu PRIVATE pos2_gpu_host)
+    target_compile_definitions(pos2_pr118_grow_worker_host PRIVATE GROW_GPU_BACKEND=1)
+    target_link_libraries(pos2_pr118_grow_worker_host PRIVATE pos2_gpu_host)
+
+    add_library(xchplot2_groups STATIC src/host/GroupPlotter.cpp src/host/ComputeSession.cpp
+        $<TARGET_OBJECTS:xchplot2_group_gpu>)
+    target_compile_features(xchplot2_groups PRIVATE cxx_std_20)
+    target_compile_definitions(xchplot2_groups PRIVATE
+        XCHPLOT2_GROUP_COMMANDS=1 GROW_GPU_BACKEND=1 GROW_POOL_NETWORK=1)
+    target_include_directories(xchplot2_groups BEFORE PRIVATE
+        "${_pos2_grow_include}" "${POS2_CHIP_DIR}/src" "${POS2_CHIP_DIR}/src/plot"
+        ${_xchplot2_cuda_include})
+    target_link_libraries(xchplot2_groups PUBLIC pos2_pr118_grow_worker_host pos2_gpu_host pos2_keygen Threads::Threads)
+    pos2_grow_identity(xchplot2_groups "${POS2_CHIP_DIR}" GPU NETWORK)
+    target_sources(xchplot2_cli PRIVATE tools/xchplot2/group_options.cpp tools/xchplot2/group_commands.cpp
+        tools/xchplot2/compute_broker.cpp tools/xchplot2/compute_worker.cpp tools/xchplot2/compute_commands.cpp
+        tools/xchplot2/compute_membership.cpp tools/xchplot2/compute_status.cpp)
+    if(WIN32)
+        target_sources(xchplot2_cli PRIVATE tools/xchplot2/compute_service_windows.cpp)
+        target_link_libraries(xchplot2_cli PUBLIC taskschd oleaut32 uuid)
+    else()
+        target_sources(xchplot2_cli PRIVATE tools/xchplot2/compute_service.cpp)
+    endif()
+    target_compile_definitions(xchplot2_cli PRIVATE
+        XCHPLOT2_GROUP_COMMANDS=1 GROW_GPU_BACKEND=1 GROW_POOL_NETWORK=1)
+    target_link_libraries(xchplot2_cli PUBLIC xchplot2_groups)
+
+    # Cargo links the same archives and exact TLS libraries selected by CMake.
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/group-link.txt"
+        CONTENT "$<TARGET_FILE:OpenSSL::SSL>\n$<TARGET_FILE:OpenSSL::Crypto>\n")
+    include(cmake/GroupTests.cmake)
+    pos2_group_tests("${POS2_CHIP_DIR}" "${_pos2_grow_include}")
+    foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test
+                   pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_merge_test)
+        if(TARGET ${target})
+            target_link_libraries(${target} PRIVATE pos2_keygen)
+        endif()
+    endforeach()
+    add_executable(pos2_pr118_grow_gpu_packed_test tools/parity/group_gpu_packed_test.cpp)
+    x2_add_sycl_to_target(TARGET pos2_pr118_grow_gpu_packed_test
+        SOURCES tools/parity/group_gpu_packed_test.cpp)
+    target_compile_features(pos2_pr118_grow_gpu_packed_test PRIVATE cxx_std_20)
+    target_include_directories(pos2_pr118_grow_gpu_packed_test PRIVATE src "${POS2_CHIP_DIR}/src")
+    set_target_properties(pos2_pr118_grow_gpu_packed_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+    target_link_libraries(pos2_pr118_grow_pool_owner_test PRIVATE pos2_keygen)
+    foreach(target pos2_pr118_grow_worker pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test)
+        target_sources(${target} PRIVATE $<TARGET_OBJECTS:xchplot2_group_gpu>)
+        if(XCHPLOT2_BUILD_CUDA)
+            target_sources(${target} PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+        endif()
+        target_link_libraries(${target} PRIVATE pos2_gpu_host)
+        target_link_options(${target} PRIVATE ${_xchplot2_multiple_definitions})
+    endforeach()
+endif()
+
+# Standalone low-level runners remain available for the reference and recovery
+# harnesses. They are not required to install or use the public CLI commands.
+option(XCHPLOT2_BUILD_GROUP_GROW "Build the standalone group recovery/reference runner" OFF)
+option(XCHPLOT2_BUILD_GROUP_POOL "Enable shared compute in the standalone group runner" OFF)
+if(XCHPLOT2_BUILD_GROUP_POOL AND NOT XCHPLOT2_BUILD_GROUP_GROW)
+    message(FATAL_ERROR "XCHPLOT2_BUILD_GROUP_POOL requires XCHPLOT2_BUILD_GROUP_GROW")
+endif()
+if(XCHPLOT2_BUILD_GROUP_GROW)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
+        message(FATAL_ERROR "Group construction requires Linux or Windows physical allocation preflight")
+    endif()
+    find_package(Threads REQUIRED)
+    include(cmake/GroupPlotter.cmake)
+    pos2_grow_prepare("${POS2_CHIP_DIR}" _pos2_grow_include)
+    # Like pos2_gpu_host, the codec/runner uses the native host compiler. Only
+    # the adapter needs AdaptiveCpp; its launcher applies to an entire target.
+    add_library(pos2_pr118_grow_host OBJECT src/host/GroupPlotter.cpp
+        tools/xchplot2/group_options.cpp tools/xchplot2/group_reference.cpp)
+    add_executable(pos2_pr118_grow_gpu src/host/GroupGpu.cpp
+        $<TARGET_OBJECTS:pos2_pr118_grow_host>)
+    if(XCHPLOT2_BUILD_CUDA)
+        target_sources(pos2_pr118_grow_gpu PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)
+    endif()
+    x2_add_sycl_to_target(TARGET pos2_pr118_grow_gpu
+        SOURCES src/host/GroupGpu.cpp)
+    target_compile_features(pos2_pr118_grow_host PRIVATE cxx_std_20)
+    target_compile_features(pos2_pr118_grow_gpu PRIVATE cxx_std_20)
+    target_compile_definitions(pos2_pr118_grow_host PRIVATE GROW_GPU_BACKEND=1)
+    # Ordinary format headers precede the transitive solver overlay. The CPU
+    # producer alone uses the build-local final-vector ownership patch.
+    target_include_directories(pos2_pr118_grow_host BEFORE PRIVATE
+        "${_pos2_grow_include}" "${POS2_CHIP_DIR}/src" "${POS2_CHIP_DIR}/src/plot"
+        ${_xchplot2_cuda_include})
+    target_link_libraries(pos2_pr118_grow_gpu PRIVATE pos2_gpu_host pos2_keygen Threads::Threads)
+    target_link_libraries(pos2_pr118_grow_host PRIVATE pos2_gpu_host pos2_keygen Threads::Threads)
+    if(XCHPLOT2_BUILD_GROUP_POOL)
+        target_compile_definitions(pos2_pr118_grow_host PRIVATE GROW_POOL_NETWORK=1)
+        target_link_libraries(pos2_pr118_grow_host PRIVATE pos2_pr118_grow_worker_host)
+        target_link_libraries(pos2_pr118_grow_gpu PRIVATE pos2_pr118_grow_worker_host)
+    endif()
+    target_link_options(pos2_pr118_grow_gpu PRIVATE ${_xchplot2_multiple_definitions})
+    pos2_grow_identity(pos2_pr118_grow_host "${POS2_CHIP_DIR}" GPU)
+    set_target_properties(pos2_pr118_grow_gpu PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/experimental")
+endif()
 
 # These parity tests use CUDA allocations; AES tests also define CUDA
 # kernels. The SYCL-native parity tests below stay unconditional so

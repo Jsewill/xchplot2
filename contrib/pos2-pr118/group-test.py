@@ -81,6 +81,24 @@ def main():
             run(command + ["--resume"], False)
             assert digest(output) == group_hash
             raw[0].write_bytes(raw_bytes)
+            inputs = raw_dir / "group.inputs"
+            assembled = root / f"{mode}-assembly-only.gplot"
+            run([args.reference.resolve(), "assemble-only", inputs, assembled, 16])
+            assert digest(assembled) == group_hash
+            run([args.reference.resolve(), "verify", inputs, assembled, 512])
+            assert not list(root.glob("xchplot2-group-index-*"))
+            # Sequential index validation must still reject gaps/overlap and
+            # truncated payloads before creating an output.
+            index = 51 + raw_bytes[42]
+            offset = int.from_bytes(raw_bytes[index:index + 8], "little")
+            corruptions = [raw_bytes[:index] + (offset + 1).to_bytes(8, "little") + raw_bytes[index + 8:],
+                           raw_bytes[:-1], raw_bytes + b"trailing"]
+            rejected = root / f"{mode}-bad-raw.gplot"
+            for corrupt in corruptions:
+                raw[0].write_bytes(corrupt)
+                run([args.reference.resolve(), "assemble-only", inputs, rejected, 16], False)
+                assert not rejected.exists()
+            raw[0].write_bytes(raw_bytes)
             edited = json.loads(job_path.read_text())
             edited["derived"]["members"].reverse()
             job_path.write_text(json.dumps(edited))
@@ -91,7 +109,6 @@ def main():
             run(command + ["--resume"], False)
 
             # Reject an index larger than the modeled budget before raw reads.
-            inputs = raw_dir / "group.inputs"
             limited = root / "over-budget.inputs"
             lines = inputs.read_text().splitlines()
             lines[0] = "28" + lines[0][2:]
@@ -100,6 +117,8 @@ def main():
             result = run([args.reference.resolve(), "assemble", limited, partial, 16], False)
             assert "RAM budget" in result.stderr
             assert not partial.exists()
+            result = run([args.reference.resolve(), "check-raw", limited, "-", 16], False)
+            assert "RAM budget" in result.stderr
         # Files share keys, but every member in both unseeded jobs is unique.
         fresh = []
         members = set()

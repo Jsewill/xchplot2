@@ -23,6 +23,7 @@ extern "C" {
 #define POS2_BAD_SEED           -5
 #define POS2_BAD_ADDRESS        -6
 #define POS2_BAD_HRP            -7
+#define POS2_BAD_HASH_INPUT     -8
 
 // pool_kind values
 #define POS2_POOL_PK  0  // pool_key_ptr points to 48 bytes (G1 public key)
@@ -78,6 +79,64 @@ int pos2_keygen_derive_subseed(
     const uint8_t base_seed[32],
     uint64_t idx,
     uint8_t out_seed[32]);
+
+// General SHA-256 helper, independent of key derivation. Hashes the exact
+// concatenation of caller-owned byte segments in array order, without adding
+// lengths, separators, or copying the input into a combined buffer.
+typedef struct pos2_sha256_segment {
+    const uint8_t* data;
+    size_t len;
+} pos2_sha256_segment;
+
+// segments may be NULL only when segment_count is zero. A segment's data may
+// be NULL only when its len is zero. All nonempty regions must be readable and
+// the descriptor array properly aligned; out_digest points to 32 writable bytes.
+// Returns POS2_OK or POS2_BAD_HASH_INPUT for null pointers, invalid alignment,
+// lengths beyond the addressable slice range or SHA-256 message-length limit.
+// On an error, out_digest is unchanged. Input memory remains caller-owned.
+int pos2_sha256_segments(
+    const pos2_sha256_segment* segments, size_t segment_count,
+    uint8_t out_digest[32]);
+
+// Streaming equivalent for bounded, reusable input buffers. The reader returns
+// 1 with the next segment, 0 at EOF, or a negative value on failure. Other return
+// values are invalid. Each segment is consumed before the next reader call, so
+// its storage need only remain readable and unchanged until that call. The
+// reader must not throw or unwind across this C boundary. context is passed
+// through unchanged and may be NULL if the reader supports it.
+typedef int (*pos2_sha256_reader)(void* context, pos2_sha256_segment* next);
+
+// reader and out_digest must be non-NULL. Segment lengths have the same limits
+// as pos2_sha256_segments. Returns POS2_OK or POS2_BAD_HASH_INPUT; the output is
+// unchanged on invalid metadata or reader failure, including after partial input.
+int pos2_sha256_stream(
+    pos2_sha256_reader reader, void* context, uint8_t out_digest[32]);
+
+// Process-local incremental SHA state for consumers that hash while producing
+// their input. Handles own their allocation and must be freed exactly once;
+// clones are independent, and digest does not consume or modify its state.
+// Handles must originate from new/clone and may not be used after free. These
+// native states are not a serialization format and must not be written to disk.
+typedef struct pos2_sha256_state pos2_sha256_state;
+
+// Return NULL on allocation failure; clone(NULL) also returns NULL. Each state
+// allocation has a conservative bound reported by state_bytes(), including an
+// allocator allowance. Callers also account for clone/digest temporary storage.
+pos2_sha256_state* pos2_sha256_state_new(void);
+pos2_sha256_state* pos2_sha256_state_clone(const pos2_sha256_state* state);
+size_t pos2_sha256_state_bytes(void);
+// free(NULL) is harmless. No other operation may overlap free on the same state.
+void pos2_sha256_state_free(pos2_sha256_state* state);
+
+// Returns POS2_OK or POS2_BAD_HASH_INPUT. NULL state, NULL nonempty data,
+// unaddressable lengths and cumulative SHA message-length overflow are rejected
+// without modifying state. Empty data may be NULL. Input remains caller-owned
+// and is consumed synchronously before return. Input/output buffers must not
+// overlap the opaque state allocation. State access must be serialized.
+int pos2_sha256_state_update(pos2_sha256_state* state, const uint8_t* data, size_t len);
+// NULL state/output is rejected; on failure the output is unchanged. On success
+// out_digest points to 32 writable bytes, and the state remains reusable.
+int pos2_sha256_state_digest(const pos2_sha256_state* state, uint8_t out_digest[32]);
 
 #ifdef __cplusplus
 } // extern "C"

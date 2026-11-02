@@ -3,6 +3,7 @@
 [README](README.md) · [Installation](INSTALL.md) · [Benchmarks](BENCHMARKS.md)
 
 [Plotting and recovery](#plotting-and-recovery) · [Configuration](#configuration-and-argument-files) ·
+[Groups and drive filling](#grouped-plotting-and-drive-filling) · [Shared compute](#shared-compute) ·
 [Devices](#devices-and-cpu-workers) ·
 [Benchmarking](#benchmarking) · [Memory](#memory-requirements) ·
 [Disk-offload](#host-ram-and-disk-offload) · [Other commands](#lower-level-subcommands) ·
@@ -20,7 +21,9 @@ xchplot2 plot -k 28 -n 10 \
 | Option | Meaning |
 |---|---|
 | `-k`, `--k K` | Even plot size in 18..28; default 28 |
-| `-n`, `--num N` | Number of plots; default 1 |
+| `-n`, `--num N` | Number of independent output files; default 1 |
+| `--group-members N` | Members per file, 1..65535; default 1 |
+| `--compute auto\|off` | Use saved compute pool membership when present; default `auto` |
 | `-s`, `--strength S` | Proof strength; default 2 |
 | `-f`, `--farmer-pk HEX` | Farmer public key, 96 hex characters |
 | `-p`, `--pool-pk HEX` | Pool public key, 96 hex characters |
@@ -106,7 +109,7 @@ as they do for `plot`:
 xchplot2 batch /path/to/job.tsv --devices gpu --resume
 ```
 
-Each non-comment line has nine whitespace-separated fields in this order:
+Ordinary single-member and raw manifests have nine whitespace-separated fields in this order:
 
 ```text
 k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
@@ -116,6 +119,11 @@ k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
 for a temporary member consumed by the group assembler. `group_id_hex` is
 64 hex characters; the member ID is derived from it, the index, and meta group.
 `memo_hex` encodes up to 255 bytes (`""` represents an empty memo).
+`plot --group-members N` and automatic shared plotting save `gplot-v2-grouped`
+rows with a tenth field, the member count. This explicit format prevents older
+binaries from silently treating a grouped job as single-member output. Grouped
+rows start at index zero; `batch` selects grouped construction for that format.
+Grouped, ordinary single-member and raw jobs require separate manifests.
 Legacy manifests with a testnet boolean and per-plot ID are rejected.
 Memo and path fields accept double quotes, with backslash escapes
 for quotes and backslashes. `out_name` must be a filename, not a path;
@@ -123,6 +131,498 @@ relative `out_dir` paths resolve from the working directory. Blank lines
 and `#` comments are ignored. Invalid rows are rejected before plotting.
 Prefer the automatically saved manifest for recovery; see
 [Security](SECURITY.md) before sharing manifests containing private keys.
+
+## Grouped plotting and drive filling
+
+These commands are included in normal Linux Cargo, CMake and container builds,
+and in experimental native Windows CMake builds. Windows grouped construction
+requires local NTFS volumes with ordinary, uncompressed, unencrypted files;
+ReFS, network volumes and sparse files are rejected. Native Windows recovery
+and GPU qualification remain pending.
+Windows retains compact retirement records beside completed external jobs
+for recovery. Keep them with the output until recovery is no longer needed.
+Unknown disk topology is scheduled conservatively; Windows NVMe destinations
+share one writer group because namespace independence is not established.
+
+The grouped engine supports one local CPU or GPU producer, or a shared compute
+pool. Select `--devices cpu`, `--devices gpu0`, or `--backend auto`; automatic
+selection can fall back to CPU. Multi-device selectors, CPU NUMA selectors,
+`--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`, and
+`--max-host-ram min` belong to the single-member batch engine. Use
+`--compute off` to keep that engine for ordinary plotting after enrolling a
+machine in shared compute.
+
+Create three independent files, each containing four members:
+
+```bash
+xchplot2 plot -n 3 --group-members 4 \
+    -f "$FARMER_PK" -c "$POOL_ADDRESS" -o /plots
+```
+
+`-n` always counts files; `--group-members` counts members within each file.
+The normal private job manifest and `plot --resume` / `batch --resume`
+interfaces retain the prepared identities. New unseeded jobs get fresh keys.
+
+For a directory layout, preview first:
+
+```bash
+xchplot2 plan /disk-a/plots --destination /disk-b/plots
+xchplot2 fill /disk-a/plots --destination /disk-b/plots --plan-only
+```
+
+Both forms perform the same read-only preview. They need existing destination
+directories but no keys, create no files or locks, and start no compute services.
+`--json` emits the machine-readable report. An infeasible layout reports its
+reason and exits unsuccessfully. A preview is not a saved execution plan.
+
+To build the layout, supply a stable 32-byte seed and the farmer and pool keys:
+
+```bash
+xchplot2 fill /disk-a/plots --destination /disk-b/plots \
+    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS"
+# Repeat with the same seed, keys and directory order after interruption:
+xchplot2 fill /disk-a/plots --destination /disk-b/plots \
+    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS" --resume
+```
+
+`fill` always plans a farming layout, including with an explicit
+`--group-members N`. Omit that option or use `auto` to select file membership
+from the farming profile. Files start at index zero; the planner assigns
+shared-ID families and meta groups across physical storage resources.
+`--max-groups N` limits files per directory, and `--max-total-members N`
+limits membership per directory. Without those limits, construction uses the
+available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
+per filesystem; `--headroom-bytes SIZE` leaves space free (default 64 MiB).
+Sizes accept bytes or suffixes such as `512M` and `14G`.
+
+The first directory contains the private, checksummed `grow-farm.plan`.
+It saves the layout and farming profile without the seed. Keep it with all
+outputs and retain the seed separately. Resume audits all destinations before
+modifying them, preserves completed files, and recovers partial construction.
+Changes in free space or plotting RAM do not change saved identities. An
+explicitly changed farming profile is rejected. Actual compressed sizes can
+permit additional membership only after the frozen layout passes admission
+again. The planner's size forecast is not a promise of exact disk utilization.
+
+### Growing an existing group
+
+```bash
+xchplot2 grow /plots/example.gplot --max-members 8
+```
+
+`grow` requires an existing ordinary v2 group file and recovers interrupted
+construction before extending it. It reads the file's identity and parameters;
+keys are unnecessary. `--max-members N` is the desired total membership, with
+a maximum of 65535. Capacity and construction limits can stop growth earlier.
+Use `plot` to create a new named job, or `fill` to manage a directory layout.
+
+### Construction and recovery
+
+`--max-host-ram SIZE` bounds modeled construction, producer, transport and
+codec buffers across the job. The default is 14,000,000,000 bytes.
+`--workers N` bounds the shared compression CPU allowance; zero or omission
+uses the available logical CPU count. The operating system, libraries and
+file cache are outside that buffer model. Separate plotting processes each
+have their own construction budget.
+
+Automatic construction chooses among incremental rewriting, staging,
+merging and external contributions according to available RAM and scratch.
+`--construction auto|incremental|staged|merged|external` forces a method when
+needed. `--batch-members N` bounds construction batches independently of the
+final file membership. `--member-storage compact|raw` selects retained
+fragments; compact is the default.
+
+Repeat `--temp-dir DIR` to offer scratch on additional filesystems.
+Destination directories are excluded from automatic scratch selection unless
+`--destination-temp on|ssd|hdd` permits them; the default is `off`. The media
+filters require known, uniformly matching drives. Explicit scratch directories
+remain available regardless of that policy. `--temp-capacity-bytes SIZE` caps
+scratch per filesystem. External construction needs permitted scratch.
+
+Writers sharing a physical drive serialize their I/O. Independent drives can
+progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
+`--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
+and clean-cache release. `--window-bytes SIZE` and `--checkpoint-bytes SIZE`
+set fixed I/O and durability windows instead of the automatic choices.
+
+Construction checkpoints are private and tied to the same build. Retain the
+in-progress file, plan and any owned scratch/checkpoint directory together;
+do not move or edit them during recovery. A file being constructed is not a
+farmable completed output. Stop gracefully with Ctrl-C, then repeat the
+owning command with `--resume` (`grow` resumes implicitly). Completed output
+paths appear on stdout after publication or a successful resume audit.
+`--json` replaces human output with the plan or construction metrics;
+`--quiet` suppresses informational stderr and `--verbose` adds member progress.
+
+### Farming layout
+
+Automatic directory planning chooses farming group size and meta families
+together. The plotting machine's RAM, GPU speed and temporary disks determine
+how to construct that layout; the planner does not use them as the final
+harvester's CPU or cache capacity. It uses the destination's physical-resource
+topology and an explicit farming profile. The preview reports the assumed
+profile, selected sizes, family/meta counts, resource sharing and forecasts.
+
+Defaults are deliberately independent of the plotting host:
+
+| Farming input | Default | Override |
+| --- | --- | --- |
+| Objective | Minimize recurring dynamic work within the hard response deadline; latency breaks ties | `--farming-objective energy\|latency` |
+| Eligible groups per physical storage resource | At most 1 per filter check | `--farming-max-eligible-groups N` |
+| Relative CPU and I/O work weights | 1 and 1 | `--farming-cpu-work-weight N`, `--farming-io-work-weight N` |
+| Concurrent CPU work | 4 cores | `--farming-cores N` |
+| Synchronous lookups | 4 workers | `--farming-lookup-workers N` |
+| Reader working memory | 512 MiB | `--farming-memory-bytes N` |
+| Index cache | Stateless reader, no cache | `--farming-reader stateless\|cached`, `--farming-index-cache-bytes N` |
+| Per-member CPU time | 4 ms for decoding, chaining and reader work | `--farming-chain-us-per-member N` |
+| Index/open CPU allowance | 50 ns per expanded entry | `--farming-index-ns-per-entry N` |
+| Hard modeled quality-response deadline | 8 seconds | `--farming-deadline-ms N` |
+| Filter horizon | Base bits 9 and 8, adjusted for strength and capped at 13 | `--farming-filter-bits N`, `--farming-future-filter-bits N` set effective bits directly |
+
+The response deadline is an operational latency limit, not a consensus deadline.
+The future profile models one scheduled filter reduction without assigning a
+calendar activation date. The default cadence is 75/8 seconds. The CPU
+coefficients are assumed service envelopes, not measurements of the user's
+harvester. Deadline admission is conditional on those envelopes covering the
+reader and storage's actual service costs.
+
+Cold-reader admission reserves up to eight compressed bytes per index entry,
+the valid format's maximum codeword size. Capacity forecasting uses an expected
+index size separately. This avoids treating the average compressed index as a
+worst-case read bound.
+
+Detected HDDs use a 10 ms access cost, 250 MB/s transfers and one active read;
+detected SSDs use 0.2 ms, 500 MB/s and up to four active reads. Unknown devices
+use 20 ms, 125 MB/s and one active read, with shared resources serialized
+conservatively. These are model inputs, not storage benchmarks. Shared transfer
+bandwidth, synchronous lookup workers and harvester CPU capacity constrain the
+whole farm. Per-file member processing remains serial.
+
+Larger files reduce repeated index work and disk accesses, but processing more
+members serially makes each lookup longer. Smaller files shorten individual
+lookups while increasing the repeated work. The planner compares balanced
+integer layouts within the declared storage, CPU, worker and memory limits.
+An efficient average workload alone does not establish a response deadline.
+
+Meta groups change eligibility correlations, so choose them together with file
+size. The [filter implementation](https://github.com/Chia-Network/chia-blockchain/blob/main/chia/types/blockchain_format/proof_of_space.py)
+compares a hash of the group ID and filter challenge with the signage-point
+index XOR the meta value, masked by the effective filter. Distinct masked meta
+values exclude simultaneous eligibility only within the same group ID.
+Rotating meta numbers while generating unrelated group IDs does not provide
+that guarantee. When the effective filter shrinks, some meta values alias.
+Window scheduling also correlates neighboring signage points; a planner must
+evaluate consecutive challenges, including carried-over work.
+
+Within one shared-ID family, balance member counts across its usable meta
+slots. With one file per slot and no other eligible work on the drive, this
+minimizes the largest activation. Ordinary files start at member index zero:
+reusing both the group ID and meta value in another such file duplicates member
+identities. Exhausted meta slots require a new identity family. Assign families
+per physical storage resource, keeping that assignment stable on resume.
+
+Measure or explicitly model the actual reader. The pinned k28 C++ reader
+expands a chunk index to 32 MiB per resident group reader. The pinned C API
+constructs a reader for each quality request, so it instead pays index loading
+and decoding on each lookup. The on-disk index is compressed and data dependent;
+32 MiB describes the expanded index, not a fixed read size. It also reads the
+selected chunks for all members and chains them before returning the group's
+qualities. Index-cache policy,
+decoding/chaining work and total farm concurrency therefore matter alongside
+disk access. Do not infer farming CPU or cache capacity from the plotting host.
+
+The cached profile assumes persistent readers loaded before farming. It removes
+index-loading costs only when the entire expanded index set fits the declared
+cache; otherwise it uses cold costs. The working-memory budget includes that
+cache and concurrent reader scratch. Repeated lookups on one persistent reader
+are serialized. These memory estimates constrain the profile; they are not a
+strict RSS bound on the farmer's variable proof and fragment allocations.
+
+Deadline admission considers every identity family that could be eligible
+together, including families on different drives. It bounds CPU, lookup-worker
+and physical I/O contention for that burst. The bound must fit both the response
+deadline and the signage-point interval, so admitted work finishes before the
+next arrival. The model assumes work-conserving queues with FIFO admission to
+CPU and read resources. Same-family meta exclusion is retained under both
+modeled filter settings. A finite sample with no late responses cannot replace
+this admission check.
+
+`--farming-objective energy`, the default, minimizes an expected dynamic-work
+proxy: weighted CPU-active seconds plus I/O-active seconds per signage point.
+The positive `--farming-cpu-work-weight` and `--farming-io-work-weight` values
+express their relative costs. The defaults compare active time with equal
+weights. This proxy does not measure joules or account for idle power, spin-down
+policies or memory power. `--farming-objective latency` instead minimizes the
+response bound, with work as a tie-break. Both modes must satisfy the same hard
+deadline and eligibility limits.
+
+The preview reports `response_bound_seconds`, `feasible` and
+`infeasibility_reason`, along with `dynamic_work_seconds_per_sp` and its CPU/I/O
+components. `max_eligible_groups` is the configured per-resource limit;
+`certified_max_eligible_groups` is the assessed maximum. An infeasible profile
+produces a report and an error exit, without publishing a new plan or starting
+plot production. Extra files or members on resume must pass a joint assessment
+of all directories using the frozen identities and profile.
+
+The search includes every balanced file count within its bounds. It compares
+joint file counts and refines individual directories until no such move
+improves the result. Mixed farms do not receive an exhaustive comparison of all
+possible assignments. Work and memory limits are enforced explicitly. Selection
+is conditional on the declared service envelopes and search coverage; it does
+not establish measured energy use or physical farming performance. Exact
+file-format and construction admission still apply when plotting.
+[Chia's farming estimates](https://docs.chia.net/chia-blockchain/consensus/proof-of-space-2.0/new-proof-farming-requirements/)
+provide context for the tradeoff; qualify the intended storage and reader before
+relying on a latency bound.
+
+
+## Shared compute
+
+A compute pool is a set of trusted machines that share generation and encoding
+capacity. It is independent of the Chia pool destination used for plot keys.
+A plotting host owns its files, checkpoints and publication. A broker assigns
+leases; workers return computed fragments directly to the plotting host.
+Workers never receive destination paths, farmer/pool keys, seeds or private
+plot memos. Enroll only machines you trust to compute correctly.
+
+On the first machine, create a pool and an invitation for another machine:
+
+```bash
+xchplot2 compute init --name storage-a
+xchplot2 compute invite worker-b.invite --name worker-b
+```
+
+Transfer the invitation privately to that machine, then run there:
+
+```bash
+xchplot2 compute join worker-b.invite
+xchplot2 compute worker
+```
+
+Create a separate invitation for each additional machine. An invitation holds
+that machine's private TLS identity, not the pool's signing key. Delete
+transferred copies after joining. Enrollment is pool membership: every member
+can share with multiple plotting hosts. It is not an exclusive machine pair.
+
+After enrollment, `plot`, `fill`, and `grow` use shared compute automatically.
+Each job starts an embedded broker unless a dedicated broker is configured.
+Its local executor also offers bounded capacity while the job runs; nearby
+workers discover the broker and join. Several brokers can use one worker at
+once. The worker enforces one combined CPU, RAM, GPU and task-slot budget
+across their requests. One executor per enrolled machine identity prevents
+concurrent local jobs from advertising the same capacity twice.
+
+Run `compute worker` to keep offering capacity independently of a plotting
+job; it stays in the foreground until stopped. Save defaults for future jobs:
+
+```bash
+xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
+xchplot2 compute status
+```
+
+A standalone worker defaults to half the logical CPUs, half physical RAM
+capped at 16 GiB, one task slot, and automatic CPU/GPU selection. Automatic
+GPU capacity is 80% of the smaller of reported free and total VRAM. A plotting
+job partitions its own host budget between the embedded service, local work,
+construction and optional remote encoding, honoring saved offered limits.
+A worker registers with up to 128 brokers by default. Save another limit with
+`compute configure --max-brokers N`, or override it with
+`compute worker --max-brokers N` (1..4096). Each registration consumes reserved
+transport RAM; automatic local executors lower their registration limit to
+fit the offered memory. Dedicated workers enforce the saved or explicit limit;
+when lowering their host RAM, lower `--max-brokers` too if startup reports an
+insufficient transport budget. For example, a 512 MiB CPU worker can use
+`compute configure --max-brokers 16`.
+Status reports deferred brokers when the limit is
+reached. Idle registrations rotate to admit waiting brokers; granted or active
+work keeps its registration until its reservation is released.
+For large registries or slow links, raise each dedicated broker's `--worker-ms`
+above the full refresh cycle; the default registration expiry is 30 seconds.
+Refreshes use bounded concurrency, so an oversized limit can otherwise cause
+idle registrations to expire between visits.
+Explicit service flags override saved defaults. Admission and retries adapt
+to available workers and measured task/transfer cost; discovery alone does
+not guarantee that a worker has enough capacity for a particular task.
+
+`compute status` shows saved defaults and certificate expiry, then authenticates
+live brokers and workers. It lists owners, jobs, queue wait reasons, offered
+resources, broker reservations and actual worker usage. A worker shared by
+several brokers enforces its total limit locally; a broker's reservation view
+is not a pool-wide capacity measurement.
+
+```bash
+xchplot2 compute status --json
+xchplot2 compute status --broker 192.168.1.10:18444 --limit 256
+xchplot2 compute pause
+xchplot2 compute drain
+xchplot2 compute resume
+```
+
+`pause` stops new task admission while accepted tasks finish. `drain` also
+changes to `drained` after accepted work finishes; `resume` reopens admission.
+Only the worker's own enrolled identity can control it. These settings last
+for that worker process. Use `--worker HOST:PORT` to query or control a worker
+when discovery is unavailable. Explicit endpoints select the services to
+query; otherwise status uses saved broker settings and LAN discovery.
+`--limit` bounds each broker section (default 128, maximum 4096);
+`--timeout-ms` bounds network queries (default 5000). JSON includes errors and
+truncation indicators. Live pages can change while being read.
+
+Discovery advertisements are untrusted hints. Status and work connections
+require mutual TLS in the enrolled pool. Use the same build on collaborating
+machines; incompatible compute formats are not scheduled. This revision
+changes the compute protocol and saved membership format: upgrade brokers,
+workers and plotting hosts together, then restart their services. Existing
+membership can be loaded without creating a new pool.
+
+### Background workers and brokers
+
+Save resource and network defaults with `compute configure`, then install a
+service for this enrolled machine:
+
+```bash
+xchplot2 compute service print
+xchplot2 compute service install
+xchplot2 compute service status
+xchplot2 compute service restart
+xchplot2 compute service remove
+```
+
+The default role is `worker`; add `--role broker` for a dedicated broker.
+`print` displays the definition without installing or starting it. `install`
+starts the service and arranges subsequent startup. `start`, `stop`, `restart`
+and `remove` act only on the service generated for this identity. Use
+`compute drain` and wait for `drained` before stopping if accepted tasks should
+finish first. Restart after changing saved defaults or replacing the executable.
+
+Linux uses a systemd user service; logout behavior follows the system's user
+manager policy. Windows uses Task Scheduler at user login, without elevation,
+and requires that user to remain logged in. The native Windows service path
+is experimental and still needs native runtime qualification.
+
+### Networks and dedicated brokers
+
+LAN discovery uses mDNS/DNS-SD on active multicast interfaces. It excludes
+loopback and point-to-point VPNs unless selected explicitly. Sharing listeners
+accept the selected networks plus loopback. Interface changes are refreshed
+automatically. IPv4 and IPv6 are supported; write IPv6 endpoints as
+`[address]:port`, with a scope on link-local addresses such as
+`[fe80::1234%enp3s0]:18444`. On Windows, select an adapter by its name or
+interface index; `lo` selects loopback on either platform. Choose interfaces
+explicitly when needed:
+
+```bash
+xchplot2 compute configure --interface enp3s0 --interface wg0
+xchplot2 compute configure --interface auto
+```
+
+Discovery stays on the local link. Routed networks and VPNs can use a direct
+broker address. Run a dedicated broker on an enrolled machine, then configure
+plotting hosts and workers to use it:
+
+```bash
+# Dedicated machine; default TCP port 18444:
+xchplot2 compute broker
+# On participating machines:
+xchplot2 compute configure --broker 192.168.1.10:18444
+# Return a plotting host to an embedded broker per job:
+xchplot2 compute configure --broker auto
+```
+
+`compute worker --broker HOST:PORT` can repeat direct addresses and also
+browse discovered brokers. `--discovery off` disables discovery; a standalone
+worker then needs a direct broker. Broker and worker `--listen` / `--advertise`
+options set fixed reachable endpoints. Firewalls must permit UDP 5353 for
+discovery and the chosen TCP listener ports; automatic embedded services and
+workers choose available TCP ports. Use explicit interfaces for a VPN rather
+than exposing the services publicly.
+
+The saved setup is in `$XDG_CONFIG_HOME/xchplot2/compute`, falling back to
+`$HOME/.config/xchplot2/compute`; Windows instead defaults to
+`%LOCALAPPDATA%\xchplot2\compute` when `XDG_CONFIG_HOME` is unset.
+`compute ... --directory DIR` or plotting's
+`--compute-directory DIR` selects another setup. Preserve it for recovery:
+the stable node identity scopes fixed seeds, so the same supplied seed on two
+enrolled plotting machines creates different plot identities. Private saved
+manifests can be resumed directly with `batch` without re-deriving keys.
+Old ordinary manifests continue to use their original engine; use
+`plot --compute off --resume` when resuming one after enrollment.
+
+### Overrides and interruption
+
+`--compute off` disables automatic sharing for a plotting command.
+`--compute-local off` uses pool workers without offering local capacity.
+`--compute-broker HOST:PORT` overrides the saved broker for one job.
+Advanced direct connections can still supply `--compute-owner-id`,
+`--compute-ca`, `--compute-cert` and `--compute-key`; the broker and worker
+help list their corresponding TLS flags. No enrollment files are needed for
+that explicit interface. It does not keep a signed membership registry or
+propagate policy updates; use saved enrollment for managed revocation and
+renewal. An enrolled peer still applies its own policy to direct connections.
+
+`--compute-owner-id ID` also overrides an enrolled machine's storage-owner
+namespace and keeps a stable broker owner for the broker's `--owner-share ID:WEIGHT`
+setting. Use a distinct explicit ID for each concurrent job. Without this
+override, automatic jobs get separate temporary broker owners while retaining
+the machine's stable key namespace.
+
+`--compute-inflight N` bounds outstanding work, `--compute-codec-ram auto|SIZE`
+controls the optional encoding partition (`0` disables it), and
+`--compute-timeout-ms N` / `--compute-socket-timeout-ms N` bound task and socket
+waits. The defaults are one hour per task and 30 seconds per socket operation.
+`--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
+are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
+`--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
+lists standalone task, thread, window and transport limits.
+
+Workers may arrive or leave while jobs run. Lost or expired work is retried
+without publishing incomplete results. Available local compute permits
+fallback during broker outages. A storage-only job waits within its task
+deadline, then reports failure while preserving recovery state. Broker
+restarts fence old leases; plot commits remain on their storage owners.
+Stopping a job also stops any broker and executor it owns. Other local jobs
+can take over the executor and retry unfinished work.
+
+### Membership renewal and revocation
+
+Enrollment files and invitations use owner-only permissions. The pool creator
+holds the signing authority. Inspect its registry and revoke a stable node ID:
+
+```bash
+xchplot2 compute members
+xchplot2 compute revoke NODE_ID
+xchplot2 compute policy-export pool.policy
+```
+
+Revocation applies to that node, including replacement certificates. Signed
+policy updates propagate over authenticated connections and are checked on
+existing connections before further operations. Disconnected members cannot
+learn a new revocation until they reconnect or import the policy with
+`compute policy-import pool.policy`. Distribute it to every remaining member
+when excluding a machine. The registry holds up to 1024 stable nodes. Members
+created by an older build may be absent from the registry until renewal;
+the authority can still revoke their node IDs explicitly.
+
+To rotate a machine's certificate while preserving its node ID and seeded
+plot namespace, run these commands on the indicated machines:
+
+```bash
+# Machine being renewed:
+xchplot2 compute renew-request machine.request
+# Pool creator, after receiving that request:
+xchplot2 compute renew-sign machine.request machine.replacement
+# Original machine, after receiving the replacement:
+xchplot2 compute renew-import machine.replacement
+```
+
+Restart the renewed machine's services to use the new credentials. Repeat the
+same command and file paths if interrupted; renewal retains the pending key
+and signed response for recovery. Certificates last at most one year and
+cannot outlive the pool authority. An expired leaf can be renewed while the
+saved private key and authority remain valid. The authority lasts ten years;
+its expiry or loss of its signing key requires a new pool and re-enrollment.
+Lost machine credentials also require re-enrollment unless a private backup
+is available. Keep plot manifests for recovery of existing output identities.
 
 ## Configuration and argument files
 
@@ -134,7 +634,8 @@ strings and `#` or `;` comments. Arrays, nested tables, and multiline strings
 are unsupported.
 
 Use long option names without `--`. `[defaults]` applies to every command;
-a section such as `[plot]` or `[bench]` overrides those defaults. Explicit
+a section such as `[plot]`, `[fill]` or `[bench]` overrides those defaults.
+Compute service sections use `[compute.broker]` and `[compute.worker]`. Explicit
 command-line flags override the same options from the file. Put options
 that only apply to one command in that command's section:
 
@@ -188,18 +689,20 @@ spaces. Pass `--config` directly on the command line, not inside an argument fil
 ## Plot indices and meta groups
 
 Both are v2 PoS fields and default to 0. `plot -n N` writes N independent
-single-member `.gplot` groups with fresh keys, each at member index 0.
+`.gplot` groups with fresh keys. `--group-members M` chooses M members per
+file; every file starts at member index zero.
 `--seed` and saved-job resume preserve those identities. The meta group (u8)
 selects a challenge-isolation boundary. Every member of a group shares its
 group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || meta_group`.
 
 The official version 2 format from
 [pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118)
-stores a group size and assumes member indices start at zero. The
+stores a group size and assumes member indices start at zero. Installed
+`plot`, `fill` and `grow` commands write this ordinary format. The separate
 [experimental grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
-assembles multiple members with shared keys. Its `--files` and nonzero
-`--plot-index` support still require the explicitly marked 0x82 reader
-extension, which unmodified upstream readers cannot read.
+retains shared-ID files with nonzero starting indices. Those files require
+the explicitly marked 0x82 reader extension, which unmodified upstream
+readers cannot read.
 
 PoS2 1.0 changes the Feistel cipher as well as the file format. Old raw plots,
 earlier experimental groups, and saved jobs require replotting; renaming or
@@ -213,8 +716,8 @@ establish compatibility with a released farmer.
 
 ## Devices and CPU workers
 
-`xchplot2 devices` lists the IDs accepted by `--devices`. With no selection,
-plotting uses one GPU. CPU plotting is opt-in and uses pos2-chip's CPU
+`xchplot2 devices` lists the IDs accepted by `--devices`. Without an enrolled
+compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses pos2-chip's CPU
 implementation. Combine selectors with commas:
 
 | Selector | Workers |
@@ -673,7 +1176,7 @@ common commands and options; use this reference for the complete command guide.
 | `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
-| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr.     |
+| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr. The [group construction engine](#construction-and-recovery) also reports output transfers, host CPU time and controller waits. Diagnostic synchronization can change overlap; these are not kernel-busy measurements. |
 | `ACPP_GFX=gfxXXXX` | AMD container AOT target; Cargo detects the GPU separately. See [AMD target selection](INSTALL.md#amd-target-selection). |
 | `ACPP_TARGETS=...` | Override Cargo target selection, such as `generic` or `hip:gfx1031`. For direct CMake use `-DACPP_TARGETS=...`. |
 | `CUDA_ARCHITECTURES=89`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |

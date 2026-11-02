@@ -1,0 +1,26 @@
+diff --git a/plot/Plotter.hpp b/plot/Plotter.hpp
+--- a/plot/Plotter.hpp
++++ b/plot/Plotter.hpp
+@@ -1,4 +1,6 @@
+ #pragma once
+ 
++#define GROW_MOVE_PLOTTER_OUTPUT 1
++
+ #include <algorithm> // std::max, std::copy
+ #include <array>
+@@ -11,6 +13,7 @@
+ #include <optional>
+ #include <stdexcept> // std::runtime_error
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "PlotData.hpp"
+@@ -243,6 +246,6 @@
+ #endif
+         }
+-        plot_data.t3_proof_fragments = t3_proof_fragments;
++        plot_data.t3_proof_fragments = std::move(t3_proof_fragments);
+ 
+         return plot_data;
+     }

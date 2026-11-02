@@ -35,8 +35,8 @@ cp /usr/share/common-licenses/Apache-2.0 "$licenses/Apache-2.0.txt"
 # LLVM's distribution libraries have additional ABI-versioned dependencies.
 # Bundle their permissively licensed runtimes so other Linux distributions do
 # not need Ubuntu's particular libxml2/ICU versions installed system-wide.
-libraries=(libffi.so.8 libedit.so.2 libz.so.1 libzstd.so.1 libtinfo.so.6 libbsd.so.0 liblzma.so.5 libmd.so.0)
-packages=(libffi8 libedit2 zlib1g libzstd1 libtinfo6 libbsd0 liblzma5 libmd0)
+libraries=(libffi.so.8 libedit.so.2 libz.so.1 libzstd.so.1 libtinfo.so.6 libbsd.so.0 liblzma.so.5 libmd.so.0 libssl.so.3 libcrypto.so.3)
+packages=(libffi8 libedit2 zlib1g libzstd1 libtinfo6 libbsd0 liblzma5 libmd0 libssl-dev)
 if [[ $arch == aarch64 ]]; then
     libraries+=(libxml2.so.16 libLLVM.so.21.1 libhiprtc-builtins.so.7)
     packages+=(libxml2-16 libllvm21 libhiprtc-builtins7 ocl-icd-libopencl1 libomp5)

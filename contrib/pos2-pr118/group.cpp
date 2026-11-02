@@ -1,5 +1,5 @@
 // Experimental PR #118 multi-member writer. The production format stays unchanged.
-#include "plot/PlotFile.hpp"
+#include "host/GroupFormat.hpp"
 #include "pos/ProofValidator.hpp"
 #include "pos2_keygen.h"
 #include "prove/Prover.hpp"
@@ -7,12 +7,20 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
+
+#ifdef _WIN32
+#include "../../src/host/WindowsFile.hpp"
+#else
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -21,57 +29,14 @@ static_assert(sizeof(PlotGroupFile::Info) == 64 &&
               offsetof(PlotGroupFile::Info, version) == 58 &&
               offsetof(PlotGroupFile::Info, memo_length) == 62);
 
-void require(bool condition, std::string const& message)
-{
-    if (!condition)
-        throw std::runtime_error(message);
-}
-uint64_t number(char const* text)
-{
-    std::string s(text);
-    require(!s.empty() && s.find_first_not_of("0123456789") == s.npos, "invalid integer");
-    return std::stoull(s);
-}
-std::vector<uint8_t> hex(std::string const& text)
-{
-    require(text.size() % 2 == 0, "invalid hex length");
-    auto digit = [](char c)
-    {
-        if (c >= '0' && c <= '9')
-            return c - '0';
-        if (c >= 'a' && c <= 'f')
-            return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F')
-            return c - 'A' + 10;
-        throw std::runtime_error("invalid hex");
-    };
-    std::vector<uint8_t> bytes;
-    for (size_t i = 0; i < text.size(); i += 2)
-        bytes.push_back((digit(text[i]) << 4) | digit(text[i + 1]));
-    return bytes;
-}
-std::string hex(std::span<uint8_t const> bytes)
-{
-    return Utils::bytesToHex(bytes);
-}
-template <typename T> T read(std::ifstream& in)
-{
-    T value{};
-    in.read(reinterpret_cast<char*>(&value), sizeof(value));
-    return value;
-}
-std::ifstream input(std::string const& path)
-{
-    std::ifstream in(path, std::ios::binary);
-    require(bool(in), "cannot open " + path);
-    in.exceptions(std::ios::failbit | std::ios::badbit);
-    return in;
-}
+using namespace group_tools;
 struct Raw
 {
     std::string path;
-    std::vector<uint64_t> offsets;
     std::vector<uint64_t> fragments;
+    uint64_t count = 0;
+    uint64_t data_start = 0;
+    uint64_t next_offset = 0;
     uint64_t cached = std::numeric_limits<uint64_t>::max();
 };
 struct Job
@@ -98,10 +63,17 @@ struct Job
             chunk >> (PlotFile::CHUNK_SPAN_RANGE_BITS - PlotGroupFile::PROOFS_PER_CHUNK_BITS);
         if (raw.cached != raw_chunk)
         {
+            require(raw_chunk < raw.count, "raw chunk index outside file");
+            // Both assembly and exhaustive verification visit regions in order.
+            // Restart at zero for verification after assembly in the same job.
+            if (raw_chunk == 0)
+                raw.next_offset = raw.data_start;
+            else
+                require(raw.cached + 1 == raw_chunk, "raw chunks must be read in order");
             cached_bytes -= raw.fragments.capacity() * 8;
             std::vector<uint64_t>().swap(raw.fragments);
             auto in = input(raw.path);
-            in.seekg(raw.offsets.at(raw_chunk));
+            in.seekg(raw.next_offset);
             uint64_t const bytes = read<uint64_t>(in);
             room(bytes + live);
             require(bytes >= 12, "raw chunk too small");
@@ -112,7 +84,7 @@ struct Job
             require(stub_size == (uint64_t(count) * (params.get_k() - 2) + 7) / 8,
                     "invalid raw stub length");
             room(bytes + uint64_t(count) * 32 + live);
-            in.seekg(raw.offsets.at(raw_chunk) + 8);
+            in.seekg(raw.next_offset + 8);
             std::vector<uint8_t> compressed(bytes);
             in.read(reinterpret_cast<char*>(compressed.data()), bytes);
             require(count > 0, "empty raw chunk");
@@ -131,6 +103,7 @@ struct Job
                         raw.fragments.back() < start + (1ull << (params.get_k() + 16)),
                     "raw fragments outside chunk");
             raw.cached = raw_chunk;
+            raw.next_offset += 8 + bytes;
         }
         uint64_t const start = chunk * region_range;
         auto first = std::lower_bound(raw.fragments.begin(), raw.fragments.end(), start);
@@ -140,7 +113,7 @@ struct Job
         return {first, last};
     }
 };
-Job load_job(std::string const& path, uint64_t budget, bool allow_missing = false)
+Job load_job(std::string const& path, uint64_t budget, bool verification, bool allow_missing = false)
 {
     require(std::filesystem::file_size(path) < budget / 16,
             "group input manifest exceeds RAM budget");
@@ -161,8 +134,10 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
             "invalid experimental group parameters (k must be 18..28)");
     require(plot_index_base <= 65535, "group member index base exceeds 65535");
     PlotGroupParams params{PlotGroupId(group_hex), uint8_t(k), uint8_t(strength), uint8_t(meta)};
+    // Streamed index buffers, streams and compression table. Verification still
+    // uses the upstream reader's complete index and its separate buffer reserve.
     Job job{params, hex(memo_hex), {}, uint16_t(plot_index_base), budget,
-            PlotGroupFile::getChunkCountForK(k) * 24};
+            1024 * 1024 + (verification ? PlotGroupFile::getChunkCountForK(k) * 24 : 0)};
     require(job.memo.size() <= 255, "memo too long");
     require(job.fixed < budget, "group index exceeds RAM budget");
     // The file-size cap above bounds text allocation before std::quoted parses.
@@ -172,12 +147,12 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
     {
         require(job.members.size() < 65535 && name.size() <= 4096,
                 "too many members or path too long");
-        job.members.push_back(Raw{name, {}, {}, std::numeric_limits<uint64_t>::max()});
+        job.members.push_back(Raw{name});
     }
     require(in.eof() && !job.members.empty(), "invalid or empty member list");
     require(plot_index_base + job.members.size() <= 65536, "group member index exceeds 65535");
     uint64_t const max_raw_count = 1ull << (k - PlotFile::CHUNK_SPAN_RANGE_BITS);
-    job.fixed += job.members.size() * (max_raw_count * 8 + 4096);
+    job.fixed += job.members.size() * 4096;
     job.room(0);
     for (size_t member = 0; member < job.members.size(); ++member)
     {
@@ -202,15 +177,17 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
         uint64_t const count = read<uint64_t>(file);
         require(count > 0 && count <= max_raw_count, "raw chunk count exceeds bounds");
         require(size >= 51 + memo.size() + count * 8, "truncated raw index");
-        raw.offsets.resize(count);
-        file.read(reinterpret_cast<char*>(raw.offsets.data()), count * 8);
-        uint64_t end = 51 + memo.size() + count * 8;
-        for (uint64_t offset : raw.offsets)
+        raw.count = count;
+        raw.data_start = 51 + memo.size() + count * 8;
+        uint64_t end = raw.data_start;
+        auto payload = input(raw.path);
+        for (uint64_t chunk = 0; chunk < count; ++chunk)
         {
+            uint64_t const offset = read<uint64_t>(file);
             require(offset == end && offset <= size && size - offset >= 8,
                     "invalid raw chunk offset");
-            file.seekg(offset);
-            uint64_t const bytes = read<uint64_t>(file);
+            payload.seekg(offset);
+            uint64_t const bytes = read<uint64_t>(payload);
             require(bytes <= size - offset - 8, "truncated raw chunk");
             end = offset + bytes + 8;
         }
@@ -218,33 +195,46 @@ Job load_job(std::string const& path, uint64_t budget, bool allow_missing = fals
     }
     return job;
 }
-// Same normalization as pinned PlotGroupFile::createFSECTable (private upstream).
-std::unique_ptr<FSE_CTable, decltype(&POS2_FSE_freeCTable)> compression_table()
+std::unique_ptr<FILE, int (*)(FILE*)> index_file(std::string const& output_path)
 {
-    std::array<short, 256> norm{};
-    std::array<double, 178> weights{};
-    double total = 0;
-    for (size_t i = 0; i < weights.size(); ++i)
+    // Follow TempFile's private, exclusive creation and crash cleanup, keeping
+    // the index on the output filesystem without linking the spill subsystem.
+    auto const parent = std::filesystem::path(output_path).parent_path();
+    std::string path = (parent / "xchplot2-group-index-XXXXXX").string();
+#ifdef _WIN32
+    int const fd = pos2gpu::create_private_temp(path, FILE_FLAG_DELETE_ON_CLOSE);
+    FILE* file = ::_fdopen(fd, "w+b");
+    if (!file) ::_close(fd);
+#else
+    int const fd = ::mkstemp(path.data());
+    require(fd >= 0, "cannot create group index temporary file");
+    if (::unlink(path.c_str()) != 0)
     {
-        weights[i] = std::exp(-double(i) / 256.0);
-        total += weights[i];
+        ::close(fd);
+        throw std::runtime_error("cannot unlink group index temporary file");
     }
-    int assigned = 0;
-    for (size_t i = 0; i < weights.size(); ++i)
-    {
-        norm[i] = std::max(short(1), short(weights[i] / total * 2048 + 0.5));
-        assigned += norm[i];
-    }
-    norm[0] += short(2048 - assigned);
-    std::unique_ptr<FSE_CTable, decltype(&POS2_FSE_freeCTable)> table(
-        POS2_FSE_createCTable(177, 11), POS2_FSE_freeCTable);
-    require(bool(table), "cannot allocate FSE table");
-    require(!POS2_FSE_isError(POS2_FSE_buildCTable(table.get(), norm.data(), 177, 11)),
-            "cannot build FSE table");
-    return table;
+    FILE* file = ::fdopen(fd, "w+b");
+    if (!file) ::close(fd);
+#endif
+    require(file != nullptr, "cannot open group index temporary stream");
+    return {file, &std::fclose};
 }
 void assemble(Job& job, std::string const& output_path)
 {
+    auto index = index_file(output_path);
+    BitWriter index_bits;
+    auto flush_index = [&](bool finish)
+    {
+        // GSZ entries may cross a byte boundary. Keep its unfinished byte.
+        auto const bytes = index_bits.asBytes();
+        size_t const count = finish ? bytes.size() : index_bits.bitCount() / 8;
+        uint32_t const carry = finish ? 0 : uint32_t(index_bits.bitCount() % 8);
+        uint8_t const tail = carry ? bytes[count] : 0;
+        require(std::fwrite(bytes.data(), 1, count, index.get()) == count,
+                "cannot write group index");
+        index_bits.clear();
+        if (carry) index_bits.append(tail, carry);
+    };
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
     require(bool(out), "cannot create group temporary file");
     out.exceptions(std::ios::badbit | std::ios::failbit);
@@ -264,9 +254,8 @@ void assemble(Job& job, std::string const& output_path)
     out.write(reinterpret_cast<char*>(job.memo.data()), job.memo.size());
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
     uint64_t const range = 1ull << (header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
-    uint64_t const threshold = 178ull << (header.k - 8);
     auto table = compression_table();
-    std::vector<uint64_t> sizes(chunks);
+    uint32_t const rice = uint32_t(gsz_rice_k_for_g(header.group_size));
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
         uint64_t const begin = uint64_t(out.tellp());
@@ -288,14 +277,7 @@ void assemble(Job& job, std::string const& output_path)
                 uint64_t const value = fragment + member * range;
                 uint64_t const delta = value - previous;
                 previous = value;
-                uint64_t const quotient = delta / threshold;
-                uint64_t const remainder = delta % threshold;
-                require(quotient + 1 + header.k - 8 <= 64, "unencodable fragment delta");
-                uint64_t const unary = (1ull << quotient) - 1;
-                bits.append((unary << (header.k - 8)) |
-                                (remainder & ((1ull << (header.k - 8)) - 1)),
-                            uint32_t(quotient + 1 + header.k - 8));
-                high.push_back(uint8_t(remainder >> (header.k - 8)));
+                append_delta(delta, header.k, high, bits);
             }
         }
         job.room(high.size() * 64);
@@ -313,21 +295,21 @@ void assemble(Job& job, std::string const& output_path)
         out.write(reinterpret_cast<char*>(ans.data()), size);
         auto bytes = bits.asBytes();
         out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size());
-        sizes[chunk] = uint64_t(out.tellp()) - begin;
-    }
-    header.chunk_index_offset = uint64_t(out.tellp());
-    BitWriter index;
-    uint32_t const rice = uint32_t(gsz_rice_k_for_g(header.group_size));
-    for (uint64_t size : sizes)
-    {
-        int64_t const delta = int64_t(size) - int64_t(gsz_expected_for_g(header.group_size));
+        uint64_t const chunk_size = uint64_t(out.tellp()) - begin;
+        int64_t const delta = int64_t(chunk_size) - int64_t(gsz_expected_for_g(header.group_size));
         uint64_t const magnitude = delta < 0 ? uint64_t(-delta) : uint64_t(delta);
         require((magnitude >> rice) + rice + 2 <= 64,
                 "group chunk index cannot encode this group size");
+        gsz_encode(std::span<uint64_t const>(&chunk_size, 1), header.group_size, index_bits);
+        if (index_bits.asBytes().size() >= 65536) flush_index(false);
     }
-    gsz_encode(sizes, header.group_size, index);
-    auto bytes = index.asBytes();
-    out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size());
+    header.chunk_index_offset = uint64_t(out.tellp());
+    flush_index(true);
+    require(std::fseek(index.get(), 0, SEEK_SET) == 0, "cannot rewind group index");
+    std::array<char, 65536> buffer;
+    while (size_t const bytes = std::fread(buffer.data(), 1, buffer.size(), index.get()))
+        out.write(buffer.data(), bytes);
+    require(!std::ferror(index.get()), "cannot read group index");
     out.seekp(0);
     out.write(reinterpret_cast<char*>(&header), sizeof(header));
     out.close();
@@ -488,7 +470,7 @@ int main(int argc, char** argv)
 try
 {
     require(std::endian::native == std::endian::little, "upstream format requires little endian");
-    require(argc >= 2, "identity|prepare|assemble|verify");
+    require(argc >= 2, "identity|prepare|assemble|assemble-only|verify|check-raw");
     std::string const mode = argv[1];
     if (mode == "identity")
     {
@@ -499,16 +481,22 @@ try
         prepare(argc, argv);
     else
     {
-        require((mode == "assemble" || mode == "verify" || mode == "check-raw") && argc == 5,
-                "assemble|verify|check-raw INPUTS GROUP_FILE RAM_MIB");
+        require((mode == "assemble" || mode == "assemble-only" || mode == "verify" ||
+                 mode == "check-raw") && argc == 5,
+                "assemble|assemble-only|verify|check-raw INPUTS GROUP_FILE RAM_MIB");
         uint64_t const mib = number(argv[4]);
         require(mib >= 16 && mib <= 1048576, "RAM budget must be 16..1048576 MiB");
-        auto job = load_job(argv[2], mib * 1024 * 1024, mode == "check-raw");
+        bool const verification = mode == "assemble" || mode == "verify";
+        // check-raw is the runner's preflight before plotting: retain its
+        // verification reserve so an inadequate budget fails before that work.
+        auto job = load_job(argv[2], mib * 1024 * 1024,
+                            verification || mode == "check-raw", mode == "check-raw");
         if (mode == "check-raw")
             return 0;
-        if (mode == "assemble")
+        if (mode == "assemble" || mode == "assemble-only")
             assemble(job, argv[3]);
-        verify(job, argv[3]);
+        if (verification)
+            verify(job, argv[3]);
     }
     return 0;
 }
