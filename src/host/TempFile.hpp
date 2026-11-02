@@ -53,10 +53,11 @@ public:
 
     // Pageable, file-backed home for a CPU-touched buffer (the host-RAM
     // disk-offload; see the README's "Host RAM and disk-offload").
-    // Sizes the file to `bytes` and maps it read/write and shared, returning a host
-    // pointer the CPU (and pageable-host DMA) can use as a drop-in
-    // replacement for a pinned allocation. Unlike pinned pages, these
-    // are reclaimable: under memory pressure the kernel writes dirty
+    // Sizes the file to `bytes` and maps it read/write and shared for CPU
+    // access. Device transfers go through SpillEngine's pinned staging
+    // windows; directly registering a file mapping for DMA can stall in
+    // filesystem writeback. Unlike pinned pages, these are reclaimable:
+    // under memory pressure the kernel writes dirty
     // pages back to THIS temp file (not swap) and evicts clean ones, so
     // the resident set can fall below `bytes`. Only ONE mapping per
     // TempFile; call unmap() (or let the destructor run) to release it.

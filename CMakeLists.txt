@@ -480,6 +480,12 @@ if(NOT AdaptiveCpp_FOUND)
                 "${CMAKE_CURRENT_SOURCE_DIR}/ci/release/adaptivecpp-level-zero-events.patch"
                 WORKING_DIRECTORY "${adaptivecpp_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
         endif()
+        file(READ "${adaptivecpp_SOURCE_DIR}/src/runtime/ze/ze_queue.cpp" _x2_ze_queue_source)
+        if(NOT _x2_ze_queue_source MATCHES "void ze_queue::prepare_submission")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" apply
+                "${CMAKE_CURRENT_SOURCE_DIR}/ci/release/adaptivecpp-level-zero-event-lifetime.patch"
+                WORKING_DIRECTORY "${adaptivecpp_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+        endif()
         set(_x2_acpp_prefix "$ENV{ACPP_PREFIX}")
         if(NOT _x2_acpp_prefix)
             set(_x2_acpp_prefix "$ENV{HOME}/.local")

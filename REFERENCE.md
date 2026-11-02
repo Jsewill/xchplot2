@@ -912,6 +912,7 @@ cap. CPU allocations and cache activity affect those counters, so they cannot
 measure dedicated GPU memory use. `POS2GPU_ASSERT_VRAM=1` is unavailable on
 these devices; use `POS2GPU_ASSERT_VRAM=0` for throughput benchmarks. CPU byte
 parity and full-proof checks still apply to plotting correctness.
+See the [integrated Intel limitation](#troubleshooting) before production use.
 
 The streaming base peaks below come from [VramBudget.hpp](src/host/VramBudget.hpp).
 They are allocation models, not the desktop driver deltas or host RSS in
@@ -1105,6 +1106,10 @@ common commands and options; use this reference for the complete command guide.
   the floor the spill can reach, so if it says the gap cannot be
   closed, the box genuinely needs more RAM for that card. See [Host RAM
   and disk-offload](#host-ram-and-disk-offload).
+
+- **Integrated Intel Level Zero plotting**: production plotting remains
+  unqualified because large sorts can produce incorrect fragments. Use
+  `--devices cpu` for production jobs on these devices.
 
 - **Intel Arc B580 sort hangs**: on Fedora 44 with AdaptiveCpp 25.10 and
   Intel compute-runtime 26.22, disable direct submission. Apply the workaround to the plotting process:

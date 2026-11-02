@@ -458,7 +458,8 @@ struct StreamingPinnedScratch {
     //     resides in host RAM, so the RSS win is real even without
     //     memory pressure.
     //   - CPU-touched tables (mmap'd TempFile, pageable drop-in):
-    //     h_frags. Reclaimable only under pressure.
+    //     h_frags. Device transfers also use the shared staging windows;
+    //     the mapping stays CPU-only and reclaimable under pressure.
     // Some large tables are deliberately NOT routable because a device
     // KERNEL accesses them through a USM-host pointer, which a disk file
     // or mmap cannot satisfy: h_keys_merged and the partition's h_part_*

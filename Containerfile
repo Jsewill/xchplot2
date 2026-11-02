@@ -170,11 +170,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSfL \
 ENV PATH=/root/.cargo/bin:${PATH}
 
 # AdaptiveCpp from source, pinned. Installs to /opt/adaptivecpp.
-COPY ci/release/adaptivecpp-level-zero-events.patch /tmp/
+COPY ci/release/adaptivecpp-level-zero-events.patch ci/release/adaptivecpp-level-zero-event-lifetime.patch /tmp/
 RUN git clone --depth 1 --branch ${ACPP_REF} \
         https://github.com/AdaptiveCpp/AdaptiveCpp.git /tmp/acpp-src \
  && (git -C /tmp/acpp-src apply --reverse --check /tmp/adaptivecpp-level-zero-events.patch 2>/dev/null \
      || git -C /tmp/acpp-src apply /tmp/adaptivecpp-level-zero-events.patch) \
+ && (git -C /tmp/acpp-src apply --reverse --check /tmp/adaptivecpp-level-zero-event-lifetime.patch 2>/dev/null \
+     || git -C /tmp/acpp-src apply /tmp/adaptivecpp-level-zero-event-lifetime.patch) \
  && cmake -S /tmp/acpp-src -B /tmp/acpp-build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/adaptivecpp \

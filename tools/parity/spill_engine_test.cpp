@@ -56,22 +56,29 @@ void check(bool ok, char const* what)
 struct MemOps final : pos2gpu::SpillHostOps
 {
     int live = 0;
+    std::vector<void*> staging;
 
     void* alloc_staging(std::size_t bytes, char const*) override
     {
         void* p = std::malloc(bytes);
         if (!p) throw std::bad_alloc();
         ++live;
+        staging.push_back(p);
         return p;
     }
     void free_staging(void* p) override
     {
         if (!p) return;
+        staging.erase(std::remove(staging.begin(), staging.end(), p), staging.end());
         std::free(p);
         --live;
     }
     void copy_blocking(void* dst, void const* src, std::size_t bytes) override
     {
+        if ((std::find(staging.begin(), staging.end(), dst) == staging.end() &&
+             std::find(staging.begin(), staging.end(), src) == staging.end()) ||
+            bytes > pos2gpu::SpillEngine::kStageBytes)
+            throw std::runtime_error("device copy bypassed the staging window");
         std::memcpy(dst, src, bytes);
     }
 };
@@ -218,6 +225,37 @@ int main()
         a.read_to_device(mid.data(), half, 1024);
         check(std::equal(mid.begin(), mid.end(), a_src.begin() + half),
               "a sub-range read lands at entry_off * elem");
+    }
+
+    // Mapped tables share the same windows, including a partial final chunk.
+    // CPU edits must survive H2D, and an earlier deferred file write must
+    // finish before a mapped transfer reuses its window.
+    {
+        EngineWithThreads e(2);
+        std::size_t const bytes = kWin * 5 / 2 + 17;
+        std::vector<std::uint8_t> src(bytes), dst(bytes, 0);
+        for (std::size_t i = 0; i < bytes; ++i)
+            src[i] = static_cast<std::uint8_t>((i * 37) ^ (i >> 12));
+        pos2gpu::TempFile file;
+        auto* mapped = static_cast<std::uint8_t*>(file.map(bytes));
+
+        auto const pending = ramp(1024, 0x9876ull);
+        SpillBuffer other(*e, sizeof(std::uint64_t), pending.size());
+        e.eng->io_delay_us = 20000;
+        other.write_from_device(pending.data(), 0, pending.size());
+        e.eng->copy_to_mapped(mapped, src.data(), bytes);
+        check(std::memcmp(mapped, src.data(), bytes) == 0,
+              "device-to-mapped copy uses staging across full and partial windows");
+        for (std::size_t i = 0; i < bytes; ++i) mapped[i] ^= 0x5a;
+        e.eng->copy_from_mapped(dst.data(), mapped, bytes);
+        for (auto& value : src) value ^= 0x5a;
+        check(dst == src, "mapped CPU edits survive the staged device copy");
+
+        std::vector<std::uint64_t> reread(pending.size());
+        other.file.pread_at(0, reread.data(), reread.size() * sizeof(std::uint64_t));
+        check(reread == pending, "mapped transfers preserve pending writes on shared windows");
+        check(e.ops.live == SpillEngine::kNumWindows,
+              "mapped transfers reuse the existing pinned windows");
     }
 
     // ---------------------------------------------------------------

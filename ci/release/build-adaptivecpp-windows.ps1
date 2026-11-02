@@ -40,6 +40,9 @@ if (-not (Get-Content "$acpp/src/runtime/CMakeLists.txt" -Raw).Contains('LEVEL_Z
 if (-not (Get-Content "$acpp/src/runtime/ze/ze_hardware_manager.cpp" -Raw).Contains('if(_num_used_events >= _pool_size)')) {
     git -C $acpp apply "$PWD/ci/release/adaptivecpp-level-zero-events.patch"
 }
+if (-not (Get-Content "$acpp/src/runtime/ze/ze_queue.cpp" -Raw).Contains('void ze_queue::prepare_submission')) {
+    git -C $acpp apply "$PWD/ci/release/adaptivecpp-level-zero-event-lifetime.patch"
+}
 if (-not (Get-Content "$acpp/src/runtime/cuda/cuda_queue.cpp" -Raw).Contains('LLVM 20 targets')) {
     git -C $acpp apply "$PWD/ci/release/adaptivecpp-cuda-llvm20.patch"
 }
@@ -136,6 +139,7 @@ if ($arm64) {
 Copy-Item "$acpp/LICENSE" "$prefix/adaptivecpp-license.txt"
 Copy-Item ci/release/adaptivecpp-cuda-llvm20.patch "$prefix/adaptivecpp-cuda-llvm20.txt"
 Copy-Item ci/release/adaptivecpp-level-zero-events.patch "$prefix/adaptivecpp-level-zero-events.txt"
+Copy-Item ci/release/adaptivecpp-level-zero-event-lifetime.patch "$prefix/adaptivecpp-level-zero-event-lifetime.txt"
 Copy-Item "$root/llvm/llvm/LICENSE.TXT" "$prefix/llvm-license.txt"
 @"
 AdaptiveCpp: $revision

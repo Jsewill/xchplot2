@@ -4679,10 +4679,9 @@ t3_match_entry:
             h_frags = h_frags_owned_oneshot;
             d_frags_out_on_host = true;
         } else if (scratch.spill.h_frags) {
-            // ~2 GiB pageable, file-backed drop-in. q.memcpy D2H into it
-            // (line ~4614) and std::inplace_merge both work on a plain
-            // host pointer; under pressure the kernel reclaims its pages
-            // to THIS temp file instead of holding them pinned.
+            // ~2 GiB pageable, file-backed merge target. Device transfers
+            // use the existing spill windows; only CPU code touches the
+            // mapping, whose pages remain reclaimable under pressure.
             frags_spill_file = std::make_unique<pos2gpu::TempFile>();
             h_frags = static_cast<uint64_t*>(
                 frags_spill_file->map(cap * sizeof(uint64_t)));
@@ -4729,8 +4728,13 @@ t3_match_entry:
                 d_sort_scratch_tile, t3_tile_sort_bytes,
                 const_cast<uint64_t*>(sort_in), d_frags_out_tile,
                 tile_n, /*begin_bit=*/0, /*end_bit=*/2 * cfg.k, q);
-            q.memcpy(h_frags + tile_off, d_frags_out_tile,
-                     tile_n * sizeof(uint64_t)).wait();
+            if (frags_spill_file)
+                ensure_spill_engine().copy_to_mapped(
+                    h_frags + tile_off, d_frags_out_tile,
+                    tile_n * sizeof(uint64_t));
+            else
+                q.memcpy(h_frags + tile_off, d_frags_out_tile,
+                         tile_n * sizeof(uint64_t)).wait();
         }
         end_phase(p_t3_sort);
 
@@ -4816,7 +4820,11 @@ t3_match_entry:
             // the existing D2H phase.
             s_malloc(stats, d_frags_out, cap * sizeof(uint64_t), "d_frags_out");
             if (t3_count > 0) {
-                q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
+                if (frags_spill_file)
+                    ensure_spill_engine().copy_from_mapped(
+                        d_frags_out, h_frags, t3_count * sizeof(uint64_t));
+                else
+                    q.memcpy(d_frags_out, h_frags, t3_count * sizeof(uint64_t)).wait();
             }
             if (frags_spill_file) frags_spill_file.reset();  // munmap + drop temp file
             else s_free_host(stats, h_frags, q);

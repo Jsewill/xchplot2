@@ -1,0 +1,139 @@
+AdaptiveCpp 25.10.0 Level Zero event dependency lifetime correction.
+
+Retain each submitted operation's wait events until that operation completes.
+A predecessor can finish before its consumer has read the native wait handle;
+replacing the queue's last event must not destroy that handle. Prepare ownership
+before the asynchronous append, and wait before destroying the command list.
+
+Level Zero requires events to outlive device references:
+https://oneapi-src.github.io/level-zero-spec/level-zero/latest/core/api/apis/event.html#zeeventdestroy
+
+Upstream source is BSD-2-Clause; retain its notices in the patched files.
+
+--- a/include/hipSYCL/runtime/ze/ze_queue.hpp
++++ b/include/hipSYCL/runtime/ze/ze_queue.hpp
+@@ -82,7 +82,15 @@
+   std::vector<ze_event_handle_t>
+   get_enqueued_event_handles() const;
+ 
++  void prepare_submission(const std::shared_ptr<dag_node_event>& evt);
++  void cancel_submission();
+   void register_submitted_op(std::shared_ptr<dag_node_event> evt);
++  void release_completed_dependencies();
++  struct pending_dependencies {
++    std::shared_ptr<dag_node_event> completion;
++    std::vector<std::shared_ptr<dag_node_event>> dependencies;
++  };
++  std::vector<pending_dependencies> _pending_dependencies;
+ 
+   std::shared_ptr<dag_node_event> create_event();
+ 
+--- a/src/runtime/ze/ze_queue.cpp
++++ b/src/runtime/ze/ze_queue.cpp
+@@ -8,6 +8,7 @@
+  * See file LICENSE in the project root for full license details.
+  */
+ // SPDX-License-Identifier: BSD-2-Clause
++#include <algorithm>
+ #include <cassert>
+ #include <chrono>
+ #include <future>
+@@ -177,6 +178,7 @@
+ }
+ 
+ ze_queue::~ze_queue() {
++  wait();
+ 
+   ze_result_t err = zeCommandListDestroy(_command_list);
+   if(err != ZE_RESULT_SUCCESS) {
+@@ -272,6 +274,7 @@
+   std::vector<ze_event_handle_t> wait_events = get_enqueued_event_handles();
+ 
+   if(dimension == 1) {
++    prepare_submission(completion_evt);
+     ze_result_t err = zeCommandListAppendMemoryCopy(
+         _command_list, op.dest().get_access_ptr(), op.source().get_access_ptr(),
+         op.get_num_transferred_bytes(),
+@@ -279,6 +282,7 @@
+         static_cast<uint32_t>(wait_events.size()), wait_events.data());
+ 
+     if(err != ZE_RESULT_SUCCESS) {
++      cancel_submission();
+       return make_error(
+           __acpp_here(),
+           error_info{"ze_queue: zeCommandListAppendMemoryCopy() failed",
+@@ -316,6 +320,7 @@
+   std::vector<ze_event_handle_t> wait_events = get_enqueued_event_handles();
+   
+   auto pattern = op.get_pattern();
++  prepare_submission(completion_evt);
+   ze_result_t err = zeCommandListAppendMemoryFill(
+       _command_list, op.get_pointer(), &pattern, sizeof(decltype(pattern)),
+       op.get_num_bytes(),
+@@ -323,6 +328,7 @@
+       static_cast<uint32_t>(wait_events.size()), wait_events.data());
+ 
+   if(err != ZE_RESULT_SUCCESS) {
++    cancel_submission();
+     return make_error(
+           __acpp_here(),
+           error_info{"ze_queue: zeCommandListAppendMemoryFill() failed",
+@@ -342,6 +348,10 @@
+   }
+   if(_last_event)
+     _last_event->wait();
++  {
++    std::lock_guard<std::mutex> lock{_mutex};
++    release_completed_dependencies();
++  }
+   return make_success();
+ }
+ 
+@@ -417,6 +427,27 @@
+     }
+   }
+   return evts;
++}
++
++void ze_queue::release_completed_dependencies() {
++  _pending_dependencies.erase(
++      std::remove_if(_pending_dependencies.begin(), _pending_dependencies.end(),
++                     [](const pending_dependencies& pending) {
++                       return pending.completion->is_complete();
++                     }),
++      _pending_dependencies.end());
++}
++
++void ze_queue::prepare_submission(const std::shared_ptr<dag_node_event>& evt) {
++  release_completed_dependencies();
++  // Allocate before the asynchronous append. Once it succeeds, updating the
++  // queue's last event must not throw and release live native wait handles.
++  _enqueued_synchronization_ops.reserve(1);
++  _pending_dependencies.push_back({evt, _enqueued_synchronization_ops});
++}
++
++void ze_queue::cancel_submission() {
++  _pending_dependencies.pop_back();
+ }
+ 
+ void ze_queue::register_submitted_op(std::shared_ptr<dag_node_event> evt) {
+@@ -569,6 +600,7 @@
+   HIPSYCL_DEBUG_INFO << "ze_queue: Attempting to submit SSCP kernel"
+                      << std::endl;
+ 
++  prepare_submission(completion_evt);
+   auto submission_err = submit_ze_kernel(
+       kernel, get_ze_command_list(),
+       static_cast<ze_node_event *>(completion_evt.get())->get_event_handle(),
+@@ -576,8 +608,10 @@
+       const_cast<std::size_t *>(_arg_mapper.get_mapped_arg_sizes()),
+       _arg_mapper.get_mapped_num_args(), kernel_info);
+ 
+-  if(!submission_err.is_success())
++  if(!submission_err.is_success()) {
++    cancel_submission();
+     return submission_err;
++  }
+ 
+   register_submitted_op(completion_evt);
+   on_kernel_launch_complete(kernel_name, obj);

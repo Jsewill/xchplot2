@@ -454,6 +454,33 @@ struct SpillEngine {
                           std::chrono::steady_clock::now() - t0).count();
         rethrow_locked();
     }
+
+    // File mappings stay CPU-only. Registering their pages for a device copy
+    // can stall in filesystem writeback (Level Zero on Btrfs). Reuse an idle
+    // staging window, so mapped tables add no pinned allocation of their own.
+    void copy_to_mapped(void* mapped, void const* device, size_t bytes) {
+        drain();
+        auto* dst = static_cast<uint8_t*>(mapped);
+        auto const* src = static_cast<uint8_t const*>(device);
+        for (size_t done = 0; done < bytes; ) {
+            size_t const n = std::min<size_t>(kStageBytes, bytes - done);
+            ops->copy_blocking(win[0], src + done, n);
+            std::memcpy(dst + done, win[0], n);
+            done += n;
+        }
+    }
+
+    void copy_from_mapped(void* device, void const* mapped, size_t bytes) {
+        drain();
+        auto* dst = static_cast<uint8_t*>(device);
+        auto const* src = static_cast<uint8_t const*>(mapped);
+        for (size_t done = 0; done < bytes; ) {
+            size_t const n = std::min<size_t>(kStageBytes, bytes - done);
+            std::memcpy(win[0], src + done, n);
+            ops->copy_blocking(dst + done, win[0], n);
+            done += n;
+        }
+    }
 };
 
 // One spilled table. Owns its TempFile + element size; borrows the

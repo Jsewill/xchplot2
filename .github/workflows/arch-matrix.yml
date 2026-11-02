@@ -118,7 +118,7 @@ jobs:
           # cache that lands the dir but is corrupt would only show as
           # a downstream link error — at which point bumping
           # install-deps.sh's hash naturally re-keys the cache.
-          key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh', 'ci/release/adaptivecpp-level-zero-events.patch') }}
+          key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh', 'ci/release/adaptivecpp-level-zero-*.patch') }}
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
           # Distro-aware bootstrap: apt-installs build-essential, cmake,

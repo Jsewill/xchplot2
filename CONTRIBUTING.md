@@ -429,7 +429,11 @@ checks do not qualify GPU drivers or hardware.
 All project-managed AdaptiveCpp builds apply
 `ci/release/adaptivecpp-level-zero-events.patch`, which backports upstream's
 event-pool rotation fix. The first event in a new pool must consume its slot
-before another command can allocate one. Existing Intel toolchains need the
+before another command can allocate one. They also apply
+`ci/release/adaptivecpp-level-zero-event-lifetime.patch` to retain native wait
+events until their consuming commands complete. Ownership is prepared before
+submission, and completed dependencies are released under the queue mutex.
+Existing Intel toolchains need the
 [rebuild described in INSTALL.md](INSTALL.md#native-install).
 
 Linux archives also include OpenSSL 3 and the mdns license.
