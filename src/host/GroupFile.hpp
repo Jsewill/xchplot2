@@ -254,8 +254,18 @@ inline Count write_file(int fd, void const* data, size_t bytes)
 inline int resize_file(int fd, Offset bytes)
 {
     if (bytes < 0) { errno = EINVAL; return -1; }
+    FILE_STANDARD_INFO current{};
+    if (!::GetFileInformationByHandleEx(handle(fd), FileStandardInfo, &current, sizeof(current))) return failed();
     FILE_END_OF_FILE_INFO value{}; value.EndOfFile.QuadPart = bytes;
-    return ::SetFileInformationByHandle(handle(fd), FileEndOfFileInfo, &value, sizeof(value)) ? 0 : failed();
+    if (!::SetFileInformationByHandle(handle(fd), FileEndOfFileInfo, &value, sizeof(value))) return failed();
+    // NTFS otherwise retains excess allocation until close, invalidating the
+    // controller's saved file guards. Growing still keeps preflight reserves.
+    if (bytes <= current.EndOfFile.QuadPart)
+    {
+        FILE_ALLOCATION_INFO allocation{}; allocation.AllocationSize.QuadPart = bytes;
+        if (!::SetFileInformationByHandle(handle(fd), FileAllocationInfo, &allocation, sizeof(allocation))) return failed();
+    }
+    return 0;
 }
 inline int allocate_file(int fd, int mode, Offset offset, Offset bytes)
 {

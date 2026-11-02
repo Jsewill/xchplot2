@@ -68,6 +68,9 @@ int main() try
     require(!io::allocate_file(file.fd, io::keep_size, 0, reserved / 2), "smaller physical reservation failed");
     io::Stat retained{}; require(!io::inspect_fd(file.fd, &retained) && !retained.st_size && retained.st_blocks >= allocated.st_blocks,
         "smaller reservation released previously admitted physical storage");
+    require(!io::resize_file(file.fd, 4096), "native file extension failed");
+    io::Stat extended{}; require(!io::inspect_fd(file.fd, &extended) && extended.st_size == 4096 && extended.st_blocks >= allocated.st_blocks,
+        "extending EOF released preflight allocation");
     std::array<uint8_t, 4096> first{}, second{}; first.fill(0x51); second.fill(0xb2);
     auto a = std::async(std::launch::async, [&] { require(io::write_at(file.fd, first.data(), first.size(), 0) == first.size(), "first positioned write failed"); });
     auto b = std::async(std::launch::async, [&] { require(io::write_at(file.fd, second.data(), second.size(), first.size()) == second.size(), "second positioned write failed"); });
@@ -87,9 +90,25 @@ int main() try
     require(!io::resize_file(file.fd, first.size()) && !io::flush(file.fd), "native file resize/barrier failed");
     io::Stat before_close{}, after_close{};
     require(!io::inspect_link(target, &before_close), "cannot inspect synced construction metadata");
+    require(before_close.st_size == first.size() && before_close.st_blocks < allocated.st_blocks,
+        "truncation retained excess preflight allocation or changed EOF");
     file.close();
     require(!io::inspect_link(target, &after_close), "cannot inspect closed construction metadata");
     same_metadata(before_close, after_close);
+    {
+        File reopened(io::open_file(target, io::read_write | io::no_follow));
+        require(!io::allocate_file(reopened.fd, io::keep_size, 0, reserved) &&
+            !io::resize_file(reopened.fd, first.size()) && !io::flush(reopened.fd),
+            "cannot trim a reservation without changing EOF");
+        std::array<uint8_t, 4096> value{};
+        require(io::read_at(reopened.fd, value.data(), value.size(), 0) == value.size() && value == first,
+            "releasing excess allocation changed retained file contents");
+        require(!io::inspect_link(target, &before_close) && before_close.st_blocks < allocated.st_blocks,
+            "same-size truncation retained excess allocation");
+        reopened.close();
+        require(!io::inspect_link(target, &after_close), "cannot inspect reopened construction metadata");
+        same_metadata(before_close, after_close);
+    }
     auto const occupied = directory.path / "occupied";
     { File other(io::open_file(occupied, flags)); }
     require(io::rename_file(target, occupied, false) != 0 && !io::inspect_link(target, &written) && written.st_ino == initial.st_ino,
