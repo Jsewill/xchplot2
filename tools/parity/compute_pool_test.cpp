@@ -705,7 +705,8 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
 {
-    options.max_tasks = 64; options.owner_shares = {{"heavy", 3}, {"light", 1}};
+    // Keep queued requests live through the full scheduling-order check.
+    options.lease_ms = 10000; options.max_tasks = 64; options.owner_shares = {{"heavy", 3}, {"light", 1}};
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient first(endpoint, first_tls), second(endpoint, second_tls), worker(endpoint, worker_tls);
     auto advertised = offer("weighted", 49503); auto model = profile(Kind::GenerateCpu); model.max_batch_members = 3;
@@ -743,6 +744,7 @@ void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOpti
 void idle_lending_fairness(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                           TlsOptions const& worker_tls)
 {
+    options.lease_ms = 10000;
     for (bool blocked : {false, true})
     {
         options.max_tasks = 64;
@@ -785,7 +787,7 @@ void idle_lending_fairness(BrokerOptions options, TlsOptions const& first_tls, T
 void brief_idle_preserves_debt(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                                TlsOptions const& worker_tls)
 {
-    options.max_tasks = 64;
+    options.lease_ms = 10000; options.max_tasks = 64;
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient batch(endpoint, first_tls), steady(endpoint, second_tls), worker(endpoint, worker_tls);
     auto advertised = offer("brief-idle", 49508); auto model = profile(Kind::GenerateCpu);
@@ -822,9 +824,9 @@ void persistent_control(BrokerOptions options, TlsOptions const& owner_tls, TlsO
     worker.register_worker(offer("persistent", 49504)); auto session = owner.open_owner("persistent");
     auto request = task("probe");
     for (unsigned i = 0; i < 32; ++i) require(owner.generation_hint(session, request) == 1, "idle channels occupied control handlers");
-    auto short_task = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+    auto short_task = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
     require(short_task.generation_hint(session, request) == 1, "bounded persistent request failed");
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
     require(owner.generation_hint(session, request) == 1, "earlier task deadline poisoned reused control channel");
     transient_rejects([&] { (void)short_task.generation_hint(session, request); });
     auto metrics = owner.metrics();
