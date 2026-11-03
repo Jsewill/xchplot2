@@ -22,6 +22,7 @@ spec.loader.exec_module(pool)
 
 def check(binary, root, service_manager=False):
     services = []
+    worker_address = None
     sequence = 0
     directories = {name: root / name for name in ("authority", "worker", "owner")}
 
@@ -70,7 +71,6 @@ def check(binary, root, service_manager=False):
             try:
                 result = run("authority", "service", "status")
                 print("Service status after failure:\n" + result.stdout + result.stderr, file=sys.stderr, flush=True)
-                print("Compute status after service failure:\n" + json.dumps(status("owner")), file=sys.stderr, flush=True)
             except Exception as error:
                 print("Cannot inspect service after failure:", error, file=sys.stderr, flush=True)
             raise
@@ -210,6 +210,23 @@ def check(binary, root, service_manager=False):
         print("PASS generated user service, exact manager actions and unrelated-unit preservation", flush=True)
         if service_manager:
             managed_service()
+    except Exception:
+        for service in services:
+            try:
+                print(f"Process log: {service.log.name} (exit {service.process.poll()})\n" +
+                      service.log.read_text(encoding="utf-8", errors="replace"), file=sys.stderr, flush=True)
+            except OSError as error:
+                print(f"Cannot read process log {service.log.name}:", error, file=sys.stderr, flush=True)
+        queries = [("owner", ())]
+        if worker_address:
+            queries.append(("worker", ("--worker", worker_address)))
+        for name, arguments in queries:
+            try:
+                print(f"{name.capitalize()} compute status after failure:\n" + json.dumps(status(name, *arguments)),
+                      file=sys.stderr, flush=True)
+            except Exception as error:
+                print(f"Cannot inspect {name} compute state after failure:", error, file=sys.stderr, flush=True)
+        raise
     finally:
         for service in reversed(services):
             service.stop()
