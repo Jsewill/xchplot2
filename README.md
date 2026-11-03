@@ -79,20 +79,20 @@ host test binaries.
 
 ## Use
 
-| Command | Purpose and guide |
-|---|---|
-| [xchplot2 plot](REFERENCE.md#plotting-and-recovery) | Create plots from farmer and pool keys |
-| [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout without writing files |
-| [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
-| [xchplot2 grow](REFERENCE.md#growing-an-existing-group) | Extend or recover an existing group file |
-| [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
-| [xchplot2 batch](REFERENCE.md#batch-manifests) | Run or resume a saved plot manifest |
-| [xchplot2 bench](REFERENCE.md#benchmarking) | Measure throughput and estimate time to fill storage |
-| [xchplot2 devices](REFERENCE.md#devices-and-cpu-workers) | List GPUs and CPU NUMA nodes |
-| [xchplot2 verify](REFERENCE.md#verification) | Check an existing plot, including full proofs with `--full` |
-| [xchplot2 test](REFERENCE.md#single-test-plot) | Build a test plot from a group ID and memo |
-| [xchplot2 parity-check](REFERENCE.md#parity-checks) | Run the built parity and host tests |
-| [xchplot2 completions](REFERENCE.md#shell-completions) | Generate Bash, zsh, or fish completions |
+| Category | Command | Purpose and guide |
+|---|---|---|
+| Drive management | [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout without writing files |
+| | [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
+| | [xchplot2 grow](REFERENCE.md#growing-an-existing-group) | Extend or recover an existing group file |
+| Shared compute | [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
+| Plotting jobs | [xchplot2 plot](REFERENCE.md#plotting-and-recovery) | Create plots from farmer and pool keys |
+| | [xchplot2 batch](REFERENCE.md#batch-manifests) | Run or resume a saved plot manifest |
+| Checks and performance | [xchplot2 devices](REFERENCE.md#devices-and-cpu-workers) | List GPUs and CPU NUMA nodes |
+| | [xchplot2 bench](REFERENCE.md#benchmarking) | Measure throughput and estimate time to fill storage |
+| | [xchplot2 verify](REFERENCE.md#verification) | Check an existing plot, including full proofs with `--full` |
+| Testing | [xchplot2 test](REFERENCE.md#single-test-plot) | Build a test plot from a group ID and memo |
+| | [xchplot2 parity-check](REFERENCE.md#parity-checks) | Run the built parity and host tests |
+| Shell setup | [xchplot2 completions](REFERENCE.md#shell-completions) | Generate Bash, zsh, or fish completions |
 
 See [configuration and argument files](REFERENCE.md#configuration-and-argument-files)
 for reusable options. `xchplot2 --help` prints command syntax.
