@@ -4590,7 +4590,15 @@ FarmingJob farming_arguments(Arguments& args)
             job.copies.push_back({path, {}, {}, pending}); return;
         }
         auto const stamp = stream_state::stamp(path);
-        auto state = group_grow::load_farming_state(path, args.max_ram);
+        auto const file = group_grow::read_farming_state(path, args.max_ram);
+        // Every copy is read and checksummed. Canonical replicas already
+        // validated in this discovery need no repeated parsing or formatting.
+        if (revisions.contains(file.digest))
+        {
+            require(stream_state::stamp(path) == stamp, "farming job changed while loading");
+            job.copies.push_back({path, stamp, file.digest, pending}); return;
+        }
+        auto state = group_grow::parse_farming_state(file.body);
         require(stream_state::stamp(path) == stamp, "farming job changed while loading");
         auto const digest = stream_state::digest(group_grow::farming_state_text(state));
         job.copies.push_back({path, stamp, digest, pending});
@@ -5021,25 +5029,33 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
     if (!args.plan_only && run->feasible())
     {
         job.check();
-        auto const digest = stream_state::digest(group_grow::farming_state_text(run->state));
+        std::string digest;
         std::vector<std::optional<stream_state::Stamp>> pending_stamps(directories.size());
         // Prepare all copies before publishing the first. The first published
         // revision commits the addition; an interruption leaves complete .next
         // copies for the remaining members. Partial recovery never changes scope.
-        for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
         {
-            auto const path = directories[i] / "grow-farm.plan";
-            auto const pending = directories[i] / "grow-farm.plan.next";
-            auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
-            auto next = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == pending; });
-            if (next != job.copies.end()) pending_stamps[i] = next->stamp;
-            if (copy != job.copies.end() && copy->stamp && copy->digest == digest) continue;
-            if (next != job.copies.end() && next->stamp)
-                require(next->digest == digest, "pending farming revision differs from the admitted job");
-            else
+            auto contents = group_grow::farming_state_text(run->state);
+            digest = stream_state::digest(contents);
+            contents += digest + '\n';
+            uint64_t const publication_metadata = sum(run->metadata, contents.capacity());
+            require(publication_metadata < args.max_ram, "farming publication metadata exceeds --max-ram");
+            run->planning_peak = std::max(run->planning_peak, publication_metadata);
+            for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
             {
-                group_grow::stage_farming_state(path, run->state);
-                pending_stamps[i] = stream_state::stamp(pending);
+                auto const path = directories[i] / "grow-farm.plan";
+                auto const pending = directories[i] / "grow-farm.plan.next";
+                auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
+                auto next = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == pending; });
+                if (next != job.copies.end()) pending_stamps[i] = next->stamp;
+                if (copy != job.copies.end() && copy->stamp && copy->digest == digest) continue;
+                if (next != job.copies.end() && next->stamp)
+                    require(next->digest == digest, "pending farming revision differs from the admitted job");
+                else
+                {
+                    group_grow::stage_farming_state(path, contents);
+                    pending_stamps[i] = stream_state::stamp(pending);
+                }
             }
         }
         group_grow::grow_failpoint("farm-plan-all-staged");

@@ -231,10 +231,31 @@ inline Topology topology(std::vector<FarmingDestination> const& destinations)
             { if (other < lane) ++value.ranks[lane]; ++value.lanes[lane]; }
     return value;
 }
+struct AssessmentTopology
+{
+    Topology physical;
+    std::vector<uint16_t> ranks, lanes;
+    std::vector<size_t> first;
+};
+inline AssessmentTopology assessment_topology(Topology physical, std::vector<FarmingDrivePlan> const& layouts)
+{
+    AssessmentTopology value; value.physical = std::move(physical);
+    value.ranks.resize(layouts.size()); value.lanes.resize(layouts.size()); value.first.resize(layouts.size());
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    {
+        size_t first = lane;
+        for (size_t other = 0; other < lane; ++other)
+            if (layouts[other].schedule == layouts[lane].schedule) { first = other; break; }
+        value.first[lane] = first;
+        value.ranks[lane] = value.lanes[first]++;
+    }
+    for (size_t lane = 0; lane < layouts.size(); ++lane) value.lanes[lane] = value.lanes[value.first[lane]];
+    return value;
+}
 struct Event { uint64_t family, schedule; uint32_t resource; uint16_t members; bool end; };
 inline FarmingAssessment assess(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
     std::vector<FarmingDrivePlan> const& layouts, std::vector<std::vector<uint16_t>> const* extents,
-    PlanningMemory& memory)
+    PlanningMemory& memory, AssessmentTopology const* prepared = nullptr)
 {
     farming_require(layouts.size() == destinations.size() && (!extents || extents->size() == layouts.size()),
         "farming assessment lane count differs");
@@ -252,27 +273,24 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
         else add(event_count, 4);
     }
     PlanningReservation allocation(memory, 64 * 1024 + event_count * (sizeof(Event) + 8) + destinations.size() * 512);
-    auto input = topology(destinations);
+    AssessmentTopology local;
+    if (!prepared) { local = assessment_topology(topology(destinations), layouts); prepared = &local; }
+    auto resources = prepared->physical.resources;
     std::vector<Event> events; events.reserve(size_t(event_count));
     unsigned const meta_bits = std::min({8u, filter(config, false), filter(config, true)});
     for (size_t lane = 0; lane < layouts.size(); ++lane)
     {
         auto const& plan = layouts[lane];
-        uint16_t rank = 0, lanes = 0;
         // A saved identity schedule can now span several physical resources.
-        for (size_t other = 0; other < layouts.size(); ++other)
-            if (layouts[other].schedule == plan.schedule)
-            { if (other < lane) ++rank; ++lanes; }
-        farming_require(plan.resource_rank == rank && plan.resource_lanes == lanes &&
+        farming_require(plan.resource_rank == prepared->ranks[lane] && plan.resource_lanes == prepared->lanes[lane] &&
             plan.meta_slots && plan.meta_slots <= (1u << meta_bits) && plan.meta_bits == meta_bits &&
             plan.meta_base == config.meta_group_override && (!config.fixed_meta || plan.meta_slots == 1) &&
             (!config.meta_slots_override || plan.meta_slots == config.meta_slots_override),
             "farming assessment layout aliases resource/meta identities");
-        for (size_t before = 0; before < lane; ++before)
-            farming_require(layouts[before].schedule != plan.schedule ||
-                layouts[before].meta_slots == plan.meta_slots,
-                "farming resource lanes use incompatible family schedules");
-        auto& resource = input.resources[input.resource[lane]];
+        farming_require(layouts[prepared->first[lane]].meta_slots == plan.meta_slots,
+            "farming resource lanes use incompatible family schedules");
+        auto const resource_index = prepared->physical.resource[lane];
+        auto& resource = resources[resource_index];
         uint64_t const count = extents ? (*extents)[lane].size() : plan.files;
         add(resource.files, count);
         auto interval = [&](uint64_t first, uint64_t last, uint16_t members)
@@ -281,8 +299,8 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
             farming_require(members && shape(config, members), "farming extent has an invalid modeled chunk shape");
             uint64_t const begin = plan.family(first), end = plan.family(last - 1);
             farming_require(end != UINT64_MAX, "farming family extent overflows");
-            events.push_back({begin, plan.schedule, uint32_t(input.resource[lane]), members, false});
-            events.push_back({end + 1, plan.schedule, uint32_t(input.resource[lane]), members, true});
+            events.push_back({begin, plan.schedule, uint32_t(resource_index), members, false});
+            events.push_back({end + 1, plan.schedule, uint32_t(resource_index), members, true});
             resource.largest = std::max(resource.largest, members);
         };
         if (extents || plan.resource_lanes > plan.meta_slots)
@@ -330,15 +348,15 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
             if (largest && position < events.size() && events[position].resource == resource && events[position].schedule == schedule)
             {
                 uint64_t const span = events[position].family - family;
-                add(input.resources[resource].families, span);
+                add(resources[resource].families, span);
                 farming_require(span <= UINT64_MAX / largest, "farming family work overflows");
-                add(input.resources[resource].family_members, span * largest);
+                add(resources[resource].family_members, span * largest);
             }
         }
     }
     FarmingAssessment result;
     uint64_t jobs = 0, largest_members = 0;
-    for (auto const& resource : input.resources)
+    for (auto const& resource : resources)
     {
         add(jobs, resource.families); largest_members = std::max<uint64_t>(largest_members, resource.largest);
         result.max_eligible_families_per_resource = std::max(result.max_eligible_families_per_resource, resource.families);
@@ -367,7 +385,7 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
     long double total = 0, largest = 0;
     long double const chunk_per_member = 4 * 64 * (config.k + 1.45L) / 8;
     long double const eligibility = std::ldexp(1.0L, -int(std::min(filter(config, false), filter(config, true))));
-    for (auto const& resource : input.resources)
+    for (auto const& resource : resources)
     {
         if (!resource.families) continue;
         auto const& storage = resource.storage;
@@ -401,7 +419,7 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
     // Outward allowance for the bounded positive floating-point arithmetic;
     // this is numerical rounding protection, not a hardware timing margin.
     result.response_bound_seconds = std::nextafter(result.response_bound_seconds *
-        (1 + 128 * (input.resources.size() + 1) * std::numeric_limits<long double>::epsilon()),
+        (1 + 128 * (resources.size() + 1) * std::numeric_limits<long double>::epsilon()),
         std::numeric_limits<long double>::infinity());
     result.dynamic_work_seconds_per_sp = config.cpu_work_weight * result.cpu_work_seconds_per_sp +
         config.io_work_weight * result.io_work_seconds_per_sp;
@@ -568,8 +586,11 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
         selected[lane] = tables[lane]->back();
         selected[lane].schedule = schedule + topology_value.resource[lane];
     }
+    // Candidate file counts change, but their physical resources and saved
+    // identity schedules stay fixed throughout the search.
+    auto const assessment = assessment_topology(topology_value, selected);
     FarmingPlan result;
-    auto best = assess(config, destinations, selected, nullptr, memory); ++result.candidates_evaluated;
+    auto best = assess(config, destinations, selected, nullptr, memory, &assessment); ++result.candidates_evaluated;
     std::vector<bool> swept(destinations.size());
     auto search = [&](std::vector<size_t> const& unit)
     {
@@ -588,7 +609,7 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
                 selected[lane].schedule = schedule + topology_value.resource[lane];
             }
             if (!matched) { selected = original; continue; }
-            auto proposed = assess(config, destinations, selected, nullptr, memory); ++result.candidates_evaluated;
+            auto proposed = assess(config, destinations, selected, nullptr, memory, &assessment); ++result.candidates_evaluated;
             resource_require(result.candidates_evaluated <= maximum_candidates, "farming search exceeds its comparison work bound");
             if (better(config, proposed, best)) { best = std::move(proposed); chosen = selected; improved = true; }
             selected = original;
@@ -622,7 +643,7 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
             if (search({lane})) improved = true;
     } while (improved);
     // Each retained lane is checked once more as the exact proposed forecast.
-    best = assess(config, destinations, selected, nullptr, memory);
+    best = assess(config, destinations, selected, nullptr, memory, &assessment);
     static_cast<FarmingAssessment&>(result) = best;
     result.destinations = std::move(selected);
     result.index_bytes = (uint64_t(1) << (config.k - 6)) * 8;

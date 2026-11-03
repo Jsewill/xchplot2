@@ -105,14 +105,20 @@ inline std::string farming_state_text(FarmingState const& state)
     }
     return out.str();
 }
-inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, FarmingState const& state)
+inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, std::string const& contents)
 {
-    auto const text = farming_state_text(state);
     auto const pending = file_io::native_path(file_io::path_text(path) + ".next");
     require(!std::filesystem::exists(pending), "pending farming revision must be recovered first");
-    stream_state::atomic_save(pending, text + stream_state::digest(text) + '\n', false);
+    stream_state::atomic_save(pending, contents, false);
     grow_failpoint("farm-plan-before-publication");
     return pending;
+}
+inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, FarmingState const& state)
+{
+    auto contents = farming_state_text(state);
+    auto const digest = stream_state::digest(contents);
+    contents += digest + '\n';
+    return stage_farming_state(path, contents);
 }
 inline void publish_farming_state(std::filesystem::path const& pending, std::filesystem::path const& path, bool replace)
 {
@@ -122,15 +128,26 @@ inline void publish_farming_state(std::filesystem::path const& pending, std::fil
     stream_state::sync_path(path.parent_path(), true);
     grow_failpoint("farm-plan-published");
 }
-inline FarmingState load_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
+struct FarmingStateFile
+{
+    std::string body, digest;
+    stream_state::Stamp stamp;
+};
+inline FarmingStateFile read_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
 {
     auto const stamp = stream_state::stamp(path);
     require(stamp.bytes < memory_limit / 16, "saved farming plan exceeds --max-ram");
     auto file = group_tools::input(file_io::path_text(path));
     std::string contents{std::istreambuf_iterator<char>(file), {}};
     require(contents.size() >= 65 && contents.back() == '\n', "invalid farming plan checksum");
-    auto const body = contents.substr(0, contents.size() - 65);
-    require(contents.substr(contents.size() - 65, 64) == stream_state::digest(body), "farming plan checksum mismatch");
+    auto const digest = contents.substr(contents.size() - 65, 64);
+    contents.resize(contents.size() - 65);
+    require(digest == stream_state::digest(contents), "farming plan checksum mismatch");
+    require(stream_state::stamp(path) == stamp, "farming plan changed while loading");
+    return {std::move(contents), digest, stamp};
+}
+inline FarmingState parse_farming_state(std::string const& body)
+{
     std::istringstream in(body);
     std::string version, build, model;
     std::getline(in, version); in >> std::quoted(build);
@@ -185,7 +202,13 @@ inline FarmingState load_farming_state(std::filesystem::path const& path, uint64
         state.estimate.destinations.push_back(p);
     }
     in >> std::ws; require(in.eof(), "unexpected saved farming plan data");
-    require(stream_state::stamp(path) == stamp, "farming plan changed while loading");
+    return state;
+}
+inline FarmingState load_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
+{
+    auto const file = read_farming_state(path, memory_limit);
+    auto state = parse_farming_state(file.body);
+    require(stream_state::stamp(path) == file.stamp, "farming plan changed while loading");
     return state;
 }
 } // namespace group_grow

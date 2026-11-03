@@ -518,6 +518,8 @@ void test_extent_admission()
     bad = shared.destinations;
     bad[1].meta_slots = 128;
     rejects([&] { farming_assess(c, {drive, second}, bad, shared_counts); }, "shared schedules alias");
+    rejects([&] { farming_plan(c, {drive, second}, 64ull << 20, bad); },
+            "frozen shared schedules alias");
     c.reader = FarmingReader::cached;
     c.index_cache_bytes = 8ull * 32 * 1024 * 1024;
     c.memory_bytes = 4000000000ull;
@@ -547,6 +549,65 @@ void test_extent_admission()
     c.chain_seconds_per_member = std::numeric_limits<long double>::max() / 4;
     auto overflow = farming_assess(c, {hdd()}, plan.destinations, {{20}});
     check(!overflow.feasible && !overflow.reason.empty(), "nonfinite service work was admitted");
+}
+void test_planning_memory_boundaries()
+{
+    FarmingConfig config;
+    config.k = 18;
+    auto drive = hdd(64000000);
+    drive.max_total_members = 4;
+    drive.max_groups = 2;
+    for (bool shared : {false, true})
+    {
+        std::vector<FarmingDestination> drives(16, drive);
+        if (shared) for (auto& destination : drives) destination.resource = 7;
+        auto original = farming_plan(config, drives);
+        auto exact = farming_plan(config, drives, original.planning_memory_bytes);
+        check(exact.destinations == original.destinations && exact.feasible == original.feasible &&
+                  exact.response_bound_seconds == original.response_bound_seconds &&
+                  exact.dynamic_work_seconds_per_sp == original.dynamic_work_seconds_per_sp &&
+                  exact.candidates_evaluated == original.candidates_evaluated &&
+                  exact.planning_memory_bytes == original.planning_memory_bytes,
+              "exact planning memory budget changed the search");
+        rejects<FarmingResourceError>([&] { farming_plan(config, drives, original.planning_memory_bytes - 1); },
+                                      "planning memory boundary was bypassed");
+        auto counts = extents(original.destinations);
+        auto live = farming_assess(config, drives, original.destinations, counts);
+        auto bounded = farming_assess(config, drives, original.destinations, counts, live.planning_memory_bytes);
+        check(bounded.feasible == live.feasible && bounded.response_bound_seconds == live.response_bound_seconds &&
+                  bounded.dynamic_work_seconds_per_sp == live.dynamic_work_seconds_per_sp &&
+                  bounded.planning_memory_bytes == live.planning_memory_bytes,
+              "exact assessment memory budget changed the certificate");
+        rejects<FarmingResourceError>([&] {
+            farming_assess(config, drives, original.destinations, counts, live.planning_memory_bytes - 1);
+        }, "assessment memory boundary was bypassed");
+    }
+}
+void test_large_frozen_expansion()
+{
+    FarmingConfig config;
+    config.k = 18;
+    config.group_members_override = 2;
+    config.harvester_cores = config.lookup_workers = 1024;
+    config.memory_bytes = 4000000000ull;
+    config.max_eligible_families_per_resource = 16;
+    auto drive = hdd(64000000);
+    drive.max_total_members = 2;
+    drive.max_groups = 1;
+    std::vector<FarmingDestination> original_drives(512, drive), drives(1024, drive);
+    auto original = farming_plan(config, original_drives);
+    for (size_t lane = 0; lane < drives.size(); ++lane) drives[lane].resource = lane % 64;
+    auto expanded = farming_plan(config, drives, 64ull << 20, original.destinations);
+    check(original.feasible && expanded.feasible && expanded.destinations.size() == drives.size() &&
+              std::equal(original.destinations.begin(), original.destinations.end(), expanded.destinations.begin()),
+          "large expansion changed its frozen assignments");
+    auto counts = extents(expanded.destinations);
+    auto live = farming_assess(config, drives, expanded.destinations, counts);
+    check(live.feasible && live.response_bound_seconds == expanded.response_bound_seconds &&
+              live.cpu_work_seconds_per_sp == expanded.cpu_work_seconds_per_sp &&
+              live.io_work_seconds_per_sp == expanded.io_work_seconds_per_sp &&
+              live.max_eligible_families_per_resource == expanded.max_eligible_families_per_resource,
+          "large relocated expansion differs from its live certificate");
 }
 void test_explicit_family_tradeoff()
 {
@@ -779,6 +840,8 @@ int main()
         test_storage_profiles();
         test_frozen_expansion();
         test_extent_admission();
+        test_planning_memory_boundaries();
+        test_large_frozen_expansion();
         test_small_exhaustive();
         test_explicit_family_tradeoff();
         test_sparse_automatic_search();

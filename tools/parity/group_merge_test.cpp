@@ -2984,6 +2984,45 @@ void farming_extent_admission(fs::path const& root)
     require(resumed.feasible() && resumed.admission && resumed.admission->max_eligible_families_per_resource == 3,
         "resumed shared-resource farming extension was not assessed beyond its forecast");
 
+    auto const replica = file_io::native_path(saved.state.directories.back().directory) / "grow-farm.plan";
+    auto const locator = file_io::native_path(saved.state.directories.front().directory) / "grow-farm.plan";
+    auto const digest = stream_state::digest(text);
+    stream_state::atomic_save(locator, text + digest + '\n');
+    stream_state::atomic_save(replica, text + digest + '\n');
+    auto const original_replica = contents(locator);
+    auto discover = [&]
+    {
+        Arguments args; args.plan_only = true; args.target = locator.parent_path(); args.max_ram = saved.memory_limit;
+        return farming_arguments(args);
+    };
+    auto duplicates = discover();
+    require(duplicates.saved && duplicates.digest == digest && duplicates.directories.size() == saved.state.directories.size(),
+        "identical farming replicas changed the discovered job");
+    auto const formatted = text + '\n';
+    stream_state::atomic_save(replica, formatted + stream_state::digest(formatted) + '\n');
+    auto noncanonical = discover();
+    require(noncanonical.saved && noncanonical.digest == digest && !noncanonical.pending,
+        "equivalent noncanonical farming replica changed the canonical revision");
+    for (auto const& copy : noncanonical.copies) if (copy.stamp)
+        require(copy.digest == digest, "noncanonical farming replica retained its raw checksum as revision identity");
+    stream_state::atomic_save(replica, text + std::string(64, '0') + '\n');
+    bool corrupt_replica = false;
+    try { (void)discover(); }
+    catch (std::runtime_error const& error)
+    { corrupt_replica = std::string(error.what()).find("checksum mismatch") != std::string::npos; }
+    require(corrupt_replica && contents(locator) == original_replica,
+        "later farming replica bypassed its checksum check");
+    auto foreign_build = text;
+    auto const build = std::string(GROW_IDENTITY);
+    foreign_build.replace(foreign_build.find(build), build.size(), "different grow build");
+    stream_state::atomic_save(replica, foreign_build + stream_state::digest(foreign_build) + '\n');
+    bool foreign_replica = false;
+    try { (void)discover(); }
+    catch (std::runtime_error const& error)
+    { foreign_replica = std::string(error.what()).find("original grow build") != std::string::npos; }
+    require(foreign_replica && contents(locator) == original_replica,
+        "later farming replica bypassed its saved-build validation");
+
     auto const exclusive_directory = root / "exclusive-farming-publication";
     fs::create_directory(exclusive_directory);
     auto const exclusive_path = exclusive_directory / "grow-farm.plan";
