@@ -152,7 +152,9 @@ def check(binary, root, service_manager=False):
 
         if os.name == "nt":
             printed = run("authority", "service", "print").stdout
-            task = ET.fromstring(printed)
+            task = ET.fromstring(printed.encode("utf-8"))
+            # Registration passes the same XML to Task Scheduler as a BSTR.
+            ET.fromstring(printed.encode("utf-16"))
             ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
             assert task.findtext("t:Actions/t:Exec/t:Command", namespaces=ns) == str(binary)
             arguments = task.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)

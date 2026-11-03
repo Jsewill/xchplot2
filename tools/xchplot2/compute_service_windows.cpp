@@ -142,7 +142,8 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
     auto const marker = wide("xchplot2 compute service " + role + ' ' + identity->node_id);
     pos2gpu::PrivateFileSecurity security;
     auto const user = std::wstring(security.sid_text);
-    auto const definition = L"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    // The same XML is printed as UTF-8 and registered through a UTF-16 BSTR.
+    auto const definition = L"<?xml version=\"1.0\"?>\n"
         L"<Task version=\"1.3\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
         L"<RegistrationInfo><Description>" + xml(marker) + L"</Description></RegistrationInfo>\n"
         L"<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + xml(user) + L"</UserId></LogonTrigger></Triggers>\n"
