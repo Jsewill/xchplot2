@@ -30,8 +30,8 @@ void reference_help()
     std::cout <<
         "Ordinary PoS2 group construction reference runner\n"
         "Usage: pos2_pr118_grow TARGET [OPTIONS]\n"
-        "  --destination FILE|DIR    additional key-derived destination; repeat for more drives\n"
-        "  --temp-dir DIR            optional contribution storage; repeat for more devices\n"
+        "  -D, --destination FILE|DIR  additional key-derived destination; repeat for more drives\n"
+        "  -t, --temp-dir DIR        optional contribution storage; repeat for more devices\n"
         "  --destination-temp off|on|ssd|hdd  destination scratch policy, default off\n"
         "                            on: any destination; ssd/hdd: only known drives of that type\n"
         "  --temp-capacity-bytes N    aggregate scratch cap per filesystem; default available space\n"
@@ -60,12 +60,12 @@ void reference_help()
         "  --k EVEN                  18..28, default 28\n"
         "  --strength N              default 2\n"
         "  --meta-group N            default 0\n"
-        "  --resume                  continue/recover an existing destination\n"
+        "  -r, --resume              continue/recover an existing destination\n"
         "  --capacity-bytes N        logical destination cap; default filesystem capacity\n"
         "  --headroom-bytes N        filesystem bytes left free, default 67108864\n"
-        "  --max-ram N               modeled app buffer budget in bytes, default 14000000000\n"
+        "  -M, --max-ram N           modeled app buffer budget in bytes, default 14000000000\n"
         "  --window-bytes N          fixed I/O window; default auto up to 16777216\n"
-        "  --workers N               compression workers, default available CPU count\n"
+        "  -j, --workers N           compression workers, default available CPU count\n"
         "  --batch-members N         maximum additions per rewrite, default fits available RAM\n"
         "  --max-members N           stop at this total membership, default 65535\n"
         "  --max-groups N            per-directory rollover file limit; default fills capacity\n"
@@ -121,7 +121,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         std::string key = argv[i];
         if (!command.empty() && key.starts_with("--compute-")) key.replace(2, 8, "pool-");
         if (key == "--help" && command.empty()) { reference_help(); std::exit(0); }
-        if (key == "--resume") { result.resume = true; continue; }
+        if (key == "--resume" || key == "-r") { result.resume = true; continue; }
         if (key == "--plan-only") { result.plan_only = true; continue; }
         if (!command.empty())
         {
@@ -172,7 +172,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--pool-frame-bytes") result.pool_frame_bytes = number(value.c_str());
             else if (key == "--pool-codec-ram")
             { result.pool_codec_auto = value == "auto"; if (!result.pool_codec_auto) result.pool_codec_ram = number(value.c_str()); }
-            else if (key == "--temp-dir")
+            else if (key == "--temp-dir" || key == "-t")
             {
                 require(result.temporary.size() < 1024, "too many temporary directories");
                 result.temporary.push_back(fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal());
@@ -183,7 +183,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(result.temporary_capacity > 0, "--temp-capacity-bytes must be positive");
             }
             else if (key == "--destination-temp") result.destination_temp = value;
-            else if (key == "--destination")
+            else if (key == "--destination" || key == "-D")
             {
                 require(result.destinations.size() < 1023, "too many destinations");
                 result.destinations.push_back(fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal());
@@ -197,9 +197,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(result.capacity > 0, "--capacity-bytes must be positive");
             }
             else if (key == "--headroom-bytes") result.headroom = number(value.c_str());
-            else if (key == "--max-ram") result.max_ram = number(value.c_str());
+            else if (key == "--max-ram" || key == "-M") result.max_ram = number(value.c_str());
             else if (key == "--window-bytes") { result.window = number(value.c_str()); result.window_set = true; }
-            else if (key == "--workers") result.workers = number(value.c_str());
+            else if (key == "--workers" || key == "-j") result.workers = number(value.c_str());
             else if (key == "--batch-members") result.batch = number(value.c_str());
             else if (key == "--max-members") result.max_members = number(value.c_str());
             else if (key == "--group-members")

@@ -19,7 +19,7 @@ pos2gpu::GroupOptions command_arguments(std::string_view command, std::vector<st
 void command_help(std::string_view command)
 {
     std::cout << "Usage: xchplot2 " << command
-        << (command == "grow" ? " FILE [OPTIONS]\n" : " DIR [--destination DIR ...] [OPTIONS]\n");
+        << (command == "grow" ? " FILE [OPTIONS]\n" : " DIR [-D|--destination DIR ...] [OPTIONS]\n");
     if (command == "grow")
         std::cout << "Add members to an existing ordinary v2 group, recovering interrupted construction first.\n";
     else if (command == "plan")
@@ -27,6 +27,7 @@ void command_help(std::string_view command)
     else
         std::cout << "Plan and populate destination directories. --plan-only is the same preview as plan.\n";
     std::cout <<
+        "  -D, --destination PATH   additional destination; repeat for more drives\n"
         "  -k, --k N                 even k in 18..28, default 28\n"
         "  -s, --strength N          default 2\n"
         "  --group-members auto|N    members per file (plan/fill); default auto\n"
@@ -34,21 +35,21 @@ void command_help(std::string_view command)
         "  --max-total-members N     per-directory member limit (fill)\n"
         "  --max-members N           total members in an existing file (grow)\n"
         "  --plan-only               preview a fill without writing\n"
-        "  --resume                  reuse the saved layout and recover interrupted work\n"
+        "  -r, --resume              reuse the saved layout and recover interrupted work\n"
         "  -f, --farmer-pk HEX        farmer public key (fill)\n"
         "  -p, --pool-pk HEX          pool public key; choose one pool source\n"
         "  --pool-ph HEX             pool contract puzzle hash\n"
         "  -c, --pool-contract-address ADDRESS  pool contract address\n"
         "  -S, --seed HEX            stable 32-byte seed for fill; keep it for resume\n"
         "  --backend cpu|gpu|auto    producer selection, default auto\n"
-        "  --devices cpu|gpuN        select one local producer\n"
+        "  -d, --devices cpu|gpuN    select one local producer\n"
         "  --device N --tier NAME    local GPU and production tier\n"
-        "  --max-host-ram SIZE       shared construction/producer RAM budget (e.g. 14G)\n"
-        "  --workers N               shared compression CPU allowance\n"
+        "  -M, --max-host-ram SIZE   shared construction/producer RAM budget (e.g. 14G)\n"
+        "  -j, --workers N           shared compression CPU allowance\n"
         "  --batch-members N         maximum members generated per construction batch\n"
         "  --capacity-bytes N        aggregate output capacity per filesystem\n"
         "  --headroom-bytes N        filesystem bytes to leave free\n"
-        "  --temp-dir DIR            contribution storage; repeat for more devices\n"
+        "  -t, --temp-dir DIR        contribution storage; repeat for more devices\n"
         "  --destination-temp off|on|ssd|hdd  destination scratch permission, default off\n"
         "  --temp-capacity-bytes N   temporary capacity per filesystem\n"
         "  --construction auto|incremental|staged|merged|external\n"

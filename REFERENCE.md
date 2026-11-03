@@ -30,6 +30,11 @@ xchplot2 plot -k 28 -n 10 \
 | `--pool-ph HEX` | Pool puzzle hash, 64 hex characters |
 | `-c`, `--pool-contract-address ADDRESS` | Pool contract address, `xch1...` or `txch1...` |
 | `-o`, `--out DIR` | Output directory; default current directory |
+| `-d`, `--devices SPEC` | Select [GPUs and CPU workers](#devices-and-cpu-workers) |
+| `-M`, `--max-host-ram SIZE` | Host-memory budget, such as `8G` or `512M` |
+| `-t`, `--temp-dir DIR` | Temporary storage for spill or grouped construction |
+| `-j`, `--workers N` | Shared compression CPU allowance for grouped construction |
+| `-r`, `--resume` | Recover the saved job and skip validated completed files |
 | `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
 | `-g`, `--meta-group N` | Meta-group field; default 0 |
 | `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
@@ -50,7 +55,7 @@ to choose its location. Each new job keeps its own manifest; another job
 cannot overwrite it. Manifests contain private plot keys and are created
 with owner-only permissions on Linux and protected owner-only ACLs on Windows.
 
-Repeat the same `plot` command with `--resume` (or `--skip-existing`) to
+Repeat the same `plot` command with `-r`/`--resume` (or `--skip-existing`) to
 recover its saved job, including when no `--seed` was supplied. If several
 saved jobs match, select one with `--manifest FILE`. The original keys,
 plot parameters, count, and output directory must match; devices and memory
@@ -163,26 +168,30 @@ xchplot2 plot -n 3 --group-members 4 \
 The normal private job manifest and `plot --resume` / `batch --resume`
 interfaces retain the prepared identities. New unseeded jobs get fresh keys.
 
-For a directory layout, preview first:
+For a directory layout, preview first. Pass the first directory as a positional
+argument, then repeat `-D`/`--destination` for each additional directory:
 
 ```bash
-xchplot2 plan /disk-a/plots --destination /disk-b/plots
-xchplot2 fill /disk-a/plots --destination /disk-b/plots --plan-only
+xchplot2 plan /disk-a/plots -D /disk-b/plots -D /disk-c/plots
+xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots --plan-only
 ```
 
 Both forms perform the same read-only preview. They need existing destination
 directories but no keys, create no files or locks, and start no compute services.
 `--json` emits the machine-readable report. An infeasible layout reports its
 reason and exits unsuccessfully. A preview is not a saved execution plan.
+One command accepts up to 1,024 destination directories. Directories on the
+same filesystem share its available capacity; adding another directory there
+does not add disk space.
 
 To build the layout, supply a stable 32-byte seed and the farmer and pool keys:
 
 ```bash
-xchplot2 fill /disk-a/plots --destination /disk-b/plots \
+xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots \
     -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS"
 # Repeat with the same seed, keys and directory order after interruption:
-xchplot2 fill /disk-a/plots --destination /disk-b/plots \
-    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS" --resume
+xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots \
+    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS" -r
 ```
 
 `fill` always plans a farming layout, including with an explicit
@@ -218,9 +227,9 @@ Use `plot` to create a new named job, or `fill` to manage a directory layout.
 
 ### Construction and recovery
 
-`--max-host-ram SIZE` bounds modeled construction, producer, transport and
+`-M`/`--max-host-ram SIZE` bounds modeled construction, producer, transport and
 codec buffers across the job. The default is 14,000,000,000 bytes.
-`--workers N` bounds the shared compression CPU allowance; zero or omission
+`-j`/`--workers N` bounds the shared compression CPU allowance; zero or omission
 uses the available logical CPU count. The operating system, libraries and
 file cache are outside that buffer model. Separate plotting processes each
 have their own construction budget.
@@ -232,7 +241,7 @@ needed. `--batch-members N` bounds construction batches independently of the
 final file membership. `--member-storage compact|raw` selects retained
 fragments; compact is the default.
 
-Repeat `--temp-dir DIR` to offer scratch on additional filesystems.
+Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems.
 Destination directories are excluded from automatic scratch selection unless
 `--destination-temp on|ssd|hdd` permits them; the default is `off`. The media
 filters require known, uniformly matching drives. Explicit scratch directories
@@ -858,9 +867,9 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 | `-n N`, `--num N` | Measured plot count used to size the queue; default 10 |
 | `--warmup W` | Initial completions excluded per worker; default 1 |
 | `-o DIR`, `--out DIR` | Directory for real output writes; default current directory |
-| `--devices SPEC`, `--cpu`, `--cpu-workers N` | Select the [devices and CPU workers](#devices-and-cpu-workers) to measure |
+| `-d`/`--devices SPEC`, `--cpu`, `--cpu-workers N` | Select the [devices and CPU workers](#devices-and-cpu-workers) to measure |
 | `--tier T` | Force a [streaming tier](#memory-requirements), even when the pool fits |
-| `--max-host-ram SIZE`, `--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
+| `-M`/`--max-host-ram SIZE`, `-t`/`--temp-dir DIR`, `--no-auto-spill` | Use the normal [host memory and spill policy](#host-ram-and-disk-offload) |
 | `--keep` | Retain synthetic output files on disk for inspection |
 | `--json` | Also emit a JSON report to stdout for saving or comparing runs |
 | `--compute-only` | Add a second pass using RAM-backed output when available |

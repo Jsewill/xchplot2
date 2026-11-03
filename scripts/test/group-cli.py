@@ -69,7 +69,7 @@ def check(binary, root, reference=None):
         assert found and int(found[1]) > 0, result
 
     keys = ["-f", FARMER, "--pool-ph", POOL]
-    construction = ["--devices", "cpu", "--max-host-ram", "512M", "--workers", 2,
+    construction = ["-d", "cpu", "-M", "512M", "-j", 2,
                     "--window-bytes", "64K", "--checkpoint-bytes", "64K",
                     "--capacity-bytes", "64M", "--headroom-bytes", 0]
     for subcommand in [("plan",), ("plot",), ("fill",), ("grow",),
@@ -78,17 +78,19 @@ def check(binary, root, reference=None):
         assert "Usage:" in run(*subcommand, "--help").stdout + (root / f"{counter:03d}.log").read_text(encoding="utf-8")
 
     preview = root / "preview"
+    preview_peer = root / "preview peer"
     preview.mkdir()
-    options = [preview, "-k", 18, "--group-members", 2, "--max-total-members", 3, *construction]
-    before = snapshot(preview)
+    preview_peer.mkdir()
+    options = [preview, "-D", preview_peer, "-k", 18, "--group-members", 2, "--max-total-members", 3, *construction]
+    before = snapshot(preview), snapshot(preview_peer)
     planned = json.loads(run("plan", *options, "--json").stdout)
     filled = json.loads(run("fill", *options, "--plan-only", "--json").stdout)
     assert planned == filled and planned["feasible"]
-    assert planned["destinations"][0]["files"] == 2
-    assert snapshot(preview) == before, "preview created or changed files"
+    assert len(planned["destinations"]) == 2 and all(d["files"] == 2 for d in planned["destinations"])
+    assert (snapshot(preview), snapshot(preview_peer)) == before, "preview created or changed files"
     for subcommand in [("plan",), ("fill", "--plan-only")]:
         refused = json.loads(run(*subcommand, *options, "--farming-deadline-ms", 1, "--json", code=2).stdout)
-        assert not refused["feasible"] and snapshot(preview) == before
+        assert not refused["feasible"] and (snapshot(preview), snapshot(preview_peer)) == before
     print("PASS plan/fill preview equivalence and no writes on infeasibility", flush=True)
 
     output = root / "grouped files"
@@ -157,7 +159,7 @@ def check(binary, root, reference=None):
                         ("merged", "merge-index-flushed"), ("external", "external-header-flushed")):
         engine = ["plot", "-k", 18, *keys, "-S", SEED, "-o", root / (mode + " recovered"),
                   "--group-members", 3, "--batch-members", 2, "--construction", mode,
-                  *construction, "--temp-dir", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+                  *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
         run(*engine, point=point, code=86)
         recovered = Path(run(*engine, "--resume").stdout.strip())
         assert header(recovered)[3] == 3
@@ -229,10 +231,11 @@ def check(binary, root, reference=None):
     fill = ["fill", *options, *keys, "--seed", SEED, "--quiet"]
     produced = run(*fill)
     farm_outputs = [Path(line) for line in produced.stdout.splitlines()]
-    assert sorted(header(p)[3] for p in farm_outputs) == [1, 2]
+    assert sorted(header(p)[3] for p in farm_outputs) == [1, 1, 2, 2]
+    assert {p.parent for p in farm_outputs} == {preview, preview_peer}
     assert (preview / "grow-farm.plan").is_file()
     farm_hashes = {p: digest(p) for p in farm_outputs}
-    assert set(run(*fill, "--resume").stdout.splitlines()) == set(map(str, farm_outputs))
+    assert set(run(*fill, "-r").stdout.splitlines()) == set(map(str, farm_outputs))
     assert all(digest(p) == value for p, value in farm_hashes.items())
     for path in farm_outputs:
         verify(path)

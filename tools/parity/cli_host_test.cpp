@@ -216,6 +216,11 @@ int main(int argc, char** argv)
     assert(std::string(std::getenv("XCHPLOT2_TEMP_DIR")) == dir.string());
     assert(last_options.device_ids == std::vector<int>{0} && !last_options.quiet);
     assert(last_options.cpu_workers == 0 && !last_options.auto_host_ram_spill);
+    assert(cli({"batch", manifest.string(), "--config", config.string(), "-d", "2", "-M", "256M",
+                "-t", dir.string(), "--no-resume", "-r"}) == 0);
+    assert(last_options.device_ids == std::vector<int>{2} && last_options.skip_existing);
+    assert(last_options.has_max_host_ram && last_options.max_host_ram == 256ull * 1024 * 1024);
+    assert(std::string(std::getenv("XCHPLOT2_TEMP_DIR")) == dir.string());
     put(config, "[bench]\nwarmup=0\nnum=1\nkeep=false\nverbose=false\n");
 #ifdef _WIN32
     _putenv_s("POS2GPU_ASSERT_VRAM", "");
@@ -223,8 +228,10 @@ int main(int argc, char** argv)
     unsetenv("POS2GPU_ASSERT_VRAM");
 #endif
     int const before = batch_calls;
-    assert(cli({"bench", "--config", config.string(), "--out", dir.string()}) == 0);
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string(),
+                "-d", "cpu", "-M", "256M", "-t", dir.string()}) == 0);
     assert(batch_calls == before + 1);
+    assert(last_options.cpu_selected() && last_options.has_max_host_ram && last_options.max_host_ram == 256ull * 1024 * 1024);
     auto const [json_code, json_report] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json"});
     assert(json_code == 0 && json_report.starts_with("{\"version\":"));
     assert(json_report.find("\"queue_plots\":1") != std::string::npos);
@@ -365,10 +372,11 @@ int main(int argc, char** argv)
     auto const plots = dir / "plots with spaces";
     std::vector<std::string> args = {"plot", "--config", config.string(), "-k", "18", "-n", "3",
         "-f", std::string(96, 'a'), "--pool-ph", std::string(64, 'b'), "-o", plots.string(),
-        "--quiet", "--no-progress", "--continue-on-error"};
+        "-d", "cpu", "-M", "256M", "-t", dir.string(), "--quiet", "--no-progress", "--continue-on-error"};
     write_limit = 1; fail_remaining = true;
     auto [failed_code, failed_output] = capture(args);
     assert(failed_code == 3 && std::count(failed_output.begin(), failed_output.end(), '\n') == 1);
+    assert(last_options.cpu_selected() && last_options.has_max_host_ram && last_options.max_host_ram == 256ull * 1024 * 1024);
     auto const original = last_entries;
     std::filesystem::path job;
     for (auto const& file : std::filesystem::directory_iterator(plots))
@@ -376,7 +384,7 @@ int main(int argc, char** argv)
     assert(pos2gpu::parse_manifest(job.string()) == original);
     assert(failed_output == (plots / original[0].out_name).string() + '\n');
     write_limit = 0; fail_remaining = false;
-    auto resume = args; resume.push_back("--resume");
+    auto resume = args; resume.push_back("-r");
     int const generated = keygen_calls;
     auto [cancelled_code, cancelled_output] = capture(resume);
     assert(cancelled_code == 4 && last_entries == original && keygen_calls == generated);
@@ -457,6 +465,18 @@ int main(int argc, char** argv)
     assert(cli({"fill", dir.string(), "--config", config.string(), "--devices", "cpu"}) == 0);
     assert(last_group_options.plan_only && last_group_options.json && last_group_options.backend == "cpu");
     assert(last_group_options.max_ram == 512ull * 1024 * 1024);
+    auto const other = dir / "another destination";
+    auto const third = dir / "third destination";
+    std::filesystem::create_directory(other);
+    std::filesystem::create_directory(third);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "-r", "-d", "gpu2:tiny", "-M", "768M",
+                "-j", "2", "-D", other.string(), "--destination", third.string(),
+                "-t", other.string(), "--temp-dir", third.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.resume && last_group_options.backend == "gpu");
+    assert(last_group_options.device == 2 && last_group_options.tier == "tiny" && last_group_options.workers == 2);
+    assert(last_group_options.max_ram == 768ull * 1024 * 1024);
+    assert((last_group_options.destinations == std::vector<std::filesystem::path>{other, third}));
+    assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
     auto const argfile = dir / "group.args";
@@ -464,6 +484,10 @@ int main(int argc, char** argv)
     assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);
     assert(last_group_options.plan_only && last_group_options.group_members == 3 && last_group_options.max_ram == 768ull * 1024 * 1024);
     assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) != 0);
+    int const before_missing_value = group_calls;
+    for (auto const* option : {"-d", "-M", "-j", "-D", "-t"})
+        assert(cli({"plan", dir.string(), "--config", config.string(), option}) != 0);
+    assert(group_calls == before_missing_value);
     put(config, "[compute.worker]\nhost-bytes=\"1000000000\"\n");
     assert(cli({"compute", "worker", "--config", config.string(), "--host-bytes", "2000000000"}) == 0);
     assert((last_compute == std::vector<std::string>{"worker", "--host-bytes", "1000000000", "--host-bytes", "2000000000"}));
@@ -477,16 +501,22 @@ int main(int argc, char** argv)
     auto const group_job = dir / "group-job.tsv";
     std::vector<std::string> group_args = {"plot", "--config", config.string(), "-k", "18", "-n", "2",
         "-f", std::string(96, 'a'), "--pool-ph", std::string(64, 'b'), "-o", group_dir.string(),
-        "--group-members", "3", "--devices", "cpu", "--manifest", group_job.string(), "--quiet"};
+        "--group-members", "3", "-d", "cpu", "-M", "512M", "-j", "2", "-t", dir.string(),
+        "--manifest", group_job.string(), "--quiet"};
     auto const [group_code, group_paths] = capture(group_args);
     assert(group_code == 0 && std::count(group_paths.begin(), group_paths.end(), '\n') == 2);
     assert(last_entries.size() == 2 && last_entries.front().group_members == 3 && last_entries.front().grouped);
+    assert(last_group_options.workers == 2 && last_group_options.max_ram == 512ull * 1024 * 1024);
+    assert(last_group_options.temporary == std::vector<std::filesystem::path>{dir});
     auto const group_entries = last_entries;
     int const prior_derivations = keygen_calls;
     group_args.emplace_back("--resume");
     assert(capture(group_args).first == 0 && last_entries == group_entries && keygen_calls == prior_derivations);
-    assert(capture({"batch", group_job.string(), "--resume", "--devices", "cpu", "--config", config.string()}).first == 0);
+    assert(capture({"batch", group_job.string(), "-r", "-d", "cpu", "-M", "256M", "-j", "3", "-t", dir.string(),
+                    "--config", config.string()}).first == 0);
     assert(last_entries == group_entries);
+    assert(last_group_options.workers == 3 && last_group_options.max_ram == 256ull * 1024 * 1024);
+    assert(last_group_options.temporary == std::vector<std::filesystem::path>{dir});
     group_args.insert(group_args.end(), {"--group-members", "4"});
     assert(capture(group_args).first != 0);
     auto const invalid_job = dir / "invalid-group.tsv";
