@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pos2gpu {
@@ -17,10 +18,12 @@ struct GroupOptions
     bool json = false, quiet = false, verbose = false, report_metrics = true;
     std::function<bool()> cancelled;
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
-    std::filesystem::path target, fixtures;
+    std::filesystem::path target, fixtures, manifest;
     std::vector<std::filesystem::path> destinations, temporary;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> relocations;
     std::optional<std::string> group, memo;
     std::optional<std::string> farmer, pool_pk, pool_ph, pool_address, seed;
+    std::optional<std::string> seed_owner;
     std::optional<uint64_t> k, strength, meta;
     uint64_t max_ram = 14000000000ull;
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024, temporary_capacity = 0;
@@ -36,6 +39,8 @@ struct GroupOptions
     bool window_set = false, checkpoint_set = false, generation_overlap_auto = true;
     bool backend_set = false;
     bool resume = false, group_auto = false, plan_only = false, directory_farm = false;
+    bool extend = false, allow_missing = false;
+    bool capacity_set = false, headroom_set = false, max_groups_set = false, max_total_members_set = false;
     std::optional<std::string> farming_reader, farming_objective;
     std::optional<uint64_t> farming_cores, farming_lookup_workers, farming_memory, farming_index_cache, farming_filter_bits, farming_future_filter_bits, farming_deadline_ms, farming_chain_us, farming_index_ns;
     std::optional<uint64_t> farming_cpu_work_weight, farming_io_work_weight, farming_max_eligible_groups;

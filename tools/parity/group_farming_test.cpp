@@ -191,7 +191,7 @@ std::vector<Job> adversarial(std::vector<FarmingDestination> const& destinations
                              std::vector<FarmingDrivePlan> const& layouts,
                              std::vector<std::vector<uint16_t>> const& counts)
 {
-    std::map<std::pair<size_t, uint64_t>, Job> families;
+    std::map<std::tuple<size_t, uint64_t, uint64_t>, Job> families;
     for (size_t lane = 0; lane < layouts.size(); ++lane)
     {
         size_t resource = lane;
@@ -206,7 +206,7 @@ std::vector<Job> adversarial(std::vector<FarmingDestination> const& destinations
         }
         for (size_t file = 0; file < counts[lane].size(); ++file)
         {
-            auto key = std::make_pair(resource, layouts[lane].family(file));
+            auto key = std::make_tuple(resource, layouts[lane].schedule, layouts[lane].family(file));
             Job job{lane, file, counts[lane][file]};
             auto found = families.find(key);
             if (found == families.end() || found->second.members < job.members)
@@ -322,6 +322,7 @@ void test_adversarial_scheduler()
         layouts[lane].meta_bits = 8;
         layouts[lane].resource_lanes = lane < 2 ? 2 : 1;
         layouts[lane].resource_rank = lane == 1 ? 1 : 0;
+        layouts[lane].schedule = lane < 2 ? 0 : 1;
     }
     std::vector<std::vector<uint16_t>> counts{{240, 1, 2, 1, 3}, {1, 2, 1, 2, 1}, {4, 1, 5, 2}};
     // Multiple replacement families outnumber workers. Long and short CPU
@@ -372,10 +373,12 @@ void test_adversarial_scheduler()
     c.lookup_workers = c.harvester_cores = 2;
     std::vector<FarmingDestination> independent{a, d, hdd(), hdd()};
     std::vector<FarmingDrivePlan> simple(4);
-    for (auto& layout : simple)
+    for (size_t lane = 0; lane < simple.size(); ++lane)
     {
+        auto& layout = simple[lane];
         layout.meta_slots = 256;
         layout.meta_bits = 8;
+        layout.schedule = lane;
     }
     std::vector<std::vector<uint16_t>> values{{1}, {20}, {3}, {8}};
     auto certificate = farming_assess(c, independent, simple, values);
@@ -428,6 +431,59 @@ void test_storage_profiles()
           "storage profiles lost their conservative latency ordering");
     check(unknown.max_eligible_families_per_resource == 1,
           "unknown storage bypassed same-resource family exclusion");
+}
+void test_frozen_expansion()
+{
+    FarmingConfig config;
+    config.k = 18; config.max_eligible_families_per_resource = 4;
+    auto a = hdd(64000000), b = a, added = a;
+    a.resource = 0; b.resource = 1; added.resource = 2;
+    a.max_total_members = b.max_total_members = added.max_total_members = 4;
+    auto original = farming_plan(config, {a, b});
+    check(original.feasible, "initial expansion fixture is infeasible");
+    auto extended = farming_plan(config, {a, b, added}, 64ull << 20, original.destinations);
+    check(extended.feasible && extended.destinations[0] == original.destinations[0] &&
+        extended.destinations[1] == original.destinations[1], "expansion changed a frozen farming assignment");
+    check(extended.destinations[2].schedule > original.destinations[0].schedule &&
+        extended.destinations[2].schedule > original.destinations[1].schedule &&
+        extended.cpu_work_seconds_per_sp > original.cpu_work_seconds_per_sp,
+        "expansion reused a family schedule or omitted existing farm demand");
+    added.resource = a.resource;
+    auto shared = farming_plan(config, {a, b, added}, 64ull << 20, original.destinations);
+    check(shared.feasible && shared.max_eligible_families_per_resource == 2,
+        "additional shared-device schedules were not charged independently");
+    auto restricted = config; restricted.max_eligible_families_per_resource = 1;
+    auto refused = farming_plan(restricted, {a, b, added}, 64ull << 20, original.destinations);
+    check(!refused.feasible, "expansion bypassed the combined physical-resource limit");
+    b.resource = a.resource;
+    auto relocated = farming_assess(config, {a, b}, original.destinations, extents(original.destinations));
+    check(relocated.feasible && relocated.max_eligible_families_per_resource == 2,
+        "relocated independent families were merged when their disks began sharing I/O");
+    auto jobs = adversarial({a, b}, original.destinations, extents(original.destinations));
+    check(jobs.size() == 2 && simulate(config, {a, b}, jobs,
+        original.destinations[0].files + original.destinations[1].files).tail <= relocated.response_bound_seconds,
+        "relocated independent schedules escaped the physical-resource certificate");
+
+    auto together = farming_plan(config, {a, b});
+    b.resource = 1;
+    auto split = farming_assess(config, {a, b}, together.destinations, extents(together.destinations));
+    check(split.feasible && split.max_eligible_families_per_resource == 1 &&
+        split.cpu_work_seconds_per_sp == together.cpu_work_seconds_per_sp,
+        "relocation split changed the saved identity interleave or omitted existing work");
+    auto after_split = farming_plan(config, {a, b, added}, 64ull << 20, together.destinations);
+    check(after_split.feasible && after_split.destinations[0] == together.destinations[0] &&
+        after_split.destinations[1] == together.destinations[1] &&
+        after_split.max_eligible_families_per_resource == 2,
+        "expansion after relocation changed frozen assignments or merged independent schedules");
+    auto alias = together.destinations;
+    alias[1].resource_rank = alias[0].resource_rank;
+    rejects([&] { farming_assess(config, {a, b}, alias, extents(alias)); },
+        "relocated schedule accepted repeated identity ranks");
+    auto exhausted = farming_plan(config, {a}).destinations;
+    exhausted[0].schedule = UINT64_MAX - 1;
+    b.resource = a.resource; added.resource = 1;
+    rejects([&] { farming_plan(config, {a, b, added}, 64ull << 20, exhausted); },
+        "reused candidate table bypassed identity schedule exhaustion");
 }
 void test_extent_admission()
 {
@@ -591,6 +647,7 @@ void test_small_exhaustive()
             {
                 auto a = farming_detail::candidate(c, drives[0], first, 4, 0, 1),
                      b = farming_detail::candidate(c, drives[1], second, 4, 0, 1);
+                b.schedule = 1;
                 check(!farming_detail::better(c, forecast(c, drives, {a, b}), selected),
                       "small exhaustive assignment dominates search");
             }
@@ -604,6 +661,7 @@ void test_small_exhaustive()
             {
                 auto a = farming_detail::candidate(c, drives[0], first, 4, 0, 1),
                      b = farming_detail::candidate(c, drives[1], second, 4, 0, 1);
+                b.schedule = 1;
                 check(!farming_detail::better(c, forecast(c, drives, {a, b}), selected),
                       "mixed exhaustive assignment dominates search");
             }
@@ -650,7 +708,9 @@ void test_fleet()
         {
             auto option = farming_detail::candidate(c, drive, files, 256, 0, 1);
             check(option.files == files, "balanced file-count neighbor omitted");
-            check(!farming_detail::better(c, forecast(c, drives, std::vector<FarmingDrivePlan>(60, option)),
+            std::vector<FarmingDrivePlan> options(drives.size(), option);
+            for (size_t lane = 0; lane < options.size(); ++lane) options[lane].schedule = lane;
+            check(!farming_detail::better(c, forecast(c, drives, options),
                                           selected),
                   "homogeneous exhaustive count dominates search");
         }
@@ -700,6 +760,7 @@ void test_fleet()
         for (auto const& d : almost)
         {
             options.push_back(farming_detail::candidate(c, d, files, 256, 0, 1));
+            options.back().schedule = options.size() - 1;
         }
         check(!farming_detail::better(c, forecast(c, almost, options), mixed),
               "manifest asymmetry lost a uniform better layout");
@@ -716,6 +777,7 @@ int main()
         test_adversarial_scheduler();
         test_filter_exclusion();
         test_storage_profiles();
+        test_frozen_expansion();
         test_extent_admission();
         test_small_exhaustive();
         test_explicit_family_tradeoff();

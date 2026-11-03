@@ -48,15 +48,16 @@ def check(binary, root, reference=None):
     counter = 0
 
     def command(*args):
-        return [str(binary), *map(str, args), "--config", os.devnull]
+        return [str(binary), str(args[0]), "--config", os.devnull, *map(str, args[1:])]
 
-    def run(*args, code=0, point=None):
+    def run(*args, code=0, point=None, input=None, cwd=None):
         nonlocal counter
         env = dict(os.environ)
         env.pop("XCHPLOT2_GROW_FAILPOINT", None)
         if point:
             env["XCHPLOT2_GROW_FAILPOINT"] = point
-        result = subprocess.run(command(*args), capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
+        result = subprocess.run(command(*args), capture_output=True, text=True, encoding="utf-8", env=env,
+                                input=input, cwd=cwd, timeout=180)
         counter += 1
         (root / f"{counter:03d}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         assert SEED not in result.stdout + result.stderr, "private seed exposed in diagnostics"
@@ -81,7 +82,7 @@ def check(binary, root, reference=None):
     preview_peer = root / "preview peer"
     preview.mkdir()
     preview_peer.mkdir()
-    options = [preview, "-D", preview_peer, "-k", 18, "--group-members", 2, "--max-total-members", 3, *construction]
+    options = [preview, preview_peer, "-k", 18, "--group-members", 2, "--max-total-members", 3, *construction]
     before = snapshot(preview), snapshot(preview_peer)
     planned = json.loads(run("plan", *options, "--json").stdout)
     filled = json.loads(run("fill", *options, "--plan-only", "--json").stdout)
@@ -240,6 +241,179 @@ def check(binary, root, reference=None):
     for path in farm_outputs:
         verify(path)
     print("PASS interrupted construction, directory fill, saved-plan resume and full proofs", flush=True)
+
+    # An interrupted initial publication must retain its random identity, and
+    # either member must locate the complete job without repeated keys/options.
+    farm = root / "saved farm"
+    farm.mkdir()
+    members = [farm / name for name in ("disk a", "disk b", "disk c")]
+    for directory in members:
+        directory.mkdir()
+    a, b, c = members
+    initial = ["fill", *keys, "-k", 18, "--group-members", 2, "--max-total-members", 3,
+               "--max-groups", 2, "--farming-max-eligible-groups", 4, *construction,
+               "--construction", "incremental", "--quiet", "--", a, b]
+    run(*initial, point="farm-plan-published", code=86)
+    resume = ["fill", "-r", "-d", "cpu", "-M", "512M", "-j", 2, "--compute", "off", "--quiet"]
+    recovered = run(*resume, b)
+    farm_paths = [Path(line) for line in recovered.stdout.splitlines()]
+    assert len(farm_paths) == 4 and {p.parent for p in farm_paths} == {a, b}
+    original_plan = (a / "grow-farm.plan").read_bytes()
+    assert original_plan == (b / "grow-farm.plan").read_bytes()
+    for directory in (a, b):
+        assert not (directory / "grow-farm.plan.next").exists()
+        if os.name != "nt":
+            assert (directory / "grow-farm.plan").stat().st_mode & 0o777 == 0o600
+    before = snapshot(a), snapshot(b)
+    assert set(run(*resume, b, a).stdout.splitlines()) == set(map(str, farm_paths))
+    assert set(run(*resume, "--manifest", b / "grow-farm.plan").stdout.splitlines()) == set(map(str, farm_paths))
+    assert set(run(*resume, cwd=b).stdout.splitlines()) == set(map(str, farm_paths))
+    assert (snapshot(a), snapshot(b)) == before, "keyless recovery rewrote the saved job or completed plots"
+    for path in farm_paths:
+        verify(path)
+    run(*resume, b, "-S", "cd" * 32, code=2)
+    assert (snapshot(a), snapshot(b)) == before
+    for changed in (["--max-total-members", 4], ["--max-groups", 3], ["--capacity-bytes", "96M"]):
+        run(*resume, b, *changed, code=2)
+        assert (snapshot(a), snapshot(b)) == before, "changed extent mutated the saved job"
+
+    candidates = json.loads(run("plan", "--json").stdout)
+    assert candidates["destination_candidates"] and isinstance(candidates["destinations"], list)
+    paths_file = farm / "destinations.txt"
+    paths_file.write_text(f"{b}\n{a}\n", encoding="utf-8")
+    selected = json.loads(run("plan", "--paths-from", paths_file, "--json").stdout)
+    streamed = json.loads(run("plan", "--paths0-from", "-", "--json", input=f"{a}\0{b}\0").stdout)
+    assert selected == streamed and len(selected["destinations"]) == 2
+    run("plan", "--paths-from", "-", input="", code=2)
+    print("PASS private replicated jobs, path lists and keyless recovery from any member", flush=True)
+
+    # Publication precedes opening the compute connection. Preserve that saved
+    # owner namespace when recovery switches to a local producer.
+    owned, control = farm / "compute owner", farm / "owner control"
+    owned.mkdir()
+    control.mkdir()
+    owner = "farm-owner"
+    owned_options = [*keys, "-k", 18, "--group-members", 1, "--max-total-members", 1,
+                     "--max-groups", 1, *construction, "--quiet"]
+    run("fill", *owned_options, "-S", SEED, "--compute-broker", "127.0.0.1:1",
+        "--compute-owner-id", owner, "--compute-ca", farm / "unused-ca",
+        "--compute-cert", farm / "unused-cert", "--compute-key", farm / "unused-key",
+        owned, point="farm-plan-published", code=86)
+    owned_path = Path(run(*resume, owned).stdout.strip())
+    scoped_seed = hashlib.sha256(b"xchplot2-pool-storage-owner-v1" + bytes.fromhex(SEED) + owner.encode()).hexdigest()
+    control_path = Path(run("fill", *owned_options, "--compute", "off", "-S", scoped_seed, control).stdout.strip())
+    assert digest(owned_path) == digest(control_path), "changing compute provider changed saved plot identities"
+    verify(owned_path)
+    print("PASS keyless local recovery preserves the saved compute owner namespace", flush=True)
+
+    offline = farm / "disk b offline"
+    b.rename(offline)
+    before_a = snapshot(a)
+    run(*resume, a, code=2)
+    partial = run(*resume, "--allow-missing", a, code=4)
+    assert set(partial.stdout.splitlines()) == {str(p) for p in farm_paths if p.parent == a}
+    assert "unavailable" in partial.stderr and snapshot(a) == before_a
+    unavailable = json.loads(run("plan", "--json", a, code=2).stdout)
+    assert [d["available"] for d in unavailable["destinations"]] == [True, False]
+    # An empty directory at an absent mountpoint is not the saved volume.
+    b.mkdir()
+    run(*resume, a, code=2)
+    assert not list(b.iterdir())
+    b.rmdir()
+    offline.rename(b)
+    assert set(run(*resume, a).stdout.splitlines()) == set(map(str, farm_paths))
+    print("PASS unavailable members remain pending and replaced mountpoints receive no writes", flush=True)
+
+    # Expansion on shared storage also accounts for the existing family's
+    # workload. Completed fixed extents release their unused capacity quota.
+    original_hashes = {p: digest(p) for p in farm_paths}
+    before = tuple(snapshot(directory) for directory in members)
+    expansion = json.loads(run("plan", c, b, a, "--json").stdout)
+    assert expansion["feasible"] and len(expansion["destinations"]) == 3
+    assert tuple(snapshot(directory) for directory in members) == before
+    run(*resume, a, c, code=2)
+    assert tuple(snapshot(directory) for directory in members) == before
+    run("fill", "--extend", "-d", "cpu", "-M", "512M", "-j", 2, "--quiet", c, a,
+        point="farm-plan-published:2", code=86)
+    assert all(digest(p) == value for p, value in original_hashes.items())
+    extended = run(*resume, c)
+    all_paths = [Path(line) for line in extended.stdout.splitlines()]
+    assert len(all_paths) == 6 and {p.parent for p in all_paths} == set(members)
+    assert all(digest(p) == value for p, value in original_hashes.items())
+    revised = (c / "grow-farm.plan").read_bytes()
+    assert revised != original_plan and all((d / "grow-farm.plan").read_bytes() == revised for d in members)
+    identities = {(header(p)[0], header(p)[4], index) for p in all_paths for index in range(header(p)[3])}
+    assert len(identities) == sum(header(p)[3] for p in all_paths), "expansion reused an existing plot identity"
+    for path in all_paths:
+        if path.parent == c:
+            verify(path)
+    # Repair a stale parent copy using the committed successor, never timestamps.
+    (b / "grow-farm.plan").write_bytes(original_plan)
+    run(*resume, b)
+    assert (b / "grow-farm.plan").read_bytes() == revised
+    corrupt = bytearray(revised)
+    corrupt[-2] = ord("0") if corrupt[-2] != ord("0") else ord("1")
+    (b / "grow-farm.plan").write_bytes(corrupt)
+    before_a = snapshot(a)
+    run(*resume, a, code=2)
+    assert snapshot(a) == before_a
+    (b / "grow-farm.plan").write_bytes(revised)
+    print("PASS expansion preserves old plots, accounts for the whole farm and recovers partial publication", flush=True)
+
+    relocated = farm / "disk a moved"
+    a.rename(relocated)
+    run(*resume, b, code=2)
+    before = tuple(snapshot(directory) for directory in (relocated, b, c))
+    moving = json.loads(run("plan", "--relocate", a, relocated, "--json").stdout)
+    assert moving["feasible"] and moving["destinations"][0]["directory"] == str(relocated)
+    assert tuple(snapshot(directory) for directory in (relocated, b, c)) == before
+    moved = run(*resume, "--relocate", a, relocated)
+    moved_paths = [Path(line) for line in moved.stdout.splitlines()]
+    assert len(moved_paths) == 6 and all(p.exists() for p in moved_paths)
+    for path, value in original_hashes.items():
+        assert digest(relocated / path.name if path.parent == a else path) == value
+    assert (relocated / "grow-farm.plan").read_bytes() == (c / "grow-farm.plan").read_bytes()
+    run(*resume, c)
+    other_job = farm / "different job"
+    other_job.mkdir()
+    run("fill", *keys, "-k", 18, "--max-total-members", 1, "--max-groups", 1, *construction, "--quiet", other_job)
+    before = snapshot(relocated), snapshot(other_job)
+    run("plan", relocated, other_job, code=2)
+    assert (snapshot(relocated), snapshot(other_job)) == before
+    print("PASS explicit relocation and conflicting-job rejection", flush=True)
+
+    # Recovery also completes an interrupted preparation before any replica
+    # is published. An offline member cannot commit an incomplete preparation.
+    for point in ("farm-plan-before-publication", "farm-plan-all-staged", "initialized"):
+        interrupted = farm / point
+        interrupted.mkdir()
+        left, right = interrupted / "left", interrupted / "right"
+        left.mkdir()
+        right.mkdir()
+        run("fill", *keys, "-k", 18, "--group-members", 2, "--max-total-members", 1,
+            "--max-groups", 1, *construction, "--construction", "incremental", "--quiet", left, right,
+            point=point, code=86)
+        pending = interrupted / "offline"
+        right.rename(pending)
+        before = snapshot(left)
+        if point != "initialized":
+            run(*resume, "--allow-missing", left, code=2)
+            assert snapshot(left) == before
+        else:
+            available = run(*resume, "--allow-missing", left, code=4)
+            assert len(available.stdout.splitlines()) == 1
+        pending.rename(right)
+        if point == "farm-plan-before-publication":
+            run(*resume, right, code=2)  # This member did not receive its first copy yet.
+        finished = run(*resume, left if point == "farm-plan-before-publication" else right)
+        paths = [Path(line) for line in finished.stdout.splitlines()]
+        assert len(paths) == 2 and all(header(path)[3] == 1 for path in paths)
+        assert (left / "grow-farm.plan").read_bytes() == (right / "grow-farm.plan").read_bytes()
+        assert not (left / "grow-farm.plan.next").exists() and not (right / "grow-farm.plan.next").exists()
+        if point == "initialized":
+            for path in paths:
+                verify(path)
+    print("PASS staged-job recovery and unfinished partial recovery preserve the saved extent", flush=True)
 
 
 def check_compute(binary, root):

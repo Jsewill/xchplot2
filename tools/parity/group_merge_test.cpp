@@ -23,7 +23,7 @@ std::atomic<bool> background_write_timed_out{false};
 std::thread::id producer_thread;
 std::promise<void>* background_write_started = nullptr;
 std::shared_future<void> background_write_release;
-std::atomic<bool> hold_background_check{false};
+std::atomic<bool> hold_background_check{false}, background_check_after{false};
 std::string background_check_target;
 std::atomic<bool> replace_unlinked{false};
 std::string replacement_target;
@@ -62,7 +62,10 @@ extern "C" ssize_t __wrap_pwrite(int fd, void const* bytes, size_t count, off_t 
 extern "C" int __real_lstat(char const*, struct stat*);
 extern "C" int __wrap_lstat(char const* path, struct stat* info)
 {
-    if (std::this_thread::get_id() != producer_thread && path == background_check_target &&
+    bool const captured = background_check_after.load(std::memory_order_acquire) &&
+        std::this_thread::get_id() != producer_thread && path == background_check_target;
+    int const result = captured ? __real_lstat(path, info) : 0;
+    if ((!captured || !result) && std::this_thread::get_id() != producer_thread && path == background_check_target &&
         hold_background_check.exchange(false, std::memory_order_acq_rel))
     {
         background_write_active.store(true, std::memory_order_release);
@@ -71,7 +74,7 @@ extern "C" int __wrap_lstat(char const* path, struct stat* info)
             background_write_timed_out.store(true, std::memory_order_release);
         background_write_active.store(false, std::memory_order_release);
     }
-    return __real_lstat(path, info);
+    return captured ? result : __real_lstat(path, info);
 }
 #endif
 
@@ -2902,6 +2905,8 @@ void farming_extent_admission(fs::path const& root)
         auto& config = farm.state.config; config.k = 18; config.group_members_override = 1;
         config.fixed_meta = true; config.max_eligible_families_per_resource = family_limit;
         farm.state.fingerprint = std::string(64, '0'); farm.state.manifest_reserved_bytes = 4096;
+        farm.state.job_id = farm.state.seed = farm.state.pool = std::string(64, '0');
+        farm.state.farmer = std::string(96, '0');
         std::vector<FarmingDestination> destinations(2);
         std::vector<FarmingDrivePlan> layouts(2);
         for (size_t lane = 0; lane < layouts.size(); ++lane)
@@ -2915,6 +2920,7 @@ void farming_extent_admission(fs::path const& root)
             auto const directory = root / (std::string(name) + "-" + std::to_string(lane));
             fs::create_directory(directory);
             farm.state.directories.push_back({directory.string(), "test", storage.capacity_bytes, 0, layout, storage});
+            farm.state.directories.back().directory_identity = "test:" + std::to_string(lane);
         }
         auto const initial = farming_assess(config, destinations, layouts,
             std::vector<std::vector<uint16_t>>(2, std::vector<uint16_t>(size_t(files), 1)));
@@ -2923,6 +2929,17 @@ void farming_extent_admission(fs::path const& root)
         farm.state.estimate.destinations = layouts; farm.lanes.resize(2);
         return farm;
     };
+    auto bounded = make_farm("bounded", 2, 4);
+    bounded.state.fixed_extent = true;
+    auto& terminal = bounded.state.directories[0].layout;
+    terminal.group_members = 2; terminal.total_members = 3;
+    bounded.lanes[0].ordinal = 1; bounded.lanes[0].completed_members = 2;
+    Arguments options;
+    require(bounded.maximum(options, 0) == 1 && bounded.file_maximum(0, 2) == 0,
+        "managed recovery enlarged a partial terminal file or added an unplanned file");
+    bounded.lanes[0].ordinal = 2;
+    require(!bounded.maximum(options, 0), "managed recovery exceeded its saved extent");
+
     auto promised = make_farm("promised", 2, 4);
     promised.lanes[0].outputs.resize(2);
     for (auto& output : promised.lanes[0].outputs) output.members = 1;
@@ -2966,6 +2983,115 @@ void farming_extent_admission(fs::path const& root)
     resumed.lanes[0].reserved_members = 1; resumed.certify(resumed.metadata);
     require(resumed.feasible() && resumed.admission && resumed.admission->max_eligible_families_per_resource == 3,
         "resumed shared-resource farming extension was not assessed beyond its forecast");
+
+    auto const exclusive_directory = root / "exclusive-farming-publication";
+    fs::create_directory(exclusive_directory);
+    auto const exclusive_path = exclusive_directory / "grow-farm.plan";
+    FarmingJob::Copy exclusive_copy{exclusive_path, {}, {}, false};
+    exclusive_copy.check();
+    auto const exclusive_pending = stage_farming_state(exclusive_path, saved.state);
+    auto const prepared = contents(exclusive_pending);
+    bool exclusive_rejected = false;
+    try { stream_state::atomic_save(exclusive_pending, "conflicting pending revision\n", false); }
+    catch (std::exception const&) { exclusive_rejected = true; }
+    require(exclusive_rejected && contents(exclusive_pending) == prepared,
+        "exclusive farming staging replaced an existing pending revision");
+    // A competing file appears after the controller validated its absence.
+    std::string const competing = "concurrently saved job\n";
+    stream_state::atomic_save(exclusive_path, competing);
+    exclusive_rejected = false;
+    try { publish_farming_state(exclusive_pending, exclusive_path, exclusive_copy.stamp.has_value()); }
+    catch (std::runtime_error const&) { exclusive_rejected = true; }
+    require(exclusive_rejected && contents(exclusive_pending) == prepared &&
+        contents(exclusive_path) == std::vector<uint8_t>(competing.begin(), competing.end()),
+        "exclusive farming publication replaced a concurrently appearing job");
+    for (auto const& entry : fs::directory_iterator(exclusive_directory))
+        require(entry.path() == exclusive_path || entry.path() == exclusive_pending,
+            "failed exclusive farming publication retained a private temporary file");
+    publish_farming_state(exclusive_pending, exclusive_path, true);
+    require(contents(exclusive_path) == prepared && !fs::exists(exclusive_pending),
+        "validated farming-parent replacement failed");
+
+    auto partial = make_farm("partial-topology", 1, 3);
+    for (auto& directory : partial.state.directories)
+    {
+        directory.directory_identity = farming_directory_identity(directory.directory);
+        directory.resource = directory.storage.resource = 1;
+        directory.layout.schedule = 1;
+        directory.identity_resources = 2; directory.identity_resource = 1;
+    }
+    partial.state.estimate.destinations.clear();
+    for (auto const& directory : partial.state.directories)
+        partial.state.estimate.destinations.push_back(directory.layout);
+    auto absent = partial.state.directories.front();
+    absent.directory = (root / "offline-topology").string(); absent.directory_identity = "offline";
+    absent.resource = absent.storage.resource = 0;
+    absent.layout.schedule = 0; absent.layout.resource_rank = 0; absent.layout.resource_lanes = 1;
+    absent.identity_resource = 0;
+    absent.layout.files = absent.layout.total_members = absent.layout.families = 0;
+    partial.state.directories.push_back(absent);
+    partial.state.estimate.destinations.push_back(absent.layout);
+    partial.state.fixed_extent = true;
+    FarmingJob job; job.saved = partial.state;
+    for (auto const& directory : partial.state.directories) job.directories.push_back(directory.directory);
+    Arguments preview; preview.plan_only = true; preview.max_ram = 512 * mib;
+    auto available = farming_run(preview, nullptr, job);
+    require(available->available[0] && available->available[1] && !available->available[2],
+        "partial topology compared renumbered resource IDs instead of available resource relationships");
+    job.saved->directories[1].resource = job.saved->directories[1].storage.resource = 0;
+    bool changed_topology = false;
+    try { (void)farming_run(preview, nullptr, job); }
+    catch (std::runtime_error const& error)
+    { changed_topology = std::string(error.what()).find("storage topology changed") != std::string::npos; }
+    require(changed_topology, "offline destination bypassed changed storage topology among available members");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    for (bool pending_source : {true, false})
+    {
+        auto const directory = root / (pending_source ? "changed-pending" : "appeared-parent");
+        auto const left = directory / "a", right = directory / "b";
+        fs::create_directories(left); fs::create_directory(right);
+        Arguments options; options.command = "fill"; options.directory_farm = true;
+        options.target = left; options.destinations.push_back(right);
+        options.k = 18; options.group_members = 1; options.meta = 0;
+        options.farming_max_eligible_groups = 4;
+        options.capacity = 64 * mib; options.headroom = 0; options.max_ram = 512 * mib;
+        options.max_groups = options.max_total_members = 1;
+        auto job = farming_arguments(options);
+        auto const pending = right / "grow-farm.plan.next", published = left / "grow-farm.plan";
+        std::promise<void> started, release;
+        auto ready = started.get_future();
+        producer_thread = std::this_thread::get_id();
+        background_write_started = &started; background_write_release = release.get_future().share();
+        background_check_target = pending.string();
+        background_write_timed_out = false; background_check_after = true; hold_background_check = true;
+        auto writer = std::async(std::launch::async, [&]
+        {
+            try
+            {
+                auto run = farming_run(options, nullptr, job);
+                if (!run->feasible()) return run->infeasibility_reason();
+            }
+            catch (std::runtime_error const& error) { return std::string(error.what()); }
+            return std::string{};
+        });
+        bool const paused = ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        auto const changed = pending_source ? pending : published;
+        std::string const replacement = "unrelated replacement\n";
+        if (paused) stream_state::atomic_save(changed, replacement);
+        release.set_value();
+        auto const error = writer.get();
+        hold_background_check = false; background_check_after = false; background_check_target.clear();
+        background_write_started = nullptr;
+        require(paused && !background_write_timed_out &&
+            error.find(pending_source ? "pending farming revision changed" : "farming job appeared") != std::string::npos,
+            "concurrent farming metadata change bypassed its publication audit: " + error);
+        require(!fs::exists(right / "grow-farm.plan") && (!pending_source || !fs::exists(published)),
+            "farming metadata conflict published part of the job before rejection");
+        require(contents(changed) == std::vector<uint8_t>(replacement.begin(), replacement.end()),
+            "farming publication overwrote concurrently replaced metadata");
+    }
+#endif
 }
 
 void output_reservations(fs::path const& root, Members input, Config cfg)

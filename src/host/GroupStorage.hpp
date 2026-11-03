@@ -1,6 +1,10 @@
 // Storage limits shared by single-file growth and destination scheduling.
 #pragma once
 #include "host/GroupEngine.hpp"
+#include <cwctype>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <set>
 #ifdef _WIN32
 #include <winioctl.h>
@@ -74,6 +78,108 @@ struct StorageDevice
     // Both remain false for mixed media or an unknown rotation classification.
     bool nonrotating = false, rotating = false;
 };
+
+// Paths and Linux device numbers can change across boots. Pair the persistent
+// filesystem identity with the directory's native file ID when recovering a job.
+inline std::string farming_directory_identity(std::filesystem::path const& path)
+{
+    file_io::Stat info{};
+    require(!file_io::inspect_path(path.c_str(), &info) && file_io::is_directory(info.st_mode),
+        "cannot identify farming destination directory");
+    std::ostringstream value;
+#ifdef __linux__
+    struct statfs filesystem{};
+    require(!::statfs(path.c_str(), &filesystem), "cannot identify farming destination filesystem");
+    value << std::hex << uint64_t(filesystem.f_type) << ':';
+    if (unsigned(filesystem.f_type) == 0x9123683eu)
+    {
+        // Btrfs statfs IDs can include the current device number. Its UUID and
+        // subvolume ID retain the directory identity across mount cycles.
+        int const fd = file_io::open_file(path.c_str(), file_io::read_only | file_io::directory | file_io::close_on_exec);
+        require(fd >= 0, "cannot open farming destination directory");
+        struct Close { int fd; ~Close() { file_io::close_file(fd); } } close{fd};
+        struct btrfs_ioctl_fs_info_args btrfs{};
+        struct btrfs_ioctl_get_subvol_info_args subvolume{};
+        require(!::ioctl(fd, BTRFS_IOC_FS_INFO, &btrfs) && !::ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, &subvolume),
+            "cannot identify farming destination subvolume");
+        for (auto byte : btrfs.fsid) value << std::setw(2) << std::setfill('0') << unsigned(byte);
+        value << ':' << subvolume.treeid;
+    }
+    else for (auto byte : std::as_bytes(std::span(&filesystem.f_fsid, 1)))
+        value << std::setw(2) << std::setfill('0') << std::to_integer<unsigned>(byte);
+#elif defined(_WIN32)
+    std::wstring mount(32768, L'\0');
+    std::array<wchar_t, 64> name{};
+    require(::GetVolumePathNameW(path.c_str(), mount.data(), DWORD(mount.size())) &&
+        ::GetVolumeNameForVolumeMountPointW(mount.c_str(), name.data(), DWORD(name.size())),
+        "cannot identify farming destination volume");
+    value << file_io::path_text(std::filesystem::path(name.data()));
+#else
+    value << uint64_t(info.st_dev);
+#endif
+    value << ':' << uint64_t(info.st_ino);
+    return value.str();
+}
+
+inline std::vector<std::filesystem::path> farming_destination_candidates()
+{
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates;
+#ifdef __linux__
+    std::ifstream mounts("/proc/self/mountinfo");
+    for (std::string line; std::getline(mounts, line);)
+    {
+        std::istringstream row(line);
+        std::string id, parent, device, root, mount, options;
+        if (!(row >> id >> parent >> device >> root >> mount >> options)) continue;
+        if (!(options == "rw" || options.starts_with("rw,"))) continue;
+        std::string decoded;
+        for (size_t i = 0; i < mount.size(); ++i)
+        {
+            if (mount[i] == '\\' && i + 3 < mount.size() &&
+                mount[i + 1] >= '0' && mount[i + 1] <= '7' && mount[i + 2] >= '0' && mount[i + 2] <= '7' &&
+                mount[i + 3] >= '0' && mount[i + 3] <= '7')
+            {
+                decoded.push_back(char((mount[i + 1] - '0') * 64 + (mount[i + 2] - '0') * 8 + mount[i + 3] - '0'));
+                i += 3;
+            }
+            else decoded.push_back(mount[i]);
+        }
+        if (decoded == "/" || decoded == "/home" || decoded == "/usr" || decoded == "/var" ||
+            decoded == "/boot" || decoded.starts_with("/boot/") || decoded == "/efi") continue;
+        struct statfs filesystem{};
+        auto path = file_io::native_path(decoded);
+        if (::statfs(path.c_str(), &filesystem) || ram_backed_filesystem(uint64_t(filesystem.f_type))) continue;
+        // These are suggestions for persistent local plot storage. Explicit
+        // destinations still go through the normal filesystem validation.
+        if (unsigned(filesystem.f_type) != 0xef53u && unsigned(filesystem.f_type) != 0x58465342u &&
+            unsigned(filesystem.f_type) != 0x9123683eu && unsigned(filesystem.f_type) != 0x5346544eu) continue;
+        if (::access(path.c_str(), W_OK | X_OK)) continue;
+        candidates.push_back(std::move(path));
+    }
+#elif defined(_WIN32)
+    std::array<wchar_t, 32768> windows{};
+    auto const length = ::GetWindowsDirectoryW(windows.data(), DWORD(windows.size()));
+    wchar_t const system = length && length < windows.size() ? wchar_t(std::towupper(windows[0])) : L'C';
+    DWORD const drives = ::GetLogicalDrives();
+    for (unsigned index = 0; index < 26; ++index)
+    {
+        if (!(drives & (DWORD(1) << index)) || wchar_t(L'A' + index) == system) continue;
+        std::wstring path{wchar_t(L'A' + index), L':', L'\\'};
+        auto const kind = ::GetDriveTypeW(path.c_str());
+        if (kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE) continue;
+        std::array<wchar_t, 32> filesystem{};
+        DWORD flags = 0;
+        if (!::GetVolumeInformationW(path.c_str(), nullptr, 0, nullptr, nullptr, &flags,
+                filesystem.data(), DWORD(filesystem.size())) || (flags & FILE_READ_ONLY_VOLUME) ||
+            std::wstring_view(filesystem.data()) != L"NTFS") continue;
+        candidates.emplace_back(path);
+    }
+#endif
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
+}
 
 // Follow partitions, device-mapper and RAID slaves to the underlying devices.
 // Btrfs uses an anonymous st_dev, so obtain its filesystem UUID and device

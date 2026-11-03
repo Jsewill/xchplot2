@@ -4,6 +4,7 @@
 #endif
 #include <algorithm>
 #include <climits>
+#include <fstream>
 #include <iostream>
 #include <thread>
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
@@ -30,7 +31,7 @@ void reference_help()
     std::cout <<
         "Ordinary PoS2 group construction reference runner\n"
         "Usage: pos2_pr118_grow TARGET [OPTIONS]\n"
-        "  -D, --destination FILE|DIR  additional key-derived destination; repeat for more drives\n"
+        "      --destination FILE|DIR  additional key-derived destination; repeat for more drives\n"
         "  -t, --temp-dir DIR        optional contribution storage; repeat for more devices\n"
         "  --destination-temp off|on|ssd|hdd  destination scratch policy, default off\n"
         "                            on: any destination; ssd/hdd: only known drives of that type\n"
@@ -101,14 +102,15 @@ void reference_help()
         "group may be continued with a larger cap. Rollover uses private grow-group-\n"
         "<ordinal>.gplot files, distinct key-derived identities, and index zero in each\n"
         "group. Its capacity cap covers all output files and active construction.\n"
-        "All rollover commands must reuse the same seed, keys and group parameters.\n"
+        "File rollover resumes must reuse the same seed, keys and group parameters.\n"
+        "Directory farming jobs save their seed, keys and destinations for --resume.\n"
         "The RAM budget models app buffers; physical memory qualification is separate.\n";
 }
 } // namespace
 
 pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::string_view command)
 {
-    require(argc > 1, "destination required; use --help");
+    require(argc > 1 || command == "plan", "destination required; use --help");
     GroupOptions result;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     result.backend = "auto";
@@ -116,17 +118,37 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     result.command = command;
     result.plan_only = command == "plan";
     result.resume = command == "grow";
+    bool literal = false;
+    auto path = [](std::string const& value)
+    { return fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal(); };
+    auto destination = [&](std::string const& value)
+    {
+        require(!value.empty(), "empty destination path");
+        if (result.target.empty()) result.target = path(value);
+        else
+        {
+            require(command != "grow" && command != "plot", "unexpected destination " + value);
+            require(result.destinations.size() < 1023, "too many destinations");
+            result.destinations.push_back(path(value));
+        }
+    };
     for (int i = 1; i < argc; ++i)
     {
         std::string key = argv[i];
+        if (literal) { destination(key); continue; }
+        if (key == "--") { literal = true; continue; }
         if (!command.empty() && key.starts_with("--compute-")) key.replace(2, 8, "pool-");
         if (key == "--help" && command.empty()) { reference_help(); std::exit(0); }
         if (key == "--resume" || key == "-r") { result.resume = true; continue; }
         if (key == "--plan-only") { result.plan_only = true; continue; }
+        if (key == "--extend") { result.extend = true; continue; }
+        if (key == "--allow-missing") { result.allow_missing = true; continue; }
         if (!command.empty())
         {
             if (key == "--no-resume") { result.resume = command == "grow"; continue; }
             if (key == "--no-plan-only") { result.plan_only = command == "plan"; continue; }
+            if (key == "--no-extend") { result.extend = false; continue; }
+            if (key == "--no-allow-missing") { result.allow_missing = false; continue; }
             if (key == "--json") { result.json = true; continue; }
             if (key == "--no-json") { result.json = false; continue; }
             if (key == "--quiet" || key == "-q") { result.quiet = true; continue; }
@@ -140,6 +162,30 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             require(i + 1 < argc, "missing value for " + key);
             std::string const value = argv[++i];
             if (key == "--group-id") result.group = value;
+            else if (key == "--manifest") result.manifest = path(value);
+            else if (key == "--relocate")
+            {
+                require(i + 1 < argc, "--relocate requires OLD and NEW paths");
+                result.relocations.emplace_back(path(value), path(argv[++i]));
+            }
+            else if (key == "--paths-from" || key == "--paths0-from")
+            {
+                std::ifstream file;
+                if (value != "-") file.open(path(value), std::ios::binary);
+                require(value == "-" || file.is_open(), "cannot open destination list: " + value);
+                auto& input = value == "-" ? std::cin : file;
+                bool const nul = key == "--paths0-from";
+                size_t count = 0;
+                for (std::string line; std::getline(input, line, nul ? '\0' : '\n');)
+                {
+                    if (!nul && !line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    require(line.find('\0') == line.npos, "NUL in a line-delimited destination list; use --paths0-from");
+                    destination(line); ++count;
+                }
+                require(input.eof() && !input.bad(), "cannot read destination list: " + value);
+                require(count, "destination list is empty: " + value);
+            }
             else if (key == "--compute") result.compute_mode = value;
             else if (key == "--pool-directory") result.pool_directory = value;
             else if (key == "--pool-local")
@@ -183,7 +229,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(result.temporary_capacity > 0, "--temp-capacity-bytes must be positive");
             }
             else if (key == "--destination-temp") result.destination_temp = value;
-            else if (key == "--destination" || key == "-D")
+            else if (key == "--destination" && command.empty())
             {
                 require(result.destinations.size() < 1023, "too many destinations");
                 result.destinations.push_back(fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal());
@@ -194,9 +240,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--capacity-bytes")
             {
                 result.capacity = number(value.c_str());
+                result.capacity_set = true;
                 require(result.capacity > 0, "--capacity-bytes must be positive");
             }
-            else if (key == "--headroom-bytes") result.headroom = number(value.c_str());
+            else if (key == "--headroom-bytes") { result.headroom = number(value.c_str()); result.headroom_set = true; }
             else if (key == "--max-ram" || key == "-M") result.max_ram = number(value.c_str());
             else if (key == "--window-bytes") { result.window = number(value.c_str()); result.window_set = true; }
             else if (key == "--workers" || key == "-j") result.workers = number(value.c_str());
@@ -226,8 +273,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--farming-chain-us-per-member") result.farming_chain_us = number(value.c_str());
             else if (key == "--farming-index-ns-per-entry") result.farming_index_ns = number(value.c_str());
             else if (key == "--farming-deadline-ms") result.farming_deadline_ms = number(value.c_str());
-            else if (key == "--max-groups") result.max_groups = number(value.c_str());
-            else if (key == "--max-total-members") result.max_total_members = number(value.c_str());
+            else if (key == "--max-groups") { result.max_groups = number(value.c_str()); result.max_groups_set = true; }
+            else if (key == "--max-total-members") { result.max_total_members = number(value.c_str()); result.max_total_members_set = true; }
             else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str()); result.checkpoint_set = true; }
             else if (key == "--backend") { result.backend = value; result.backend_set = true; }
             else if (key == "--device") result.device = number(value.c_str());
@@ -255,37 +302,35 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
         else
         {
-            require(result.target.empty(), "unexpected argument " + key);
-            result.target = fs::path(reinterpret_cast<char8_t const*>(key.c_str()));
+            destination(key);
         }
     }
-    require(!result.target.empty(), "destination required");
+    bool const farm_command = command == "fill" || command == "plan";
+    if (result.extend || !result.relocations.empty()) result.resume = true;
+    require(!result.target.empty() || (farm_command && (result.plan_only || result.resume || !result.manifest.empty())), "destination required");
+    require((!result.extend && !result.allow_missing && result.manifest.empty() && result.relocations.empty()) || farm_command,
+        "saved farming job options require plan or fill");
+    require(!result.allow_missing || (result.resume && !result.extend && result.relocations.empty()),
+        "--allow-missing requires --resume without --extend or --relocate");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
                 result.max_members <= 65535, "member caps must be in 1..65535");
     require(result.workers <= 1024, "compression worker cap exceeds 1024");
     require(result.group_members <= 65535 && result.max_groups && result.max_total_members,
             "rollover group membership must fit in 1..65535 and limits must be positive");
-    result.target = fs::absolute(result.target).lexically_normal();
+    if (!result.target.empty()) result.target = fs::absolute(result.target).lexically_normal();
     bool const farming_options = result.farming_reader || result.farming_objective || result.farming_cpu_work_weight ||
         result.farming_io_work_weight || result.farming_max_eligible_groups || result.farming_cores || result.farming_lookup_workers ||
         result.farming_memory || result.farming_index_cache || result.farming_filter_bits || result.farming_future_filter_bits ||
         result.farming_deadline_ms || result.farming_chain_us || result.farming_index_ns;
     bool const directory_target = fs::is_directory(result.target);
-    if (command == "fill" || command == "plan")
-        require(directory_target, "plan and fill require an existing destination directory");
     if (command == "grow")
         require(!directory_target && fs::exists(result.target), "grow requires an existing group file; use plot to create files");
     require(command.empty() || !result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
     bool saved_farm = false;
     if (result.resume && directory_target)
-    {
-        saved_farm = fs::exists(result.target / "grow-farm.plan");
-        if (!saved_farm) for (auto const& entry : fs::directory_iterator(result.target))
-            if (entry.path().filename().u8string().starts_with(u8"grow-farm.plan.pending-"))
-            { saved_farm = true; break; }
-    }
-    result.directory_farm = directory_target &&
-        (command == "fill" || command == "plan" || !result.group_members || !result.destinations.empty() || result.plan_only || farming_options || saved_farm);
+        saved_farm = fs::exists(result.target / "grow-farm.plan") || fs::exists(result.target / "grow-farm.plan.next");
+    result.directory_farm = farm_command || (directory_target &&
+        (!result.group_members || !result.destinations.empty() || result.plan_only || farming_options || saved_farm));
     require(!result.group_auto || result.directory_farm, "--group-members auto requires a directory target");
     require(!result.group_members || !result.group_auto, "choose one --group-members value");
     require(!(result.group_members || result.directory_farm) || (result.max_members == 65535 && !result.group && !result.memo &&
@@ -389,7 +434,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "remote codec partition leaves insufficient owner RAM");
         result.max_ram -= result.pool_codec_ram;
     }
-    if (result.directory_farm)
+    if (result.directory_farm && !farm_command)
     {
         result.target = fs::canonical(result.target);
         for (auto& destination : result.destinations) destination = fs::canonical(destination);

@@ -9,6 +9,7 @@
 #include "host/GroupFarming.hpp"
 #include "host/GroupFarmState.hpp"
 #include "host/GroupWriter.hpp"
+#include "host/Random.hpp"
 #include "plot/Plotter.hpp"
 #include "pos2_keygen.h"
 #include "host/GroupPlotter.hpp"
@@ -154,8 +155,8 @@ void requested_identity(Arguments const& args, Identity const& identity)
 }
 
 // Use exactly the production CLI's base-seed/subseed and BLS group derivation.
-// Requiring a seed keeps the complete recoverable identity inside each output:
-// there is no separate random-seed manifest or construction sidecar.
+// Named files retain their identity in the output. Directory jobs also save
+// their base seed and original owner namespace before creating any output.
 struct Keys
 {
     std::array<uint8_t, 32> seed{};
@@ -174,7 +175,8 @@ struct Keys
         auto const raw_seed = hex(*args.seed);
         require(raw_seed.size() == seed.size(), "--seed must be 64 hex chars");
         std::copy(raw_seed.begin(), raw_seed.end(), seed.begin());
-        if (!args.pool_broker.empty()) seed = pos2gpu::compute_owner_seed(seed, args.pool_owner);
+        auto const owner = args.seed_owner.value_or(args.pool_broker.empty() ? "" : args.pool_owner);
+        if (!owner.empty()) seed = pos2gpu::compute_owner_seed(seed, owner);
         farmer = hex(*args.farmer);
         require(farmer.size() == 48, "--farmer-pk must be 96 hex chars");
         if (args.pool_pk)
@@ -4243,7 +4245,9 @@ struct FarmingRun
     std::vector<Lane> lanes;
     std::vector<std::unique_ptr<DirectoryLock>> locks;
     fs::path manifest;
-    std::optional<stream_state::Stamp> manifest_stamp;
+    std::vector<std::pair<fs::path, stream_state::Stamp>> manifests;
+    std::vector<uint8_t> available;
+    size_t previous_destinations = 0;
     group_grow::Stats audited;
     uint64_t metadata = 0, memory_limit = 0, manifest_charge = 0, planning_peak = 0;
     std::optional<group_grow::FarmingAssessment> admission;
@@ -4340,10 +4344,9 @@ struct FarmingRun
 
     Identity identity(Keys const& keys, size_t lane, uint64_t ordinal) const
     {
-        auto const& layout = state.directories[lane].layout;
-        uint64_t resources = 0;
-        auto const resource = state.directories[lane].resource;
-        for (auto const& directory : state.directories) resources = std::max(resources, directory.resource + 1);
+        auto const& directory = state.directories[lane];
+        auto const& layout = directory.layout;
+        auto const resources = directory.identity_resources, resource = directory.identity_resource;
         // Check the interleave before the policy accessor multiplies its ordinal.
         (void)sum(product(ordinal, layout.resource_lanes), layout.resource_rank);
         uint64_t const family = sum(product(layout.family(ordinal), resources), resource);
@@ -4352,6 +4355,13 @@ struct FarmingRun
         std::string_view const domain = "xchplot2 directory farming v1";
         sha256_update(&hash, domain.data(), domain.size());
         sha256_update(&hash, keys.seed.data(), keys.seed.size());
+        if (directory.identity_epoch)
+        {
+            // Expansion gets its own key namespace without changing the
+            // original family interleave, including on an offline member.
+            std::string const epoch = " expansion " + std::to_string(directory.identity_epoch);
+            sha256_update(&hash, epoch.data(), epoch.size());
+        }
         sha256_sum(&hash, farming_keys.seed.data());
         auto value = farming_keys.derive(family);
         value.params = PlotGroupParams(value.params.get_plot_group_id(), keys.k, keys.strength, layout.meta(ordinal));
@@ -4368,6 +4378,7 @@ struct FarmingRun
     uint16_t file_maximum(size_t lane, uint64_t ordinal) const
     {
         auto const& layout = state.directories[lane].layout;
+        if (state.fixed_extent) return ordinal < layout.files ? layout.file_members(ordinal) : 0;
         // The forecast terminal file may be partial. A fixed rollover size
         // still allows that same file to grow when the total limit increases.
         return layout.fixed_members ? layout.group_members : layout.file_members(ordinal);
@@ -4375,6 +4386,7 @@ struct FarmingRun
     uint16_t maximum(Arguments const& args, size_t lane) const
     {
         auto const& current = lanes[lane];
+        if (state.fixed_extent && current.ordinal >= state.directories[lane].layout.files) return 0;
         if (current.no_capacity || current.ordinal >= args.max_groups || current.completed_members >= args.max_total_members ||
             current.completed_charge >= state.directories[lane].capacity_bytes) return 0;
         return uint16_t(std::min<uint64_t>(file_maximum(lane, current.ordinal),
@@ -4382,10 +4394,12 @@ struct FarmingRun
     }
     void check(std::span<uint8_t const> active = {}) const
     {
-        if (manifest_stamp) require(stream_state::stamp(manifest) == *manifest_stamp, "farming plan changed during the run");
+        for (auto const& [path, stamp] : manifests)
+            require(stream_state::stamp(path) == stamp, "farming plan changed during the run");
         for (size_t i = 0; i < lanes.size(); ++i)
         {
-            if (!locks.empty()) locks[i]->check();
+            if (!available.empty() && !available[i]) continue;
+            if (!locks.empty() && locks[i]) locks[i]->check();
             auto const& lane = lanes[i];
             auto const& directory = state.directories[i].directory;
             bool const writing = !active.empty() && active[i];
@@ -4419,6 +4433,17 @@ struct FarmingRun
                     now.modified_nanoseconds == saved.modified_nanoseconds && now.changed_seconds == saved.changed_seconds &&
                     now.changed_nanoseconds == saved.changed_nanoseconds, "saved farming output changed during the run");
             }
+        }
+    }
+
+    void select_available()
+    {
+        for (size_t i = available.size(); i-- > 0;) if (!available[i])
+        {
+            state.directories.erase(state.directories.begin() + i);
+            lanes.erase(lanes.begin() + i);
+            if (!locks.empty()) locks.erase(locks.begin() + i);
+            available.erase(available.begin() + i);
         }
     }
 };
@@ -4498,55 +4523,272 @@ std::string farming_fingerprint(Keys const& keys)
         << ' ' << group_tools::hex(identity.memo);
     return stream_state::digest(value.str());
 }
-std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys)
+
+struct FarmingJob
+{
+    struct Copy
+    {
+        fs::path path;
+        std::optional<stream_state::Stamp> stamp;
+        std::string digest;
+        bool pending = false;
+
+        void check() const
+        {
+            if (stamp)
+                require(stream_state::stamp(path) == *stamp, "farming job changed while acquiring its directories");
+            else
+            {
+                file_io::Stat info{};
+                require(file_io::inspect_link(path.c_str(), &info) != 0 && errno == ENOENT,
+                    "farming job appeared while acquiring its directories");
+            }
+        }
+    };
+    std::optional<group_grow::FarmingState> saved;
+    std::vector<Copy> copies;
+    std::vector<fs::path> directories;
+    std::set<size_t> relocated;
+    std::string digest;
+    bool pending = false, published = false, changed = false;
+
+    void check() const
+    {
+        for (auto const& copy : copies) copy.check();
+    }
+};
+
+FarmingJob farming_arguments(Arguments& args)
+{
+    FarmingJob job;
+    std::vector<fs::path> requested;
+    if (!args.target.empty()) requested.push_back(args.target);
+    requested.insert(requested.end(), args.destinations.begin(), args.destinations.end());
+    if (requested.empty() && args.manifest.empty() && args.relocations.empty()) requested.push_back(fs::current_path());
+    for (auto& path : requested) path = fs::weakly_canonical(path);
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    auto same_directory = [](fs::path const& a, fs::path const& b)
+    {
+        if (a == b) return true;
+        std::error_code error;
+        return fs::equivalent(a, b, error) && !error;
+    };
+
+    std::vector<fs::path> directories = requested;
+    for (auto const& [old, replacement] : args.relocations) directories.push_back(fs::canonical(replacement));
+    std::map<std::string, group_grow::FarmingState> revisions;
+    std::set<fs::path> visited;
+    auto read = [&](fs::path path, bool pending)
+    {
+        path = fs::absolute(path).lexically_normal();
+        if (!visited.insert(path).second) return;
+        file_io::Stat info{};
+        if (file_io::inspect_link(path.c_str(), &info))
+        {
+            require(errno == ENOENT, "cannot inspect farming job: " + file_io::path_text(path));
+            job.copies.push_back({path, {}, {}, pending}); return;
+        }
+        auto const stamp = stream_state::stamp(path);
+        auto state = group_grow::load_farming_state(path, args.max_ram);
+        require(stream_state::stamp(path) == stamp, "farming job changed while loading");
+        auto const digest = stream_state::digest(group_grow::farming_state_text(state));
+        job.copies.push_back({path, stamp, digest, pending});
+        if (!revisions.empty()) require(revisions.begin()->second.job_id == state.job_id,
+            "destinations contain different farming jobs; select one job with --manifest and its own destinations");
+        if (revisions.contains(digest)) return;
+        require(revisions.size() < 2, "conflicting farming revisions; restore a consistent job before continuing");
+        for (auto const& d : state.directories) directories.push_back(file_io::native_path(d.directory));
+        revisions.emplace(digest, std::move(state));
+    };
+    if (!args.manifest.empty())
+    {
+        require(fs::is_regular_file(args.manifest), "--manifest requires an existing farming job file");
+        read(args.manifest, args.manifest.extension() == ".next");
+    }
+    std::set<fs::path> seen;
+    for (size_t i = 0; i < directories.size(); ++i)
+    {
+        auto const directory = directories[i];
+        if (!seen.insert(directory).second) continue;
+        read(directory / "grow-farm.plan", false);
+        read(directory / "grow-farm.plan.next", true);
+    }
+    if (!revisions.empty())
+    {
+        auto selected = revisions.begin();
+        for (auto at = revisions.begin(); at != revisions.end(); ++at)
+            if (at->second.revision > selected->second.revision) selected = at;
+        if (revisions.size() == 2)
+        {
+            auto const previous = selected == revisions.begin() ? std::next(selected) : revisions.begin();
+            auto const& before = previous->second; auto const& after = selected->second;
+            require(before.revision < UINT64_MAX && after.revision == before.revision + 1 &&
+                after.parent_digest == previous->first && after.seed == before.seed && after.seed_owner == before.seed_owner &&
+                after.farmer == before.farmer && after.pool == before.pool && after.pool_public_key == before.pool_public_key &&
+                after.config == before.config && after.fixed_extent == before.fixed_extent &&
+                after.directories.size() >= before.directories.size(), "conflicting farming revisions; no files were changed");
+            for (size_t i = 0; i < before.directories.size(); ++i)
+            {
+                auto const& a = before.directories[i]; auto const& b = after.directories[i];
+                require(a.layout == b.layout && a.identity_resource == b.identity_resource &&
+                    a.identity_resources == b.identity_resources && a.identity_epoch == b.identity_epoch,
+                    "farming revision changed an existing identity assignment");
+            }
+        }
+        job.digest = selected->first; job.saved = std::move(selected->second);
+        auto const& saved = *job.saved;
+        for (auto const& copy : job.copies) if (copy.stamp)
+        {
+            job.pending = job.pending || copy.pending || copy.digest != job.digest;
+            job.published = job.published || (!copy.pending && copy.digest == job.digest);
+        }
+        require(args.resume || args.plan_only, "farming job exists; use --resume or --extend");
+        farming_requested(args, saved.config);
+        if (!args.seed) args.seed = saved.seed;
+        if (!args.farmer) args.farmer = saved.farmer;
+        if (!args.pool_pk && !args.pool_ph && !args.pool_address)
+        {
+            if (saved.pool_public_key) args.pool_pk = saved.pool;
+            else args.pool_ph = saved.pool;
+        }
+        args.seed_owner = saved.seed_owner;
+        args.k = saved.config.k; args.strength = saved.config.strength;
+        if (saved.config.fixed_meta) args.meta = saved.config.meta_group_override;
+        if (!args.group_members && !args.group_auto) args.group_members = saved.config.group_members_override;
+        auto limit = [&](bool specified, uint64_t& value, uint64_t original, char const* name)
+        {
+            require(!saved.fixed_extent || !specified || value == original,
+                std::string(name) + " differs from the saved job; resume preserves its planned extent");
+            if (!specified) value = original;
+        };
+        limit(args.capacity_set, args.capacity, saved.capacity, "--capacity-bytes");
+        limit(args.headroom_set, args.headroom, saved.headroom, "--headroom-bytes");
+        limit(args.max_groups_set, args.max_groups, saved.max_groups, "--max-groups");
+        limit(args.max_total_members_set, args.max_total_members, saved.max_total_members, "--max-total-members");
+        for (auto const& d : saved.directories) job.directories.push_back(file_io::native_path(d.directory));
+        for (auto const& [old, replacement] : args.relocations)
+        {
+            auto at = std::find_if(job.directories.begin(), job.directories.end(),
+                [&](auto const& directory) { return same_directory(directory, old); });
+            require(at != job.directories.end(), "--relocate source does not belong to this job: " + file_io::path_text(old));
+            auto path = fs::canonical(replacement);
+            require(std::any_of(job.copies.begin(), job.copies.end(), [&](auto const& copy)
+                { return copy.stamp && same_directory(copy.path.parent_path(), path); }),
+                "relocated destination must contain its saved grow-farm.plan or grow-farm.plan.next");
+            require(!fs::exists(old) || fs::equivalent(old, path),
+                "old destination is still present; take it offline before relocating its job");
+            auto const index = size_t(at - job.directories.begin());
+            require(job.relocated.insert(index).second, "destination relocated more than once");
+            *at = std::move(path); job.changed = true;
+        }
+        for (auto const& path : requested)
+        {
+            if (std::any_of(job.directories.begin(), job.directories.end(),
+                [&](auto const& directory) { return same_directory(directory, path); })) continue;
+            bool const old_location = std::any_of(args.relocations.begin(), args.relocations.end(),
+                [&](auto const& relocation) { return relocation.first == path; });
+            if (old_location) continue;
+            require(args.extend || args.plan_only,
+                "destination is not in the saved job; preview with plan, then add it with fill --extend: " + file_io::path_text(path));
+            require(saved.fixed_extent, "reference farming jobs cannot add destinations; start a managed fill job");
+            job.directories.push_back(path); job.changed = true;
+        }
+        require(!job.changed || !job.pending, "recover the pending farming revision with --resume before changing destinations");
+    }
+    else
+    {
+        require(!args.resume && !args.extend && args.relocations.empty(), "no saved farming job found; supply any member directory or --manifest FILE");
+        job.directories = std::move(requested);
+        if (!args.seed && !args.plan_only)
+        {
+            std::array<uint8_t, 32> seed{}; pos2gpu::read_random_bytes(seed.data(), seed.size());
+            args.seed = group_tools::hex(seed);
+        }
+    }
+    require(!job.directories.empty() && job.directories.size() <= 1024, "farming job requires 1..1024 destinations");
+    std::set<fs::path> unique;
+    std::set<std::string> unique_identities;
+    for (auto& path : job.directories)
+    {
+        path = fs::weakly_canonical(path);
+        require(unique.insert(path).second, "duplicate destination in saved farming job");
+        if (fs::is_directory(path)) require(unique_identities.insert(group_grow::farming_directory_identity(path)).second,
+            "destination paths refer to the same directory");
+    }
+    args.target = job.directories.front();
+    args.destinations.assign(job.directories.begin() + 1, job.directories.end());
+    return job;
+}
+std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys, FarmingJob const& job)
 {
     auto run = std::make_unique<FarmingRun>();
-    std::vector<fs::path> directories{args.target};
-    directories.insert(directories.end(), args.destinations.begin(), args.destinations.end());
-    std::set<fs::path> names;
-    std::vector<group_grow::StorageDevice> devices;
-    for (auto const& directory : directories)
+    auto const& directories = job.directories;
+    size_t const previous = job.saved ? job.saved->directories.size() : 0;
+    run->previous_destinations = previous;
+    run->lanes.resize(directories.size()); run->available.resize(directories.size());
+    run->metadata = sum(product(directories.size(), mib), path_metadata(directories));
+    run->memory_limit = args.max_ram;
+    require(run->metadata < args.max_ram, "farming destination metadata exceeds --max-ram");
+    std::vector<group_grow::StorageDevice> devices(directories.size());
+    std::vector<std::string> identities(directories.size());
+    std::vector<fs::path> missing;
+    for (size_t i = 0; i < directories.size(); ++i)
     {
-        require(fs::is_directory(file_io::native_path(directory)), "all farming destinations must be existing directories");
-        require(names.insert(fs::canonical(file_io::native_path(directory))).second, "duplicate farming destination directory");
-        devices.push_back(group_grow::storage_device(directory));
+        std::error_code error;
+        bool present = fs::is_directory(directories[i], error);
+        require(!error || error == std::errc::no_such_file_or_directory,
+            "cannot inspect farming destination: " + file_io::path_text(directories[i]));
+        if (present)
+        {
+            identities[i] = group_grow::farming_directory_identity(directories[i]);
+            if (i < previous && !job.relocated.contains(i) &&
+                identities[i] != job.saved->directories[i].directory_identity) present = false;
+        }
+        if (!present)
+        {
+            require(i < previous, "new destination must be an existing directory: " + file_io::path_text(directories[i]));
+            missing.push_back(directories[i]);
+        }
+        else
+        {
+            run->available[i] = 1;
+            devices[i] = group_grow::storage_device(directories[i]);
+        }
+    }
+    if (!missing.empty())
+    {
+        std::string message = "unavailable or replaced farming destinations:";
+        for (auto const& path : missing) message += "\n  " + file_io::path_text(path);
+        message += "\nMount the original directories, or use --relocate OLD NEW for an intentional move.";
+        require(args.plan_only || (args.allow_missing && job.saved->fixed_extent && !job.changed &&
+            (!job.pending || job.published)), message + " Independent recovery can use --resume --allow-missing.");
     }
     if (!args.plan_only)
     {
-        std::vector<size_t> order(directories.size());
-        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::vector<size_t> order;
+        for (size_t i = 0; i < directories.size(); ++i) if (run->available[i]) order.push_back(i);
+        require(!order.empty(), "no saved farming destination is available");
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return directories[a] < directories[b]; });
         run->locks.resize(directories.size());
         for (auto i : order) run->locks[i] = std::make_unique<DirectoryLock>(directories[i]);
     }
-    run->manifest = directories.front() / "grow-farm.plan";
-    std::optional<fs::path> pending_plan;
-    std::optional<stream_state::Stamp> pending_stamp;
-    for (auto const& entry : fs::directory_iterator(file_io::native_path(directories.front())))
-    {
-        if (!file_io::path_text(entry.path().filename()).starts_with("grow-farm.plan.pending-")) continue;
-        require(!pending_plan, "ambiguous pending farming plans");
-        pending_plan = entry.path();
-    }
-    bool const published_plan = fs::exists(file_io::native_path(run->manifest));
-    bool const saved_plan = published_plan || pending_plan.has_value();
-    require(!saved_plan || args.resume || args.plan_only, "farming plan exists; use --resume");
-    require(saved_plan || !args.resume, "--resume found no farming plan");
-    auto const resources = group_grow::writer_groups(devices);
-    run->lanes.resize(directories.size());
-    run->metadata = sum(product(directories.size(), mib), path_metadata(directories));
-    run->memory_limit = args.max_ram;
-    require(run->metadata < args.max_ram, "farming destination metadata exceeds --max-ram");
-    std::map<std::string, uint64_t> allocated, available;
-    std::map<std::string, size_t> shares;
+    job.check();
+    for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
+        require(group_grow::farming_directory_identity(directories[i]) == identities[i],
+            "farming destination changed while acquiring its lock");
+    std::map<std::string, uint64_t> allocated, space_available;
+    std::vector<uint64_t> plan_charges(directories.size());
+    uint64_t alignment = 1;
     for (size_t i = 0; i < directories.size(); ++i)
     {
+        if (!run->available[i]) continue;
         auto& lane = run->lanes[i];
-        for (auto const& entry : fs::directory_iterator(file_io::native_path(directories[i])))
+        for (auto const& entry : fs::directory_iterator(directories[i]))
         {
             auto const ordinal = rollover_entry(directories[i], entry.path(), args.max_ram - run->metadata);
             if (!ordinal) continue;
-            require(saved_plan, "directory contains rollover outputs without a farming plan");
+            require(i < previous, "new destination contains rollover outputs without its saved farming job");
             lane.outputs.push_back(snapshot(entry.path(), *ordinal));
             run->metadata = sum(run->metadata, sizeof(Output) * 4);
             require(run->metadata < args.max_ram / 2, "saved farming output metadata exceeds --max-ram");
@@ -4559,75 +4801,46 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys)
             allocated[devices[i].filesystem] = sum(allocated[devices[i].filesystem],
                 sum(lane.outputs[ordinal].allocated, lane.outputs[ordinal].auxiliary_allocated));
         }
+        for (auto const& copy : job.copies) if (copy.stamp && copy.path.parent_path() == directories[i])
+        {
+            file_io::Stat info{};
+            require(!file_io::inspect_link(copy.path.c_str(), &info) && file_io::is_regular(info.st_mode) &&
+                info.st_blocks >= 0 && info.st_size >= 0, "cannot inspect farming-plan allocation");
+            plan_charges[i] = sum(plan_charges[i], std::max(uint64_t(info.st_size), product(uint64_t(info.st_blocks), 512)));
+        }
+        allocated[devices[i].filesystem] = sum(allocated[devices[i].filesystem], plan_charges[i]);
         file_io::Space space{};
         require(!file_io::space_path(directories[i].c_str(), &space), "cannot inspect farming destination capacity");
         uint64_t const bytes = product(space.f_bavail, space.f_frsize);
-        auto [where, inserted] = available.emplace(devices[i].filesystem, bytes);
+        auto [where, inserted] = space_available.emplace(devices[i].filesystem, bytes);
         if (!inserted) where->second = std::min(where->second, bytes);
-        ++shares[devices[i].filesystem];
+        alignment = std::max({alignment, uint64_t(space.f_bsize), uint64_t(space.f_frsize)});
     }
-    if (saved_plan)
+    if (job.saved)
     {
-        auto const& saved_path = published_plan ? run->manifest : *pending_plan;
-        run->state = group_grow::load_farming_state(saved_path, args.max_ram);
-        if (published_plan) run->manifest_stamp = stream_state::stamp(run->manifest);
-        else pending_stamp = stream_state::stamp(*pending_plan);
-        require(!keys || run->state.fingerprint == farming_fingerprint(*keys), "keys or plot parameters differ from the saved farming plan");
-        farming_requested(args, run->state.config);
-        require(run->state.directories.size() == directories.size(), "destination count differs from the saved farming plan");
-        for (size_t i = 0; i < directories.size(); ++i)
-        {
-            auto const& saved = run->state.directories[i];
-            require(saved.directory == file_io::path_text(directories[i]) && saved.resource == resources[i],
-                "directory or physical-resource assignment differs from the saved farming plan");
-            // Linux device numbers can change across boots. A filesystem UUID,
-            // when available, is stable; ordinary paths and existing files are
-            // protected by the per-run directory/file identity guards instead.
-            if (saved.filesystem.starts_with("btrfs:")) require(saved.filesystem == devices[i].filesystem,
-                "farming destination filesystem differs from the saved farming plan");
-        }
+        run->state = *job.saved;
+        require(!keys || run->state.fingerprint == farming_fingerprint(*keys), "keys or plot parameters differ from the saved farming job");
     }
     else
     {
         run->state.config = farming_configuration(args);
         run->state.fingerprint = keys ? farming_fingerprint(*keys) : std::string(64, '0');
-        std::vector<group_grow::FarmingDestination> destinations;
-        for (size_t i = 0; i < directories.size(); ++i)
-        {
-            uint64_t const bytes = sum(available.at(devices[i].filesystem), allocated[devices[i].filesystem]);
-            require(bytes > args.headroom, "farming destination has no capacity above headroom");
-            uint64_t const capacity = args.capacity ? std::min(args.capacity, bytes - args.headroom) : bytes - args.headroom;
-            group_grow::FarmingDestination d;
-            d.capacity_bytes = capacity / shares.at(devices[i].filesystem);
-            d.max_file_bytes = group_grow::maximum_file_bytes(file_io::path_text(directories[i]));
-            d.max_total_members = args.max_total_members; d.max_groups = args.max_groups;
-            d.resource = resources[i]; d = farming_destination_profile(devices[i], d);
-            destinations.push_back(d);
-            run->state.directories.push_back({file_io::path_text(directories[i]), devices[i].filesystem, d.capacity_bytes, resources[i], {}, d});
-        }
-        file_io::Space allocation{};
-        require(!file_io::space_path(directories.front().c_str(), &allocation), "cannot inspect farming-plan allocation alignment");
-        uint64_t const alignment = std::max(uint64_t(allocation.f_bsize), uint64_t(allocation.f_frsize));
-        require(alignment, "invalid farming-plan allocation alignment");
-        uint64_t const first_capacity = destinations.front().capacity_bytes;
-        for (;;)
-        {
-            require(first_capacity >= run->state.manifest_reserved_bytes, "destination cannot hold its farming plan");
-            destinations.front().capacity_bytes = first_capacity - run->state.manifest_reserved_bytes;
-            run->state.estimate = group_grow::farming_plan(run->state.config, destinations, args.max_ram - run->metadata);
-            run->planning_peak = std::max(run->planning_peak, sum(run->metadata, run->state.estimate.planning_memory_bytes));
-            require(run->planning_peak <= args.max_ram, "farming planner exceeds --max-ram");
-            require(run->state.estimate.destinations.size() == directories.size(), "incomplete farming plan");
-            for (size_t i = 0; i < directories.size(); ++i) run->state.directories[i].layout = run->state.estimate.destinations[i];
-            uint64_t const bytes = sum(group_grow::farming_state_text(run->state).size(), 65);
-            uint64_t const needed = product(bytes / alignment + bool(bytes % alignment), alignment);
-            if (needed <= run->state.manifest_reserved_bytes) break;
-            run->state.manifest_reserved_bytes = needed;
-        }
+        std::array<uint8_t, 32> id{};
+        if (!args.plan_only) pos2gpu::read_random_bytes(id.data(), id.size());
+        run->state.job_id = group_tools::hex(id);
+        run->state.seed = args.seed.value_or(std::string(64, '0'));
+        run->state.seed_owner = args.seed_owner.value_or(args.pool_broker.empty() ? "" : args.pool_owner);
+        run->state.farmer = keys ? group_tools::hex(keys->farmer) : std::string(96, '0');
+        run->state.pool = keys ? group_tools::hex(keys->pool) : std::string(96, '0');
+        run->state.pool_public_key = keys ? keys->pool_kind == POS2_POOL_PK : true;
+        run->state.fixed_extent = !args.command.empty();
+        run->state.capacity = args.capacity; run->state.headroom = args.headroom;
+        run->state.max_groups = args.max_groups; run->state.max_total_members = args.max_total_members;
     }
     // Audit every saved output before writing the plan or confirming a group.
-    for (size_t i = 0; i < directories.size(); ++i)
+    for (size_t i = 0; i < previous; ++i)
     {
+        if (!run->available[i]) continue;
         auto& lane = run->lanes[i];
         require(lane.outputs.size() <= args.max_groups, "saved farming outputs exceed --max-groups");
         uint64_t audited_members = 0, audited_charge = 0;
@@ -4676,75 +4889,216 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys)
         }
         require(audited_charge <= run->state.directories[i].capacity_bytes, "saved farming outputs exceed planned capacity");
         lane.no_capacity = lane.ordinal == lane.outputs.size() &&
-            (available.at(devices[i].filesystem) <= args.headroom || !run->state.directories[i].layout.total_members);
+            (space_available.at(devices[i].filesystem) <= args.headroom || !run->state.directories[i].layout.total_members);
     }
-    uint64_t plan_charge = run->state.manifest_reserved_bytes;
-    if (saved_plan)
+    if (job.changed)
     {
-        file_io::Stat plan{};
-        auto const& saved_path = published_plan ? run->manifest : *pending_plan;
-        require(!file_io::inspect_link(saved_path.c_str(), &plan) && file_io::is_regular(plan.st_mode) && plan.st_blocks >= 0 && plan.st_size >= 0,
-            "cannot inspect saved farming-plan allocation");
-        plan_charge = std::max(uint64_t(plan.st_size), product(uint64_t(plan.st_blocks), 512));
+        require(run->state.revision < UINT64_MAX, "farming job revision exhausted");
+        ++run->state.revision; run->state.parent_digest = job.digest;
     }
-    if (args.capacity)
+    bool const planning = !job.saved || job.changed;
+    if (planning)
     {
-        std::map<std::string, uint64_t> charged;
-        charged[devices.front().filesystem] = plan_charge;
-        for (size_t i = 0; i < run->lanes.size(); ++i)
-            for (auto const& output : run->lanes[i].outputs)
-                charged[devices[i].filesystem] = sum(charged[devices[i].filesystem], output.charge());
-        for (auto const& [filesystem, bytes] : charged)
-            require(bytes <= args.capacity, "saved farming outputs and plan exceed --capacity-bytes");
-        for (size_t i = 0; i < run->lanes.size(); ++i)
-            if (run->lanes[i].ordinal == run->lanes[i].outputs.size() && charged[devices[i].filesystem] == args.capacity)
-                run->lanes[i].no_capacity = true;
+        require(missing.empty(), "all existing destinations must be available to plan an expansion or relocation");
+        auto const resources = group_grow::writer_groups(devices);
+        auto const resource_count = *std::max_element(resources.begin(), resources.end()) + 1;
+        std::map<std::string, uint64_t> assigned;
+        std::map<std::string, size_t> shares;
+        std::vector<bool> completed(previous);
+        for (size_t i = 0; i < previous; ++i)
+        {
+            completed[i] = run->state.fixed_extent && run->lanes[i].ordinal >= run->state.directories[i].layout.files;
+            if (completed[i]) run->state.directories[i].capacity_bytes =
+                sum(run->lanes[i].completed_charge, run->state.manifest_reserved_bytes);
+            assigned[devices[i].filesystem] = sum(assigned[devices[i].filesystem], run->state.directories[i].capacity_bytes);
+        }
+        for (size_t i = previous; i < directories.size(); ++i) ++shares[devices[i].filesystem];
+        std::vector<group_grow::FarmingDrivePlan> frozen;
+        for (auto const& d : run->state.directories) frozen.push_back(d.layout);
+        for (size_t i = 0; i < directories.size(); ++i)
+        {
+            if (i >= previous)
+            {
+                uint64_t const bytes = sum(space_available.at(devices[i].filesystem), allocated[devices[i].filesystem]);
+                require(bytes > args.headroom, "farming destination has no capacity above headroom");
+                uint64_t const total = args.capacity ? std::min(args.capacity, bytes - args.headroom) : bytes - args.headroom;
+                require(total > assigned[devices[i].filesystem],
+                    "new destination has no unassigned capacity on its filesystem; another directory does not add disk space");
+                uint64_t const capacity = (total - assigned[devices[i].filesystem]) / shares.at(devices[i].filesystem);
+                group_grow::FarmingDirectory d;
+                d.capacity_bytes = capacity;
+                d.identity_resources = resource_count; d.identity_resource = resources[i];
+                d.identity_epoch = run->state.revision - 1;
+                d.storage.max_file_bytes = group_grow::maximum_file_bytes(file_io::path_text(directories[i]));
+                d.storage.max_total_members = args.max_total_members; d.storage.max_groups = args.max_groups;
+                run->state.directories.push_back(std::move(d));
+            }
+            auto& d = run->state.directories[i];
+            d.directory = file_io::path_text(directories[i]); d.directory_identity = identities[i];
+            d.filesystem = devices[i].filesystem; d.resource = resources[i];
+            d.storage.resource = d.resource; d.storage = farming_destination_profile(devices[i], d.storage);
+        }
+        for (;;)
+        {
+            // Finished fixed assignments need only their actual output and
+            // revision storage. Release unused quota for additional directories
+            // on that filesystem without changing any completed plot.
+            assigned.clear();
+            for (size_t i = 0; i < previous; ++i)
+            {
+                if (completed[i]) run->state.directories[i].capacity_bytes =
+                    sum(run->lanes[i].completed_charge, run->state.manifest_reserved_bytes);
+                assigned[devices[i].filesystem] = sum(assigned[devices[i].filesystem], run->state.directories[i].capacity_bytes);
+            }
+            for (size_t i = previous; i < directories.size(); ++i)
+            {
+                uint64_t const bytes = sum(space_available.at(devices[i].filesystem), allocated[devices[i].filesystem]);
+                uint64_t const total = args.capacity ? std::min(args.capacity, bytes - args.headroom) : bytes - args.headroom;
+                require(total > assigned[devices[i].filesystem], "filesystem has no unassigned capacity for additional destinations");
+                run->state.directories[i].capacity_bytes = (total - assigned[devices[i].filesystem]) / shares.at(devices[i].filesystem);
+            }
+            std::vector<group_grow::FarmingDestination> destinations;
+            for (auto& d : run->state.directories)
+            {
+                require(d.capacity_bytes > run->state.manifest_reserved_bytes, "destination cannot hold its farming job");
+                d.storage.capacity_bytes = d.capacity_bytes - run->state.manifest_reserved_bytes;
+                destinations.push_back(d.storage);
+            }
+            run->state.estimate = group_grow::farming_plan(run->state.config, destinations,
+                args.max_ram - run->metadata, frozen);
+            run->planning_peak = std::max(run->planning_peak, sum(run->metadata, run->state.estimate.planning_memory_bytes));
+            require(run->planning_peak <= args.max_ram, "farming planner exceeds --max-ram");
+            for (size_t i = 0; i < directories.size(); ++i) run->state.directories[i].layout = run->state.estimate.destinations[i];
+            // Reserve the published copy and one durable replacement on each
+            // destination. Keyless previews allow for the largest identity form.
+            auto reservation = run->state;
+            reservation.pool.assign(96, '0'); reservation.seed_owner.assign(128, 'x');
+            reservation.parent_digest.assign(64, '0');
+            uint64_t const bytes = sum(group_grow::farming_state_text(reservation).size(), 65 + 1024);
+            uint64_t const needed = product(product(bytes / alignment + bool(bytes % alignment), alignment), 2);
+            if (needed <= run->state.manifest_reserved_bytes) break;
+            run->state.manifest_reserved_bytes = needed;
+        }
     }
-    run->manifest_charge = plan_charge;
-    run->lanes.front().completed_charge = sum(run->lanes.front().completed_charge, run->manifest_charge);
-    uint64_t first_charge = plan_charge;
-    for (auto const& output : run->lanes.front().outputs) first_charge = sum(first_charge, output.charge());
-    require(first_charge <= run->state.directories.front().capacity_bytes,
-        "farming-plan metadata and outputs exceed the first destination capacity");
+    else
+    {
+        std::vector<group_grow::StorageDevice> present;
+        std::vector<size_t> indices;
+        for (size_t i = 0; i < directories.size(); ++i)
+            if (run->available[i]) { present.push_back(devices[i]); indices.push_back(i); }
+        auto const resources = group_grow::writer_groups(present);
+        for (size_t i = 0; i < indices.size(); ++i)
+            for (size_t j = 0; j < i; ++j)
+                require((resources[i] == resources[j]) ==
+                    (run->state.directories[indices[i]].resource == run->state.directories[indices[j]].resource),
+                    "destination storage topology changed; inspect the saved job before continuing");
+    }
+    std::map<std::string, uint64_t> preflight_charge, replacement_bytes;
+    for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
+    {
+        auto const path = directories[i] / "grow-farm.plan";
+        auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
+        bool const publishing = planning || job.pending || copy == job.copies.end() || !copy->stamp;
+        uint64_t const metadata_charge = publishing ? std::max(plan_charges[i], run->state.manifest_reserved_bytes) : plan_charges[i];
+        uint64_t charge = metadata_charge;
+        for (auto const& output : run->lanes[i].outputs) charge = sum(charge, output.charge());
+        require(charge <= run->state.directories[i].capacity_bytes, "farming job and outputs exceed destination capacity");
+        preflight_charge[devices[i].filesystem] = sum(preflight_charge[devices[i].filesystem], charge);
+        replacement_bytes[devices[i].filesystem] = sum(replacement_bytes[devices[i].filesystem], metadata_charge - plan_charges[i]);
+    }
+    for (auto const& [filesystem, charge] : preflight_charge)
+    {
+        require(!args.capacity || charge <= args.capacity, "saved farming outputs and job exceed --capacity-bytes");
+        require(replacement_bytes[filesystem] <= space_available.at(filesystem), "destination cannot hold the next farming-job revision");
+    }
     if (run->state.estimate.feasible)
     {
-        for (size_t lane = 0; lane < run->lanes.size(); ++lane) run->lanes[lane].reserved_members = run->maximum(args, lane);
+        for (size_t lane = 0; lane < run->lanes.size(); ++lane)
+            if (run->available[lane]) run->lanes[lane].reserved_members = run->maximum(args, lane);
         run->certify(run->metadata);
     }
     run->check();
     if (!args.plan_only && run->feasible())
     {
-        if (!saved_plan)
+        job.check();
+        auto const digest = stream_state::digest(group_grow::farming_state_text(run->state));
+        std::vector<std::optional<stream_state::Stamp>> pending_stamps(directories.size());
+        // Prepare all copies before publishing the first. The first published
+        // revision commits the addition; an interruption leaves complete .next
+        // copies for the remaining members. Partial recovery never changes scope.
+        for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
         {
-            pending_plan = group_grow::stage_farming_state(run->manifest, run->state);
-            pending_stamp = stream_state::stamp(*pending_plan);
+            auto const path = directories[i] / "grow-farm.plan";
+            auto const pending = directories[i] / "grow-farm.plan.next";
+            auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
+            auto next = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == pending; });
+            if (next != job.copies.end()) pending_stamps[i] = next->stamp;
+            if (copy != job.copies.end() && copy->stamp && copy->digest == digest) continue;
+            if (next != job.copies.end() && next->stamp)
+                require(next->digest == digest, "pending farming revision differs from the admitted job");
+            else
+            {
+                group_grow::stage_farming_state(path, run->state);
+                pending_stamps[i] = stream_state::stamp(pending);
+            }
         }
-        if (!published_plan)
+        group_grow::grow_failpoint("farm-plan-all-staged");
+        // Staging may take time on a large farm. Recheck every published
+        // parent before committing, then guard each replacement and its source.
+        for (auto const& copy : job.copies) if (!copy.pending) copy.check();
+        for (size_t i = 0; i < directories.size(); ++i) if (pending_stamps[i])
+            require(stream_state::stamp(directories[i] / "grow-farm.plan.next") == *pending_stamps[i],
+                "pending farming revision changed before publication");
+        for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
         {
-            require(pending_plan.has_value() && pending_stamp.has_value(), "missing pending farming plan");
-            require(stream_state::stamp(*pending_plan) == *pending_stamp, "pending farming plan changed during audit");
-            group_grow::publish_farming_state(*pending_plan, run->manifest);
+            auto const path = directories[i] / "grow-farm.plan";
+            auto const pending = directories[i] / "grow-farm.plan.next";
+            auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
+            if (copy != job.copies.end()) copy->check();
+            if (pending_stamps[i]) require(stream_state::stamp(pending) == *pending_stamps[i],
+                "pending farming revision changed before publication");
+            if (copy == job.copies.end() || !copy->stamp || copy->digest != digest)
+                group_grow::publish_farming_state(pending, path, copy != job.copies.end() && copy->stamp.has_value());
+            else if (fs::exists(pending))
+            {
+                auto next = group_grow::load_farming_state(pending, args.max_ram);
+                require(stream_state::digest(group_grow::farming_state_text(next)) == digest, "conflicting pending farming copy");
+                require(!file_io::unlink_file(pending), "cannot retire pending farming copy");
+                stream_state::sync_path(directories[i], true);
+            }
+            run->manifests.emplace_back(path, stream_state::stamp(path));
+            if (run->manifest.empty()) run->manifest = path;
+            file_io::Stat plan{};
+            require(!file_io::inspect_link(path.c_str(), &plan) && file_io::is_regular(plan.st_mode) &&
+                plan.st_nlink == 1 && plan.st_blocks >= 0, "invalid published farming-job allocation");
+            plan_charges[i] = std::max(uint64_t(plan.st_size), product(uint64_t(plan.st_blocks), 512));
+            require(plan_charges[i] <= run->state.manifest_reserved_bytes, "farming job exceeds its metadata reservation");
+            run->metadata = sum(run->metadata, product(uint64_t(plan.st_size), 4));
         }
-        else if (pending_plan)
-        {
-            // A crash after the exclusive hard link may leave its private name.
-            auto const final = stream_state::stamp(run->manifest), pending = stream_state::stamp(*pending_plan);
-            require(final.device == pending.device && final.inode == pending.inode,
-                "unexpected pending farming plan beside published plan");
-            require(!file_io::unlink_file(*pending_plan), "cannot retire pending farming-plan link");
-            stream_state::sync_path(run->manifest.parent_path(), true);
-        }
-        run->manifest_stamp = stream_state::stamp(run->manifest);
-        file_io::Stat plan{};
-        require(!file_io::inspect_link(run->manifest.c_str(), &plan) && file_io::is_regular(plan.st_mode) && plan.st_nlink == 1 && plan.st_blocks >= 0,
-            "invalid published farming-plan allocation");
-        auto const previous = run->manifest_charge;
-        run->manifest_charge = std::max(uint64_t(plan.st_size), product(uint64_t(plan.st_blocks), 512));
-        require(run->manifest_charge <= run->state.manifest_reserved_bytes, "farming-plan allocation exceeds its reservation");
-        run->lanes.front().completed_charge = sum(run->lanes.front().completed_charge - previous, run->manifest_charge);
-        run->metadata = sum(run->metadata, product(uint64_t(plan.st_size), 4));
     }
-    require(run->metadata < args.max_ram, "farming plan and output metadata exceed --max-ram");
+    else
+    {
+        for (auto const& copy : job.copies) if (copy.stamp)
+        {
+            run->manifests.emplace_back(copy.path, *copy.stamp);
+            if (run->manifest.empty()) run->manifest = copy.path;
+        }
+    }
+    std::map<std::string, uint64_t> charged;
+    for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
+    {
+        auto& lane = run->lanes[i];
+        uint64_t charge = plan_charges[i];
+        for (auto const& output : lane.outputs) charge = sum(charge, output.charge());
+        require(charge <= run->state.directories[i].capacity_bytes, "farming job and outputs exceed destination capacity");
+        charged[devices[i].filesystem] = sum(charged[devices[i].filesystem], charge);
+        lane.completed_charge = sum(lane.completed_charge, plan_charges[i]);
+        run->manifest_charge = sum(run->manifest_charge, plan_charges[i]);
+    }
+    if (args.capacity)
+        for (auto const& [filesystem, charge] : charged)
+            require(charge <= args.capacity, "saved farming outputs and job exceed --capacity-bytes");
+    require(run->metadata < args.max_ram, "farming job and output metadata exceed --max-ram");
     return run;
 }
 std::string json_string(std::string_view value)
@@ -4784,10 +5138,14 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             << " s per signage point; filter bits: " << group_grow::farming_filter_bits(c)
             << " now, " << group_grow::farming_filter_bits(c, true) << " future\n";
         for (auto const& d : run.state.directories)
+        {
+            size_t const index = size_t(&d - run.state.directories.data());
             out << d.directory << ": " << d.layout.files << " files, up to " << d.layout.group_members
                 << " members/file, " << d.layout.total_members << " members, " << d.layout.families
                 << " identity families, " << d.layout.meta_slots << " meta slots; storage resource " << d.resource
-                << "; capacity " << d.capacity_bytes << " bytes\n";
+                << "; capacity " << d.capacity_bytes << " bytes; "
+                << (!run.available[index] ? "unavailable" : index < run.previous_destinations ? "saved assignment" : "new destination") << '\n';
+        }
         if (!run.feasible()) out << "Reason: " << run.infeasibility_reason() << '\n';
         out << "Estimates use the declared harvester profile and modeled storage costs.\n";
         return;
@@ -4838,8 +5196,10 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
     for (auto const& d : run.state.directories)
     {
         if (comma) std::cout << ','; comma = true;
+        size_t const index = size_t(&d - run.state.directories.data());
         auto const& p = d.layout; auto const& storage = d.storage;
         std::cout << "{\"directory\":" << json_string(d.directory) << ",\"capacity_bytes\":" << d.capacity_bytes
+            << ",\"available\":" << (run.available[index] ? "true" : "false")
             << ",\"resource\":" << d.resource << ",\"resource_rank\":" << p.resource_rank << ",\"resource_lanes\":" << p.resource_lanes
             << ",\"members\":" << p.total_members << ",\"files\":" << p.files << ",\"group_bytes\":" << p.group_bytes
             << ",\"group_members\":" << p.group_members << ",\"meta_slots\":" << p.meta_slots << ",\"families\":" << p.families
@@ -4850,6 +5210,41 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             << ",\"read_concurrency\":" << storage.read_concurrency << '}';
     }
     std::cout << "]}\n";
+}
+
+int print_destination_candidates(Arguments const& args)
+{
+    auto const paths = group_grow::farming_destination_candidates();
+    std::vector<group_grow::StorageDevice> devices;
+    for (auto const& path : paths) devices.push_back(group_grow::storage_device(path));
+    auto const resources = group_grow::writer_groups(devices);
+    if (args.json) std::cout << "{\"destination_candidates\":true,\"destinations\":[";
+    else std::cout << "Select destination directories on these mounted filesystems. No files have been written.\n";
+    bool comma = false;
+    for (size_t i = 0; i < paths.size(); ++i)
+    {
+        file_io::Space space{};
+        if (file_io::space_path(paths[i].c_str(), &space)) continue;
+        auto const bytes = product(space.f_bavail, space.f_frsize);
+        if (bytes <= args.headroom) continue;
+        auto const media = devices[i].nonrotating ? "SSD" : devices[i].rotating ? "HDD" : "unknown";
+        if (args.json)
+        {
+            if (comma) std::cout << ','; comma = true;
+            std::cout << "{\"directory\":" << json_string(file_io::path_text(paths[i])) << ",\"available_bytes\":" << bytes
+                << ",\"media\":" << json_string(media) << ",\"resource\":" << resources[i] << '}';
+        }
+        else std::cout << file_io::path_text(paths[i]) << ": " << bytes << " bytes available; " << media
+            << "; storage resource " << resources[i] << '\n';
+    }
+    if (args.json) std::cout << "]}\n";
+    else
+    {
+        if (paths.empty()) std::cout << "No eligible data-volume candidates found. Supply the intended directories explicitly.\n";
+        std::cout << "Preview the selected directories with: xchplot2 plan [OPTIONS] -- DIR...\n"
+            << "Suggestions exclude system mounts, RAM filesystems and unsupported volumes.\n";
+    }
+    return 0;
 }
 
 struct NamedGroup
@@ -5911,6 +6306,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (lane.ordinal + 1 >= args.max_groups || members >= args.max_total_members) return false;
             maximum = uint16_t(std::min<uint64_t>(farm->file_maximum(d.owner, lane.ordinal + 1),
                 args.max_total_members - members));
+            if (!maximum) return false;
             uint64_t const quota = std::min(farm->state.directories[d.owner].capacity_bytes, d.farm_capacity);
             if (lane.completed_charge >= quota || d.metrics.capacity_bytes >= quota - lane.completed_charge) return false;
             room = quota - lane.completed_charge - d.metrics.capacity_bytes;
@@ -6092,6 +6488,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (lane.ordinal + 1 >= args.max_groups || members >= args.max_total_members) return false;
             maximum = uint16_t(std::min<uint64_t>(farm->file_maximum(d.owner, lane.ordinal + 1),
                 args.max_total_members - members));
+            if (!maximum) return false;
             identity = farm->identity(*keys, d.owner, lane.ordinal + 1);
         }
         auto const packing = std::find_if(destinations.begin(), destinations.end(), [&](auto const& other)
@@ -6735,10 +7132,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     print_metrics(args, total, *backend, output_count, last_members, accounted); return total.members ? 0 : 2;
 }
 #ifndef GROW_TEST_CONSTRUCTION
-int run(Arguments const& args)
+int run(Arguments const& supplied)
 {
+    Arguments args = supplied;
     require(std::endian::native == std::endian::little, "upstream format requires little endian");
     check_cancel(args);
+    if (args.directory_farm && args.plan_only && args.target.empty() && args.manifest.empty() && args.relocations.empty())
+        return print_destination_candidates(args);
+    std::optional<FarmingJob> farming_job;
+    if (args.directory_farm) farming_job = farming_arguments(args);
     bool const key_options = args.farmer || args.pool_pk || args.pool_ph || args.pool_address || args.seed;
     require(!key_options || (!args.group && !args.memo && args.fixtures.empty()),
             "key-derived identities cannot be combined with --group-id, --memo or fixtures");
@@ -6746,11 +7148,19 @@ int run(Arguments const& args)
     if (!args.plan_only && (key_options || args.group_members || args.directory_farm || !args.destinations.empty())) keys.emplace(args);
     if (args.directory_farm)
     {
-        auto farm = farming_run(args, keys ? &*keys : nullptr);
+        auto farm = farming_run(args, keys ? &*keys : nullptr, *farming_job);
         print_farming_plan(*farm, args);
         require(farm->feasible(), "farming profile or requested extent is infeasible: " + farm->infeasibility_reason());
-        if (args.plan_only) return 0;
-        return multiple_destinations(args, &*keys, farm.get());
+        bool const missing = std::find(farm->available.begin(), farm->available.end(), uint8_t(0)) != farm->available.end();
+        if (args.plan_only) return missing ? 2 : 0;
+        if (!args.command.empty() && !args.quiet)
+            std::cerr << '[' << args.command << "] saved job: " << file_io::path_text(farm->manifest)
+                << " (resume with fill -r and any member directory)\n";
+        for (size_t i = 0; i < farm->available.size(); ++i) if (!farm->available[i])
+            std::cerr << "[fill] pending unavailable destination: " << farm->state.directories[i].directory << '\n';
+        farm->select_available();
+        int const result = multiple_destinations(args, &*keys, farm.get());
+        return !result && missing ? 4 : result;
     }
     if (!args.destinations.empty()) return multiple_destinations(args, &*keys);
     if (args.group_members) return rollover(args, *keys);

@@ -3,6 +3,17 @@
 #include "host/GroupPlotter.hpp"
 
 namespace pos2gpu {
+inline unsigned group_option_values(std::string_view option)
+{
+    if (option == "--relocate") return 2;
+    if (option == "--" || !option.starts_with('-') || option == "--resume" || option == "-r" ||
+        option == "--no-resume" || option == "--plan-only" || option == "--no-plan-only" ||
+        option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
+        option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||
+        option == "--progress" || option == "--no-progress" || option == "--help" || option == "-h" ||
+        option == "--extend" || option == "--no-extend" || option == "--allow-missing" || option == "--no-allow-missing") return 0;
+    return 1;
+}
 GroupOptions parse_group_options(int argc, char** argv, std::string_view command = {});
 GroupOptions group_batch_options(BatchOptions const&, std::vector<std::string> const&);
 int run_group_command(std::string_view command, std::vector<std::string> const&);

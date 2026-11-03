@@ -168,30 +168,49 @@ xchplot2 plot -n 3 --group-members 4 \
 The normal private job manifest and `plot --resume` / `batch --resume`
 interfaces retain the prepared identities. New unseeded jobs get fresh keys.
 
-For a directory layout, preview first. Pass the first directory as a positional
-argument, then repeat `-D`/`--destination` for each additional directory:
+For a directory layout, pass the destination directories as trailing arguments.
+Shell globs, brace expansion and quoted Bash arrays work normally:
 
 ```bash
-xchplot2 plan /disk-a/plots -D /disk-b/plots -D /disk-c/plots
-xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots --plan-only
+xchplot2 plan -- /disk-{a,b}/plots
+xchplot2 fill --plan-only -- /disk-a/plots /disk-b/plots
+# Quoted arrays preserve spaces in destination names:
+destinations=(/disk-a/plots "/disk-b/plot files")
+xchplot2 plan -- "${destinations[@]}"
 ```
 
 Both forms perform the same read-only preview. They need existing destination
 directories but no keys, create no files or locks, and start no compute services.
 `--json` emits the machine-readable report. An infeasible layout reports its
 reason and exits unsuccessfully. A preview is not a saved execution plan.
+With no directories, `plan` lists candidate mounted data volumes with available
+space and detected media type. It excludes system mounts, RAM filesystems,
+read-only volumes and unsupported filesystems. These are suggestions; select
+the intended directories explicitly before filling them.
 One command accepts up to 1,024 destination directories. Directories on the
 same filesystem share its available capacity; adding another directory there
 does not add disk space.
 
-To build the layout, supply a stable 32-byte seed and the farmer and pool keys:
+Use `--paths-from FILE` for one literal path per line, including paths with
+spaces. Blank lines are ignored; paths resolve from the current working
+directory. Use `--paths0-from FILE` for NUL-delimited paths. Either accepts `-`
+to read standard input. Lists do not expand shell expressions or comments.
+An empty explicit list is an error. `--` makes subsequent arguments literal,
+including names beginning with `-` or `@`:
 
 ```bash
-xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots \
-    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS"
-# Repeat with the same seed, keys and directory order after interruption:
-xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots \
-    -S "$SEED" -f "$FARMER_PK" -c "$POOL_ADDRESS" -r
+xchplot2 plan --paths-from destinations.txt
+printf '%s\0' /disk-*/plots | xchplot2 plan --paths0-from -
+```
+
+To build the layout, supply the farmer public key and one pool destination.
+The plot seed is generated automatically; `-S "$SEED"` remains available for
+reproducible identities:
+
+```bash
+xchplot2 fill -f "$FARMER_PK" -c "$POOL_ADDRESS" -- /disk-{a,b}/plots
+# Resume the entire job through either member, without repeating keys or paths:
+xchplot2 fill -r /disk-b/plots
 ```
 
 `fill` always plans a farming layout, including with an explicit
@@ -199,19 +218,57 @@ xchplot2 fill /disk-a/plots -D /disk-b/plots -D /disk-c/plots \
 from the farming profile. Files start at index zero; the planner assigns
 shared-ID families and meta groups across physical storage resources.
 `--max-groups N` limits files per directory, and `--max-total-members N`
-limits membership per directory. Without those limits, construction uses the
+limits membership per directory. Without those limits, the initial layout uses
 available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
 per filesystem; `--headroom-bytes SIZE` leaves space free (default 64 MiB).
 Sizes accept bytes or suffixes such as `512M` and `14G`.
 
-The first directory contains the private, checksummed `grow-farm.plan`.
-It saves the layout and farming profile without the seed. Keep it with all
-outputs and retain the seed separately. Resume audits all destinations before
-modifying them, preserves completed files, and recovers partial construction.
-Changes in free space or plotting RAM do not change saved identities. An
-explicitly changed farming profile is rejected. Actual compressed sizes can
-permit additional membership only after the frozen layout passes admission
-again. The planner's size forecast is not a promise of exact disk utilization.
+Every member directory contains a private, checksummed `grow-farm.plan` with
+the seed, farmer/pool identity, complete destination list, limits and farming
+profile. Keep these files with the outputs; the seed derives private plot keys
+and must not be shared. It is not a wallet seed. A temporary `grow-farm.plan.next`
+may remain after interruption; keep it for recovery too. Saved construction
+requires the original build.
+
+Resume searches every supplied directory and loads the full job. Directory
+order and omitted arguments do not change its scope. `fill -r` from a member
+directory, or `fill -r --manifest /disk-b/plots/grow-farm.plan`, also works.
+Different jobs, conflicting revisions, corrupt copies or mismatching explicit
+keys are rejected before output changes. Resume audits existing outputs,
+preserves completed files, and recovers partial construction. Plotting RAM,
+workers and compute selection can change; the saved identity namespace, farming
+profile and planned member counts remain fixed. Compressed sizes can leave
+unused space; the forecast is not a promise of exact disk utilization.
+
+To add another destination, preview it together with any existing member,
+then explicitly extend the job:
+
+```bash
+xchplot2 plan /disk-b/plots /disk-c/plots
+xchplot2 fill --extend /disk-b/plots /disk-c/plots
+```
+
+The preview includes all saved destinations. Existing plot identities and
+assignments stay fixed; the new layout must fit the combined farm's CPU,
+memory, storage and response limits. An expansion can be infeasible even when
+the new disk has room. The assessment covers plots belonging to this job;
+unmanaged plots consume disk space but their farming workload is not modeled.
+All original destinations must be available for expansion. A new revision is
+saved across the members before new plotting starts; interrupted publication
+is completed with ordinary `fill -r`.
+
+If a saved directory is unavailable or its mountpoint now refers to a different
+directory, normal resume stops and lists it. `fill -r --allow-missing DIR`
+continues the available members within their existing assignments and exits
+with status 4 while other members remain unavailable. It cannot change the
+job or commit an incompletely staged revision. Restore the original mounts
+and resume normally to finish the whole job.
+
+For an intentional move, keep the output and saved job together, take the old
+path offline, then use `fill -r --relocate OLD NEW`. The new directory locates
+the job; another existing member or `--manifest FILE` can also serve that purpose.
+All members must be available after applying the relocation. Replacement
+outputs are audited before the new location is saved.
 
 ### Growing an existing group
 
@@ -370,8 +427,8 @@ The preview reports `response_bound_seconds`, `feasible` and
 components. `max_eligible_groups` is the configured per-resource limit;
 `certified_max_eligible_groups` is the assessed maximum. An infeasible profile
 produces a report and an error exit, without publishing a new plan or starting
-plot production. Extra files or members on resume must pass a joint assessment
-of all directories using the frozen identities and profile.
+plot production. Adding destinations must pass a joint assessment of the new
+and existing assignments using the saved identities and profile.
 
 The search includes every balanced file count within its bounds. It compares
 joint file counts and refines individual directories until no such move
@@ -692,7 +749,9 @@ Later flags override earlier values. `@~/bench.args` expands the leading
 `~/` in the argument-file path. Inside the file, `#` starts a comment;
 shell quoting, variable expansion, and nested argument files are unsupported.
 Use the configuration file or directly quoted CLI arguments for paths with
-spaces. Pass `--config` directly on the command line, not inside an argument file.
+spaces. For `plan` and `fill` destination lists, use
+[`--paths-from` or `--paths0-from`](#grouped-plotting-and-drive-filling).
+Pass `--config` directly on the command line, not inside an argument file.
 
 ## Plot indices and meta groups
 

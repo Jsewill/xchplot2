@@ -1,5 +1,5 @@
-// Immutable directory farming assignments. Progress remains in each group's
-// existing durable construction protocol; this checkpoint contains no seed.
+// Private directory farming jobs. Progress remains in each group's durable
+// construction protocol; replicated job revisions retain keys and assignments.
 #pragma once
 #include "host/GroupEngine.hpp"
 #include "host/GroupFarming.hpp"
@@ -23,6 +23,8 @@ struct FarmingDirectory
     uint64_t capacity_bytes = 0, resource = 0;
     FarmingDrivePlan layout;
     FarmingDestination storage;
+    std::string directory_identity;
+    uint64_t identity_resources = 1, identity_resource = 0, identity_epoch = 0;
 };
 struct FarmingState
 {
@@ -31,6 +33,13 @@ struct FarmingState
     std::string fingerprint;
     FarmingPlan estimate;
     std::vector<FarmingDirectory> directories;
+    std::string job_id, parent_digest;
+    uint64_t revision = 1;
+    std::string seed, seed_owner, farmer, pool;
+    bool pool_public_key = false;
+    bool fixed_extent = false;
+    uint64_t capacity = 0, headroom = 64 * 1024 * 1024;
+    uint64_t max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
 };
 inline void farming_config_write(std::ostream& out, FarmingConfig const& c)
 {
@@ -66,8 +75,12 @@ inline std::string farming_state_text(FarmingState const& state)
 {
     std::ostringstream out;
     out << std::setprecision(std::numeric_limits<long double>::max_digits10);
-    out << "ordinary-group-farming-v2\n" << std::quoted(GROW_IDENTITY) << '\n'
+    out << "ordinary-group-farming-v3\n" << std::quoted(GROW_IDENTITY) << '\n'
         << std::quoted(farming_model_identity) << '\n' << std::quoted(state.fingerprint) << '\n';
+    out << std::quoted(state.job_id) << ' ' << state.revision << ' ' << std::quoted(state.parent_digest) << '\n'
+        << std::quoted(state.seed) << ' ' << std::quoted(state.seed_owner) << ' ' << std::quoted(state.farmer) << ' '
+        << std::quoted(state.pool) << ' ' << state.pool_public_key << ' ' << state.fixed_extent << '\n'
+        << state.capacity << ' ' << state.headroom << ' ' << state.max_groups << ' ' << state.max_total_members << '\n';
     out << state.manifest_reserved_bytes << '\n';
     farming_config_write(out, state.config);
     auto const& e = state.estimate;
@@ -80,47 +93,34 @@ inline std::string farming_state_text(FarmingState const& state)
     {
         auto const& p = d.layout;
         out << std::quoted(d.directory) << ' ' << std::quoted(d.filesystem) << ' ' << d.capacity_bytes << ' ' << d.resource << '\n'
+            << std::quoted(d.directory_identity) << ' ' << d.identity_resources << ' ' << d.identity_resource << ' '
+            << d.identity_epoch << ' ' << p.schedule << '\n'
             << p.total_members << ' ' << p.files << ' ' << p.families << ' ' << p.group_bytes << ' '
             << p.group_members << ' ' << p.meta_slots << ' ' << unsigned(p.meta_bits) << ' '
             << unsigned(p.meta_base) << ' ' << p.fixed_members << ' ' << p.resource_rank << ' ' << p.resource_lanes << '\n'
             << d.storage.known_device << ' ' << d.storage.nonrotating << ' ' << d.storage.read_bytes_per_second << ' '
-            << d.storage.read_latency_seconds << ' ' << d.storage.read_concurrency << '\n';
+            << d.storage.read_latency_seconds << ' ' << d.storage.read_concurrency << '\n'
+            << d.storage.capacity_bytes << ' ' << d.storage.max_file_bytes << ' ' << d.storage.max_total_members << ' '
+            << d.storage.max_groups << '\n';
     }
     return out.str();
 }
 inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, FarmingState const& state)
 {
     auto const text = farming_state_text(state);
-    std::string temporary = file_io::path_text(path) + ".pending-XXXXXX";
-    // Reserve the private name, then close its placeholder before replacement.
-    // MoveFileEx cannot replace a destination that still has an open handle.
-    { stream_state::Descriptor owned(file_io::temp_file(temporary.data())); }
-    try
-    {
-        // The private name belongs to this invocation. Final publication below
-        // remains exclusive, as for initial checkpoints.
-        stream_state::atomic_save(file_io::native_path(temporary), text + stream_state::digest(text) + '\n');
-        grow_failpoint("farm-plan-before-publication");
-        return file_io::native_path(temporary);
-    }
-    catch (...)
-    {
-        (void)file_io::unlink_file(temporary); throw;
-    }
+    auto const pending = file_io::native_path(file_io::path_text(path) + ".next");
+    require(!std::filesystem::exists(pending), "pending farming revision must be recovered first");
+    stream_state::atomic_save(pending, text + stream_state::digest(text) + '\n', false);
+    grow_failpoint("farm-plan-before-publication");
+    return pending;
 }
-inline void publish_farming_state(std::filesystem::path const& pending, std::filesystem::path const& path)
+inline void publish_farming_state(std::filesystem::path const& pending, std::filesystem::path const& path, bool replace)
 {
-#ifdef _WIN32
-    require(!file_io::rename_file(pending, path, false), "cannot publish farming plan");
+    // The controller holds all member directory locks, checks the parent
+    // revision, and stages every copy before replacing any published copy.
+    require(!file_io::rename_file(pending, path, replace), "cannot publish farming plan");
     stream_state::sync_path(path.parent_path(), true);
     grow_failpoint("farm-plan-published");
-#else
-    std::filesystem::create_hard_link(pending, path);
-    stream_state::sync_path(path.parent_path(), true);
-    grow_failpoint("farm-plan-published");
-    require(std::filesystem::remove(pending), "cannot retire farming-plan publication file");
-    stream_state::sync_path(path.parent_path(), true);
-#endif
 }
 inline FarmingState load_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
 {
@@ -134,11 +134,22 @@ inline FarmingState load_farming_state(std::filesystem::path const& path, uint64
     std::istringstream in(body);
     std::string version, build, model;
     std::getline(in, version); in >> std::quoted(build);
-    require(version == "ordinary-group-farming-v2" && build == GROW_IDENTITY,
+    require(version == "ordinary-group-farming-v3" && build == GROW_IDENTITY,
         "farming plan requires its original grow build");
     FarmingState state;
     in >> std::quoted(model); require(model == farming_model_identity, "saved farming model differs from this build");
-    in >> std::quoted(state.fingerprint) >> state.manifest_reserved_bytes; state.config = farming_config_read(in);
+    in >> std::quoted(state.fingerprint) >> std::quoted(state.job_id) >> state.revision >> std::quoted(state.parent_digest)
+        >> std::quoted(state.seed) >> std::quoted(state.seed_owner) >> std::quoted(state.farmer) >> std::quoted(state.pool)
+        >> state.pool_public_key >> state.fixed_extent >> state.capacity >> state.headroom >> state.max_groups >> state.max_total_members
+        >> state.manifest_reserved_bytes;
+    auto encoded = [](std::string const& value, size_t bytes)
+    { return value.size() == bytes * 2 && value.find_first_not_of("0123456789abcdefABCDEF") == value.npos; };
+    require(in && encoded(state.job_id, 32) && encoded(state.fingerprint, 32) && state.revision &&
+        (state.revision == 1 ? state.parent_digest.empty() : encoded(state.parent_digest, 32)) &&
+        encoded(state.seed, 32) && encoded(state.farmer, 48) && encoded(state.pool, state.pool_public_key ? 48 : 32) &&
+        state.seed_owner.size() <= 128 && state.max_groups && state.max_total_members,
+        "invalid saved farming identity or limits");
+    state.config = farming_config_read(in);
     auto& e = state.estimate;
     auto real = [&]
     {
@@ -158,15 +169,19 @@ inline FarmingState load_farming_state(std::filesystem::path const& path, uint64
     {
         auto& p = d.layout; unsigned members, slots, bits, meta, rank, lanes;
         in >> std::quoted(d.directory) >> std::quoted(d.filesystem) >> d.capacity_bytes >> d.resource >>
+            std::quoted(d.directory_identity) >> d.identity_resources >> d.identity_resource >> d.identity_epoch >> p.schedule >>
             p.total_members >> p.files >> p.families >> p.group_bytes >> members >> slots >> bits >> meta >> p.fixed_members >> rank >> lanes >> d.storage.known_device >> d.storage.nonrotating >>
-            d.storage.read_bytes_per_second >> d.storage.read_latency_seconds >> d.storage.read_concurrency;
+            d.storage.read_bytes_per_second >> d.storage.read_latency_seconds >> d.storage.read_concurrency >>
+            d.storage.capacity_bytes >> d.storage.max_file_bytes >> d.storage.max_total_members >> d.storage.max_groups;
         require(in && !d.directory.empty() && members <= 65535 && slots && slots <= 256 &&
             bits <= 8 && meta <= 255 && d.resource < count && lanes && lanes <= count && rank < lanes &&
+            !d.directory_identity.empty() && d.identity_resources && d.identity_resources <= count &&
+            d.identity_resource < d.identity_resources && d.identity_epoch < state.revision &&
             ((p.files && p.total_members && p.families) || (!p.files && !p.total_members && !p.families)),
             "invalid saved farming layout");
         p.group_members = uint16_t(members); p.meta_slots = uint16_t(slots);
         p.meta_bits = uint8_t(bits); p.meta_base = uint8_t(meta); p.resource_rank = uint16_t(rank); p.resource_lanes = uint16_t(lanes);
-        d.storage.resource = d.resource; d.storage.capacity_bytes = d.capacity_bytes;
+        d.storage.resource = d.resource;
         state.estimate.destinations.push_back(p);
     }
     in >> std::ws; require(in.eof(), "unexpected saved farming plan data");

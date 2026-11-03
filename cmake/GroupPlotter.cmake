@@ -52,7 +52,7 @@ function(pos2_grow_identity target upstream_dir)
     foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
-                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp)
+                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp Random.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"

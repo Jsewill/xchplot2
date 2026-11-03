@@ -46,7 +46,7 @@ int cli(std::vector<std::string> args)
 }
 void put(std::filesystem::path const& path, std::string const& data)
 {
-    std::ofstream out(path); out << data; assert(out.good());
+    std::ofstream out(path, std::ios::binary); out << data; assert(out.good());
 }
 }
 namespace pos2gpu {
@@ -208,7 +208,7 @@ int main(int argc, char** argv)
             assert(script.find("'--trials[Random challenges]:count:'") != std::string::npos);
             assert(script.find("'-n[Random challenges]:count:'") != std::string::npos);
         }
-        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers", "plan", "fill", "grow", "broker", "worker", "group-members", "plan-only", "construction", "compute-broker", "compute-local", "compute-directory", "init", "invite", "join", "configure", "status", "host-bytes", "gpu-bytes", "max-frame-bytes", "members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import", "pause", "drain", "resume", "service", "restart", "remove", "max-brokers", "limit", "role"})
+        for (auto const* option : {"trials", "full", "json", "warmup", "max-host-ram", "cpu-workers", "plan", "fill", "grow", "broker", "worker", "group-members", "plan-only", "paths-from", "paths0-from", "extend", "allow-missing", "relocate", "construction", "compute-broker", "compute-local", "compute-directory", "init", "invite", "join", "configure", "status", "host-bytes", "gpu-bytes", "max-frame-bytes", "members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import", "pause", "drain", "resume", "service", "restart", "remove", "max-brokers", "limit", "role"})
             assert(script.find(option) != std::string::npos);
     }
     put(config, "[batch]\ndevices=\"0\"\nquiet=0\nprogress=false\ncpu=false\nauto-spill=false\n");
@@ -461,6 +461,13 @@ int main(int argc, char** argv)
         assert(refused);
     }
 #ifdef XCHPLOT2_GROUP_COMMANDS
+    auto const [fill_help_code, fill_help] = capture({"fill", "--config", config.string(), "--help"});
+    assert(fill_help_code == 0 && fill_help.find("[DIR...]") != std::string::npos);
+    assert(fill_help.find("--paths-from") != std::string::npos && fill_help.find("current member directory") != std::string::npos);
+    auto const [grow_help_code, grow_help] = capture({"grow", "--config", config.string(), "--help"});
+    assert(grow_help_code == 0 && grow_help.find("always enabled") != std::string::npos);
+    assert(grow_help.find("--paths-from") == std::string::npos && grow_help.find("--manifest") == std::string::npos);
+    assert(grow_help.find("--farming-") == std::string::npos && grow_help.find("--extend") == std::string::npos);
     put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     assert(cli({"fill", dir.string(), "--config", config.string(), "--devices", "cpu"}) == 0);
     assert(last_group_options.plan_only && last_group_options.json && last_group_options.backend == "cpu");
@@ -469,14 +476,68 @@ int main(int argc, char** argv)
     auto const third = dir / "third destination";
     std::filesystem::create_directory(other);
     std::filesystem::create_directory(third);
-    assert(cli({"fill", dir.string(), "--config", config.string(), "-r", "-d", "gpu2:tiny", "-M", "768M",
-                "-j", "2", "-D", other.string(), "--destination", third.string(),
-                "-t", other.string(), "--temp-dir", third.string()}) == 0);
+    assert(cli({"fill", "--config", config.string(), "-r", "-d", "gpu2:tiny", "-M", "768M",
+                "-j", "2", "-t", other.string(), "--temp-dir", third.string(),
+                "--", dir.string(), other.string(), third.string()}) == 0);
     assert(last_group_options.plan_only && last_group_options.resume && last_group_options.backend == "gpu");
     assert(last_group_options.device == 2 && last_group_options.tier == "tiny" && last_group_options.workers == 2);
     assert(last_group_options.max_ram == 768ull * 1024 * 1024);
     assert((last_group_options.destinations == std::vector<std::filesystem::path>{other, third}));
     assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
+    auto const paths_file = dir / "destinations.txt";
+    put(paths_file, other.string() + "\r\n" + third.string() + "\n");
+    assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) == 0);
+    assert(last_group_options.target == other && last_group_options.destinations == std::vector{third});
+    auto const nul_file = dir / "destinations.nul";
+    put(nul_file, other.string() + '\0' + third.string() + '\0');
+    assert(cli({"plan", "--config", config.string(), "--paths0-from", nul_file.string()}) == 0);
+    assert(last_group_options.target == other && last_group_options.destinations == std::vector{third});
+    assert(cli({"plan", "--config", config.string(), "--paths-from", nul_file.string()}) != 0);
+    std::istringstream paths_input(other.string() + '\0' + third.string() + '\0');
+    auto* previous_input = std::cin.rdbuf(paths_input.rdbuf());
+    assert(cli({"plan", "--config", config.string(), "--paths0-from", "-"}) == 0);
+    std::cin.rdbuf(previous_input); std::cin.clear();
+    assert(last_group_options.target == other && last_group_options.destinations == std::vector{third});
+    put(paths_file, "");
+    assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) != 0);
+    auto const previous_directory = std::filesystem::current_path();
+    std::filesystem::current_path(dir);
+    auto const calls_before_literal = group_calls;
+    assert(cli({"plan", "--config", config.string(), "--", "--help", "@literal", "--config"}) == 0);
+    assert(group_calls == calls_before_literal + 1 && last_group_options.target == dir / "--help");
+    assert((last_group_options.destinations == std::vector{dir / "@literal", dir / "--config"}));
+    put(dir / "--", other.string() + "\n");
+    assert(cli({"plan", "--config", config.string(), "--paths-from", "--", "-M", "256M"}) == 0);
+    assert(last_group_options.target == other && last_group_options.max_ram == 256ull * 1024 * 1024);
+    put(dir / "@paths", third.string() + "\n");
+    assert(cli({"plan", "--config", config.string(), "--paths-from", "@paths", "--manifest", "--help"}) == 0);
+    assert(last_group_options.target == third && last_group_options.manifest == dir / "--help");
+    assert(cli({"--config", config.string(), "plan", "--paths-from", "@paths"}) == 0);
+    assert(last_group_options.target == third);
+    put(dir / "@config", "");
+    assert(cli({"--config", "@config", "plan", "--paths-from", "@paths"}) == 0);
+    assert(last_group_options.target == third);
+    assert(cli({"plan", "--config", config.string(), "--relocate", "--config", "@new"}) == 0);
+    assert((last_group_options.target.empty() && last_group_options.relocations == std::vector{std::pair{dir / "--config", dir / "@new"}}));
+    assert(cli({"--config", config.string(), "plan", "--relocate", "--config", "@new"}) == 0);
+    assert((last_group_options.relocations == std::vector{std::pair{dir / "--config", dir / "@new"}}));
+    put(config, "[plan]\npaths-from=\"@paths\"\nmanifest=\"--help\"\ncapacity-bytes=\"64M\"\n");
+    assert(cli({"plan", "--config", config.string(), "--", "--config"}) == 0);
+    assert(last_group_options.target == third && last_group_options.destinations == std::vector{dir / "--config"});
+    assert(last_group_options.manifest == dir / "--help" && last_group_options.capacity_set);
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
+    std::filesystem::current_path(previous_directory);
+    assert(cli({"fill", "--config", config.string(), "-r", "--allow-missing", other.string()}) == 0);
+    assert(last_group_options.resume && last_group_options.allow_missing && last_group_options.target == other);
+    assert(cli({"fill", "--config", config.string(), "--extend", other.string(), third.string()}) == 0);
+    assert(last_group_options.resume && last_group_options.extend);
+    assert(cli({"fill", "--config", config.string(), "--relocate", other.string(), third.string()}) == 0);
+    assert((last_group_options.resume && last_group_options.target.empty() && last_group_options.relocations == std::vector{std::pair{other, third}}));
+    assert(cli({"fill", "--config", config.string(), "-r", "--manifest", manifest.string()}) == 0);
+    assert(last_group_options.resume && last_group_options.target.empty() && last_group_options.manifest == manifest);
+    assert(cli({"plan", "--config", config.string()}) == 0 && last_group_options.target.empty());
+    assert(cli({"fill", "--config", config.string(), "-r"}) == 0 && last_group_options.target.empty());
+    assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
     auto const argfile = dir / "group.args";
@@ -485,7 +546,7 @@ int main(int argc, char** argv)
     assert(last_group_options.plan_only && last_group_options.group_members == 3 && last_group_options.max_ram == 768ull * 1024 * 1024);
     assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) != 0);
     int const before_missing_value = group_calls;
-    for (auto const* option : {"-d", "-M", "-j", "-D", "-t"})
+    for (auto const* option : {"-d", "-M", "-j", "-t", "--paths-from", "--paths0-from", "--manifest", "--relocate"})
         assert(cli({"plan", dir.string(), "--config", config.string(), option}) != 0);
     assert(group_calls == before_missing_value);
     put(config, "[compute.worker]\nhost-bytes=\"1000000000\"\n");

@@ -16,8 +16,10 @@ Farmer integration is still in progress upstream; see the
 
 Linux and experimental native Windows builds include
 [grouped plotting, drive filling and growth](REFERENCE.md#grouped-plotting-and-drive-filling).
-Use `plot --group-members N` for several members per file, `plan` to preview
-a farming layout, and `fill` to build it. [Shared compute](REFERENCE.md#shared-compute)
+Use `plot --group-members N` for several members per file, `plan DIR...` to preview
+a farming layout, and `fill` to build it. `fill -r DIR` restores the keys and all
+destinations from any member; `fill --extend` adds storage while preserving
+existing plots. [Shared compute](REFERENCE.md#shared-compute)
 lets enrolled machines contribute CPU/GPU capacity to multiple plotting hosts.
 These features are available in `main` source builds; the v0.14.1 release
 archives predate them. Follow the [installation guide](INSTALL.md) to build

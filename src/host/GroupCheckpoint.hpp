@@ -58,7 +58,9 @@ std::string digest(std::string const& text)
     sha256_sum(&context, result.data());
     return group_tools::hex(result);
 }
-void atomic_save(fs::path const& path, std::string const& text)
+// Immutable revisions disable replacement even if another file appears while
+// their private temporary file is being written.
+void atomic_save(fs::path const& path, std::string const& text, bool replace = true)
 {
     std::string temporary = file_io::path_text(path) + ".partial.XXXXXX";
     Descriptor handle(file_io::temp_file(temporary.data()));
@@ -74,9 +76,9 @@ void atomic_save(fs::path const& path, std::string const& text)
         }
         require(file_io::flush(handle.fd) == 0, "cannot sync checkpoint");
 #ifdef _WIN32
-        require(!file_io::rename_file(file_io::native_path(temporary), path, fs::exists(file_io::native_path(path))), "cannot publish checkpoint");
+        require(!file_io::rename_file(file_io::native_path(temporary), path, replace && fs::exists(file_io::native_path(path))), "cannot publish checkpoint");
 #else
-        if (fs::exists(file_io::native_path(path))) fs::rename(temporary, path);
+        if (replace && fs::exists(file_io::native_path(path))) fs::rename(temporary, path);
         else
         {
             // Initial checkpoint creation also checks the no-overwrite
