@@ -9,7 +9,8 @@ x86_64 requirements:
   NVIDIA: Maxwell or newer; driver 576.57+ recommended for CUDA 12.9.1.
   AMD: a Windows HIP-capable GPU and an Adrenalin driver with HIP runtime 6.
   Intel: a GPU and graphics driver supporting Level Zero.
-  An ACL-capable filesystem (NTFS/ReFS) for plots, manifests, and spill files.
+  An ACL-capable filesystem (NTFS/ReFS) for ordinary plots, manifests, and spill.
+  Grouped plotting and growth require local NTFS with ordinary files.
 
 The x86_64 ZIP includes all three GPU backends, AdaptiveCpp, LLVM, CUDA runtime,
 HIP runtime compiler libraries and device bitcode, the Intel Level Zero
@@ -24,18 +25,19 @@ runtime libraries. Each backend needs a compatible ARM64 graphics driver.
 OpenCL requires SPIR-V, Intel USM or fine-grained system SVM, and 64-bit
 atomics. There is no native Windows ARM64 HIP runtime in AMD's SDK.
 
-Windows SYCL is experimental. Hosted Windows checks cover CPU plotting,
-proofs, recovery, and offline SPIR-V compilation (also AMD on x86_64).
-GPU plotting requires separate qualification on Windows hardware.
-BUILDINFO.txt records the source and toolchain revisions;
-licenses/ contains dependency notices.
+Windows support is experimental, including GPU plotting. Grouped construction
+rejects sparse, compressed, encrypted and network-backed storage. The x86_64
+background worker can stop after rapid service restarts; check compute service
+status and compute status after restarting. See the command reference below.
+Dependency notices are in licenses/.
 
 First Ctrl-C or Ctrl-Break finishes the current plot; a second aborts.
 Use --resume with the saved manifest to continue an interrupted job.
 The default config is %APPDATA%\xchplot2\config.toml.
 Use --temp-dir to select a disk with enough free space for spill files.
-Consult the release notes for tested hardware and driver versions.
+See the installation guide for driver requirements and known limitations.
 
 Usage: https://github.com/Jsewill/xchplot2
 Installation: https://github.com/Jsewill/xchplot2/blob/main/INSTALL.md
+Commands and shared compute: https://github.com/Jsewill/xchplot2/blob/main/REFERENCE.md
 Report issues: https://github.com/Jsewill/xchplot2/issues

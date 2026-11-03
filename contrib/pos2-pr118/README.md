@@ -7,24 +7,20 @@ the incompatible Feistel cipher ([#119](https://github.com/Chia-Network/pos2-chi
 and corrected decompression buffer sizing ([#120](https://github.com/Chia-Network/pos2-chip/pull/120)).
 The directory/tool names retain `pr118` for existing scripts.
 
-Installed Linux builds include ordinary multi-member construction, planning,
-growth and shared compute. See the [command reference](../../REFERENCE.md#grouped-plotting-and-drive-filling)
-and [compute setup](../../REFERENCE.md#shared-compute). Their implementations
-now live in `src/host`, with command handling in `tools/xchplot2` and tests in
-`tools/parity` and `scripts/test`.
+Normal Linux and experimental native Windows builds include multi-member
+construction, planning, growth and shared compute. Use the installed commands
+described in the [command reference](../../REFERENCE.md#grouped-plotting-and-drive-filling)
+and [compute setup](../../REFERENCE.md#shared-compute).
 
 This directory retains the independent reference tools and experimental
 nonzero-index reader extension. Files starting at nonzero indices use the
 0x82 extension; normal xchplot2 and upstream readers reject that extension.
 
-As of 2026-10-22, the companion
-[chia-rs PR #1517](https://github.com/Chia-Network/chia_rs/pull/1517) is merged,
-but its plot-group interface is not included in the released `chia_rs` 0.52.1.
-[Farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
-remains a draft. Key generation already implements the V2 taproot change
-merged in [chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500),
-including its independent public-key test vector. These checks establish
-format/proof interoperability, not released farmer compatibility.
+Farming requires a farmer that supports the PoS2 1.0 group format. Upstream
+[farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
+remains in development; confirm support in your farmer release before plotting
+for production. Key generation includes the V2 taproot change from
+[chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
 
 ## Run the compatibility check
 
@@ -67,49 +63,6 @@ The test generates four temporary fixtures with plot indices 0, 1,
 Fixtures are written directly as raw-v2 members; no legacy header conversion
 is performed. Files are removed when the test exits. Synthetic IDs are not
 farming keys; the Rust shim separately checks key and memo derivation.
-
-### PoS2 1.0 validation
-
-Checked on 2026-10-08 against `ff89d3e` on Linux x86-64 with an RTX 4090
-and NVIDIA driver 610.57.04:
-
-- Main: 39 CTest checks, a separate 11-test host-only build, and seven Rust
-  key tests passed. Native CUDA: all 18 CTest checks passed. Cargo release
-  builds linked successfully for both branches.
-- Main passed all four upstream fixtures on CPU and GPU at k=18. Both
-  branches passed all four GPU fixtures at k=22, and main also passed all
-  four at k=28. These included exact raw fragments, native single-member
-  group bytes, and full proofs.
-- The correctness suite passed CPU byte parity and positive full-proof
-  samples for the k=28 group and both k=18 raw boundary vectors. Main used
-  all five tiers and four spill variants; native CUDA used its four tiers
-  and Compact/Minimal spill variants. The host budget was 14 GiB, with
-  explicit spill cases using `min`.
-- Grouped-job regressions passed on main CPU/GPU and native CUDA GPU,
-  including 64-member k=18 groups, multiple files, private saved jobs,
-  partial resume, identity mismatches, corruption, and RAM-budget rejection.
-- Official two-member groups at k=22 and k=28 passed full-proof validation
-  in both production executables, using the assembler's 512 MiB modeled
-  buffer cap.
-
-These were correctness checks on a shared desktop GPU. They do not qualify
-isolated VRAM limits or physical small cards. AMD, Intel, ARM64, and Windows
-were not exercised for this migration.
-
-### Historical validation
-
-The historical results below used earlier formats and ciphers. They are not
-PoS2 1.0 qualifications.
-
-Verified on 2026-09-09 with GCC 15.3: CPU and GPU runs passed for both
-branches, with 129 validated full group proofs per run (516 total). GPU
-runs used an NVIDIA GeForce RTX 4090 with driver 610.57.04. These results
-cover k=18 single-plot test groups and the Plain GPU tier; production group
-sizes, other tiers, AMD, and Intel hardware remain outside this check.
-
-Refreshed on 2026-09-30 with GCC 16.2: CPU and RTX 4090 Plain GPU runs passed
-all four fixtures and 129 full proofs each. The production dependency pin
-remains unchanged.
 
 ## Experimental grouped jobs
 
@@ -225,26 +178,6 @@ owns cleanup, durability and publication. The private index spool is removed
 on close or process exit. Direct assembly still keeps decoded chunks for every
 member and does not provide the streaming prototype's checkpoints or reclamation.
 
-Historical (pre-1.0), 2026-09-30: the regression passed on CPU and RTX 4090 Plain GPU,
-including every member of a 64-member k=18 group. A two-member k=28 GPU group
-passed exact round-trip checks across all 4,194,304 grouped chunks and 86 full
-proofs (43 per member). The complete GPU job took 59.60 s with an 18 GiB plotting
-budget in a 22 GiB container. A separate host assembly plus verification took
-50.75 s, peaked at 295,944 KiB RSS (289.01 MiB), and reproduced the published
-group byte for byte under the 512 MiB modeled buffer cap. Solver/chainer memory
-is included in that measured RSS, although excluded from the modeled cap.
-These measurements cover this hardware, two members per k=28 file, and 64
-members per k=18 file; larger k=28 files and other GPU tiers/vendors remain
-unverified.
-
-Historical (pre-1.0), 2026-10-01 with GCC 16.2 and RTX 4090 Plain: CPU/GPU k=18
-regressions cover multiple files, distinct member IDs, resume, corruption,
-and index 65535. Two-file jobs with two members per file at k=22 and k=28
-passed CPU/GPU raw byte comparisons, complete grouped-fragment round-trips,
-and 206 full proofs. The k=22 job used indices 65532–65535 and meta group 255;
-the k=28 job used indices 0–3 and meta group 0. Unmodified readers rejected
-the 0x82 files, and the patched reader rejected overflowing index ranges.
-
 ## Group construction reference runner
 
 Ordinary group construction and compute services are part of the installed
@@ -328,9 +261,9 @@ Publication syncs the finished file and creates `group.gplot` without replacing
 an occupied destination. An interrupted publication can be resumed; resuming a
 completed job preserves its output. Checkpoints have checksums, and raw/completed
 file checks use identity, size and timestamps, not full content hashes. These
-checks do not replace verification or backups. Integration with plotting,
-device-fill sizing, physical power-loss testing, and physical-layout/farming-latency
-qualification remain future work.
+checks do not replace verification or backups. This standalone prototype does
+not plan drive layouts or run compute services; use the installed commands for
+those workflows.
 
 The work directory contains `group.gplot`, `metrics.json`, `checkpoint` and `lock`
 on success; unfinished output uses `group.gplot.partial`. Metrics report original
@@ -415,13 +348,10 @@ measure farming challenge latency or model a drive-filling build.
 
 ## Migration boundaries
 
-The production writer retains the existing CPU reference boundary, shared
-compression pool, exclusive temporary files, fsync, atomic publication, and
-bounded resume checks. GPU kernels receive derived member IDs. Manifests
-persist group IDs plus explicit `gplot-v2` or `raw-v2` format names; legacy
-boolean/testnet manifests fail before plotting. Group verification uses each
-returned member index for solving and full-proof validation. Raw-v2 `.plot2`
-files are temporary assembler inputs, not the supported farming format.
+Installed commands write ordinary version 2 `.gplot` files. Saved manifests
+record group IDs, plot parameters and private memos; see
+[batch manifests](../../REFERENCE.md#batch-manifests) for the current formats.
+Raw-v2 `.plot2` files are temporary assembler inputs, not farming output.
 
 Do not rename or convert old `.plot2` files or earlier experimental groups.
 The Feistel change alters every plot's fragments, so these files and saved

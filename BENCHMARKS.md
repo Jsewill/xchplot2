@@ -1,11 +1,13 @@
 # Benchmarks
 
+These historical measurements use the pre-1.0 cipher and raw format. They do
+not estimate current `.gplot` performance or memory requirements. Use
+[`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
+
 Single-GPU results measured September 9, 2026, at **k=28, strength=2**.
 Each run measured ten plots after two warmups, including FSE compression,
 file writes, and fsync. Times are completion intervals, reported as mean ±
 standard deviation (σ). Output size was approximately 0.921 GiB/plot.
-These measurements use the pre-1.0 cipher and raw format, not current `.gplot`
-output. Use [`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
 
 ## GPU results
 

@@ -1,6 +1,6 @@
 # xchplot2
 
-GPU plotter for Chia v2 proofs of space (CHIP-48). Produces ordinary
+CPU and GPU plotter for Chia v2 proofs of space (CHIP-48). Produces ordinary
 PoS2 1.0 `.gplot` files using the pinned
 [pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
 
@@ -19,6 +19,9 @@ Linux and experimental native Windows builds include
 Use `plot --group-members N` for several members per file, `plan` to preview
 a farming layout, and `fill` to build it. [Shared compute](REFERENCE.md#shared-compute)
 lets enrolled machines contribute CPU/GPU capacity to multiple plotting hosts.
+These features are available in `main` source builds; the v0.14.1 release
+archives predate them. Follow the [installation guide](INSTALL.md) to build
+from source.
 
 [Quick start](#quick-start) · [Hardware](#hardware-compatibility) ·
 [Build](#build) · [Commands](#use) · [Performance](#performance) ·
@@ -54,20 +57,19 @@ for CPU-reference comparisons.
 
 ## Hardware compatibility
 
-| Resource | Requirement or tested scope |
+| Resource | Support and requirements |
 |---|---|
-| NVIDIA | Maxwell or newer via CUDA/CUB. Pre-Turing GPUs require a CUDA 12.x build. RTX 4090 is in the current hardware benchmark set. |
-| AMD | AdaptiveCpp HIP; RX 6700 XT (`gfx1031`) is in the current hardware benchmark set. RDNA1 needs the [installation-path guidance](INSTALL.md#amd-target-selection). |
-| Intel | Arc B580 with AdaptiveCpp Level Zero; see the [runtime workaround](REFERENCE.md#troubleshooting). |
+| NVIDIA | Maxwell or newer via CUDA/CUB. Pre-Turing GPUs require a CUDA 12.x build. |
+| AMD | AdaptiveCpp HIP with a compatible ROCm runtime and driver. RDNA1 needs the [target-selection guidance](INSTALL.md#amd-target-selection). |
+| Intel | AdaptiveCpp Level Zero; see the [required settings and limitations](REFERENCE.md#troubleshooting). Use CPU plotting on integrated Intel GPUs for production. |
 | VRAM | Tiny's base k=28 floor is 1,228 MiB free after context creation, including the default 128 MiB buffer. Backend sort scratch can raise it. |
 | Host RAM | Depends on tier and worker count. Lower VRAM tiers generally use more host RAM; see [memory requirements](REFERENCE.md#memory-requirements). |
 | CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses pos2-chip's CPU plotter. |
-| OS | Linux is tested. WSL2 requires support from the GPU vendor. [Native Windows SYCL/NVIDIA](INSTALL.md#windows) is experimental, with GPU qualification pending. macOS is unsupported. |
+| OS | Linux; WSL2 requires support from the GPU vendor. [Native Windows builds](INSTALL.md#windows) are experimental. macOS is unsupported. |
 
-The [benchmark report](BENCHMARKS.md) records tested hardware and toolchains.
-Build checks and GPU hardware checks are described separately in
-[CONTRIBUTING.md](CONTRIBUTING.md). Physical low-capacity cards are outside
-the latest benchmark set; a software VRAM cap does not certify another card.
+See the [installation guide](INSTALL.md) for drivers, runtime versions and
+platform requirements. Memory needs depend on the backend, tier and workload;
+use the [memory guide](REFERENCE.md#memory-requirements) when sizing a system.
 
 ## Build
 
@@ -95,7 +97,8 @@ host test binaries.
 See [configuration and argument files](REFERENCE.md#configuration-and-argument-files)
 for reusable options. `xchplot2 --help` prints command syntax.
 
-Without shared compute, ordinary single-member plotting uses one GPU. Select all GPUs with `--devices gpu`; add
+Without shared compute, ordinary single-member plotting uses one GPU.
+Select all GPUs with `--devices gpu`; add
 CPU workers with `--cpu`, or select both with `--devices all`. Each GPU
 chooses a tier from its own free VRAM. See the
 [device reference](REFERENCE.md#devices-and-cpu-workers).
@@ -119,37 +122,19 @@ tier and branch; see [host RAM and disk-offload](REFERENCE.md#host-ram-and-disk-
 
 ## Performance
 
-These figures use the pre-1.0 cipher and raw plot format.
+Measure the current build on your hardware and destination disk:
 
-Measured September 9, 2026, at k=28, strength=2, using real file writes,
-FSE compression, and durability barriers. Times are mean completion intervals
-over ten measured plots after two warmups, using one GPU per host. Each
-non-auto tier was forced.
+```bash
+xchplot2 bench -k 28 -n 10 --warmup 2 --devices gpu0 -o /scratch
+```
 
-| Tier (`main`) | RTX 4090, CUDA/CUB | RX 6700 XT, AdaptiveCpp HIP | Arc B580, AdaptiveCpp Level Zero |
-|---|---:|---:|---:|
-| Auto (pool) | 2.50 s | 9.63 s | 13.75 s |
-| Plain | 3.91 s; 2.66 s repeat | 9.76 s | 14.17 s |
-| Compact | 3.84 s | 10.51 s | — |
-| Minimal | 16.40 s | 22.19 s | — |
-| Tiny | 27.74 s | 29.77 s | — |
-| Pinned | 27.42 s | 29.73 s | — |
+Use `--devices cpu` to compare CPU plotting. Throughput depends on the tier,
+available memory, compression and storage; sharing a GPU or disk can change
+the result. See the [benchmarking guide](REFERENCE.md#benchmarking) for options.
 
-— means not benchmarked. See the [benchmark configurations](BENCHMARKS.md#hardware-and-builds).
-
-The two RTX 4090 Plain timings differ for an undetermined reason.
-
-The native `cuda-only` auto path measured **2.20 s/plot** on the same RTX
-4090, with its optional D2H/Xs overlap enabled. These runs do not isolate the
-cause of the difference between the native and SYCL runtimes.
-
-The [benchmarks](BENCHMARKS.md) include configurations, variability, and
-memory use. Forced tiers can use additional match scratch on these roomy GPUs;
-their timings do not predict performance on a card restricted to a tier's
-minimum VRAM.
-
-Multi-GPU throughput also depends on shared PCIe bandwidth, CPU compression,
-and storage. This benchmark set uses one GPU per host.
+[Recorded benchmarks](BENCHMARKS.md) use the older, pre-1.0 cipher and raw
+format. They are historical comparisons, not current `.gplot` performance
+estimates.
 
 ## Documentation
 

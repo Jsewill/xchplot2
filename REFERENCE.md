@@ -48,7 +48,7 @@ Before plotting starts, `plot` saves the prepared identities and keys in an
 `xchplot2-job-*.tsv` manifest in the output directory. Use `--manifest FILE`
 to choose its location. Each new job keeps its own manifest; another job
 cannot overwrite it. Manifests contain private plot keys and are created
-with owner-only permissions on Linux.
+with owner-only permissions on Linux and protected owner-only ACLs on Windows.
 
 Repeat the same `plot` command with `--resume` (or `--skip-existing`) to
 recover its saved job, including when no `--seed` was supplied. If several
@@ -137,9 +137,8 @@ Prefer the automatically saved manifest for recovery; see
 These commands are included in normal Linux Cargo, CMake and container builds,
 and in experimental native Windows CMake builds. Windows grouped construction
 requires local NTFS volumes with ordinary, uncompressed, unencrypted files;
-ReFS, network volumes and sparse files are rejected. CPU construction and
-recovery have been checked on native Windows x86-64 and ARM64; GPU
-qualification remains pending.
+ReFS, network volumes and sparse files are rejected. Native Windows support
+remains experimental; see the [platform limitations](INSTALL.md#windows).
 Windows retains compact retirement records beside completed external jobs
 for recovery. Keep them with the output until recovery is no longer needed.
 Unknown disk topology is scheduled conservatively; Windows NVMe destinations
@@ -376,7 +375,6 @@ file-format and construction admission still apply when plotting.
 provide context for the tradeoff; qualify the intended storage and reader before
 relying on a latency bound.
 
-
 ## Shared compute
 
 A compute pool is a set of trusted machines that share generation and encoding
@@ -471,10 +469,9 @@ truncation indicators. Live pages can change while being read.
 
 Discovery advertisements are untrusted hints. Status and work connections
 require mutual TLS in the enrolled pool. Use the same build on collaborating
-machines; incompatible compute formats are not scheduled. This revision
-changes the compute protocol and saved membership format: upgrade brokers,
-workers and plotting hosts together, then restart their services. Existing
-membership can be loaded without creating a new pool.
+machines; incompatible compute formats are not scheduled. Upgrade brokers,
+workers and plotting hosts together, then restart their services. Preserve
+the saved enrollment directory when upgrading.
 
 ### Background workers and brokers
 
@@ -939,11 +936,10 @@ memory throughout the run and fails if use exceeds the budget.
 `POS2GPU_VRAM_MARGIN_MB` changes the buffer; desktop activity may need more
 than the default. Models scale with k.
 
-Lower VRAM tiers generally need more host RAM. Use the current per-tier
-[host RSS measurements](BENCHMARKS.md#gpu-results) for
-planning, with room for the OS and other workers. Host admission uses a
-separate model of pinned and anonymous memory, plus a reserve. Eligible
-storage can be moved to disk when that model does not fit.
+Lower VRAM tiers generally need more host RAM. Set `--max-host-ram` to leave
+room for the OS and other workers; see [host RAM and disk-offload](#host-ram-and-disk-offload).
+Host admission uses a separate model of pinned and anonymous memory, plus a
+reserve. Eligible storage can be moved to disk when that model does not fit.
 
 Memory quantities in this guide use MiB/GiB. Environment names ending in
 `_MB` take MiB counts; existing diagnostic output may label them `MB`.
@@ -1109,11 +1105,9 @@ common commands and options; use this reference for the complete command guide.
   closed, the box genuinely needs more RAM for that card. See [Host RAM
   and disk-offload](#host-ram-and-disk-offload).
 
-- **Integrated Intel Level Zero plotting**: production plotting remains
-  unqualified because large sorts can produce incorrect fragments. Use
-  `--devices cpu` for production jobs on these devices. An integrated GPU
-  does not necessarily outperform the host CPU; compare correct, complete
-  plots before choosing it for shared compute.
+- **Integrated Intel Level Zero plotting**: this path can produce invalid
+  plots and is not supported for production. Use `--devices cpu` on these
+  systems.
 
 - **Intel Arc B580 sort hangs**: on Fedora 44 with AdaptiveCpp 25.10 and
   Intel compute-runtime 26.22, disable direct submission. Apply the workaround to the plotting process:

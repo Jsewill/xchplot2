@@ -21,6 +21,10 @@ CUDA build, use the [`cuda-only` installation guide](https://github.com/Jsewill/
 
 ## Binary archives
 
+The v0.14.1 release archives predate the grouped plotting and shared-compute
+commands on `main`. Build from source using the [native](#native-install),
+[container](#container) or [Windows](#windows) instructions for those features.
+
 Download the combined Linux x86-64 or ARM64 `sycl.tar.gz` archive
 and its `.sha256` file from [GitHub Releases](https://github.com/Jsewill/xchplot2/releases).
 Each release contains SYCL and native CUDA packages with the same version;
@@ -32,7 +36,7 @@ add that `bin` directory to `PATH` to run the CLI elsewhere.
 The x86-64 archive requires glibc 2.39+ (Ubuntu 24.04 or a compatible system)
 and a CPU with AES, SSSE3, and SSE4.1. The ARM64 archive requires Ubuntu 26.04
 or a compatible system with glibc 2.43+ and ARMv8-A crypto extensions.
-Both require a compatible GPU driver. On Ubuntu,
+GPU plotting requires a compatible driver; CPU plotting does not. On Ubuntu,
 install `libstdc++6`, `libnuma1`, and `libelf1t64`; AMD also needs `libdrm2`
 and `libdrm-amdgpu1`. The archive includes AdaptiveCpp, LLVM, CUDA and HIP
 runtimes, the Level Zero loader, and its SPIR-V translator. NVIDIA, AMD,
@@ -43,15 +47,14 @@ The CUDA runtime is 12.9.1; NVIDIA driver 575.57.08+ is recommended. The HIP
 runtime is ROCm 7.1.1 on x86-64; ARM64 uses Ubuntu's HIP 7.1.0 and compiler
 libraries 7.1.1. Hardware support follows those runtimes. Intel
 uses Level Zero and requires the Intel GPU compute driver. See
-[troubleshooting](REFERENCE.md#troubleshooting) for the tested Intel driver
-settings and the release notes for hardware qualification.
+[troubleshooting](REFERENCE.md#troubleshooting) for Intel driver settings
+and known limitations.
 
 ARM64 includes CUDA (Linux SBSA), HIP, Level Zero, and OpenCL backends.
 OpenCL devices must support SPIR-V, Intel USM or fine-grained system SVM,
 and 64-bit atomics. A bundled backend does not supply a GPU driver: each
-device needs a driver for the host architecture. ARM64 GPU execution still
-requires hardware qualification; the hosted release checks cover native
-compilation, the bundled runtime, CPU/SYCL plotting parity, and full proofs.
+device needs a driver for the host architecture. GPU plotting on ARM64
+remains experimental.
 
 The experimental Windows x86-64 `sycl.zip` includes NVIDIA, AMD, and Intel
 backends together. Extract it and run `.\bin\xchplot2.exe devices`; keep the
@@ -61,26 +64,25 @@ runtime DLLs are bundled. No CUDA, HIP/ROCm, or oneAPI SDK installation is neede
 Install the normal graphics driver: NVIDIA 576.57+, AMD Adrenalin with the
 HIP 6 runtime, or Intel's graphics driver with Level Zero support.
 It requires Windows 10 22H2, Windows 11, or Server 2022/2025, an AES/SSSE3/SSE4.1
-CPU, and NTFS/ReFS for plots and spill. Hosted checks exercise CPU plotting,
-recovery, and offline GPU compilation. An RX 6700 XT completed a
-[reported Windows benchmark](BENCHMARKS.md#windows-rx-6700-xt-report);
-full Windows GPU qualification is still pending. See [Windows](#windows)
-for source builds.
+CPU, and an ACL-capable filesystem for plots and spill. Ordinary plots support
+NTFS/ReFS; grouped construction requires local NTFS. Windows GPU plotting
+remains experimental. See [Windows](#windows) for source builds and known
+limitations.
 
 The experimental Windows ARM64 ZIP requires Windows 11 ARM64. It includes
 CUDA 13.4.2 (Turing and newer), Level Zero, and OpenCL, with native ARM64
 runtime libraries and the same plotting features. Each backend requires a
 compatible ARM64 graphics driver. OpenCL has the SPIR-V, USM/SVM, and 64-bit
 atomic requirements described above. AMD's Windows HIP SDK does not supply
-an ARM64 runtime, so this archive does not include HIP. GPU execution still
-requires hardware qualification.
+an ARM64 runtime, so this archive does not include HIP. GPU plotting remains
+experimental.
 
 Apple Silicon GPU builds are not available. AdaptiveCpp's experimental
 [Metal backend](https://github.com/AdaptiveCpp/AdaptiveCpp/blob/develop/doc/install-metal.md)
 lacks the 64-bit atomics used by the plotting kernels.
 
-`BUILDINFO.txt` records source and toolchain revisions; `licenses/` contains
-dependency notices. Releases without binary assets require a source build.
+`licenses/` contains dependency notices. Releases without binary assets require
+a source build.
 
 ## Container
 
@@ -133,10 +135,10 @@ podman compose build cuda
 ACPP_GFX=gfx1031 podman compose build rocm    # Navi 22
 ACPP_GFX=gfx1100 podman compose build rocm    # Navi 31
 
-# Intel oneAPI (experimental, untested).
+# Intel Level Zero; see the known limitations in REFERENCE.md.
 podman compose build intel
 
-# CPU-only (no GPU; AdaptiveCpp OpenMP backend; ~400 MB image).
+# CPU-only (no GPU; AdaptiveCpp OpenMP backend).
 # CPU plotting is opt-in; see REFERENCE.md for worker controls.
 podman compose build cpu
 ```
@@ -271,9 +273,8 @@ the system package manager itself.
 Intel plotting requires the
 [Level Zero event-pool fix](https://github.com/AdaptiveCpp/AdaptiveCpp/commit/7bb430d5e04e497ac6b0e5b56f0f5e46f646b3af)
 and [event dependency lifetime correction](ci/release/adaptivecpp-level-zero-event-lifetime.patch).
-They prevent reuse of live completion slots and keep dependency events alive
-until their consuming commands finish. The project's installer, automatic CMake
-build, containers, and Windows toolchain apply both to AdaptiveCpp 25.10.
+The project's installer, automatic CMake build, containers, and Windows
+toolchain apply both to AdaptiveCpp 25.10.
 Existing installations without these corrections need
 `./scripts/install-deps.sh --gpu intel --rebuild-acpp` before rebuilding
 xchplot2. Manually managed toolchains need both corrections.
@@ -436,8 +437,8 @@ including the W5700 and RX 5700 series):
 
 For RDNA1, use the [native installation](#native-install) and the generic
 SSCP path. The legacy spoof produced no-op kernels on a reported W5700 with
-ROCm 6 and AdaptiveCpp 25.10; generic SSCP passed that host's checks through
-k=24. This is separate from the current RX 6700 XT k=28 benchmark set.
+ROCm 6 and AdaptiveCpp 25.10. Avoid that spoof unless it has been validated
+on your GPU and toolchain.
 
 Cargo and direct CMake preserve two environment overrides for already validated stacks:
 `XCHPLOT2_FORCE_GFX_SPOOF=1` selects the legacy `gfx1013` spoof;
@@ -456,10 +457,8 @@ runners do not validate GPU execution.
 ### Native SYCL
 
 The native Windows build is experimental and uses the standalone CMake
-executable. Cargo's dependency bootstrap remains Linux-specific. The Windows
-release job builds all CMake targets, runs host tests, and exercises the
-packaged CPU kernels, plotting, full proofs, cancellation, and recovery. GPU
-plotting has not yet been qualified on Windows hardware.
+executable. Cargo's dependency bootstrap remains Linux-specific. GPU plotting
+has not yet been qualified on Windows hardware.
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
 20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),
@@ -487,7 +486,6 @@ cmake --build build/windows-sycl --parallel 2
 python scripts/test/recovery.py build/windows-sycl/tools/xchplot2/xchplot2.exe
 ```
 
-The initial Windows CI toolchain build took about 95 minutes with two parallel jobs.
 The script pins AdaptiveCpp 25.10.0 and LLVM 20.1.8, enables CPU, CUDA, HIP,
 and Level Zero backends, builds the Level Zero loader and SPIR-V translator,
 and replaces the separately licensed Windows error formatter with the C++
@@ -500,9 +498,8 @@ at runtime; the packaged application avoids that dependency.
 Use an ACL-capable filesystem (NTFS/ReFS) for ordinary plots, manifests and
 spill. Grouped construction and recovery require local NTFS; sparse,
 compressed, encrypted and network-backed group storage is rejected. The
-Windows group and background-service ports remain experimental. CPU
-construction and recovery have been checked on native x86-64 and ARM64;
-the x86-64 Task Scheduler worker can stop after rapid service restarts. See the
+Windows group and background-service ports remain experimental. The x86-64
+Task Scheduler worker can stop after rapid service restarts. See the
 [shared-compute reference](REFERENCE.md#shared-compute) for enrollment,
 services and firewall requirements.
 The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.
@@ -530,11 +527,6 @@ The RX 6700 XT (`gfx1031`) is listed for
 Its plotting path still needs hardware qualification. Extra ROCm math
 libraries are not required.
 
-The HIP and Level Zero VRAM probes resolve the loaded Windows runtime DLLs.
-Their driver queries still need Windows hardware qualification. Intel uses
-Level Zero; support depends on the GPU and its graphics driver.
-
-Before qualifying any Windows GPU backend, run allocation and kernel parity
-checks, k=22/k=28 CPU byte comparisons, full proofs, every fitting tier and
-disk-spill variant, memory-pressure rejection, cancellation, and recovery
-using the extracted package on Windows hardware.
+Intel uses Level Zero; support depends on the GPU and its graphics driver.
+See [binary release checks](CONTRIBUTING.md#binary-releases) for the developer
+validation workflow.

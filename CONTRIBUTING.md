@@ -372,6 +372,11 @@ memory budgets and spill support. Record GPU, source revision, sample count,
 warmup, units, and measurement date with new results. Label older results
 whose provenance is incomplete.
 
+Contributor guides describe workflows and acceptance criteria. Keep debugging
+sessions, test counts and run-by-run validation results in local records or CI
+artifacts. User guides should explain supported behavior, limitations and the
+actions readers need to take.
+
 The existing Markdown job lints tracked documentation, including section
 fragments. Local links are checked without contacting external websites:
 
@@ -489,6 +494,10 @@ additionally requires their graphics drivers, so those two checks run only
 when their drivers are installed. The ZIP includes the compiler and
 redistributable runtime dependencies; users need only their graphics driver.
 These checks do not qualify Windows GPU execution.
+Windows GPU qualification requires allocation and kernel parity checks,
+k=22/k=28 CPU byte comparisons and full proofs, every fitting tier and disk-spill
+variant, memory-pressure rejection, cancellation and recovery using the
+extracted archive on Windows hardware.
 
 Run `scripts/test/release.py ARCHIVE.tar.gz` (or `ARCHIVE.zip` on Windows)
 for the archive and CPU checks. It also compares the SYCL plotting pipeline
