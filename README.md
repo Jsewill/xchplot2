@@ -47,6 +47,13 @@ xchplot2 plot -k 28 -n 10 \
     -o /mnt/plots
 ```
 
+Without shared compute, this command uses one GPU. Add `--devices gpu` to
+use all GPUs, or `--devices all` to include CPU workers. See
+[device selection](REFERENCE.md#devices-and-cpu-workers) for more options.
+
+Keep the generated `xchplot2-job-*.tsv` manifest private: it contains plot
+keys and lets you [resume an interrupted job](REFERENCE.md#plotting-and-recovery).
+
 Each completed output path is printed to stdout. Check one output with:
 
 ```bash
@@ -84,13 +91,12 @@ host test binaries.
 See [configuration and argument files](REFERENCE.md#configuration-and-argument-files)
 for reusable options. `xchplot2 --help` prints command syntax.
 
-### Drive management
+### Storage planning and filling
 
 | Command | Purpose and guide |
 |---|---|
 | [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout without writing files |
 | [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
-| [xchplot2 grow](REFERENCE.md#growing-an-existing-group) | Extend or recover an existing group file |
 
 ### Shared compute
 
@@ -104,29 +110,10 @@ for reusable options. `xchplot2 --help` prints command syntax.
 |---|---|
 | [xchplot2 plot](REFERENCE.md#plotting-and-recovery) | Create plots from farmer and pool keys |
 | [xchplot2 batch](REFERENCE.md#batch-manifests) | Run or resume a saved plot manifest |
+| [xchplot2 grow](REFERENCE.md#growing-an-existing-group) | Extend or recover an existing group file |
 
-Without shared compute, ordinary single-member plotting uses one GPU.
-Select all GPUs with `--devices gpu`; add
-CPU workers with `--cpu`, or select both with `--devices all`. Each GPU
-chooses a tier from its own free VRAM. See the
-[device reference](REFERENCE.md#devices-and-cpu-workers).
-
-Before starting, `plot` saves an `xchplot2-job-*.tsv` manifest in the output
-directory. It contains private plot keys; keep it private and retain it to
-recover the job. Repeat the original `plot` command with `--resume`, or
-resume directly from the saved manifest:
-
-```bash
-xchplot2 batch /path/to/job.tsv --resume
-```
-
-Resume validates existing files before skipping them. See
-[plotting and recovery](REFERENCE.md#plotting-and-recovery) for identity
-matching, manifest selection, progress, stdout, and exit status.
-
-If host RAM is short, use `--temp-dir` to select a real disk for automatic
-spill, or `--max-host-ram` to set a budget. Available reductions differ by
-tier and branch; see [host RAM and disk-offload](REFERENCE.md#host-ram-and-disk-offload).
+See [plotting and recovery](REFERENCE.md#plotting-and-recovery) for saved jobs
+and resuming interrupted work.
 
 ### Checks and performance
 
