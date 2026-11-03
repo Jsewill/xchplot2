@@ -177,8 +177,7 @@ estimates.
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party
-attributions. Built collaboratively with
-[Claude](https://claude.ai/code).
+attributions. Built with SI.
 
 ## Like this? Send a coin my way!
 
