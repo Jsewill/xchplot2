@@ -10,7 +10,7 @@ mdns
     https://github.com/mjansson/mdns
     Written by Mattias Jansson. Released under the Unlicense.
 
-    The pinned header-only library supplies Linux LAN service discovery.
+    The pinned header-only library supplies LAN service discovery.
     Fetched at build time via cmake/ComputePool.cmake.
 ================================================================================
 OpenSSL 3
@@ -18,7 +18,7 @@ OpenSSL 3
     Copyright The OpenSSL Project Authors.
     Licensed under the Apache License, Version 2.0.
 
-    Linux shared compute uses TLS and certificate enrollment through OpenSSL.
+    Shared compute uses TLS and certificate enrollment through OpenSSL.
 ================================================================================
 pos2-chip
     https://github.com/Chia-Network/pos2-chip
