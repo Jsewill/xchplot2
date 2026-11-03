@@ -62,9 +62,18 @@ def check(binary, root, service_manager=False):
             run("authority", "service", "install")
             node = status("authority")["node_id"]
             until(lambda: any(w["node_id"] == node for w in status("owner")["workers"]))
-            for action in ("status", "stop", "start", "restart"):
-                run("authority", "service", action)
-            until(lambda: any(w["node_id"] == node for w in status("owner")["workers"]))
+            for _ in range(3):
+                for action in ("status", "stop", "start", "restart"):
+                    run("authority", "service", action)
+                until(lambda: any(w["node_id"] == node for w in status("owner")["workers"]))
+        except Exception:
+            try:
+                result = run("authority", "service", "status")
+                print("Service status after failure:\n" + result.stdout + result.stderr, file=sys.stderr, flush=True)
+                print("Compute status after service failure:\n" + json.dumps(status("owner")), file=sys.stderr, flush=True)
+            except Exception as error:
+                print("Cannot inspect service after failure:", error, file=sys.stderr, flush=True)
+            raise
         finally:
             run("authority", "service", "remove")
         print("PASS native user service worker startup, control and removal", flush=True)
