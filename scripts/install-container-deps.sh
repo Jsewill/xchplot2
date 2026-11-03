@@ -162,7 +162,7 @@ if [[ -z "$GPU" ]]; then
         echo "[install-container-deps] Could not auto-detect a GPU. Pass" >&2
         echo "[install-container-deps]   --gpu nvidia | amd | intel | cpu" >&2
         echo "[install-container-deps] explicitly. Use --gpu cpu for a GPU-less host" >&2
-        echo "[install-container-deps] (CPU-only image; slow plotting, see README)." >&2
+        echo "[install-container-deps] (CPU-only image; see README)." >&2
     fi
     exit 1
 fi

@@ -137,8 +137,9 @@ Prefer the automatically saved manifest for recovery; see
 These commands are included in normal Linux Cargo, CMake and container builds,
 and in experimental native Windows CMake builds. Windows grouped construction
 requires local NTFS volumes with ordinary, uncompressed, unencrypted files;
-ReFS, network volumes and sparse files are rejected. Native Windows recovery
-and GPU qualification remain pending.
+ReFS, network volumes and sparse files are rejected. CPU construction and
+recovery have been checked on native Windows x86-64 and ARM64; GPU
+qualification remains pending.
 Windows retains compact retirement records beside completed external jobs
 for recovery. Keep them with the output until recovery is no longer needed.
 Unknown disk topology is scheduled conservatively; Windows NVMe destinations
@@ -498,7 +499,8 @@ finish first. Restart after changing saved defaults or replacing the executable.
 Linux uses a systemd user service; logout behavior follows the system's user
 manager policy. Windows uses Task Scheduler at user login, without elevation,
 and requires that user to remain logged in. The native Windows service path
-is experimental and still needs native runtime qualification.
+is experimental: rapid stop/start/restart can leave the worker stopped on
+x86-64. Check `compute service status` and `compute status` after restarting.
 
 ### Networks and dedicated brokers
 
@@ -1109,7 +1111,9 @@ common commands and options; use this reference for the complete command guide.
 
 - **Integrated Intel Level Zero plotting**: production plotting remains
   unqualified because large sorts can produce incorrect fragments. Use
-  `--devices cpu` for production jobs on these devices.
+  `--devices cpu` for production jobs on these devices. An integrated GPU
+  does not necessarily outperform the host CPU; compare correct, complete
+  plots before choosing it for shared compute.
 
 - **Intel Arc B580 sort hangs**: on Fedora 44 with AdaptiveCpp 25.10 and
   Intel compute-runtime 26.22, disable direct submission. Apply the workaround to the plotting process:

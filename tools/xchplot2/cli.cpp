@@ -265,7 +265,7 @@ void print_usage(char const* prog)
         << "                                      list mixing any of:\n"
         << "                                        all       — every GPU + every CPU node\n"
         << "                                        gpu       — every visible GPU\n"
-        << "                                        cpu       — every CPU node (slow)\n"
+        << "                                        cpu       — every CPU node\n"
         << "                                        gpu0,gpu2 — those GPUs\n"
         << "                                        cpu1      — that CPU (NUMA) node only\n"
         << "                                        0,1,3     — explicit GPU ids (== gpu0,..)\n"
@@ -1697,10 +1697,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 ? "Host CPU plotter (NUMA node " + std::to_string(node.node_id) + ")"
                 : std::string("Host CPU plotter");
             if (node_threads == 0) {
-                std::printf("  %-7s%-32s backend=%-10s threads=  ?            sort:SYCL  (1-2 orders slower than GPU)\n",
+                std::printf("  %-7s%-32s backend=%-10s threads=  ?            sort:SYCL\n",
                             tag.c_str(), name.c_str(), "omp");
             } else {
-                std::printf("  %-7s%-32s backend=%-10s threads=%-4zu           sort:SYCL  (1-2 orders slower than GPU)\n",
+                std::printf("  %-7s%-32s backend=%-10s threads=%-4zu           sort:SYCL\n",
                             tag.c_str(), name.c_str(), "omp", node_threads);
             }
         }
@@ -1718,7 +1718,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         } else {
             std::printf("\nUse `--devices gpu0` (or bare `0`) for a specific GPU,\n"
                         "     `--devices gpu` for every plottable GPU (tiny iGPUs skipped),\n"
-                        "     `--devices cpu` for every CPU node (opt-in; slow),\n"
+                        "     `--devices cpu` for every CPU node (opt-in),\n"
                         "     `--devices cpu0` for one CPU node,\n"
                         "     `--devices all` for every GPU + every CPU node,\n"
                         "  or any comma combination (e.g. `0,2,cpu`).\n"
