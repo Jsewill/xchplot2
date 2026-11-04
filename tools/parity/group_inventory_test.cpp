@@ -92,6 +92,7 @@ int fake_adapter(int argc, char** argv)
     if (mode == "timeout") { std::this_thread::sleep_for(std::chrono::seconds(5)); return 0; }
     if (mode == "flood") { for (unsigned i = 0; i < 65536; ++i) std::cout << "private-memo-must-never-be-logged\n"; return 1; }
     if (mode == "failed") { std::cout << "private-memo-must-never-be-logged"; return 1; }
+    if (argc == 4 && std::string_view(argv[3]) == "version") { std::cout << "fixture-native-1\n"; return 0; }
     std::string endpoint = argv[argc - 1];
     auto const root = fs::path(argv[2]); std::string const service = argv[4];
     auto flag = [&](char const* name) { return fs::exists(root / name); };
@@ -120,7 +121,8 @@ int fake_adapter(int argc, char** argv)
         std::cout << "{\"success\":true,\"connections\":[";
         for (size_t i = 0; i < peers.size(); ++i)
         { auto const p = peers[i]; if (i) std::cout << ','; std::cout << "{\"type\":" << p.type << ",\"local_port\":" << p.local << ",\"peer_server_port\":" << p.server
-            << ",\"peer_port\":" << p.port << ",\"peer_host\":\"127.0.0.1\",\"node_id\":\"" << std::string(64, p.id)
+            << ",\"peer_port\":" << p.port << ",\"peer_host\":\"" << (flag("remote-peers") ? (service != "farmer" ? "10.0.0.2" : p.type == 2 ? "10.0.0.1" : p.type == 1 ? "10.0.0.3" : "10.0.0.4") : "127.0.0.1")
+            << "\",\"node_id\":\"" << std::string(64, p.id)
             << "\",\"creation_time\":" << (flag("connection-churn") ? "2.25" : "1.25") << ",\"last_message_time\":0}"; }
         std::cout << "]}";
     }
@@ -129,7 +131,10 @@ int fake_adapter(int argc, char** argv)
     {
         std::string const pool(64, flag("pool-mismatch") ? '8' : '4');
         std::cout << "{\"success\":true,\"pool_state\":[{\"p2_singleton_puzzle_hash\":\"" << pool << "\",\"pool_config\":{\"p2_singleton_puzzle_hash\":\"" << pool
-            << "\",\"pool_url\":\"" << (flag("pool-external") ? "https://unsupported.example" : "") << "\"}}]}";
+            << "\",\"pool_url\":\"" << ((flag("pool-external") || flag("pool-uninitialized")) ? "https://pool.example" : "")
+            << "\",\"launcher_id\":\"" << std::string(64, '1') << "\",\"owner_public_key\":\"" << std::string(96, '6')
+            << "\",\"target_puzzle_hash\":\"" << std::string(64, '2') << "\",\"version\":" << (flag("pool-version-invalid") ? 3 : flag("pool-v2") ? 2 : 1)
+            << "},\"current_difficulty\":" << (flag("pool-uninitialized") ? "null" : "17") << ",\"authentication_token_timeout\":5}]}";
     }
     else if (endpoint == "get_harvesters" || endpoint == "get_harvesters_summary")
     {
@@ -138,10 +143,19 @@ int fake_adapter(int argc, char** argv)
         auto parsed = profile_detail::JsonReader(raw, 16 * 1024 * 1024).read(); auto const count = inventory_detail::required_field(parsed, "plots").items.size();
         auto const start = raw.find('['), end = raw.rfind(']'); require(start != raw.npos && end != raw.npos, "bad fake farmer registry");
         std::cout << "{\"success\":true,\"harvesters\":[{\"connection\":{\"node_id\":\"" << std::string(64, flag("farmer-mismatch") ? '6' : '3')
-            << "\",\"host\":\"127.0.0.1\",\"port\":61934},\"syncing\":" << (flag("farmer-syncing") ? "{}" : "null")
+            << "\",\"host\":\"" << (flag("remote-peers") ? "10.0.0.1" : "127.0.0.1") << "\",\"port\":61934},\"syncing\":" << (flag("farmer-syncing") ? "{}" : "null")
             << ",\"last_sync_time\":" << (flag("farmer-zero-sync") ? "0" : flag("farmer-future-sync") ? "99999999999" : flag("sync-churn") ? "2.25" : "1.25") << ",\"plots\":";
         if (endpoint == "get_harvesters_summary") std::cout << count; else std::cout << raw.substr(start, end - start + 1);
-        std::cout << "}]}";
+        std::cout << '}';
+        if (flag("other-harvester"))
+        {
+            std::cout << ",{\"connection\":{\"node_id\":\"" << std::string(64, '9') << "\",\"host\":\"10.0.0.9\",\"port\":61939},\"syncing\":" << (flag("other-harvester-syncing") ? "{}" : "null") << ",\"last_sync_time\":"
+                << (flag("other-harvester-growth") ? "2.25" : "1.25") << ",\"plots\":";
+            if (endpoint == "get_harvesters_summary") std::cout << (flag("other-harvester-empty") ? 0 : flag("other-harvester-growth") ? 2 : 1);
+            else std::cout << (flag("other-harvester-empty") ? "[]" : "[{\"size\":130,\"group_size\":4}]");
+            std::cout << '}';
+        }
+        std::cout << "]}";
     }
     else if (endpoint == "get_constants") std::cout << "{\"success\":true,\"constants\":{\"GENESIS_CHALLENGE\":\"" << std::string(64, 'a') << "\",\"HARD_FORK2_HEIGHT\":100,\"MIN_PLOT_STRENGTH\":2,\"MAX_PLOT_STRENGTH\":17,\"PLOT_SIZE_V2\":28}}";
     else if (endpoint == "get_plots")
@@ -156,40 +170,11 @@ int fake_adapter(int argc, char** argv)
     else if (endpoint == "get_blockchain_state")
     {
         bool const inactive = fs::exists(fs::path(argv[2]) / "inactive");
-        std::cout << "{\"success\":true,\"blockchain_state\":{\"sync\":{\"synced\":true,\"sync_mode\":false},\"peak\":{\"prev_transaction_block_height\":"
+        std::cout << "{\"success\":true,\"blockchain_state\":{\"sync\":{\"synced\":" << (flag("unsynced") ? "false" : "true") << ",\"sync_mode\":false},\"peak\":{\"prev_transaction_block_height\":"
             << (inactive ? 99 : 101) << ",\"timestamp\":" << std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) << "}}}";
     }
     else return 2;
     return 0;
-}
-int fake_checker(int argc, char** argv)
-{
-    if (std::string_view(argv[1]) == "verify")
-    {
-        require(argc == 8 && std::string_view(argv[2]) == "-k" && std::string_view(argv[4]) == "-i",
-            "native identity verifier received arbitrary arguments");
-        if (std::string_view(argv[6]).substr(0, 64) != argv[5]) return 1;
-        if (auto const* mutate = std::getenv("XCHPLOT2_INVENTORY_TEST_MUTATE"))
-        { std::ofstream changed(mutate, std::ios::binary | std::ios::trunc); changed.put('\0'); }
-        if (auto const* version = std::getenv("XCHPLOT2_INVENTORY_TEST_VERSION"))
-        { std::ofstream changed(version); changed << "fixture-native-2"; }
-        std::cout << "Proof verification suceeded. Quality: b" << std::string(256, '1') << '\n'; return 0;
-    }
-    require(argc == 8 && std::string_view(argv[2]) == "-r" && std::string_view(argv[3]) == "1" && std::string_view(argv[4]) == "--parallel_read=false" &&
-        std::string_view(argv[5]) == "-f" && std::string_view(argv[7]) == "1", "native checker received unbounded or arbitrary arguments");
-    require(std::getenv("CHIAPOS_MAX_GPU_DEVICES") && std::string_view(std::getenv("CHIAPOS_MAX_GPU_DEVICES")) == "0" &&
-        std::getenv("CHIAPOS_MAX_CORES") && std::string_view(std::getenv("CHIAPOS_MAX_CORES")) == "1" && !std::getenv("CHIAPOS_RECOMPUTE_HOST"),
-        "native checker escaped declared CPU-only local resources");
-    if (auto const* delay = std::getenv("XCHPLOT2_INVENTORY_TEST_DELAY_MS"))
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::stoul(delay)));
-    std::ifstream file(argv[6], std::ios::binary); char first = 0; file.get(first); bool success = first == 'P';
-    std::array<uint8_t, 32> id{}; unsigned k = 32;
-    if (success) { char magic[4]{}; file.seekg(0); file.read(magic, 4); file.seekg(std::string_view(magic, 4) == "PLOT" ? 8 : 19); file.read(reinterpret_cast<char*>(id.data()), id.size()); k = unsigned(file.get()); }
-    std::cout << "private-memo-must-never-be-logged\niterations: 1\n";
-    if (success) std::cout << "challenge: 0x" << std::string(64, '3') << "\nproof: 0x" << group_tools::hex(id) << std::string(16 * k - 64, '1')
-        << "\nquality: b" << std::string(256, '1') << "\nProof verification succeeded. k = " << k << '\n';
-    std::cout << "Total success: " << (success ? 2 : 0) << " / 1, fixture\nTotal failures: " << (success ? 0 : 1) << " / 1, fixture\n";
-    return 0; // Real native check also returns zero when every sample fails.
 }
 void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProjection const& projection, InventoryRoot const& root,
     ReplacementExpectation const& prototype, std::vector<uint8_t> const& bytes, std::string const& loaded_key)
@@ -283,58 +268,117 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
     require(!next_boundary.check(expected, publication(expected, 0)).ready, "next retirement boundary reused a cached loaded registry");
 }
 #ifdef __linux__
-void slow_native_catalog(fs::path const& directory, HarvesterAdapterOptions options, std::string const& loaded_key)
+void source_metadata_snapshot(fs::path const& directory, HarvesterAdapterOptions options, std::string const& loaded_key)
 {
-    auto root = directory / "slow-native-files"; fs::create_directory(root);
+    auto root = directory / "metadata-native-files"; fs::create_directory(root);
     auto bytes = legacy(false); auto const id = adapter_detail::legacy_id_from_loaded_key(loaded_key, std::string(64, '4'));
     auto public_id = group_tools::hex(id); std::copy(public_id.begin(), public_id.end(), bytes.begin() + 19); bytes[54] = 'x';
     write(root / "first.plot", bytes); write(root / "second.plot", bytes);
-    std::array<fs::path, 1> roots{root}; auto original = scan_farm_inventory(roots);
-    auto registry = [&](FarmInventory const& catalog)
+    std::array<fs::path, 1> roots{root}; auto catalog = scan_farm_inventory(roots);
+    auto registry = [&](bool missing = false)
     {
         std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
-        for (size_t i = 0; i < catalog.plots.size(); ++i)
+        for (size_t i = 0; i < catalog.plots.size() - size_t(missing); ++i)
         {
             auto const& plot = catalog.plots[i]; if (i) out << ','; out << "{\"filename\":";
             profile_detail::quote(out, file_io::path_text(root / plot.relative_path));
             out << ",\"size\":32,\"plot_id\":\"" << id << "\",\"file_size\":" << plot.identity.stamp.bytes << ",\"time_modified\":" << plot.identity.stamp.mtime
-                << ",\"pool_contract_puzzle_hash\":\"" << std::string(64, '4') << "\",\"plot_public_key\":\"" << loaded_key << "\"}";
+                << ",\"pool_contract_puzzle_hash\":\"" << std::string(64, '4') << "\",\"plot_public_key\":\"" << loaded_key << "\",\"compression_level\":33}";
         }
         out << "]}";
     };
-    options.limits.timeout_ms = 2000; registry(original);
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_DELAY_MS", "1200", 1), "cannot install slow native fixture");
-    auto catalog = original; auto const started = std::chrono::steady_clock::now();
+    registry();
     observe_harvester_inventory(catalog, options);
-    require(std::chrono::steady_clock::now() - started > std::chrono::milliseconds(options.limits.timeout_ms) &&
-        std::all_of(catalog.plots.begin(), catalog.plots.end(), [](auto const& p) { return p.native_identified && p.status == "native-observed"; }),
-        "serial native catalog shared one per-operation deadline instead of independent bounded grants");
-    catalog = original; catalog.plots.resize(1); registry(catalog);
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_RPC_DELAY_MS", "1000", 1), "cannot install slow registry fixture");
-    rejects([&] { observe_harvester_inventory(catalog, options, false); }, "narrow runtime source recheck reset its original shared phase deadline");
-    ::unsetenv("XCHPLOT2_INVENTORY_TEST_RPC_DELAY_MS"); registry(original);
-    auto version = file_io::path_text(options.root / "version");
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_VERSION", version.c_str(), 1), "cannot install changed version fixture");
-    catalog = original;
-    rejects([&] { observe_harvester_inventory(catalog, options); }, "long catalog accepted a changed native service version");
-    ::unsetenv("XCHPLOT2_INVENTORY_TEST_VERSION"); fs::remove(options.root / "version");
-    auto const original_checker = options.checker; options.checker = options.root / "checker-wrapper";
+    require(std::all_of(catalog.plots.begin(), catalog.plots.end(), [](auto const& p) { return p.native_identified && p.status == "native-observed"; }),
+        "reader metadata retirement required an unavailable compressed-plot GPU checker");
+    std::array<uint64_t, 2> indices{0, 1};
+    auto count = [&] { unsigned value = 0; std::ifstream in(options.root / "registry-count"); in >> value; return value; };
+    auto const before = count();
     {
-        std::ofstream wrapper(options.checker); wrapper << "#!/bin/sh\nexec '" << file_io::path_text(original_checker) << "' \"$@\"\n";
+        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        for (auto const& plot : catalog.plots) (void)snapshot.check(catalog.roots[plot.root], plot);
+        snapshot.finish();
     }
-    fs::permissions(options.checker, fs::perms::owner_all);
-    auto mutate = file_io::path_text(options.checker);
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_MUTATE", mutate.c_str(), 1), "cannot install changed checker fixture");
-    catalog = original;
-    rejects([&] { observe_harvester_inventory(catalog, options); }, "long catalog accepted a changed native checker implementation");
-    ::unsetenv("XCHPLOT2_INVENTORY_TEST_MUTATE"); fs::remove(options.checker); options.checker = original_checker;
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_DELAY_MS", "5000", 1), "cannot install hung native fixture");
-    catalog = original; catalog.plots.resize(1); registry(catalog);
-    observe_harvester_inventory(catalog, options);
-    ::unsetenv("XCHPLOT2_INVENTORY_TEST_DELAY_MS");
-    require(!catalog.plots[0].native_identified && catalog.plots[0].status == "protected",
-        "catalog allowance enlarged an individual hung native checker grant");
+    require(count() == before + 2, "source snapshot rescanned the complete registry per source instead of bounded capture/final fences");
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices); registry(true);
+        rejects([&] { snapshot.finish(); }, "source loaded-population loss survived an unchanged reader version"); registry();
+    }
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        auto registry_file = options.root / "plots.json"; std::ifstream in(registry_file); std::string raw(std::istreambuf_iterator<char>(in), {});
+        auto row = raw.substr(raw.find('{', raw.find('[')), raw.find('}', raw.find('[')) - raw.find('{', raw.find('[')) + 1);
+        auto const path = file_io::path_text(root / "first.plot"); auto where = row.find(path);
+        require(where != row.npos, "source arrival fixture cannot locate its original row"); row.replace(where, path.size(), file_io::path_text(root / "arrival.plot"));
+        { std::ofstream changed(registry_file); changed << raw.substr(0, raw.rfind(']')) << ',' << row << "]}"; }
+        rejects([&] { snapshot.finish(); }, "new source arrival survived the coherent route scope fence"); registry();
+    }
+    registry(true);
+    rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices); (void)snapshot.check(catalog.roots[0], catalog.plots[1]); },
+        "missing source reader acknowledgement retained native identification");
+    registry();
+    {
+        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        { std::ofstream changed(options.root / "version"); changed << "fixture-native-2"; }
+        rejects([&] { snapshot.finish(); }, "source snapshot lost its version fence");
+        fs::remove(options.root / "version");
+    }
+    auto drchia = options; drchia.kind = HarvesterAdapterKind::drchia;
+    auto dr_catalog = scan_farm_inventory(roots); observe_harvester_inventory(dr_catalog, drchia);
+    require(dr_catalog.plots[0].native_identified && dr_catalog.plots[0].reader == "drchia" && dr_catalog.plots[0].reader_version == "cli:fixture-native-1" &&
+        dr_catalog.plots[0].container == PlotContainer::unknown, "compatible DrChia public metadata was either rejected or given a guessed grammar");
+    { std::ofstream empty(options.root / "plots.json"); empty << "{\"success\":true,\"plots\":[]}"; }
+    rejects([&] { SourceReadinessSnapshot initial(options, catalog, indices); (void)initial.check(catalog.roots[0], catalog.plots[0]); },
+        "initial source phase accepted files never acknowledged by its reader");
+    {
+        SourceReadinessSnapshot resumed(options, catalog, indices, {}, true);
+        for (auto const& plot : catalog.plots) (void)resumed.check(catalog.roots[plot.root], plot);
+        resumed.finish();
+    }
+    auto unreviewed = catalog; unreviewed.plots[0].native_identified = false;
+    rejects([&] { SourceReadinessSnapshot resumed(options, unreviewed, indices, {}, true); (void)resumed.check(catalog.roots[0], unreviewed.plots[0]); },
+        "unloaded recovery invented previously unobserved reader metadata");
+    write(root / "known.plot", legacy(false));
+    auto known = observe_inventory_file(catalog.roots[0], "known.plot");
+    FarmInventory known_catalog; known_catalog.roots = catalog.roots; known_catalog.plots = {known};
+    std::array<uint64_t, 1> known_index{0};
+    auto legacy_known_catalog = known_catalog;
+    observe_harvester_inventory(known_catalog, options);
+    require(!known_catalog.plots[0].native_identified && known_catalog.plots[0].reader == "gigahorse" &&
+        !known_catalog.plots[0].reader_identity.empty() && known_catalog.plots[0].plot_public_key.empty(),
+        "absent ordinary header lost route context or acquired invented loaded-file metadata");
+    {
+        SourceReadinessSnapshot snapshot(options, known_catalog, known_index);
+        auto header_only = snapshot.check(known_catalog.roots[0], known);
+        require(header_only.header_validated && !header_only.native_identified, "unloaded ordinary public-header identity required invented reader acknowledgement");
+        snapshot.finish();
+    }
+    write(root / "known.plot", {1});
+    rejects([&] { SourceReadinessSnapshot snapshot(options, known_catalog, known_index); (void)snapshot.check(known_catalog.roots[0], known); },
+        "unloaded known-header source mutation survived the native object fence");
+    fs::remove(root / "known.plot");
+    require(observe_sources_retired(options, known_catalog, known_index).no_loaded_record &&
+        observe_sources_retired(options, legacy_known_catalog, known_index).no_loaded_record,
+        "retired unloaded ordinary header could not release old arrivals under a fresh complete route registry");
+    {
+        std::ofstream loaded(options.root / "plots.json"); loaded << "{\"success\":true,\"plots\":[{\"filename\":";
+        profile_detail::quote(loaded, file_io::path_text(root / "known.plot")); loaded << ",\"plot_id\":\"" << known.plot_id << "\"}]}";
+    }
+    require(!observe_sources_retired(options, known_catalog, known_index).no_loaded_record,
+        "still-registered ordinary source released old arrivals");
+    { std::ofstream empty(options.root / "plots.json"); empty << "{\"success\":true,\"plots\":[]}"; }
+    auto stale_opaque = catalog; observe_harvester_inventory(stale_opaque, options);
+    require(std::none_of(stale_opaque.plots.begin(), stale_opaque.plots.end(), [](auto const& plot) { return plot.native_identified; }) &&
+        std::all_of(stale_opaque.plots.begin(), stale_opaque.plots.end(), [](auto const& plot) { return plot.status == "protected"; }),
+        "refresh retained stale opaque reader identification while its registry was empty");
+    auto malformed = catalog; malformed.plots[0].plot_id = std::string(64, '9');
+    rejects([&] { SourceReadinessSnapshot resumed(options, malformed, indices, {}, true); (void)resumed.check(catalog.roots[0], malformed.plots[0]); },
+        "unloaded recovery accepted malformed public plot-key/route identity metadata");
+    write(root / catalog.plots[0].relative_path, {1});
+    rejects([&] { SourceReadinessSnapshot resumed(options, catalog, indices, {}, true); (void)resumed.check(catalog.roots[0], catalog.plots[0]); },
+        "unloaded recovery ignored mutation of the exact reviewed native object");
 }
+
 #endif
 void adapters(fs::path const& directory)
 {
@@ -376,14 +420,66 @@ void adapters(fs::path const& directory)
     fs::remove(root / "harvester-advertised");
     for (char const* failure : {"farmer-unavailable", "farmer-disconnected", "farmer-mismatch", "node-mismatch", "farmer-syncing",
         "farmer-zero-sync", "farmer-future-sync", "solver-stopped", "solver-disconnected", "solver-mismatch", "solver-network",
-        "pool-external", "pool-mismatch", "farmer-version", "solver-version", "farmer-zero-port", "harvester-port-mismatch"})
+        "pool-uninitialized", "pool-version-invalid", "pool-mismatch", "farmer-version", "solver-version", "farmer-zero-port", "harvester-port-mismatch"})
     {
         { std::ofstream flag(root / failure); flag << '1'; }
         require(!observe_target_prerequisites(options, projection, 28, 2, service).ready, "missing genuine target service prerequisite was accepted");
         fs::remove(root / failure);
     }
     auto og = service; og.pool_public_key = std::string(96, '4'); og.pool_contract_puzzle_hash.clear();
-    require(!observe_target_prerequisites(options, projection, 28, 2, og).ready, "OG target fabricated live pool-signing-key readiness");
+    require(observe_target_prerequisites(options, projection, 28, 2, og).ready, "OG public route was unnecessarily refused");
+    { std::ofstream external(root / "pool-external"); external << '1'; }
+    auto pooled = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(pooled.ready && pooled.pool.external && pooled.pool.difficulty == 17 && pooled.pool.protocol_version == 1,
+        "ordinary initialized pool startup required a partial or invented authentication evidence");
+    { std::ofstream modern(root / "pool-v2"); modern << '1'; }
+    pooled = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(pooled.ready && pooled.pool.protocol_version == 2, "RewardPuzzle v2 route was refused");
+    fs::remove(root / "pool-v2"); fs::remove(root / "pool-external");
+    { std::ofstream other(root / "other-harvester"); other << '1'; }
+    auto other_receivers = observe_target_prerequisites(options, projection, 28, 2, service);
+    require(other_receivers.ready && other_receivers.other_harvesters.size() == 1 && other_receivers.other_harvesters[0].files == 1 && other_receivers.other_harvesters[0].members == 4,
+        "other receiver population was hidden or conflated with the selected exact file scope");
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        { std::ofstream growth(root / "other-harvester-growth"); growth << '1'; }
+        rejects([&] { snapshot.finish(); }, "new other-harvester workload escaped the live phase lease");
+        fs::remove(root / "other-harvester-growth");
+    }
+    { std::ofstream empty(root / "other-harvester-empty"); empty << '1'; }
+    { std::ofstream syncing(root / "other-harvester-syncing"); syncing << '1'; }
+    require(!observe_target_prerequisites(options, projection, 28, 2, service).ready,
+        "empty partial sync was mistaken for a known empty other-harvester workload");
+    fs::remove(root / "other-harvester-syncing");
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        snapshot.finish();
+        { std::ofstream syncing(root / "other-harvester-syncing"); syncing << '1'; }
+        rejects([&] { snapshot.finish(); }, "empty other receiver began synchronization without invalidating readiness");
+        fs::remove(root / "other-harvester-syncing");
+    }
+    fs::remove(root / "other-harvester-empty"); fs::remove(root / "other-harvester");
+    auto remote = options; remote.host = "fixture-harvester";
+    for (auto const& [role, host, node, farmer] : {std::tuple{"harvester", "10.0.0.1", '3', '1'},
+        std::tuple{"farmer", "10.0.0.2", '1', '1'}, std::tuple{"full_node", "10.0.0.3", '4', '2'}, std::tuple{"solver", "10.0.0.4", '5', '2'}})
+    {
+        FarmServiceBinding binding; binding.root = directory / (std::string("remote-") + role); binding.rpc_host = host;
+        binding.host = std::string("fixture-") + role; binding.node_id = std::string(64, node); binding.farmer_node_id = std::string(64, farmer);
+        fs::create_directories(binding.root / "config");
+        { std::ofstream config(binding.root / "config" / "config.yaml"); config << "self_hostname: " << host << "\nharvester:\n  num_threads: 2\n"; }
+        { std::ofstream flags(binding.root / "remote-peers"); flags << '1'; }
+        if (std::string_view(role) == "harvester") { remote.root = binding.root; remote.rpc_host = binding.rpc_host; }
+        remote.services.emplace(role, std::move(binding));
+    }
+    auto remote_projection = observe_network_projection(remote);
+    require(remote_projection.available && remote_projection.reader_identity != projection.reader_identity &&
+        observe_target_prerequisites(remote, remote_projection, 28, 2, service).ready,
+        "explicit authenticated remote contexts and reciprocal TLS node IDs were refused");
+    auto misbound = remote; misbound.services.at("solver").node_id = std::string(64, '8');
+    auto misbound_projection = observe_network_projection(misbound);
+    require(!observe_target_prerequisites(misbound, misbound_projection, 28, 2, service).ready,
+        "remote solver service was matched by host/port instead of its explicit TLS identity");
+    require(target_service_hosts(remote).at("solver") == "fixture-solver", "remote service lost its physical resource host binding");
     auto unreviewed = projection; unreviewed.farmer_version.clear();
     require(!observe_target_prerequisites(options, unreviewed, 28, 2, service).ready, "unreviewed service version silently authorized execution");
     { std::ofstream flag(root / "farmer-unavailable"); flag << '1'; }
@@ -396,12 +492,28 @@ void adapters(fs::path const& directory)
     require(!observe_replacement_readiness(options, expected).ready, "public metadata substituted for private first-publication evidence");
     ReplacementPublication publication{expected.path, expected.identity, std::string(64, 'b'), 0};
     require(observe_replacement_readiness(options, expected, publication).ready, "actual native API fields could not attest a sealed first publication");
-    for (char const* failure : {"connection-churn", "sync-churn", "solver-stopped", "pool-external", "farmer-version", "solver-version"})
+    for (char const* failure : {"connection-churn", "sync-churn", "farmer-syncing", "solver-stopped", "pool-external", "farmer-version", "solver-version", "inactive", "unsynced"})
     {
         TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
         require(snapshot.check(expected, publication).ready, "service drift fixture did not begin with exact sync");
         { std::ofstream flag(root / failure); flag << '1'; }
         rejects([&] { snapshot.finish(); }, "service connection/sync/pool/version drift survived snapshot finish"); fs::remove(root / failure);
+    }
+    {
+        TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
+        require(snapshot.check(expected, publication).ready, "replacement path fence fixture did not begin ready");
+        snapshot.finish();
+        auto hidden = expected.path; hidden += ".hidden"; fs::rename(expected.path, hidden);
+        rejects([&] { snapshot.finish(); }, "local replacement deletion escaped unchanged cached RPC metadata");
+        fs::rename(hidden, expected.path);
+        expected.identity = observe_inventory_file(observed.roots[0], "published.plot2").identity; publication.identity = expected.identity; loaded(loaded_key);
+    }
+    {
+        auto short_options = options; short_options.limits.timeout_ms = 1000;
+        TargetReadinessSnapshot snapshot(short_options, projection, expected.k, expected.strength, service);
+        require(snapshot.check(expected, publication).ready, "expiry fixture did not begin ready");
+        snapshot.finish(); std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        rejects([&] { snapshot.finish(); }, "expired readiness phase lease authorized another retirement action");
     }
     auto farmer_override = [&](bool empty, bool group)
     {
@@ -455,18 +567,7 @@ void adapters(fs::path const& directory)
 #ifdef __linux__
     auto proprietary = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "unknown.drplot"; });
     require(proprietary != observed.plots.end(), "missing native failure fixture");
-    options.kind = HarvesterAdapterKind::gigahorse; options.checker = self;
-    auto source = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "native-source.plot"; });
-    require(source != observed.plots.end() && observe_gigahorse_check(observed.roots[0], *source, options).identity_verified, "bounded exact-held-file native sample identity check failed");
-    auto mutate = file_io::path_text(directory / "native-source.plot");
-    require(!::setenv("XCHPLOT2_INVENTORY_TEST_MUTATE", mutate.c_str(), 1), "cannot install native mutation fixture");
-    auto changed_after_proof = observe_gigahorse_check(observed.roots[0], *source, options);
-    ::unsetenv("XCHPLOT2_INVENTORY_TEST_MUTATE");
-    require(!changed_after_proof.identity_verified && !changed_after_proof.completed, "post-proof source change retained a successful identity observation");
-    auto opaque = *proprietary; opaque.plot_id = source->plot_id; opaque.k = 32;
-    auto failed = observe_gigahorse_check(observed.roots[0], opaque, options);
-    require(!failed.completed && failed.failures == 1 && failed.reason.find("private-memo") == failed.reason.npos,
-        "native exit zero/failure or secret output was promoted to valid metadata");
+    options.kind = HarvesterAdapterKind::gigahorse;
     auto proprietary_bytes = legacy(false); auto native_id = adapter_detail::legacy_id_from_loaded_key(loaded_key, std::string(64, '4'));
     auto native_id_bytes = group_tools::hex(native_id); std::copy(native_id_bytes.begin(), native_id_bytes.end(), proprietary_bytes.begin() + 19);
     proprietary_bytes[54] = 'x'; // A genuinely unknown header grammar to our parser.
@@ -481,23 +582,48 @@ void adapters(fs::path const& directory)
     };
     native_registry(); FarmInventory native_catalog; native_catalog.roots = observed.roots; native_catalog.plots = {native_plot}; native_catalog.complete = true;
     observe_harvester_inventory(native_catalog, options); native_plot = native_catalog.plots[0];
-    require(native_plot.native_identified && native_plot.status == "native-observed" && native_plot.farmer_public_key.empty() && native_plot.container == PlotContainer::unknown,
+    require(native_plot.native_identified && native_plot.members == 1 && native_plot.status == "native-observed" && native_plot.farmer_public_key.empty() && native_plot.container == PlotContainer::unknown,
         "native observation invented undisclosed proprietary metadata");
-    (void)recheck_native_source(native_catalog.roots[0], native_plot, options);
-    auto stale = native_plot; stale.reader_version = "older-reader";
-    rejects([&] { (void)recheck_native_source(native_catalog.roots[0], stale, options); }, "changed reader version silently refreshed reviewed costs");
-    stale = native_plot; stale.checker_identity = std::string(64, '0');
-    rejects([&] { (void)recheck_native_source(native_catalog.roots[0], stale, options); }, "changed checker bytes silently refreshed reviewed costs");
+    std::array<uint64_t, 1> native_indices{0};
+    {
+        SourceReadinessSnapshot snapshot(options, native_catalog, native_indices);
+        (void)snapshot.check(native_catalog.roots[0], native_plot); snapshot.finish();
+    }
+    auto stale_catalog = native_catalog; stale_catalog.plots[0].reader_version = "older-reader";
+    rejects([&] { SourceReadinessSnapshot snapshot(options, stale_catalog, native_indices);
+        (void)snapshot.check(stale_catalog.roots[0], stale_catalog.plots[0]); snapshot.finish(); },
+        "changed reader version silently refreshed reviewed costs");
+    stale_catalog = native_catalog; stale_catalog.plots[0].checker_identity = std::string(64, '0');
+    {
+        SourceReadinessSnapshot snapshot(options, stale_catalog, native_indices);
+        (void)snapshot.check(stale_catalog.roots[0], stale_catalog.plots[0]); snapshot.finish();
+    } // Historical optional diagnostics are not retirement authority.
     { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 3\n"; }
-    rejects([&] { (void)recheck_native_source(native_catalog.roots[0], native_plot, options); }, "changed reader configuration silently refreshed reviewed costs");
+    rejects([&] { SourceReadinessSnapshot snapshot(options, native_catalog, native_indices);
+        (void)snapshot.check(native_catalog.roots[0], native_plot); snapshot.finish(); },
+        "changed reader configuration silently refreshed reviewed costs");
     { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+    InventorySourcePin pin(native_catalog.roots[0], native_plot, options.limits);
     fs::rename(directory / "native-opaque.plot", directory / ".claim" / "native");
     { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
-    require(recheck_claimed_native_source(native_catalog.roots[0], native_plot, ".claim/native", options).identity_verified,
-        "claimed recovery incorrectly required original-path loaded registry state");
-    stale = native_plot; stale.plot_id = std::string(64, '9');
-    rejects([&] { (void)recheck_claimed_native_source(native_catalog.roots[0], stale, ".claim/native", options); }, "wrong reviewed ID accepted for a claimed source");
-    slow_native_catalog(directory, options, loaded_key);
+    require(pin.matches_claim(".claim/native", options.limits), "native claim rename lost the exact held object");
+    {
+        InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native");
+        require(recovered.matches_claim(".claim/native", options.limits),
+            "claimed recovery incorrectly required original-path loaded registry state");
+    }
+    fs::rename(directory / ".claim" / "native", directory / ".claim" / "native-original");
+    write(directory / ".claim" / "native", proprietary_bytes);
+    require(!pin.matches_claim(".claim/native", options.limits), "replacement claim object matched the held native identity");
+    rejects([&] { InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native"); },
+        "substituted claim object accepted for recovered native identity");
+    fs::remove(directory / ".claim" / "native");
+    fs::rename(directory / ".claim" / "native-original", directory / ".claim" / "native");
+    write(directory / ".claim" / "native", {1});
+    require(!pin.matches_claim(".claim/native", options.limits), "claimed native object mutation was ignored");
+    rejects([&] { InventorySourcePin recovered(native_catalog.roots[0], native_plot, options.limits, ".claim/native"); },
+        "changed native object accepted for claimed recovery");
+    source_metadata_snapshot(directory, options, loaded_key);
 #endif
     AdapterCommand command; command.executable = self; command.root = directory / "flood";
     calibration_process::Limits limits{64 * 1024 * 1024, 2000, 4096, {}};
@@ -515,7 +641,7 @@ void routes(fs::path const& directory)
     std::ostringstream out;
     auto quote = [&](fs::path const& path) { profile_detail::quote(out, file_io::path_text(path)); };
     out << "{\"farm_adapters\":{\"schema\":1,\"target_route\":\"new-chia\",\"routes\":[{\"id\":\"old-gh\",\"kind\":\"gigahorse\",\"root\":";
-    quote(directory / "gh-config"); out << ",\"executable\":"; quote(self); out << ",\"checker\":"; quote(self); out << ",\"source_roots\":["; quote(directory);
+    quote(directory / "gh-config"); out << ",\"executable\":"; quote(self); out << ",\"source_roots\":["; quote(directory);
     out << "]},{\"id\":\"new-chia\",\"kind\":\"chia\",\"root\":"; quote(directory / "chia-config"); out << ",\"executable\":"; quote(self); out << ",\"source_roots\":[]}]}}";
     std::istringstream input(out.str()); auto table = read_farm_adapters(input);
     InventoryRoot root; root.path = file_io::path_text(directory); InventoryPlot plot; plot.harvester = "old-gh";
@@ -554,8 +680,6 @@ void large_catalog(fs::path const& directory)
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
-    if (argc > 1 && std::string_view(argv[1]) == "check") return fake_checker(argc, argv);
-    if (argc > 1 && std::string_view(argv[1]) == "verify") return fake_checker(argc, argv);
     auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try { fs::create_directory(root); inventory(root); large_catalog(root); adapters(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
     catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }

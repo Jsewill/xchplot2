@@ -527,7 +527,7 @@ inline std::string process_status(ProcessResult const& value)
     return {};
 }
 struct ChiaConfig
-{ std::optional<unsigned> workers; bool local_rpc = false; std::string status; };
+{ std::optional<unsigned> workers; bool local_rpc = false; std::string rpc_hostname, status; };
 inline std::string_view trim(std::string_view value)
 {
     while (!value.empty() && (value.front() == ' ' || value.front() == '\r')) value.remove_prefix(1);
@@ -540,7 +540,7 @@ inline std::string_view trim(std::string_view value)
 inline ChiaConfig read_chia_config(std::istream& input, uint64_t max_memory_bytes = parsing_memory_bytes)
 {
     ChiaConfig result; result.status = "unsupported: expected conventional harvester.num_threads YAML scalar";
-    auto unsupported = [&] { result.workers.reset(); result.local_rpc = false; return result; };
+    auto unsupported = [&] { result.workers.reset(); result.local_rpc = false; result.rpc_hostname.clear(); return result; };
     auto contents = read_text(input, std::min<uint64_t>(config_bytes, max_memory_bytes / 4)); std::istringstream lines(std::move(contents));
     bool harvester = false, seen_harvester = false, seen_workers = false, seen_host = false;
     size_t direct_indent = 0;
@@ -573,6 +573,8 @@ inline ChiaConfig read_chia_config(std::istream& input, uint64_t max_memory_byte
                 auto const comment = host.find(" #"); if (comment != host.npos) host = trim(host.substr(0, comment));
                 if (host.size() >= 2 && ((host.front() == '"' && host.back() == '"') || (host.front() == '\'' && host.back() == '\'')))
                     host = host.substr(1, host.size() - 2);
+                if (host.empty() || host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-:") != host.npos) return unsupported();
+                result.rpc_hostname = host;
                 result.local_rpc = host == "localhost" || host == "127.0.0.1" || host == "::1";
             }
             continue;

@@ -27,7 +27,47 @@ pool::PoolIdentity required_pool(std::filesystem::path const& path)
 {
     auto identity = pool::load_pool(path); require(bool(identity), "saved pool membership disappeared"); return std::move(*identity);
 }
+void prepare_automatic_offer(pool::PoolIdentity const& identity, group_grow::WorkerConfig& config,
+    std::function<std::vector<pool::Endpoint>()> discover)
+{
+    config.server_name = identity.server_name; config.max_brokers = identity.defaults.max_brokers;
+    config.tls.listen_lan = identity.defaults.interfaces.empty(); config.tls.listen_interfaces = identity.defaults.interfaces;
+    config.tls.listen_interfaces.push_back("lo");
+    if (identity.defaults.discovery) config.discover_brokers = std::move(discover);
+    group_grow::fit_worker_broker_budget(config); group_grow::default_worker_resources(config);
+}
 } // namespace
+
+group_grow::WorkerConfig make_group_compute_offer(GroupOptions const& args, std::shared_ptr<group_grow::CodecScheduler> scheduler)
+{
+    require(!args.pool_broker.empty() && args.pool_offer_ram && args.pool_offer_cpus, "local compute offer has no bounded broker, CPU or RAM scope");
+    group_grow::WorkerConfig config;
+    // Only the presence of a broker route affects readonly transport admission.
+    // The automatic session replaces this placeholder with its actual endpoint.
+    config.broker = args.pool_broker == "auto" ? pool::Endpoint{"127.0.0.1", 1} : pool::parse_endpoint(args.pool_broker);
+    config.broker.server_name = args.pool_server_name;
+    config.tls.ca_file = args.pool_ca; config.tls.cert_file = args.pool_cert; config.tls.key_file = args.pool_key;
+    if (args.automatic_compute) config.tls.membership_directory = args.pool_directory;
+    config.tls.timeout_ms = unsigned(args.pool_socket_timeout_ms); config.tls.max_frame_bytes = uint32_t(args.pool_frame_bytes);
+    config.listen = args.pool_listen.empty() ? pool::Endpoint{"::", 0} : pool::parse_endpoint(args.pool_listen);
+    if (!args.pool_advertise.empty()) config.advertise = pool::parse_endpoint(args.pool_advertise);
+    config.capacity = {uint32_t(args.pool_offer_cpus), uint32_t(args.pool_offer_slots), args.pool_offer_ram, args.pool_offer_vram};
+    config.backend = args.pool_offer_backend; config.tier = args.tier; config.device = int(args.device);
+    config.task_timeout_ms = unsigned(args.pool_timeout_ms);
+    // Protected migration reserves the complete executor independently of its
+    // owner/client/codec partition. Reuse the worker's own bounded CPU gate;
+    // ordinary jobs retain their established shared owner scheduler.
+    config.cpu_scheduler = args.protected_resources ? nullptr : std::move(scheduler);
+    require(args.pool_frame_bytes <= UINT64_MAX - args.window, "local compute transport bound overflows");
+    config.max_task_bytes = args.window + args.pool_frame_bytes; config.admit_start = args.compute_admit_worker;
+    if (args.automatic_compute)
+    {
+        auto const identity = required_pool(std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())));
+        prepare_automatic_offer(identity, config, [] { return std::vector<pool::Endpoint>{}; });
+    }
+    else group_grow::default_worker_resources(config);
+    return config;
+}
 
 bool saved_compute_available(std::filesystem::path const& directory)
 { return bool(pool::load_pool(directory.empty() ? pool::pool_directory() : directory)); }
@@ -92,6 +132,8 @@ struct ComputeSession::Impl
     explicit Impl(GroupOptions& args) : identity(required_pool(
         std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())))), verbose(args.verbose)
     {
+        require(!args.protected_resources || bool(args.compute_admit_session), "protected compute session has no reviewed service admission");
+        if (args.compute_admit_session) args.compute_admit_session();
         if (!args.pool_owner_explicit)
             args.pool_session_owner = args.pool_owner + '-' + pool::random_token().substr(0, 32);
         if (args.pool_broker == "auto")
@@ -149,13 +191,7 @@ struct ComputeSession::Impl
     void offer(group_grow::WorkerConfig config)
     {
         if (offering) return;
-        config.server_name = identity.server_name;
-        config.max_brokers = identity.defaults.max_brokers;
-        config.tls.listen_lan = identity.defaults.interfaces.empty();
-        config.tls.listen_interfaces = identity.defaults.interfaces;
-        config.tls.listen_interfaces.push_back("lo");
-        if (discovery) config.discover_brokers = [browse = discovery] { return browse->brokers(); };
-        group_grow::fit_worker_broker_budget(config);
+        prepare_automatic_offer(identity, config, [browse = discovery] { return browse ? browse->brokers() : std::vector<pool::Endpoint>{}; });
         start_worker(config); offering = true;
         worker_thread = std::thread([this, config = std::move(config)]
         {

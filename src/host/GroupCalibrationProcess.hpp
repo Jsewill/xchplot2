@@ -3,6 +3,7 @@
 #include "host/GroupHarvesterProfile.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <climits>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -29,7 +30,25 @@ inline void check(bool condition, char const* message)
 { if (!condition) throw std::runtime_error(message); }
 inline uint64_t install_cpu_cap(uint64_t requested)
 {
-#ifdef __linux__
+#ifdef _WIN32
+    USHORT groups = 1, group = 0;
+    check(::GetProcessGroupAffinity(::GetCurrentProcess(), &groups, &group) && groups == 1,
+        "bounded proof CPU affinity requires a single Windows processor group");
+    DWORD_PTR allowed = 0, system = 0;
+    check(::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system) && allowed,
+        "cannot inspect bounded proof CPU affinity");
+    uint64_t const count = uint64_t(std::popcount(allowed));
+    check(requested <= count, "proof CPU cap exceeds inherited affinity");
+    if (!requested) return count;
+    DWORD_PTR selected = 0; uint64_t picked = 0;
+    for (unsigned id = 0; id < sizeof(allowed) * CHAR_BIT && picked < requested; ++id)
+        if (allowed & (DWORD_PTR(1) << id)) { selected |= DWORD_PTR(1) << id; ++picked; }
+    DWORD_PTR actual = 0;
+    check(picked == requested && ::SetProcessAffinityMask(::GetCurrentProcess(), selected) &&
+        ::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual == selected,
+        "cannot enforce bounded proof CPU affinity");
+    return requested;
+#elif defined(__linux__)
     cpu_set_t allowed, selected, actual; CPU_ZERO(&allowed); CPU_ZERO(&selected); CPU_ZERO(&actual);
     check(!::sched_getaffinity(0, sizeof(allowed), &allowed), "cannot inspect bounded proof CPU affinity");
     uint64_t const count = uint64_t(CPU_COUNT(&allowed)); check(count && requested <= count, "proof CPU cap exceeds inherited affinity");
@@ -45,20 +64,29 @@ inline uint64_t install_cpu_cap(uint64_t requested)
     auto const count = profile_detail::logical_cpus(); check(count, "cannot inspect inherited proof CPU capacity"); return count;
 #endif
 }
-// Save/restore the calling thread's Linux affinity around upstream code that
-// creates its own workers. All those workers must be joined before this guard
-// ends: new threads inherit the cap, existing unrelated threads are unchanged.
+// Save/restore affinity around upstream code that creates its own workers.
+// Linux scopes the calling thread and its children; Windows scopes the process
+// because new Windows threads inherit process affinity. Join workers before
+// restoration; callers serialize these caps within a construction session.
 class ScopedCpuCap
 {
     uint64_t lanes_ = 0;
-#ifdef __linux__
+#ifdef _WIN32
+    DWORD_PTR original_ = 0;
+    bool active_ = false;
+#elif defined(__linux__)
     cpu_set_t original_{};
     bool active_ = false;
 #endif
 public:
     explicit ScopedCpuCap(uint64_t requested)
     {
-#ifdef __linux__
+#ifdef _WIN32
+        DWORD_PTR system = 0;
+        check(::GetProcessAffinityMask(::GetCurrentProcess(), &original_, &system) && original_, "cannot save scoped CPU affinity");
+        try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }
+        catch (...) { (void)::SetProcessAffinityMask(::GetCurrentProcess(), original_); throw; }
+#elif defined(__linux__)
         check(!::sched_getaffinity(0, sizeof(original_), &original_), "cannot save scoped CPU affinity");
         try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }
         catch (...)
@@ -73,7 +101,9 @@ public:
     }
     ~ScopedCpuCap()
     {
-#ifdef __linux__
+#ifdef _WIN32
+        if (active_) (void)::SetProcessAffinityMask(::GetCurrentProcess(), original_);
+#elif defined(__linux__)
         if (active_) (void)::sched_setaffinity(0, sizeof(original_), &original_);
 #endif
     }
@@ -82,7 +112,13 @@ public:
     uint64_t lanes() const { return lanes_; }
     void restore()
     {
-#ifdef __linux__
+#ifdef _WIN32
+        if (!active_) return;
+        DWORD_PTR actual = 0, system = 0;
+        check(::SetProcessAffinityMask(::GetCurrentProcess(), original_) &&
+            ::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual == original_, "cannot restore scoped CPU affinity");
+        active_ = false;
+#elif defined(__linux__)
         if (!active_) return;
         cpu_set_t actual; CPU_ZERO(&actual);
         check(!::sched_setaffinity(0, sizeof(original_), &original_) &&
@@ -184,13 +220,14 @@ inline std::filesystem::path executable()
 
 enum class Worker { calibration, migration_proof };
 inline std::string run_worker(std::filesystem::path const& plot, uint64_t samples, Limits const& limits,
-                              Worker worker = Worker::calibration, uint64_t proof_cpus = 0)
+                              Worker worker = Worker::calibration, uint64_t proof_cpus = 0, uint64_t proof_solves = 1)
 {
     check(worker == Worker::calibration || worker == Worker::migration_proof, "invalid bounded plot worker mode");
     check(!proof_cpus || (worker == Worker::migration_proof && proof_cpus <= 1024), "invalid bounded proof CPU request");
-#ifndef __linux__
+#if !defined(__linux__) && !defined(_WIN32)
     check(!proof_cpus, "explicit proof CPU affinity is unsupported on this platform");
 #endif
+    check(worker != Worker::migration_proof || (proof_solves && proof_solves <= samples), "invalid bounded proof solve budget");
     auto const until = deadline(limits.timeout_ms);
     check_running(until, limits.cancelled);
     check(samples && limits.memory_bytes && limits.output_bytes && limits.output_bytes <= std::string().max_size(),
@@ -233,7 +270,8 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     std::wstring command = quote(self.wstring()) + L" plan --config NUL --calibrate --calibration-worker --calibration-samples " +
         std::to_wstring(samples) + L" --calibration-memory-bytes " + std::to_wstring(limits.memory_bytes) +
         L" --calibration-timeout-ms " + std::to_wstring(limits.timeout_ms) +
-        (worker == Worker::migration_proof ? L" --replot-proof-worker" : L"") + L" --json -- " + quote(absolute.wstring());
+        (worker == Worker::migration_proof ? L" --replot-proof-worker --replot-proof-solves " + std::to_wstring(proof_solves) : L"") +
+        (proof_cpus ? L" --replot-proof-cpus " + std::to_wstring(proof_cpus) : L"") + L" --json -- " + quote(absolute.wstring());
     STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdOutput = write.value; startup.StartupInfo.hStdError = write.value; startup.StartupInfo.hStdInput = input.value;
     startup.lpAttributeList = list;
@@ -317,7 +355,8 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     std::vector<std::string> arguments{self.string(), "plan", "--config", "/dev/null", "--calibrate", "--calibration-worker",
         "--calibration-samples", std::to_string(samples), "--calibration-memory-bytes", std::to_string(limits.memory_bytes),
         "--calibration-timeout-ms", std::to_string(limits.timeout_ms)};
-    if (worker == Worker::migration_proof) arguments.push_back("--replot-proof-worker");
+    if (worker == Worker::migration_proof)
+        arguments.insert(arguments.end(), {"--replot-proof-worker", "--replot-proof-solves", std::to_string(proof_solves)});
     if (proof_cpus) arguments.insert(arguments.end(), {"--replot-proof-cpus", std::to_string(proof_cpus)});
     arguments.insert(arguments.end(), {"--json", "--", absolute.string()});
     std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data()); argv.push_back(nullptr);

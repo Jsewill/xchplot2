@@ -42,7 +42,22 @@ template<class Function> void rejected(Function operation)
 }
 void scoped_cpu_fixture()
 {
-#ifdef __linux__
+#ifdef _WIN32
+    DWORD_PTR original = 0, system = 0;
+    check(::GetProcessAffinityMask(::GetCurrentProcess(), &original, &system) && original, "cannot save fixture CPU affinity");
+    auto unchanged = [&]
+    { DWORD_PTR actual = 0; check(::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual == original, "scoped CPU cap did not restore original affinity"); };
+    {
+        process::ScopedCpuCap cap(1);
+        check(cap.lanes() == 1 && group_grow::profile_detail::logical_cpus() == 1, "scoped process CPU cap not enforced");
+        uint64_t inherited = 0; std::thread worker([&] { inherited = group_grow::profile_detail::logical_cpus(); }); worker.join();
+        check(inherited == 1, "ordinary generation worker did not inherit scoped process CPU affinity");
+    }
+    unchanged();
+    rejected([] { process::ScopedCpuCap cap(1); throw std::runtime_error("scoped generation failure"); }); unchanged();
+    { process::ScopedCpuCap cap(1); cap.restore(); unchanged(); }
+    rejected([&] { process::ScopedCpuCap impossible(uint64_t(std::popcount(original)) + 1); }); unchanged();
+#elif defined(__linux__)
     cpu_set_t original, restored; CPU_ZERO(&original); CPU_ZERO(&restored);
     check(!::sched_getaffinity(0, sizeof(original), &original) && CPU_COUNT(&original), "cannot save fixture CPU affinity");
     auto unchanged = [&]
@@ -132,7 +147,7 @@ int direct(std::string const& mode)
 #endif
     if (mode == "--direct-cpu")
     {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
         check(process::install_cpu_cap(1) == 1 && group_grow::profile_detail::logical_cpus() == 1, "direct proof CPU cap not installed");
         uint64_t inherited = 0; std::thread worker([&] { inherited = group_grow::profile_detail::logical_cpus(); }); worker.join();
         check(inherited == 1, "solver thread did not inherit bounded proof CPU affinity");
@@ -185,8 +200,11 @@ int direct(std::string const& mode)
 }
 int fake_worker(std::vector<std::string> args)
 {
-    bool const proof_worker = args.size() >= 16 && args[12] == "--replot-proof-worker";
+    bool const proof_worker = args.size() >= 18 && args[12] == "--replot-proof-worker";
     if (proof_worker) args.erase(args.begin() + 12);
+    bool const solve_budget = proof_worker && args.size() >= 17 && args[12] == "--replot-proof-solves" && args[13] == "1";
+    check(!proof_worker || solve_budget, "proof worker omitted its explicit solve budget");
+    if (solve_budget) args.erase(args.begin() + 12, args.begin() + 14);
     bool const cpu_cap = args.size() == 17 && args[12] == "--replot-proof-cpus" && args[13] == "1";
     if (cpu_cap) args.erase(args.begin() + 12, args.begin() + 14);
     check(args.size() == 15 && args[1] == "plan" && args[2] == "--config" &&
@@ -269,10 +287,12 @@ int main(int argc, char** argv) try
     check(process::run_worker(input, 1, limits) == "{\"ok\":true}\n", "successful calibration output changed");
     check(process::run_worker(input, 1, limits, process::Worker::migration_proof) == "{\"proof_worker\":true}\n",
         "bounded migration proof worker did not receive its isolated typed mode");
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     check(process::run_worker(input, 1, limits, process::Worker::migration_proof, 1) == "{\"proof_worker\":true,\"cpu_cap\":1}\n",
         "bounded migration proof worker did not enforce its CPU request");
 #endif
+    rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_proof, 1, 0); });
+    rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_proof, 1, 2); });
     check(launch_direct("--direct-cpu") == 0, "direct proof CPU-affinity enforcement failed");
 #ifdef __linux__
     check(launch_direct("--direct-active-pressure") == 0, "active/inactive default pressure enforcement failed");

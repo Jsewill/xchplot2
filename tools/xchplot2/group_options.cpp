@@ -1,5 +1,6 @@
 #include "group_commands.hpp"
 #include "host/GroupHarvesterProfile.hpp"
+#include "host/GroupFarmFile.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
 #endif
@@ -194,7 +195,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         else if (key == "--no-calibrate") calibrate = false;
         if (key == "--calibration-worker") calibration_worker = true;
         if (key == "--replot-proof-worker") proof_worker = true;
-        if (key == "--replot-proof-cpus") proof_options = true;
+        if (key == "--replot-proof-cpus" || key == "--replot-proof-solves") proof_options = true;
         if (key.starts_with("--calibration-")) calibration_options = true;
         i += int(group_option_values(key));
     }
@@ -205,7 +206,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "choose one of --metadata-only, --assess-jobs, --calibrate or --inventory");
         require(!calibration_options || calibrate, "calibration controls require --calibrate");
         require(!proof_worker || (calibrate && calibration_worker), "private proof verification requires the capped calibration worker scope");
-        require(!proof_options || proof_worker, "proof CPU controls require the private proof worker");
+        require(!proof_options || proof_worker, "proof controls require the private proof worker");
 #ifndef XCHPLOT2_GROUP_COMMANDS
         require(!calibrate, "reader calibration requires the installed xchplot2 plan command");
 #endif
@@ -215,14 +216,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (key == "--") break;
             if (!key.starts_with('-')) continue;
             bool const worker_option = key == "--calibration-worker" || key == "--calibration-samples" ||
-                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes" || key == "--replot-proof-worker" || key == "--replot-proof-cpus";
+                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes" || key == "--replot-proof-worker" || key == "--replot-proof-cpus" || key == "--replot-proof-solves";
             bool const calibration_input = !calibration_worker && (key == "--save-profile" || key == "--harvester" ||
                 key == "--chia-root" || key == "--chia-executable" || key.starts_with("--farming-"));
             require(key == "--metadata-only" || key == "--no-metadata-only" || key == "--assess-jobs" || key == "--no-assess-jobs" ||
                 key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
                 (inventory && (key == "--inventory" || key == "--no-inventory" || key == "--save-plan" ||
                     key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable")) ||
-                (inventory && (key == "--farm-adapter" || key == "--farm-checker")) ||
+                (inventory && key == "--farm-adapter") ||
                 (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
                 key == "--json" || (!calibration_worker && (key == "--max-ram" || key == "-M" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v")),
@@ -278,11 +279,11 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
             else if (key == "--replot") result.replot_inventory = path(value);
             else if (key == "--farm-adapter") result.farm_adapter = value;
-            else if (key == "--farm-checker") result.farm_checker = path(value);
             else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str());
             else if (key == "--save-profile") result.save_profile = path(value);
             else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str());
             else if (key == "--replot-proof-cpus") result.replot_proof_cpus = number(value.c_str());
+            else if (key == "--replot-proof-solves") result.replot_proof_solves = number(value.c_str());
             else if (key == "--calibration-timeout-ms") result.calibration_timeout_ms = number(value.c_str());
             else if (key == "--calibration-memory-bytes") result.calibration_memory_bytes = number(value.c_str());
             else if (key == "--harvester")
@@ -438,7 +439,6 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     bool const farm_command = command == "fill" || command == "plan";
     require(result.farm_adapter == "chia" || result.farm_adapter == "gigahorse" || result.farm_adapter == "drchia",
         "--farm-adapter requires chia, gigahorse or drchia");
-    require(result.farm_checker.empty() || result.farm_adapter == "gigahorse", "--farm-checker requires the supported gigahorse adapter");
     if (result.inventory)
     {
         require(command == "plan" && !result.target.empty(), "plan --inventory requires explicit existing farm roots");
@@ -495,7 +495,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();
     }
-    require((result.farm_adapter == "chia" && result.farm_checker.empty()) || !result.replot_inventory.empty() || !result.from_plan.empty(),
+    require(result.farm_adapter == "chia" || !result.replot_inventory.empty() || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
     if (result.extend || !result.relocations.empty()) result.resume = true;
     require(!result.target.empty() || (farm_command &&
@@ -617,8 +617,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             result.pool_offer_ram && result.pool_offer_cpus),
             "offering local compute requires listen, advertise, RAM and CPU grants");
         unsigned const workers = result.workers ? unsigned(result.workers) : std::max(1u, std::thread::hardware_concurrency());
-        require(!offer || ((workers == 1 ? result.pool_offer_cpus == 1 : result.pool_offer_cpus < workers) &&
-            result.pool_offer_slots && result.pool_offer_slots <= 1024),
+        require(!offer || (result.pool_offer_cpus && result.pool_offer_cpus <= 1024 && result.pool_offer_slots && result.pool_offer_slots <= 1024),
+            "local compute offer exceeds CPU or slot bounds");
+        bool const shared = workers == 1 ? result.pool_offer_cpus == 1 : result.pool_offer_cpus < workers;
+        bool const migration = offer && !shared && (!result.replot_inventory.empty() || (farm_command && !result.from_plan.empty() &&
+            group_grow::farm::inventory_detail::is_replot_review(result.from_plan)));
+        require(!offer || shared || migration,
             "local compute offer must leave CPU capacity for receiving and storage");
         require(result.pool_offer_backend == "cpu" || result.pool_offer_backend == "gpu" || result.pool_offer_backend == "auto",
             command.empty() ? "--pool-offer-backend requires cpu, gpu or auto" : "--compute-offer-backend requires cpu, gpu or auto");

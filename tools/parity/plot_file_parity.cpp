@@ -159,6 +159,23 @@ bool file_safety(bool raw)
     }
     auto const verification = pos2gpu::verify_plot_file(path.string(), 100, true);
     if (verification.proofs_found == 0 || verification.full_proofs_validated != verification.proofs_found) return false;
+    if (!raw) {
+        constexpr uint64_t memory_bytes = uint64_t(512) << 20;
+        auto const bounded = pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes);
+        if (bounded.full_proofs_validated != 1 || !bounded.trials || bounded.trials > 100) return false;
+        auto rejects = [](auto operation) {
+            try { operation(); } catch (std::exception const&) { return true; }
+            return false;
+        };
+        if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, 1); })) return false;
+        if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes,
+            [] { throw std::runtime_error("cancelled proof sample"); }); })) return false;
+        // A zero tail can decode to the same chunk sizes; production validation
+        // must still reject a noncanonical index instead of accepting padding.
+        { std::ofstream append(path, std::ios::binary | std::ios::app); append.put(0); }
+        if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes); })) return false;
+        write();
+    }
     auto corrupt_u64 = [&](std::streamoff offset) {
         std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
         uint64_t const impossible = ~uint64_t{0};

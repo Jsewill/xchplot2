@@ -257,6 +257,8 @@ void metadata_options()
     reject("plan", {"plan", "--assess-jobs", "saved.plan", "--save-plan", "replacement.plan"});
     reject("plan", {"plan", "--assess-jobs", "saved.plan", "--harvester", "local"});
     reject("plan", {"plan", "--assess-jobs", "saved.plan", "--calibrate"});
+    reject("fill", {"fill", "unread.plot2", "--replot-proof-solves", "1"});
+    reject("plan", {"plan", "--calibrate", "unread.plot2", "--replot-proof-solves", "1"});
 #ifndef XCHPLOT2_GROUP_COMMANDS
     reject("plan", {"plan", "--calibrate", "not-read.gplot", "--json"});
     reject("plan", {"plan", "--calibrate", "--calibration-worker", "not-read.gplot", "--json"});
@@ -283,6 +285,32 @@ void temporary_admission(std::filesystem::path const& root, group_grow::Identity
     require(pool.try_reserve_output(0, root, directory.available_bytes),
         "ordinary handoff could not restore the original capacity after scratch cleanup");
     pool.cancel(0);
+}
+
+void replot_external_projection(fs::path const& directory, group_grow::Identity const& initial)
+{
+    using namespace grow_controller_test;
+    Arguments args; args.max_ram = 256 * mib; args.workers = 2; args.batch = 4;
+    args.construction = "external"; args.window = 65536; args.headroom = 0;
+    auto const requested = identity_from(initial); auto target = group_grow::ScratchRoot::inspect(directory);
+    target.available_bytes = 2 * 1024 * mib;
+    auto const capacity = sum(canonical_bound(requested, 4), args.max_ram);
+    require(replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
+        "ordinary scratch policy could not admit a projected external migration");
+    auto empty = target; empty.available_bytes = 0;
+    require(!replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {empty}, empty, 0),
+        "external migration admitted scratch/output without actual or reviewed prospective space");
+    auto missing_output = target; missing_output.available_bytes = 0;
+    require(!replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, missing_output, 0),
+        "scratch alias multiplied projected filesystem space");
+    auto changed = target; ++changed.directory_inode;
+    bool refused = false;
+    try { (void)replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {changed}, changed, 0); }
+    catch (std::runtime_error const&) { refused = true; }
+    require(refused, "projected scratch admission accepted a changed native directory");
+    auto capped = args; capped.temporary_capacity = 1;
+    require(!replot_external_capacity(capped, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
+        "projected external migration ignored the ordinary scratch cap");
 }
 
 // Exercise actual controller lifecycle with synthetic known drive identities;
@@ -3184,6 +3212,16 @@ void replot_capacity_prefix()
     auto elsewhere = input; elsewhere.inventory.roots[0].storage.filesystem = "other-fs";
     elsewhere.review.reclaim_before_bytes = 1024;
     require(!replot_prefix_capacity(elsewhere).empty(), "retiring another filesystem supplied output free space");
+    auto resources = input; resources.review.space[0].free_bytes = 1024;
+    std::vector<std::vector<uint64_t>> early;
+    auto requires_retirement = [&](size_t batch, auto const&, std::span<uint64_t const> selected)
+    { return selected.size() == 1 && selected.front() == resources.review.sources[batch]; };
+    require(replot_prefix_capacity(resources, requires_retirement, {"output-fs"}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{0}, {1}},
+        "resource-driven retirement did not use the same bounded indivisible source mapping with ample free disk space");
+    resources.review.reclaim_before_bytes = 31;
+    require(!replot_prefix_capacity(resources, requires_retirement, {"output-fs"}, &early).empty() && early.front().empty(),
+        "resource-driven retirement exceeded the physical early-deletion cap");
     auto no_journal = input; no_journal.review.space[0].free_bytes = 7;
     no_journal.review.reclaim_before_bytes = 1024;
     require(!replot_prefix_capacity(no_journal).empty(), "retirement began without space for durable private state");
@@ -5065,7 +5103,7 @@ void prepared_producer(fs::path const& root, Members input)
 int main(int argc, char** argv) try
 {
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--prefetch-only" ||
-        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--prepared-input-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--prepared-input-only]");
+        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--replot-capacity-only|--prepared-input-only]");
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
@@ -5080,6 +5118,11 @@ int main(int argc, char** argv) try
     require(::mkdtemp(name.data()), "cannot create merge test directory");
     fs::path root(name); struct Cleanup { fs::path root; ~Cleanup() { fs::remove_all(root); } } cleanup{root};
     auto input = members(); auto cfg = configuration();
+    if (argc == 2 && std::string(argv[1]) == "--replot-capacity-only")
+    {
+        temporary_admission(root, identity()); replot_external_projection(root, identity()); replot_capacity_prefix();
+        std::cout << "projected migration output/scratch admission checks passed\n"; return 0;
+    }
     joined_worker_cpu(input);
     if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--prepared-input-only"))
     {
@@ -5120,7 +5163,7 @@ int main(int argc, char** argv) try
     }
     writers(root); group_prefetch(root, input); destination_admission(); execution_planning();
     if (prefetch_only) { std::cout << "next-group prefetch and receiver admission checks passed\n"; return 0; }
-    construction_selection(); construction_histories(); cache_frontiers(root, cfg); temporary_admission(root, identity());
+    construction_selection(); construction_histories(); cache_frontiers(root, cfg); temporary_admission(root, identity()); replot_external_projection(root, identity());
     {
         // External scratch needs physical allocation, while the existing
         // same-file cases may keep using a RAM-backed temporary directory.

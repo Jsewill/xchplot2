@@ -642,21 +642,30 @@ relying on a latency bound.
 
 Ordinary `fill` uses available space without deleting existing plots. Replacing
 an existing farm requires an explicit inventory, a saved migration review and
-execution of that review. Migration execution currently requires Linux, local
-construction with `--compute off`, and compatible local Chia harvester, farmer,
-PoS2 solver and synced full-node services. Native Windows supports inventory
-and forecasting; it refuses migration execution before changing files. See the
+execution of that review. Execution needs a compatible Chia harvester, farmer,
+started PoS2 solver and synced, activated full node, with complete resource
+bounds for the selected construction backend. Linux and native Windows use
+native file claims and bounded worker processes. A platform without the required
+telemetry or process controls refuses admission. See the
 [compatibility guide](contrib/pos2-pr118/README.md) for PoS2 reader support.
 
-The supported replacement route is a configured self-pooling plot NFT.
-External pooled targets and OG pool-public-key targets refuse execution:
-the supported RPC cannot establish their required PoS2 pool acceptance or pool
-signing-key readiness. Original and OG source plots can still be inventoried
-and retired into the supported replacement route.
+Replacement routes include solo pool contracts, external pooling and OG pool
+public keys. For an external pool, the farmer must report the configured public
+route, supported pooling protocol, initialized authentication parameters and
+current difficulty. The review must cover that protocol and a conservative
+minimum difficulty. These RPC observations do not prove pool registration, a
+current authentication token, possession of an OG signing key or acceptance of
+a future proof. The replacement's exact public-key route is acknowledged after
+publication; migration does not wait for a random winning proof or pool partial.
+The selected membership and contract hash must already be appropriate for the
+pool. The [current Pool2 protocol](https://github.com/Chia-Network/pool2-reference#how-it-works)
+uses a RewardPuzzle route tied to the launcher ID and versioned authentication;
+an older contract address is not evidence of that membership. Migration does
+not create or upgrade a Plot NFT or change the wallet's pool membership.
 
 Inventory every loaded plot root of each configured source and target reader,
 and include existing destination data. The optional installed-reader arguments
-add authenticated loopback observations from the existing services:
+add authenticated observations from the existing services:
 
 ```bash
 xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
@@ -672,24 +681,30 @@ hostnames remain in the report, so review those before sharing it.
 
 File names and extensions do not establish a format or deletion eligibility.
 Supported PoS1 headers can become retirement candidates after rechecking the
-same native files. Unknown containers, links, aliases and unreadable or changed
-files stay protected. Existing PoS2 files are included in the workload but are
-not PoS1 retirement candidates. A header observation does not validate every
-proof in an old file.
+same native files and parsed public header, including ordinary files currently
+unloaded from the reader. A present loaded record must agree with those fields.
+Proprietary PoS1 containers can also become candidates when
+an explicitly selected installed reader reports consistent public plot metadata
+for that exact native object. Filename and size alone are insufficient: native
+identity, timestamps and the observed header bytes are pinned, and the reader's
+plot public key and pool route must bind its reported plot ID. This identifies
+the reviewed object without reconstructing old proofs or claiming its contents
+are valid. Unknown files without that metadata, links, aliases and unreadable
+or changed objects stay protected. Existing PoS2 files remain part of the
+workload and are not PoS1 retirement candidates.
 
 `--farm-adapter chia|gigahorse|drchia` selects the installed reader interface;
-`--chia-executable` must name its actual executable. Proprietary containers
-remain protected unless a supported reader can establish their identity from
-the current file. A loaded-file observation alone is insufficient.
-`--farm-checker FILE` selects the supported Gigahorse checker: bounded samples
-and independent proof verification must bind the held file to its observed
-plot ID. These checks do not establish complete validity or decode unavailable
-compression metadata. DrChia containers without a supported identity check stay
-protected. Changes to the configured reader, checker, configuration or observed
-service versions require a new review.
-Catalog traversal and serial native checks use an entry-count-bounded total
-allowance. Each registry operation and native check retains its own time,
-memory and output limits; a large catalog does not enlarge an individual check.
+`--chia-executable` must name its actual executable. Each source phase captures
+and fences one coherent bounded reader registry for the selected batch. Reader,
+configuration or reported version changes invalidate the review. DrChia builds
+without a version RPC record explicitly labelled CLI version provenance instead;
+that is not an independently reported running-service version. Unloaded ordinary
+files record the selected reader's route context separately from their public
+header identity; this does not claim that the reader loaded or decoded them.
+Native source claims retain the exact reviewed object across interruption and recovery.
+Registry calls, catalog traversal and native object reads have explicit time,
+memory and output limits. Retirement requires no vendor proof checker or GPU
+reconstruction of the old plot.
 
 For different source and replacement readers, add a `farm_adapters` object
 beside `farm_resources` in the local `--harvester` profile:
@@ -701,7 +716,7 @@ beside `farm_resources` in the local `--harvester` profile:
   "routes": [
     {"id": "old-gigahorse", "kind": "gigahorse",
      "root": "/home/farmer/.chia/gigahorse", "executable": "/opt/gigahorse/chia",
-     "checker": "/opt/gigahorse/ProofOfSpace", "source_roots": ["/disk-a/plots"]},
+     "source_roots": ["/disk-a/plots"]},
     {"id": "new-chia", "kind": "chia",
      "root": "/home/farmer/.chia/mainnet", "executable": "/opt/chia/bin/chia",
      "source_roots": []}
@@ -717,6 +732,24 @@ reviewed again. During execution, only the catalog and replacements already
 published by the private journal may appear in those readers' loaded registries.
 Explicitly classified metadata artifacts remain protected; a reader reporting
 one as a loaded plot contradicts its zero-workload classification and is refused.
+
+For authenticated remote services, a route can also declare `host` and
+`services`, keyed by `harvester`, `farmer`, `full_node` and `solver`. Each service
+entry supplies an absolute local `root` containing its existing private-CA CLI
+configuration, `rpc_host` matching that configuration's `self_hostname`, and
+`host` naming its physical resource host. Harvester, full-node and solver entries
+also supply `node_id`, the service TLS identity seen by the farmer, and
+`farmer_node_id`, the reciprocal farmer identity seen by that service. The
+farmer's public and private connection identities can differ. These local
+bindings select the authenticated contexts; a saved public plan imports none of
+the executable paths or authentication authority.
+
+Replacement and source paths must identify the same accessible native files for
+the controller and selected harvester, such as an explicitly shared filesystem
+with matching paths. RPC supplies public loaded metadata, not remote native
+inode attestation. A matching pathname on an unrelated remote filesystem does
+not establish the controller's exact replacement. Configure the actual shared
+file namespace and physical storage/resource mappings before review.
 
 The inventory contains an editable `farm_resources` template with unknown
 capacities and costs. Complete it for the actual mixed farm before reviewing a
@@ -735,6 +768,22 @@ That classification never makes the file a retirement candidate.
 | `native` | Bounds for the selected construction and verification settings, physical output/scratch/source mappings, controller and RPC supervision, and increasing member cohorts with separate new-farming and full-proof reserves. |
 | `gate` | Maximum telemetry age and the recovery interval/sample count required before admitting work again. |
 
+`native.service_hosts` maps service roles to their physical resource hosts;
+omitted roles use `native.host`. These labels must match the local adapter
+bindings. For external pooling, set `native.min_pool_difficulty` to the lowest
+difficulty covered by the full-solver envelope and `native.pool_protocol_version`
+to the configured protocol. A live difficulty below that floor, or a different
+protocol, stops further retirement. Higher difficulty remains within the
+reviewed arrival bound. Solo and OG routes leave both values zero.
+
+Additional loaded farmer-side harvesters require reviewed aggregate workloads with
+`external_service_node_id`, `external_service_host`, `plot_count` bounding loaded
+files, and `external_service_members` bounding their full member population.
+Their costs cover the receiver host and the shared farmer/solver resources.
+These unscanned service reservations remain charged throughout migration and
+cannot be retired as inventoried files. Unknown receivers or populations beyond
+the reviewed bounds stop progress.
+
 Unknown costs or capacities block admission. Declared reservations must cover
 the entire workload; changing a flag to `bounded` does not measure that bound.
 Partial-proof calibration does not supply a full-proof solver reserve. GPU
@@ -748,7 +797,7 @@ Native envelopes must explicitly cover future filters and the controller's
 memory in each phase (`covers_future_filter` and
 `phase_totals_include_controller`). Construction, proof verification and RPC
 supervision run sequentially. The proof worker has a memory and time limit;
-`verification_cpu_threads` can additionally limit its CPU affinity on Linux.
+`verification_cpu_threads` can additionally limit its CPU affinity.
 Each phase's CPU envelope includes its concurrent controller or monitor and
 capped worker, within the inherited CPU set.
 GPU session envelopes cover the full inherited CPU set in every phase:
@@ -769,6 +818,25 @@ that envelope.
 For resources marked `conditional_shared`, admission adds all declared work and
 queued blocking time and checks response deadlines. This permits conditional
 sharing of a CPU or disk lane; it does not establish a measured service bound.
+
+Shared compute also needs a reviewed migration envelope. `native.compute_workers`
+maps each worker's authenticated `tls_identity` to its physical `host` and,
+where used, `gpu_identity`. Declare the configured `cpu_threads`, `slots`,
+`host_bytes`, `gpu_bytes`, standing host/GPU memory and permitted `allowed_kinds`
+(`generate-cpu`, `generate-gpu` or `encode`). Each worker's `reservation` covers
+its entire service, including work from other owners; idle status supplies no
+extra capacity. The host-memory partition already includes the worker baseline.
+`native.compute_owner_identity`, `compute_broker_identity` and
+`compute_broker_host` bind the owner and broker; `compute_services` reserves the
+persistent session/codec and broker resources. These are explicit reviewed
+physical mappings, not remote hardware discovery or permission to reconfigure a
+foreign worker. Missing mappings or grants beyond the envelope block admission.
+Protected migration gives the owner/client/codec and the worker independent
+CPU gates. Its reviewed envelope reserves both workloads in full, so a local
+offer may exceed `--workers` when physical capacity and complete phase bounds
+permit it. Ordinary plotting retains its shared owner/worker gate.
+Local GPU worker reservations also cover the complete inherited CPU affinity
+for runtime helpers, as well as offered task CPUs and GPU allocation/residency.
 
 Review destinations and the completed profile, then save the resulting plan:
 
@@ -798,8 +866,12 @@ and restarts. Removal is irreversible: the new plot cannot reconstruct an old
 one. This limit measures physical bytes, not lost income or equal farming
 value. Temporary space selected with `--temp-dir` is construction scratch;
 it is not automatically a farmable replacement.
-External construction requires zero pre-delete credit; use incremental
-construction for bounded pre-deletion.
+External construction with pre-delete credit also requires a joint output and
+scratch admission. The review and execution check the actual temporary roots,
+filesystem sharing, full output/checkpoint reservations and outstanding deletion
+debt before claiming any source. An inadequate `--temp-capacity-bytes` or
+unavailable scratch root refuses the deletion; credit cannot stand in for a
+complete scratch grant.
 
 Each batch must fit conservative output, construction, recovery and headroom
 allowances. Execution checks actual available space again. A rename or
@@ -808,23 +880,27 @@ can delay its release after deletion. Extra free space does not enlarge the
 reviewed replacement schedule.
 
 For replacement-first retirement, execution seals and checks the exact replacement,
-runs bounded full-proof samples, and publishes a new immutable `.plot2` file.
+runs bounded full-proof samples that must yield a valid complete proof, and
+publishes a new immutable `.plot2` file. Sampling does not inspect every chain
+or prove every byte of the file correct.
 The configured harvester must report that exact path with matching plot
 identity, public-key route, size and modification time. The target network
 must be synced, active for PoS2 and compatible with the replacement parameters.
 The connected farmer must acknowledge the same exact plot and key route in a
 completed plot synchronization. Multi-member replacements require its exact
-reported group membership. Fresh matching local peer observations bind the
-harvester, farmer, queried full node and started solver; changes during the
-snapshot invalidate it. Completed synchronization can remain valid while the
-matched services are idle. Other farmer-side harvesters with loaded plots are
-outside this supported local target scope and stop migration.
-These observations are refreshed before each deletion; imported JSON cannot
-assert readiness. The process does not wait for a random winning proof or a
-pool partial. Missing capabilities or stale observations pause further work.
+reported group membership. Matched peer observations bind the selected
+harvester, farmer, full node and solver, using explicit reciprocal TLS identities
+for remote links. Other receivers must fit their reviewed service reservations.
+A bounded phase captures the complete loaded prefix once. Before each protected
+retirement action it rechecks network activation and sync, service connections,
+completed plot-sync generations, pool route/difficulty and native paths of all
+acknowledged replacements. Construction or proof work invalidates that phase;
+changed generations require a fresh exact prefix audit. Completed synchronization
+can remain valid while services are idle. Imported JSON cannot assert readiness.
+Missing capabilities, changed populations or stale observations pause work.
 An authorized pre-deletion still requires the live target network and fresh
 readiness of previously credited replacements.
-General service and configured NFT prerequisites apply before private
+General service and configured public pool-route prerequisites apply before private
 preparation and pre-deletion; exact new plot/key acknowledgement follows
 publication. Missing or changed reviewed farmer/solver versions block execution
 while network-only forecasts remain available.
@@ -845,7 +921,13 @@ contains the seed and assignments from preparation onward. Resume with the
 same reviewed plan and installed-reader arguments; saved private state restores
 the keys. All required source and destination roots must be available and must
 still identify the same directories. A source mismatch stops retirement while
-preserving the claimed file for inspection.
+preserving the claimed file for inspection. On Windows, a reader that holds a
+source without delete sharing must unload it before the native claim can open.
+Keep the reader's RPC service running. Recovery of a batch with durable
+retirement progress can retain its previously validated metadata for those exact
+now-unloaded native objects. A later opaque batch without previously validated
+reader metadata must be loaded and freshly acknowledged before its own retirement
+begins. Ordinary supported public headers can identify unloaded files directly.
 Migration currently requires unchanged native file and device identifiers;
 device renumbering after a remount or reboot can prevent resume even when the
 filesystem's persistent identity is unchanged.

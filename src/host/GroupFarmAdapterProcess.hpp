@@ -1,5 +1,5 @@
-// Fixed native farm-adapter operations. Output stays private to the parser:
-// upstream checkers can print memo secrets even when they subsequently fail.
+// Fixed authenticated farm-adapter RPC operations. Native process output
+// stays private to the parser, including unsuccessful RPC diagnostics.
 #pragma once
 #include "host/GroupCalibrationProcess.hpp"
 #include "host/GroupFile.hpp"
@@ -10,19 +10,16 @@
 
 namespace group_grow::farm
 {
-enum class AdapterOperation { harvester_version, harvester_plots, harvester_network,
+enum class AdapterOperation { reader_cli_version, harvester_version, harvester_plots, harvester_network,
     harvester_connections, full_node_version, full_node_network, full_node_constants, full_node_state, full_node_block_record, full_node_connections,
     farmer_version, farmer_network, farmer_connections, farmer_harvesters, farmer_harvesters_summary, farmer_pool_state,
-    solver_version, solver_network, solver_connections, solver_state, gigahorse_check, gigahorse_farm, gigahorse_verify };
+    solver_version, solver_network, solver_connections, solver_state };
 struct AdapterCommand
 {
     AdapterOperation operation = AdapterOperation::harvester_version;
-    std::filesystem::path executable, root, plot;
-    unsigned threads = 1, samples = 1;
-    uint64_t difficulty = 100;
+    std::filesystem::path executable, root;
+    unsigned threads = 1;
     uint32_t height = 0;
-    uint8_t k = 0;
-    std::string plot_id, proof, challenge;
 };
 struct AdapterResult
 {
@@ -44,28 +41,9 @@ inline std::vector<std::string> arguments(AdapterCommand const& command)
 {
     check(command.executable.is_absolute(), "farm adapter executable must be an explicit absolute path");
     std::vector<std::string> result{file_io::path_text(command.executable)};
-    if (command.operation == AdapterOperation::gigahorse_verify)
-    {
-        auto hex = [](std::string const& value, size_t bytes) { return value.size() == bytes * 2 && value.find_first_not_of("0123456789abcdef") == value.npos; };
-        check(command.k >= 18 && command.k <= 50 && hex(command.plot_id, 32) && hex(command.challenge, 32) && hex(command.proof, 8 * command.k),
-            "invalid bounded Gigahorse public proof verification");
-        result.insert(result.end(), {"verify", "-k", std::to_string(command.k), "-i", command.plot_id, command.proof, command.challenge}); return result;
-    }
-    if (command.operation == AdapterOperation::gigahorse_check || command.operation == AdapterOperation::gigahorse_farm)
-    {
-        check(command.plot.is_absolute() && command.threads && command.threads <= 64 && command.samples && command.samples <= 1000 && command.difficulty,
-            "invalid bounded Gigahorse check parameters");
-        result.push_back(command.operation == AdapterOperation::gigahorse_check ? "check" : "farm");
-        result.insert(result.end(), {"-r", std::to_string(command.threads)});
-        result.push_back("--parallel_read=false");
-        if (command.operation == AdapterOperation::gigahorse_farm) result.insert(result.end(), {"--diff", std::to_string(command.difficulty)});
-        result.insert(result.end(), {"-f", file_io::path_text(command.plot)});
-        // The installed native help documents [count] for check as well as
-        // farm. Never accept its potentially expensive default iteration count.
-        result.push_back(std::to_string(command.samples));
-        return result;
-    }
     check(command.root.is_absolute(), "farm adapter Chia root must be an explicit absolute path");
+    if (command.operation == AdapterOperation::reader_cli_version)
+    { result.insert(result.end(), {"--root-path", file_io::path_text(command.root), "version"}); return result; }
     char const* service = "harvester"; char const* endpoint = nullptr;
     switch (command.operation)
     {
@@ -141,26 +119,6 @@ inline AdapterResult run_farm_adapter(AdapterCommand const& command, calibration
     struct List { LPPROC_THREAD_ATTRIBUTE_LIST p; ~List() { ::DeleteProcThreadAttributeList(p); } } cleanup{list};
     std::array<HANDLE, 2> inherited{write.value, input.value};
     check(::UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(), sizeof(inherited), nullptr, nullptr), "cannot restrict farm adapter handles");
-    // The native proof benchmark is deliberately CPU-only. A remote solver or
-    // implicitly selected GPU would escape this child's resource boundary.
-    bool const proof = command.operation == AdapterOperation::gigahorse_check || command.operation == AdapterOperation::gigahorse_farm || command.operation == AdapterOperation::gigahorse_verify;
-    std::vector<wchar_t> environment;
-    if (proof)
-    {
-        auto* inherited_environment = ::GetEnvironmentStringsW(); check(inherited_environment, "cannot read farm adapter environment");
-        struct Free { wchar_t* p; ~Free() { ::FreeEnvironmentStringsW(p); } } free{inherited_environment};
-        std::map<std::wstring, std::wstring> values;
-        for (auto p = inherited_environment; *p; p += std::wcslen(p) + 1)
-        {
-            std::wstring entry(p); auto at = entry.find(L'=', 1); if (at == entry.npos) continue;
-            auto key = entry.substr(0, at); std::transform(key.begin(), key.end(), key.begin(), ::towupper);
-            if (!key.starts_with(L"CHIAPOS_RECOMPUTE_")) values[key] = entry.substr(at + 1);
-        }
-        values[L"CHIAPOS_MAX_GPU_DEVICES"] = L"0"; values[L"CHIAPOS_MAX_CUDA_DEVICES"] = L"0"; values[L"CHIAPOS_MAX_OPENCL_DEVICES"] = L"0";
-        values[L"CHIAPOS_MAX_CORES"] = std::to_wstring(command.threads); values.erase(L"CHIAPOS_RECOMPUTE_HOST"); values[L"CUDA_VISIBLE_DEVICES"] = L"";
-        for (auto const& [key, value] : values) { auto entry = key + L'=' + value; environment.insert(environment.end(), entry.begin(), entry.end()); environment.push_back(0); }
-        environment.push_back(0);
-    }
     struct Child
     {
         PROCESS_INFORMATION p{}; HANDLE job = nullptr; bool done = false;
@@ -171,7 +129,7 @@ inline AdapterResult run_farm_adapter(AdapterCommand const& command, calibration
     startup.StartupInfo.hStdOutput = write.value; startup.StartupInfo.hStdError = write.value;
     check(::CreateProcessW(command.executable.c_str(), command_line.data(), nullptr, nullptr, TRUE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-        proof ? environment.data() : nullptr, nullptr, &startup.StartupInfo, &child.p), "cannot start installed farm adapter");
+        nullptr, nullptr, &startup.StartupInfo, &child.p), "cannot start installed farm adapter");
     check(::AssignProcessToJobObject(job.value, child.p.hProcess), "cannot contain installed farm adapter");
     calibration_process::check_running(until, limits.cancelled);
     check(::ResumeThread(child.p.hThread) != DWORD(-1), "cannot resume installed farm adapter");
@@ -197,17 +155,6 @@ inline AdapterResult run_farm_adapter(AdapterCommand const& command, calibration
     { int moved = ::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1); check(moved >= 0, "cannot isolate farm adapter descriptors"); ::close(fd); fd = moved; }
     check(::fcntl(pipe.fd[0], F_SETFL, O_NONBLOCK) >= 0, "cannot make farm adapter output cancellable");
     std::vector<char*> argv; for (auto& arg : args) argv.push_back(arg.data()); argv.push_back(nullptr);
-    std::vector<std::string> environment;
-    bool const proof = command.operation == AdapterOperation::gigahorse_check || command.operation == AdapterOperation::gigahorse_farm || command.operation == AdapterOperation::gigahorse_verify;
-    for (char** p = environ; p && *p; ++p)
-    {
-        std::string_view entry(*p);
-        if (proof && (entry.starts_with("CHIAPOS_MAX_") || entry.starts_with("CHIAPOS_RECOMPUTE_") || entry.starts_with("CUDA_VISIBLE_DEVICES="))) continue;
-        environment.emplace_back(entry);
-    }
-    if (proof) environment.insert(environment.end(), {"CHIAPOS_MAX_GPU_DEVICES=0", "CHIAPOS_MAX_CUDA_DEVICES=0", "CHIAPOS_MAX_OPENCL_DEVICES=0",
-        "CUDA_VISIBLE_DEVICES=", "CHIAPOS_MAX_CORES=" + std::to_string(command.threads)});
-    std::vector<char*> env; for (auto& entry : environment) env.push_back(entry.data()); env.push_back(nullptr);
     struct rlimit inherited{}; check(!::getrlimit(RLIMIT_AS, &inherited), "cannot inspect farm adapter memory limit");
     uint64_t cap = limits.memory_bytes;
     if (inherited.rlim_cur != RLIM_INFINITY) cap = std::min(cap, uint64_t(inherited.rlim_cur));
@@ -233,7 +180,7 @@ inline AdapterResult run_farm_adapter(AdapterCommand const& command, calibration
         int input = ::open("/dev/null", O_RDONLY);
         if (input < 0 || ::dup2(input, STDIN_FILENO) < 0 || ::dup2(pipe.fd[1], STDOUT_FILENO) < 0 || ::dup2(pipe.fd[1], STDERR_FILENO) < 0) ::_exit(125);
         if (input > STDERR_FILENO) ::close(input); ::close(pipe.fd[0]); ::close(pipe.fd[1]);
-        ::execve(argv[0], argv.data(), env.data()); ::_exit(126);
+        ::execve(argv[0], argv.data(), environ); ::_exit(126);
     }
     (void)::setpgid(child.pid, child.pid); ::close(pipe.fd[1]); pipe.fd[1] = -1; bool eof = false;
     while (!child.done || !eof)

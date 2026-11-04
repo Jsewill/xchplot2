@@ -95,6 +95,19 @@ struct VerifyResult {
 // every returned chain; a chain without a valid full proof throws.
 VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full = false);
 
+// Production smoke validation is separate from verify's all-returned-chain
+// semantics. Each fresh challenge contributes at most one uniformly selected
+// full reconstruction. full_proofs is both the required positive sample count
+// and the maximum number of solver calls: a selected invalid chain fails.
+// Exhaustion, cancellation and empty samples fail; this does not certify every
+// member or compressed payload. Run inside the worker's OS RAM/CPU/time caps.
+struct BoundedVerifyBudget
+{
+    size_t max_challenges = 0, full_proofs = 0;
+};
+VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled = {});
+
 // Read-only reference-reader observations. Call only inside the calibration
 // worker's OS memory cap and deadline: Chainer's search is data-dependent.
 struct ReaderCalibrationPhase

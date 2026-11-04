@@ -42,7 +42,7 @@ int main() try
     native.host = host; native.k = 18; native.strength = 2; native.reader = "stateless"; native.backend = "cpu"; native.engine = "reference";
     native.max_ram_bytes = 16 * mib; native.max_cpu_threads = cpus; native.max_batch_members = 1; native.max_group_members = 1;
     native.max_construction_us = native.max_verification_us = 100000; native.output_resources = {disk};
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     native.verification_cpu_threads = 1;
 #endif
     native.construction = {service("cpu"), memory(18 * mib), service(disk), service("controller")};
@@ -60,6 +60,60 @@ int main() try
     pos2gpu::GroupOptions args; args.backend = "cpu"; args.construction = "reference"; args.workers = 1; args.max_ram = 16 * mib; args.batch = 65535; args.compute_mode = "off";
     ReplotSupervision supervision{mib, 8 * mib, 1, 100000}; supervision.source_roots = {directory}; native.source_resources = {disk};
     auto request = replot_native_request(args, profile, state, {}, 0, 16 * mib, supervision);
+    std::map<std::string, std::string> service_hosts{{"harvester", host}, {"farmer", host}, {"full_node", host}, {"solver", host}};
+    struct Other { std::string node_id, peer_host; uint64_t files, members; };
+    std::vector<Other> outside;
+    require_target_service_scope(profile, service_hosts, outside);
+    require_target_pool_difficulty(profile, 0);
+    auto pooled = profile; pooled.native.min_pool_difficulty = 128; pooled.native.pool_protocol_version = 2;
+    require_target_pool_difficulty(pooled, 128, 2);
+    require_target_pool_difficulty(pooled, 256, 2);
+    rejects([&] { require_target_pool_difficulty(pooled, 64, 2); }, "changed pool difficulty silently reused a full-solver envelope");
+    rejects([&] { require_target_pool_difficulty(pooled, 128, 1); }, "changed pool protocol silently reused a full-solver envelope");
+    rejects([&] { require_target_pool_difficulty(profile, 128, 2); }, "solo declaration admitted external full-solver arrivals");
+    std::ostringstream pooled_json; write_profile_json(pooled_json, pooled);
+    auto pooled_roundtrip = parse_profile(profile_detail::JsonReader(pooled_json.str()).read());
+    require(pooled_roundtrip.native.min_pool_difficulty == 128 && pooled_roundtrip.native.pool_protocol_version == 2,
+        "quantitative pool scope did not survive profile serialization");
+    std::ostringstream solo_json; write_profile_json(solo_json, profile);
+    require(solo_json.str().find("\"pool_protocol_version\"") == std::string::npos,
+        "optional pool scope changed existing solo profile bytes");
+    outside.push_back({std::string(64, 'a'), "untrusted-peer-address", 2, 200});
+    rejects([&] { require_target_service_scope(profile, service_hosts, outside); }, "untracked receiver work escaped reviewed resources");
+    auto external = profile;
+    Resource remote_cpu = cpu; remote_cpu.id = "remote-cpu"; remote_cpu.host = "remote-receiver";
+    Resource remote_ram = ram; remote_ram.id = "remote-ram"; remote_ram.host = "remote-receiver";
+    Resource network = controller; network.id = "network"; network.host = "reviewed-network-path"; network.kind = ResourceKind::network;
+    external.resources.insert(external.resources.end(), {remote_cpu, remote_ram, network});
+    Workload unscanned = old; unscanned.id = "outside-receiver"; unscanned.plot_count = 2;
+    unscanned.external_service_node_id = outside.front().node_id; unscanned.external_service_host = "remote-receiver";
+    unscanned.external_service_members = 200;
+    auto remote_use = old.uses.front(); remote_use.resource = remote_cpu.id; unscanned.uses.push_back(remote_use);
+    auto remote_memory = held; remote_memory.resource = remote_ram.id; unscanned.uses.push_back(remote_memory);
+    auto network_use = remote_use; network_use.resource = network.id; unscanned.uses.push_back(network_use);
+    external.workloads.push_back(unscanned);
+    require_target_service_scope(external, service_hosts, outside);
+    validate_inventory_coverage(external, {{"legacy", 1}});
+    rejects([&] { validate_inventory_coverage(external, {{"legacy", 1}, {"outside-receiver", 2}}); }, "unscanned receiver became retirement inventory");
+    auto reduced = replot_stage(external, request, {{"outside-receiver", 0}}, 0, false, false, false);
+    rejects([&] { (void)assess_stage(external, reduced); }, "retirement released unscanned shared service demand");
+    auto population = outside; population.front().members = 201;
+    rejects([&] { require_target_service_scope(external, service_hosts, population); }, "external member population exceeded reviewed bound");
+    population = outside; population.front().files = 3;
+    rejects([&] { require_target_service_scope(external, service_hosts, population); }, "external file population exceeded reviewed bound");
+    auto omitted = external; omitted.workloads.back().uses.pop_back();
+    rejects([&] { require_target_service_scope(omitted, service_hosts, outside); }, "remote receiver omitted shared-service network load");
+    auto moved_service = service_hosts; moved_service["solver"] = "remote-receiver";
+    rejects([&] { require_target_service_scope(external, moved_service, outside); }, "solver peer moved beyond its reviewed physical resource host");
+    external.native.service_hosts["solver"] = "remote-receiver";
+    external.native.cohorts.front().proof_reserve = {service(remote_cpu.id), memory(mib), service(network.id)};
+    external.native.cohorts.front().proof_reserve[1].resource = remote_ram.id;
+    require_target_service_scope(external, moved_service, outside);
+    std::ostringstream external_json; write_profile_json(external_json, external);
+    auto external_roundtrip = parse_profile(profile_detail::JsonReader(external_json.str()).read());
+    require_target_service_scope(external_roundtrip, moved_service, outside);
+    omitted = external; omitted.native.cohorts.front().proof_reserve[1].resource = "ram";
+    rejects([&] { replot_stage(omitted, request, {}, 0, false, false, false); }, "remote solver CPU reused another host's memory envelope");
     require(request.cpu_threads == 1 && request.batch_members == 1 && request.controller_ram_bytes == mib, "bridge did not bind actual execution caps");
     require(!request.gpu_bytes && !request.standing_gpu_bytes, "CPU migration acquired GPU residency demand");
     require(request.group_members == 1, "bridge did not derive maximum actual reviewed file membership");

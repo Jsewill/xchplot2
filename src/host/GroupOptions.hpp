@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace group_grow { struct FarmingProfile; }
+namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; }
 
 namespace pos2gpu {
 class ComputeSession;
@@ -22,7 +22,6 @@ struct GroupOptions
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
     std::filesystem::path replot_inventory;
-    std::filesystem::path farm_checker;
     std::string farm_adapter = "chia";
     uint64_t reclaim_before_bytes = 0;
     std::vector<std::filesystem::path> assessment_plans;
@@ -50,7 +49,7 @@ struct GroupOptions
     bool resume = false, group_auto = false, plan_only = false, directory_farm = false, metadata_only = false, assess_jobs = false;
     bool calibrate = false, calibration_worker = false;
     bool replot_proof_worker = false;
-    uint64_t replot_proof_cpus = 0;
+    uint64_t replot_proof_cpus = 0, replot_proof_solves = 1;
     bool protected_resources = false;
     uint64_t protected_gpu_bytes = 0;
     bool inventory = false;
@@ -66,6 +65,9 @@ struct GroupOptions
     std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
     bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;
     std::shared_ptr<ComputeSession> compute_session;
+    std::function<void()> compute_admit_session;
+    std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
+    std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
     std::string pool_offer_backend = "cpu";
     uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
     uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;

@@ -146,6 +146,9 @@ private:
 };
 std::string random_token();
 std::string certificate_identity(std::string const& cert_file);
+// Load the ordinary TLS context and matching credentials without opening a
+// listener or connection, for deterministic embedding preflight.
+void validate_tls_credentials(TlsOptions const&);
 std::string certificate_node_id(std::string const& cert_file);
 Endpoint parse_endpoint(std::string const&);
 // Address of the local interface used to reach this peer; sends no data.

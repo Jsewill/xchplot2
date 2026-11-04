@@ -23,6 +23,9 @@ HEADER = struct.Struct("<4sB32sBBHBQB")
 # Public key from the pinned keygen code for SEED's directory-farming family 0,
 # FARMER and POOL. The RPC fixture still checks each generated group's ID.
 FARMING_PLOT_KEY = "8c31b3cca1d31b09bb0172b7654cb2ad9beaef7ae15d59a5e7131aa9162dc966350306c2e8a7096902dac1905c821ddc"
+# The same pinned derivation after compute_owner_seed for the fixture's
+# protected-migration-owner namespace; both public keys are checked by group ID.
+COMPUTE_FARMING_PLOT_KEY = "88485b2103714b3791ae725a4d3049de6cbf83fb6b56c5c788801fd5a4405a8e3b29e057024d59691cb755be061edd93"
 
 
 def replot_rpc_fixture(args):
@@ -65,10 +68,12 @@ def replot_rpc_fixture(args):
         assert service == "farmer"
         pool = "99" * 32 if fixture.get("pool_mismatch") else POOL
         result = {"pool_state": [{"p2_singleton_puzzle_hash": pool,
+                                 "current_difficulty": None if fixture.get("pool_uninitialized") else fixture.get("pool_difficulty", 17),
+                                 "authentication_token_timeout": 5,
                                  "pool_config": {"p2_singleton_puzzle_hash": pool,
                                                  "launcher_id": "11" * 32, "target_puzzle_hash": "22" * 32,
-                                                 "owner_public_key": FARMER,
-                                                 "pool_url": "https://unsupported.example" if fixture.get("pool_external") else ""}}]}
+                                                 "owner_public_key": FARMER, "version": fixture.get("pool_protocol_version", 1),
+                                                 "pool_url": "https://pool.example" if fixture.get("pool_external") else ""}}]}
     elif endpoint == "get_constants":
         assert service == "full_node"
         result = {"constants": {"GENESIS_CHALLENGE": "a1" * 32, "HARD_FORK2_HEIGHT": 100,
@@ -96,14 +101,19 @@ def replot_rpc_fixture(args):
                 continue
             for path in sorted(directory.glob("*.plot2")):
                 group, _, strength, members, meta, memo = header(path)
-                assert memo[:64] == POOL and memo[64:160] == FARMER
-                expected = hashlib.sha256(bytes([strength]) + bytes.fromhex(FARMING_PLOT_KEY + POOL)).hexdigest()
+                pooled = len(memo) == 224
+                assert pooled or len(memo) == 256
+                route_bytes = 64 if pooled else 96
+                route = memo[:route_bytes]
+                assert route == (POOL if pooled else FARMER) and memo[route_bytes:route_bytes + 96] == FARMER
+                plot_key = fixture.get("plot_public_key", FARMING_PLOT_KEY)
+                expected = hashlib.sha256(bytes([strength]) + bytes.fromhex(plot_key + route)).hexdigest()
                 assert group == expected, "fixture's public key no longer matches the seeded family"
                 stat = path.stat()
                 plots.append({"filename": str(path), "plot_id": group, "size": 0x80 | strength,
                               "file_size": stat.st_size, "time_modified": int(stat.st_mtime),
-                              "pool_contract_puzzle_hash": POOL, "pool_public_key": None,
-                              "plot_public_key": FARMER if fixture.get("wrong_key") else FARMING_PLOT_KEY,
+                              "pool_contract_puzzle_hash": route if pooled else None, "pool_public_key": None if pooled else route,
+                              "plot_public_key": FARMER if fixture.get("wrong_key") else plot_key,
                               "group_size": members, "meta_group": meta})
         if endpoint == "get_plots":
             result = {"plots": plots}
@@ -1046,31 +1056,19 @@ def check_replot(binary, root, reference=None):
     external_options = list(options)
     external_options[external_options.index("--construction") + 1] = "external"
     external_options[external_options.index("--destination-temp") + 1] = "on"
+    external_scratch = directory / "external migration scratch"
+    external_scratch.mkdir()
+    external_options += ["--temp-dir", external_scratch]
     guarded = snapshot(farm)
-    refused = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", external_file,
-                             *adapter, *external_options, "--reclaim-before-bytes", 1, "--json", code=2).stdout)
-    assert any("external migration with positive pre-delete credit" in reason for reason in refused["infeasibility_reasons"])
-    rejected_review = directory / "unsupported external.plan"
-    run("plan", farm, "--replot", inventory_file, "--harvester", external_file, *adapter,
-        *external_options, "--reclaim-before-bytes", 1, "--save-plan", rejected_review, code=2)
-    assert not rejected_review.exists() and snapshot(farm) == guarded
-    external_review = directory / "zero-credit external.plan"
-    zero = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", external_file,
-                          *adapter, *external_options, "--save-plan", external_review, "--json").stdout)
-    assert zero["feasible"] and zero["reclaim_before_bytes"] == 0
-    record = external_review.read_bytes()
-    body = record[:-65]
-    assert record[-65:] == hashlib.sha256(body).hexdigest().encode() + b"\n"
-    rows = farming_plan_rows(body)
-    assert rows[0] == b"ordinary-group-replot-review-v1\n" and rows[4].startswith(b"0 ")
-    rows[4] = b"1 " + rows[4].split(b" ", 1)[1]
-    body = b"".join(rows)
-    rejected_review.write_bytes(body + hashlib.sha256(body).hexdigest().encode() + b"\n")
-    imported = json.loads(run("plan", rejected_review, "--harvester", external_file,
-                              *adapter, *external_options, "--json", code=2).stdout)
-    assert any("external migration with positive pre-delete credit" in reason for reason in imported["infeasibility_reasons"])
-    run("fill", rejected_review, "--harvester", external_file, *adapter, *external_options, *keys, code=2)
-    assert snapshot(farm) == guarded, "imported external predelete review changed the farm"
+    external_review = directory / "positive-credit external.plan"
+    positive_credit = catalog["plots"][0]["identity"]["allocated_bytes"]
+    accepted = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", external_file,
+                              *adapter, *external_options, "--reclaim-before-bytes", positive_credit,
+                              "--save-plan", external_review, "--json").stdout)
+    assert accepted["feasible"] and accepted["reclaim_before_bytes"] == positive_credit and snapshot(farm) == guarded
+    run("fill", external_review, "--harvester", external_file, *adapter, *external_options, *keys,
+        "--temp-capacity-bytes", 1, code=2)
+    assert snapshot(farm) == guarded and not (farm / "grow-replot.plan").exists(), "joint scratch refusal claimed a source or published a journal"
     temporary_profile = json.loads(json.dumps(profile))
     temporary_profile["farm_resources"]["native"]["scratch_resources"] = disks
     temporary_file = directory / "temporary profile.json"
@@ -1113,19 +1111,17 @@ def check_replot(binary, root, reference=None):
         unavailable = run(*execute, *keys, code=2)
         assert snapshot(farm) == before and not (farm / "grow-replot.plan").exists()
         if failure == "pool_external":
-            assert "external pooled target execution is unsupported" in unavailable.stdout + unavailable.stderr
+            assert "pool" in (unavailable.stdout + unavailable.stderr).lower()
     flags()
     for name in ("farmer_version", "solver_version"):
         flags(**{name: "changed-service-version"})
         drift = run(*execute, *keys, code=2)
         assert "service version changed since review" in drift.stdout + drift.stderr and snapshot(farm) == before
     flags()
-    og = run(*execute, "-f", FARMER, "--pool-pk", FARMER, "-S", SEED, code=2)
-    assert "OG pool-public-key target execution is unsupported" in og.stdout + og.stderr and snapshot(farm) == before
-    run(*execute, *keys, "--compute", "auto", code=2)
-    assert snapshot(farm) == before, "uncovered compute changed the farm"
     run(*execute, *keys, point="replot-journal-all-staged", code=86)
     staged_private = snapshot(farm)
+    run(*execute, "-f", FARMER, "--pool-pk", FARMER, "-S", SEED, code=2)
+    assert snapshot(farm) == staged_private, "different supplied pool route changed a prepared NFT journal"
     for failure in ("farmer_disconnected", "solver_stopped"):
         flags(**{failure: True})
         run(*execute, code=2)
@@ -1240,7 +1236,7 @@ def check_replot(binary, root, reference=None):
     routed_source.write_bytes(legacy)
     route_specs = []
     for name, kind, extra in (("old-gh", "gigahorse", {"source_only": True, "version": "fixture-gh-v1"}),
-                              ("new-chia", "chia", {"target_only": True})):
+                              ("new-chia", "chia", {"target_only": True, "pool_external": True, "pool_protocol_version": 2})):
         config = directory / name
         (config / "config").mkdir(parents=True)
         (config / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
@@ -1249,6 +1245,7 @@ def check_replot(binary, root, reference=None):
                             "source_roots": [str(routed_farm)] if name == "old-gh" else []})
     routed_profile = json.loads(json.dumps(profile))
     routed_profile["farm_adapters"] = {"schema": 1, "target_route": "new-chia", "routes": route_specs}
+    routed_profile["farm_resources"]["native"].update(min_pool_difficulty=17, pool_protocol_version=2, engine="external", scratch_resources=disks)
     routed_file = directory / "routed profile.json"
     routed_file.write_text(json.dumps(routed_profile), encoding="utf-8")
     routed_inventory = directory / "routed inventory.plan"
@@ -1257,22 +1254,33 @@ def check_replot(binary, root, reference=None):
     assert observed["plots"][0]["harvester"] == "old-gh" and observed["network"]["target_route"] == "new-chia"
     routed_review = directory / "routed migration.plan"
     reviewed = json.loads(run("plan", routed_farm, "--replot", routed_inventory, "--harvester", routed_file,
-                              *options, "--save-plan", routed_review, "--json").stdout)
+                              *external_options, "--reclaim-before-bytes", observed["plots"][0]["identity"]["allocated_bytes"], "--save-plan", routed_review, "--json").stdout)
+    assert reviewed["feasible"] and reviewed["reclaim_before_bytes"] > 0
     before = snapshot(routed_farm)
-    run("fill", routed_review, *keys, *adapter, *options, code=2)
+    run("fill", routed_review, *keys, "--harvester", routed_file, *external_options, "--temp-capacity-bytes", 1, code=2)
+    assert snapshot(routed_farm) == before and not (routed_farm / "grow-replot.plan").exists()
+    target_fixture = Path(route_specs[1]["root"]) / "fixture.json"
+    target_original = target_fixture.read_bytes()
+    for change in ({"pool_difficulty": 16}, {"pool_protocol_version": 1}, {"pool_uninitialized": True}):
+        target_fixture.write_text(json.dumps({**json.loads(target_original), **change}), encoding="utf-8")
+        rejected_pool = run("fill", routed_review, *keys, "--harvester", routed_file, *external_options, code=2)
+        failure = (rejected_pool.stdout + rejected_pool.stderr).lower()
+        assert ("pool" in failure or (change.get("pool_uninitialized") and "integer" in failure)) and snapshot(routed_farm) == before
+    target_fixture.write_bytes(target_original)
+    run("fill", routed_review, *keys, *adapter, *external_options, code=2)
     assert snapshot(routed_farm) == before, "saved public route IDs authorized a missing local adapter profile"
     swapped = json.loads(json.dumps(routed_profile))
     swapped["farm_adapters"]["target_route"] = "old-gh"
     wrong_route = directory / "wrong route.json"
     wrong_route.write_text(json.dumps(swapped), encoding="utf-8")
-    run("fill", routed_review, *keys, "--harvester", wrong_route, *options, code=2)
+    run("fill", routed_review, *keys, "--harvester", wrong_route, *external_options, code=2)
     assert snapshot(routed_farm) == before, "changed target route wrote before rejecting the saved binding"
     uncovered = json.loads(json.dumps(routed_profile))
     uncovered["farm_adapters"]["routes"][0]["source_roots"] = []
     wrong_route.write_text(json.dumps(uncovered), encoding="utf-8")
-    run("fill", routed_review, *keys, "--harvester", wrong_route, *options, code=2)
+    run("fill", routed_review, *keys, "--harvester", wrong_route, *external_options, code=2)
     assert snapshot(routed_farm) == before, "missing source route wrote before rejection"
-    run("fill", routed_review, *keys, "--harvester", routed_file, *options,
+    run("fill", routed_review, *keys, "--harvester", routed_file, *external_options,
         point="replot-replacement-published", code=86)
     routed_final = Path(reviewed["batches"][0]["path"])
     routed_hash = digest(routed_final)
@@ -1280,16 +1288,213 @@ def check_replot(binary, root, reference=None):
     original_fixture = old_fixture.read_bytes()
     try:
         old_fixture.write_text(json.dumps({"roots": [str(routed_farm)], "version": "fixture-gh-v1"}), encoding="utf-8")
-        doubled = run("fill", routed_review, "--harvester", routed_file, *options, code=2)
+        doubled = run("fill", routed_review, "--harvester", routed_file, *external_options, code=2)
         assert "outside the reviewed reader/catalog scope" in doubled.stdout + doubled.stderr
         assert routed_source.exists() and digest(routed_final) == routed_hash
     finally:
         old_fixture.write_bytes(original_fixture)
-    run("fill", routed_review, "--harvester", routed_file, *options)
+    run("fill", routed_review, "--harvester", routed_file, *external_options)
     routed_final = Path(reviewed["batches"][0]["path"])
     assert not routed_source.exists() and digest(routed_final) == replacement_hash
     assert (routed_farm / "grow-farm.plan").is_file()
-    print("PASS distinct source/target adapters and missing/swapped route rejection before writes", flush=True)
+    print("PASS distinct source/target adapters, initialized RewardPuzzle v2 pooling, external positive credit and reviewed difficulty/protocol gates", flush=True)
+
+    # Resource-only bootstrap: actual disk space is ample. Complete serialized
+    # CPU envelopes fit separately; their simultaneous response does not fit.
+    resource_farm = directory / "resource-only migration"
+    resource_farm.mkdir()
+    resource_source = resource_farm / "legacy.plot"
+    resource_source.write_bytes(legacy)
+    resource_reader = directory / "resource-only reader"
+    (resource_reader / "config").mkdir(parents=True)
+    (resource_reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+    (resource_reader / "fixture.json").write_text(json.dumps({"roots": [str(resource_farm)]}), encoding="utf-8")
+    resource_adapter = ["--chia-root", resource_reader, "--chia-executable", executable]
+    resource_inventory = directory / "resource-only inventory.plan"
+    resource_catalog = json.loads(run("plan", "--inventory", resource_farm, *resource_adapter,
+                                      "--save-plan", resource_inventory, "--json").stdout)
+    resource_profile = json.loads(json.dumps(profile))
+    for workload in resource_profile["farm_resources"]["workloads"]:
+        for use in workload["uses"]:
+            if use["resource"] == cpu:
+                use.update(quality_us=10000000, proof_us=10000000)
+    for phase in ("construction", "verification"):
+        for demand in resource_profile["farm_resources"]["native"][phase]:
+            if demand["resource"] == cpu:
+                demand["work_us"] = 55000000
+    resource_file = directory / "resource-only profile.json"
+    resource_file.write_text(json.dumps(resource_profile), encoding="utf-8")
+    before = snapshot(resource_farm)
+    refused = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
+                            *resource_adapter, *options, "--json", code=2).stdout)
+    assert not refused["feasible"] and any("response-deadline-exceeded" in reason for reason in refused["infeasibility_reasons"])
+    resource_credit = resource_catalog["plots"][0]["identity"]["allocated_bytes"]
+    resource_review = directory / "resource-only migration.plan"
+    reviewed_resource = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
+                                      *resource_adapter, *options, "--reclaim-before-bytes", resource_credit,
+                                      "--save-plan", resource_review, "--json").stdout)
+    assert reviewed_resource["feasible"] and snapshot(resource_farm) == before
+    import shutil
+    assert shutil.disk_usage(resource_farm).free > ram + 256 * mib, "resource-only fixture unexpectedly depends on disk pressure"
+    resource_final = Path(reviewed_resource["batches"][0]["path"])
+    run("fill", resource_review, "--harvester", resource_file, *resource_adapter, *options, *keys,
+        point="replot-source-unlinked", code=86)
+    assert not resource_source.exists() and not resource_final.exists()
+    assert not list(resource_farm.glob(".xchplot2-stage-*.building")), "resource-only predelete followed construction instead of enabling it"
+    run("fill", resource_review, "--harvester", resource_file, *resource_adapter, *options)
+    assert digest(resource_final) == replacement_hash and (resource_farm / "grow-farm.plan").is_file()
+    proof = run("verify", resource_final, "--full", "--trials", 100)
+    found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
+    assert found and int(found[1]) > 0
+    print("PASS resource-only predelete despite ample disk, exact source unload, post-unlink recovery, byte parity and full proofs", flush=True)
+
+    # Key-free review does not prescribe NFT versus OG. Once prepared, keys
+    # are immutable, as checked above; a first preparation may choose OG.
+    og_farm = directory / "OG migration"
+    og_farm.mkdir()
+    og_source = og_farm / "legacy.plot"
+    og_source.write_bytes(legacy)
+    og_reader = directory / "OG reader"
+    (og_reader / "config").mkdir(parents=True)
+    (og_reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+    (og_reader / "fixture.json").write_text(json.dumps({"roots": [str(og_farm)]}), encoding="utf-8")
+    og_adapter = ["--chia-root", og_reader, "--chia-executable", executable]
+    og_inventory = directory / "OG inventory.plan"
+    run("plan", "--inventory", og_farm, *og_adapter, "--save-plan", og_inventory, "--json")
+    og_review = directory / "OG migration.plan"
+    reviewed_og = json.loads(run("plan", og_farm, "--replot", og_inventory, "--harvester", profile_file,
+                                *og_adapter, *options, "--save-plan", og_review, "--json").stdout)
+    run("fill", og_review, "--harvester", profile_file, *og_adapter, *options,
+        "-f", FARMER, "--pool-pk", FARMER, "-S", SEED)
+    og_final = Path(reviewed_og["batches"][0]["path"])
+    assert not og_source.exists() and len(header(og_final)[5]) == 256
+    proof = run("verify", og_final, "--full", "--trials", 100)
+    found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
+    assert found and int(found[1]) > 0
+    print("PASS first preparation OG route, truthful loaded key metadata and full proofs", flush=True)
+
+    # A real saved pool and embedded CPU executor use the same migration
+    # controller. These declared protocol fixtures do not measure farm load.
+    cpus = len(os.sched_getaffinity(0))
+    if cpus < 4:
+        print("SKIP protected compute migration: insufficient inherited CPU lanes for the complete concurrent fixture reservations", flush=True)
+        return
+    compute_farm = directory / "compute migration"
+    compute_farm.mkdir()
+    compute_source = compute_farm / "legacy.plot"
+    compute_source.write_bytes(legacy)
+    compute_reader = directory / "compute reader"
+    (compute_reader / "config").mkdir(parents=True)
+    (compute_reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+    (compute_reader / "fixture.json").write_text(json.dumps({"roots": [str(compute_farm)],
+                                                            "plot_public_key": COMPUTE_FARMING_PLOT_KEY}), encoding="utf-8")
+    compute_adapter = ["--chia-root", compute_reader, "--chia-executable", executable]
+    compute_inventory = directory / "compute inventory.plan"
+    compute_catalog = json.loads(run("plan", "--inventory", compute_farm, *compute_adapter,
+                                     "--save-plan", compute_inventory, "--json").stdout)
+    membership = directory / "migration compute membership"
+    run("compute", "init", "--directory", membership, "--name", "protected migration fixture")
+    # Leave saved caps unset so the explicit offers below reach the reviewed
+    # physical envelope rather than being clipped by membership defaults.
+    run("compute", "configure", "--directory", membership, "--interface", "lo", "--discovery", "off",
+        "--backend", "cpu", "--cpus", 0, "--host-bytes", 0, "--max-brokers", 16)
+    import ssl
+    credentials = membership / "credentials.pem"
+    if not credentials.exists():
+        credentials = membership / "cert.pem"
+    certificate = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                            credentials.read_text(encoding="utf-8"), re.S).group()
+    identity = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).hexdigest()
+    compute_profile = json.loads(json.dumps(profile))
+    compute_resources = compute_profile["farm_resources"]
+    for resource in compute_resources["resources"]:
+        if resource["kind"] == "cpu":
+            resource["capacity"] = cpus
+    for workload, current in zip(compute_resources["workloads"], compute_catalog["farm_resources"]["workloads"]):
+        workload.update(id=current["id"], plot_count=current["plot_count"])
+    native = compute_resources["native"]
+    native.update(engine="external", max_ram_bytes=2 * ram, max_batch_members=2, max_group_members=2,
+                  scratch_resources=disks, construction=demands(2 * ram + 64 * mib, phase_cpu),
+                  verification=demands(2 * ram + 64 * mib, phase_cpu),
+                  compute_owner_identity=identity, compute_broker_identity=identity, compute_broker_host=compute_catalog["host"])
+    native["compute_services"] = demands(192 * mib)
+    native["compute_services"][-1].update(resident_units=128 * mib, transient_units=64 * mib)
+    native["compute_workers"] = [{"tls_identity": identity, "host": compute_catalog["host"], "gpu_identity": "",
+                                  "cpu_threads": 2, "slots": 1, "host_bytes": ram // 2, "gpu_bytes": 0,
+                                  "standing_host_bytes": 256 * mib, "standing_gpu_bytes": 0,
+                                  "allowed_kinds": ["generate-cpu", "encode"],
+                                  "reservation": [{"resource": cpu, "reserved_units": 2, "bounded": True},
+                                                  {"resource": memory, "resident_units": 256 * mib,
+                                                   "transient_units": ram // 2 - 256 * mib, "bounded": True}]}]
+    compute_file = directory / "protected compute profile.json"
+    compute_file.write_text(json.dumps(compute_profile), encoding="utf-8")
+    compute_options = list(external_options)
+    for key, value in (("--compute", "auto"), ("--group-members", 2), ("--max-total-members", 2),
+                       ("--batch-members", 2), ("-M", 2 * ram), ("--capacity-bytes", 2 * ram + 256 * mib)):
+        compute_options[compute_options.index(key) + 1] = value
+    compute_options += ["--compute-directory", membership, "--compute-owner-id", "protected-migration-owner",
+                        "--compute-offer-ram", "1G", "--compute-offer-cpus", 2, "--compute-offer-slots", 1,
+                        "--compute-offer-backend", "cpu", "--compute-codec-ram", "64M", "--compute-inflight", 1,
+                        "--compute-timeout-ms", 120000]
+    ordinary = directory / "ordinary shared scheduler"
+    ordinary.mkdir()
+    refused_ordinary = run("plan", ordinary, *compute_options, "--json", code=2)
+    assert "local compute offer must leave cpu capacity" in (refused_ordinary.stdout + refused_ordinary.stderr).lower()
+    assert not list(ordinary.iterdir()), "ordinary shared-scheduler refusal changed its destination"
+    compute_review = directory / "protected compute.plan"
+    before = snapshot(compute_farm)
+    uncovered_profile = json.loads(json.dumps(compute_profile))
+    for field in ("compute_owner_identity", "compute_broker_identity", "compute_broker_host", "compute_services", "compute_workers"):
+        uncovered_profile["farm_resources"]["native"].pop(field)
+    uncovered_file = directory / "uncovered compute profile.json"
+    uncovered_file.write_text(json.dumps(uncovered_profile), encoding="utf-8")
+    uncovered = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", uncovered_file,
+                              *compute_adapter, *compute_options, "--json", code=2).stdout)
+    assert not uncovered["feasible"] and any("compute requires reviewed" in reason for reason in uncovered["infeasibility_reasons"])
+    assert snapshot(compute_farm) == before
+    compute_credit = compute_catalog["plots"][0]["identity"]["allocated_bytes"]
+    reviewed_compute = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", compute_file,
+                                     *compute_adapter, *compute_options, "--reclaim-before-bytes", compute_credit,
+                                     "--save-plan", compute_review, "--json").stdout)
+    assert reviewed_compute["feasible"] and reviewed_compute["native_request"]["compute_enabled"] and snapshot(compute_farm) == before
+    huge_offer = list(compute_options)
+    huge_offer[huge_offer.index("--compute-offer-cpus") + 1] = 1025
+    refused_huge = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *huge_offer, *keys, code=2)
+    assert "local compute offer exceeds CPU or slot bounds" in refused_huge.stdout + refused_huge.stderr
+    assert snapshot(compute_farm) == before and not (compute_farm / "grow-replot.plan").exists()
+    bad_offer = list(compute_options)
+    bad_offer[bad_offer.index("--compute-offer-ram") + 1] = "2G"
+    refusal = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *bad_offer, *keys, code=2)
+    assert "local compute offer exceeds" in refusal.stdout + refusal.stderr
+    assert snapshot(compute_farm) == before and not (compute_farm / "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
+    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options, *keys,
+        point="replot-journal-all-staged", code=86)
+    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options,
+        point="replot-replacement-verified", code=86)
+    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options)
+    compute_final = Path(reviewed_compute["batches"][0]["path"])
+    assert not compute_source.exists() and header(compute_final)[3] == 2
+    proof = run("verify", compute_final, "--full", "--trials", 100)
+    found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
+    assert found and int(found[1]) > 0
+    if reference:
+        group, k, strength, count, meta, memo = header(compute_final)
+        raw_directory = directory / "compute reference fragments"
+        raw_directory.mkdir()
+        raw = []
+        for index in range(count):
+            path = raw_directory / f"{index}.plot2"
+            run("test", k, group, strength, index, meta, "--raw", "-m", memo, "-o", raw_directory, "-N", path.name)
+            raw.append(path)
+        inputs = raw_directory / "group.inputs"
+        inputs.write_text(f"{k} {strength} {meta} {group} {memo}\n" +
+                          "".join(json.dumps(str(path), ensure_ascii=False) + "\n" for path in raw), encoding="utf-8")
+        canonical = raw_directory / "canonical.gplot"
+        comparison = subprocess.run([str(reference), "assemble-only", str(inputs), str(canonical), "512"],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=180)
+        assert comparison.returncode == 0, (comparison.stdout, comparison.stderr)
+        assert digest(canonical) == digest(compute_final), "protected compute migration differs from the independent assembler"
+    print("PASS saved-pool protected migration, complete worker reservations, preclaim offer refusal, owner-key recovery, real multi-member contributions and full proofs", flush=True)
 
 
 def check_compute(binary, root):

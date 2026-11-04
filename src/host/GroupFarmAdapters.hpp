@@ -1,5 +1,5 @@
 // Observations from an explicitly selected installed harvester. The CLI uses
-// its configured private-CA client authentication; we only permit loopback RPC.
+// its configured private-CA client authentication and explicit local service bindings.
 #pragma once
 #include "host/GroupFarmInventory.hpp"
 #include "host/GroupFarmAdapterProcess.hpp"
@@ -7,16 +7,33 @@
 namespace group_grow::farm
 {
 enum class HarvesterAdapterKind { chia, gigahorse, drchia };
+struct FarmServiceBinding
+{
+    std::filesystem::path root;
+    std::string rpc_host, host, node_id, farmer_node_id;
+};
 struct HarvesterAdapterOptions
 {
     HarvesterAdapterKind kind = HarvesterAdapterKind::chia;
-    std::filesystem::path executable, root, checker;
-    std::string host, harvester, solver;
+    std::filesystem::path executable, root;
+    std::string host, harvester, solver, rpc_host;
+    std::map<std::string, FarmServiceBinding> services;
     // Private operation budget. The caller separately reserves retained
     // catalog/plan memory before offering this additional process/parse grant.
     InventoryLimits limits;
     uint64_t max_peak_age_seconds = 600;
 };
+inline std::map<std::string, std::string> target_service_hosts(HarvesterAdapterOptions const& options)
+{
+    std::map<std::string, std::string> result;
+    auto const local = profile_detail::host_name();
+    for (auto const* service : {"harvester", "farmer", "full_node", "solver"})
+    {
+        auto found = options.services.find(service);
+        result.emplace(service, found == options.services.end() ? (options.host.empty() ? local : options.host) : found->second.host);
+    }
+    return result;
+}
 struct FarmAdapterRoute
 {
     std::string id;
@@ -56,11 +73,25 @@ struct TargetServiceExpectation
 {
     std::string farmer_public_key, pool_public_key, pool_contract_puzzle_hash;
 };
+struct TargetPoolState
+{
+    std::string mode, pool_url, launcher_id, owner_public_key, target_puzzle_hash;
+    uint64_t protocol_version = 0, difficulty = 0, authentication_token_timeout = 0;
+    bool external = false;
+    bool operator==(TargetPoolState const&) const = default;
+};
+struct OtherHarvesterObservation
+{
+    std::string node_id, peer_host;
+    uint64_t files = 0, members = 0;
+};
 struct TargetPrerequisites
 {
     bool ready = false;
     NetworkProjection observed;
     std::string reason, pool_mode;
+    TargetPoolState pool;
+    std::vector<OtherHarvesterObservation> other_harvesters;
 };
 inline uint64_t target_readiness_supervision_bytes(InventoryLimits const& limits)
 {
@@ -86,13 +117,6 @@ struct SourceRetirementObservation
     std::string source, captured_at, reason;
     std::chrono::steady_clock::time_point observed;
 };
-struct NativeCheckObservation
-{
-    bool completed = false, identity_verified = false;
-    uint64_t successes = 0, failures = 0, requested_samples = 0, wall_ms = 0;
-    std::string source, captured_at, status, reason, checker_identity;
-    InventoryFileIdentity identity;
-};
 namespace adapter_detail
 {
 using inventory_detail::require;
@@ -102,6 +126,21 @@ inline std::string hex_string(Json const& value, size_t bytes)
     auto text = profile_detail::text(value); if (text.starts_with("0x")) text.erase(0, 2);
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
     require(inventory_detail::hex(text, bytes), "native farm adapter returned an invalid public identifier"); return text;
+}
+// Canonical bounded public RPC projection, including loaded population and
+// failure lists. Retain only its digest between the phase's capture/final fence.
+inline std::string registry_identity(Json const& document)
+{
+    struct sha256 hash; sha256_init(&hash);
+    auto append = [&](std::string_view value) { sha256_update(&hash, value.data(), value.size()); };
+    auto visit = [&](auto&& self, Json const& value) -> void
+    {
+        append(std::to_string(int(value.kind))); append(":"); append(std::to_string(value.scalar.size())); append(":"); append(value.scalar);
+        for (auto const& [key, child] : value.fields)
+        { append(std::to_string(key.size())); append(":"); append(key); self(self, child); }
+        append("["); for (auto const& child : value.items) self(self, child); append("]");
+    };
+    visit(visit, document); std::array<uint8_t, 32> digest{}; sha256_sum(&hash, digest.data()); return group_tools::hex(digest);
 }
 inline std::string version(Json const& value)
 { return inventory_detail::string(value, "version"); }
@@ -145,12 +184,13 @@ inline std::string implementation_identity(std::filesystem::path const& path, In
 }
 class Session
 {
-    HarvesterAdapterOptions const& options_;
+    HarvesterAdapterOptions options_;
     std::chrono::steady_clock::time_point until_;
     inventory_detail::RootHandle root_;
     inventory_detail::SourceHandle config_;
     stream_state::Stamp config_stamp_, executable_stamp_;
     std::string config_digest_, reader_identity_;
+    std::map<std::string, std::unique_ptr<Session>> services_;
 public:
     explicit Session(HarvesterAdapterOptions const& options)
         : options_(options), until_(calibration_process::deadline(options.limits.timeout_ms)), root_(options.root), config_(root_, "config/config.yaml")
@@ -168,10 +208,28 @@ public:
         }
         config_digest_ = stream_state::digest(contents); std::istringstream input(contents);
         auto parsed = profile_detail::read_chia_config(input, options.limits.memory_bytes / 4);
-        require(parsed.local_rpc && parsed.workers.has_value(), "native farm adapter requires conventional loopback self_hostname/harvester configuration");
+        require(parsed.workers.has_value() && (parsed.local_rpc || (!options.rpc_host.empty() && parsed.rpc_hostname == options.rpc_host && !options.host.empty())),
+            "native farm adapter requires conventional configuration and an explicit host binding for authenticated remote RPC");
+        require(options.rpc_host.empty() || parsed.rpc_hostname == options.rpc_host, "configured native RPC host differs from its local service binding");
         executable_stamp_ = stream_state::stamp(options.executable);
         reader_identity_ = stream_state::digest(file_io::path_text(options.executable) + '\n' +
-            implementation_identity(options.executable, options.limits, until_) + '\n' + file_io::path_text(root_.path) + '\n' + config_digest_);
+            implementation_identity(options.executable, options.limits, until_) + '\n' + file_io::path_text(root_.path) + '\n' + config_digest_ + '\n' + options.rpc_host + '\n' + options.host);
+        std::string bindings;
+        for (auto const& [service, binding] : options.services)
+        {
+            require(service == "harvester" || service == "farmer" || service == "full_node" || service == "solver", "unsupported native service binding");
+            require(!binding.host.empty() && !binding.rpc_host.empty() && binding.root.is_absolute(), "native service binding lacks its explicit RPC/resource host or local config root");
+            bindings += service + '\n' + binding.node_id + '\n' + binding.farmer_node_id + '\n' + binding.host + '\n';
+            if (service == "harvester")
+            {
+                require(binding.root == options.root && binding.rpc_host == parsed.rpc_hostname && binding.host == options.host, "harvester service binding differs from the selected reader context");
+                continue;
+            }
+            auto child = options; child.services.clear(); child.root = binding.root; child.rpc_host = binding.rpc_host; child.host = binding.host;
+            auto context = std::make_unique<Session>(child); bindings += context->reader_identity() + '\n';
+            services_.emplace(service, std::move(context));
+        }
+        if (!bindings.empty()) reader_identity_ = stream_state::digest(reader_identity_ + '\n' + bindings);
         unchanged();
     }
     void running() const
@@ -179,21 +237,49 @@ public:
     void unchanged() const
     {
         running();
+        for (auto const& [service, context] : services_) { (void)service; context->unchanged(); }
         require(inventory_detail::stamp(inventory_detail::stat(config_.handle)) == config_stamp_ &&
             stream_state::stamp(options_.root / "config" / "config.yaml") == config_stamp_ &&
             stream_state::stamp(options_.executable) == executable_stamp_, "native farm adapter executable or configuration changed");
     }
     Json rpc(AdapterOperation operation, uint32_t height = 0)
     {
-        unchanged(); auto const remaining = std::chrono::duration_cast<std::chrono::milliseconds>(until_ - std::chrono::steady_clock::now()).count();
+        unchanged();
+        char const* service = "harvester";
+        switch (operation)
+        {
+        case AdapterOperation::full_node_version: case AdapterOperation::full_node_network: case AdapterOperation::full_node_constants:
+        case AdapterOperation::full_node_state: case AdapterOperation::full_node_block_record: case AdapterOperation::full_node_connections: service = "full_node"; break;
+        case AdapterOperation::farmer_version: case AdapterOperation::farmer_network: case AdapterOperation::farmer_connections:
+        case AdapterOperation::farmer_harvesters: case AdapterOperation::farmer_harvesters_summary: case AdapterOperation::farmer_pool_state: service = "farmer"; break;
+        case AdapterOperation::solver_version: case AdapterOperation::solver_network: case AdapterOperation::solver_connections: case AdapterOperation::solver_state: service = "solver"; break;
+        default: break;
+        }
+        if (auto found = services_.find(service); found != services_.end()) return found->second->rpc(operation, height);
+        auto const remaining = std::chrono::duration_cast<std::chrono::milliseconds>(until_ - std::chrono::steady_clock::now()).count();
         require(remaining > 0, "native farm adapter deadline expired");
         AdapterCommand command; command.operation = operation; command.root = options_.root; command.executable = options_.executable;
         command.height = height;
+        // DrChia's published Chia 2.2-based RPC exposes no get_version.
+        // Record CLI implementation provenance honestly; get_plots supplies
+        // the fresh authoritative public metadata, not a made-up version RPC.
+        if (operation == AdapterOperation::harvester_version && options_.kind == HarvesterAdapterKind::drchia)
+            command.operation = AdapterOperation::reader_cli_version;
         // Reserve parent capture/JSON structure separately from the child OS cap.
         calibration_process::Limits limits{options_.limits.memory_bytes / 2, std::min(uint64_t(remaining), options_.limits.timeout_ms),
             std::min(options_.limits.max_output_bytes, options_.limits.memory_bytes / 64), options_.limits.cancelled};
         auto result = run_farm_adapter(command, limits);
         require(result.exit_code == 0, "native farm RPC failed (native output withheld)"); unchanged();
+        if (command.operation == AdapterOperation::reader_cli_version)
+        {
+            auto text = std::string_view(result.output);
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
+            require(!text.empty() && text.size() <= 128 && text.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+_-") == text.npos,
+                "native reader CLI returned invalid version provenance (output withheld)");
+            Json parsed; parsed.kind = Json::object; Json success; success.kind = Json::boolean; success.scalar = "true";
+            Json version; version.kind = Json::string; version.scalar = "cli:" + std::string(text);
+            parsed.fields.emplace("success", std::move(success)); parsed.fields.emplace("version", std::move(version)); return parsed;
+        }
         auto parsed = profile_detail::JsonReader(result.output, options_.limits.memory_bytes / 8, options_.limits.memory_bytes / 4096).read();
         auto const* success = profile_detail::field(parsed, "success");
         require(success && profile_detail::boolean(*success), "native farm RPC did not report success"); return parsed;
@@ -206,6 +292,7 @@ public:
     void begin_inventory_files(uint64_t entries)
     {
         unchanged(); until_ = inventory_detail::catalog_deadline(options_.limits, entries);
+        for (auto& [service, context] : services_) { (void)service; context->begin_inventory_files(entries); }
     }
     InventoryLimits remaining_limits() const
     {
@@ -317,16 +404,20 @@ inline std::vector<ServiceConnection> service_connections(Session& session, Adap
     return result;
 }
 inline std::pair<ServiceConnection, ServiceConnection> service_pair(std::vector<ServiceConnection> const& first,
-    std::vector<ServiceConnection> const& second, uint64_t first_role, uint64_t second_role, bool allow_first_unadvertised = false)
+    std::vector<ServiceConnection> const& second, uint64_t first_role, uint64_t second_role, bool allow_first_unadvertised = false,
+    std::string const& first_peer = {}, std::string const& second_peer = {})
 {
     std::optional<std::pair<ServiceConnection, ServiceConnection>> result;
+    require(first_peer.empty() == second_peer.empty(), "native peer identity binding must identify both sides of a service link");
     for (auto const& a : first) for (auto const& b : second)
-        if (a.type == second_role && b.type == first_role && !loopback_peer(a.host).empty() && loopback_peer(a.host) == loopback_peer(b.host) &&
-            a.server && (b.server || allow_first_unadvertised) && a.local == b.server && b.local == a.server)
+        if (a.type == second_role && b.type == first_role &&
+            (first_peer.empty() ? (!loopback_peer(a.host).empty() && loopback_peer(a.host) == loopback_peer(b.host) &&
+                a.server && (b.server || allow_first_unadvertised) && a.local == b.server && b.local == a.server) :
+                (a.node == first_peer && b.node == second_peer)))
         {
-            require(!result, "target local service connection pairing is ambiguous"); result = std::pair{a, b};
+            require(!result, "target service connection pairing is ambiguous"); result = std::pair{a, b};
         }
-    require(result.has_value(), "target harvester/farmer/full-node/solver lack a matched active local peer connection"); return *result;
+    require(result.has_value(), "target services lack a matched active peer connection; remote links require explicit reciprocal TLS node identities"); return *result;
 }
 inline void service_network(Session& session, AdapterOperation operation, NetworkProjection const& reviewed)
 {
@@ -342,23 +433,55 @@ class TargetServices
     Json const* receiver_ = nullptr;
     std::array<ServiceConnection, 3> farmer_links_;
     long double generation_ = 0;
-    std::string pool_hash_, farmer_version_, solver_version_;
+    struct ReceiverGeneration { std::string host; uint64_t port = 0, files = 0; long double generation = 0; };
+    std::map<std::string, ReceiverGeneration> other_generations_;
+    std::string pool_hash_, pool_key_, farmer_version_, solver_version_, reviewed_network_;
     void pool_route()
     {
+        if (!pool_key_.empty()) { pool.mode = "og-public-key-route"; pool_mode = pool.mode; return; }
         auto response = session_.rpc(AdapterOperation::farmer_pool_state); auto const& pools = inventory_detail::required_field(response, "pool_state");
         require(pools.kind == Json::array && pools.items.size() <= 128, "target farmer pool-state view exceeds its bound");
-        bool selected = false;
+        bool selected = false; TargetPoolState observed;
         for (auto const& row : pools.items)
         {
             session_.running(); auto const id = hex_string(inventory_detail::required_field(row, "p2_singleton_puzzle_hash"), 32);
             if (id != pool_hash_) continue;
-            require(!selected, "target farmer reports duplicate NFT pool routes"); selected = true;
+            require(!selected, "target farmer reports duplicate pool-contract routes"); selected = true;
             auto const& config = inventory_detail::required_field(row, "pool_config");
-            require(hex_string(inventory_detail::required_field(config, "p2_singleton_puzzle_hash"), 32) == id, "target farmer NFT pool route is inconsistent");
-            require(inventory_detail::string(config, "pool_url").empty(),
-                "external pooled target execution is unsupported: the available RPC cannot establish exact PoS2 acceptance");
+            require(hex_string(inventory_detail::required_field(config, "p2_singleton_puzzle_hash"), 32) == id, "target farmer pool-contract route is inconsistent");
+            observed.pool_url = inventory_detail::string(config, "pool_url");
+            inventory_detail::bounded_text(observed.pool_url, 2048);
+            auto const* version = profile_detail::field(config, "version"); observed.protocol_version = version ? profile_detail::integer(*version) : 1;
+            require(observed.protocol_version == 1 || observed.protocol_version == 2, "target farmer reports an unsupported pooling protocol version");
+            // These are public pool route fields in both Plot NFT and
+            // RewardPuzzle v2. They identify the route, not the auth secret.
+            observed.launcher_id = hex_string(inventory_detail::required_field(config, "launcher_id"), 32);
+            observed.owner_public_key = hex_string(inventory_detail::required_field(config, "owner_public_key"), 48);
+            observed.target_puzzle_hash = hex_string(inventory_detail::required_field(config, "target_puzzle_hash"), 32);
+            observed.external = !observed.pool_url.empty();
+            observed.mode = observed.external ? "configured-external-pool" : "configured-self-pooling";
+            if (observed.external)
+            {
+                require(observed.pool_url.starts_with("https://") || (reviewed_network_ != "mainnet" && observed.pool_url.starts_with("http://")),
+                    "target farmer pool URL does not satisfy its network transport policy");
+                observed.difficulty = inventory_detail::integer(row, "current_difficulty");
+                observed.authentication_token_timeout = inventory_detail::integer(row, "authentication_token_timeout");
+                require(observed.difficulty && observed.authentication_token_timeout && observed.authentication_token_timeout <= 255,
+                    "target farmer has not initialized pool difficulty/authentication parameters");
+                // Upstream initializes difficulty from public pool_info. Its
+                // update schedule and counters do not attest registration or
+                // possession of a current v2 bearer token. No partial from a
+                // particular file, startup partial or arbitrary age is required.
+            }
         }
-        require(selected, "target farmer has no configured self-pooling NFT matching the supplied pool-contract hash");
+        require(selected, "target farmer has no configured route matching the supplied pool-contract hash");
+        if (!pool.mode.empty())
+        {
+            auto previous = pool; previous.difficulty = observed.difficulty;
+            previous.authentication_token_timeout = observed.authentication_token_timeout;
+            require(previous == observed, "target pool route or protocol changed during readiness observation");
+        }
+        pool = std::move(observed); pool_mode = pool.mode;
     }
     Json const& receiver(Json const& response) const
     {
@@ -369,24 +492,27 @@ class TargetServices
         {
             session_.running(); auto const& connection = inventory_detail::required_field(row, "connection");
             if (hex_string(inventory_detail::required_field(connection, "node_id"), 32) != farmer_links_[0].node) continue;
-            require(!found && loopback_peer(inventory_detail::string(connection, "host")) == loopback_peer(farmer_links_[0].host) &&
+            auto const host = inventory_detail::string(connection, "host");
+            require(!found && (host == farmer_links_[0].host || (!loopback_peer(host).empty() && loopback_peer(host) == loopback_peer(farmer_links_[0].host))) &&
                 inventory_detail::integer(connection, "port") == farmer_links_[0].peer,
                 "target farmer receiver differs from its matched live harvester connection"); found = &row;
         }
-        require(found, "target farmer has no synchronized receiver for the connected local harvester");
+        require(found, "target farmer has no synchronized receiver for the connected selected harvester");
         require(inventory_detail::required_field(*found, "syncing").kind == Json::null, "target farmer harvester synchronization is still in progress");
         (void)service_time(*found, "last_sync_time", true); return *found;
     }
 public:
-    std::string pool_mode = "configured-self-pooling-nft";
+    std::string pool_mode;
+    TargetPoolState pool;
+    std::vector<OtherHarvesterObservation> other_harvesters;
     TargetServices(Session& session, HarvesterAdapterOptions const& options, NetworkProjection const& reviewed,
         NetworkProjection& observed, TargetServiceExpectation const& expected) : session_(session)
     {
-        pool_hash_ = expected.pool_contract_puzzle_hash; farmer_version_ = reviewed.farmer_version; solver_version_ = reviewed.solver_version;
-        require(options.kind == HarvesterAdapterKind::chia, "protected target readiness requires the supported local official Chia service interfaces");
+        pool_hash_ = expected.pool_contract_puzzle_hash; pool_key_ = expected.pool_public_key; reviewed_network_ = reviewed.network;
+        farmer_version_ = reviewed.farmer_version; solver_version_ = reviewed.solver_version;
         require(inventory_detail::hex(expected.farmer_public_key, 48), "target service prerequisite requires the supplied public farmer key");
-        require(expected.pool_public_key.empty(), "OG pool-public-key target execution is unsupported: live pool signing-key readiness is not exposed by the supported RPC");
-        require(inventory_detail::hex(expected.pool_contract_puzzle_hash, 32), "target service prerequisite requires one public pool-contract route");
+        require(expected.pool_public_key.empty() != expected.pool_contract_puzzle_hash.empty(), "target service prerequisite requires exactly one public pool route");
+        require(pool_key_.empty() ? inventory_detail::hex(pool_hash_, 32) : inventory_detail::hex(pool_key_, 48), "target public pool route is invalid");
         require(!reviewed.farmer_version.empty() && !reviewed.solver_version.empty(), "target farmer/solver versions were not observed during review; refresh inventory and migration review with these services available");
         observed.farmer_version = version(session.rpc(AdapterOperation::farmer_version)); observed.solver_version = version(session.rpc(AdapterOperation::solver_version));
         require(observed.farmer_version == reviewed.farmer_version && observed.solver_version == reviewed.solver_version,
@@ -398,9 +524,19 @@ public:
         auto solver = service_connections(session, AdapterOperation::solver_connections);
         // NodeType values and advertised-port semantics are from the pinned
         // Chia peer protocol. Farmer TLS identities can differ by channel.
-        farmer_links_[0] = service_pair(harvester, farmer, 2, 3, true).second;
-        farmer_links_[1] = service_pair(farmer, node, 3, 1).first;
-        farmer_links_[2] = service_pair(farmer, solver, 3, 8).first;
+        auto pair = [&](auto const& first, auto const& second, uint64_t first_role, uint64_t second_role, char const* service, bool reverse = false)
+        {
+            auto found = options.services.find(service);
+            if (found == options.services.end()) return service_pair(first, second, first_role, second_role, reverse);
+            auto const& binding = found->second;
+            require(inventory_detail::hex(binding.node_id, 32) && inventory_detail::hex(binding.farmer_node_id, 32),
+                "explicit service link requires reciprocal reviewed TLS node identities");
+            return service_pair(first, second, first_role, second_role, reverse,
+                reverse ? binding.farmer_node_id : binding.node_id, reverse ? binding.node_id : binding.farmer_node_id);
+        };
+        farmer_links_[0] = pair(harvester, farmer, 2, 3, "harvester", true).second;
+        farmer_links_[1] = pair(farmer, node, 3, 1, "full_node").first;
+        farmer_links_[2] = pair(farmer, solver, 3, 8, "solver").first;
         {
             auto state = session.rpc(AdapterOperation::solver_state);
             require(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver has not completed startup");
@@ -413,9 +549,29 @@ public:
         {
             auto const& plots = inventory_detail::required_field(row, "plots");
             require(plots.kind == Json::array && plots.items.size() <= options.limits.max_files, "target farmer plot view exceeds its bound");
-            require(&row == receiver_ || plots.items.empty(), "another farmer-side harvester has loaded work outside the reviewed local target scope");
+            if (&row == receiver_) continue;
+            require(inventory_detail::required_field(row, "syncing").kind == Json::null,
+                "another harvester synchronization is incomplete; even an empty partial view has unknown workload");
+            (void)service_time(row, "last_sync_time", true);
+            if (plots.items.empty()) continue;
+            auto const& connection = inventory_detail::required_field(row, "connection");
+            OtherHarvesterObservation other;
+            other.node_id = hex_string(inventory_detail::required_field(connection, "node_id"), 32);
+            other.peer_host = inventory_detail::string(connection, "host"); other.files = plots.items.size();
+            for (auto const& plot : plots.items)
+            {
+                auto const size = inventory_detail::integer(plot, "size");
+                auto const members = (size & 0x80) ? inventory_detail::integer(plot, "group_size") : 1;
+                require(size <= 255 && members && members <= 65535 && members <= UINT64_MAX - other.members,
+                    "other harvester reports unsupported member population");
+                other.members += members;
+            }
+            require(other_generations_.emplace(other.node_id, ReceiverGeneration{other.peer_host,
+                inventory_detail::integer(connection, "port"), other.files, service_time(row, "last_sync_time", true)}).second,
+                "target farmer reports duplicate harvester receivers");
+            other_harvesters.push_back(std::move(other));
         }
-        observed.service_status = "live local farmer/node/solver and configured self-pooling NFT prerequisites observed";
+        observed.service_status = "live farmer/node/solver, completed selected-harvester sync and public pool route observed; signing-key possession and external pool authentication/acceptance are not exposed by these RPCs";
     }
     TargetServices(TargetServices const&) = delete;
     TargetServices& operator=(TargetServices const&) = delete;
@@ -429,9 +585,24 @@ public:
             auto summary = session_.rpc(AdapterOperation::farmer_harvesters_summary);
             auto const& selected = receiver(summary);
             require(service_time(selected, "last_sync_time", true) == generation_, "target farmer synchronization generation changed during the readiness snapshot");
+            size_t observed = 0;
             for (auto const& row : inventory_detail::required_field(summary, "harvesters").items)
-                require(&row == &selected || inventory_detail::integer(row, "plots") == 0,
-                    "another farmer-side harvester acquired loaded work during readiness observation");
+            {
+                if (&row == &selected) continue;
+                require(inventory_detail::required_field(row, "syncing").kind == Json::null,
+                    "another harvester began synchronization during readiness observation; its workload is unknown");
+                (void)service_time(row, "last_sync_time", true);
+                auto const files = inventory_detail::integer(row, "plots"); if (!files) continue;
+                auto const& connection = inventory_detail::required_field(row, "connection");
+                auto const id = hex_string(inventory_detail::required_field(connection, "node_id"), 32);
+                auto found = other_generations_.find(id);
+                require(found != other_generations_.end() && found->second.files == files &&
+                    found->second.host == inventory_detail::string(connection, "host") && found->second.port == inventory_detail::integer(connection, "port") &&
+                    found->second.generation == service_time(row, "last_sync_time", true),
+                    "another harvester's observed workload changed during readiness observation");
+                ++observed;
+            }
+            require(observed == other_generations_.size(), "another harvester receiver disappeared during readiness observation");
         }
         {
             auto state = session_.rpc(AdapterOperation::solver_state);
@@ -468,7 +639,7 @@ inline FarmAdapterTable parse_farm_adapters(profile_detail::Json const& document
     };
     for (auto const& value : routes.items)
     {
-        shape(value, {"id", "kind", "root", "executable", "checker", "source_roots"});
+        shape(value, {"id", "kind", "root", "executable", "source_roots", "host", "services"});
         FarmAdapterRoute route; route.id = string(value, "id");
         require(!route.id.empty() && route.id.size() <= 128 && route.id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == route.id.npos &&
             ids.insert(route.id).second, "invalid or duplicate local farm adapter route ID");
@@ -478,9 +649,6 @@ inline FarmAdapterTable parse_farm_adapters(profile_detail::Json const& document
         else if (kind == "drchia") route.options.kind = HarvesterAdapterKind::drchia;
         else throw std::runtime_error("unsupported local farm adapter kind");
         route.options.root = path(string(value, "root")); route.options.executable = path(string(value, "executable"));
-        if (auto const* checker = profile_detail::field(value, "checker")) route.options.checker = path(profile_detail::text(*checker));
-        require(route.options.checker.empty() || route.options.kind == HarvesterAdapterKind::gigahorse,
-            "only the supported Gigahorse adapter accepts a native checker");
         auto const& sources = required_field(value, "source_roots");
         require(sources.kind == profile_detail::Json::array && sources.items.size() <= limits.max_roots, "local source route mapping exceeds its bound");
         for (auto const& source : sources.items)
@@ -489,6 +657,24 @@ inline FarmAdapterTable parse_farm_adapters(profile_detail::Json const& document
             require(roots.insert(normalized).second, "ambiguous local farm source root routing"); route.source_roots.push_back(std::move(normalized));
         }
         route.options.limits = limits; route.options.host = profile_detail::host_name(); route.options.harvester = route.id;
+        if (auto const* host = profile_detail::field(value, "host")) { route.options.host = profile_detail::text(*host); bounded_text(route.options.host, 256); require(!route.options.host.empty(), "farm adapter host binding is empty"); }
+        if (auto const* services = profile_detail::field(value, "services"))
+        {
+            shape(*services, {"harvester", "farmer", "full_node", "solver"});
+            for (auto const& [service, entry] : services->fields)
+            {
+                shape(entry, {"root", "rpc_host", "host", "node_id", "farmer_node_id"});
+                FarmServiceBinding binding; binding.root = path(string(entry, "root")); binding.rpc_host = string(entry, "rpc_host"); binding.host = string(entry, "host");
+                bounded_text(binding.host, 256); bounded_text(binding.rpc_host, 256);
+                require(!binding.host.empty() && !binding.rpc_host.empty(), "service RPC/resource host binding is empty");
+                if (auto const* id = profile_detail::field(entry, "node_id")) binding.node_id = adapter_detail::hex_string(*id, 32);
+                if (auto const* id = profile_detail::field(entry, "farmer_node_id")) binding.farmer_node_id = adapter_detail::hex_string(*id, 32);
+                require(service == "farmer" || (!binding.node_id.empty() && !binding.farmer_node_id.empty()), "service link requires both reciprocal TLS identities");
+                if (service == "harvester")
+                { require(binding.host == route.options.host, "harvester resource host differs from its route"); route.options.root = binding.root; route.options.rpc_host = binding.rpc_host; }
+                route.options.services.emplace(service, std::move(binding));
+            }
+        }
         result.routes.push_back(std::move(route));
     }
     require(ids.contains(result.target_route), "local farm adapter target_route is missing"); return result;
@@ -622,135 +808,50 @@ inline TargetPrerequisites observe_target_prerequisites(HarvesterAdapterOptions 
         result.observed.target_route = reviewed.target_route;
         (void)adapter_detail::reviewed_target(session, options, reviewed, result.observed, k, strength);
         adapter_detail::TargetServices services(session, options, reviewed, result.observed, expected); services.finish();
-        result.ready = true; result.pool_mode = services.pool_mode;
-        result.reason = "live local farmer/full-node/solver, completed harvester sync and configured self-pooling NFT prerequisites observed; exact new plot/key acknowledgement awaits publication";
+        result.ready = true; result.pool_mode = services.pool_mode; result.pool = services.pool; result.other_harvesters = services.other_harvesters;
+        result.reason = result.observed.service_status + "; exact new plot/key acknowledgement awaits publication";
     }
     catch (std::exception const& error)
     { if (options.limits.cancelled && options.limits.cancelled()) throw; result.reason = error.what(); }
     return result;
 }
-inline NativeCheckObservation observe_gigahorse_check(InventoryRoot const& root, InventoryPlot const& plot,
-    HarvesterAdapterOptions const& options, unsigned samples = 1, std::string current_relative = {})
+namespace adapter_detail
 {
-    NativeCheckObservation result; result.captured_at = inventory_detail::timestamp(); result.requested_samples = samples;
-    try
-    {
-        inventory_detail::require(options.kind == HarvesterAdapterKind::gigahorse && options.checker.is_absolute() && samples && samples <= 1000,
-            "Gigahorse native checks require an explicit compatible checker and bounded samples");
-        inventory_detail::require(inventory_detail::hex(plot.plot_id, 32) && plot.k >= 18 && plot.k <= 50,
-            "native check requires the exact loaded public plot ID and PoS1 k");
-        auto const until = calibration_process::deadline(options.limits.timeout_ms);
-        InventorySourcePin pin(root, plot, options.limits, current_relative);
-        AdapterCommand command; command.operation = AdapterOperation::gigahorse_check; command.executable = options.checker;
-        command.threads = 1; command.samples = samples;
-#ifdef __linux__
-        // The child opens the held object, rather than resolving a potentially
-        // replaced original pathname. No raw header or memo is exported.
-        command.plot = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" / std::to_string(pin.source_fd());
-#else
-        throw std::runtime_error("exact pinned-file native checks are unavailable on this platform");
-#endif
-        auto const checker = stream_state::stamp(options.checker);
-        result.checker_identity = adapter_detail::implementation_identity(options.checker, options.limits, until);
-        inventory_detail::require(plot.checker_identity.empty() || plot.checker_identity == result.checker_identity,
-            "native checker implementation changed since review; create a new reviewed inventory/profile");
-        auto grant = [&]
-        {
-            inventory_detail::check(options.limits, until);
-            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
-            inventory_detail::require(left > 0, "native check deadline expired");
-            return calibration_process::Limits{options.limits.memory_bytes / 2, uint64_t(left),
-                std::min(options.limits.max_output_bytes, options.limits.memory_bytes / 32), options.limits.cancelled};
-        };
-        auto checked = run_farm_adapter(command, grant()); result.wall_ms = checked.wall_ms;
-        auto unchanged_source = [&]
-        {
-            inventory_detail::require(current_relative.empty() ? recheck_inventory_source(root, plot, options.limits) == plot.identity :
-                pin.matches_claim(current_relative, options.limits), "native source changed during check");
-        };
-        inventory_detail::require(stream_state::stamp(options.checker) == checker, "native checker changed during check"); unchanged_source();
-        result.source = "gigahorse-native-check:" + file_io::path_text(options.checker) + ":file-id=" + std::to_string(checker.device) + ':' + std::to_string(checker.inode);
-        // This is the published check utility's observed result contract. Exit
-        // zero alone is insufficient: it also returns zero for failed proofs.
-        bool successes = false, failures = false, iterations = false;
-        std::string challenge, proof, quality, selected_challenge, selected_proof, selected_quality;
-        std::istringstream lines(checked.output);
-        for (std::string line; std::getline(lines, line);)
-        {
-            auto parse = [&](std::string_view prefix, uint64_t& target, bool& seen)
-            {
-                if (!line.starts_with(prefix)) return;
-                inventory_detail::require(!seen, "native checker repeated a result summary"); seen = true;
-                std::istringstream in(line.substr(prefix.size())); uint64_t count = 0, total = 0; char slash = 0;
-                in >> count >> slash >> total;
-                inventory_detail::require(in && slash == '/' && total == samples, "unsupported native checker result summary"); target = count;
-            };
-            parse("Total success:", result.successes, successes); parse("Total failures:", result.failures, failures);
-            if (line.starts_with("iterations:"))
-            {
-                inventory_detail::require(!iterations, "native checker repeated its iteration count"); iterations = true;
-                auto text = profile_detail::trim(line.substr(11)); unsigned value = 0;
-                auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-                inventory_detail::require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && value == samples,
-                    "native checker did not honor the bounded sample count");
-            }
-            if (line.starts_with("challenge: 0x")) { challenge = line.substr(13); proof.clear(); quality.clear(); }
-            else if (line.starts_with("proof: 0x")) proof = line.substr(9);
-            else if (line.starts_with("quality: ")) quality = line.substr(9);
-            else if (line.starts_with("Proof verification succeeded. k = ") && selected_proof.empty())
-            {
-                auto text = line.substr(34); unsigned value = 0;
-                auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-                bool const quality_bits = quality.size() == 257 && quality.front() == 'b' && quality.find_first_not_of("01", 1) == quality.npos;
-                inventory_detail::require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && value == plot.k &&
-                    inventory_detail::hex(challenge, 32) && inventory_detail::hex(proof, 8 * plot.k) && quality_bits,
-                    "native checker returned an unsupported public proof record");
-                selected_challenge = challenge; selected_proof = proof; selected_quality = quality;
-            }
-        }
-        result.completed = checked.exit_code == 0 && iterations && successes && failures && result.successes > 0 && result.failures == 0 && !selected_proof.empty();
-        if (result.completed)
-        {
-            AdapterCommand verify; verify.operation = AdapterOperation::gigahorse_verify; verify.executable = options.checker;
-            verify.k = plot.k; verify.plot_id = plot.plot_id; verify.proof = selected_proof; verify.challenge = selected_challenge;
-            auto verified = run_farm_adapter(verify, grant()); result.wall_ms += verified.wall_ms;
-            std::string const expected = "Proof verification suceeded. Quality: " + selected_quality;
-            result.identity_verified = verified.exit_code == 0 && verified.output.find(expected) != std::string::npos;
-            result.completed = result.identity_verified;
-            inventory_detail::require(stream_state::stamp(options.checker) == checker, "native checker changed during identity verification"); unchanged_source();
-        }
-        result.status = result.completed ? "sampled-native-check" : "unavailable"; result.identity = plot.identity;
-        result.reason = result.completed ? "bounded exact-file native proof samples bind the loaded public plot ID/k; complete validity, undisclosed proprietary metadata and farming capacity remain unverified" :
-            "native check did not produce the required positive bounded proof result (native output withheld)";
-    }
-    catch (std::exception const& error)
-    { if (options.limits.cancelled && options.limits.cancelled()) throw; result.completed = result.identity_verified = false; result.status = "unavailable"; result.reason = error.what(); }
-    return result;
-}
-inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, bool complete_registry = true)
+inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, Session& session,
+    std::string const& version, Json const& response, bool complete_registry)
 {
     inventory_detail::validate(inventory, options.limits);
     for (auto const* text : {&options.host, &options.harvester, &options.solver}) inventory_detail::bounded_text(*text);
     uint64_t retained = farm_inventory_memory(inventory);
-    adapter_detail::Session session(options);
-    auto version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
-    auto response = session.rpc(AdapterOperation::harvester_plots); auto const& plots = inventory_detail::required_field(response, "plots");
+    auto const& plots = inventory_detail::required_field(response, "plots");
     inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files, "native plot inventory exceeds its bound");
     if (complete_registry) adapter_detail::require_registry_scope(session, response, inventory, options);
     inventory_detail::require(inventory.plots.size() <= options.limits.memory_bytes / 4096,
         "native inventory lookup exceeds its private memory grant");
-    std::map<std::pair<size_t, std::string_view>, size_t> paths;
+    std::map<std::string, size_t> paths;
+    std::set<size_t> loaded;
     std::vector<bool> duplicate(inventory.plots.size(), false);
     for (size_t i = 0; i < inventory.plots.size(); ++i)
     {
-        paths.emplace(std::pair(inventory.plots[i].root, std::string_view(inventory.plots[i].relative_path)), i);
+        auto& plot = inventory.plots[i];
+        if (plot.harvester.empty() || options.harvester.empty() || plot.harvester == options.harvester)
+        {
+            auto const before = inventory_detail::plot_memory(plot); plot.native_identified = false;
+            if (!plot.header_validated && plot.status == "native-observed")
+            { plot.status = "protected"; plot.reason = "previous reader metadata is not a fresh loaded-file observation"; }
+            auto const after = inventory_detail::plot_memory(plot);
+            if (after >= before) retained += after - before; else retained -= before - after;
+        }
+        auto filename = file_io::path_text(file_io::native_path(inventory.roots.at(plot.root).path) / inventory_detail::relative(plot.relative_path));
+#ifdef _WIN32
+        std::replace(filename.begin(), filename.end(), '\\', '/');
+#endif
+        paths.emplace(std::move(filename), i);
         if (inventory.plots[i].alias_of) { duplicate[i] = true; duplicate[*inventory.plots[i].alias_of] = true; }
     }
-    // Registry capture/parse above keeps its original short deadline. Serial
-    // held-file proofs get independent bounded grants under a count-bounded
-    // catalog allowance, with the same pinned implementation/configuration.
-    if (complete_registry) session.begin_inventory_files(plots.items.size());
-    std::optional<stream_state::Stamp> checker_stamp;
+    // Native object reads share a count-bounded catalog grant. No proof
+    // reconstruction is required to retire an exact reviewed object.
+    if (complete_registry) session.begin_inventory_files(inventory.plots.size());
     for (auto const& native : plots.items)
     {
         session.running();
@@ -758,18 +859,9 @@ inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapt
 #ifdef _WIN32
         std::replace(filename.begin(), filename.end(), '\\', '/');
 #endif
-        for (size_t r = 0; r < inventory.roots.size(); ++r)
-        {
-            auto prefix = inventory.roots[r].path;
-#ifdef _WIN32
-            std::replace(prefix.begin(), prefix.end(), '\\', '/');
-#endif
-            bool const separator = !prefix.empty() && (prefix.back() == '/' || prefix.back() == '\\');
-            size_t const offset = prefix.size() + (separator ? 0 : 1);
-            if (filename.size() <= offset || filename.compare(0, prefix.size(), prefix) || (!separator && filename[prefix.size()] != '/' && filename[prefix.size()] != '\\')) continue;
-            auto relative = std::string_view(filename).substr(offset); at = paths.find({r, relative}); if (at != paths.end()) break;
-        }
+        at = paths.find(filename);
         if (at == paths.end()) continue;
+        inventory_detail::require(loaded.insert(at->second).second, "native reader reports duplicate source path records");
         auto& plot = inventory.plots[at->second];
         if (!plot.harvester.empty() && !options.harvester.empty() && plot.harvester != options.harvester) continue;
         inventory_detail::require(retained + 128 * 1024 < options.limits.memory_bytes / 2,
@@ -811,33 +903,50 @@ inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapt
                 "native public plot key/pool route does not bind the observed legacy plot ID");
         plot.harvester = options.harvester; plot.solver = options.solver;
         if (!options.host.empty()) plot.host = options.host;
-        if (!plot.header_validated)
+        if (plot.algorithm == PlotAlgorithm::pos1) { plot.native_identified = true; plot.members = 1; }
+        if (!plot.header_validated && plot.algorithm == PlotAlgorithm::pos1)
         {
-            // Proprietary containers retain their unknown/protected status.
-            // A loaded plot observation is useful provenance, not a guessed
-            // header grammar, proof-completeness claim or deletion permission.
-            plot.reason = "installed reader reports this public plot ID; proprietary header/complete validity unverified";
-            if (options.kind == HarvesterAdapterKind::gigahorse && !options.checker.empty())
-            {
-                auto const current_checker = stream_state::stamp(options.checker);
-                if (!checker_stamp) checker_stamp = current_checker;
-                inventory_detail::require(current_checker == *checker_stamp, "native checker changed during catalog observation");
-                auto current_options = options; current_options.limits = session.remaining_limits();
-                auto checked = observe_gigahorse_check(inventory.roots[plot.root], plot, current_options);
-                inventory_detail::require(stream_state::stamp(options.checker) == *checker_stamp, "native checker changed during catalog observation");
-                plot.native_identified = checked.identity_verified;
-                if (checked.identity_verified) plot.checker_identity = checked.checker_identity;
-                if (checked.identity_verified && plot.identity.links == 1 && !duplicate[at->second]) plot.status = "native-observed";
-                plot.reason = checked.reason;
-            }
+            // The reader supplies public metadata; the native file stamp binds
+            // the reviewed object. This does not attest old proof validity or
+            // invent a proprietary header grammar.
+            plot.native_identified = true;
+            if (plot.identity.links == 1 && !duplicate[at->second]) plot.status = "native-observed";
+            plot.reason = "exact native file with reader-reported public metadata; old proof validity untested";
         }
         auto const after_memory = inventory_detail::plot_memory(plot);
         if (after_memory >= before_memory) retained += after_memory - before_memory; else retained -= before_memory - after_memory;
     }
+    for (size_t i = 0; i < inventory.plots.size(); ++i)
+    {
+        auto& plot = inventory.plots[i];
+        if (loaded.contains(i) || !plot.header_validated || plot.algorithm != PlotAlgorithm::pos1 ||
+            (plot.container != PlotContainer::chiapos_v1 && plot.container != PlotContainer::chiapos_v2) ||
+            (!plot.harvester.empty() && !options.harvester.empty() && plot.harvester != options.harvester)) continue;
+        session.running();
+        inventory_detail::require(plot.reader_identity.empty() || (plot.reader_identity == session.reader_identity() &&
+            plot.reader_version == version && plot.reader == adapter_detail::name(options.kind)),
+            "ordinary source reader/configuration implementation changed since review");
+        (void)recheck_inventory_source(inventory.roots.at(plot.root), plot, session.remaining_limits());
+        auto const before = inventory_detail::plot_memory(plot);
+        plot.reader = adapter_detail::name(options.kind); plot.reader_version = version; plot.reader_identity = session.reader_identity();
+        plot.harvester = options.harvester; plot.solver = options.solver; if (!options.host.empty()) plot.host = options.host;
+        if (plot.status != "protected") plot.reason = "ordinary public header; reader registry reports no loaded record; route context observed, old proof validity untested";
+        auto const after = inventory_detail::plot_memory(plot);
+        if (after >= before) retained += after - before; else retained -= before - after;
+        inventory_detail::require(retained + 128 * 1024 < options.limits.memory_bytes / 2,
+            "ordinary source context exceeds its retained catalog grant");
+    }
     inventory_detail::require(adapter_detail::version(session.rpc(AdapterOperation::harvester_version)) == version,
         "native reader service version changed during catalog observation");
-    inventory_detail::require(!checker_stamp || stream_state::stamp(options.checker) == *checker_stamp, "native checker changed during catalog observation");
     session.unchanged();
+}
+} // namespace adapter_detail
+inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, bool complete_registry = true)
+{
+    adapter_detail::Session session(options);
+    auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
+    auto response = session.rpc(AdapterOperation::harvester_plots);
+    adapter_detail::observe_inventory(inventory, options, session, version, response, complete_registry);
 }
 inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTable const& table)
 {
@@ -850,37 +959,113 @@ inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTab
     inventory.network = observe_network_projection(target);
     inventory.network.target_route = table.target_route;
 }
-inline InventoryPlot recheck_native_source(InventoryRoot const& root, InventoryPlot const& plot, HarvesterAdapterOptions const& options)
+// One authoritative reader snapshot for a route and phase. The caller pins
+// every selected native object before claiming it; this object retains only
+// bounded public metadata and never grants deletion permission by itself.
+class SourceReadinessSnapshot
 {
-    FarmInventory current; current.host = profile_detail::host_name(); current.captured_at = inventory_detail::timestamp(); current.producer_build = GROW_IDENTITY;
-    current.roots.push_back(root); current.plots.push_back(plot); current.complete = true;
-    current.plots[0].root = 0; current.plots[0].alias_of.reset(); current.plots[0].native_identified = false; current.plots[0].status = "protected";
-    inventory_detail::require(plot.identity.links == 1 && !plot.alias_of && options.kind == HarvesterAdapterKind::gigahorse && !options.checker.empty() &&
-        inventory_detail::hex(plot.reader_identity, 32) && inventory_detail::hex(plot.checker_identity, 32),
-        "native source requires a supported explicit decoder/checker and unique file identity");
-    // This is a deliberately narrow identity recheck, not an assertion of
-    // complete farm scope. Execution separately audits all configured routes.
-    observe_harvester_inventory(current, options, false);
-    inventory_detail::require(current.plots[0].native_identified && current.plots[0].status == "native-observed" &&
-        current.plots[0].identity == plot.identity && current.plots[0].plot_id == plot.plot_id && current.plots[0].k == plot.k,
-        "fresh native source identity proof is unavailable; no source may be retired");
-    return std::move(current.plots[0]);
-}
-inline NativeCheckObservation recheck_claimed_native_source(InventoryRoot const& root, InventoryPlot const& plot,
-    std::string const& claimed_relative, HarvesterAdapterOptions const& options)
-{
-    inventory_detail::require(options.kind == HarvesterAdapterKind::gigahorse && plot.reader == "gigahorse" &&
-        inventory_detail::hex(plot.reader_identity, 32) && inventory_detail::hex(plot.checker_identity, 32),
-        "claimed native source has no reviewed implementation identity");
-    adapter_detail::Session session(options); auto version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
-    inventory_detail::require(version == plot.reader_version && session.reader_identity() == plot.reader_identity,
-        "claimed source reader/configuration changed since review; preserve the claim and rereview");
-    auto current_options = options; current_options.limits = session.remaining_limits();
-    auto result = observe_gigahorse_check(root, plot, current_options, 1, claimed_relative);
-    inventory_detail::require(result.identity_verified && result.checker_identity == plot.checker_identity,
-        "claimed source native proof/checker identity is unavailable; preserve the claim");
-    session.unchanged(); return result;
-}
+    HarvesterAdapterOptions options_;
+    adapter_detail::Session session_;
+    FarmInventory current_;
+    std::string version_, registry_identity_;
+    FarmInventory const& inventory_;
+    PublishedPlotAllowance published_;
+    std::map<std::pair<std::string, std::string>, size_t> paths_;
+    bool finished_ = false, allow_unloaded_ = false;
+public:
+    SourceReadinessSnapshot(HarvesterAdapterOptions const& options, FarmInventory const& inventory, std::span<uint64_t const> sources,
+        PublishedPlotAllowance const& published = {}, bool allow_unloaded = false)
+        : options_(options), session_(options), inventory_(inventory), published_(published), allow_unloaded_(allow_unloaded)
+    {
+        inventory_detail::require(!sources.empty() && sources.size() <= options.limits.max_files &&
+            sources.size() <= options.limits.memory_bytes / 32768, "source snapshot exceeds its retained metadata grant");
+        current_.host = inventory.host; current_.captured_at = inventory_detail::timestamp(); current_.producer_build = GROW_IDENTITY;
+        current_.roots = inventory.roots; current_.complete = true;
+        for (auto index : sources)
+        {
+            inventory_detail::require(index < inventory.plots.size(), "source snapshot index is invalid");
+            auto plot = inventory.plots[size_t(index)];
+            inventory_detail::require(plot.root < inventory.roots.size() && plot.identity.links == 1 && !plot.alias_of &&
+                (options.harvester.empty() || plot.harvester.empty() || options.harvester == plot.harvester),
+                "source snapshot crosses a reviewed route or lacks unique native identity");
+            auto const key = std::pair(current_.roots[plot.root].path, plot.relative_path);
+            inventory_detail::require(paths_.emplace(key, current_.plots.size()).second, "source snapshot repeats a path");
+            plot.native_identified = false; current_.plots.push_back(std::move(plot));
+        }
+        uint64_t index_bytes = 0;
+        for (auto const& [key, index] : paths_)
+        {
+            (void)index;
+            auto const bytes = uint64_t(key.first.capacity()) + key.second.capacity() + 256;
+            inventory_detail::require(bytes <= options.limits.memory_bytes - index_bytes, "source snapshot path index exceeds its private grant");
+            index_bytes += bytes;
+        }
+        auto charge = [&]
+        { inventory_detail::require(farm_inventory_memory(current_) <= options.limits.memory_bytes / 2 &&
+            index_bytes <= options.limits.memory_bytes / 2 - farm_inventory_memory(current_), "source snapshot copied roots, metadata and path index exceed their retained grant"); };
+        charge();
+        version_ = adapter_detail::version(session_.rpc(AdapterOperation::harvester_version));
+        auto response = session_.rpc(AdapterOperation::harvester_plots);
+        adapter_detail::require_registry_scope(session_, response, inventory, options_, published);
+        registry_identity_ = adapter_detail::registry_identity(response);
+        adapter_detail::observe_inventory(current_, options_, session_, version_, response, false); charge();
+    }
+    InventoryPlot check(InventoryRoot const& root, InventoryPlot const& reviewed)
+    {
+        inventory_detail::require(!finished_, "source snapshot is already finished"); session_.running();
+        auto at = paths_.find({root.path, reviewed.relative_path});
+        inventory_detail::require(at != paths_.end(), "source is absent from the route snapshot");
+        auto const& current = current_.plots.at(at->second);
+        if (!current.native_identified && reviewed.header_validated && reviewed.algorithm == PlotAlgorithm::pos1 &&
+            (reviewed.container == PlotContainer::chiapos_v1 || reviewed.container == PlotContainer::chiapos_v2))
+        {
+            inventory_detail::require(reviewed.reader_identity.empty() || (reviewed.reader_identity == session_.reader_identity() &&
+                reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind)),
+                "previously observed source reader/configuration changed since review");
+            auto observed = observe_inventory_file(root, reviewed.relative_path, session_.remaining_limits());
+            inventory_detail::require(observed.identity == reviewed.identity && observed.header_validated && observed.algorithm == reviewed.algorithm &&
+                observed.container == reviewed.container && observed.k == reviewed.k && observed.plot_id == reviewed.plot_id &&
+                observed.farmer_public_key == reviewed.farmer_public_key && observed.pool_public_key == reviewed.pool_public_key &&
+                observed.pool_contract_puzzle_hash == reviewed.pool_contract_puzzle_hash && observed.compression_level == reviewed.compression_level,
+                "unloaded ordinary source public header or native object differs from review");
+            observed.root = reviewed.root; observed.harvester = reviewed.harvester; observed.workload_id = reviewed.workload_id;
+            observed.reason = "exact reviewed native object and ordinary public header; currently unloaded, no fresh reader acknowledgement or old proof validity claimed";
+            return observed;
+        }
+        if (!current.native_identified && allow_unloaded_)
+        {
+            inventory_detail::require(reviewed.native_identified && reviewed.algorithm == PlotAlgorithm::pos1 && reviewed.k >= 18 && reviewed.k <= 50 &&
+                (reviewed.pool_public_key.empty() != reviewed.pool_contract_puzzle_hash.empty()) &&
+                adapter_detail::legacy_id_from_loaded_key(reviewed.plot_public_key,
+                    reviewed.pool_public_key.empty() ? reviewed.pool_contract_puzzle_hash : reviewed.pool_public_key) == reviewed.plot_id &&
+                reviewed.reader_identity == session_.reader_identity() && reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind),
+                "unloaded source lacks the exact previously reviewed reader metadata");
+            (void)recheck_inventory_source(root, reviewed, session_.remaining_limits());
+            auto observed = reviewed;
+            observed.reason = "exact reviewed native object is currently unloaded; public identity retained from the authorized review, old proof validity untested";
+            return observed;
+        }
+        inventory_detail::require(current.reader_identity == session_.reader_identity() && current.reader_version == version_ &&
+            current.reader == adapter_detail::name(options_.kind) && current.identity == reviewed.identity &&
+            current.plot_id == reviewed.plot_id && current.k == reviewed.k && current.algorithm == reviewed.algorithm &&
+            (reviewed.plot_public_key.empty() || current.plot_public_key == reviewed.plot_public_key) && current.pool_public_key == reviewed.pool_public_key &&
+            current.pool_contract_puzzle_hash == reviewed.pool_contract_puzzle_hash && current.compression_level == reviewed.compression_level &&
+            current.native_identified && (reviewed.header_validated || current.status == "native-observed"),
+            "fresh authoritative source metadata differs from the reviewed native object");
+        (void)recheck_inventory_source(root, reviewed, session_.remaining_limits()); return current;
+    }
+    void finish()
+    {
+        inventory_detail::require(!finished_, "source snapshot is already finished");
+        inventory_detail::require(adapter_detail::version(session_.rpc(AdapterOperation::harvester_version)) == version_,
+            "source reader version changed during the batch snapshot");
+        auto response = session_.rpc(AdapterOperation::harvester_plots);
+        adapter_detail::require_registry_scope(session_, response, inventory_, options_, published_);
+        inventory_detail::require(adapter_detail::registry_identity(response) == registry_identity_,
+            "source loaded population or reader metadata changed during the batch snapshot");
+        session_.unchanged(); finished_ = true;
+    }
+};
 inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
     std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {})
 {
@@ -902,8 +1087,10 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
         for (auto index : sources)
         {
             auto const& p = inventory.plots[size_t(index)];
-            inventory_detail::require(p.reader_identity == session.reader_identity() && p.reader_version == version &&
-                p.reader == adapter_detail::name(options.kind), "source registry reader implementation changed or was not reviewed; retain old reservations");
+            bool const header_only = p.reader_identity.empty() && p.header_validated && p.algorithm == PlotAlgorithm::pos1 &&
+                (p.container == PlotContainer::chiapos_v1 || p.container == PlotContainer::chiapos_v2);
+            inventory_detail::require(header_only || (p.reader_identity == session.reader_identity() && p.reader_version == version &&
+                p.reader == adapter_detail::name(options.kind)), "source registry reader implementation changed or was not reviewed; retain old reservations");
         }
         auto response = session.rpc(AdapterOperation::harvester_plots); auto const& plots = inventory_detail::required_field(response, "plots");
         inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files,
@@ -913,6 +1100,8 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
             if (paths.contains(inventory_detail::string(p, "filename")) ||
                 ids.contains(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32)))
             { result.reason = "a batch source path or plot ID is still registered; old arrivals remain reserved"; return result; }
+        inventory_detail::require(adapter_detail::version(session.rpc(AdapterOperation::harvester_version)) == version,
+            "source registry reader version changed during absence observation; retain old reservations");
         session.unchanged(); result.observed = std::chrono::steady_clock::now(); result.no_loaded_record = true;
         result.reason = "one fresh native registry snapshot has no batch source paths/IDs; queued/resident/opaque reservations remain separate";
     }
@@ -926,8 +1115,8 @@ inline SourceRetirementObservation observe_source_retired(HarvesterAdapterOption
     std::array<uint64_t, 1> indices{0}; return observe_sources_retired(options, inventory, indices);
 }
 // One bounded live observation for one prefix audit. Stream expectations into
-// check(), finish before authorizing retirement, and discard this object at
-// every deletion boundary. It is not a saved or reusable readiness certificate.
+// check(), and finish before every retirement action while this phase lease
+// remains live. Construction/proof phases invalidate it. It is never saved.
 class TargetReadinessSnapshot
 {
     HarvesterAdapterOptions options_;
@@ -937,7 +1126,13 @@ class TargetReadinessSnapshot
     TargetServiceExpectation service_;
     std::unique_ptr<adapter_detail::TargetServices> services_;
     // Keys refer to immutable JSON storage, avoiding another full path copy.
-    std::map<std::string_view, adapter_detail::Json const*, std::less<>> loaded_;
+    struct LoadedPlot
+    {
+        adapter_detail::Json const* plot;
+        std::optional<stream_state::Stamp> checked;
+        LoadedPlot(adapter_detail::Json const* value) : plot(value) {}
+    };
+    std::map<std::string_view, LoadedPlot, std::less<>> loaded_;
     std::map<std::string_view, adapter_detail::Json const*, std::less<>> farmer_loaded_;
     uint64_t peak_timestamp_ = 0;
     uint8_t k_ = 0, strength_ = 0;
@@ -982,15 +1177,30 @@ public:
     TargetReadinessSnapshot& operator=(TargetReadinessSnapshot const&) = delete;
     TargetReadinessSnapshot(TargetReadinessSnapshot&&) = delete;
     TargetReadinessSnapshot& operator=(TargetReadinessSnapshot&&) = delete;
+    TargetPoolState const& pool_state() const { return services_->pool; }
+    std::vector<OtherHarvesterObservation> const& other_harvesters() const { return services_->other_harvesters; }
     void finish()
     {
-        try { current(); services_->finish(); session_.unchanged(); }
+        try
+        {
+            current(); ReplacementExpectation expected; expected.k = k_; expected.strength = strength_;
+            expected.network = projection_.network; expected.genesis_challenge = projection_.genesis_challenge;
+            peak_timestamp_ = adapter_detail::active_network(session_, options_, expected, projection_);
+            services_->finish();
+            for (auto const& [path, entry] : loaded_) if (entry.checked)
+            {
+                session_.running();
+                inventory_detail::require(stream_state::stamp(file_io::native_path(path)) == *entry.checked,
+                    "previously acknowledged replacement native path changed or disappeared during the readiness phase");
+            }
+            session_.unchanged();
+        }
         catch (...) { healthy_ = false; throw; }
     }
     ReplacementReadiness check(ReplacementExpectation const& expected, ReplacementPublication const& publication)
     {
         ReplacementReadiness result; result.host = options_.host.empty() ? profile_detail::host_name() : options_.host;
-        result.captured_at = projection_.captured_at; result.method = "authenticated-loopback-native-rpc";
+        result.captured_at = projection_.captured_at; result.method = "authenticated-configured-native-rpc";
         result.network = projection_.network; result.version = projection_.reader_version;
         try
         {
@@ -1012,7 +1222,7 @@ public:
             auto const farmer_at = farmer_loaded_.find(file_io::path_text(expected.path));
             inventory_detail::require(at != loaded_.end(), "exact replacement is not loaded by the configured harvester");
             inventory_detail::require(farmer_at != farmer_loaded_.end(), "exact replacement has not reached the connected farmer's completed plot synchronization");
-            for (auto const* record : {at->second, farmer_at->second})
+            for (auto const* record : {at->second.plot, farmer_at->second})
             {
                 auto const& p = *record;
                 inventory_detail::require(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32) == expected.group_id &&
@@ -1034,6 +1244,7 @@ public:
             }
             auto after = inventory_detail::observe(root, file_io::path_text(expected.path.filename()), options_.limits);
             inventory_detail::require(after.identity == expected.identity, "published replacement changed during live readiness observation");
+            at->second.checked = expected.identity.stamp;
             current(); result.identity = file.identity; result.ready = true; result.status = "ready";
             result.reason = "new immutable publication matches the live harvester and connected farmer's completed sync, key route and solver prerequisites; finish the complete audit before retirement";
         }
@@ -1046,7 +1257,7 @@ inline ReplacementReadiness observe_replacement_readiness(HarvesterAdapterOption
     std::optional<ReplacementPublication> const& publication = {})
 {
     ReplacementReadiness result; result.host = options.host.empty() ? profile_detail::host_name() : options.host;
-    result.captured_at = inventory_detail::timestamp(); result.method = "authenticated-loopback-native-rpc";
+    result.captured_at = inventory_detail::timestamp(); result.method = "authenticated-configured-native-rpc";
     try
     {
         inventory_detail::require(publication.has_value(), "replacement requires the private journal's immutable first .plot2 publication receipt");

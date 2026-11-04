@@ -4,7 +4,9 @@
 #include "host/GroupFarmResources.hpp"
 #include "host/GroupFarmState.hpp"
 #include "host/GroupOptions.hpp"
+#include "host/ComputeSession.hpp"
 #include "host/GroupStorage.hpp"
+#include <type_traits>
 
 namespace group_grow::farm
 {
@@ -16,6 +18,72 @@ struct ReplotSupervision
     uint64_t controller_ram_bytes = 0, adapter_ram_bytes = 0, adapter_cpu_threads = 0, adapter_timeout_us = 0;
     std::vector<std::filesystem::path> source_roots;
 };
+// Match authenticated service observations to a reviewed physical resource
+// scope. Remote addresses identify peers, never spare compute or host aliases.
+template<class Others>
+inline void require_target_service_scope(Profile const& profile,
+    std::map<std::string, std::string> const& actual_hosts, Others const& other_harvesters)
+{
+    using namespace resource_detail;
+    validate(profile); Graph graph(profile);
+    require(actual_hosts.size() == 4, "target service physical host binding set is incomplete or unsupported");
+    auto host = [&](std::string const& role) -> std::string const&
+    {
+        auto const actual = actual_hosts.find(role);
+        require(actual != actual_hosts.end() && !actual->second.empty(), "target service has no explicit physical host binding");
+        auto const reviewed = profile.native.service_hosts.find(role);
+        auto const& expected = reviewed == profile.native.service_hosts.end() ? profile.native.host : reviewed->second;
+        require(actual->second == expected, "target service physical host differs from the reviewed resource scope");
+        return actual->second;
+    };
+    auto const& harvester = host("harvester"); auto const& farmer = host("farmer");
+    auto const& full_node = host("full_node"); auto const& solver = host("solver");
+    auto covered = [&](auto const& uses, std::string const& physical, bool proof)
+    {
+        bool cpu = false, ram = false, full = false;
+        for (auto const& use : uses)
+        {
+            auto const& resource = graph.resources[graph.find(use.resource)];
+            if (resource.host != physical) continue;
+            if (resource.kind == ResourceKind::cpu && (use.required_units || use.reserved_units)) cpu = true;
+            if (resource.kind == ResourceKind::host_memory && (use.resident_units || use.transient_units)) ram = true;
+            if (resource.kind == ResourceKind::cpu || resource.kind == ResourceKind::gpu_compute || resource.kind == ResourceKind::solver)
+            {
+                if constexpr (std::is_same_v<std::decay_t<decltype(use)>, Use>) full = full || use.reserved_units || use.proof_us;
+                else full = full || use.reserved_units || use.work_us;
+            }
+        }
+        require(cpu && ram && (!proof || full), "reviewed service envelope omits physical-host CPU, memory or full-proof work");
+    };
+    auto network = [&](auto const& uses)
+    {
+        return std::any_of(uses.begin(), uses.end(), [&](auto const& use)
+        { return graph.resources[graph.find(use.resource)].kind == ResourceKind::network && (use.required_units || use.reserved_units); });
+    };
+    for (auto const& cohort : profile.native.cohorts)
+    {
+        covered(cohort.new_farming, harvester, false); covered(cohort.new_farming, farmer, false);
+        covered(cohort.new_farming, full_node, false); covered(cohort.proof_reserve, solver, true);
+        if (harvester != farmer || farmer != full_node) require(network(cohort.new_farming), "remote target farming omits its reviewed network envelope");
+        if (harvester != solver || farmer != solver) require(network(cohort.proof_reserve), "remote target full proofs omit their reviewed network envelope");
+    }
+    require(other_harvesters.size() <= max_workloads, "too many observed outside harvesters");
+    std::set<std::string> observed;
+    for (auto const& other : other_harvesters)
+    {
+        require(observed.insert(other.node_id).second, "outside harvester identity is ambiguous");
+        Workload const* found = nullptr;
+        for (auto const& workload : profile.workloads) if (workload.external_service_node_id == other.node_id)
+        { require(!found, "outside harvester has repeated reviewed workload scopes"); found = &workload; }
+        require(found && found->bounded && found->scope_complete && found->cost != CostKind::unknown,
+            "outside harvester has no complete reviewed external service envelope");
+        require(other.files <= found->plot_count && other.members <= found->external_service_members,
+            "outside harvester inventory exceeds its reviewed maximum service population");
+        covered(found->uses, found->external_service_host, false); covered(found->uses, farmer, false); covered(found->uses, solver, true);
+        if (found->external_service_host != farmer || found->external_service_host != solver)
+            require(network(found->uses), "outside harvester omits its reviewed shared-service network envelope");
+    }
+}
 inline std::string replot_storage_id(StorageDevice const& device)
 { return "storage:" + device.filesystem; }
 inline std::vector<std::string> replot_physical_storage(Profile const& profile,
@@ -49,12 +117,12 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
 {
     using namespace resource_detail;
     validate(profile); auto const& native = profile.native;
-    // These offers can serve other owners while a batch is running. The first
-    // migration path deliberately admits no uncovered compute service/client.
-    require(!args.automatic_compute && !args.compute_session && args.pool_broker.empty() && !args.pool_offer_ram &&
-            !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_codec_ram,
-            "migration requires compute off and no external compute offers or codec clients");
     NativeRequest result; result.host = profile_detail::host_name();
+    result.compute_enabled = !args.pool_broker.empty();
+    require(result.compute_enabled || (!args.automatic_compute && !args.compute_session && !args.pool_offer_ram &&
+        !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_codec_ram), "compute service/client options have no reviewed broker scope");
+    result.compute_session_ram_bytes = args.automatic_compute ? pos2gpu::ComputeSession::memory_bytes : 0;
+    result.compute_codec_ram_bytes = args.pool_codec_ram;
     require(!result.host.empty(), "cannot establish migration execution host");
     auto const cpus = profile_detail::logical_cpus(); require(cpus, "cannot establish inherited migration CPU affinity");
     result.cpu_affinity_lanes = cpus;
@@ -66,9 +134,9 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     require(result.cpu_threads && result.cpu_threads <= cpus, "migration construction workers exceed inherited CPU affinity");
     result.batch_members = std::min(args.batch, native.max_batch_members);
     result.gpu_bytes = gpu_bytes; result.gpu_identity = std::move(gpu_identity);
-    result.standing_gpu_bytes = args.backend == "gpu" ? native.standing_gpu_bytes : 0;
+    result.standing_gpu_bytes = args.backend == "gpu" && !result.compute_enabled ? native.standing_gpu_bytes : 0;
     result.gpu_binding_verified = !result.gpu_identity.empty();
-    require((args.backend == "cpu" && !gpu_bytes) || (args.backend == "gpu" && gpu_bytes && result.gpu_binding_verified),
+    require((result.compute_enabled && !gpu_bytes) || (args.backend == "cpu" && !gpu_bytes) || (args.backend == "gpu" && gpu_bytes && result.gpu_binding_verified),
             "migration backend requires exact bounded CPU or physically identified GPU execution");
     result.construction_us = native.max_construction_us; result.verification_us = native.max_verification_us;
     // The existing verifier may create hardware-concurrency solver threads.
@@ -77,7 +145,7 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     // alone is not an OS affinity limit. The self-worker also caps RAM/time.
     result.verification_cpu_threads = native.verification_cpu_threads ? native.verification_cpu_threads : cpus;
     require(result.verification_cpu_threads <= cpus, "migration verifier CPU cap exceeds inherited affinity");
-#ifndef __linux__
+#if !defined(__linux__) && !defined(_WIN32)
     require(!native.verification_cpu_threads, "explicit migration verifier CPU affinity is unsupported on this platform");
 #endif
     result.verification_ram_bytes = verification_ram_bytes ? verification_ram_bytes : native.max_ram_bytes;
@@ -125,7 +193,7 @@ inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions cons
 {
     auto result = options; result.max_ram = request.ram_bytes; result.workers = request.cpu_threads;
     result.batch = request.batch_members; result.backend = request.backend; result.backend_set = true;
-    result.construction = request.engine; result.compute_mode = "off";
+    result.construction = request.engine;
     result.protected_resources = true; result.protected_gpu_bytes = request.gpu_bytes;
     result.io_overlap = false; result.generation_overlap = false; result.generation_overlap_auto = false;
     result.cancelled = [cancelled = options.cancelled, until] { return (cancelled && cancelled()) || Clock::now() >= until; };
@@ -196,6 +264,10 @@ inline void write_replot_request_json(std::ostream& out, NativeRequest const& re
         << ",\"adapter_cpu_threads\":" << request.adapter_cpu_threads << ",\"adapter_timeout_us\":" << request.adapter_timeout_us
         << ",\"gpu_binding_verified\":" << (request.gpu_binding_verified ? "true" : "false") << ",\"gpu_identity\":";
     pos2gpu::write_json_string(out, request.gpu_identity);
+    if (request.generation_peak_bytes) out << ",\"generation_peak_bytes\":" << request.generation_peak_bytes;
+    if (request.compute_enabled)
+        out << ",\"compute_enabled\":true,\"compute_session_ram_bytes\":" << request.compute_session_ram_bytes
+            << ",\"compute_codec_ram_bytes\":" << request.compute_codec_ram_bytes;
     for (auto const& [name, values] : {std::pair{"output_resources", &request.output_resources}, {"scratch_resources", &request.scratch_resources}, {"source_resources", &request.source_resources}})
     {
         out << ",\"" << name << "\":["; bool comma = false;
@@ -219,12 +291,14 @@ class ReplotGate
         {
             resource_detail::require(!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty(),
                                      "active monitoring requires the running construction phase");
-            for (auto const& d : stage.construction)
+            auto own_cpu = [&](std::vector<Demand> const& demands) { for (auto const& d : demands)
             {
                 auto const& resource = graph_.resources[graph_.find(d.resource)];
                 if (resource.kind == ResourceKind::cpu && resource.host == profile_.native.host)
                     lanes = resource_detail::add(lanes, resource_detail::add(d.required_units, d.reserved_units));
-            }
+            } };
+            own_cpu(stage.construction); own_cpu(stage.background);
+            lanes = std::min<uint64_t>(lanes, profile_detail::logical_cpus());
             resource_detail::require(lanes, "active construction has no declared CPU reservation");
         }
         std::string failure;

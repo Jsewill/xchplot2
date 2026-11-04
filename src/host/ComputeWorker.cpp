@@ -397,6 +397,19 @@ std::string worker_compatibility()
     return {};
 #endif
 }
+uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
+{
+    worker_detail::require(!config.cpu_scheduler || config.capacity.cpu_threads <= config.cpu_scheduler->workers(),
+        "worker offer exceeds shared CPU gate");
+    auto const brokers = config.discover_brokers ? config.max_brokers :
+        std::max<size_t>(1, config.brokers.size() + bool(config.broker.port));
+    auto result = worker_detail::service_overhead(config, brokers);
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (config.backend != "cpu" && config.capacity.gpu_bytes)
+        result = worker_detail::add(result, GpuProducer::runtime_host_allowance_bytes());
+#endif
+    return result;
+}
 uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength)
 {
     auto const params = parameters(k, strength);
@@ -411,6 +424,14 @@ uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength)
     constexpr uint64_t copies = 2;
 #endif
     return add(add(layout, multiply(pairs, sizeof(uint64_t) * copies)), 128 * mib);
+}
+uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes)
+{
+    using namespace worker_detail;
+    require(members && members <= pool::max_generation_batch_members, "invalid CPU worker task membership");
+    return add(add(add(worker_cpu_generation_bytes(k, strength),
+        multiply(multiply(fragment_count_bound(k, strength), sizeof(uint64_t)), members - 1)),
+        multiply(boundary_bytes(k), members)), transport_bytes);
 }
 
 struct WorkerIdentityReservation
@@ -580,6 +601,7 @@ struct WorkerService::Impl
         require(config.broker_rotation_ms >= 100 && config.broker_rotation_ms <= 3600000, "invalid broker rotation interval");
         require(config.brokers.size() + bool(config.broker.port) <= config.max_brokers,
             "configured brokers exceed worker registration budget");
+        if (config.admit_start) config.admit_start(config);
         scheduler = config.cpu_scheduler ? config.cpu_scheduler : std::make_shared<CodecScheduler>(config.capacity.cpu_threads);
         require(config.capacity.cpu_threads <= scheduler->workers(), "worker offer exceeds shared CPU gate");
         auto const broker_slots = config.discover_brokers ? config.max_brokers :
@@ -995,7 +1017,8 @@ struct WorkerService::Impl
 
     void generation(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
         WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
-        WorkerCancellation cancel, bool use_gpu, bool task_slot = true, pool::Resources const* grant = nullptr)
+        WorkerCancellation cancel, bool use_gpu, bool task_slot = true, pool::Resources const* grant = nullptr,
+        std::function<void(WorkerTaskAdmission const&)> const& admit = {})
     {
         cancel = cancellation(cancel); cancel.check();
         require(!ids.empty() && ids.size() <= config.max_batch_members &&
@@ -1003,8 +1026,7 @@ struct WorkerService::Impl
         auto const bound = fragment_count_bound(k, strength);
         uint64_t const raw_bytes = multiply(bound, sizeof(uint64_t));
         uint64_t const indexes = multiply(boundary_bytes(k), ids.size());
-        uint64_t peak = add(add(add(worker_cpu_generation_bytes(k, strength),
-            multiply(raw_bytes, ids.size() - 1)), indexes), config.max_task_bytes);
+        uint64_t peak = worker_cpu_task_bytes(k, strength, ids.size(), config.max_task_bytes);
         uint64_t const prior_retained = retained_gpu_host.load();
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (use_gpu)
@@ -1020,6 +1042,14 @@ struct WorkerService::Impl
         uint64_t const dynamic_peak = use_gpu && peak > prior_retained ? peak - prior_retained : use_gpu ? indexes : peak;
         if (grant && dynamic_peak > grant->host_bytes)
             throw pool::UnsupportedResources("generation model exceeds leased host memory");
+        if (admit)
+        {
+            WorkerTaskAdmission value; value.worker = status(); value.local_fallback = true;
+            value.task.compatibility = worker_compatibility(); value.task.kind = use_gpu ? pool::Kind::GenerateGpu : pool::Kind::GenerateCpu;
+            value.task.k = k; value.task.strength = strength; value.task.work_units = ids.size();
+            value.task.resources = {threads, 1, dynamic_peak, use_gpu ? config.capacity.gpu_bytes : 0};
+            admit(value); cancel.check();
+        }
         auto memory = budget->acquire(dynamic_peak, task_slot, cancel);
         auto execute = [&]
         {
@@ -1638,18 +1668,20 @@ void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t 
     try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease); } catch (...) {}
 }
 void WorkerService::generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
-    WorkerPackedSink const& sink, WorkerCancellation cancel, pool::Kind kind)
+    WorkerPackedSink const& sink, WorkerCancellation cancel, pool::Kind kind,
+    std::function<void(WorkerTaskAdmission const&)> const& admit)
 {
     require(kind != pool::Kind::GenerateGpu || impl_->gpu_enabled, "local GPU generation was not offered");
     Impl::Acceptance accepted(*impl_);
-    impl_->generation(k, strength, {&id, 1}, sink, {}, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled);
+    impl_->generation(k, strength, {&id, 1}, sink, {}, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
 }
 void WorkerService::contributions_local(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
-    WorkerContributionSink const& sink, WorkerCancellation cancel, pool::Kind kind)
+    WorkerContributionSink const& sink, WorkerCancellation cancel, pool::Kind kind,
+    std::function<void(WorkerTaskAdmission const&)> const& admit)
 {
     require(kind != pool::Kind::GenerateGpu || impl_->gpu_enabled, "local GPU generation was not offered");
     Impl::Acceptance accepted(*impl_);
-    impl_->generation(k, strength, ids, {}, sink, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled);
+    impl_->generation(k, strength, ids, {}, sink, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
 }
 
 namespace worker_detail
@@ -1966,6 +1998,23 @@ struct WorkerClient::Impl
         { std::lock_guard lock(planning_mutex); planning.observed(value, route, selection); }
         if (config.observe) try { config.observe(value); } catch (...) {}
     }
+    void admit(WorkerTaskAdmission const& value) const
+    {
+        if (!config.admit_task) return;
+        try { config.admit_task(value); }
+        catch (WorkerAdmissionRejected const&) { throw; }
+        catch (std::exception const& error) { throw WorkerAdmissionRejected(error.what()); }
+        catch (...) { throw WorkerAdmissionRejected("compute admission policy failed"); }
+    }
+    std::function<void(WorkerTaskAdmission const&)> local_admission() const
+    {
+        if (!config.admit_task) return {};
+        return [this](WorkerTaskAdmission value)
+        {
+            value.owner_identity = pool::certificate_identity(config.tls.cert_file); value.owner_id = config.owner_id;
+            admit(value);
+        };
+    }
     struct Connection
     {
         Impl& impl;
@@ -2086,6 +2135,27 @@ struct WorkerClient::Impl
         }
         try
         {
+            if (config.admit_task)
+            {
+                bool const concrete = task.kind == pool::Kind::GenerateAny ?
+                    (lease->task.kind == pool::Kind::GenerateCpu || lease->task.kind == pool::Kind::GenerateGpu) : lease->task.kind == task.kind;
+                if (lease->owner_identity != pool::certificate_identity(config.tls.cert_file) || lease->owner_id != config.owner_id ||
+                    lease->owner_session != session.token || lease->owner_generation != session.generation ||
+                    lease->task.task_id != task.task_id || lease->task.attempt != task.attempt || lease->task.sequence != task.sequence ||
+                    lease->task.k != task.k || lease->task.strength != task.strength || lease->task.work_units != task.work_units ||
+                    lease->task.compatibility != task.compatibility || lease->task.chunk_count != task.chunk_count ||
+                    lease->task.max_output_bytes != task.max_output_bytes || !concrete)
+                    throw WorkerAdmissionRejected("compute lease differs from its authenticated owner request");
+                auto tls = config.tls; tls.deadline = std::min(tls.deadline, cancel.deadline);
+                WorkerStatus status;
+                try { status = connection->local_direct ? connection->local_service->status() : WorkerService::remote_status(lease->endpoint, tls); }
+                catch (pool::TransientTransport const&) { throw; }
+                catch (std::exception const& error) { throw WorkerAdmissionRejected(error.what()); }
+                if (status.identity != lease->worker_identity || status.instance != lease->worker_instance)
+                    throw WorkerAdmissionRejected("compute lease differs from authenticated worker status");
+                admit({std::move(status), lease->task, lease->owner_identity, lease->owner_id, lease->broker_identity, false});
+                cancel.check();
+            }
             if (config.selected) config.selected(connection->observation());
             if (options.selected && !options.selected(connection->observation())) throw WorkerTaskDeclined();
         }
@@ -2109,8 +2179,7 @@ struct WorkerClient::Impl
         cancel = cancellation(cancel); auto const count_bound = fragment_count_bound(k, strength);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members &&
             (!packed_sink || ids.size() == 1), "invalid compute generation batch");
-        uint64_t const host = add(add(add(worker_cpu_generation_bytes(k, strength),
-            multiply(multiply(count_bound, sizeof(uint64_t)), ids.size() - 1)), multiply(boundary_bytes(k), ids.size())), config.max_task_bytes);
+        uint64_t const host = worker_cpu_task_bytes(k, strength, ids.size(), config.max_task_bytes);
         auto connection = connect(config.generation_kind, k, strength, ids.size(), host,
             packed_sink ? Operation::Packed : Operation::Contributions, identity, cancel);
         if (connection->local_direct)
@@ -2268,7 +2337,7 @@ void WorkerClient::generate_local(uint8_t k, uint8_t strength, std::array<uint8_
 {
     auto local = impl_->local_service(); require(bool(local), "local compute fallback was not configured");
     cancel = impl_->cancellation(cancel); Impl::GenerationLease admission(*impl_, 1, cancel);
-    local->generate_local(k, strength, id, sink, cancel, impl_->config.generation_kind);
+    local->generate_local(k, strength, id, sink, cancel, impl_->config.generation_kind, impl_->local_admission());
 }
 void WorkerClient::contributions_local(uint8_t k, uint8_t strength,
     std::span<std::array<uint8_t, 32> const> ids, WorkerContributionSink const& sink, WorkerCancellation cancel)
@@ -2277,7 +2346,7 @@ void WorkerClient::contributions_local(uint8_t k, uint8_t strength,
     require(local && !ids.empty() && ids.size() <= pool::max_generation_batch_members,
         "local compute fallback was not configured or exceeds its batch limit");
     cancel = impl_->cancellation(cancel); Impl::GenerationLease admission(*impl_, ids.size(), cancel);
-    local->contributions_local(k, strength, ids, sink, cancel, impl_->config.generation_kind);
+    local->contributions_local(k, strength, ids, sink, cancel, impl_->config.generation_kind, impl_->local_admission());
 }
 std::vector<std::vector<uint8_t>> WorkerClient::encode(uint8_t k, std::span<WorkerChunkInput const> chunks,
     uint64_t maximum, WorkerCancellation cancel, WorkerTaskIdentity identity, WorkerEncodedValidator const& validator,

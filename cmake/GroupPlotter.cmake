@@ -54,7 +54,7 @@ function(pos2_grow_identity target upstream_dir)
     foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
-                 GroupFarmPreview.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
+                 GroupFarmPreview.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
                  GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
@@ -67,7 +67,7 @@ function(pos2_grow_identity target upstream_dir)
     endif()
     if(grow_NETWORK OR XCHPLOT2_BUILD_GROUP_POOL)
         foreach(name ComputeNetwork.hpp ComputeNetwork.cpp ComputePool.hpp ComputePool.cpp
-                     ComputeWorker.hpp ComputeWorker.cpp ComputeThreads.hpp GroupRemoteCodec.hpp)
+                     ComputeWorker.hpp ComputeWorker.cpp ComputeThreads.hpp GroupRemoteCodec.hpp GroupFarmComputeResources.hpp)
             list(APPEND local_sources "${host_dir}/${name}")
         endforeach()
         list(APPEND local_sources "${repo_dir}/cmake/ComputeWorker.cmake"

@@ -12,6 +12,8 @@
 namespace group_grow
 {
 class CodecScheduler;
+struct WorkerStatus;
+struct WorkerTaskAdmission;
 namespace worker_detail { struct RetryHandle; class TaskRegistry; }
 
 struct WorkerCancellation
@@ -121,6 +123,9 @@ struct WorkerConfig
     // retained GPU allocations. An optional embedding reservation owns it.
     std::shared_ptr<CodecScheduler> cpu_scheduler;
     std::shared_ptr<void> host_reservation;
+    // Optional embedding policy, called with finalized configuration before
+    // service/GPU executor construction. Throws before unreviewed work starts.
+    std::function<void(WorkerConfig const&)> admit_start;
 };
 
 enum class WorkerControl : uint8_t { Pause = 1, Drain, Resume };
@@ -133,6 +138,18 @@ struct WorkerStatus
     uint64_t broker_limit = 0, known_brokers = 0, healthy_brokers = 0, deferred_brokers = 0;
     uint64_t broker_transport_bytes = 0;
     bool broker_saturated = false;
+};
+struct WorkerTaskAdmission
+{
+    WorkerStatus worker;
+    pool::Task task;
+    std::string owner_identity, owner_id, broker_identity;
+    bool local_fallback = false;
+};
+class WorkerAdmissionRejected : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
 };
 
 class WorkerService
@@ -158,10 +175,11 @@ public:
     // outages. No independent fallback producer may bypass these resources.
     void generate_local(uint8_t k, uint8_t strength,
         std::array<uint8_t, 32> const&, WorkerPackedSink const&, WorkerCancellation = {},
-        pool::Kind = pool::Kind::GenerateAny);
+        pool::Kind = pool::Kind::GenerateAny, std::function<void(WorkerTaskAdmission const&)> const& = {});
     void contributions_local(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const>, WorkerContributionSink const&,
-        WorkerCancellation = {}, pool::Kind = pool::Kind::GenerateAny);
+        WorkerCancellation = {}, pool::Kind = pool::Kind::GenerateAny,
+        std::function<void(WorkerTaskAdmission const&)> const& = {});
 private:
     friend class WorkerClient;
     void generate_assigned(pool::Lease const&, std::span<std::array<uint8_t, 32> const>,
@@ -172,6 +190,11 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 void default_worker_resources(WorkerConfig&);
+// Complete startup service/transport and selected GPU runtime host allowance,
+// inside capacity.host_bytes rather than additional to that total partition.
+// An explicitly shared scheduler must also cover the complete offered CPUs.
+uint64_t worker_service_baseline_bytes(WorkerConfig const&);
+uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes);
 // Automatic services may reduce their discovery ceiling to retain room for a
 // supported CPU generation task. Explicit limits remain constructor errors.
 void fit_worker_broker_budget(WorkerConfig&);
@@ -194,6 +217,10 @@ struct WorkerClientConfig
     // Called after selection, before worker contact. A caller may reject an
     // optional task by throwing; the unbegun grant is then cancelled.
     std::function<void(WorkerTaskObservation const&)> selected;
+    // Whole-service status is authenticated separately before contacting the
+    // selected executor with Work. Local outage fallback uses the same hook
+    // after resolving its concrete resource grant, before allocation/compute.
+    std::function<void(WorkerTaskAdmission const&)> admit_task;
     // Shared ceiling for queued/acquiring and executing generation requests.
     unsigned max_active_generation = 64;
 };

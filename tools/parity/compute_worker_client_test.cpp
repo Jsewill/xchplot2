@@ -215,6 +215,10 @@ void network_deadlines()
     auto ca = pool_test::issue(directory.path, "client-ca");
     auto identity = pool_test::issue(directory.path, "client-host", &ca);
     auto tls = pool_test::tls(ca, identity); tls.timeout_ms = 3000;
+    pool::validate_tls_credentials(tls);
+    auto other_key = pool_test::issue(directory.path, "admission-wrong-key", &ca);
+    auto mismatched_key = tls; mismatched_key.key_file = pool_test::utf8_path(other_key.key_file);
+    rejects([&] { pool::validate_tls_credentials(mismatched_key); });
     {
         StalledPeer peer(tls);
         WorkerClientConfig config; config.broker = peer.listener.endpoint(); config.tls = tls;
@@ -572,6 +576,63 @@ void generation_admission()
         "fallback did not release/reuse generation admission or changed broker completion counts");
 }
 
+void protected_admission()
+{
+    pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "admission-ca");
+    auto identity = pool_test::issue(directory.path, "admission-host", &ca);
+    auto tls = pool_test::tls(ca, identity); tls.timeout_ms = 3000;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls; RunningBroker broker(options);
+    auto data_tls = tls; data_tls.max_frame_bytes = 4096;
+    WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0}; offered.tls = data_tls;
+    offered.capacity = {1, 2, uint64_t(2) << 30, 0}; offered.generation_threads = 1;
+    bool startup_checked = false;
+    offered.admit_start = [&](WorkerConfig const& actual)
+    { startup_checked = true; require(actual.capacity == offered.capacity && worker_service_baseline_bytes(actual) < actual.capacity.host_bytes,
+        "service startup was not checked against its finalized complete partition"); };
+    WorkerService service(offered); require(startup_checked, "worker executor started without its embedding admission"); service.start();
+    WorkerClientConfig config; config.broker = broker.server.endpoint(); config.tls = data_tls; config.owner_id = "protected-owner";
+    unsigned selected = 0; bool fallback = false;
+    config.admit_task = [&](WorkerTaskAdmission const& value)
+    {
+        ++selected; fallback = value.local_fallback;
+        require(value.worker.identity == pool::certificate_identity(tls.cert_file) && value.worker.instance == service.status().instance &&
+            value.task.resources.cpu_threads && value.task.resources.host_bytes && value.task.kind == pool::Kind::GenerateCpu,
+            "task admission did not receive authenticated status and a concrete grant");
+        throw WorkerAdmissionRejected("fixture refuses this compute grant");
+    };
+    auto rejected = [&](auto operation)
+    { bool typed = false; try { operation(); } catch (WorkerAdmissionRejected const&) { typed = true; } require(typed, "policy rejection lost its permanent type"); };
+    std::array<uint8_t, 32> id{};
+    WorkerClient remote(config);
+    rejected([&] { remote.generate(18, 2, id, [](auto const&, auto) {}); });
+    require(selected == 1 && !fallback && !remote.stats().input_bytes && !remote.stats().output_bytes && !service.status().accepted_tasks,
+        "rejected remote grant submitted Work or data to its executor");
+    config.local_service = &service; WorkerClient local(config);
+    rejected([&] { local.generate(18, 2, id, [](auto const&, auto) {}); });
+    require(selected == 2 && !fallback && !local.stats().local_tasks && !service.status().accepted_tasks,
+        "assigned local work bypassed pre-execution admission");
+    rejected([&] { local.generate_local(18, 2, id, [](auto const&, auto) {}); });
+    require(selected == 3 && fallback && !service.status().accepted_tasks && !service.status().active.host_bytes,
+        "outage fallback allocated or executed before policy admission");
+    auto denied = offered; denied.backend = "gpu";
+    denied.admit_start = [](WorkerConfig const&) { throw WorkerAdmissionRejected("reject before selecting GPU executor"); };
+    rejected([&] { WorkerService unreviewed(denied); });
+    service.stop();
+    auto unregistered_config = offered; unregistered_config.broker = {};
+    WorkerService unregistered(unregistered_config); unregistered.start();
+    pool::WorkerOffer stale; stale.instance = pool::random_token(); stale.compatibility = worker_compatibility();
+    stale.endpoint = unregistered.endpoint(); stale.capacity = unregistered.status().capacity;
+    stale.capabilities = pool::capability(pool::Kind::GenerateCpu); stale.generation_threads = 1;
+    pool::BrokerClient controller(broker.server.endpoint(), tls); controller.register_worker(stale);
+    auto changed = config; changed.local_service = nullptr; changed.owner_id = "stale-instance-owner";
+    bool callback = false; changed.admit_task = [&](auto const&) { callback = true; };
+    WorkerClient stale_client(changed);
+    rejected([&] { stale_client.generate(18, 2, id, [](auto const&, auto) {}); });
+    require(!callback && !stale_client.stats().input_bytes && !unregistered.status().accepted_tasks,
+        "lease/status instance mismatch reached policy or executor Work");
+    controller.unregister_worker(stale.instance); unregistered.stop();
+}
+
 void codec_window_limits()
 {
     pool_test::Directory directory;
@@ -677,7 +738,7 @@ void renewal_fence()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); codec_window_limits(); renewal_fence();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); codec_window_limits(); renewal_fence();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

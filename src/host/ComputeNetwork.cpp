@@ -767,6 +767,8 @@ std::string certificate_identity(std::string const& path)
     std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
     return fingerprint(certificate.get());
 }
+void validate_tls_credentials(TlsOptions const& options)
+{ (void)context(options, false); }
 std::string certificate_node_id(std::string const& path)
 {
     std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);

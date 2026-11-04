@@ -136,7 +136,12 @@ public:
         // generation deadline is much longer. No asynchronous borrower can
         // outlive these source spans.
         counters.calibration_attempts.fetch_add(1);
-        auto result = dispatch(k, chunks, false, shape, local, true, std::min<uint64_t>(elapsed, 250000000));
+        std::optional<DispatchResult> result;
+        try { result = dispatch(k, chunks, false, shape, local, true, std::min<uint64_t>(elapsed, 250000000)); }
+        catch (...)
+        {
+            std::lock_guard lock(policy_); local_sample(shape).probing = false; throw;
+        }
         bool identical = bool(result);
         size_t position = 0;
         if (result) for (auto const& block : blocks)
@@ -411,6 +416,7 @@ private:
             }
             return outcome;
         }
+        catch (WorkerAdmissionRejected const&) { throw; }
         catch (std::exception const&)
         {
             std::lock_guard lock(policy_);

@@ -11,6 +11,7 @@
 // pos2-chip.
 
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/BoundedProofSampling.hpp"
 #include "host/BatchPlotter.hpp"
 
 #include "gpu/AsyncErrorLog.hpp"   // async_error_count / first_async_error
@@ -709,7 +710,111 @@ void calibration_measure(ReaderCalibrationPhase& phase, Operation&& operation)
         phase.cpu_ns = calibration_add(phase.cpu_ns, cpu); phase.max_cpu_ns = std::max(phase.max_cpu_ns, cpu);
     }
 }
+struct CanonicalGroupIndex
+{
+    PlotGroupFile::Header header{};
+    std::vector<uint64_t> offsets;
+    uint64_t chunks = 0, index_bytes = 0, largest_chunk_bytes = 0;
+};
+CanonicalGroupIndex read_canonical_group_index(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled)
+{
+    auto require = [](bool condition, char const* message)
+    { if (!condition) throw std::runtime_error(message); };
+    auto room = [&](uint64_t bytes)
+    { require(bytes <= memory_bytes && bytes <= SIZE_MAX, "group index buffers exceed the worker memory cap"); };
+    if (check_cancelled) check_cancelled();
+    CanonicalGroupIndex index; auto& header = index.header; auto& offsets = index.offsets;
+    constexpr uint64_t fixed_bytes = 1024 * 1024;
+    std::ifstream input(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())), std::ios::binary);
+    input.exceptions(std::ios::failbit | std::ios::badbit);
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    require(header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION && header.group_size,
+        "verification requires a complete ordinary v2 group");
+    PlotProofParams::validate_input_args(header.k, header.strength);
+    require(header.k >= 18 && header.k <= 28 && !(header.k & 1), "unsupported verification plot k");
+    uint64_t const begin = sizeof(header) + header.memo_length;
+    auto const size = std::filesystem::file_size(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())));
+
+    index.chunks = PlotGroupFile::getChunkCountForK(header.k);
+    require(header.chunk_index_offset >= begin && header.chunk_index_offset < size &&
+        size - header.chunk_index_offset <= calibration_product(index.chunks, 16), "invalid group index bounds");
+    index.index_bytes = size - header.chunk_index_offset;
+    // Covers packed input, decoded offsets and canonical re-encoding's
+    // vector growth, then the retained offsets beside the actual reader.
+    room(calibration_add(fixed_bytes, calibration_add(index.index_bytes, calibration_product(index.chunks, 32))));
+    std::vector<uint64_t> packed(size_t((index.index_bytes + 7) / 8));
+    offsets.resize(size_t(index.chunks));
+    input.seekg(std::streamoff(header.chunk_index_offset));
+    input.read(reinterpret_cast<char*>(packed.data()), std::streamsize(index.index_bytes));
+    BitReader bits(packed, size_t(index.index_bytes * 8));
+    gsz_decode(offsets, header.group_size, bits);
+    uint64_t end = begin;
+    auto const expected = gsz_expected_for_g(header.group_size);
+    unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
+    require(rice < 63, "invalid group index parameter");
+    for (auto bytes : offsets)
+    {
+        require(bytes && bytes <= header.chunk_index_offset - end, "group index does not cover payload");
+        auto const magnitude = bytes < expected ? expected - bytes : bytes - expected;
+        require((magnitude >> rice) <= 62 - rice, "group index code exceeds its bound");
+        index.largest_chunk_bytes = std::max(index.largest_chunk_bytes, bytes); end += bytes;
+    }
+    require(end == header.chunk_index_offset, "group index does not cover payload");
+    BitWriter canonical; gsz_encode(offsets, header.group_size, canonical);
+    auto const encoded = canonical.asBytes();
+    require(encoded.size() == index.index_bytes && std::equal(encoded.begin(), encoded.end(),
+        reinterpret_cast<uint8_t const*>(packed.data())), "group plot has a noncanonical index or unfinished tail");
+    uint64_t offset = begin;
+    for (auto& bytes : offsets) { auto const next = offset + bytes; bytes = offset; offset = next; }
+    if (check_cancelled) check_cancelled();
+    return index;
+}
 } // namespace
+
+VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled)
+{
+    if (!budget.max_challenges || !budget.full_proofs || budget.full_proofs > budget.max_challenges)
+        throw std::invalid_argument("invalid bounded plot verification challenge or solve budget");
+    if (check_cancelled) check_cancelled();
+    // Release the shared structural probe before the reader allocates its index.
+    {
+        auto const index = read_canonical_group_index(filename, memory_bytes, check_cancelled);
+        auto const index_memory = calibration_add(index.index_bytes, calibration_product(index.chunks, 32));
+        auto const sets_memory = calibration_product(NUM_CHALLENGE_SETS, calibration_add(
+            calibration_product(index.largest_chunk_bytes, 24),
+            calibration_product(index.header.group_size, sizeof(std::vector<ProofFragment>))));
+        if (calibration_add(1024 * 1024, calibration_add(index_memory, sets_memory)) > memory_bytes)
+            throw std::runtime_error("group reader buffers exceed the worker memory cap");
+    }
+    GroupProver group(filename);
+    auto const& info = group.getPlotGroup().getInfo();
+    PlotGroupParams const params(info.group_id, info.k, info.strength, info.meta_group);
+    std::random_device entropy;
+    std::mt19937_64 random(entropy());
+    return verification_detail::sample(budget, random,
+        [&](auto const& challenge) { return group.prove(challenge); },
+        [&](auto const& challenge, auto const& member, auto const& chain)
+        {
+            auto const member_params = params.get_plot_params_for_index(member.plot_index);
+            ProofFragmentCodec codec(member_params);
+            std::array<uint32_t, TOTAL_T1_PAIRS_IN_PROOF> x_bits{};
+            size_t index = 0;
+            for (auto fragment : chain.chain_links)
+                for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits.at(index++) = x;
+            if (index != x_bits.size()) throw std::runtime_error("Sampled quality chain has an invalid proof width");
+            if (check_cancelled) check_cancelled();
+            Solver solver(member_params);
+            ProofValidator validator(params, member.plot_index);
+            for (auto const& proof : solver.solve(x_bits)) {
+                if (check_cancelled) check_cancelled();
+                auto const links = validator.validate_full_proof(proof, challenge);
+                if (links && *links == chain.chain_links) return;
+            }
+            throw std::runtime_error("Sampled quality chain has no valid full proof");
+        }, check_cancelled);
+}
 
 ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint64_t samples,
     uint64_t memory_bytes, std::function<void()> const& check_cancelled)
@@ -727,47 +832,10 @@ ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint6
     constexpr uint64_t fixed_bytes = 1024 * 1024;
     calibration_measure(result.index_probe, [&]
     {
-        std::ifstream input(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())), std::ios::binary);
-        input.exceptions(std::ios::failbit | std::ios::badbit);
-        input.read(reinterpret_cast<char*>(&header), sizeof(header));
-        require(header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION && header.group_size,
-            "reader calibration requires a complete ordinary v2 group");
-        PlotProofParams::validate_input_args(header.k, header.strength);
-        require(header.k >= 18 && header.k <= 28 && !(header.k & 1), "unsupported calibration plot k");
-        uint64_t const begin = sizeof(header) + header.memo_length;
-        auto const size = std::filesystem::file_size(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())));
+        auto index = read_canonical_group_index(filename, memory_bytes, check_cancelled);
+        header = index.header; offsets = std::move(index.offsets);
         result.k = header.k; result.strength = header.strength; result.members = header.group_size;
-        result.chunks = PlotGroupFile::getChunkCountForK(header.k);
-        require(header.chunk_index_offset >= begin && header.chunk_index_offset < size &&
-            size - header.chunk_index_offset <= calibration_product(result.chunks, 16), "invalid calibration group index bounds");
-        result.index_bytes = size - header.chunk_index_offset;
-        // Covers packed input, decoded offsets and canonical re-encoding's
-        // vector growth, then the retained offsets beside the actual reader.
-        room(calibration_add(fixed_bytes, calibration_add(result.index_bytes, calibration_product(result.chunks, 32))));
-        std::vector<uint64_t> packed(size_t((result.index_bytes + 7) / 8));
-        offsets.resize(size_t(result.chunks));
-        input.seekg(std::streamoff(header.chunk_index_offset));
-        input.read(reinterpret_cast<char*>(packed.data()), std::streamsize(result.index_bytes));
-        BitReader bits(packed, size_t(result.index_bytes * 8));
-        gsz_decode(offsets, header.group_size, bits);
-        uint64_t end = begin;
-        auto const expected = gsz_expected_for_g(header.group_size);
-        unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
-        require(rice < 63, "invalid calibration group index parameter");
-        for (auto bytes : offsets)
-        {
-            require(bytes && bytes <= header.chunk_index_offset - end, "calibration group index does not cover payload");
-            auto const magnitude = bytes < expected ? expected - bytes : bytes - expected;
-            require((magnitude >> rice) <= 62 - rice, "calibration group index code exceeds its bound");
-            result.largest_chunk_bytes = std::max(result.largest_chunk_bytes, bytes); end += bytes;
-        }
-        require(end == header.chunk_index_offset, "calibration group index does not cover payload");
-        BitWriter canonical; gsz_encode(offsets, header.group_size, canonical);
-        auto const encoded = canonical.asBytes();
-        require(encoded.size() == result.index_bytes && std::equal(encoded.begin(), encoded.end(),
-            reinterpret_cast<uint8_t const*>(packed.data())), "calibration plot has a noncanonical index or unfinished tail");
-        uint64_t offset = begin;
-        for (auto& bytes : offsets) { auto const next = offset + bytes; bytes = offset; offset = next; }
+        result.chunks = index.chunks; result.index_bytes = index.index_bytes; result.largest_chunk_bytes = index.largest_chunk_bytes;
     });
     result.index_probe.logical_requested_bytes = calibration_add(sizeof(header), result.index_bytes);
     // The same per-chunk encoded-size bound used by the reference verifier,

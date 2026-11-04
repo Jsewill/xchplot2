@@ -3,6 +3,10 @@
 #pragma once
 #include "host/GroupHarvesterProfile.hpp"
 #include <set>
+#ifdef _WIN32
+#include <psapi.h>
+#include <winternl.h>
+#endif
 #ifdef __linux__
 #include <dirent.h>
 #include <time.h>
@@ -14,6 +18,8 @@ using Clock = std::chrono::steady_clock;
 inline constexpr uint64_t resource_schema = 1;
 inline constexpr size_t max_resources = 128, max_workloads = 256, max_stages = 4096;
 inline constexpr uint64_t profile_byte_limit = 4 * 1024 * 1024;
+inline constexpr uint64_t compute_generate_cpu = uint64_t(1) << 1, compute_generate_gpu = uint64_t(1) << 2,
+    compute_encode = uint64_t(1) << 3;
 enum class ResourceKind { cpu, host_memory, gpu_compute, gpu_memory, storage, controller, network, solver };
 enum class CostKind { unknown, reservation, serialized };
 struct Resource
@@ -40,6 +46,10 @@ struct Workload
 {
     std::string id, format, decoder, decoder_version, backend, pool_difficulty;
     std::string source, captured_at;
+    // Explicit, unscanned service scope. Its complete maximum inventory and
+    // queued/full-proof envelope remains reserved throughout retirement.
+    std::string external_service_node_id, external_service_host;
+    uint64_t external_service_members = 0;
     CostKind cost = CostKind::unknown;
     bool bounded = false, scope_complete = false;
     uint64_t plot_count = 0, quality_burst = 0, proof_burst = 0;
@@ -61,7 +71,7 @@ struct Demand
     std::string resource;
     uint64_t resident_units = 0, transient_units = 0, reserved_units = 0, required_units = 0;
     // Construction/verification demands cover the entire file operation,
-    // including every member/window and the fixed verification trial sequence.
+    // including every member/window and the bounded verification sample policy.
     // Other arrays cover their declared cohort/supervision burst. These are
     // conditional service/whole carried-in blocking bounds, not batch averages
     // or the separate operation timeout.
@@ -73,11 +83,25 @@ struct NativeCohort
     uint64_t max_members = 0;
     std::vector<Demand> new_farming, proof_reserve;
 };
+struct ComputeWorkerEnvelope
+{
+    // The reviewed local profile is authority for TLS identity to physical
+    // host/device mapping, just as for remote Chia service host bindings.
+    std::string tls_identity, host, gpu_identity;
+    uint64_t cpu_threads = 0, slots = 0, host_bytes = 0, gpu_bytes = 0;
+    uint64_t standing_host_bytes = 0, standing_gpu_bytes = 0, allowed_kinds = 0;
+    // Reserve the whole globally bounded executor, including other owners and
+    // idle residency. Current lease/queue occupancy never releases this scope.
+    std::vector<Demand> reservation;
+};
 struct NativeEnvelope
 {
     bool bounded = false, scope_complete = false, covers_future_filter = false, phase_totals_include_controller = false;
     uint64_t k = 0, strength = 0;
     std::string host, reader, backend, engine;
+    // Service roles without an override are declared colocated on host.
+    // These are physical resource hosts, never names inferred from peer IPs.
+    std::map<std::string, std::string> service_hosts;
     std::string gpu_compute_resource, gpu_memory_resource;
     uint64_t max_ram_bytes = 0, max_cpu_threads = 0, max_gpu_bytes = 0, max_batch_members = 0;
     // Reviewed context/runtime/cache residency, additional to the construction
@@ -89,6 +113,13 @@ struct NativeEnvelope
     uint64_t max_group_members = 0;
     uint64_t max_construction_us = 0, max_verification_us = 0;
     uint64_t verification_cpu_threads = 0;
+    // Minimum external-pool difficulty covered by the full-solver demand in
+    // every cohort. Zero means solo/OG; a descriptive workload label is not a
+    // quantitative authorization for external-pool arrivals.
+    uint64_t min_pool_difficulty = 0, pool_protocol_version = 0;
+    std::string compute_owner_identity, compute_broker_identity, compute_broker_host;
+    std::vector<ComputeWorkerEnvelope> compute_workers;
+    std::vector<Demand> compute_services;
     std::vector<std::string> output_resources, scratch_resources, source_resources;
     std::vector<Demand> construction, verification, supervision;
     std::vector<NativeCohort> cohorts;
@@ -105,6 +136,8 @@ struct NativeRequest
     bool gpu_binding_verified = false;
     std::string gpu_identity;
     uint64_t controller_ram_bytes = 0, adapter_ram_bytes = 0, adapter_cpu_threads = 0, adapter_timeout_us = 0;
+    uint64_t generation_peak_bytes = 0, compute_session_ram_bytes = 0, compute_codec_ram_bytes = 0;
+    bool compute_enabled = false;
     std::vector<std::string> output_resources, scratch_resources, source_resources;
 };
 struct Profile
@@ -122,7 +155,7 @@ struct Stage
     std::vector<Remaining> remaining;
     // Already-assessed native v2 quality demand is independent of its separately
     // bounded full-proof solver reserve. Reader calibration does not supply it.
-    std::vector<Demand> new_farming, proof_reserve, construction, verification, supervision;
+    std::vector<Demand> new_farming, proof_reserve, construction, verification, supervision, background;
 };
 struct Margin
 {
@@ -242,7 +275,7 @@ inline void validate(Profile const& profile)
             profile.gate.recovery_hold_ms <= 3600000 && profile.gate.recovery_samples &&
             profile.gate.recovery_samples <= 64 && profile.gate.max_cpu_busy_permille <= 1000,
             "invalid mixed farm telemetry policy");
-    std::set<std::string> ids;
+    std::set<std::string> ids, external_ids;
     for (auto const& w : profile.workloads)
     {
         text(w.id, true); require(ids.insert(w.id).second, "duplicate mixed farm workload ID");
@@ -251,6 +284,18 @@ inline void validate(Profile const& profile)
                 "invalid mixed farm workload filter or resource count");
         require(w.cost == CostKind::unknown || w.cost == CostKind::reservation || w.cost == CostKind::serialized,
                 "unsupported mixed farm cost kind");
+        bool const external = !w.external_service_node_id.empty();
+        require(external == !w.external_service_host.empty() && external == bool(w.external_service_members),
+            "external service workload requires its peer node identity, physical host and maximum member count");
+        if (external)
+        {
+            require(external_ids.insert(w.external_service_node_id).second, "external service node identity has duplicate workload scopes");
+            require(w.plot_count && w.external_service_members >= w.plot_count && w.external_service_node_id.size() == 64 &&
+                std::all_of(w.external_service_node_id.begin(), w.external_service_node_id.end(),
+                    [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }),
+                "invalid external service identity or maximum population");
+            text(w.external_service_host, true);
+        }
         std::set<size_t> used;
         for (auto const& u : w.uses)
         {
@@ -268,7 +313,16 @@ inline void validate(Profile const& profile)
         }
     }
     auto const& n = profile.native;
+    require((!n.min_pool_difficulty && !n.pool_protocol_version) ||
+        (n.min_pool_difficulty && (n.pool_protocol_version == 1 || n.pool_protocol_version == 2)),
+        "native pool demand requires both a reviewed difficulty and supported pooling protocol");
     text(n.host); text(n.reader); text(n.backend); text(n.engine); text(n.gpu_compute_resource); text(n.gpu_memory_resource);
+    require(n.service_hosts.size() <= 4, "too many native service host bindings");
+    for (auto const& [role, host] : n.service_hosts)
+    {
+        require(role == "harvester" || role == "farmer" || role == "full_node" || role == "solver", "unknown native service host role");
+        text(host, true);
+    }
     require(n.max_group_members <= UINT16_MAX, "native whole-file membership bound exceeds the plot format");
     require(n.cohorts.size() <= 256 && n.output_resources.size() <= max_resources && n.scratch_resources.size() <= max_resources && n.source_resources.size() <= max_resources &&
             n.construction.size() <= max_resources * 4 && n.verification.size() <= max_resources * 4 &&
@@ -286,6 +340,29 @@ inline void validate(Profile const& profile)
     };
     for (auto const* mappings : {&n.output_resources, &n.scratch_resources, &n.source_resources}) for (auto const& id : *mappings) { text(id, true); (void)graph.find(id); }
     demands(n.construction); demands(n.verification); demands(n.supervision);
+    demands(n.compute_services);
+    require(n.compute_workers.size() <= max_workloads && n.compute_services.size() <= max_resources * 4,
+        "native compute scope exceeds its bounded declaration size");
+    text(n.compute_owner_identity); text(n.compute_broker_identity); text(n.compute_broker_host);
+    std::set<std::string> compute_ids;
+    for (auto const& worker : n.compute_workers)
+    {
+        text(worker.tls_identity, true); text(worker.host, true); text(worker.gpu_identity);
+        require(compute_ids.insert(worker.tls_identity).second && worker.tls_identity.size() == 64 &&
+            std::all_of(worker.tls_identity.begin(), worker.tls_identity.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }),
+            "invalid or duplicate reviewed compute worker TLS identity");
+        require(worker.cpu_threads && worker.cpu_threads <= 1024 && worker.slots && worker.slots <= 1024 && worker.host_bytes &&
+            worker.standing_host_bytes && worker.standing_host_bytes < worker.host_bytes && worker.allowed_kinds &&
+            !(worker.allowed_kinds & ~(compute_generate_cpu | compute_generate_gpu | compute_encode)) &&
+            !worker.reservation.empty() && worker.reservation.size() <= max_resources * 4,
+            "reviewed compute worker omits bounded whole-service capacity or task capabilities");
+        require((worker.gpu_bytes && worker.standing_gpu_bytes && !worker.gpu_identity.empty()) ||
+            (!worker.gpu_bytes && !worker.standing_gpu_bytes && worker.gpu_identity.empty()), "reviewed compute GPU requires allocation and standing physical residency");
+        require(worker.gpu_identity.empty() || worker.gpu_identity.starts_with("host:" + worker.host + '/'),
+            "reviewed compute physical GPU identity differs from its resource host");
+        require(!(worker.allowed_kinds & compute_generate_gpu) || worker.gpu_bytes, "reviewed GPU task capability has no physical GPU service budget");
+        demands(worker.reservation);
+    }
     for (auto const& c : n.cohorts)
     {
         require(c.max_members > prior && c.new_farming.size() <= max_resources * 4 && c.proof_reserve.size() <= max_resources * 4,
@@ -313,6 +390,11 @@ inline void validate_inventory_coverage(Profile const& profile, std::vector<Rema
     for (auto const& w : profile.workloads)
     {
         auto at = actual.find(w.id);
+        if (!w.external_service_node_id.empty())
+        {
+            resource_detail::require(at == actual.end(), "unscanned external service workload was assigned scanned retirement inventory");
+            continue;
+        }
         resource_detail::require((at == actual.end() ? 0 : at->second) == w.plot_count,
                                  "mixed farm profile does not cover the complete active inventory");
         if (at != actual.end()) actual.erase(at);
@@ -339,8 +421,8 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
             "selected whole-file membership exceeds reviewed construction and verification phase bounds");
     require(request.cpu_affinity_lanes && request.cpu_threads <= request.cpu_affinity_lanes,
             "native request has no valid inherited CPU affinity scope");
-    require(request.standing_gpu_bytes == (request.backend == "gpu" ? n.standing_gpu_bytes : 0) &&
-            (request.backend != "gpu" || request.standing_gpu_bytes),
+    require(request.standing_gpu_bytes == (request.backend == "gpu" && !request.compute_enabled ? n.standing_gpu_bytes : 0) &&
+            (request.backend != "gpu" || request.compute_enabled || request.standing_gpu_bytes),
             "GPU migration requires a reviewed standing native GPU residency bound");
     auto mappings = [&](std::vector<std::string> const& actual, std::vector<std::string> const& saved)
     {
@@ -363,6 +445,10 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
                 "selected GPU differs from reviewed physical compute or memory resource");
     }
     stage.new_farming.clear(); stage.proof_reserve.clear(); stage.construction.clear(); stage.verification.clear(); stage.supervision.clear();
+    stage.background = n.compute_services;
+    for (auto const& worker : n.compute_workers)
+        stage.background.insert(stage.background.end(), worker.reservation.begin(), worker.reservation.end());
+    require(stage.background.size() <= max_resources * 4, "native compute background demands exceed their bounded stage size");
     // Target farming/solver services must already be live before replacement.
     // Reserve the first complete cohort even with no ready members, covering
     // standing residency and queues without guessing a smaller idle footprint.
@@ -382,6 +468,7 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
                         uint64_t gpu_required, bool scratch, bool local, bool sources = false)
     {
         std::map<size_t, uint64_t> units, resident;
+        std::map<std::string, std::set<ResourceKind>> hosts;
         std::set<ResourceKind> kinds; std::set<size_t> used;
         for (auto const& d : values)
         {
@@ -390,11 +477,17 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
             uint64_t const amount = memory(kind) ? add(d.resident_units, d.transient_units) : add(d.required_units, d.reserved_units);
             require(amount > 0 && (memory(kind) || d.reserved_units || d.work_us), "zero or irrelevant native resource demand");
             used.insert(i);
+            hosts[graph.resources[i].host].insert(kind);
             if (!local || graph.resources[i].host == request.host) kinds.insert(kind);
             units[i] = add(units[i], amount);
             resident[i] = add(resident[i], d.resident_units);
         }
         require(kinds.contains(ResourceKind::cpu) && kinds.contains(ResourceKind::host_memory), "native demand omits CPU or host memory");
+        for (auto const& [host, resources] : hosts)
+            if (resources.contains(ResourceKind::cpu) || resources.contains(ResourceKind::host_memory) ||
+                resources.contains(ResourceKind::gpu_compute) || resources.contains(ResourceKind::gpu_memory) || resources.contains(ResourceKind::solver))
+                require(resources.contains(ResourceKind::cpu) && resources.contains(ResourceKind::host_memory),
+                    "native service demand omits CPU or host memory on its physical execution host");
         uint64_t cpu = 0, ram = 0, vram = 0;
         for (auto const& [i, amount] : units)
         {
@@ -424,7 +517,7 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
     // scoped generation cap. host_threads does not cap those existing threads,
     // so every GPU-session phase retains the whole inherited CPU-set envelope.
     auto concurrent_cpu = [&](uint64_t child)
-    { return request.backend == "gpu" ? request.cpu_affinity_lanes : std::min(request.cpu_affinity_lanes, add(child, 1)); };
+    { return request.backend == "gpu" && !request.compute_enabled ? request.cpu_affinity_lanes : std::min(request.cpu_affinity_lanes, add(child, 1)); };
     if (building) coverage(stage.construction, concurrent_cpu(request.cpu_threads), add(request.ram_bytes, request.controller_ram_bytes), request.gpu_bytes, true, true);
     if (verifying)
     {
@@ -441,7 +534,70 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
     // work statistics and a memory-only 'proof reserve' cannot supply them.
     coverage(stage.new_farming, 1, 1, 0, false, false);
     coverage(stage.proof_reserve, 1, 1, 0, false, false);
+    if (request.compute_enabled)
+    {
+        require(!n.compute_workers.empty() && !n.compute_owner_identity.empty() && !n.compute_broker_identity.empty() && !n.compute_broker_host.empty(),
+            "selected compute requires reviewed owner, broker and physical worker scopes");
+        uint64_t const generation = request.backend == "cpu" ? compute_generate_cpu : compute_generate_gpu;
+        require(std::any_of(n.compute_workers.begin(), n.compute_workers.end(), [&](auto const& worker) { return bool(worker.allowed_kinds & generation); }),
+            "reviewed compute workers cannot generate the selected construction backend");
+        require(!request.compute_codec_ram_bytes || std::any_of(n.compute_workers.begin(), n.compute_workers.end(),
+            [](auto const& worker) { return bool(worker.allowed_kinds & compute_encode); }), "reviewed compute workers have no permitted codec capability");
+        uint64_t const service_ram = add(request.compute_session_ram_bytes, request.compute_codec_ram_bytes);
+        uint64_t cpu = 0, ram = 0, broker_cpu = 0, broker_ram = 0; bool network = n.compute_broker_host == request.host;
+        for (auto const& demand : n.compute_services)
+        {
+            auto const& resource = graph.resources[graph.find(demand.resource)];
+            if (resource.host == n.compute_broker_host)
+            {
+                if (resource.kind == ResourceKind::cpu) broker_cpu = add(broker_cpu, add(demand.reserved_units, demand.required_units));
+                if (resource.kind == ResourceKind::host_memory) broker_ram = add(broker_ram, add(demand.resident_units, demand.transient_units));
+            }
+            if (resource.kind == ResourceKind::network && (demand.reserved_units || demand.required_units)) network = true;
+            if (resource.host != request.host) continue;
+            if (resource.kind == ResourceKind::cpu) cpu = add(cpu, add(demand.reserved_units, demand.required_units));
+            if (resource.kind == ResourceKind::host_memory) ram = add(ram, add(demand.resident_units, demand.transient_units));
+        }
+        require(!service_ram || (cpu && ram >= service_ram), "reviewed compute services omit the local broker/codec memory and CPU partitions");
+        require(broker_cpu && broker_ram && network, "reviewed compute services omit the physical broker host or its remote network scope");
+    }
+    for (auto const& worker : n.compute_workers)
+    {
+        uint64_t cpu = 0, ram = 0, resident_ram = 0, vram = 0, resident_vram = 0;
+        bool gpu = false, network = worker.host == request.host;
+        std::optional<size_t> selected;
+        if (worker.gpu_bytes) selected = graph.find(worker.gpu_identity + "/memory");
+        for (auto const& demand : worker.reservation)
+        {
+            require(demand.bounded && !demand.required_units && !demand.work_us,
+                "whole compute worker requires opaque globally bounded service reservations");
+            auto const i = graph.find(demand.resource); auto const& resource = graph.resources[i];
+            if (resource.kind == ResourceKind::network && demand.reserved_units) network = true;
+            if (resource.host != worker.host) continue;
+            if (resource.kind == ResourceKind::cpu) cpu = add(cpu, demand.reserved_units);
+            if (resource.kind == ResourceKind::host_memory)
+            { ram = add(ram, add(demand.resident_units, demand.transient_units)); resident_ram = add(resident_ram, demand.resident_units); }
+            if (worker.gpu_bytes && resource.kind == ResourceKind::gpu_compute && i == graph.find(worker.gpu_identity + "/compute") && demand.reserved_units) gpu = true;
+            if (selected && i == *selected)
+            { vram = add(vram, add(demand.resident_units, demand.transient_units)); resident_vram = add(resident_vram, demand.resident_units); }
+        }
+        uint64_t const cpu_bound = worker.gpu_bytes && worker.host == request.host ?
+            std::max(worker.cpu_threads, request.cpu_affinity_lanes) : worker.cpu_threads;
+        require(cpu >= cpu_bound && ram >= worker.host_bytes && resident_ram >= worker.standing_host_bytes && network,
+            "whole compute worker reservation omits physical CPU, total/standing host memory or remote network capacity");
+        if (worker.gpu_bytes)
+            require(selected && graph.resources[*selected].kind == ResourceKind::gpu_memory && graph.resources[*selected].host == worker.host && gpu &&
+                vram >= add(worker.gpu_bytes, worker.standing_gpu_bytes) && resident_vram >= worker.standing_gpu_bytes,
+                "whole compute worker reservation omits physical GPU allocation or standing residency");
+    }
     stage.scope_complete = true;
+}
+
+inline void require_target_pool_difficulty(Profile const& profile, uint64_t current, uint64_t protocol = 0)
+{
+    resource_detail::require(((!current && !profile.native.min_pool_difficulty) || (current && profile.native.min_pool_difficulty && current >= profile.native.min_pool_difficulty)) &&
+        profile.native.pool_protocol_version == protocol,
+        "current target pool difficulty is below the reviewed full-solver floor or its protocol differs");
 }
 
 inline Assessment assess_stage(Profile const& profile, Stage const& stage)
@@ -468,6 +624,8 @@ inline Assessment assess_stage(Profile const& profile, Stage const& stage)
         auto at = remaining.find(w.id);
         // Omitting an outside workload retains it; it never silently vanishes.
         uint64_t const count = at == remaining.end() ? w.plot_count : at->second;
+        require(w.external_service_node_id.empty() || count == w.plot_count,
+            "migration cannot reduce an unscanned external service reservation");
         require(count <= w.plot_count, "stage increases an existing workload inventory");
         if (at != remaining.end()) remaining.erase(at);
         bool const active = count != 0;
@@ -558,6 +716,7 @@ inline Assessment assess_stage(Profile const& profile, Stage const& stage)
     demands(stage.new_farming, "native-farming", false); demands(stage.proof_reserve, "native-full-proof", false);
     demands(stage.construction, "construction", true); demands(stage.verification, "verification", true);
     demands(stage.supervision, "supervision", true);
+    demands(stage.background, "compute-services", false);
     for (size_t i = 0; i < result.margins.size(); ++i)
     {
         auto& m = result.margins[i]; auto const& r = graph.resources[i];
@@ -658,16 +817,22 @@ inline uint64_t profile_memory(Profile const& profile)
     }
     for (auto const& w : profile.workloads)
     {
-        for (auto const* s : {&w.id, &w.format, &w.decoder, &w.decoder_version, &w.backend, &w.pool_difficulty, &w.source, &w.captured_at}) string(*s);
+        for (auto const* s : {&w.id, &w.format, &w.decoder, &w.decoder_version, &w.backend, &w.pool_difficulty, &w.source, &w.captured_at,
+            &w.external_service_node_id, &w.external_service_host}) string(*s);
         bytes = add(bytes, multiply(w.uses.capacity(), sizeof(Use)));
         for (auto const& u : w.uses) string(u.resource);
     }
     auto const& native = profile.native;
     string(native.host); string(native.reader); string(native.backend); string(native.engine);
+    for (auto const& [role, host] : native.service_hosts) { string(role); string(host); bytes = add(bytes, 128); }
     string(native.gpu_compute_resource); string(native.gpu_memory_resource);
     auto demands = [&](std::vector<Demand> const& values)
     { bytes = add(bytes, multiply(values.capacity(), sizeof(Demand))); for (auto const& d : values) string(d.resource); };
-    demands(native.construction); demands(native.verification); demands(native.supervision);
+    demands(native.construction); demands(native.verification); demands(native.supervision); demands(native.compute_services);
+    string(native.compute_owner_identity); string(native.compute_broker_identity); string(native.compute_broker_host);
+    bytes = add(bytes, multiply(native.compute_workers.capacity(), sizeof(ComputeWorkerEnvelope)));
+    for (auto const& worker : native.compute_workers)
+    { string(worker.tls_identity); string(worker.host); string(worker.gpu_identity); demands(worker.reservation); }
     for (auto const* mappings : {&native.output_resources, &native.scratch_resources, &native.source_resources})
     { bytes = add(bytes, multiply(mappings->capacity(), sizeof(std::string))); for (auto const& id : *mappings) string(id); }
     bytes = add(bytes, multiply(native.cohorts.capacity(), sizeof(NativeCohort)));
@@ -719,12 +884,19 @@ inline NativeEnvelope parse_native(profile_detail::Json const& object)
     if (auto const* value = field(object, "covers_future_filter")) n.covers_future_filter = boolean(*value);
     if (auto const* value = field(object, "phase_totals_include_controller")) n.phase_totals_include_controller = boolean(*value);
     n.host = string("host"); n.k = number("k"); n.strength = number("strength"); n.reader = string("reader"); n.backend = string("backend"); n.engine = string("engine");
+    if (auto const* hosts = field(object, "service_hosts"))
+    {
+        require(hosts->kind == Json::object && hosts->fields.size() <= 4, "invalid native service host bindings");
+        for (auto const& [role, host] : hosts->fields) n.service_hosts.emplace(role, profile_detail::text(host));
+    }
     n.gpu_compute_resource = string("gpu_compute_resource"); n.gpu_memory_resource = string("gpu_memory_resource");
     n.max_ram_bytes = number("max_ram_bytes"); n.max_cpu_threads = number("max_cpu_threads"); n.max_gpu_bytes = number("max_gpu_bytes");
     n.standing_gpu_bytes = number("standing_gpu_bytes");
     n.max_batch_members = number("max_batch_members"); n.max_group_members = number("max_group_members");
     n.max_construction_us = number("max_construction_us"); n.max_verification_us = number("max_verification_us");
     n.verification_cpu_threads = number("verification_cpu_threads");
+    n.min_pool_difficulty = number("min_pool_difficulty");
+    n.pool_protocol_version = number("pool_protocol_version");
     for (auto const& [name, target] : {std::pair{"output_resources", &n.output_resources}, {"scratch_resources", &n.scratch_resources}, {"source_resources", &n.source_resources}})
         if (auto const* values = field(object, name))
         {
@@ -734,6 +906,37 @@ inline NativeEnvelope parse_native(profile_detail::Json const& object)
     if (auto const* values = field(object, "construction")) n.construction = parse_demands(*values);
     if (auto const* values = field(object, "verification")) n.verification = parse_demands(*values);
     if (auto const* values = field(object, "supervision")) n.supervision = parse_demands(*values);
+    n.compute_owner_identity = string("compute_owner_identity"); n.compute_broker_identity = string("compute_broker_identity");
+    n.compute_broker_host = string("compute_broker_host");
+    if (auto const* values = field(object, "compute_services")) n.compute_services = parse_demands(*values);
+    if (auto const* workers = field(object, "compute_workers"))
+    {
+        require(workers->kind == Json::array && workers->items.size() <= max_workloads, "invalid reviewed compute worker array");
+        for (auto const& object : workers->items)
+        {
+            require(object.kind == Json::object, "invalid reviewed compute worker declaration");
+            auto number = [&](char const* name) { auto const* value = field(object, name); return value ? integer(*value) : uint64_t(0); };
+            auto string = [&](char const* name) { auto const* value = field(object, name); return value ? profile_detail::text(*value) : std::string{}; };
+            ComputeWorkerEnvelope worker; worker.tls_identity = string("tls_identity"); worker.host = string("host"); worker.gpu_identity = string("gpu_identity");
+            worker.cpu_threads = number("cpu_threads"); worker.slots = number("slots"); worker.host_bytes = number("host_bytes"); worker.gpu_bytes = number("gpu_bytes");
+            worker.standing_host_bytes = number("standing_host_bytes"); worker.standing_gpu_bytes = number("standing_gpu_bytes");
+            if (auto const* kinds = field(object, "allowed_kinds"))
+            {
+                require(kinds->kind == Json::array && kinds->items.size() <= 3, "invalid reviewed compute task kind array");
+                for (auto const& value : kinds->items)
+                {
+                    auto const kind = profile_detail::text(value); uint64_t bit = 0;
+                    if (kind == "generate-cpu") bit = compute_generate_cpu;
+                    else if (kind == "generate-gpu") bit = compute_generate_gpu;
+                    else if (kind == "encode") bit = compute_encode;
+                    else throw std::runtime_error("unknown reviewed compute task kind");
+                    require(!(worker.allowed_kinds & bit), "repeated reviewed compute task kind"); worker.allowed_kinds |= bit;
+                }
+            }
+            if (auto const* values = field(object, "reservation")) worker.reservation = parse_demands(*values);
+            n.compute_workers.push_back(std::move(worker));
+        }
+    }
     if (auto const* cohorts = field(object, "cohorts"))
     {
         require(cohorts->kind == Json::array && cohorts->items.size() <= 256, "invalid native resource cohort array");
@@ -756,12 +959,19 @@ inline void write_native(std::ostream& out, NativeEnvelope const& n)
         << ",\"phase_totals_include_controller\":" << (n.phase_totals_include_controller ? "true" : "false")
         << ",\"k\":" << n.k << ",\"strength\":" << n.strength << ",\"host\":"; quote(n.host); out << ",\"reader\":"; quote(n.reader);
     out << ",\"backend\":"; quote(n.backend); out << ",\"engine\":"; quote(n.engine);
+    if (!n.service_hosts.empty())
+    {
+        out << ",\"service_hosts\":{"; bool comma = false;
+        for (auto const& [role, host] : n.service_hosts) { if (comma) out << ','; comma = true; quote(role); out << ':'; quote(host); }
+        out << '}';
+    }
     out << ",\"gpu_compute_resource\":"; quote(n.gpu_compute_resource); out << ",\"gpu_memory_resource\":"; quote(n.gpu_memory_resource);
     out << ",\"max_ram_bytes\":" << n.max_ram_bytes << ",\"max_cpu_threads\":" << n.max_cpu_threads << ",\"max_gpu_bytes\":" << n.max_gpu_bytes
         << ",\"standing_gpu_bytes\":" << n.standing_gpu_bytes
         << ",\"max_batch_members\":" << n.max_batch_members << ",\"max_group_members\":" << n.max_group_members
         << ",\"max_construction_us\":" << n.max_construction_us << ",\"max_verification_us\":" << n.max_verification_us
         << ",\"verification_cpu_threads\":" << n.verification_cpu_threads;
+    if (n.min_pool_difficulty) out << ",\"min_pool_difficulty\":" << n.min_pool_difficulty << ",\"pool_protocol_version\":" << n.pool_protocol_version;
     for (auto const& [name, values] : {std::pair{"output_resources", &n.output_resources}, {"scratch_resources", &n.scratch_resources}, {"source_resources", &n.source_resources}})
     {
         out << ",\"" << name << "\":["; bool comma = false;
@@ -769,6 +979,28 @@ inline void write_native(std::ostream& out, NativeEnvelope const& n)
     }
     out << ",\"construction\":"; write_demands(out, n.construction); out << ",\"verification\":"; write_demands(out, n.verification);
     out << ",\"supervision\":"; write_demands(out, n.supervision);
+    if (!n.compute_workers.empty() || !n.compute_services.empty())
+    {
+        out << ",\"compute_owner_identity\":"; quote(n.compute_owner_identity);
+        out << ",\"compute_broker_identity\":"; quote(n.compute_broker_identity);
+        out << ",\"compute_broker_host\":"; quote(n.compute_broker_host);
+        out << ",\"compute_services\":"; write_demands(out, n.compute_services);
+        out << ",\"compute_workers\":["; bool comma = false;
+        for (auto const& worker : n.compute_workers)
+        {
+            if (comma) out << ','; comma = true; out << "{\"tls_identity\":"; quote(worker.tls_identity);
+            out << ",\"host\":"; quote(worker.host); out << ",\"gpu_identity\":"; quote(worker.gpu_identity);
+            out << ",\"cpu_threads\":" << worker.cpu_threads << ",\"slots\":" << worker.slots << ",\"host_bytes\":" << worker.host_bytes
+                << ",\"gpu_bytes\":" << worker.gpu_bytes << ",\"standing_host_bytes\":" << worker.standing_host_bytes
+                << ",\"standing_gpu_bytes\":" << worker.standing_gpu_bytes << ",\"allowed_kinds\":[";
+            bool kind_comma = false;
+            for (auto const& [name, bit] : {std::pair{"generate-cpu", compute_generate_cpu}, {"generate-gpu", compute_generate_gpu}, {"encode", compute_encode}})
+                if (worker.allowed_kinds & bit) { if (kind_comma) out << ','; kind_comma = true; quote(name); }
+            out << "],\"reservation\":";
+            write_demands(out, worker.reservation); out << '}';
+        }
+        out << ']';
+    }
     out << ",\"cohorts\":["; bool comma = false;
     for (auto const& c : n.cohorts)
     {
@@ -817,6 +1049,8 @@ inline Profile parse_profile(profile_detail::Json const& supplied)
         w.id = string(item, "id"); w.format = string(item, "format"); w.decoder = string(item, "decoder");
         w.decoder_version = string(item, "decoder_version"); w.backend = string(item, "backend"); w.pool_difficulty = string(item, "pool_difficulty");
         w.source = string(item, "source"); w.captured_at = string(item, "captured_at");
+        w.external_service_node_id = string(item, "external_service_node_id"); w.external_service_host = string(item, "external_service_host");
+        w.external_service_members = number(item, "external_service_members");
         auto const cost = string(item, "cost");
         resource_detail::require(cost == "unknown" || cost == "reservation" || cost == "serialized", "unsupported mixed farm workload cost kind");
         w.cost = cost == "reservation" ? CostKind::reservation : cost == "serialized" ? CostKind::serialized : CostKind::unknown;
@@ -896,7 +1130,12 @@ inline std::vector<RankedVictim> rank_victims(Profile const& profile, Stage cons
     std::optional<size_t> selected;
     if (!bottleneck.empty()) selected = graph.find(bottleneck);
     std::map<std::string, uint64_t> remaining;
-    for (auto const& w : profile.workloads) remaining[w.id] = w.plot_count;
+    std::set<std::string> external;
+    for (auto const& w : profile.workloads)
+    {
+        remaining[w.id] = w.plot_count;
+        if (!w.external_service_node_id.empty()) external.insert(w.id);
+    }
     for (auto const& item : stage.remaining) remaining[item.workload] = item.count;
     std::set<std::string> ids; std::vector<RankedVictim> result;
     std::map<std::pair<std::string, uint64_t>, std::pair<uint64_t, uint64_t>> relief_cache;
@@ -906,6 +1145,7 @@ inline std::vector<RankedVictim> rank_victims(Profile const& profile, Stage cons
         require(ids.insert(v.id).second && v.count && v.physical_bytes, "invalid migration ranking candidate");
         auto const at = remaining.find(v.workload);
         require(at != remaining.end() && v.count <= at->second, "ranking candidate exceeds remaining workload");
+        require(!external.contains(v.workload), "unscanned external service workload cannot be a retirement candidate");
         if (v.forecast_value) require(!v.value_unit.empty(), "forecast value is missing its explicit unit");
         if (v.eligible_capacity_known) require(!v.eligible_capacity_unit.empty(), "eligible capacity is missing its explicit unit");
         if (v.replacement_us) require(*v.replacement_us, "replacement duration must be positive when known");
@@ -977,6 +1217,12 @@ inline void write_profile_json(std::ostream& out, Profile const& profile)
         out << ",\"decoder\":"; quote(w.decoder); out << ",\"decoder_version\":"; quote(w.decoder_version);
         out << ",\"backend\":"; quote(w.backend); out << ",\"pool_difficulty\":"; quote(w.pool_difficulty);
         out << ",\"source\":"; quote(w.source); out << ",\"captured_at\":"; quote(w.captured_at);
+        if (!w.external_service_node_id.empty())
+        {
+            out << ",\"external_service_node_id\":"; quote(w.external_service_node_id);
+            out << ",\"external_service_host\":"; quote(w.external_service_host);
+            out << ",\"external_service_members\":" << w.external_service_members;
+        }
         out << ",\"cost\":"; quote(w.cost == CostKind::reservation ? "reservation" : w.cost == CostKind::serialized ? "serialized" : "unknown");
         out << ",\"bounded\":" << (w.bounded ? "true" : "false") << ",\"scope_complete\":" << (w.scope_complete ? "true" : "false")
             << ",\"plot_count\":" << w.plot_count << ",\"quality_burst\":" << w.quality_burst << ",\"proof_burst\":" << w.proof_burst
@@ -1042,11 +1288,13 @@ class AssessmentAccumulator
         {
             auto at = remaining.find(w.id); auto const count = at == remaining.end() ? w.plot_count : at->second;
             require(count <= w.plot_count, "streaming stage increases existing workload count");
+            require(w.external_service_node_id.empty() || count == w.plot_count,
+                "streaming migration cannot reduce an unscanned external service reservation");
             out << (count != 0); if (at != remaining.end()) remaining.erase(at);
         }
         require(remaining.empty(), "streaming stage names an unknown workload");
         uint64_t bytes = 0;
-        for (auto const* values : {&stage.new_farming, &stage.proof_reserve, &stage.construction, &stage.verification, &stage.supervision})
+        for (auto const* values : {&stage.new_farming, &stage.proof_reserve, &stage.construction, &stage.verification, &stage.supervision, &stage.background})
         {
             require(values->size() <= max_resources * 4, "too many streaming native demands");
             for (auto const& d : *values) { bytes = resource_detail::add(bytes, resource_detail::add(d.resource.size(), 256)); if (bytes > 65536) return {}; }
@@ -1184,6 +1432,7 @@ public:
         };
         add_demands(stage.new_farming); add_demands(stage.proof_reserve); add_demands(stage.construction); add_demands(stage.verification);
         add_demands(stage.supervision);
+        add_demands(stage.background);
         if (active_own_anon_bytes)
         {
             require(!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty(),
@@ -1261,7 +1510,7 @@ inline uint64_t busy_permille(uint64_t busy, uint64_t total)
 inline std::optional<uint64_t> active_cpu_pressure(uint64_t total, uint64_t idle, uint64_t own_ns,
     uint64_t interior_ns, uint64_t lanes, uint64_t units, uint64_t processors)
 {
-    if (!total || idle > total || !lanes || !units || units > 1000000 || !processors) return {};
+    if (!total || idle > total || !lanes || !units || units > 1000000000 || !processors) return {};
     // Only the interior process-clock interval is credited. User/system tick
     // conversion can each round at a boundary; retain two ticks per CPU as
     // uncertainty rather than subtracting another process's busy time.
@@ -1327,7 +1576,39 @@ public:
         return std::pair{*busy, uint64_t(age)};
     }
 };
-#ifdef __linux__
+#ifdef _WIN32
+inline std::optional<uint64_t> process_cpu_ns()
+{
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user)) return {};
+    auto number = [](FILETIME value) { return (uint64_t(value.dwHighDateTime) << 32) | value.dwLowDateTime; };
+    return multiply(add(number(kernel), number(user)), 100);
+}
+inline std::optional<uint64_t> private_working_set()
+{
+    // PROCESS_MEMORY_COUNTERS_EX2 is supported by the Windows releases with
+    // the September 2023 cumulative update. Keep its documented layout here
+    // because older SDKs expose only EX. An older OS that fills only EX leaves
+    // the sentinel unchanged and cannot grant resident-memory credit.
+    struct Counters
+    {
+        PROCESS_MEMORY_COUNTERS_EX base;
+        SIZE_T private_working_set;
+        ULONG64 shared_commit;
+    } value{};
+    value.base.cb = sizeof(value); value.private_working_set = SIZE_MAX;
+    if (!::K32GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&value), sizeof(value)) ||
+        value.private_working_set == SIZE_MAX || value.private_working_set > value.base.WorkingSetSize ||
+        value.private_working_set > value.base.PrivateUsage) return {};
+    return uint64_t(value.private_working_set);
+}
+inline bool process_affinity_within(DWORD_PTR allowed)
+{
+    DWORD_PTR actual = 0, system = 0;
+    return ::GetActiveProcessorGroupCount() == 1 &&
+        ::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual && !(actual & ~allowed);
+}
+#elif defined(__linux__)
 inline std::optional<uint64_t> process_cpu_ns()
 {
     timespec value{};
@@ -1383,17 +1664,49 @@ public:
         std::optional<CpuObservation> cpu;
         std::string cpu_scope; bool own_scope = false;
 #ifdef _WIN32
+        auto const private_before = active ? private_working_set() : std::optional<uint64_t>{};
         MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
         if (GlobalMemoryStatusEx(&memory)) available = memory.ullAvailPhys;
-        FILETIME idle{}, kernel{}, user{}; DWORD_PTR allowed = 0, system = 0;
-        DWORD const count = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-        if (count && ::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system) &&
-            std::popcount(allowed) == count && GetSystemTimes(&idle, &kernel, &user))
+        if (active)
         {
-            auto number = [](FILETIME time) { return (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
-            CpuObservation value; value.total = add(number(kernel), number(user)); value.idle = number(idle);
-            value.units_per_second = 10000000; value.processors = count; value.at = now;
-            value.scope = cpu_scope = "windows-all:" + std::to_string(count); cpu = value;
+            auto const private_after = private_working_set();
+            if (private_before && private_after) own_anon_ = std::min(*private_before, *private_after);
+        }
+        DWORD_PTR allowed = 0, system = 0;
+        DWORD const count = ::GetActiveProcessorCount(0);
+        if (::GetActiveProcessorGroupCount() == 1 && count && count <= sizeof(DWORD_PTR) * CHAR_BIT &&
+            ::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system) && allowed)
+        {
+            // GetSystemTimes aggregates CPUs outside a restricted affinity.
+            // Query the documented per-processor records dynamically and use
+            // only the known single group's selected processors. Unsupported
+            // layouts/counters remain unknown and cannot satisfy admission.
+            using Query = NTSTATUS (NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+            auto const module = ::GetModuleHandleW(L"ntdll.dll");
+            auto const query = module ? reinterpret_cast<Query>(::GetProcAddress(module, "NtQuerySystemInformation")) : nullptr;
+            std::array<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION, sizeof(DWORD_PTR) * CHAR_BIT> records{};
+            ULONG returned = 0;
+            CpuObservation value; value.at = now; value.processors = uint64_t(std::popcount(allowed));
+            value.units_per_second = 10000000;
+            value.before_wall = Clock::now(); value.own_before_ns = process_cpu_ns();
+            bool valid = process_affinity_within(allowed) && query &&
+                query(SystemProcessorPerformanceInformation, records.data(), ULONG(sizeof(records)), &returned) >= 0 &&
+                returned == count * sizeof(records.front());
+            for (DWORD id = 0; id < count && valid; ++id) if (allowed & (DWORD_PTR(1) << id))
+            {
+                auto const& record = records[id];
+                if (record.IdleTime.QuadPart < 0 || record.KernelTime.QuadPart < record.IdleTime.QuadPart || record.UserTime.QuadPart < 0)
+                { valid = false; break; }
+                value.total = add(value.total, add(uint64_t(record.KernelTime.QuadPart), uint64_t(record.UserTime.QuadPart)));
+                value.idle = add(value.idle, uint64_t(record.IdleTime.QuadPart));
+                cpu_scope += std::to_string(id) + ',';
+            }
+            value.own_after_ns = process_cpu_ns(); value.after_wall = Clock::now();
+            own_scope = process_affinity_within(allowed);
+            value.own_scope_known = valid && own_scope && value.own_before_ns && value.own_after_ns &&
+                *value.own_after_ns >= *value.own_before_ns;
+            value.scope = cpu_scope;
+            if (valid) cpu = value;
         }
 #elif defined(__linux__)
         auto kib_field = [&](char const* path, std::string_view field) -> std::optional<uint64_t>

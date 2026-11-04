@@ -58,7 +58,6 @@ void command_help_all(std::string_view command)
         "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
-        "  --farm-checker FILE       optional documented native plot checker\n"
         "  --extend                 add destinations while preserving saved assignments\n"
         "  --allow-missing          with --resume, continue available members; incomplete exit 4\n"
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";

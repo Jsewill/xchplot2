@@ -1,6 +1,7 @@
 // Public, bounded observations of explicitly selected farm roots. A catalog is
 // never authority to unlink a path; retirement pins and rechecks its native ID.
 #pragma once
+#include "host/GroupFarmFile.hpp"
 #include "host/GroupFarmState.hpp"
 #include "host/GroupStorage.hpp"
 #include "host/GroupFarmResources.hpp"
@@ -49,8 +50,8 @@ struct InventoryPlot
     std::string reader_identity, checker_identity;
     // Structural header validation is not a complete proof or decoder check.
     bool header_validated = false;
-    // Observation only: execution repeats the supported native exact-file proof
-    // check. Imported public JSON cannot grant a native deletion capability.
+    // Reader-reported identity bound to the exact observed native file. This
+    // is not old proof validation or an imported deletion capability.
     bool native_identified = false;
     std::optional<size_t> alias_of;
 };
@@ -73,9 +74,14 @@ struct FarmInventory
 };
 namespace inventory_detail
 {
-namespace fs = std::filesystem;
-inline void require(bool value, std::string const& message)
-{ if (!value) throw std::runtime_error(message); }
+inline void RootHandle::matches(InventoryRoot const& root) const
+{
+    auto const s = stat(handle); RootHandle current(path); auto const now = stat(current.handle);
+    require(uint64_t(s.st_dev) == root.device && uint64_t(s.st_ino) == root.inode &&
+        s.st_dev == now.st_dev && s.st_ino == now.st_ino &&
+        file_io::path_text(path) == root.path && farming_directory_identity(path) == root.directory_identity,
+        "farm inventory root identity changed");
+}
 inline std::string timestamp()
 {
     auto const now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -114,29 +120,6 @@ inline std::chrono::steady_clock::time_point catalog_deadline(InventoryLimits co
 }
 inline bool hex(std::string const& text, size_t bytes)
 { return text.size() == bytes * 2 && text.find_first_not_of("0123456789abcdef") == text.npos; }
-inline void bounded_text(std::string const& text, size_t bound = 4096)
-{ require(text.size() <= bound && text.find('\0') == text.npos, "farm inventory text exceeds its bound"); }
-inline fs::path relative(std::string const& value)
-{
-    bounded_text(value); auto result = file_io::native_path(value);
-    require(!result.empty() && !result.is_absolute() && !result.has_root_name(), "inventory path must be relative");
-    for (auto const& component : result)
-        require(component != "." && component != ".." && !component.empty(), "invalid inventory path component");
-    return result;
-}
-struct Handle
-{
-    int fd = -1;
-    Handle() = default;
-    explicit Handle(int value) : fd(value) { require(fd >= 0, "cannot open farm inventory source without following links"); }
-    Handle(Handle const&) = delete; Handle& operator=(Handle const&) = delete;
-    Handle(Handle&& other) noexcept : fd(std::exchange(other.fd, -1)) {}
-    Handle& operator=(Handle&& other) noexcept
-    { if (this != &other) { if (fd >= 0) file_io::close_file(fd); fd = std::exchange(other.fd, -1); } return *this; }
-    ~Handle() { if (fd >= 0) file_io::close_file(fd); }
-};
-inline file_io::Stat stat(Handle const& handle)
-{ file_io::Stat result{}; require(!file_io::inspect_fd(handle.fd, &result), "cannot inspect farm inventory handle"); return result; }
 inline stream_state::Stamp stamp(file_io::Stat const& s)
 {
 #ifdef __APPLE__
@@ -148,77 +131,6 @@ inline stream_state::Stamp stamp(file_io::Stat const& s)
     return {uint64_t(s.st_dev), uint64_t(s.st_ino), uint64_t(s.st_size), m.tv_sec, c.tv_sec,
         uint32_t(m.tv_nsec), uint32_t(c.tv_nsec)};
 }
-#ifdef _WIN32
-inline Handle windows_open(fs::path const& path, bool directory)
-{
-    // Held ancestors deny delete/rename. Held files also deny writes, so an
-    // adapter observes the same object throughout its bounded operation.
-    HANDLE native = ::CreateFileW(path.c_str(), GENERIC_READ,
-        directory ? FILE_SHARE_READ | FILE_SHARE_WRITE : FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : FILE_FLAG_OVERLAPPED), nullptr);
-    require(native != INVALID_HANDLE_VALUE, "cannot pin farm inventory source");
-    int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(native), _O_RDONLY | _O_BINARY);
-    if (fd < 0) { ::CloseHandle(native); throw std::runtime_error("cannot retain farm inventory handle"); }
-    Handle result(fd); auto const s = stat(result);
-    require(directory ? file_io::is_directory(s.st_mode) : file_io::is_regular(s.st_mode), "unsupported farm inventory file type");
-    return result;
-}
-#endif
-struct RootHandle
-{
-    fs::path path;
-    Handle handle;
-#ifdef _WIN32
-    std::vector<Handle> ancestors;
-#endif
-    explicit RootHandle(fs::path const& input)
-    {
-        path = fs::absolute(input).lexically_normal();
-        if (path != path.root_path() && path.filename().empty()) path = path.parent_path();
-#ifdef _WIN32
-        fs::path current = path.root_path(); ancestors.push_back(windows_open(current, true));
-        for (auto const& part : path.relative_path()) { current /= part; ancestors.push_back(windows_open(current, true)); }
-        handle = windows_open(path, true);
-#else
-        handle = Handle(::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-        for (auto const& component : path.relative_path())
-            handle = Handle(::openat(handle.fd, component.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-#endif
-    }
-    void matches(InventoryRoot const& root) const
-    {
-        auto const s = stat(handle); RootHandle current(path); auto const now = stat(current.handle);
-        require(uint64_t(s.st_dev) == root.device && uint64_t(s.st_ino) == root.inode &&
-            s.st_dev == now.st_dev && s.st_ino == now.st_ino &&
-            file_io::path_text(path) == root.path && farming_directory_identity(path) == root.directory_identity,
-            "farm inventory root identity changed");
-    }
-};
-struct SourceHandle
-{
-    Handle handle;
-    Handle parent;
-    std::string basename;
-#ifdef _WIN32
-    std::vector<Handle> ancestors;
-#endif
-    SourceHandle(RootHandle const& root, std::string const& name)
-    {
-        auto const value = relative(name);
-        basename = file_io::path_text(value.filename());
-#ifdef _WIN32
-        auto current = root.path;
-        for (auto const& part : value.parent_path()) { current /= part; ancestors.push_back(windows_open(current, true)); }
-        handle = windows_open(root.path / value, false);
-#else
-        parent = Handle(::fcntl(root.handle.fd, F_DUPFD_CLOEXEC, 3));
-        for (auto const& part : value.parent_path())
-            parent = Handle(::openat(parent.fd, part.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-        handle = Handle(::openat(parent.fd, value.filename().c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW));
-        require(file_io::is_regular(stat(handle).st_mode), "inventory source is not a regular file");
-#endif
-    }
-};
 inline uint64_t number(std::span<uint8_t const> data, size_t position, size_t bytes, bool little = false)
 {
     require(position <= data.size() && bytes <= data.size() - position && bytes <= 8, "truncated plot header");
@@ -285,9 +197,9 @@ inline void header(InventoryPlot& p, std::span<uint8_t const> data)
     else { p.status = "protected"; p.reason = "unknown container; an installed supported reader must identify it"; return; }
     p.header_validated = true; p.status = "observed"; p.reason = "public header only; complete validity and farming resources are unverified";
 }
-inline InventoryPlot observe(RootHandle const& root, std::string const& relative_path, InventoryLimits const& limits)
+inline InventoryPlot observe_handle(Handle const& handle, std::string const& relative_path, InventoryLimits const& limits)
 {
-    SourceHandle source(root, relative_path); auto const before = stat(source.handle);
+    auto const before = stat(handle);
     InventoryPlot result; result.relative_path = relative_path; result.identity.stamp = stamp(before);
     require(before.st_blocks >= 0 && uint64_t(before.st_blocks) <= UINT64_MAX / 512, "invalid allocated file size");
     result.identity.allocated_bytes = uint64_t(before.st_blocks) * 512; result.identity.links = uint64_t(before.st_nlink);
@@ -295,12 +207,12 @@ inline InventoryPlot observe(RootHandle const& root, std::string const& relative
     std::vector<uint8_t> data(size_t(bytes), uint8_t{}); size_t at = 0;
     while (at < data.size())
     {
-        auto const count = file_io::read_at(source.handle.fd, data.data() + at, data.size() - at, at);
+        auto const count = file_io::read_at(handle.fd, data.data() + at, data.size() - at, at);
         if (count < 0 && errno == EINTR) continue;
         require(count > 0, "farm inventory header changed while reading"); at += size_t(count);
     }
     result.identity.header_bytes = bytes; result.identity.header_digest = group_tools::hex(grow_digest(data));
-    require(stamp(stat(source.handle)) == result.identity.stamp, "farm inventory source changed while reading");
+    require(stamp(stat(handle)) == result.identity.stamp, "farm inventory source changed while reading");
     try { header(result, data); }
     catch (std::exception const& error)
     {
@@ -311,6 +223,8 @@ inline InventoryPlot observe(RootHandle const& root, std::string const& relative
     if (result.identity.links != 1) { result.status = "protected"; result.reason = "multiple links; allocated bytes are not independently reclaimable"; }
     return result;
 }
+inline InventoryPlot observe(RootHandle const& root, std::string const& relative_path, InventoryLimits const& limits)
+{ SourceHandle source(root, relative_path); return observe_handle(source.handle, relative_path, limits); }
 inline uint64_t plot_memory(InventoryPlot const& p)
 {
     uint64_t bytes = sizeof(p) + 256; // Native-identity map node and allocator overhead.
@@ -352,17 +266,21 @@ class InventorySourcePin
     inventory_detail::RootHandle root_handle_;
     inventory_detail::SourceHandle source_;
 public:
-    InventorySourcePin(InventoryRoot const& root, InventoryPlot const& plot, InventoryLimits const& limits = {}, std::string current_relative = {})
+    InventorySourcePin(InventoryRoot const& root, InventoryPlot const& plot, InventoryLimits const& limits = {}, std::string current_relative = {}, bool retirement = false)
         : root_(root), plot_(plot), root_handle_(file_io::native_path(root.path)),
-          source_(root_handle_, current_relative.empty() ? plot.relative_path : current_relative)
+          source_(root_handle_, current_relative.empty() ? plot.relative_path : current_relative, retirement)
     {
         inventory_detail::validate_limits(limits); root_handle_.matches(root_);
         auto const held = inventory_detail::stamp(inventory_detail::stat(source_.handle));
-        auto const current = inventory_detail::observe(root_handle_, current_relative.empty() ? plot.relative_path : current_relative, limits);
+        auto const current = inventory_detail::observe_handle(source_.handle, current_relative.empty() ? plot.relative_path : current_relative, limits);
         inventory_detail::require((current_relative.empty() ? held == plot.identity.stamp : stream_state::same_output(plot.identity.stamp, held)) &&
             (current_relative.empty() ? current.identity == plot.identity : same_inventory_contents(plot.identity, current.identity)),
             "farm inventory source changed before retirement pin");
+        recheck_parent(current_relative.empty() ? plot.relative_path : current_relative);
     }
+    InventoryFileIdentity identity(std::string const& relative, InventoryLimits const& limits) const
+    { return inventory_detail::observe_handle(source_.handle, relative, limits).identity; }
+    int close_source() { return file_io::close_file(std::exchange(source_.handle.fd, -1)); }
     int root_fd() const { return root_handle_.handle.fd; }
     int source_fd() const { return source_.handle.fd; }
     int source_parent_fd() const { return source_.parent.fd; }
@@ -370,17 +288,35 @@ public:
     void recheck_parent(std::string const& current_relative_path) const
     {
         root_handle_.matches(root_);
+#ifdef _WIN32
+        file_io::Stat current{}, parent{};
+        auto const path = root_handle_.path / inventory_detail::relative(current_relative_path);
+        inventory_detail::require(!file_io::inspect_link(path, &current) && !file_io::inspect_link(path.parent_path(), &parent),
+            "cannot inspect pinned retirement namespace");
+        auto const held_parent = inventory_detail::stat(source_.parent);
+        inventory_detail::require(parent.st_dev == held_parent.st_dev && parent.st_ino == held_parent.st_ino &&
+            inventory_detail::stamp(current) == inventory_detail::stamp(inventory_detail::stat(source_.handle)),
+            "farm retirement parent or source path changed");
+#else
         inventory_detail::SourceHandle current(root_handle_, current_relative_path);
         auto const a = inventory_detail::stat(source_.parent), b = inventory_detail::stat(current.parent);
         inventory_detail::require(a.st_dev == b.st_dev && a.st_ino == b.st_ino &&
             inventory_detail::stamp(inventory_detail::stat(current.handle)) == inventory_detail::stamp(inventory_detail::stat(source_.handle)),
             "farm retirement parent or source path changed");
+#endif
     }
     bool matches_claim(std::string const& claimed_relative_path, InventoryLimits const& limits = {}) const
     {
         root_handle_.matches(root_);
         auto const held = inventory_detail::stamp(inventory_detail::stat(source_.handle));
+#ifdef _WIN32
+        file_io::Stat name{};
+        if (file_io::inspect_link(root_handle_.path / inventory_detail::relative(claimed_relative_path), &name) ||
+            inventory_detail::stamp(name) != held) return false;
+        auto const claimed = inventory_detail::observe_handle(source_.handle, claimed_relative_path, limits);
+#else
         auto const claimed = inventory_detail::observe(root_handle_, claimed_relative_path, limits);
+#endif
         return stream_state::same_output(plot_.identity.stamp, held) && same_inventory_contents(plot_.identity, claimed.identity);
     }
 };
@@ -447,7 +383,8 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
             !p.plot_id.empty() && !p.farmer_public_key.empty() &&
             (p.pool_public_key.empty() != p.pool_contract_puzzle_hash.empty()) && !id.header_digest.empty()), "incomplete inventory public header");
         require(!p.native_identified || (p.algorithm == PlotAlgorithm::pos1 && !p.plot_id.empty() && p.k >= 18 && p.k <= 50 &&
-            !p.reader.empty() && !p.reader_version.empty() && hex(p.reader_identity, 32) && hex(p.checker_identity, 32) && !id.header_digest.empty()), "incomplete native inventory observation");
+            !p.reader.empty() && !p.reader_version.empty() && hex(p.reader_identity, 32) && !p.plot_public_key.empty() &&
+            (p.pool_public_key.empty() != p.pool_contract_puzzle_hash.empty()) && !id.header_digest.empty()), "incomplete native inventory observation");
     }
 }
 inline void write_identity(std::ostream& out, InventoryFileIdentity const& id)
