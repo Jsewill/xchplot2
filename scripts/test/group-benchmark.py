@@ -7,7 +7,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import select
 import shlex
 import shutil
 import subprocess
@@ -17,7 +16,8 @@ import time
 
 # Keep filesystem, allocated-space and post-exec RSS measurements consistent
 # with the existing external-assembly benchmark.
-spec = importlib.util.spec_from_file_location("group_benchmark", Path(__file__).with_name("group-benchmark.py"))
+spec = importlib.util.spec_from_file_location("external_group_benchmark",
+    Path(__file__).resolve().parents[2] / "contrib" / "pos2-pr118" / "group-benchmark.py")
 common = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(common)
 
@@ -40,36 +40,48 @@ def measure(command, log_path, work, interval, nvidia):
     peak_allocated = 0
     counters = {}
     samples = 0
-    started = time.monotonic()
+    process_samples = 0
+    sampling_wall_seconds = 0
+    sampling_cpu_seconds = 0
+    gpu_query_seconds = 0
     with log_path.open("x") as log:
+        started = time.monotonic()
         process = subprocess.Popen([str(value) for value in command], stdout=log, stderr=subprocess.STDOUT)
-        pidfd = None
+        observer = None
         try:
-            pidfd = os.pidfd_open(process.pid)
-            while True:
+            observer = common.ProcessExit(process.pid)
+            while not observer.completed.is_set():
+                sample_started, cpu_started = time.monotonic(), time.thread_time()
                 memory, io, space = common.sample(process.pid, Path(command[0]), work)
+                process_samples += 1
                 if memory is not None:
                     peak_rss = max(peak_rss or 0, memory)
                 peak_allocated = max(peak_allocated, space)
                 counters.update(io)
-                if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
-                    _, io, space = common.sample(process.pid, Path(command[0]), work)
-                    counters.update(io)
-                    peak_allocated = max(peak_allocated, space)
-                    _, status, usage = os.wait4(process.pid, 0)
-                    process.returncode = os.waitstatus_to_exitcode(status)
-                    break
-                if nvidia:
+                if nvidia and not observer.completed.is_set():
+                    query_started = time.monotonic()
                     memory = gpu_memory(process.pid)
+                    gpu_query_seconds += time.monotonic() - query_started
                     if memory is not None:
                         peak_gpu = max(peak_gpu or 0, memory)
                         samples += 1
-                select.select([pidfd], [], [], interval)
+                sampling_wall_seconds += time.monotonic() - sample_started
+                sampling_cpu_seconds += time.thread_time() - cpu_started
+                observer.completed.wait(interval)
+            observer.join()
+            sample_started, cpu_started = time.monotonic(), time.thread_time()
+            _, io, space = common.sample(process.pid, Path(command[0]), work)
+            counters.update(io)
+            peak_allocated = max(peak_allocated, space)
+            sampling_wall_seconds += time.monotonic() - sample_started
+            sampling_cpu_seconds += time.thread_time() - cpu_started
+            _, status, usage = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
         finally:
-            if pidfd is not None:
-                os.close(pidfd)
             if process.returncode is None:
                 process.kill()
+                if observer is not None:
+                    observer.thread.join()
                 process.wait()
     if process.returncode:
         raise RuntimeError(f"growth failed ({process.returncode}); output retained; see {log_path}")
@@ -79,7 +91,12 @@ def measure(command, log_path, work, interval, nvidia):
     if nvidia and metrics["mode"] == "gpu" and not samples:
         raise RuntimeError("no matching GPU PID observed; run outside a PID namespace or omit --nvidia")
     return {
-        "seconds": time.monotonic() - started,
+        "seconds": observer.observed - started,
+        "measurement_seconds": time.monotonic() - started,
+        "sampling_wall_seconds": sampling_wall_seconds,
+        "sampling_cpu_seconds": sampling_cpu_seconds,
+        "gpu_query_seconds": gpu_query_seconds,
+        "process_samples": process_samples,
         "user_cpu_seconds": usage.ru_utime,
         "system_cpu_seconds": usage.ru_stime,
         "sampled_peak_rss_bytes": peak_rss,
@@ -140,10 +157,11 @@ def main():
         "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "executables": {name: common.digest(getattr(args, name)) for name in ("grow", "group", "plotter")},
         "measurement": {
-            "timing": "whole process including generation/loading, admission, durable construction and final publication",
+            "timing": "launch through independently observed process exit, including generation/loading, admission, durable construction and publication; final sampling and log parsing excluded",
             "reference": "pinned CPU assembly and 100 full-proof trials outside timed growth; every output must match its bytes",
             "memory": "post-exec sampled RSS plus grow's actual process RSS high-water mark; excludes filesystem cache",
             "vram": "optional sampled memory for this process only, summed across devices; brief peaks may be missed",
+            "sampling": "sampling remains active during growth and may contend for CPU/storage; sampling effort and optional nvidia-smi query wall time are reported separately; sampling CPU excludes nvidia-smi subprocess CPU",
             "io": "grow counters count destination syscalls; /proc counters include other process I/O; neither is physical device traffic",
             "space": "logical capacity bounded; sampled st_blocks excludes filesystem metadata and CoW snapshots",
             "cache": "uncontrolled; no system-wide cache drop; method order rotates each repeat",

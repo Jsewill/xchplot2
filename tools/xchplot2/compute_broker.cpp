@@ -2,6 +2,7 @@
 #include "host/ComputePool.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
+#include "compute_output.hpp"
 #include <charconv>
 #include <csignal>
 #include <iostream>
@@ -25,8 +26,11 @@ unsigned number(std::string_view value)
         throw std::runtime_error("option requires a positive integer");
     return result;
 }
-void help()
+void help(bool all)
 {
+#ifndef XCHPLOT2_GROUP_COMMANDS
+    all = true;
+#endif
     std::cout <<
         "Network-compute broker for ordinary PoS2 group growth\n"
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -35,10 +39,12 @@ void help()
         "  --listen HOST:PORT   default: all selected interfaces, port 18444\n"
         "  --interface NAME     sharing/discovery interface; repeat for more\n"
         "  --discovery on|off   LAN advertising, default from saved setup\n"
-        "  --tls-ca FILE --tls-cert FILE --tls-key FILE  explicit credentials\n"
 #else
         "Usage: pos2_pr118_pool --listen HOST:PORT --tls-ca FILE --tls-cert FILE --tls-key FILE [OPTIONS]\n"
 #endif
+        ;
+    if (all) std::cout <<
+        "  --tls-ca FILE --tls-cert FILE --tls-key FILE  explicit credentials\n"
         "  --timeout-ms N       socket/TLS/frame deadline, default 5000\n"
         "  --lease-ms N         renewable compute lease duration, default 120000\n"
         "  --worker-ms N        worker registration expiry, default 30000\n"
@@ -50,6 +56,8 @@ void help()
         "  --max-owners N       coordinator namespaces, default 128\n"
         "  --max-tasks N        queued, active, and recent task records, default 4096\n"
         "Every connection requires a trusted client certificate. Restarting fences old leases.\n";
+    else std::cout << "Use --help-all for TLS, scheduling and connection limits.\n";
+    std::cout << pos2gpu::compute_output_help;
 }
 }
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -61,10 +69,12 @@ int main(int argc, char** argv) try
     group_grow::pool::BrokerOptions options; options.tls.timeout_ms = 5000; options.tls.max_frame_bytes = 65536;
     std::filesystem::path directory; std::vector<std::string> interfaces;
     bool discover = true, discovery_set = false;
+    pos2gpu::ComputeOutputOptions output;
     for (int i = 1; i < argc; ++i)
     {
         std::string const key = argv[i];
-        if (key == "--help" || key == "-h") { help(); return 0; }
+        if (key == "--help" || key == "-h" || key == "--help-all") { help(key == "--help-all"); return 0; }
+        if (output.parse(key)) continue;
         if (key == "--no-discovery") { discover = false; discovery_set = true; continue; }
         if (i + 1 >= argc) throw std::runtime_error("missing value for " + key);
         std::string const value = argv[++i];
@@ -97,6 +107,7 @@ int main(int argc, char** argv) try
         else if (key == "--max-tasks") options.max_tasks = number(value);
         else throw std::runtime_error("unknown option: " + key);
     }
+    output.validate();
     std::optional<group_grow::pool::PoolIdentity> identity;
 #ifdef XCHPLOT2_GROUP_COMMANDS
     if (options.tls.ca_file.empty() && options.tls.cert_file.empty() && options.tls.key_file.empty())
@@ -125,6 +136,9 @@ int main(int argc, char** argv) try
     if (sigaction(SIGINT, &action, nullptr) || sigaction(SIGTERM, &action, nullptr))
 #endif
         throw std::runtime_error("cannot install broker shutdown handlers");
+    if (output.details())
+        std::cerr << "Broker limits: " << options.max_workers << " workers, " << options.max_owners << " owners, "
+            << options.max_tasks << " task records; lease " << options.lease_ms << " ms\n";
     group_grow::pool::BrokerServer server(std::move(options)); auto const endpoint = server.endpoint();
     std::unique_ptr<group_grow::pool::ComputeDiscovery> discovery;
     if (identity && discover)
@@ -135,7 +149,7 @@ int main(int argc, char** argv) try
         discovery = std::make_unique<group_grow::pool::ComputeDiscovery>(std::move(announcement));
         if (discovery->status() != "LAN discovery active") std::cerr << discovery->status() << '\n';
     }
-    std::cout << "Network-compute broker listening on " << endpoint.host << ':' << endpoint.port << '\n' << std::flush;
+    if (!output.quiet) std::cout << "Network-compute broker listening on " << endpoint.host << ':' << endpoint.port << '\n' << std::flush;
     server.serve(stopping); return 0;
 }
 catch (std::exception const& error) { std::cerr << "compute broker: " << error.what() << '\n'; return 1; }

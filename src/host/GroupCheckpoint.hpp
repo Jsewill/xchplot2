@@ -117,6 +117,18 @@ Stamp stamp(fs::path const& path)
     return {uint64_t(value.st_dev), uint64_t(value.st_ino), uint64_t(value.st_size),
             modified.tv_sec, changed.tv_sec, uint32_t(modified.tv_nsec), uint32_t(changed.tv_nsec)};
 }
+// A preflight file size is an allocation bound, even if the file grows or is
+// replaced before it is opened. Never follow a changed input to its new EOF.
+std::string read_exact(std::istream& in, uint64_t bytes)
+{
+    require(bytes <= std::numeric_limits<size_t>::max() &&
+        bytes <= uint64_t(std::numeric_limits<std::streamsize>::max()), "saved state exceeds the read size limit");
+    std::string text(size_t(bytes), '\0');
+    in.read(text.data(), std::streamsize(bytes));
+    require(uint64_t(in.gcount()) == bytes && !in.bad(), "saved state was truncated while loading");
+    require(in.peek() == std::char_traits<char>::eof() && !in.bad(), "saved state grew while loading");
+    return text;
+}
 bool same_output(Stamp const& saved, Stamp const& current)
 {
     // Publication changes link count/ctime, but must not change contents/mtime.
@@ -296,11 +308,14 @@ State load_state(fs::path const& work, Config const& config, std::string const& 
                  uint64_t members, uint64_t limit, uint64_t chunks)
 {
     auto const path = work / "checkpoint";
-    require(stamp(path).bytes < limit / 8, "checkpoint exceeds RAM budget");
+    auto const saved_stamp = stamp(path);
+    require(saved_stamp.bytes < limit / 8, "checkpoint exceeds RAM budget");
     auto file = group_tools::input(file_io::path_text(path));
-    std::string hash;
-    std::getline(file, hash);
-    std::string body(std::istreambuf_iterator<char>(file), {});
+    auto body = read_exact(file, saved_stamp.bytes);
+    require(stamp(path) == saved_stamp, "checkpoint changed while loading");
+    require(body.size() >= 65 && body[64] == '\n', "invalid checkpoint checksum");
+    auto const hash = body.substr(0, 64);
+    body.erase(0, 65);
     require(hash == digest(body), "checkpoint checksum mismatch");
     std::istringstream in(body);
     in.exceptions(std::ios::badbit | std::ios::failbit);

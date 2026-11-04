@@ -1109,6 +1109,83 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
     rejects([&] { owner.status({StatusSection::Jobs, 0, 0}); });
     require(owner.status({StatusSection::Jobs, UINT64_MAX}).job_records.empty(), "status cursor overflow was not bounded");
 }
+void queued_capacity_status(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
+                            TlsOptions const& worker_tls)
+{
+    options.lease_ms = 10000; options.worker_ms = 1000; options.max_tasks = 64;
+    RunningBroker live(options); auto endpoint = live.server.endpoint();
+    BrokerClient first(endpoint, first_tls), second(endpoint, second_tls), worker(endpoint, worker_tls);
+    auto a = first.open_owner("queued-capacity-a"), b = second.open_owner("queued-capacity-b");
+    struct Request { BrokerClient* client; OwnerSession owner; Task task; };
+    std::vector<Request> requests;
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence)
+    {
+        requests.push_back({&first, a, task("a-" + std::to_string(sequence), sequence)});
+        requests.push_back({&second, b, task("b-" + std::to_string(sequence), sequence)});
+    }
+    for (auto const& request : requests)
+        require(!request.client->acquire(request.owner, request.task), "workerless queue unexpectedly received a grant");
+    auto advertised = offer("queued-capacity-worker", 49509); advertised.capacity = {3, 3, 3072, 0};
+    worker.register_worker(advertised);
+    auto check_status = [&]
+    {
+        auto page = first.status();
+        require(page.worker_records.size() == 1 && page.worker_records.front().reserved == advertised.capacity,
+            "scheduling a queued wave lost or exceeded the worker's reservations");
+        auto owners = first.status({StatusSection::Owners});
+        uint64_t queued = 0, granted = 0, running = 0, cancelled = 0;
+        for (auto const& owner : owners.owner_records)
+        { queued += owner.queued; granted += owner.granted; running += owner.running; cancelled += owner.cancelled; }
+        require(owners.owner_records.size() == 2 && queued == page.queued && granted == page.granted &&
+            running == page.running && cancelled == page.cancelled,
+            "owner status counters disagree with live reservations");
+        return page;
+    };
+    auto page = check_status();
+    require(page.granted == 3 && page.queued == 3, "one scheduling pass overcommitted a queued wave");
+    std::vector<std::pair<Request const*, Lease>> running;
+    for (auto const& request : requests)
+        if (auto grant = request.client->acquire(request.owner, request.task))
+        {
+            require(worker.begin(*grant, grant->owner_identity), "queued wave grant did not begin");
+            running.emplace_back(&request, *grant);
+        }
+    require(running.size() == 3, "queued wave did not fill the advertised capacity");
+    auto const& [request, cancelled] = running.front();
+    request->client->cancel(request->owner, request->task.task_id, request->task.attempt);
+    page = check_status();
+    require(page.cancelled == 1 && page.running == 2 && page.queued == 3,
+        "cancelled running work released capacity before worker acknowledgement");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    advertised.instance = "queued-capacity-replacement"; worker.register_worker(advertised);
+    page = check_status();
+    require(page.cancelled == 1 && page.running == 2 && page.queued == 3,
+        "a replacement worker escaped the old incarnation's live reservations");
+    worker.finish(cancelled); page = check_status();
+    require(!page.cancelled && page.running == 2 && page.granted == 1 && page.queued == 2,
+        "worker acknowledgement did not replenish exactly the released reservation");
+    auto jobs = first.status({StatusSection::Jobs});
+    for (auto const& job : jobs.job_records)
+        if (job.state == JobState::Granted)
+            require(job.worker_instance == advertised.instance, "new grant reused a departed worker incarnation");
+    auto const closed = running.back().first;
+    closed->client->close_owner(closed->owner);
+    auto owners = first.status({StatusSection::Owners}); jobs = first.status({StatusSection::Jobs});
+    auto const survivor = closed->owner.owner_id == a.owner_id ? b.owner_id : a.owner_id;
+    require(owners.owner_records.size() == 1 && owners.owner_records.front().owner_id == survivor,
+        "closed owner retained live diagnostic counters");
+    std::array<uint64_t, 4> counts{}; bool fenced = false;
+    for (auto const& job : jobs.job_records)
+    {
+        if (job.owner_id == survivor)
+        { counts[0] += job.state == JobState::Queued; counts[1] += job.state == JobState::Granted;
+          counts[2] += job.state == JobState::Running; counts[3] += job.state == JobState::Cancelled; }
+        if (job.owner_id == closed->owner.owner_id && job.state == JobState::Cancelled) fenced = true;
+    }
+    auto const& owner = owners.owner_records.front();
+    require(fenced && owner.queued == counts[0] && owner.granted == counts[1] && owner.running == counts[2] && owner.cancelled == counts[3],
+        "closed-owner reservations leaked into the surviving owner's status counters");
+}
 } // namespace
 int main() try
 {
@@ -1148,6 +1225,7 @@ int main() try
     automatic_lifecycle(options, a_tls, tls(ca, wa));
     restart(options, a_tls, tls(ca, wa));
     live_status(options, a_tls, tls(ca, wa));
+    queued_capacity_status(options, a_tls, b_tls, tls(ca, wa));
     std::cout << "network pool transport, authentication, fairness, fencing, and recovery tests passed\n"; return 0;
 }
 catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -88,9 +88,9 @@ struct ComputeSession::Impl
     std::shared_ptr<group_grow::WorkerService> worker;
     mutable std::mutex mutex;
     std::condition_variable changed;
-    bool offering = false, quiet = false;
+    bool offering = false, verbose = false;
     explicit Impl(GroupOptions& args) : identity(required_pool(
-        std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())))), quiet(args.quiet)
+        std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())))), verbose(args.verbose)
     {
         if (!args.pool_owner_explicit)
             args.pool_session_owner = args.pool_owner + '-' + pool::random_token().substr(0, 32);
@@ -114,14 +114,14 @@ struct ComputeSession::Impl
                 auto discover = discovery_options(identity); discover.role = "broker"; discover.endpoint = address;
                 discovery = std::make_shared<pool::ComputeDiscovery>(std::move(discover));
             }
-            if (!quiet) std::cerr << "[compute] Automatic broker on port " << address.port << '\n';
+            if (verbose) std::cerr << "[compute] Automatic broker on port " << address.port << '\n';
         }
         else
         {
             if (identity.defaults.discovery) discovery = std::make_shared<pool::ComputeDiscovery>(discovery_options(identity));
-            if (!quiet) std::cerr << "[compute] Using broker " << args.pool_broker << '\n';
+            if (verbose) std::cerr << "[compute] Using broker " << args.pool_broker << '\n';
         }
-        if (discovery && !quiet && discovery->status() != "LAN discovery active")
+        if (discovery && discovery->status() != "LAN discovery active")
             std::cerr << "[compute] " << discovery->status() << '\n';
     }
     ~Impl()
@@ -143,7 +143,7 @@ struct ComputeSession::Impl
             worker_advertisement = std::make_unique<pool::ComputeDiscovery>(std::move(advertise));
         }
         { std::lock_guard lock(mutex); worker = std::move(candidate); }
-        if (!quiet) std::cerr << "[compute] Local compute is available to this pool while plotting\n";
+        if (verbose) std::cerr << "[compute] Local compute is available to this pool while plotting\n";
         return true;
     }
     void offer(group_grow::WorkerConfig config)
@@ -166,7 +166,7 @@ struct ComputeSession::Impl
                 lock.unlock();
                 try { start_worker(config); }
                 catch (std::exception const& error)
-                { if (!quiet) std::cerr << "[compute] Local compute unavailable: " << error.what() << '\n'; }
+                { std::cerr << "[compute] Local compute unavailable: " << error.what() << '\n'; }
                 lock.lock();
             }
         });

@@ -831,10 +831,9 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg)
 // pinned D2H buffer — used by BatchPlotter to amortise cudaMallocHost
 // across plots and double-buffer the D2H with the FSE consumer.
 //
-// Exception safety: on throw mid-pipeline we currently leak the
-// still-live device allocations. The CLI terminates on exception anyway,
-// so the OS reclaims the context. If we later embed this in a long-lived
-// process we can add RAII owners without changing the public surface.
+// Exception safety: StreamingStats releases still-live owned device and
+// pinned-host allocations on a mid-pipeline throw. Caller-provided pinned
+// scratch and HostPinnedPool slots remain with their existing owners.
 // =====================================================================
 namespace { // anon: shared impl, not part of the public API.
 

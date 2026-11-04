@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <span>
 #include <string>
@@ -93,5 +94,24 @@ struct VerifyResult {
 // Samples quality chains. With full=true, solve and validate a full proof for
 // every returned chain; a chain without a valid full proof throws.
 VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full = false);
+
+// Read-only reference-reader observations. Call only inside the calibration
+// worker's OS memory cap and deadline: Chainer's search is data-dependent.
+struct ReaderCalibrationPhase
+{
+    uint64_t calls = 0, wall_ns = 0, cpu_ns = 0, max_wall_ns = 0, max_cpu_ns = 0;
+    uint64_t logical_requested_bytes = 0;
+    bool cpu_measured = true;
+};
+struct ReaderCalibrationResult
+{
+    uint8_t k = 0, strength = 0;
+    uint16_t members = 0;
+    uint64_t chunks = 0, index_bytes = 0, largest_chunk_bytes = 0;
+    uint64_t samples = 0, quality_chains = 0, logical_lookup_bytes = 0, storage_bytes = 0;
+    ReaderCalibrationPhase index_probe, fresh_open, first_lookup, retained_lookup, storage_reads;
+};
+ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint64_t samples,
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled);
 
 } // namespace pos2gpu

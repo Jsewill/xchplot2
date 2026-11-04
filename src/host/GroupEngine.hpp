@@ -169,6 +169,10 @@ public:
     Engine& operator=(Engine const&) = delete;
 
     Identity const& identity() const { return identity_; }
+    // Conservative, fixed-memory admission probe. Ambiguous reads and private
+    // markers keep the existing serial recovery envelope. An orphan tail can
+    // still be discovered while decoding an otherwise ordinary index.
+    static bool pending(std::string const& path);
     static uint64_t memory_bytes(uint8_t k, Config const& config, uint16_t batch_members = 1,
                                  uint16_t wide_members = 0, uint16_t compact_members = 0);
     uint64_t memory_bytes(uint16_t batch_members = 1, uint16_t wide_members = 0,
@@ -178,7 +182,7 @@ public:
     Plan plan(Members members, MemberBatchHash const* hash = nullptr);
     std::optional<Plan> plan_fresh(Members members, MemberBatchHash const* hash = nullptr);
     Result apply(Plan& plan, Members members);
-    AppendResult append(Members members, MemberBatchHash const* hash = nullptr);
+    AppendResult append(Members members, MemberBatchHash const* hash = nullptr, bool reject_window = false);
     Result resume(Members members, MemberBatchHash const* hash = nullptr);
     void confirm_identity();
     Stats const& stats() const { return stats_; }
@@ -358,6 +362,43 @@ struct Engine::Record
     std::array<uint8_t, 32> members_digest{}, redo_digest{};
     std::array<char, 64> build{};
 };
+
+inline bool Engine::pending(std::string const& path)
+{
+    int fd = file_io::open_file(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    if (fd < 0) return true;
+    struct Close { int fd; ~Close() { file_io::close_file(fd); } } close{fd};
+    file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
+    if (file_io::inspect_fd(fd, &info) || !file_io::is_regular(info.st_mode) || info.st_size < file_io::Offset(sizeof(Header)) ||
+        file_io::space_fd(fd, &allocation) || page <= 0 || info.st_blksize <= 0) return true;
+    auto read = [&](uint64_t offset, std::span<uint8_t> bytes)
+    {
+        while (!bytes.empty())
+        {
+            auto n = file_io::read_at(fd, bytes.data(), bytes.size(), file_io::Offset(offset));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
+        }
+        return true;
+    };
+    Header header{};
+    if (!read(0, {reinterpret_cast<uint8_t*>(&header), sizeof(header)}) ||
+        header.magic != PlotGroupFile::MAGIC || header.version != PlotGroupFile::FORMAT_VERSION) return true;
+    uint64_t const alignment = std::max({uint64_t(record_bytes), uint64_t(page), uint64_t(info.st_blksize),
+        uint64_t(allocation.f_bsize), uint64_t(allocation.f_frsize)});
+    if (uint64_t(info.st_size) < alignment + record_bytes) return false;
+    uint64_t const last = (uint64_t(info.st_size) - record_bytes) / alignment * alignment;
+    for (uint64_t offset : {last - alignment, last})
+    {
+        std::array<uint8_t, record_bytes> bytes{};
+        if (!read(offset, bytes)) return true;
+        auto const digest = grow_digest(std::span(bytes).first(record_bytes - 32));
+        if (std::equal(digest.begin(), digest.end(), bytes.end() - 32) &&
+            !std::memcmp(bytes.data(), "XCHPLOT2GROWv1\0\0\0", 16)) return true;
+    }
+    return false;
+}
 
 inline Engine::Engine(std::string path, Config config, bool allow_resume,
                       std::optional<Identity> initial)
@@ -1333,10 +1374,21 @@ inline Result Engine::apply(Plan& plan, Members members)
     return apply_prepared(plan, members);
 }
 
-inline AppendResult Engine::append(Members members, MemberBatchHash const* hash)
+inline AppendResult Engine::append(Members members, MemberBatchHash const* hash, bool reject_window)
 {
-    auto plan = plan_fresh(members, hash);
-    if (!plan) plan = this->plan(members, hash);
+    std::optional<Plan> plan;
+    try
+    {
+        plan = plan_fresh(members, hash);
+        if (!plan) plan = this->plan(members, hash);
+    }
+    catch (WindowBudgetError const& error)
+    {
+        // Sizing has not created a durable transaction. Exceptions during
+        // apply retain their ordinary pending-work recovery behavior.
+        if (!reject_window) throw;
+        return {false, false, 0, 0, error.what(), {}};
+    }
     AppendResult result{plan->accepted, plan->fresh_single_pass,
         plan->final_bytes, plan->peak_file_bytes, plan->reason, {}};
     // No caller can change the input between these phases. Public plan/apply

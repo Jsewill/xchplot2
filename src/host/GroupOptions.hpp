@@ -9,16 +9,21 @@
 #include <utility>
 #include <vector>
 
+namespace group_grow { struct FarmingProfile; }
+
 namespace pos2gpu {
 class ComputeSession;
 
 struct GroupOptions
 {
     std::string command;
-    bool json = false, quiet = false, verbose = false, report_metrics = true;
+    bool json = false, quiet = false, verbose = false, progress = false, report_metrics = true;
     std::function<bool()> cancelled;
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
-    std::filesystem::path target, fixtures, manifest;
+    std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
+    std::vector<std::filesystem::path> assessment_plans;
+    std::vector<std::filesystem::path> calibration_plots;
+    uint64_t calibration_samples = 16, calibration_timeout_ms = 30000, calibration_memory_bytes = 512 * 1024 * 1024;
     std::vector<std::filesystem::path> destinations, temporary;
     std::vector<std::pair<std::filesystem::path, std::filesystem::path>> relocations;
     std::optional<std::string> group, memo;
@@ -38,12 +43,16 @@ struct GroupOptions
     bool io_overlap = true, generation_overlap = true, cache_release = true;
     bool window_set = false, checkpoint_set = false, generation_overlap_auto = true;
     bool backend_set = false;
-    bool resume = false, group_auto = false, plan_only = false, directory_farm = false;
+    bool resume = false, group_auto = false, plan_only = false, directory_farm = false, metadata_only = false, assess_jobs = false;
+    bool calibrate = false, calibration_worker = false;
     bool extend = false, allow_missing = false;
     bool capacity_set = false, headroom_set = false, max_groups_set = false, max_total_members_set = false;
     std::optional<std::string> farming_reader, farming_objective;
     std::optional<uint64_t> farming_cores, farming_lookup_workers, farming_memory, farming_index_cache, farming_filter_bits, farming_future_filter_bits, farming_deadline_ms, farming_chain_us, farming_index_ns;
     std::optional<uint64_t> farming_cpu_work_weight, farming_io_work_weight, farming_max_eligible_groups;
+    std::filesystem::path farming_profile_path, chia_root, chia_executable;
+    bool farming_detect_local = false;
+    std::shared_ptr<group_grow::FarmingProfile const> farming_profile;
     std::string pool_broker, pool_owner, pool_ca, pool_cert, pool_key, pool_listen, pool_advertise;
     std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
     bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;

@@ -1,4 +1,5 @@
 #include "group_commands.hpp"
+#include "compute_output.hpp"
 #include "host/ComputeIdentity.hpp"
 #include <iostream>
 
@@ -15,6 +16,7 @@ void help(std::string const& command)
     else if (command == "renew-sign") std::cout << " REQUEST REPLACEMENT";
     else if (command != "members") std::cout << " FILE";
     std::cout << " [--directory DIR]\n";
+    std::cout << pos2gpu::compute_output_help;
     if (command == "members") std::cout << "Show the signed member registry. Older enrollments appear after renewal.\n";
     else if (command == "revoke") std::cout << "Revoke a node on the authority machine. Connected members exchange the signed policy automatically.\n"
         "Use policy-export and policy-import for offline members.\n";
@@ -36,23 +38,27 @@ int pos2gpu::run_compute_membership(int argc, char** argv)
         require(command == "members" || command == "revoke" || command == "renew-request" || command == "renew-sign" ||
             command == "renew-import" || command == "policy-export" || command == "policy-import", "unknown compute membership command");
         auto directory = pool::pool_directory(); std::vector<std::string> arguments;
+        ComputeOutputOptions output;
         for (int i = 1; i < argc; ++i)
         {
             std::string value = argv[i];
-            if (value == "--help" || value == "-h") { help(command); return 0; }
+            if (value == "--help" || value == "-h" || value == "--help-all") { help(command); return 0; }
+            if (output.parse(value)) continue;
             if (value == "--directory") { require(i + 1 < argc, "missing --directory value"); directory = path(argv[++i]); }
             else { require(!value.starts_with('-'), "unknown compute membership option"); arguments.push_back(std::move(value)); }
         }
+        output.validate();
         auto expected = command == "members" ? 0 : command == "renew-sign" ? 2 : 1;
         require(arguments.size() == size_t(expected), "incorrect compute membership arguments; use --help");
         auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
         if (command == "members")
         {
-            std::cout << "Policy generation: " << identity->policy_generation << '\n';
+            if (output.details()) std::cout << "Policy generation: " << identity->policy_generation << '\n';
             if (!identity->policy_generation) std::cout << "Legacy enrollment: export policy on the authority machine to migrate.\n";
             for (auto const& member : pool::pool_members(*identity))
                 std::cout << member.node_id << ' ' << (member.revoked ? "revoked" : "active") << ' ' << member.name << '\n';
-            std::cout << "Certificate expires: " << identity->certificate_expires << "\nAuthority expires: " << identity->authority_expires << '\n';
+            if (output.details())
+                std::cout << "Certificate expires: " << identity->certificate_expires << "\nAuthority expires: " << identity->authority_expires << '\n';
             if (identity->authority_expired) std::cout << "The pool authority has expired; create a new pool and re-enroll its members.\n";
             else if (identity->certificate_expired) std::cout << "This machine's certificate needs renewal before it can connect.\n";
         }

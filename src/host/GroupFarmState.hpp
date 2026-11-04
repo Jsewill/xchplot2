@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupEngine.hpp"
 #include "host/GroupFarming.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 // Only the shared durability, checksum and file-stamp primitives are used.
 // The unrelated stream checkpoint functions still require their build macro.
 #ifndef STREAM_IDENTITY
@@ -17,6 +18,14 @@
 
 namespace group_grow
 {
+// Bump this when owner/base-seed derivation, family/meta identity schedules or
+// the Rust group-key derivation changes. Construction checkpoints separately
+// require their exact GROW_IDENTITY; completed ordinary groups are portable.
+inline constexpr char farming_key_derivation_identity[] = "directory-farming-keys-1";
+enum class FarmingStateLoad { recovery, metadata_only };
+inline constexpr size_t farming_profile_metadata_bytes = 65536;
+inline void check_farming_state_size(uint64_t bytes, uint64_t memory_limit)
+{ require(bytes < memory_limit / 16, "saved farming plan exceeds --max-ram"); }
 struct FarmingDirectory
 {
     std::string directory, filesystem;
@@ -25,9 +34,19 @@ struct FarmingDirectory
     FarmingDestination storage;
     std::string directory_identity;
     uint64_t identity_resources = 1, identity_resource = 0, identity_epoch = 0;
+    // Initial forecasts retain the identity schedule. Live capacity admission
+    // records exact targets separately, sealing them before publication.
+    std::vector<uint16_t> extents;
+    uint64_t sealed_files = 0;
+    std::string fill_stop;
 };
 struct FarmingState
 {
+    unsigned version = 6;
+    // Preserve the creating build as provenance and in every revision digest.
+    // Schema/model/key derivation and numeric representation define v6 plan
+    // compatibility independently.
+    std::string producer_build = GROW_IDENTITY;
     FarmingConfig config;
     uint64_t manifest_reserved_bytes = 0;
     std::string fingerprint;
@@ -38,9 +57,186 @@ struct FarmingState
     std::string seed, seed_owner, farmer, pool;
     bool pool_public_key = false;
     bool fixed_extent = false;
+    bool capacity_fill = false;
+    std::optional<FarmingProfileMetadata> profile_metadata;
+    // Earlier revisions retain their original public JSON and canonical bytes.
+    std::string profile_json;
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024;
     uint64_t max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
 };
+inline bool same_farming_profile_metadata(FarmingState const& before, FarmingState const& after)
+{ return before.profile_metadata == after.profile_metadata && before.profile_json == after.profile_json; }
+inline std::string farming_profile_metadata_text(FarmingProfileMetadata const& profile, unsigned version = 5)
+{
+    require(version >= 6 || !profile.reader_calibration, "scoped reader calibration requires farming plan v6");
+    uint64_t bytes = 0;
+    auto string = [&](std::string const& value) { bytes = grow_add(bytes, value.size()); };
+    string(profile.source); string(profile.captured_at); string(profile.chia_version); string(profile.host_name);
+    string(profile.config_status); string(profile.inventory_status);
+    if (profile.reader_calibration)
+    {
+        validate_reader_calibration_scope(*profile.reader_calibration); string(profile.reader_calibration->method);
+        string(profile.reader_calibration->host_name); string(profile.reader_calibration->captured_at);
+    }
+    for (auto const& assumption : profile.assumptions) string(assumption);
+    require(bytes <= farming_profile_metadata_bytes && profile.assumptions.size() <= 64,
+        "saved farming profile metadata exceeds its bound");
+    std::ostringstream out;
+    out << std::setprecision(std::numeric_limits<long double>::max_digits10);
+    out << std::quoted(profile.source) << ' ' << std::quoted(profile.captured_at) << ' '
+        << std::quoted(profile.chia_version) << ' ' << std::quoted(profile.host_name) << '\n'
+        << std::quoted(profile.config_status) << ' ' << std::quoted(profile.inventory_status) << '\n'
+        << profile.detected_logical_cpus << ' ' << profile.detected_available_memory_bytes << ' '
+        << profile.inventory_available << ' ' << profile.inventory_v1_files << ' ' << profile.inventory_v2_files << ' '
+        << profile.inventory_v2_members << ' ' << profile.inventory_failed_files << ' ' << profile.inventory_no_key_files << '\n'
+        << profile.assumptions.size();
+    for (auto const& assumption : profile.assumptions) out << ' ' << std::quoted(assumption);
+    out << '\n';
+    if (version >= 6)
+    {
+        out << profile.reader_calibration.has_value();
+        if (profile.reader_calibration)
+        {
+            auto const& scope = *profile.reader_calibration;
+            out << ' ' << unsigned(scope.k) << ' ' << unsigned(scope.strength) << ' ' << unsigned(scope.reader)
+                << ' ' << std::quoted(scope.method) << ' ' << scope.margin
+                << ' ' << std::quoted(scope.host_name) << ' ' << std::quoted(scope.captured_at);
+        }
+        out << '\n';
+    }
+    auto text = out.str();
+    require(text.size() <= farming_profile_metadata_bytes, "saved farming profile metadata exceeds its bound");
+    return text;
+}
+inline FarmingProfileMetadata farming_profile_metadata_read(std::istream& in, unsigned version = 5)
+{
+    FarmingProfileMetadata profile;
+    size_t count = 0;
+    in >> std::quoted(profile.source) >> std::quoted(profile.captured_at) >> std::quoted(profile.chia_version)
+        >> std::quoted(profile.host_name) >> std::quoted(profile.config_status) >> std::quoted(profile.inventory_status)
+        >> profile.detected_logical_cpus >> profile.detected_available_memory_bytes >> profile.inventory_available
+        >> profile.inventory_v1_files >> profile.inventory_v2_files >> profile.inventory_v2_members
+        >> profile.inventory_failed_files >> profile.inventory_no_key_files >> count;
+    require(in && count <= 64, "invalid saved farming profile metadata");
+    profile.assumptions.clear(); profile.assumptions.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        std::string assumption; in >> std::quoted(assumption);
+        require(bool(in), "incomplete saved farming profile metadata");
+        profile.assumptions.push_back(std::move(assumption));
+    }
+    if (version >= 6)
+    {
+        bool calibrated = false; in >> calibrated;
+        require(bool(in), "invalid saved reader calibration presence");
+        if (calibrated)
+        {
+            ReaderCalibrationScope scope; unsigned k = 0, strength = 0, reader = 0;
+            in >> k >> strength >> reader >> std::quoted(scope.method) >> scope.margin
+                >> std::quoted(scope.host_name) >> std::quoted(scope.captured_at);
+            require(in && k <= UINT8_MAX && strength <= UINT8_MAX && reader <= 1,
+                "invalid saved reader calibration scope");
+            scope.k = uint8_t(k); scope.strength = uint8_t(strength); scope.reader = FarmingReader(reader);
+            validate_reader_calibration_scope(scope); profile.reader_calibration = std::move(scope);
+        }
+    }
+    (void)farming_profile_metadata_text(profile, version);
+    return profile;
+}
+inline void set_farming_state_profile(FarmingState& state, FarmingProfile const& profile)
+{
+    require(state.version >= 5 && profile.config == state.config,
+        "saved farming profile differs from its configuration");
+    profile_detail::validate(profile.config);
+    validate_reader_calibration_scope(profile, state.config);
+    (void)farming_profile_metadata_text(profile, state.version);
+    state.profile_metadata = profile;
+    state.profile_json.clear();
+}
+inline std::optional<FarmingProfile> farming_state_profile(FarmingState const& state,
+    uint64_t memory_limit = profile_detail::parsing_memory_bytes)
+{
+    if (state.version < 5)
+    {
+        if (state.profile_json.empty()) return std::nullopt;
+        std::istringstream in(state.profile_json);
+        auto profile = read_farming_profile(in, memory_limit);
+        require(!profile.reader_calibration, "scoped reader calibration requires farming plan v6");
+        return profile;
+    }
+    if (!state.profile_metadata) return std::nullopt;
+    require(state.version >= 6 || !state.profile_metadata->reader_calibration,
+        "scoped reader calibration requires farming plan v6");
+    require(farming_profile_metadata_memory(*state.profile_metadata) < memory_limit,
+        "saved farming profile metadata exceeds its parsing memory budget");
+    FarmingProfile profile;
+    static_cast<FarmingProfileMetadata&>(profile) = *state.profile_metadata;
+    profile.config = state.config;
+    profile_detail::validate(profile.config);
+    validate_reader_calibration_scope(profile, profile.config);
+    return profile;
+}
+inline void initialize_farming_extents(FarmingState& state, size_t first = 0)
+{
+    if (!state.capacity_fill) return;
+    for (size_t lane = first; lane < state.directories.size(); ++lane)
+    {
+        auto& d = state.directories[lane];
+        require(d.layout.files <= farming_detail::maximum_files, "farming extent exceeds its file work bound");
+        d.extents.clear(); d.extents.reserve(size_t(d.layout.files));
+        for (uint64_t file = 0; file < d.layout.files; ++file) d.extents.push_back(d.layout.file_members(file));
+        d.sealed_files = 0; d.fill_stop.clear();
+    }
+}
+inline uint64_t farming_extent_memory(FarmingState const& state)
+{
+    uint64_t bytes = grow_add(state.profile_json.capacity(), state.producer_build.capacity());
+    if (state.profile_metadata) bytes = grow_add(bytes, farming_profile_metadata_memory(*state.profile_metadata));
+    for (auto const& d : state.directories)
+        bytes = grow_add(bytes, grow_add(d.extents.capacity() * sizeof(uint16_t), d.fill_stop.capacity()));
+    return bytes;
+}
+inline uint64_t farming_revision_margin(FarmingState const& state)
+{
+    // Every lane can seal its current extent and record its terminal reason,
+    // including decimal count growth, after the last successful admission.
+    return grow_add(128, state.directories.size() * 64);
+}
+inline bool farming_revision_fits(FarmingState const& state, uint64_t bytes)
+{
+    uint64_t const capacity = state.manifest_reserved_bytes / 2;
+    return bytes <= capacity && farming_revision_margin(state) <= capacity - bytes;
+}
+inline bool valid_farming_extent_revision(FarmingState const& before, FarmingState const& after)
+{
+    if (before.capacity_fill != after.capacity_fill || before.version != after.version ||
+        before.producer_build != after.producer_build || !same_farming_profile_metadata(before, after)) return false;
+    for (size_t lane = 0; lane < before.directories.size(); ++lane)
+    {
+        auto const& a = before.directories[lane]; auto const& b = after.directories[lane];
+        if (b.sealed_files < a.sealed_files || b.sealed_files > a.sealed_files + 1 ||
+            b.extents.size() < a.sealed_files || b.extents.size() > a.extents.size() + 1 ||
+            (!a.fill_stop.empty() && (a.fill_stop != b.fill_stop || a.extents != b.extents))) return false;
+        bool const stopped = !b.fill_stop.empty();
+        if (stopped && b.sealed_files != b.extents.size()) return false;
+        if (b.extents.size() < a.extents.size() && b.fill_stop != "capacity") return false;
+        if (b.extents.size() > a.extents.size() && (a.sealed_files != a.extents.size() || b.extents.back() != 1)) return false;
+        for (size_t file = 0; file < a.extents.size(); ++file)
+        {
+            if (file < a.sealed_files && a.extents[file] != b.extents[file]) return false;
+            if (file >= b.extents.size()) continue;
+            if (a.extents[file] == b.extents[file]) continue;
+            if (file != a.sealed_files) return false;
+            if (b.extents[file] > a.extents[file])
+            {
+                if (file + 1 < a.layout.files || b.sealed_files != a.sealed_files ||
+                    unsigned(b.extents[file]) != unsigned(a.extents[file]) + 1) return false;
+            }
+            else if (b.sealed_files != a.sealed_files + 1) return false;
+        }
+    }
+    return true;
+}
 inline void farming_config_write(std::ostream& out, FarmingConfig const& c)
 {
     out << unsigned(c.k) << ' ' << unsigned(c.strength) << ' ' << unsigned(c.filter_bits) << ' '
@@ -71,16 +267,84 @@ inline FarmingConfig farming_config_read(std::istream& in)
     c.meta_group_override = uint8_t(meta);
     return c;
 }
-inline std::string farming_state_text(FarmingState const& state)
+// Storage defaults and overrides contain only the fields previously repeated
+// in every directory. Its physical resource remains the directory's resource.
+inline constexpr unsigned farming_storage_fields = 511;
+inline unsigned farming_storage_overrides(FarmingDestination const& value, FarmingDestination const& defaults)
 {
+    return unsigned(value.known_device != defaults.known_device) |
+        (unsigned(value.nonrotating != defaults.nonrotating) << 1) |
+        (unsigned(value.read_bytes_per_second != defaults.read_bytes_per_second) << 2) |
+        (unsigned(value.read_latency_seconds != defaults.read_latency_seconds) << 3) |
+        (unsigned(value.read_concurrency != defaults.read_concurrency) << 4) |
+        (unsigned(value.capacity_bytes != defaults.capacity_bytes) << 5) |
+        (unsigned(value.max_file_bytes != defaults.max_file_bytes) << 6) |
+        (unsigned(value.max_total_members != defaults.max_total_members) << 7) |
+        (unsigned(value.max_groups != defaults.max_groups) << 8);
+}
+inline void farming_storage_write(std::ostream& out, FarmingDestination const& value, unsigned mask)
+{
+    out << mask;
+    if (mask & 1) out << ' ' << value.known_device;
+    if (mask & 2) out << ' ' << value.nonrotating;
+    if (mask & 4) out << ' ' << value.read_bytes_per_second;
+    if (mask & 8) out << ' ' << value.read_latency_seconds;
+    if (mask & 16) out << ' ' << value.read_concurrency;
+    if (mask & 32) out << ' ' << value.capacity_bytes;
+    if (mask & 64) out << ' ' << value.max_file_bytes;
+    if (mask & 128) out << ' ' << value.max_total_members;
+    if (mask & 256) out << ' ' << value.max_groups;
+    out << '\n';
+}
+inline FarmingDestination farming_storage_read(std::istream& in, FarmingDestination value = {}, bool complete = false)
+{
+    unsigned mask = 0; in >> mask;
+    require(in && mask <= farming_storage_fields && (!complete || mask == farming_storage_fields),
+        "invalid saved farming storage overrides");
+    if (mask & 1) in >> value.known_device;
+    if (mask & 2) in >> value.nonrotating;
+    if (mask & 4) in >> value.read_bytes_per_second;
+    if (mask & 8) in >> value.read_latency_seconds;
+    if (mask & 16) in >> value.read_concurrency;
+    if (mask & 32) in >> value.capacity_bytes;
+    if (mask & 64) in >> value.max_file_bytes;
+    if (mask & 128) in >> value.max_total_members;
+    if (mask & 256) in >> value.max_groups;
+    require(bool(in), "incomplete saved farming storage overrides");
+    return value;
+}
+inline std::string farming_state_text(FarmingState const& state, bool keyless = false)
+{
+    require(state.version >= 3 && state.version <= 6, "unsupported saved farming plan version");
+    require(state.profile_json.size() <= farming_profile_metadata_bytes,
+        "saved farming profile metadata exceeds its bound");
+    require(state.version < 5 || state.profile_json.empty(), "saved farming profile duplicates its configuration");
+    if (state.profile_metadata)
+    {
+        require(state.version >= 6 || !state.profile_metadata->reader_calibration,
+            "scoped reader calibration requires farming plan v6");
+        validate_reader_calibration_scope(*state.profile_metadata, state.config);
+    }
     std::ostringstream out;
     out << std::setprecision(std::numeric_limits<long double>::max_digits10);
-    out << "ordinary-group-farming-v3\n" << std::quoted(GROW_IDENTITY) << '\n'
-        << std::quoted(farming_model_identity) << '\n' << std::quoted(state.fingerprint) << '\n';
+    out << "ordinary-group-farming-v" << state.version << '\n' << std::quoted(state.producer_build) << '\n'
+        << std::quoted(farming_model_identity) << '\n';
+    if (state.version >= 6) out << std::quoted(farming_key_derivation_identity) << ' '
+        << std::numeric_limits<long double>::radix << ' ' << std::numeric_limits<long double>::digits << ' '
+        << std::numeric_limits<long double>::max_exponent << '\n';
+    out << std::quoted(keyless ? std::string(64, '0') : state.fingerprint) << '\n';
     out << std::quoted(state.job_id) << ' ' << state.revision << ' ' << std::quoted(state.parent_digest) << '\n'
-        << std::quoted(state.seed) << ' ' << std::quoted(state.seed_owner) << ' ' << std::quoted(state.farmer) << ' '
-        << std::quoted(state.pool) << ' ' << state.pool_public_key << ' ' << state.fixed_extent << '\n'
+        << std::quoted(keyless ? std::string(64, '0') : state.seed) << ' ' << std::quoted(keyless ? std::string{} : state.seed_owner)
+        << ' ' << std::quoted(keyless ? std::string(96, '0') : state.farmer) << ' '
+        << std::quoted(keyless ? std::string(state.pool_public_key ? 96 : 64, '0') : state.pool)
+        << ' ' << state.pool_public_key << ' ' << state.fixed_extent << '\n'
         << state.capacity << ' ' << state.headroom << ' ' << state.max_groups << ' ' << state.max_total_members << '\n';
+    if (state.version == 4) out << state.capacity_fill << ' ' << std::quoted(state.profile_json) << '\n';
+    if (state.version >= 5)
+    {
+        out << state.capacity_fill << ' ' << state.profile_metadata.has_value() << '\n';
+        if (state.profile_metadata) out << farming_profile_metadata_text(*state.profile_metadata, state.version);
+    }
     out << state.manifest_reserved_bytes << '\n';
     farming_config_write(out, state.config);
     auto const& e = state.estimate;
@@ -89,6 +353,8 @@ inline std::string farming_state_text(FarmingState const& state)
         << std::quoted(e.reason) << ' ' << e.response_bound_seconds << ' ' << e.dynamic_work_seconds_per_sp << ' '
         << e.cpu_work_seconds_per_sp << ' ' << e.io_work_seconds_per_sp << ' '
         << e.max_eligible_families_per_resource << '\n' << state.directories.size() << '\n';
+    FarmingDestination const defaults = state.directories.empty() ? FarmingDestination{} : state.directories.front().storage;
+    if (state.version >= 5) farming_storage_write(out, defaults, farming_storage_fields);
     for (auto const& d : state.directories)
     {
         auto const& p = d.layout;
@@ -97,20 +363,35 @@ inline std::string farming_state_text(FarmingState const& state)
             << d.identity_epoch << ' ' << p.schedule << '\n'
             << p.total_members << ' ' << p.files << ' ' << p.families << ' ' << p.group_bytes << ' '
             << p.group_members << ' ' << p.meta_slots << ' ' << unsigned(p.meta_bits) << ' '
-            << unsigned(p.meta_base) << ' ' << p.fixed_members << ' ' << p.resource_rank << ' ' << p.resource_lanes << '\n'
-            << d.storage.known_device << ' ' << d.storage.nonrotating << ' ' << d.storage.read_bytes_per_second << ' '
+            << unsigned(p.meta_base) << ' ' << p.fixed_members << ' ' << p.resource_rank << ' ' << p.resource_lanes << '\n';
+        if (state.version >= 5) farming_storage_write(out, d.storage, farming_storage_overrides(d.storage, defaults));
+        else out << d.storage.known_device << ' ' << d.storage.nonrotating << ' ' << d.storage.read_bytes_per_second << ' '
             << d.storage.read_latency_seconds << ' ' << d.storage.read_concurrency << '\n'
             << d.storage.capacity_bytes << ' ' << d.storage.max_file_bytes << ' ' << d.storage.max_total_members << ' '
             << d.storage.max_groups << '\n';
+        if (state.version >= 4)
+        {
+            size_t runs = 0;
+            for (size_t file = 0; file < d.extents.size(); ++file)
+                if (!file || d.extents[file] != d.extents[file - 1]) ++runs;
+            out << d.sealed_files << ' ' << std::quoted(d.fill_stop) << ' ' << d.extents.size() << ' ' << runs;
+            for (size_t first = 0; first < d.extents.size();)
+            {
+                size_t last = first + 1;
+                while (last < d.extents.size() && d.extents[last] == d.extents[first]) ++last;
+                out << ' ' << d.extents[first] << ' ' << last - first; first = last;
+            }
+            out << '\n';
+        }
     }
     return out.str();
 }
-inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, std::string const& contents)
+inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, std::string const& contents, bool failpoints = true)
 {
     auto const pending = file_io::native_path(file_io::path_text(path) + ".next");
     require(!std::filesystem::exists(pending), "pending farming revision must be recovered first");
     stream_state::atomic_save(pending, contents, false);
-    grow_failpoint("farm-plan-before-publication");
+    if (failpoints) grow_failpoint("farm-plan-before-publication");
     return pending;
 }
 inline std::filesystem::path stage_farming_state(std::filesystem::path const& path, FarmingState const& state)
@@ -136,9 +417,9 @@ struct FarmingStateFile
 inline FarmingStateFile read_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
 {
     auto const stamp = stream_state::stamp(path);
-    require(stamp.bytes < memory_limit / 16, "saved farming plan exceeds --max-ram");
+    check_farming_state_size(stamp.bytes, memory_limit);
     auto file = group_tools::input(file_io::path_text(path));
-    std::string contents{std::istreambuf_iterator<char>(file), {}};
+    auto contents = stream_state::read_exact(file, stamp.bytes);
     require(contents.size() >= 65 && contents.back() == '\n', "invalid farming plan checksum");
     auto const digest = contents.substr(contents.size() - 65, 64);
     contents.resize(contents.size() - 65);
@@ -146,27 +427,58 @@ inline FarmingStateFile read_farming_state(std::filesystem::path const& path, ui
     require(stream_state::stamp(path) == stamp, "farming plan changed while loading");
     return {std::move(contents), digest, stamp};
 }
-inline FarmingState parse_farming_state(std::string const& body)
+inline FarmingState parse_farming_state(std::string const& body, uint64_t memory_limit = UINT64_MAX,
+    FarmingStateLoad mode = FarmingStateLoad::recovery)
 {
+    require(body.size() < memory_limit / 4, "saved farming state exceeds its parsing memory budget");
     std::istringstream in(body);
     std::string version, build, model;
     std::getline(in, version); in >> std::quoted(build);
-    require(version == "ordinary-group-farming-v3" && build == GROW_IDENTITY,
-        "farming plan requires its original grow build");
+    require(version == "ordinary-group-farming-v3" || version == "ordinary-group-farming-v4" ||
+        version == "ordinary-group-farming-v5" || version == "ordinary-group-farming-v6",
+        "unsupported saved farming plan version");
     FarmingState state;
+    state.version = version == "ordinary-group-farming-v3" ? 3 : version == "ordinary-group-farming-v4" ? 4 :
+        version == "ordinary-group-farming-v5" ? 5 : 6;
+    require(!build.empty() && build.size() <= 128, "invalid saved farming producer build");
+    require(state.version >= 6 || mode == FarmingStateLoad::metadata_only || build == GROW_IDENTITY,
+        "farming plan requires its original grow build; plan --metadata-only can inspect its saved metadata");
+    state.producer_build = std::move(build);
     in >> std::quoted(model); require(model == farming_model_identity, "saved farming model differs from this build");
+    if (state.version >= 6)
+    {
+        std::string keys; int radix = 0, digits = 0, exponent = 0;
+        in >> std::quoted(keys);
+        require(in && keys == farming_key_derivation_identity, "saved farming key derivation differs from this build");
+        in >> radix >> digits >> exponent;
+        require(in && radix == std::numeric_limits<long double>::radix && digits == std::numeric_limits<long double>::digits &&
+            exponent == std::numeric_limits<long double>::max_exponent,
+            "saved farming numeric representation is unsupported by this build; values were not loaded");
+    }
     in >> std::quoted(state.fingerprint) >> std::quoted(state.job_id) >> state.revision >> std::quoted(state.parent_digest)
         >> std::quoted(state.seed) >> std::quoted(state.seed_owner) >> std::quoted(state.farmer) >> std::quoted(state.pool)
-        >> state.pool_public_key >> state.fixed_extent >> state.capacity >> state.headroom >> state.max_groups >> state.max_total_members
-        >> state.manifest_reserved_bytes;
+        >> state.pool_public_key >> state.fixed_extent >> state.capacity >> state.headroom >> state.max_groups >> state.max_total_members;
+    if (state.version == 4)
+    {
+        in >> state.capacity_fill >> std::quoted(state.profile_json);
+        require(in && state.profile_json.size() <= farming_profile_metadata_bytes, "saved farming profile metadata exceeds its bound");
+    }
+    if (state.version >= 5)
+    {
+        bool metadata = false; in >> state.capacity_fill >> metadata;
+        require(bool(in), "invalid saved farming profile metadata");
+        if (metadata) state.profile_metadata = farming_profile_metadata_read(in, state.version);
+    }
+    in >> state.manifest_reserved_bytes;
     auto encoded = [](std::string const& value, size_t bytes)
     { return value.size() == bytes * 2 && value.find_first_not_of("0123456789abcdefABCDEF") == value.npos; };
     require(in && encoded(state.job_id, 32) && encoded(state.fingerprint, 32) && state.revision &&
         (state.revision == 1 ? state.parent_digest.empty() : encoded(state.parent_digest, 32)) &&
         encoded(state.seed, 32) && encoded(state.farmer, 48) && encoded(state.pool, state.pool_public_key ? 48 : 32) &&
-        state.seed_owner.size() <= 128 && state.max_groups && state.max_total_members,
+        state.seed_owner.size() <= 128 && state.max_groups && state.max_total_members && (!state.capacity_fill || state.fixed_extent),
         "invalid saved farming identity or limits");
     state.config = farming_config_read(in);
+    if (state.profile_metadata) validate_reader_calibration_scope(*state.profile_metadata, state.config);
     auto& e = state.estimate;
     auto real = [&]
     {
@@ -181,13 +493,20 @@ inline FarmingState parse_farming_state(std::string const& body)
     in >> e.max_eligible_families_per_resource;
     size_t count = 0; in >> count;
     require(in && count && count <= 1024, "invalid saved farming destination count");
+    uint64_t expanded = grow_add(sizeof(FarmingState), grow_add(body.size() * 4, count * sizeof(FarmingDirectory)));
+    if (state.profile_metadata) expanded = grow_add(expanded, farming_profile_metadata_memory(*state.profile_metadata));
+    require(expanded < memory_limit, "saved farming state exceeds its parsing memory budget");
     state.directories.resize(count);
+    FarmingDestination const defaults = state.version >= 5 ? farming_storage_read(in, {}, true) : FarmingDestination{};
+    uint64_t extent_count = 0;
     for (auto& d : state.directories)
     {
         auto& p = d.layout; unsigned members, slots, bits, meta, rank, lanes;
         in >> std::quoted(d.directory) >> std::quoted(d.filesystem) >> d.capacity_bytes >> d.resource >>
             std::quoted(d.directory_identity) >> d.identity_resources >> d.identity_resource >> d.identity_epoch >> p.schedule >>
-            p.total_members >> p.files >> p.families >> p.group_bytes >> members >> slots >> bits >> meta >> p.fixed_members >> rank >> lanes >> d.storage.known_device >> d.storage.nonrotating >>
+            p.total_members >> p.files >> p.families >> p.group_bytes >> members >> slots >> bits >> meta >> p.fixed_members >> rank >> lanes;
+        if (state.version >= 5) d.storage = farming_storage_read(in, defaults);
+        else in >> d.storage.known_device >> d.storage.nonrotating >>
             d.storage.read_bytes_per_second >> d.storage.read_latency_seconds >> d.storage.read_concurrency >>
             d.storage.capacity_bytes >> d.storage.max_file_bytes >> d.storage.max_total_members >> d.storage.max_groups;
         require(in && !d.directory.empty() && members <= 65535 && slots && slots <= 256 &&
@@ -199,15 +518,51 @@ inline FarmingState parse_farming_state(std::string const& body)
         p.group_members = uint16_t(members); p.meta_slots = uint16_t(slots);
         p.meta_bits = uint8_t(bits); p.meta_base = uint8_t(meta); p.resource_rank = uint16_t(rank); p.resource_lanes = uint16_t(lanes);
         d.storage.resource = d.resource;
+        if (state.version >= 4)
+        {
+            size_t files = 0, runs = 0; in >> d.sealed_files >> std::quoted(d.fill_stop) >> files >> runs;
+            require(in && files <= farming_detail::maximum_files - extent_count && files <= state.max_groups && runs <= files &&
+                bool(runs) == bool(files) &&
+                d.sealed_files <= files && (state.capacity_fill || (!files && !d.sealed_files && d.fill_stop.empty())) &&
+                (d.fill_stop.empty() || d.fill_stop == "capacity" || d.fill_stop == "farming-limit" ||
+                 d.fill_stop == "group-limit" || d.fill_stop == "total-member-limit" || d.fill_stop == "metadata-capacity"),
+                "invalid saved farming extents");
+            uint64_t const extent_bytes = files * sizeof(uint16_t);
+            require(extent_bytes <= memory_limit - expanded, "saved farming extents exceed their parsing memory budget");
+            expanded = grow_add(expanded, extent_bytes);
+            extent_count += files; d.extents.reserve(files);
+            uint64_t total = 0;
+            for (size_t run = 0; run < runs; ++run)
+            {
+                unsigned extent = 0; size_t length = 0; in >> extent >> length;
+                require(in && extent && extent <= UINT16_MAX &&
+                    (!state.config.group_members_override || extent <= state.config.group_members_override) && length &&
+                    length <= files - d.extents.size(),
+                    "invalid saved farming member extent");
+                for (size_t member = 0; member < length; ++member)
+                {
+                    auto const file = d.extents.size();
+                    require(file + 1 >= p.files || extent == p.file_members(file) ||
+                        (!d.fill_stop.empty() && file + 1 == files && extent < p.file_members(file)),
+                        "saved farming extent changed an initial assignment");
+                    d.extents.push_back(uint16_t(extent)); farming_detail::add(total, extent);
+                }
+            }
+            require(d.extents.size() == files && total <= state.max_total_members,
+                "saved farming extents exceed their total member limit");
+            require(!state.capacity_fill || (!d.fill_stop.empty() ? d.sealed_files == files : files >= p.files),
+                "saved farming extent omitted an initial assignment");
+        }
         state.estimate.destinations.push_back(p);
     }
     in >> std::ws; require(in.eof(), "unexpected saved farming plan data");
     return state;
 }
-inline FarmingState load_farming_state(std::filesystem::path const& path, uint64_t memory_limit)
+inline FarmingState load_farming_state(std::filesystem::path const& path, uint64_t memory_limit,
+    FarmingStateLoad mode = FarmingStateLoad::recovery)
 {
     auto const file = read_farming_state(path, memory_limit);
-    auto state = parse_farming_state(file.body);
+    auto state = parse_farming_state(file.body, memory_limit, mode);
     require(stream_state::stamp(path) == file.stamp, "farming plan changed while loading");
     return state;
 }

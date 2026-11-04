@@ -8,13 +8,13 @@ import json
 import os
 from pathlib import Path
 import platform
-import select
 import shlex
 import shutil
 import stat
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -95,41 +95,64 @@ def sync_output(path):
         os.close(fd)
 
 
+class ProcessExit:
+    """Observe exit independently of potentially slow sampling; leave a zombie for final I/O."""
+
+    def __init__(self, pid):
+        self.completed = threading.Event()
+        self.observed = None
+        self.error = None
+        self.thread = threading.Thread(target=self._wait, args=(pid,))
+        self.thread.start()
+
+    def _wait(self, pid):
+        try:
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+            self.observed = time.monotonic()
+        except OSError as error:
+            self.error = error
+        finally:
+            self.completed.set()
+
+    def join(self):
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+
+
 def measure(command, log_path, work, interval, output=None):
     command = [str(arg) for arg in command]
     peak_rss = None
     peak_allocated = 0
     counters = {}
-    started = time.monotonic()
     with log_path.open("w") as log:
+        started = time.monotonic()
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
-        pidfd = None
+        observer = None
         try:
-            pidfd = os.pidfd_open(process.pid)
-            while True:
+            observer = ProcessExit(process.pid)
+            while not observer.completed.is_set():
                 memory, io, space = sample(process.pid, Path(command[0]), work)
                 if memory is not None:
                     peak_rss = max(peak_rss or 0, memory)
                 peak_allocated = max(peak_allocated, space)
                 counters.update(io)
-                if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
-                    # Sample final I/O without reaping the process first.
-                    _, io, space = sample(process.pid, Path(command[0]), work)
-                    counters.update(io)
-                    peak_allocated = max(peak_allocated, space)
-                    _, status, usage = os.wait4(process.pid, 0)
-                    process.returncode = os.waitstatus_to_exitcode(status)
-                    break
-                # Wake immediately at exit instead of rounding small timings up
-                # to a sampling interval. Leave the zombie for final counters.
-                select.select([pidfd], [], [], interval)
+                observer.completed.wait(interval)
+            observer.join()
+            # Sample final I/O without reaping the process first. Its exit
+            # timestamp is already fixed, so sampling cannot inflate it.
+            _, io, space = sample(process.pid, Path(command[0]), work)
+            counters.update(io)
+            peak_allocated = max(peak_allocated, space)
+            _, status, usage = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
         finally:
-            if pidfd is not None:
-                os.close(pidfd)
             if process.returncode is None:
                 process.kill()
+                if observer is not None:
+                    observer.thread.join()
                 process.wait()
-    process_seconds = time.monotonic() - started
+    process_seconds = observer.observed - started
     if process.returncode:
         raise RuntimeError(f"command failed ({process.returncode}); see {log_path}")
     synced = time.monotonic()
@@ -138,7 +161,8 @@ def measure(command, log_path, work, interval, output=None):
     sync_seconds = time.monotonic() - synced if output is not None else 0
     return {
         "command": command,
-        "seconds": time.monotonic() - started,
+        "seconds": process_seconds + sync_seconds,
+        "measurement_seconds": time.monotonic() - started,
         "process_seconds": process_seconds,
         "output_sync_seconds": sync_seconds,
         "user_cpu_seconds": usage.ru_utime,
@@ -209,7 +233,8 @@ def main():
         "executables": {name: {"path": str(path), "sha256": digest(path)}
                         for name, path in tools.items()},
         "measurement": {
-            "assembly": "includes process startup, input preflight and output file/directory fsync",
+            "assembly": "launch through independently observed exit plus output file/directory fsync; final sampling excluded",
+            "sampling": "RSS/I/O/allocation sampling remains active during assembly and may contend for CPU/storage; total measurement time is reported separately",
             "verification": "same direct verifier once per method, outside assembly timing; every repeat must match verified bytes",
             "cache": "input pre-read is outside timing; residency is not guaranteed; no global cache drop",
             "rss": "sampled post-exec VmHWM; may miss the final peak; excludes filesystem cache",

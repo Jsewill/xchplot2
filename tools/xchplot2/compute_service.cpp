@@ -1,4 +1,5 @@
 #include "group_commands.hpp"
+#include "compute_output.hpp"
 #include "host/ComputeIdentity.hpp"
 #include <cerrno>
 #include <cstdlib>
@@ -37,8 +38,9 @@ fs::path unit_directory()
     value = std::getenv("HOME"); require(value && *value, "HOME or XDG_CONFIG_HOME is required for a user service");
     return fs::absolute(value) / ".config/systemd/user";
 }
-int systemctl(std::vector<std::string> arguments)
+int systemctl(std::vector<std::string> arguments, bool quiet = false)
 {
+    if (quiet) arguments.insert(arguments.begin(), "--quiet");
     arguments.insert(arguments.begin(), {"systemctl", "--user", "--no-pager"});
     std::vector<char*> values; for (auto& argument : arguments) values.push_back(argument.data()); values.push_back(nullptr);
     pid_t child = 0;
@@ -92,28 +94,34 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
             "  start    Start an installed service\n"
             "  stop     Stop it; owners retry unfinished tasks elsewhere\n"
             "  restart  Apply changed defaults or installed executable\n"
-            "  status   Show the service manager's status and recent log\n"
+            "  status   Show whether the service is active; -v includes manager details and logs\n"
             "  remove   Stop, disable and remove this generated service\n"
             "  print    Print the unit without writing files or starting work\n"
             "  --role worker|broker  Service role, default worker\n"
             "  --directory DIR       Saved pool membership\n"
+            << pos2gpu::compute_output_help <<
             "Resources and network selection come from compute configure.\n"
             "Use compute drain before stop to let accepted work finish.\n"
             "User services run while the user manager is active; logout behavior follows the system's login policy.\n";
     };
     if (argc < 2) { help(); return 1; }
+    std::string command, role = "worker"; auto directory = pool::pool_directory();
+    ComputeOutputOptions output;
     for (int i = 1; i < argc; ++i)
-        if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") { help(); return 0; }
-    std::string const command = argv[1]; std::string role = "worker"; auto directory = pool::pool_directory();
-    require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
-        command == "status" || command == "remove" || command == "print", "unknown compute service command");
-    for (int i = 2; i < argc; ++i)
     {
-        std::string const option = argv[i]; require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
+        std::string const option = argv[i];
+        if (option == "--help" || option == "-h" || option == "--help-all") { help(); return 0; }
+        if (output.parse(option)) continue;
+        if (!option.starts_with('-'))
+        { require(command.empty(), "unexpected compute service argument"); command = option; continue; }
+        require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
         if (option == "--role") role = value;
         else if (option == "--directory") directory = value;
         else throw std::invalid_argument("unknown compute service option: " + option);
     }
+    output.validate();
+    require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
+        command == "status" || command == "remove" || command == "print", "unknown compute service command");
     require(role == "worker" || role == "broker", "service role must be worker or broker");
     auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
     auto const name = "xchplot2-compute-" + role + '-' + identity->node_id + ".service";
@@ -128,8 +136,8 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
             "\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=45\nUMask=0077\n\n[Install]\nWantedBy=default.target\n";
         if (command == "print") { std::cout << contents; return 0; }
         check_unit(path, marker, true); publish_unit(path, contents);
-        auto result = systemctl({"daemon-reload"});
-        if (!result) result = systemctl({"enable", "--now", name});
+        auto result = systemctl({"daemon-reload"}, output.quiet);
+        if (!result) result = systemctl({"enable", "--now", name}, output.quiet);
         std::cout << "Installed " << path.string() << '\n';
         if (result) std::cerr << "The unit is saved, but systemd did not enable/start it. Check that a systemd user manager is available.\n";
         return result;
@@ -137,10 +145,15 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
     check_unit(path, marker, false);
     if (command == "remove")
     {
-        auto result = systemctl({"disable", "--now", name}); if (result) return result;
+        auto result = systemctl({"disable", "--now", name}, output.quiet); if (result) return result;
         require(::unlink(path.c_str()) == 0, "cannot remove compute service file");
-        result = systemctl({"daemon-reload"}); std::cout << "Removed " << path.string() << '\n'; return result;
+        result = systemctl({"daemon-reload"}, output.quiet); std::cout << "Removed " << path.string() << '\n'; return result;
     }
-    return systemctl({command, name});
+    if (command == "status" && !output.details())
+    {
+        std::cout << "Compute " << role << " service: " << std::flush;
+        return systemctl({"is-active", name});
+    }
+    return systemctl({command, name}, output.quiet);
 }
 catch (std::exception const& error) { std::cerr << "compute service: " << error.what() << '\n'; return 1; }

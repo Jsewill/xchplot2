@@ -21,6 +21,7 @@
 #include "host/Cancel.hpp"
 #include "host/ConfigFile.hpp"
 #include "host/Random.hpp"
+#include "host/Json.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
@@ -193,16 +194,16 @@ bool resolve_progress(int tri, bool quiet)
 #endif
 }
 
-void print_usage(char const* prog)
+void print_usage(char const* prog, std::ostream& out = std::cerr)
 {
-    std::cerr
+    out
         << "Usage:\n"
         << "  " << prog << " plan [OPTIONS] [--] [DIR...]\n"
         << "  " << prog << " fill [OPTIONS] [-r|--resume] [--] [DIR...]\n"
         << "  " << prog << " grow FILE [--max-members N] [OPTIONS]\n"
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
         << "    Farming-layout preview, capacity-driven plotting, group growth and shared compute.\n"
-        << "    Use COMMAND --help for its options. plan and fill --plan-only do not create files.\n"
+        << "    Use COMMAND --help for its options. Previews write only requested plan or profile exports.\n"
         << "  " << prog << " test <k> <group_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
@@ -233,7 +234,7 @@ void print_usage(char const* prog)
         << "        --pool-ph HEX               : 64 hex chars (raw puzzle hash).\n"
         << "    -c, --pool-contract-address ADR : Chia bech32m address (xch1.../txch1...);\n"
         << "                                      decoded internally to a 32-byte hash.\n"
-        << "    -k, --k K                       : k size (default 28).\n"
+        << "    -k, --k K                       : k size: 28 for farming (default); smaller sizes for testing.\n"
         << "    -n, --num N                     : number of plots to create.\n"
         << "    --group-members N               : members per file, 1..65535.\n"
         << "                                      -n still counts files; default is one member per file.\n"
@@ -409,6 +410,70 @@ void print_usage(char const* prog)
         << "    POS2GPU_PHASE_TIMING=1        per-phase wall-time breakdown on stderr.\n"
         << "    ACPP_GFX=gfxXXXX              AMD container AOT target; Cargo detects the\n"
         << "                                  GPU separately (see INSTALL.md).\n";
+}
+
+void print_command_help(char const* prog, std::string_view command, std::ostream& out = std::cout)
+{
+    out << "Usage: " << prog << ' ' << command;
+    if (command == "plot")
+        out << " -f FARMER_KEY -c POOL_ADDRESS [OPTIONS]\n"
+            "Create plots and save a resumable job. Farming uses k=28; other sizes are test-only.\n"
+            "  -n, --num N           plots to create\n"
+            "  -o, --out DIR         output directory\n"
+            "  -d, --devices SPEC    cpu, gpu, all, or selected device IDs\n"
+            "  -M, --max-host-ram N  host RAM budget (for example, 14G)\n"
+            "  -r, --resume          continue a saved job\n"
+            "  --manifest FILE      choose the saved job file\n"
+            "  --pool-ph HEX        pool hash instead of a contract address; --pool-pk also supported\n";
+    else if (command == "batch")
+        out << " MANIFEST [OPTIONS]\n"
+            "Run or resume a saved plotting job.\n"
+            "  -r, --resume          preserve completed plots and recover unfinished work\n"
+            "  -d, --devices SPEC    cpu, gpu, all, or selected device IDs\n"
+            "  -M, --max-host-ram N  host RAM budget (for example, 14G)\n";
+    else if (command == "bench")
+        out << " [OPTIONS]\n"
+            "Measure plotting throughput using disposable synthetic plots.\n"
+            "  -k N                 test size, default 28; only k=28 represents farming\n"
+            "  -n N                 measured queue allowance per worker, default 10\n"
+            "  --warmup N           warmup plots per worker, default 1\n"
+            "  -d, --devices SPEC   cpu, gpu, all, or selected device IDs\n"
+            "  -o, --out DIR        benchmark output directory\n"
+            "  --keep               retain benchmark files\n"
+            "  --compute-only       also measure a RAM-backed pass when available\n"
+            "  --json               machine-readable measurements on stdout\n";
+    else if (command == "test")
+        out << " K GROUP_ID [STRENGTH] [INDEX] [META] [VERBOSE] [OPTIONS]\n"
+            "Low-level test harness; use plot or fill for farming.\n"
+            "  -o, --out DIR        output directory\n"
+            "  -m, --memo HEX       caller-supplied memo\n"
+            "  -N, --out-name NAME  output filename\n"
+            "  --raw               write a temporary group member\n"
+            "  -G, --gpu-all       run all phases on the GPU\n"
+            "  -P, --profile       request phase timing\n";
+    else if (command == "verify")
+        out << " [OPTIONS] [--] FILE\n"
+            "Sample quality chains; use --full to solve and validate full proofs.\n"
+            "  -n, --trials N      random challenges, default 100\n"
+            "  --full              validate full proofs\n";
+    else if (command == "devices")
+        out << " [OPTIONS]\nList selectable GPUs and CPU nodes.\n";
+    else if (command == "parity-check")
+        out << " [OPTIONS]\nRun available parity and host tests; failures include their output.\n"
+            "  --dir PATH          test binary directory, default ./build/tools/parity\n";
+    out << "  -v, --verbose       show diagnostics and detailed measurements\n"
+        "  -q, --quiet         suppress informational output; keep results and errors\n";
+    if (command == "plot" || command == "batch" || command == "bench")
+        out << "  --progress / --no-progress  override automatic terminal progress\n";
+    out << "  --config FILE       load command settings\nUse " << prog << ' ' << command
+        << " --help-all for the complete reference.\n";
+}
+
+bool command_help(char const* prog, std::string_view command, std::string_view option)
+{
+    if (option == "--help" || option == "-h") { print_command_help(prog, command); return true; }
+    if (option == "--help-all") { print_usage(prog, std::cout); return true; }
+    return false;
 }
 
 bool parse_hex_bytes(std::string const& s, std::vector<uint8_t>& out)
@@ -860,7 +925,7 @@ void print_run_workers(char const* prefix, pos2gpu::BatchResult const& res)
     print_batch_sizing(prefix, pos2gpu::pick_batch_sizing(rates, ids), ids);
 }
 
-void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
+void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res, bool verbose)
 {
     double const per = res.plots_written
         ? res.total_wall_seconds / double(res.plots_written) : 0.0;
@@ -882,7 +947,7 @@ void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res)
     // progress prefix already had to be fixed for (see BatchPlotter's
     // progress_prefix).
     std::cerr.flush();
-    print_run_workers(prefix, res);
+    if (verbose) print_run_workers(prefix, res);
 }
 
 int batch_exit_code(pos2gpu::BatchResult const& res, std::size_t requested)
@@ -1052,34 +1117,7 @@ BenchMeasurement analyze_bench_run(
 }
 
 // JSON is opt-in on stdout; the human report remains on stderr.
-void write_json_string(std::ostream& out, std::string const& value)
-{
-    static constexpr char hex[] = "0123456789abcdef";
-    out << '"';
-    for (std::size_t i = 0; i < value.size(); ++i) {
-        unsigned char const c = value[i];
-        if (c >= 0x80) {
-            // Preserve valid UTF-8; escape invalid filesystem bytes individually.
-            std::size_t const n = c >= 0xc2 && c <= 0xdf ? 2 :
-                c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
-            bool valid = n != 0 && i + n <= value.size();
-            for (std::size_t j = 1; valid && j < n; ++j) {
-                unsigned char const next = value[i + j];
-                valid = next >= 0x80 && next <= 0xbf;
-                if (j == 1) valid = valid && !(c == 0xe0 && next < 0xa0) &&
-                    !(c == 0xed && next >= 0xa0) && !(c == 0xf0 && next < 0x90) &&
-                    !(c == 0xf4 && next >= 0x90);
-            }
-            if (valid) { out.write(value.data() + i, n); i += n - 1; }
-            else out << "\\u00" << hex[c >> 4] << hex[c & 15];
-            continue;
-        }
-        if (c == '"' || c == '\\') out << '\\' << c;
-        else if (c < 0x20) out << "\\u00" << hex[c >> 4] << hex[c & 15];
-        else out << c;
-    }
-    out << '"';
-}
+using pos2gpu::write_json_string;
 
 void write_bench_json_pass(std::ostream& out, BenchMeasurement const& m,
                            std::string const& label)
@@ -1126,6 +1164,7 @@ void write_bench_json_pass(std::ostream& out, BenchMeasurement const& m,
 void print_bench_measurement(char const* label,
                            BenchMeasurement const& m,
                            int k,
+                           bool verbose,
                            char const* suffix = nullptr)
 {
     double const tib_hour = m.rate_tib_s * 3600.0;
@@ -1135,10 +1174,10 @@ void print_bench_measurement(char const* label,
     // which %.6f rounds to a printed "0.000000" — a zero rate — while the three
     // fields beside it (already %.3g) carry three real digits off the same
     // number. One line, contradicting itself. At k=28 both spellings agree.
-    std::fprintf(stderr,
-        "[bench] %s: %.3g TiB/s | %.3g TiB/hour | %.3g TiB/day | "
-        "%.3g TiB/month (30d)",
+    if (verbose) std::fprintf(stderr,
+        "[bench] %s: %.3g TiB/s | %.3g TiB/hour | %.3g TiB/day | %.3g TiB/month (30d)",
         label, m.rate_tib_s, tib_hour, tib_day, tib_month);
+    else std::fprintf(stderr, "[bench] %s: %.3g TiB/hour", label, tib_hour);
     if (suffix && suffix[0]) std::fprintf(stderr, "  [%s]", suffix);
     std::fprintf(stderr, "\n");
 }
@@ -1151,7 +1190,8 @@ void print_bench_measurement(char const* label,
 void print_bench_workers(pos2gpu::BenchStats const& stats,
                          std::size_t warmup_per_worker,
                          std::size_t queue_len,
-                         std::size_t worker_count)
+                         std::size_t worker_count,
+                         bool verbose, bool quiet)
 {
     // "raise -n" is useless advice on its own: the queue is sized as if the
     // workers were equal, and they never are, so a user has no way to guess how
@@ -1169,7 +1209,7 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
         return static_cast<int>(std::ceil(std::max(1.0, n)));
     };
 
-    std::fprintf(stderr, "[bench] per-worker steady-state:\n");
+    if (!quiet) std::fprintf(stderr, "[bench] per-worker steady-state:\n");
     // Same naming rule the batch's log prefixes use, from the same function, so
     // the two can be read side by side. It matters here: with --cpu-workers 4
     // every one of these lines would otherwise be called "cpu", and the block's
@@ -1212,12 +1252,14 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
         // produce a plot in under 6.6 s. The mean is exact regardless (the
         // intervals tile the window by construction); the spread is a contention
         // signal, and a bare "min" invited reading it as a 1-second plot.
-        std::fprintf(stderr,
+        if (verbose) std::fprintf(stderr,
             "[bench]   %-5s %zu plots (%zu warmup, %zu measured%s) — "
             "%.2f s/plot (interval min %.2f / max %.2f, σ %.2f)%s\n",
             name.c_str(), w.plots_total, w.warmup_dropped, w.plots_measured,
             dropped, w.s_per_plot, w.interval_min, w.interval_max,
             w.interval_stddev, tail);
+        else if (!quiet) std::fprintf(stderr, "[bench]   %-5s %.2f s/plot (%zu measured plots)\n",
+            name.c_str(), w.s_per_plot, w.plots_measured);
         if (w.plots_measured < 3) {
             std::fprintf(stderr,
                 "[bench]   WARNING: %s measured on only %zu plot%s — its rate is "
@@ -1226,7 +1268,7 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
                 w.plots_measured == 1 ? "" : "s", suggest_n(w.plots_total));
         }
     }
-    std::fprintf(stderr,
+    if (verbose) std::fprintf(stderr,
         "[bench]   steady window: %.1f s → %.1f s (%.1f s, every worker busy) — "
         "the aggregate below is the sum of the rates above\n",
         stats.window_begin, stats.window_end,
@@ -1238,8 +1280,7 @@ void print_bench_workers(pos2gpu::BenchStats const& stats,
     std::vector<double> rates;
     rates.reserve(stats.workers.size());
     for (auto const& w : stats.workers) rates.push_back(w.s_per_plot);
-    print_batch_sizing("[bench]", pos2gpu::pick_batch_sizing(rates, worker_devices),
-                       worker_devices);
+    if (verbose) print_batch_sizing("[bench]", pos2gpu::pick_batch_sizing(rates, worker_devices), worker_devices);
 }
 
 std::vector<pos2gpu::BatchEntry> build_bench_entries(
@@ -1285,7 +1326,6 @@ BenchMeasurement run_bench_pass(
         paths.push_back(std::filesystem::path(e.out_dir) / e.out_name);
     }
     pos2gpu::BatchOptions run_opts = opts;
-    run_opts.progress = !opts.quiet;
     run_opts.skip_existing = false;
     run_opts.continue_on_error = false;
     // A benchmark is exactly where a VRAM regression should be caught, so the
@@ -1452,6 +1492,19 @@ bool group_commands_available()
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
     pos2gpu::install_cancel_signal_handlers();
+    // Direct help must remain available when a saved config needs repair.
+    // Inspect only the first option here; command parsers handle later options
+    // without mistaking their values or literal filenames for help requests.
+    if (argc > 1 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h" ||
+        std::string_view(argv[1]) == "--help-all")) {
+        print_usage(argv[0], std::cout); return 0;
+    }
+    if (argc > 2) {
+        std::string_view const command = argv[1];
+        if ((command == "plot" || command == "batch" || command == "bench" || command == "test" ||
+             command == "verify" || command == "devices" || command == "parity-check") &&
+            command_help(argv[0], command, argv[2])) return 0;
+    }
 
     // Layer 1: TOML-subset config from `--config PATH` or
     // `~/.config/xchplot2/config.toml`. Schema:
@@ -1524,7 +1577,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
                     "--no-auto-spill", "--keep", "--compute-only", "--full", "--json", "--plan-only",
-                    "--extend", "--allow-missing"
+                    "--extend", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
                 auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
@@ -1588,15 +1641,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
     std::string mode = argv[1];
 
-    if (mode == "--help" || mode == "-h") {
-        print_usage(argv[0]);
+    if (mode == "--help" || mode == "-h" || mode == "--help-all") {
+        print_usage(argv[0], std::cout);
         return 0;
-    }
-
-    if ((mode == "plot" || mode == "batch") &&
-        (std::find(expanded.begin() + 2, expanded.end(), "--help") != expanded.end() ||
-         std::find(expanded.begin() + 2, expanded.end(), "-h") != expanded.end())) {
-        print_usage(argv[0]); return 0;
     }
     if (mode == "plan" || mode == "fill" || mode == "grow") {
         if (!group_commands_available()) return 1;
@@ -1609,7 +1656,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 #endif
     }
     if (mode == "compute") {
-        if (argc < 3 || std::string_view(argv[2]) == "--help" || std::string_view(argv[2]) == "-h") {
+        bool help = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string_view const option = argv[i];
+            if (option == "--help" || option == "-h" || option == "--help-all") { help = true; break; }
+            if (option != "--verbose" && option != "-v" && option != "--no-verbose" &&
+                option != "--quiet" && option != "-q" && option != "--no-quiet") break;
+        }
+        if (argc < 3 || help) {
             std::cout << "Usage: xchplot2 compute COMMAND [OPTIONS]\n"
                       << "  init       Create a pool on the first machine\n"
                       << "  invite     Create a private invitation for another machine\n"
@@ -1653,6 +1707,19 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     if (mode == "devices") {
+        bool verbose = false, quiet = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string_view const option = argv[i];
+            if (command_help(argv[0], mode, option)) return 0;
+            if (option == "--verbose" || option == "-v") verbose = true;
+            else if (option == "--no-verbose") verbose = false;
+            else if (option == "--quiet" || option == "-q") quiet = true;
+            else if (option == "--no-quiet") quiet = false;
+            else { std::cerr << "Error: unknown argument: " << option << '\n'; return 1; }
+        }
+        if (quiet && verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually exclusive\n"; return 1;
+        }
         // Enumerate every visible SYCL GPU device + the CPU plotter
         // (always available via AdaptiveCpp's OpenMP host backend).
         // Reports id, name, backend, capacity, and which sort path
@@ -1664,7 +1731,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         auto const cpu_nodes = pos2gpu::host_numa_nodes();
         // "1 CPU" was hard-coded, which a multi-socket host makes a lie — it
         // gets one selectable row per node, and the header has to count them.
-        std::printf("Visible devices (%zu GPU + %zu CPU node%s):\n",
+        if (!quiet) std::printf("Visible devices (%zu GPU + %zu CPU node%s):\n",
                     devices.size(), cpu_nodes.size(),
                     cpu_nodes.size() == 1 ? "" : "s");
         for (auto const& d : devices) {
@@ -1684,9 +1751,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             // dispatch (--devices gpu/all, zero-config) skips it — say so.
             char const* auto_note = d.auto_dispatchable
                 ? "" : "  (auto-dispatch skips this — explicit --devices only)";
-            std::printf("  %-7s%-32s backend=%-10s vram=%5zu MB  CUs=%-4u  sort:%s%s\n",
-                        tag.c_str(), d.name.c_str(), d.backend.c_str(),
-                        vram_mb, d.cu_count, sort_hint, auto_note);
+            std::printf("  %-7s%-32s %5zu MiB VRAM", tag.c_str(), d.name.c_str(), vram_mb);
+            if (verbose) std::printf("  backend=%s CUs=%u sort:%s", d.backend.c_str(), d.cu_count, sort_hint);
+            std::printf("%s\n", auto_note);
         }
         // One row per CPU node, because those are the ids --devices accepts.
         // hardware_concurrency() returns 0 when it can't figure the count out
@@ -1706,14 +1773,17 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 ? "Host CPU plotter (NUMA node " + std::to_string(node.node_id) + ")"
                 : std::string("Host CPU plotter");
             if (node_threads == 0) {
-                std::printf("  %-7s%-32s backend=%-10s threads=  ?            sort:SYCL\n",
-                            tag.c_str(), name.c_str(), "omp");
+                std::printf("  %-7s%-32s ? threads", tag.c_str(), name.c_str());
             } else {
-                std::printf("  %-7s%-32s backend=%-10s threads=%-4zu           sort:SYCL\n",
-                            tag.c_str(), name.c_str(), "omp", node_threads);
+                std::printf("  %-7s%-32s %zu threads", tag.c_str(), name.c_str(), node_threads);
             }
+            if (verbose) std::printf("  backend=omp sort:SYCL");
+            std::printf("\n");
         }
-        if (devices.empty()) {
+        if (devices.empty() && !quiet) {
+            std::printf("\nNo GPU devices visible. CPU plotting remains available; use -v for driver diagnostics.\n");
+        }
+        if (devices.empty() && verbose) {
             std::printf("\nNo GPU devices visible to AdaptiveCpp / SYCL.\n"
 #ifdef _WIN32
                         "Check your Intel, AMD, or NVIDIA graphics driver in Device Manager,\n"
@@ -1724,7 +1794,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         "relevant SYCL backend was built into AdaptiveCpp.\n"
 #endif
                         "The CPU plotter is always available via `--devices cpu` or `--cpu`.\n");
-        } else {
+        } else if (verbose) {
             std::printf("\nUse `--devices gpu0` (or bare `0`) for a specific GPU,\n"
                         "     `--devices gpu` for every plottable GPU (tiny iGPUs skipped),\n"
                         "     `--devices cpu` for every CPU node (opt-in),\n"
@@ -1734,6 +1804,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                         "--devices names DEVICES; `--cpu-workers N` sets how many\n"
                         "plots run on each CPU node.\n");
         }
+        if (!quiet && !verbose) std::printf("Use --devices with a listed ID, gpu, cpu, or all on plotting commands.\n");
         return 0;
     }
 
@@ -1749,9 +1820,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string out_dir = ".";
         double target_size_tib = -1.0;
         pos2gpu::BatchOptions opts{};
+        int progress_tri = -1;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
+            if (command_help(argv[0], mode, a)) return 0;
             auto need = [&](int more) -> bool {
                 if (i + more >= argc) {
                     std::cerr << "Error: " << a << " requires " << more << " arg(s)\n";
@@ -1790,6 +1863,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if (a == "-v" || a == "--verbose") opts.verbose = true;
             else if (a == "--no-verbose") opts.verbose = false;
+            else if (a == "--progress") progress_tri = 1;
+            else if (a == "--no-progress") progress_tri = 0;
             // CPU is opt-in. --cpu asks for it on every node without naming
             // --devices; it says nothing about HOW MANY, so it never disturbs an
             // explicit --cpu-workers N in either direction.
@@ -1838,7 +1913,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
-                print_usage(argv[0]);
+                print_command_help(argv[0], mode, std::cerr);
                 return 1;
             }
         }
@@ -1855,6 +1930,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             std::cerr << "Error: --warmup must be >= 0\n";
             return 1;
         }
+        if (opts.quiet && opts.verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually exclusive\n"; return 1;
+        }
+        opts.progress = resolve_progress(progress_tri, opts.quiet);
 
         std::size_t const worker_count = pos2gpu::batch_worker_count(opts, k);
         // Per worker, not a global total: each worker has its own cold-start
@@ -1910,7 +1989,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     std::fprintf(stderr,
                         "[bench] warmup: %d plot/worker (excluded). queue: %d plots "
                         "for %zu workers.\n", warmup, plot_count, worker_count);
-                    std::fprintf(stderr,
+                    if (opts.verbose) std::fprintf(stderr,
                         "[bench]   -n %d sizes the queue at (%d warmup + %d) x %zu "
                         "workers; the work-queue then hands each plot to whoever is "
                         "free, so a fast worker takes more than %d and a slow one "
@@ -1927,7 +2006,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if (ran > 1) {
                 print_bench_workers(e2e.stats, warmup_per_worker,
                                     static_cast<std::size_t>(plot_count),
-                                    worker_count);
+                                    worker_count, opts.verbose, opts.quiet);
             }
 
             // A worker that finished too few plots to measure still did work
@@ -1944,8 +2023,9 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 "[bench] steady-state: %.2f s/plot, %.3f GiB/plot (k=%d, %zu worker%s)%s\n",
                 e2e.s_per_plot, e2e.gib_per_plot, k, ran,
                 ran == 1 ? "" : "s", bound);
+            if (k != 28) std::fprintf(stderr, "[bench] k=%d is test-only; use k=28 for farming measurements\n", k);
 
-            if (ran == 1) {
+            if (opts.verbose && ran == 1) {
                 auto const& w = e2e.stats.workers.front();
                 std::fprintf(stderr,
                     "[bench]   per-plot spread: size %.3f GiB (min %.3f / max %.3f), "
@@ -1953,7 +2033,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max,
                     w.s_per_plot, w.interval_min, w.interval_max,
                     w.interval_stddev);
-            } else {
+            } else if (opts.verbose) {
                 // No aggregate interval spread here: the gap between successive
                 // completions across workers is short when two finish together
                 // and long across a slow worker's plot, so it measures the
@@ -1964,7 +2044,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     e2e.gib_per_plot, e2e.size_gib_min, e2e.size_gib_max);
             }
 
-            print_bench_measurement("end-to-end", e2e, k);
+            print_bench_measurement("end-to-end", e2e, k, opts.verbose);
 
             std::string compute_label;
             if (compute_only) {
@@ -2034,7 +2114,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 compute = run_bench_pass(
                     k, strength, testnet, plot_count, compute_dir, compute_opts,
                     warmup_per_worker, keep);
-                print_bench_measurement("compute-only", compute, k,
+                print_bench_measurement("compute-only", compute, k, opts.verbose,
                                         compute_label.c_str());
 
                 // Did the pin hold? A pool/streaming split cannot be pinned at
@@ -2119,11 +2199,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if (e2e.rate_tib_s > 0.0 && fill_bytes > 0.0) {
                 double const fill_s = fill_bytes / (e2e.rate_tib_s * kTibBytes);
                 std::fprintf(stderr,
-                    "[bench] %s: %.3g TiB %s — fully plotted in ~%s (end-to-end rate)\n",
+                    "[bench] %s: %.3g TiB %s — estimated write time ~%s (%s rate)\n",
                     out_dir.c_str(),
                     fill_bytes / kTibBytes,
                     target_size_tib > 0.0 ? "target" : "free",
-                    format_duration_dh(fill_s).c_str());
+                    format_duration_dh(fill_s).c_str(), k == 28 ? "end-to-end" : "test-size");
             }
             if (json) {
                 std::ostringstream report;
@@ -2166,14 +2246,20 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     if (mode == "batch") {
-        if (argc < 3) { print_usage(argv[0]); return 1; }
-        std::string manifest = argv[2];
+        if (argc < 3) { print_command_help(argv[0], mode, std::cerr); return 1; }
+        std::string manifest;
         pos2gpu::BatchOptions opts{};
         std::vector<std::string> group_options;
-        bool group_requested = false;
+        bool group_requested = false, literal = false;
         int progress_tri = -1;  // -1 auto (TTY), 0 off, 1 on
-        for (int i = 3; i < argc; ++i) {
+        for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
+            if (!literal && a == "--") { literal = true; continue; }
+            if (!literal && command_help(argv[0], mode, a)) return 0;
+            if (literal || !a.starts_with('-')) {
+                if (!manifest.empty()) { std::cerr << "Error: unexpected argument: " << a << '\n'; return 1; }
+                manifest = a; continue;
+            }
             if (group_value_option(a)) {
                 if (i + 1 == argc) { std::cerr << "Error: " << a << " requires a value\n"; return 1; }
                 group_requested = true;
@@ -2298,7 +2384,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
-                print_usage(argv[0]);
+                print_command_help(argv[0], mode, std::cerr);
                 return 1;
             }
         }
@@ -2307,6 +2393,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                          "exclusive\n";
             return 1;
         }
+        if (manifest.empty()) { print_command_help(argv[0], mode, std::cerr); return 1; }
         opts.progress = resolve_progress(progress_tri, opts.quiet);
         try {
             auto entries = pos2gpu::parse_manifest(manifest);
@@ -2319,14 +2406,16 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if (grouped) {
                 if (!group_commands_available()) return 1;
 #ifdef XCHPLOT2_GROUP_COMMANDS
-                res = pos2gpu::run_group_batch(entries, opts, pos2gpu::group_batch_options(opts, group_arguments(group_options)));
+                auto grouped_options = pos2gpu::group_batch_options(opts, group_arguments(group_options));
+                grouped_options.command = "batch";
+                res = pos2gpu::run_group_batch(entries, opts, std::move(grouped_options));
 #endif
             } else {
                 if (group_requested || opts.streaming_tier == "pool")
                     throw std::invalid_argument("group construction options require a grouped manifest created with plot --group-members");
                 res = pos2gpu::run_batch(entries, opts);
             }
-            if (!opts.quiet) print_run_summary("[batch]", res);
+            if (!opts.quiet) print_run_summary("[batch]", res, opts.verbose);
             return batch_exit_code(res, entries.size());
         } catch (std::exception const& e) {
             std::cerr << "[batch] FAILED: " << e.what() << "\n";
@@ -2335,13 +2424,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     }
 
     if (mode == "verify") {
-        if (argc < 3) { print_usage(argv[0]); return 1; }
-        std::string plotfile = argv[2];
+        std::string plotfile;
         size_t trials = 100;
-        bool full = false;
-        for (int i = 3; i < argc; ++i) {
+        bool full = false, verbose = false, quiet = false, literal = false;
+        for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if ((a == "--trials" || a == "-n") && i + 1 < argc) {
+            if (!literal && a == "--") { literal = true; continue; }
+            if (!literal && command_help(argv[0], mode, a)) return 0;
+            if (!literal && (a == "--trials" || a == "-n") && i + 1 < argc) {
                 long v = 0;
                 if (!parse_integer_arg(argv[++i], v, a)) return 1;
                 if (v <= 0) {
@@ -2349,19 +2439,28 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     return 1;
                 }
                 trials = static_cast<size_t>(v);
-            } else if (a == "--full") full = true;
-            else if (a == "--no-full") full = false;
+            } else if (!literal && a == "--full") full = true;
+            else if (!literal && a == "--no-full") full = false;
+            else if (!literal && (a == "--verbose" || a == "-v")) verbose = true;
+            else if (!literal && a == "--no-verbose") verbose = false;
+            else if (!literal && (a == "--quiet" || a == "-q")) quiet = true;
+            else if (!literal && a == "--no-quiet") quiet = false;
+            else if ((literal || !a.starts_with('-')) && plotfile.empty()) plotfile = a;
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
-                print_usage(argv[0]);
+                print_command_help(argv[0], mode, std::cerr);
                 return 1;
             }
         }
+        if (plotfile.empty()) { print_command_help(argv[0], mode, std::cerr); return 1; }
+        if (quiet && verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually exclusive\n"; return 1;
+        }
         try {
-            std::cerr << "[verify] " << plotfile << ": running " << trials
+            if (verbose) std::cerr << "[verify] " << plotfile << ": running " << trials
                       << " random challenges\n";
             auto res = pos2gpu::verify_plot_file(plotfile, trials, full);
-            std::cerr << "[verify] " << res.trials << " trials, "
+            if (!quiet) std::cerr << "[verify] " << res.trials << " trials, "
                       << res.challenges_with_proof << " with >=1 quality chain, "
                       << res.proofs_found << " quality chains total\n";
             if (res.proofs_found == 0) {
@@ -2381,15 +2480,24 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
     if (mode == "parity-check") {
         std::string dir = "./build/tools/parity";
+        bool verbose = false, quiet = false;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
+            if (command_help(argv[0], mode, a)) return 0;
             if ((a == "--dir" || a == "-d") && i + 1 < argc) {
                 dir = argv[++i];
-            } else {
+            } else if (a == "--verbose" || a == "-v") verbose = true;
+            else if (a == "--no-verbose") verbose = false;
+            else if (a == "--quiet" || a == "-q") quiet = true;
+            else if (a == "--no-quiet") quiet = false;
+            else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
-                print_usage(argv[0]);
+                print_command_help(argv[0], mode, std::cerr);
                 return 1;
             }
+        }
+        if (quiet && verbose) {
+            std::cerr << "Error: -q/--quiet and -v/--verbose are mutually exclusive\n"; return 1;
         }
 
         // Glob every *_parity AND *_test binary in `dir`. Same code path works
@@ -2435,7 +2543,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::sort(tests.begin(), tests.end());
 
         int pass = 0, fail = 0;
-        std::cerr << "==> parity + host tests (" << tests.size() << " found in "
+        if (!quiet) std::cerr << "==> parity + host tests (" << tests.size() << " found in "
                   << dir << ")\n";
         for (auto const& test : tests) {
             auto const name = test.filename().string();
@@ -2449,8 +2557,14 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             auto const ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t0).count();
             if (rc == 0) {
-                std::fprintf(stderr, "  PASS  %-32s  (%.1f ms)\n",
-                             name.c_str(), ms);
+                if (verbose) std::fprintf(stderr, "  PASS  %-32s  (%.1f ms)\n", name.c_str(), ms);
+                else if (!quiet) std::fprintf(stderr, "  PASS  %s\n", name.c_str());
+                if (verbose) {
+                    std::rewind(log.get());
+                    char output[4096];
+                    while (auto n = std::fread(output, 1, sizeof(output), log.get()))
+                        std::fwrite(output, 1, n, stderr);
+                }
                 ++pass;
             } else {
                 std::fprintf(stderr,
@@ -2508,6 +2622,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
+            if (command_help(argv[0], mode, a)) return 0;
             auto need = [&](int more) -> bool {
                 if (i + more >= argc) {
                     std::cerr << "Error: " << a << " requires " << more << " arg(s)\n";
@@ -2677,7 +2792,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else {
                 std::cerr << "Error: unknown argument: " << a << "\n";
-                print_usage(argv[0]);
+                print_command_help(argv[0], mode, std::cerr);
                 return 1;
             }
         }
@@ -2937,7 +3052,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else
 #endif
                 res = pos2gpu::run_batch(entries, opts);
-            if (!plot_quiet) print_run_summary("[plot]", res);
+            if (!plot_quiet) print_run_summary("[plot]", res, verbose);
             return batch_exit_code(res, entries.size());
         } catch (std::exception const& e) {
             std::cerr << "[plot] FAILED: " << e.what() << "\n";
@@ -2976,12 +3091,16 @@ _xchplot2() {
                 case "${COMP_WORDS[i]}" in
                     --) literal=1; break ;;
                     --relocate) values=2 ;;
-                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--extend|--no-extend|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help) ;;
+                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--calibrate|--no-calibrate|--extend|--no-extend|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
                     -*) values=1 ;;
                 esac
             fi
         done
-        if ((literal)) || { ((values)) && [[ "$option" == --relocate ]]; }; then
+        if ((literal)); then
+            while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
+            return 0
+        fi
+        if ((values)) && [[ "$option" == --relocate ]]; then
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -d -- "$cur")
             return 0
         fi
@@ -2993,9 +3112,17 @@ _xchplot2() {
         --compute-local|--discovery|--io-overlap|--cache-release) COMPREPLY=( $(compgen -W "on off" -- "$cur") ); return 0 ;;
         --backend|--compute-offer-backend) COMPREPLY=( $(compgen -W "auto cpu gpu" -- "$cur") ); return 0 ;;
         --construction)    COMPREPLY=( $(compgen -W "auto incremental staged merged external" -- "$cur") ); return 0 ;;
-        -o|--out|-t|--temp-dir|--relocate|--directory|--compute-directory) COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+        -o|--out|-t|--temp-dir|--relocate|--chia-root|--directory|--compute-directory)
+            while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -d -- "$cur")
+            return 0 ;;
         -M|--max-host-ram|-j|--workers) return 0 ;;
-        --manifest|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key) COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+        --harvester)
+            COMPREPLY=( $(compgen -W "local" -- "$cur") )
+            while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
+            return 0 ;;
+        --manifest|--save-plan|-F|--from-plan|--save-profile|--chia-executable|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key)
+            while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
+            return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
         compute)           COMPREPLY=( $(compgen -W "init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker" -- "$cur") ); return 0 ;;
         service)           if [[ "${COMP_WORDS[1]}" == compute ]]; then COMPREPLY=( $(compgen -W "install start stop restart status remove print" -- "$cur") ); return 0; fi ;;
@@ -3008,18 +3135,18 @@ _xchplot2() {
     fi
     if [[ "${COMP_WORDS[1]}" == verify ]]; then
         if [[ "$cur" == -* ]]; then
-            COMPREPLY=( $(compgen -W "--trials -n --full --no-full --config --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--trials -n --full --no-full -v --verbose --no-verbose -q --quiet --no-quiet --config -h --help --help-all" -- "$cur") )
         elif [[ "$prev" != --trials && "$prev" != -n ]]; then
             COMPREPLY=( $(compgen -f -- "$cur") )
         fi
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose -q --quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --paths-from --paths0-from --extend --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --extend --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill ]]; then
-        while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -d -- "$cur")
+        while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
     fi
 }
 complete -F _xchplot2 xchplot2
@@ -3045,11 +3172,14 @@ _xchplot2() {
     if [[ "${words[2]}" == verify ]]; then
         _arguments '--trials[Random challenges]:count:' '-n[Random challenges]:count:' \
             '--full[Validate full proofs]' '--no-full[Quality-chain sample]' \
+            '-v[Additional verification details]' '--verbose[Additional verification details]' '--no-verbose[Concise output]' \
+            '-q[Suppress informational output]' '--quiet[Suppress informational output]' '--no-quiet[Show informational output]' \
+            '-h[Show help]' '--help[Show help]' '--help-all[Show the complete reference]' \
             '--config[Configuration file]:file:_files' '2:plot file:_files'
         return
     fi
     if [[ "${words[2]}" == plan || "${words[2]}" == fill ]]; then
-        positional='*:destination directory:_files -/'
+        positional='*:destination directory or saved plan:_files'
     fi
     _arguments \
         '--compute[Shared compute auto or off]:value:' \
@@ -3074,6 +3204,15 @@ _xchplot2() {
         '--tls-timeout-ms[TLS operation deadline]:value:' \
         '--group-members[Members per file]:value:' \
         '--plan-only[Preview without writing]' \
+        '--metadata-only[Inspect saved plan metadata without live checks]' \
+        '--no-metadata-only[Restore live plan checks]' \
+        '--assess-jobs[Jointly assess saved keyless job forecasts]' \
+        '--no-assess-jobs[Restore ordinary plan mode]' \
+        '--calibrate[Measure explicitly supplied plot files]' \
+        '--no-calibrate[Disable reader calibration]' \
+        '--calibration-samples[Quality lookups per plot]:count:' \
+        '--calibration-timeout-ms[Reader worker deadline]:milliseconds:' \
+        '--calibration-memory-bytes[Reader worker memory limit]:size:' \
         '--paths-from[Literal destination list]:file:_files' \
         '--paths0-from[NUL-delimited destination list]:file:_files' \
         '--extend[Add destinations to a saved farm]' \
@@ -3098,6 +3237,13 @@ _xchplot2() {
         '--io-overlap[I/O overlap]:value:' \
         '--generation-overlap[Producer overlap]:value:' \
         '--cache-release[Release clean file cache]:value:' \
+        '--save-plan[Save a keyless plan]:file:_files' \
+        '-F[Use a saved plan]:file:_files' '--from-plan[Use a saved plan]:file:_files' \
+        '--save-profile[Export harvester settings]:file:_files' \
+        '--help-all[All planning and recovery options]' \
+        "--harvester[Intended harvester]:harvester:_alternative 'local\:local harvester\:(local)' 'profile\:profile file\:_files'" \
+        '--chia-root[Local Chia configuration root]:directory:_files -/' \
+        '--chia-executable[Installed Chia CLI]:file:_files' \
         '--farming-reader[Final reader profile]:value:' \
         '--farming-objective[Layout objective]:value:' \
         '--farming-cores[Harvester CPU allowance]:value:' \
@@ -3154,8 +3300,8 @@ _xchplot2() {
         '-d[Device selector]:spec:(all gpu cpu 0 1 2 3)' '--devices[Device selector]:spec:(all gpu cpu 0 1 2 3)' \
         '--progress[Force aggregate progress line on]' \
         '--no-progress[Force aggregate progress line off]' \
-        '-v[Verbose]' '--verbose[Verbose]' \
-        '-q[Quiet — suppress info-level output]' '--quiet[Quiet — suppress info-level output]' \
+        '-v[Verbose]' '--verbose[Verbose]' '--no-verbose[Concise output]' \
+        '-q[Quiet — suppress info-level output]' '--quiet[Quiet — suppress info-level output]' '--no-quiet[Show informational output]' \
         '-r[Resume a saved job]' '--resume[Resume a saved job]' \
         '--cpu[Add CPU worker]' \
         '--cpu-workers[CPU plots to run concurrently: auto|max|N|off (default auto, RAM-gated)]:count:(auto max off)' \
@@ -3214,12 +3360,19 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l task-timeout-ms
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-timeout-ms -r -d 'TLS operation deadline'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l group-members -r -d 'Members per file'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l plan-only -d 'Preview without writing'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-plan -r -F -d 'Save a keyless plan'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -s F -l from-plan -r -F -d 'Use a saved plan'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-profile -r -F -d 'Export harvester settings'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -l help-all -d 'Full command reference'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l harvester -r -F -a local -d 'Local harvester or profile file'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l chia-root -r -a '(__fish_complete_directories)' -d 'Local Chia configuration root'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l chia-executable -r -F -d 'Installed Chia CLI'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l paths-from -r -d 'Literal destination list'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l paths0-from -r -d 'NUL-delimited destination list'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l extend -d 'Add destinations to a saved farm'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l allow-missing -d 'Resume available destinations'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l relocate -r -d 'Old and new destination directories'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -a '(__fish_complete_directories)' -d 'Destination directory'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -a '(__fish_complete_path)' -d 'Destination directory or saved plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l construction -r -d 'Group construction method'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l backend -r -d 'Member producer'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l device -r -d 'GPU device'
@@ -3306,8 +3459,10 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch b
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l manifest  -r -d 'Saved job'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l progress  -d 'Force aggregate progress line on'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l no-progress -d 'Force aggregate progress line off'
-complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s v -l verbose -d 'Verbose'
-complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s q -l quiet -d 'Quiet — suppress info-level output'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -s v -l verbose -d 'Verbose'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -l no-verbose -d 'Concise output'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -s q -l quiet -d 'Quiet — suppress info-level output'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -l no-quiet -d 'Show informational output'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l cpu-workers -x -a 'auto max off' -d 'CPU workers per node'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l cpu       -d 'Add CPU worker'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l shard-plot     -d 'Single-plot multi-GPU (experimental)'
@@ -3360,15 +3515,25 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
 
     pos2gpu::GpuPlotOptions opts{};
     std::string output_dir = ".";
+    std::optional<bool> verbose_flag;
+    bool quiet = false, literal = false;
 
     // Strip flags from argv into a positional vector.
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
+        if (literal) { pos.push_back(a); continue; }
+        if (a == "--") { literal = true; continue; }
+        if (command_help(argv[0], mode, a)) return 0;
+        if (a == "--verbose" || a == "-v") { verbose_flag = true; continue; }
+        if (a == "--no-verbose") { verbose_flag = false; continue; }
+        if (a == "--quiet" || a == "-q") { quiet = true; continue; }
+        if (a == "--no-quiet") { quiet = false; continue; }
         if (a == "--testnet" || a == "-T") {
             std::cerr << "Error: PoS2 1.0 removes testnet-specific plots; omit --testnet\n";
             return 1;
         }
+        else if (a == "--no-testnet") opts.testnet = false;
         else if (a == "--raw") opts.raw = true;
         else if  (a == "--gpu-t1") opts.t1 = pos2gpu::PhaseStrategy::Gpu;
         else if  (a == "--gpu-t2") opts.t2 = pos2gpu::PhaseStrategy::Gpu;
@@ -3396,8 +3561,11 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     }
 
     if (pos.size() < 2) {
-        print_usage(argv[0]);
+        print_command_help(argv[0], mode, std::cerr);
         return 1;
+    }
+    if (pos.size() > 6) {
+        std::cerr << "Error: unexpected argument: " << pos[6] << '\n'; return 1;
     }
 
     if (!parse_integer_arg(pos[0], opts.k, "k")) return 1;
@@ -3412,6 +3580,10 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
         int verbose = 0;
         if (!parse_integer_arg(pos[5], verbose, "verbose")) return 1;
         opts.verbose = verbose != 0;
+    }
+    if (verbose_flag) opts.verbose = *verbose_flag;
+    if (quiet && opts.verbose) {
+        std::cerr << "Error: -q/--quiet and -v/--verbose are mutually exclusive\n"; return 1;
     }
 
     if (opts.plot_index < 0 || opts.plot_index > 65535 ||

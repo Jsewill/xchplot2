@@ -20,7 +20,7 @@ xchplot2 plot -k 28 -n 10 \
 
 | Option | Meaning |
 |---|---|
-| `-k`, `--k K` | Even plot size in 18..28; default 28 |
+| `-k`, `--k K` | 28 for farming (default); even sizes 18..26 for testing |
 | `-n`, `--num N` | Number of independent output files; default 1 |
 | `--group-members N` | Members per file, 1..65535; default 1 |
 | `--compute auto\|off` | Use saved compute pool membership when present; default `auto` |
@@ -43,6 +43,8 @@ xchplot2 plot -k 28 -n 10 \
 Supply the farmer key and one of the pool key, puzzle hash, or contract
 address forms. See [plot indices and meta groups](#plot-indices-and-meta-groups)
 for the grouping distinction. Full help: `xchplot2 --help`.
+Only k28 is valid for farming. Smaller sizes exercise construction, recovery
+and proof validation in tests; their output is not farmable.
 
 On a host that is short of RAM for the tier its GPU lands on, add
 `--temp-dir <path>` to choose where the automatic disk-offload writes
@@ -75,6 +77,12 @@ continues; both options work in `plot` and `batch` modes. Manifest paths may
 be double-quoted to include spaces, quotes, or backslashes; line breaks in
 paths are unsupported.
 
+Commands show concise results by default. `-v`/`--verbose` adds diagnostics,
+assumptions and worker details; `-q`/`--quiet` suppresses informational messages.
+Quiet mode retains command results, output paths, warnings and errors. JSON
+reports retain their fields regardless of verbosity. Use `COMMAND --help`
+for common options and `COMMAND --help-all` for the extended plotting options.
+
 An aggregate progress line updates after each plot completes:
 
 ```
@@ -87,9 +95,9 @@ stderr is redirected it prints one line per plot and defaults to off.
 plots-based (average s/plot × remaining), formatted as
 hours/minutes/seconds when the estimate exceeds one hour.
 
-`-q`/`--quiet` suppresses info-level stderr output — the progress line,
-end-of-run summaries, and streaming-tier notes. Warnings and errors
-still print. `plot` writes each absolute output path to stdout after that
+Quiet mode suppresses automatic progress and plotting summaries. Explicit
+`--progress` still enables progress; `--no-progress` does not disable verbose
+details. `plot` writes each absolute output path to stdout after that
 file is published or validated by resume, in completion order. Failed or
 unstarted plots are never listed, and completed paths remain available if
 a later plot fails. Exit status is 0 for completion, 1 for argument errors,
@@ -146,8 +154,10 @@ ReFS, network volumes and sparse files are rejected. Native Windows support
 remains experimental; see the [platform limitations](INSTALL.md#windows).
 Windows retains compact retirement records beside completed external jobs
 for recovery. Keep them with the output until recovery is no longer needed.
-Unknown disk topology is scheduled conservatively; Windows NVMe destinations
-share one writer group because namespace independence is not established.
+Unknown disk topology is scheduled conservatively. Windows NVMe destinations
+sharing a known subsystem share a writer group; distinct known subsystems can
+run independently. Unsupported or unknown NVMe identities retain conservative
+whole-job serialization.
 
 The grouped engine supports one local CPU or GPU producer, or a shared compute
 pool. Select `--devices cpu`, `--devices gpu0`, or `--backend auto`; automatic
@@ -179,10 +189,37 @@ destinations=(/disk-a/plots "/disk-b/plot files")
 xchplot2 plan -- "${destinations[@]}"
 ```
 
-Both forms perform the same read-only preview. They need existing destination
-directories but no keys, create no files or locks, and start no compute services.
-`--json` emits the machine-readable report. An infeasible layout reports its
-reason and exits unsuccessfully. A preview is not a saved execution plan.
+Without `--save-plan`, both forms perform the same read-only preview. They need
+existing destination directories but no keys, create no files or locks, and
+start no compute services.
+The default report summarizes the destinations, planned files and members,
+storage allowance and intended harvester. `-v` adds model assumptions and
+resource details; `--json` emits the machine-readable report. An infeasible
+layout reports its reason and exits unsuccessfully. `--help` shows the common workflow;
+`--help-all` includes recovery, tuning and shared-compute options.
+
+To execute a reviewed layout, save a keyless plan:
+
+```bash
+xchplot2 plan /disk-a/plots /disk-b/plots --save-plan farm.plan
+xchplot2 fill farm.plan -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+`--save-plan` also works with `fill --plan-only`. It creates only the requested
+plan and refuses to overwrite an existing file. The plan contains the
+resolved harvester inputs, initial assignments, destination identities, quotas
+and fill policy, with no plot keys. `plan farm.plan` inspects it without
+plotting; `-F FILE` or `--from-plan FILE` is an explicit alternative for either command.
+Execution preserves those assignments and checks the current storage,
+available space and joint farming workload before creating the private job.
+The reviewed capacity must still be available; additional free space does not
+enlarge its quota. Execution options such as plotting RAM, workers and scratch
+may change. Different layout inputs, destination selectors or a changed source
+job require a new review. New previews and completed-job recovery require
+matching plan schema, farming model, key derivation and numeric representation.
+Legacy plans and in-progress construction checkpoints retain their
+original-build requirement.
+
 With no directories, `plan` lists candidate mounted data volumes with available
 space and detected media type. It excludes system mounts, RAM filesystems,
 read-only volumes and unsupported filesystems. These are suggestions; select
@@ -225,10 +262,49 @@ Sizes accept bytes or suffixes such as `512M` and `14G`.
 
 Every member directory contains a private, checksummed `grow-farm.plan` with
 the seed, farmer/pool identity, complete destination list, limits and farming
-profile. Keep these files with the outputs; the seed derives private plot keys
+profile. Each copy describes the whole job. New jobs store shared storage
+settings and the resolved farming configuration once within each copy; the
+capacity allowance includes recovery files and space for their replacements.
+Keep these files with the outputs; the seed derives private plot keys
 and must not be shared. It is not a wallet seed. A temporary `grow-farm.plan.next`
-may remain after interruption; keep it for recovery too. Saved construction
-requires the original build.
+may remain after interruption; keep it for recovery too. New farming plans
+record their creating build as provenance and can resume completed ordinary
+groups with a build supporting the same plan schema, farming model,
+key-derivation identity and numeric representation. In-progress construction
+checkpoints and legacy plans still require their original build. A compatible
+plan does not make an incompatible construction checkpoint resumable.
+
+`plan --metadata-only PLAN` reads a saved keyless preview, and
+`plan --metadata-only --manifest FILE` reads one private job copy. This mode
+reports saved assignments and compatibility without probing destinations,
+starting services or inspecting construction checkpoints. It can inspect a
+supported legacy plan from another build without making that plan executable.
+The report does not establish current availability or farming readiness.
+
+To assess several managed jobs under one harvester budget, refresh a keyless
+summary for each job, then assess the summaries together:
+
+```bash
+xchplot2 plan --manifest /disk-a/plots/grow-farm.plan --save-plan job-a.plan
+xchplot2 plan --manifest /disk-b/plots/grow-farm.plan --save-plan job-b.plan
+xchplot2 plan --assess-jobs job-a.plan job-b.plan --json
+```
+
+Refreshing requires all of that job's destinations and a recovered revision.
+The summary retains its initial forecast and admitted member extents, including
+expansions. Joint assessment includes those full promises even for offline
+destinations. It shares the declared CPU, lookup-worker, cache and reader-memory
+budgets, keeps independent jobs' identity families independent, and combines
+known storage sharing conservatively. Duplicate jobs and destination aliases
+are rejected. Harvester service inputs, plot parameters and meta constraints
+must match; saved group-size choices and layout objectives may differ.
+
+This mode reads the supplied summaries and checks their explicit destination
+paths for topology. It does not open private source manifests, plots or
+checkpoints, and does not create an execution plan. Its result covers saved
+forecasts, not a measurement of current load. Refresh summaries after filling
+or expanding a job before drawing current-load conclusions. Unresolved offline
+topology is shared conservatively; outside plots and services remain unmodeled.
 
 Resume searches every supplied directory and loads the full job. Directory
 order and omitted arguments do not change its scope. `fill -r` from a member
@@ -237,15 +313,30 @@ Different jobs, conflicting revisions, corrupt copies or mismatching explicit
 keys are rejected before output changes. Resume audits existing outputs,
 preserves completed files, and recovers partial construction. Plotting RAM,
 workers and compute selection can change; the saved identity namespace, farming
-profile and planned member counts remain fixed. Compressed sizes can leave
-unused space; the forecast is not a promise of exact disk utilization.
+profile, initial assignments and quotas stay fixed.
+
+The initial member count is a size forecast. As compression leaves room, new
+jobs can extend the final unsealed file or admit another file within the
+reviewed limits. Each addition must fit the combined job's farming workload,
+exact construction space, file-size limit, headroom and scratch allowance.
+Compatible changes on different destinations can share a saved revision.
+Replacement copies can be staged concurrently on independent drives; every
+destination must have a durable copy before the revision is published and
+construction relying on it proceeds.
+Completed files stay unchanged, and resume retains admitted additions and the
+recorded stop reason. Construction methods and configured I/O windows can
+stop filling before the output budget is exhausted, so some unused capacity
+can remain. Existing jobs retain their saved fill policy.
+`metadata-capacity` means another extent would exceed the job's reserved
+recovery metadata. That limit can also leave space unused; resume does not
+retry an addition already recorded as stopped.
 
 To add another destination, preview it together with any existing member,
 then explicitly extend the job:
 
 ```bash
-xchplot2 plan /disk-b/plots /disk-c/plots
-xchplot2 fill --extend /disk-b/plots /disk-c/plots
+xchplot2 plan /disk-b/plots /disk-c/plots --save-plan expansion.plan
+xchplot2 fill expansion.plan
 ```
 
 The preview includes all saved destinations. Existing plot identities and
@@ -253,15 +344,17 @@ assignments stay fixed; the new layout must fit the combined farm's CPU,
 memory, storage and response limits. An expansion can be infeasible even when
 the new disk has room. The assessment covers plots belonging to this job;
 unmanaged plots consume disk space but their farming workload is not modeled.
-All original destinations must be available for expansion. A new revision is
+`fill --extend /disk-b/plots /disk-c/plots` plans and executes an expansion
+directly. All original destinations must be available for expansion. A new revision is
 saved across the members before new plotting starts; interrupted publication
 is completed with ordinary `fill -r`.
 
 If a saved directory is unavailable or its mountpoint now refers to a different
 directory, normal resume stops and lists it. `fill -r --allow-missing DIR`
-continues the available members within their existing assignments and exits
+continues already admitted construction on available members and exits
 with status 4 while other members remain unavailable. It cannot change the
-job or commit an incompletely staged revision. Restore the original mounts
+job, admit another extent, seal an unfinished file or commit an incompletely
+staged revision. Restore the original mounts
 and resume normally to finish the whole job.
 
 For an intentional move, keep the output and saved job together, take the old
@@ -318,7 +411,9 @@ farmable completed output. Stop gracefully with Ctrl-C, then repeat the
 owning command with `--resume` (`grow` resumes implicitly). Completed output
 paths appear on stdout after publication or a successful resume audit.
 `--json` replaces human output with the plan or construction metrics;
-`--quiet` suppresses informational stderr and `--verbose` adds member progress.
+`--quiet` suppresses informational stderr and `--verbose` adds construction
+details and final metrics. Aggregate member progress uses `--progress` and
+`--no-progress`, with the same terminal defaults as `plot`.
 
 ### Farming layout
 
@@ -326,8 +421,110 @@ Automatic directory planning chooses farming group size and meta families
 together. The plotting machine's RAM, GPU speed and temporary disks determine
 how to construct that layout; the planner does not use them as the final
 harvester's CPU or cache capacity. It uses the destination's physical-resource
-topology and an explicit farming profile. The preview reports the assumed
-profile, selected sizes, family/meta counts, resource sharing and forecasts.
+topology and a declared farming profile. The default preview reports the
+profile's source, CPU and memory allowances and initial file counts.
+`--verbose` adds response estimates, assumptions, detected configuration,
+identity families, resource sharing and workload estimates.
+
+File sizes are estimates: compressed output can be slightly larger or smaller,
+and a small difference can decide whether one more whole member fits. Filling
+checks actual storage use before admitting more work. Temporary construction
+and recovery space is a separate allowance, so it can limit filling even when
+the final files would fit.
+
+Use `--harvester local` when plotting on the intended harvester, or
+`--harvester FILE` to use a profile from another machine. To transfer a profile,
+export it on the intended harvester and copy it to the plotter:
+
+```bash
+# On the intended harvester; no destination or plotting keys are needed:
+xchplot2 plan --harvester local --save-profile harvester.json
+# Copy harvester.json to the plotter, then review its destinations:
+xchplot2 plan /disk-a/plots --harvester harvester.json --save-plan farm.plan
+xchplot2 fill farm.plan -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+`--save-profile` writes only the requested profile, refuses to overwrite an
+existing file and needs no destination. Explicit farming overrides are included
+in the export. A saved plan already contains its harvester profile; execution
+does not need the profile file again. A file literally named `local` can be
+selected as `--harvester ./local`.
+
+For repeated use, set the harvester in the existing
+[configuration file](#configuration-and-argument-files), so normal plan and
+fill commands need no selection flag:
+
+```toml
+[plan]
+harvester = "/path/to/harvester.json"
+
+[fill]
+harvester = "/path/to/harvester.json"
+```
+
+Use `harvester = "local"` on the intended harvester. Command-line
+`--harvester` overrides the saved selection. Without a selection, the planner
+uses its declared defaults and reports them as assumptions.
+
+Detection observes this process's CPU affinity and available memory, reads
+the local Chia configuration, and attempts read-only authenticated harvester
+RPCs through the installed `chia` executable. It starts no Chia services.
+Use `--chia-root DIR` and `--chia-executable FILE` when needed. The default root
+follows `CHIA_ROOT`, then `~/.chia/mainnet`. RPC detection is limited to a
+configured loopback endpoint; missing tools, unsupported configuration or an
+offline service are reported as unavailable, not as an empty farm.
+
+The public [Chia development implementation](https://github.com/Chia-Network/chia-blockchain/tree/f94da8ed38485c7c1cb5f9a3d252d26f68ad6efb/chia/harvester)
+uses the configured harvester lookup thread pool for v2 partial proofs.
+Detection can use that observed concurrency. It does not establish finalized
+PoS2 CPU, memory or cache defaults. Available hardware is not measured spare
+capacity: CPU/memory budgets and service costs remain declared assumptions.
+Explicit `--farming-*` options override imported or detected inputs for a new
+job; for example, lower `--farming-cores` and `--farming-memory-bytes` to leave
+resources for other services. Saved jobs keep the resolved profile and its
+provenance on resume.
+
+The JSON report's `farming_profile` can be imported either on its own or inside
+the full report. It carries harvester inputs, hostname, observation time and
+count-only loaded-plot snapshots; it imports no destination assignments or
+plot keys. Snapshots do not establish refresh completion or the cost of
+unmanaged plots. The assessment covers this job only, even when other plots
+were detected. Reserve an allowance for outside work and qualify the intended
+reader before relying on the estimate.
+
+To sample the pinned group reader on explicit ordinary plots, run calibration on
+the intended reader machine and save its observations with an editable profile:
+
+```bash
+xchplot2 plan --calibrate /plots/example.gplot --calibration-samples 16 \
+  --save-profile reader-profile.json --json
+xchplot2 plan /new/plots --harvester reader-profile.json --save-plan farm.plan
+```
+
+Calibration reads the supplied files without changing them. It reports fresh
+and retained-reader quality lookups, foreground reader CPU time, and separate
+read-only storage observations. Storage observations remain report-only; they
+do not replace bandwidth, seek or concurrency assumptions. OS cache state is
+uncontrolled, so opening a fresh reader does not establish cold physical reads.
+Calibration does not solve full proofs or measure spare harvester capacity.
+
+Existing CPU inputs only increase from the scoped samples and margin. These
+are editable, conditional service envelopes, not measured worst-case bounds.
+The saved profile records the sampled k, strength, reader, method and margin,
+with its own calibration hostname/time. An imported baseline's configuration,
+inventory and hardware snapshot keep their original hostname/time. Planning
+rejects a calibrated profile for a different k, strength or reader; test-size
+profiles require matching explicit test-size options rather than default k28.
+
+Supply at most 64 plots with the same k and strength. Samples default to 16 per
+plot and are capped at 1024. `--calibration-timeout-ms` defaults to 30000 and
+`--calibration-memory-bytes` to `512M`, per reader worker. The worker cap is
+admitted alongside the parent's buffers under `--max-host-ram`; its platform
+limit covers address space on Linux or committed process memory on Windows,
+and does not promise an equal RSS or filesystem-cache limit. Use `--json` or
+`--save-profile FILE`; saving refuses an existing file. Harvester imports and
+explicit farming inputs can supply the baseline. Calibration samples only the
+supplied plots.
 
 Defaults are deliberately independent of the plotting host:
 
@@ -347,7 +544,7 @@ Defaults are deliberately independent of the plotting host:
 
 The response deadline is an operational latency limit, not a consensus deadline.
 The future profile models one scheduled filter reduction without assigning a
-calendar activation date. The default cadence is 75/8 seconds. The CPU
+calendar activation date. The default cadence is 75/8 seconds. The default CPU
 coefficients are assumed service envelopes, not measurements of the user's
 harvester. Deadline admission is conditional on those envelopes covering the
 reader and storage's actual service costs.
@@ -362,7 +559,7 @@ detected SSDs use 0.2 ms, 500 MB/s and up to four active reads. Unknown devices
 use 20 ms, 125 MB/s and one active read, with shared resources serialized
 conservatively. These are model inputs, not storage benchmarks. Shared transfer
 bandwidth, synchronous lookup workers and harvester CPU capacity constrain the
-whole farm. Per-file member processing remains serial.
+modeled job. Per-file member processing remains serial.
 
 Larger files reduce repeated index work and disk accesses, but processing more
 members serially makes each lookup longer. Smaller files shorten individual
@@ -422,7 +619,7 @@ policies or memory power. `--farming-objective latency` instead minimizes the
 response bound, with work as a tie-break. Both modes must satisfy the same hard
 deadline and eligibility limits.
 
-The preview reports `response_bound_seconds`, `feasible` and
+The JSON report includes `response_bound_seconds`, `feasible` and
 `infeasibility_reason`, along with `dynamic_work_seconds_per_sp` and its CPU/I/O
 components. `max_eligible_groups` is the configured per-resource limit;
 `certified_max_eligible_groups` is the assessed maximum. An infeasible profile
@@ -509,9 +706,10 @@ Explicit service flags override saved defaults. Admission and retries adapt
 to available workers and measured task/transfer cost; discovery alone does
 not guarantee that a worker has enough capacity for a particular task.
 
-`compute status` shows saved defaults and certificate expiry, then authenticates
-live brokers and workers. It lists owners, jobs, queue wait reasons, offered
-resources, broker reservations and actual worker usage. A worker shared by
+`compute status` authenticates live brokers and workers and summarizes their
+availability and work. Add `-v` to see saved defaults, certificate expiry,
+identities, owners, jobs, queue wait reasons, offered resources, broker
+reservations and actual worker usage. A worker shared by
 several brokers enforces its total limit locally; a broker's reservation view
 is not a pool-wide capacity measurement.
 
@@ -777,9 +975,9 @@ rewriting their headers is insufficient. `--testnet` / `-T` are rejected:
 PoS2 no longer has a separate testnet Xs hash. Both pool modes now use the
 V2 taproot derivation in
 [chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
-[Farmer plot-group integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
-remains a draft as of 2026-10-22, so format/proof interoperability does not
-establish compatibility with a released farmer.
+[Farmer plot-group integration](https://github.com/Chia-Network/chia-blockchain/pull/21566)
+merged on 2026-10-28. Development integration and format/proof interoperability
+do not establish support in a released farmer or network activation.
 
 ## Devices and CPU workers
 
@@ -839,8 +1037,8 @@ grep -h Cpus_allowed_list /proc/$(pgrep -n xchplot2)/task/*/status | sort | uniq
 
 ### Batch completion and worker rates
 
-Multi-worker jobs report each worker's rate and suggested batch sizes that
-reduce idle time at the end. A tail guard stops a slower worker from starting
+With `-v`, multi-worker jobs report each worker's rate and suggested batch
+sizes that reduce idle time at the end. A tail guard stops a slower worker from starting
 a plot when faster workers are expected to finish the remaining queue sooner.
 It applies to CPUs and GPUs. `XCHPLOT2_TAIL_GUARD=0` disables the guard.
 Rate estimates and already-running plots can still leave a tail.
@@ -905,9 +1103,10 @@ deprecated no-op alias because peer transport is already the default.
 ## Benchmarking
 
 `bench` measures how fast your hardware plots by writing synthetic
-unfarmable `.gplot` files (random group IDs, no keys), then reports
-steady-state throughput in TiB/s, TiB/hour, TiB/day, and TiB/month
-(30-day basis):
+unfarmable `.gplot` files (random group IDs, no keys). The default report shows
+seconds per plot, TiB/hour and a write-time estimate. `-v` adds TiB/s, TiB/day,
+TiB/month (30-day basis) and detailed measurements. Use k28 to measure farming
+throughput; smaller sizes report test-size results:
 
 ```bash
 # Quick smoke (k=18 finishes in seconds on most GPUs)
@@ -937,8 +1136,8 @@ xchplot2 bench -k 28 -o /scratch --compute-only
 
 The queue contains `(warmup + num) × workers` plots. Faster workers can
 complete more of that queue; `-n` does not guarantee equal per-worker counts.
-Each worker's warmup is excluded separately, and the report shows the
-steady-state window and per-worker rates. Increase `-n` if a short run
+Each worker's warmup is excluded separately. `-v` adds the steady-state
+window and detailed per-worker measurements to the report. Increase `-n` if a short run
 cannot measure a slower worker.
 
 Every pass includes FSE compression and real file writes. The second
@@ -1097,6 +1296,8 @@ This accepts a 64-character hex group ID and derives its member ID. It uses CPU 
 prints phase timings. Use `-m` / `--memo HEX`, `-o` / `--out DIR`,
 `-N` / `--out-name NAME` for output parameters. `--raw` writes a temporary
 raw member and allows indices 0..65535; group output requires index 0.
+Use `-v`/`--verbose` for diagnostics; the positional verbose argument remains
+supported, with an explicit flag taking precedence.
 The [CPU-reference fixture](CONTRIBUTING.md#building-and-running-tests)
 shows a matching group-ID test and GPU batch. Arbitrary IDs and memos do not
 produce farmable plots.
@@ -1120,7 +1321,8 @@ xchplot2 parity-check --dir build/tools/parity
 ```
 
 Runs the available `*_parity` and `*_test` executables, prints each result
-and failure output, and returns nonzero if a test fails. The default
+and failure output, and returns nonzero if a test fails. `-v` includes timings
+and output from successful tests; `-q` retains the final counts and failures. The default
 directory is `./build/tools/parity`. Build the tests first; see
 [CONTRIBUTING.md](CONTRIBUTING.md#building-and-running-tests) for CMake,
 CTest, hardware requirements, and CPU-reference byte comparisons.

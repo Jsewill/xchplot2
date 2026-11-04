@@ -1,4 +1,5 @@
 #include "group_commands.hpp"
+#include "compute_output.hpp"
 #include "host/ComputeIdentity.hpp"
 #include <charconv>
 #include <iostream>
@@ -59,6 +60,7 @@ void help(std::string_view command)
                      "  --backend auto|cpu|gpu  offered generation backend\n";
     if (command == "configure") std::cout << "  --max-brokers N         bounded broker registrations, default 128\n";
     std::cout << "  --directory DIR    saved compute setup directory\n";
+    std::cout << pos2gpu::compute_output_help;
 #ifdef _WIN32
     std::cout << "Default: %LOCALAPPDATA%\\xchplot2\\compute, or $XDG_CONFIG_HOME/xchplot2/compute when set.\n";
 #else
@@ -74,15 +76,16 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
         std::string const command = argv[0];
         require(command == "init" || command == "invite" || command == "join" || command == "configure",
             "unknown compute command; use compute --help");
-        for (int i = 1; i < argc; ++i)
-            if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") { help(command); return 0; }
         auto directory = pool::pool_directory();
         std::string name = command == "init" ? hostname() : "";
         std::filesystem::path file;
         std::vector<std::pair<std::string, std::string>> settings;
+        ComputeOutputOptions output;
         for (int i = 1; i < argc; ++i)
         {
             std::string key = argv[i];
+            if (key == "--help" || key == "-h" || key == "--help-all") { help(command); return 0; }
+            if (output.parse(key)) continue;
             if (!key.starts_with('-'))
             { require((command == "invite" || command == "join") && file.empty(), "unexpected compute argument"); file = std::filesystem::path(reinterpret_cast<char8_t const*>(key.c_str())); continue; }
             require(i + 1 < argc, "missing compute option value"); std::string value = argv[++i];
@@ -92,21 +95,23 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
             else
             { require(command == "configure", "unknown compute setup option"); settings.emplace_back(std::move(key), std::move(value)); }
         }
+        output.validate();
         if (command == "init")
         {
             auto identity = pool::create_pool(directory, name);
-            std::cout << "Created pool " << identity.pool_id.substr(0, 12) << " for " << identity.name << ".\n"
-                      << "Plot, fill and grow will use shared compute automatically.\n"
-                      << "Add another machine with: xchplot2 compute invite FILE --name NAME\n";
+            std::cout << "Created pool " << identity.pool_id.substr(0, 12) << " for " << identity.name << ".\n";
+            if (output.details())
+                std::cout << "Plot, fill and grow will use shared compute automatically.\n"
+                          << "Add another machine with: xchplot2 compute invite FILE --name NAME\n";
             return 0;
         }
         if (command == "join")
         {
             require(!file.empty(), "compute join requires an invitation file");
             auto identity = pool::join_pool(file, directory);
-            std::cout << "Joined pool " << identity.pool_id.substr(0, 12) << " as " << identity.name << ".\n"
-                      << "Plot normally, or offer this machine with: xchplot2 compute worker\n"
-                      << "Delete the transferred invitation copies after joining.\n";
+            std::cout << "Joined pool " << identity.pool_id.substr(0, 12) << " as " << identity.name << ".\n";
+            if (output.details()) std::cout << "Plot normally, or offer this machine with: xchplot2 compute worker\n";
+            std::cout << "Delete the transferred invitation copies after joining.\n";
             return 0;
         }
         auto identity = pool::load_pool(directory);

@@ -1,4 +1,6 @@
-# Shared CPU ownership patch and consumed-source identity for both grow builds.
+# Shared CPU ownership patch and build provenance for both grow builds. Exact
+# source identities fence transient construction checkpoints; farming plan
+# compatibility has separate schema, model, key-derivation and numeric guards.
 include_guard(GLOBAL)
 
 function(pos2_grow_prepare upstream_dir output_include)
@@ -52,7 +54,8 @@ function(pos2_grow_identity target upstream_dir)
     foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
-                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp Random.hpp)
+                 GroupFarmPreview.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
+                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"

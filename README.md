@@ -11,13 +11,17 @@ provides the native CUDA implementation for NVIDIA.
 This build pins [pos2-chip 1.0.0](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.0).
 The new Feistel cipher and group format are incompatible with earlier plots;
 existing plots must be replotted and old job manifests cannot be resumed.
-Farmer integration is still in progress upstream; see the
+Farmer plot-group integration has merged upstream; release and activation
+support must still be confirmed in the
 [compatibility notes](contrib/pos2-pr118/README.md).
+Only k28 plots are intended for farming; smaller supported sizes are for testing.
 
 Linux and experimental native Windows builds include
 [grouped plotting, drive filling and growth](REFERENCE.md#grouped-plotting-and-drive-filling).
-Use `plot --group-members N` for several members per file, `plan DIR...` to preview
-a farming layout, and `fill` to build it. `fill -r DIR` restores the keys and all
+Use `plot --group-members N` for several members per file, or
+`plan DIR... --save-plan farm.plan` followed by `fill farm.plan` to review and
+execute a farming layout. Use the intended harvester's profile when plotting
+on another machine. `fill -r DIR` restores the keys and all
 destinations from any member; `fill --extend` adds storage while preserving
 existing plots. [Shared compute](REFERENCE.md#shared-compute)
 lets enrolled machines contribute CPU/GPU capacity to multiple plotting hosts.
@@ -95,7 +99,7 @@ for reusable options. `xchplot2 --help` prints command syntax.
 
 | Command | Purpose and guide |
 |---|---|
-| [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout without writing files |
+| [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout; optionally save it for execution |
 | [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
 
 ### Shared compute

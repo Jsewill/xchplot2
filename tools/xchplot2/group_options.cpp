@@ -1,12 +1,19 @@
 #include "group_commands.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
 #endif
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <thread>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
 #include "host/ComputeNetwork.hpp"
 #endif
@@ -26,6 +33,43 @@ uint64_t sum(uint64_t a, uint64_t b)
 { require(b <= UINT64_MAX - a, "byte count overflow"); return a + b; }
 uint64_t product(uint64_t a, uint64_t b)
 { require(!b || a <= UINT64_MAX / b, "byte count overflow"); return a * b; }
+void load_harvester_profile(pos2gpu::GroupOptions& result)
+{
+    if (result.farming_detect_local)
+    {
+        group_grow::ChiaDetectionOptions options;
+        options.root = result.chia_root; options.executable = result.chia_executable;
+        options.max_memory_bytes = std::min(result.max_ram / 8, uint64_t(256 * mib));
+        if (result.farming_lookup_workers) options.lookup_workers = unsigned(*result.farming_lookup_workers);
+        result.farming_profile = std::make_shared<group_grow::FarmingProfile>(group_grow::detect_farming_profile(options));
+    }
+    else if (!result.farming_profile_path.empty())
+    {
+        std::ifstream input(result.farming_profile_path, std::ios::binary);
+        require(input.is_open(), "cannot open farming profile: " + result.farming_profile_path.string());
+        result.farming_profile = std::make_shared<group_grow::FarmingProfile>(
+            group_grow::read_farming_profile(input, std::min(result.max_ram / 8, uint64_t(256 * mib))));
+    }
+}
+void validate_harvester_options(pos2gpu::GroupOptions const& result)
+{
+    require(!result.farming_reader || *result.farming_reader == "stateless" || *result.farming_reader == "cached",
+        "--farming-reader requires stateless or cached");
+    require(!result.farming_objective || *result.farming_objective == "energy" || *result.farming_objective == "latency",
+        "--farming-objective requires energy or latency");
+    require(!result.farming_cpu_work_weight || *result.farming_cpu_work_weight > 0, "farming CPU work weight must be positive");
+    require(!result.farming_io_work_weight || *result.farming_io_work_weight > 0, "farming I/O work weight must be positive");
+    require(!result.farming_max_eligible_groups || *result.farming_max_eligible_groups > 0,
+        "farming eligible-group limit must be positive");
+    require(!result.farming_cores || (*result.farming_cores > 0 && *result.farming_cores <= 1024), "invalid farming CPU budget");
+    require(!result.farming_lookup_workers || (*result.farming_lookup_workers > 0 && *result.farming_lookup_workers <= 1024),
+        "invalid farming reader concurrency");
+    require(!result.farming_memory || *result.farming_memory > 0, "farming memory must be positive");
+    require(!result.farming_filter_bits || *result.farming_filter_bits <= 13, "invalid farming filter");
+    require(!result.farming_future_filter_bits || *result.farming_future_filter_bits <= 13, "invalid future farming filter");
+    require(!result.farming_chain_us || *result.farming_chain_us > 0, "farming chain cost must be positive");
+    require(!result.farming_deadline_ms || *result.farming_deadline_ms > 0, "farming deadline must be positive");
+}
 void reference_help()
 {
     std::cout <<
@@ -119,6 +163,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     result.plan_only = command == "plan";
     result.resume = command == "grow";
     bool literal = false;
+    int progress = -1;
     auto path = [](std::string const& value)
     { return fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal(); };
     auto destination = [&](std::string const& value)
@@ -132,6 +177,51 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             result.destinations.push_back(path(value));
         }
     };
+    // Validate inspection's narrow input scope before options such as path
+    // lists or local harvester detection can read anything beyond its source.
+    bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string_view const key = argv[i];
+        if (key == "--") break;
+        if (key == "--metadata-only") metadata_only = true;
+        else if (key == "--no-metadata-only") metadata_only = false;
+        else if (key == "--assess-jobs") assess_jobs = true;
+        else if (key == "--no-assess-jobs") assess_jobs = false;
+        else if (key == "--calibrate") calibrate = true;
+        else if (key == "--no-calibrate") calibrate = false;
+        if (key == "--calibration-worker") calibration_worker = true;
+        if (key.starts_with("--calibration-")) calibration_options = true;
+        i += int(group_option_values(key));
+    }
+    if (metadata_only || assess_jobs || calibrate || calibration_options)
+    {
+        require(command == "plan", "saved metadata and joint assessment modes require plan");
+        require(unsigned(metadata_only) + unsigned(assess_jobs) + unsigned(calibrate) == 1,
+            "choose one of --metadata-only, --assess-jobs or --calibrate");
+        require(!calibration_options || calibrate, "calibration controls require --calibrate");
+#ifndef XCHPLOT2_GROUP_COMMANDS
+        require(!calibrate, "reader calibration requires the installed xchplot2 plan command");
+#endif
+        for (int i = 1; i < argc; ++i)
+        {
+            std::string_view const key = argv[i];
+            if (key == "--") break;
+            if (!key.starts_with('-')) continue;
+            bool const worker_option = key == "--calibration-worker" || key == "--calibration-samples" ||
+                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes";
+            bool const calibration_input = !calibration_worker && (key == "--save-profile" || key == "--harvester" ||
+                key == "--chia-root" || key == "--chia-executable" || key.starts_with("--farming-"));
+            require(key == "--metadata-only" || key == "--no-metadata-only" || key == "--assess-jobs" || key == "--no-assess-jobs" ||
+                key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
+                (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
+                key == "--json" || (!calibration_worker && (key == "--max-ram" || key == "-M" || key == "--no-json" ||
+                key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v")),
+                "saved metadata, joint assessment and calibration modes accept only their explicit inputs and controls");
+            auto const values = group_option_values(key);
+            require(i + int(values) < argc, "missing value for " + std::string(key)); i += int(values);
+        }
+    }
     for (int i = 1; i < argc; ++i)
     {
         std::string key = argv[i];
@@ -141,6 +231,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--help" && command.empty()) { reference_help(); std::exit(0); }
         if (key == "--resume" || key == "-r") { result.resume = true; continue; }
         if (key == "--plan-only") { result.plan_only = true; continue; }
+        if (key == "--metadata-only") { result.metadata_only = true; continue; }
+        if (key == "--no-metadata-only") { result.metadata_only = false; continue; }
+        if (key == "--assess-jobs") { result.assess_jobs = true; continue; }
+        if (key == "--no-assess-jobs") { result.assess_jobs = false; continue; }
+        if (key == "--calibrate") { result.calibrate = true; continue; }
+        if (key == "--no-calibrate") { result.calibrate = false; continue; }
+        if (key == "--calibration-worker") { result.calibration_worker = true; continue; }
         if (key == "--extend") { result.extend = true; continue; }
         if (key == "--allow-missing") { result.allow_missing = true; continue; }
         if (!command.empty())
@@ -153,8 +250,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (key == "--no-json") { result.json = false; continue; }
             if (key == "--quiet" || key == "-q") { result.quiet = true; continue; }
             if (key == "--no-quiet") { result.quiet = false; continue; }
-            if (key == "--verbose" || key == "-v" || key == "--progress") { result.verbose = true; continue; }
-            if (key == "--no-verbose" || key == "--no-progress") { result.verbose = false; continue; }
+            if (key == "--verbose" || key == "-v") { result.verbose = true; continue; }
+            if (key == "--no-verbose") { result.verbose = false; continue; }
+            if (key == "--progress") { progress = 1; continue; }
+            if (key == "--no-progress") { progress = 0; continue; }
             require(key != "--fixture-inputs", "fixture input is only available in the reference test runner");
         }
         if (key.starts_with("-"))
@@ -163,6 +262,20 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             std::string const value = argv[++i];
             if (key == "--group-id") result.group = value;
             else if (key == "--manifest") result.manifest = path(value);
+            else if (key == "--save-plan") result.save_plan = path(value);
+            else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
+            else if (key == "--save-profile") result.save_profile = path(value);
+            else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str());
+            else if (key == "--calibration-timeout-ms") result.calibration_timeout_ms = number(value.c_str());
+            else if (key == "--calibration-memory-bytes") result.calibration_memory_bytes = number(value.c_str());
+            else if (key == "--harvester")
+            {
+                require(!value.empty(), "--harvester requires local or a profile file");
+                result.farming_detect_local = value == "local";
+                result.farming_profile_path = result.farming_detect_local ? fs::path{} : path(value);
+            }
+            else if (key == "--chia-root") result.chia_root = path(value);
+            else if (key == "--chia-executable") result.chia_executable = path(value);
             else if (key == "--relocate")
             {
                 require(i + 1 < argc, "--relocate requires OLD and NEW paths");
@@ -306,12 +419,75 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
     }
     bool const farm_command = command == "fill" || command == "plan";
+    if (result.metadata_only || result.assess_jobs || result.calibrate)
+    {
+        if (result.assess_jobs || result.calibrate)
+        {
+            require(!result.target.empty(), "supply the saved PLAN files or calibration plot files explicitly");
+            auto& inputs = result.assess_jobs ? result.assessment_plans : result.calibration_plots;
+            inputs.reserve(result.destinations.size() + 1);
+            inputs.push_back(std::move(result.target)); result.target.clear();
+            for (auto& path : result.destinations) inputs.push_back(std::move(path));
+            result.destinations.clear();
+        }
+        else if (!result.target.empty())
+        {
+            require(result.from_plan.empty() && result.manifest.empty() && result.destinations.empty(),
+                "--metadata-only requires one saved PLAN or --manifest FILE");
+            result.from_plan = std::move(result.target); result.target.clear();
+        }
+        require(result.assess_jobs || result.calibrate || (result.from_plan.empty() != result.manifest.empty()),
+            "--metadata-only requires one saved PLAN or --manifest FILE");
+        require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
+        require(result.max_ram >= 16 * mib, "at least 16777216 budget bytes required");
+        result.directory_farm = true;
+        if (result.calibrate)
+        {
+            require(result.calibration_plots.size() <= 64 && result.calibration_samples && result.calibration_samples <= 1024 &&
+                result.calibration_timeout_ms && result.calibration_timeout_ms <= UINT_MAX && result.calibration_memory_bytes,
+                "invalid calibration plot count, sample count, timeout or worker-memory limit");
+            require(!result.calibration_worker || (result.calibration_plots.size() == 1 && result.json),
+                "calibration worker requires exactly one explicit plot and --json");
+            require(result.calibration_worker || result.json || !result.save_profile.empty(),
+                "calibration requires --json or --save-profile FILE");
+            require(result.farming_detect_local || (result.chia_root.empty() && result.chia_executable.empty()),
+                "--chia-root and --chia-executable require --harvester local");
+            if (!result.calibration_worker)
+            { validate_harvester_options(result); load_harvester_profile(result); }
+        }
+        return result;
+    }
+    if (farm_command && !result.target.empty() && fs::is_regular_file(result.target))
+    {
+        require(result.from_plan.empty() && result.destinations.empty(),
+            "supply a saved plan on its own, without destination directories");
+        result.from_plan = std::move(result.target); result.target.clear();
+    }
     if (result.extend || !result.relocations.empty()) result.resume = true;
-    require(!result.target.empty() || (farm_command && (result.plan_only || result.resume || !result.manifest.empty())), "destination required");
+    require(!result.target.empty() || (farm_command &&
+        (result.plan_only || result.resume || !result.manifest.empty() || !result.from_plan.empty())), "destination required");
     require((!result.extend && !result.allow_missing && result.manifest.empty() && result.relocations.empty()) || farm_command,
         "saved farming job options require plan or fill");
     require(!result.allow_missing || (result.resume && !result.extend && result.relocations.empty()),
         "--allow-missing requires --resume without --extend or --relocate");
+    require((result.save_plan.empty() && result.from_plan.empty()) || farm_command,
+        "saved previews require plan or fill");
+    require(result.save_plan.empty() || result.plan_only,
+        "--save-plan requires plan or fill --plan-only");
+    require(result.save_plan.empty() || result.from_plan.empty(),
+        "--save-plan and --from-plan cannot be combined");
+    require(result.from_plan.empty() || (result.target.empty() && result.destinations.empty() &&
+        result.manifest.empty() && result.relocations.empty() && !result.resume && !result.extend && !result.allow_missing),
+        "--from-plan supplies the saved destinations and action; omit other job selectors");
+    require(result.save_profile.empty() || (farm_command && result.plan_only && result.target.empty() &&
+        result.destinations.empty() && result.save_plan.empty() && result.from_plan.empty() && result.manifest.empty() &&
+        result.relocations.empty() && !result.resume && !result.extend && !result.allow_missing),
+        "export a harvester profile with plan --save-profile FILE, without a destination or saved job");
+    require((!result.farming_detect_local && result.farming_profile_path.empty() &&
+        result.chia_root.empty() && result.chia_executable.empty()) || farm_command,
+        "harvester profiles require plan or fill");
+    require(result.farming_detect_local || (result.chia_root.empty() && result.chia_executable.empty()),
+        "--chia-root and --chia-executable require --harvester local");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
                 result.max_members <= 65535, "member caps must be in 1..65535");
     require(result.workers <= 1024, "compression worker cap exceeds 1024");
@@ -326,6 +502,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     if (command == "grow")
         require(!directory_target && fs::exists(result.target), "grow requires an existing group file; use plot to create files");
     require(command.empty() || !result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
+    // Match plot/batch: an explicit progress choice wins; otherwise use stderr
+    // TTY detection, with quiet suppressing the automatic progress display.
+    if (progress >= 0) result.progress = progress != 0;
+#ifdef _WIN32
+    else result.progress = !result.quiet && ::_isatty(::_fileno(stderr)) != 0;
+#else
+    else result.progress = !result.quiet && ::isatty(::fileno(stderr)) != 0;
+#endif
     bool saved_farm = false;
     if (result.resume && directory_target)
         saved_farm = fs::exists(result.target / "grow-farm.plan") || fs::exists(result.target / "grow-farm.plan.next");
@@ -341,22 +525,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.destinations.empty() || ((!result.group_members || result.directory_farm) && result.fixtures.empty() && !result.group && !result.memo),
             "multiple destinations require matching file or directory targets and key-derived identities");
     require(!result.plan_only || result.directory_farm, "--plan-only requires a directory target");
-    require(!result.farming_reader || *result.farming_reader == "stateless" || *result.farming_reader == "cached",
-            "--farming-reader requires stateless or cached");
-    require(!result.farming_objective || *result.farming_objective == "energy" || *result.farming_objective == "latency",
-            "--farming-objective requires energy or latency");
-    require(!result.farming_cpu_work_weight || *result.farming_cpu_work_weight > 0, "farming CPU work weight must be positive");
-    require(!result.farming_io_work_weight || *result.farming_io_work_weight > 0, "farming I/O work weight must be positive");
-    require(!result.farming_max_eligible_groups || *result.farming_max_eligible_groups > 0,
-            "farming eligible-group limit must be positive");
     require(!farming_options || result.directory_farm, "farming profile options require automatic directory planning");
-    require(!result.farming_cores || (*result.farming_cores > 0 && *result.farming_cores <= 1024), "invalid farming CPU budget");
-    require(!result.farming_lookup_workers || (*result.farming_lookup_workers > 0 && *result.farming_lookup_workers <= 1024), "invalid farming reader concurrency");
-    require(!result.farming_memory || *result.farming_memory > 0, "farming memory must be positive");
-    require(!result.farming_filter_bits || *result.farming_filter_bits <= 13, "invalid farming filter");
-    require(!result.farming_future_filter_bits || *result.farming_future_filter_bits <= 13, "invalid future farming filter");
-    require(!result.farming_chain_us || *result.farming_chain_us > 0, "farming chain cost must be positive");
-    require(!result.farming_deadline_ms || *result.farming_deadline_ms > 0, "farming deadline must be positive");
+    validate_harvester_options(result);
     require(result.backend == "cpu" || result.backend == "gpu" || result.backend == "auto",
             "--backend requires cpu, gpu or auto");
     require(result.tier == "auto" || result.tier == "pool" || result.tier == "plain" || result.tier == "compact" ||
@@ -382,8 +552,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(!result.k || *result.k <= 255, "invalid k");
     require(!result.strength || *result.strength <= 255, "invalid strength");
     require(!result.meta || *result.meta <= 255, "invalid meta group");
+    load_harvester_profile(result);
 #ifdef XCHPLOT2_GROUP_COMMANDS
-    prepare_group_compute(result);
+    if (result.save_profile.empty()) prepare_group_compute(result);
 #endif
     bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
         !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||

@@ -60,6 +60,102 @@ void retry_pressure()
     rejects([&] { (void)bounded.acquire(overflow, "bounded-session"); });
 }
 
+void planning_feedback()
+{
+    using Planning = worker_detail::GenerationPlanning;
+    auto const now = Clock::now(); pool::Endpoint route{"127.0.0.1", 49101};
+    WorkerTaskObservation fast; fast.worker_identity = "local-worker"; fast.worker_instance = "first";
+    fast.kind = pool::Kind::GenerateCpu; fast.k = 18; fast.strength = 2; fast.work_units = 1;
+    fast.local_direct = true; fast.execution_ns = 400; fast.transfer_ns = 100;
+    auto hint = [&](Planning& planning, uint8_t k = 18, uint8_t strength = 2, pool::Kind kind = pool::Kind::GenerateCpu)
+    { return planning.suggested(k, strength, kind, now); };
+    auto observe = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
+    { auto const selected = planning.selected(value, endpoint, now); planning.observed(value, endpoint, selected, now); };
+    auto train = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
+    { for (unsigned i = 0; i < 3; ++i) observe(planning, value, endpoint); };
+    Planning planning(1000);
+    auto missing = fast; missing.transfer_ns = 0; train(planning, missing, route);
+    require(hint(planning).batch == 1 && hint(planning).concurrency == 2,
+        "missing delivery phase evidence trained a generation policy");
+    observe(planning, fast, route); observe(planning, fast, route);
+    require(hint(planning).batch == 1, "one noisy completion changed generation batching");
+    observe(planning, fast, route);
+    require(hint(planning).batch == 2 && hint(planning).concurrency == 3,
+        "consistent generation observations did not train bounded hints");
+    auto pressure = fast; pressure.execution_ns = 100; pressure.transfer_ns = 400;
+    for (unsigned i = 0; i < 6; ++i) observe(planning, i & 1 ? fast : pressure, route);
+    require(hint(planning).batch == 2 && hint(planning).concurrency == 3,
+        "alternating result pressure bypassed planning hysteresis");
+    require(hint(planning, 20).batch == 1 && hint(planning, 18, 3).batch == 1 &&
+        hint(planning, 18, 2, pool::Kind::GenerateGpu).batch == 1,
+        "generation hints crossed a plot parameter or backend boundary");
+    auto slow = pressure; slow.worker_identity = "remote-worker"; slow.local_direct = false;
+    train(planning, slow, route);
+    require(hint(planning).batch == 2 && hint(planning).concurrency == 3,
+        "a slow remote minority pinned the local worker's learned policy");
+    auto gpu = fast; gpu.worker_identity = "gpu-worker"; gpu.kind = pool::Kind::GenerateGpu;
+    train(planning, gpu, route);
+    planning.failed(fast, route, planning.selected(fast, route, now), now);
+    require(hint(planning).batch == 1 && hint(planning, 18, 2, pool::Kind::GenerateGpu).batch == 2,
+        "a CPU worker failure changed another backend's policy");
+    auto hybrid = gpu; hybrid.kind = pool::Kind::GenerateCpu; train(planning, hybrid, route);
+    planning.failed(hybrid, route, planning.selected(hybrid, route, now), now);
+    require(hint(planning, 18, 2, pool::Kind::GenerateGpu).batch == 2,
+        "one backend's failure changed the same worker's other backend policy");
+    require(hint(planning, 18, 2, pool::Kind::GenerateAny).batch == 1,
+        "mixed-backend aggregation ignored its active worker majority");
+
+    Planning replacement(1000); train(replacement, fast, route);
+    auto changed = fast; changed.worker_instance = "replacement";
+    observe(replacement, changed, route);
+    require(hint(replacement).batch == 1, "a replacement worker inherited an old incarnation's feedback");
+    observe(replacement, changed, route); observe(replacement, changed, route);
+    require(hint(replacement).batch == 2, "replacement worker could not learn its own feedback");
+    auto relocated = route; ++relocated.port; observe(replacement, changed, relocated);
+    require(hint(replacement).batch == 1, "a changed authenticated route inherited old feedback");
+    changed.local_direct = false; observe(replacement, changed, relocated);
+    require(hint(replacement).batch == 1, "a TLS route inherited local delivery votes");
+    require(replacement.suggested(18, 2, pool::Kind::GenerateCpu, now + std::chrono::milliseconds(1001)).concurrency == 2,
+        "an idle worker retained stale pressure beyond the task timeout");
+
+    Planning bounded(1000);
+    for (unsigned i = 0; i < 256; ++i) observe(bounded, fast, route);
+    require(hint(bounded).batch == pool::max_generation_batch_members && hint(bounded).concurrency == 64,
+        "generation feedback exceeded or failed to reach its bounded policy");
+    auto older_workload = fast; older_workload.k = 20; train(bounded, older_workload, route);
+    auto retired_selection = bounded.selected(older_workload, route, now);
+    for (size_t i = 0; i < Planning::maximum; ++i)
+    {
+        auto fresh = fast; fresh.worker_identity = "fresh-" + std::to_string(i);
+        observe(bounded, fresh, route);
+    }
+    bounded.observed(older_workload, route, retired_selection, now);
+    bounded.failed(older_workload, route, retired_selection, now);
+    require(hint(bounded, 20).batch == 1, "late feedback resurrected a worker after bounded history eviction");
+    Planning invalid(1000); auto oversized = fast; oversized.worker_identity.assign(65, 'x');
+    train(invalid, oversized, route); auto invalid_route = route; invalid_route.host.assign(254, 'x');
+    train(invalid, fast, invalid_route);
+    require(hint(invalid).batch == 1, "invalid protocol keys entered fixed planning storage");
+
+    Planning late(1000); auto old_selection = late.selected(fast, route, now);
+    train(late, fast, route); changed = fast; changed.worker_instance = "new-process";
+    train(late, changed, route);
+    for (unsigned i = 0; i < 3; ++i) late.observed(pressure, route, old_selection, now);
+    late.failed(fast, route, old_selection, now);
+    require(hint(late).batch == 2 && hint(late).concurrency == 3,
+        "an old incarnation's late completion or failure replaced current feedback");
+    auto before_relocation = late.selected(changed, route, now);
+    train(late, changed, relocated); train(late, changed, route);
+    late.observed(changed, route, before_relocation, now); late.failed(changed, route, before_relocation, now);
+    require(hint(late).batch == 2 && hint(late).concurrency == 3,
+        "returning to an earlier route resurrected a fenced selection's feedback");
+    auto expired_selection = late.selected(changed, route, now);
+    auto const expired = now + std::chrono::milliseconds(1001);
+    late.observed(changed, route, expired_selection, expired); late.failed(changed, route, expired_selection, expired);
+    require(late.suggested(18, 2, pool::Kind::GenerateCpu, expired).batch == 1,
+        "a delayed completion revived a peer after its monotonic observation timeout");
+}
+
 struct RunningBroker
 {
     pool::BrokerServer server;
@@ -208,9 +304,15 @@ void assigned_local_and_fencing()
     std::vector<std::array<uint8_t, 32>> oversized(pool::max_generation_batch_members + 1);
     rejects([&] { client.contributions(18, 2, oversized, [](auto, auto, auto) {}); });
     std::unique_ptr<CompactMemberReceiver> receiver;
+    uint64_t sink_ns = 0;
     client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t count)
     {
-        if (!receiver) receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count));
+        if (!receiver)
+        {
+            auto const begin = Clock::now(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            sink_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
+            receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count));
+        }
         receiver->append(tile);
     });
     require(bool(receiver), "assigned local generation produced no member");
@@ -218,8 +320,22 @@ void assigned_local_and_fencing()
     require(generated.size(), "assigned local generation produced an empty member");
     auto stats = client.stats();
     require(stats.local_tasks == 1 && !stats.input_bytes && !stats.output_bytes &&
-        observations.size() == 1 && observations.front().local_direct && observations.front().execution_ns,
+        observations.size() == 1 && observations.front().local_direct && observations.front().execution_ns &&
+        sink_ns && observations.front().transfer_ns >= sink_ns,
         "ordinary local assignment used wire payload or omitted its observation");
+    WorkerTaskObservation remote_observation;
+    auto remote_config = config; remote_config.local_service = nullptr; remote_config.owner_id = "remote-observation-owner";
+    remote_config.observe = [&](auto const& value) { remote_observation = value; };
+    WorkerClient remote(remote_config); sink_ns = 0;
+    remote.generate(18, 2, id, [&](auto const&, uint64_t)
+    {
+        if (sink_ns) return;
+        auto const begin = Clock::now(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        sink_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
+    });
+    require(!remote_observation.local_direct && remote_observation.execution_ns &&
+        sink_ns && remote_observation.transfer_ns >= sink_ns,
+        "TLS result consumption used a different sink observation boundary");
 
     std::array<uint64_t, 3> fragments{1, 2, 3}; std::span<uint64_t const> region(fragments);
     WorkerChunkInput chunk{0, {}, 0, {}, {&region, 1}};
@@ -561,7 +677,7 @@ void renewal_fence()
 
 int main() try
 {
-    retry_pressure(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); codec_window_limits(); renewal_fence();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); codec_window_limits(); renewal_fence();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

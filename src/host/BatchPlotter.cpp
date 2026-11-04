@@ -1485,12 +1485,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             for (auto const& n : nodes) {
                 if (n.node_id != want) continue;
                 if (!pin_thread_to_cpus(n.cpus)) {
-                    if (!opts.quiet) {
-                        std::fprintf(stderr,
-                            "%s could not pin to NUMA node %d — running unpinned "
-                            "(slower on a multi-socket host, but not wrong)\n",
-                            log_prefix.c_str(), want);
-                    }
+                    std::fprintf(stderr,
+                        "%s could not pin to NUMA node %d — running unpinned "
+                        "(slower on a multi-socket host, but not wrong)\n",
+                        log_prefix.c_str(), want);
                 } else if (opts.verbose) {
                     // Read the mask BACK rather than echoing what we asked for.
                     // The label already says which node this worker was meant to
@@ -1580,7 +1578,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     claimed < entries.size() ? entries.size() - claimed : 0;
                 std::string why;
                 if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
-                    if (!opts.quiet)
+                    if (opts.verbose)
                         std::fprintf(stderr, "%s %s\n",
                                      log_prefix.c_str(), why.c_str());
                     break;
@@ -1841,16 +1839,16 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         // from a tier name, not folded into one.
         res.pipeline = "pool";
     } catch (InsufficientVramError const& e) {
-        if (opts.quiet) {
-            // info-level: which pipeline was picked and why
-        } else if (tier_forced) {
-            std::fprintf(stderr, "%s --tier override — using "
-                                 "streaming pipeline per plot\n",
-                                 log_prefix.c_str());
+        if (tier_forced) {
+            if (opts.verbose)
+                std::fprintf(stderr, "%s --tier override — using "
+                                     "streaming pipeline per plot\n",
+                                     log_prefix.c_str());
         } else if (force_streaming) {
-            std::fprintf(stderr, "%s XCHPLOT2_STREAMING=1 — using "
-                                 "streaming pipeline per plot\n",
-                                 log_prefix.c_str());
+            if (!opts.quiet)
+                std::fprintf(stderr, "%s XCHPLOT2_STREAMING=1 — using "
+                                     "streaming pipeline per plot\n",
+                                     log_prefix.c_str());
         } else if (e.from_allocation) {
             // The gate said yes and the driver said no. Worth its own line:
             // the free-VRAM figure the gate trusted was wrong, which on a
@@ -1863,7 +1861,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 "allowing it — using streaming pipeline per plot. (%s)\n",
                 log_prefix.c_str(),
                 e.required_bytes / double(1ULL << 30), e.what());
-        } else {
+        } else if (opts.verbose) {
             std::fprintf(stderr,
                 "%s pool needs %.2f GiB, only %.2f GiB free — using "
                 "streaming pipeline per plot\n",
@@ -2394,7 +2392,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // whether its two passes are comparable. See WorkerTimeline.
             res.pipeline = tier_name(tier);
 
-            if (!opts.quiet) {
+            if (opts.verbose) {
                 std::fprintf(stderr,
                     "%s streaming tier: %s "
                     "(%.2f GiB free, %.2f GiB peak, %.2f GiB plain floor)\n",
@@ -2674,7 +2672,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     claimed < entries.size() ? entries.size() - claimed : 0;
                 std::string why;
                 if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
-                    if (!opts.quiet)
+                    if (opts.verbose)
                         std::fprintf(stderr, "%s %s\n",
                                      log_prefix.c_str(), why.c_str());
                     break;
@@ -2817,7 +2815,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         uint64_t const peak     = vram.peak();
         auto to_mib = [](uint64_t b) { return b / double(1ULL << 20); };
 
-        if (!opts.quiet) {
+        if (opts.verbose) {
             std::fprintf(stderr,
                 "%s %s: peak %.0f MiB of %.0f free "
                 "(model %.0f + two-phase %.0f + margin %.0f = %.0f declared; "
@@ -3334,7 +3332,7 @@ BatchResult run_batch_pipeline_plot(std::vector<BatchEntry> const& entries,
     // that is busy nearly all the time and waiting on nobody; every other stage
     // is either backpressured by it (blocked, sitting above it) or starved by it
     // (waiting, sitting below it).
-    if (!opts.quiet && !stage_stats.empty() && res.total_wall_seconds > 0.0) {
+    if (opts.verbose && !stage_stats.empty() && res.total_wall_seconds > 0.0) {
         double busiest = 0.0;
         for (auto const& s : stage_stats) busiest = std::max(busiest, s.busy_seconds);
 
@@ -4150,9 +4148,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         std::vector<std::string> dropped;
         device_ids = usable_batch_devices(device_ids, &dropped);
         for (auto const& d : dropped) {
-            if (!opts.quiet) {
-                std::fprintf(stderr, "[batch] device dropped — %s\n", d.c_str());
-            }
+            std::fprintf(stderr, "[batch] device dropped — %s\n", d.c_str());
         }
         if (device_ids.empty() && !dropped.empty()) {
             std::string msg = "every selected device failed its dispatch check:";
@@ -4301,7 +4297,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     // the filesystem.
     size_t const N = device_ids.size();
     auto const labels = worker_labels(device_ids);
-    if (!opts.quiet) {
+    if (opts.verbose) {
         std::string devs;
         for (size_t i = 0; i < N; ++i) {
             if (i) devs += ", ";

@@ -1,4 +1,5 @@
 #include "group_commands.hpp"
+#include "compute_output.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/WindowsFile.hpp"
 #include <taskschd.h>
@@ -119,23 +120,29 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
             "  print    Print the task XML without registering or starting it\n"
             "  --role worker|broker  Task role, default worker\n"
             "  --directory DIR       Saved pool membership\n"
+            << pos2gpu::compute_output_help <<
             "The task starts at login and runs as this user, without elevation.\n"
             "Resource and network defaults come from compute configure.\n"
             "Use compute drain before stop to let accepted work finish.\n";
     };
     if (argc < 2) { help(); return 1; }
+    std::string command, role = "worker"; auto directory = pool::pool_directory();
+    ComputeOutputOptions output;
     for (int i = 1; i < argc; ++i)
-        if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") { help(); return 0; }
-    std::string const command = argv[1]; std::string role = "worker"; auto directory = pool::pool_directory();
-    require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
-        command == "status" || command == "remove" || command == "print", "unknown compute service command");
-    for (int i = 2; i < argc; ++i)
     {
-        std::string const option = argv[i]; require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
+        std::string const option = argv[i];
+        if (option == "--help" || option == "-h" || option == "--help-all") { help(); return 0; }
+        if (output.parse(option)) continue;
+        if (!option.starts_with('-'))
+        { require(command.empty(), "unexpected compute service argument"); command = option; continue; }
+        require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
         if (option == "--role") role = value;
         else if (option == "--directory") directory = fs::path(reinterpret_cast<char8_t const*>(value.c_str()));
         else throw std::invalid_argument("unknown compute service option: " + option);
     }
+    output.validate();
+    require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
+        command == "status" || command == "remove" || command == "print", "unknown compute service command");
     require(role == "worker" || role == "broker", "service role must be worker or broker");
     auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
     auto const name = wide("xchplot2-compute-" + role + '-' + identity->node_id);
@@ -182,7 +189,11 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
         checked(task->get_State(&state), "read task state"); checked(task->get_LastTaskResult(&result), "read task result");
         char const* label = state == TASK_STATE_RUNNING ? "running" : state == TASK_STATE_QUEUED ? "queued" :
             state == TASK_STATE_READY ? "ready" : state == TASK_STATE_DISABLED ? "disabled" : "unknown";
-        std::cout << utf8(name) << ": " << label << "; last result " << result << '\n'; return 0;
+        if (output.details()) std::cout << utf8(name);
+        else std::cout << "Compute " << role << " service";
+        std::cout << ": " << label;
+        if (output.details() || result) std::cout << "; last result " << result;
+        std::cout << '\n'; return 0;
     }
     if (command == "stop" || command == "restart" || command == "remove") stop(task.value);
     if (command == "remove")

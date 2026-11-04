@@ -64,8 +64,9 @@ struct WorkerTaskObservation
     std::string worker_identity, worker_instance;
     pool::Kind kind = pool::Kind::GenerateCpu;
     uint8_t k = 0, strength = 0;
-    // Owner-observed phases: selection to first output, then result receipt.
-    // These include scheduling/transport latency, rather than kernel timing.
+    // Owner wall phases: selection to first output, then result consumption.
+    // Include admission, transport, sinks and acknowledgement, not kernel or
+    // pure network timing. Local generation uses the same output boundary.
     uint64_t work_units = 0, elapsed_ns = 0, execution_ns = 0, transfer_ns = 0;
     uint64_t input_bytes = 0, output_bytes = 0;
     bool local_direct = false;

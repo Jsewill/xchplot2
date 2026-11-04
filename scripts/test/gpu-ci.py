@@ -267,7 +267,7 @@ def main():
                                 f"{vector['meta_group']} {'raw-v2' if vector['raw'] else 'gplot-v2'} "
                                 f"{vector['group_id']} {vector['memo']} . {plot.name}\n")
                             command = [binary, "batch", manifest, "--devices", "0", "--tier", tier,
-                                       "--no-progress", "--config", "/dev/null"]
+                                       "--verbose", "--no-progress", "--config", "/dev/null"]
                             if spill:
                                 command += ["--max-host-ram", "min", "--temp-dir", work]
                             plot_env = (dict(env, POS2GPU_MAX_VRAM_MB=str(caps[tier]))

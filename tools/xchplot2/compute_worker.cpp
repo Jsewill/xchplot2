@@ -1,6 +1,7 @@
 #include "host/ComputeWorker.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
+#include "compute_output.hpp"
 
 #include <csignal>
 #include <iostream>
@@ -27,8 +28,11 @@ unsigned small(char const* value)
     if (result > UINT32_MAX) throw std::runtime_error("worker integer exceeds supported range");
     return unsigned(result);
 }
-void help()
+void help(bool all)
 {
+#ifndef XCHPLOT2_GROUP_COMMANDS
+    all = true;
+#endif
     std::cout <<
 #ifdef XCHPLOT2_GROUP_COMMANDS
         "Usage: xchplot2 compute worker [OPTIONS]\n"
@@ -41,13 +45,14 @@ void help()
 #else
         "Usage: pos2_pr118_grow_worker --broker HOST:PORT --listen HOST:PORT\n"
 #endif
+        "  --cpus N --host-bytes SIZE   offered CPU and host RAM limits\n"
+        "  --backend cpu|gpu|auto   offered generation backend, default auto with saved setup\n"
+        "  --gpu-bytes N --device N --tier NAME   bounded GPU offer\n";
+    if (all) std::cout <<
         "  --advertise HOST:PORT     endpoint reachable by storage owners\n"
         "  --ca FILE --cert FILE --key FILE  mutual TLS credentials\n"
-        "  --cpus N --host-bytes SIZE   offered CPU and host RAM limits\n"
         "  --slots N                maximum active tasks, default 1\n"
         "  --generation-threads N   CPU permits per generation, default CPUs / slots\n"
-        "  --backend cpu|gpu|auto   offered generation backend, default auto with saved setup\n"
-        "  --gpu-bytes N --device N --tier NAME   bounded GPU offer\n"
         "  --max-frame-bytes N      bounded transport frame\n"
         "  --max-task-bytes N       bounded codec window and contribution scratch\n"
         "  --max-window-chunks N    maximum chunks per codec task\n"
@@ -55,6 +60,8 @@ void help()
         "  --task-timeout-ms N      maximum task duration\n"
         "  --tls-timeout-ms N       deadline for each TLS operation\n"
         "  --max-brokers N          bounded broker registrations, default 128\n";
+    else std::cout << "Use --help-all for TLS, transport and task limits.\n";
+    std::cout << pos2gpu::compute_output_help;
 }
 }
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -68,12 +75,13 @@ int main(int argc, char** argv)
         group_grow::WorkerConfig config;
         std::filesystem::path directory;
         std::vector<std::string> interfaces;
-        bool discover = true, discovery_set = false, backend_set = false, brokers_set = false, quiet = false;
+        bool discover = true, discovery_set = false, backend_set = false, brokers_set = false;
+        pos2gpu::ComputeOutputOptions output;
         for (int i = 1; i < argc; ++i)
         {
             std::string option(argv[i]);
-            if (option == "--help" || option == "-h") { help(); return 0; }
-            if (option == "--quiet" || option == "-q") { quiet = true; continue; }
+            if (option == "--help" || option == "-h" || option == "--help-all") { help(option == "--help-all"); return 0; }
+            if (output.parse(option)) continue;
             if (option == "--no-discovery") { discover = false; discovery_set = true; continue; }
             if (i + 1 == argc) throw std::runtime_error("missing worker option value");
             auto const value = argv[++i];
@@ -109,6 +117,7 @@ int main(int argc, char** argv)
             else if (option == "--max-brokers") { config.max_brokers = small(value); brokers_set = true; }
             else throw std::runtime_error("unknown worker option: " + option);
         }
+        output.validate();
         std::optional<group_grow::pool::PoolIdentity> identity;
 #ifdef XCHPLOT2_GROUP_COMMANDS
         if (config.tls.ca_file.empty() && config.tls.cert_file.empty() && config.tls.key_file.empty())
@@ -142,7 +151,7 @@ int main(int argc, char** argv)
             {
                 discovery = std::make_shared<group_grow::pool::ComputeDiscovery>(announcement);
                 config.discover_brokers = [discovery] { return discovery->brokers(); };
-                if (!quiet && discovery->status() != "LAN discovery active") std::cerr << discovery->status() << '\n';
+                if (discovery->status() != "LAN discovery active") std::cerr << discovery->status() << '\n';
             }
             group_grow::default_worker_resources(config);
         }
@@ -157,13 +166,16 @@ int main(int argc, char** argv)
         std::signal(SIGINT, stop); std::signal(SIGTERM, stop);
         config.identity_reservation = group_grow::WorkerService::reserve_identity(config.tls.cert_file);
         auto capacity = config.capacity;
+        if (output.details())
+            std::cerr << "Worker limits: " << capacity.slots << " slots, " << capacity.gpu_bytes << " GPU bytes; backend "
+                << config.backend << ", generation threads " << config.generation_threads << ", broker limit " << config.max_brokers << '\n';
         group_grow::WorkerService worker(std::move(config)); worker.start();
         if (identity && discover)
         {
             announcement.role = "worker"; announcement.endpoint = worker.endpoint();
             advertisement = std::make_unique<group_grow::pool::ComputeDiscovery>(std::move(announcement));
         }
-        if (!quiet) std::cout << "Sharing " << capacity.cpu_threads << " CPU threads and " << capacity.host_bytes
+        if (!output.quiet) std::cout << "Sharing " << capacity.cpu_threads << " CPU threads and " << capacity.host_bytes
             << " bytes of host RAM on port " << worker.endpoint().port << ". Waiting for plotting work.\n" << std::flush;
         while (!stopped) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         worker.stop(); return 0;

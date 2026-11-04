@@ -534,14 +534,20 @@ struct BrokerServer::Impl
         return it != owners.end() && job.lease && it->second.session.token == job.lease->owner_session &&
             it->second.session.generation == job.lease->owner_generation;
     }
-    Resources available(std::string const& identity, Worker const& worker) const
+    using Availability = std::map<std::string, Resources>;
+    Availability available() const
     {
-        auto result = worker.offer.capacity;
+        Availability result;
+        for (auto const& [identity, worker] : workers) result.emplace(identity, worker.offer.capacity);
         for (auto const& [key, job] : jobs)
-            if (reserved(job) && job.lease->worker_identity == identity)
+            if (reserved(job))
             {
-                if (!fits(job.lease->task.resources, result)) return Resources{0, 0, 0, 0};
-                subtract(result, job.lease->task.resources);
+                // Reservations fence the node identity, including cancelled
+                // work whose original worker process has disappeared.
+                auto at = result.find(job.lease->worker_identity);
+                if (at == result.end()) continue;
+                if (!fits(job.lease->task.resources, at->second)) at->second = Resources{0, 0, 0, 0};
+                else subtract(at->second, job.lease->task.resources);
             }
         return result;
     }
@@ -642,15 +648,20 @@ struct BrokerServer::Impl
     }
     void schedule()
     {
+        auto capacity = available();
+        std::map<std::string, std::vector<Job*>> queued;
+        for (auto& [key, job] : jobs)
+            if (job.state == State::Queued && owners.contains(job.owner)) queued[job.owner].push_back(&job);
+        for (auto& [owner, queue] : queued)
+            std::sort(queue.begin(), queue.end(), [](Job const* a, Job const* b)
+            { return a->requested.sequence < b->requested.sequence; });
         // Weighted virtual service chooses among ready owners. Idle shares are
         // lent immediately; queued incompatible work does not block peers.
         for (;;)
         {
             advance_service_floor();
             std::vector<std::string> waiting;
-            for (auto const& [key, value] : owners)
-                if (std::any_of(jobs.begin(), jobs.end(), [&](auto const& entry)
-                    { return entry.second.owner == key && entry.second.state == State::Queued; })) waiting.push_back(key);
+            for (auto const& [key, queue] : queued) if (!queue.empty()) waiting.push_back(key);
             if (waiting.empty()) return;
             auto start = std::upper_bound(waiting.begin(), waiting.end(), last_owner);
             std::rotate(waiting.begin(), start, waiting.end());
@@ -659,19 +670,18 @@ struct BrokerServer::Impl
             bool granted = false;
             for (auto const& owner_id : waiting)
             {
-                auto job_it = jobs.end();
-                for (auto it = jobs.begin(); it != jobs.end(); ++it)
+                auto& queue = queued.at(owner_id);
+                auto job_it = queue.end();
+                for (auto it = queue.begin(); it != queue.end(); ++it)
                 {
-                    if (it->second.owner != owner_id || it->second.state != State::Queued ||
-                        (job_it != jobs.end() && it->second.requested.sequence >= job_it->second.requested.sequence)) continue;
                     bool const ready = std::any_of(workers.begin(), workers.end(), [&](auto const& worker)
-                    { return eligible(it->second, worker.first, worker.second, available(worker.first, worker.second)).has_value(); });
+                    { return eligible(**it, worker.first, worker.second, capacity.at(worker.first)).has_value(); });
                     // Keep blocked jobs' original sequence so they regain FIFO
                     // priority as soon as a compatible worker has room.
-                    if (ready) job_it = it;
+                    if (ready) { job_it = it; break; }
                 }
-                if (job_it == jobs.end()) continue;
-                auto& job = job_it->second;
+                if (job_it == queue.end()) continue;
+                auto& job = **job_it;
                 std::vector<std::string> candidates;
                 for (auto const& [identity, worker] : workers) candidates.push_back(identity);
                 auto worker_start = std::upper_bound(candidates.begin(), candidates.end(), last_worker);
@@ -687,7 +697,7 @@ struct BrokerServer::Impl
                     auto& worker = workers.at(identity);
                     for (auto const kind : {Kind::GenerateGpu, Kind::GenerateCpu, Kind::Pack})
                     {
-                        auto selected = eligible(job, identity, worker, available(identity, worker), kind);
+                        auto selected = eligible(job, identity, worker, capacity.at(identity), kind);
                         if (!selected) continue;
                         auto const& sample = history(worker, job.requested, selected->kind, job.owner, selected->resources.cpu_threads);
                         uint64_t const age = assignments - sample.assigned;
@@ -718,6 +728,7 @@ struct BrokerServer::Impl
                     lease.worker_instance = worker.offer.instance; lease.endpoint = worker.offer.endpoint;
                     lease.task = job.requested; lease.task.kind = chosen_kind; lease.task.resources = chosen_resources; lease.ttl_ms = options.lease_ms;
                     job.lease = std::move(lease); job.state = State::Granted;
+                    subtract(capacity.at(identity), chosen_resources); queue.erase(job_it);
                     job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms); job.touched = Clock::now();
                     last_owner = owner_id; last_worker = identity; granted = true;
                     auto const share = options.owner_shares.find(owner.session.owner_id);
@@ -785,7 +796,7 @@ struct BrokerServer::Impl
                 (oldest == jobs.end() || it->second.touched < oldest->second.touched)) oldest = it;
         require(oldest != jobs.end(), "broker task capacity is full"); jobs.erase(oldest);
     }
-    WaitReason waiting(Job const& job) const
+    WaitReason waiting(Job const& job, Availability const& capacity) const
     {
         if (job.state == State::Cancelled) return WaitReason::OwnerCancelled;
         if (job.state != State::Queued) return WaitReason::None;
@@ -795,7 +806,7 @@ struct BrokerServer::Impl
             WaitReason candidate = WaitReason::None;
             if (eligible(job, identity, worker, worker.offer.capacity, {}, &candidate))
             {
-                if (eligible(job, identity, worker, available(identity, worker), {}, &candidate)) return WaitReason::FairQueue;
+                if (eligible(job, identity, worker, capacity.at(identity), {}, &candidate)) return WaitReason::FairQueue;
                 switch (candidate)
                 {
                 case WaitReason::CpuCapacity: reserved_reason = WaitReason::CpuReserved; break;
@@ -816,10 +827,20 @@ struct BrokerServer::Impl
         require(section >= StatusSection::Workers && section <= StatusSection::Jobs && limit && limit <= max_status_page_size,
             "invalid broker status page request");
         uint64_t queued = 0, granted = 0, running = 0, cancelled = 0;
+        auto const capacity = section == StatusSection::Owners ? Availability{} : available();
+        std::map<std::string, std::array<uint64_t, 4>> owner_counts;
+        if (section == StatusSection::Owners)
+            for (auto const& [key, owner] : owners) owner_counts.emplace(key, std::array<uint64_t, 4>{});
         for (auto const& [key, job] : jobs)
         {
             queued += job.state == State::Queued; granted += job.state == State::Granted;
             running += job.state == State::Running; cancelled += job.state == State::Cancelled;
+            if (auto at = owner_counts.find(job.owner); at != owner_counts.end())
+            {
+                auto& counts = at->second;
+                counts[0] += job.state == State::Queued; counts[1] += job.state == State::Granted;
+                counts[2] += job.state == State::Running; counts[3] += job.state == State::Cancelled;
+            }
         }
         auto const total = section == StatusSection::Workers ? workers.size() : section == StatusSection::Owners ? owners.size() : jobs.size();
         auto const count = cursor >= total ? 0 : std::min<uint64_t>(limit, total - cursor);
@@ -832,7 +853,7 @@ struct BrokerServer::Impl
         {
             if (selected())
             {
-                auto reserved_capacity = worker.offer.capacity; subtract(reserved_capacity, available(identity, worker));
+                auto reserved_capacity = worker.offer.capacity; subtract(reserved_capacity, capacity.at(identity));
                 response.string(identity); response.string(worker.offer.instance); response.string(worker.offer.compatibility);
                 write_endpoint(response, worker.offer.endpoint);
                 write_resources(response, worker.offer.capacity); write_resources(response, reserved_capacity);
@@ -845,12 +866,9 @@ struct BrokerServer::Impl
         {
             if (selected())
             {
-                uint64_t own_queued = 0, own_granted = 0, own_running = 0, own_cancelled = 0;
-                for (auto const& [task_key, job] : jobs) if (job.owner == key)
-                { own_queued += job.state == State::Queued; own_granted += job.state == State::Granted;
-                  own_running += job.state == State::Running; own_cancelled += job.state == State::Cancelled; }
-                response.string(owner.identity); response.string(owner.session.owner_id); response.u64(own_queued);
-                response.u64(own_granted); response.u64(own_running); response.u64(own_cancelled);
+                auto const& counts = owner_counts.at(key);
+                response.string(owner.identity); response.string(owner.session.owner_id); response.u64(counts[0]);
+                response.u64(counts[1]); response.u64(counts[2]); response.u64(counts[3]);
             }
             ++index; if (index >= cursor && index - cursor >= count) break;
         }
@@ -864,7 +882,7 @@ struct BrokerServer::Impl
                 response.string(owner != owners.end() ? owner->second.session.owner_id : job.lease ? job.lease->owner_id : "");
                 response.string(job.lease ? job.lease->worker_identity : ""); response.string(job.lease ? job.lease->worker_instance : "");
                 auto const& task = job.lease ? job.lease->task : job.requested;
-                response.u8(uint8_t(task.kind)); response.u8(uint8_t(job.state)); response.u8(uint8_t(waiting(job)));
+                response.u8(uint8_t(task.kind)); response.u8(uint8_t(job.state)); response.u8(uint8_t(waiting(job, capacity)));
                 write_resources(response, task.resources); response.u64(task.attempt); response.u64(task.work_units);
                 response.u64(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - job.created).count()));
                 response.u8(task.k); response.u8(task.strength);

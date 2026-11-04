@@ -17,9 +17,9 @@ nonzero-index reader extension. Files starting at nonzero indices use the
 0x82 extension; normal xchplot2 and upstream readers reject that extension.
 
 Farming requires a farmer that supports the PoS2 1.0 group format. Upstream
-[farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21396)
-remains in development; confirm support in your farmer release before plotting
-for production. Key generation includes the V2 taproot change from
+[farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21566)
+merged on 2026-10-28. Confirm support in your farmer release and network
+activation before plotting for production. Key generation includes the V2 taproot change from
 [chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
 
 ## Run the compatibility check

@@ -87,6 +87,9 @@ jobs:
       - name: Check GPU CI admission logic
         if: matrix.mode == 'plain'
         run: python3 scripts/test/gpu-ci-test.py
+      - name: Check growth benchmark measurement
+        if: matrix.mode == 'plain'
+        run: python3 -B scripts/test/group-benchmark-test.py
 
   hadolint:
     name: hadolint Containerfile

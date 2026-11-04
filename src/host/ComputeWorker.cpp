@@ -1654,6 +1654,178 @@ void WorkerService::contributions_local(uint8_t k, uint8_t strength, std::span<s
 
 namespace worker_detail
 {
+// Delivery hints are bounded, workload-specific observations of each worker
+// route. They do not replace the broker's resource or per-task admission.
+class GenerationPlanning
+{
+public:
+    static constexpr size_t maximum = 64;
+    struct Plan { unsigned batch = 1, concurrency = 2; };
+    explicit GenerationPlanning(unsigned timeout_ms) : lifetime_(timeout_ms) {}
+    uint64_t selected(WorkerTaskObservation const& value, pool::Endpoint const& route, Clock::time_point now = Clock::now())
+    {
+        if (!valid(value, route)) return 0;
+        require(selection_ != UINT64_MAX, "compute planning selection sequence exhausted");
+        auto const selection = ++selection_; retire(now);
+        auto const peer = key(value, route);
+        auto at = current(peer);
+        if (at == peers_.begin() + peer_count_)
+        {
+            if (peer_count_ == maximum)
+                at = std::min_element(peers_.begin(), peers_.end(),
+                    [](ActivePeer const& a, ActivePeer const& b) { return a.last < b.last; });
+            else at = peers_.begin() + peer_count_++;
+            *at = ActivePeer{};
+        }
+        // Only selection can activate an incarnation or route. Late success or
+        // failure from an older lease must not resurrect its previous path.
+        if (at->peer != peer)
+        {
+            erase([&](History const& item) { return item.peer.worker == peer.worker; });
+            at->peer = peer; at->first = selection;
+        }
+        at->last = selection; at->seen = now; at->sequence = sequence_;
+        return selection;
+    }
+    void observed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection,
+                  Clock::time_point now = Clock::now())
+    {
+        if (!valid(value, route)) return;
+        retire(now);
+        auto const peer = key(value, route); auto active = current(peer);
+        if (!accepts(active, peer, selection)) return;
+        if (sequence_ == UINT64_MAX) { count_ = peer_count_ = 0; sequence_ = 0; return; }
+        active->sequence = ++sequence_; active->seen = now; retire(now);
+        if (!value.execution_ns || !value.transfer_ns) return;
+        auto at = find(value, peer);
+        if (at == histories_.begin() + count_)
+        {
+            if (count_ == maximum)
+                at = std::min_element(histories_.begin(), histories_.end(),
+                    [](History const& a, History const& b) { return a.sequence < b.sequence; });
+            else at = histories_.begin() + count_++;
+            *at = History{}; at->peer = peer; at->kind = value.kind; at->k = value.k; at->strength = value.strength;
+        }
+        at->seen = now; at->sequence = sequence_;
+        int const direction = value.execution_ns > value.transfer_ns ? 1 : value.execution_ns < value.transfer_ns ? -1 : 0;
+        at->votes = direction && direction == at->direction ? at->votes + 1 : unsigned(direction != 0);
+        at->direction = direction;
+        // A single noisy completion must not change every following request.
+        if (at->votes < 3) return;
+        at->votes = 0;
+        if (direction > 0)
+        { at->plan.batch = std::min(unsigned(pool::max_generation_batch_members), at->plan.batch + 1);
+          at->plan.concurrency = std::min(64u, at->plan.concurrency + 1); }
+        else
+        { at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2); }
+    }
+    void failed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection,
+                Clock::time_point now = Clock::now())
+    {
+        if (!valid(value, route)) return;
+        retire(now); auto const peer = key(value, route);
+        if (!accepts(current(peer), peer, selection)) return;
+        auto at = find(value, peer);
+        if (at == histories_.begin() + count_) return;
+        at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2);
+        at->votes = 0; at->direction = 0;
+    }
+    Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, Clock::time_point now = Clock::now())
+    {
+        retire(now);
+        std::array<unsigned, maximum> batches{}, concurrency{};
+        std::array<History const*, maximum> representatives{}; size_t count = 0;
+        for (size_t i = 0; i < count_; ++i)
+        {
+            auto const& item = histories_[i];
+            if (item.k != k || item.strength != strength || (kind != pool::Kind::GenerateAny && item.kind != kind)) continue;
+            size_t at = 0;
+            while (at < count && representatives[at]->peer.worker != item.peer.worker) ++at;
+            if (at == count) { representatives[count] = &item; ++count; }
+            // GenerateAny may have CPU and GPU samples for the same peer.
+            // Count that worker once, using its less constrained backend.
+            batches[at] = std::max(batches[at], item.plan.batch);
+            concurrency[at] = std::max(concurrency[at], item.plan.concurrency);
+        }
+        if (!count) return {};
+        // The worker is unknown before leasing. Use a representative active
+        // route, so a slow minority or a departed worker cannot pin the fleet.
+        std::sort(batches.begin(), batches.begin() + count); std::sort(concurrency.begin(), concurrency.begin() + count);
+        return {batches[count / 2], concurrency[count / 2]};
+    }
+private:
+    // Fixed protocol-sized keys keep the history entirely inside the client's
+    // sizeof(Impl) memory reservation, including its replacement path.
+    struct Peer
+    {
+        std::array<char, 64> worker{}, instance{};
+        std::array<char, 253> host{}, server_name{};
+        uint16_t port = 0;
+        bool local = false;
+        bool operator==(Peer const&) const = default;
+    };
+    struct History
+    {
+        Peer peer;
+        pool::Kind kind = pool::Kind::GenerateCpu;
+        uint8_t k = 0, strength = 0;
+        Plan plan;
+        uint64_t sequence = 0;
+        Clock::time_point seen{};
+        int direction = 0;
+        unsigned votes = 0;
+    };
+    struct ActivePeer
+    {
+        Peer peer;
+        uint64_t first = 0, last = 0, sequence = 0;
+        Clock::time_point seen{};
+    };
+    static bool valid(WorkerTaskObservation const& value, pool::Endpoint const& route)
+    {
+        return (value.kind == pool::Kind::GenerateCpu || value.kind == pool::Kind::GenerateGpu) &&
+            value.k >= 18 && value.k <= 28 && !(value.k & 1) && value.strength <= 32 && value.work_units &&
+            !value.worker_identity.empty() && value.worker_identity.size() <= 64 &&
+            !value.worker_instance.empty() && value.worker_instance.size() <= 64 &&
+            route.host.size() <= 253 && route.server_name.size() <= 253;
+    }
+    template<size_t Size> static std::array<char, Size> text(std::string const& value)
+    { std::array<char, Size> result{}; std::copy(value.begin(), value.end(), result.begin()); return result; }
+    static Peer key(WorkerTaskObservation const& value, pool::Endpoint const& route)
+    { return {text<64>(value.worker_identity), text<64>(value.worker_instance), text<253>(route.host),
+        text<253>(route.server_name), route.port, value.local_direct}; }
+    std::array<History, maximum>::iterator find(WorkerTaskObservation const& value, Peer const& peer)
+    {
+        return std::find_if(histories_.begin(), histories_.begin() + count_, [&](History const& item)
+        { return item.peer == peer && item.kind == value.kind && item.k == value.k && item.strength == value.strength; });
+    }
+    std::array<ActivePeer, maximum>::iterator current(Peer const& peer)
+    {
+        return std::find_if(peers_.begin(), peers_.begin() + peer_count_, [&](ActivePeer const& item)
+        { return item.peer.worker == peer.worker; });
+    }
+    bool accepts(std::array<ActivePeer, maximum>::iterator at, Peer const& peer, uint64_t selection) const
+    { return selection && at != peers_.begin() + peer_count_ && at->peer == peer && selection >= at->first && selection <= at->last; }
+    template<class Predicate> void erase(Predicate predicate)
+    {
+        auto end = std::remove_if(histories_.begin(), histories_.begin() + count_, predicate);
+        count_ = size_t(end - histories_.begin());
+    }
+    void retire(Clock::time_point now)
+    {
+        auto end = std::remove_if(peers_.begin(), peers_.begin() + peer_count_, [&](ActivePeer const& item)
+        { return sequence_ - item.sequence >= maximum || now - item.seen >= lifetime_; });
+        peer_count_ = size_t(end - peers_.begin());
+        erase([&](History const& item)
+        { auto at = current(item.peer); return sequence_ - item.sequence >= maximum || now - item.seen >= lifetime_ ||
+            at == peers_.begin() + peer_count_ || at->peer != item.peer; });
+    }
+    std::array<History, maximum> histories_{};
+    std::array<ActivePeer, maximum> peers_{};
+    size_t count_ = 0, peer_count_ = 0;
+    uint64_t sequence_ = 0, selection_ = 0;
+    std::chrono::milliseconds lifetime_;
+};
 struct TaskState { uint64_t sequence = 0, next_attempt = 1, touched = 0; };
 struct RetryHandle
 {
@@ -1717,11 +1889,10 @@ struct WorkerClient::Impl
     pool::OwnerSession owner;
     std::timed_mutex sequence_mutex;
     worker_detail::TaskRegistry task_states;
-    struct Planning { unsigned batch = 1, concurrency = 2; };
     mutable std::mutex planning_mutex;
-    std::array<std::array<Planning, 33>, 6> planning;
+    worker_detail::GenerationPlanning planning;
     explicit Impl(WorkerClientConfig options) : config(std::move(options)), broker(config.broker, config.tls),
-        generation_admission(0, config.max_active_generation, 0)
+        generation_admission(0, config.max_active_generation, 0), planning(config.task_timeout_ms)
     {
         if (config.compatibility.empty()) config.compatibility = worker_compatibility();
         require(!config.compatibility.empty() && !config.owner_id.empty(), "compute client requires a compatibility identity and persistent owner ID");
@@ -1790,19 +1961,9 @@ struct WorkerClient::Impl
         ~GenerationLease() { impl.active_generation.fetch_sub(1); }
         GenerationLease(GenerationLease const&) = delete;
     };
-    void observed(WorkerTaskObservation const& value)
+    void observed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection)
     {
-        if (value.kind != pool::Kind::Pack && value.k >= 18 && value.k <= 28 && !(value.k & 1) && value.strength <= 32)
-        {
-            std::lock_guard lock(planning_mutex); auto& plan = planning[(value.k - 18) / 2][value.strength];
-            // Amortize setup while generation dominates observed delivery.
-            // A transfer-heavy result instead reduces in-flight pressure.
-            if (value.execution_ns >= value.transfer_ns)
-            { plan.batch = std::min(unsigned(pool::max_generation_batch_members), plan.batch + 1);
-              plan.concurrency = std::min(64u, plan.concurrency + 1); }
-            else
-            { plan.batch = std::max(1u, plan.batch / 2); plan.concurrency = std::max(1u, plan.concurrency / 2); }
-        }
+        { std::lock_guard lock(planning_mutex); planning.observed(value, route, selection); }
         if (config.observe) try { config.observe(value); } catch (...) {}
     }
     struct Connection
@@ -1821,6 +1982,7 @@ struct WorkerClient::Impl
         std::shared_ptr<WorkerService> local_service;
         Clock::time_point selected_at = Clock::now(), first_output{};
         WorkerTaskOptions options;
+        uint64_t planning_selection = 0;
         WorkerTaskObservation observation() const
         {
             WorkerTaskObservation result; result.worker_identity = lease.worker_identity;
@@ -1849,10 +2011,7 @@ struct WorkerClient::Impl
                 if (!declined)
                 {
                     impl.failures.fetch_add(1);
-                    if (lease.task.kind != pool::Kind::Pack && lease.task.k >= 18 && lease.task.k <= 28 && lease.task.strength <= 32)
-                    { std::lock_guard lock(impl.planning_mutex);
-                      auto& plan = impl.planning[(lease.task.k - 18) / 2][lease.task.strength];
-                      plan.batch = std::max(1u, plan.batch / 2); plan.concurrency = std::max(1u, plan.concurrency / 2); }
+                    { std::lock_guard lock(impl.planning_mutex); impl.planning.failed(observation(), lease.endpoint, planning_selection); }
                 }
                 if (declined) try { impl.cleanup_control().cancel(session, lease.task.task_id, lease.task.attempt); } catch (...) {}
                 else if (!resource_rejected) try { impl.cleanup_control().abandon(lease); } catch (...) {}
@@ -1868,7 +2027,7 @@ struct WorkerClient::Impl
             completed = true;
             if (local_direct) impl.local_tasks.fetch_add(1);
             impl.task_elapsed_ns.fetch_add(uint64_t(std::max<int64_t>(0, elapsed)));
-            auto const value = observation(); impl.observed(value);
+            auto const value = observation(); impl.observed(value, lease.endpoint, planning_selection);
             if (options.observe) try { options.observe(value); } catch (...) {}
         }
     };
@@ -1921,6 +2080,10 @@ struct WorkerClient::Impl
         connection->options = options;
         connection->local_service = local_service();
         connection->local_direct = connection->local_service && connection->local_service->owns(*lease);
+        {
+            std::lock_guard lock(planning_mutex); connection->selected_at = Clock::now();
+            connection->planning_selection = planning.selected(connection->observation(), lease->endpoint, connection->selected_at);
+        }
         try
         {
             if (config.selected) config.selected(connection->observation());
@@ -1953,11 +2116,13 @@ struct WorkerClient::Impl
         if (connection->local_direct)
         {
             connection->logical_input_bytes = multiply(ids.size(), sizeof(ids.front()));
+            auto first_output = [&]
+            { if (connection->first_output == Clock::time_point{}) connection->first_output = Clock::now(); };
             auto packed = [&](PackedFragmentTile const& tile, uint64_t count)
-            { connection->logical_output_bytes = add(connection->logical_output_bytes,
+            { first_output(); connection->logical_output_bytes = add(connection->logical_output_bytes,
                 add(tile.boundaries.size_bytes(), tile.words.size_bytes())); packed_sink(tile, count); };
             auto contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
-            { connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
+            { first_output(); connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
               contribution_sink(ordinal, bytes, members); };
             try
             {
@@ -2204,7 +2369,7 @@ unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsi
 {
     (void)parameters(k, strength); if (!maximum) return 0;
     unsigned value;
-    { std::lock_guard lock(impl_->planning_mutex); value = impl_->planning[(k - 18) / 2][strength].batch; }
+    { std::lock_guard lock(impl_->planning_mutex); value = impl_->planning.suggested(k, strength, impl_->config.generation_kind).batch; }
     // Hints share the control pool and use a short optional deadline. Failure
     // leaves the learned bounded policy usable during a broker outage.
     try
@@ -2228,12 +2393,13 @@ unsigned WorkerClient::suggested_generation_concurrency(uint8_t k, uint8_t stren
 {
     (void)parameters(k, strength); if (!maximum) return 0;
     std::lock_guard lock(impl_->planning_mutex);
-    return std::max(1u, std::min(maximum, impl_->planning[(k - 18) / 2][strength].concurrency));
+    return std::max(1u, std::min(maximum, impl_->planning.suggested(k, strength, impl_->config.generation_kind).concurrency));
 }
 uint64_t WorkerClient::memory_bytes()
 {
-    // Includes bounded keys, hash nodes/buckets (including replacement growth),
-    // shared task records and allocator overhead. Session TLS is per-call.
+    // sizeof(Impl) includes fixed worker/route planning histories and keys.
+    // Also reserve hash nodes/buckets (including replacement growth), shared
+    // retry records and allocator overhead. Session TLS is per-call.
     return sizeof(Impl) + pool::BrokerClient::memory_bytes() + uint64_t(worker_detail::TaskRegistry::maximum) *
         (sizeof(worker_detail::TaskState) + sizeof(worker_detail::RetryHandle) + sizeof(std::shared_ptr<worker_detail::TaskState>) + 1024);
 }

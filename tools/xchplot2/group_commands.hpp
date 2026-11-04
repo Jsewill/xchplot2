@@ -8,9 +8,12 @@ inline unsigned group_option_values(std::string_view option)
     if (option == "--relocate") return 2;
     if (option == "--" || !option.starts_with('-') || option == "--resume" || option == "-r" ||
         option == "--no-resume" || option == "--plan-only" || option == "--no-plan-only" ||
+        option == "--metadata-only" || option == "--no-metadata-only" ||
+        option == "--assess-jobs" || option == "--no-assess-jobs" ||
+        option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" ||
         option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
         option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||
-        option == "--progress" || option == "--no-progress" || option == "--help" || option == "-h" ||
+        option == "--progress" || option == "--no-progress" || option == "--help" || option == "--help-all" || option == "-h" ||
         option == "--extend" || option == "--no-extend" || option == "--allow-missing" || option == "--no-allow-missing") return 0;
     return 1;
 }

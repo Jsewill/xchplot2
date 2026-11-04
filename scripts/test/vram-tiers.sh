@@ -28,7 +28,7 @@ for spec in "$@"; do
     echo "Checking $tier at ${cap} MiB free (peak $peak + buffer $buffer)"
     if ! POS2GPU_MAX_VRAM_MB=$cap POS2GPU_VRAM_MARGIN_MB=$buffer POS2GPU_ASSERT_VRAM=1 \
         "$binary" bench --devices "$device" --tier "$tier" -k 28 -n 3 --warmup 0 \
-        --out "$test_dir" --config /dev/null > "$run_log" 2>&1; then
+        --verbose --out "$test_dir" --config /dev/null > "$run_log" 2>&1; then
         cat "$run_log" >&2
         exit 1
     fi

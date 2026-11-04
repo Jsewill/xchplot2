@@ -443,8 +443,89 @@ void ssd_backlog(fs::path const& directory)
     require(io && !unknown.try_io(1), "backlog ranking weakened unknown-resource I/O exclusion");
     io.reset(); unknown.cancel(0); unknown.cancel(1);
 }
+void nvme_topology()
+{
+    auto field = [](std::string_view name)
+    {
+        std::array<uint8_t, 256> encoded{};
+        require(name.size() < encoded.size(), "NQN test fixture is too large");
+        std::copy(name.begin(), name.end(), encoded.begin()); return encoded;
+    };
+    std::string const first = "nqn.2026-11.com.example:namespace-\xc3\xa9-\xf0\x9f\x8c\xb1";
+    std::string const second = "nqn.2014-08.org.nvmexpress:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    require(storage_detail::nvme_subsystem_name(field(first)) == first && storage_detail::nvme_subsystem_name(field(second)) == second,
+        "documented Unicode/domain or UUID subsystem identity was changed");
+    for (auto const& invalid : std::vector<std::string>{
+        "", "independent-controller", "nqn.", "nqn.0000-11.com.example:value", "nqn.2026-00.com.example:value",
+        "nqn.2026-13.com.example:value", "nqn.2026-11.example:value", "nqn.2026-11.com..example:value",
+        "nqn.2026-11.com.example.:value", "nqn.2026-11.com.-example:value", "nqn.2026-11.com.example",
+        "nqn.2026-11.com.example:", "nqn.2026-11.com.example:value\n", "nqn.2026-11.com.example:value with space",
+        "nqn.2026-11.com.example:\xed\xa0\x80", "nqn.2026-11.com.example:\xe2\x82",
+        "nqn.2014-08.org.nvmexpress:arbitrary", "nqn.2014-08.ORG.NVMEXPRESS:arbitrary",
+        "nqn.2014-08.org.nvmexpress:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bfz",
+        "nqn.2014-08.org.nvmexpress:uuid:f81d4fae_7dec-11d0-a765-00a0c91e6bf6"})
+        require(storage_detail::nvme_subsystem_name(field(invalid)).empty(), "malformed NQN established independent storage");
+    auto maximum = std::string("nqn.2026-11.com.example:"); maximum.append(223 - maximum.size(), 'x');
+    require(storage_detail::nvme_subsystem_name(field(maximum)) == maximum &&
+        storage_detail::nvme_subsystem_name(field(maximum + 'x')).empty(), "NQN byte limit was not enforced");
+    auto unterminated = field(first); unterminated.fill('x');
+    auto const complete = field(first);
+    require(storage_detail::nvme_subsystem_name(unterminated).empty() &&
+        storage_detail::nvme_subsystem_name(std::span(complete).first(223)).empty(),
+        "unterminated or truncated subsystem identity was accepted");
+    std::vector<StorageDevice> devices{
+        {"a", {"windows:disk:0", "windows:nvme:" + first}},
+        {"b", {"windows:disk:1", "windows:nvme:" + first}},
+        {"c", {"windows:disk:2", "windows:nvme:" + second}},
+        {"alias-a", {"windows:disk:0", "windows:nvme:" + first}}};
+    auto groups = writer_groups(devices);
+    require(groups[0] == groups[1] && groups[0] == groups[3] && groups[0] != groups[2],
+        "NVMe namespace/partition aliases or distinct subsystems received incorrect writer groups");
+    devices.push_back({"unresolved", {}}); groups = writer_groups(devices);
+    require(std::all_of(groups.begin(), groups.end(), [&](size_t group) { return group == groups.front(); }),
+        "unresolved NVMe topology bypassed conservative whole-job serialization");
+#ifdef _WIN32
+    constexpr size_t offset = sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR);
+    std::vector<uint8_t> reply(offset + sizeof(NVME_IDENTIFY_CONTROLLER_DATA));
+    STORAGE_PROTOCOL_DATA_DESCRIPTOR descriptor{}; descriptor.Version = descriptor.Size = sizeof(descriptor);
+    auto& protocol = descriptor.ProtocolSpecificData; protocol.ProtocolType = ProtocolTypeNvme; protocol.DataType = NVMeDataTypeIdentify;
+    protocol.ProtocolDataRequestValue = NVME_IDENTIFY_CNS_CONTROLLER;
+    protocol.ProtocolDataOffset = sizeof(protocol); protocol.ProtocolDataLength = sizeof(NVME_IDENTIFY_CONTROLLER_DATA);
+    NVME_IDENTIFY_CONTROLLER_DATA controller{}; controller.VID = 1; controller.NN = 1;
+    std::copy(first.begin(), first.end(), controller.SUBNQN);
+    auto encode = [&]
+    { std::memcpy(reply.data(), &descriptor, sizeof(descriptor)); std::memcpy(reply.data() + offset, &controller, sizeof(controller)); };
+    encode(); require(storage_detail::nvme_subsystem_reply(reply) == first, "valid Windows Identify reply lost subsystem identity");
+    require(storage_detail::nvme_subsystem_reply(std::span(reply).first(sizeof(descriptor) - 1)).empty(),
+        "short Windows Identify descriptor was accepted");
+    for (unsigned invalid = 0; invalid < 10; ++invalid)
+    {
+        auto changed = descriptor;
+        switch (invalid)
+        {
+        case 0: changed.Version = 0; break;
+        case 1: changed.Size = 0; break;
+        case 2: changed.Size = DWORD(reply.size() + 1); break;
+        case 3: changed.ProtocolSpecificData.ProtocolType = ProtocolTypeUnknown; break;
+        case 4: changed.ProtocolSpecificData.DataType = NVMeDataTypeLogPage; break;
+        case 5: changed.ProtocolSpecificData.ProtocolDataRequestValue = NVME_IDENTIFY_CNS_SPECIFIC_NAMESPACE; break;
+        case 6: changed.ProtocolSpecificData.ProtocolDataOffset = 0; break;
+        case 7: changed.ProtocolSpecificData.ProtocolDataOffset = UINT32_MAX; break;
+        case 8: changed.ProtocolSpecificData.ProtocolDataLength = UINT32_MAX; break;
+        case 9: changed.ProtocolSpecificData.ProtocolDataLength = sizeof(NVME_IDENTIFY_CONTROLLER_DATA) - 1; break;
+        }
+        std::memcpy(reply.data(), &changed, sizeof(changed));
+        require(storage_detail::nvme_subsystem_reply(reply).empty(), "malformed Windows Identify descriptor established independence");
+    }
+    encode(); require(storage_detail::nvme_subsystem_reply(std::span(reply).first(reply.size() - 1)).empty(), "truncated controller payload was accepted");
+    controller.VID = 0; encode(); require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller vendor was accepted");
+    controller.VID = 1; controller.NN = 0; encode();
+    require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller namespaces were accepted");
+#endif
+}
 int main() try
 {
+    nvme_topology();
 #ifdef _WIN32
     fs::path directory;
     std::random_device random;

@@ -26,12 +26,12 @@ def check(binary, root, service_manager=False):
     sequence = 0
     directories = {name: root / name for name in ("authority", "worker", "owner")}
 
-    def command(name, *args):
-        return [str(binary), "compute", *map(str, args), "--directory", str(directories[name]), "--config", os.devnull]
+    def command(name, *args, config=os.devnull):
+        return [str(binary), "compute", *map(str, args), "--directory", str(directories[name]), "--config", str(config)]
 
-    def run(name, *args, code=0, env=None):
+    def run(name, *args, code=0, env=None, config=os.devnull):
         nonlocal sequence
-        result = subprocess.run(command(name, *args), capture_output=True, text=True, encoding="utf-8", timeout=30, env=env)
+        result = subprocess.run(command(name, *args, config=config), capture_output=True, text=True, encoding="utf-8", timeout=30, env=env)
         sequence += 1
         (root / f"{sequence:03d}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
@@ -82,8 +82,13 @@ def check(binary, root, service_manager=False):
         for name in ("members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import",
                      "status", "pause", "drain", "resume", "service"):
             assert "Usage:" in run("authority", name, "--help").stdout
+        for name, advanced in (("worker", "--max-task-bytes"), ("broker", "--max-tasks")):
+            common = run("authority", name, "--help").stdout
+            detailed = run("authority", name, "--help-all").stdout
+            assert "--verbose" in common and advanced not in common and advanced in detailed
         assert not status("authority")["configured"]
-        run("authority", "init", "--name", "authority")
+        initialized = run("authority", "init", "--name", "authority", "--quiet")
+        assert "Created pool" in initialized.stdout and "Plot, fill" not in initialized.stdout
         for name in ("worker", "owner"):
             invitation = root / (name + ".invite")
             run("authority", "invite", invitation, "--name", name)
@@ -93,14 +98,38 @@ def check(binary, root, service_manager=False):
         for name in directories:
             run(name, "configure", "--discovery", "off", "--broker", broker_address,
                 "--backend", "cpu", "--cpus", 2, "--host-bytes", "1G", "--max-brokers", 32)
+        config = root / "verbose.toml"
+        config.write_text("[defaults]\nverbose=true\nquiet=false\n", encoding="utf-8")
+        assert "Usage:" in run("authority", "service", "--help", config=config).stdout
+        common = run("authority", "status").stdout
+        detailed = run("authority", "status", config=config).stdout
+        assert "Machine: authority" in common and "Node:" not in common and "Offered defaults:" not in common
+        assert "Node:" in detailed and "Certificate expires:" in detailed and "Offered defaults:" in detailed
+        assert run("authority", "status", "--no-verbose", config=config).stdout == common
+        quiet = run("authority", "status", "--no-verbose", "-q", config=config).stdout
+        assert "No authenticated live services" in quiet and "Machine:" not in quiet
+        run("authority", "status", "-q", config=config, code=1)
+        assert status("authority") == json.loads(run("authority", "status", "--json", config=config).stdout)
+        assert run("authority", "status", "--json", "--no-json").stdout == common
+        roster = run("authority", "members").stdout
+        assert " active authority" in roster and "Policy generation:" not in roster
+        assert run("authority", "members", "-q").stdout == roster
+        assert "Policy generation:" in run("authority", "members", config=config).stdout
+        print("PASS concise/verbose/quiet output, configuration overrides and invariant JSON status", flush=True)
         broker = start("authority", "broker", "--listen", broker_address, "--worker-ms", 3000,
-                       "--lease-ms", 3000, port=broker_port)
+                       "--lease-ms", 3000, "--verbose", "--no-verbose", port=broker_port)
         worker_args = ("worker", "--listen", worker_address, "--slots", 1, "--generation-threads", 1,
-                       "--max-frame-bytes", "64K", "--max-task-bytes", "16M")
+                       "--max-frame-bytes", "64K", "--max-task-bytes", "16M", "--quiet", "--no-quiet")
         worker = start("worker", *worker_args, port=worker_port)
         live = until(lambda: (value if (value := status("owner", "--worker", worker_address))["workers"] else None))
         worker_node = live["workers"][0]["node_id"]
         assert live["workers"][0]["broker_limit"] == 32
+        common = run("owner", "status", "--worker", worker_address).stdout
+        detailed = run("owner", "status", "--worker", worker_address, "-v").stdout
+        quiet = run("owner", "status", "--worker", worker_address, "-q").stdout
+        assert "Worker " + worker_address in common and "host bytes" not in common
+        assert "host bytes" in detailed and "Brokers:" in detailed
+        assert "Worker " + worker_address in quiet and "Machine:" not in quiet
         run("owner", "pause", "--worker", worker_address, code=1)
         paused = json.loads(run("worker", "pause", "--worker", worker_address, "--json").stdout)
         assert paused["changed"] == 1 and paused["workers"][0]["admission"] == "paused"
@@ -191,17 +220,25 @@ def check(binary, root, service_manager=False):
         environment["PATH"] = str(fake) + os.pathsep + environment["PATH"]
         printed = run("authority", "service", "print", env=environment).stdout
         assert "Type=exec" in printed and "Restart=on-failure" in printed and " compute worker " in printed
+        assert run("authority", "service", "print", "-q", env=environment).stdout == printed
+        assert run("authority", "service", "print", env=environment, config=config).stdout == printed
         assert not calls.exists()
         run("authority", "service", "install", env=environment)
         units = list((Path(environment["XDG_CONFIG_HOME"]) / "systemd/user").glob("*.service"))
         assert len(units) == 1 and units[0].read_text() == printed
         for action in ("start", "status", "stop", "restart"):
             run("authority", "service", action, env=environment)
+        run("authority", "service", "status", "-v", env=environment)
+        run("authority", "service", "status", "-q", env=environment)
+        run("authority", "service", "stop", "-q", env=environment)
         run("authority", "service", "remove", env=environment)
         assert not units[0].exists()
         recorded = [json.loads(line) for line in calls.read_text().splitlines()]
         assert all(call[:2] == ["--user", "--no-pager"] for call in recorded)
         assert recorded[1][2:] == ["enable", "--now", units[0].name]
+        assert ["--user", "--no-pager", "is-active", units[0].name] in recorded
+        assert ["--user", "--no-pager", "status", units[0].name] in recorded
+        assert ["--user", "--no-pager", "--quiet", "stop", units[0].name] in recorded
         assert recorded[-2][2:] == ["disable", "--now", units[0].name]
         # Refuse to overwrite a unit supplied by the user.
         units[0].write_text("[Service]\nExecStart=/bin/true\n")

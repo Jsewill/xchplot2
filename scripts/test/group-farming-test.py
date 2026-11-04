@@ -26,6 +26,14 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def farming_copy(path):
+    value = path.read_bytes()
+    assert len(value) >= 65 and value.endswith(b"\n"), path
+    assert hashlib.sha256(value[:-65]).hexdigest().encode() == value[-65:-1], path
+    assert path.stat().st_mode & 0o777 == 0o600 and path.stat().st_nlink == 1, path
+    return value
+
+
 def run(command, code=0, point=None, **kwargs):
     env = dict(os.environ)
     env.pop("XCHPLOT2_GROW_FAILPOINT", None)
@@ -58,7 +66,13 @@ def plan(result):
 
 
 def frozen_plan(value):
-    return {name: field for name, field in value.items() if name != "extent_assessment"}
+    # The source label changes on resume; the saved inputs and initial layout
+    # stay fixed while live extent admission has its own assessment.
+    result = {name: field for name, field in value.items() if name not in ("extent_assessment", "profile_input")}
+    result["destinations"] = [{name: field for name, field in lane.items()
+                               if name not in ("admitted_files", "sealed_files", "fill_stop")}
+                              for lane in value["destinations"]]
+    return result
 
 
 def metrics(result):
@@ -258,8 +272,53 @@ def saved_external_pairs(args, root, references, results, construction):
     print("PASS consecutive external saved-pair audit, prior-first recovery and bounds", flush=True)
 
 
+def compatible_builds(original, replacement, root, maximum_ram):
+    """Use genuinely different producers with the same explicit farm semantics."""
+    root.mkdir(mode=0o700)
+    original_job, replacement_job = root / "original job", root / "replacement job"
+    original_job.mkdir(mode=0o700)
+    replacement_job.mkdir(mode=0o700)
+    limits = ["--k", 18, "--strength", 2, "--backend", "cpu", "--max-ram", maximum_ram,
+              "--workers", 2, "--window-bytes", 65536, "--checkpoint-bytes", 65536,
+              "--capacity-bytes", 100000000, "--headroom-bytes", 0, "--construction", "incremental"]
+    policy = ["--group-members", "auto", "--max-total-members", 1, "--max-groups", 1]
+    keys = ["--farmer-pk", FARMER, "--pool-ph", POOL]
+    run([original, original_job, *limits, *policy, *keys, "--seed", SEED])
+    run([replacement, replacement_job, *limits, *policy, *keys, "--seed", OTHER_SEED])
+    manifests = [directory / "grow-farm.plan" for directory in (original_job, replacement_job)]
+    records = [farming_copy(path) for path in manifests]
+    producers = [json.loads(record.splitlines()[1]) for record in records]
+    assert producers[0] != producers[1], "compatibility fixture requires different source build identities"
+    assert all(record.startswith(b"ordinary-group-farming-v6\n") for record in records)
+    before = snapshot([original_job, replacement_job])
+    resumed = run([replacement, original_job, "--resume", *limits, *policy])
+    assert metrics(resumed)["generated_members"] == 0
+    assert snapshot([original_job, replacement_job]) == before, "compatible build changed completed job bytes or metadata"
+    assert farming_copy(manifests[0]) == records[0], "compatible build rewrote provenance or canonical digest"
+
+    # This same-file checkpoint has no farming manifest. Its exact construction
+    # identity must independently refuse the replacement build before writes.
+    pending = root / "pending.gplot"
+    pending_options = [pending, *limits, "--group-id", "ab" * 32, "--memo", "00" * 112,
+                       "--max-members", 1]
+    run([original, *pending_options], 86, "initialized")
+    before = snapshot([root])
+    refused = run([replacement, *pending_options, "--resume"], 1)
+    assert "same codec/build identity" in refused.stderr, refused.stderr
+    assert snapshot([root]) == before, "incompatible checkpoint inspection modified pending data"
+    run([original, *pending_options, "--resume"])
+    completed = digest(pending)
+    ordinary = run([replacement, *pending_options, "--resume"])
+    assert metrics(ordinary)["generated_members"] == 0 and digest(pending) == completed
+    print("PASS compatible completed-job recovery, canonical provenance and strict transient checkpoint identity", flush=True)
+    return {"original_producer": producers[0], "replacement_producer": producers[1],
+            "original_binary": digest(original), "replacement_binary": digest(replacement)}
+
+
 def check(args, root):
     results = {"backend": args.backend, "plans": [], "parity": [], "recovery": [], "rejections": []}
+    if args.replacement_grow:
+        results["compatibility"] = compatible_builds(args.grow, args.replacement_grow, root / "compatible builds", args.max_ram)
     keys = ["--seed", SEED, "--farmer-pk", FARMER, "--pool-ph", POOL]
     construction = ["--k", 18, "--strength", 2, "--backend", args.backend,
                     "--max-ram", args.max_ram, "--window-bytes", 65536,
@@ -365,7 +424,8 @@ def check(args, root):
     omitted = [args.grow, *options(opted), *keys, *construction, "--group-members", 2,
                "--max-total-members", 1, "--max-groups", 1, "--resume"]
     repeated = run([*omitted, "--backend", "gpu", "--device", 2147483647])
-    assert plan(repeated) == opted_preview and metrics(repeated)["generated_members"] == 0
+    assert plan(repeated) == {**opted_preview, "profile_input": "saved job"}
+    assert metrics(repeated)["generated_members"] == 0
     assert snapshot(opted) == before
     run([*omitted, "--group-members", 3], 1)
     assert snapshot(opted) == before
@@ -454,7 +514,7 @@ def check(args, root):
     before = snapshot(multiple)
     repeated = run([*command, "--resume", "--backend", "gpu", "--device", 2147483647])
     assert metrics(repeated)["generated_members"] == 0 and snapshot(multiple) == before
-    assert plan(repeated) == saved_plan
+    assert plan(repeated) == {**saved_plan, "profile_input": "saved job"}
     results["recovery"].append("planned multi-group fill, terminal partial and producer-free no-op")
 
     # Preview and apply must reserve the same manifest space. Resume with no
@@ -497,7 +557,7 @@ def check(args, root):
         assert len(completed) == 1
         result = run([*mixed_command, *keys, "--resume"])
         bounded(metrics(result), mixed, args.max_ram)
-        assert plan(result) == mixed_plan
+        assert plan(result) == {**mixed_plan, "profile_input": "saved job"}
         assert all(digest(path) == saved for path, saved in completed.items())
         assert metrics(result)["generated_members"] > 0
         assert not list(scratch.iterdir())
@@ -668,6 +728,9 @@ def check(args, root):
             assert not published.exists()
         else:
             assert published.is_file() and (interrupted[1] / "grow-farm.plan.next").read_bytes() == published.read_bytes()
+        if point == "farm-plan-all-staged":
+            copies = [farming_copy(directory / "grow-farm.plan.next") for directory in interrupted]
+            assert all(value == copies[0] for value in copies), "all-staged barrier omitted a complete plan replica"
         recovered = run([*recovery_command, "--resume"])
         assert all((directory / "grow-farm.plan").read_bytes() == published.read_bytes() and
                    not (directory / "grow-farm.plan.next").exists() for directory in interrupted)
@@ -678,6 +741,43 @@ def check(args, root):
                                        **canonical(args, outputs(directory)[0], references / f"{point}-{lane}")})
         results["recovery"].append({"point": point, "members": metrics(recovered)["members"]})
     print("PASS durable farming-plan publication interruption recovery", flush=True)
+
+    for point in ("farm-extent-all-staged", "farm-extent-one-published", "farm-extent-published"):
+        interrupted = directories(point, 2)
+        recovery_command = [args.plotter, "fill", *interrupted, "--compute", "off", "--json", *keys, *construction,
+                            "--max-total-members", 2, "--max-groups", 2]
+        forecast = plan(run([*recovery_command, "--plan-only"]))
+        assert forecast["fill_policy"] == "capacity-with-joint-admission", forecast
+        run(recovery_command, 86, point)
+        published = [directory / "grow-farm.plan" for directory in interrupted]
+        pending = [directory / "grow-farm.plan.next" for directory in interrupted]
+        current = [farming_copy(path) for path in published]
+        if point == "farm-extent-all-staged":
+            staged = [farming_copy(path) for path in pending]
+            assert all(value == current[0] for value in current), "extent staging replaced a published parent early"
+            assert all(value == staged[0] for value in staged) and staged[0] != current[0], \
+                "extent all-staged barrier omitted the same complete revision on every destination"
+        elif point == "farm-extent-one-published":
+            assert not pending[0].exists() and farming_copy(pending[1]) == current[0]
+            assert current[0] != current[1], "extent interruption did not preserve its unpublished parent replica"
+        else:
+            assert all(value == current[0] for value in current) and all(not path.exists() for path in pending)
+        recovered = run([*recovery_command, "--resume"])
+        assert frozen_plan(plan(recovered)) == frozen_plan(forecast)
+        copies = [farming_copy(path) for path in published]
+        assert all(value == copies[0] for value in copies) and all(not path.exists() for path in pending)
+        bounded(metrics(recovered), interrupted, args.max_ram)
+        counts, _ = memberships(interrupted, plan(recovered))
+        assert all(sum(lane) == 2 for lane in counts), counts
+        for lane, directory in enumerate(interrupted):
+            for ordinal, path in enumerate(outputs(directory)):
+                results["parity"].append({"point": point, "lane": lane, "file": ordinal,
+                                           **canonical(args, path, references / f"{point}-{lane}-{ordinal}")})
+        before = snapshot(interrupted)
+        idle = run([*recovery_command, "--resume"])
+        assert metrics(idle)["generated_members"] == 0 and snapshot(interrupted) == before
+        results["recovery"].append({"point": point, "members": metrics(recovered)["members"]})
+    print("PASS replicated capacity-extent interruption recovery and ordinary parity", flush=True)
     return results
 
 
@@ -690,9 +790,13 @@ def main():
     parser.add_argument("--max-ram", type=int, default=536870912)
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--results", type=Path)
+    parser.add_argument("--replacement-grow", type=Path,
+                        help="also check a compatible reference build with a different source identity")
     args = parser.parse_args()
     for name in ("grow", "plotter", "reference"):
         setattr(args, name, getattr(args, name).resolve())
+    if args.replacement_grow:
+        args.replacement_grow = args.replacement_grow.resolve()
     if args.work_dir:
         directory = args.work_dir.resolve()
         directory.mkdir(mode=0o700)

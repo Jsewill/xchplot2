@@ -1,4 +1,5 @@
 #include "group_commands.hpp"
+#include "compute_output.hpp"
 #include "host/ComputeDiscovery.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeWorker.hpp"
@@ -141,11 +142,13 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
         << ",\"broker_transport_bytes\":" << value.broker_transport_bytes
         << ",\"broker_saturated\":" << (value.broker_saturated ? "true" : "false") << '}';
 }
-void broker_text(BrokerSnapshot const& value)
+void broker_text(BrokerSnapshot const& value, bool verbose)
 {
     std::cout << "Broker " << address(value.endpoint) << ": " << value.summary.workers << " workers, "
         << value.summary.owners << " owners; " << value.summary.queued << " queued, " << value.summary.granted
         << " granted, " << value.summary.running << " running\n";
+    if (value.truncated) std::cerr << "Listing truncated; increase --limit to inspect more rows.\n";
+    if (!verbose) return;
     for (auto const& worker : value.workers)
         std::cout << "  Worker " << worker.identity.substr(0, 12) << ' ' << address(worker.endpoint) << ' '
             << pool::admission_name(worker.admission) << ": reserved " << worker.reserved.slots << '/' << worker.capacity.slots
@@ -158,17 +161,19 @@ void broker_text(BrokerSnapshot const& value)
     for (auto const& job : value.jobs)
         std::cout << "  Job " << job.id << " owner=" << job.owner_id << ' ' << kind(job.kind) << " k=" << unsigned(job.k)
             << ' ' << pool::job_state_name(job.state) << " waiting=" << pool::wait_reason_name(job.waiting) << '\n';
-    if (value.truncated) std::cout << "  Listing truncated; increase --limit to inspect more rows.\n";
 }
-void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const& value)
+void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const& value, bool verbose)
 {
     std::cout << "Worker " << address(endpoint) << ' ' << pool::admission_name(value.admission)
         << ": " << value.accepted_tasks << " accepted, " << value.waiting_cpu << " waiting for CPU; active "
         << value.active.slots << '/' << value.capacity.slots << " slots, " << value.active.cpu_threads << '/' << value.capacity.cpu_threads
-        << " CPUs, " << value.active.host_bytes << '/' << value.capacity.host_bytes << " host bytes, "
-        << value.active.gpu_bytes << '/' << value.capacity.gpu_bytes << " GPU bytes\n"
-        << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
-        << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes\n";
+        << " CPUs";
+    if (verbose)
+        std::cout << ", " << value.active.host_bytes << '/' << value.capacity.host_bytes << " host bytes, "
+            << value.active.gpu_bytes << '/' << value.capacity.gpu_bytes << " GPU bytes\n"
+            << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
+            << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes";
+    std::cout << '\n';
     if (value.broker_saturated) std::cout << "  Broker limit reached; use compute worker --max-brokers to change the bounded limit.\n";
 }
 } // namespace
@@ -178,12 +183,13 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
     std::string const command = argv[0]; bool const control = command != "status";
     require(command == "status" || command == "pause" || command == "drain" || command == "resume", "unknown compute control");
     auto directory = pool::pool_directory(); bool json = false;
+    ComputeOutputOptions output;
     unsigned timeout = 5000, limit = 128;
     std::vector<pool::Endpoint> brokers, workers;
     for (int i = 1; i < argc; ++i)
     {
         std::string const option = argv[i];
-        if (option == "--help" || option == "-h")
+        if (option == "--help" || option == "-h" || option == "--help-all")
         {
             std::cout << "Usage: xchplot2 compute " << command << " [OPTIONS]\n"
                 << (control ? "Control this machine's running worker; accepted tasks finish normally.\n" :
@@ -194,11 +200,14 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
                    "  --timeout-ms N      network query budget, default 5000\n"
                    "  --limit N           rows per broker section, default 128 (maximum 4096)\n"
                    "  --json              machine-readable status\n"
-                   "Without addresses, use saved broker and LAN discovery. Mutations require the worker's own identity.\n";
+                << compute_output_help
+                << "Without addresses, use saved broker and LAN discovery. Mutations require the worker's own identity.\n";
             if (command == "drain") std::cout << "Draining becomes drained when all accepted tasks finish; resume reopens admission.\n";
             return 0;
         }
         if (option == "--json") { json = true; continue; }
+        if (option == "--no-json") { json = false; continue; }
+        if (output.parse(option)) continue;
         require(i + 1 < argc, "missing compute status option value"); std::string value = argv[++i];
         if (option == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value.c_str()));
         else if (option == "--broker") brokers.push_back(pool::parse_endpoint(value));
@@ -207,6 +216,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         else if (option == "--limit") limit = number(value);
         else throw std::invalid_argument("unknown compute status option: " + option);
     }
+    output.validate();
     require(timeout >= 100 && timeout <= 60000 && limit <= 4096, "status timeout must be 100..60000 ms and limit 1..4096");
     require(brokers.size() <= 128 && workers.size() <= 128, "too many explicit status endpoints");
     auto identity = pool::load_pool(directory);
@@ -263,22 +273,30 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         { if (comma) std::cout << ','; comma = true; string(interface); }
         std::cout << "]},\"brokers\":[";
     }
-    else
+    else if (!output.quiet)
     {
-        std::cout << "Machine: " << identity->name << "\nNode: " << identity->node_id << "\nPool: " << identity->pool_id.substr(0, 12)
-            << "\nBroker: " << (identity->defaults.broker.empty() ? "automatic for each plotting job" : identity->defaults.broker)
-            << "\nMembership policy: " << identity->policy_generation
-            << "\nCertificate expires: " << identity->certificate_expires << (identity->certificate_expired ? " (renewal required)" : "")
-            << "\nPool authority expires: " << identity->authority_expires << (identity->authority_expired ? " (re-enrollment required)" : "") << '\n';
-        auto automatic = [](uint64_t value) { return value ? std::to_string(value) : std::string("automatic"); };
-        std::cout << "LAN discovery: " << (identity->defaults.discovery ? "on" : "off")
-            << "\nOffered defaults: " << identity->defaults.backend << ", CPUs " << automatic(identity->defaults.cpus)
-            << ", host bytes " << automatic(identity->defaults.host_bytes) << ", GPU bytes " << automatic(identity->defaults.gpu_bytes)
-            << ", broker limit " << identity->defaults.max_brokers << "\nInterfaces:";
-        if (identity->defaults.interfaces.empty()) std::cout << " active LAN interfaces";
-        else for (auto const& interface : identity->defaults.interfaces) std::cout << ' ' << interface;
-        std::cout << '\n';
+        std::cout << "Machine: " << identity->name
+            << "\nBroker: " << (identity->defaults.broker.empty() ? "automatic for each plotting job" : identity->defaults.broker) << '\n';
+        if (output.details())
+        {
+            std::cout << "Node: " << identity->node_id << "\nPool: " << identity->pool_id.substr(0, 12)
+                << "\nMembership policy: " << identity->policy_generation
+                << "\nCertificate expires: " << identity->certificate_expires << (identity->certificate_expired ? " (renewal required)" : "")
+                << "\nPool authority expires: " << identity->authority_expires << (identity->authority_expired ? " (re-enrollment required)" : "") << '\n';
+            auto automatic = [](uint64_t value) { return value ? std::to_string(value) : std::string("automatic"); };
+            std::cout << "LAN discovery: " << (identity->defaults.discovery ? "on" : "off")
+                << "\nOffered defaults: " << identity->defaults.backend << ", CPUs " << automatic(identity->defaults.cpus)
+                << ", host bytes " << automatic(identity->defaults.host_bytes) << ", GPU bytes " << automatic(identity->defaults.gpu_bytes)
+                << ", broker limit " << identity->defaults.max_brokers << "\nInterfaces:";
+            if (identity->defaults.interfaces.empty()) std::cout << " active LAN interfaces";
+            else for (auto const& interface : identity->defaults.interfaces) std::cout << ' ' << interface;
+            std::cout << '\n';
+        }
     }
+    if (!json && identity->authority_expired)
+        std::cerr << "The pool authority has expired; create a new pool and re-enroll its members.\n";
+    else if (!json && identity->certificate_expired)
+        std::cerr << "This machine's certificate needs renewal before it can connect.\n";
     bool comma = false; unsigned authenticated = 0, changed = 0;
     for (auto const& endpoint : brokers)
     {
@@ -289,7 +307,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
             if (!explicit_workers)
                 for (auto const& worker : value.workers) if (workers.size() < 256) workers.push_back(worker.endpoint);
             if (json) { if (comma) std::cout << ','; comma = true; broker_json(value); }
-            else broker_text(value);
+            else broker_text(value, output.details());
         }
         catch (std::exception const& error) { errors.push_back({address(endpoint), "broker", error.what()}); }
     }
@@ -313,7 +331,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
             }
             ++authenticated;
             if (json) { if (comma) std::cout << ','; comma = true; worker_json(endpoint, value); }
-            else worker_text(endpoint, value);
+            else worker_text(endpoint, value, output.details());
         }
         catch (std::exception const& error) { errors.push_back({address(endpoint), "worker", error.what()}); }
     }

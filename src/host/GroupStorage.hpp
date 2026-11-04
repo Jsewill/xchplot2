@@ -1,6 +1,8 @@
 // Storage limits shared by single-file growth and destination scheduling.
 #pragma once
 #include "host/GroupEngine.hpp"
+#include "host/Utf8.hpp"
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -8,6 +10,7 @@
 #include <set>
 #ifdef _WIN32
 #include <winioctl.h>
+#include <nvme.h>
 #else
 #include <sys/resource.h>
 #endif
@@ -181,6 +184,98 @@ inline std::vector<std::filesystem::path> farming_destination_candidates()
     return candidates;
 }
 
+namespace storage_detail
+{
+inline std::string nvme_subsystem_name(std::span<uint8_t const> field)
+{
+    if (field.size() != 256) return {};
+    auto end = std::find(field.begin(), field.end(), uint8_t(0));
+    auto const length = size_t(end - field.begin());
+    if (end == field.end() || !length || length > 223) return {};
+    std::string_view name(reinterpret_cast<char const*>(field.data()), length);
+    if (!name.starts_with("nqn.") || !pos2gpu::valid_utf8(name) ||
+        std::any_of(name.begin(), name.end(), [](unsigned char c) { return c <= 0x20 || c == 0x7f; })) return {};
+    // Conservative subset of NVMe Base Specification, "NVMe Qualified Names":
+    // date/domain names with ASCII DNS labels (including IDNA), no ASCII
+    // whitespace/control bytes, and the UUID form. Other shapes stay unknown.
+    // https://nvmexpress.org/specifications/
+    // Compare accepted NQNs byte-for-byte; case/Unicode normalization changes identity.
+    constexpr std::string_view uuid_prefix = "nqn.2014-08.org.nvmexpress:uuid:";
+    if (name.starts_with(uuid_prefix))
+    {
+        auto const uuid = name.substr(uuid_prefix.size());
+        if (uuid.size() != 36) return {};
+        for (size_t i = 0; i < uuid.size(); ++i)
+            if (i == 8 || i == 13 || i == 18 || i == 23)
+            { if (uuid[i] != '-') return {}; }
+            else if (!((uuid[i] >= '0' && uuid[i] <= '9') || (uuid[i] >= 'a' && uuid[i] <= 'f') ||
+                       (uuid[i] >= 'A' && uuid[i] <= 'F'))) return {};
+        return std::string(name);
+    }
+    if (name.size() <= 12 || name[8] != '-' || name[11] != '.') return {};
+    for (auto i : {4, 5, 6, 7, 9, 10}) if (name[i] < '0' || name[i] > '9') return {};
+    unsigned const month = unsigned(name[9] - '0') * 10 + unsigned(name[10] - '0');
+    if (name.substr(4, 4) == "0000" || month < 1 || month > 12) return {};
+    auto const colon = name.find(':', 12);
+    if (colon == name.npos || colon + 1 == name.size()) return {};
+    auto const domain = name.substr(12, colon - 12);
+    auto alphanumeric = [](unsigned char c)
+    { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
+    size_t labels = 0;
+    for (size_t first = 0; first < domain.size();)
+    {
+        auto last = domain.find('.', first); if (last == domain.npos) last = domain.size();
+        if (last == first || last - first > 63 || !alphanumeric(domain[first]) || !alphanumeric(domain[last - 1])) return {};
+        for (size_t i = first; i < last; ++i) if (!alphanumeric(domain[i]) && domain[i] != '-') return {};
+        ++labels; first = last + 1;
+    }
+    if (labels < 2 || domain.back() == '.') return {};
+    constexpr std::string_view reserved = "org.nvmexpress";
+    if (domain.size() == reserved.size() && std::equal(domain.begin(), domain.end(), reserved.begin(), [](char a, char b)
+        { return a == b || (a >= 'A' && a <= 'Z' && a - 'A' + 'a' == b); })) return {};
+    return std::string(name);
+}
+#ifdef _WIN32
+inline std::string nvme_subsystem_reply(std::span<uint8_t const> encoded)
+{
+    if (encoded.size() < sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) return {};
+    STORAGE_PROTOCOL_DATA_DESCRIPTOR descriptor{}; std::memcpy(&descriptor, encoded.data(), sizeof(descriptor));
+    auto const& protocol = descriptor.ProtocolSpecificData;
+    constexpr size_t base = offsetof(STORAGE_PROTOCOL_DATA_DESCRIPTOR, ProtocolSpecificData);
+    if (descriptor.Version != sizeof(descriptor) || descriptor.Size < sizeof(descriptor) || descriptor.Size > encoded.size() ||
+        protocol.ProtocolType != ProtocolTypeNvme || protocol.DataType != NVMeDataTypeIdentify ||
+        protocol.ProtocolDataRequestValue != NVME_IDENTIFY_CNS_CONTROLLER || protocol.ProtocolDataOffset < sizeof(protocol) ||
+        protocol.ProtocolDataOffset > encoded.size() - base) return {};
+    size_t const offset = base + protocol.ProtocolDataOffset;
+    if (protocol.ProtocolDataLength < sizeof(NVME_IDENTIFY_CONTROLLER_DATA) || protocol.ProtocolDataLength > encoded.size() - offset) return {};
+    NVME_IDENTIFY_CONTROLLER_DATA controller{}; std::memcpy(&controller, encoded.data() + offset, sizeof(controller));
+    if (!controller.VID || !controller.NN) return {};
+    return nvme_subsystem_name(controller.SUBNQN);
+}
+inline std::string nvme_subsystem(HANDLE disk)
+{
+    // Microsoft's protocol-specific Identify query returns one fixed controller
+    // payload. Unsupported drivers or malformed replies leave topology unknown.
+    constexpr size_t size = offsetof(STORAGE_PROPERTY_QUERY, AdditionalParameters) +
+        sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + sizeof(NVME_IDENTIFY_CONTROLLER_DATA);
+    static_assert(alignof(STORAGE_PROPERTY_QUERY) <= alignof(STORAGE_PROTOCOL_DATA_DESCRIPTOR));
+    static_assert(alignof(STORAGE_PROTOCOL_SPECIFIC_DATA) <= alignof(STORAGE_PROTOCOL_DATA_DESCRIPTOR));
+    static_assert(offsetof(STORAGE_PROPERTY_QUERY, AdditionalParameters) % alignof(STORAGE_PROTOCOL_SPECIFIC_DATA) == 0);
+    alignas(STORAGE_PROTOCOL_DATA_DESCRIPTOR) std::array<uint8_t, size> encoded{};
+    auto query = reinterpret_cast<STORAGE_PROPERTY_QUERY*>(encoded.data());
+    query->PropertyId = StorageAdapterProtocolSpecificProperty; query->QueryType = PropertyStandardQuery;
+    auto protocol = reinterpret_cast<STORAGE_PROTOCOL_SPECIFIC_DATA*>(query->AdditionalParameters);
+    protocol->ProtocolType = ProtocolTypeNvme; protocol->DataType = NVMeDataTypeIdentify;
+    protocol->ProtocolDataRequestValue = NVME_IDENTIFY_CNS_CONTROLLER;
+    protocol->ProtocolDataOffset = sizeof(*protocol); protocol->ProtocolDataLength = sizeof(NVME_IDENTIFY_CONTROLLER_DATA);
+    DWORD returned = 0;
+    if (!::DeviceIoControl(disk, IOCTL_STORAGE_QUERY_PROPERTY, encoded.data(), DWORD(encoded.size()),
+        encoded.data(), DWORD(encoded.size()), &returned, nullptr) || returned > encoded.size()) return {};
+    return nvme_subsystem_reply(std::span<uint8_t const>(encoded).first(returned));
+}
+#endif
+} // namespace storage_detail
+
 // Follow partitions, device-mapper and RAID slaves to the underlying devices.
 // Btrfs uses an anonymous st_dev, so obtain its filesystem UUID and device
 // links through the kernel's filesystem-info ioctl and sysfs interface.
@@ -296,7 +391,7 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         break;
     }
     if (disks.empty()) return result;
-    bool nonrotating = true, all_rotating = true, nvme = false;
+    bool nonrotating = true, all_rotating = true;
     std::vector<std::string> drives;
     for (auto number : disks)
     {
@@ -316,7 +411,12 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         // having distinct disk numbers. Their unresolved topology serializes.
         if (device->BusType == BusTypeUnknown || device->BusType == BusTypeVirtual || device->BusType == BusTypeFileBackedVirtual ||
             device->BusType == BusTypeSpaces || device->BusType == BusTypeRAID || device->BusType >= BusTypeMax) return result;
-        nvme = nvme || device->BusType == BusTypeNvme;
+        if (device->BusType == BusTypeNvme)
+        {
+            auto subsystem = storage_detail::nvme_subsystem(disk.value);
+            if (subsystem.empty()) return result;
+            drives.push_back("windows:nvme:" + subsystem);
+        }
         query.PropertyId = StorageDeviceSeekPenaltyProperty;
         DEVICE_SEEK_PENALTY_DESCRIPTOR seek{};
         if (!::DeviceIoControl(disk.value, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &seek, sizeof(seek), &returned, nullptr) ||
@@ -326,9 +426,6 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         else all_rotating = false;
         drives.push_back("windows:disk:" + std::to_string(number));
     }
-    // Namespace disk numbers do not establish independent NVMe subsystems.
-    // Keep their physical overlap keys and serialize all unresolved NVMe.
-    if (nvme) drives.push_back("windows:nvme");
     result.drives = std::move(drives); result.nonrotating = nonrotating; result.rotating = all_rotating;
 #endif
     return result;

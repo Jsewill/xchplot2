@@ -26,6 +26,7 @@ namespace {
 size_t verified_trials = 0;
 bool verified_full = false;
 pos2gpu::BatchOptions last_options;
+pos2gpu::GpuPlotOptions last_test_options;
 int batch_calls = 0;
 #ifdef XCHPLOT2_GROUP_COMMANDS
 pos2gpu::GroupOptions last_group_options;
@@ -60,7 +61,8 @@ std::array<uint8_t, 32> plot_id_for_group(
     return id;
 }
 std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
-std::string plot_to_file(GpuPlotOptions const&, std::string const&) { return {}; }
+std::string plot_to_file(GpuPlotOptions const& options, std::string const&)
+{ last_test_options = options; return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
 size_t batch_worker_count(BatchOptions const&, int) { return 1; }
 BatchResult run_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts)
@@ -159,11 +161,13 @@ int main(int argc, char** argv)
             << std::quoted(dir.string()) << ' ' << std::quoted(name) << '\n';
         return row.str();
     };
-    auto capture = [&](std::vector<std::string> const& command) {
-        std::ostringstream output;
+    auto capture = [&](std::vector<std::string> const& command, std::string* errors = nullptr) {
+        std::ostringstream output, error;
         auto* previous = std::cout.rdbuf(output.rdbuf());
+        auto* previous_error = errors ? std::cerr.rdbuf(error.rdbuf()) : nullptr;
         int const code = cli(command);
         std::cout.rdbuf(previous);
+        if (errors) { std::cerr.rdbuf(previous_error); *errors = error.str(); }
         return std::pair{code, output.str()};
     };
     put(manifest, line("18 2 0 0 gplot-v2"));
@@ -172,6 +176,31 @@ int main(int argc, char** argv)
     assert(cli({"-h", "--config", config.string()}) == 0);
     assert(cli({"--config", config.string()}) != 0);
     assert(cli({"--unknown", "--config", config.string()}) != 0);
+    for (auto const* command : {"plot", "batch", "bench", "test", "verify", "devices", "parity-check"}) {
+        int const calls_before_help = batch_calls;
+        auto const [code, help] = capture({command, "--help", "--config", config.string()});
+        assert(code == 0 && help.starts_with("Usage:") && help.find(command) != std::string::npos);
+        assert(batch_calls == calls_before_help);
+        assert(capture({command, "-h", "--config", config.string()}).second == help);
+    }
+    // Help-like option values must reach their actual parser.
+    assert(cli({"plot", "--farmer-pk", "--help", "--config", config.string()}) != 0);
+    assert(cli({"verify", "unused.gplot", "--trials", "--help", "--config", config.string()}) != 0);
+    put(config, "[defaults]\nverbose=true\nquiet=false\n");
+    for (auto const* command : {"plot", "batch", "bench", "test", "verify", "devices", "parity-check"})
+        assert(capture({command, "--config", config.string(), "--help"}).first == 0);
+    assert(capture({"--config", config.string(), "batch", "--help"}).first == 0);
+    assert(capture({"compute", "--config", config.string(), "--help"}).first == 0);
+    assert(capture({"--config", config.string(), "compute", "--help-all"}).first == 0);
+    std::string detail;
+    assert(capture({"verify", "unused.gplot", "--config", config.string()}, &detail).first == 0);
+    assert(detail.find("random challenges") != std::string::npos && detail.find("[verify] OK") != std::string::npos);
+    assert(capture({"verify", "--config", config.string(), "--no-verbose", "-q", "--", "--help"}, &detail).first == 0);
+    assert(detail.find("random challenges") == std::string::npos && detail.find("[verify] OK") != std::string::npos);
+    assert(cli({"test", "18", std::string(64, 'a'), "--config", config.string()}) == 0 && last_test_options.verbose);
+    assert(cli({"test", "18", std::string(64, 'a'), "2", "0", "0", "1", "--no-verbose", "--config", config.string()}) == 0);
+    assert(!last_test_options.verbose);
+    assert(cli({"test", "18", std::string(64, 'a'), "-q", "--config", config.string()}) != 0);
     put(config, "[verify]\ntrials=1\nfull=true\n");
     assert(cli({"verify", "unused.gplot", "--config", config.string()}) == 0);
     assert(verified_trials == 1 && verified_full);
@@ -203,6 +232,9 @@ int main(int argc, char** argv)
     for (auto const* shell : {"bash", "zsh", "fish"}) {
         auto const [code, script] = capture({"completions", shell, "--config", config.string()});
         assert(code == 0 && script.find("verify") != std::string::npos);
+        for (auto const* option : {"save-plan", "from-plan", "save-profile", "harvester", "help-all"})
+            assert(script.find(option) != std::string::npos);
+        assert(script.find("farming-detect-local") == std::string::npos && script.find("farming-profile") == std::string::npos);
         if (std::string(shell) == "zsh") {
             assert(script.find("'2:plot file:_files'") != std::string::npos);
             assert(script.find("'--trials[Random challenges]:count:'") != std::string::npos);
@@ -232,6 +264,12 @@ int main(int argc, char** argv)
                 "-d", "cpu", "-M", "256M", "-t", dir.string()}) == 0);
     assert(batch_calls == before + 1);
     assert(last_options.cpu_selected() && last_options.has_max_host_ram && last_options.max_host_ram == 256ull * 1024 * 1024);
+    assert(!last_options.verbose);
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string(), "-q", "--progress"}) == 0);
+    assert(last_options.quiet && last_options.progress && !last_options.verbose);
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string(), "-v", "--no-progress"}) == 0);
+    assert(last_options.verbose && !last_options.progress);
+    assert(cli({"bench", "--config", config.string(), "--out", dir.string(), "-q", "-v"}) != 0);
     auto const [json_code, json_report] = capture({"bench", "--config", config.string(), "--out", dir.string(), "--json"});
     assert(json_code == 0 && json_report.starts_with("{\"version\":"));
     assert(json_report.find("\"queue_plots\":1") != std::string::npos);
@@ -462,8 +500,11 @@ int main(int argc, char** argv)
     }
 #ifdef XCHPLOT2_GROUP_COMMANDS
     auto const [fill_help_code, fill_help] = capture({"fill", "--config", config.string(), "--help"});
-    assert(fill_help_code == 0 && fill_help.find("[DIR...]") != std::string::npos);
-    assert(fill_help.find("--paths-from") != std::string::npos && fill_help.find("current member directory") != std::string::npos);
+    assert(fill_help_code == 0 && fill_help.find("fill [OPTIONS] -F PLAN") != std::string::npos);
+    assert(fill_help.find("-F, --from-plan") != std::string::npos && fill_help.find("-r --manifest FILE") != std::string::npos);
+    assert(fill_help.find("fill farm.plan") != std::string::npos && fill_help.find("current member directory") != std::string::npos);
+    auto const [fill_all_code, fill_all] = capture({"fill", "--config", config.string(), "--help-all"});
+    assert(fill_all_code == 0 && fill_all.find("--paths-from") != std::string::npos && fill_all.size() > fill_help.size());
     auto const [grow_help_code, grow_help] = capture({"grow", "--config", config.string(), "--help"});
     assert(grow_help_code == 0 && grow_help.find("always enabled") != std::string::npos);
     assert(grow_help.find("--paths-from") == std::string::npos && grow_help.find("--manifest") == std::string::npos);
@@ -472,6 +513,13 @@ int main(int argc, char** argv)
     assert(cli({"fill", dir.string(), "--config", config.string(), "--devices", "cpu"}) == 0);
     assert(last_group_options.plan_only && last_group_options.json && last_group_options.backend == "cpu");
     assert(last_group_options.max_ram == 512ull * 1024 * 1024);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--progress"}) == 0);
+    assert(last_group_options.progress && !last_group_options.verbose);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "-v", "--no-progress"}) == 0);
+    assert(last_group_options.verbose && !last_group_options.progress);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "-q", "--progress"}) == 0);
+    assert(last_group_options.quiet && last_group_options.progress && !last_group_options.verbose);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "-q", "-v"}) != 0);
     auto const other = dir / "another destination";
     auto const third = dir / "third destination";
     std::filesystem::create_directory(other);
@@ -573,9 +621,17 @@ int main(int argc, char** argv)
     int const prior_derivations = keygen_calls;
     group_args.emplace_back("--resume");
     assert(capture(group_args).first == 0 && last_entries == group_entries && keygen_calls == prior_derivations);
+    auto group_progress = group_args;
+    group_progress.emplace_back("--progress");
+    assert(capture(group_progress).first == 0);
+    assert(last_options.progress && last_group_options.progress && !last_group_options.verbose);
+    group_progress.insert(group_progress.end(), {"--no-quiet", "-v", "--no-progress"});
+    assert(capture(group_progress).first == 0);
+    assert(last_options.verbose && last_group_options.verbose && !last_group_options.progress);
     assert(capture({"batch", group_job.string(), "-r", "-d", "cpu", "-M", "256M", "-j", "3", "-t", dir.string(),
                     "--config", config.string()}).first == 0);
     assert(last_entries == group_entries);
+    assert(last_group_options.command == "batch");
     assert(last_group_options.workers == 3 && last_group_options.max_ram == 256ull * 1024 * 1024);
     assert(last_group_options.temporary == std::vector<std::filesystem::path>{dir});
     group_args.insert(group_args.end(), {"--group-members", "4"});

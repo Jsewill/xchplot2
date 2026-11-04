@@ -38,6 +38,52 @@ def header(path):
     return group.hex(), k, strength, count, meta, memo.hex()
 
 
+def farming_plan_rows(body):
+    # std::quoted permits literal newlines inside metadata strings. Preserve
+    # complete serializer rows rather than treating those as row boundaries.
+    rows = []
+    start = 0
+    quoted = escaped = False
+    for offset, byte in enumerate(body):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                quoted = False
+        elif byte == ord('"'):
+            quoted = True
+        elif byte == ord("\n"):
+            rows.append(body[start:offset + 1])
+            start = offset + 1
+    assert not quoted and start == len(body), "incomplete farming fixture row"
+    return rows
+
+
+def rewrite_plan(record, *, producer=None, legacy=False, model=None):
+    body = record[:-65]
+    assert record[-65:] == hashlib.sha256(body).hexdigest().encode() + b"\n"
+    rows = farming_plan_rows(body)
+    assert rows[0] == b"ordinary-group-farming-v6\n"
+    if producer is not None:
+        rows[1] = json.dumps(producer).encode() + b"\n"
+    if model is not None:
+        rows[2] = json.dumps(model).encode() + b"\n"
+    if legacy:
+        metadata = rows[8].split()
+        assert len(metadata) == 2 and metadata[1] in (b"0", b"1")
+        if metadata[1] == b"1":
+            # v5 metadata ends after its assumptions row. A calibrated v6
+            # profile has no legacy representation and must not lose scope.
+            assert rows[13] == b"0\n", "scoped calibration cannot become a legacy fixture"
+            del rows[13]
+        rows[0] = b"ordinary-group-farming-v5\n"
+        del rows[3]  # v6 key-derivation and numeric compatibility row
+    rewritten = b"".join(rows)
+    return rewritten + hashlib.sha256(rewritten).hexdigest().encode() + b"\n"
+
+
 def snapshot(root):
     return {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_size, p.stat().st_mtime_ns,
                                      digest(p) if p.is_file() else None)
@@ -73,10 +119,36 @@ def check(binary, root, reference=None):
     construction = ["-d", "cpu", "-M", "512M", "-j", 2,
                     "--window-bytes", "64K", "--checkpoint-bytes", "64K",
                     "--capacity-bytes", "64M", "--headroom-bytes", 0]
-    for subcommand in [("plan",), ("plot",), ("fill",), ("grow",),
+    for subcommand in [("plan",), ("plot",), ("fill",), ("grow",), ("batch",),
+                       ("bench",), ("test",), ("verify",), ("devices",), ("parity-check",),
                        ("compute",), ("compute", "broker"), ("compute", "worker"),
                        *(("compute", command) for command in ("init", "invite", "join", "configure", "status"))]:
         assert "Usage:" in run(*subcommand, "--help").stdout + (root / f"{counter:03d}.log").read_text(encoding="utf-8")
+
+    devices = run("devices").stdout
+    assert "Host CPU plotter" in devices and "backend=" not in devices
+    assert "backend=" in run("devices", "-v").stdout
+    quiet_devices = run("devices", "-q").stdout
+    assert "Host CPU plotter" in quiet_devices and "Visible devices" not in quiet_devices
+    run("devices", "-q", "-v", code=1)
+
+    # Small synthetic plots exercise reporting, not farming performance.
+    bench_dir = root / "benchmark"
+    bench_dir.mkdir()
+    bench = ["bench", "-k", 18, "-n", 1, "--warmup", 0, "-d", "cpu", "--cpu-workers", 1,
+             "-o", bench_dir, "--target-size", "0.01", "--json"]
+    measured = run(*bench)
+    detailed = run(*bench, "-v", "--no-progress")
+    quiet = run(*bench, "-q", "--progress")
+    reports = [json.loads(result.stdout) for result in (measured, detailed, quiet)]
+    assert all(report.keys() == reports[0].keys() for report in reports)
+    assert all(report["passes"][0].keys() == reports[0]["passes"][0].keys() for report in reports)
+    assert "progress:" not in measured.stderr and "per-plot spread:" not in measured.stderr
+    assert "per-plot spread:" in detailed.stderr and "progress:" not in detailed.stderr
+    assert "progress:" in quiet.stderr and "steady-state:" in quiet.stderr and "warmup:" not in quiet.stderr
+    assert all("test-only" in result.stderr and "test-size rate" in result.stderr for result in (measured, detailed, quiet))
+    assert not list(bench_dir.iterdir())
+    print("PASS command help, inventory and benchmark verbosity, independent progress and JSON fields", flush=True)
 
     preview = root / "preview"
     preview_peer = root / "preview peer"
@@ -84,15 +156,239 @@ def check(binary, root, reference=None):
     preview_peer.mkdir()
     options = [preview, preview_peer, "-k", 18, "--group-members", 2, "--max-total-members", 3, *construction]
     before = snapshot(preview), snapshot(preview_peer)
+    farming_size = run("plan", preview, "--group-members", 1, "--max-total-members", 1,
+                       "--max-groups", 1, "--capacity-bytes", "2G", "--headroom-bytes", 0).stdout
+    assert "k28" in farming_size and "test only" not in farming_size
     planned = json.loads(run("plan", *options, "--json").stdout)
     filled = json.loads(run("fill", *options, "--plan-only", "--json").stdout)
     assert planned == filled and planned["feasible"]
     assert len(planned["destinations"]) == 2 and all(d["files"] == 2 for d in planned["destinations"])
     assert (snapshot(preview), snapshot(preview_peer)) == before, "preview created or changed files"
+    if os.name != "nt":
+        native = root / os.fsdecode(b"native-byte-\xff")
+        native.mkdir()
+        native_options = [native, *options[2:]]
+        native_plan = run("plan", *native_options, "--json").stdout
+        native_fill = run("fill", *native_options, "--plan-only", "--json").stdout
+        assert json.loads(native_plan) == json.loads(native_fill)
+        assert "native-byte-\\u00ff" in native_plan and not list(native.iterdir())
     for subcommand in [("plan",), ("fill", "--plan-only")]:
         refused = json.loads(run(*subcommand, *options, "--farming-deadline-ms", 1, "--json", code=2).stdout)
         assert not refused["feasible"] and (snapshot(preview), snapshot(preview_peer)) == before
     print("PASS plan/fill preview equivalence and no writes on infeasibility", flush=True)
+
+    # A portable profile contains harvester inputs, independent of destination
+    # assignments and plotting keys. Offline observations remain unavailable.
+    profile_file = root / "harvester profile.json"
+    exported = json.loads(run("plan", "--farming-cores", 3, "--farming-memory-bytes", "256M",
+                              "--save-profile", profile_file, "--json").stdout)
+    assert json.loads(profile_file.read_text(encoding="utf-8")) == exported["farming_profile"]
+    assert "destination_candidates" not in exported
+    profile_before = profile_file.read_bytes(), profile_file.stat().st_mtime_ns
+    run("plan", "--save-profile", profile_file, code=2)
+    assert (profile_file.read_bytes(), profile_file.stat().st_mtime_ns) == profile_before
+    run("plan", *options, "--save-profile", root / "invalid profile.json", code=2)
+    assert not (root / "invalid profile.json").exists()
+    imported = json.loads(run("plan", *options, "--harvester", profile_file, "--json").stdout)
+    assert imported["harvester_cores"] == 3 and imported["memory_bytes"] == 256 * 1024 * 1024
+    assert imported["farming_profile"] == exported["farming_profile"]
+    assert imported["assessment_scope"] == "this-job" and imported["outside_job_workload"] == "unmodeled"
+    overridden = json.loads(run("plan", *options, "--harvester", profile_file, "--farming-cores", 2, "--json").stdout)
+    assert overridden["harvester_cores"] == overridden["farming_profile"]["harvester_cores"] == 2
+    tuned_profile = root / "tuned harvester.json"
+    quiet_export = run("plan", "--harvester", profile_file, "--farming-cores", 2,
+                       "--save-profile", tuned_profile, "--quiet")
+    assert not quiet_export.stdout and not quiet_export.stderr
+    assert json.loads(tuned_profile.read_text(encoding="utf-8")) == overridden["farming_profile"]
+    profile_config = root / "harvester.toml"
+    profile_config.write_text('[plan]\nharvester = ' + json.dumps(str(profile_file), ensure_ascii=False) + '\n', encoding="utf-8")
+    configured = json.loads(run("plan", *options, "--config", profile_config, "--json").stdout)
+    assert configured["farming_profile"] == imported["farming_profile"]
+    configured_override = json.loads(run("plan", *options, "--config", profile_config,
+                                         "--harvester", tuned_profile, "--json").stdout)
+    assert configured_override["farming_profile"] == overridden["farming_profile"]
+    chia_root = root / "offline chia"
+    (chia_root / "config").mkdir(parents=True)
+    (chia_root / "config/config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 7\n", encoding="utf-8")
+    offline_profile = json.loads(run("plan", "--harvester", "local", "--chia-root", chia_root,
+                                    "--chia-executable", root / "missing-chia", "--json").stdout)["farming_profile"]
+    assert offline_profile["lookup_workers"] == 7 and not offline_profile["inventory_available"]
+    assert offline_profile["host_name"] and offline_profile["captured_at"]
+    assert "unavailable" in offline_profile["inventory_status"]
+    assert (snapshot(preview), snapshot(preview_peer)) == before
+    help_text = run("plan", "--help").stdout
+    full_help = run("plan", "--help-all").stdout
+    assert "--save-plan" in help_text and "--harvester" in help_text and len(help_text) < len(full_help)
+    concise = run("plan", *options).stdout
+    detailed = run("plan", *options, "-v").stdout
+    assert len(concise) < len(detailed) and "--harvester" in concise
+    assert "k18 (test only)" in concise
+    assert run("plan", *options, "--progress").stdout == concise
+    assert run("plan", *options, "-v", "--no-progress").stdout == detailed
+    assert json.loads(run("plan", *options, "-v", "--json").stdout) == planned
+
+    # Save exactly the reviewed assignments, then publish the private job and
+    # recover without the preview or keys. A second execution is stale.
+    reviewed_profile = dict(exported["farming_profile"])
+    reviewed_profile.update(source="manual harvester profile", captured_at="2026-11-03T00:00:00Z",
+                            chia_version="fixture version", host_name='harvester é "quoted"',
+                            config_status="declared inputs", inventory_status="observed",
+                            detected_logical_cpus=8, detected_available_memory_bytes=16 * 1024**3,
+                            inventory_available=True, inventory_v1_files=4, inventory_v2_files=5,
+                            inventory_v2_members=6, inventory_failed_files=1, inventory_no_key_files=2,
+                            assumptions=["Declared CPU allowance", 'Unicode é, quote " and slash \\',
+                                         "First line\nSecond line"])
+    profile_file.write_text(json.dumps(reviewed_profile, ensure_ascii=False) + "\n", encoding="utf-8")
+    review = root / "reviewed farm.plan"
+    review_a, review_b = root / "review a", root / "review b"
+    review_a.mkdir()
+    review_b.mkdir()
+    review_options = [review_a, review_b, *options[2:]]
+    review_before = snapshot(review_a), snapshot(review_b)
+    reviewed = json.loads(run("plan", *review_options, "--harvester", profile_file, "--save-plan", review, "--json").stdout)
+    assert reviewed["farming_profile"] == reviewed_profile
+    assert review.is_file() and SEED not in review.read_text(encoding="utf-8")
+    assert (snapshot(review_a), snapshot(review_b)) == review_before
+    saved_review = review.read_bytes()
+    run("plan", *review_options, "--save-plan", review, code=2)
+    assert review.read_bytes() == saved_review
+    inspected = json.loads(run("plan", review, "--json").stdout)
+    assert inspected["destinations"] == reviewed["destinations"]
+    assert inspected["farming_profile"] == reviewed["farming_profile"]
+    assert json.loads(run("plan", "--from-plan", review, "--json").stdout) == inspected
+    assert json.loads(run("plan", "-F", review, "--json").stdout) == inspected
+    joint_single = json.loads(run("plan", "--assess-jobs", review, "--json").stdout)
+    assert joint_single["joint_assessment"] and joint_single["feasible"]
+    assert not joint_single["current_load_checked"] and not joint_single["execution_plan"]
+    assert joint_single["assessment_scope"] == "saved-job-forecasts"
+    assert joint_single["jobs"][0]["harvester_profile"]["host_name"] == reviewed_profile["host_name"]
+    assert "Saved forecasts only" in run("plan", "--assess-jobs", review).stdout
+    peer = root / "joint peer"
+    peer.mkdir()
+    peer_review = root / "joint peer.plan"
+    run("plan", peer, *options[2:], "--harvester", profile_file, "--save-plan", peer_review, "--json")
+    joint = json.loads(run("plan", "--assess-jobs", review, peer_review, "--json", code=2).stdout)
+    assert len(joint["jobs"]) == 2 and not joint["feasible"] and joint["certified_max_eligible_groups"] == 2
+    run("plan", "--assess-jobs", review, review, "--json", code=2)
+    run("plan", "--assess-jobs", review, "--metadata-only", code=2)
+    run("plan", "--assess-jobs", review, "--save-plan", root / "joint mutation.plan", code=2)
+    run("plan", "--assess-jobs", review, "--harvester", "local", code=2)
+    run("fill", "--assess-jobs", review, code=2)
+    assert not (root / "joint mutation.plan").exists() and not list(peer.iterdir())
+    offline_review = root / "review b offline"
+    review_b.rename(offline_review)
+    try:
+        metadata = json.loads(run("plan", "--metadata-only", review, "--json").stdout)
+        assert metadata["metadata_only"] and not metadata["live_readiness_checked"]
+        assert metadata["checkpoint_compatibility"] == "not-inspected" and metadata["plan_compatible"]
+        assert metadata["farming_profile"] == reviewed_profile
+        assert {entry["directory"] for entry in metadata["destinations"]} == {str(review_a), str(review_b)}
+        assert "current farming readiness were not checked" in run("plan", "--metadata-only", "-F", review).stdout
+        offline_joint = json.loads(run("plan", "--assess-jobs", review, "--json").stdout)
+        assert offline_joint["offline_destinations"] == 1
+        assert offline_joint["jobs"][0]["members"] == joint_single["jobs"][0]["members"]
+        for override in (["--save-plan", root / "metadata mutation.plan"], ["--harvester", "local"],
+                         ["--farming-cores", 1], ["--extend"]):
+            run("plan", "--metadata-only", review, *override, code=2)
+        run("fill", "--metadata-only", review, code=2)
+        run("plan", "--metadata-only", code=2)
+        assert review.read_bytes() == saved_review and not (root / "metadata mutation.plan").exists()
+    finally:
+        offline_review.rename(review_b)
+    run("plan", review, review_a, "--json", code=2)
+    run("plan", review, "--save-profile", root / "invalid profile.json", code=2)
+    assert not (root / "invalid profile.json").exists()
+    run("fill", "--from-plan", review, "--resume", *keys, *construction, code=2)
+    run("fill", "--from-plan", review, *keys, "--farming-cores", 1, *construction, code=2)
+    assert (snapshot(review_a), snapshot(review_b)) == review_before
+    run("fill", review, *keys, *construction, "--quiet", point="farm-plan-published", code=86)
+    run("fill", review, *keys, *construction, code=2)
+    recovered_review = run("fill", "-r", review_b, "--compute", "off", "-d", "cpu", "-M", "512M", "--quiet")
+    reviewed_paths = [Path(line) for line in recovered_review.stdout.splitlines()]
+    assert len(reviewed_paths) == 4 and all(sum(header(p)[3] for p in reviewed_paths if p.parent == d) == 3
+                                            for d in (review_a, review_b))
+    frozen_profile = json.loads(run("plan", review_a, "--json").stdout)["farming_profile"]
+    assert frozen_profile == reviewed["farming_profile"]
+    completed = snapshot(review_a), snapshot(review_b)
+    run("fill", "-r", review_a, "--compute", "off", "-d", "cpu", "--quiet")
+    assert (snapshot(review_a), snapshot(review_b)) == completed
+    refreshed = root / "completed job forecast.plan"
+    run("plan", "--manifest", review_a / "grow-farm.plan", "--save-plan", refreshed, "--json")
+    refreshed_joint = json.loads(run("plan", "--assess-jobs", refreshed, "--json").stdout)
+    assert refreshed_joint["jobs"][0]["members"] >= sum(header(path)[3] for path in reviewed_paths)
+    assert refreshed_joint["jobs"][0]["source_job_digest"] == (review_a / "grow-farm.plan").read_bytes()[-65:-1].decode()
+    assert (snapshot(review_a), snapshot(review_b)) == completed
+    for path in reviewed_paths:
+        verify(path)
+    print("PASS portable profiles, offline detection, saved review execution and private recovery", flush=True)
+
+    # Explicit reader calibration reuses a complete file and keeps the imported
+    # harvester snapshot separate from this machine's bounded observations.
+    calibration_plot = reviewed_paths[0]
+    calibration_before = calibration_plot.stat(), digest(calibration_plot)
+    calibrated_file = root / "calibrated harvester.json"
+    calibrated = json.loads(run("plan", "--calibrate", "--harvester", profile_file,
+                                "--calibration-samples", 2, "--calibration-timeout-ms", 10000,
+                                "--save-profile", calibrated_file, "--json", "--", calibration_plot).stdout)
+    assert json.loads(calibrated_file.read_text(encoding="utf-8")) == calibrated
+    assert calibrated["reader_calibration"] and not calibrated["hardware_qualified"]
+    calibrated_profile = calibrated["farming_profile"]
+    scope = calibrated_profile["reader_calibration"]
+    assert calibrated_profile["schema_version"] == 2 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
+    assert scope["reader"] == calibrated_profile["reader"] and scope["method"] == "pos2-group-reference-reader-gsz-1"
+    assert scope["host_name"] and scope["captured_at"]
+    assert scope["host_name"] != reviewed_profile["host_name"] and scope["captured_at"] != reviewed_profile["captured_at"]
+    for field in ("source", "captured_at", "host_name", "chia_version", "config_status", "inventory_status",
+                  "detected_logical_cpus", "detected_available_memory_bytes", "inventory_available",
+                  "inventory_v1_files", "inventory_v2_files", "inventory_v2_members", "inventory_failed_files", "inventory_no_key_files"):
+        assert calibrated_profile[field] == reviewed_profile[field], field
+    for field in ("chain_seconds_per_member", "index_seconds_per_entry"):
+        assert calibrated_profile[field] >= reviewed_profile[field], field
+    imported_calibration = root / "imported calibration.json"
+    copied = json.loads(run("plan", "--harvester", calibrated_file, "-k", 18, "-s", 2,
+                            "--save-profile", imported_calibration, "--json").stdout)["farming_profile"]
+    assert copied == calibrated_profile == json.loads(imported_calibration.read_text(encoding="utf-8"))
+    for mismatch in ([], ["-k", 18, "-s", 3], ["-k", 18, "--farming-reader", "cached"]):
+        run("plan", "--harvester", calibrated_file, *mismatch, "--json", code=2)
+    failed_calibration = root / "failed calibration.json"
+    rejected = run("plan", "--calibrate", *keys, "--save-profile", failed_calibration,
+                   "--json", "--", root / "missing calibration.gplot", code=2)
+    assert "accept only their explicit inputs and controls" in rejected.stderr and not failed_calibration.exists()
+    capped = run("plan", "--calibrate", "--calibration-worker", "--calibration-memory-bytes", 1024,
+                 "--json", "--", root / "missing calibration.gplot", code=2)
+    assert "startup" in capped.stderr and not capped.stdout
+    run("plan", "--calibrate", "--calibration-samples", 1024, "--calibration-timeout-ms", 1,
+        "--save-profile", failed_calibration, "--json", "--", calibration_plot, code=2)
+    assert not failed_calibration.exists()
+    after_calibration = calibration_plot.stat()
+    before_info, before_digest = calibration_before
+    assert (after_calibration.st_dev, after_calibration.st_ino, after_calibration.st_mode, after_calibration.st_size,
+            after_calibration.st_mtime_ns, after_calibration.st_ctime_ns, digest(calibration_plot)) == (
+            before_info.st_dev, before_info.st_ino, before_info.st_mode, before_info.st_size,
+            before_info.st_mtime_ns, before_info.st_ctime_ns, before_digest)
+    print("PASS bounded read-only reader calibration, scoped profile import and snapshot provenance", flush=True)
+
+    # Compression admits one more member than the initial forecast. The next
+    # candidate exceeds this I/O window; sealing must make resume a no-op.
+    capacity_dir = root / "capacity fill"
+    capacity_dir.mkdir()
+    capacity_options = [capacity_dir, "-k", 18, *construction, "--compute", "off",
+                        "--construction", "incremental", "--capacity-bytes", 5110000,
+                        "--window-bytes", 1536, "--batch-members", 2]
+    capacity_plan = json.loads(run("plan", *capacity_options, "--json").stdout)
+    assert capacity_plan["destinations"][0]["members"] == 7
+    capacity_fill = run("fill", *capacity_options, *keys, "--seed", "aa" * 32, "--json")
+    capacity_metrics = json.loads(capacity_fill.stdout.splitlines()[-1])
+    capacity_path, = capacity_dir.glob("*.gplot")
+    assert header(capacity_path)[3] == capacity_metrics["members"] == 8
+    assert capacity_metrics["stop_reason"] == "capacity"
+    assert capacity_metrics["peak_file_bytes"] <= capacity_metrics["capacity_bytes"]
+    completed = snapshot(capacity_dir)
+    resumed = run("fill", "-r", *capacity_options, "--json")
+    assert json.loads(resumed.stdout.splitlines()[-1])["generated_members"] == 0
+    assert snapshot(capacity_dir) == completed, "completed capacity fill retried or changed files"
+    verify(capacity_path)
+    print("PASS compression top-up, window-limited sealing and unchanged resume", flush=True)
 
     output = root / "grouped files"
     plot = ["plot", "-k", 18, "-n", 2, *keys, "-o", output,
@@ -127,10 +423,15 @@ def check(binary, root, reference=None):
     # A one-member group must match the existing ordinary writer exactly.
     one = root / "one"
     single = root / "single"
-    grouped_one = Path(run("plot", "-k", 18, *keys, "-S", SEED, "-o", one,
-                           "--group-members", 1, *construction, "--quiet").stdout.strip())
-    ordinary_one = Path(run("plot", "-k", 18, *keys, "-S", SEED, "-o", single,
-                            "--devices", "cpu", "--cpu-workers", 1, "--quiet").stdout.strip())
+    grouped_result = run("plot", "-k", 18, *keys, "-S", SEED, "-o", one,
+                         "--group-members", 1, *construction, "--quiet", "--progress")
+    grouped_one = Path(grouped_result.stdout.strip())
+    assert "members assembled" in grouped_result.stderr
+    assert "construction=" not in grouped_result.stderr and "committed " not in grouped_result.stderr
+    ordinary_result = run("plot", "-k", 18, *keys, "-S", SEED, "-o", single,
+                          "--devices", "cpu", "--cpu-workers", 1, "--quiet")
+    ordinary_one = Path(ordinary_result.stdout.strip())
+    assert not ordinary_result.stderr
     assert digest(grouped_one) == digest(ordinary_one)
     if reference:
         group, k, strength, count, meta, memo = header(paths[0])
@@ -170,11 +471,15 @@ def check(binary, root, reference=None):
         verify(recovered)
     print("PASS all construction engines recover to identical ordinary bytes and full proofs", flush=True)
 
-    run("grow", grouped_one, "--max-members", 3, *construction, "--quiet")
+    concise_grow = run("grow", grouped_one, "--max-members", 3, *construction)
+    assert "[grow] 3 members" in concise_grow.stderr
+    assert "members assembled" not in concise_grow.stderr and "Buffers:" not in concise_grow.stderr
     assert header(grouped_one)[3] == 3
     verify(grouped_one)
     grown = digest(grouped_one)
-    run("grow", grouped_one, "--max-members", 3, *construction, "--quiet")
+    detailed_grow = run("grow", grouped_one, "--max-members", 3, *construction, "-v", "--no-progress")
+    assert "Backend:" in detailed_grow.stderr and "Buffers:" in detailed_grow.stderr
+    assert "members assembled" not in detailed_grow.stderr
     assert digest(grouped_one) == grown
     run("grow", root / "missing.gplot", "--max-members", 2, *construction, code=2)
     assert not (root / "missing.gplot").exists()
@@ -260,6 +565,59 @@ def check(binary, root, reference=None):
     assert len(farm_paths) == 4 and {p.parent for p in farm_paths} == {a, b}
     original_plan = (a / "grow-farm.plan").read_bytes()
     assert original_plan == (b / "grow-farm.plan").read_bytes()
+    # A compatible creating build is provenance. The normal executable must
+    # still audit saved keys/identities and completed ordinary output files.
+    foreign_producer = "e" * 64
+    original_plan = rewrite_plan(original_plan, producer=foreign_producer)
+    for directory in (a, b):
+        (directory / "grow-farm.plan").write_bytes(original_plan)
+    metadata = json.loads(run("plan", "--metadata-only", "--manifest", a / "grow-farm.plan", "--json").stdout)
+    assert metadata["producer_build"] == foreign_producer and metadata["plan_compatible"]
+    legacy = root / "legacy foreign farm.plan"
+    legacy.write_bytes(rewrite_plan(original_plan, legacy=True))
+    legacy_before = snapshot(a), snapshot(b), legacy.read_bytes()
+    legacy_metadata = json.loads(run("plan", "--metadata-only", "--manifest", legacy, "--json").stdout)
+    assert legacy_metadata["schema_version"] == 5 and not legacy_metadata["plan_compatible"]
+    run("plan", "--manifest", legacy, "--json", code=2)
+    assert (snapshot(a), snapshot(b), legacy.read_bytes()) == legacy_before
+    def checksummed(rows):
+        body = b"".join(rows)
+        return body + hashlib.sha256(body).hexdigest().encode() + b"\n"
+
+    def quoted(value):
+        return b'"' + value.encode().replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+    rows = farming_plan_rows(original_plan[:-65])
+    assert rows[8].split()[1] == b"1" and rows[13] == b"0\n"
+    no_metadata = list(rows)
+    no_metadata[8] = no_metadata[8].split()[0] + b" 0\n"
+    del no_metadata[9:14]
+    multiline = list(rows)
+    extra_assumption = 'line one\n0\nline two "quoted" and \\ slash'
+    count, _, assumptions = multiline[12].partition(b" ")
+    multiline[12] = (str(int(count) + 1).encode() + b" " + assumptions.removesuffix(b"\n") + b" " +
+                     quoted(extra_assumption) + b"\n")
+    for name, variant in (("without metadata", no_metadata), ("multiline metadata", multiline)):
+        variant_path = root / ("legacy " + name + ".plan")
+        variant_path.write_bytes(rewrite_plan(checksummed(variant), legacy=True))
+        inspected_variant = json.loads(run("plan", "--metadata-only", "--manifest", variant_path, "--json").stdout)
+        assert inspected_variant["schema_version"] == 5 and not inspected_variant["plan_compatible"]
+        if name == "without metadata":
+            assert inspected_variant["farming_profile"] is None
+        else:
+            assert inspected_variant["farming_profile"]["assumptions"][-1] == extra_assumption
+    scoped = list(rows)
+    scoped[13] = (b"1 18 2 0 " + quoted(scope["method"]) + b" " + str(scope["margin"]).encode() + b" " +
+                  quoted(scope["host_name"]) + b" " + quoted(scope["captured_at"]) + b"\n")
+    try:
+        rewrite_plan(checksummed(scoped), legacy=True)
+    except AssertionError as error:
+        assert "scoped calibration" in str(error)
+    else:
+        raise AssertionError("legacy fixture conversion discarded reader calibration scope")
+    unsupported = root / "unsupported model farm.plan"
+    unsupported.write_bytes(rewrite_plan(original_plan, model="unknown-farming-model"))
+    run("plan", "--metadata-only", "--manifest", unsupported, "--json", code=2)
     for directory in (a, b):
         assert not (directory / "grow-farm.plan.next").exists()
         if os.name != "nt":
@@ -328,12 +686,14 @@ def check(binary, root, reference=None):
     # workload. Completed fixed extents release their unused capacity quota.
     original_hashes = {p: digest(p) for p in farm_paths}
     before = tuple(snapshot(directory) for directory in members)
-    expansion = json.loads(run("plan", c, b, a, "--json").stdout)
+    expansion_review = farm / "expansion.plan"
+    expansion = json.loads(run("plan", c, b, a, "--save-plan", expansion_review, "--json").stdout)
     assert expansion["feasible"] and len(expansion["destinations"]) == 3
     assert tuple(snapshot(directory) for directory in members) == before
     run(*resume, a, c, code=2)
     assert tuple(snapshot(directory) for directory in members) == before
-    run("fill", "--extend", "-d", "cpu", "-M", "512M", "-j", 2, "--quiet", c, a,
+    assert SEED not in expansion_review.read_text(encoding="utf-8")
+    run("fill", "-F", expansion_review, "-d", "cpu", "-M", "512M", "-j", 2, "--quiet",
         point="farm-plan-published:2", code=86)
     assert all(digest(p) == value for p, value in original_hashes.items())
     extended = run(*resume, c)
@@ -347,10 +707,12 @@ def check(binary, root, reference=None):
     for path in all_paths:
         if path.parent == c:
             verify(path)
-    # Repair a stale parent copy using the committed successor, never timestamps.
+    # Mixed direct-parent publication was recovered above. Older ancestors no
+    # longer describe the sealed extents and cannot replace the current job.
     (b / "grow-farm.plan").write_bytes(original_plan)
-    run(*resume, b)
-    assert (b / "grow-farm.plan").read_bytes() == revised
+    run(*resume, b, code=2)
+    (b / "grow-farm.plan").write_bytes(revised)
+    run("fill", "--from-plan", expansion_review, "-d", "cpu", "--quiet", code=2)
     corrupt = bytearray(revised)
     corrupt[-2] = ord("0") if corrupt[-2] != ord("0") else ord("1")
     (b / "grow-farm.plan").write_bytes(corrupt)
@@ -364,10 +726,11 @@ def check(binary, root, reference=None):
     a.rename(relocated)
     run(*resume, b, code=2)
     before = tuple(snapshot(directory) for directory in (relocated, b, c))
-    moving = json.loads(run("plan", "--relocate", a, relocated, "--json").stdout)
+    relocation_review = farm / "relocation.plan"
+    moving = json.loads(run("plan", "--relocate", a, relocated, "--save-plan", relocation_review, "--json").stdout)
     assert moving["feasible"] and moving["destinations"][0]["directory"] == str(relocated)
     assert tuple(snapshot(directory) for directory in (relocated, b, c)) == before
-    moved = run(*resume, "--relocate", a, relocated)
+    moved = run("fill", "--from-plan", relocation_review, "--compute", "off", "-d", "cpu", "-M", "512M", "--quiet")
     moved_paths = [Path(line) for line in moved.stdout.splitlines()]
     assert len(moved_paths) == 6 and all(p.exists() for p in moved_paths)
     for path, value in original_hashes.items():
@@ -393,6 +756,11 @@ def check(binary, root, reference=None):
         run("fill", *keys, "-k", 18, "--group-members", 2, "--max-total-members", 1,
             "--max-groups", 1, *construction, "--construction", "incremental", "--quiet", left, right,
             point=point, code=86)
+        if point == "farm-plan-before-publication":
+            # The controller failpoint follows joined staging. Remove one
+            # copy to retain recovery coverage for a partially staged job.
+            assert (left / "grow-farm.plan.next").read_bytes() == (right / "grow-farm.plan.next").read_bytes()
+            (right / "grow-farm.plan.next").unlink()
         pending = interrupted / "offline"
         right.rename(pending)
         before = snapshot(left)
@@ -401,10 +769,10 @@ def check(binary, root, reference=None):
             assert snapshot(left) == before
         else:
             available = run(*resume, "--allow-missing", left, code=4)
-            assert len(available.stdout.splitlines()) == 1
+            assert not available.stdout.strip() and "waits for all saved farming destinations" in available.stderr
         pending.rename(right)
         if point == "farm-plan-before-publication":
-            run(*resume, right, code=2)  # This member did not receive its first copy yet.
+            run(*resume, right, code=2)  # This member has no recovery copy.
         finished = run(*resume, left if point == "farm-plan-before-publication" else right)
         paths = [Path(line) for line in finished.stdout.splitlines()]
         assert len(paths) == 2 and all(header(path)[3] == 1 for path in paths)
@@ -556,12 +924,20 @@ def check_automatic_compute(binary, root):
         preview = directory / "preview"
         preview.mkdir()
         before = {name: snapshot(state) for name, state in states.items()}
+        automatic_profile = directory / "harvester.json"
+        exported = run("first", "plan", "--save-profile", automatic_profile, "-M", "16M", "--quiet")
+        assert automatic_profile.is_file() and not exported.stdout and not exported.stderr
+        assert all(snapshot(states[name]) == saved for name, saved in before.items()), "profile export changed compute settings"
         plan_options = [preview, "-k", 18, "--group-members", 2, "--max-total-members", 3,
                         "--capacity-bytes", "64M", "--headroom-bytes", 0, *limits, "--json"]
         plan = run("first", "plan", *plan_options)
         dry_fill = run("first", "fill", *plan_options, "--plan-only")
         assert json.loads(plan.stdout) == json.loads(dry_fill.stdout)
         assert not list(preview.iterdir()) and all(snapshot(states[name]) == saved for name, saved in before.items())
+        automatic_review = directory / "automatic.plan"
+        run("first", "plan", *plan_options, "--save-plan", automatic_review)
+        assert automatic_review.is_file() and not list(preview.iterdir())
+        assert all(snapshot(states[name]) == saved for name, saved in before.items()), "saved review started compute services"
 
         # No worker or dedicated broker is running: a normal plot still works.
         made = run("first", *plot, "--max-host-ram", "512M", "-S", SEED, "-o", directory / "local")
@@ -575,12 +951,9 @@ def check_automatic_compute(binary, root):
         run("first", "grow", output, "--max-members", 3, *limits)
         assert header(output)[3] == 3
         run("first", "verify", output, "--full", "--trials", 100)
-        fill_dir = directory / "fill"
-        fill_dir.mkdir()
-        filled = run("first", "fill", fill_dir, "-k", 18, *keys, "-S", SEED,
-                     "--group-members", 2, "--max-total-members", 2, "--capacity-bytes", "64M", "--headroom-bytes", 0, *limits)
+        filled = run("first", "fill", "--from-plan", automatic_review, *keys, "-S", SEED, *limits)
         fill_paths = [Path(line) for line in filled.stdout.splitlines() if line.endswith(".gplot")]
-        assert len(fill_paths) == 1 and header(fill_paths[0])[3] == 2, filled
+        assert len(fill_paths) == 2 and sum(header(path)[3] for path in fill_paths) == 3, filled
         print("PASS saved enrollment, read-only plans and automatic local plot/fill/grow", flush=True)
 
         # Both storage machines broker their own work; a worker can arrive later.
@@ -605,7 +978,7 @@ def check_automatic_compute(binary, root):
         broker, broker_log = start("first", "dedicated-broker", "compute", "broker", "--listen", f"127.0.0.1:{port}",
                                    "--worker-ms", 3000, "--lease-ms", 3000)
         run("second", "compute", "configure", "--broker", f"127.0.0.1:{port}")
-        result = run("second", *plot, "--compute-local", "off", "-o", directory / "dedicated", "--no-quiet")
+        result = run("second", *plot, "--compute-local", "off", "-o", directory / "dedicated", "--no-quiet", "-v")
         assert "Using broker 127.0.0.1:" in result.stderr and "Automatic broker" not in result.stderr
         assert Path(result.stdout.strip()).is_file()
         assert broker.poll() is None, broker_log.read_text(encoding="utf-8")
