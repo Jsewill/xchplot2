@@ -179,7 +179,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     };
     // Validate inspection's narrow input scope before options such as path
     // lists or local harvester detection can read anything beyond its source.
-    bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false;
+    bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false, inventory = false, proof_worker = false, proof_options = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string_view const key = argv[i];
@@ -188,18 +188,24 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         else if (key == "--no-metadata-only") metadata_only = false;
         else if (key == "--assess-jobs") assess_jobs = true;
         else if (key == "--no-assess-jobs") assess_jobs = false;
+        else if (key == "--inventory") inventory = true;
+        else if (key == "--no-inventory") inventory = false;
         else if (key == "--calibrate") calibrate = true;
         else if (key == "--no-calibrate") calibrate = false;
         if (key == "--calibration-worker") calibration_worker = true;
+        if (key == "--replot-proof-worker") proof_worker = true;
+        if (key == "--replot-proof-cpus") proof_options = true;
         if (key.starts_with("--calibration-")) calibration_options = true;
         i += int(group_option_values(key));
     }
-    if (metadata_only || assess_jobs || calibrate || calibration_options)
+    if (metadata_only || assess_jobs || calibrate || calibration_options || inventory || proof_worker || proof_options)
     {
         require(command == "plan", "saved metadata and joint assessment modes require plan");
-        require(unsigned(metadata_only) + unsigned(assess_jobs) + unsigned(calibrate) == 1,
-            "choose one of --metadata-only, --assess-jobs or --calibrate");
+        require(unsigned(metadata_only) + unsigned(assess_jobs) + unsigned(calibrate) + unsigned(inventory) == 1,
+            "choose one of --metadata-only, --assess-jobs, --calibrate or --inventory");
         require(!calibration_options || calibrate, "calibration controls require --calibrate");
+        require(!proof_worker || (calibrate && calibration_worker), "private proof verification requires the capped calibration worker scope");
+        require(!proof_options || proof_worker, "proof CPU controls require the private proof worker");
 #ifndef XCHPLOT2_GROUP_COMMANDS
         require(!calibrate, "reader calibration requires the installed xchplot2 plan command");
 #endif
@@ -209,11 +215,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (key == "--") break;
             if (!key.starts_with('-')) continue;
             bool const worker_option = key == "--calibration-worker" || key == "--calibration-samples" ||
-                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes";
+                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes" || key == "--replot-proof-worker" || key == "--replot-proof-cpus";
             bool const calibration_input = !calibration_worker && (key == "--save-profile" || key == "--harvester" ||
                 key == "--chia-root" || key == "--chia-executable" || key.starts_with("--farming-"));
             require(key == "--metadata-only" || key == "--no-metadata-only" || key == "--assess-jobs" || key == "--no-assess-jobs" ||
                 key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
+                (inventory && (key == "--inventory" || key == "--no-inventory" || key == "--save-plan" ||
+                    key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable")) ||
+                (inventory && (key == "--farm-adapter" || key == "--farm-checker")) ||
                 (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
                 key == "--json" || (!calibration_worker && (key == "--max-ram" || key == "-M" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v")),
@@ -235,9 +244,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--no-metadata-only") { result.metadata_only = false; continue; }
         if (key == "--assess-jobs") { result.assess_jobs = true; continue; }
         if (key == "--no-assess-jobs") { result.assess_jobs = false; continue; }
+        if (key == "--inventory") { result.inventory = true; continue; }
+        if (key == "--no-inventory") { result.inventory = false; continue; }
         if (key == "--calibrate") { result.calibrate = true; continue; }
         if (key == "--no-calibrate") { result.calibrate = false; continue; }
         if (key == "--calibration-worker") { result.calibration_worker = true; continue; }
+        if (key == "--replot-proof-worker") { result.replot_proof_worker = true; continue; }
         if (key == "--extend") { result.extend = true; continue; }
         if (key == "--allow-missing") { result.allow_missing = true; continue; }
         if (!command.empty())
@@ -264,8 +276,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--manifest") result.manifest = path(value);
             else if (key == "--save-plan") result.save_plan = path(value);
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
+            else if (key == "--replot") result.replot_inventory = path(value);
+            else if (key == "--farm-adapter") result.farm_adapter = value;
+            else if (key == "--farm-checker") result.farm_checker = path(value);
+            else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str());
             else if (key == "--save-profile") result.save_profile = path(value);
             else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str());
+            else if (key == "--replot-proof-cpus") result.replot_proof_cpus = number(value.c_str());
             else if (key == "--calibration-timeout-ms") result.calibration_timeout_ms = number(value.c_str());
             else if (key == "--calibration-memory-bytes") result.calibration_memory_bytes = number(value.c_str());
             else if (key == "--harvester")
@@ -419,6 +436,21 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
     }
     bool const farm_command = command == "fill" || command == "plan";
+    require(result.farm_adapter == "chia" || result.farm_adapter == "gigahorse" || result.farm_adapter == "drchia",
+        "--farm-adapter requires chia, gigahorse or drchia");
+    require(result.farm_checker.empty() || result.farm_adapter == "gigahorse", "--farm-checker requires the supported gigahorse adapter");
+    if (result.inventory)
+    {
+        require(command == "plan" && !result.target.empty(), "plan --inventory requires explicit existing farm roots");
+        require(result.max_ram >= 16 * mib, "at least 16777216 budget bytes required");
+        require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
+        result.directory_farm = true;
+        return result;
+    }
+    require(result.replot_inventory.empty() || (command == "plan" && !result.target.empty() &&
+        result.from_plan.empty() && result.manifest.empty() && !result.resume && !result.extend && result.relocations.empty() && !result.allow_missing),
+        "replot review requires plan DEST... --replot INVENTORY, without an existing job selector");
+    require(!result.reclaim_before_bytes || !result.replot_inventory.empty(), "--reclaim-before-bytes belongs in a saved replot review");
     if (result.metadata_only || result.assess_jobs || result.calibrate)
     {
         if (result.assess_jobs || result.calibrate)
@@ -463,6 +495,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();
     }
+    require((result.farm_adapter == "chia" && result.farm_checker.empty()) || !result.replot_inventory.empty() || !result.from_plan.empty(),
+        "native farm adapters require inventory, replot review or a saved migration plan");
     if (result.extend || !result.relocations.empty()) result.resume = true;
     require(!result.target.empty() || (farm_command &&
         (result.plan_only || result.resume || !result.manifest.empty() || !result.from_plan.empty())), "destination required");
@@ -486,7 +520,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require((!result.farming_detect_local && result.farming_profile_path.empty() &&
         result.chia_root.empty() && result.chia_executable.empty()) || farm_command,
         "harvester profiles require plan or fill");
-    require(result.farming_detect_local || (result.chia_root.empty() && result.chia_executable.empty()),
+    require(result.farming_detect_local || !result.replot_inventory.empty() || !result.from_plan.empty() ||
+        (result.chia_root.empty() && result.chia_executable.empty()),
         "--chia-root and --chia-executable require --harvester local");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
                 result.max_members <= 65535, "member caps must be in 1..65535");

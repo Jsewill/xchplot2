@@ -100,6 +100,7 @@ struct GpuProducerPreflight
     std::string tier;
     uint64_t borrowed_host_bytes = 0, owning_host_bytes = 0;
     uint64_t device_bytes = 0;
+    std::string physical_identity;
 };
 
 // Construct, generate and destroy on the same thread. Device generation is

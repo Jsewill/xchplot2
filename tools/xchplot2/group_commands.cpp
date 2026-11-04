@@ -30,6 +30,8 @@ void command_usage(std::string_view command)
     else std::cout << "Usage: xchplot2 " << command
         << (command == "grow" ? " FILE [OPTIONS]\n" : " [OPTIONS] [DIR... | PLAN]\n");
     if (command == "plan") std::cout << "       xchplot2 plan --assess-jobs [OPTIONS] PLAN...\n";
+    if (command == "plan") std::cout << "       xchplot2 plan --inventory ROOT... [--save-plan inventory.plan]\n"
+        "       xchplot2 plan DEST... --replot inventory.plan [--save-plan migration.plan]\n";
 }
 
 void command_help_all(std::string_view command)
@@ -52,6 +54,11 @@ void command_help_all(std::string_view command)
         "  --save-profile FILE      export harvester settings without destinations\n"
         "  --metadata-only          plan: inspect saved metadata without checking destinations or recovery\n"
         "  --assess-jobs             plan: assess saved keyless job forecasts under one harvester budget\n"
+        "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
+        "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
+        "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
+        "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
+        "  --farm-checker FILE       optional documented native plot checker\n"
         "  --extend                 add destinations while preserving saved assignments\n"
         "  --allow-missing          with --resume, continue available members; incomplete exit 4\n"
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";
@@ -145,7 +152,10 @@ void command_help(std::string_view command, bool all)
             "  -F, --from-plan FILE      inspect a saved plan (also accepts positional PLAN)\n"
             "  --save-profile FILE       export harvester settings; omit destinations\n"
             "  --metadata-only           read saved PLAN or --manifest FILE without live checks\n"
-            "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n";
+            "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n"
+            "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
+            "  --replot INVENTORY       review migration into DEST...; save with --save-plan\n"
+            "  --reclaim-before-bytes SIZE  physical bytes retired before replacement readiness\n";
     else
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n"

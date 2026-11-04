@@ -102,6 +102,10 @@ for reusable options. `xchplot2 --help` prints command syntax.
 | [xchplot2 plan](REFERENCE.md#grouped-plotting-and-drive-filling) | Preview a farming layout; optionally save it for execution |
 | [xchplot2 fill](REFERENCE.md#grouped-plotting-and-drive-filling) | Populate destination drives and resume interrupted work |
 
+To replace an existing farm, use the separate
+[inventory and migration workflow](REFERENCE.md#replacing-an-existing-farm).
+Ordinary `fill` uses free space and does not remove existing plots.
+
 ### Shared compute
 
 | Command | Purpose and guide |

@@ -18,14 +18,18 @@ function(pos2_group_tests upstream_dir grow_include)
     endif()
     add_executable(pos2_pr118_grow_scratch_test "${repo_dir}/tools/parity/group_scratch_test.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
+    add_executable(pos2_pr118_grow_inventory_test "${repo_dir}/tools/parity/group_inventory_test.cpp"
+        "${upstream_dir}/src/pos/sha/sha256.c")
+    add_executable(pos2_pr118_grow_replot_resources_test "${repo_dir}/tools/parity/group_replot_resources_test.cpp"
+        "${upstream_dir}/src/pos/sha/sha256.c")
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_definitions(pos2_pr118_grow_external_test PRIVATE GROW_TEST_WRAP_PWRITE=1)
         target_link_options(pos2_pr118_grow_external_test PRIVATE "-Wl,--wrap=pwrite" "-Wl,--wrap=pread"
             "-Wl,--wrap=POS2_FSE_compress_usingCTable" "-Wl,--wrap=fsetxattr" "-Wl,--wrap=renameat2" "-Wl,--wrap=fsync")
         target_compile_definitions(pos2_pr118_grow_merge_test PRIVATE GROW_TEST_WRAP_PWRITE=1)
-        target_link_options(pos2_pr118_grow_merge_test PRIVATE "-Wl,--wrap=pwrite" "-Wl,--wrap=unlink" "-Wl,--wrap=lstat")
+        target_link_options(pos2_pr118_grow_merge_test PRIVATE "-Wl,--wrap=pwrite" "-Wl,--wrap=unlink" "-Wl,--wrap=lstat" "-Wl,--wrap=renameat2")
     endif()
-    foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test)
+    foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_replot_resources_test)
         if(NOT TARGET ${target})
             continue()
         endif()
@@ -49,7 +53,7 @@ function(pos2_group_tests upstream_dir grow_include)
         target_sources(pos2_pr118_grow_merge_test PRIVATE "${repo_dir}/tools/xchplot2/group_options.cpp")
     endif()
     foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test
-                   pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test
+                   pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_replot_resources_test
                    pos2_pr118_grow_merge_test pos2_pr118_grow_gpu_output_test pos2_pr118_grow_farming_test)
         if(NOT TARGET ${target})
             continue()

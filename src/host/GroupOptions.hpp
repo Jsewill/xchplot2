@@ -21,6 +21,10 @@ struct GroupOptions
     std::function<bool()> cancelled;
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
+    std::filesystem::path replot_inventory;
+    std::filesystem::path farm_checker;
+    std::string farm_adapter = "chia";
+    uint64_t reclaim_before_bytes = 0;
     std::vector<std::filesystem::path> assessment_plans;
     std::vector<std::filesystem::path> calibration_plots;
     uint64_t calibration_samples = 16, calibration_timeout_ms = 30000, calibration_memory_bytes = 512 * 1024 * 1024;
@@ -45,6 +49,11 @@ struct GroupOptions
     bool backend_set = false;
     bool resume = false, group_auto = false, plan_only = false, directory_farm = false, metadata_only = false, assess_jobs = false;
     bool calibrate = false, calibration_worker = false;
+    bool replot_proof_worker = false;
+    uint64_t replot_proof_cpus = 0;
+    bool protected_resources = false;
+    uint64_t protected_gpu_bytes = 0;
+    bool inventory = false;
     bool extend = false, allow_missing = false;
     bool capacity_set = false, headroom_set = false, max_groups_set = false, max_total_members_set = false;
     std::optional<std::string> farming_reader, farming_objective;

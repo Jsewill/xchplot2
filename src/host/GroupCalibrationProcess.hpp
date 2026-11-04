@@ -1,4 +1,4 @@
-// Private, bounded process ownership for explicit farming calibration only.
+// Private, bounded self-workers for explicit calibration and migration proofs.
 #pragma once
 #include "host/GroupHarvesterProfile.hpp"
 #include <atomic>
@@ -27,6 +27,70 @@ struct MemoryCap
 };
 inline void check(bool condition, char const* message)
 { if (!condition) throw std::runtime_error(message); }
+inline uint64_t install_cpu_cap(uint64_t requested)
+{
+#ifdef __linux__
+    cpu_set_t allowed, selected, actual; CPU_ZERO(&allowed); CPU_ZERO(&selected); CPU_ZERO(&actual);
+    check(!::sched_getaffinity(0, sizeof(allowed), &allowed), "cannot inspect bounded proof CPU affinity");
+    uint64_t const count = uint64_t(CPU_COUNT(&allowed)); check(count && requested <= count, "proof CPU cap exceeds inherited affinity");
+    if (!requested) return count;
+    uint64_t picked = 0;
+    for (int id = 0; id < CPU_SETSIZE && picked < requested; ++id)
+        if (CPU_ISSET(id, &allowed)) { CPU_SET(id, &selected); ++picked; }
+    check(picked == requested && !::sched_setaffinity(0, sizeof(selected), &selected) &&
+          !::sched_getaffinity(0, sizeof(actual), &actual) && CPU_EQUAL(&actual, &selected), "cannot enforce bounded proof CPU affinity");
+    return requested;
+#else
+    check(!requested, "explicit proof CPU affinity is unsupported on this platform");
+    auto const count = profile_detail::logical_cpus(); check(count, "cannot inspect inherited proof CPU capacity"); return count;
+#endif
+}
+// Save/restore the calling thread's Linux affinity around upstream code that
+// creates its own workers. All those workers must be joined before this guard
+// ends: new threads inherit the cap, existing unrelated threads are unchanged.
+class ScopedCpuCap
+{
+    uint64_t lanes_ = 0;
+#ifdef __linux__
+    cpu_set_t original_{};
+    bool active_ = false;
+#endif
+public:
+    explicit ScopedCpuCap(uint64_t requested)
+    {
+#ifdef __linux__
+        check(!::sched_getaffinity(0, sizeof(original_), &original_), "cannot save scoped CPU affinity");
+        try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }
+        catch (...)
+        {
+            // install_cpu_cap can fail its read-back after applying the mask.
+            // An incomplete constructor still owns restoration of that change.
+            (void)::sched_setaffinity(0, sizeof(original_), &original_); throw;
+        }
+#else
+        lanes_ = install_cpu_cap(requested);
+#endif
+    }
+    ~ScopedCpuCap()
+    {
+#ifdef __linux__
+        if (active_) (void)::sched_setaffinity(0, sizeof(original_), &original_);
+#endif
+    }
+    ScopedCpuCap(ScopedCpuCap const&) = delete;
+    ScopedCpuCap& operator=(ScopedCpuCap const&) = delete;
+    uint64_t lanes() const { return lanes_; }
+    void restore()
+    {
+#ifdef __linux__
+        if (!active_) return;
+        cpu_set_t actual; CPU_ZERO(&actual);
+        check(!::sched_setaffinity(0, sizeof(original_), &original_) &&
+              !::sched_getaffinity(0, sizeof(actual), &actual) && CPU_EQUAL(&actual, &original_), "cannot restore scoped CPU affinity");
+        active_ = false;
+#endif
+    }
+};
 inline Clock::time_point deadline(uint64_t timeout_ms)
 {
     auto const now = Clock::now();
@@ -118,8 +182,15 @@ inline std::filesystem::path executable()
 #endif
 }
 
-inline std::string run_worker(std::filesystem::path const& plot, uint64_t samples, Limits const& limits)
+enum class Worker { calibration, migration_proof };
+inline std::string run_worker(std::filesystem::path const& plot, uint64_t samples, Limits const& limits,
+                              Worker worker = Worker::calibration, uint64_t proof_cpus = 0)
 {
+    check(worker == Worker::calibration || worker == Worker::migration_proof, "invalid bounded plot worker mode");
+    check(!proof_cpus || (worker == Worker::migration_proof && proof_cpus <= 1024), "invalid bounded proof CPU request");
+#ifndef __linux__
+    check(!proof_cpus, "explicit proof CPU affinity is unsupported on this platform");
+#endif
     auto const until = deadline(limits.timeout_ms);
     check_running(until, limits.cancelled);
     check(samples && limits.memory_bytes && limits.output_bytes && limits.output_bytes <= std::string().max_size(),
@@ -161,7 +232,8 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     auto quote = profile_detail::windows_argument;
     std::wstring command = quote(self.wstring()) + L" plan --config NUL --calibrate --calibration-worker --calibration-samples " +
         std::to_wstring(samples) + L" --calibration-memory-bytes " + std::to_wstring(limits.memory_bytes) +
-        L" --calibration-timeout-ms " + std::to_wstring(limits.timeout_ms) + L" --json -- " + quote(absolute.wstring());
+        L" --calibration-timeout-ms " + std::to_wstring(limits.timeout_ms) +
+        (worker == Worker::migration_proof ? L" --replot-proof-worker" : L"") + L" --json -- " + quote(absolute.wstring());
     STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdOutput = write.value; startup.StartupInfo.hStdError = write.value; startup.StartupInfo.hStdInput = input.value;
     startup.lpAttributeList = list;
@@ -244,7 +316,10 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     check(!action, "cannot configure calibration worker descriptors");
     std::vector<std::string> arguments{self.string(), "plan", "--config", "/dev/null", "--calibrate", "--calibration-worker",
         "--calibration-samples", std::to_string(samples), "--calibration-memory-bytes", std::to_string(limits.memory_bytes),
-        "--calibration-timeout-ms", std::to_string(limits.timeout_ms), "--json", "--", absolute.string()};
+        "--calibration-timeout-ms", std::to_string(limits.timeout_ms)};
+    if (worker == Worker::migration_proof) arguments.push_back("--replot-proof-worker");
+    if (proof_cpus) arguments.insert(arguments.end(), {"--replot-proof-cpus", std::to_string(proof_cpus)});
+    arguments.insert(arguments.end(), {"--json", "--", absolute.string()});
     std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data()); argv.push_back(nullptr);
     struct Child
     {

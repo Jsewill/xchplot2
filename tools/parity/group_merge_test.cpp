@@ -1,6 +1,8 @@
 #include "host/GroupMerge.hpp"
 #include "host/GroupWriter.hpp"
 #include "host/GroupPolicy.hpp"
+#include "host/GroupFarmMigration.hpp"
+#include "host/GroupFarmRetirement.hpp"
 #include <iostream>
 #include <sstream>
 #include <sys/wait.h>
@@ -27,6 +29,17 @@ std::atomic<bool> hold_background_check{false}, background_check_after{false};
 std::string background_check_target;
 std::atomic<bool> replace_unlinked{false};
 std::string replacement_target;
+std::function<void(int, char const*, int, char const*)> retirement_rename_hook;
+extern "C" int __real_renameat2(int, char const*, int, char const*, unsigned);
+extern "C" int __wrap_renameat2(int from, char const* old_name, int to, char const* new_name, unsigned flags)
+{
+    if (retirement_rename_hook)
+    {
+        auto hook = std::move(retirement_rename_hook); retirement_rename_hook = {};
+        hook(from, old_name, to, new_name);
+    }
+    return __real_renameat2(from, old_name, to, new_name, flags);
+}
 extern "C" int __real_unlink(char const*);
 extern "C" int __wrap_unlink(char const* path)
 {
@@ -3038,6 +3051,309 @@ FarmingState farming_format_fixture(unsigned version)
     return state;
 }
 
+void replot_journal_protocol(fs::path const& root)
+{
+    using grow_controller_test::mib;
+    ReplotJournal journal; journal.review_digest = std::string(64, 'a');
+    journal.farm = farming_format_fixture(6); journal.farm.capacity_fill = false;
+    for (auto& directory : journal.farm.directories) { directory.extents.clear(); directory.sealed_files = 0; }
+    journal.retirements.resize(2);
+    ReplotReview review; review.inventory_json = "{}"; review.resources_json = "{}";
+    review.memory_limit_bytes = 16 * grow_controller_test::mib;
+    review.farm = parse_farming_state(farming_state_text(journal.farm, true), 16 * mib);
+    review.sources = {0, 1}; review.space.resize(review.farm.directories.size());
+    uint64_t source = 0;
+    for (size_t lane = 0; lane < review.farm.directories.size(); ++lane)
+        for (uint64_t ordinal = 0; ordinal < review.farm.directories[lane].layout.files; ++ordinal)
+        {
+            uint64_t const count = source < review.sources.size() ? 1 : 0;
+            review.batches.push_back({lane, ordinal, source, count, 4096, 8192, 16384, 4096}); source += count;
+        }
+    for (auto& space : review.space) space.metadata_allowance_bytes = 65536;
+    auto const review_body = replot_review_text(review);
+    require(replot_review_text(parse_replot_review(review_body, 16 * mib)) == review_body,
+        "replot review changed canonical bytes");
+    auto roundtrip = [&](ReplotJournal const& value)
+    {
+        auto const body = replot_journal_text(value);
+        require(replot_journal_text(parse_replot_journal(body, 16 * mib)) == body, "replot journal changed canonical bytes");
+    };
+    roundtrip(journal);
+    auto advance = [&](auto change)
+    {
+        auto next = journal; ++next.revision; next.parent_digest = stream_state::digest(replot_journal_text(journal)); change(next);
+        validate_replot_journal(next); require(valid_replot_revision(journal, next), "legal replot revision rejected");
+        roundtrip(next); journal = std::move(next);
+    };
+    advance([](auto& value) { value.phase = ReplotPhase::replacing; });
+    auto early_retirement = journal; ++early_retirement.revision;
+    early_retirement.parent_digest = stream_state::digest(replot_journal_text(journal));
+    early_retirement.retirements[0].state = ReplotRetirement::claim_intent;
+    require(!valid_replot_revision(journal, early_retirement), "replot retirement lacked replacement or explicit predelete state");
+    advance([](auto& value) { value.retirements[0] = {ReplotRetirement::claim_intent, true}; });
+    advance([](auto& value) { value.retirements[0].state = ReplotRetirement::claimed; });
+    advance([](auto& value) { value.retirements[0].state = ReplotRetirement::retired; });
+    advance([](auto& value) { value.verified_stage = stream_state::Stamp{1, 2, 4096, 3, 4, 5, 6}; });
+    advance([](auto& value) { value.published = value.verified_stage; });
+    advance([](auto& value) { value.ready = value.published; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::claim_intent; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::claimed; });
+    advance([](auto& value) { value.retirements[1].state = ReplotRetirement::retired; });
+    ReplotReceipt receipt{journal.review_digest, {}, 0, 0, 2, *journal.ready};
+    auto const body = replot_receipt_text(receipt);
+    require(replot_receipt_text(parse_replot_receipt(body)) == body, "replot receipt changed canonical bytes");
+    advance([&](auto& value)
+    {
+        ++value.batch; value.retired_prefix += value.retirements.size(); value.retirements.clear(); value.verified_stage.reset(); value.published.reset(); value.ready.reset();
+        value.receipt_digest = stream_state::digest(body);
+    });
+    auto invalid = journal; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(journal));
+    invalid.farm.seed = std::string(64, 'e');
+    require(!valid_replot_revision(journal, invalid), "replot revision changed plot identities");
+    invalid = journal; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(journal));
+    invalid.retired_prefix = 0;
+    require(!valid_replot_revision(journal, invalid), "replot revision forgot outstanding retirement progress");
+    auto reject = [](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    reject([&] { (void)parse_replot_journal(replot_journal_text(journal), 64); }, "replot journal ignored parser budget");
+    reject([&] { (void)parse_replot_receipt(body + "extra"); }, "replot receipt accepted trailing data");
+    invalid = journal; invalid.retirements.resize(replot_maximum_batch_sources + 1);
+    reject([&] { (void)replot_journal_text(invalid); }, "replot journal retained an unbounded active batch");
+    invalid = journal; invalid.phase = ReplotPhase::complete;
+    reject([&] { (void)replot_journal_text(invalid); }, "replot handoff skipped unfinished replacements");
+    for (auto const* point : {"replot-journal-all-staged", "replot-journal-one-published"})
+    {
+        auto const base = root / point; fs::create_directory(base);
+        std::vector<fs::path> directories{base / "a", base / "b"};
+        for (auto const& path : directories) fs::create_directory(path);
+        ReplotJournal initial; initial.review_digest = std::string(64, 'b'); initial.farm = journal.farm; initial.retirements.resize(1);
+        auto replicas = load_replot_journals(directories, initial.review_digest, 16 * mib);
+        require(!replicas.present, "fresh replot journal unexpectedly exists");
+        publish_replot_journals(replicas, initial, 16 * mib, [] {});
+        auto next = initial; ++next.revision; next.parent_digest = replicas.digest; next.phase = ReplotPhase::replacing;
+        auto const child = ::fork(); require(child >= 0, "cannot fork replot journal recovery test");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+            publish_replot_journals(replicas, next, 16 * mib, [] {}); std::_Exit(1);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "replot journal did not stop at its durability boundary");
+        auto recovered = load_replot_journals(directories, initial.review_digest, 16 * mib);
+        require(recovered.state.revision == next.revision && recovered.digest == stream_state::digest(replot_journal_text(next)),
+            "replot journal selected an older interrupted revision");
+        publish_replot_journals(recovered, recovered.state, 16 * mib, [] {});
+        for (auto const& replica : recovered.replicas)
+            require(replica.digest == recovered.digest && replica.published && !replica.pending,
+                "replot journal recovery did not finish every replica");
+        reject([&] { (void)load_replot_journals(directories, std::string(64, 'c'), 16 * mib); },
+            "replot journal accepted another review's authority");
+    }
+}
+
+void replot_capacity_prefix()
+{
+    using namespace grow_controller_test;
+    require(replot_metadata_remaining(64, 0) == 64 && replot_metadata_remaining(64, 24) == 40 &&
+        !replot_metadata_remaining(64, 64) && !replot_metadata_remaining(64, 80),
+        "live migration metadata reservation omitted future allocations or charged current blocks twice");
+    require(sum(replot_metadata_remaining(64, 24), replot_metadata_remaining(64, 8)) == 96,
+        "shared-filesystem migration replicas failed to reserve every unallocated metadata allowance");
+    ReplotInputs input;
+    input.review.farm.headroom = 0;
+    FarmingDirectory destination; destination.filesystem = "output-fs";
+    input.review.farm.directories = {destination};
+    input.review.space = {{96, 96, 128, 32, 8}};
+    input.review.sources = {0, 1};
+    input.review.batches = {{0, 0, 0, 1, 64, 32, 4, 4}, {0, 1, 1, 1, 64, 32, 4, 4}};
+    farm::InventoryRoot root; root.storage.filesystem = "output-fs";
+    input.inventory.roots = {root}; input.inventory.plots.resize(2);
+    input.inventory.plots[0].identity.allocated_bytes = 32;
+    input.inventory.plots[1].identity.allocated_bytes = 64;
+    require(!replot_prefix_capacity(input).empty(),
+        "replacement-first prefix spent source bytes before its mapped replacement was ready");
+    input.review.reclaim_before_bytes = 36;
+    require(!replot_prefix_capacity(input).empty(), "pre-delete limit admitted a fraction of an indivisible old file");
+    input.review.reclaim_before_bytes = 64;
+    require(replot_prefix_capacity(input).empty(),
+        "ready replacement failed to release its outstanding pre-delete allowance for the next batch");
+    auto receipts = input;
+    for (auto& batch : receipts.review.batches) batch.receipt_allowance_bytes = 12;
+    require(!replot_prefix_capacity(receipts).empty(), "later replacement ignored retained receipt allocations");
+    auto elsewhere = input; elsewhere.inventory.roots[0].storage.filesystem = "other-fs";
+    elsewhere.review.reclaim_before_bytes = 1024;
+    require(!replot_prefix_capacity(elsewhere).empty(), "retiring another filesystem supplied output free space");
+    auto no_journal = input; no_journal.review.space[0].free_bytes = 7;
+    no_journal.review.reclaim_before_bytes = 1024;
+    require(!replot_prefix_capacity(no_journal).empty(), "retirement began without space for durable private state");
+}
+
+void replot_destination_namespace(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const destination = root / "replot-namespace", empty = root / "replot-empty";
+    fs::create_directory(destination); fs::create_directory(empty);
+    Arguments args; args.max_ram = 512 * mib;
+    std::array<fs::path, 1> roots{destination};
+    auto catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    replot_destination_coverage(args, catalog, empty, {});
+    auto const file = destination / "opaque-farm-data";
+    { std::ofstream out(file, std::ios::binary); out << "protected existing data"; }
+    auto reject = [&](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    reject([&] { replot_destination_coverage(args, catalog, destination, {}); },
+        "migration accepted existing destination data omitted from inventory");
+    catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    replot_destination_coverage(args, catalog, destination, {});
+    { std::ofstream out(file, std::ios::app); out << " changed"; }
+    reject([&] { replot_destination_coverage(args, catalog, destination, {}); },
+        "migration accepted a changed inventoried destination object");
+    catalog = scan_farm_inventory(roots, replot_inventory_limits(args));
+    auto const metadata = destination / "explicit-inventory-input";
+    { std::ofstream out(metadata, std::ios::binary); out << "typed caller-validated catalog fixture"; }
+    std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+    replot_destination_coverage(args, catalog, destination, supplied, &catalog);
+    require(catalog.plots.size() == 2 && replot_nonplot(catalog.plots.back()),
+        "explicit typed metadata failed to retain a protected native-stamped observation");
+    replot_destination_coverage(args, catalog, destination, {});
+    { std::ofstream out(metadata, std::ios::app); out << " stale"; }
+    reject([&] { replot_destination_coverage(args, catalog, destination, supplied); },
+        "changed metadata received an unverified destination exemption");
+}
+
+void replot_retirement_protocol(fs::path const& root)
+{
+#ifdef __linux__
+    using namespace group_grow::farm;
+    auto const base = root / "replot-retirement"; fs::create_directory(base);
+    std::string const job(64, 'd');
+    auto reject = [](auto operation, char const* message)
+    { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    auto write = [](fs::path const& path, std::string const& bytes)
+    { std::ofstream out(path, std::ios::binary); out << bytes; require(bool(out), "cannot write retirement fixture"); };
+    auto read = [](fs::path const& path)
+    { auto bytes = contents(path); return std::string(bytes.begin(), bytes.end()); };
+    auto fixture = [&](std::string const& name)
+    {
+        auto const directory = base / name; fs::create_directories(directory / "nested");
+        // The low-level retirement protocol operates on an already-authorized
+        // native object. Format eligibility is covered by inventory/controller
+        // fixtures; these bytes make accidental substitution easy to detect.
+        write(directory / "nested" / "source.plot", "reviewed source bytes");
+        std::array<fs::path, 1> roots{directory}; auto inventory = scan_farm_inventory(roots);
+        require(inventory.plots.size() == 1, "retirement fixture has an unexpected inventory");
+        return inventory;
+    };
+    auto claim_path = [&](FarmInventory const& inventory)
+    { return file_io::native_path(inventory.roots[0].path) / replot_claim_path(job, 0); };
+    auto original_path = [](FarmInventory const& inventory)
+    { return file_io::native_path(inventory.roots[0].path) / inventory.plots[0].relative_path; };
+    auto claim = [&](FarmInventory const& inventory)
+    { return claim_replot_source(inventory.roots[0], inventory.plots[0], job, 0, {}); };
+    auto unlink = [&](FarmInventory const& inventory, std::function<void()> gate)
+    { unlink_replot_claim(inventory.roots[0], inventory.plots[0], job, 0, {}, gate); };
+    auto normal = fixture("normal"); auto const observed = normal.plots[0].identity;
+    require(same_inventory_contents(claim(normal), observed) && !fs::exists(original_path(normal)) &&
+        read(claim_path(normal)) == "reviewed source bytes", "claim lost or replaced the reviewed source");
+    require(same_inventory_contents(claim(normal), observed), "claim could not recover an interrupted rename");
+    reject([&] { unlink(normal, [] { throw std::runtime_error("not ready"); }); }, "retirement ignored a fresh readiness refusal");
+    require(read(claim_path(normal)) == "reviewed source bytes", "failed readiness removed the claim");
+    unsigned gates = 0; unlink(normal, [&] { ++gates; });
+    require(gates == 1 && replot_claim_missing(normal.roots[0], normal.plots[0], job, 0), "retirement did not recheck readiness or finish its claim");
+
+    auto changed = fixture("changed-source"); auto const original = original_path(changed);
+    fs::rename(original, original.parent_path() / "saved.plot"); write(original, "reviewed source bytes");
+    reject([&] { (void)claim(changed); }, "same-byte replacement inode was claimed as the old source");
+    require(read(original) == "reviewed source bytes" && fs::exists(original.parent_path() / "saved.plot") &&
+        !fs::exists(claim_path(changed)), "source mismatch changed a file");
+
+    auto collision = fixture("claim-collision"); fs::create_directory(claim_path(collision).parent_path());
+    require(!::chmod(claim_path(collision).parent_path().c_str(), 0700), "cannot protect fixture claim directory");
+    write(claim_path(collision), "unrelated claim");
+    reject([&] { (void)claim(collision); }, "claim overwrote a pre-existing file");
+    require(read(claim_path(collision)) == "unrelated claim" && read(original_path(collision)) == "reviewed source bytes",
+        "claim collision did not preserve both files");
+
+    auto unprotected = fixture("unprotected-claim"); fs::create_directory(claim_path(unprotected).parent_path());
+    require(!::chmod(claim_path(unprotected).parent_path().c_str(), 0755), "cannot set fixture claim permissions");
+    reject([&] { (void)claim(unprotected); }, "retirement accepted a claim directory accessible to other users");
+    require(fs::exists(original_path(unprotected)), "unprotected claim directory lost the original");
+
+    auto alias = fixture("new-hardlink"); fs::create_hard_link(original_path(alias), original_path(alias).parent_path() / "alias.plot");
+    reject([&] { (void)claim(alias); }, "source gained a hardlink after review but was still claimed");
+    require(fs::exists(original_path(alias)), "hardlink rejection removed the source");
+    auto changed_claim = fixture("changed-claim"); (void)claim(changed_claim);
+    reject([&] { unlink(changed_claim, [&]
+        {
+            fs::rename(claim_path(changed_claim), claim_path(changed_claim).parent_path() / "saved-claim");
+            write(claim_path(changed_claim), "substituted claim");
+        }); }, "claim substituted during live readiness was unlinked");
+    require(read(claim_path(changed_claim)) == "substituted claim" &&
+        read(claim_path(changed_claim).parent_path() / "saved-claim") == "reviewed source bytes",
+        "changed claim did not preserve both native objects");
+
+    auto changed_root = fixture("changed-root"); auto const root_path = file_io::native_path(changed_root.roots[0].path);
+    fs::rename(root_path, base / "old-root"); fs::create_directories(root_path / "nested"); write(original_path(changed_root), "new mount contents");
+    reject([&] { (void)claim(changed_root); }, "retirement accepted a different root directory");
+    require(read(original_path(changed_root)) == "new mount contents" &&
+        read(base / "old-root" / "nested" / "source.plot") == "reviewed source bytes", "root mismatch removed a file");
+
+#ifdef GROW_TEST_WRAP_PWRITE
+    auto swapped = fixture("rename-substitution");
+    retirement_rename_hook = [&](int parent, char const* name, int, char const*)
+    {
+        require(!::renameat(parent, name, parent, "saved-before-rename"), "cannot inject source substitution");
+        write(original_path(swapped), "substituted source");
+    };
+    reject([&] { (void)claim(swapped); }, "source substituted between pin and rename was accepted");
+    require(!retirement_rename_hook && read(claim_path(swapped)) == "substituted source" &&
+        read(original_path(swapped).parent_path() / "saved-before-rename") == "reviewed source bytes",
+        "failed native identity check did not preserve both files");
+
+    auto moved_parent = fixture("moved-parent"); auto const moved_root = file_io::native_path(moved_parent.roots[0].path);
+    fs::create_directory(moved_root / "other"); write(moved_root / "other" / "source.plot", "unrelated symlink target");
+    retirement_rename_hook = [&](int, char const*, int, char const*)
+    {
+        fs::rename(moved_root / "nested", moved_root / "parked");
+        fs::create_directory_symlink(moved_root / "other", moved_root / "nested");
+    };
+    require(same_inventory_contents(claim(moved_parent), moved_parent.plots[0].identity) && !retirement_rename_hook &&
+        read(claim_path(moved_parent)) == "reviewed source bytes" &&
+        read(moved_root / "other" / "source.plot") == "unrelated symlink target",
+        "retirement followed a swapped ancestor instead of its pinned parent");
+    unlink(moved_parent, [] {});
+    require(read(moved_root / "other" / "source.plot") == "unrelated symlink target", "retirement deleted through a substituted ancestor");
+#endif
+
+    for (auto const* point : {"replot-source-renamed", "replot-before-unlink", "replot-source-unlinked"})
+    {
+        auto interrupted = fixture(point); auto const child = ::fork(); require(child >= 0, "cannot fork retirement recovery fixture");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+            (void)claim(interrupted); unlink(interrupted, [] {}); std::_Exit(1);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "retirement missed its injected durability boundary");
+        bool const removed = std::string_view(point) == "replot-source-unlinked";
+        require(!fs::exists(original_path(interrupted)) &&
+            replot_claim_missing(interrupted.roots[0], interrupted.plots[0], job, 0) == removed,
+            "retirement recovery confused claimed and removed sources");
+        if (!removed)
+        {
+            require(same_inventory_contents(claim(interrupted), interrupted.plots[0].identity), "interrupted claim lost its native identity");
+            unsigned fresh = 0; unlink(interrupted, [&] { ++fresh; });
+            require(fresh == 1, "recovered retirement skipped its fresh readiness check");
+        }
+        require(replot_claim_missing(interrupted.roots[0], interrupted.plots[0], job, 0), "retirement recovery left a source behind");
+    }
+#else
+    (void)root;
+#endif
+}
+
 void farming_saved_reads(fs::path const& root)
 {
     using namespace grow_controller_test;
@@ -3471,6 +3787,41 @@ void controller_wakeups()
         require(notified_before_return && woken && ready && propagated && joined && !pending.valid(),
             "receiver notification preceded result publication or lost failure/borrower cleanup");
     }
+}
+
+void replot_publication_names(fs::path const& root, Members input)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "replot-publication-names"; fs::create_directory(directory);
+    auto cfg = configuration(); cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    auto const ordinary = group_path(directory, 0); direct(ordinary, input.subspan(0, 2), cfg);
+    auto const before = contents(ordinary); auto const job = std::string(64, 'a');
+    auto const published = group_path(directory, 0, job); fs::rename(ordinary, published);
+    auto const saved = snapshot(published, 0);
+    require(saved.published_plot2 && group_tools::hex(saved.publication_job) == job && group_output_path(directory, saved) == published &&
+        rollover_entry(directory, published, 512 * mib) == 0 && contents(published) == before,
+        "migration publication changed bytes or lost its canonical name");
+    Arguments args; args.max_ram = 512 * mib; args.workers = 1; args.max_groups = 4; args.max_total_members = 8; args.headroom = 0;
+    auto fixture = [&]
+    {
+        FarmingRun run; run.state = farming_format_fixture(6); run.state.capacity_fill = false; run.state.job_id = job;
+        run.state.directories.resize(1); auto& d = run.state.directories.front(); d.directory = directory.string();
+        d.capacity_bytes = 128 * mib; d.layout.files = 1; d.layout.total_members = d.layout.group_members = 2;
+        d.extents.clear(); d.sealed_files = 0; run.lanes.resize(1); run.lanes.front().outputs.push_back(saved);
+        run.available = {1}; run.memory_limit = args.max_ram; run.metadata = mib; return run;
+    };
+    std::vector<fs::path> const directories{directory}; std::vector<StorageDevice> const devices{{"fs", {"drive"}}};
+    std::vector<size_t> const physical{0}; std::map<std::string, uint64_t> const spaces{{"fs", 128 * mib}};
+    auto valid = fixture(); valid.audit_outputs(args, nullptr, directories, devices, physical, spaces, 1);
+    require(valid.lanes.front().ordinal == 1 && valid.path(0) == group_path(directory, 1),
+        "complete published fixed group was scheduled for regrowth");
+    auto wrong = fixture(); wrong.state.job_id = std::string(64, 'b'); bool rejected = false;
+    try { wrong.audit_outputs(args, nullptr, directories, devices, physical, spaces, 1); }
+    catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && contents(published) == before, "wrong migration output nonce was accepted or changed");
+    fs::copy_file(published, ordinary); rejected = false;
+    try { check_outputs(directory, std::span(&saved, 1), args.max_ram); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "ordinary and published aliases for one ordinal were accepted");
 }
 
 void farming_parallel_audits(fs::path const& root, Members input)
@@ -4746,6 +5097,11 @@ int main(int argc, char** argv) try
         Cleanup external_cleanup{fs::path(name)};
         bounded_saved_reads(external_cleanup.root);
         farming_saved_reads(external_cleanup.root);
+        replot_journal_protocol(external_cleanup.root);
+        replot_capacity_prefix();
+        replot_destination_namespace(external_cleanup.root);
+        replot_retirement_protocol(external_cleanup.root);
+        replot_publication_names(external_cleanup.root, input);
         farming_compatibility_format(external_cleanup.root);
         farming_joint_forecasts(external_cleanup.root);
         farming_reader_scope();
@@ -4775,6 +5131,11 @@ int main(int argc, char** argv) try
         successor_staging(external_cleanup.root, input, cfg);
         external_finish_grants(external_cleanup.root, input, cfg);
         external_batch_observations(external_cleanup.root, input, cfg);
+        replot_journal_protocol(external_cleanup.root);
+        replot_capacity_prefix();
+        replot_destination_namespace(external_cleanup.root);
+        replot_retirement_protocol(external_cleanup.root);
+        replot_publication_names(external_cleanup.root, input);
         bounded_saved_reads(external_cleanup.root);
         farming_saved_reads(external_cleanup.root);
         farming_compatibility_format(external_cleanup.root);

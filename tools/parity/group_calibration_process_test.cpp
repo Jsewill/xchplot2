@@ -1,4 +1,5 @@
 #include "host/GroupCalibrationProcess.hpp"
+#include "host/GroupFarmResources.hpp"
 #include <iostream>
 #ifdef _WIN32
 #include <shellapi.h>
@@ -39,8 +40,112 @@ template<class Function> void rejected(Function operation)
     try { operation(); } catch (std::exception const&) { return; }
     throw std::runtime_error("calibration failure fixture unexpectedly succeeded");
 }
+void scoped_cpu_fixture()
+{
+#ifdef __linux__
+    cpu_set_t original, restored; CPU_ZERO(&original); CPU_ZERO(&restored);
+    check(!::sched_getaffinity(0, sizeof(original), &original) && CPU_COUNT(&original), "cannot save fixture CPU affinity");
+    auto unchanged = [&]
+    { CPU_ZERO(&restored); check(!::sched_getaffinity(0, sizeof(restored), &restored) && CPU_EQUAL(&restored, &original), "scoped CPU cap did not restore original affinity"); };
+    {
+        process::ScopedCpuCap cap(1);
+        check(cap.lanes() == 1 && group_grow::profile_detail::logical_cpus() == 1, "scoped calling thread CPU cap not enforced");
+        uint64_t inherited = 0; std::thread worker([&] { inherited = group_grow::profile_detail::logical_cpus(); }); worker.join();
+        check(inherited == 1, "ordinary generation worker did not inherit scoped CPU affinity");
+    }
+    unchanged();
+    rejected([] { process::ScopedCpuCap cap(1); throw std::runtime_error("scoped generation failure"); });
+    unchanged();
+    {
+        process::ScopedCpuCap cap(1); cap.restore(); unchanged();
+        check(cap.lanes() == 1, "restoration changed admitted CPU lanes");
+    }
+    unchanged();
+    rejected([&] { process::ScopedCpuCap impossible(uint64_t(CPU_COUNT(&original)) + 1); });
+    unchanged();
+#else
+    rejected([] { process::ScopedCpuCap unsupported(1); });
+#endif
+}
 int direct(std::string const& mode)
 {
+#ifdef __linux__
+    if (mode == "--direct-active-pressure")
+    {
+        process::ScopedCpuCap cap(1);
+        using namespace group_grow::farm;
+        auto const host = group_grow::profile_detail::host_name();
+        Profile profile; profile.source = "actual-process-pressure-fixture"; profile.producer = "test"; profile.native.host = host;
+        Resource cpu; cpu.id = "cpu"; cpu.host = host; cpu.capacity = 1; cpu.capacity_known = true;
+        Resource ram; ram.id = "ram"; ram.host = host; ram.kind = ResourceKind::host_memory;
+        ram.capacity = group_grow::profile_detail::available_memory(); ram.capacity_known = true; profile.resources = {cpu, ram};
+        profile.gate.recovery_hold_ms = 0; profile.gate.recovery_samples = 1;
+        check(profile.gate.max_cpu_busy_permille == 950, "actual pressure fixture disabled the default CPU guard");
+        Stage stage; stage.name = "actual-active-construction"; stage.scope_complete = true;
+        Demand compute; compute.resource = "cpu"; compute.required_units = 1; compute.work_us = 1; compute.period_us = compute.deadline_us = 1000000; compute.bounded = true;
+        Demand memory; memory.resource = "ram"; memory.transient_units = uint64_t(32) << 20; memory.bounded = true;
+        stage.construction = {compute, memory}; LocalPressureSampler sampler(host);
+        (void)sampler.sample(profile); std::this_thread::sleep_for(std::chrono::milliseconds(80)); (void)sampler.sample(profile);
+        std::vector<uint8_t> held(size_t(8) << 20, 0x5a);
+        std::atomic<bool> stop{false};
+        struct Work
+        {
+            std::atomic<bool>& stop; std::thread worker;
+            explicit Work(std::atomic<bool>& stop_) : stop(stop_), worker([&] { while (!stop.load(std::memory_order_relaxed)) std::atomic_signal_fence(std::memory_order_seq_cst); }) {}
+            ~Work() { stop.store(true); worker.join(); }
+        };
+        uint64_t own_busy = 0, raw_busy = 0;
+        {
+            Work work(stop); std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            auto observed = sampler.sample(profile, Clock::now(), 1); auto const anon = sampler.own_anon_bytes();
+            auto cpu_reading = [&](Telemetry const& value) -> ResourceSample const&
+            { auto at = std::find_if(value.resources.begin(), value.resources.end(), [](ResourceSample const& r) { return r.resource == "cpu"; });
+              check(at != value.resources.end() && at->cpu_busy_known, "actual CPU pressure evidence unavailable"); return *at; };
+            own_busy = cpu_reading(observed).cpu_busy_permille;
+            check(anon && *anon >= held.size(), "active memory credit did not observe the held private anonymous pages");
+            AdmissionGate active_gate(profile); check(active_gate.observe(observed), "active process observation rejected");
+            check(active_gate.evaluate(stage, Clock::now(), anon).allowed, "default CPU guard cancelled its own admitted generation work");
+            auto rapid = sampler.sample(profile, Clock::now(), 1);
+            check(cpu_reading(rapid).cpu_busy_permille == own_busy && !rapid.recovery_observation,
+                "rapid horizon check discarded a valid active interval or invented a recovery vote");
+            auto inactive = sampler.sample(profile); raw_busy = cpu_reading(inactive).cpu_busy_permille;
+            check(raw_busy > own_busy && inactive.epoch > observed.epoch && !sampler.own_anon_bytes(), "active discount leaked into inactive telemetry");
+            if (raw_busy >= profile.gate.max_cpu_busy_permille)
+            {
+                check(active_gate.observe(inactive) && !active_gate.evaluate(stage).allowed,
+                    "inactive admission ignored default-threshold CPU contention");
+            }
+        }
+        pid_t child = ::fork(); check(child >= 0, "cannot start isolated foreign-load fixture");
+        if (!child) { ::alarm(2); for (;;) std::atomic_signal_fence(std::memory_order_seq_cst); }
+        struct Child { pid_t pid; ~Child() { ::kill(pid, SIGKILL); int status = 0; while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {} } } cleanup{child};
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto foreign = sampler.sample(profile, Clock::now(), 1); auto raw = sampler.sample(profile);
+        auto cpu_busy = [](Telemetry const& value)
+        { for (auto const& r : value.resources) if (r.resource == "cpu" && r.cpu_busy_known) return r.cpu_busy_permille;
+          throw std::runtime_error("foreign-load CPU counters unavailable"); };
+        check(cpu_busy(foreign) == cpu_busy(raw) && cpu_busy(foreign) > own_busy,
+            "another process's CPU work was credited to active construction");
+        std::cout << "actual default CPU pressure own=" << own_busy << " raw=" << raw_busy << " foreign=" << cpu_busy(foreign) << '\n';
+        return 0;
+    }
+#endif
+    if (mode == "--direct-cpu")
+    {
+#ifdef __linux__
+        check(process::install_cpu_cap(1) == 1 && group_grow::profile_detail::logical_cpus() == 1, "direct proof CPU cap not installed");
+        uint64_t inherited = 0; std::thread worker([&] { inherited = group_grow::profile_detail::logical_cpus(); }); worker.join();
+        check(inherited == 1, "solver thread did not inherit bounded proof CPU affinity");
+        group_grow::farm::Profile profile; group_grow::farm::Resource cpu;
+        cpu.id = "cpu"; cpu.host = group_grow::profile_detail::host_name(); cpu.capacity = 1; cpu.capacity_known = true; profile.resources = {cpu};
+        group_grow::farm::LocalPressureSampler sampler(cpu.host); (void)sampler.sample(profile);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80)); auto observation = sampler.sample(profile);
+        check(observation.resources.size() == 1 && observation.resources[0].cpu_busy_known,
+            "local pressure source did not measure the enforced CPU affinity rows"); return 0;
+#else
+        rejected([] { process::install_cpu_cap(1); }); return 0;
+#endif
+    }
     auto bytes = budget();
 #ifndef _WIN32
     if (mode == "--direct-cap")
@@ -78,8 +183,12 @@ int direct(std::string const& mode)
     std::this_thread::sleep_for(std::chrono::seconds(10));
     return 9;
 }
-int fake_worker(std::vector<std::string> const& args)
+int fake_worker(std::vector<std::string> args)
 {
+    bool const proof_worker = args.size() >= 16 && args[12] == "--replot-proof-worker";
+    if (proof_worker) args.erase(args.begin() + 12);
+    bool const cpu_cap = args.size() == 17 && args[12] == "--replot-proof-cpus" && args[13] == "1";
+    if (cpu_cap) args.erase(args.begin() + 12, args.begin() + 14);
     check(args.size() == 15 && args[1] == "plan" && args[2] == "--config" &&
 #ifdef _WIN32
         args[3] == "NUL" &&
@@ -90,6 +199,7 @@ int fake_worker(std::vector<std::string> const& args)
         args[7] == "1" && args[8] == "--calibration-memory-bytes" && args[10] == "--calibration-timeout-ms" &&
         args[12] == "--json" && args[13] == "--" && native(args[14]).is_absolute(), "private worker argv is not isolated from user defaults");
     auto const cap = process::install_memory_cap(std::stoull(args[9]));
+    if (cpu_cap) check(process::install_cpu_cap(1) == 1, "hidden proof worker did not enforce CPU cap");
     check(cap.enforced_bytes, "fake hidden worker did not install its own cap");
     auto const mode = text(native(args[14]).filename());
     if (mode == "hang")
@@ -102,7 +212,7 @@ int fake_worker(std::vector<std::string> const& args)
     if (mode == "flood") { for (unsigned i = 0; i < 65536; ++i) std::cout.put('x'); std::cout.flush(); return 0; }
     if (mode == "failure") { std::cerr << "fixture failure\n"; return 7; }
     if (mode == "empty") return 0;
-    std::cout << "{\"ok\":true}\n" << std::flush; return 0;
+    std::cout << (cpu_cap ? "{\"proof_worker\":true,\"cpu_cap\":1}\n" : proof_worker ? "{\"proof_worker\":true}\n" : "{\"ok\":true}\n") << std::flush; return 0;
 }
 int launch_direct(std::string const& mode)
 {
@@ -153,9 +263,20 @@ int main(int argc, char** argv) try
 #endif
     if (args.size() > 1 && args[1].starts_with("--direct-")) return direct(args[1]);
     if (args.size() > 1 && args[1] == "plan") return fake_worker(args);
+    scoped_cpu_fixture();
     process::Limits limits{budget(), 3000, 4096, {}};
     auto const input = native("calibration fixture-\xc3\xa9-\"quoted");
     check(process::run_worker(input, 1, limits) == "{\"ok\":true}\n", "successful calibration output changed");
+    check(process::run_worker(input, 1, limits, process::Worker::migration_proof) == "{\"proof_worker\":true}\n",
+        "bounded migration proof worker did not receive its isolated typed mode");
+#ifdef __linux__
+    check(process::run_worker(input, 1, limits, process::Worker::migration_proof, 1) == "{\"proof_worker\":true,\"cpu_cap\":1}\n",
+        "bounded migration proof worker did not enforce its CPU request");
+#endif
+    check(launch_direct("--direct-cpu") == 0, "direct proof CPU-affinity enforcement failed");
+#ifdef __linux__
+    check(launch_direct("--direct-active-pressure") == 0, "active/inactive default pressure enforcement failed");
+#endif
     auto const before = handles();
     for (unsigned i = 0; i < 8; ++i)
         check(process::run_worker(input, 1, limits) == "{\"ok\":true}\n", "final worker output was lost at process exit");

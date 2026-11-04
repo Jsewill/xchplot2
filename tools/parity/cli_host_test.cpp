@@ -31,6 +31,7 @@ int batch_calls = 0;
 #ifdef XCHPLOT2_GROUP_COMMANDS
 pos2gpu::GroupOptions last_group_options;
 int group_calls = 0;
+std::vector<std::filesystem::path> checked_group_directories;
 std::vector<std::string> last_compute;
 #endif
 std::vector<pos2gpu::BatchEntry> last_entries;
@@ -98,6 +99,8 @@ std::array<uint8_t, 32> compute_owner_seed(std::array<uint8_t, 32> const& seed, 
 { auto result = seed; for (size_t i = 0; i < owner.size(); ++i) result[i % result.size()] ^= uint8_t(owner[i]); return result; }
 int run_group(GroupOptions const& options)
 { ++group_calls; last_group_options = options; return 0; }
+void check_group_output_directory(std::filesystem::path const& directory)
+{ checked_group_directories.push_back(directory); }
 BatchResult run_group_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts, GroupOptions group)
 { ++group_calls; last_group_options = group; return run_batch(entries, opts); }
 int run_compute_broker(int argc, char** argv)
@@ -414,6 +417,9 @@ int main(int argc, char** argv)
     write_limit = 1; fail_remaining = true;
     auto [failed_code, failed_output] = capture(args);
     assert(failed_code == 3 && std::count(failed_output.begin(), failed_output.end(), '\n') == 1);
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    assert(!checked_group_directories.empty() && checked_group_directories.back() == plots);
+#endif
     assert(last_options.cpu_selected() && last_options.has_max_host_ram && last_options.max_host_ram == 256ull * 1024 * 1024);
     auto const original = last_entries;
     std::filesystem::path job;
@@ -463,7 +469,13 @@ int main(int argc, char** argv)
     fail_remaining = false; write_limit = std::numeric_limits<std::size_t>::max();
     auto seeded = args;
     seeded.insert(seeded.end(), {"--seed", std::string(64, 'c'), "--manifest", (dir / "seeded.tsv").string()});
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    checked_group_directories.clear();
+#endif
     assert(capture(seeded).first == 0);
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    assert((checked_group_directories == std::vector{plots, dir}));
+#endif
     auto const seeded_entries = last_entries;
     seeded.push_back("--resume");
     assert(capture(seeded).first == 0 && last_entries == seeded_entries);

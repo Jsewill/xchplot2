@@ -130,7 +130,7 @@ class JsonReader
 {
     std::string_view text_;
     size_t position_ = 0, nodes_ = 0;
-    uint64_t memory_limit_, memory_used_;
+    uint64_t memory_limit_, memory_used_, node_limit_;
     void whitespace()
     { while (position_ < text_.size() && (text_[position_] == ' ' || text_[position_] == '\n' || text_[position_] == '\r' || text_[position_] == '\t')) ++position_; }
     char take()
@@ -208,7 +208,7 @@ class JsonReader
     }
     Json value(unsigned depth)
     {
-        profile_require(depth <= 32 && ++nodes_ <= 262144, "farming profile JSON exceeds its structure limit");
+        profile_require(depth <= 32 && ++nodes_ <= node_limit_, "farming profile JSON exceeds its structure limit");
         // Covers node temporaries, map allocation/key storage and vector growth
         // including the old vector while a larger allocation is constructed.
         static_assert(sizeof(Json) <= 128);
@@ -259,7 +259,8 @@ class JsonReader
         result.kind = Json::number; result.scalar = text_.substr(start, position_ - start); return result;
     }
 public:
-    explicit JsonReader(std::string_view text, uint64_t memory_limit = parsing_memory_bytes) : text_(text), memory_limit_(memory_limit), memory_used_(0)
+    explicit JsonReader(std::string_view text, uint64_t memory_limit = parsing_memory_bytes, uint64_t node_limit = 262144)
+        : text_(text), memory_limit_(memory_limit), memory_used_(0), node_limit_(std::min(node_limit, memory_limit / 512))
     {
         // Input capture capacity plus decoded strings can each grow beyond
         // their used length. Charge both before allocating parsed structure.

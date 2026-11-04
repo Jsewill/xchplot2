@@ -1577,7 +1577,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
                     "--no-auto-spill", "--keep", "--compute-only", "--full", "--json", "--plan-only",
-                    "--extend", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate"
+                    "--extend", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
                 auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
@@ -1752,7 +1752,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             char const* auto_note = d.auto_dispatchable
                 ? "" : "  (auto-dispatch skips this — explicit --devices only)";
             std::printf("  %-7s%-32s %5zu MiB VRAM", tag.c_str(), d.name.c_str(), vram_mb);
-            if (verbose) std::printf("  backend=%s CUs=%u sort:%s", d.backend.c_str(), d.cu_count, sort_hint);
+            if (verbose) std::printf("  backend=%s CUs=%u sort:%s physical=%s", d.backend.c_str(), d.cu_count, sort_hint,
+                d.physical_identity.empty() ? "unknown" : d.physical_identity.c_str());
             std::printf("%s\n", auto_note);
         }
         // One row per CPU node, because those are the ids --devices accepts.
@@ -2934,6 +2935,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 #endif
             }
             out_dir = std::filesystem::absolute(out_dir).lexically_normal().string();
+#ifdef XCHPLOT2_GROUP_COMMANDS
+            pos2gpu::check_group_output_directory(out_dir);
+            if (!manifest_path.empty())
+                pos2gpu::check_group_output_directory(std::filesystem::absolute(manifest_path).lexically_normal().parent_path());
+#endif
             std::filesystem::create_directories(out_dir);
             std::filesystem::path job_path = manifest_path;
             std::vector<pos2gpu::BatchEntry> entries;
@@ -3091,7 +3097,7 @@ _xchplot2() {
                 case "${COMP_WORDS[i]}" in
                     --) literal=1; break ;;
                     --relocate) values=2 ;;
-                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--calibrate|--no-calibrate|--extend|--no-extend|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
+                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--calibrate|--no-calibrate|--extend|--no-extend|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
                     -*) values=1 ;;
                 esac
             fi
@@ -3120,7 +3126,8 @@ _xchplot2() {
             COMPREPLY=( $(compgen -W "local" -- "$cur") )
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
-        --manifest|--save-plan|-F|--from-plan|--save-profile|--chia-executable|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key)
+        --farm-adapter) COMPREPLY=( $(compgen -W "chia gigahorse drchia" -- "$cur") ); return 0 ;;
+        --manifest|--save-plan|-F|--from-plan|--replot|--farm-checker|--save-profile|--chia-executable|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key)
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
@@ -3142,7 +3149,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --extend --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --replot --reclaim-before-bytes --farm-adapter --farm-checker --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --extend --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill ]]; then
@@ -3207,6 +3214,12 @@ _xchplot2() {
         '--metadata-only[Inspect saved plan metadata without live checks]' \
         '--no-metadata-only[Restore live plan checks]' \
         '--assess-jobs[Jointly assess saved keyless job forecasts]' \
+        '--inventory[Inspect explicit existing farm roots]' \
+        '--no-inventory[Restore ordinary plan mode]' \
+        '--replot[Inventory to migrate into destinations]:file:_files' \
+        '--farm-adapter[Installed native farm adapter]:adapter:(chia gigahorse drchia)' \
+        '--farm-checker[Installed native plot checker]:file:_files' \
+        '--reclaim-before-bytes[Outstanding pre-delete limit]:size:' \
         '--no-assess-jobs[Restore ordinary plan mode]' \
         '--calibrate[Measure explicitly supplied plot files]' \
         '--no-calibrate[Disable reader calibration]' \
@@ -3360,6 +3373,11 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l task-timeout-ms
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-timeout-ms -r -d 'TLS operation deadline'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l group-members -r -d 'Members per file'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l plan-only -d 'Preview without writing'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l farm-adapter -r -a 'chia gigahorse drchia' -d 'Installed native farm adapter'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l farm-checker -r -F -d 'Installed native plot checker'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l inventory -d 'Inspect explicit farm roots'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot -r -F -d 'Review migration from inventory'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l reclaim-before-bytes -r -d 'Outstanding pre-delete limit'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-plan -r -F -d 'Save a keyless plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -s F -l from-plan -r -F -d 'Use a saved plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-profile -r -F -d 'Export harvester settings'

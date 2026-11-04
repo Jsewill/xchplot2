@@ -10,7 +10,8 @@ inline unsigned group_option_values(std::string_view option)
         option == "--no-resume" || option == "--plan-only" || option == "--no-plan-only" ||
         option == "--metadata-only" || option == "--no-metadata-only" ||
         option == "--assess-jobs" || option == "--no-assess-jobs" ||
-        option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" ||
+        option == "--inventory" || option == "--no-inventory" ||
+        option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" || option == "--replot-proof-worker" ||
         option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
         option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||
         option == "--progress" || option == "--no-progress" || option == "--help" || option == "--help-all" || option == "-h" ||

@@ -2,6 +2,7 @@
 #include "host/GroupGpuPacked.hpp"
 
 #include "gpu/SyclBackend.hpp"
+#include "gpu/SyclDeviceList.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
 #include "host/HostGuard.hpp"
@@ -452,6 +453,7 @@ GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOpti
     auto const margin = pos2gpu::vram_safety_margin();
     auto const capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
     GpuProducerPreflight result;
+    result.physical_identity = pos2gpu::gpu_physical_identity(options.device_id);
     result.tier = options.tier;
     if (result.tier == "auto" || result.tier == "pool")
     {

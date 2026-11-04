@@ -638,6 +638,225 @@ file-format and construction admission still apply when plotting.
 provide context for the tradeoff; qualify the intended storage and reader before
 relying on a latency bound.
 
+### Replacing an existing farm
+
+Ordinary `fill` uses available space without deleting existing plots. Replacing
+an existing farm requires an explicit inventory, a saved migration review and
+execution of that review. Migration execution currently requires Linux, local
+construction with `--compute off`, and compatible local Chia harvester, farmer,
+PoS2 solver and synced full-node services. Native Windows supports inventory
+and forecasting; it refuses migration execution before changing files. See the
+[compatibility guide](contrib/pos2-pr118/README.md) for PoS2 reader support.
+
+The supported replacement route is a configured self-pooling plot NFT.
+External pooled targets and OG pool-public-key targets refuse execution:
+the supported RPC cannot establish their required PoS2 pool acceptance or pool
+signing-key readiness. Original and OG source plots can still be inventoried
+and retired into the supported replacement route.
+
+Inventory every loaded plot root of each configured source and target reader,
+and include existing destination data. The optional installed-reader arguments
+add authenticated loopback observations from the existing services:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --save-plan inventory.plan --json
+```
+
+This reads native file identities, allocated and logical sizes, supported
+public headers and storage sharing. It exports no plot memos, private keys or
+seeds and starts no farming services. Without `--save-plan`, it only reports
+the inventory. Saving refuses an existing file. Paths, public identifiers and
+hostnames remain in the report, so review those before sharing it.
+
+File names and extensions do not establish a format or deletion eligibility.
+Supported PoS1 headers can become retirement candidates after rechecking the
+same native files. Unknown containers, links, aliases and unreadable or changed
+files stay protected. Existing PoS2 files are included in the workload but are
+not PoS1 retirement candidates. A header observation does not validate every
+proof in an old file.
+
+`--farm-adapter chia|gigahorse|drchia` selects the installed reader interface;
+`--chia-executable` must name its actual executable. Proprietary containers
+remain protected unless a supported reader can establish their identity from
+the current file. A loaded-file observation alone is insufficient.
+`--farm-checker FILE` selects the supported Gigahorse checker: bounded samples
+and independent proof verification must bind the held file to its observed
+plot ID. These checks do not establish complete validity or decode unavailable
+compression metadata. DrChia containers without a supported identity check stay
+protected. Changes to the configured reader, checker, configuration or observed
+service versions require a new review.
+Catalog traversal and serial native checks use an entry-count-bounded total
+allowance. Each registry operation and native check retains its own time,
+memory and output limits; a large catalog does not enlarge an individual check.
+
+For different source and replacement readers, add a `farm_adapters` object
+beside `farm_resources` in the local `--harvester` profile:
+
+```json
+{
+  "schema": 1,
+  "target_route": "new-chia",
+  "routes": [
+    {"id": "old-gigahorse", "kind": "gigahorse",
+     "root": "/home/farmer/.chia/gigahorse", "executable": "/opt/gigahorse/chia",
+     "checker": "/opt/gigahorse/ProofOfSpace", "source_roots": ["/disk-a/plots"]},
+    {"id": "new-chia", "kind": "chia",
+     "root": "/home/farmer/.chia/mainnet", "executable": "/opt/chia/bin/chia",
+     "source_roots": []}
+  ]
+}
+```
+
+Each source root must match one explicit route. Pass this local profile during
+inventory, review and execution; saved public plans do not authorize executable
+paths. The resource declarations must also match the saved review on resume.
+An unexpected loaded plot stops progress until the catalog and workload are
+reviewed again. During execution, only the catalog and replacements already
+published by the private journal may appear in those readers' loaded registries.
+Explicitly classified metadata artifacts remain protected; a reader reporting
+one as a loaded plot contradicts its zero-workload classification and is refused.
+
+The inventory contains an editable `farm_resources` template with unknown
+capacities and costs. Complete it for the actual mixed farm before reviewing a
+migration. Use the existing [harvester profile workflow](#farming-layout) for
+the intended PoS2 reader, and include the completed `farm_resources` object in
+the profile supplied through `--harvester FILE`. Keep each inventory entry's
+`workload_id` consistent with the profile's counts. Opaque data also needs a
+workload reservation unless explicitly classified as `non-plot` with a reason.
+That classification never makes the file a retirement candidate.
+
+| Profile part | Required scope |
+| --- | --- |
+| `resources` | Physical host, CPU, host memory, GPU compute and memory, storage, controllers, network and solvers actually shared by the work. Aliases identify one resource, not extra capacity. Memory capacities are bytes; other capacities are concurrent service lanes. |
+| `workloads` | Format, decoder/version, backend, pool difficulty, current and future quality/full-proof bursts, response deadline, provenance and complete resource costs for each existing cohort. |
+| `uses` | Resident and transient memory, full carried-in queue bounds, and either explicit reserved lanes or bounded service times. Service times are microseconds; memory use is bytes. |
+| `native` | Bounds for the selected construction and verification settings, physical output/scratch/source mappings, controller and RPC supervision, and increasing member cohorts with separate new-farming and full-proof reserves. |
+| `gate` | Maximum telemetry age and the recovery interval/sample count required before admitting work again. |
+
+Unknown costs or capacities block admission. Declared reservations must cover
+the entire workload; changing a flag to `bounded` does not measure that bound.
+Partial-proof calibration does not supply a full-proof solver reserve. GPU
+names and ordinals are not physical identities: supported CUDA/HIP selections
+report their PCI identity with `devices --verbose`. A shared GPU needs a
+complete conditional service envelope; it has no guaranteed preemption or
+isolation from another application's queues. Imported remote resource profiles
+can support forecasts but do not grant control over remote services.
+
+Native envelopes must explicitly cover future filters and the controller's
+memory in each phase (`covers_future_filter` and
+`phase_totals_include_controller`). Construction, proof verification and RPC
+supervision run sequentially. The proof worker has a memory and time limit;
+`verification_cpu_threads` can additionally limit its CPU affinity on Linux.
+Each phase's CPU envelope includes its concurrent controller or monitor and
+capped worker, within the inherited CPU set.
+GPU session envelopes cover the full inherited CPU set in every phase:
+retained runtime helpers are not constrained by the host worker limit.
+They also require an explicit `standing_gpu_bytes` resident-memory bound in
+every phase for retained contexts, runtime caches and tables. Supply a complete
+declared or measured bound; it is additional to the allocation grant, and the
+VRAM safety margin does not substitute for it. GPU preflight can perform bounded
+active device probes.
+Construction and verification service costs cover the entire file up to
+`max_group_members`, including all internal batches and windows.
+`max_batch_members` limits an individual construction batch; a measured cost
+for one batch is insufficient for a larger file. An operation timeout does not
+measure or enforce its per-resource service cost.
+Declared bounds must cover every permitted execution setting, including smaller
+worker, batch and memory limits; measurements at one setting do not establish
+that envelope.
+For resources marked `conditional_shared`, admission adds all declared work and
+queued blocking time and checks response deadlines. This permits conditional
+sharing of a CPU or disk lane; it does not establish a measured service bound.
+
+Review destinations and the completed profile, then save the resulting plan:
+
+```bash
+xchplot2 plan /disk-a/plots /disk-b/plots --replot inventory.plan \
+  --harvester mixed-farm.json --compute off --devices cpu \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --save-plan migration.plan --json
+xchplot2 fill migration.plan --compute off --devices cpu \
+  --harvester mixed-farm.json \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+The review fixes the selected source files, replacement batches, destination
+identities and resource assumptions. Inspect the old formats, k sizes, file
+counts and allocated bytes alongside the new k size and member counts.
+Physical bytes do not imply equivalent farming capacity, rewards or fees;
+unavailable value estimates remain unknown. A smaller compressed file need
+not use fewer farming resources.
+
+`--reclaim-before-bytes SIZE` belongs to the review and defaults to zero.
+Zero requires each mapped replacement to be ready before its sources are
+removed. A positive value permits that many allocated source bytes to be
+retired while their mapped replacements are not yet ready, across interruptions
+and restarts. Removal is irreversible: the new plot cannot reconstruct an old
+one. This limit measures physical bytes, not lost income or equal farming
+value. Temporary space selected with `--temp-dir` is construction scratch;
+it is not automatically a farmable replacement.
+External construction requires zero pre-delete credit; use incremental
+construction for bounded pre-deletion.
+
+Each batch must fit conservative output, construction, recovery and headroom
+allowances. Execution checks actual available space again. A rename or
+quarantine frees no capacity; open handles, snapshots or filesystem behavior
+can delay its release after deletion. Extra free space does not enlarge the
+reviewed replacement schedule.
+
+For replacement-first retirement, execution seals and checks the exact replacement,
+runs bounded full-proof samples, and publishes a new immutable `.plot2` file.
+The configured harvester must report that exact path with matching plot
+identity, public-key route, size and modification time. The target network
+must be synced, active for PoS2 and compatible with the replacement parameters.
+The connected farmer must acknowledge the same exact plot and key route in a
+completed plot synchronization. Multi-member replacements require its exact
+reported group membership. Fresh matching local peer observations bind the
+harvester, farmer, queried full node and started solver; changes during the
+snapshot invalidate it. Completed synchronization can remain valid while the
+matched services are idle. Other farmer-side harvesters with loaded plots are
+outside this supported local target scope and stop migration.
+These observations are refreshed before each deletion; imported JSON cannot
+assert readiness. The process does not wait for a random winning proof or a
+pool partial. Missing capabilities or stale observations pause further work.
+An authorized pre-deletion still requires the live target network and fresh
+readiness of previously credited replacements.
+General service and configured NFT prerequisites apply before private
+preparation and pre-deletion; exact new plot/key acknowledgement follows
+publication. Missing or changed reviewed farmer/solver versions block execution
+while network-only forecasts remain available.
+
+Resource admission includes the old farm, completed replacements, construction,
+verification and separate full-proof demand, under current and future filter
+conditions. Retiring a plot does not release a foreign decoder's resident
+memory or queued work. Telemetry can restrict new plotting admissions; it does
+not stop or reconfigure the farmer, harvester, remote solver or their services.
+The reviewed envelope must also allow fresh observations after a restart while
+conservatively retaining the original arrivals until their removal is confirmed.
+The first complete target farming and full-proof cohort is reserved even when
+no replacement exists, covering the services that must already be running.
+
+Keep the original `migration.plan`, every private `grow-replot.plan` copy and
+any `.next` file, receipts and owned temporary files. The private journal
+contains the seed and assignments from preparation onward. Resume with the
+same reviewed plan and installed-reader arguments; saved private state restores
+the keys. All required source and destination roots must be available and must
+still identify the same directories. A source mismatch stops retirement while
+preserving the claimed file for inspection.
+Migration currently requires unchanged native file and device identifiers;
+device renumbering after a remount or reboot can prevent resume even when the
+filesystem's persistent identity is unchanged.
+
+After all replacements and retirements pass the final audit, the job publishes
+ordinary `grow-farm.plan` copies. Completed replacement files retain their
+identities and fixed member counts; ordinary recovery never grows them.
+An unfinished migration must finish through its original review before ordinary
+fill or extension can operate on its destinations.
+Reassess any remaining legacy workload before extending a completed ordinary job.
+
 ## Shared compute
 
 A compute pool is a set of trusted machines that share generation and encoding
