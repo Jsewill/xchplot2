@@ -100,7 +100,8 @@ int fake_adapter(int argc, char** argv)
     {
         if (service == "farmer" && flag("farmer-unavailable")) return 1;
         std::string version = "fixture-native-1"; std::ifstream in(fs::path(argv[2]) / "version"); if (in) in >> version;
-        if ((service == "farmer" && flag("farmer-version")) || (service == "solver" && flag("solver-version"))) version = "fixture-native-2";
+        if ((service == "farmer" && flag("farmer-version")) || (service == "solver" && flag("solver-version")) ||
+            (service == "harvester" && flag("harvester-version")) || (service == "full_node" && flag("full-node-version"))) version = "fixture-native-2";
         std::cout << "{\"success\":true,\"version\":\"" << version << "\"}";
     }
     else if (endpoint == "get_network_info") std::cout << "{\"success\":true,\"network_name\":\"simulator0\",\"genesis_challenge\":\"" << std::string(64, service == "solver" && flag("solver-network") ? 'b' : 'a') << "\"}";
@@ -291,15 +292,36 @@ void source_metadata_snapshot(fs::path const& directory, HarvesterAdapterOptions
     observe_harvester_inventory(catalog, options);
     require(std::all_of(catalog.plots.begin(), catalog.plots.end(), [](auto const& p) { return p.native_identified && p.status == "native-observed"; }),
         "reader metadata retirement required an unavailable compressed-plot GPU checker");
+    RegistryScopeIndex scope(catalog, options.limits);
+    observe_registry_scope(options, catalog, {}, &scope);
+    auto copied_catalog = catalog;
+    rejects([&] { observe_registry_scope(options, copied_catalog, {}, &scope); }, "registry index silently used another catalog's borrowed paths");
+    auto tight = options.limits; tight.memory_bytes = RegistryScopeIndex::memory_bound(catalog) - 1;
+    rejects([&] { RegistryScopeIndex index(catalog, tight); }, "retained registry index escaped its memory grant");
     std::array<uint64_t, 2> indices{0, 1};
     auto count = [&] { unsigned value = 0; std::ifstream in(options.root / "registry-count"); in >> value; return value; };
     auto const before = count();
     {
-        SourceReadinessSnapshot snapshot(options, catalog, indices);
+        SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope);
         for (auto const& plot : catalog.plots) (void)snapshot.check(catalog.roots[plot.root], plot);
         snapshot.finish();
     }
     require(count() == before + 2, "source snapshot rescanned the complete registry per source instead of bounded capture/final fences");
+    {
+        std::ofstream changed(options.root / "version"); changed << "fixture-native-2"; changed.close();
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "fresh protected-action scope ignored a source-only version change");
+        rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope); },
+            "post-construction metadata refresh silently rebound a changed reader version");
+        fs::remove(options.root / "version");
+    }
+    {
+        auto path = options.root / "config" / "config.yaml"; std::ifstream in(path); std::string original(std::istreambuf_iterator<char>(in), {});
+        { std::ofstream changed(path); changed << original << "# changed source-only config\n"; }
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "fresh protected-action scope ignored source-only configuration change");
+        rejects([&] { SourceReadinessSnapshot snapshot(options, catalog, indices, {}, false, &scope); },
+            "post-construction metadata refresh silently rebound a changed reader configuration");
+        { std::ofstream restored(path); restored << original; }
+    }
     {
         SourceReadinessSnapshot snapshot(options, catalog, indices); registry(true);
         rejects([&] { snapshot.finish(); }, "source loaded-population loss survived an unchanged reader version"); registry();
@@ -311,6 +333,7 @@ void source_metadata_snapshot(fs::path const& directory, HarvesterAdapterOptions
         auto const path = file_io::path_text(root / "first.plot"); auto where = row.find(path);
         require(where != row.npos, "source arrival fixture cannot locate its original row"); row.replace(where, path.size(), file_io::path_text(root / "arrival.plot"));
         { std::ofstream changed(registry_file); changed << raw.substr(0, raw.rfind(']')) << ',' << row << "]}"; }
+        rejects([&] { observe_registry_scope(options, catalog, {}, &scope); }, "protected-action route guard ignored a new source arrival");
         rejects([&] { snapshot.finish(); }, "new source arrival survived the coherent route scope fence"); registry();
     }
     registry(true);
@@ -492,7 +515,7 @@ void adapters(fs::path const& directory)
     require(!observe_replacement_readiness(options, expected).ready, "public metadata substituted for private first-publication evidence");
     ReplacementPublication publication{expected.path, expected.identity, std::string(64, 'b'), 0};
     require(observe_replacement_readiness(options, expected, publication).ready, "actual native API fields could not attest a sealed first publication");
-    for (char const* failure : {"connection-churn", "sync-churn", "farmer-syncing", "solver-stopped", "pool-external", "farmer-version", "solver-version", "inactive", "unsynced"})
+    for (char const* failure : {"connection-churn", "sync-churn", "farmer-syncing", "solver-stopped", "pool-external", "farmer-version", "solver-version", "harvester-version", "full-node-version", "inactive", "unsynced"})
     {
         TargetReadinessSnapshot snapshot(options, projection, expected.k, expected.strength, service);
         require(snapshot.check(expected, publication).ready, "service drift fixture did not begin with exact sync");
@@ -635,6 +658,120 @@ void adapters(fs::path const& directory)
     { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: farm.example.com\nharvester:\n  num_threads: 2\n"; }
     require(!observe_network_projection(options).available, "nonloopback native adapter accepted");
 }
+void retirement_configuration(fs::path const& directory)
+{
+    auto root = directory / "removal-config", old = directory / "removal-old", target = directory / "removal-target";
+    fs::create_directories(root / "config"); fs::create_directory(old); fs::create_directory(target); write(old / "one.plot", legacy(false));
+    HarvesterAdapterOptions options; options.root = root; options.executable = calibration_process::executable(); options.host = "fixture-host";
+    auto configuration = [&](bool source, bool replacement, bool addition = false)
+    {
+        std::ostringstream out;
+        out << "# conventional native configuration\nself_hostname: &self_hostname \"localhost\"\nother: &shared\n  label: 'true'\n  enabled: true\n  ratio: 1.5\nharvester:\n  num_threads: 1\n  plot_directories:\n";
+        for (auto const& [include, path] : {std::pair{source, old}, {replacement, target}, {addition, directory / "unreviewed"}})
+            if (include) { out << "  - "; profile_detail::quote(out, file_io::path_text(path)); out << '\n'; }
+        if (!source && !replacement && !addition) out << "    []\n";
+        out << "  farmer_peers:\n  - host: *self_hostname\n    port: 8447\ncopy: *shared\n"; return out.str();
+    };
+    auto save = [&](std::string const& text) { std::ofstream out(root / "config" / "config.yaml"); out << text; };
+    auto original = configuration(true, true); save(original);
+    std::array<fs::path, 1> roots{old}; auto catalog = scan_farm_inventory(roots); observe_harvester_inventory(catalog, options);
+    catalog.network = observe_network_projection(options, &catalog);
+    require(catalog.retirement_readers.size() == 1, "conventional config did not record optional retirement context");
+    auto encoded = farm_inventory_text(catalog);
+    require(farm_inventory_text(parse_farm_inventory(encoded)) == encoded, "optional retirement context failed deterministic catalog roundtrip");
+    auto legacy_catalog = catalog; legacy_catalog.retirement_readers.clear();
+    auto legacy_encoded = farm_inventory_text(legacy_catalog);
+    require(legacy_encoded.find("retirement_readers") == legacy_encoded.npos && farm_inventory_text(parse_farm_inventory(legacy_encoded)) == legacy_encoded,
+        "strict legacy catalogs acquired new serialized policy bytes");
+    auto unexpected = encoded; auto at = unexpected.find("\"retirement_identity\":"); unexpected.insert(at, "\"unreviewed\":true,");
+    rejects([&] { (void)parse_farm_inventory(unexpected); }, "unknown retirement authority field was silently accepted");
+    RetirementConfigurationAllowance allowance(catalog, options.limits); allowance.authorize(options, catalog.roots[0]); allowance.retain(options, file_io::path_text(target));
+    auto permitted = options; permitted.retirement = &allowance;
+    auto matches = [&](HarvesterAdapterOptions const& value)
+    { adapter_detail::Session session(value); return session.matches_reader_identity(catalog.plots[0].reader_identity); };
+    save(original + "# no-op rewrite\n");
+    require(!matches(permitted), "canonical formatting alone became general config compatibility");
+    save(configuration(false, true));
+    require(!matches(options) && matches(permitted), "authorized source-directory removal either bypassed strict policy or remained unusable");
+    require(observe_target_network(permitted, catalog.network, 28, 2).ready, "same-config source removal blocked target network provenance");
+    auto trailing = options; trailing.root /= "";
+    RetirementConfigurationAllowance trailing_allowance(catalog, options.limits);
+    trailing_allowance.authorize(trailing, catalog.roots[0]); trailing_allowance.retain(trailing, file_io::path_text(target)); trailing.retirement = &trailing_allowance;
+    require(matches(trailing) && observe_target_network(trailing, catalog.network, 28, 2).ready,
+        "trailing reader-root separator blocked authorized source removal or shared target provenance");
+    RetirementConfigurationAllowance trailing_retained(catalog, options.limits);
+    trailing_retained.authorize(trailing, catalog.roots[0]); trailing_retained.retain(trailing, file_io::path_text(old / "replacement")); trailing.retirement = &trailing_retained;
+    require(!matches(trailing), "trailing reader-root separator bypassed retained target ancestry");
+    std::array<uint64_t, 1> indices{0};
+    { SourceReadinessSnapshot snapshot(permitted, catalog, indices); (void)snapshot.check(catalog.roots[0], catalog.plots[0]); snapshot.finish(); }
+    {
+        auto fresh = scan_farm_inventory(roots); observe_harvester_inventory(fresh, permitted);
+        require(fresh.plots[0].reader_identity != catalog.plots[0].reader_identity, "fresh inventory reported the compatibility alias as actual raw provenance");
+    }
+    RetirementConfigurationAllowance strict(legacy_catalog, options.limits); strict.authorize(options, legacy_catalog.roots[0]);
+    auto old_policy = options; old_policy.retirement = &strict;
+    require(!matches(old_policy), "legacy inventory silently gained removal authority");
+    save(configuration(false, true, true)); require(!matches(permitted), "source unload admitted a new plot directory");
+    save(configuration(true, false)); require(!matches(permitted), "source unload removed a retained replacement directory");
+    auto changed = configuration(false, true); at = changed.find("ratio: 1.5"); changed.replace(at, std::string("ratio: 1.5").size(), "ratio: 2.5"); save(changed);
+    require(!matches(permitted), "non-directory service configuration drift survived retirement compatibility");
+    save(configuration(false, true));
+    auto changed_host = permitted; changed_host.host = "other-physical-host";
+    require(!matches(changed_host), "retirement compatibility omitted the physical host binding");
+    auto changed_service = permitted;
+    FarmServiceBinding service; service.root = root; service.rpc_host = "localhost"; service.host = options.host;
+    changed_service.services.emplace("farmer", service);
+    require(!matches(changed_service), "retirement compatibility omitted service-role bindings");
+    { adapter_detail::Session session(changed_service); require(session.retirement_context().configurations.size() == 1, "shared service config roots were duplicated"); }
+    auto copy = directory / "different-reader-executable"; fs::copy_file(options.executable, copy);
+    auto changed_executable = permitted; changed_executable.executable = copy;
+    require(!matches(changed_executable), "retirement compatibility omitted the exact executable path/implementation"); fs::remove(copy);
+    RetirementConfigurationAllowance nested(catalog, options.limits); nested.authorize(options, catalog.roots[0]); nested.retain(options, file_io::path_text(old / "replacement"));
+    auto ancestor = options; ancestor.retirement = &nested;
+    require(!matches(ancestor), "removing an ancestor directory disabled retained replacement discovery");
+#ifdef _WIN32
+    FarmInventory mixed_case; mixed_case.roots.push_back(catalog.roots[0]); mixed_case.roots[0].path = "D:\\farm";
+    RetirementConfigurationAllowance native_case(mixed_case, options.limits); native_case.authorize(options, mixed_case.roots[0]);
+    native_case.retain(options, "d:\\FARM\\replacement");
+    require(!native_case.permits(stream_state::digest(file_io::path_text(options.root)), "D:\\farm"), "Windows case spelling concealed retained target ancestry");
+#else
+    RetirementConfigurationAllowance native_case(catalog, options.limits); native_case.authorize(options, catalog.roots[0]);
+    native_case.retain(options, file_io::path_text(directory / "REMOVAL-OLD" / "replacement"));
+    require(native_case.permits(stream_state::digest(file_io::path_text(options.root)), file_io::path_text(old)), "native target ancestry lost Linux case sensitivity");
+#endif
+    auto fingerprint = [&](std::string const& text) { return adapter_detail::retirement_config(text, options.limits.memory_bytes / 4).identity; };
+    auto reordered = std::string("copy:\n  ratio: 1.50\n  enabled: True\n  label: \"true\"\nharvester:\n  farmer_peers:\n  - host: localhost\n    port: 8447\n  num_threads: 1\n  plot_directories:\n  - ") + [&] { std::ostringstream out; profile_detail::quote(out, file_io::path_text(target)); return out.str(); }() +
+        "\nother:\n  enabled: true\n  label: true\n  ratio: 1.5\nself_hostname: localhost\n";
+    auto string_label = reordered; at = string_label.find("label: true"); string_label.replace(at, 11, "label: 'true'");
+    require(fingerprint(original) == fingerprint(string_label) && fingerprint(original) != fingerprint(reordered), "canonical YAML changed a scalar type or failed alias/map ordering");
+    for (auto suffix : {"bad: true\nbad: false\n", "bad: {x: 1}\n", "bad: &cycle\n  self: *cycle\n", "bad: !!str hello\n", "true: 1\n1: 2\n", "bad: 0123\n", "bad: -\n", "bad: :\n", "bad: -.inf\n"})
+        require(fingerprint(original + suffix).empty(), "ambiguous, duplicate, cyclic or unsupported YAML gained retirement authority");
+    auto set = original + "keys: !!set\n  public: null\n  second: null\n";
+    auto reordered_set = original + "keys: !!set\n  second:\n  'public': ~\n";
+    require(!fingerprint(set).empty() && fingerprint(set) == fingerprint(reordered_set), "native bounded string-key YAML set lost its exact semantics");
+    require(!fingerprint(original + "keys: !!set {}\n").empty(), "empty standard YAML set lost optional retirement compatibility");
+    require(fingerprint(original + "keys: !!set\n  public: true\n").empty(), "YAML set with non-null values gained retirement authority");
+    for (auto const& [raw, escaped] : {std::pair{"\xc2\x85", "\\u0085"}, {"\xe2\x80\xa8", "\\u2028"}, {"\xe2\x80\xa9", "\\u2029"}})
+    {
+        require(fingerprint(original + "unicode: \"" + raw + "\"\n").empty(), "raw YAML line separators were mistaken for literal JSON string content");
+        require(fingerprint(original + "# comment" + raw + "non_directory: changed\n").empty(), "Unicode line break hid a native configuration key behind a comment");
+        require(!fingerprint(original + "unicode: \"" + escaped + "\"\n").empty(), "literal escaped Unicode text was mistaken for a raw YAML line break");
+    }
+    require(fingerprint(original + "# comment\rnon_directory: changed\n").empty(), "bare carriage return hid a native configuration key behind a comment");
+    std::string crlf; for (char c : original) { if (c == '\n') crlf += '\r'; crlf += c; }
+    require(fingerprint(crlf) == fingerprint(original), "ordinary native CRLF configuration lost optional compatibility");
+    for (auto anchor : {"", " &entry"})
+    {
+        auto flat = fingerprint(original + "x:\n  -" + anchor + "\n  - a\n");
+        auto nested_list = fingerprint(original + "x:\n  -" + anchor + "\n    - a\n");
+        require(!flat.empty() && !nested_list.empty() && flat != nested_list,
+            "empty list member consumed an equal-indent sibling as a nested list");
+    }
+    std::string aliases = original + "alias0: &a0 value\n";
+    for (unsigned i = 1; i < 80; ++i) aliases += "alias" + std::to_string(i) + ": &a" + std::to_string(i) + "\n  - *a" + std::to_string(i - 1) + '\n';
+    require(fingerprint(aliases).empty(), "alias DAG escaped the semantic depth bound");
+    require(adapter_detail::retirement_config(original, 1).identity.empty(), "optional configuration parser escaped its memory bound");
+}
 void routes(fs::path const& directory)
 {
     auto self = calibration_process::executable();
@@ -681,6 +818,6 @@ int main(int argc, char** argv)
 {
     if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
     auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { fs::create_directory(root); inventory(root); large_catalog(root); adapters(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
+    try { fs::create_directory(root); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
     catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }
 }

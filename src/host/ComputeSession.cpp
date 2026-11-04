@@ -126,6 +126,7 @@ struct ComputeSession::Impl
     std::shared_ptr<pool::ComputeDiscovery> discovery;
     std::unique_ptr<pool::ComputeDiscovery> worker_advertisement;
     std::shared_ptr<group_grow::WorkerService> worker;
+    uint64_t owned_worker_bytes = 0;
     mutable std::mutex mutex;
     std::condition_variable changed;
     bool offering = false, verbose = false;
@@ -171,6 +172,7 @@ struct ComputeSession::Impl
         stopping.store(true); changed.notify_all();
         if (worker_thread.joinable()) worker_thread.join();
         worker_advertisement.reset(); worker.reset(); discovery.reset();
+        { std::lock_guard lock(mutex); owned_worker_bytes = 0; }
         if (broker_thread.joinable()) broker_thread.join();
     }
     bool start_worker(group_grow::WorkerConfig config)
@@ -178,13 +180,23 @@ struct ComputeSession::Impl
         try { config.identity_reservation = group_grow::WorkerService::reserve_identity(config.tls.cert_file); }
         catch (group_grow::WorkerAlreadyRunning const&) { return false; }
         group_grow::default_worker_resources(config);
-        auto candidate = std::make_shared<group_grow::WorkerService>(std::move(config)); candidate->start();
-        if (identity.defaults.discovery)
+        // capacity.host_bytes already includes the complete service baseline.
+        // Publish ownership before its constructor allocates transport/GPU
+        // buffers, but never when a foreign worker holds this identity.
+        require(group_grow::worker_service_baseline_bytes(config) < config.capacity.host_bytes,
+            "automatic worker has no host capacity after its service baseline");
+        { std::lock_guard lock(mutex); owned_worker_bytes = config.capacity.host_bytes; }
+        try
         {
-            auto advertise = discovery_options(identity); advertise.role = "worker"; advertise.endpoint = candidate->endpoint();
-            worker_advertisement = std::make_unique<pool::ComputeDiscovery>(std::move(advertise));
+            auto candidate = std::make_shared<group_grow::WorkerService>(std::move(config)); candidate->start();
+            if (identity.defaults.discovery)
+            {
+                auto advertise = discovery_options(identity); advertise.role = "worker"; advertise.endpoint = candidate->endpoint();
+                worker_advertisement = std::make_unique<pool::ComputeDiscovery>(std::move(advertise));
+            }
+            { std::lock_guard lock(mutex); worker = std::move(candidate); }
         }
-        { std::lock_guard lock(mutex); worker = std::move(candidate); }
+        catch (...) { std::lock_guard lock(mutex); owned_worker_bytes = 0; throw; }
         if (verbose) std::cerr << "[compute] Local compute is available to this pool while plotting\n";
         return true;
     }
@@ -213,4 +225,6 @@ ComputeSession::~ComputeSession() = default;
 void ComputeSession::offer_local(group_grow::WorkerConfig config) { impl_->offer(std::move(config)); }
 std::shared_ptr<group_grow::WorkerService> ComputeSession::local_worker() const
 { std::lock_guard lock(impl_->mutex); return impl_->worker; }
+uint64_t ComputeSession::owned_worker_bytes() const
+{ std::lock_guard lock(impl_->mutex); return impl_->owned_worker_bytes; }
 } // namespace pos2gpu

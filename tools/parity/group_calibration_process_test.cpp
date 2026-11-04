@@ -227,10 +227,103 @@ int fake_worker(std::vector<std::string> args)
         std::this_thread::sleep_for(std::chrono::seconds(10)); return 9;
     }
     process::Deadline watchdog(std::stoull(args[11]));
+    if (mode == "observe-quiet" || mode == "observe-busy")
+    {
+        std::vector<uint8_t> resident(size_t(8) << 20, 0x5a);
+        auto const until = process::Clock::now() + std::chrono::milliseconds(400);
+        if (mode == "observe-quiet") std::this_thread::sleep_until(until);
+        else while (process::Clock::now() < until) std::atomic_signal_fence(std::memory_order_seq_cst);
+        check(resident.back() == 0x5a, "observed worker lost its private allocation");
+    }
     if (mode == "flood") { for (unsigned i = 0; i < 65536; ++i) std::cout.put('x'); std::cout.flush(); return 0; }
     if (mode == "failure") { std::cerr << "fixture failure\n"; return 7; }
     if (mode == "empty") return 0;
     std::cout << (cpu_cap ? "{\"proof_worker\":true,\"cpu_cap\":1}\n" : proof_worker ? "{\"proof_worker\":true}\n" : "{\"ok\":true}\n") << std::flush; return 0;
+}
+void monitor_fixture(process::Limits const& limits)
+{
+#if defined(__linux__) || defined(_WIN32)
+    using namespace group_grow::farm;
+    auto const host = group_grow::profile_detail::host_name();
+    Profile profile; profile.source = profile.producer = "held-proof-process-fixture"; profile.native.host = host;
+    Resource cpu; cpu.id = "cpu"; cpu.host = host; cpu.capacity = group_grow::profile_detail::logical_cpus(); cpu.capacity_known = true;
+    Resource ram; ram.id = "ram"; ram.host = host; ram.kind = ResourceKind::host_memory;
+    ram.capacity = group_grow::profile_detail::available_memory(); ram.capacity_known = true; profile.resources = {cpu, ram};
+    LocalPressureSampler sampler(host); (void)sampler.sample(profile);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80)); (void)sampler.sample(profile);
+    uint64_t generation = 0, maximum_resident = 0, last_generation = 0, last_epoch = 0;
+    unsigned observations = 0, known_cpu = 0;
+    auto observe = [&](SupervisedProcess const& held)
+    {
+        check(held.generation && (!generation || held.generation == generation), "one worker changed observation generation");
+        generation = held.generation; ++observations;
+#ifdef _WIN32
+        DWORD_PTR allowed = 0, system = 0;
+        check(::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system), "cannot inspect fixture affinity");
+        auto const scope = resource_detail::proof_affinity(held, allowed);
+        check(scope && std::popcount(DWORD_PTR(std::stoull(*scope))) == 1, "proof ran before its suspended-process CPU cap");
+#else
+        cpu_set_t allowed; CPU_ZERO(&allowed);
+        check(!::sched_getaffinity(0, sizeof(allowed), &allowed), "cannot inspect fixture affinity");
+        auto const scope = resource_detail::proof_affinity(held, allowed);
+        check(scope && std::count(scope->begin(), scope->end(), ',') == 1, "proof did not inherit the spawning-thread CPU cap");
+#endif
+        auto const reading = sampler.sample(profile, Clock::now(), cpu.capacity, &held, true);
+        if (last_generation && held.generation != last_generation)
+            check(reading.epoch > last_epoch, "a new proof reused the previous child's pressure epoch");
+        last_generation = held.generation; last_epoch = reading.epoch;
+        auto const bytes = sampler.child_anon_bytes(); check(bytes.has_value(), "held child private resident observation is missing");
+        maximum_resident = std::max(maximum_resident, *bytes);
+        for (auto const& value : reading.resources) if (value.resource == "cpu" && value.cpu_busy_known) ++known_cpu;
+        return true;
+    };
+    auto const original_cpus = group_grow::profile_detail::logical_cpus();
+    auto output = process::run_worker("observe-quiet", 1, limits, process::Worker::migration_proof, 1, 1, observe);
+    check(output == "{\"proof_worker\":true,\"cpu_cap\":1}\n" && observations > 2 && known_cpu > 1 && maximum_resident >= (uint64_t(8) << 20),
+        "quiet child did not retain valid repeated CPU/RSS evidence");
+    check(group_grow::profile_detail::logical_cpus() == original_cpus, "supervised proof changed its parent's CPU scope");
+    auto const first_generation = generation; generation = 0; observations = known_cpu = 0;
+    Stage stage; stage.name = "held-proof"; stage.scope_complete = true;
+    Demand memory; memory.resource = "ram"; memory.transient_units = uint64_t(64) << 20; memory.bounded = true; stage.verification = {memory};
+    AdmissionGate gate(profile); bool paused = false;
+    try
+    {
+        process::run_worker("observe-busy", 1, limits, process::Worker::migration_proof, 1, 1, [&](SupervisedProcess const& held)
+        {
+            observe(held); check(held.generation != first_generation, "proof retry reused a child observation epoch");
+            if (observations < 4) return true;
+            Telemetry pressure; pressure.producer = "fixture-current-headroom-loss"; pressure.epoch = held.generation;
+            pressure.sequence = pressure.producer_tick_ms = observations; pressure.bounded_source_age_ms = 0;
+            ResourceSample sample; sample.resource = "ram"; sample.available_known = true; sample.available_units = 0; pressure.resources = {sample};
+            check(gate.observe(pressure), "current pressure fixture was rejected");
+            OwnMemoryCredit credit; credit.child_limit_bytes = memory.transient_units; credit.child_resident_bytes = sampler.child_anon_bytes().value();
+            return gate.evaluate_owned(stage, Clock::now(), credit).allowed;
+        });
+    }
+    catch (process::WorkerPaused const&) { paused = true; }
+    check(paused && observations >= 4, "headroom loss did not terminate and drain the held proof process");
+    paused = false;
+    try
+    {
+        process::run_worker("hang", 1, limits, process::Worker::migration_proof, 1, 1,
+            [](SupervisedProcess const&) -> bool { throw ProcessObservationUnavailable(); });
+    }
+    catch (process::WorkerPaused const&) { paused = true; }
+    check(paused, "missing counters admitted a still-running proof worker");
+    output = process::run_worker("observe-quiet", 1, limits, process::Worker::migration_proof, 1, 1,
+        [](SupervisedProcess const& held) -> bool
+        {
+            auto const until = Clock::now() + std::chrono::seconds(2);
+            while (!held.exited() && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            check(held.exited(), "exit-race fixture did not complete");
+            throw ProcessObservationUnavailable();
+        });
+    check(output == "{\"proof_worker\":true,\"cpu_cap\":1}\n", "a confirmed child exit lost its final bounded result");
+    rejected([&] { process::run_worker("hang", 1, limits, process::Worker::migration_proof, 1, 1,
+        [](SupervisedProcess const&) -> bool { throw std::runtime_error("proof observation failure"); }); });
+#else
+    (void)limits;
+#endif
 }
 int launch_direct(std::string const& mode)
 {
@@ -298,6 +391,7 @@ int main(int argc, char** argv) try
     check(launch_direct("--direct-active-pressure") == 0, "active/inactive default pressure enforcement failed");
 #endif
     auto const before = handles();
+    monitor_fixture(limits);
     for (unsigned i = 0; i < 8; ++i)
         check(process::run_worker(input, 1, limits) == "{\"ok\":true}\n", "final worker output was lost at process exit");
     rejected([&] { (void)process::run_worker("failure", 1, limits); });

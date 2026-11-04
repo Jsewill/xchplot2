@@ -356,6 +356,9 @@ with status 4 while other members remain unavailable. It cannot change the
 job, admit another extent, seal an unfinished file or commit an incompletely
 staged revision. Restore the original mounts
 and resume normally to finish the whole job.
+Before new external construction, all fixed-job destinations must be available
+to account for preserved scratch and its ownership records. This does not
+prevent read-only inspection or resuming available members without new scratch.
 
 For an intentional move, keep the output and saved job together, take the old
 path offline, then use `fill -r --relocate OLD NEW`. The new directory locates
@@ -695,8 +698,12 @@ workload and are not PoS1 retirement candidates.
 
 `--farm-adapter chia|gigahorse|drchia` selects the installed reader interface;
 `--chia-executable` must name its actual executable. Each source phase captures
-and fences one coherent bounded reader registry for the selected batch. Reader,
-configuration or reported version changes invalidate the review. DrChia builds
+and fences a coherent bounded reader registry for the selected batch. After
+construction and verification, migration refreshes source metadata before
+retirement and checks each reviewed source and target reader's loaded scope
+before each claim and unlink. Unexpected arrivals stop retirement. Reader,
+configuration or reported version changes invalidate the review, apart from
+the reviewed source-directory removal described below. DrChia builds
 without a version RPC record explicitly labelled CLI version provenance instead;
 that is not an independently reported running-service version. Unloaded ordinary
 files record the selected reader's route context separately from their public
@@ -908,8 +915,11 @@ while network-only forecasts remain available.
 Resource admission includes the old farm, completed replacements, construction,
 verification and separate full-proof demand, under current and future filter
 conditions. Retiring a plot does not release a foreign decoder's resident
-memory or queued work. Telemetry can restrict new plotting admissions; it does
-not stop or reconfigure the farmer, harvester, remote solver or their services.
+memory or queued work. Telemetry restricts native admissions and interrupts
+construction or proof work if protected headroom is lost. Construction saves a
+checkpoint; a paused proof attempt restarts against the sealed replacement
+within its original verification deadline. Telemetry does not stop or
+reconfigure the farmer, harvester, remote solver or their services.
 The reviewed envelope must also allow fresh observations after a restart while
 conservatively retaining the original arrivals until their removal is confirmed.
 The first complete target farming and full-proof cohort is reserved even when
@@ -928,6 +938,20 @@ retirement progress can retain its previously validated metadata for those exact
 now-unloaded native objects. A later opaque batch without previously validated
 reader metadata must be loaded and freshly acknowledged before its own retirement
 begins. Ordinary supported public headers can identify unloaded files directly.
+
+New reviews can record a removal-compatible fingerprint for conventional Chia
+configuration. Once the private journal has durable retirement intent, removing
+that reviewed source directory from the reader's configuration is permitted.
+Keep all replacement directories configured and preserve every other setting,
+executable and service binding. Removing an ancestor of a replacement directory
+is refused.
+This also applies when the source and target share that configuration; fresh
+target acknowledgements remain required. Directory additions are refused.
+Native configuration rewrites may reorder keys or remove comments without
+changing the other settings. Older reviews and unsupported configuration syntax
+retain the exact-configuration requirement; keep or restore the reviewed
+configuration to resume those jobs.
+
 Migration currently requires unchanged native file and device identifiers;
 device renumbering after a remount or reboot can prevent resume even when the
 filesystem's persistent identity is unchanged.

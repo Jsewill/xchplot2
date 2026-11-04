@@ -1,6 +1,6 @@
 // Private, bounded self-workers for explicit calibration and migration proofs.
 #pragma once
-#include "host/GroupHarvesterProfile.hpp"
+#include "host/GroupFarmResources.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <climits>
@@ -219,8 +219,14 @@ inline std::filesystem::path executable()
 }
 
 enum class Worker { calibration, migration_proof };
+class WorkerPaused : public std::runtime_error
+{
+public:
+    WorkerPaused() : std::runtime_error("bounded proof worker paused for farm resources") {}
+};
 inline std::string run_worker(std::filesystem::path const& plot, uint64_t samples, Limits const& limits,
-                              Worker worker = Worker::calibration, uint64_t proof_cpus = 0, uint64_t proof_solves = 1)
+                              Worker worker = Worker::calibration, uint64_t proof_cpus = 0, uint64_t proof_solves = 1,
+                              std::function<bool(farm::SupervisedProcess const&)> const& observe = {})
 {
     check(worker == Worker::calibration || worker == Worker::migration_proof, "invalid bounded plot worker mode");
     check(!proof_cpus || (worker == Worker::migration_proof && proof_cpus <= 1024), "invalid bounded proof CPU request");
@@ -236,6 +242,20 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     check(!error, "cannot resolve calibration input path");
     auto const self = executable();
     std::string output;
+    static std::atomic<uint64_t> generations{1};
+    farm::SupervisedProcess observed; observed.generation = generations.fetch_add(1);
+    check(observed.generation && observed.generation != UINT64_MAX, "bounded worker observation generation exhausted");
+    auto monitor = [&]
+    {
+        if (!observe) return;
+        try { if (!observe(observed)) throw WorkerPaused(); }
+        catch (farm::ProcessObservationUnavailable const&)
+        {
+            // Exit can race a last /proc/working-set read. Only this held
+            // process's confirmed exit makes that observation unnecessary.
+            if (!observed.exited()) throw WorkerPaused();
+        }
+    };
     auto append = [&](char const* buffer, size_t count)
     {
         check(uint64_t(count) <= limits.output_bytes - output.size(), "calibration worker output exceeded its byte limit");
@@ -298,13 +318,32 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo, &created),
         "cannot start calibration worker");
     child.process = created;
+    observed.handle = child.process.hProcess;
     ::CloseHandle(write.value); write.value = nullptr;
     check(::AssignProcessToJobObject(job.value, child.process.hProcess), "cannot assign calibration worker to its memory job");
+    if (proof_cpus)
+    {
+        DWORD_PTR allowed = 0, system = 0, selected = 0; uint64_t count = 0;
+        check(::GetProcessAffinityMask(child.process.hProcess, &allowed, &system) && allowed, "cannot inspect suspended proof CPU affinity");
+        for (unsigned id = 0; id < sizeof(allowed) * CHAR_BIT && count < proof_cpus; ++id)
+            if (allowed & (DWORD_PTR(1) << id)) { selected |= DWORD_PTR(1) << id; ++count; }
+        DWORD_PTR actual = 0;
+        check(count == proof_cpus && ::SetProcessAffinityMask(child.process.hProcess, selected) &&
+            ::GetProcessAffinityMask(child.process.hProcess, &actual, &system) && actual == selected,
+            "cannot enforce suspended proof CPU affinity");
+    }
     check_running(until, limits.cancelled);
     check(::ResumeThread(child.process.hThread) != DWORD(-1), "cannot resume capped calibration worker");
     for (;;)
     {
         check_running(until, limits.cancelled);
+        if (observe && !child.done)
+        {
+            DWORD const state = ::WaitForSingleObject(child.process.hProcess, 0);
+            check(state != WAIT_FAILED, "cannot inspect monitored proof worker exit");
+            if (state == WAIT_OBJECT_0) child.done = true;
+            else monitor();
+        }
         DWORD available = 0;
         if (!::PeekNamedPipe(read.value, nullptr, 0, nullptr, &available, nullptr))
             check(::GetLastError() == ERROR_BROKEN_PIPE, "cannot inspect calibration worker output");
@@ -374,13 +413,29 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     } child;
     check_running(until, limits.cancelled);
     pid_t created = 0;
-    check(!::posix_spawn(&created, argv.front(), &actions, nullptr, argv.data(), environ), "cannot start calibration worker");
-    child.pid = created;
+    {
+        // Only this spawning thread changes affinity. Existing broker/worker
+        // threads retain their independently admitted CPU scope.
+        ScopedCpuCap cpu(proof_cpus);
+        check(!::posix_spawn(&created, argv.front(), &actions, nullptr, argv.data(), environ), "cannot start calibration worker");
+        // Adopt before restoration, whose read-back may throw.
+        child.pid = created;
+        cpu.restore();
+    }
+    observed.pid = child.pid;
     ::close(pipe.values[1]); pipe.values[1] = -1;
     bool eof = false;
     for (;;)
     {
         check_running(until, limits.cancelled);
+        if (observe && !child.done)
+        {
+            auto const waited = ::waitpid(child.pid, &child.status, WNOHANG);
+            if (waited == child.pid) child.done = true;
+            else if (waited < 0 && errno != EINTR)
+            { child.done = errno == ECHILD; throw std::runtime_error("cannot reap monitored proof worker"); }
+            if (!child.done) monitor();
+        }
         char buffer[4096]; auto const count = ::read(pipe.values[0], buffer, sizeof(buffer));
         if (count > 0) { append(buffer, size_t(count)); continue; }
         if (!count) eof = true;

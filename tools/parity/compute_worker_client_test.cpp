@@ -1,6 +1,8 @@
 // As in grow-worker-test, include the implementation to exercise bounded
 // private ownership without adding a production cache-testing interface.
 #include "host/ComputeWorker.cpp"
+#include "host/ComputeSession.hpp"
+#include "host/ComputeIdentity.hpp"
 #include "compute_pool_fixture.hpp"
 #include <iostream>
 
@@ -633,6 +635,46 @@ void protected_admission()
     controller.unregister_worker(stale.instance); unregistered.stop();
 }
 
+void session_memory_ownership()
+{
+    pool_test::Directory directory;
+    auto identity = pool::create_pool(directory.path / "session", "owned-startup-fixture");
+    auto defaults = identity.defaults; defaults.discovery = false; defaults.interfaces = {"lo"}; defaults.max_brokers = 16;
+    pool::configure_pool(identity, defaults);
+    pos2gpu::GroupOptions args; args.pool_directory = pool_test::utf8_path(identity.directory);
+    args.max_ram = uint64_t(2) << 30; args.workers = 1; args.backend = "cpu"; args.backend_set = true;
+    args.pool_offer_ram = uint64_t(512) << 20; args.pool_offer_cpus = 1; args.pool_offer_backend_set = true;
+    args.pool_frame_bytes = args.window = 65536; args.pool_socket_timeout_ms = 500;
+    args.protected_resources = true; args.compute_admit_session = [] {};
+    pos2gpu::prepare_group_compute(args);
+    pos2gpu::ComputeSession session(args);
+    require(!session.owned_worker_bytes(), "a session credited worker memory before acquiring its identity");
+    auto offer = pos2gpu::make_group_compute_offer(args);
+    offer.admit_start = [&](WorkerConfig const& actual)
+    {
+        require(session.owned_worker_bytes() == actual.capacity.host_bytes &&
+            session.owned_worker_bytes() > worker_service_baseline_bytes(actual),
+            "identity-reserved startup omitted its total/baseline ownership");
+        throw WorkerAdmissionRejected("startup fixture refuses construction");
+    };
+    rejects([&] { session.offer_local(offer); });
+    require(!session.owned_worker_bytes() && !session.local_worker(), "failed worker startup retained a resident-memory grant");
+    offer.admit_start = [&](WorkerConfig const& actual)
+    { require(session.owned_worker_bytes() == actual.capacity.host_bytes, "worker startup lost its owned partition"); };
+    session.offer_local(offer);
+    {
+        auto local = session.local_worker(); require(bool(local), "automatic worker did not reach its ready lifetime");
+        auto const status = local->status();
+        require(session.owned_worker_bytes() == status.capacity.host_bytes + status.baseline_host_bytes,
+            "ready worker double counted or omitted its service baseline");
+    }
+    auto foreign_args = args;
+    pos2gpu::ComputeSession foreign(foreign_args);
+    foreign.offer_local(pos2gpu::make_group_compute_offer(foreign_args));
+    require(!foreign.local_worker() && !foreign.owned_worker_bytes(),
+        "an already-running worker identity granted its foreign pages to another session");
+}
+
 void codec_window_limits()
 {
     pool_test::Directory directory;
@@ -738,7 +780,7 @@ void renewal_fence()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); codec_window_limits(); renewal_fence();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); session_memory_ownership(); codec_window_limits(); renewal_fence();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

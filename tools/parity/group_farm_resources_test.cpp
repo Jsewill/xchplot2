@@ -299,6 +299,23 @@ int main()
               "own memory credit consumed protected farming/proof/foreign transient budget");
         check(!active.evaluate(memory_stage, now).allowed, "active memory credit leaked into new admission");
 
+        auto proof_stage = memory_stage; proof_stage.construction.clear(); proof_stage.verification = {memory("ram", 2000)};
+        proof_stage.background = {memory("ram", 1000)};
+        OwnMemoryCredit proof_credit{999999, 1100, 999999, 1900};
+        AdmissionGate own_proof(p), foreign_memory(p), retained_worker(p);
+        check(own_proof.observe(sample(1, 1, 1, 700), now) && own_proof.evaluate_owned(proof_stage, now, proof_credit).allowed,
+            "held verifier and retained worker pages were charged again as future allocations");
+        check(own_proof.evaluate_owned(proof_stage, now, proof_credit).assessment.margins[1].occupied_units == 4700,
+            "owned resident credit weakened the static whole-worker and verifier reservations");
+        check(foreign_memory.observe(sample(1, 1, 1, 699), now) && !foreign_memory.evaluate_owned(proof_stage, now, proof_credit).allowed,
+            "proof resident credit consumed protected old/new farming or solver memory");
+        OwnMemoryCredit parent_credit{999999, 1100, 0, 0};
+        check(retained_worker.observe(sample(1, 1, 1, 2600), now) && retained_worker.evaluate_owned(proof_stage, now, parent_credit).allowed,
+            "phase admission double charged its already-resident controller and owned worker");
+        check(!retained_worker.evaluate(proof_stage, now).allowed, "phase ownership credit leaked into ordinary admission");
+        proof_credit.parent_limit_bytes = 3001;
+        rejects([&] { own_proof.evaluate_owned(proof_stage, now, proof_credit); }, "resident credit exceeded its local declared phase budget");
+
         resource_detail::CpuPressureHistory counters;
         auto first = cpu_observation(1000, 100, 0, 0); counters.observe(first, 5000);
         check(!counters.reading(first.at, 5000, first.scope, 0, true), "first CPU sample invented an interval");
@@ -322,6 +339,13 @@ int main()
               !resource_detail::active_cpu_pressure(10, 0, 0, 100000000, 1, 0, 1), "invalid clock/tick evidence received CPU credit");
         auto regression = second; regression.at += std::chrono::milliseconds(100); --regression.total; counters.observe(regression, 5000);
         check(!counters.reading(regression.at, 5000, regression.scope, 0, true), "CPU counter regression reused old evidence");
+        resource_detail::CpuPressureHistory quiet;
+        auto idle_child = cpu_observation(1000, 100, 100, 0); idle_child.own_after_ns = 0; idle_child.own_counter_padding_ns = 200;
+        quiet.observe(idle_child, 5000); idle_child.at += std::chrono::milliseconds(100);
+        idle_child.before_wall += std::chrono::milliseconds(100); idle_child.after_wall += std::chrono::milliseconds(100);
+        idle_child.total += 10; idle_child.idle += 10; quiet.observe(idle_child, 5000);
+        auto const quiet_pressure = quiet.reading(idle_child.at, 5000, idle_child.scope, 1, true);
+        check(quiet_pressure && quiet_pressure->first == 0, "quiet proof child was mistaken for missing CPU evidence");
         LocalPressureSampler local("harvester"); auto pressure = local.sample(fixture());
         check(pressure.producer == "local-os-pressure-v2:harvester" && pressure.bounded_source_age_ms.has_value() && pressure.sequence == 1,
               "local current-counter telemetry has no bounded source provenance");

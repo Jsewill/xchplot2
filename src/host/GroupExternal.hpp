@@ -120,6 +120,28 @@ public:
     ~ExternalEngine();
     ExternalEngine(ExternalEngine const&) = delete;
     ExternalEngine& operator=(ExternalEngine const&) = delete;
+    struct FileIdentity
+    {
+        uint64_t device = 0, inode = 0;
+        bool operator==(FileIdentity const&) const = default;
+    };
+    struct Stamp
+    {
+        FileIdentity file;
+        uint64_t bytes = 0;
+        int64_t modified = 0, changed = 0;
+        uint32_t modified_ns = 0, changed_ns = 0;
+        bool operator==(Stamp const&) const = default;
+    };
+    // Read-only authority for terminal metadata whose original target was
+    // published by rename. The controller supplies its durable native stamp
+    // and the exact fixed assignment; active construction never uses aliases.
+    struct PublishedTarget
+    {
+        std::string path;
+        Stamp stamp;
+        Identity identity;
+    };
     struct Inspection
     {
         ExternalConfig external;
@@ -133,6 +155,8 @@ public:
     static bool pending(std::string const& path);
     static Inspection inspect(std::string const& path, uint64_t memory_limit_bytes = UINT64_MAX);
     static Inspection inspect_retired(std::string const& path, std::string const& directory, uint64_t memory_limit_bytes = UINT64_MAX);
+    static Inspection inspect_retired_published(std::string const& path, std::string const& directory,
+        PublishedTarget const& published, uint64_t memory_limit_bytes = UINT64_MAX);
     static uint64_t memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
                                  uint16_t batch_members = 1);
     enum class MemoryPhase { staging, packing, publication };
@@ -222,19 +246,6 @@ public:
 
 private:
     enum class Phase { stage, pack, ready, done, empty };
-    struct FileIdentity
-    {
-        uint64_t device = 0, inode = 0;
-        bool operator==(FileIdentity const&) const = default;
-    };
-    struct Stamp
-    {
-        FileIdentity file;
-        uint64_t bytes = 0;
-        int64_t modified = 0, changed = 0;
-        uint32_t modified_ns = 0, changed_ns = 0;
-        bool operator==(Stamp const&) const = default;
-    };
     struct Root
     {
         std::string path;
@@ -316,8 +327,11 @@ private:
     static uint64_t checkpoint_buffer_bytes(ExternalConfig const& external);
     static uint64_t packing_index_bytes(Config const& config)
     { return std::clamp<uint64_t>(config.window_bytes, 65536, 1024 * 1024); }
-    static Inspection inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired);
-    static Inspection inspect_receipt(std::string const& path, std::string const& holder, uint64_t memory_limit_bytes);
+    static Inspection inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
+        PublishedTarget const* published = nullptr);
+    static Inspection inspect_receipt(std::string const& path, std::string const& holder, uint64_t memory_limit_bytes,
+        PublishedTarget const* published = nullptr);
+    static void validate_publication(PublishedTarget const& published, Inspection const& retired);
     bool save_retired_receipt(std::string const& holder, FileIdentity holder_identity);
     void measure_remaining_metadata(std::string const& holder, FileIdentity holder_identity);
     static uint64_t aligned(uint64_t bytes, uint64_t alignment)
@@ -2890,10 +2904,13 @@ inline Result ExternalEngine::finish()
 
 namespace group_grow
 {
-inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired)
+inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
+                                                            PublishedTarget const* published)
 {
     using namespace external_detail;
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
+    require(!published || retired, "published aliases cannot recover active external construction");
+    auto const& current = published ? published->path : target;
     std::string const checkpoint = retired ? work + "/checkpoint" : checkpoint_path(work, target, memory_limit_bytes / 8);
     auto const value = stamp(checkpoint);
     require(value.bytes <= uint64_t(SIZE_MAX) && value.bytes <= memory_limit_bytes / 8, "external checkpoint inspection exceeds memory budget");
@@ -2907,7 +2924,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     auto const token = get_string(in);
     require(token.size() == 64 && (!retired || work == target + ".external.retired-" + token),
         "retired external directory name does not match its ownership record");
-    require(get<FileIdentity>(in) == file_identity(target, false), "external destination was replaced");
+    require(get<FileIdentity>(in) == file_identity(current, false), "external destination was replaced");
     require(get<FileIdentity>(in) == file_identity(work, true), "external checkpoint directory was replaced");
     require(get<FileIdentity>(in) == file_identity(file_io::path_text(file_io::native_path(target).parent_path()), true), "external destination parent directory was replaced");
     auto const header = get<Header>(in);
@@ -2947,11 +2964,12 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     auto const bound = get<uint64_t>(in), committed = get<uint64_t>(in);
     require(unsigned(phase) <= unsigned(Phase::empty), "invalid external checkpoint phase");
     if (retired) require(phase == Phase::done || phase == Phase::empty, "retired external record is not terminal");
+    if (published) require(phase == Phase::done && result.members, "only a completed nonempty external target can be published");
     if (checkpoint != work + "/checkpoint") require(phase == Phase::stage && !result.members, "only an initial external checkpoint can be recovered from a temporary record");
     result.finishing = phase != Phase::stage; result.complete = retired || phase == Phase::done; result.external = external;
     result.identity.pending = !result.complete && result.members; result.identity.target_members = result.members;
     if (result.complete) { result.identity.bytes = committed; result.identity.header.group_size = result.members; }
-    file_io::Stat target_info{}; require(!file_io::inspect_link(target.c_str(), &target_info) && file_io::is_regular(target_info.st_mode) && target_info.st_nlink == 1 &&
+    file_io::Stat target_info{}; require(!file_io::inspect_link(current.c_str(), &target_info) && file_io::is_regular(target_info.st_mode) && target_info.st_nlink == 1 &&
         (retired || uint64_t(target_info.st_size) >= committed), "external destination is truncated or shared");
     result.target_allocated_bytes = multiply(uint64_t(target_info.st_blocks), 512);
     result.target_bytes = std::max(uint64_t(target_info.st_size), result.target_allocated_bytes);
@@ -3169,6 +3187,65 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_retired(std::string co
     }
     return inspect_at(target, holder, memory_limit_bytes, true);
 }
+inline void ExternalEngine::validate_publication(PublishedTarget const& published, Inspection const& retired)
+{
+    using namespace external_detail;
+    auto const& expected = published.identity; auto const& saved = retired.identity;
+    require(retired.complete && retired.members && !saved.pending && !expected.pending &&
+        saved.header.magic == expected.header.magic && saved.header.version == PlotGroupFile::FORMAT_VERSION &&
+        saved.header.group_id == expected.header.group_id && saved.header.k == expected.header.k &&
+        saved.header.strength == expected.header.strength && saved.header.meta_group == expected.header.meta_group &&
+        saved.header.group_size == expected.header.group_size && saved.header.group_size == retired.members && saved.memo == expected.memo,
+        "retired external publication differs from its fixed sealed assignment");
+    require(stamp(published.path) == published.stamp, "published external target changed before retired inspection");
+    Descriptor file(file_io::open_file(file_io::native_path(published.path), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
+    auto held = [&]
+    {
+        file_io::Stat value{};
+        require(!file_io::inspect_fd(file.fd, &value) && file_io::is_regular(value.st_mode) && value.st_nlink == 1 && value.st_size >= 0,
+            "published external target handle is shared or changed");
+#ifdef __APPLE__
+        auto const modified = value.st_mtimespec, changed = value.st_ctimespec;
+#else
+        auto const modified = value.st_mtim, changed = value.st_ctim;
+#endif
+        return Stamp{{uint64_t(value.st_dev), uint64_t(value.st_ino)}, uint64_t(value.st_size),
+            modified.tv_sec, changed.tv_sec, uint32_t(modified.tv_nsec), uint32_t(changed.tv_nsec)};
+    };
+    require(held() == published.stamp, "published external native object changed while opening retired inspection");
+    Header header{};
+    read(file.fd, 0, {reinterpret_cast<uint8_t*>(&header), sizeof(header)}, nullptr, {"retired_publication", &published.path});
+    require(!std::memcmp(&header, &saved.header, sizeof(header)) && header.memo_length == saved.memo.size() &&
+        header.chunk_index_offset >= sizeof(header) + saved.memo.size() && header.chunk_index_offset < published.stamp.bytes &&
+        saved.bytes == published.stamp.bytes, "published external header differs from its terminal ownership record");
+    std::array<uint8_t, 255> memo{};
+    read(file.fd, sizeof(header), {memo.data(), saved.memo.size()}, nullptr, {"retired_publication", &published.path});
+    require(std::equal(saved.memo.begin(), saved.memo.end(), memo.begin()) && held() == published.stamp && stamp(published.path) == published.stamp,
+        "published external target changed during retired inspection");
+}
+inline ExternalEngine::Inspection ExternalEngine::inspect_retired_published(std::string const& path, std::string const& directory,
+    PublishedTarget const& published, uint64_t memory_limit_bytes)
+{
+    auto const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
+    auto const holder = file_io::path_text(std::filesystem::absolute(file_io::native_path(directory)).lexically_normal());
+    auto const actual = file_io::native_path(published.path);
+    require(actual.is_absolute() && actual == actual.lexically_normal() && actual != file_io::native_path(target) &&
+        actual.parent_path() == file_io::native_path(target).parent_path() &&
+        file_io::native_path(holder).parent_path() == actual.parent_path() && file_identity(holder, true).inode,
+        "published external alias is outside its original target directory");
+    file_io::Stat original{}, checkpoint{};
+    require(file_io::inspect_link(target, &original) && errno == ENOENT,
+        "original external target reappeared beside its publication");
+    require(stamp(published.path) == published.stamp, "published external alias differs from its authorized native stamp");
+    Inspection result;
+    if (file_io::inspect_link(holder + "/checkpoint", &checkpoint))
+    {
+        require(errno == ENOENT, "cannot inspect published retired external checkpoint");
+        result = inspect_receipt(target, holder, memory_limit_bytes, &published);
+    }
+    else result = inspect_at(target, holder, memory_limit_bytes, true, &published);
+    validate_publication(published, result); return result;
+}
 }
 
 namespace group_grow
@@ -3200,7 +3277,7 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
 #endif
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string const& path, std::string const& holder,
-                                                                 uint64_t memory_limit_bytes)
+                                                                 uint64_t memory_limit_bytes, PublishedTarget const* published)
 {
 #ifdef __linux__
     using namespace external_detail;
@@ -3218,7 +3295,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string co
     auto const owner = get<FileIdentity>(in), target = get<FileIdentity>(in), parent = get<FileIdentity>(in), checkpoint_directory = get<FileIdentity>(in);
     file_io::Stat value{}; require(!file_io::inspect_fd(directory.fd, &value) && file_io::is_directory(value.st_mode) &&
         FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == owner && file_identity(holder, true) == owner &&
-        file_identity(path, false) == target && file_identity(file_io::path_text(file_io::native_path(path).parent_path()), true) == parent,
+        file_identity(published ? published->path : path, false) == target && file_identity(file_io::path_text(file_io::native_path(path).parent_path()), true) == parent,
         "retired external receipt inode ownership mismatch");
     require(checkpoint_directory == owner, "retired receipt checkpoint directory differs from its holder");
     Inspection result; result.identity.header = get<Header>(in); auto const memo = get_string(in, 255);
@@ -3232,13 +3309,14 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string co
     result.complete = result.finishing = true;
     result.metadata_occupied_bytes = multiply(uint64_t(value.st_blocks), 512);
     require(std::filesystem::is_empty(file_io::native_path(holder)), "unrecognized contents in retired external holder");
-    auto const output = stamp(path); file_io::Stat allocation{}; require(!file_io::inspect_link(path.c_str(), &allocation), "cannot inspect retired target allocation");
+    auto const& current = published ? published->path : path;
+    auto const output = stamp(current); file_io::Stat allocation{}; require(!file_io::inspect_link(current.c_str(), &allocation), "cannot inspect retired target allocation");
     result.target_allocated_bytes = multiply(uint64_t(allocation.st_blocks), 512);
     result.target_bytes = std::max(output.bytes, result.target_allocated_bytes);
     result.metadata_reserved_bytes = result.metadata_occupied_bytes;
     result.peak_bytes = grow_add(result.target_bytes, result.metadata_reserved_bytes); return result;
 #else
-    (void)path; (void)holder; (void)memory_limit_bytes;
+    (void)path; (void)holder; (void)memory_limit_bytes; (void)published;
     throw std::runtime_error("retired external checkpoint is missing its ownership proof");
 #endif
 }

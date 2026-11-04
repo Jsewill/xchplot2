@@ -62,6 +62,16 @@ struct NetworkProjection
     uint64_t hard_fork2_height = 0, min_strength = 0, max_strength = 0, plot_size = 0;
     bool available = false;
 };
+struct RetirementReaderConfiguration
+{
+    std::string root_identity;
+    std::vector<std::string> plot_directories;
+};
+struct RetirementReaderContext
+{
+    std::string reader_identity, retirement_identity;
+    std::vector<RetirementReaderConfiguration> configurations;
+};
 struct FarmInventory
 {
     unsigned version = 1;
@@ -69,6 +79,9 @@ struct FarmInventory
     std::vector<InventoryRoot> roots;
     std::vector<InventoryPlot> plots;
     NetworkProjection network;
+    // Optional reviewed compatibility for removal of explicitly authorized old
+    // source directories. Older catalogs retain their strict reader identity.
+    std::vector<RetirementReaderContext> retirement_readers;
     std::optional<Profile> resource_template;
     bool complete = false;
 };
@@ -245,6 +258,17 @@ inline uint64_t memory(FarmInventory const& value)
         &value.network.farmer_version, &value.network.solver_version, &value.network.service_status}) charge(*s);
     if (value.resource_template) bytes += profile_memory(*value.resource_template);
     for (auto const& p : value.plots) bytes += plot_memory(p) - sizeof(p);
+    bytes += value.retirement_readers.capacity() * sizeof(RetirementReaderContext);
+    for (auto const& reader : value.retirement_readers)
+    {
+        charge(reader.reader_identity); charge(reader.retirement_identity);
+        bytes += reader.configurations.capacity() * sizeof(RetirementReaderConfiguration);
+        for (auto const& config : reader.configurations)
+        {
+            charge(config.root_identity); bytes += config.plot_directories.capacity() * sizeof(std::string);
+            for (auto const& directory : config.plot_directories) charge(directory);
+        }
+    }
     return bytes;
 }
 } // namespace inventory_detail
@@ -348,6 +372,26 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
         &v.network.source, &v.network.version, &v.network.captured_at, &v.network.target_route, &v.network.reader_version, &v.network.reader_identity,
         &v.network.farmer_version, &v.network.solver_version, &v.network.service_status}) bounded_text(*text);
     require(!v.network.available || (!v.network.network.empty() && hex(v.network.genesis_challenge, 32)), "invalid inventory network projection");
+    require(v.retirement_readers.size() <= limits.max_roots, "inventory retirement reader count exceeds its bound");
+    std::set<std::string> readers;
+    for (auto const& reader : v.retirement_readers)
+    {
+        require(hex(reader.reader_identity, 32) && hex(reader.retirement_identity, 32) && readers.insert(reader.reader_identity).second &&
+            !reader.configurations.empty() && reader.configurations.size() <= 5, "invalid inventory retirement reader context");
+        std::set<std::string> configurations;
+        for (auto const& config : reader.configurations)
+        {
+            require(hex(config.root_identity, 32) && configurations.insert(config.root_identity).second &&
+                config.plot_directories.size() <= limits.max_roots, "invalid inventory retirement configuration");
+            std::set<std::string> directories;
+            for (auto const& directory : config.plot_directories)
+            {
+                bounded_text(directory); auto path = file_io::native_path(directory);
+                require(path.is_absolute() && file_io::path_text(path.lexically_normal()) == directory && directories.insert(directory).second,
+                    "invalid reviewed retirement directory");
+            }
+        }
+    }
     std::set<std::pair<uint64_t, uint64_t>> roots;
     for (auto const& r : v.roots)
     {
@@ -477,6 +521,25 @@ inline void write_farm_inventory_json(std::ostream& destination, FarmInventory c
         text("workload_id", p.workload_id); text("status", p.status); text("reason", p.reason); out << '}';
     }
     out << ']';
+    if (!v.retirement_readers.empty())
+    {
+        out << ",\"retirement_readers\":["; bool reader_comma = false;
+        for (auto const& reader : v.retirement_readers)
+        {
+            if (reader_comma) out << ','; reader_comma = true; out << "{\"reader_identity\":"; quote(reader.reader_identity);
+            text("retirement_identity", reader.retirement_identity); out << ",\"configurations\":["; bool config_comma = false;
+            for (auto const& config : reader.configurations)
+            {
+                if (config_comma) out << ','; config_comma = true; out << "{\"root_identity\":"; quote(config.root_identity);
+                out << ",\"plot_directories\":["; bool directory_comma = false;
+                for (auto const& directory : config.plot_directories)
+                { if (directory_comma) out << ','; directory_comma = true; quote(directory); }
+                out << "]}";
+            }
+            out << "]}";
+        }
+        out << ']';
+    }
     if (v.resource_template) { out << ",\"farm_resources\":"; write_profile_json(out, *v.resource_template); }
     out << '}'; inventory_detail::require(bool(out), "cannot write farm inventory");
 }
@@ -500,6 +563,31 @@ inline FarmInventory read_farm_inventory(std::istream& in, InventoryLimits const
         std::pair{"solver_version", &result.network.solver_version}, std::pair{"service_status", &result.network.service_status}})
         if (auto const* value = profile_detail::field(n, name)) *target = profile_detail::text(*value);
     result.network.min_strength = integer(n, "min_strength"); result.network.max_strength = integer(n, "max_strength"); result.network.plot_size = integer(n, "plot_size");
+    if (auto const* readers = profile_detail::field(j, "retirement_readers"))
+    {
+        require(readers->kind == Json::array && readers->items.size() <= limits.max_roots, "inventory retirement reader count exceeds its bound");
+        auto shape = [](Json const& object, std::initializer_list<std::string_view> names)
+        {
+            require(object.kind == Json::object, "expected retirement reader context object");
+            for (auto const& [key, child] : object.fields)
+            { (void)child; require(std::find(names.begin(), names.end(), key) != names.end(), "unsupported retirement reader context field"); }
+        };
+        for (auto const& value : readers->items)
+        {
+            shape(value, {"reader_identity", "retirement_identity", "configurations"});
+            RetirementReaderContext reader; reader.reader_identity = string(value, "reader_identity"); reader.retirement_identity = string(value, "retirement_identity");
+            auto const& configs = required_field(value, "configurations"); require(configs.kind == Json::array && configs.items.size() <= 5, "retirement configuration count exceeds its bound");
+            for (auto const& config : configs.items)
+            {
+                shape(config, {"root_identity", "plot_directories"});
+                RetirementReaderConfiguration context; context.root_identity = string(config, "root_identity");
+                auto const& dirs = required_field(config, "plot_directories"); require(dirs.kind == Json::array && dirs.items.size() <= limits.max_roots, "retirement directory count exceeds its bound");
+                for (auto const& dir : dirs.items) context.plot_directories.push_back(profile_detail::text(dir));
+                reader.configurations.push_back(std::move(context));
+            }
+            result.retirement_readers.push_back(std::move(reader));
+        }
+    }
     auto const& roots = required_field(j, "roots"); auto const& plots = required_field(j, "plots");
     require(roots.kind == Json::array && !roots.items.empty() && roots.items.size() <= limits.max_roots &&
         plots.kind == Json::array && plots.items.size() <= limits.max_files &&

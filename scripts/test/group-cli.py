@@ -36,6 +36,39 @@ def replot_rpc_fixture(args):
     service, endpoint = args[3:5]
     assert service in ("harvester", "full_node", "farmer", "solver"), service
     assert service == "harvester" or not fixture.get("source_only"), "source reader used as a target service"
+    mutation = fixture.get("mutate_source")
+    if mutation and not (root / "source-mutated").exists():
+        source = Path(mutation["source"])
+        claims = list(source.parent.glob(".xchplot2-retire-*/source-*"))
+        published = list(source.parent.glob("*.plot2"))
+        trigger = ((mutation["when"] == "published" and endpoint == "get_plots" and published) or
+                   (mutation["when"] == "claimed" and endpoint == "get_harvesters_summary" and claims))
+        if trigger:
+            old_root = Path(mutation["root"])
+            old_fixture = old_root / "fixture.json"
+            old = json.loads(old_fixture.read_text(encoding="utf-8"))
+            if mutation["change"] == "config":
+                config = old_root / "config" / "config.yaml"
+                text = config.read_text(encoding="utf-8")
+                assert "num_threads: 1" in text
+                config.write_text(text.replace("num_threads: 1", "num_threads: 2"), encoding="utf-8")
+            elif mutation["change"] == "version":
+                old["version"] = "fixture-gh-v2"
+                old_fixture.write_text(json.dumps(old), encoding="utf-8")
+            elif mutation["change"] == "target_population":
+                # Native harvester discovery precedes completed farmer sync.
+                # The farmer registry and its generation intentionally stay
+                # unchanged until the controller's fresh native route fence.
+                fixture["native_arrival"] = str(root / "unreviewed-native.plot2")
+                (root / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
+            else:
+                assert mutation["change"] == "population"
+                arrival = old_root / "unreviewed-arrival"
+                arrival.mkdir()
+                (arrival / "new.plot").write_bytes((source if source.exists() else claims[0]).read_bytes())
+                old["roots"].append(str(arrival))
+                old_fixture.write_text(json.dumps(old), encoding="utf-8")
+            (root / "source-mutated").write_text(mutation["change"], encoding="utf-8")
     if endpoint == "get_version":
         if fixture.get(service + "_unavailable"):
             raise SystemExit(1)
@@ -116,6 +149,8 @@ def replot_rpc_fixture(args):
                               "plot_public_key": FARMER if fixture.get("wrong_key") else plot_key,
                               "group_size": members, "meta_group": meta})
         if endpoint == "get_plots":
+            if fixture.get("native_arrival"):
+                plots.append({"filename": fixture["native_arrival"], "plot_id": "9f" * 32})
             result = {"plots": plots}
         else:
             if fixture.get("farmer_unloaded"):
@@ -1298,6 +1333,118 @@ def check_replot(binary, root, reference=None):
     assert not routed_source.exists() and digest(routed_final) == replacement_hash
     assert (routed_farm / "grow-farm.plan").is_file()
     print("PASS distinct source/target adapters, initialized RewardPuzzle v2 pooling, external positive credit and reviewed difficulty/protocol gates", flush=True)
+
+    # Mutate only the old reader while this invocation constructs its real
+    # replacement, or after it claims the old object. A restart-only preflight
+    # cannot detect the first event and target-only leases cannot detect either.
+    for when in ("published", "claimed"):
+        for change in (("config", "version", "population") if when == "published" else
+                       ("config", "version", "population", "target_population")):
+            guarded_farm = directory / f"source guard {when} {change}"
+            guarded_farm.mkdir()
+            guarded_source = guarded_farm / "legacy.plot"
+            guarded_source.write_bytes(legacy)
+            guarded_hash = digest(guarded_source)
+            guarded_routes = []
+            for spec in route_specs:
+                config = directory / f"{when} {change} {spec['id']}"
+                (config / "config").mkdir(parents=True)
+                (config / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+                is_source = spec["id"] == "old-gh"
+                settings = {"roots": [str(guarded_farm)], "source_only" if is_source else "target_only": True}
+                if is_source:
+                    settings["version"] = "fixture-gh-v1"
+                (config / "fixture.json").write_text(json.dumps(settings), encoding="utf-8")
+                guarded_routes.append({**spec, "root": str(config), "source_roots": [str(guarded_farm)] if is_source else []})
+            guarded_profile = json.loads(json.dumps(profile))
+            guarded_profile["farm_adapters"] = {"schema": 1, "target_route": "new-chia", "routes": guarded_routes}
+            guarded_file = directory / f"source guard {when} {change}.json"
+            guarded_file.write_text(json.dumps(guarded_profile), encoding="utf-8")
+            guarded_inventory = directory / f"source guard {when} {change}.inventory"
+            run("plan", "--inventory", guarded_farm, "--harvester", guarded_file, "--save-plan", guarded_inventory, "--json")
+            guarded_review = directory / f"source guard {when} {change}.plan"
+            planned = json.loads(run("plan", guarded_farm, "--replot", guarded_inventory, "--harvester", guarded_file,
+                                     *options, "--save-plan", guarded_review, "--json").stdout)
+            assert planned["feasible"]
+            target = Path(guarded_routes[1]["root"])
+            settings = json.loads((target / "fixture.json").read_text(encoding="utf-8"))
+            settings["mutate_source"] = {"when": when, "change": change, "root": guarded_routes[0]["root"], "source": str(guarded_source)}
+            (target / "fixture.json").write_text(json.dumps(settings), encoding="utf-8")
+            refused = run("fill", guarded_review, "--harvester", guarded_file, *options, *keys, code=2)
+            assert (target / "source-mutated").read_text(encoding="utf-8") == change
+            failure = (refused.stdout + refused.stderr).lower()
+            assert "reader" in failure or "scope" in failure, failure
+            claims = list(guarded_farm.glob(".xchplot2-retire-*/source-*"))
+            if when == "published":
+                assert guarded_source.exists() and digest(guarded_source) == guarded_hash and not claims
+            else:
+                assert not guarded_source.exists() and len(claims) == 1 and digest(claims[0]) == guarded_hash
+            assert not (guarded_farm / "grow-farm.plan").exists()
+    print("PASS in-process source configuration/version/population fences before claim and unlink", flush=True)
+
+    # A native plots-remove operation rewrites YAML as well as unloading the
+    # source directory. Preserve the replacement directory and every other
+    # setting, for distinct readers and one shared source/target Chia reader.
+    for shared in (False, True):
+        name = "shared" if shared else "distinct"
+        old = directory / f"{name} unload old"
+        destination = directory / f"{name} unload target"
+        old.mkdir()
+        destination.mkdir()
+        old_source = old / "legacy.plot"
+        old_source.write_bytes(legacy)
+        old_hash = digest(old_source)
+        old_reader = directory / f"{name} unload reader"
+        new_reader = old_reader if shared else directory / f"{name} unload target reader"
+        for config in {old_reader, new_reader}:
+            (config / "config").mkdir(parents=True)
+
+        def config_text(roots, rewritten=False):
+            dirs = ("  plot_directories:\n" + "".join("  - " + json.dumps(str(path)) + "\n" for path in roots)) if roots else "  plot_directories: []\n"
+            if rewritten:
+                return "harvester:\n  num_threads: 1\n" + dirs + "self_hostname: localhost\n"
+            return "# initial conventional config\nself_hostname: &self_hostname \"localhost\"\nharvester:\n  num_threads: 1\n" + dirs
+
+        original_config = config_text([old, destination] if shared else [old])
+        (old_reader / "config" / "config.yaml").write_text(original_config, encoding="utf-8")
+        old_settings = {"roots": [str(old), str(destination)] if shared else [str(old)]}
+        if not shared:
+            old_settings.update(source_only=True, version="fixture-gh-v1")
+            (new_reader / "config" / "config.yaml").write_text(config_text([destination]), encoding="utf-8")
+            (new_reader / "fixture.json").write_text(json.dumps({"roots": [str(destination)], "target_only": True}), encoding="utf-8")
+        (old_reader / "fixture.json").write_text(json.dumps(old_settings), encoding="utf-8")
+        unload_routes = [{"id": "new-chia" if shared else "old-gh", "kind": "chia" if shared else "gigahorse",
+                          "root": str(old_reader), "executable": str(executable),
+                          "source_roots": [str(old), str(destination)] if shared else [str(old)]}]
+        if not shared:
+            unload_routes.append({"id": "new-chia", "kind": "chia", "root": str(new_reader), "executable": str(executable),
+                                  "source_roots": [str(destination)]})
+        unload_profile = json.loads(json.dumps(profile))
+        unload_profile["farm_adapters"] = {"schema": 1, "target_route": "new-chia", "routes": unload_routes}
+        unload_file = directory / f"{name} unload profile.json"
+        unload_file.write_text(json.dumps(unload_profile), encoding="utf-8")
+        unload_inventory = directory / f"{name} unload inventory.plan"
+        unload_catalog = json.loads(run("plan", "--inventory", old, destination, "--harvester", unload_file,
+                                        "--save-plan", unload_inventory, "--json").stdout)
+        assert unload_catalog["retirement_readers"]
+        unload_review = directory / f"{name} unload migration.plan"
+        planned = json.loads(run("plan", destination, "--replot", unload_inventory, "--harvester", unload_file,
+                                 *options, "--save-plan", unload_review, "--json").stdout)
+        assert planned["feasible"]
+        after = config_text([destination] if shared else [], rewritten=True)
+        # Public review alone cannot authorize a changed reader context.
+        (old_reader / "config" / "config.yaml").write_text(after, encoding="utf-8")
+        run("fill", unload_review, "--harvester", unload_file, *options, *keys, code=2)
+        assert old_source.exists() and digest(old_source) == old_hash and not (destination / "grow-replot.plan").exists()
+        (old_reader / "config" / "config.yaml").write_text(original_config, encoding="utf-8")
+        run("fill", unload_review, "--harvester", unload_file, *options, *keys, point="replot-retirement-intent", code=86)
+        assert old_source.exists() and digest(old_source) == old_hash
+        (old_reader / "config" / "config.yaml").write_text(after, encoding="utf-8")
+        (old_reader / "fixture.json").write_text(json.dumps({**old_settings, "roots": [str(destination)] if shared else []}), encoding="utf-8")
+        run("fill", unload_review, "--harvester", unload_file, *options)
+        final_unload = Path(planned["batches"][0]["path"])
+        assert not old_source.exists() and digest(final_unload) == replacement_hash and (destination / "grow-farm.plan").is_file()
+    print("PASS durable reviewed source-directory removal with distinct and shared target configurations", flush=True)
 
     # Resource-only bootstrap: actual disk space is ample. Complete serialized
     # CPU envelopes fit separately; their simultaneous response does not fit.

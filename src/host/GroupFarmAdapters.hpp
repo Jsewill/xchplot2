@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupFarmInventory.hpp"
 #include "host/GroupFarmAdapterProcess.hpp"
+#include <cctype>
 
 namespace group_grow::farm
 {
@@ -12,17 +13,98 @@ struct FarmServiceBinding
     std::filesystem::path root;
     std::string rpc_host, host, node_id, farmer_node_id;
 };
+struct HarvesterAdapterOptions;
+class RetirementConfigurationAllowance
+{
+    FarmInventory const& inventory_;
+    std::map<std::string, std::set<std::string>> directories_;
+    std::map<std::string, std::set<std::string>> retained_;
+    uint64_t limit_;
+public:
+    static uint64_t memory_bound(FarmInventory const& inventory, std::span<FarmingDirectory const> targets = {})
+    {
+        uint64_t bytes = sizeof(RetirementConfigurationAllowance) + 4096;
+        for (auto const& root : inventory.roots)
+        {
+            inventory_detail::require(bytes <= UINT64_MAX - 4096 && root.path.capacity() <= (UINT64_MAX - bytes - 4096) / 2, "retirement allowance memory bound overflows");
+            bytes += 2 * root.path.capacity() + 4096;
+        }
+        for (auto const& target : targets)
+        {
+            inventory_detail::require(bytes <= UINT64_MAX - 4096 && target.directory.capacity() <= (UINT64_MAX - bytes - 4096) / 2, "retirement allowance target memory bound overflows");
+            bytes += 2 * target.directory.capacity() + 4096;
+        }
+        return bytes;
+    }
+    explicit RetirementConfigurationAllowance(FarmInventory const& inventory, InventoryLimits const& limits = {}) : inventory_(inventory), limit_(limits.memory_bytes)
+    { inventory_detail::require(memory_bound(inventory) <= limits.memory_bytes, "retirement allowance exceeds its retained grant"); }
+    void authorize(HarvesterAdapterOptions const& options, InventoryRoot const& root);
+    void retain(HarvesterAdapterOptions const& options, std::string const& directory);
+    FarmInventory const& inventory() const { return inventory_; }
+    bool permits(std::string const& configuration, std::string const& directory) const
+    {
+        auto held = retained_.find(configuration);
+        if (held != retained_.end()) for (auto const& target : held->second)
+        {
+            auto const parent = file_io::native_path(directory).lexically_normal(), child = file_io::native_path(target).lexically_normal();
+            auto part = parent.begin(), descendant = child.begin(); bool contains = true;
+            for (; part != parent.end(); ++part, ++descendant)
+            {
+                if (descendant == child.end()) { contains = false; break; }
+#ifdef _WIN32
+                auto left = part->native(), right = descendant->native();
+                std::replace(left.begin(), left.end(), L'/', L'\\'); std::replace(right.begin(), right.end(), L'/', L'\\');
+                if (::CompareStringOrdinal(left.data(), int(left.size()), right.data(), int(right.size()), TRUE) != CSTR_EQUAL)
+                { contains = false; break; }
+#else
+                if (*part != *descendant) { contains = false; break; }
+#endif
+            }
+            if (contains) return false;
+        }
+        auto at = directories_.find(configuration); return at != directories_.end() && at->second.contains(directory);
+    }
+};
 struct HarvesterAdapterOptions
 {
     HarvesterAdapterKind kind = HarvesterAdapterKind::chia;
     std::filesystem::path executable, root;
     std::string host, harvester, solver, rpc_host;
     std::map<std::string, FarmServiceBinding> services;
+    // Local execution authority, derived only after the private retirement
+    // journal has been locked and validated. Never imported from a review.
+    RetirementConfigurationAllowance const* retirement = nullptr;
     // Private operation budget. The caller separately reserves retained
     // catalog/plan memory before offering this additional process/parse grant.
     InventoryLimits limits;
     uint64_t max_peak_age_seconds = 600;
 };
+inline void RetirementConfigurationAllowance::authorize(HarvesterAdapterOptions const& options, InventoryRoot const& root)
+{
+    inventory_detail::require(std::find_if(inventory_.roots.begin(), inventory_.roots.end(), [&](auto const& reviewed)
+        { return &reviewed == &root; }) != inventory_.roots.end(), "retirement allowance requires a borrowed reviewed source root");
+    auto path = options.root.lexically_normal();
+    if (path != path.root_path() && path.filename().empty()) path = path.parent_path();
+    inventory_detail::require(path.is_absolute(), "retirement allowance requires the explicit local reader root");
+    if (auto binding = options.services.find("harvester"); binding != options.services.end())
+        inventory_detail::require(binding->second.root == options.root, "retirement allowance source reader binding is inconsistent");
+    directories_[stream_state::digest(file_io::path_text(path))].insert(root.path);
+}
+inline void RetirementConfigurationAllowance::retain(HarvesterAdapterOptions const& options, std::string const& directory)
+{
+    inventory_detail::bounded_text(directory); auto const path = file_io::native_path(directory);
+    inventory_detail::require(path.is_absolute() && file_io::path_text(path.lexically_normal()) == directory, "retained target directory must be normalized and absolute");
+    auto root = options.root.lexically_normal();
+    if (root != root.root_path() && root.filename().empty()) root = root.parent_path();
+    retained_[stream_state::digest(file_io::path_text(root))].insert(directory);
+    uint64_t bytes = memory_bound(inventory_);
+    for (auto const& [configuration, directories] : retained_)
+    {
+        (void)configuration;
+        for (auto const& entry : directories)
+        { inventory_detail::require(bytes <= limit_ && entry.capacity() <= (limit_ - bytes) / 2 && 4096 <= limit_ - bytes - 2 * entry.capacity(), "retained target directories exceed their memory grant"); bytes += 2 * entry.capacity() + 4096; }
+    }
+}
 inline std::map<std::string, std::string> target_service_hosts(HarvesterAdapterOptions const& options)
 {
     std::map<std::string, std::string> result;
@@ -182,6 +264,239 @@ inline std::string implementation_identity(std::filesystem::path const& path, In
         "native farm executable changed while fingerprinting");
     std::array<uint8_t, 32> digest{}; sha256_sum(&hash, digest.data()); return group_tools::hex(digest);
 }
+// This is optional retirement compatibility, not the configuration parser
+// used to admit RPC. Accept only conventional block YAML, with bounded aliases
+// to already completed nodes. Unsupported syntax keeps the strict byte identity.
+struct RetirementConfig
+{ std::string identity; std::vector<std::string> directories; };
+class RetirementConfigReader
+{
+    struct Node
+    {
+        char kind = 's'; size_t depth = 1; std::string scalar, identity;
+        std::map<std::string, std::shared_ptr<Node>> fields;
+        std::vector<std::shared_ptr<Node>> items;
+    };
+    struct Line { size_t indent; std::string text; };
+    std::vector<Line> lines_;
+    std::map<std::string, std::shared_ptr<Node>> anchors_;
+    size_t at_ = 0, nodes_ = 0;
+    uint64_t bytes_ = 0, limit_;
+    void charge(uint64_t bytes)
+    { require(bytes <= limit_ - std::min(bytes_, limit_), "retirement configuration exceeds its parse grant"); bytes_ += bytes; }
+    static std::string_view trim(std::string_view value) { return profile_detail::trim(value); }
+    static bool sequence(std::string_view value) { return value == "-" || value.starts_with("- "); }
+    static size_t colon(std::string_view value)
+    {
+        char quote = 0;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            char const c = value[i];
+            if (quote == '"' && c == '\\') { require(i + 1 < value.size(), "incomplete YAML escape"); ++i; continue; }
+            if (quote == '\'' && c == '\'' && i + 1 < value.size() && value[i + 1] == '\'') { ++i; continue; }
+            if (quote) { if (c == quote) quote = 0; continue; }
+            if (c == '\'' || c == '"') { quote = c; continue; }
+            if (c == ':' && (i + 1 == value.size() || value[i + 1] == ' ')) return i;
+        }
+        require(!quote, "unterminated YAML scalar"); return value.npos;
+    }
+    static std::string scalar(std::string_view value)
+    {
+        value = trim(value);
+        if (value.empty() || value == "~" || value == "null" || value == "Null" || value == "NULL") return "n";
+        if (value.front() == '\'' || value.front() == '"')
+        {
+            require(value.size() >= 2 && value.back() == value.front(), "unsupported YAML quoted scalar");
+            if (value.front() == '"')
+            { auto parsed = profile_detail::JsonReader(std::string(value), 8 * value.size() + 1024).read(); return "s" + profile_detail::text(parsed); }
+            std::string result = "s";
+            for (size_t i = 1; i + 1 < value.size(); ++i)
+            {
+                if (value[i] == '\'') { require(i + 2 < value.size() && value[i + 1] == '\'', "unsupported YAML quoted scalar"); ++i; }
+                result += value[i];
+            }
+            return result;
+        }
+        for (auto text : {"true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON"}) if (value == text) return "b1";
+        for (auto text : {"false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}) if (value == text) return "b0";
+        require(value != "-" && value != ":" && !value.starts_with("- ") &&
+            value.find_first_of("[]{}!|>\"'`@") == value.npos && value.front() != '?' && value.front() != '%' &&
+            value.front() != '&' && value.front() != '*' && value.find(": ") == value.npos, "unsupported YAML scalar syntax");
+        auto digits = value; bool const negative = digits.front() == '-';
+        if (digits.front() == '+' || digits.front() == '-') digits.remove_prefix(1);
+        bool const numeric = !digits.empty() && (std::isdigit(static_cast<unsigned char>(digits.front())) || digits.front() == '.');
+        if (numeric && digits.find_first_not_of("0123456789") == digits.npos)
+        {
+            require(digits.size() == 1 || digits.front() != '0', "ambiguous YAML integer representation");
+            return std::string("i") + (negative && digits != "0" ? "-" : "") + std::string(digits);
+        }
+        // PyYAML's ordinary float resolver requires a decimal point and an
+        // explicit sign on an exponent. Other numeric-looking syntax is not
+        // accepted as compatibility authority.
+        if (numeric)
+        {
+            size_t i = 0; while (i < digits.size() && std::isdigit(static_cast<unsigned char>(digits[i]))) ++i;
+            if (i < digits.size() && digits[i] == '.')
+            {
+                ++i; while (i < digits.size() && std::isdigit(static_cast<unsigned char>(digits[i]))) ++i;
+                bool valid = i > 1 || (i == 1 && digits.front() != '.');
+                if (i < digits.size() && (digits[i] == 'e' || digits[i] == 'E'))
+                {
+                    ++i; valid = valid && i < digits.size() && (digits[i] == '+' || digits[i] == '-');
+                    if (valid) { ++i; size_t const start = i; while (i < digits.size() && std::isdigit(static_cast<unsigned char>(digits[i]))) ++i; valid = i > start; }
+                }
+                if (valid && i == digits.size())
+                {
+                    auto text = value; if (text.front() == '+') text.remove_prefix(1);
+                    double number = 0; auto parsed = std::from_chars(text.data(), text.data() + text.size(), number);
+                    require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && std::isfinite(number), "unsupported YAML float");
+                    std::ostringstream out; out << 'f' << std::hexfloat << number; return out.str();
+                }
+            }
+            require(digits.find_first_of("_:-") == digits.npos && !digits.starts_with("0x") && !digits.starts_with("0X") &&
+                !digits.starts_with("0o") && !digits.starts_with("0O") && !digits.starts_with("0b") && !digits.starts_with("0B"),
+                "ambiguous YAML numeric scalar");
+        }
+        auto nonfinite = value; if (nonfinite.front() == '+' || nonfinite.front() == '-') nonfinite.remove_prefix(1);
+        require(nonfinite != ".inf" && nonfinite != ".Inf" && nonfinite != ".INF" && nonfinite != ".nan" && nonfinite != ".NaN" && nonfinite != ".NAN",
+            "unsupported YAML nonfinite scalar");
+        return "s" + std::string(value);
+    }
+    std::shared_ptr<Node> node(char kind)
+    { require(++nodes_ <= 16384, "retirement configuration exceeds its node bound"); charge(sizeof(Node) + 256); auto result = std::make_shared<Node>(); result->kind = kind; return result; }
+    std::shared_ptr<Node> value(std::string_view text, size_t indent, size_t depth, bool mapping_value = false)
+    {
+        require(depth <= 64, "retirement configuration exceeds its depth bound"); text = trim(text); std::string anchor;
+        if (text.starts_with('&'))
+        {
+            auto const end = text.find(' '); anchor = text.substr(1, end == text.npos ? text.size() - 1 : end - 1);
+            require(!anchor.empty() && anchor.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == anchor.npos && !anchors_.contains(anchor), "invalid YAML anchor");
+            text = end == text.npos ? std::string_view{} : trim(text.substr(end));
+        }
+        std::shared_ptr<Node> result;
+        if (text.starts_with('*'))
+        {
+            require(anchor.empty(), "unsupported anchored YAML alias"); auto found = anchors_.find(std::string(text.substr(1)));
+            require(found != anchors_.end(), "forward, cyclic or unknown YAML alias"); charge(64); return found->second;
+        }
+        if (text == "!!set {}") result = node('u');
+        else if (text == "!!set")
+        {
+            require(at_ < lines_.size() && lines_[at_].indent > indent, "unsupported YAML set"); result = block(lines_[at_].indent, depth + 1);
+            require(result->kind == 'm', "unsupported YAML set structure");
+            for (auto const& [key, member] : result->fields)
+                require(key.starts_with('s') && member->kind == 's' && member->scalar == "n", "unsupported YAML set member");
+            result->kind = 'u';
+        }
+        else if (text.empty() && at_ < lines_.size() && (lines_[at_].indent > indent ||
+            (mapping_value && lines_[at_].indent == indent && sequence(lines_[at_].text)))) result = block(lines_[at_].indent, depth + 1);
+        else if (text == "[]") result = node('l');
+        else if (text == "{}") result = node('m');
+        else { result = node('s'); result->scalar = scalar(text); charge(2 * result->scalar.capacity()); }
+        if (!anchor.empty()) { charge(anchor.capacity() + 128); anchors_.emplace(std::move(anchor), result); }
+        return result;
+    }
+    void field(Node& map, std::string_view text, size_t indent, size_t depth)
+    {
+        auto const split = colon(text); require(split != text.npos, "unsupported YAML block mapping"); auto key = scalar(trim(text.substr(0, split)));
+        require(key.starts_with('s') && key != "s<<", "YAML mapping keys must be unique strings without merges"); charge(2 * key.capacity() + 128);
+        auto child = value(text.substr(split + 1), indent, depth, true);
+        require(child->depth < 64, "retirement configuration alias depth exceeds its bound");
+        map.depth = std::max(map.depth, child->depth + 1);
+        require(map.fields.emplace(std::move(key), std::move(child)).second, "duplicate YAML mapping key");
+    }
+    std::shared_ptr<Node> block(size_t indent, size_t depth)
+    {
+        require(depth <= 64, "retirement configuration exceeds its depth bound");
+        bool const list = sequence(lines_[at_].text); auto result = node(list ? 'l' : 'm');
+        while (at_ < lines_.size() && lines_[at_].indent == indent && sequence(lines_[at_].text) == list)
+        {
+            auto const text = lines_[at_++].text;
+            if (!list) { field(*result, text, indent, depth); continue; }
+            auto rest = trim(std::string_view(text).substr(1));
+            if (colon(rest) != rest.npos)
+            {
+                auto row = node('m'); field(*row, rest, indent + 2, depth + 1);
+                while (at_ < lines_.size() && lines_[at_].indent == indent + 2 && !sequence(lines_[at_].text))
+                { auto next = lines_[at_++].text; field(*row, next, indent + 2, depth + 1); }
+                result->items.push_back(std::move(row));
+            }
+            else result->items.push_back(value(rest, indent, depth));
+            require(result->items.back()->depth < 64, "retirement configuration alias depth exceeds its bound");
+            result->depth = std::max(result->depth, result->items.back()->depth + 1);
+            charge(64);
+        }
+        return result;
+    }
+    std::string digest(Node& value, bool root = false)
+    {
+        if (!root && !value.identity.empty()) return value.identity;
+        std::string material(1, value.kind);
+        if (value.kind == 's') material += value.scalar;
+        for (auto const& item : value.items) material += digest(*item);
+        for (auto const& [key, child] : value.fields)
+        {
+            material += stream_state::digest(key);
+            if (root && key == "sharvester")
+            {
+                require(child->kind == 'm', "unsupported harvester config"); std::string fields = "m";
+                for (auto const& [name, nested] : child->fields)
+                { fields += stream_state::digest(name); fields += name == "splot_directories" ? stream_state::digest("retirement-plot-directories-v1") : digest(*nested); }
+                material += stream_state::digest(fields);
+            }
+            else material += digest(*child);
+        }
+        charge(material.capacity()); auto result = stream_state::digest(material); if (!root) value.identity = result; return result;
+    }
+public:
+    explicit RetirementConfigReader(std::string_view contents, uint64_t limit) : limit_(limit)
+    {
+        // YAML treats these raw Unicode characters as line breaks, including
+        // inside quoted text. JSON-style escapes instead denote literal text.
+        for (auto separator : {"\xc2\x85", "\xe2\x80\xa8", "\xe2\x80\xa9"})
+            require(contents.find(separator) == contents.npos, "unsupported raw YAML Unicode line separator");
+        for (size_t i = 0; i < contents.size(); ++i) if (contents[i] == '\r')
+            require(i + 1 < contents.size() && contents[i + 1] == '\n', "unsupported bare YAML carriage return");
+        charge(contents.size()); std::istringstream input{std::string(contents)};
+        for (std::string line; std::getline(input, line);)
+        {
+            require(line.find('\t') == line.npos, "unsupported YAML indentation"); char quote = 0;
+            for (size_t i = 0; i < line.size(); ++i)
+            {
+                char const c = line[i];
+                if (quote == '"' && c == '\\') { require(i + 1 < line.size(), "incomplete YAML escape"); ++i; continue; }
+                if (quote == '\'' && c == '\'' && i + 1 < line.size() && line[i + 1] == '\'') { ++i; continue; }
+                if (quote) { if (c == quote) quote = 0; continue; }
+                if (c == '\'' || c == '"') quote = c;
+                else if (c == '#' && (!i || line[i - 1] == ' ')) { line.resize(i); break; }
+            }
+            require(!quote, "unsupported multiline YAML scalar"); auto text = trim(line); if (text.empty()) continue;
+            require(text != "---" && text != "..." && !text.starts_with('%'), "unsupported YAML directive");
+            charge(2 * line.capacity() + sizeof(Line) + 64); lines_.push_back({line.find_first_not_of(' '), std::string(text)});
+        }
+    }
+    RetirementConfig read()
+    {
+        require(!lines_.empty() && !lines_[0].indent, "unsupported YAML root"); auto root = block(0, 0);
+        require(at_ == lines_.size() && root->kind == 'm', "unsupported YAML block structure");
+        auto harvester = root->fields.find("sharvester"); require(harvester != root->fields.end() && harvester->second->kind == 'm', "missing harvester configuration");
+        auto dirs = harvester->second->fields.find("splot_directories"); require(dirs != harvester->second->fields.end() && dirs->second->kind == 'l', "unsupported plot directory list");
+        RetirementConfig result;
+        for (auto const& dir : dirs->second->items)
+        {
+            require(dir->kind == 's' && dir->scalar.starts_with('s'), "plot directory is not text"); auto path = dir->scalar.substr(1);
+            require(file_io::native_path(path).is_absolute() && file_io::path_text(file_io::native_path(path).lexically_normal()) == path &&
+                std::find(result.directories.begin(), result.directories.end(), path) == result.directories.end(), "plot directories are not unique normalized absolute paths");
+            result.directories.push_back(std::move(path));
+        }
+        std::sort(result.directories.begin(), result.directories.end()); result.identity = digest(*root, true); return result;
+    }
+};
+inline RetirementConfig retirement_config(std::string_view contents, uint64_t limit)
+{
+    try { return RetirementConfigReader(contents, limit).read(); }
+    catch (std::exception const&) { return {}; }
+}
 class Session
 {
     HarvesterAdapterOptions options_;
@@ -190,6 +505,7 @@ class Session
     inventory_detail::SourceHandle config_;
     stream_state::Stamp config_stamp_, executable_stamp_;
     std::string config_digest_, reader_identity_;
+    RetirementReaderContext retirement_;
     std::map<std::string, std::unique_ptr<Session>> services_;
 public:
     explicit Session(HarvesterAdapterOptions const& options)
@@ -212,14 +528,23 @@ public:
             "native farm adapter requires conventional configuration and an explicit host binding for authenticated remote RPC");
         require(options.rpc_host.empty() || parsed.rpc_hostname == options.rpc_host, "configured native RPC host differs from its local service binding");
         executable_stamp_ = stream_state::stamp(options.executable);
+        auto implementation = implementation_identity(options.executable, options.limits, until_);
         reader_identity_ = stream_state::digest(file_io::path_text(options.executable) + '\n' +
-            implementation_identity(options.executable, options.limits, until_) + '\n' + file_io::path_text(root_.path) + '\n' + config_digest_ + '\n' + options.rpc_host + '\n' + options.host);
-        std::string bindings;
+            implementation + '\n' + file_io::path_text(root_.path) + '\n' + config_digest_ + '\n' + options.rpc_host + '\n' + options.host);
+        auto conventional = retirement_config(contents, options.limits.memory_bytes / 4);
+        bool compatible = !conventional.identity.empty() && conventional.directories.size() <= options.limits.max_roots;
+        std::string retirement_identity = "farm-reader-retirement-1\n" +
+            file_io::path_text(options.executable) + '\n' + implementation + '\n' + file_io::path_text(root_.path) + '\n' +
+            conventional.identity + '\n' + options.rpc_host + '\n' + options.host;
+        std::map<std::string, std::vector<std::string>> configurations;
+        if (compatible) configurations.emplace(stream_state::digest(file_io::path_text(root_.path)), std::move(conventional.directories));
+        std::string bindings, retirement_bindings;
         for (auto const& [service, binding] : options.services)
         {
             require(service == "harvester" || service == "farmer" || service == "full_node" || service == "solver", "unsupported native service binding");
             require(!binding.host.empty() && !binding.rpc_host.empty() && binding.root.is_absolute(), "native service binding lacks its explicit RPC/resource host or local config root");
             bindings += service + '\n' + binding.node_id + '\n' + binding.farmer_node_id + '\n' + binding.host + '\n';
+            retirement_bindings += service + '\n' + binding.node_id + '\n' + binding.farmer_node_id + '\n' + binding.host + '\n';
             if (service == "harvester")
             {
                 require(binding.root == options.root && binding.rpc_host == parsed.rpc_hostname && binding.host == options.host, "harvester service binding differs from the selected reader context");
@@ -227,9 +552,22 @@ public:
             }
             auto child = options; child.services.clear(); child.root = binding.root; child.rpc_host = binding.rpc_host; child.host = binding.host;
             auto context = std::make_unique<Session>(child); bindings += context->reader_identity() + '\n';
+            auto const& observed = context->retirement_context(); compatible = compatible && !observed.retirement_identity.empty();
+            retirement_bindings += observed.retirement_identity + '\n';
+            for (auto const& config : observed.configurations)
+            {
+                auto [at, fresh] = configurations.emplace(config.root_identity, config.plot_directories);
+                compatible = compatible && (fresh || at->second == config.plot_directories);
+            }
             services_.emplace(service, std::move(context));
         }
         if (!bindings.empty()) reader_identity_ = stream_state::digest(reader_identity_ + '\n' + bindings);
+        if (compatible)
+        {
+            retirement_.reader_identity = reader_identity_;
+            retirement_.retirement_identity = stream_state::digest(retirement_identity + '\n' + retirement_bindings);
+            for (auto& [root, directories] : configurations) retirement_.configurations.push_back({root, std::move(directories)});
+        }
         unchanged();
     }
     void running() const
@@ -289,6 +627,31 @@ public:
         return std::string(name(options_.kind)) + ":" + file_io::path_text(options_.executable) + ":config-sha256=" + config_digest_;
     }
     std::string const& reader_identity() const { return reader_identity_; }
+    RetirementReaderContext const& retirement_context() const { return retirement_; }
+    bool matches_reader_identity(std::string_view reviewed) const
+    {
+        if (reviewed == reader_identity_) return true;
+        if (!options_.retirement || retirement_.retirement_identity.empty()) return false;
+        for (auto const& reader : options_.retirement->inventory().retirement_readers)
+        {
+            if (reader.reader_identity != reviewed || reader.retirement_identity != retirement_.retirement_identity ||
+                reader.configurations.size() != retirement_.configurations.size()) continue;
+            bool removed = false, matches = true;
+            for (auto const& current : retirement_.configurations)
+            {
+                auto found = std::find_if(reader.configurations.begin(), reader.configurations.end(), [&](auto const& config)
+                    { return config.root_identity == current.root_identity; });
+                if (found == reader.configurations.end()) { matches = false; break; }
+                for (auto const& directory : current.plot_directories)
+                    if (std::find(found->plot_directories.begin(), found->plot_directories.end(), directory) == found->plot_directories.end()) matches = false;
+                for (auto const& directory : found->plot_directories)
+                    if (std::find(current.plot_directories.begin(), current.plot_directories.end(), directory) == current.plot_directories.end())
+                    { removed = true; if (!options_.retirement->permits(current.root_identity, directory)) matches = false; }
+            }
+            if (matches && removed) return true;
+        }
+        return false;
+    }
     void begin_inventory_files(uint64_t entries)
     {
         unchanged(); until_ = inventory_detail::catalog_deadline(options_.limits, entries);
@@ -350,7 +713,7 @@ inline uint64_t active_network(Session& session, HarvesterAdapterOptions const& 
 inline uint64_t reviewed_target(Session& session, HarvesterAdapterOptions const& options, NetworkProjection const& reviewed,
     NetworkProjection const& observed, uint8_t k, uint8_t strength)
 {
-    require(reviewed.available && reviewed.reader_identity == observed.reader_identity && reviewed.reader_version == observed.reader_version &&
+    require(reviewed.available && session.matches_reader_identity(reviewed.reader_identity) && reviewed.reader_version == observed.reader_version &&
         reviewed.version == observed.version && (reviewed.target_route.empty() || reviewed.target_route == options.harvester),
         "target reader/configuration/route changed since review; sources must be preserved");
     ReplacementExpectation expected; expected.k = k; expected.strength = strength; expected.network = reviewed.network;
@@ -616,6 +979,93 @@ public:
 };
 } // namespace adapter_detail
 
+// The catalog is immutable throughout an invocation. Keep its path and reader
+// lookups once while each protected observation still obtains fresh native RPC
+// data. The caller includes memory_bound() in its retained controller grant.
+class RegistryScopeIndex
+{
+    using Reader = std::tuple<std::string_view, std::string_view, std::string_view>;
+    FarmInventory const& inventory_;
+    std::multimap<std::string, InventoryPlot const*, std::less<>> paths_;
+    std::map<std::string_view, std::set<Reader>, std::less<>> readers_;
+    static std::string filename(FarmInventory const& inventory, InventoryPlot const& plot)
+    {
+        auto value = file_io::path_text(file_io::native_path(inventory.roots.at(plot.root).path) /
+            inventory_detail::relative(plot.relative_path));
+#ifdef _WIN32
+        std::replace(value.begin(), value.end(), '\\', '/');
+#endif
+        return value;
+    }
+    static bool nonplot(InventoryPlot const& plot)
+    { return plot.status == "non-plot" && !plot.header_validated && !plot.reason.empty(); }
+public:
+    static uint64_t memory_bound(FarmInventory const& inventory)
+    {
+        uint64_t bytes = sizeof(RegistryScopeIndex) + 4096;
+        for (auto const& plot : inventory.plots)
+        {
+            // A full-path node, reader tuple and (at most) one reader group.
+            // All metadata except the normalized full path stays borrowed.
+            uint64_t const capacity = nonplot(plot) ? 0 : filename(inventory, plot).capacity();
+            inventory_detail::require(capacity <= UINT64_MAX - 4096 && capacity + 4096 <= UINT64_MAX - bytes,
+                "registry scope index memory bound overflows");
+            bytes += capacity + 4096;
+        }
+        return bytes;
+    }
+    RegistryScopeIndex(FarmInventory const& inventory, InventoryLimits const& limits = {}) : inventory_(inventory)
+    {
+        inventory_detail::validate_limits(limits);
+        inventory_detail::require(inventory.plots.size() <= limits.max_files && memory_bound(inventory) <= limits.memory_bytes,
+            "registry scope index exceeds its retained controller grant");
+        for (auto const& plot : inventory.plots)
+        {
+            if (!plot.reader_identity.empty()) readers_[plot.harvester].emplace(plot.reader_identity, plot.reader_version, plot.reader);
+            if (!nonplot(plot)) paths_.emplace(filename(inventory, plot), &plot);
+        }
+    }
+    FarmInventory const& inventory() const { return inventory_; }
+    void require_reader(adapter_detail::Session& session, HarvesterAdapterOptions const& options, std::string const& version) const
+    {
+        auto check = [&](auto const& readers)
+        {
+            for (auto const& [identity, observed_version, reader] : readers)
+                inventory_detail::require(session.matches_reader_identity(identity) && observed_version == version &&
+                    reader == adapter_detail::name(options.kind), "registry scope reader implementation changed since review");
+        };
+        if (options.harvester.empty()) for (auto const& [route, readers] : readers_) { (void)route; check(readers); }
+        else
+        {
+            if (auto at = readers_.find(""); at != readers_.end()) check(at->second);
+            if (auto at = readers_.find(options.harvester); at != readers_.end()) check(at->second);
+        }
+    }
+    void require_scope(adapter_detail::Session& session, profile_detail::Json const& plots,
+        HarvesterAdapterOptions const& options, PublishedPlotAllowance const& published = {}) const
+    {
+        inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files,
+            "loaded registry scope exceeds its bounded lookup grant");
+        for (auto const& native : plots.items)
+        {
+            session.running(); auto name = inventory_detail::string(native, "filename");
+            auto const id = adapter_detail::hex_string(inventory_detail::required_field(native, "plot_id"), 32);
+#ifdef _WIN32
+            std::replace(name.begin(), name.end(), '\\', '/');
+#endif
+            auto const [first, last] = paths_.equal_range(name); bool covered = false;
+            for (auto at = first; at != last; ++at)
+            {
+                auto const& plot = *at->second;
+                if ((plot.harvester.empty() || options.harvester.empty() || plot.harvester == options.harvester) &&
+                    (plot.plot_id.empty() || plot.plot_id == id)) { covered = true; break; }
+            }
+            inventory_detail::require(covered || (published && published(name, id)),
+                "loaded plot is outside the reviewed reader/catalog scope; inventory every loaded source root and review the complete workload");
+        }
+    }
+};
+
 inline FarmAdapterTable parse_farm_adapters(profile_detail::Json const& document, InventoryLimits const& limits = {})
 {
     using namespace inventory_detail;
@@ -705,10 +1155,17 @@ inline HarvesterAdapterOptions resolve_target(FarmAdapterTable const& table, std
     inventory_detail::require(found, "local farm target route is unavailable"); return found->options;
 }
 
-inline NetworkProjection observe_network_projection(HarvesterAdapterOptions const& options)
+inline void record_retirement_reader(FarmInventory& inventory, adapter_detail::Session const& session)
+{
+    auto const& context = session.retirement_context(); if (context.retirement_identity.empty()) return;
+    auto found = std::find_if(inventory.retirement_readers.begin(), inventory.retirement_readers.end(), [&](auto const& reader)
+        { return reader.reader_identity == context.reader_identity; });
+    if (found == inventory.retirement_readers.end()) inventory.retirement_readers.push_back(context);
+}
+inline NetworkProjection observe_network_projection(HarvesterAdapterOptions const& options, FarmInventory* inventory = nullptr)
 {
     NetworkProjection result;
-    try { adapter_detail::Session session(options); result = adapter_detail::projection(session); session.unchanged(); }
+    try { adapter_detail::Session session(options); result = adapter_detail::projection(session); session.unchanged(); if (inventory) record_retirement_reader(*inventory, session); }
     catch (std::exception const& error)
     {
         if (options.limits.cancelled && options.limits.cancelled()) throw;
@@ -731,9 +1188,27 @@ inline NetworkProjection observe_network_projection(HarvesterAdapterOptions cons
 }
 namespace adapter_detail
 {
-inline void require_plot_scope(Session& session, Json const& plots, FarmInventory const& inventory,
-    HarvesterAdapterOptions const& options, PublishedPlotAllowance const& published = {})
+inline void require_reviewed_reader(Session& session, FarmInventory const& inventory, HarvesterAdapterOptions const& options,
+    std::string const& version, RegistryScopeIndex const* index = nullptr)
 {
+    if (index)
+    {
+        inventory_detail::require(&index->inventory() == &inventory, "registry scope index belongs to another catalog");
+        index->require_reader(session, options, version); return;
+    }
+    for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() &&
+        (options.harvester.empty() || plot.harvester.empty() || options.harvester == plot.harvester))
+        inventory_detail::require(session.matches_reader_identity(plot.reader_identity) && plot.reader_version == version &&
+            plot.reader == name(options.kind), "registry scope reader implementation changed since review");
+}
+inline void require_plot_scope(Session& session, Json const& plots, FarmInventory const& inventory,
+    HarvesterAdapterOptions const& options, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* index = nullptr)
+{
+    if (index)
+    {
+        inventory_detail::require(&index->inventory() == &inventory, "registry scope index belongs to another catalog");
+        index->require_scope(session, plots, options, published); return;
+    }
     inventory_detail::require(plots.kind == Json::array && plots.items.size() <= options.limits.max_files &&
         inventory.plots.size() <= options.limits.memory_bytes / 4096, "loaded registry scope exceeds its bounded lookup grant");
     // Reference the retained catalog's relative paths instead of duplicating
@@ -769,19 +1244,19 @@ inline void require_plot_scope(Session& session, Json const& plots, FarmInventor
     }
 }
 inline void require_registry_scope(Session& session, Json const& response, FarmInventory const& inventory,
-    HarvesterAdapterOptions const& options, PublishedPlotAllowance const& published = {})
-{ require_plot_scope(session, inventory_detail::required_field(response, "plots"), inventory, options, published); }
+    HarvesterAdapterOptions const& options, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* index = nullptr)
+{ require_plot_scope(session, inventory_detail::required_field(response, "plots"), inventory, options, published, index); }
 } // namespace adapter_detail
 inline void observe_registry_scope(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
-    PublishedPlotAllowance const& published = {})
+    PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* index = nullptr)
 {
     adapter_detail::Session session(options); auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
-    for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() &&
-        (options.harvester.empty() || plot.harvester.empty() || options.harvester == plot.harvester))
-        inventory_detail::require(plot.reader_identity == session.reader_identity() && plot.reader_version == version &&
-            plot.reader == adapter_detail::name(options.kind), "registry scope reader implementation changed since review");
+    adapter_detail::require_reviewed_reader(session, inventory, options, version, index);
     auto response = session.rpc(AdapterOperation::harvester_plots);
-    adapter_detail::require_registry_scope(session, response, inventory, options, published); session.unchanged();
+    adapter_detail::require_registry_scope(session, response, inventory, options, published, index);
+    inventory_detail::require(adapter_detail::version(session.rpc(AdapterOperation::harvester_version)) == version,
+        "source reader version changed during the registry scope observation");
+    session.unchanged();
 }
 inline TargetNetworkReadiness observe_target_network(HarvesterAdapterOptions const& options, NetworkProjection const& reviewed, uint8_t k, uint8_t strength)
 {
@@ -873,7 +1348,7 @@ inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions 
             inventory_detail::integer(native, "time_modified") == uint64_t(plot.identity.stamp.mtime), "native loaded plot differs from the observed file");
         auto const id = adapter_detail::hex_string(inventory_detail::required_field(native, "plot_id"), 32);
         inventory_detail::require(plot.plot_id.empty() || plot.plot_id == id, "native reader and public header disagree on plot identity");
-        inventory_detail::require(plot.reader_identity.empty() || (plot.reader_identity == session.reader_identity() && plot.reader_version == version &&
+        inventory_detail::require(plot.reader_identity.empty() || (session.matches_reader_identity(plot.reader_identity) && plot.reader_version == version &&
             plot.reader == adapter_detail::name(options.kind)), "native reader/configuration implementation changed since review; create a new reviewed inventory/profile");
         plot.reader = adapter_detail::name(options.kind); plot.reader_version = version; plot.plot_id = id;
         plot.reader_identity = session.reader_identity();
@@ -923,7 +1398,7 @@ inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions 
             (plot.container != PlotContainer::chiapos_v1 && plot.container != PlotContainer::chiapos_v2) ||
             (!plot.harvester.empty() && !options.harvester.empty() && plot.harvester != options.harvester)) continue;
         session.running();
-        inventory_detail::require(plot.reader_identity.empty() || (plot.reader_identity == session.reader_identity() &&
+        inventory_detail::require(plot.reader_identity.empty() || (session.matches_reader_identity(plot.reader_identity) &&
             plot.reader_version == version && plot.reader == adapter_detail::name(options.kind)),
             "ordinary source reader/configuration implementation changed since review");
         (void)recheck_inventory_source(inventory.roots.at(plot.root), plot, session.remaining_limits());
@@ -947,6 +1422,7 @@ inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapt
     auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
     auto response = session.rpc(AdapterOperation::harvester_plots);
     adapter_detail::observe_inventory(inventory, options, session, version, response, complete_registry);
+    record_retirement_reader(inventory, session);
 }
 inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTable const& table)
 {
@@ -956,7 +1432,7 @@ inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTab
     for (auto const& route : table.routes) if (selected.contains(route.id)) observe_harvester_inventory(inventory, route.options);
     auto const target = resolve_target(table);
     if (!selected.contains(table.target_route)) observe_registry_scope(target, inventory);
-    inventory.network = observe_network_projection(target);
+    inventory.network = observe_network_projection(target, &inventory);
     inventory.network.target_route = table.target_route;
 }
 // One authoritative reader snapshot for a route and phase. The caller pins
@@ -969,13 +1445,14 @@ class SourceReadinessSnapshot
     FarmInventory current_;
     std::string version_, registry_identity_;
     FarmInventory const& inventory_;
+    RegistryScopeIndex const* scope_ = nullptr;
     PublishedPlotAllowance published_;
     std::map<std::pair<std::string, std::string>, size_t> paths_;
     bool finished_ = false, allow_unloaded_ = false;
 public:
     SourceReadinessSnapshot(HarvesterAdapterOptions const& options, FarmInventory const& inventory, std::span<uint64_t const> sources,
-        PublishedPlotAllowance const& published = {}, bool allow_unloaded = false)
-        : options_(options), session_(options), inventory_(inventory), published_(published), allow_unloaded_(allow_unloaded)
+        PublishedPlotAllowance const& published = {}, bool allow_unloaded = false, RegistryScopeIndex const* scope = nullptr)
+        : options_(options), session_(options), inventory_(inventory), scope_(scope), published_(published), allow_unloaded_(allow_unloaded)
     {
         inventory_detail::require(!sources.empty() && sources.size() <= options.limits.max_files &&
             sources.size() <= options.limits.memory_bytes / 32768, "source snapshot exceeds its retained metadata grant");
@@ -1005,8 +1482,9 @@ public:
             index_bytes <= options.limits.memory_bytes / 2 - farm_inventory_memory(current_), "source snapshot copied roots, metadata and path index exceed their retained grant"); };
         charge();
         version_ = adapter_detail::version(session_.rpc(AdapterOperation::harvester_version));
+        adapter_detail::require_reviewed_reader(session_, inventory_, options_, version_, scope_);
         auto response = session_.rpc(AdapterOperation::harvester_plots);
-        adapter_detail::require_registry_scope(session_, response, inventory, options_, published);
+        adapter_detail::require_registry_scope(session_, response, inventory, options_, published, scope_);
         registry_identity_ = adapter_detail::registry_identity(response);
         adapter_detail::observe_inventory(current_, options_, session_, version_, response, false); charge();
     }
@@ -1019,7 +1497,7 @@ public:
         if (!current.native_identified && reviewed.header_validated && reviewed.algorithm == PlotAlgorithm::pos1 &&
             (reviewed.container == PlotContainer::chiapos_v1 || reviewed.container == PlotContainer::chiapos_v2))
         {
-            inventory_detail::require(reviewed.reader_identity.empty() || (reviewed.reader_identity == session_.reader_identity() &&
+            inventory_detail::require(reviewed.reader_identity.empty() || (session_.matches_reader_identity(reviewed.reader_identity) &&
                 reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind)),
                 "previously observed source reader/configuration changed since review");
             auto observed = observe_inventory_file(root, reviewed.relative_path, session_.remaining_limits());
@@ -1038,7 +1516,7 @@ public:
                 (reviewed.pool_public_key.empty() != reviewed.pool_contract_puzzle_hash.empty()) &&
                 adapter_detail::legacy_id_from_loaded_key(reviewed.plot_public_key,
                     reviewed.pool_public_key.empty() ? reviewed.pool_contract_puzzle_hash : reviewed.pool_public_key) == reviewed.plot_id &&
-                reviewed.reader_identity == session_.reader_identity() && reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind),
+                session_.matches_reader_identity(reviewed.reader_identity) && reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind),
                 "unloaded source lacks the exact previously reviewed reader metadata");
             (void)recheck_inventory_source(root, reviewed, session_.remaining_limits());
             auto observed = reviewed;
@@ -1060,14 +1538,14 @@ public:
         inventory_detail::require(adapter_detail::version(session_.rpc(AdapterOperation::harvester_version)) == version_,
             "source reader version changed during the batch snapshot");
         auto response = session_.rpc(AdapterOperation::harvester_plots);
-        adapter_detail::require_registry_scope(session_, response, inventory_, options_, published_);
+        adapter_detail::require_registry_scope(session_, response, inventory_, options_, published_, scope_);
         inventory_detail::require(adapter_detail::registry_identity(response) == registry_identity_,
             "source loaded population or reader metadata changed during the batch snapshot");
         session_.unchanged(); finished_ = true;
     }
 };
 inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
-    std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {})
+    std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr)
 {
     SourceRetirementObservation result; result.captured_at = inventory_detail::timestamp();
     try
@@ -1089,13 +1567,13 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
             auto const& p = inventory.plots[size_t(index)];
             bool const header_only = p.reader_identity.empty() && p.header_validated && p.algorithm == PlotAlgorithm::pos1 &&
                 (p.container == PlotContainer::chiapos_v1 || p.container == PlotContainer::chiapos_v2);
-            inventory_detail::require(header_only || (p.reader_identity == session.reader_identity() && p.reader_version == version &&
+            inventory_detail::require(header_only || (session.matches_reader_identity(p.reader_identity) && p.reader_version == version &&
                 p.reader == adapter_detail::name(options.kind)), "source registry reader implementation changed or was not reviewed; retain old reservations");
         }
         auto response = session.rpc(AdapterOperation::harvester_plots); auto const& plots = inventory_detail::required_field(response, "plots");
         inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files,
             "native source registry snapshot exceeds its bound");
-        adapter_detail::require_registry_scope(session, response, inventory, options, published);
+        adapter_detail::require_registry_scope(session, response, inventory, options, published, scope);
         for (auto const& p : plots.items)
             if (paths.contains(inventory_detail::string(p, "filename")) ||
                 ids.contains(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32)))
@@ -1122,6 +1600,7 @@ class TargetReadinessSnapshot
     HarvesterAdapterOptions options_;
     adapter_detail::Session session_;
     NetworkProjection projection_;
+    std::string reviewed_reader_identity_;
     adapter_detail::Json response_;
     TargetServiceExpectation service_;
     std::unique_ptr<adapter_detail::TargetServices> services_;
@@ -1146,15 +1625,16 @@ class TargetReadinessSnapshot
     }
 public:
     TargetReadinessSnapshot(HarvesterAdapterOptions const& options, NetworkProjection const& reviewed, uint8_t k, uint8_t strength,
-        TargetServiceExpectation const& service, FarmInventory const* inventory = nullptr, PublishedPlotAllowance const& published = {})
-        : options_(options), session_(options_), projection_(adapter_detail::projection(session_)), service_(service), k_(k), strength_(strength)
+        TargetServiceExpectation const& service, FarmInventory const* inventory = nullptr, PublishedPlotAllowance const& published = {},
+        RegistryScopeIndex const* scope = nullptr)
+        : options_(options), session_(options_), projection_(adapter_detail::projection(session_)), reviewed_reader_identity_(reviewed.reader_identity), service_(service), k_(k), strength_(strength)
     {
         projection_.target_route = reviewed.target_route;
         peak_timestamp_ = adapter_detail::reviewed_target(session_, options_, reviewed, projection_, k, strength);
         services_ = std::make_unique<adapter_detail::TargetServices>(session_, options_, reviewed, projection_, service_);
         response_ = session_.rpc(AdapterOperation::harvester_plots);
-        if (inventory) adapter_detail::require_registry_scope(session_, response_, *inventory, options_, published);
-        if (inventory) adapter_detail::require_plot_scope(session_, services_->plots(), *inventory, options_, published);
+        if (inventory) adapter_detail::require_registry_scope(session_, response_, *inventory, options_, published, scope);
+        if (inventory) adapter_detail::require_plot_scope(session_, services_->plots(), *inventory, options_, published, scope);
         // JSON already owns/costs its strings and nodes. The additional index
         // has no path copies and reserves at least 4096 bytes per entry, well
         // above its map-node storage, within the existing private grant.
@@ -1184,6 +1664,9 @@ public:
         try
         {
             current(); ReplacementExpectation expected; expected.k = k_; expected.strength = strength_;
+            inventory_detail::require(adapter_detail::version(session_.rpc(AdapterOperation::harvester_version)) == projection_.reader_version &&
+                adapter_detail::version(session_.rpc(AdapterOperation::full_node_version)) == projection_.version,
+                "target harvester or full-node version changed during the readiness phase");
             expected.network = projection_.network; expected.genesis_challenge = projection_.genesis_challenge;
             peak_timestamp_ = adapter_detail::active_network(session_, options_, expected, projection_);
             services_->finish();
@@ -1206,7 +1689,7 @@ public:
         {
             current(); adapter_detail::require_publication(expected, publication);
             inventory_detail::require(expected.k == k_ && expected.strength == strength_ && expected.network == projection_.network &&
-                expected.genesis_challenge == projection_.genesis_challenge && expected.reader_identity == projection_.reader_identity &&
+                expected.genesis_challenge == projection_.genesis_challenge && expected.reader_identity == reviewed_reader_identity_ &&
                 expected.reader_version == projection_.reader_version && expected.network_version == projection_.version && expected.target_route == projection_.target_route &&
                 expected.farmer_version == projection_.farmer_version && expected.solver_version == projection_.solver_version &&
                 expected.farmer_public_key == service_.farmer_public_key && expected.pool_public_key == service_.pool_public_key &&

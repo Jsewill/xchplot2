@@ -59,6 +59,7 @@ function(pos2_pool_targets upstream_dir grow_include)
     add_executable(pos2_pr118_grow_worker_test "${repo_dir}/tools/parity/compute_worker_test.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
     add_executable(pos2_pr118_grow_worker_client_test "${repo_dir}/tools/parity/compute_worker_client_test.cpp"
+        "${repo_dir}/src/host/ComputeSession.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
     # Keep the independent parity reference on the original upstream headers.
     add_library(pos2_pr118_grow_worker_reference OBJECT "${repo_dir}/tools/parity/compute_worker_reference_test.cpp")

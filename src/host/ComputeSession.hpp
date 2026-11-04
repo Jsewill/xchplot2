@@ -24,6 +24,9 @@ public:
     ComputeSession& operator=(ComputeSession const&) = delete;
     void offer_local(group_grow::WorkerConfig);
     std::shared_ptr<group_grow::WorkerService> local_worker() const;
+    // Total partition, including service baseline, only while this session
+    // owns the worker identity and its startup/live allocations.
+    uint64_t owned_worker_bytes() const;
     static constexpr uint64_t memory_bytes = 128ULL << 20;
 private:
     struct Impl;

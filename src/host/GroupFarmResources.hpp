@@ -1350,6 +1350,13 @@ struct Telemetry
     bool recovery_observation = true;
     std::vector<ResourceSample> resources;
 };
+// These are current observations of this process and its held proof child,
+// never imported telemetry or credit for a foreign farming/compute service.
+struct OwnMemoryCredit
+{
+    uint64_t parent_resident_bytes = 0, parent_limit_bytes = 0;
+    uint64_t child_resident_bytes = 0, child_limit_bytes = 0;
+};
 struct Admission
 {
     Assessment assessment;
@@ -1402,8 +1409,7 @@ public:
         if (sample.recovery_observation) observations_ = add(observations_, 1);
         return true;
     }
-    Admission evaluate(Stage const& stage, Clock::time_point now = Clock::now(),
-                       std::optional<uint64_t> active_own_anon_bytes = {})
+    Admission evaluate_owned(Stage const& stage, Clock::time_point now, OwnMemoryCredit const& credit)
     {
         using namespace resource_detail;
         Admission result; result.assessment = assess_stage(profile_, stage);
@@ -1433,22 +1439,26 @@ public:
         add_demands(stage.new_farming); add_demands(stage.proof_reserve); add_demands(stage.construction); add_demands(stage.verification);
         add_demands(stage.supervision);
         add_demands(stage.background);
-        if (active_own_anon_bytes)
+        if (credit.parent_limit_bytes || credit.child_limit_bytes)
         {
-            require(!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty(),
-                    "active own-memory credit requires one running construction phase");
             std::vector<uint64_t> own(graph_.resources.size());
-            for (auto const& d : stage.construction)
+            for (auto const* values : {&stage.construction, &stage.verification, &stage.supervision, &stage.background})
+            for (auto const& d : *values)
             {
                 size_t const i = graph_.find(d.resource);
                 if (graph_.resources[i].kind == ResourceKind::host_memory && graph_.resources[i].host == profile_.native.host)
                     own[i] = add(own[i], add(d.resident_units, d.transient_units));
             }
+            uint64_t const limit = add(credit.parent_limit_bytes, credit.child_limit_bytes);
+            uint64_t const observed = add(std::min(credit.parent_resident_bytes, credit.parent_limit_bytes),
+                std::min(credit.child_resident_bytes, credit.child_limit_bytes));
+            uint64_t room = 0; for (auto bytes : own) room = add(room, bytes);
+            require(limit <= room, "owned process memory exceeds the declared local phase and background demand");
             for (size_t i = 0; i < own.size(); ++i)
-                incremental[i] -= std::min(own[i], *active_own_anon_bytes);
+                incremental[i] -= std::min(own[i], observed);
             // Static capacity, protected farming/proof and foreign transient
             // demand remain unchanged. Only already-resident anonymous pages
-            // belonging to this process can offset its own additional demand.
+            // belonging to these owned processes can offset their own demand.
         }
         for (size_t i = 0; i < graph_.resources.size(); ++i)
         {
@@ -1493,8 +1503,50 @@ public:
         }
         result.paused = paused_; result.allowed = result.assessment.feasible && !paused_; return result;
     }
+    Admission evaluate(Stage const& stage, Clock::time_point now = Clock::now(),
+                       std::optional<uint64_t> active_own_anon_bytes = {})
+    {
+        OwnMemoryCredit credit;
+        if (active_own_anon_bytes)
+        {
+            resource_detail::require(!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty(),
+                "active own-memory credit requires one running construction phase");
+            credit.parent_resident_bytes = *active_own_anon_bytes;
+            for (auto const& d : stage.construction)
+            {
+                auto const& r = graph_.resources[graph_.find(d.resource)];
+                if (r.kind == ResourceKind::host_memory && r.host == profile_.native.host)
+                    credit.parent_limit_bytes = resource_detail::add(credit.parent_limit_bytes, resource_detail::add(d.resident_units, d.transient_units));
+            }
+        }
+        return evaluate_owned(stage, now, credit);
+    }
 };
 
+// Borrowed only during run_worker's observation callback. The supervisor owns
+// and has not reaped/closed this process; generation distinguishes retry epochs.
+struct SupervisedProcess
+{
+    uint64_t generation = 0;
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+    bool exited() const { return handle && ::WaitForSingleObject(handle, 0) == WAIT_OBJECT_0; }
+#elif defined(__linux__)
+    pid_t pid = 0;
+    bool exited() const
+    {
+        siginfo_t info{};
+        return pid > 0 && !::waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) && info.si_pid == pid;
+    }
+#else
+    bool exited() const { return false; }
+#endif
+};
+class ProcessObservationUnavailable : public std::runtime_error
+{
+public:
+    ProcessObservationUnavailable() : std::runtime_error("held proof process counters or affinity are unavailable") {}
+};
 namespace resource_detail
 {
 struct CpuObservation
@@ -1503,6 +1555,7 @@ struct CpuObservation
     std::string scope;
     Clock::time_point at, before_wall, after_wall;
     std::optional<uint64_t> own_before_ns, own_after_ns;
+    uint64_t own_counter_padding_ns = 0;
     bool own_scope_known = false;
 };
 inline uint64_t busy_permille(uint64_t busy, uint64_t total)
@@ -1555,7 +1608,8 @@ public:
         if (!total || uint64_t(elapsed) < minimum_ms) return;
         bool const known = old.own_scope_known && value.own_scope_known && old.own_after_ns && value.own_before_ns &&
             *value.own_before_ns >= *old.own_after_ns && value.before_wall >= old.after_wall;
-        uint64_t const own = known ? *value.own_before_ns - *old.own_after_ns : 0;
+        uint64_t const raw_own = known ? *value.own_before_ns - *old.own_after_ns : 0;
+        uint64_t const own = raw_own > old.own_counter_padding_ns ? raw_own - old.own_counter_padding_ns : 0;
         auto const interior = known ? std::chrono::duration_cast<std::chrono::nanoseconds>(value.before_wall - old.after_wall).count() : 0;
         interval_ = Interval{total, idle, own, uint64_t(interior), value.units_per_second, value.processors, value.at, known, value.scope};
         generation_ = add(generation_, 1);
@@ -1577,14 +1631,14 @@ public:
     }
 };
 #ifdef _WIN32
-inline std::optional<uint64_t> process_cpu_ns()
+inline std::optional<uint64_t> process_cpu_ns(HANDLE process = ::GetCurrentProcess())
 {
     FILETIME created{}, exited{}, kernel{}, user{};
-    if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user)) return {};
+    if (!::GetProcessTimes(process, &created, &exited, &kernel, &user)) return {};
     auto number = [](FILETIME value) { return (uint64_t(value.dwHighDateTime) << 32) | value.dwLowDateTime; };
     return multiply(add(number(kernel), number(user)), 100);
 }
-inline std::optional<uint64_t> private_working_set()
+inline std::optional<uint64_t> private_working_set(HANDLE process = ::GetCurrentProcess())
 {
     // PROCESS_MEMORY_COUNTERS_EX2 is supported by the Windows releases with
     // the September 2023 cumulative update. Keep its documented layout here
@@ -1597,7 +1651,7 @@ inline std::optional<uint64_t> private_working_set()
         ULONG64 shared_commit;
     } value{};
     value.base.cb = sizeof(value); value.private_working_set = SIZE_MAX;
-    if (!::K32GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&value), sizeof(value)) ||
+    if (!::K32GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&value), sizeof(value)) ||
         value.private_working_set == SIZE_MAX || value.private_working_set > value.base.WorkingSetSize ||
         value.private_working_set > value.base.PrivateUsage) return {};
     return uint64_t(value.private_working_set);
@@ -1608,6 +1662,13 @@ inline bool process_affinity_within(DWORD_PTR allowed)
     return ::GetActiveProcessorGroupCount() == 1 &&
         ::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual && !(actual & ~allowed);
 }
+inline std::optional<std::string> proof_affinity(SupervisedProcess const& process, DWORD_PTR allowed)
+{
+    DWORD_PTR actual = 0, system = 0;
+    if (!process.handle || !process.generation || ::GetActiveProcessorGroupCount() != 1 ||
+        !::GetProcessAffinityMask(process.handle, &actual, &system) || !actual || (actual & ~allowed)) return {};
+    return std::to_string(actual);
+}
 #elif defined(__linux__)
 inline std::optional<uint64_t> process_cpu_ns()
 {
@@ -1615,22 +1676,54 @@ inline std::optional<uint64_t> process_cpu_ns()
     if (::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) || value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000) return {};
     return add(multiply(uint64_t(value.tv_sec), 1000000000), uint64_t(value.tv_nsec));
 }
-inline bool process_affinity_within(cpu_set_t const& allowed)
+inline std::optional<std::string> process_affinity_scope(cpu_set_t const& allowed, pid_t process)
 {
-    DIR* directory = ::opendir("/proc/self/task"); if (!directory) return false;
+    auto const path = "/proc/" + std::to_string(process) + "/task";
+    DIR* directory = ::opendir(path.c_str()); if (!directory) return {};
     struct Close { DIR* value; ~Close() { ::closedir(value); } } close{directory};
-    size_t count = 0;
+    size_t count = 0; cpu_set_t scope; CPU_ZERO(&scope);
     for (;;)
     {
-        errno = 0; auto const* entry = ::readdir(directory); if (!entry) return !errno && count != 0;
+        errno = 0; auto const* entry = ::readdir(directory);
+        if (!entry)
+        {
+            if (errno || !count || !CPU_COUNT(&scope)) return {};
+            std::string result;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &scope)) result += std::to_string(cpu) + ',';
+            return result;
+        }
         std::string_view name(entry->d_name); if (name == "." || name == "..") continue;
-        if (++count > 4096) return false;
+        if (++count > 4096) return {};
         pid_t id = 0; auto const parsed = std::from_chars(name.data(), name.data() + name.size(), id);
-        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || id <= 0) return false;
+        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || id <= 0) return {};
         cpu_set_t actual; CPU_ZERO(&actual);
-        if (::sched_getaffinity(id, sizeof(actual), &actual)) { if (errno == ESRCH) continue; return false; }
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &actual) && !CPU_ISSET(cpu, &allowed)) return false;
+        if (::sched_getaffinity(id, sizeof(actual), &actual)) { if (errno == ESRCH) continue; return {}; }
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &actual))
+        { if (!CPU_ISSET(cpu, &allowed)) return {}; CPU_SET(cpu, &scope); }
     }
+}
+inline bool process_affinity_within(cpu_set_t const& allowed)
+{ return process_affinity_scope(allowed, ::getpid()).has_value(); }
+inline std::optional<std::string> proof_affinity(SupervisedProcess const& process, cpu_set_t const& allowed)
+{ return process.pid > 0 && process.generation ? process_affinity_scope(allowed, process.pid) : std::optional<std::string>{}; }
+inline std::optional<uint64_t> proof_cpu_ns(SupervisedProcess const& process)
+{
+    clockid_t clock; timespec value{};
+    if (process.pid <= 0 || ::clock_getcpuclockid(process.pid, &clock) || ::clock_gettime(clock, &value) ||
+        value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1000000000) return {};
+    return add(multiply(uint64_t(value.tv_sec), 1000000000), uint64_t(value.tv_nsec));
+}
+inline std::optional<uint64_t> kib_field(std::string const& path, std::string_view field)
+{
+    std::ifstream input(path); if (!input) return {};
+    auto const text = profile_detail::read_text(input, 65536); std::istringstream lines(text); std::string line;
+    while (std::getline(lines, line)) if (line.starts_with(field))
+    {
+        std::istringstream fields(line.substr(field.size())); uint64_t value; std::string unit, extra;
+        if (fields >> value >> unit && unit == "kB" && !(fields >> extra)) return multiply(value, 1024);
+        return {};
+    }
+    return {};
 }
 #endif
 } // namespace resource_detail
@@ -1645,32 +1738,44 @@ class LocalPressureSampler
     bool active_ = false;
     std::optional<std::string> cpu_scope_;
     resource_detail::CpuPressureHistory cpu_history_;
+    resource_detail::CpuPressureHistory raw_cpu_history_;
     uint64_t recovery_generation_ = 0;
     std::optional<uint64_t> own_anon_;
+    std::optional<uint64_t> child_anon_;
 public:
     explicit LocalPressureSampler(std::string host, uint64_t epoch = 1) : host_(std::move(host)), epoch_(epoch)
     { resource_detail::text(host_, true); resource_detail::require(epoch_, "local telemetry epoch must be positive"); }
     std::optional<uint64_t> own_anon_bytes() const { return own_anon_; }
-    Telemetry sample(Profile const& profile, Clock::time_point now = Clock::now(), uint64_t active_cpu_lanes = 0)
+    std::optional<uint64_t> child_anon_bytes() const { return child_anon_; }
+    Telemetry sample(Profile const& profile, Clock::time_point now = Clock::now(), uint64_t active_cpu_lanes = 0,
+        SupervisedProcess const* proof = nullptr, bool observe_parent_memory = false)
     {
         using namespace resource_detail;
         bool const active = active_cpu_lanes != 0;
         if (active != active_) { epoch_ = add(epoch_, 1); active_ = active; }
         Telemetry result; result.producer = "local-os-pressure-v2:" + host_; result.epoch = epoch_;
-        result.sequence = sequence_ = add(sequence_, 1); own_anon_.reset();
+        result.sequence = sequence_ = add(sequence_, 1); own_anon_.reset(); child_anon_.reset();
+        require(!proof || (active && proof->generation), "proof pressure requires a live supervised CPU scope");
         auto const tick = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         require(tick >= 0, "local monotonic telemetry clock is negative"); result.producer_tick_ms = uint64_t(tick);
         std::optional<uint64_t> available;
         std::optional<CpuObservation> cpu;
         std::string cpu_scope; bool own_scope = false;
 #ifdef _WIN32
-        auto const private_before = active ? private_working_set() : std::optional<uint64_t>{};
+        auto const private_before = active || observe_parent_memory ? private_working_set() : std::optional<uint64_t>{};
+        auto const child_before = proof ? private_working_set(proof->handle) : std::optional<uint64_t>{};
         MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
         if (GlobalMemoryStatusEx(&memory)) available = memory.ullAvailPhys;
-        if (active)
+        if (active || observe_parent_memory)
         {
             auto const private_after = private_working_set();
             if (private_before && private_after) own_anon_ = std::min(*private_before, *private_after);
+        }
+        if (proof)
+        {
+            auto const child_after = private_working_set(proof->handle);
+            if (!child_before || !child_after) throw ProcessObservationUnavailable();
+            child_anon_ = std::min(*child_before, *child_after);
         }
         DWORD_PTR allowed = 0, system = 0;
         DWORD const count = ::GetActiveProcessorCount(0);
@@ -1688,7 +1793,9 @@ public:
             ULONG returned = 0;
             CpuObservation value; value.at = now; value.processors = uint64_t(std::popcount(allowed));
             value.units_per_second = 10000000;
+            auto const child_scope_before = proof ? proof_affinity(*proof, allowed) : std::optional<std::string>{};
             value.before_wall = Clock::now(); value.own_before_ns = process_cpu_ns();
+            auto const child_cpu_before = proof ? process_cpu_ns(proof->handle) : std::optional<uint64_t>{};
             bool valid = process_affinity_within(allowed) && query &&
                 query(SystemProcessorPerformanceInformation, records.data(), ULONG(sizeof(records)), &returned) >= 0 &&
                 returned == count * sizeof(records.front());
@@ -1701,34 +1808,41 @@ public:
                 value.idle = add(value.idle, uint64_t(record.IdleTime.QuadPart));
                 cpu_scope += std::to_string(id) + ',';
             }
+            auto const child_cpu_after = proof ? process_cpu_ns(proof->handle) : std::optional<uint64_t>{};
             value.own_after_ns = process_cpu_ns(); value.after_wall = Clock::now();
+            if (proof)
+            {
+                auto const child_scope_after = proof_affinity(*proof, allowed);
+                if (!child_scope_before || child_scope_before != child_scope_after || !child_cpu_before || !child_cpu_after)
+                    throw ProcessObservationUnavailable();
+                if (value.own_before_ns) *value.own_before_ns = add(*value.own_before_ns, *child_cpu_before);
+                if (value.own_after_ns) *value.own_after_ns = add(*value.own_after_ns, *child_cpu_after);
+                value.own_counter_padding_ns = 200;
+                cpu_scope += "/proof:" + std::to_string(proof->generation) + ':' + *child_scope_before;
+            }
             own_scope = process_affinity_within(allowed);
             value.own_scope_known = valid && own_scope && value.own_before_ns && value.own_after_ns &&
                 *value.own_after_ns >= *value.own_before_ns;
-            value.scope = cpu_scope;
+            value.scope = cpu_scope.substr(0, cpu_scope.find("/proof:"));
             if (valid) cpu = value;
         }
 #elif defined(__linux__)
-        auto kib_field = [&](char const* path, std::string_view field) -> std::optional<uint64_t>
-        {
-            std::ifstream input(path); if (!input) return {};
-            auto const text = profile_detail::read_text(input, 65536); std::istringstream lines(text); std::string line;
-            while (std::getline(lines, line)) if (line.starts_with(field))
-            {
-                std::istringstream fields(line.substr(field.size())); uint64_t value; std::string unit, extra;
-                if (fields >> value >> unit && unit == "kB" && !(fields >> extra)) return multiply(value, 1024);
-                return {};
-            }
-            return {};
-        };
         // Bracket the available-memory observation. Credit only private
         // anonymous pages observed at both sides, never file RSS/page cache.
-        auto const anon_before = active ? kib_field("/proc/self/status", "RssAnon:") : std::optional<uint64_t>{};
+        auto const anon_before = active || observe_parent_memory ? kib_field("/proc/self/status", "RssAnon:") : std::optional<uint64_t>{};
+        auto const child_path = proof ? "/proc/" + std::to_string(proof->pid) + "/status" : std::string{};
+        auto const child_before = proof ? kib_field(child_path, "RssAnon:") : std::optional<uint64_t>{};
         available = kib_field("/proc/meminfo", "MemAvailable:");
-        if (active)
+        if (active || observe_parent_memory)
         {
             auto const anon_after = kib_field("/proc/self/status", "RssAnon:");
             if (anon_before && anon_after) own_anon_ = std::min(*anon_before, *anon_after);
+        }
+        if (proof)
+        {
+            auto const child_after = kib_field(child_path, "RssAnon:");
+            if (!child_before || !child_after) throw ProcessObservationUnavailable();
+            child_anon_ = std::min(*child_before, *child_after);
         }
         cpu_set_t allowed, found; CPU_ZERO(&allowed); CPU_ZERO(&found);
         if (!::sched_getaffinity(0, sizeof(allowed), &allowed) && CPU_COUNT(&allowed))
@@ -1738,7 +1852,9 @@ public:
             for (int id = 0; id < CPU_SETSIZE; ++id) if (CPU_ISSET(id, &allowed)) cpu_scope += std::to_string(id) + ',';
             value.scope = cpu_scope;
             bool const before_scope = process_affinity_within(allowed);
+            auto const child_scope_before = proof ? proof_affinity(*proof, allowed) : std::optional<std::string>{};
             value.before_wall = Clock::now(); value.own_before_ns = process_cpu_ns();
+            auto const child_cpu_before = proof ? proof_cpu_ns(*proof) : std::optional<uint64_t>{};
             std::ifstream input("/proc/stat"); char buffer[4096];
             for (size_t lines = 0; lines <= CPU_SETSIZE + 1 && input.getline(buffer, sizeof(buffer)); ++lines)
             {
@@ -1756,9 +1872,20 @@ public:
                 if (CPU_EQUAL(&allowed, &found)) { cpu = value; break; }
             }
             own_scope = before_scope && process_affinity_within(allowed);
+            auto const child_cpu_after = proof ? proof_cpu_ns(*proof) : std::optional<uint64_t>{};
             value.own_after_ns = process_cpu_ns(); value.after_wall = Clock::now();
+            if (proof)
+            {
+                auto const child_scope_after = proof_affinity(*proof, allowed);
+                if (!child_scope_before || child_scope_before != child_scope_after || !child_cpu_before || !child_cpu_after)
+                    throw ProcessObservationUnavailable();
+                if (value.own_before_ns) *value.own_before_ns = add(*value.own_before_ns, *child_cpu_before);
+                if (value.own_after_ns) *value.own_after_ns = add(*value.own_after_ns, *child_cpu_after);
+                cpu_scope += "/proof:" + std::to_string(proof->generation) + ':' + *child_scope_before;
+            }
             if (cpu)
             {
+                cpu->own_before_ns = value.own_before_ns;
                 cpu->own_after_ns = value.own_after_ns; cpu->after_wall = value.after_wall;
                 cpu->own_scope_known = own_scope && cpu->own_before_ns && cpu->own_after_ns && *cpu->own_after_ns >= *cpu->own_before_ns;
             }
@@ -1766,11 +1893,18 @@ public:
 #endif
         if (cpu_scope_ && *cpu_scope_ != cpu_scope) epoch_ = add(epoch_, 1);
         cpu_scope_ = cpu_scope; result.epoch = epoch_;
+        raw_cpu_history_.observe(cpu, profile.gate.max_age_ms);
+        if (cpu) cpu->scope = cpu_scope;
         cpu_history_.observe(cpu, profile.gate.max_age_ms);
         auto const collected = Clock::now();
-        auto const pressure = cpu_history_.reading(collected, profile.gate.max_age_ms, cpu_scope, active_cpu_lanes, own_scope);
-        result.recovery_observation = pressure && cpu_history_.generation() != recovery_generation_;
-        if (result.recovery_observation) recovery_generation_ = cpu_history_.generation();
+        auto pressure = cpu_history_.reading(collected, profile.gate.max_age_ms, cpu_scope, active_cpu_lanes, own_scope);
+        // A new child's CPU history needs a fresh interval. Until then retain
+        // the complete observed system pressure, giving no own-work discount.
+        if (!pressure && proof && cpu && cpu->own_scope_known)
+            pressure = raw_cpu_history_.reading(collected, profile.gate.max_age_ms,
+                cpu_scope.substr(0, cpu_scope.find("/proof:")), 0, true);
+        result.recovery_observation = pressure && raw_cpu_history_.generation() != recovery_generation_;
+        if (result.recovery_observation) recovery_generation_ = raw_cpu_history_.generation();
         Graph graph(profile);
         for (auto const& resource : graph.resources)
         {

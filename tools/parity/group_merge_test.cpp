@@ -30,6 +30,13 @@ std::string background_check_target;
 std::atomic<bool> replace_unlinked{false};
 std::string replacement_target;
 std::function<void(int, char const*, int, char const*)> retirement_rename_hook;
+std::atomic<bool> fail_retired_xattr{false};
+extern "C" int __real_fsetxattr(int, char const*, void const*, size_t, int);
+extern "C" int __wrap_fsetxattr(int fd, char const* name, void const* value, size_t bytes, int flags)
+{
+    if (fail_retired_xattr.load(std::memory_order_acquire)) { errno = ENOTSUP; return -1; }
+    return __real_fsetxattr(fd, name, value, bytes, flags);
+}
 extern "C" int __real_renameat2(int, char const*, int, char const*, unsigned);
 extern "C" int __wrap_renameat2(int from, char const* old_name, int to, char const* new_name, unsigned flags)
 {
@@ -3225,6 +3232,19 @@ void replot_capacity_prefix()
     auto no_journal = input; no_journal.review.space[0].free_bytes = 7;
     no_journal.review.reclaim_before_bytes = 1024;
     require(!replot_prefix_capacity(no_journal).empty(), "retirement began without space for durable private state");
+    auto oversized = input;
+    oversized.review.batches = {{0, 0, 0, 2, 120, 0, 0, 0}};
+    oversized.review.reclaim_before_bytes = 32;
+    oversized.inventory.plots[0].identity.allocated_bytes = UINT64_MAX;
+    oversized.inventory.plots[1].identity.allocated_bytes = 32;
+    require(replot_prefix_capacity(oversized, {}, {}, &early).empty() && early == std::vector<std::vector<uint64_t>>{{1}},
+        "an oversized earlier source hid a later legal indivisible predelete candidate");
+    oversized.inventory.plots[0].identity.allocated_bytes = 16;
+    oversized.inventory.plots[1].identity.allocated_bytes = UINT64_MAX;
+    oversized.inventory.plots.push_back(oversized.inventory.plots[0]);
+    oversized.review.sources.push_back(2); oversized.review.batches[0].sources = 3;
+    require(replot_prefix_capacity(oversized, {}, {}, &early).empty() && early == std::vector<std::vector<uint64_t>>{{0, 2}},
+        "a later fitting candidate lost remaining predelete allowance after an overflowing source");
 }
 
 void replot_destination_namespace(fs::path const& root)
@@ -4978,6 +4998,108 @@ void output_reservations(fs::path const& root, Members input, Config cfg)
         "ordinary output inspection retained an unrelated reservation or metadata charge");
 }
 
+void published_retired_external(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const scratch = root / "published-retired-scratch"; fs::create_directory(scratch);
+    auto state = farming_format_fixture(6); state.capacity_fill = false;
+#ifndef GROW_TEST_WRAP_PWRITE
+    state.directories.resize(1);
+#else
+    auto const probe_path = root / "retired-receipt-xattr-probe";
+    int const probe = ::open(probe_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    require(probe >= 0, "cannot create retired receipt capability probe");
+    bool const native_receipt = !::fsetxattr(probe, "user.xchplot2.retired-test", "", 0, 0);
+    require(!::close(probe) && !::unlink(probe_path.c_str()), "cannot remove retired receipt capability probe");
+    if (native_receipt) state.directories.push_back(state.directories.back());
+#endif
+    state.seed = std::string(64, 'a'); state.seed_owner.clear(); state.pool = std::string(64, '4');
+    state.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Arguments args; args.seed = state.seed; args.farmer = state.farmer; args.pool_ph = state.pool;
+    args.k = state.config.k; args.strength = state.config.strength; Keys keys(args);
+    std::vector<fs::path> directories;
+    std::vector<fs::path> holders;
+    cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        auto directory = root / ("published-retired-" + std::to_string(lane)); fs::create_directory(directory); directories.push_back(directory);
+        auto& saved = state.directories[lane]; saved.directory = file_io::path_text(directory);
+        saved.identity_resources = state.directories.size(); saved.identity_resource = lane;
+        saved.layout.files = saved.layout.total_members = saved.layout.group_members = 1;
+        auto const target = migration_stage_path(directory, state.job_id, lane);
+        ExternalConfig external; external.scratch.push_back({scratch.string(), 128 * mib}); external.segment_bytes = mib;
+        auto construct = [&]
+        {
+            auto requested = initial_identity(farming_identity(keys, saved, 0));
+            Construction engine(target.string(), cfg, false, requested, "external", external); engine.confirm_identity();
+            require(engine.append(input.subspan(0, 1)).accepted, "published-retired fixture did not admit its member");
+            if (!lane)
+            {
+                for (auto const& entry : fs::directory_iterator(scratch)) if (entry.is_directory())
+                { std::ofstream file(entry.path() / "preserved"); file.put('!'); break; }
+            }
+#ifdef GROW_TEST_WRAP_PWRITE
+            fail_retired_xattr = lane == 1;
+#endif
+            (void)engine.finish(); engine.release_external();
+#ifdef GROW_TEST_WRAP_PWRITE
+            fail_retired_xattr = false;
+            require(engine.scratch_cleanup_complete == bool(lane), "clean and changed retired fixtures lost their distinct cleanup state");
+#endif
+        };
+#ifdef GROW_TEST_WRAP_PWRITE
+        if (lane == 2)
+        {
+            auto const child = ::fork(); require(child >= 0, "cannot fork retired publication receipt fixture");
+            if (!child)
+            { ::setenv("XCHPLOT2_GROW_FAILPOINT", "external-handoff-checkpoint-removed", 1); construct(); std::_Exit(1); }
+            int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+                "retired publication did not stop after its inode receipt was durable");
+        }
+        else
+#endif
+            construct();
+        for (auto const& entry : fs::directory_iterator(directory))
+            if (file_io::path_text(entry.path().filename()).starts_with(file_io::path_text(target.filename()) + ".external.retired-"))
+                holders.push_back(entry.path());
+        require(holders.size() == lane + 1, "published fixture lost its retained terminal record");
+        if (lane == 2) require(!fs::exists(holders.back() / "checkpoint"), "inode receipt fixture retained its ordinary checkpoint");
+        auto const published = group_path(directory, 0, state.job_id);
+        require(!file_io::rename_file(target, published, false), "cannot publish external alias fixture");
+        auto alias = retired_farming_publication(state, target, &keys);
+        require(alias.has_value(), "fixed saved assignment lost its terminal publication alias");
+        auto inspected = ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias, cfg.memory_limit_bytes);
+        require(inspected.complete && inspected.members == 1 && (lane == 2 || inspected.metadata_occupied_bytes),
+            "published terminal ownership lost its metadata allocation");
+        auto output = snapshot(published, 0);
+        auto resolve = [&](fs::path const& original, fs::path const& requested) { return retired_farming_publication(state, original, &keys, requested); };
+        require(!output_auxiliary(published, output, cfg.memory_limit_bytes, resolve) &&
+            output.retired == inspected.metadata_occupied_bytes && output.auxiliary_allocated == inspected.metadata_occupied_bytes,
+            "ordinary fixed-farm accounting omitted published stage metadata");
+        auto rejects = [&](auto operation)
+        { bool rejected = false; try { operation(); } catch (std::runtime_error const&) { rejected = true; }
+          require(rejected, "unreviewed terminal publication alias was accepted"); };
+        auto bad = *alias; ++bad.stamp.bytes;
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), bad); });
+        bad = *alias; ++bad.identity.header.group_size;
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), bad); });
+        { std::ofstream file(target); file << "reappeared original"; }
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias); });
+        fs::remove(target);
+        auto const retained = directory / "original-publication"; fs::rename(published, retained);
+        fs::copy_file(retained, published);
+        auto substitute = retired_farming_publication(state, target, &keys);
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *substitute); });
+        fs::remove(published); fs::rename(retained, published);
+    }
+    PublishedRetirements publications{directories, [&](fs::path const& original, fs::path const& requested)
+        { return retired_farming_publication(state, original, &keys, requested); }};
+    ScratchPool pool(std::vector<fs::path>{scratch}, 0, 1);
+    preserve_published_retired(pool, publications, cfg.memory_limit_bytes);
+    bool rejected = false; try { pool.seal_recovery(); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "another destination's preserved scratch bypassed the shared temporary cap");
+}
+
 void farming_active_audit(fs::path const& root, Members input, Config cfg)
 {
     using namespace grow_controller_test;
@@ -5157,6 +5279,7 @@ int main(int argc, char** argv) try
         farming_preview_handoff(external_cleanup.root);
         farming_active_audit(external_cleanup.root, input, cfg);
         output_reservations(external_cleanup.root, input, cfg);
+        published_retired_external(external_cleanup.root, input, cfg);
         successor_staging(external_cleanup.root, input, cfg);
         external_finish_grants(external_cleanup.root, input, cfg);
         std::cout << "farming extent admission, ownership and inactive metadata audit checks passed\n"; return 0;
@@ -5193,6 +5316,7 @@ int main(int argc, char** argv) try
         farming_preview_handoff(external_cleanup.root);
         farming_active_audit(external_cleanup.root, input, cfg);
         output_reservations(external_cleanup.root, input, cfg);
+        published_retired_external(external_cleanup.root, input, cfg);
     }
     test_construction_history(root, input, identity(), cfg); parity(root, input, cfg);
     retuning(root, input, cfg); worker_grants(root, input, cfg); placement_costs(); placement(root, cfg); packing_windows(root, cfg);

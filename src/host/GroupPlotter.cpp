@@ -1863,8 +1863,16 @@ Output snapshot(fs::path const& path, uint64_t ordinal)
     }
     return result;
 }
+// A requested output filters the immutable stage mapping before keys/native
+// metadata are derived; an empty output selects all publications for a pool.
+using RetiredPublicationResolver = std::function<std::optional<group_grow::ExternalEngine::PublishedTarget>(fs::path const&, fs::path const&)>;
+struct PublishedRetirements
+{
+    std::span<fs::path const> directories;
+    RetiredPublicationResolver resolve;
+};
 std::optional<group_grow::ExternalEngine::Inspection> output_auxiliary(
-    fs::path const& path, Output& output, uint64_t memory_limit)
+    fs::path const& path, Output& output, uint64_t memory_limit, RetiredPublicationResolver const& published = {})
 {
     output.auxiliary = output.auxiliary_allocated = output.retired = output.retired_allocated = output.reservation = 0;
     std::optional<group_grow::ExternalEngine::Inspection> active;
@@ -1872,13 +1880,23 @@ std::optional<group_grow::ExternalEngine::Inspection> output_auxiliary(
     {
         auto const name = file_io::path_text(entry.path().filename()), base = file_io::path_text(path.filename());
         std::optional<group_grow::ExternalEngine::Inspection> saved;
-        bool const retired = name.starts_with(base + ".external.retired-");
+        bool retired = name.starts_with(base + ".external.retired-");
+        std::optional<group_grow::ExternalEngine::PublishedTarget> alias;
+        auto const position = name.rfind(".external.retired-");
+        if (!retired && published && position != std::string::npos)
+        {
+            alias = published(path.parent_path() / file_io::native_path(name.substr(0, position)), path);
+            retired = alias && file_io::native_path(alias->path) == path;
+        }
         if (name != base + ".external" && !retired) continue;
         uint64_t const held = active ? external_metadata(*active) : 0;
         require(held < memory_limit, "saved output metadata exceeds --max-ram");
         if (!retired) saved = group_grow::ExternalEngine::inspect(file_io::path_text(path), memory_limit - held);
-        else if (retired)
-            saved = group_grow::ExternalEngine::inspect_retired(file_io::path_text(path), file_io::path_text(entry.path()), memory_limit - held);
+        else if (alias)
+            saved = group_grow::ExternalEngine::inspect_retired_published(
+                file_io::path_text(path.parent_path() / file_io::native_path(name.substr(0, position))),
+                file_io::path_text(entry.path()), *alias, memory_limit - held);
+        else saved = group_grow::ExternalEngine::inspect_retired(file_io::path_text(path), file_io::path_text(entry.path()), memory_limit - held);
         if (!saved) continue;
         uint64_t const charge = std::max(saved->metadata_reserved_bytes, saved->metadata_occupied_bytes);
         output.auxiliary = sum(output.auxiliary, charge);
@@ -1895,6 +1913,27 @@ std::optional<group_grow::ExternalEngine::Inspection> output_auxiliary(
         }
     }
     return active;
+}
+
+void preserve_published_retired(group_grow::ScratchPool& pool, PublishedRetirements const& published, uint64_t memory_limit,
+    std::function<group_grow::ScratchRoot(group_grow::ScratchRoot)> const& project = {})
+{
+    if (!published.resolve) return;
+    for (auto const& directory : published.directories)
+        for (auto const& entry : fs::directory_iterator(directory))
+        {
+            auto const name = file_io::path_text(entry.path().filename()); auto const position = name.rfind(".external.retired-");
+            if (position == std::string::npos) continue;
+            auto const original = directory / file_io::native_path(name.substr(0, position));
+            auto const alias = published.resolve(original, {}); if (!alias) continue;
+            auto const saved = group_grow::ExternalEngine::inspect_retired_published(
+                file_io::path_text(original), file_io::path_text(entry.path()), *alias, memory_limit);
+            for (size_t i = 0; i < saved.external.scratch.size(); ++i) if (saved.occupied_bytes[i])
+            {
+                auto root = group_grow::ScratchRoot::inspect(file_io::native_path(saved.external.scratch[i].directory));
+                pool.preserve(project ? project(std::move(root)) : std::move(root), saved.occupied_bytes[i]);
+            }
+        }
 }
 
 void preserve_retired(group_grow::ScratchPool& pool, fs::path const& target, uint64_t memory_limit,
@@ -3262,7 +3301,8 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                   GroupPrefetch* inherited = nullptr,
                   std::function<uint32_t(uint64_t, uint16_t, std::future<group_grow::Result>&)> const& prefetch_next = {},
                   GroupSuccessor* successor = nullptr,
-                  std::shared_ptr<std::recursive_mutex> const& target_gate = {})
+                  std::shared_ptr<std::recursive_mutex> const& target_gate = {},
+                  PublishedRetirements const& published_retirements = {})
 {
     bool const compact = args.member_storage == "compact";
     unsigned const cpu_workers = args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency());
@@ -3324,6 +3364,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     {
         scratch_pool = std::make_unique<group_grow::ScratchPool>(roots, args.headroom, args.temporary_capacity);
         preserve_retired(*scratch_pool, target, args.max_ram - std::min(args.max_ram, external_bytes), args.group_members != 0);
+        preserve_published_retired(*scratch_pool, published_retirements, args.max_ram - std::min(args.max_ram, external_bytes));
         if (initial || recovery)
             capacity_limit = sum(auxiliary.retired, temporary_output_capacity(args,
                 identity_from(initial ? *initial : recovery->identity), maximum, capacity - auxiliary.retired));
@@ -4017,6 +4058,8 @@ fs::path group_path(fs::path const& directory, uint64_t ordinal, std::string con
 }
 fs::path group_output_path(fs::path const& directory, Output const& output)
 { return group_path(directory, output.ordinal, output.published_plot2 ? group_tools::hex(output.publication_job) : ""); }
+fs::path migration_stage_path(fs::path const& directory, std::string const& job, uint64_t batch)
+{ return directory / (".xchplot2-stage-" + job + '-' + std::to_string(batch) + ".building"); }
 std::optional<uint64_t> rollover_entry(fs::path const& directory, fs::path const& path, uint64_t memory_limit,
                                      std::optional<uint64_t> writer_owned = {})
 {
@@ -4463,6 +4506,31 @@ void stage_farming_replicas(group_grow::FarmingState const& state, std::span<siz
         if (selected[lane]) group_grow::grow_failpoint("farm-plan-before-publication");
 }
 
+Identity farming_identity(Keys const& keys, group_grow::FarmingDirectory const& directory, uint64_t ordinal)
+{
+    auto const& layout = directory.layout;
+    auto const resources = directory.identity_resources, resource = directory.identity_resource;
+    // Check the interleave before the policy accessor multiplies its ordinal.
+    (void)sum(product(ordinal, layout.resource_lanes), layout.resource_rank);
+    uint64_t const family = sum(product(layout.family(ordinal), resources), resource);
+    auto farming_keys = keys;
+    struct sha256 hash; sha256_init(&hash);
+    std::string_view const domain = "xchplot2 directory farming v1";
+    sha256_update(&hash, domain.data(), domain.size());
+    sha256_update(&hash, keys.seed.data(), keys.seed.size());
+    if (directory.identity_epoch)
+    {
+        // Expansion gets its own key namespace without changing the
+        // original family interleave, including on an offline member.
+        std::string const epoch = " expansion " + std::to_string(directory.identity_epoch);
+        sha256_update(&hash, epoch.data(), epoch.size());
+    }
+    sha256_sum(&hash, farming_keys.seed.data());
+    auto value = farming_keys.derive(family);
+    value.params = PlotGroupParams(value.params.get_plot_group_id(), keys.k, keys.strength, layout.meta(ordinal));
+    return value;
+}
+
 struct FarmingRun
 {
     struct Lane
@@ -4829,30 +4897,7 @@ struct FarmingRun
     }
 
     Identity identity(Keys const& keys, size_t lane, uint64_t ordinal) const
-    {
-        auto const& directory = state.directories[lane];
-        auto const& layout = directory.layout;
-        auto const resources = directory.identity_resources, resource = directory.identity_resource;
-        // Check the interleave before the policy accessor multiplies its ordinal.
-        (void)sum(product(ordinal, layout.resource_lanes), layout.resource_rank);
-        uint64_t const family = sum(product(layout.family(ordinal), resources), resource);
-        auto farming_keys = keys;
-        struct sha256 hash; sha256_init(&hash);
-        std::string_view const domain = "xchplot2 directory farming v1";
-        sha256_update(&hash, domain.data(), domain.size());
-        sha256_update(&hash, keys.seed.data(), keys.seed.size());
-        if (directory.identity_epoch)
-        {
-            // Expansion gets its own key namespace without changing the
-            // original family interleave, including on an offline member.
-            std::string const epoch = " expansion " + std::to_string(directory.identity_epoch);
-            sha256_update(&hash, epoch.data(), epoch.size());
-        }
-        sha256_sum(&hash, farming_keys.seed.data());
-        auto value = farming_keys.derive(family);
-        value.params = PlotGroupParams(value.params.get_plot_group_id(), keys.k, keys.strength, layout.meta(ordinal));
-        return value;
-    }
+    { return farming_identity(keys, state.directories[lane], ordinal); }
     std::string stop_reason(Arguments const& args) const
     {
         if (std::any_of(lanes.begin(), lanes.end(), [](auto const& lane) { return lane.no_capacity; })) return "capacity";
@@ -5068,6 +5113,46 @@ struct FarmingRun
         metadata -= certificate_bytes - certificate_memory();
     }
 };
+
+std::optional<group_grow::ExternalEngine::PublishedTarget> retired_farming_publication(
+    group_grow::FarmingState const& state, fs::path const& original, Keys const* supplied_keys = nullptr,
+    fs::path const& requested = {}, Identity const* supplied_identity = nullptr)
+{
+    if (!state.fixed_extent || state.capacity_fill) return {};
+    auto const name = file_io::path_text(original.filename());
+    auto const prefix = ".xchplot2-stage-" + state.job_id + '-';
+    if (!name.starts_with(prefix) || !name.ends_with(".building")) return {};
+    auto const digits = name.substr(prefix.size(), name.size() - prefix.size() - std::string_view(".building").size());
+    if (digits.empty() || digits.find_first_not_of("0123456789") != digits.npos) return {};
+    auto const batch = number(digits.c_str()); uint64_t first = 0;
+    for (auto const& directory : state.directories)
+    {
+        auto const path = file_io::native_path(directory.directory);
+        auto const end = sum(first, directory.layout.files);
+        if (batch >= first && batch < end && original == migration_stage_path(path, state.job_id, batch))
+        {
+            auto const ordinal = batch - first; auto const published = group_path(path, ordinal, state.job_id);
+            if (!requested.empty() && requested != published) return {};
+            std::optional<Keys> saved_keys;
+            if (!supplied_keys && !supplied_identity)
+            {
+                Arguments saved; saved.seed = state.seed; saved.seed_owner = state.seed_owner; saved.farmer = state.farmer;
+                if (state.pool_public_key) saved.pool_pk = state.pool; else saved.pool_ph = state.pool;
+                saved.k = state.config.k; saved.strength = state.config.strength;
+                saved_keys.emplace(saved); supplied_keys = &*saved_keys;
+            }
+            auto identity = initial_identity(supplied_identity ? *supplied_identity : farming_identity(*supplied_keys, directory, ordinal));
+            identity.header.version = PlotGroupFile::FORMAT_VERSION;
+            identity.header.group_size = directory.layout.file_members(ordinal);
+            auto const output = snapshot(published, ordinal);
+            return group_grow::ExternalEngine::PublishedTarget{file_io::path_text(published),
+                {{output.device, output.inode}, output.bytes, output.modified_seconds, output.changed_seconds,
+                    uint32_t(output.modified_nanoseconds), uint32_t(output.changed_nanoseconds)}, std::move(identity)};
+        }
+        first = end;
+    }
+    return {};
+}
 
 group_grow::FarmingDestination farming_destination_profile(group_grow::StorageDevice const& device,
     group_grow::FarmingDestination destination = {})
@@ -5583,7 +5668,9 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         for (size_t ordinal = 0; ordinal < lane.outputs.size(); ++ordinal)
         {
             require(lane.outputs[ordinal].ordinal == ordinal, "saved farming output sequence has a hole");
-            output_auxiliary(group_output_path(directories[i], lane.outputs[ordinal]), lane.outputs[ordinal], args.max_ram - run->metadata);
+            output_auxiliary(group_output_path(directories[i], lane.outputs[ordinal]), lane.outputs[ordinal], args.max_ram - run->metadata,
+                [&](fs::path const& original, fs::path const& requested) -> std::optional<group_grow::ExternalEngine::PublishedTarget>
+                { return job.saved ? retired_farming_publication(*job.saved, original, keys, requested) : std::nullopt; });
             allocated[devices[i].filesystem] = sum(allocated[devices[i].filesystem],
                 sum(lane.outputs[ordinal].allocated, lane.outputs[ordinal].auxiliary_allocated));
         }
@@ -6171,7 +6258,7 @@ int print_farm_inventory(Arguments const& args)
     else if (!args.chia_executable.empty())
     {
         auto const options = replot_adapter(args); observe_harvester_inventory(inventory, options);
-        inventory.network = observe_network_projection(options);
+        inventory.network = observe_network_projection(options, &inventory);
     }
     for (auto& plot : inventory.plots) if (!plot.alias_of)
     {
@@ -6340,7 +6427,7 @@ ReplotInputs make_replot_review(Arguments const& args)
     else if (!args.chia_executable.empty())
     {
         observe_harvester_inventory(result.inventory, replot_adapter(args));
-        result.inventory.network = observe_network_projection(replot_adapter(args));
+        result.inventory.network = observe_network_projection(replot_adapter(args), &result.inventory);
     }
     require(result.inventory.network.available, "replot review requires a genuine network projection; select --chia-root and --chia-executable");
     if (!args.farming_profile_path.empty())
@@ -6500,9 +6587,9 @@ std::vector<std::string> replot_prefix_capacity(ReplotInputs const& inputs,
             auto const& plot = inputs.inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source) + source)));
             auto const& root = inputs.inventory.roots.at(plot.root);
             if (root.storage.filesystem != filesystem && (!extra_capacity || !construction_filesystems.contains(root.storage.filesystem))) continue;
-            uint64_t const next = sum(outstanding, plot.identity.allocated_bytes);
-            if (next > review.reclaim_before_bytes) break;
-            outstanding = next; available[root.storage.filesystem] = sum(available[root.storage.filesystem], plot.identity.allocated_bytes); predeleted[source] = true;
+            if (plot.identity.allocated_bytes > review.reclaim_before_bytes - outstanding) continue;
+            outstanding = sum(outstanding, plot.identity.allocated_bytes);
+            available[root.storage.filesystem] = sum(available[root.storage.filesystem], plot.identity.allocated_bytes); predeleted[source] = true;
             early.push_back(review.sources.at(size_t(batch.first_source) + source));
         }
         if (!fits())
@@ -6543,7 +6630,7 @@ std::shared_ptr<group_grow::RemoteEncoder> replot_preview_encoder(Arguments cons
 bool replot_external_capacity(Arguments const& args, Identity const& identity, uint16_t maximum,
     uint64_t output_bound, fs::path const& target, std::vector<group_grow::ScratchRoot> roots, group_grow::ScratchRoot output,
     uint64_t generation_peak, std::optional<group_grow::ExternalEngine::Inspection> const& recovery = {},
-    Output const& auxiliary = {}, uint64_t inspection_grant = 0)
+    Output const& auxiliary = {}, uint64_t inspection_grant = 0, PublishedRetirements const& published_retirements = {})
 {
     using namespace group_grow;
     require(!roots.empty() && auxiliary.retired <= output_bound, "external migration requires eligible roots and a bounded output reservation");
@@ -6561,6 +6648,10 @@ bool replot_external_capacity(Arguments const& args, Identity const& identity, u
     uint64_t const held_inspection = recovery ? external_metadata(*recovery) : 0;
     require(!inspection_grant || held_inspection < inspection_grant, "active external inspection exceeds its migration supervision grant");
     preserve_retired(pool, target, inspection_grant ? std::min(parse_room, inspection_grant - held_inspection) : parse_room, args.group_members != 0,
+        [&](ScratchRoot root)
+        { if (auto at = projected_free.find(root.device.filesystem); at != projected_free.end()) root.available_bytes = at->second; return root; });
+    preserve_published_retired(pool, published_retirements,
+        inspection_grant ? std::min(parse_room, inspection_grant - held_inspection) : parse_room,
         [&](ScratchRoot root)
         { if (auto at = projected_free.find(root.device.filesystem); at != projected_free.end()) root.available_bytes = at->second; return root; });
     uint64_t const limit = sum(auxiliary.retired, temporary_output_capacity(args, identity, maximum, output_bound - auxiliary.retired));
@@ -6635,9 +6726,12 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
 #endif
     }
     auto const farm_text = group_grow::farming_state_text(inputs.review.farm);
-    uint64_t const controller = sum(replot_inventory_limits(args).memory_bytes, sum(inputs.memory_bytes, sum(ReplotGate::memory_bytes(inputs.resources),
+    uint64_t const controller = sum(sum(RegistryScopeIndex::memory_bound(inputs.inventory),
+        sum(RetirementConfigurationAllowance::memory_bound(inputs.inventory, inputs.review.farm.directories),
+            product(inputs.inventory.roots.size(), 4 * sizeof(HarvesterAdapterOptions const*)))),
+        sum(replot_inventory_limits(args).memory_bytes, sum(inputs.memory_bytes, sum(ReplotGate::memory_bytes(inputs.resources),
         sum(product(farm_text.capacity(), 16), sum(sum(product(inputs.review.batches.size(), 512), product(inputs.review.sources.size(), 512)),
-            sum(4 * mib, product(replot_adapter_memory(replot_adapter_table(args)), 4)))))));
+            sum(512, sum(4 * mib, product(replot_adapter_memory(replot_adapter_table(args)), 4)))))))));
     require(controller < args.max_ram / 2, "migration controller and active journal exceed their retained-memory grant");
     auto const limits = replot_inventory_limits(args);
     ReplotSupervision supervision{controller, target_readiness_supervision_bytes(limits), 1, product(limits.timeout_ms, 1000)};
@@ -7789,6 +7883,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     std::vector<fs::path> paths;
     if (farm) for (size_t i = 0; i < farm->lanes.size(); ++i) paths.push_back(farm->path(i));
     else { paths.push_back(args.target); paths.insert(paths.end(), args.destinations.begin(), args.destinations.end()); }
+    std::vector<fs::path> publication_directories;
+    PublishedRetirements published_retirements;
+    if (farm && farm->state.fixed_extent && !farm->state.capacity_fill)
+    {
+        for (auto const& directory : farm->state.directories) publication_directories.push_back(file_io::native_path(directory.directory));
+        published_retirements = {publication_directories, [&](fs::path const& original, fs::path const& requested)
+            { return retired_farming_publication(farm->state, original, keys, requested); }};
+    }
     if (!farm) for (auto const& path : paths)
     {
         require(!migration_publication_job(path), "named group writers cannot change an immutable migration publication");
@@ -7797,6 +7899,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     require((keys && named.empty()) || (!farm && named.size() == paths.size()), "missing destination identities");
     uint64_t metadata = sum(sum(farm ? farm->metadata : product(paths.size(), mib), path_metadata(args.temporary)),
         product(paths.size(), 64 * sizeof(group_grow::ConstructionRun)));
+    metadata = sum(metadata, path_metadata(publication_directories));
     require(metadata < args.max_ram, "destination metadata exceeds --max-ram");
     std::vector<group_grow::StorageDevice> devices; devices.reserve(paths.size());
     std::vector<std::optional<Output>> guards; guards.reserve(paths.size());
@@ -7844,7 +7947,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     {
         Output absent;
         auto& output = guards[i] ? *guards[i] : absent;
-        inspections[i] = output_auxiliary(paths[i], output, args.max_ram - metadata);
+        inspections[i] = output_auxiliary(paths[i], output, args.max_ram - metadata, published_retirements.resolve);
         spaces[devices[i].filesystem].allocated = sum(spaces[devices[i].filesystem].allocated,
             output.auxiliary_allocated);
         if (inspections[i])
@@ -7884,8 +7987,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     std::map<std::string, uint64_t> output_room;
     if (!roots.empty())
     {
+        require(!farm || farm->all_replicas || !published_retirements.resolve,
+            "all fixed-farm destinations must be available to inspect preserved scratch before new construction");
         scratch_pool = std::make_unique<group_grow::ScratchPool>(roots, args.headroom, args.temporary_capacity);
         for (auto const& path : paths) preserve_retired(*scratch_pool, path, args.max_ram - metadata, farm != nullptr);
+        preserve_published_retired(*scratch_pool, published_retirements, args.max_ram - metadata);
         for (size_t i = 0; i < paths.size(); ++i)
         {
             if (farm && !farm->maximum(args, i) && !guards[i]) continue;
@@ -9896,19 +10002,49 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     auto const request = replot_request(args, inputs);
     auto effective = replot_execution_options(args, request);
     auto const& review = inputs.review; auto const& inventory = inputs.inventory;
-    auto const routes = replot_adapter_table(args);
-    auto const target_options = routes.routes.empty() ? replot_adapter(args) : resolve_target(routes, inventory.network.target_route);
+    auto routes = replot_adapter_table(args);
+    auto target_options = routes.routes.empty() ? replot_adapter(args) : resolve_target(routes, inventory.network.target_route);
     require(inventory.network.target_route.empty() || !routes.routes.empty(), "saved migration requires an explicit local farm_adapters profile");
     require(target_options.root.is_absolute() && target_options.executable.is_absolute(), "migration requires an explicit installed target reader and configuration");
-    auto source_options = [&](InventoryPlot const& plot)
-    { return routes.routes.empty() ? replot_adapter(args) : resolve_source(routes, inventory.roots.at(plot.root), plot); };
+    std::vector<HarvesterAdapterOptions const*> source_bindings(inventory.roots.size(), nullptr), source_routes;
     for (auto const& plot : inventory.plots) if (!replot_nonplot(plot))
     {
-        auto const options = source_options(plot);
+        auto& bound = source_bindings.at(plot.root);
+        if (!bound)
+        {
+            if (routes.routes.empty()) bound = &target_options;
+            else
+            {
+                auto const resolved = resolve_source(routes, inventory.roots.at(plot.root), plot);
+                auto const found = std::find_if(routes.routes.begin(), routes.routes.end(), [&](auto const& route) { return route.id == resolved.harvester; });
+                require(found != routes.routes.end(), "reviewed source route disappeared during local binding"); bound = &found->options;
+            }
+            if (std::find(source_routes.begin(), source_routes.end(), bound) == source_routes.end()) source_routes.push_back(bound);
+        }
+        auto const& options = *bound;
+        require(options.harvester.empty() || plot.harvester.empty() || plot.harvester == options.harvester, "reviewed source route changed within its root");
         require(options.root.is_absolute() && options.executable.is_absolute(), "migration source route is not explicitly configured");
     }
+    auto source_options = [&](InventoryPlot const& plot) -> HarvesterAdapterOptions const&
+    { auto const bound = source_bindings.at(plot.root); require(bound, "source root has no reviewed reader binding"); return *bound; };
+    require(sum(source_bindings.capacity(), source_routes.capacity()) <= product(inventory.roots.size(), 4),
+        "cached source route references exceed their retained controller allowance");
     if (local_profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *local_profile_stamp, "local adapter profile changed while binding execution");
-    ReplotGate gate(inputs.resources, request.host);
+    ReplotGate gate(inputs.resources, request.host, request.controller_ram_bytes, [&](bool constructing)
+    {
+        uint64_t bytes = 0;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (effective.compute_session)
+        {
+            bytes = sum(pos2gpu::ComputeSession::memory_bytes, effective.compute_session->owned_worker_bytes());
+        }
+        else if (constructing) bytes = effective.pool_offer_ram;
+        if (constructing) bytes = sum(bytes, request.compute_codec_ram_bytes);
+#else
+        (void)constructing;
+#endif
+        return bytes;
+    });
     auto last_remaining = replot_inventory_counts(inventory);
     // Before reading a journal, any previously published prefix is possible.
     // The immutable plan has already certified restart supervision for each;
@@ -9928,6 +10064,9 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         require(left > 0, "migration pre-read supervision deadline exceeded");
         gate.wait(replot_stage(inputs.resources, request, last_remaining, prefix_members, false, false, future, "prepare-private-journal"), uint64_t(left), args.cancelled);
     }
+    auto index_limits = replot_inventory_limits(args);
+    index_limits.memory_bytes = std::max(index_limits.memory_bytes, RegistryScopeIndex::memory_bound(inventory));
+    RegistryScopeIndex registry_index(inventory, index_limits);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     if (!args.pool_broker.empty())
     {
@@ -9944,23 +10083,15 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         options.root == target_options.root && options.harvester == target_options.harvester; };
     auto registry_scope = [&](std::chrono::steady_clock::time_point until, PublishedPlotAllowance const& published)
     {
-        std::set<std::tuple<fs::path, fs::path, std::string>> seen;
-        auto observe = [&](HarvesterAdapterOptions const& options)
-        { if (seen.emplace(options.executable, options.root, options.harvester).second)
-            observe_registry_scope(bounded_adapter(options, until), inventory, target_route(options) ? published : PublishedPlotAllowance{}); };
-        for (auto const& plot : inventory.plots) if (!replot_nonplot(plot)) observe(source_options(plot));
-        observe(target_options);
+        bool target_seen = false;
+        for (auto const* options : source_routes)
+        {
+            if (target_route(*options)) { if (target_seen) continue; target_seen = true; }
+            observe_registry_scope(bounded_adapter(*options, until), inventory,
+                target_route(*options) ? published : PublishedPlotAllowance{}, &registry_index);
+        }
+        if (!target_seen) observe_registry_scope(bounded_adapter(target_options, until), inventory, published, &registry_index);
     };
-    auto network = observe_target_network(bounded_adapter(target_options, prepare_deadline), inventory.network, review.farm.config.k, review.farm.config.strength);
-    require(network.ready, "target reader/network is unavailable before migration preparation: " + network.reason);
-    std::set<std::string> checked_readers;
-    for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() && checked_readers.insert(plot.reader_identity).second)
-    {
-        auto const options = bounded_adapter(source_options(plot), prepare_deadline); adapter_detail::Session session(options);
-        auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
-        require(session.reader_identity() == plot.reader_identity && version == plot.reader_version, "source reader changed since review; save a fresh inventory and plan");
-        session.unchanged();
-    }
     std::vector<fs::path> destinations;
     std::map<std::string, fs::path> lock_paths;
     for (auto const& root : inventory.roots)
@@ -10019,6 +10150,32 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     }
     else if (!args.seed)
     { std::array<uint8_t, 32> seed{}; pos2gpu::read_random_bytes(seed.data(), seed.size()); args.seed = group_tools::hex(seed); }
+    auto retirement_limits = replot_inventory_limits(args);
+    retirement_limits.memory_bytes = std::max(retirement_limits.memory_bytes,
+        RetirementConfigurationAllowance::memory_bound(inventory, review.farm.directories));
+    RetirementConfigurationAllowance retirement_configuration(inventory, retirement_limits);
+    target_options.retirement = &retirement_configuration;
+    for (auto& route : routes.routes) route.options.retirement = &retirement_configuration;
+    for (auto const& directory : review.farm.directories) retirement_configuration.retain(target_options, directory.directory);
+    auto authorize_retirement_configuration = [&](uint64_t index)
+    {
+        auto const& plot = inventory.plots.at(size_t(index));
+        retirement_configuration.authorize(source_options(plot), inventory.roots.at(plot.root));
+    };
+    if (journal.present)
+    {
+        require(journal.state.batch <= review.batches.size(), "private migration batch exceeds its reviewed assignment");
+        bool const active = journal.state.batch < review.batches.size();
+        auto const first = active ? review.batches[size_t(journal.state.batch)].first_source : review.sources.size();
+        auto const count = active ? review.batches[size_t(journal.state.batch)].sources : 0;
+        require(journal.state.retired_prefix == first && journal.state.retirements.size() == count,
+            "private migration retirement progress differs from its reviewed source mapping");
+        for (uint64_t source = 0; source < journal.state.retired_prefix; ++source)
+            authorize_retirement_configuration(review.sources.at(size_t(source)));
+        for (size_t source = 0; source < journal.state.retirements.size(); ++source)
+            if (journal.state.retirements[source].state != ReplotRetirement::active)
+                authorize_retirement_configuration(review.sources.at(size_t(first) + source));
+    }
     Keys keys(args); FarmingRun identity_run; identity_run.state = review.farm;
     TargetServiceExpectation service; service.farmer_public_key = group_tools::hex(keys.farmer);
     if (keys.pool_kind == POS2_POOL_PK) service.pool_public_key = group_tools::hex(keys.pool);
@@ -10026,8 +10183,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     auto final_path = [&](uint64_t batch)
     { auto const& plan = review.batches.at(size_t(batch)); return group_path(destinations.at(size_t(plan.lane)), plan.ordinal, review.farm.job_id); };
     auto stage_path = [&](uint64_t batch)
-    { auto const& plan = review.batches.at(size_t(batch)); return destinations.at(size_t(plan.lane)) /
-        (".xchplot2-stage-" + review.farm.job_id + '-' + std::to_string(batch) + ".building"); };
+    { auto const& plan = review.batches.at(size_t(batch)); return migration_stage_path(destinations.at(size_t(plan.lane)), review.farm.job_id, batch); };
     auto receipt_path = [&](uint64_t batch)
     { return final_path(batch).parent_path() / (".xchplot2-replot-" + review.farm.job_id) / ("receipt-" + std::to_string(batch)); };
     auto service_members = [&]
@@ -10100,6 +10256,17 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         }
         return remaining;
     };
+    auto const observation_deadline = replot_operation_deadline(request.adapter_timeout_us);
+    auto network = observe_target_network(bounded_adapter(target_options, observation_deadline), inventory.network, review.farm.config.k, review.farm.config.strength);
+    require(network.ready, "target reader/network is unavailable before migration preparation: " + network.reason);
+    std::set<std::string> checked_readers;
+    for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() && checked_readers.insert(plot.reader_identity).second)
+    {
+        auto const options = bounded_adapter(source_options(plot), observation_deadline); adapter_detail::Session session(options);
+        auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
+        require(session.matches_reader_identity(plot.reader_identity) && version == plot.reader_version, "source reader changed since review; save a fresh inventory and plan");
+        session.unchanged();
+    }
     if (!journal.present)
     {
         std::vector<ReplotMetadataFile> metadata{{args.from_plan, *inputs.stamp}};
@@ -10153,12 +10320,37 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         journal_allocation(next);
         publish_replot_journals(journal, next, args.max_ram - inputs.memory_bytes, check);
     };
+    struct CachedReceipt
+    {
+        stream_state::Stamp file, replacement;
+        std::string digest;
+        Identity identity;
+    };
+    // Canonical receipts and derived public keys are immutable. Readiness,
+    // native object/header fences and the final full audit remain fresh.
+    std::vector<CachedReceipt> receipts;
+    receipts.reserve(review.batches.size());
+    uint64_t receipt_memory = product(receipts.capacity(), sizeof(CachedReceipt));
+    require(receipt_memory <= product(review.batches.size(), 512), "migration receipt container exceeds its retained memory allowance");
+    std::optional<std::pair<uint64_t, Identity>> current_identity;
+    auto identity_for = [&](uint64_t batch) -> Identity const&
+    {
+        if (batch < receipts.size()) return receipts[size_t(batch)].identity;
+        if (!current_identity || current_identity->first != batch)
+        {
+            auto const& plan = review.batches.at(size_t(batch));
+            current_identity.emplace(batch, identity_run.identity(keys, size_t(plan.lane), plan.ordinal));
+            require(sizeof(*current_identity) + current_identity->second.memo.capacity() <= 512,
+                "active migration identity exceeds its retained memory allowance");
+        }
+        return current_identity->second;
+    };
     auto audit_file = [&](uint64_t batch, fs::path const& path, stream_state::Stamp const& stamp, bool rename_allowed)
     {
         auto const now = stream_state::stamp(path); auto const output = snapshot(path, review.batches.at(size_t(batch)).ordinal);
         require(rename_allowed ? stream_state::same_output(stamp, now) : stamp == now, "sealed migration replacement changed");
         auto const& plan = review.batches.at(size_t(batch));
-        auto const expected = initial_identity(identity_run.identity(keys, size_t(plan.lane), plan.ordinal));
+        auto const expected = initial_identity(identity_for(batch));
         inventory_detail::RootHandle root(path.parent_path());
         inventory_detail::SourceHandle source(root, file_io::path_text(path.filename()));
         std::array<uint8_t, sizeof(group_grow::Header) + 255> bytes{}; size_t read = 0;
@@ -10179,16 +10371,6 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         require(inventory_detail::stamp(inventory_detail::stat(source.handle)) == now && stream_state::stamp(path) == now,
             "replacement changed during its bounded seal audit");
     };
-    struct CachedReceipt
-    {
-        stream_state::Stamp file, replacement;
-        std::string digest;
-    };
-    // Canonical receipt contents are authenticated once against the journal's
-    // chain. Subsequent actions use only these immutable stamps/digests, with
-    // current-object fences and a complete audit at final handoff.
-    std::vector<CachedReceipt> receipts;
-    receipts.reserve(review.batches.size());
     uint64_t receipt_sources = 0;
     auto append_receipt = [&](uint64_t batch)
     {
@@ -10200,9 +10382,13 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             receipt.first_candidate == plan.first_source && receipt.candidates == plan.sources, "migration receipt chain differs from the review");
         audit_file(batch, final_path(batch), receipt.replacement, false);
         receipt_sources = sum(receipt_sources, receipt.candidates);
-        receipts.push_back({file.stamp, receipt.replacement, std::move(file.digest)});
-        require(sizeof(CachedReceipt) + receipts.back().digest.capacity() <= 512,
+        require(current_identity && current_identity->first == batch, "active receipt lost its derived immutable identity");
+        receipts.push_back({file.stamp, receipt.replacement, std::move(file.digest), std::move(current_identity->second)});
+        current_identity.reset();
+        require(sizeof(CachedReceipt) + receipts.back().digest.capacity() + receipts.back().identity.memo.capacity() <= 512,
             "migration receipt index exceeds its retained per-output memory allowance");
+        receipt_memory = sum(receipt_memory, sum(receipts.back().digest.capacity(), receipts.back().identity.memo.capacity()));
+        require(receipt_memory <= product(review.batches.size(), 512), "migration receipt identities exceed their retained memory allowance");
     };
     for (uint64_t batch = 0; batch < journal.state.batch; ++batch) append_receipt(batch);
     auto audit_receipts = [&](bool complete = false)
@@ -10217,6 +10403,30 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             audit_file(batch, final_path(batch), cached.replacement, false);
         }
     };
+    PublishedRetirements published_retirements{destinations, [&](fs::path const& original, fs::path const& requested)
+        -> std::optional<ExternalEngine::PublishedTarget>
+    {
+        auto const name = file_io::path_text(original.filename()); auto const prefix = ".xchplot2-stage-" + review.farm.job_id + '-';
+        if (!name.starts_with(prefix) || !name.ends_with(".building")) return {};
+        auto const digits = name.substr(prefix.size(), name.size() - prefix.size() - std::string_view(".building").size());
+        if (digits.empty() || digits.find_first_not_of("0123456789") != digits.npos) return {};
+        auto const batch = number(digits.c_str());
+        if (batch >= review.batches.size() || original != stage_path(batch)) return {};
+        if (!requested.empty() && requested != final_path(batch)) return {};
+        stream_state::Stamp authorized; bool rename_allowed = false;
+        if (batch < journal.state.batch) authorized = receipts.at(size_t(batch)).replacement;
+        else if (batch == journal.state.batch && journal.state.published) authorized = *journal.state.published;
+        else if (batch == journal.state.batch && journal.state.verified_stage && fs::exists(final_path(batch)))
+        { authorized = *journal.state.verified_stage; rename_allowed = true; }
+        else return {};
+        audit_file(batch, final_path(batch), authorized, rename_allowed);
+        auto alias = retired_farming_publication(journal.state.farm, original, &keys, requested, &identity_for(batch));
+        auto const current = stream_state::stamp(final_path(batch));
+        require(alias && (rename_allowed ? stream_state::same_output(authorized, current) : authorized == current) &&
+            alias->stamp == ExternalEngine::Stamp{{current.device, current.inode}, current.bytes, current.mtime, current.ctime,
+                current.mtime_ns, current.ctime_ns}, "retired publication changed after its private journal/receipt audit");
+        return alias;
+    }};
     auto expected = [&](uint64_t batch, stream_state::Stamp const& authorized)
     {
         auto const& plan = review.batches.at(size_t(batch)); auto const& directory = review.farm.directories.at(size_t(plan.lane));
@@ -10224,7 +10434,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         InventoryRoot root{directory.directory, directory.directory_identity, storage_device(path.parent_path()), uint64_t(native.st_dev), uint64_t(native.st_ino)};
         auto const plot = observe_inventory_file(root, file_io::path_text(path.filename()), replot_inventory_limits(args));
         require(plot.identity.stamp == authorized, "replacement changed between its private receipt and live readiness observation");
-        auto const identity = identity_run.identity(keys, size_t(plan.lane), plan.ordinal);
+        auto const& identity = identity_for(batch);
         ReplacementExpectation result; result.path = path; result.identity = plot.identity;
         result.group_id = group_tools::hex(identity.params.get_plot_group_id().span()); result.farmer_public_key = service.farmer_public_key;
         result.pool_public_key = service.pool_public_key; result.pool_contract_puzzle_hash = service.pool_contract_puzzle_hash;
@@ -10257,7 +10467,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 }
                 else return false;
                 require(stream_state::stamp(path) == authorized, "registry allowance replacement changed since publication");
-                auto const identity = identity_run.identity(keys, lane, ordinal);
+                auto const& identity = identity_for(batch);
                 return path == final_path(batch) && plot_id == group_tools::hex(identity.params.get_plot_group_id().span());
             }
             prefix = sum(prefix, files);
@@ -10297,7 +10507,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 auto const& plot = inventory.plots.at(size_t(indices.front()));
                 auto options = bounded_adapter(source_options(plot), until);
                 gone = gone && observe_sources_retired(options, inventory, indices,
-                    target_route(options) ? published_allowance : PublishedPlotAllowance{}).no_loaded_record;
+                    target_route(options) ? published_allowance : PublishedPlotAllowance{}, &registry_index).no_loaded_record;
             }
             if (gone) confirmed_unloaded.insert(count.workload);
         }
@@ -10316,9 +10526,11 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         }
         return counts;
     };
-    auto admit = [&](bool building, bool verifying, uint64_t ready)
+    auto admit = [&](bool building, bool verifying, uint64_t ready,
+        std::optional<std::chrono::steady_clock::time_point> deadline = {})
     {
-        auto const until = replot_operation_deadline(request.adapter_timeout_us);
+        auto until = replot_operation_deadline(request.adapter_timeout_us);
+        if (deadline) until = std::min(until, *deadline);
         auto wait = [&](Stage const& stage)
         { auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
           require(left > 0, "migration admission/registry phase exceeded its bounded deadline");
@@ -10387,7 +10599,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             }
             catch (std::runtime_error const&) { target_snapshot.reset(); }
         }
-        target_snapshot = std::make_unique<TargetReadinessSnapshot>(options, inventory.network, keys.k, keys.strength, service, &inventory, published_allowance);
+        target_snapshot = std::make_unique<TargetReadinessSnapshot>(options, inventory.network, keys.k, keys.strength, service, &inventory, published_allowance, &registry_index);
         snapshot_count = count;
         for (uint64_t batch = 0; batch < count; ++batch)
         {
@@ -10460,27 +10672,31 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         // One authoritative observation per route and batch. The temporary
         // source DOM is gone before target readiness or construction retains
         // its own supervision grant. Native identity is fenced again at claim.
-        std::map<std::tuple<fs::path, fs::path, std::string>, std::vector<uint64_t>> active_sources;
-        for (size_t source = 0; source < journal.state.retirements.size(); ++source)
-            if (journal.state.retirements[source].state == ReplotRetirement::active)
-            {
-                auto const source_index = review.sources.at(size_t(plan.first_source) + source);
-                auto const& plot = inventory.plots.at(size_t(source_index));
-                require(replot_source_candidate(plot), "review selects a protected or unsupported retirement source");
-                auto const options = source_options(plot);
-                active_sources[{options.executable, options.root, options.harvester}].push_back(source_index);
-            }
-        for (auto const& [route, indices] : active_sources)
+        auto refresh_batch_sources = [&]
         {
-            checkpoint_gate(); auto const& first = inventory.plots.at(size_t(indices.front()));
-            auto const options = source_options(first);
-            bool const durable_retirement = std::any_of(journal.state.retirements.begin(), journal.state.retirements.end(),
-                [](auto const& progress) { return progress.state != ReplotRetirement::active; });
-            SourceReadinessSnapshot snapshot(options, inventory, indices, target_route(options) ? published_allowance : PublishedPlotAllowance{}, durable_retirement);
-            for (auto source_index : indices)
-            { auto const& plot = inventory.plots.at(size_t(source_index)); (void)snapshot.check(inventory.roots.at(plot.root), plot); }
-            snapshot.finish();
-        }
+            std::map<std::tuple<fs::path, fs::path, std::string>, std::vector<uint64_t>> active_sources;
+            for (size_t source = 0; source < journal.state.retirements.size(); ++source)
+                if (journal.state.retirements[source].state == ReplotRetirement::active)
+                {
+                    auto const source_index = review.sources.at(size_t(plan.first_source) + source);
+                    auto const& plot = inventory.plots.at(size_t(source_index));
+                    require(replot_source_candidate(plot), "review selects a protected or unsupported retirement source");
+                    auto const options = source_options(plot);
+                    active_sources[{options.executable, options.root, options.harvester}].push_back(source_index);
+                }
+            for (auto const& [route, indices] : active_sources)
+            {
+                checkpoint_gate(); auto const& first = inventory.plots.at(size_t(indices.front()));
+                auto const options = source_options(first);
+                bool const durable_retirement = std::any_of(journal.state.retirements.begin(), journal.state.retirements.end(),
+                    [](auto const& progress) { return progress.state != ReplotRetirement::active; });
+                SourceReadinessSnapshot snapshot(options, inventory, indices, target_route(options) ? published_allowance : PublishedPlotAllowance{}, durable_retirement, &registry_index);
+                for (auto source_index : indices)
+                { auto const& plot = inventory.plots.at(size_t(source_index)); (void)snapshot.check(inventory.roots.at(plot.root), plot); }
+                snapshot.finish();
+            }
+        };
+        refresh_batch_sources();
         std::function<void()> early_admission;
         auto retire = [&](size_t source, bool predelete)
         {
@@ -10492,6 +10708,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             {
                 recheck_replot_source(args, root, plot);
                 persist([&](auto& state) { state.retirements[source] = {ReplotRetirement::claim_intent, predelete}; });
+                authorize_retirement_configuration(source_index);
                 grow_failpoint("replot-retirement-intent");
             }
             if (journal.state.retirements[source].state == ReplotRetirement::claim_intent)
@@ -10502,6 +10719,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 recheck_replot_source(args, root, plot, claimed ? claim : "");
                 if (journal.state.retirements[source].predelete) early_admission();
                 fresh_target(journal.state.retirements[source].predelete, until);
+                registry_scope(until, published_allowance);
                 check();
                 (void)claim_replot_source(root, plot, review.farm.job_id, source_index, replot_inventory_limits(args));
                 persist([&](auto& state) { state.retirements[source].state = ReplotRetirement::claimed; });
@@ -10518,6 +10736,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                     auto const until = replot_operation_deadline(request.adapter_timeout_us);
                     if (journal.state.retirements[source].predelete) early_admission();
                     fresh_target(journal.state.retirements[source].predelete, until);
+                    registry_scope(until, published_allowance);
                     check();
                 });
             }
@@ -10534,7 +10753,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             auto cfg = configuration(inspection, sum(plan.final_bound_bytes, plan.workspace_bound_bytes), 0);
             auto const before = stream_state::stamp(stage_path(index));
             Construction audit(file_io::path_text(stage_path(index)), cfg, true); auto const saved = audit.identity();
-            same_identity(identity_run.identity(keys, size_t(plan.lane), plan.ordinal), identity_from(saved));
+            same_identity(identity_for(index), identity_from(saved));
             require(saved.header.group_size <= review.farm.directories[size_t(plan.lane)].layout.file_members(plan.ordinal) &&
                 (!saved.pending || saved.target_members <= review.farm.directories[size_t(plan.lane)].layout.file_members(plan.ordinal)) &&
                 stream_state::stamp(stage_path(index)) == before, "unverified migration stage is not a recoverable planned identity");
@@ -10644,11 +10863,11 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             if (fs::exists(stage_path(index))) auxiliary = snapshot(stage_path(index), plan.ordinal);
             uint64_t const inspection_grant = replot_inventory_limits(args).memory_bytes / 2;
             auto recovery = output_auxiliary(stage_path(index), auxiliary, inspection_grant);
-            auto const identity = identity_run.identity(keys, size_t(plan.lane), plan.ordinal);
+            auto const& identity = identity_for(index);
             return replot_external_capacity(effective, identity,
                 identity_run.state.directories[size_t(plan.lane)].layout.file_members(plan.ordinal),
                 sum(plan.final_bound_bytes, plan.workspace_bound_bytes), stage_path(index), std::move(roots),
-                project(ScratchRoot::inspect(destinations[size_t(plan.lane)])), request.generation_peak_bytes, recovery, auxiliary, inspection_grant);
+                project(ScratchRoot::inspect(destinations[size_t(plan.lane)])), request.generation_peak_bytes, recovery, auxiliary, inspection_grant, published_retirements);
         };
         auto viable_predelete = [&]
         {
@@ -10668,7 +10887,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 auto const& progress = journal.state.retirements[source];
                 auto const& plot = inventory.plots.at(size_t(review.sources.at(size_t(plan.first_source) + source)));
                 if (progress.state != ReplotRetirement::active || !construction_filesystems.contains(inventory.roots[plot.root].storage.filesystem)) continue;
-                if (plot.identity.allocated_bytes > review.reclaim_before_bytes - outstanding) break;
+                if (plot.identity.allocated_bytes > review.reclaim_before_bytes - outstanding) continue;
                 outstanding = sum(outstanding, plot.identity.allocated_bytes); projected.push_back(source);
                 if (!next) next = source;
                 fits = construction_fits(projected);
@@ -10691,7 +10910,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             refresh_source_registries();
             supervised_preflight(); admit(true, false, service_members());
             auto const construction_until = replot_operation_deadline(request.construction_us);
-            auto const identity = identity_run.identity(keys, size_t(plan.lane), plan.ordinal); Metrics result;
+            auto const& identity = identity_for(index); Metrics result;
             for (;;)
             {
                 auto bounded = replot_execution_options(effective, request, construction_until);
@@ -10729,7 +10948,8 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                     try
                     {
                         result = run_group(bounded, stage_path(index), nullptr, identity, identity_run.state.directories[size_t(plan.lane)].layout.file_members(plan.ordinal),
-                            sum(plan.final_bound_bytes, plan.workspace_bound_bytes), 0, backend, nullptr, std::move(recovery), auxiliary);
+                            sum(plan.final_bound_bytes, plan.workspace_bound_bytes), 0, backend, nullptr, std::move(recovery), auxiliary,
+                            nullptr, {}, nullptr, {}, published_retirements);
                         backend.reset(); cpu_cap.restore();
                     }
                     catch (...) { backend.reset(); cpu_cap.restore(); throw; }
@@ -10747,15 +10967,37 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             require(result.members == identity_run.state.directories[size_t(plan.lane)].layout.file_members(plan.ordinal), "migration replacement did not reach its exact planned membership");
             auto const stamp = stream_state::stamp(stage_path(index)); audit_file(index, stage_path(index), stamp, false);
             target_snapshot.reset();
-            admit(false, true, service_members());
-            calibration_process::Limits limits{request.verification_ram_bytes, replot_milliseconds(request.verification_us), 65536, args.cancelled};
-            auto raw = calibration_process::run_worker(stage_path(index), 100, limits, calibration_process::Worker::migration_proof, inputs.resources.native.verification_cpu_threads, 1);
-            auto proof = group_grow::profile_detail::JsonReader(raw, 8 * limits.output_bytes).read();
-            require(inventory_detail::integer(proof, "replot_proof_worker") == 1 && inventory_detail::integer(proof, "full_proofs_validated") == 1 &&
-                inventory_detail::integer(proof, "trials") <= 100 &&
-                inventory_detail::integer(proof, "cpu_affinity_lanes") == request.verification_cpu_threads &&
-                inventory_detail::string(proof, "source_stamp") == calibration_stamp(stamp) && stream_state::stamp(stage_path(index)) == stamp,
-                "bounded proof worker did not verify this exact sealed replacement");
+            auto const verification_until = replot_operation_deadline(request.verification_us);
+            for (;;)
+            {
+                check_cancel(args);
+                require(std::chrono::steady_clock::now() < verification_until, "replacement verification exceeded its reviewed deadline");
+                admit(false, true, service_members(), verification_until);
+                require(stream_state::stamp(stage_path(index)) == stamp, "sealed replacement changed while verification was paused");
+                auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(verification_until - std::chrono::steady_clock::now()).count();
+                require(left > 0, "replacement verification exceeded its reviewed deadline");
+                calibration_process::Limits limits{request.verification_ram_bytes, uint64_t(left), 65536, args.cancelled};
+                auto const current = replot_stage(inputs.resources, request, last_remaining, service_members(), false, true, false);
+                auto const future = replot_stage(inputs.resources, request, last_remaining, service_members(), false, true, true);
+                try
+                {
+                    auto raw = calibration_process::run_worker(stage_path(index), 100, limits, calibration_process::Worker::migration_proof,
+                        inputs.resources.native.verification_cpu_threads, 1, [&](SupervisedProcess const& worker)
+                        { return gate.poll_verification(current, worker, request.verification_ram_bytes).allowed &&
+                            gate.poll_verification(future, worker, request.verification_ram_bytes).allowed; });
+                    auto proof = group_grow::profile_detail::JsonReader(raw, 8 * limits.output_bytes).read();
+                    require(inventory_detail::integer(proof, "replot_proof_worker") == 1 && inventory_detail::integer(proof, "full_proofs_validated") == 1 &&
+                        inventory_detail::integer(proof, "trials") <= 100 &&
+                        inventory_detail::integer(proof, "cpu_affinity_lanes") == request.verification_cpu_threads &&
+                        inventory_detail::string(proof, "source_stamp") == calibration_stamp(stamp) && stream_state::stamp(stage_path(index)) == stamp,
+                        "bounded proof worker did not verify this exact sealed replacement");
+                    break;
+                }
+                catch (calibration_process::WorkerPaused const&)
+                {
+                    if (!args.quiet) std::cerr << "[fill] protected verification stopped; waiting for farm resources before a fresh proof attempt\n";
+                }
+            }
             persist([&](auto& state) { state.verified_stage = stamp; }); grow_failpoint("replot-replacement-verified");
         }
         if (!journal.state.published)
@@ -10785,6 +11027,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             persist([](auto& state) { state.ready = state.published; }); grow_failpoint("replot-replacement-ready");
             report_output(args, final_path(index), identity_run.state.directories[size_t(plan.lane)].layout.file_members(plan.ordinal), journal.state.ready->bytes);
         }
+        refresh_batch_sources();
         for (size_t source = 0; source < journal.state.retirements.size(); ++source) retire(source, false);
         supervised_preflight(); auto receipt = ReplotReceipt{inputs.digest, journal.state.receipt_digest, index, plan.first_source, plan.sources, *journal.state.ready};
         auto body = replot_receipt_text(receipt); auto const digest = stream_state::digest(body); body += digest + '\n';

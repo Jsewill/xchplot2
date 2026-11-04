@@ -284,43 +284,69 @@ class ReplotGate
     resource_detail::Graph graph_;
     std::optional<uint64_t> previous_tick_;
     std::optional<uint64_t> accepted_own_anon_;
-    Admission poll_impl(Stage const& stage, bool active)
+    std::optional<uint64_t> accepted_child_anon_;
+    uint64_t controller_ram_bytes_ = 0;
+    // The caller reports only live/identity-reserved services it owns, never
+    // all reviewed workers on this host. Phase totals still reserve all of them.
+    std::function<uint64_t(bool)> owned_background_ram_;
+    Admission poll_impl(Stage const& stage, bool active, SupervisedProcess const* proof = nullptr, uint64_t proof_ram_bytes = 0)
     {
+        using namespace resource_detail;
+        bool const constructing = active && !proof;
+        require(!proof || (active && !stage.verification.empty() && stage.construction.empty() && stage.supervision.empty() && proof_ram_bytes),
+            "active proof monitoring requires its one capped verification phase");
+        auto memory = [&](std::vector<Demand> const& demands)
+        { uint64_t bytes = 0; for (auto const& d : demands)
+          { auto const& r = graph_.resources[graph_.find(d.resource)];
+            if (r.kind == ResourceKind::host_memory && r.host == profile_.native.host) bytes = add(bytes, add(d.resident_units, d.transient_units)); }
+          return bytes; };
+        auto const background = owned_background_ram_ ? owned_background_ram_(constructing) : 0;
+        require(background <= memory(stage.background), "owned compute services exceed their reviewed local background demand");
+        OwnMemoryCredit credit; credit.parent_limit_bytes = add(constructing ? memory(stage.construction) : controller_ram_bytes_, background);
+        credit.child_limit_bytes = proof_ram_bytes;
         uint64_t lanes = 0;
-        if (active)
+        if (active || controller_ram_bytes_)
         {
-            resource_detail::require(!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty(),
-                                     "active monitoring requires the running construction phase");
+            require(!constructing || (!stage.construction.empty() && stage.verification.empty() && stage.supervision.empty()),
+                "active monitoring requires the running construction phase");
             auto own_cpu = [&](std::vector<Demand> const& demands) { for (auto const& d : demands)
             {
                 auto const& resource = graph_.resources[graph_.find(d.resource)];
                 if (resource.kind == ResourceKind::cpu && resource.host == profile_.native.host)
                     lanes = resource_detail::add(lanes, resource_detail::add(d.required_units, d.reserved_units));
             } };
-            own_cpu(stage.construction); own_cpu(stage.background);
+            own_cpu(stage.construction); own_cpu(stage.verification); own_cpu(stage.supervision); own_cpu(stage.background);
             lanes = std::min<uint64_t>(lanes, profile_detail::logical_cpus());
-            resource_detail::require(lanes, "active construction has no declared CPU reservation");
+            require(lanes, "owned processes have no declared CPU reservation");
         }
         std::string failure;
         try
         {
-            auto reading = sampler_.sample(profile_, Clock::now(), lanes); auto const now = Clock::now();
+            auto reading = sampler_.sample(profile_, Clock::now(), lanes, proof, credit.parent_limit_bytes != 0); auto const now = Clock::now();
             bool const duplicate_tick = previous_tick_ && reading.producer_tick_ms <= *previous_tick_;
-            if (gate_.observe(reading, now)) accepted_own_anon_ = sampler_.own_anon_bytes();
+            if (gate_.observe(reading, now))
+            { accepted_own_anon_ = sampler_.own_anon_bytes(); accepted_child_anon_ = sampler_.child_anon_bytes(); }
             else if (!duplicate_tick) failure = "unavailable-current-local-pressure";
-            if (active && !sampler_.own_anon_bytes()) failure = "unavailable-current-own-anonymous-memory";
+            if (credit.parent_limit_bytes && !sampler_.own_anon_bytes()) failure = "unavailable-current-own-anonymous-memory";
+            if (proof && !sampler_.child_anon_bytes()) failure = "unavailable-current-proof-anonymous-memory";
             previous_tick_ = reading.producer_tick_ms;
         }
+        catch (ProcessObservationUnavailable const&) { throw; }
         catch (std::exception const&) { failure = "unavailable-current-local-pressure"; }
-        if (active && !accepted_own_anon_) failure = "unavailable-current-own-anonymous-memory";
+        if (credit.parent_limit_bytes && !accepted_own_anon_) failure = "unavailable-current-own-anonymous-memory";
+        if (proof && !accepted_child_anon_) failure = "unavailable-current-proof-anonymous-memory";
         if (!failure.empty()) gate_.pause();
-        auto result = gate_.evaluate(stage, Clock::now(), active ? accepted_own_anon_ : std::optional<uint64_t>{});
+        credit.parent_resident_bytes = accepted_own_anon_.value_or(0);
+        credit.child_resident_bytes = proof ? accepted_child_anon_.value_or(0) : 0;
+        auto result = gate_.evaluate_owned(stage, Clock::now(), credit);
         if (!failure.empty()) { resource_detail::fail(result.assessment, failure); result.allowed = false; result.paused = true; }
         return result;
     }
 public:
-    explicit ReplotGate(Profile profile, std::string actual_host)
-        : profile_(std::move(profile)), gate_(profile_), sampler_(actual_host), graph_(profile_)
+    explicit ReplotGate(Profile profile, std::string actual_host, uint64_t controller_ram_bytes = 0,
+        std::function<uint64_t(bool)> owned_background_ram = {})
+        : profile_(std::move(profile)), gate_(profile_), sampler_(actual_host), graph_(profile_),
+          controller_ram_bytes_(controller_ram_bytes), owned_background_ram_(std::move(owned_background_ram))
     {
         resource_detail::require(!actual_host.empty() && actual_host == profile_detail::host_name() && actual_host == profile_.native.host,
                                  "migration runtime gate host differs from the reviewed execution host");
@@ -330,6 +356,8 @@ public:
     // Sole monitor caller, while the declared construction reservation is held.
     // This is not admission of new work: static envelopes remain fully charged.
     Admission poll_active(Stage const& stage) { return poll_impl(stage, true); }
+    Admission poll_verification(Stage const& stage, SupervisedProcess const& proof, uint64_t proof_ram_bytes)
+    { return poll_impl(stage, true, &proof, proof_ram_bytes); }
     Admission wait(Stage const& stage, uint64_t timeout_ms, std::function<bool()> const& cancelled = {},
                    std::function<void(Admission const&)> const& on_pause = {})
     {
