@@ -23,7 +23,11 @@ struct GroupOptions
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
     std::filesystem::path replot_inventory;
     std::string farm_adapter = "chia";
+    bool farm_adapter_set = false, chia_root_set = false, chia_executable_set = false, farming_profile_set = false;
     uint64_t reclaim_before_bytes = 0;
+    std::vector<std::filesystem::path> replot_source_roots, replot_exclude_roots;
+    uint64_t replot_max_source_files = 0, replot_max_source_bytes = 0;
+    bool replot_status = false, replot_revalidate = false;
     std::vector<std::filesystem::path> assessment_plans;
     std::vector<std::filesystem::path> calibration_plots;
     uint64_t calibration_samples = 16, calibration_timeout_ms = 30000, calibration_memory_bytes = 512 * 1024 * 1024;

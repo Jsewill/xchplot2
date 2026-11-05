@@ -11,6 +11,7 @@ inline unsigned group_option_values(std::string_view option)
         option == "--metadata-only" || option == "--no-metadata-only" ||
         option == "--assess-jobs" || option == "--no-assess-jobs" ||
         option == "--inventory" || option == "--no-inventory" ||
+        option == "--status" || option == "--no-status" || option == "--revalidate" || option == "--no-revalidate" ||
         option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" || option == "--replot-proof-worker" ||
         option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
         option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||

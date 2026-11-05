@@ -758,11 +758,67 @@ inode attestation. A matching pathname on an unrelated remote filesystem does
 not establish the controller's exact replacement. Configure the actual shared
 file namespace and physical storage/resource mappings before review.
 
-The inventory contains an editable `farm_resources` template with unknown
-capacities and costs. Complete it for the actual mixed farm before reviewing a
-migration. Use the existing [harvester profile workflow](#farming-layout) for
-the intended PoS2 reader, and include the completed `farm_resources` object in
-the profile supplied through `--harvester FILE`. Keep each inventory entry's
+The inventory contains an editable `farm_resources` template and a separate
+`resource_preparation` checklist. Preparation generates local source filesystem
+and drive aliases, CPU/RAM resources for selected physical service hosts, and
+only the workload edges established by those bindings. Supported public format
+parameters and selected reader/version provenance are filled when observed.
+It does not select destination or scratch paths or invent capacities and costs.
+The checklist groups missing declarations by purpose and gives their field
+paths and required inputs. Every fact identifies its source and scope as
+observed, declared or unknown. OS CPU/memory snapshots and configured lookup
+threads are diagnostics; they are not running service limits or spare capacity.
+Saved quality-reader calibration retains its sample scope and cannot establish
+worst-case queues or a full-proof solver reserve.
+
+For a local setup, start with the controller, selected Chia services and source
+files on the same physical host. Inventory all source and existing destination
+data with the command above. The generated CPU/RAM nodes share that host; source
+storage nodes share any observed drive aliases. An unrecognized data file gets
+only its known storage edge until its decoder/service topology is declared.
+For example, the generated local memory node has this shape; retain its actual
+host and ID from the inventory:
+
+```json
+{
+  "id": "memory:<observed-host>",
+  "host": "<observed-host>",
+  "kind": "host_memory",
+  "capacity": 0,
+  "capacity_known": false,
+  "conditional_shared": false,
+  "telemetry_required": false,
+  "aliases": []
+}
+```
+
+The zero capacity and false flags are deliberately unknown placeholders.
+Complete the existing `farm_resources` object in a copy of the inventory using
+the checklist: declare offered CPU/RAM/storage capacity, existing service and
+whole-queue bounds, output/scratch mappings, whole-file construction and proof
+verification bounds, and replacement farming/full-proof cohorts. If a decoder
+or solver uses a GPU or another host, add its physical resources and complete
+service/network demands. A local topology does not exempt those workloads.
+Keep the original observations for comparison and save the completed copy as
+`farm-resources.json`. Reuse the declarations during another inventory without
+reentering the resource graph:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --harvester farm-resources.json --save-plan refreshed-inventory.plan --json
+```
+
+This copies the saved declarations unchanged, checks inventory counts and
+reports physical binding differences beside the new observations. It does not
+requalify the declared bounds. Review still checks the concrete migration and
+every resource phase. A completed resource-only file or inventory within the
+profile input size and parsing limits can also be supplied through
+`--harvester FILE`. For a large catalog, copy its completed `farm_resources`
+object into a standalone resource file, retaining any needed `farming_profile`
+and `farm_adapters` objects beside it. Use the existing
+[harvester profile workflow](#farming-layout) when supplying reader model inputs
+or quality calibration for the intended PoS2 reader. Keep each inventory entry's
 `workload_id` consistent with the profile's counts. Opaque data also needs a
 workload reservation unless explicitly classified as `non-plot` with a reason.
 That classification never makes the file a retirement candidate.
@@ -865,6 +921,30 @@ Physical bytes do not imply equivalent farming capacity, rewards or fees;
 unavailable value estimates remain unknown. A smaller compressed file need
 not use fewer farming resources.
 
+By default the review selects every eligible old PoS1 file in the inventory.
+Use repeatable `--replot-source-root ROOT` to select only exact inventoried
+roots, or `--replot-exclude-root ROOT` to protect exact inventoried roots.
+A root cannot be both selected and excluded. The complete inventory remains
+in the review: excluded and unselected files still consume their declared
+farming resources. Output limits such as `--max-groups` bound replacement
+outputs; they do not bound old-file retirement.
+
+For a bounded initial run, add `--replot-max-source-files N` or
+`--replot-max-source-bytes SIZE`. These limits apply to ranked whole old
+files, using their observed allocated bytes; a file that exceeds the remaining
+byte allowance is skipped. The review reports selected and protected file
+counts and allocated bytes. For example, pair `--replot-max-source-files 1`
+with `--max-groups 1 --max-total-members 1` to bound both old-file retirement
+and replacement work per destination, inspect the result, and save that review
+for execution. A saved review's exact source list remains authoritative.
+
+Replacement outputs retain the destination order in the review. Source mapping
+favors the same filesystem, spreads allocated bytes across its replacement
+outputs, and keeps reader workload cohorts together when the active batch can
+hold them. Bootstrap sources are mapped to the output that needs their space.
+Every prefix must still pass the resource, scratch-space and outstanding
+pre-delete checks; execution proceeds sequentially through that fixed mapping.
+
 `--reclaim-before-bytes SIZE` belongs to the review and defaults to zero.
 Zero requires each mapped replacement to be ready before its sources are
 removed. A positive value permits that many allocated source bytes to be
@@ -925,11 +1005,17 @@ conservatively retaining the original arrivals until their removal is confirmed.
 The first complete target farming and full-proof cohort is reserved even when
 no replacement exists, covering the services that must already be running.
 
-Keep the original `migration.plan`, every private `grow-replot.plan` copy and
-any `.next` file, receipts and owned temporary files. The private journal
-contains the seed and assignments from preparation onward. Resume with the
-same reviewed plan and installed-reader arguments; saved private state restores
-the keys. All required source and destination roots must be available and must
+Keep the original `migration.plan`, any active reviewed successor, every private
+`grow-replot.plan` copy and any `.next` file, receipts and owned temporary files.
+The private journal contains the seed and assignments from preparation onward.
+Resume with `xchplot2 fill --from-plan migration.plan`, using the active successor
+in place of that filename after revalidation. Private state restores the keys.
+Accepted local reader paths, adapter kind and profile selection are also saved
+privately on the first destination when its metadata allowance has room.
+These defaults belong to the local host and user; explicit arguments override
+them, and a public review never supplies a local executable. Missing defaults
+require the original explicit local selections. Compute connection options remain
+explicit. All required source and destination roots must be available and must
 still identify the same directories. A source mismatch stops retirement while
 preserving the claimed file for inspection. On Windows, a reader that holds a
 source without delete sharing must unload it before the native claim can open.
@@ -938,6 +1024,46 @@ retirement progress can retain its previously validated metadata for those exact
 now-unloaded native objects. A later opaque batch without previously validated
 reader metadata must be loaded and freshly acknowledged before its own retirement
 begins. Ordinary supported public headers can identify unloaded files directly.
+
+Use `xchplot2 plan --status --from-plan migration.plan --json` for read-only
+progress. Status separates the durable phase, completed receipts, retirement
+states and outstanding pre-delete debt from current filesystem observations.
+It shows exact active claim and replacement paths, pending replica publication
+and the next safe action. It does not contact farming or compute services and
+does not diagnose their current health or the reason a previous process stopped.
+Missing replicas are reported as incomplete observations. No journal found is
+not proof that the job never ran; preserve remaining artifacts before recovery.
+
+To review changed installed readers or resource declarations, stop the
+coordinator, keep the original source and replacement objects, and save an
+updated local profile separately:
+
+```bash
+xchplot2 plan --revalidate --from-plan migration.plan \
+  --harvester updated-farm.json --save-plan migration-successor.plan --json
+xchplot2 fill --from-plan migration-successor.plan --harvester updated-farm.json
+```
+
+Revalidation audits every original inventory entry, exact claims, completed
+receipts and sealed replacements, then refreshes reader observations and current
+farming acknowledgements. Review covers current and remaining phases; decoder
+residency or queues remain charged until fresh observations confirm unload.
+The successor preserves the original keys, fixed output identities and layout,
+selected native sources, completed receipts and pre-delete limit and debt.
+Claimed or retired files retain their original identification; separate current
+reader observations do not identify them again. Active opaque files must still
+be loaded and freshly identified by the current reader.
+
+A successor is bound to the exact stopped journal revision. If durable journal
+progress advances before activation, save a new review. After activation, resume
+through that successor; the original review cannot remove its policy. Further revalidation
+uses the currently active successor. Preserve the original review because
+completed receipts remain bound to its identity. Unverified partial construction,
+including saved external work without its stage file, must first recover through
+its original exact-build checkpoint to a verified boundary. Handoff and completed
+jobs need status or ordinary recovery rather than revalidation. If activation
+is interrupted before local defaults are saved, a profile with multiple reader
+routes may need to be supplied explicitly once more.
 
 New reviews can record a removal-compatible fingerprint for conventional Chia
 configuration. Once the private journal has durable retirement intent, removing
@@ -959,7 +1085,7 @@ filesystem's persistent identity is unchanged.
 After all replacements and retirements pass the final audit, the job publishes
 ordinary `grow-farm.plan` copies. Completed replacement files retain their
 identities and fixed member counts; ordinary recovery never grows them.
-An unfinished migration must finish through its original review before ordinary
+An unfinished migration must finish through its active reviewed plan before ordinary
 fill or extension can operate on its destinations.
 Reassess any remaining legacy workload before extending a completed ordinary job.
 

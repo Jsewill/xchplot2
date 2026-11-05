@@ -2,6 +2,8 @@
 // replacement keys and assignments from the first durable revision onward.
 #pragma once
 #include "host/GroupFarmState.hpp"
+#include "host/GroupFarmInventory.hpp"
+#include <array>
 #include <functional>
 
 namespace group_grow
@@ -15,6 +17,42 @@ struct ReplotCandidateProgress
     bool operator==(ReplotCandidateProgress const&) const = default;
 };
 inline constexpr size_t replot_maximum_batch_sources = 1024;
+struct ReplotPredeleteCandidate
+{
+    uint64_t allocated_bytes = 0;
+    bool eligible = false;
+};
+struct ReplotPredeleteSelection
+{
+    std::vector<size_t> sources;
+    bool feasible = false;
+};
+// Forecast and runtime supply their own space/resource projections. Only whole
+// eligible files can join the reviewed order, within the same outstanding debt.
+template<class Candidate, class Fits>
+ReplotPredeleteSelection select_replot_predeletions(size_t count, uint64_t allowance, uint64_t outstanding,
+    std::vector<size_t> selected, Candidate candidate, Fits fits)
+{
+    require(count <= replot_maximum_batch_sources && outstanding <= allowance && selected.size() <= count,
+        "invalid migration predelete selection bounds");
+    std::array<bool, replot_maximum_batch_sources> included{};
+    for (auto source : selected)
+    {
+        require(source < count && !included[source], "migration pending predelete source is duplicated or exceeds its batch");
+        included[source] = true;
+    }
+    selected.reserve(count);
+    bool feasible = fits(std::span<size_t const>(selected));
+    for (size_t source = 0; source < count && !feasible; ++source)
+    {
+        if (included[source]) continue;
+        auto const current = candidate(source);
+        if (!current.eligible || current.allocated_bytes > allowance - outstanding) continue;
+        outstanding += current.allocated_bytes; selected.push_back(source); included[source] = true;
+        feasible = fits(std::span<size_t const>(selected));
+    }
+    return {std::move(selected), feasible};
+}
 struct ReplotBatch
 {
     uint64_t lane = 0, ordinal = 0, first_source = 0, sources = 0;
@@ -114,9 +152,88 @@ inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory
     require(bool(in), "incomplete replot review"); in >> std::ws; require(in.eof(), "unexpected replot review data");
     validate_replot_review(result); return result;
 }
+struct ReplotRevalidation
+{
+    // Flat successors retain the original bytes once. Progress and receipts
+    // remain bound to that origin; only these reviewed observations can vary.
+    std::string origin_review, inventory_json, resources_json;
+    std::string parent_policy_digest, journal_digest;
+    std::vector<farm::ReplotReaderObservation> readers;
+};
+inline void validate_replot_reader_changes(farm::FarmInventory const& origin, farm::FarmInventory const& current)
+{
+    require(origin.plots.size() == current.plots.size(), "revalidation changed the original inventory entry count");
+    auto const original = farm::farm_inventory_text(origin);
+    (void)farm::farm_inventory_text(current);
+    auto comparable = current;
+    for (size_t index = 0; index < comparable.plots.size(); ++index)
+    {
+        auto& plot = comparable.plots[index]; auto const& saved = origin.plots[index];
+        plot.reader = saved.reader; plot.reader_identity = saved.reader_identity; plot.reader_version = saved.reader_version;
+    }
+    auto& network = comparable.network; auto const& saved = origin.network;
+    network.source = saved.source; network.version = saved.version; network.captured_at = saved.captured_at;
+    network.reader_version = saved.reader_version; network.reader_identity = saved.reader_identity;
+    network.farmer_version = saved.farmer_version; network.solver_version = saved.solver_version; network.service_status = saved.service_status;
+    comparable.retirement_readers = origin.retirement_readers;
+    require(original == farm::farm_inventory_text(comparable),
+        "revalidation changed original native objects, network, routes, workloads or protected inventory accounting");
+    require(current.network.available && !current.network.reader_identity.empty() && !current.network.reader_version.empty(),
+        "revalidation requires fresh target reader/network observations");
+    for (auto const& plot : current.plots) if (!plot.reader_identity.empty())
+        require(!plot.reader.empty() && !plot.reader_version.empty(), "revalidation has incomplete source reader observations");
+}
+inline void validate_replot_nonactive_provenance(farm::FarmInventory const& origin, farm::FarmInventory const& current,
+    std::span<uint64_t const> nonactive)
+{
+    for (auto index : nonactive)
+    {
+        auto const& original = origin.plots.at(size_t(index)); auto const& active = current.plots.at(size_t(index));
+        require(original.reader == active.reader && original.reader_version == active.reader_version && original.reader_identity == active.reader_identity,
+            "revalidation cannot relabel original durable source identification as a new reader observation");
+    }
+}
+inline std::string replot_revalidation_text(ReplotRevalidation const& value)
+{
+    require(!value.origin_review.empty() && !value.inventory_json.empty() && !value.resources_json.empty() &&
+        (value.parent_policy_digest.empty() || (value.parent_policy_digest.size() == 64 &&
+            value.parent_policy_digest.find_first_not_of("0123456789abcdef") == value.parent_policy_digest.npos)) &&
+        value.journal_digest.size() == 64 && value.journal_digest.find_first_not_of("0123456789abcdef") == value.journal_digest.npos,
+        "invalid reviewed replot revalidation");
+    require(value.origin_review.starts_with("ordinary-group-replot-review-v1\n"), "revalidation must embed one original review, never a nested successor");
+    require(value.readers.size() <= 1024, "revalidation reader observations exceed their root bound");
+    std::set<uint64_t> roots;
+    for (auto const& reader : value.readers)
+        require(roots.insert(reader.root).second && (reader.reader == "chia" || reader.reader == "gigahorse" || reader.reader == "drchia") &&
+            !reader.version.empty() && reader.version.size() <= 4096 && reader.identity.size() == 64 &&
+            reader.identity.find_first_not_of("0123456789abcdef") == reader.identity.npos && !reader.source.empty() && reader.source.size() <= 8192 &&
+            !reader.captured_at.empty() && reader.captured_at.size() <= 128, "invalid revalidation reader observation");
+    std::ostringstream out; out << "ordinary-group-replot-revalidation-v1\n" << std::quoted(value.origin_review) << '\n'
+        << std::quoted(value.inventory_json) << '\n' << std::quoted(value.resources_json) << '\n'
+        << std::quoted(value.parent_policy_digest) << ' ' << std::quoted(value.journal_digest) << '\n' << value.readers.size() << '\n';
+    for (auto const& reader : value.readers) out << reader.root << ' ' << std::quoted(reader.reader) << ' ' << std::quoted(reader.version) << ' '
+        << std::quoted(reader.identity) << ' ' << std::quoted(reader.source) << ' ' << std::quoted(reader.captured_at) << '\n';
+    return out.str();
+}
+inline ReplotRevalidation parse_replot_revalidation(std::string const& body, uint64_t memory_limit)
+{
+    require(body.size() < memory_limit / 16, "replot revalidation exceeds its parsing memory budget");
+    std::istringstream in(body); std::string version; std::getline(in, version);
+    require(version == "ordinary-group-replot-revalidation-v1", "expected a reviewed replot revalidation");
+    ReplotRevalidation result; in >> std::quoted(result.origin_review) >> std::quoted(result.inventory_json) >> std::quoted(result.resources_json)
+        >> std::quoted(result.parent_policy_digest) >> std::quoted(result.journal_digest);
+    size_t count = 0; in >> count;
+    require(in && count <= 1024 && count < memory_limit / (128 * sizeof(farm::ReplotReaderObservation)), "revalidation reader count exceeds its memory bound");
+    result.readers.resize(count);
+    for (auto& reader : result.readers) in >> reader.root >> std::quoted(reader.reader) >> std::quoted(reader.version) >> std::quoted(reader.identity)
+        >> std::quoted(reader.source) >> std::quoted(reader.captured_at);
+    require(bool(in), "incomplete replot revalidation"); in >> std::ws; require(in.eof(), "unexpected replot revalidation data");
+    (void)replot_revalidation_text(result); return result;
+}
 struct ReplotJournal
 {
     std::string review_digest, parent_digest, receipt_digest;
+    std::string policy_digest;
     uint64_t revision = 1, batch = 0, retired_prefix = 0;
     ReplotPhase phase = ReplotPhase::preparing;
     FarmingState farm;
@@ -125,6 +242,28 @@ struct ReplotJournal
     std::vector<ReplotCandidateProgress> retirements;
     std::optional<stream_state::Stamp> verified_stage, published, ready;
 };
+inline char const* replot_phase_name(ReplotPhase phase)
+{
+    switch (phase)
+    {
+    case ReplotPhase::preparing: return "preparing";
+    case ReplotPhase::replacing: return "replacing";
+    case ReplotPhase::handoff: return "handoff";
+    case ReplotPhase::complete: return "complete";
+    }
+    throw std::runtime_error("invalid replot phase");
+}
+inline char const* replot_retirement_name(ReplotRetirement state)
+{
+    switch (state)
+    {
+    case ReplotRetirement::active: return "active";
+    case ReplotRetirement::claim_intent: return "claim-intent";
+    case ReplotRetirement::claimed: return "claimed";
+    case ReplotRetirement::retired: return "retired";
+    }
+    throw std::runtime_error("invalid replot retirement state");
+}
 inline bool replot_digest(std::string const& value)
 { return value.size() == 64 && value.find_first_not_of("0123456789abcdef") == value.npos; }
 inline uint64_t replot_output_count(FarmingState const& state)
@@ -139,7 +278,7 @@ inline uint64_t replot_output_count(FarmingState const& state)
 }
 inline void validate_replot_journal(ReplotJournal const& journal)
 {
-    require(replot_digest(journal.review_digest) && journal.revision &&
+    require(replot_digest(journal.review_digest) && (journal.policy_digest.empty() || (replot_digest(journal.policy_digest) && journal.revision > 1)) && journal.revision &&
         ((journal.revision == 1 && journal.parent_digest.empty()) ||
             (journal.revision > 1 && replot_digest(journal.parent_digest))), "invalid replot journal revision");
     require(journal.farm.version == 6 && journal.farm.fixed_extent && !journal.farm.capacity_fill &&
@@ -169,7 +308,7 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
 {
     validate_replot_journal(journal);
     std::ostringstream out;
-    out << "ordinary-group-replot-journal-v1\n" << std::quoted(journal.review_digest) << ' '
+    out << (journal.policy_digest.empty() ? "ordinary-group-replot-journal-v1\n" : "ordinary-group-replot-journal-v2\n") << std::quoted(journal.review_digest) << ' '
         << journal.revision << ' ' << std::quoted(journal.parent_digest) << ' ' << unsigned(journal.phase) << ' ' << journal.batch << ' '
         << journal.retired_prefix << ' ' << std::quoted(journal.receipt_digest) << '\n'
         << std::quoted(farming_state_text(journal.farm)) << '\n' << journal.retirements.size();
@@ -182,13 +321,14 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
             << stamp.mtime << ' ' << stamp.ctime << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns; }
         out << '\n';
     }
+    if (!journal.policy_digest.empty()) out << std::quoted(journal.policy_digest) << '\n';
     return out.str();
 }
 inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memory_limit)
 {
     require(body.size() < memory_limit / 8, "replot journal exceeds its parsing memory budget");
     std::istringstream in(body); std::string version, farm; unsigned phase = 0;
-    std::getline(in, version); require(version == "ordinary-group-replot-journal-v1", "unsupported replot journal version");
+    std::getline(in, version); require(version == "ordinary-group-replot-journal-v1" || version == "ordinary-group-replot-journal-v2", "unsupported replot journal version");
     ReplotJournal result; size_t count = 0;
     in >> std::quoted(result.review_digest) >> result.revision >> std::quoted(result.parent_digest) >> phase >> result.batch
         >> result.retired_prefix >> std::quoted(result.receipt_digest) >> std::quoted(farm);
@@ -216,6 +356,8 @@ inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memo
         require(bool(in), "incomplete replot replacement publication record");
     }
     require(bool(in), "incomplete replot readiness record");
+    if (version == "ordinary-group-replot-journal-v2")
+    { in >> std::quoted(result.policy_digest); require(in && replot_digest(result.policy_digest), "invalid replot active policy digest"); }
     in >> std::ws; require(in.eof(), "unexpected replot journal data");
     validate_replot_journal(result); return result;
 }
@@ -226,6 +368,14 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
     if (before.revision == UINT64_MAX || after.revision != before.revision + 1 ||
         after.parent_digest != stream_state::digest(replot_journal_text(before)) ||
         before.review_digest != after.review_digest || farming_state_text(before.farm) != farming_state_text(after.farm)) return false;
+    if (before.policy_digest != after.policy_digest)
+    {
+        // The coordinator separately binds this one transition to an explicit
+        // successor and audits every retained object at its reviewed boundary.
+        return !after.policy_digest.empty() && before.phase < ReplotPhase::handoff && after.phase == before.phase &&
+            after.batch == before.batch && after.retired_prefix == before.retired_prefix && after.receipt_digest == before.receipt_digest &&
+            after.retirements == before.retirements && after.verified_stage == before.verified_stage && after.published == before.published && after.ready == before.ready;
+    }
     if (after.phase < before.phase || unsigned(after.phase) > unsigned(before.phase) + 1 ||
         after.batch < before.batch || after.batch > before.batch + 1) return false;
     // A completed receipt is durable before advancing the prefix. Its content
@@ -258,6 +408,53 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
     }
     return changes == 1;
 }
+inline void validate_replot_progress(ReplotReview const& review, ReplotJournal const& journal)
+{
+    validate_replot_journal(journal);
+    auto policy = journal.farm;
+    policy.seed_owner.clear(); policy.pool_public_key = review.farm.pool_public_key;
+    policy.fingerprint = policy.seed = std::string(64, '0'); policy.farmer = std::string(96, '0');
+    policy.pool = std::string(policy.pool_public_key ? 96 : 64, '0');
+    require(farming_state_text(policy) == farming_state_text(review.farm), "private migration assignments differ from the original review");
+    require(journal.batch <= review.batches.size(), "private migration batch exceeds its reviewed assignment");
+    bool const active = journal.batch < review.batches.size();
+    auto const first = active ? review.batches[size_t(journal.batch)].first_source : review.sources.size();
+    auto const count = active ? review.batches[size_t(journal.batch)].sources : 0;
+    require(journal.retired_prefix == first && journal.retirements.size() == count,
+        "private migration retirement progress differs from its reviewed source mapping");
+}
+inline ReplotJournal next_replot_revision(ReplotJournal const& current, std::string const& digest,
+    std::function<void(ReplotJournal&)> const& change)
+{
+    auto next = current; require(next.revision < UINT64_MAX, "migration revision exhausted");
+    ++next.revision; next.parent_digest = digest; change(next);
+    require(valid_replot_revision(current, next), "invalid replot journal update");
+    return next;
+}
+inline uint64_t replot_journal_allocation(uint64_t journal_bytes, uint64_t farming_bytes, uint64_t unit)
+{
+    using namespace farm::resource_detail;
+    group_tools::require(unit, "invalid migration metadata alignment");
+    auto align = [&](uint64_t bytes) { return multiply(bytes / unit + bool(bytes % unit), unit); };
+    return add(add(multiply(align(add(journal_bytes, 65)), 2), multiply(align(add(farming_bytes, 65)), 2)), multiply(unit, 4));
+}
+inline bool replot_local_bindings_fit(uint64_t journal_bytes, uint64_t farming_bytes, uint64_t local_bytes, uint64_t unit, uint64_t allowance)
+{
+    using namespace farm::resource_detail;
+    auto const required = replot_journal_allocation(journal_bytes, farming_bytes, unit);
+    auto const bytes = add(local_bytes, 65);
+    auto const local = add(multiply(multiply(bytes / unit + bool(bytes % unit), unit), 2), multiply(unit, 2));
+    return required <= allowance && local <= allowance - required;
+}
+inline bool replot_policy_activation(ReplotJournal const& journal, std::string const& journal_digest,
+    std::string const& policy_digest, ReplotRevalidation const* successor)
+{
+    if (journal.policy_digest == policy_digest) return false;
+    require(successor && !policy_digest.empty(), "migration has an active reviewed successor; use its matching --from-plan file");
+    require(journal.phase < ReplotPhase::handoff && successor->parent_policy_digest == journal.policy_digest && successor->journal_digest == journal_digest,
+        "migration advanced after this successor was reviewed; save a new revalidation at the current stopped boundary");
+    return true;
+}
 struct ReplotReceipt
 {
     std::string review_digest, previous_digest;
@@ -289,11 +486,63 @@ inline ReplotReceipt parse_replot_receipt(std::string const& body)
     in >> std::ws; require(in.eof(), "unexpected replot receipt data");
     (void)replot_receipt_text(result); return result;
 }
+inline void validate_replot_receipt(ReplotReview const& review, std::string const& review_digest,
+    uint64_t batch, std::string const& previous, ReplotReceipt const& receipt)
+{
+    auto const& plan = review.batches.at(size_t(batch));
+    require(receipt.review_digest == review_digest && receipt.batch == batch && receipt.previous_digest == previous &&
+        receipt.first_candidate == plan.first_source && receipt.candidates == plan.sources,
+        "migration receipt chain differs from the review");
+}
+inline void complete_replot_batch(ReplotReview const& review, ReplotReceipt const& receipt,
+    std::string const& receipt_digest, ReplotJournal& state)
+{
+    validate_replot_progress(review, state);
+    validate_replot_receipt(review, state.review_digest, state.batch, state.receipt_digest, receipt);
+    require(state.ready && *state.ready == receipt.replacement && replot_digest(receipt_digest) &&
+        std::all_of(state.retirements.begin(), state.retirements.end(), [](auto value) { return value.state == ReplotRetirement::retired; }),
+        "migration batch cannot complete before its replacement and retirements");
+    state.retired_prefix += state.retirements.size(); ++state.batch; state.receipt_digest = receipt_digest;
+    state.verified_stage.reset(); state.published.reset(); state.ready.reset(); state.retirements.clear();
+    if (state.batch < review.batches.size()) state.retirements.resize(size_t(review.batches[size_t(state.batch)].sources));
+}
+// Local convenience defaults are separate from portable observations and never
+// replace reader, resource, native-object or journal authorization checks.
+struct ReplotLocalBindings
+{
+    std::string review_digest, job_id, host, user;
+    std::string adapter, root, executable, profile;
+    std::string policy_digest;
+};
+inline std::string replot_local_bindings_text(ReplotLocalBindings const& local)
+{
+    require(replot_digest(local.review_digest) && replot_digest(local.job_id) && !local.host.empty() && !local.user.empty() &&
+        (local.adapter == "chia" || local.adapter == "gigahorse" || local.adapter == "drchia") &&
+        (local.policy_digest.empty() || replot_digest(local.policy_digest)), "invalid private replot bindings");
+    for (auto const* path : {&local.root, &local.executable, &local.profile})
+        require(path->empty() || file_io::native_path(*path).is_absolute(), "private replot binding paths must be absolute");
+    std::ostringstream out; out << "ordinary-group-replot-local-v1\n" << std::quoted(local.review_digest) << ' '
+        << std::quoted(local.job_id) << ' ' << std::quoted(local.host) << ' ' << std::quoted(local.user) << '\n'
+        << std::quoted(local.adapter) << ' ' << std::quoted(local.root) << ' ' << std::quoted(local.executable) << ' ' << std::quoted(local.profile)
+        << ' ' << std::quoted(local.policy_digest) << '\n';
+    auto result = out.str(); require(result.size() <= 8192, "private replot bindings exceed their allocation allowance"); return result;
+}
+inline ReplotLocalBindings parse_replot_local_bindings(std::string const& body)
+{
+    require(body.size() <= 8192, "private replot bindings exceed their allocation allowance");
+    std::istringstream in(body); std::string version; std::getline(in, version);
+    require(version == "ordinary-group-replot-local-v1", "unsupported private replot bindings version");
+    ReplotLocalBindings result; in >> std::quoted(result.review_digest) >> std::quoted(result.job_id) >> std::quoted(result.host) >> std::quoted(result.user)
+        >> std::quoted(result.adapter) >> std::quoted(result.root) >> std::quoted(result.executable) >> std::quoted(result.profile) >> std::quoted(result.policy_digest);
+    require(bool(in), "incomplete private replot bindings"); in >> std::ws; require(in.eof(), "unexpected private replot binding data");
+    (void)replot_local_bindings_text(result); return result;
+}
 struct ReplotJournalReplica
 {
     std::filesystem::path path;
     std::optional<stream_state::Stamp> published, pending;
     std::string digest, pending_digest;
+    bool available = true;
 };
 struct ReplotJournalSet
 {
@@ -303,7 +552,7 @@ struct ReplotJournalSet
     bool present = false;
 };
 inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path const> directories,
-    std::string const& review_digest, uint64_t memory_limit)
+    std::string const& review_digest, uint64_t memory_limit, bool allow_missing = false)
 {
     require(!directories.empty() && directories.size() <= 1024, "invalid replot replica scope");
     ReplotJournalSet result;
@@ -311,8 +560,10 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
     uint64_t minimum = UINT64_MAX, maximum = 0;
     for (auto const& directory : directories)
     {
-        require(std::filesystem::is_directory(directory), "all replot destinations must be available");
         ReplotJournalReplica replica; replica.path = directory / "grow-replot.plan";
+        replica.available = std::filesystem::is_directory(directory);
+        require(replica.available || allow_missing, "all replot destinations must be available");
+        if (!replica.available) { result.replicas.push_back(std::move(replica)); continue; }
         for (bool pending : {false, true})
         {
             auto const path = pending ? file_io::native_path(file_io::path_text(replica.path) + ".next") : replica.path;
@@ -343,6 +594,26 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
     }
     if (previous) require(valid_replot_revision(*previous, result.state), "invalid replot journal parent transition");
     return result;
+}
+inline bool replot_journals_unchanged(ReplotJournalSet const& saved)
+{
+    try
+    {
+        for (auto const& replica : saved.replicas)
+        {
+            if (std::filesystem::is_directory(replica.path.parent_path()) != replica.available) return false;
+            if (!replica.available) continue;
+            for (bool pending : {false, true})
+            {
+                auto const path = pending ? file_io::native_path(file_io::path_text(replica.path) + ".next") : replica.path;
+                auto const& expected = pending ? replica.pending : replica.published; file_io::Stat info{};
+                if (expected) { if (stream_state::stamp(path) != *expected) return false; }
+                else if (!file_io::inspect_link(path, &info) || errno != ENOENT) return false;
+            }
+        }
+        return true;
+    }
+    catch (std::exception const&) { return false; }
 }
 inline void publish_replot_journals(ReplotJournalSet& saved, ReplotJournal const& state,
     uint64_t memory_limit, std::function<void()> const& check)

@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupFarmResources.hpp"
 #include "host/GroupFarmState.hpp"
+#include "host/GroupFarmMigration.hpp"
 #include "host/GroupOptions.hpp"
 #include "host/ComputeSession.hpp"
 #include "host/GroupStorage.hpp"
@@ -224,6 +225,98 @@ inline uint64_t replot_ready_members(FarmingState const& state, uint64_t ready_f
         }
     }
     require(!ready_files, "migration ready prefix exceeds immutable output assignments"); return result;
+}
+// Forecast only work still required at this exact stopped boundary. Current
+// counts are caller-authoritative after native retirement and fresh complete
+// registry unload checks; this function never guesses an already-retired
+// cohort away. Future whole-cohort reductions retain the ordinary forecast's
+// explicit conditional unload assumption for fully observable inventories.
+inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest const& request, FarmInventory const& inventory,
+    ReplotReview const& review, ReplotJournal const& journal, std::vector<Remaining> remaining, uint64_t ready_members)
+{
+    using namespace resource_detail;
+    validate_replot_review(review); validate_replot_journal(journal);
+    require(journal.batch <= review.batches.size() && remaining.size() <= max_workloads,
+        "remaining replot assessment exceeds its immutable boundary");
+    require(journal.retired_prefix == (journal.batch < review.batches.size() ? review.batches[size_t(journal.batch)].first_source : review.sources.size()),
+        "remaining replot assessment has a different retired source prefix");
+    auto const completed_members = replot_ready_members(review.farm, journal.batch);
+    auto const exposed_members = journal.batch < review.batches.size() && (journal.verified_stage || journal.published || journal.ready) ?
+        replot_ready_members(review.farm, journal.batch + 1) : completed_members;
+    require(ready_members >= completed_members && ready_members <= exposed_members,
+        "remaining replot assessment has an unaudited ready member prefix");
+    std::map<std::string, bool> can_confirm_unload;
+    for (auto const& plot : inventory.plots) if (!plot.alias_of && !(plot.status == "non-plot" && !plot.header_validated && !plot.reason.empty()))
+    {
+        bool const known = plot.header_validated || (!plot.reader_identity.empty() && !plot.reader_version.empty());
+        auto [at, fresh] = can_confirm_unload.emplace(plot.workload_id, known); if (!fresh) at->second = at->second && known;
+    }
+    auto workload = [&](ReplotBatch const& batch, size_t source) -> InventoryPlot const&
+    { return inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source) + source))); };
+    auto reduce = [&](std::vector<Remaining>& counts, InventoryPlot const& plot)
+    {
+        auto at = std::find_if(counts.begin(), counts.end(), [&](auto const& item) { return item.workload == plot.workload_id; });
+        require(at != counts.end() && at->count, "remaining replot forecast lost an active source workload");
+        auto known = can_confirm_unload.find(plot.workload_id);
+        if (at->count > 1 || (known != can_confirm_unload.end() && known->second)) --at->count;
+    };
+    auto const restart_counts = remaining; AssessmentAccumulator accumulation(profile);
+    auto phase = [&](std::vector<Remaining> const& counts, uint64_t ready, bool building, bool verifying, std::string const& name)
+    { for (bool future : {false, true}) accumulation.add(replot_stage(profile, request, counts, ready, building, verifying, future, name)); };
+    phase(remaining, ready_members, false, false, "current-confirmed-boundary-supervision");
+    for (size_t index = size_t(journal.batch); index < review.batches.size(); ++index)
+    {
+        auto const& batch = review.batches[index]; bool const current = index == journal.batch;
+        bool const sealed = current && (journal.verified_stage || journal.published || journal.ready);
+        require(!current || journal.retirements.size() == batch.sources, "remaining replot assessment lacks its exact current retirement ledger");
+        auto const prefix = "remaining-batch-" + std::to_string(index);
+        phase(remaining, ready_members, false, false, prefix + "-conditional-before-retirement");
+        std::vector<size_t> early;
+        if (!sealed)
+        {
+            uint64_t outstanding = 0;
+            if (current) for (size_t source = 0; source < journal.retirements.size(); ++source)
+            {
+                auto const progress = journal.retirements[source];
+                require(progress.state == ReplotRetirement::active || progress.predelete,
+                    "unsealed remaining batch has an unauthorized post-publication retirement");
+                if (progress.predelete)
+                {
+                    outstanding = add(outstanding, workload(batch, source).identity.allocated_bytes);
+                    if (progress.state != ReplotRetirement::retired) early.push_back(source);
+                }
+            }
+            auto selected = select_replot_predeletions(size_t(batch.sources), review.reclaim_before_bytes, outstanding, std::move(early),
+                [&](size_t source)
+                {
+                    bool const active = !current || journal.retirements[source].state == ReplotRetirement::active;
+                    auto const& plot = workload(batch, source);
+                    return ReplotPredeleteCandidate{plot.identity.allocated_bytes, active && plot.identity.links == 1 && !plot.alias_of};
+                }, [&](std::span<size_t const> prospective)
+                {
+                    auto counts = remaining; for (auto source : prospective) reduce(counts, workload(batch, source));
+                    for (bool future : {false, true})
+                        if (!assess_stage(profile, replot_stage(profile, request, counts, ready_members, true, false, future)).feasible ||
+                            !assess_stage(profile, replot_stage(profile, request, counts, ready_members, false, true, future)).feasible) return false;
+                    return true;
+                });
+            early = std::move(selected.sources);
+            for (auto source : early) reduce(remaining, workload(batch, source));
+            phase(remaining, ready_members, true, false, prefix + "-conditional-build-after-confirmed-unload");
+            phase(remaining, ready_members, false, true, prefix + "-conditional-verify-after-confirmed-unload");
+        }
+        ready_members = std::max(ready_members, replot_ready_members(review.farm, uint64_t(index) + 1));
+        phase(restart_counts, ready_members, false, false, prefix + "-restart-with-unconfirmed-future-registries");
+        phase(remaining, ready_members, false, false, prefix + "-conditional-replacement-overlap");
+        for (size_t source = 0; source < batch.sources; ++source)
+        {
+            bool const retired = current && journal.retirements[source].state == ReplotRetirement::retired;
+            if (!retired && std::find(early.begin(), early.end(), source) == early.end()) reduce(remaining, workload(batch, source));
+        }
+    }
+    accumulation.add(replot_stage(profile, request, remaining, ready_members, false, false, true,
+        "remaining-final-after-conditional-confirmed-source-unload"));
+    return accumulation.finish();
 }
 inline FarmingAssessment replot_native_farming_assessment(FarmingState const& state, uint64_t memory_limit)
 {

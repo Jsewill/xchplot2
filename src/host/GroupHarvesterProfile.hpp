@@ -306,10 +306,10 @@ inline void validate(FarmingConfig const& config)
 { farming_detail::validate(config, {}); }
 } // namespace profile_detail
 
-inline FarmingProfile read_farming_profile(std::istream& in, uint64_t max_memory_bytes = profile_detail::parsing_memory_bytes)
+namespace profile_detail
 {
-    using namespace profile_detail;
-    auto document = JsonReader(read_text(in, std::min<uint64_t>(profile_bytes, max_memory_bytes / 4)), max_memory_bytes).read();
+inline FarmingProfile parse_farming_profile(Json const& document)
+{
     auto const* nested = field(document, "farming_profile"); auto const& object = nested ? *nested : document;
     FarmingProfile result; auto& c = result.config;
     auto const* schema = field(object, "schema_version");
@@ -377,6 +377,29 @@ inline FarmingProfile read_farming_profile(std::istream& in, uint64_t max_memory
         c.k = result.reader_calibration->k; c.strength = result.reader_calibration->strength;
     }
     validate_reader_calibration_scope(result, c); validate(c); return result;
+}
+} // namespace profile_detail
+inline FarmingProfile read_farming_profile(std::istream& in, uint64_t max_memory_bytes = profile_detail::parsing_memory_bytes)
+{
+    using namespace profile_detail;
+    return parse_farming_profile(JsonReader(read_text(in, std::min<uint64_t>(profile_bytes, max_memory_bytes / 4)), max_memory_bytes).read());
+}
+inline std::optional<FarmingProfile> read_replot_farming_profile(std::istream& in, uint64_t max_memory_bytes = profile_detail::parsing_memory_bytes)
+{
+    using namespace profile_detail;
+    auto const document = JsonReader(read_text(in, std::min<uint64_t>(profile_bytes, max_memory_bytes / 4)), max_memory_bytes).read();
+    // Resource-only migration inputs do not claim an ordinary reader profile.
+    // Their resource policy is validated separately by the migration planner.
+    auto const* kind = field(document, "kind");
+    bool const inventory = kind && kind->kind == Json::string && kind->scalar == "farm-inventory";
+    bool const ordinary = field(document, "farming_profile") || field(document, "model") ||
+        (field(document, "schema_version") && !inventory);
+    auto const* schema = field(document, "schema"); auto const* resources = field(document, "resources");
+    auto const* workloads = field(document, "workloads");
+    bool const raw_resources = schema && schema->kind == Json::number && resources && resources->kind == Json::array &&
+        workloads && workloads->kind == Json::array;
+    if (!ordinary && (field(document, "farm_resources") || raw_resources)) return {};
+    return parse_farming_profile(document);
 }
 inline void write_farming_profile_json(std::ostream& out, FarmingProfile const& value)
 {

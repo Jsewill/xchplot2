@@ -14,6 +14,60 @@ struct FarmServiceBinding
     std::string rpc_host, host, node_id, farmer_node_id;
 };
 struct HarvesterAdapterOptions;
+class RevalidationReaderAllowance
+{
+    using Reader = std::tuple<std::string_view, std::string_view, std::string_view>;
+    FarmInventory const& inventory_;
+    std::map<InventoryPlot const*, ReplotReaderObservation const*> expected_;
+    std::map<std::string_view, std::set<Reader>, std::less<>> readers_;
+public:
+    static uint64_t memory_bound(FarmInventory const& inventory, std::span<ReplotReaderObservation const> observations,
+        std::span<uint64_t const> nonactive)
+    {
+        using namespace resource_detail;
+        return add(sizeof(RevalidationReaderAllowance) + 4096, add(multiply(inventory.plots.size(), 256),
+            add(multiply(observations.size(), 128), multiply(nonactive.size(), 128))));
+    }
+    RevalidationReaderAllowance(FarmInventory const& inventory, std::span<ReplotReaderObservation const> observations,
+        std::span<uint64_t const> native_audited_nonactive, InventoryLimits const& limits = {}) : inventory_(inventory)
+    {
+        inventory_detail::require(observations.size() <= inventory.roots.size() && native_audited_nonactive.size() <= inventory.plots.size() &&
+            memory_bound(inventory, observations, native_audited_nonactive) <= limits.memory_bytes, "revalidation reader allowance exceeds its retained grant");
+        std::map<size_t, ReplotReaderObservation const*> roots;
+        for (auto const& observation : observations)
+        {
+            inventory_detail::require(observation.root < inventory.roots.size() && roots.emplace(size_t(observation.root), &observation).second &&
+                (observation.reader == "chia" || observation.reader == "gigahorse" || observation.reader == "drchia") &&
+                !observation.version.empty() && inventory_detail::hex(observation.identity, 32) && !observation.source.empty() && !observation.captured_at.empty(),
+                "invalid or duplicate current revalidation reader observation");
+        }
+        for (auto index : native_audited_nonactive)
+        {
+            inventory_detail::require(index < inventory.plots.size(), "revalidation reader allowance has an invalid native-audited source");
+            auto const& plot = inventory.plots[size_t(index)]; auto at = roots.find(plot.root);
+            inventory_detail::require(at != roots.end() && expected_.emplace(&plot, at->second).second,
+                "native-audited nonactive source lacks a unique current reader observation");
+        }
+        for (auto const& plot : inventory.plots)
+        {
+            if (auto current = expected(plot)) readers_[plot.harvester].emplace(current->identity, current->version, current->reader);
+            else if (!plot.reader_identity.empty()) readers_[plot.harvester].emplace(plot.reader_identity, plot.reader_version, plot.reader);
+        }
+    }
+    FarmInventory const& inventory() const { return inventory_; }
+    ReplotReaderObservation const* expected(InventoryPlot const& plot) const
+    { auto at = expected_.find(&plot); return at == expected_.end() ? nullptr : at->second; }
+    template<class Check> void for_each_reader(std::string const& route, Check check) const
+    {
+        if (route.empty()) for (auto const& [id, readers] : readers_)
+        { (void)id; for (auto const& reader : readers) std::apply(check, reader); }
+        else
+        {
+            if (auto at = readers_.find(""); at != readers_.end()) for (auto const& reader : at->second) std::apply(check, reader);
+            if (auto at = readers_.find(route); at != readers_.end()) for (auto const& reader : at->second) std::apply(check, reader);
+        }
+    }
+};
 class RetirementConfigurationAllowance
 {
     FarmInventory const& inventory_;
@@ -74,6 +128,10 @@ struct HarvesterAdapterOptions
     // Local execution authority, derived only after the private retirement
     // journal has been locked and validated. Never imported from a review.
     RetirementConfigurationAllowance const* retirement = nullptr;
+    // Bound by the caller only after its locked native audit proves these
+    // exact indices are durable nonactive sources. Public mappings alone
+    // never authorize a different reader for an active source.
+    RevalidationReaderAllowance const* revalidation = nullptr;
     // Private operation budget. The caller separately reserves retained
     // catalog/plan memory before offering this additional process/parse grant.
     InventoryLimits limits;
@@ -505,6 +563,7 @@ class Session
     inventory_detail::SourceHandle config_;
     stream_state::Stamp config_stamp_, executable_stamp_;
     std::string config_digest_, reader_identity_;
+    unsigned configured_lookup_workers_ = 0;
     RetirementReaderContext retirement_;
     std::map<std::string, std::unique_ptr<Session>> services_;
 public:
@@ -527,6 +586,7 @@ public:
         require(parsed.workers.has_value() && (parsed.local_rpc || (!options.rpc_host.empty() && parsed.rpc_hostname == options.rpc_host && !options.host.empty())),
             "native farm adapter requires conventional configuration and an explicit host binding for authenticated remote RPC");
         require(options.rpc_host.empty() || parsed.rpc_hostname == options.rpc_host, "configured native RPC host differs from its local service binding");
+        configured_lookup_workers_ = *parsed.workers;
         executable_stamp_ = stream_state::stamp(options.executable);
         auto implementation = implementation_identity(options.executable, options.limits, until_);
         reader_identity_ = stream_state::digest(file_io::path_text(options.executable) + '\n' +
@@ -627,6 +687,7 @@ public:
         return std::string(name(options_.kind)) + ":" + file_io::path_text(options_.executable) + ":config-sha256=" + config_digest_;
     }
     std::string const& reader_identity() const { return reader_identity_; }
+    unsigned configured_lookup_workers() const { return configured_lookup_workers_; }
     RetirementReaderContext const& retirement_context() const { return retirement_; }
     bool matches_reader_identity(std::string_view reviewed) const
     {
@@ -664,6 +725,13 @@ public:
         require(left > 0, "native inventory deadline expired"); result.timeout_ms = std::min(uint64_t(left), options_.limits.timeout_ms); return result;
     }
 };
+inline bool matches_reviewed_reader(Session const& session, HarvesterAdapterOptions const& options,
+    InventoryPlot const& plot, std::string const& version)
+{
+    if (options.revalidation) if (auto current = options.revalidation->expected(plot))
+        return session.matches_reader_identity(current->identity) && current->version == version && current->reader == name(options.kind);
+    return session.matches_reader_identity(plot.reader_identity) && plot.reader_version == version && plot.reader == name(options.kind);
+}
 inline NetworkProjection projection(Session& session)
 {
     NetworkProjection result; result.source = session.source(); result.captured_at = inventory_detail::timestamp();
@@ -1028,6 +1096,14 @@ public:
     FarmInventory const& inventory() const { return inventory_; }
     void require_reader(adapter_detail::Session& session, HarvesterAdapterOptions const& options, std::string const& version) const
     {
+        if (options.revalidation)
+        {
+            inventory_detail::require(&options.revalidation->inventory() == &inventory_, "revalidation reader allowance belongs to another catalog");
+            options.revalidation->for_each_reader(options.harvester, [&](std::string_view identity, std::string_view observed_version, std::string_view reader)
+            { inventory_detail::require(session.matches_reader_identity(identity) && observed_version == version && reader == adapter_detail::name(options.kind),
+                "current revalidation reader implementation changed since review"); });
+            return;
+        }
         auto check = [&](auto const& readers)
         {
             for (auto const& [identity, observed_version, reader] : readers)
@@ -1195,6 +1271,14 @@ inline void require_reviewed_reader(Session& session, FarmInventory const& inven
     {
         inventory_detail::require(&index->inventory() == &inventory, "registry scope index belongs to another catalog");
         index->require_reader(session, options, version); return;
+    }
+    if (options.revalidation)
+    {
+        inventory_detail::require(&options.revalidation->inventory() == &inventory, "revalidation reader allowance belongs to another catalog");
+        options.revalidation->for_each_reader(options.harvester, [&](std::string_view identity, std::string_view observed_version, std::string_view reader)
+        { inventory_detail::require(session.matches_reader_identity(identity) && observed_version == version && reader == name(options.kind),
+            "current revalidation reader implementation changed since review"); });
+        return;
     }
     for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() &&
         (options.harvester.empty() || plot.harvester.empty() || options.harvester == plot.harvester))
@@ -1416,20 +1500,28 @@ inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions 
     session.unchanged();
 }
 } // namespace adapter_detail
-inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, bool complete_registry = true)
+inline void observe_harvester_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, bool complete_registry = true,
+    std::vector<ResourcePreparationFact>* preparation = nullptr)
 {
     adapter_detail::Session session(options);
     auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
     auto response = session.rpc(AdapterOperation::harvester_plots);
     adapter_detail::observe_inventory(inventory, options, session, version, response, complete_registry);
     record_retirement_reader(inventory, session);
+    if (preparation)
+    {
+        inventory_detail::require(preparation->size() < max_preparation_entries, "too many reader configuration observations");
+        preparation->push_back({"readers[" + session.reader_identity() + "].configured_num_threads", std::to_string(session.configured_lookup_workers()),
+            "observed", session.source(), "Selected config harvester.num_threads; running service may need restart. Not an OS CPU cap, whole-service queue bound or spare-resource grant."});
+    }
 }
-inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTable const& table)
+inline void observe_harvester_inventory(FarmInventory& inventory, FarmAdapterTable const& table,
+    std::vector<ResourcePreparationFact>* preparation = nullptr)
 {
     std::set<std::string> selected;
     for (auto& plot : inventory.plots)
     { auto options = resolve_source(table, inventory.roots.at(plot.root), plot); plot.harvester = options.harvester; selected.insert(options.harvester); }
-    for (auto const& route : table.routes) if (selected.contains(route.id)) observe_harvester_inventory(inventory, route.options);
+    for (auto const& route : table.routes) if (selected.contains(route.id)) observe_harvester_inventory(inventory, route.options, true, preparation);
     auto const target = resolve_target(table);
     if (!selected.contains(table.target_route)) observe_registry_scope(target, inventory);
     inventory.network = observe_network_projection(target, &inventory);
@@ -1461,12 +1553,14 @@ public:
         for (auto index : sources)
         {
             inventory_detail::require(index < inventory.plots.size(), "source snapshot index is invalid");
-            auto plot = inventory.plots[size_t(index)];
+            auto const& reviewed = inventory.plots[size_t(index)]; auto plot = reviewed;
             inventory_detail::require(plot.root < inventory.roots.size() && plot.identity.links == 1 && !plot.alias_of &&
                 (options.harvester.empty() || plot.harvester.empty() || options.harvester == plot.harvester),
                 "source snapshot crosses a reviewed route or lacks unique native identity");
             auto const key = std::pair(current_.roots[plot.root].path, plot.relative_path);
             inventory_detail::require(paths_.emplace(key, current_.plots.size()).second, "source snapshot repeats a path");
+            if (options.revalidation) if (auto current = options.revalidation->expected(reviewed))
+            { plot.reader = current->reader; plot.reader_version = current->version; plot.reader_identity = current->identity; }
             plot.native_identified = false; current_.plots.push_back(std::move(plot));
         }
         uint64_t index_bytes = 0;
@@ -1497,8 +1591,7 @@ public:
         if (!current.native_identified && reviewed.header_validated && reviewed.algorithm == PlotAlgorithm::pos1 &&
             (reviewed.container == PlotContainer::chiapos_v1 || reviewed.container == PlotContainer::chiapos_v2))
         {
-            inventory_detail::require(reviewed.reader_identity.empty() || (session_.matches_reader_identity(reviewed.reader_identity) &&
-                reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind)),
+            inventory_detail::require(reviewed.reader_identity.empty() || adapter_detail::matches_reviewed_reader(session_, options_, reviewed, version_),
                 "previously observed source reader/configuration changed since review");
             auto observed = observe_inventory_file(root, reviewed.relative_path, session_.remaining_limits());
             inventory_detail::require(observed.identity == reviewed.identity && observed.header_validated && observed.algorithm == reviewed.algorithm &&
@@ -1516,7 +1609,7 @@ public:
                 (reviewed.pool_public_key.empty() != reviewed.pool_contract_puzzle_hash.empty()) &&
                 adapter_detail::legacy_id_from_loaded_key(reviewed.plot_public_key,
                     reviewed.pool_public_key.empty() ? reviewed.pool_contract_puzzle_hash : reviewed.pool_public_key) == reviewed.plot_id &&
-                session_.matches_reader_identity(reviewed.reader_identity) && reviewed.reader_version == version_ && reviewed.reader == adapter_detail::name(options_.kind),
+                adapter_detail::matches_reviewed_reader(session_, options_, reviewed, version_),
                 "unloaded source lacks the exact previously reviewed reader metadata");
             (void)recheck_inventory_source(root, reviewed, session_.remaining_limits());
             auto observed = reviewed;
@@ -1544,6 +1637,204 @@ public:
         session_.unchanged(); finished_ = true;
     }
 };
+namespace adapter_detail
+{
+inline void require_source_resource_binding(HarvesterAdapterOptions const& options, InventoryPlot const& plot)
+{
+    // Before reader identification an opaque row's host is native file
+    // locality, not an observed remote decoder binding. Supported headers and
+    // previously identified rows retain every known physical source label.
+    if (plot.header_validated || plot.native_identified || !plot.reader_identity.empty())
+    {
+        auto const host = options.host.empty() ? profile_detail::host_name() : options.host;
+        inventory_detail::require(plot.host.empty() || plot.host == host, "revalidation changed an original source physical host binding");
+    }
+    inventory_detail::require(plot.solver.empty() || plot.solver == options.solver, "revalidation changed an original source solver binding");
+}
+inline void require_matching_catalog_metadata(Json const& native, InventoryPlot const& reviewed)
+{
+    using namespace inventory_detail;
+    auto const id = hex_string(required_field(native, "plot_id"), 32);
+    require(reviewed.plot_id.empty() || id == reviewed.plot_id, "fresh reader changed an original plot identity");
+    if (reviewed.identity.stamp.inode)
+        require(integer(native, "file_size") == reviewed.identity.stamp.bytes && integer(native, "time_modified") == uint64_t(reviewed.identity.stamp.mtime),
+            "fresh reader metadata differs from the original native file");
+    auto const size = integer(native, "size"); require(size <= 255, "fresh reader returned invalid plot parameters");
+    if (reviewed.algorithm == PlotAlgorithm::pos1 && reviewed.k) require(size == reviewed.k, "fresh reader changed original PoS1 parameters");
+    if (reviewed.algorithm == PlotAlgorithm::pos2 && reviewed.strength) require(size == uint64_t(0x80 | reviewed.strength), "fresh reader changed original PoS2 parameters");
+    if (auto const* compression = profile_detail::field(native, "compression_level"))
+    {
+        if (reviewed.header_validated || reviewed.native_identified)
+            require(profile_detail::integer(*compression) == reviewed.compression_level, "fresh reader changed original compression metadata");
+    }
+    else require(!reviewed.native_identified || reviewed.header_validated || !reviewed.compression_level,
+        "fresh reader cannot support the original opaque compression metadata");
+    for (auto const& [name, value, bytes] : {std::tuple{"plot_public_key", &reviewed.plot_public_key, size_t(48)},
+        std::tuple{"pool_public_key", &reviewed.pool_public_key, size_t(48)},
+        std::tuple{"pool_contract_puzzle_hash", &reviewed.pool_contract_puzzle_hash, size_t(32)}})
+    {
+        auto const* field = profile_detail::field(native, name);
+        if (!value->empty()) require(field && field->kind != Json::null && hex_string(*field, bytes) == *value, "fresh reader changed an original public key or pool route");
+        else if (name != std::string_view("plot_public_key") && (!reviewed.pool_public_key.empty() || !reviewed.pool_contract_puzzle_hash.empty()))
+            require(!field || field->kind == Json::null, "fresh reader added an incompatible original pool route");
+    }
+    if (reviewed.algorithm == PlotAlgorithm::pos2) if (auto const* members = profile_detail::field(native, "group_size"))
+        require(profile_detail::integer(*members) == reviewed.members, "fresh reader changed an original group membership");
+}
+} // namespace adapter_detail
+inline uint64_t replot_reader_refresh_memory_bound(FarmInventory const& inventory)
+{
+    using namespace resource_detail;
+    return add(4096, add(multiply(inventory.plots.size(), 256), multiply(inventory.roots.size(), 4096)));
+}
+namespace adapter_detail
+{
+struct ReplotReaderSnapshot
+{
+    std::vector<ReplotReaderObservation> readers;
+    std::vector<RetirementReaderContext> retirement;
+    NetworkProjection network;
+};
+// Builder refresh and successor activation share the complete native catalog
+// comparison. Validation retains the caller's native-audited allowances and
+// requires reviewed tuples; a fresh builder observation clears those aliases.
+inline ReplotReaderSnapshot observe_replot_reader_observations(FarmInventory const& inventory,
+    FarmAdapterTable const& table, HarvesterAdapterOptions const& fallback, std::span<uint64_t const> native_audited_nonactive,
+    PublishedPlotAllowance const& published, RegistryScopeIndex const* scope, uint64_t working_memory_bytes, bool require_reviewed)
+{
+    using namespace inventory_detail;
+    require(replot_reader_refresh_memory_bound(inventory) <= (working_memory_bytes ? working_memory_bytes : fallback.limits.memory_bytes),
+        "reader refresh exceeds its caller-reserved working memory grant");
+    if (scope) require(&scope->inventory() == &inventory, "reader refresh registry index belongs to another catalog");
+    std::vector<bool> nonactive(inventory.plots.size(), false), loaded(inventory.plots.size(), false);
+    for (auto index : native_audited_nonactive)
+    { require(index < nonactive.size() && !nonactive[size_t(index)], "reader refresh has an invalid or duplicate native-audited source"); nonactive[size_t(index)] = true; }
+    struct Route { HarvesterAdapterOptions options; std::vector<size_t> roots, plots; bool target = false; };
+    std::map<std::string, Route> routes; std::vector<std::string> root_routes(inventory.roots.size());
+    auto clean = [require_reviewed](HarvesterAdapterOptions options)
+    { if (!require_reviewed) { options.retirement = nullptr; options.revalidation = nullptr; } return options; };
+    auto target = clean(table.routes.empty() ? fallback : resolve_target(table, inventory.network.target_route));
+    require(inventory.network.target_route.empty() || target.harvester == inventory.network.target_route, "revalidation changed the target route");
+    routes.emplace(target.harvester, Route{target, {}, {}, true});
+    auto nonplot = [](InventoryPlot const& plot) { return plot.status == "non-plot" && !plot.header_validated && !plot.reason.empty(); };
+    std::vector<bool> data_roots(inventory.roots.size(), false);
+    for (auto const& plot : inventory.plots) if (!nonplot(plot)) data_roots.at(plot.root) = true;
+    for (size_t root = 0; root < inventory.roots.size(); ++root)
+    {
+        if (!data_roots[root]) continue;
+        InventoryPlot probe; probe.root = root;
+        auto options = clean(table.routes.empty() ? fallback : resolve_source(table, inventory.roots[root], probe));
+        root_routes[root] = options.harvester;
+        auto [at, fresh] = routes.emplace(options.harvester, Route{options, {}, {}, false});
+        (void)fresh; at->second.roots.push_back(root);
+    }
+    for (size_t i = 0; i < inventory.plots.size(); ++i)
+    {
+        auto const& plot = inventory.plots[i]; if (nonplot(plot)) continue;
+        auto& route = routes.at(root_routes.at(plot.root));
+        require(plot.harvester.empty() || plot.harvester == route.options.harvester, "revalidation changed an original source route");
+        adapter_detail::require_source_resource_binding(route.options, plot);
+        route.plots.push_back(i);
+    }
+    std::vector<ReplotReaderObservation> observations; std::vector<RetirementReaderContext> retirement;
+    std::string target_identity, target_version;
+    for (auto const& [id, route] : routes)
+    {
+        (void)id; auto const& options = route.options; adapter_detail::Session session(options);
+        auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
+        if (require_reviewed)
+        {
+            require_reviewed_reader(session, inventory, options, version, scope);
+            if (route.target) require(session.matches_reader_identity(inventory.network.reader_identity) && version == inventory.network.reader_version,
+                "current target reader differs from the reviewed successor");
+        }
+        auto response = session.rpc(AdapterOperation::harvester_plots);
+        auto const allowance = route.target ? published : PublishedPlotAllowance{};
+        adapter_detail::require_registry_scope(session, response, inventory, options, allowance, scope);
+        auto const registry = adapter_detail::registry_identity(response);
+        std::map<std::pair<size_t, std::string_view>, size_t> paths;
+        for (auto index : route.plots) paths.emplace(std::pair(inventory.plots[index].root, std::string_view(inventory.plots[index].relative_path)), index);
+        for (auto const& native : required_field(response, "plots").items)
+        {
+            auto filename = string(native, "filename");
+#ifdef _WIN32
+            std::replace(filename.begin(), filename.end(), '\\', '/');
+#endif
+            for (auto root : route.roots)
+            {
+                auto prefix = inventory.roots[root].path;
+#ifdef _WIN32
+                std::replace(prefix.begin(), prefix.end(), '\\', '/');
+#endif
+                bool const separator = !prefix.empty() && (prefix.back() == '/' || prefix.back() == '\\'); size_t const offset = prefix.size() + !separator;
+                if (filename.size() <= offset || filename.compare(0, prefix.size(), prefix) || (!separator && filename[prefix.size()] != '/')) continue;
+                auto at = paths.find({root, std::string_view(filename).substr(offset)}); if (at == paths.end()) continue;
+                require(!loaded[at->second], "fresh reader repeats original source metadata"); loaded[at->second] = true;
+                adapter_detail::require_matching_catalog_metadata(native, inventory.plots[at->second]);
+            }
+        }
+        for (auto index : route.plots)
+        {
+            auto const& plot = inventory.plots[index];
+            require(nonactive[index] || !plot.native_identified || plot.header_validated || loaded[index],
+                "active opaque source lacks fresh matching reader metadata; reload its original reader before revalidation");
+        }
+        require(adapter_detail::version(session.rpc(AdapterOperation::harvester_version)) == version, "reader version changed during revalidation");
+        auto final = session.rpc(AdapterOperation::harvester_plots);
+        adapter_detail::require_registry_scope(session, final, inventory, options, allowance, scope);
+        require(adapter_detail::registry_identity(final) == registry, "reader catalog changed during revalidation"); session.unchanged();
+        auto const captured_at = timestamp();
+        for (auto root : route.roots) observations.push_back({uint64_t(root), adapter_detail::name(options.kind), version, session.reader_identity(), session.source(), captured_at});
+        auto const& context = session.retirement_context();
+        if (!context.retirement_identity.empty() && std::none_of(retirement.begin(), retirement.end(), [&](auto const& old) { return old.reader_identity == context.reader_identity; })) retirement.push_back(context);
+        if (route.target) { target_identity = session.reader_identity(); target_version = version; }
+    }
+    FarmInventory network_context; auto network = observe_network_projection(target, &network_context); network.target_route = inventory.network.target_route;
+    auto const& prior = inventory.network;
+    require(network.available && network.reader_identity == target_identity && network.reader_version == target_version && network.network == prior.network &&
+        network.genesis_challenge == prior.genesis_challenge && network.hard_fork2_height == prior.hard_fork2_height && network.min_strength == prior.min_strength &&
+        network.max_strength == prior.max_strength && network.plot_size == prior.plot_size, "revalidation changed original network/consensus parameters or the current target reader");
+    if (require_reviewed) require(network.version == prior.version, "current full-node version differs from the reviewed successor");
+    for (auto const& context : network_context.retirement_readers) if (std::none_of(retirement.begin(), retirement.end(), [&](auto const& old) { return old.reader_identity == context.reader_identity; })) retirement.push_back(context);
+    return {std::move(observations), std::move(retirement), std::move(network)};
+}
+} // namespace adapter_detail
+// The caller first audits EVERY original native object/path under its stopped
+// job locks, including protected rows and durable claim/absence names. This
+// helper only refreshes observations in a provisional successor; it grants no
+// claim, unlink, reservation release or unchecked identification capability.
+// Borrowed registry indexes must be rebuilt after the active tuples change.
+inline std::vector<ReplotReaderObservation> refresh_replot_reader_observations(FarmInventory& inventory,
+    FarmAdapterTable const& table, HarvesterAdapterOptions const& fallback, std::span<uint64_t const> native_audited_nonactive,
+    PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr, uint64_t working_memory_bytes = 0)
+{
+    auto snapshot = adapter_detail::observe_replot_reader_observations(inventory, table, fallback, native_audited_nonactive,
+        published, scope, working_memory_bytes, false);
+    std::vector<bool> nonactive(inventory.plots.size(), false);
+    for (auto index : native_audited_nonactive) nonactive[size_t(index)] = true;
+    std::map<size_t, ReplotReaderObservation const*> current;
+    for (auto const& observation : snapshot.readers) current.emplace(size_t(observation.root), &observation);
+    for (size_t i = 0; i < inventory.plots.size(); ++i) if (!nonactive[i])
+    {
+        auto& plot = inventory.plots[i]; if (plot.status == "non-plot" && !plot.header_validated && !plot.reason.empty()) continue;
+        auto const& observation = *current.at(plot.root);
+        // Preserve entirely unknown/protected identification as unknown.
+        if (!plot.reader_identity.empty() || plot.header_validated)
+        { plot.reader = observation.reader; plot.reader_version = observation.version; plot.reader_identity = observation.identity; }
+    }
+    inventory.network = std::move(snapshot.network); inventory.retirement_readers = std::move(snapshot.retirement);
+    return std::move(snapshot.readers);
+}
+// Before activating a public successor, repeat the builder's complete catalog
+// check against the native-audited origin. This is read-only and preserves
+// legitimate removal-only configuration and nonactive-reader allowances.
+inline void validate_replot_reader_observations(FarmInventory const& inventory,
+    FarmAdapterTable const& table, HarvesterAdapterOptions const& fallback, std::span<uint64_t const> native_audited_nonactive,
+    PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr, uint64_t working_memory_bytes = 0)
+{
+    (void)adapter_detail::observe_replot_reader_observations(inventory, table, fallback, native_audited_nonactive,
+        published, scope, working_memory_bytes, true);
+}
 inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
     std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr)
 {
@@ -1567,8 +1858,8 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
             auto const& p = inventory.plots[size_t(index)];
             bool const header_only = p.reader_identity.empty() && p.header_validated && p.algorithm == PlotAlgorithm::pos1 &&
                 (p.container == PlotContainer::chiapos_v1 || p.container == PlotContainer::chiapos_v2);
-            inventory_detail::require(header_only || (session.matches_reader_identity(p.reader_identity) && p.reader_version == version &&
-                p.reader == adapter_detail::name(options.kind)), "source registry reader implementation changed or was not reviewed; retain old reservations");
+            inventory_detail::require(header_only || adapter_detail::matches_reviewed_reader(session, options, p, version),
+                "source registry reader implementation changed or was not reviewed; retain old reservations");
         }
         auto response = session.rpc(AdapterOperation::harvester_plots); auto const& plots = inventory_detail::required_field(response, "plots");
         inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files,

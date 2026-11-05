@@ -148,6 +148,23 @@ struct Profile
     GatePolicy gate;
     NativeEnvelope native;
 };
+// Preparation is guidance beside the policy, never admission authority. Keep
+// observations separate so an OS snapshot or reader sample cannot become an
+// operator-declared capacity, queue bound or full-proof reservation.
+struct ResourcePreparationFact
+{
+    std::string path, value, basis, source, scope;
+};
+struct ResourcePreparationNeed
+{
+    std::string group, path, action;
+};
+struct ResourcePreparation
+{
+    std::vector<ResourcePreparationFact> facts;
+    std::vector<ResourcePreparationNeed> missing;
+};
+inline constexpr size_t max_preparation_entries = 4096;
 struct Stage
 {
     std::string name;
@@ -838,6 +855,158 @@ inline uint64_t profile_memory(Profile const& profile)
     bytes = add(bytes, multiply(native.cohorts.capacity(), sizeof(NativeCohort)));
     for (auto const& c : native.cohorts) { demands(c.new_farming); demands(c.proof_reserve); }
     return bytes;
+}
+inline uint64_t resource_preparation_memory(ResourcePreparation const& value)
+{
+    using namespace resource_detail;
+    uint64_t bytes = add(sizeof(value), add(multiply(value.facts.capacity(), sizeof(ResourcePreparationFact)),
+        multiply(value.missing.capacity(), sizeof(ResourcePreparationNeed))));
+    auto string = [&](std::string const& text) { bytes = add(bytes, add(text.capacity(), 1)); };
+    for (auto const& fact : value.facts)
+        for (auto const* field : {&fact.path, &fact.value, &fact.basis, &fact.source, &fact.scope}) string(*field);
+    for (auto const& need : value.missing)
+        for (auto const* field : {&need.group, &need.path, &need.action}) string(*field);
+    return bytes;
+}
+inline void validate_resource_preparation(ResourcePreparation const& value)
+{
+    using namespace resource_detail;
+    require(value.facts.size() <= max_preparation_entries && value.missing.size() <= max_preparation_entries,
+        "resource preparation report exceeds its entry bound");
+    auto field_text = [&](std::string const& value)
+    { require(!value.empty() && value.size() <= 4096, "invalid resource preparation text"); };
+    for (auto const& fact : value.facts)
+    {
+        for (auto const* field : {&fact.path, &fact.value, &fact.source, &fact.scope}) field_text(*field);
+        require(fact.basis == "observed" || fact.basis == "declared" || fact.basis == "unknown",
+            "unsupported resource preparation provenance");
+    }
+    for (auto const& need : value.missing)
+        for (auto const* field : {&need.group, &need.path, &need.action}) field_text(*field);
+}
+// A checklist of absent declarations, not a second feasibility model. The
+// normal review still binds the concrete execution and assesses every stage.
+inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
+{
+    using namespace resource_detail;
+    validate(profile); Graph graph(profile); ResourcePreparation result;
+    auto need = [&](bool absent, std::string group, std::string path, std::string action)
+    { if (absent) { require(result.missing.size() < max_preparation_entries, "too many missing resource declarations");
+        result.missing.push_back({std::move(group), std::move(path), std::move(action)}); } };
+    for (size_t i = 0; i < profile.resources.size(); ++i)
+    {
+        auto const& resource = profile.resources[i];
+        need(!resource.capacity_known, "physical-capacity", "farm_resources.resources[" + std::to_string(i) + "]",
+            "Declare capacity and capacity_known for " + resource.id + "; bytes for memory, offered parallel lanes otherwise. Observed availability is not a grant.");
+    }
+    for (size_t i = 0; i < profile.workloads.size(); ++i)
+    {
+        auto const& workload = profile.workloads[i]; auto const path = "farm_resources.workloads[" + std::to_string(i) + "]";
+        need(workload.cost == CostKind::unknown || !workload.bounded || !workload.scope_complete,
+            "existing-services", path, "For " + workload.id + ", declare cost (reservation or serialized), bounded and scope_complete only after covering all services, queues, resident/transient memory and full proofs.");
+        need(workload.uses.empty(), "existing-services", path + ".uses", "Map this workload's physical CPU, memory, storage, solver and any network/GPU resources; include shared services.");
+        auto unknown = [](std::string const& value) { return value.empty() || value == "unknown"; };
+        need(unknown(workload.format) || workload.format.ends_with("/unknown") || unknown(workload.decoder) ||
+            unknown(workload.decoder_version) || unknown(workload.backend) || unknown(workload.pool_difficulty) ||
+            unknown(workload.source) || workload.source == "inventory-template", "existing-services", path,
+            "Supply format, decoder, decoder_version, backend, pool_difficulty and source for the actual cost envelope. Unknown/template labels and header-container versions do not establish the running decoder's scope.");
+        need(workload.plot_count && (!workload.quality_burst || !workload.proof_burst || !workload.future_quality_burst ||
+            !workload.future_proof_burst || !workload.period_us || !workload.deadline_us), "arrival-bounds", path,
+            "Declare quality_burst, proof_burst, future_quality_burst, future_proof_burst, period_us and deadline_us for the complete active population, including future filters.");
+        need(workload.cost == CostKind::reservation && !workload.response_tail_us, "existing-services", path + ".response_tail_us",
+            "Declare the complete reserved service response bound; opaque reservations remain charged after source retirement.");
+        bool missing_service = false;
+        for (auto const& use : workload.uses)
+        {
+            auto const kind = graph.resources[graph.find(use.resource)].kind;
+            missing_service = missing_service || (workload.cost == CostKind::serialized && !memory(kind) &&
+                (!use.required_units || (!use.quality_us && !use.proof_us)));
+        }
+        need(missing_service, "service-bounds", path + ".uses",
+            "Each serialized service entry needs required_units and quality_us/proof_us as whole-request bounds; blocking_us covers the complete carried-in queue, not sampled latency. Memory entries use bytes.");
+    }
+    auto const& native = profile.native; std::string const path = "farm_resources.native";
+    need(!native.bounded || !native.scope_complete || !native.covers_future_filter || !native.phase_totals_include_controller,
+        "replacement-scope", path, "Review bounded, scope_complete, covers_future_filter and phase_totals_include_controller for the entire replacement farm, controller and foreign services.");
+    need(!native.k || !native.strength || native.host.empty() || native.reader.empty() || native.backend.empty() || native.engine.empty(),
+        "replacement-scope", path, "Set k, strength, host, reader, backend and engine to the intended replacement execution; observed reader provenance does not select construction settings.");
+    need(!native.max_ram_bytes || !native.max_cpu_threads || !native.max_batch_members || !native.max_group_members ||
+        !native.max_construction_us || !native.max_verification_us, "whole-file-bounds", path,
+        "Declare max_ram_bytes, max_cpu_threads, max_batch_members, max_group_members, max_construction_us and max_verification_us. Bounds cover a whole output file and its proof verification, not one batch or a timeout sample.");
+    need(native.output_resources.empty(), "physical-bindings", path + ".output_resources",
+        "Map every intended output filesystem to its actual storage resource; reuse drive aliases for physically shared storage.");
+    auto demands = [&](std::vector<Demand> const& values, std::string const& field)
+    {
+        need(values.empty(), "native-demands", field, "Declare complete phase-total CPU/RAM, output I/O and relevant scratch/source/GPU demands, including controller residency; service time and whole carried-in blocking must be bounded.");
+        bool missing_bound = false, cpu = false, ram = false;
+        std::map<std::string, std::set<ResourceKind>> execution_hosts;
+        for (auto const& demand : values)
+        {
+            auto const& resource = graph.resources[graph.find(demand.resource)]; auto const kind = resource.kind;
+            cpu = cpu || kind == ResourceKind::cpu; ram = ram || kind == ResourceKind::host_memory;
+            if (kind == ResourceKind::cpu || kind == ResourceKind::host_memory || kind == ResourceKind::gpu_compute ||
+                kind == ResourceKind::gpu_memory || kind == ResourceKind::solver) execution_hosts[resource.host].insert(kind);
+            bool const absent = !demand.bounded || (memory(kind) ? !demand.resident_units && !demand.transient_units :
+                (!demand.reserved_units && (!demand.required_units || !demand.work_us || !demand.period_us || !demand.deadline_us)));
+            missing_bound = missing_bound || absent;
+        }
+        need(missing_bound, "native-demands", field,
+            "Each entry needs bounded and a positive memory footprint or service reservation/work envelope; work needs required_units, work_us, period_us and deadline_us. Samples do not establish worst-case service or queue bounds.");
+        bool missing_host = !values.empty() && (!cpu || !ram);
+        for (auto const& [host, kinds] : execution_hosts)
+        { (void)host; missing_host = missing_host || !kinds.contains(ResourceKind::cpu) || !kinds.contains(ResourceKind::host_memory); }
+        need(missing_host, "physical-bindings", field, "Include CPU and host-memory demands on every physical execution host used by this phase; solver/GPU work also requires its host CPU and RAM scope.");
+    };
+    demands(native.construction, path + ".construction"); demands(native.verification, path + ".verification");
+    demands(native.supervision, path + ".supervision");
+    need(native.cohorts.empty(), "farming-and-proofs", path + ".cohorts",
+        "Declare increasing max_members cohorts, each with complete new_farming and separate proof_reserve demands for the harvester/farmer/full node/solver. Quality calibration cannot supply a full-proof reserve.");
+    for (size_t i = 0; i < native.cohorts.size(); ++i)
+    {
+        auto const cohort = path + ".cohorts[" + std::to_string(i) + "]";
+        demands(native.cohorts[i].new_farming, cohort + ".new_farming"); demands(native.cohorts[i].proof_reserve, cohort + ".proof_reserve");
+        need(!native.cohorts[i].proof_reserve.empty() && std::none_of(native.cohorts[i].proof_reserve.begin(), native.cohorts[i].proof_reserve.end(), [&](auto const& demand)
+            { return !memory(graph.resources[graph.find(demand.resource)].kind) && (demand.work_us || demand.reserved_units); }),
+            "farming-and-proofs", cohort + ".proof_reserve", "A memory allowance alone does not reserve full-proof service. Declare complete solver work or an opaque service reservation on its physical execution resources.");
+    }
+    need(native.backend == "gpu" && (native.gpu_compute_resource.empty() || native.gpu_memory_resource.empty() ||
+        !native.max_gpu_bytes || !native.standing_gpu_bytes), "gpu-bindings", path,
+        "Bind gpu_compute_resource and gpu_memory_resource to the physical device identity; declare max_gpu_bytes and standing_gpu_bytes. OS/driver observations do not grant spare GPU capacity or preemption.");
+    validate_resource_preparation(result); return result;
+}
+inline void write_resource_preparation_json(std::ostream& out, ResourcePreparation const& value)
+{
+    validate_resource_preparation(value);
+    auto quote = [&](std::string const& text) { pos2gpu::write_json_string(out, text); };
+    out << "{\"assessment_required\":true,\"facts\":["; bool comma = false;
+    for (auto const& fact : value.facts)
+    {
+        if (comma) out << ','; comma = true; out << "{\"path\":"; quote(fact.path); out << ",\"value\":"; quote(fact.value);
+        out << ",\"basis\":"; quote(fact.basis); out << ",\"source\":"; quote(fact.source); out << ",\"scope\":"; quote(fact.scope); out << '}';
+    }
+    out << "],\"missing\":["; comma = false;
+    for (auto const& need : value.missing)
+    {
+        if (comma) out << ','; comma = true; out << "{\"group\":"; quote(need.group); out << ",\"path\":"; quote(need.path);
+        out << ",\"action\":"; quote(need.action); out << '}';
+    }
+    out << "]}";
+}
+inline ResourcePreparation parse_resource_preparation(profile_detail::Json const& object)
+{
+    using namespace profile_detail;
+    auto required = [&](Json const& value, char const* key) -> Json const&
+    { auto const* at = field(value, key); resource_detail::require(at, "missing resource preparation field"); return *at; };
+    resource_detail::require(boolean(required(object, "assessment_required")), "resource preparation cannot grant admission");
+    auto const& facts = required(object, "facts"); auto const& missing = required(object, "missing");
+    resource_detail::require(facts.kind == Json::array && missing.kind == Json::array &&
+        facts.items.size() <= max_preparation_entries && missing.items.size() <= max_preparation_entries,
+        "resource preparation report exceeds its entry bound");
+    ResourcePreparation result;
+    for (auto const& fact : facts.items) result.facts.push_back({text(required(fact, "path")), text(required(fact, "value")),
+        text(required(fact, "basis")), text(required(fact, "source")), text(required(fact, "scope"))});
+    for (auto const& need : missing.items) result.missing.push_back({text(required(need, "group")), text(required(need, "path")), text(required(need, "action"))});
+    validate_resource_preparation(result); return result;
 }
 namespace resource_detail
 {

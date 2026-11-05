@@ -31,7 +31,9 @@ void command_usage(std::string_view command)
         << (command == "grow" ? " FILE [OPTIONS]\n" : " [OPTIONS] [DIR... | PLAN]\n");
     if (command == "plan") std::cout << "       xchplot2 plan --assess-jobs [OPTIONS] PLAN...\n";
     if (command == "plan") std::cout << "       xchplot2 plan --inventory ROOT... [--save-plan inventory.plan]\n"
-        "       xchplot2 plan DEST... --replot inventory.plan [--save-plan migration.plan]\n";
+        "       xchplot2 plan DEST... --replot inventory.plan [--save-plan migration.plan]\n"
+        "       xchplot2 plan --revalidate --from-plan migration.plan --harvester UPDATED_PROFILE --save-plan NEW\n";
+    if (command == "plan" || command == "fill") std::cout << "       xchplot2 " << command << " --status PLAN\n";
 }
 
 void command_help_all(std::string_view command)
@@ -56,6 +58,12 @@ void command_help_all(std::string_view command)
         "  --assess-jobs             plan: assess saved keyless job forecasts under one harvester budget\n"
         "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
         "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
+        "  --replot-source-root ROOT  select an exact inventory root; repeat for more roots\n"
+        "  --replot-exclude-root ROOT  protect an exact inventory root; repeat for more roots\n"
+        "  --replot-max-source-files N  maximum old files selected for this review\n"
+        "  --replot-max-source-bytes SIZE  maximum allocated old-file bytes selected\n"
+        "  --status                 read saved migration progress without plotting or farm RPCs\n"
+        "  --revalidate             plan: save a reviewed successor with an updated resource profile\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
         "  --extend                 add destinations while preserving saved assignments\n"
@@ -154,6 +162,12 @@ void command_help(std::string_view command, bool all)
             "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n"
             "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
             "  --replot INVENTORY       review migration into DEST...; save with --save-plan\n"
+            "  --replot-source-root ROOT  select old files from this exact inventory root\n"
+            "  --replot-exclude-root ROOT  protect old files in this exact inventory root\n"
+            "  --replot-max-source-files N  bound old-file selection for a trial run\n"
+            "  --replot-max-source-bytes SIZE  bound selected allocated old-file bytes\n"
+            "  --status PLAN            inspect saved migration progress\n"
+            "  --revalidate              review a resource-profile successor; use --from-plan and --save-plan\n"
             "  --reclaim-before-bytes SIZE  physical bytes retired before replacement readiness\n";
     else
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
@@ -163,6 +177,7 @@ void command_help(std::string_view command, bool all)
             "Run fill -r from the current member directory to resume without a path.\n"
             "New jobs require a farmer key and one pool source; saved jobs restore their keys.\n\n"
             "  -F, --from-plan FILE      execute a saved plan (also accepts positional PLAN)\n"
+            "  --status PLAN            inspect saved migration progress without plotting\n"
             "  -r, --resume              recover the whole saved job through any member\n"
             "  --extend                  add destinations to a saved job\n"
             "  --plan-only               preview without plotting\n"

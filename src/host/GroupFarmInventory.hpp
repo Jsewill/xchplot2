@@ -72,6 +72,13 @@ struct RetirementReaderContext
     std::string reader_identity, retirement_identity;
     std::vector<RetirementReaderConfiguration> configurations;
 };
+// A successor review's current route snapshot. This never replaces the origin
+// identification provenance of an already claimed or retired source file.
+struct ReplotReaderObservation
+{
+    uint64_t root = 0;
+    std::string reader, version, identity, source, captured_at;
+};
 struct FarmInventory
 {
     unsigned version = 1;
@@ -83,6 +90,7 @@ struct FarmInventory
     // source directories. Older catalogs retain their strict reader identity.
     std::vector<RetirementReaderContext> retirement_readers;
     std::optional<Profile> resource_template;
+    std::optional<ResourcePreparation> resource_preparation;
     bool complete = false;
 };
 namespace inventory_detail
@@ -257,6 +265,7 @@ inline uint64_t memory(FarmInventory const& value)
         &value.network.target_route, &value.network.reader_version, &value.network.reader_identity,
         &value.network.farmer_version, &value.network.solver_version, &value.network.service_status}) charge(*s);
     if (value.resource_template) bytes += profile_memory(*value.resource_template);
+    if (value.resource_preparation) bytes = resource_detail::add(bytes, resource_preparation_memory(*value.resource_preparation));
     for (auto const& p : value.plots) bytes += plot_memory(p) - sizeof(p);
     bytes += value.retirement_readers.capacity() * sizeof(RetirementReaderContext);
     for (auto const& reader : value.retirement_readers)
@@ -372,6 +381,7 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
         &v.network.source, &v.network.version, &v.network.captured_at, &v.network.target_route, &v.network.reader_version, &v.network.reader_identity,
         &v.network.farmer_version, &v.network.solver_version, &v.network.service_status}) bounded_text(*text);
     require(!v.network.available || (!v.network.network.empty() && hex(v.network.genesis_challenge, 32)), "invalid inventory network projection");
+    if (v.resource_preparation) validate_resource_preparation(*v.resource_preparation);
     require(v.retirement_readers.size() <= limits.max_roots, "inventory retirement reader count exceeds its bound");
     std::set<std::string> readers;
     for (auto const& reader : v.retirement_readers)
@@ -541,6 +551,7 @@ inline void write_farm_inventory_json(std::ostream& destination, FarmInventory c
         out << ']';
     }
     if (v.resource_template) { out << ",\"farm_resources\":"; write_profile_json(out, *v.resource_template); }
+    if (v.resource_preparation) { out << ",\"resource_preparation\":"; write_resource_preparation_json(out, *v.resource_preparation); }
     out << '}'; inventory_detail::require(bool(out), "cannot write farm inventory");
 }
 inline std::string farm_inventory_text(FarmInventory const& value, InventoryLimits const& limits = {})
@@ -622,10 +633,164 @@ inline FarmInventory read_farm_inventory(std::istream& in, InventoryLimits const
         result.plots.push_back(std::move(plot));
     }
     if (profile_detail::field(j, "farm_resources")) result.resource_template = parse_profile(j);
+    if (auto const* preparation = profile_detail::field(j, "resource_preparation")) result.resource_preparation = parse_resource_preparation(*preparation);
     validate(result, limits); return result;
 }
 inline FarmInventory parse_farm_inventory(std::string const& text, InventoryLimits const& limits = {})
 { std::istringstream in(text); return read_farm_inventory(in, limits); }
+
+// These are the selected adapters' physical-host declarations, after their
+// authenticated observations. Peer addresses are deliberately not accepted.
+struct FarmResourceBindings
+{
+    std::map<std::string, std::string> target_hosts;
+    std::map<std::string, std::set<std::string>> workload_hosts;
+};
+inline Profile make_inventory_resource_template(FarmInventory const& inventory,
+    std::vector<Remaining> const& counts, FarmResourceBindings const& bindings = {})
+{
+    using namespace resource_detail;
+    std::vector<Resource> resources; std::set<std::string> hosts{inventory.host};
+    for (auto const& [role, host] : bindings.target_hosts) { (void)role; hosts.insert(host); }
+    for (auto const& [workload, physical] : bindings.workload_hosts)
+    { (void)workload; hosts.insert(physical.begin(), physical.end()); }
+    for (auto const& host : hosts)
+    {
+        text(host, true); resources.push_back({"cpu:" + host, host, {}, ResourceKind::cpu});
+        resources.push_back({"memory:" + host, host, {}, ResourceKind::host_memory});
+    }
+    std::set<std::string> filesystems;
+    for (auto const& root : inventory.roots) if (filesystems.insert(root.storage.filesystem).second)
+    {
+        Resource resource; resource.id = "storage:" + root.storage.filesystem; resource.host = inventory.host; resource.kind = ResourceKind::storage;
+        if (root.storage.drives.empty()) resource.aliases.push_back("storage:unknown:" + inventory.host);
+        else for (auto const& drive : root.storage.drives) resource.aliases.push_back("drive:" + drive);
+        resources.push_back(std::move(resource));
+    }
+    auto result = make_profile_template(std::move(resources), counts, inventory.captured_at, inventory.producer_build);
+    Graph graph(result);
+    struct ObservedValue
+    {
+        std::string value; bool mixed = false;
+        void add(std::string current) { if (value.empty()) value = std::move(current); else mixed = mixed || value != current; }
+    };
+    struct ObservedWorkload { ObservedValue format, reader, version; std::set<std::string> resources; };
+    std::map<std::string, ObservedWorkload> observations;
+    for (auto const& workload : result.workloads) observations.emplace(workload.id, ObservedWorkload{});
+    for (auto const& plot : inventory.plots) if (!plot.alias_of)
+    {
+        auto at = observations.find(plot.workload_id); if (at == observations.end()) continue;
+        auto& observed = at->second;
+        observed.resources.insert(graph.resources[graph.find("storage:" + inventory.roots.at(plot.root).storage.filesystem)].id);
+        if (plot.header_validated || plot.native_identified)
+            observed.format.add(std::string(inventory_detail::name(plot.algorithm)) + '/' + inventory_detail::name(plot.container));
+        else observed.format.add("unknown");
+        observed.reader.add(plot.reader_identity.empty() ? "unknown" : plot.reader);
+        observed.version.add(plot.reader_identity.empty() ? "unknown" : plot.reader_version);
+    }
+    for (auto& workload : result.workloads)
+    {
+        auto& observed = observations.at(workload.id); auto& used = observed.resources;
+        if (!observed.format.mixed && !observed.format.value.empty()) workload.format = observed.format.value;
+        if (!observed.reader.mixed && !observed.reader.value.empty()) workload.decoder = observed.reader.value;
+        if (!observed.version.mixed && !observed.version.value.empty()) workload.decoder_version = observed.version.value;
+        if (auto at = bindings.workload_hosts.find(workload.id); at != bindings.workload_hosts.end()) for (auto const& host : at->second)
+        { used.insert(graph.resources[graph.find("cpu:" + host)].id); used.insert(graph.resources[graph.find("memory:" + host)].id); }
+        workload.uses.clear();
+        for (auto const& id : used) { Use use; use.resource = id; workload.uses.push_back(std::move(use)); }
+    }
+    auto& native = result.native; native.host = inventory.host; native.service_hosts = bindings.target_hosts;
+    if (inventory.network.available) native.k = inventory.network.plot_size;
+    for (auto const& resource : graph.resources) if (resource.kind == ResourceKind::storage) native.source_resources.push_back(resource.id);
+    // The inventory roots are source paths, not an implicit output/scratch
+    // selection. Populate only CPU/RAM and source supervision edges we know.
+    auto local = [&](std::vector<Demand>& values)
+    { for (auto const& id : {"cpu:" + inventory.host, "memory:" + inventory.host}) { Demand demand; demand.resource = id; values.push_back(std::move(demand)); } };
+    local(native.construction); local(native.verification); local(native.supervision);
+    for (auto const& id : native.source_resources) { Demand demand; demand.resource = id; native.supervision.push_back(std::move(demand)); }
+    validate(result); return result;
+}
+inline ResourcePreparation prepare_farm_inventory_resources(FarmInventory const& inventory,
+    FarmResourceBindings const& bindings = {}, bool reused_declarations = false)
+{
+    using namespace resource_detail;
+    require(inventory.resource_template.has_value(), "resource preparation requires an inventory resource profile");
+    auto const& profile = *inventory.resource_template; auto result = prepare_resource_declarations(profile);
+    auto fact = [&](std::string path, std::string value, std::string basis, std::string source, std::string scope)
+    {
+        require(result.facts.size() < max_preparation_entries, "too many resource preparation observations");
+        result.facts.push_back({std::move(path), std::move(value), std::move(basis), std::move(source), std::move(scope)});
+    };
+    fact("farm_resources", profile.source, reused_declarations ? "declared" : "unknown", profile.producer,
+        reused_declarations ? "Saved declarations copied unchanged; observations below do not revalidate their worst-case bounds or physical scope." :
+            "Editable topology skeleton; no resource capacity, foreign queue bound or full-proof reserve has been established.");
+    fact("local.logical_cpus", std::to_string(profile_detail::logical_cpus()), "observed", "local-os",
+        "This process's affinity when available, otherwise hardware concurrency; not the running services' CPU grant or spare capacity.");
+    fact("local.available_memory_bytes", std::to_string(profile_detail::available_memory()), "observed", "local-os",
+        "Current OS availability snapshot; zero means unavailable. Not an offered budget, service memory bound or persistent capacity guarantee.");
+    for (auto const& [role, host] : bindings.target_hosts)
+    {
+        fact("target.service_hosts." + role, host, "declared", "selected-authenticated-adapter-binding",
+            "Physical host binding selected for this service; peer IP addresses are not physical resource identities.");
+        auto at = profile.native.service_hosts.find(role); auto const& declared = at == profile.native.service_hosts.end() ? profile.native.host : at->second;
+        if (reused_declarations && declared != host) result.missing.push_back({"physical-bindings", "farm_resources.native.service_hosts." + role,
+            "Selected adapter binding differs from the saved physical host scope; review that scope and its CPU/RAM/solver/network demands before planning."});
+    }
+    std::set<std::string> workload_ids;
+    for (auto const& workload : profile.workloads) workload_ids.insert(workload.id);
+    std::map<std::string, std::pair<std::string, bool>> observed;
+    auto observe = [&](std::string path, std::string value)
+    { auto [at, fresh] = observed.emplace(std::move(path), std::pair{value, false}); if (!fresh) at->second.second = at->second.second || at->second.first != value; };
+    for (auto const& plot : inventory.plots) if (!plot.alias_of && workload_ids.contains(plot.workload_id))
+    {
+        auto const path = "inventory.workloads[" + plot.workload_id + "]";
+        observe(path + ".format", std::string(inventory_detail::name(plot.algorithm)) + '/' + inventory_detail::name(plot.container));
+        if (plot.header_validated || plot.native_identified) observe(path + ".parameters", "k=" + std::to_string(plot.k) + ";strength=" +
+            std::to_string(plot.strength) + ";compression=" + std::to_string(plot.compression_level));
+        if (!plot.reader_identity.empty())
+        {
+            observe(path + ".reader", plot.reader + ':' + plot.reader_version);
+            observe(path + ".reader_identity", plot.reader_identity);
+        }
+    }
+    for (auto const& [path, values] : observed)
+    {
+        // Workload labels may aggregate different native readers. Never pick
+        // one reader or imply that one declaration covers all of them.
+        fact(path, values.second ? "mixed; inspect matching inventory.plots records" : values.first, "observed",
+            "inventory-public-header-and-selected-reader", "Exact observed metadata/provenance only; no old proof validity, decoder cost or full-proof bound is inferred.");
+    }
+    Graph graph(profile);
+    std::set<size_t> source_resources;
+    for (auto const& root : inventory.roots)
+    {
+        auto const id = "storage:" + root.storage.filesystem;
+        fact("inventory.storage[" + id + "]", root.path, "observed", "native-filesystem-and-drive-topology",
+            "Local source filesystem path; drive aliases describe observed sharing, and unknown topology remains conservatively shared.");
+        bool covered = graph.names.contains(id);
+        if (covered)
+        {
+            auto const index = graph.find(id); auto const& resource = graph.resources[index];
+            covered = resource.host == inventory.host && resource.kind == ResourceKind::storage;
+            auto alias = [&](std::string const& name) { auto at = graph.names.find(name); return at != graph.names.end() && at->second == index; };
+            if (root.storage.drives.empty()) covered = covered && alias("storage:unknown:" + inventory.host);
+            else for (auto const& drive : root.storage.drives) covered = covered && alias("drive:" + drive);
+            if (covered) source_resources.insert(index);
+        }
+        if (!covered) result.missing.push_back({"physical-bindings", "farm_resources.resources",
+            "Bind " + id + " and its observed drive aliases to this local physical storage resource; a new label cannot supply additional capacity."});
+    }
+    std::set<size_t> declared_sources;
+    for (auto const& id : profile.native.source_resources) declared_sources.insert(graph.find(id));
+    if (declared_sources != source_resources) result.missing.push_back({"physical-bindings", "farm_resources.native.source_resources",
+        "Map all inventoried source filesystems (including shared drive aliases) to the reviewed source supervision scope; inventory does not select output or scratch mappings."});
+    bool remote = std::any_of(bindings.target_hosts.begin(), bindings.target_hosts.end(), [&](auto const& item) { return item.second != inventory.host; });
+    for (auto const& [workload, hosts] : bindings.workload_hosts)
+    { (void)workload; remote = remote || std::any_of(hosts.begin(), hosts.end(), [&](auto const& host) { return host != inventory.host; }); }
+    if (remote && std::none_of(profile.resources.begin(), profile.resources.end(), [](auto const& resource) { return resource.kind == ResourceKind::network; }))
+        result.missing.push_back({"physical-bindings", "farm_resources.resources", "Declare physical network resources and their bounds for the selected remote service paths; host bindings alone do not establish network service capacity."});
+    validate_resource_preparation(result); return result;
+}
 
 inline FarmInventory scan_farm_inventory(std::span<std::filesystem::path const> paths, InventoryLimits const& limits = {})
 {

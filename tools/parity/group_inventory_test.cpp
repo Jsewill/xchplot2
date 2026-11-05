@@ -49,6 +49,43 @@ void inventory(fs::path const& directory)
     require(restored.resource_template && farm_inventory_text(restored) == text &&
         !restored.resource_template->resources[0].capacity_known && restored.resource_template->workloads[0].cost == CostKind::unknown,
         "inventory template became a resource/cost guarantee or failed roundtrip");
+    require(text.find("resource_preparation") == std::string::npos, "optional preparation changed older inventory serialization");
+    auto setup = observed;
+    for (auto& plot : setup.plots) plot.workload_id = plot.header_validated ? "known-header" : "protected-unknown";
+    FarmResourceBindings bindings; bindings.target_hosts = {{"harvester", "target-host"}, {"farmer", "target-host"},
+        {"full_node", "target-host"}, {"solver", "target-host"}};
+    bindings.workload_hosts["known-header"] = {"reader-host"};
+    setup.resource_template = make_inventory_resource_template(setup, {{"known-header", 3}, {"protected-unknown", 1}}, bindings);
+    auto const& scaffold = *setup.resource_template;
+    resource_detail::Graph physical(scaffold);
+    require(physical.names.contains("cpu:reader-host") && physical.names.contains("memory:target-host") &&
+        scaffold.native.output_resources.empty() && !scaffold.native.source_resources.empty() && !scaffold.native.bounded,
+        "preparation lost established topology or invented a bounded output selection");
+    for (auto const& workload : scaffold.workloads)
+    {
+        require(!workload.bounded && workload.cost == CostKind::unknown, "preparation invented foreign service bounds");
+        for (auto const& use : workload.uses)
+            require(use.resource != "cpu:target-host" && use.resource != "memory:target-host" &&
+                (workload.id != "protected-unknown" || physical.resources[physical.find(use.resource)].kind == ResourceKind::storage),
+                "preparation added unrelated service edges or assumed an opaque decoder host");
+    }
+    std::ostringstream policy_before; write_profile_json(policy_before, scaffold); auto const before_preparation = farm_inventory_memory(setup);
+    setup.resource_preparation = prepare_farm_inventory_resources(setup, bindings, true);
+    std::ostringstream policy_after; write_profile_json(policy_after, *setup.resource_template);
+    require(policy_before.str() == policy_after.str() && !setup.resource_preparation->missing.empty() &&
+        farm_inventory_memory(setup) > before_preparation, "preparation changed saved declarations or escaped the inventory memory ledger");
+    auto const setup_text = farm_inventory_text(setup); auto setup_restored = parse_farm_inventory(setup_text);
+    require(setup_restored.resource_preparation && farm_inventory_text(setup_restored) == setup_text,
+        "preparation provenance and missing declarations failed inventory roundtrip");
+    require(std::any_of(setup.resource_preparation->facts.begin(), setup.resource_preparation->facts.end(), [](auto const& fact)
+        { return fact.path == "local.available_memory_bytes" && fact.basis == "observed" && fact.scope.find("Not an offered budget") != std::string::npos; }),
+        "OS observations were presented as declared capacity");
+    auto drift = bindings; drift.target_hosts["solver"] = "new-solver-host";
+    auto changed = prepare_farm_inventory_resources(setup, drift, true);
+    require(std::any_of(changed.missing.begin(), changed.missing.end(), [](auto const& need)
+        { return need.path == "farm_resources.native.service_hosts.solver"; }), "changed physical service binding was not actionable");
+    auto invalid_report = setup; invalid_report.resource_preparation->facts[0].basis = "verified-capacity";
+    rejects([&] { (void)farm_inventory_text(invalid_report); }, "unsupported provenance became a resource grant");
     (void)recheck_inventory_source(observed.roots[0], og);
     InventoryLimits tiny; tiny.max_files = 1; rejects([&] { (void)scan_farm_inventory(roots, tiny); }, "entry bound was ignored");
     auto empty_tree = directory / "empty-tree"; fs::create_directories(empty_tree / "one" / "two" / "three");
@@ -509,7 +546,11 @@ void adapters(fs::path const& directory)
     auto forecast = observe_network_projection(options); fs::remove(root / "farmer-unavailable");
     require(forecast.available && forecast.farmer_version.empty() && !forecast.service_status.empty(), "missing service removed network-only forecast capability");
     loaded(loaded_key);
-    observe_harvester_inventory(observed, options);
+    std::vector<ResourcePreparationFact> reader_configuration;
+    observe_harvester_inventory(observed, options, true, &reader_configuration);
+    require(reader_configuration.size() == 1 && reader_configuration[0].value == "2" && reader_configuration[0].basis == "observed" &&
+        reader_configuration[0].scope.find("Not an OS CPU cap") != std::string::npos,
+        "configured reader threads became a bounded physical CPU grant");
     auto enriched = std::find_if(observed.plots.begin(), observed.plots.end(), [](auto const& p) { return p.relative_path == "published.plot2"; });
     require(enriched != observed.plots.end() && enriched->reader == "chia" && enriched->reader_version == "fixture-native-1", "installed reader inventory provenance was lost");
     require(!observe_replacement_readiness(options, expected).ready, "public metadata substituted for private first-publication evidence");
@@ -609,6 +650,76 @@ void adapters(fs::path const& directory)
         "native observation invented undisclosed proprietary metadata");
     std::array<uint64_t, 1> native_indices{0};
     {
+        auto original = native_catalog; original.network = observe_network_projection(options); original.captured_at = "origin-snapshot";
+        auto header_only = original.plots[0]; header_only.reader_identity.clear(); header_only.header_validated = true;
+        header_only.host = profile_detail::host_name();
+        adapter_detail::require_source_resource_binding(options, header_only);
+        auto moved = options; moved.host = "different-source-host";
+        rejects([&] { adapter_detail::require_source_resource_binding(moved, header_only); },
+            "header-only source lost its known physical host binding when no reader tuple was present");
+        header_only.solver = "original-solver";
+        rejects([&] { adapter_detail::require_source_resource_binding(options, header_only); },
+            "header-only source lost its known solver binding when no reader tuple was present");
+        auto provisional = original;
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 3\n"; }
+        auto active_readers = refresh_replot_reader_observations(provisional, {}, options, {});
+        require(active_readers.size() == 1 && !active_readers[0].source.empty() && !active_readers[0].captured_at.empty() &&
+            provisional.captured_at == original.captured_at && provisional.plots[0].reader_identity != original.plots[0].reader_identity &&
+            provisional.plots[0].identity == original.plots[0].identity && provisional.plots[0].status == original.plots[0].status &&
+            provisional.plots[0].native_identified == original.plots[0].native_identified,
+            "active reader refresh changed original object/classification or lost fresh snapshot provenance");
+        auto const reviewed_text = farm_inventory_text(provisional);
+        validate_replot_reader_observations(provisional, {}, options, {});
+        require(farm_inventory_text(provisional) == reviewed_text, "successor reader validation changed saved provenance or classification");
+        auto protected_catalog = provisional; protected_catalog.plots[0].status = "protected";
+        protected_catalog.plots[0].reason = "retained opaque cohort outside the current retirement batch";
+        auto const protected_text = farm_inventory_text(protected_catalog);
+        for (bool wrong_key : {false, true})
+        {
+            native_registry();
+            std::ifstream input(root / "plots.json"); auto text = profile_detail::read_text(input, 65536);
+            auto const field = wrong_key ? loaded_key : std::string("\"compression_level\":7");
+            auto const replacement = wrong_key ? std::string(96, '7') : std::string("\"compression_level\":8");
+            auto at = text.find(field); require(at != text.npos, "missing opaque metadata comparison fixture"); text.replace(at, field.size(), replacement);
+            { std::ofstream output(root / "plots.json"); output << text; }
+            observe_registry_scope(options, protected_catalog);
+            rejects([&] { validate_replot_reader_observations(protected_catalog, {}, options, {}); },
+                "same-ID/path protected opaque metadata bypassed preactivation successor validation");
+            require(farm_inventory_text(protected_catalog) == protected_text, "failed successor validation changed opaque metadata or protection");
+        }
+        native_registry();
+        { std::ofstream absent(root / "plots.json"); absent << "{\"success\":true,\"plots\":[]}"; }
+        rejects([&] { (void)refresh_replot_reader_observations(provisional, {}, options, {}); },
+            "unloaded active opaque source acquired unchecked current identification");
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 4\n"; }
+        auto const origin_reader = provisional.plots[0].reader_identity;
+        auto current_readers = refresh_replot_reader_observations(provisional, {}, options, native_indices);
+        require(provisional.plots[0].reader_identity == origin_reader && current_readers[0].identity != origin_reader,
+            "nonactive source origin provenance was replaced by current route metadata");
+        RevalidationReaderAllowance allowance(provisional, current_readers, native_indices);
+        auto refreshed_options = options; refreshed_options.revalidation = &allowance;
+        auto const nonactive_text = farm_inventory_text(provisional);
+        validate_replot_reader_observations(provisional, {}, refreshed_options, native_indices);
+        require(farm_inventory_text(provisional) == nonactive_text, "validation replaced a durable nonactive source's historical identification");
+        {
+            SourceReadinessSnapshot snapshot(refreshed_options, provisional, native_indices, {}, true);
+            auto retained = snapshot.check(provisional.roots[0], provisional.plots[0]); snapshot.finish();
+            require(retained.reader_identity == origin_reader && retained.identity == provisional.plots[0].identity,
+                "durable unloaded source was presented as newly identified by a changed reader");
+        }
+        require(observe_sources_retired(refreshed_options, provisional, native_indices).no_loaded_record,
+            "native-audited nonactive route could not use its separately refreshed current reader");
+        RevalidationReaderAllowance active_only(provisional, current_readers, {});
+        refreshed_options.revalidation = &active_only;
+        rejects([&] { observe_registry_scope(refreshed_options, provisional); },
+            "public current-reader mapping bypassed an active source's original identification");
+        auto changed_scope = provisional; changed_scope.network.genesis_challenge = std::string(64, 'b');
+        rejects([&] { (void)refresh_replot_reader_observations(changed_scope, {}, options, native_indices); },
+            "reader refresh changed immutable network genesis");
+        { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
+        native_registry();
+    }
+    {
         SourceReadinessSnapshot snapshot(options, native_catalog, native_indices);
         (void)snapshot.check(native_catalog.roots[0], native_plot); snapshot.finish();
     }
@@ -694,6 +805,10 @@ void retirement_configuration(fs::path const& directory)
     save(configuration(false, true));
     require(!matches(options) && matches(permitted), "authorized source-directory removal either bypassed strict policy or remained unusable");
     require(observe_target_network(permitted, catalog.network, 28, 2).ready, "same-config source removal blocked target network provenance");
+    validate_replot_reader_observations(catalog, {}, permitted, {});
+    require(farm_inventory_text(catalog) == encoded, "read-only successor validation rewrote legitimate removal-only reader provenance");
+    rejects([&] { validate_replot_reader_observations(catalog, {}, options, {}); },
+        "successor validation silently accepted source-directory removal without private authorization");
     auto trailing = options; trailing.root /= "";
     RetirementConfigurationAllowance trailing_allowance(catalog, options.limits);
     trailing_allowance.authorize(trailing, catalog.roots[0]); trailing_allowance.retain(trailing, file_io::path_text(target)); trailing.retirement = &trailing_allowance;

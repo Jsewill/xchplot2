@@ -360,6 +360,31 @@ int main()
         rejects([&] { std::istringstream bad(encoded.str()); read_profile(bad, 4096); }, "profile parsing memory bound ignored");
         auto generated = make_profile_template(fixture().resources, {{"original-pos1", 10}}, "scan", "xchplot2");
         check(!assess_stage(generated, initial()).feasible, "generated template fabricated capacity or cost");
+        auto preparation = prepare_resource_declarations(generated);
+        check(!preparation.missing.empty() && std::any_of(preparation.missing.begin(), preparation.missing.end(), [](auto const& need)
+            { return need.group == "farming-and-proofs" && need.path == "farm_resources.native.cohorts"; }),
+            "preparation omitted a missing full-proof declaration");
+        preparation.facts.push_back({"local.available_memory_bytes", "123", "observed", "local-os", "snapshot, not a grant"});
+        std::ostringstream preparation_json; write_resource_preparation_json(preparation_json, preparation);
+        auto prepared = parse_resource_preparation(group_grow::profile_detail::JsonReader(preparation_json.str()).read());
+        std::ostringstream preparation_roundtrip; write_resource_preparation_json(preparation_roundtrip, prepared);
+        check(preparation_roundtrip.str() == preparation_json.str() && resource_preparation_memory(prepared) > sizeof(prepared) &&
+            !assess_stage(generated, initial()).feasible, "preparation failed roundtrip, escaped memory charge or supplied admission authority");
+        prepared.facts[0].basis = "measured-worst-case";
+        rejects([&] { write_resource_preparation_json(preparation_roundtrip, prepared); }, "unsupported preparation provenance accepted");
+        auto complete_preparation = prepare_resource_declarations(fixture());
+        check(complete_preparation.missing.empty(), "complete declared fixture needs invented preparation inputs");
+        Profile broad; broad.source = broad.producer = "declared-stress-fixture";
+        for (size_t i = 0; i < max_resources; ++i) broad.resources.push_back(resource("storage-" + std::to_string(i), ResourceKind::storage, 1));
+        for (size_t i = 0; i < max_workloads; ++i)
+        {
+            Workload workload; workload.id = "workload-" + std::to_string(i); workload.cost = CostKind::serialized; workload.plot_count = 1;
+            for (auto const& resource : broad.resources) { Use use; use.resource = resource.id; workload.uses.push_back(std::move(use)); }
+            broad.workloads.push_back(std::move(workload));
+        }
+        auto broad_preparation = prepare_resource_declarations(broad);
+        check(!broad_preparation.missing.empty() && broad_preparation.missing.size() < max_preparation_entries,
+            "bounded preparation diagnostics refused a valid maximum-width profile");
 
         auto ranking_profile = fixture(); auto rs = initial();
         std::vector<Victim> candidates{{"a", "original-pos1", "unit-a", 1, 500, 5, 100, 30},

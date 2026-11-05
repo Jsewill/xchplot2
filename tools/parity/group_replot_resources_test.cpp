@@ -60,6 +60,73 @@ int main() try
     pos2gpu::GroupOptions args; args.backend = "cpu"; args.construction = "reference"; args.workers = 1; args.max_ram = 16 * mib; args.batch = 65535; args.compute_mode = "off";
     ReplotSupervision supervision{mib, 8 * mib, 1, 100000}; supervision.source_roots = {directory}; native.source_resources = {disk};
     auto request = replot_native_request(args, profile, state, {}, 0, 16 * mib, supervision);
+    {
+        ReplotReview review; review.farm = state; review.inventory_json = review.resources_json = "resource-fixture";
+        review.farm.fingerprint = review.farm.seed = std::string(64, '0'); review.farm.farmer = std::string(96, '0'); review.farm.pool = std::string(64, '0');
+        review.farm.estimate.feasible = true; review.farm.directories[0].layout.files = review.farm.directories[0].layout.total_members = 1;
+        review.memory_limit_bytes = 64 * mib; review.sources = {0}; review.space.resize(1);
+        ReplotBatch batch; batch.sources = 1; batch.final_bound_bytes = 1; review.batches = {batch};
+        ReplotJournal journal; journal.review_digest = std::string(64, 'a'); journal.farm = review.farm;
+        journal.phase = ReplotPhase::replacing; journal.retirements = {{ReplotRetirement::active, false}};
+        FarmInventory inventory; InventoryPlot source; source.workload_id = "legacy"; source.header_validated = true;
+        source.identity.allocated_bytes = 64; source.identity.links = 1; inventory.plots = {source};
+        auto completed = profile; completed.native.construction[0].work_us = UINT64_MAX / 4;
+        stream_state::Stamp sealed; sealed.bytes = 1; journal.verified_stage = sealed;
+        require(assess_replot_remaining(completed, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "successor replayed construction already covered by an exact verified stage");
+        journal.verified_stage.reset();
+        require(!assess_replot_remaining(completed, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "unsealed remaining construction escaped its declared service envelope");
+        auto conditional = profile; auto& workload = conditional.workloads[0]; workload.cost = CostKind::serialized; workload.response_tail_us = 0;
+        workload.quality_burst = workload.proof_burst = workload.future_quality_burst = workload.future_proof_burst = 1;
+        workload.period_us = workload.deadline_us = 1000;
+        std::erase_if(workload.uses, [&](auto const& use) { return use.resource != "cpu" && use.resource != "ram"; });
+        workload.uses[0].quality_us = workload.uses[0].proof_us = 350; workload.uses[0].blocking_us = 0;
+        conditional.native.construction[0].work_us = conditional.native.verification[0].work_us = 200;
+        conditional.native.supervision[0].work_us = 1;
+        require(!assess_replot_remaining(conditional, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "remaining forecast invented early-retirement capacity without a debt allowance");
+        review.reclaim_before_bytes = source.identity.allocated_bytes;
+        require(assess_replot_remaining(conditional, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "fully observable future cohort lost the existing conditional confirmed-unload forecast");
+        journal.retirements[0] = {ReplotRetirement::retired, true};
+        require(!assess_replot_remaining(conditional, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "current unconfirmed final registry demand was erased by a future projection");
+        require(assess_replot_remaining(conditional, request, inventory, review, journal, {{"legacy", 0}}, 0).feasible,
+            "freshly confirmed complete unload did not release per-file arrival demand");
+        inventory.plots[0].header_validated = false; journal.retirements[0] = {ReplotRetirement::active, false};
+        require(!assess_replot_remaining(conditional, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
+            "opaque unidentifiable cohort received hypothetical complete-unload credit");
+        inventory.plots[0].header_validated = true;
+        auto completed_review = review; completed_review.farm.directories[0].layout.files = completed_review.farm.directories[0].layout.total_members = 2;
+        ReplotBatch successor_batch; successor_batch.ordinal = 1; successor_batch.first_source = 1; successor_batch.final_bound_bytes = 1;
+        completed_review.batches.push_back(successor_batch);
+        auto completed_journal = journal; completed_journal.farm = completed_review.farm; completed_journal.batch = 1;
+        completed_journal.retired_prefix = 1; completed_journal.receipt_digest = std::string(64, 'b'); completed_journal.retirements.clear();
+        completed_journal.verified_stage = sealed;
+        require(assess_replot_remaining(completed, request, inventory, completed_review, completed_journal, {{"legacy", 0}}, 1).feasible,
+            "completed historical source reductions or construction phases were replayed during suffix assessment");
+        completed_journal.published = completed_journal.ready = sealed;
+        require(assess_replot_remaining(completed, request, inventory, completed_review, completed_journal, {{"legacy", 0}}, 2).feasible,
+            "already published and ready current output replayed construction or proof work");
+        auto debt_review = review; debt_review.sources = {0, 1}; debt_review.batches[0].sources = 2;
+        auto debt_inventory = inventory; debt_inventory.plots.push_back(source);
+        auto debt_profile = conditional; debt_profile.workloads[0].plot_count = 2;
+        auto debt_journal = journal; debt_journal.retirements = {{ReplotRetirement::retired, true}, {ReplotRetirement::active, false}};
+        require(!assess_replot_remaining(debt_profile, request, debt_inventory, debt_review, debt_journal, {{"legacy", 1}}, 0).feasible,
+            "retired predelete debt was forgotten before selecting another active source");
+        debt_review.reclaim_before_bytes = 128;
+        require(assess_replot_remaining(debt_profile, request, debt_inventory, debt_review, debt_journal, {{"legacy", 1}}, 0).feasible,
+            "remaining active source could not use its separately covered outstanding predelete allowance");
+        auto growing = conditional; growing.native.cohorts[0].max_members = 1;
+        auto larger = growing.native.cohorts[0]; larger.max_members = 2;
+        larger.new_farming[0].work_us = larger.proof_reserve[0].work_us = 200; growing.native.cohorts.push_back(larger);
+        require(assess_stage(growing, replot_stage(growing, request, {{"legacy", 0}}, 2, false, false, true)).feasible,
+            "cohort growth fixture does not fit after independently confirmed source unload");
+        auto growing_journal = journal; growing_journal.farm = completed_review.farm;
+        require(!assess_replot_remaining(growing, request, inventory, completed_review, growing_journal, {{"legacy", 1}}, 0).feasible,
+            "future cohort growth omitted restart supervision with unconfirmed old registries");
+    }
     std::map<std::string, std::string> service_hosts{{"harvester", host}, {"farmer", host}, {"full_node", host}, {"solver", host}};
     struct Other { std::string node_id, peer_host; uint64_t files, members; };
     std::vector<Other> outside;
