@@ -26,9 +26,22 @@ struct ReplotPredeleteSelection
 {
     std::vector<size_t> sources;
     bool feasible = false;
+    bool search_exhausted = false;
 };
+inline constexpr size_t replot_predelete_combination_checks = 32;
+inline constexpr size_t replot_predelete_fallback_source_visits = 4 * replot_maximum_batch_sources;
+inline constexpr size_t replot_predelete_fallback_candidate_visits =
+    (replot_maximum_batch_sources + 1) * (replot_predelete_combination_checks + 1);
+inline uint64_t replot_predelete_memory_bound(size_t count)
+{
+    require(count <= replot_maximum_batch_sources, "migration predelete memory exceeds its batch bound");
+    return count * (sizeof(ReplotPredeleteCandidate) + 4 * sizeof(size_t)) +
+        sizeof(std::array<bool, replot_maximum_batch_sources>) + 5 * sizeof(std::vector<size_t>) + sizeof(size_t);
+}
 // Forecast and runtime supply their own space/resource projections. Only whole
 // eligible files can join the reviewed order, within the same outstanding debt.
+// Fits must rebuild its trial projection: fallback trials can remove earlier
+// optional choices. Mandatory pending sources and their full debt never change.
 template<class Candidate, class Fits>
 ReplotPredeleteSelection select_replot_predeletions(size_t count, uint64_t allowance, uint64_t outstanding,
     std::vector<size_t> selected, Candidate candidate, Fits fits)
@@ -42,16 +55,75 @@ ReplotPredeleteSelection select_replot_predeletions(size_t count, uint64_t allow
         included[source] = true;
     }
     selected.reserve(count);
-    bool feasible = fits(std::span<size_t const>(selected));
-    for (size_t source = 0; source < count && !feasible; ++source)
+    if (fits(std::span<size_t const>(selected))) return {std::move(selected), true};
+    // Zero is replacement-first policy, including files whose native allocated
+    // byte count is zero. Previously committed pending rows remain mandatory.
+    if (!allowance) return {std::move(selected), false};
+    auto const mandatory = selected; auto const mandatory_debt = outstanding;
+    std::vector<ReplotPredeleteCandidate> candidates(count);
+    for (size_t source = 0; source < count; ++source)
     {
         if (included[source]) continue;
-        auto const current = candidate(source);
+        auto const current = candidates[source] = candidate(source);
         if (!current.eligible || current.allocated_bytes > allowance - outstanding) continue;
-        outstanding += current.allocated_bytes; selected.push_back(source); included[source] = true;
-        feasible = fits(std::span<size_t const>(selected));
+        outstanding += current.allocated_bytes; selected.push_back(source);
+        if (fits(std::span<size_t const>(selected))) return {std::move(selected), true};
     }
-    return {std::move(selected), feasible};
+    auto const greedy = std::move(selected); selected = mandatory; selected.reserve(count);
+    size_t visits = 0, candidate_visits = 0, combinations = 0;
+    auto failure = [&](bool exhausted)
+    { selected.resize(mandatory.size()); return ReplotPredeleteSelection{std::move(selected), false, exhausted}; };
+    auto evaluate = [&]() -> std::optional<bool>
+    {
+        auto const cost = std::max(size_t(1), selected.size());
+        if (cost > replot_predelete_fallback_source_visits - visits) return {};
+        visits += cost; return fits(std::span<size_t const>(selected));
+    };
+    auto tried_greedy_prefix = [&]
+    { return selected.size() <= greedy.size() && std::equal(selected.begin(), selected.end(), greedy.begin()); };
+    // Try every affordable singleton before bounded combination search. With
+    // no pending sources this covers the whole batch with one probe per source;
+    // a late useful file cannot be hidden by an earlier small debt commitment.
+    for (size_t source = 0; source < count; ++source)
+    {
+        ++candidate_visits; auto const current = candidates[source];
+        if (included[source] || !current.eligible || current.allocated_bytes > allowance - mandatory_debt) continue;
+        selected.push_back(source);
+        if (!tried_greedy_prefix())
+        {
+            auto feasible = evaluate();
+            if (!feasible) return failure(true);
+            if (*feasible) return {std::move(selected), true};
+        }
+        selected.resize(mandatory.size());
+    }
+    // Enumerate legal combinations without recursion or per-node allocation.
+    // Bound both expensive feasibility calls/source projections and cheap
+    // traversal of skipped or unaffordable branches. Exhaustion is a search
+    // limit, never evidence that no legal subset could satisfy the caller.
+    std::vector<size_t> next(count + 1, 0); size_t depth = 0; outstanding = mandatory_debt;
+    for (;;)
+    {
+        bool descended = false;
+        while (next[depth] < count)
+        {
+            if (candidate_visits == replot_predelete_fallback_candidate_visits) return failure(true);
+            ++candidate_visits; auto const source = next[depth]++; auto const current = candidates[source];
+            if (included[source] || !current.eligible || current.allocated_bytes > allowance - outstanding) continue;
+            selected.push_back(source); outstanding += current.allocated_bytes;
+            if (depth && !tried_greedy_prefix())
+            {
+                if (combinations == replot_predelete_combination_checks) return failure(true);
+                ++combinations; auto feasible = evaluate();
+                if (!feasible) return failure(true);
+                if (*feasible) return {std::move(selected), true};
+            }
+            ++depth; next[depth] = source + 1; descended = true; break;
+        }
+        if (descended) continue;
+        if (!depth) return failure(false);
+        --depth; outstanding -= candidates[selected.back()].allocated_bytes; selected.pop_back();
+    }
 }
 struct ReplotBatch
 {
@@ -68,6 +140,19 @@ struct ReplotSpace
 // only the allowance that has not yet been allocated; never credit other files.
 inline uint64_t replot_metadata_remaining(uint64_t allowance, uint64_t allocated)
 { return allowance - std::min(allowance, allocated); }
+inline void write_replot_native_identity(std::ostream& out, file_io::DurableIdentity const& identity)
+{
+    require(file_io::valid_durable_identity(identity), "invalid migration native identity");
+    out << unsigned(identity.scheme) << ' ' << std::quoted(identity.filesystem) << ' ' << identity.handle_type << ' ' << std::quoted(identity.object) << '\n';
+}
+inline file_io::DurableIdentity read_replot_native_identity(std::istream& in)
+{
+    unsigned scheme = 0; file_io::DurableIdentity result;
+    in >> scheme >> std::quoted(result.filesystem) >> result.handle_type >> std::quoted(result.object);
+    require(in && scheme <= unsigned(file_io::DurableIdentity::Scheme::windows_file_id), "invalid migration native identity representation");
+    result.scheme = file_io::DurableIdentity::Scheme(scheme);
+    require(file_io::valid_durable_identity(result), "invalid migration native identity"); return result;
+}
 struct ReplotReview
 {
     // Canonical public observations are embedded once, in this immutable file.
@@ -78,7 +163,21 @@ struct ReplotReview
     std::vector<uint64_t> sources;
     std::vector<ReplotBatch> batches;
     std::vector<ReplotSpace> space;
+    // Destination order, followed by additional explicitly reviewed scratch
+    // roots. Existing source roots remain owned by the embedded inventory.
+    std::vector<farm::InventoryRoot> owned_roots;
+    std::vector<std::string> scratch_directories;
 };
+inline uint64_t replot_native_root_memory(ReplotReview const& review)
+{
+    uint64_t bytes = review.owned_roots.capacity() * sizeof(farm::InventoryRoot) + review.scratch_directories.capacity() * sizeof(std::string);
+    for (auto const& root : review.owned_roots)
+    {
+        for (auto const* text : {&root.path, &root.directory_identity, &root.storage.filesystem, &root.durable.filesystem, &root.durable.object}) bytes += 2 * text->capacity();
+        bytes += root.storage.drives.capacity() * sizeof(std::string); for (auto const& drive : root.storage.drives) bytes += 2 * drive.capacity();
+    }
+    for (auto const& path : review.scratch_directories) bytes += 2 * path.capacity(); return bytes;
+}
 inline void validate_replot_review(ReplotReview const& review)
 {
     auto const& state = review.farm;
@@ -109,12 +208,44 @@ inline void validate_replot_review(ReplotReview const& review)
     require(batch == review.batches.size() && source == review.sources.size(), "replot review has unassigned sources or replacements");
     auto selected = review.sources; std::sort(selected.begin(), selected.end());
     require(std::adjacent_find(selected.begin(), selected.end()) == selected.end(), "duplicate replot candidate");
+    require(review.owned_roots.size() <= 1024 && review.scratch_directories.size() <= 1024 &&
+        replot_native_root_memory(review) < review.memory_limit_bytes / 4 &&
+        (!review.owned_roots.empty() || review.scratch_directories.empty()), "invalid migration native root scope");
+    if (!review.owned_roots.empty())
+    {
+        std::vector<std::string> paths; paths.reserve(state.directories.size() + review.scratch_directories.size());
+        std::set<std::string> seen, scratch; bool durable = false;
+        for (auto const& directory : state.directories)
+        { require(seen.insert(directory.directory).second, "migration destination root repeats"); paths.push_back(directory.directory); }
+        for (auto const& path : review.scratch_directories)
+        {
+            farm::inventory_detail::bounded_text(path);
+            require(file_io::native_path(path).is_absolute() && file_io::path_text(file_io::native_path(path).lexically_normal()) == path && scratch.insert(path).second,
+                "invalid or duplicate reviewed migration scratch root");
+            if (seen.insert(path).second) paths.push_back(path);
+        }
+        require(paths.size() == review.owned_roots.size(), "migration native roots differ from its reviewed destination and scratch scope");
+        std::set<std::pair<uint64_t, uint64_t>> native;
+        for (size_t index = 0; index < paths.size(); ++index)
+        {
+            auto const& root = review.owned_roots[index];
+            for (auto const* text : {&root.path, &root.directory_identity, &root.storage.filesystem}) farm::inventory_detail::bounded_text(*text);
+            require(root.path == paths[index] && !root.directory_identity.empty() && !root.storage.filesystem.empty() && root.inode &&
+                native.emplace(root.device, root.inode).second && root.storage.drives.size() <= 128 && file_io::valid_durable_identity(root.durable),
+                "invalid or contradictory migration native root owner");
+            for (auto const& drive : root.storage.drives) farm::inventory_detail::bounded_text(drive);
+            durable = durable || file_io::has_durable_identity(root.durable);
+            if (index < state.directories.size()) require(root.directory_identity == state.directories[index].directory_identity &&
+                root.storage.filesystem == state.directories[index].filesystem, "migration native destination association changed");
+        }
+        require(durable, "migration native root schema has no prospective object evidence");
+    }
 }
 inline std::string replot_review_text(ReplotReview const& review)
 {
     validate_replot_review(review);
     std::ostringstream out;
-    out << "ordinary-group-replot-review-v1\n" << std::quoted(review.inventory_json) << '\n'
+    out << (review.owned_roots.empty() ? "ordinary-group-replot-review-v1\n" : "ordinary-group-replot-review-v2\n") << std::quoted(review.inventory_json) << '\n'
         << std::quoted(review.resources_json) << '\n' << std::quoted(farming_state_text(review.farm, true)) << '\n'
         << review.reclaim_before_bytes << ' ' << review.memory_limit_bytes << ' ' << review.sources.size();
     for (auto index : review.sources) out << ' ' << index;
@@ -126,13 +257,24 @@ inline std::string replot_review_text(ReplotReview const& review)
     for (auto const& space : review.space)
         out << space.free_bytes << ' ' << space.reclaimable_allocated_bytes << ' ' << space.final_bound_bytes << ' ' << space.workspace_bound_bytes << ' '
             << space.metadata_allowance_bytes << '\n';
+    if (!review.owned_roots.empty())
+    {
+        out << review.scratch_directories.size(); for (auto const& path : review.scratch_directories) out << ' ' << std::quoted(path); out << '\n';
+        out << review.owned_roots.size() << '\n';
+        for (auto const& root : review.owned_roots)
+        {
+            out << std::quoted(root.path) << ' ' << std::quoted(root.directory_identity) << ' ' << root.device << ' ' << root.inode << ' '
+                << std::quoted(root.storage.filesystem) << ' ' << root.storage.nonrotating << ' ' << root.storage.rotating << ' ' << root.storage.drives.size();
+            for (auto const& drive : root.storage.drives) out << ' ' << std::quoted(drive); out << '\n'; write_replot_native_identity(out, root.durable);
+        }
+    }
     return out.str();
 }
 inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory_limit)
 {
     require(body.size() < memory_limit / 16, "replot review exceeds its parsing memory budget");
     std::istringstream in(body); std::string version, farm; std::getline(in, version);
-    require(version == "ordinary-group-replot-review-v1", "expected a saved replot review");
+    require(version == "ordinary-group-replot-review-v1" || version == "ordinary-group-replot-review-v2", "expected a saved replot review");
     ReplotReview result; size_t count = 0;
     in >> std::quoted(result.inventory_json) >> std::quoted(result.resources_json) >> std::quoted(farm)
         >> result.reclaim_before_bytes >> result.memory_limit_bytes >> count;
@@ -149,9 +291,33 @@ inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory
     result.space.resize(count);
     for (auto& space : result.space) in >> space.free_bytes >> space.reclaimable_allocated_bytes >> space.final_bound_bytes >> space.workspace_bound_bytes
         >> space.metadata_allowance_bytes;
+    if (version == "ordinary-group-replot-review-v2")
+    {
+        in >> count; require(in && count <= 1024 && count < memory_limit / 8192, "migration reviewed scratch scope exceeds its memory bound");
+        result.scratch_directories.resize(count); for (auto& path : result.scratch_directories) in >> std::quoted(path);
+        in >> count; require(in && count && count <= 1024 && count < memory_limit / 32768, "migration native root scope exceeds its memory bound");
+        result.owned_roots.resize(count);
+        for (auto& root : result.owned_roots)
+        {
+            size_t drives = 0;
+            in >> std::quoted(root.path) >> std::quoted(root.directory_identity) >> root.device >> root.inode >> std::quoted(root.storage.filesystem)
+                >> root.storage.nonrotating >> root.storage.rotating >> drives;
+            require(in && drives <= 128 && drives < memory_limit / 8192, "migration native drive scope exceeds its memory bound");
+            root.storage.drives.resize(drives); for (auto& drive : root.storage.drives) in >> std::quoted(drive);
+            root.durable = read_replot_native_identity(in);
+        }
+        require(replot_native_root_memory(result) < memory_limit / 4, "migration native roots exceed their expanded parsing memory bound");
+    }
     require(bool(in), "incomplete replot review"); in >> std::ws; require(in.eof(), "unexpected replot review data");
     validate_replot_review(result); return result;
 }
+struct ReplotConstructionEvidence
+{
+    uint64_t batch = 0;
+    std::string engine, source_build, inspection_digest;
+    stream_state::Stamp stage;
+    bool operator==(ReplotConstructionEvidence const&) const = default;
+};
 struct ReplotRevalidation
 {
     // Flat successors retain the original bytes once. Progress and receipts
@@ -159,7 +325,14 @@ struct ReplotRevalidation
     std::string origin_review, inventory_json, resources_json;
     std::string parent_policy_digest, journal_digest;
     std::vector<farm::ReplotReaderObservation> readers;
+    std::optional<ReplotConstructionEvidence> construction;
 };
+inline void validate_replot_construction_binding(std::optional<ReplotConstructionEvidence> const& reviewed,
+    std::optional<ReplotConstructionEvidence> const& current)
+{
+    require(current == reviewed,
+        "construction checkpoint or native stage changed since review; repeat --revalidate at the current stopped boundary");
+}
 inline void validate_replot_reader_changes(farm::FarmInventory const& origin, farm::FarmInventory const& current)
 {
     require(origin.plots.size() == current.plots.size(), "revalidation changed the original inventory entry count");
@@ -200,7 +373,8 @@ inline std::string replot_revalidation_text(ReplotRevalidation const& value)
             value.parent_policy_digest.find_first_not_of("0123456789abcdef") == value.parent_policy_digest.npos)) &&
         value.journal_digest.size() == 64 && value.journal_digest.find_first_not_of("0123456789abcdef") == value.journal_digest.npos,
         "invalid reviewed replot revalidation");
-    require(value.origin_review.starts_with("ordinary-group-replot-review-v1\n"), "revalidation must embed one original review, never a nested successor");
+    require(value.origin_review.starts_with("ordinary-group-replot-review-v1\n") || value.origin_review.starts_with("ordinary-group-replot-review-v2\n"),
+        "revalidation must embed one original review, never a nested successor");
     require(value.readers.size() <= 1024, "revalidation reader observations exceed their root bound");
     std::set<uint64_t> roots;
     for (auto const& reader : value.readers)
@@ -208,18 +382,35 @@ inline std::string replot_revalidation_text(ReplotRevalidation const& value)
             !reader.version.empty() && reader.version.size() <= 4096 && reader.identity.size() == 64 &&
             reader.identity.find_first_not_of("0123456789abcdef") == reader.identity.npos && !reader.source.empty() && reader.source.size() <= 8192 &&
             !reader.captured_at.empty() && reader.captured_at.size() <= 128, "invalid revalidation reader observation");
-    std::ostringstream out; out << "ordinary-group-replot-revalidation-v1\n" << std::quoted(value.origin_review) << '\n'
+    if (value.construction)
+    {
+        auto const& saved = *value.construction;
+        require(saved.batch < farming_detail::maximum_files && (saved.engine == "incremental" || saved.engine == "staged" ||
+            saved.engine == "merged" || saved.engine == "external") && !saved.source_build.empty() && saved.source_build.size() <= 128 &&
+            saved.inspection_digest.size() == 64 && saved.inspection_digest.find_first_not_of("0123456789abcdef") == saved.inspection_digest.npos &&
+            saved.stage.inode && saved.stage.mtime_ns < 1000000000 && saved.stage.ctime_ns < 1000000000,
+            "invalid reviewed construction checkpoint binding");
+    }
+    std::ostringstream out; out << (value.construction ? "ordinary-group-replot-revalidation-v2\n" : "ordinary-group-replot-revalidation-v1\n")
+        << std::quoted(value.origin_review) << '\n'
         << std::quoted(value.inventory_json) << '\n' << std::quoted(value.resources_json) << '\n'
         << std::quoted(value.parent_policy_digest) << ' ' << std::quoted(value.journal_digest) << '\n' << value.readers.size() << '\n';
     for (auto const& reader : value.readers) out << reader.root << ' ' << std::quoted(reader.reader) << ' ' << std::quoted(reader.version) << ' '
         << std::quoted(reader.identity) << ' ' << std::quoted(reader.source) << ' ' << std::quoted(reader.captured_at) << '\n';
+    if (value.construction)
+    {
+        auto const& saved = *value.construction; auto const& stamp = saved.stage;
+        out << saved.batch << ' ' << std::quoted(saved.engine) << ' ' << std::quoted(saved.source_build) << ' ' << std::quoted(saved.inspection_digest)
+            << ' ' << stamp.device << ' ' << stamp.inode << ' ' << stamp.bytes << ' ' << stamp.mtime << ' ' << stamp.ctime
+            << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns << '\n';
+    }
     return out.str();
 }
 inline ReplotRevalidation parse_replot_revalidation(std::string const& body, uint64_t memory_limit)
 {
     require(body.size() < memory_limit / 16, "replot revalidation exceeds its parsing memory budget");
     std::istringstream in(body); std::string version; std::getline(in, version);
-    require(version == "ordinary-group-replot-revalidation-v1", "expected a reviewed replot revalidation");
+    require(version == "ordinary-group-replot-revalidation-v1" || version == "ordinary-group-replot-revalidation-v2", "expected a reviewed replot revalidation");
     ReplotRevalidation result; in >> std::quoted(result.origin_review) >> std::quoted(result.inventory_json) >> std::quoted(result.resources_json)
         >> std::quoted(result.parent_policy_digest) >> std::quoted(result.journal_digest);
     size_t count = 0; in >> count;
@@ -227,6 +418,12 @@ inline ReplotRevalidation parse_replot_revalidation(std::string const& body, uin
     result.readers.resize(count);
     for (auto& reader : result.readers) in >> reader.root >> std::quoted(reader.reader) >> std::quoted(reader.version) >> std::quoted(reader.identity)
         >> std::quoted(reader.source) >> std::quoted(reader.captured_at);
+    if (version == "ordinary-group-replot-revalidation-v2")
+    {
+        auto& saved = result.construction.emplace(); auto& stamp = saved.stage;
+        in >> saved.batch >> std::quoted(saved.engine) >> std::quoted(saved.source_build) >> std::quoted(saved.inspection_digest)
+            >> stamp.device >> stamp.inode >> stamp.bytes >> stamp.mtime >> stamp.ctime >> stamp.mtime_ns >> stamp.ctime_ns;
+    }
     require(bool(in), "incomplete replot revalidation"); in >> std::ws; require(in.eof(), "unexpected replot revalidation data");
     (void)replot_revalidation_text(result); return result;
 }
@@ -241,7 +438,10 @@ struct ReplotJournal
     // required for resume; completed batches have chained per-output receipts.
     std::vector<ReplotCandidateProgress> retirements;
     std::optional<stream_state::Stamp> verified_stage, published, ready;
+    file_io::DurableIdentity verified_stage_identity, published_identity, ready_identity;
 };
+inline bool replot_journal_native_evidence(ReplotJournal const& journal)
+{ return file_io::has_durable_identity(journal.verified_stage_identity) || file_io::has_durable_identity(journal.published_identity) || file_io::has_durable_identity(journal.ready_identity); }
 inline char const* replot_phase_name(ReplotPhase phase)
 {
     switch (phase)
@@ -276,6 +476,17 @@ inline uint64_t replot_output_count(FarmingState const& state)
     }
     return count;
 }
+inline bool replot_output_matches(stream_state::Stamp const& saved, file_io::DurableIdentity const& saved_identity,
+    stream_state::Stamp current, file_io::DurableIdentity const& current_identity, bool rename_allowed = false)
+{
+    if (!file_io::valid_durable_identity(saved_identity) || !file_io::valid_durable_identity(current_identity)) return false;
+    if (file_io::has_durable_identity(saved_identity))
+    {
+        if (saved_identity != current_identity) return false;
+        current.device = saved.device;
+    }
+    return rename_allowed ? stream_state::same_output(saved, current) : saved == current;
+}
 inline void validate_replot_journal(ReplotJournal const& journal)
 {
     require(replot_digest(journal.review_digest) && (journal.policy_digest.empty() || (replot_digest(journal.policy_digest) && journal.revision > 1)) && journal.revision &&
@@ -291,9 +502,21 @@ inline void validate_replot_journal(ReplotJournal const& journal)
     for (auto value : journal.retirements)
         require(unsigned(value.state) <= unsigned(ReplotRetirement::retired) &&
             (value.state != ReplotRetirement::active || !value.predelete), "invalid replot retirement state");
-    require(!journal.published || (journal.verified_stage && stream_state::same_output(*journal.verified_stage, *journal.published)),
+    for (auto const pair : {std::pair{&journal.verified_stage, &journal.verified_stage_identity},
+        std::pair{&journal.published, &journal.published_identity}, std::pair{&journal.ready, &journal.ready_identity}})
+        require(file_io::valid_durable_identity(*pair.second) &&
+            (!file_io::has_durable_identity(*pair.second) || (*pair.first && (**pair.first).inode)),
+            "migration native evidence lacks its durable output stamp");
+    auto consistent = [](auto const& later, auto const& a, auto const& b)
+    { return !later || !file_io::has_durable_identity(a) || a == b; };
+    require(consistent(journal.published, journal.verified_stage_identity, journal.published_identity) &&
+        consistent(journal.ready, journal.published_identity, journal.ready_identity) &&
+        consistent(journal.ready, journal.verified_stage_identity, journal.ready_identity), "migration publication changed or omitted its durable native object");
+    require(!journal.published || (journal.verified_stage && replot_output_matches(*journal.verified_stage, journal.verified_stage_identity,
+        *journal.published, journal.published_identity, true)),
         "replot publication lacks its verified staged identity");
-    require(!journal.ready || (journal.published && *journal.ready == *journal.published), "replot readiness lacks its immutable publication");
+    require(!journal.ready || (journal.published && replot_output_matches(*journal.published, journal.published_identity,
+        *journal.ready, journal.ready_identity)), "replot readiness lacks its immutable publication");
     if (journal.phase == ReplotPhase::preparing)
     {
         require(!journal.batch && !journal.retired_prefix && !journal.verified_stage && !journal.published && !journal.ready &&
@@ -308,7 +531,8 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
 {
     validate_replot_journal(journal);
     std::ostringstream out;
-    out << (journal.policy_digest.empty() ? "ordinary-group-replot-journal-v1\n" : "ordinary-group-replot-journal-v2\n") << std::quoted(journal.review_digest) << ' '
+    bool const durable = replot_journal_native_evidence(journal);
+    out << (durable ? "ordinary-group-replot-journal-v3\n" : journal.policy_digest.empty() ? "ordinary-group-replot-journal-v1\n" : "ordinary-group-replot-journal-v2\n") << std::quoted(journal.review_digest) << ' '
         << journal.revision << ' ' << std::quoted(journal.parent_digest) << ' ' << unsigned(journal.phase) << ' ' << journal.batch << ' '
         << journal.retired_prefix << ' ' << std::quoted(journal.receipt_digest) << '\n'
         << std::quoted(farming_state_text(journal.farm)) << '\n' << journal.retirements.size();
@@ -321,14 +545,17 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
             << stamp.mtime << ' ' << stamp.ctime << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns; }
         out << '\n';
     }
-    if (!journal.policy_digest.empty()) out << std::quoted(journal.policy_digest) << '\n';
+    if (durable || !journal.policy_digest.empty()) out << std::quoted(journal.policy_digest) << '\n';
+    if (durable) for (auto const* identity : {&journal.verified_stage_identity, &journal.published_identity, &journal.ready_identity})
+        write_replot_native_identity(out, *identity);
     return out.str();
 }
 inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memory_limit)
 {
     require(body.size() < memory_limit / 8, "replot journal exceeds its parsing memory budget");
     std::istringstream in(body); std::string version, farm; unsigned phase = 0;
-    std::getline(in, version); require(version == "ordinary-group-replot-journal-v1" || version == "ordinary-group-replot-journal-v2", "unsupported replot journal version");
+    std::getline(in, version); require(version == "ordinary-group-replot-journal-v1" || version == "ordinary-group-replot-journal-v2" ||
+        version == "ordinary-group-replot-journal-v3", "unsupported replot journal version");
     ReplotJournal result; size_t count = 0;
     in >> std::quoted(result.review_digest) >> result.revision >> std::quoted(result.parent_digest) >> phase >> result.batch
         >> result.retired_prefix >> std::quoted(result.receipt_digest) >> std::quoted(farm);
@@ -356,8 +583,13 @@ inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memo
         require(bool(in), "incomplete replot replacement publication record");
     }
     require(bool(in), "incomplete replot readiness record");
-    if (version == "ordinary-group-replot-journal-v2")
-    { in >> std::quoted(result.policy_digest); require(in && replot_digest(result.policy_digest), "invalid replot active policy digest"); }
+    if (version != "ordinary-group-replot-journal-v1")
+    { in >> std::quoted(result.policy_digest); require(in && (result.policy_digest.empty() ? version == "ordinary-group-replot-journal-v3" : replot_digest(result.policy_digest)), "invalid replot active policy digest"); }
+    if (version == "ordinary-group-replot-journal-v3")
+    {
+        for (auto* identity : {&result.verified_stage_identity, &result.published_identity, &result.ready_identity}) *identity = read_replot_native_identity(in);
+        require(replot_journal_native_evidence(result), "migration native journal schema has no object evidence");
+    }
     in >> std::ws; require(in.eof(), "unexpected replot journal data");
     validate_replot_journal(result); return result;
 }
@@ -374,7 +606,8 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
         // successor and audits every retained object at its reviewed boundary.
         return !after.policy_digest.empty() && before.phase < ReplotPhase::handoff && after.phase == before.phase &&
             after.batch == before.batch && after.retired_prefix == before.retired_prefix && after.receipt_digest == before.receipt_digest &&
-            after.retirements == before.retirements && after.verified_stage == before.verified_stage && after.published == before.published && after.ready == before.ready;
+            after.retirements == before.retirements && after.verified_stage == before.verified_stage && after.published == before.published && after.ready == before.ready &&
+            after.verified_stage_identity == before.verified_stage_identity && after.published_identity == before.published_identity && after.ready_identity == before.ready_identity;
     }
     if (after.phase < before.phase || unsigned(after.phase) > unsigned(before.phase) + 1 ||
         after.batch < before.batch || after.batch > before.batch + 1) return false;
@@ -397,6 +630,11 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
         if (*pair.first != *pair.second)
         { if (*pair.first || !*pair.second || before.phase != ReplotPhase::replacing) return false; ++changes; }
     }
+    auto native_transition = [](auto const& a, auto const& b, auto const& identity_a, auto const& identity_b)
+    { return identity_a == identity_b || (!a && b); };
+    if (!native_transition(before.verified_stage, after.verified_stage, before.verified_stage_identity, after.verified_stage_identity) ||
+        !native_transition(before.published, after.published, before.published_identity, after.published_identity) ||
+        !native_transition(before.ready, after.ready, before.ready_identity, after.ready_identity)) return false;
     for (size_t index = 0; index < before.retirements.size(); ++index)
     {
         auto const a = before.retirements[index], b = after.retirements[index];
@@ -446,43 +684,61 @@ inline bool replot_local_bindings_fit(uint64_t journal_bytes, uint64_t farming_b
     auto const local = add(multiply(multiply(bytes / unit + bool(bytes % unit), unit), 2), multiply(unit, 2));
     return required <= allowance && local <= allowance - required;
 }
+inline bool replot_policy_boundary_matches(ReplotJournal const& journal, std::string const& journal_digest, ReplotRevalidation const& successor)
+{
+    return journal.phase < ReplotPhase::handoff && successor.parent_policy_digest == journal.policy_digest && successor.journal_digest == journal_digest;
+}
 inline bool replot_policy_activation(ReplotJournal const& journal, std::string const& journal_digest,
     std::string const& policy_digest, ReplotRevalidation const* successor)
 {
     if (journal.policy_digest == policy_digest) return false;
     require(successor && !policy_digest.empty(), "migration has an active reviewed successor; use its matching --from-plan file");
-    require(journal.phase < ReplotPhase::handoff && successor->parent_policy_digest == journal.policy_digest && successor->journal_digest == journal_digest,
+    require(replot_policy_boundary_matches(journal, journal_digest, *successor),
         "migration advanced after this successor was reviewed; save a new revalidation at the current stopped boundary");
     return true;
+}
+inline char const* replot_policy_binding(ReplotJournal const& journal, std::string const& journal_digest,
+    std::string const& policy_digest, ReplotRevalidation const* successor)
+{
+    if (journal.policy_digest == policy_digest) return policy_digest.empty() ? "origin" : "active";
+    if (policy_digest.empty()) return "origin-with-active-successor";
+    if (!successor || successor->parent_policy_digest != journal.policy_digest) return "different-active-policy";
+    return replot_policy_boundary_matches(journal, journal_digest, *successor) ? "pending" : "stale-boundary";
 }
 struct ReplotReceipt
 {
     std::string review_digest, previous_digest;
     uint64_t batch = 0, first_candidate = 0, candidates = 0;
     stream_state::Stamp replacement;
+    file_io::DurableIdentity replacement_identity;
 };
 inline std::string replot_receipt_text(ReplotReceipt const& receipt)
 {
     require(replot_digest(receipt.review_digest) && (receipt.batch ? replot_digest(receipt.previous_digest) : receipt.previous_digest.empty()) &&
         receipt.candidates <= replot_maximum_batch_sources && receipt.first_candidate <= farming_detail::maximum_files - receipt.candidates &&
-        receipt.replacement.bytes, "invalid replot receipt");
+        receipt.replacement.bytes && file_io::valid_durable_identity(receipt.replacement_identity) &&
+        (!file_io::has_durable_identity(receipt.replacement_identity) || receipt.replacement.inode), "invalid replot receipt");
     auto const& stamp = receipt.replacement;
     std::ostringstream out;
-    out << "ordinary-group-replot-receipt-v1\n" << std::quoted(receipt.review_digest) << ' '
+    bool const durable = file_io::has_durable_identity(receipt.replacement_identity);
+    out << (durable ? "ordinary-group-replot-receipt-v2\n" : "ordinary-group-replot-receipt-v1\n") << std::quoted(receipt.review_digest) << ' '
         << receipt.batch << ' ' << std::quoted(receipt.previous_digest) << ' ' << receipt.first_candidate << ' ' << receipt.candidates << '\n'
         << stamp.device << ' ' << stamp.inode << ' ' << stamp.bytes << ' ' << stamp.mtime << ' ' << stamp.ctime << ' '
         << stamp.mtime_ns << ' ' << stamp.ctime_ns << '\n';
+    if (durable) write_replot_native_identity(out, receipt.replacement_identity);
     return out.str();
 }
 inline ReplotReceipt parse_replot_receipt(std::string const& body)
 {
     require(body.size() <= 4096, "replot receipt exceeds its bound");
     std::istringstream in(body); std::string version; std::getline(in, version);
-    require(version == "ordinary-group-replot-receipt-v1", "unsupported replot receipt version");
+    require(version == "ordinary-group-replot-receipt-v1" || version == "ordinary-group-replot-receipt-v2", "unsupported replot receipt version");
     ReplotReceipt result; auto& stamp = result.replacement;
     in >> std::quoted(result.review_digest) >> result.batch >> std::quoted(result.previous_digest) >> result.first_candidate >> result.candidates
         >> stamp.device >> stamp.inode >> stamp.bytes >> stamp.mtime >> stamp.ctime >> stamp.mtime_ns >> stamp.ctime_ns;
     require(in && stamp.mtime_ns < 1000000000 && stamp.ctime_ns < 1000000000, "invalid replot receipt stamp");
+    if (version == "ordinary-group-replot-receipt-v2")
+    { result.replacement_identity = read_replot_native_identity(in); require(file_io::has_durable_identity(result.replacement_identity), "migration native receipt schema has no object evidence"); }
     in >> std::ws; require(in.eof(), "unexpected replot receipt data");
     (void)replot_receipt_text(result); return result;
 }
@@ -499,11 +755,12 @@ inline void complete_replot_batch(ReplotReview const& review, ReplotReceipt cons
 {
     validate_replot_progress(review, state);
     validate_replot_receipt(review, state.review_digest, state.batch, state.receipt_digest, receipt);
-    require(state.ready && *state.ready == receipt.replacement && replot_digest(receipt_digest) &&
+    require(state.ready && *state.ready == receipt.replacement && state.ready_identity == receipt.replacement_identity && replot_digest(receipt_digest) &&
         std::all_of(state.retirements.begin(), state.retirements.end(), [](auto value) { return value.state == ReplotRetirement::retired; }),
         "migration batch cannot complete before its replacement and retirements");
     state.retired_prefix += state.retirements.size(); ++state.batch; state.receipt_digest = receipt_digest;
     state.verified_stage.reset(); state.published.reset(); state.ready.reset(); state.retirements.clear();
+    state.verified_stage_identity = {}; state.published_identity = {}; state.ready_identity = {};
     if (state.batch < review.batches.size()) state.retirements.resize(size_t(review.batches[size_t(state.batch)].sources));
 }
 // Local convenience defaults are separate from portable observations and never

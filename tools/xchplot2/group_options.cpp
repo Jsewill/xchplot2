@@ -248,7 +248,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
                 (inventory && (key == "--inventory" || key == "--no-inventory" || key == "--save-plan" ||
                     key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable")) ||
-                (inventory && key == "--farm-adapter") ||
+                (inventory && (key == "--farm-adapter" || key == "--farm-adapter-timeout-ms")) ||
                 (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
                 key == "--json" || (!calibration_worker && (key == "--max-ram" || key == "-M" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v")),
@@ -308,6 +308,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
             else if (key == "--replot") result.replot_inventory = path(value);
             else if (key == "--farm-adapter") { result.farm_adapter = value; result.farm_adapter_set = true; }
+            else if (key == "--farm-adapter-timeout-ms")
+            { result.farm_adapter_timeout_ms = number(value.c_str()); result.farm_adapter_timeout_set = true; }
             else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str());
             else if (key == "--replot-source-root" || key == "--replot-exclude-root")
             {
@@ -401,7 +403,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 result.temporary_capacity = number(value.c_str());
                 require(result.temporary_capacity > 0, "--temp-capacity-bytes must be positive");
             }
-            else if (key == "--destination-temp") result.destination_temp = value;
+            else if (key == "--destination-temp") { result.destination_temp = value; result.destination_temp_set = true; }
             else if (key == "--destination" && command.empty())
             {
                 require(result.destinations.size() < 1023, "too many destinations");
@@ -494,6 +496,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     }
     require(result.farm_adapter == "chia" || result.farm_adapter == "gigahorse" || result.farm_adapter == "drchia",
         "--farm-adapter requires chia, gigahorse or drchia");
+    require(result.farm_adapter_timeout_ms && result.farm_adapter_timeout_ms <= 3600000,
+        "--farm-adapter-timeout-ms must be in 1..3600000");
     if (result.inventory)
     {
         require(command == "plan" && !result.target.empty(), "plan --inventory requires explicit existing farm roots");
@@ -555,6 +559,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     }
     require(result.farm_adapter == "chia" || !result.replot_inventory.empty() || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
+    require(!result.farm_adapter_timeout_set || !result.replot_inventory.empty() ||
+        (farm_command && !result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan)),
+        "--farm-adapter-timeout-ms requires inventory, replot review or a saved migration plan");
     if (result.extend || !result.relocations.empty()) result.resume = true;
     require(!result.target.empty() || (farm_command &&
         (result.plan_only || result.resume || !result.manifest.empty() || !result.from_plan.empty())), "destination required");

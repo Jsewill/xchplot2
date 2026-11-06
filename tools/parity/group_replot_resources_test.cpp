@@ -63,15 +63,108 @@ int main() try
     {
         ReplotReview review; review.farm = state; review.inventory_json = review.resources_json = "resource-fixture";
         review.farm.fingerprint = review.farm.seed = std::string(64, '0'); review.farm.farmer = std::string(96, '0'); review.farm.pool = std::string(64, '0');
+        review.farm.job_id = std::string(64, 'a'); review.farm.directories[0].layout.families = 1;
         review.farm.estimate.feasible = true; review.farm.directories[0].layout.files = review.farm.directories[0].layout.total_members = 1;
         review.memory_limit_bytes = 64 * mib; review.sources = {0}; review.space.resize(1);
         ReplotBatch batch; batch.sources = 1; batch.final_bound_bytes = 1; review.batches = {batch};
+        {
+            auto const strict = replot_review_text(review);
+            require(strict.starts_with("ordinary-group-replot-review-v1\n") && replot_review_text(parse_replot_review(strict, 64 * mib)) == strict,
+                "legacy review bytes changed without prospective root ownership");
+            inventory_detail::RootHandle pin(directory); auto const native = inventory_detail::stat(pin.handle);
+            InventoryRoot owner{file_io::path_text(pin.path), farming_directory_identity(pin.path), storage_device(pin.path), uint64_t(native.st_dev), uint64_t(native.st_ino)};
+            if (!file_io::capture_durable_identity(pin.handle.fd, &owner.durable))
+            {
+                auto prospective = review; prospective.owned_roots.push_back(owner); prospective.scratch_directories.push_back(owner.path);
+                auto const text = replot_review_text(prospective);
+                require(text.starts_with("ordinary-group-replot-review-v2\n") && replot_review_text(parse_replot_review(text, 64 * mib)) == text,
+                    "migration root owner lost exact explicit scope or native evidence");
+                auto invalid = prospective; invalid.owned_roots.push_back(owner);
+                rejects([&] { (void)replot_review_text(invalid); }, "extra duplicate native root gained authority");
+                invalid = prospective; invalid.owned_roots[0].storage.filesystem += "-changed";
+                rejects([&] { (void)replot_review_text(invalid); }, "native root changed its stored destination storage association");
+                invalid = prospective; invalid.scratch_directories.push_back(owner.path);
+                rejects([&] { (void)replot_review_text(invalid); }, "duplicate reviewed scratch root gained authority");
+                invalid = prospective; invalid.owned_roots[0].durable = {};
+                rejects([&] { (void)replot_review_text(invalid); }, "new root schema emitted without prospective native evidence");
+            }
+        }
         ReplotJournal journal; journal.review_digest = std::string(64, 'a'); journal.farm = review.farm;
         journal.phase = ReplotPhase::replacing; journal.retirements = {{ReplotRetirement::active, false}};
         FarmInventory inventory; InventoryPlot source; source.workload_id = "legacy"; source.header_validated = true;
         source.identity.allocated_bytes = 64; source.identity.links = 1; inventory.plots = {source};
         auto completed = profile; completed.native.construction[0].work_us = UINT64_MAX / 4;
         stream_state::Stamp sealed; sealed.bytes = 1; journal.verified_stage = sealed;
+        {
+            auto const legacy = replot_journal_text(journal);
+            require(legacy.starts_with("ordinary-group-replot-journal-v1\n") &&
+                replot_journal_text(parse_replot_journal(legacy, 64 * mib)) == legacy, "legacy migration journal bytes changed without native evidence");
+            auto native = journal; native.verified_stage->inode = 1;
+            native.verified_stage_identity = {file_io::DurableIdentity::Scheme::windows_file_id,
+                "ntfs:12345678-1234-1234-1234-123456789abc:1", std::string(32, '1')};
+            require(!replot_output_matches(*native.verified_stage, native.verified_stage_identity, *native.verified_stage, {}),
+                "recorded native generation accepted missing fresh evidence with unchanged metadata");
+            require(replot_output_matches(*native.verified_stage, {}, *native.verified_stage, native.verified_stage_identity),
+                "fresh generation evidence changed strict legacy comparison for an unchanged object");
+            auto const body = replot_journal_text(native);
+            require(body.starts_with("ordinary-group-replot-journal-v3\n") && replot_journal_text(parse_replot_journal(body, 64 * mib)) == body,
+                "migration native journal schema lost exact owner evidence");
+            auto altered = native; ++altered.revision; altered.parent_digest = stream_state::digest(body);
+            altered.verified_stage_identity.object.back() = '2';
+            require(!valid_replot_revision(native, altered), "existing stage acquired different native authority in a journal transition");
+            altered = native; ++altered.revision; altered.parent_digest = stream_state::digest(body); altered.verified_stage_identity = {};
+            require(!valid_replot_revision(native, altered), "existing stage dropped native authority in a journal transition");
+            altered = native; ++altered.revision; altered.parent_digest = stream_state::digest(body); altered.published = altered.verified_stage;
+            require(!valid_replot_revision(native, altered), "new publication omitted previously captured stage authority");
+            altered.published_identity = altered.verified_stage_identity;
+            require(valid_replot_revision(native, altered), "publication failed to propagate exact prospective authority");
+            auto remounted = altered; remounted.published->device ^= UINT64_C(0x80000000);
+            ++remounted.published->ctime;
+            auto const original_stage = native.verified_stage;
+            require(valid_replot_revision(native, remounted) && remounted.verified_stage == original_stage &&
+                replot_journal_text(parse_replot_journal(replot_journal_text(remounted), 64 * mib)) == replot_journal_text(remounted),
+                "native device-only publication recovery changed its canonical stage or rename metadata policy");
+            auto legacy_before = native; legacy_before.verified_stage_identity = {};
+            auto legacy_after = remounted; legacy_after.verified_stage_identity = legacy_after.published_identity = {};
+            legacy_after.parent_digest = stream_state::digest(replot_journal_text(legacy_before));
+            require(!valid_replot_revision(legacy_before, legacy_after), "legacy publication retroactively normalized a changed device");
+            auto wrong = remounted; wrong.published_identity.object.back() = '2';
+            require(!valid_replot_revision(native, wrong), "different native publication authority normalized a changed device");
+            wrong = remounted; wrong.published_identity = {};
+            require(!valid_replot_revision(native, wrong), "missing publication authority normalized a changed device");
+            wrong = remounted; ++wrong.published->inode;
+            require(!valid_replot_revision(native, wrong), "native publication authority normalized a changed inode");
+            wrong = remounted; ++wrong.published->mtime_ns;
+            require(!valid_replot_revision(native, wrong), "native publication authority normalized changed contents metadata");
+            auto remounted_ready = remounted; ++remounted_ready.revision;
+            remounted_ready.parent_digest = stream_state::digest(replot_journal_text(remounted)); remounted_ready.ready = remounted_ready.published;
+            remounted_ready.ready_identity = remounted_ready.published_identity; remounted_ready.ready->device ^= UINT64_C(0x80000000);
+            require(valid_replot_revision(remounted, remounted_ready), "native readiness could not bind the exact publication after a device change");
+            auto changed_ready = remounted_ready; ++changed_ready.ready->ctime;
+            require(!valid_replot_revision(remounted, changed_ready), "native readiness weakened immutable publication metadata");
+            auto readiness = altered; ++readiness.revision; readiness.parent_digest = stream_state::digest(replot_journal_text(altered)); readiness.ready = readiness.published;
+            require(!valid_replot_revision(altered, readiness), "new readiness omitted previously captured publication authority");
+            readiness.ready_identity = readiness.published_identity;
+            require(valid_replot_revision(altered, readiness), "readiness failed to propagate exact prospective authority");
+            native.published = native.ready = native.verified_stage;
+            native.published_identity = native.ready_identity = native.verified_stage_identity;
+            native.retirements[0].state = ReplotRetirement::retired;
+            ReplotReceipt receipt; receipt.review_digest = native.review_digest; receipt.candidates = 1;
+            receipt.replacement = *native.ready; receipt.replacement_identity = native.ready_identity;
+            auto const receipt_body = replot_receipt_text(receipt);
+            require(receipt_body.starts_with("ordinary-group-replot-receipt-v2\n") &&
+                replot_receipt_text(parse_replot_receipt(receipt_body)) == receipt_body, "migration receipt lost prospective native authority");
+            auto mismatched = receipt; mismatched.replacement_identity.object.back() = '2'; auto untouched = native;
+            rejects([&] { complete_replot_batch(review, mismatched, stream_state::digest(replot_receipt_text(mismatched)), untouched); },
+                "completed receipt changed its exact ready object evidence");
+            complete_replot_batch(review, receipt, stream_state::digest(receipt_body), native);
+            require(!replot_journal_native_evidence(native) && !native.verified_stage && !native.published && !native.ready,
+                "completed batch retained active native ownership");
+            receipt.replacement_identity = {};
+            auto const strict = replot_receipt_text(receipt);
+            require(strict.starts_with("ordinary-group-replot-receipt-v1\n") && replot_receipt_text(parse_replot_receipt(strict)) == strict,
+                "legacy receipt bytes changed without native evidence");
+        }
         require(assess_replot_remaining(completed, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
             "successor replayed construction already covered by an exact verified stage");
         journal.verified_stage.reset();

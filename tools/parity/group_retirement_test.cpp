@@ -52,6 +52,24 @@ void protocol(fs::path const& root)
     bool checked = false; remove(normal, [&] { checked = true; });
     require(checked && missing(normal), "retirement missed its live gate or native deletion");
 
+    auto remounted = fixture(root, "prospective-device-change");
+    if (file_io::has_durable_identity(remounted.roots[0].durable) && file_io::has_durable_identity(remounted.plots[0].identity.durable))
+    {
+        remounted.roots[0].device ^= UINT64_C(0x80000000);
+        remounted.plots[0].identity.stamp.device = remounted.roots[0].device;
+        auto strict = remounted; strict.roots[0].durable = {}; strict.plots[0].identity.durable = {};
+        rejects([&] { (void)take(strict); }, "legacy native source retroactively recovered a changed device for claim");
+        require(fs::exists(source(remounted)) && !fs::exists(claim(remounted)), "legacy device refusal moved its source");
+        auto const claimed = take(remounted);
+        require(matches_inventory_identity(remounted.plots[0].identity, claimed, true) && !fs::exists(source(remounted)) &&
+            read(claim(remounted)) == "reviewed source bytes", "prospective root/source bindings did not preserve the exact claim across simulated device change");
+        require(matches_inventory_identity(remounted.plots[0].identity, take(remounted), true), "prospective claim could not recover its held native generation");
+        rejects([&] { remove(remounted, [] { throw std::runtime_error("not ready"); }); }, "remount authority bypassed the live retirement gate");
+        require(fs::exists(claim(remounted)), "remount authority removed an unready source claim");
+        bool observed = false; remove(remounted, [&] { observed = true; });
+        require(observed && missing(remounted), "prospective device recovery missed the native unlink and live gate");
+    }
+
     auto collision = fixture(root, "collision"); protect(claim(collision).parent_path()); write(claim(collision), "unrelated claim");
     rejects([&] { (void)take(collision); }, "claim collision replaced a file");
     require(read(source(collision)) == "reviewed source bytes" && read(claim(collision)) == "unrelated claim", "collision changed either object");

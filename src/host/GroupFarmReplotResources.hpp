@@ -260,7 +260,7 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
         auto known = can_confirm_unload.find(plot.workload_id);
         if (at->count > 1 || (known != can_confirm_unload.end() && known->second)) --at->count;
     };
-    auto const restart_counts = remaining; AssessmentAccumulator accumulation(profile);
+    auto const restart_counts = remaining; AssessmentAccumulator accumulation(profile); std::string exhausted_selection;
     auto phase = [&](std::vector<Remaining> const& counts, uint64_t ready, bool building, bool verifying, std::string const& name)
     { for (bool future : {false, true}) accumulation.add(replot_stage(profile, request, counts, ready, building, verifying, future, name)); };
     phase(remaining, ready_members, false, false, "current-confirmed-boundary-supervision");
@@ -300,6 +300,7 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
                             !assess_stage(profile, replot_stage(profile, request, counts, ready_members, false, true, future)).feasible) return false;
                     return true;
                 });
+            if (selected.search_exhausted && exhausted_selection.empty()) exhausted_selection = prefix + ":predelete-selection-search-bound-exhausted";
             early = std::move(selected.sources);
             for (auto source : early) reduce(remaining, workload(batch, source));
             phase(remaining, ready_members, true, false, prefix + "-conditional-build-after-confirmed-unload");
@@ -316,7 +317,9 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
     }
     accumulation.add(replot_stage(profile, request, remaining, ready_members, false, false, true,
         "remaining-final-after-conditional-confirmed-source-unload"));
-    return accumulation.finish();
+    auto result = accumulation.finish();
+    if (!exhausted_selection.empty()) fail(result, std::move(exhausted_selection));
+    return result;
 }
 inline FarmingAssessment replot_native_farming_assessment(FarmingState const& state, uint64_t memory_limit)
 {

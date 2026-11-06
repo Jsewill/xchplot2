@@ -273,12 +273,20 @@ public:
     };
 
 private:
+    friend class MergeEngine;
+    struct ReadOnly {};
+    MergeState(std::string path, Config config, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+               std::array<uint8_t, 32>& authority);
+    void discover(bool resume, std::optional<Identity> initial,
+                  std::array<uint8_t, 32>* authority = nullptr);
     std::string path_;
+    ConstructionInspectionLimits const* inspection_limits_ = nullptr;
     int fd_ = -1;
     uint64_t device_ = 0, inode_ = 0, alignment_ = 4096, expected_bytes_ = 0;
     uint32_t allocation_hint_ = 0, placement_hint_ = 0, placement_begin_ = 0, backward_hint_ = free_block;
     bool created_ = false, confirmed_ = false, cow_ = false;
-    std::optional<std::pair<Record, std::vector<uint32_t>>> load(uint64_t slots, uint64_t slot_bytes) const;
+    std::optional<std::pair<Record, std::vector<uint32_t>>> load(uint64_t slots, uint64_t slot_bytes,
+        std::array<uint8_t, 32>* authority = nullptr) const;
     std::optional<Locator> locator(uint64_t offset) const;
     void locators(uint64_t first, uint64_t slots);
     void checkpoint_bytes();
@@ -303,6 +311,7 @@ inline void MergeState::read(uint64_t offset, std::span<uint8_t> bytes) const
     require(grow_add(offset, bytes.size()) <= size(), "read outside merged destination");
     while (!bytes.empty())
     {
+        if (inspection_limits_) inspection_limits_->check();
         auto const begin = std::chrono::steady_clock::now();
         auto const n = file_io::read_at(fd_, bytes.data(), std::min(bytes.size(), size_t(file_io::max_transfer)), file_io::Offset(offset));
         stats.read_ns += elapsed_ns(begin); ++stats.read_calls;
@@ -369,12 +378,13 @@ inline void MergeState::locators(uint64_t first, uint64_t slots)
     value(first, location); grow_failpoint("merge-locator-partial"); value(first + alignment_, location);
 }
 inline std::optional<std::pair<MergeState::Record, std::vector<uint32_t>>>
-MergeState::load(uint64_t slots, uint64_t slot_bytes) const
+MergeState::load(uint64_t slots, uint64_t slot_bytes, std::array<uint8_t, 32>* authority) const
 {
     if (slot_bytes < sizeof(Record) + 32 || slot_bytes % alignment_ || slots % alignment_ ||
         slots > size() || slot_bytes > (size() - slots) / 2) return {};
     require(slot_bytes <= config.memory_limit_bytes / 4 && slot_bytes <= SIZE_MAX,
             "merge checkpoints exceed memory budget");
+    if (inspection_limits_) inspection_limits_->check(grow_add(multiply(slot_bytes, 4), 65536));
     std::optional<std::pair<Record, std::vector<uint32_t>>> result;
     std::vector<uint8_t> bytes(size_t(slot_bytes), 0);
     for (unsigned i = 0; i < 2; ++i)
@@ -389,6 +399,7 @@ MergeState::load(uint64_t slots, uint64_t slot_bytes) const
         std::vector<uint32_t> blocks(saved.map_count);
         std::memcpy(blocks.data(), bytes.data() + sizeof(saved), blocks.size() * sizeof(uint32_t));
         result = std::pair{saved, std::move(blocks)};
+        if (authority) *authority = digest;
     }
     return result;
 }
@@ -424,6 +435,7 @@ inline void MergeState::load_ordinary(Header header)
         header.strength >= 2 && header.strength <= header.k - 3, "invalid ordinary merge source");
     identity.header = header; identity.memo.resize(header.memo_length); read(sizeof(Header), identity.memo);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
+    if (inspection_limits_) inspection_limits_->check(Engine::inspection_memory_bytes(header.k));
     require(header.chunk_index_offset >= sizeof(Header) + header.memo_length && header.chunk_index_offset < size(),
             "invalid ordinary merge source index");
     uint64_t const available = std::min(size() - header.chunk_index_offset, multiply(chunks, 8));
@@ -436,6 +448,7 @@ inline void MergeState::load_ordinary(Header header)
     unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
     for (auto& bytes : sizes)
     {
+        if (inspection_limits_) inspection_limits_->check();
         bool const negative = bits.read_u64(1);
         uint64_t const remainder = bits.read_u64(rice), quotient = bits.read_unary_64();
         require(quotient + rice + 2 <= 64, "invalid ordinary merge size code");
@@ -478,63 +491,7 @@ inline MergeState::MergeState(std::string path, Config cfg, bool resume, std::op
         struct statfs filesystem{}; require(!::fstatfs(fd_, &filesystem), "cannot inspect merge filesystem");
         cow_ = unsigned(filesystem.f_type) == 0x9123683eu;
 #endif
-        std::optional<std::pair<Record, std::vector<uint32_t>>> saved;
-        auto consider = [&](std::optional<Locator> location)
-        {
-            if (!location) return;
-            auto candidate = load(location->slots, location->slot_bytes);
-            if (candidate && (!saved || candidate->first.sequence > saved->first.sequence)) saved = std::move(candidate);
-        };
-        if (size() >= 2 * alignment_)
-        { consider(locator(size() - alignment_)); consider(locator(size() - 2 * alignment_)); }
-        Header header{};
-        if (size() >= sizeof(Header))
-        {
-            require(resume, "existing merged or ordinary groups require --resume");
-            header = value<Header>(0);
-            if (header.magic == PlotGroupFile::MAGIC &&
-                (header.version == construction_version || header.version == bootstrap_version) &&
-                header.chunk_index_offset <= size() && size() - header.chunk_index_offset >= 2 * alignment_)
-            {
-                consider(locator(header.chunk_index_offset));
-                consider(locator(header.chunk_index_offset + alignment_));
-            }
-        }
-        if (saved)
-        {
-            require(resume, "in-progress merged group is not farmable; use --resume");
-            state = saved->first; map = std::move(saved->second); active = true;
-            tail_records = state.phase == Phase::layout;
-            std::array<char, 64> build{}; auto const name = std::string_view(GROW_IDENTITY);
-            std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
-            require(state.build == build, "merge checkpoint requires the same codec/build identity");
-            validate();
-            identity = {state.original, {state.memo.begin(), state.memo.begin() + state.original.memo_length},
-                state.original_bytes, true, state.original.group_size, state.members, state.storage_bytes};
-        }
-        else if (size() && header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION)
-            load_ordinary(header);
-        else
-        {
-            // A new-file bootstrap has no committed member until its first
-            // valid checkpoint. Its private header is enough to resume it.
-            if (size())
-            {
-                require(header.magic == PlotGroupFile::MAGIC && header.version == bootstrap_version && !header.group_size,
-                        "damaged merged destination requires a valid checkpoint");
-                Identity bootstrap; bootstrap.header = header; bootstrap.header.version = PlotGroupFile::FORMAT_VERSION;
-                bootstrap.memo.resize(header.memo_length); read(sizeof(Header), bootstrap.memo);
-                bootstrap.header.chunk_index_offset = sizeof(Header) + bootstrap.memo.size(); initial = bootstrap;
-            }
-            require(initial.has_value(), "empty merged destination needs identity"); identity = *initial;
-            require(!identity.header.group_size && identity.memo.size() == identity.header.memo_length && identity.memo.size() <= 255,
-                    "invalid new merge identity");
-            identity.header.version = PlotGroupFile::FORMAT_VERSION;
-            identity.header.chunk_index_offset = sizeof(Header) + identity.memo.size(); identity.bytes = 0;
-        }
-        require(identity.header.magic == PlotGroupFile::MAGIC && identity.header.k >= 18 && identity.header.k <= 28 &&
-            !(identity.header.k & 1) && identity.header.strength >= 2 && identity.header.strength <= identity.header.k - 3,
-            "invalid merge identity");
+        discover(resume, std::move(initial));
     }
     catch (...)
     {
@@ -542,6 +499,93 @@ inline MergeState::MergeState(std::string path, Config cfg, bool resume, std::op
         file_io::close_file(fd_); fd_ = -1; throw;
     }
 }
+inline MergeState::MergeState(std::string path, Config cfg, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+                             std::array<uint8_t, 32>& authority)
+    : config(cfg), path_(std::move(path)), inspection_limits_(&limits)
+{
+    limits.check(65536);
+    require(cfg.window_bytes >= sizeof(Header) && cfg.window_bytes <= SIZE_MAX && cfg.codec_bytes &&
+        cfg.checkpoint_bytes && cfg.workers && cfg.capacity_bytes <= uint64_t(INT64_MAX), "invalid merge budgets");
+    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    require(fd_ >= 0, "cannot inspect merged destination: " + path_);
+    try
+    {
+        target = construction_stamp(fd_, path_); device_ = target.device; inode_ = target.inode;
+        file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
+        require(!file_io::inspect_fd(fd_, &info) && !file_io::space_fd(fd_, &allocation) &&
+            allocation.f_bsize && info.st_blksize > 0 && page > 0, "cannot inspect merged destination allocation");
+        alignment_ = std::max({uint64_t(4096), uint64_t(page), uint64_t(info.st_blksize),
+            uint64_t(allocation.f_bsize), uint64_t(allocation.f_frsize)});
+        expected_bytes_ = target.bytes; discover(true, initial, &authority);
+        require(size() <= cfg.capacity_bytes && identity.bytes <= cfg.capacity_bytes &&
+            (!active || state.storage_bytes <= cfg.capacity_bytes), "saved merge workspace exceeds capacity");
+        require(construction_stamp(fd_, path_) == target, "merged destination changed during inspection");
+    }
+    catch (...) { file_io::close_file(fd_); fd_ = -1; throw; }
+}
+inline void MergeState::discover(bool resume, std::optional<Identity> initial,
+                                 std::array<uint8_t, 32>* authority)
+{
+    std::optional<std::pair<Record, std::vector<uint32_t>>> saved;
+    auto consider = [&](std::optional<Locator> location)
+    {
+        if (!location) return;
+        std::array<uint8_t, 32> digest{}; auto candidate = load(location->slots, location->slot_bytes, &digest);
+        if (candidate && (!saved || candidate->first.sequence > saved->first.sequence))
+        { saved = std::move(candidate); if (authority) *authority = digest; }
+    };
+    if (size() >= 2 * alignment_)
+    { consider(locator(size() - alignment_)); consider(locator(size() - 2 * alignment_)); }
+    Header header{};
+    if (size() >= sizeof(Header))
+    {
+        require(resume, "existing merged or ordinary groups require --resume");
+        header = value<Header>(0);
+        if (header.magic == PlotGroupFile::MAGIC &&
+            (header.version == construction_version || header.version == bootstrap_version) &&
+            header.chunk_index_offset <= size() && size() - header.chunk_index_offset >= 2 * alignment_)
+        {
+            consider(locator(header.chunk_index_offset));
+            consider(locator(header.chunk_index_offset + alignment_));
+        }
+    }
+    if (saved)
+    {
+        require(resume, "in-progress merged group is not farmable; use --resume");
+        state = saved->first; map = std::move(saved->second); active = true;
+        tail_records = state.phase == Phase::layout;
+        std::array<char, 64> build{}; auto const name = std::string_view(GROW_IDENTITY);
+        std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
+        require(state.build == build, "merge checkpoint requires the same codec/build identity");
+        validate();
+        identity = {state.original, {state.memo.begin(), state.memo.begin() + state.original.memo_length},
+            state.original_bytes, true, state.original.group_size, state.members, state.storage_bytes};
+    }
+    else if (size() && header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION)
+        load_ordinary(header);
+    else
+    {
+        // A new-file bootstrap has no committed member until its first
+        // valid checkpoint. Its private header is enough to resume it.
+        if (size())
+        {
+            require(header.magic == PlotGroupFile::MAGIC && header.version == bootstrap_version && !header.group_size,
+                    "damaged merged destination requires a valid checkpoint");
+            Identity bootstrap; bootstrap.header = header; bootstrap.header.version = PlotGroupFile::FORMAT_VERSION;
+            bootstrap.memo.resize(header.memo_length); read(sizeof(Header), bootstrap.memo);
+            bootstrap.header.chunk_index_offset = sizeof(Header) + bootstrap.memo.size(); initial = bootstrap;
+        }
+        require(initial.has_value(), "empty merged destination needs identity"); identity = *initial;
+        require(!identity.header.group_size && identity.memo.size() == identity.header.memo_length && identity.memo.size() <= 255,
+                "invalid new merge identity");
+        identity.header.version = PlotGroupFile::FORMAT_VERSION;
+        identity.header.chunk_index_offset = sizeof(Header) + identity.memo.size(); identity.bytes = 0;
+    }
+    require(identity.header.magic == PlotGroupFile::MAGIC && identity.header.k >= 18 && identity.header.k <= 28 &&
+        !(identity.header.k & 1) && identity.header.strength >= 2 && identity.header.strength <= identity.header.k - 3,
+        "invalid merge identity");
+}
+
 inline MergeState::~MergeState()
 {
     if (fd_ < 0) return;
@@ -757,6 +801,7 @@ inline std::vector<uint32_t> MergeState::blocks(Run const& run) const
     uint32_t next = run.head;
     for (uint64_t i = 0; i < count; ++i)
     {
+        if (inspection_limits_) inspection_limits_->check();
         require(next < state.block_limit, "invalid merge run block link"); result.push_back(next); next = map[next];
     }
     require(next == end_block && (result.empty() ? run.head == end_block && run.tail == end_block : result.back() == run.tail),
@@ -801,6 +846,7 @@ inline void MergeState::release(Run& run, uint64_t position)
 }
 inline void MergeState::validate() const
 {
+    if (inspection_limits_) inspection_limits_->check(grow_add(multiply(map.size(), 32), 65536));
     require(state.alignment == alignment_ && state.block_bytes >= alignment_ && state.block_bytes % alignment_ == 0 &&
         state.block_bytes <= state.storage_bytes && state.transaction_bytes &&
         state.map_count == map.size() && state.map_count && state.block_limit <= state.map_count &&
@@ -833,6 +879,7 @@ inline void MergeState::validate() const
             "invalid merge layout checkpoint");
         for (uint32_t i = 0; i < state.layout_blocks; ++i)
         {
+            if (inspection_limits_) inspection_limits_->check();
             require(map[i] < state.block_limit && !used[map[i]] && (i >= state.layout_done || map[i] == i),
                     "duplicate or misplaced final merge block"); used[map[i]] = 1;
         }
@@ -885,6 +932,7 @@ inline void MergeState::validate() const
     uint64_t const end_meta = align(state.anchor + 2 * alignment_ + 2 * state.slot_bytes, state.block_bytes) / state.block_bytes;
     for (size_t i = 0; i < map.size(); ++i)
     {
+        if (inspection_limits_) inspection_limits_->check();
         bool const reserved = (i == 0 && !used[i]) || (i >= first_meta && i < end_meta);
         require(reserved ? map[i] == reserved_block : (used[i] || map[i] == free_block),
                 "unreachable or unprotected merge block");

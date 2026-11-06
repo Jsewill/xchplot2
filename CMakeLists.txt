@@ -772,18 +772,20 @@ if(XCHPLOT2_BUILD_CUDA)
         endif()
     endif()
 endif()
-execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
-        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-        "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch"
-    WORKING_DIRECTORY "${_pos2_solver_dir}"
-    RESULT_VARIABLE _solver_patch_result
-    ERROR_VARIABLE _solver_patch_error)
-if(NOT _solver_patch_result EQUAL 0)
-    message(FATAL_ERROR "pos2-chip solver patch failed: ${_solver_patch_error}")
-endif()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/pos2-solver-candidates.patch")
+foreach(_solver_patch pos2-solver-candidates.patch pos2-solver-thread-limit.patch)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+            "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+            "${GIT_EXECUTABLE}" apply --ignore-space-change "${CMAKE_CURRENT_SOURCE_DIR}/contrib/${_solver_patch}"
+        WORKING_DIRECTORY "${_pos2_solver_dir}"
+        RESULT_VARIABLE _solver_patch_result
+        ERROR_VARIABLE _solver_patch_error)
+    if(NOT _solver_patch_result EQUAL 0)
+        message(FATAL_ERROR "pos2-chip solver patch failed: ${_solver_patch_error}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/${_solver_patch}")
+endforeach()
 add_library(pos2_sha256 STATIC "${POS2_CHIP_DIR}/src/pos/sha/sha256.c")
 add_library(pos2_chip_headers INTERFACE)
 target_include_directories(pos2_chip_headers INTERFACE

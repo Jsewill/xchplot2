@@ -23,7 +23,9 @@ struct GroupOptions
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
     std::filesystem::path replot_inventory;
     std::string farm_adapter = "chia";
-    bool farm_adapter_set = false, chia_root_set = false, chia_executable_set = false, farming_profile_set = false;
+    uint64_t farm_adapter_timeout_ms = 30000;
+    bool farm_adapter_set = false, farm_adapter_timeout_set = false;
+    bool chia_root_set = false, chia_executable_set = false, farming_profile_set = false;
     uint64_t reclaim_before_bytes = 0;
     std::vector<std::filesystem::path> replot_source_roots, replot_exclude_roots;
     uint64_t replot_max_source_files = 0, replot_max_source_bytes = 0;
@@ -47,6 +49,7 @@ struct GroupOptions
     std::string member_storage = "compact";
     std::string construction = "auto";
     std::string destination_temp = "off";
+    bool destination_temp_set = false;
     bool io_overlap = true, generation_overlap = true, cache_release = true;
     bool window_set = false, checkpoint_set = false, generation_overlap_auto = true;
     bool backend_set = false;

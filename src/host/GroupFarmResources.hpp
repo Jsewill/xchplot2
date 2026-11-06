@@ -969,9 +969,10 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
             { return !memory(graph.resources[graph.find(demand.resource)].kind) && (demand.work_us || demand.reserved_units); }),
             "farming-and-proofs", cohort + ".proof_reserve", "A memory allowance alone does not reserve full-proof service. Declare complete solver work or an opaque service reservation on its physical execution resources.");
     }
-    need(native.backend == "gpu" && (native.gpu_compute_resource.empty() || native.gpu_memory_resource.empty() ||
-        !native.max_gpu_bytes || !native.standing_gpu_bytes), "gpu-bindings", path,
-        "Bind gpu_compute_resource and gpu_memory_resource to the physical device identity; declare max_gpu_bytes and standing_gpu_bytes. OS/driver observations do not grant spare GPU capacity or preemption.");
+    if (native.backend == "gpu" && (native.gpu_compute_resource.empty() || native.gpu_memory_resource.empty() ||
+        !native.max_gpu_bytes || !native.standing_gpu_bytes))
+        result.facts.push_back({path, "GPU execution scope depends on the selected local or broker execution path", "unknown", "resource-preparation-checklist",
+            "Local GPU execution requires gpu_compute_resource, gpu_memory_resource, max_gpu_bytes and standing_gpu_bytes. Broker generation instead requires complete reviewed compute_workers and compute_services. Worker records alone do not select either path; the concrete request still must pass admission."});
     validate_resource_preparation(result); return result;
 }
 inline void write_resource_preparation_json(std::ostream& out, ResourcePreparation const& value)

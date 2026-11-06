@@ -298,6 +298,7 @@ def check(binary, root, reference=None):
     inventory_before = snapshot(inventory_root)
     inventory_file = root / "inventory.plan"
     inventory_text = run("plan", "--inventory", inventory_root, "-M", "128M",
+                         "--farm-adapter-timeout-ms", 120000,
                          "--save-plan", inventory_file, "--json").stdout
     catalog = json.loads(inventory_text)
     assert catalog["kind"] == "farm-inventory" and catalog["complete"]
@@ -342,6 +343,17 @@ def check(binary, root, reference=None):
     run("plan", "--inventory", code=2)
     run("fill", "--inventory", inventory_root, code=2)
     run("plan", "--inventory", inventory_root, "--metadata-only", code=2)
+    for timeout in (0, 3600001):
+        run("plan", "--inventory", inventory_root, "--farm-adapter-timeout-ms", timeout, code=2)
+    run("plan", "--inventory", inventory_root, "--farm-adapter-timeout-ms", code=2)
+    assert not run("plan", "--inventory", inventory_root, "--farm-adapter-timeout-ms", 3600000, "--quiet").stdout
+    unrelated = run("plan", inventory_root, "--farm-adapter-timeout-ms", 120000, code=2)
+    assert "requires inventory" in unrelated.stdout + unrelated.stderr
+    run("grow", inventory_root / "legacy with spaces.plot", "--farm-adapter-timeout-ms", 120000, code=2)
+    for mode in ("--status", "--metadata-only", "--calibrate"):
+        run("plan", mode, inventory_file, "--farm-adapter-timeout-ms", 120000, code=2)
+    for shell in ("bash", "zsh", "fish"):
+        assert "farm-adapter-timeout-ms" in run("completions", shell).stdout
     unprojected = root / "unprojected-migration.plan"
     run("plan", inventory_root, "--replot", inventory_file, "--save-plan", unprojected,
         "--compute", "off", code=2)
@@ -1035,6 +1047,29 @@ def check_replot(binary, root, reference=None):
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         return result
 
+    def saved_replacement_authority(path, phase=None):
+        record = path.read_bytes()
+        body = record[:-65]
+        assert record[-65:] == hashlib.sha256(body).hexdigest().encode() + b"\n"
+        rows = farming_plan_rows(body)
+        if phase is not None:
+            assert rows[0] in (b"ordinary-group-replot-journal-v1\n", b"ordinary-group-replot-journal-v2\n",
+                               b"ordinary-group-replot-journal-v3\n")
+            if rows[0] != b"ordinary-group-replot-journal-v3\n":
+                return "stamp"
+            identities = dict(zip(("verified_stage", "published", "ready"), rows[-3:]))
+            identity = identities[phase]
+        else:
+            assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n")
+            if rows[0] == b"ordinary-group-replot-receipt-v1\n":
+                return "stamp"
+            identity = rows[-1]
+        scheme, filesystem, handle_type, object_id = shlex.split(identity.decode("utf-8"))
+        assert scheme in ("0", "1", "2")
+        if phase is None:
+            assert scheme != "0", "native receipt omitted its replacement owner"
+        return "stamp" if scheme == "0" else "owner"
+
     farm = directory / "old and new plots"
     farm.mkdir()
     reader = directory / "reader"
@@ -1063,6 +1098,10 @@ def check_replot(binary, root, reference=None):
     catalog = json.loads(run("plan", "--inventory", farm, *adapter, "--save-plan", inventory_file, "--json").stdout)
     assert catalog["network"]["available"] and len(catalog["plots"]) == 1
     assert catalog["plots"][0]["header_validated"] and catalog["plots"][0]["plot_id"] == plot_id.hex()
+    inventory_before = snapshot(farm)
+    run("plan", "--inventory", farm, *adapter, "--farm-adapter-timeout-ms", 1, "--json", code=2)
+    assert snapshot(farm) == inventory_before, "expired adapter inventory capture changed its source"
+    assert snapshot(farm) == inventory_before and digest(source) == source_hash
 
     profile_file = directory / "mixed farm.json"
     profile = json.loads(run("plan", "--farming-cores", 1, "--farming-memory-bytes", "256M",
@@ -1168,6 +1207,15 @@ def check_replot(binary, root, reference=None):
     assert any("cannot inspect scratch/destination directory" in reason for reason in imported["infeasibility_reasons"])
     run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options, "--temp-dir", invalid_temp, *keys, code=2)
     assert snapshot(farm) == guarded, "invalid temporary root changed the farm before predelete admission"
+    if temporary_review.read_bytes().startswith(b"ordinary-group-replot-review-v2\n"):
+        temporary_before = snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)
+        unreviewed = json.loads(run("plan", temporary_review, "--harvester", temporary_file, *adapter, *options,
+                                   "--temp-dir", external_scratch, "--json", code=2).stdout)
+        assert any("keep the reviewed scratch scope" in reason for reason in unreviewed["infeasibility_reasons"])
+        run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options,
+            "--temp-dir", external_scratch, *keys, code=2)
+        assert snapshot(farm) == guarded and not (farm / "grow-replot.plan").exists()
+        assert (snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)) == temporary_before
     protected_root = directory / "protected old plots"
     protected_root.mkdir()
     protected_source = protected_root / "protected.plot"
@@ -1249,9 +1297,11 @@ def check_replot(binary, root, reference=None):
     assert digest(source) == source_hash and not (farm / "grow-farm.plan").exists()
     saved_work = farm / f".xchplot2-stage-{review['job_id']}-0.building.external"
     saved_work.mkdir(mode=0o700)
+    partial_before = snapshot(farm)
     partial_review = run("plan", "--revalidate", "--from-plan", review_file, "--harvester", profile_file,
                          *adapter, *options, "--save-plan", directory / "must-not-review-partial.plan", code=2)
-    assert "unverified partial construction" in partial_review.stdout + partial_review.stderr
+    assert "retained construction lacks its exact stage target" in partial_review.stdout + partial_review.stderr
+    assert snapshot(farm) == partial_before and saved_work.is_dir()
     assert digest(source) == source_hash and not (directory / "must-not-review-partial.plan").exists()
     saved_work.rmdir()
     run("fill", farm, "--resume", "--compute", "off", "--devices", "cpu", code=2)
@@ -1286,7 +1336,8 @@ def check_replot(binary, root, reference=None):
     status = json.loads(run("fill", "--status", "--from-plan", review_file, "--json").stdout)
     assert status["durable_phase"] == "replacing" and status["active_verified_stage"]
     assert status["live_service_health"] == "not-queried" and status["blocking_reason"] is None
-    assert status["active_replacement"]["current_native_observation"] == "matching-verified-stage-native-stamp"
+    verified_authority = saved_replacement_authority(farm / "grow-replot.plan", "verified_stage")
+    assert status["active_replacement"]["current_native_observation"] == f"matching-verified-stage-native-{verified_authority}"
     assert snapshot(farm) == before_status, "status changed saved progress or native objects"
     flags()
     run("fill", "--from-plan", review_file, "--chia-executable", directory / "missing-reader", *options, code=2)
@@ -1335,20 +1386,30 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == guarded, "direct growth changed an active migration's sealed stage"
     run(*execute, point="replot-replacement-published", code=86)
     replacement_hash = digest(final)
+    before_status = snapshot(farm)
     renamed_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
     assert renamed_status["journal_digest"] == stale["reviewed_journal_digest"] and not renamed_status["active_published"]
     assert renamed_status["active_replacement"]["current_native_observation"] == "verified-object-renamed-publication-pending"
+    assert snapshot(farm) == before_status, "renamed replacement status changed saved progress or native objects"
     # Native publication precedes the durable published stamp. Preserve that
     # supported rename recovery, then advance the journal before testing stale
     # successor refusal; readiness has not yet been acknowledged.
     run(*execute, point="replot-journal-one-published", code=86)
+    before_status = snapshot(farm)
     published_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
     assert published_status["active_published"] and not published_status["active_ready_history"]
+    published_authority = saved_replacement_authority(farm / "grow-replot.plan", "published")
+    assert published_status["active_replacement"]["current_native_observation"] == f"matching-published-native-{published_authority}"
     assert published_status["journal_digest"] != stale["reviewed_journal_digest"] and digest(final) == replacement_hash
+    assert snapshot(farm) == before_status, "published replacement status changed saved progress or native objects"
     guarded = snapshot(farm)
     stale_attempt = run("fill", "--from-plan", stale_successor, *options, code=2)
     assert "advanced after this successor was reviewed" in stale_attempt.stdout + stale_attempt.stderr
     assert snapshot(farm) == guarded, "stale unactivated successor changed progress"
+    stale_status = json.loads(run("plan", "--status", "--from-plan", stale_successor, "--json").stdout)
+    assert stale_status["selected_policy_binding"] == "stale-boundary"
+    assert stale_status["reviewed_journal_digest"] == stale["reviewed_journal_digest"] != stale_status["journal_digest"]
+    assert snapshot(farm) == guarded, "stale successor status changed progress"
     immutable = run("grow", final, "--max-members", 2, "--devices", "cpu", "--compute", "off", "-M", ram, code=2)
     assert "published migration groups are immutable" in immutable.stdout + immutable.stderr
     assert snapshot(farm) == guarded, "direct growth changed an immutable migration publication"
@@ -1389,7 +1450,7 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == guarded, "unreviewed reader drift changed a claimed source"
     successor_file = directory / "active successor.plan"
     successor = json.loads(run("plan", "--revalidate", "--from-plan", review_file, "--harvester", updated_file,
-                               *adapter, *options, "--save-plan", successor_file, "--json").stdout)
+                               *adapter, *options, "--farm-adapter-timeout-ms", 120000, "--save-plan", successor_file, "--json").stdout)
     assert not successor["activated"] and snapshot(farm) == guarded and SEED not in successor_file.read_text(encoding="utf-8")
     execute = ["fill", "--from-plan", successor_file, "--harvester", updated_file, *adapter, *options]
     run(*execute, point="replot-policy-durable", code=86)
@@ -1399,10 +1460,13 @@ def check_replot(binary, root, reference=None):
     active_status = json.loads(run("plan", "--status", "--from-plan", successor_file, "--json").stdout)
     assert active_status["active_policy_digest"] == successor["successor_digest"]
     assert active_status["origin_review_digest"] == successor["origin_review_digest"]
+    assert active_status["selected_policy_binding"] == "active"
+    origin_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
+    assert origin_status["selected_policy_binding"] == "origin-with-active-successor"
     # The real activation-before-defaults crash retains the old local file.
     # A single route can bind the successor's embedded policy without reusing
     # that stale profile; then an explicit accepted profile is saved again.
-    run("fill", "--from-plan", successor_file, *options, point="replot-before-unlink", code=86)
+    run("fill", "--from-plan", successor_file, *options, "--farm-adapter-timeout-ms", 120000, point="replot-before-unlink", code=86)
     run(*execute, point="replot-before-unlink", code=86)
     execute = ["fill", "--from-plan", successor_file, *options]
     run(*execute, point="replot-before-unlink", code=86)
@@ -1444,6 +1508,213 @@ def check_replot(binary, root, reference=None):
         assert comparison.returncode == 0, (comparison.stdout, comparison.stderr)
         assert digest(canonical) == replacement_hash
     print("PASS reviewed migration, fresh readiness refusals, crash recovery, immutable handoff and full proofs", flush=True)
+
+    # Review another policy after an immutable completed prefix. Both policy
+    # and ordinary progress revisions must recover across destination replicas.
+    chain_old = directory / "successor chain old"
+    chain_destinations = [directory / "successor chain left", directory / "successor chain right"]
+    for path in [chain_old, *chain_destinations]:
+        path.mkdir()
+    chain_sources = [chain_old / "first.plot", chain_old / "second.plot"]
+    chain_sources[0].write_bytes(legacy)
+    chain_sources[1].write_bytes(legacy[:id_start] + protected_id + legacy[id_start + len(plot_id):])
+    chain_reader = directory / "successor chain reader"
+    (chain_reader / "config").mkdir(parents=True)
+    chain_config = chain_reader / "config" / "config.yaml"
+
+    def chain_threads(threads):
+        chain_config.write_text(f"self_hostname: localhost\nharvester:\n  num_threads: {threads}\n", encoding="utf-8")
+
+    chain_threads(1)
+    (chain_reader / "fixture.json").write_text(json.dumps({
+        "roots": list(map(str, [chain_old, *chain_destinations])),
+        "legacy_plot_public_keys": {str(chain_sources[1]): FARMING_PLOT_KEY}}), encoding="utf-8")
+    chain_adapter = ["--chia-root", chain_reader, "--chia-executable", executable]
+    chain_inventory = directory / "successor chain inventory.plan"
+    chain_catalog = json.loads(run("plan", "--inventory", chain_old, *chain_adapter,
+                                   "--save-plan", chain_inventory, "--json").stdout)
+    chain_profile = json.loads(json.dumps(profile))
+    for workload in chain_profile["farm_resources"]["workloads"]:
+        workload["plot_count"] = len(chain_catalog["plots"])
+    chain_profile_file = directory / "successor chain profile.json"
+    chain_profile_file.write_text(json.dumps(chain_profile), encoding="utf-8")
+    chain_options = list(options)
+    chain_review_file = directory / "successor chain origin.plan"
+    chain_review = json.loads(run("plan", *chain_destinations, "--replot", chain_inventory, "--harvester", chain_profile_file,
+                                  *chain_adapter, *chain_options, "--save-plan", chain_review_file, "--json").stdout)
+    assert [batch["source_count"] for batch in chain_review["batches"]] == [2, 0]
+    assert {Path(batch["path"]).parent for batch in chain_review["batches"]} == set(chain_destinations)
+    replicas = [Path(item["directory"]) / "grow-replot.plan" for item in chain_review["space"]]
+    run("fill", "--from-plan", chain_review_file, "--harvester", chain_profile_file, *chain_adapter, *chain_options, *keys,
+        point=f"replot-journal-one-published:{len(replicas)}", code=86)
+
+    def private_replot_farm(path):
+        return shlex.split(path.read_bytes()[:-65].decode("utf-8"))[8].encode("utf-8")
+
+    def chain_private_farms():
+        return [private_replot_farm(path) for path in replicas]
+
+    private_farm = chain_private_farms()[0]
+    assert all(body == private_farm for body in chain_private_farms()), "preparation replicas disagree on private identity"
+    chain_threads(2)
+    chain_first_profile = directory / "successor chain first profile.json"
+    chain_first_profile.write_text(json.dumps(chain_profile), encoding="utf-8")
+    chain_first_file = directory / "successor chain first.plan"
+    before = tuple(snapshot(path) for path in [chain_old, *chain_destinations])
+    chain_first = json.loads(run("plan", "--revalidate", "--from-plan", chain_review_file, "--harvester", chain_first_profile,
+                                 *chain_adapter, *chain_options, "--save-plan", chain_first_file, "--json").stdout)
+    assert tuple(snapshot(path) for path in [chain_old, *chain_destinations]) == before
+    pending = json.loads(run("plan", "--status", "--from-plan", chain_first_file, "--json").stdout)
+    assert pending["selected_policy_binding"] == "pending" and pending["reviewed_journal_digest"] == pending["journal_digest"]
+    run("fill", "--from-plan", chain_first_file, "--harvester", chain_first_profile, *chain_adapter, *chain_options,
+        point="replot-policy-activated", code=86)
+    run("fill", "--from-plan", chain_first_file, *chain_options, point="replot-receipt-synced", code=86)
+    chain_outputs = [Path(batch["path"]) for batch in chain_review["batches"]]
+    receipt = chain_outputs[0].parent / f".xchplot2-replot-{chain_review['job_id']}" / "receipt-0"
+    receipt_bytes, prefix_hash = receipt.read_bytes(), digest(chain_outputs[0])
+    # Receipt publication precedes prefix advancement. Here the next journal
+    # update is exactly complete_replot_batch; stop after every replica commits.
+    run("fill", "--from-plan", chain_first_file, *chain_options,
+        point=f"replot-journal-one-published:{len(replicas)}", code=86)
+    prefix = json.loads(run("plan", "--status", "--from-plan", chain_first_file, "--json").stdout)
+    assert prefix["completed_replacements"] == 1 and prefix["completed_retirements"] == len(chain_sources)
+    assert prefix["completed_receipt_chain_verified"] and not prefix["replica_publication_pending"]
+    completed_output, = prefix["completed_outputs"]
+    assert completed_output["current_native_observation"] == f"matching-saved-native-{saved_replacement_authority(receipt)}"
+    assert not list(chain_outputs[1].parent.glob(".xchplot2-stage-*.building"))
+    assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
+    assert all(body == private_farm for body in chain_private_farms()), "completed prefix changed private farm identity"
+
+    chain_threads(3)
+    chain_second_profile = directory / "successor chain second profile.json"
+    chain_second_profile.write_text(json.dumps(chain_profile), encoding="utf-8")
+    chain_second_file = directory / "successor chain second.plan"
+    before = tuple(snapshot(path) for path in [chain_old, *chain_destinations])
+    chain_second = json.loads(run("plan", "--revalidate", "--from-plan", chain_first_file, "--harvester", chain_second_profile,
+                                  *chain_adapter, *chain_options, "--save-plan", chain_second_file, "--json").stdout)
+    assert chain_second["parent_policy_digest"] == chain_first["successor_digest"]
+    assert chain_second["origin_review_digest"] == chain_first["origin_review_digest"] and chain_second["completed_replacements"] == 1
+    successor_text = chain_second_file.read_text(encoding="utf-8")
+    assert sum(successor_text.count("ordinary-group-replot-review-v" + version) for version in ("1", "2")) == 1
+    embedded_origin = shlex.split(farming_plan_rows(chain_second_file.read_bytes()[:-65])[1].decode("utf-8"))[0].encode("utf-8")
+    assert embedded_origin == chain_review_file.read_bytes()[:-65]
+    assert hashlib.sha256(embedded_origin).hexdigest() == chain_second["origin_review_digest"]
+    assert tuple(snapshot(path) for path in [chain_old, *chain_destinations]) == before
+    run("fill", "--from-plan", chain_second_file, "--harvester", chain_second_profile, *chain_adapter, *chain_options,
+        point="replot-journal-one-published", code=86)
+    partial = json.loads(run("plan", "--status", "--from-plan", chain_second_file, "--json").stdout)
+    assert partial["selected_policy_binding"] == "active" and partial["replica_publication_pending"]
+    assert len({replica["published_digest"] for replica in partial["replicas"]}) > 1
+    assert partial["completed_replacements"] == 1 and receipt.read_bytes() == receipt_bytes
+    before = tuple(snapshot(path) for path in [chain_old, *chain_destinations])
+    for prior in (chain_review_file, chain_first_file):
+        run("fill", "--from-plan", prior, *chain_options, code=2)
+        assert tuple(snapshot(path) for path in [chain_old, *chain_destinations]) == before, "prior policy changed a partially published successor"
+    prior_status = json.loads(run("plan", "--status", "--from-plan", chain_first_file, "--json").stdout)
+    assert prior_status["selected_policy_binding"] == "different-active-policy"
+    run("fill", "--from-plan", chain_second_file, "--harvester", chain_second_profile, *chain_adapter, *chain_options,
+        point="replot-journal-one-published", code=86)
+    reconciled = json.loads(run("plan", "--status", "--from-plan", chain_second_file, "--json").stdout)
+    assert not reconciled["replica_publication_pending"] and reconciled["active_policy_digest"] == chain_second["successor_digest"]
+    assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
+    assert all(body == private_farm for body in chain_private_farms()), "successor policy changed saved keys or fixed assignments"
+    run("fill", "--from-plan", chain_second_file, "--harvester", chain_second_profile, *chain_adapter, *chain_options)
+    assert not any(path.exists() for path in chain_sources)
+    assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
+    assert all(body == private_farm for body in chain_private_farms())
+    for output in chain_outputs:
+        proof = run("verify", output, "--full", "--trials", 100)
+        found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
+        assert found and int(found[1]) > 0
+    print("PASS repeated reviewed successors preserve completed receipts and private identity across interrupted replica publication", flush=True)
+
+    # Journal progress alone does not bind an unfinished engine checkpoint.
+    for engine, initial_point, advance_point, active_point in (
+            ("incremental", "marked", "direct-committed", "finalizing"),
+            ("staged", "stage-run-committed", "stage-pack-committed", "stage-tail-committed"),
+            ("merged", "merge-run-committed", "merge-pack-committed", "merge-layout-ready-committed"),
+            ("external", "external-run-after-checkpoint", "external-pack-after-checkpoint", "external-ready-after-checkpoint")):
+        partial_farm = directory / ("partial successor " + engine)
+        partial_farm.mkdir()
+        partial_source = partial_farm / "legacy.plot"
+        partial_source.write_bytes(legacy)
+        partial_reader = directory / ("partial reader " + engine)
+        (partial_reader / "config").mkdir(parents=True)
+        partial_config = partial_reader / "config" / "config.yaml"
+
+        def partial_threads(threads):
+            partial_config.write_text(f"self_hostname: localhost\nharvester:\n  num_threads: {threads}\n", encoding="utf-8")
+
+        partial_threads(1)
+        (partial_reader / "fixture.json").write_text(json.dumps({"roots": [str(partial_farm)]}), encoding="utf-8")
+        partial_adapter = ["--chia-root", partial_reader, "--chia-executable", executable]
+        partial_inventory = directory / (engine + " partial inventory.plan")
+        run("plan", "--inventory", partial_farm, *partial_adapter, "--save-plan", partial_inventory, "--json")
+        partial_profile = json.loads(json.dumps(profile))
+        partial_profile["farm_resources"]["native"].update(engine=engine, scratch_resources=disks if engine == "external" else [])
+        partial_profile_file = directory / (engine + " partial profile.json")
+        partial_profile_file.write_text(json.dumps(partial_profile), encoding="utf-8")
+        partial_options = list(external_options if engine == "external" else options)
+        partial_options[partial_options.index("--construction") + 1] = engine
+        partial_origin = directory / (engine + " partial origin.plan")
+        partial_review = json.loads(run("plan", partial_farm, "--replot", partial_inventory, "--harvester", partial_profile_file,
+                                        *partial_adapter, *partial_options, "--save-plan", partial_origin, "--json").stdout)
+        run("fill", "--from-plan", partial_origin, "--harvester", partial_profile_file, *partial_adapter, *partial_options, *keys,
+            point=initial_point, code=86)
+        initial_status = json.loads(run("plan", "--status", "--from-plan", partial_origin, "--json").stdout)
+        assert not initial_status["active_verified_stage"] and not initial_status["active_published"]
+        private_path = partial_farm / "grow-replot.plan"
+        partial_private_farm = private_replot_farm(private_path)
+        partial_threads(2)
+        partial_successor = directory / (engine + " partial successor.plan")
+        before = snapshot(partial_farm)
+        run("plan", "--revalidate", "--from-plan", partial_origin, "--harvester", partial_profile_file,
+            *partial_adapter, *partial_options, "--save-plan", partial_successor, "--json")
+        assert snapshot(partial_farm) == before and partial_source.read_bytes() == legacy
+        assert partial_successor.read_bytes().startswith(b"ordinary-group-replot-revalidation-v2\n")
+        evidence = shlex.split(farming_plan_rows(partial_successor.read_bytes()[:-65])[-1].decode("utf-8"))
+        assert evidence[1] == engine and len(evidence[2]) == len(evidence[3]) == 64
+        wrong_engine = json.loads(json.dumps(partial_profile))
+        wrong_engine["farm_resources"]["native"]["engine"] = "staged" if engine != "staged" else "incremental"
+        wrong_profile = directory / (engine + " wrong engine.json")
+        wrong_profile.write_text(json.dumps(wrong_engine), encoding="utf-8")
+        rejected_review = directory / (engine + " rejected successor.plan")
+        run("plan", "--revalidate", "--from-plan", partial_origin, "--harvester", wrong_profile,
+            *partial_adapter, *partial_options, "--save-plan", rejected_review, code=2)
+        assert not rejected_review.exists() and snapshot(partial_farm) == before
+
+        # Resume the origin only to another durable engine checkpoint. The
+        # reviewed private journal stays unchanged, so its digest is insufficient.
+        partial_threads(1)
+        run("fill", "--from-plan", partial_origin, "--harvester", partial_profile_file, *partial_adapter, *partial_options,
+            point=advance_point, code=86)
+        advanced = json.loads(run("plan", "--status", "--from-plan", partial_origin, "--json").stdout)
+        assert advanced["journal_digest"] == initial_status["journal_digest"] and not advanced["active_verified_stage"]
+        assert private_replot_farm(private_path) == partial_private_farm
+        partial_threads(2)
+        before = snapshot(partial_farm)
+        stale = run("fill", "--from-plan", partial_successor, "--harvester", partial_profile_file,
+                    *partial_adapter, *partial_options, code=2)
+        assert "checkpoint or native stage changed" in stale.stdout + stale.stderr and snapshot(partial_farm) == before
+        current_successor = directory / (engine + " current partial successor.plan")
+        current = json.loads(run("plan", "--revalidate", "--from-plan", partial_origin, "--harvester", partial_profile_file,
+                                  *partial_adapter, *partial_options, "--save-plan", current_successor, "--json").stdout)
+        assert snapshot(partial_farm) == before
+        run("fill", "--from-plan", current_successor, "--harvester", partial_profile_file, *partial_adapter, *partial_options,
+            point="replot-policy-activated", code=86)
+        activated = json.loads(run("plan", "--status", "--from-plan", current_successor, "--json").stdout)
+        engine_before = snapshot(partial_farm)
+        run("fill", "--from-plan", current_successor, *partial_options, point=active_point, code=86)
+        progressing = json.loads(run("plan", "--status", "--from-plan", current_successor, "--json").stdout)
+        assert progressing["journal_digest"] == activated["journal_digest"] and snapshot(partial_farm) != engine_before
+        assert progressing["active_policy_digest"] == current["successor_digest"] and private_replot_farm(private_path) == partial_private_farm
+        run("fill", "--from-plan", current_successor, *partial_options)
+        assert not partial_source.exists() and private_replot_farm(private_path) == partial_private_farm
+        output = Path(partial_review["batches"][0]["path"])
+        proof = run("verify", output, "--full", "--trials", 100)
+        found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
+        assert found and int(found[1]) > 0
+    print("PASS unfinished exact-build checkpoints bind successors and continue after reviewed activation", flush=True)
 
     # Source and target implementations use distinct explicit local routes.
     # The old route deliberately has no compatible target full-node interface.
@@ -1670,8 +1941,45 @@ def check_replot(binary, root, reference=None):
         point="replot-source-unlinked", code=86)
     assert not resource_source.exists() and not resource_final.exists()
     assert not list(resource_farm.glob(".xchplot2-stage-*.building")), "resource-only predelete followed construction instead of enabling it"
-    run("fill", resource_review, "--harvester", resource_file, *resource_adapter, *options)
+    unlinked = json.loads(run("plan", "--status", "--from-plan", resource_review, "--json").stdout)
+    assert unlinked["active_sources"][0]["durable_state"] == "claimed"
+    assert unlinked["active_sources"][0]["current_native_observation"] == "original-and-claim-absent"
+    assert unlinked["outstanding_predelete_bytes"] == unlinked["predelete_limit_bytes"] == resource_credit
+    resource_private_farm = private_replot_farm(resource_farm / "grow-replot.plan")
+    # Review a changed native phase envelope after unlink but before retirement
+    # is recorded. The old workload bounds remain; current unconfirmed demand
+    # still fits, while the original physical deletion debt cannot disappear.
+    unlinked_profile = json.loads(json.dumps(resource_profile))
+    for phase in ("construction", "verification"):
+        original_work = next(demand["work_us"] for demand in profile["farm_resources"]["native"][phase] if demand["resource"] == cpu)
+        for demand in unlinked_profile["farm_resources"]["native"][phase]:
+            if demand["resource"] == cpu:
+                demand["work_us"] = original_work
+    unlinked_profile_file = directory / "unlinked successor profile.json"
+    unlinked_profile_file.write_text(json.dumps(unlinked_profile), encoding="utf-8")
+    unlinked_successor_file = directory / "unlinked successor.plan"
+    before = snapshot(resource_farm)
+    unlinked_successor = json.loads(run("plan", "--revalidate", "--from-plan", resource_review, "--harvester", unlinked_profile_file,
+                                       *resource_adapter, *options, "--save-plan", unlinked_successor_file, "--json").stdout)
+    assert snapshot(resource_farm) == before and not unlinked_successor["activated"]
+    run("fill", "--from-plan", unlinked_successor_file, "--harvester", unlinked_profile_file, *resource_adapter, *options,
+        point="replot-policy-activated", code=86)
+    debt = json.loads(run("plan", "--status", "--from-plan", unlinked_successor_file, "--json").stdout)
+    assert debt["selected_policy_binding"] == "active" and debt["active_sources"][0]["durable_state"] == "claimed"
+    assert debt["outstanding_predelete_bytes"] == debt["predelete_limit_bytes"] == resource_credit
+    assert private_replot_farm(resource_farm / "grow-replot.plan") == resource_private_farm
+    before = snapshot(resource_farm)
+    run("fill", "--from-plan", resource_review, *options, code=2)
+    assert snapshot(resource_farm) == before, "original review changed an activated unlink-before-retirement successor"
+    run("fill", "--from-plan", unlinked_successor_file, *options)
     assert digest(resource_final) == replacement_hash and (resource_farm / "grow-farm.plan").is_file()
+    complete = json.loads(run("plan", "--status", "--from-plan", unlinked_successor_file, "--json").stdout)
+    assert complete["outstanding_predelete_bytes"] == 0 and complete["completed_receipt_chain_verified"]
+    assert private_replot_farm(resource_farm / "grow-replot.plan") == resource_private_farm
+    resource_receipt = resource_final.parent / f".xchplot2-replot-{reviewed_resource['job_id']}" / "receipt-0"
+    completed_output, = complete["completed_outputs"]
+    assert completed_output["current_native_observation"] == f"matching-saved-native-{saved_replacement_authority(resource_receipt)}"
+    assert shlex.split(resource_receipt.read_bytes()[:-65].decode("utf-8"))[1] == unlinked_successor["origin_review_digest"]
     proof = run("verify", resource_final, "--full", "--trials", 100)
     found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
     assert found and int(found[1]) > 0

@@ -42,6 +42,16 @@ class MergeEngine
     uint64_t contribution_bytes_ = 0;
     std::optional<file_io::Stat> trusted_;
     uint64_t minimum_final_bytes_ = 0;
+    struct ReadOnly {};
+    MergeEngine(std::string path, Config cfg, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+                std::array<uint8_t, 32>& authority)
+        : arena_(std::move(path), cfg, MergeState::ReadOnly{}, limits, initial, target, authority)
+    {
+        require(cfg.merge_inputs == 2 || cfg.merge_inputs == 4, "merged input count must be two or four");
+        require(required_memory() <= cfg.memory_limit_bytes, "merge workspace exceeds memory budget");
+        require(!arena_.active || (arena_.state.chunk_bound <= cfg.window_bytes && arena_.state.codec_required <= cfg.codec_bytes),
+            "saved merge chunks exceed codec/window budgets; restore the original budgets");
+    }
 
     uint8_t k() const { return arena_.identity.header.k; }
     uint64_t chunks() const { return PlotGroupFile::getChunkCountForK(k()); }
@@ -348,6 +358,19 @@ public:
                      "saved merge chunks exceed codec/window budgets; restore the original budgets");
     }
     static bool pending(std::string const& path) { return MergeState::pending(path); }
+    static ConstructionInspection inspect(std::string const& path, Config cfg, ConstructionInspectionLimits const& limits,
+        std::optional<Identity> const& initial = {})
+    {
+        ConstructionInspection result; std::array<uint8_t, 32> authority{};
+        MergeEngine engine(path, cfg, ReadOnly{}, limits, initial, result.target, authority);
+        result.identity = engine.identity(); result.checkpoint = engine.arena_.active;
+        result.committed_members = engine.committed_member_count(); result.can_append = engine.can_append();
+        result.inspection_memory_bytes = engine.arena_.active ? grow_add(MergeState::multiply(engine.arena_.state.slot_bytes, 4),
+            grow_add(MergeState::multiply(engine.arena_.map.size(), 32), 65536)) : Engine::inspection_memory_bytes(engine.k());
+        limits.check(result.inspection_memory_bytes); result.recovery_memory_bytes = engine.required_memory();
+        result.authority_digest = construction_digest(result, authority, "merged");
+        require(construction_stamp(engine.arena_.fd_, path) == result.target, "merged destination changed during inspection"); return result;
+    }
     uint64_t required_memory(uint16_t batch_members = 1, unsigned workers = 0) const
     {
         Config cfg = config();

@@ -735,6 +735,28 @@ void interruption(fs::path const& root, Members input, Config cfg, std::string c
     // invalidate the reserve committed by the interrupted writer.
     if (point == "merge-pack-committed:2") { resumed.workers = 1; resumed.checkpoint_bytes *= 8; }
     if (point == "merge-copy-committed:2") resumed.merge_inputs = cfg.merge_inputs == 4 ? 2 : 4;
+    if (point.starts_with("merge-run-committed") || point == "merge-pack-committed:2" || point == "merge-copy-committed:2")
+    {
+        auto const before = contents(path); require(!::chmod(path.c_str(), 0400), "cannot make merge checkpoint read-only");
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        auto const inspected = MergeEngine::inspect(path.string(), resumed, limits);
+        auto const repeated = MergeEngine::inspect(path.string(), resumed, limits);
+        require(inspected.checkpoint && inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target &&
+            inspected.recovery_memory_bytes && inspected.inspection_memory_bytes <= limits.memory_bytes && contents(path) == before,
+            "read-only merge inspection changed or did not bind the retained checkpoint");
+        auto denied = limits; denied.memory_bytes = 1; bool refused = false;
+        try { (void)MergeEngine::inspect(path.string(), resumed, denied); } catch (std::runtime_error const&) { refused = true; }
+        require(refused && contents(path) == before, "merge inspection ignored its distinct audit grant or changed its checkpoint");
+        require(!::chmod(path.c_str(), 0600), "cannot restore merge checkpoint permissions");
+    }
+    if (point == "merge-allocated" || point == "merge-bootstrap" || point == "merge-locator-partial")
+    {
+        auto const before = contents(path);
+        auto const inspected = MergeEngine::inspect(path.string(), resumed,
+            {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)}, identity());
+        require(!inspected.checkpoint && contents(path) == before,
+            "read-only merge bootstrap/orphan recovery invented checkpoint authority or changed retained bytes");
+    }
     if (point == "merge-contribution-partial" || point == "merge-contribution-flushed")
     {
         MergeEngine output(path.string(), resumed, true, identity());
@@ -767,6 +789,118 @@ void recovery(fs::path const& root, Members input, Config cfg)
         interruption(pressure, more, cfg, point);
     interruption(pressure, more, cfg, "merge-copy-committed:2", true);
     interruption(pressure, more, cfg, "merge-run-committed:" + std::to_string(more.size()));
+}
+void construction_inspection_recovery(fs::path const& root, Members input, Config cfg)
+{
+    auto const directory = root / "readonly-construction"; fs::create_directory(directory);
+    input = input.subspan(0, 2); auto const reference = directory / "reference.gplot"; direct(reference, input, cfg);
+    auto const expected = contents(reference);
+    for (bool prefix : {false, true}) for (std::string const point : {"bootstrap", "allocated", "checkpoint-partial", "marked", "finalizing", "retired"})
+    {
+        if (prefix && point == "bootstrap") continue;
+        auto const path = directory / (std::string(prefix ? "prefix-" : "fresh-") + point);
+        if (prefix) direct(path, input.subspan(0, 1), cfg);
+        auto const child = ::fork(); require(child >= 0, "cannot fork read-only ordinary recovery fixture");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", point.c_str(), 1);
+            Engine output(path.string(), cfg, prefix, identity()); output.confirm_identity();
+            require(output.append(input.subspan(prefix ? 1 : 0)).accepted, "ordinary inspection recovery append rejected"); std::_Exit(0);
+        }
+        int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            "ordinary inspection recovery failpoint was not reached: " + point);
+        auto const before = contents(path); require(!::chmod(path.c_str(), 0400), "cannot make ordinary bootstrap read-only");
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        auto const inspected = Engine::inspect(path.string(), cfg, limits, identity());
+        auto const repeated = Engine::inspect(path.string(), cfg, limits, identity());
+        require(inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target && contents(path) == before,
+            "read-only ordinary bootstrap/orphan inspection changed retained bytes");
+        if (point == "bootstrap" || point == "allocated" || point == "checkpoint-partial" || point == "retired")
+            require(!inspected.checkpoint, "uncheckpointed ordinary recovery invented exact-build authority");
+        require(!::chmod(path.c_str(), 0600), "cannot restore ordinary bootstrap permissions");
+        {
+            Engine output(path.string(), cfg, true, identity()); output.confirm_identity(); auto const saved = output.identity();
+            if (saved.pending) output.resume(saved.target_members > saved.old_members ?
+                input.subspan(saved.old_members, saved.target_members - saved.old_members) : Members{});
+            if (output.identity().header.group_size < input.size())
+                require(output.append(input.subspan(output.identity().header.group_size)).accepted, "ordinary bootstrap recovery rejected the remaining members");
+        }
+        require(contents(path) == expected, "read-only inspection changed original ordinary resume parity: " + point);
+    }
+    for (auto const* point : {"merge-allocated", "merge-bootstrap", "merge-locator-partial", "merge-run-committed:2", "merge-pack-committed:2"})
+        interruption(directory, input, cfg, point);
+}
+void replot_output_native_owners(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const directory = root / "replot-output-owners"; fs::create_directory(directory);
+    auto const path = directory / "replacement.gplot"; input = input.subspan(0, 2); direct(path, input, cfg);
+    auto const bytes = contents(path); auto const original = stream_state::stamp(path);
+    ReplotReview review; auto& lane = review.farm.directories.emplace_back();
+    lane.layout.files = 1; lane.layout.total_members = lane.layout.group_members = input.size(); lane.layout.fixed_members = true;
+    review.batches.push_back({0, 0, 0, 0, cfg.capacity_bytes, 0, 0, 0});
+    auto const fixed = identity_from(identity());
+    auto const owner = audit_replot_replacement(review, review.farm, fixed, 0, path, original, false, {}, true);
+    auto reject = [](auto operation, char const* message)
+    { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, message); };
+    require(check_replot_output_stamp(path, original, {}) == original, "legacy output rejected unchanged exact native metadata");
+    auto prior_device = original; prior_device.device ^= UINT64_C(0x40000000);
+    reject([&] { (void)check_replot_output_stamp(path, prior_device, {}); }, "legacy output inferred unrecorded remount authority");
+    if (file_io::has_durable_identity(owner))
+    {
+        require(check_replot_output_stamp(path, prior_device, owner) == original,
+            "prospective output owner rejected its exact current object after device renumbering");
+        (void)audit_replot_replacement(review, review.farm, fixed, 0, path, prior_device, false, owner);
+        auto substituted = owner; substituted.object.back() = substituted.object.back() == '0' ? '1' : '0';
+        reject([&] { (void)check_replot_output_stamp(path, original, substituted); }, "unchanged stat bypassed output generation evidence");
+        auto changed = prior_device; ++changed.bytes;
+        reject([&] { (void)check_replot_output_stamp(path, changed, owner); }, "output generation bypassed immutable length");
+        auto const renamed = directory / "published.gplot"; fs::rename(path, renamed);
+        (void)audit_replot_replacement(review, review.farm, fixed, 0, renamed, prior_device, true, owner);
+        require(check_replot_output_stamp(renamed, prior_device, owner, true) == stream_state::stamp(renamed) && contents(renamed) == bytes,
+            "publication lost prospective exact output ownership or changed sealed bytes");
+    }
+    else std::cout << "native output generation capture unavailable; strict legacy output checks passed\n";
+}
+void replot_bootstrap_inspection(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "replot-bootstrap"; fs::create_directory(directory); input = input.subspan(0, 2);
+    auto const reference = directory / "reference.gplot"; direct(reference, input, cfg); auto const bytes = contents(reference);
+    for (std::string const engine : {"incremental", "staged", "merged", "external"})
+        for (std::string const state : {"empty", "ordinary", "orphan"})
+        {
+            ReplotInputs inputs; auto& review = inputs.review; review.farm.job_id = stream_state::digest(engine + state);
+            review.farm.config.k = 18; review.farm.config.strength = 2;
+            auto& destination = review.farm.directories.emplace_back(); destination.directory = file_io::path_text(directory);
+            destination.layout.files = 1; destination.layout.total_members = 2; destination.layout.group_members = 2; destination.layout.fixed_members = true;
+            review.batches.resize(1); review.batches[0].final_bound_bytes = cfg.capacity_bytes;
+            inputs.resources.native.engine = engine; ReplotJournal journal; journal.farm = review.farm;
+            auto const path = migration_stage_path(directory, review.farm.job_id, 0);
+            if (state == "empty") { std::ofstream empty(path, std::ios::binary); }
+            else
+            {
+                direct(path, input.subspan(0, 1), cfg);
+                if (state == "orphan") { std::ofstream orphan(path, std::ios::binary | std::ios::app); orphan << "uncommitted tail"; }
+            }
+            auto const before = contents(path); Arguments args; args.max_ram = 2 * 1024 * mib; args.workers = cfg.workers;
+            args.window = cfg.window_bytes; args.checkpoint_bytes = cfg.checkpoint_bytes; args.io_overlap = false;
+            auto const inspected = inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, false);
+            auto const expected_engine = state != "orphan" && (engine == "staged" || engine == "merged") ? engine : "incremental";
+            require(!inspected.inspected.checkpoint && inspected.evidence.source_build.empty() && inspected.evidence.engine == expected_engine && contents(path) == before,
+                "migration bootstrap inspection changed original dispatch, invented build authority or modified bytes");
+            bool refused = false;
+            try { (void)inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, true); }
+            catch (std::runtime_error const&) { refused = true; }
+            require(refused && contents(path) == before, "checkpoint-free bootstrap authorized a reviewed successor or changed bytes");
+            {
+                Construction output(file_io::path_text(path), configuration(args, cfg.capacity_bytes, 0), true, identity(), engine, {}, 0, false);
+                output.confirm_identity(); if (output.identity().pending) output.resume({});
+                if (output.member_count() < input.size()) require(output.append(input.subspan(output.member_count())).accepted, "migration bootstrap rejected original recovery");
+                output.finish();
+            }
+            require(contents(path) == bytes, "read-only migration bootstrap inspection changed normal original recovery parity");
+        }
 }
 void capacity_pressure(fs::path const& root, Members input, Config cfg)
 {
@@ -3187,6 +3321,208 @@ void replot_journal_protocol(fs::path const& root)
     }
 }
 
+void replot_legacy_destination_metadata(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    Arguments args; args.max_ram = 512 * mib;
+    auto write = [](fs::path const& path, char const* text)
+    { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << text; require(bool(out), "cannot write destination metadata fixture"); };
+    auto legacy = [](FarmInventory value)
+    {
+        value.version = 1; for (auto& root : value.roots) root.durable = {};
+        for (auto& plot : value.plots) plot.identity.durable = {}; return value;
+    };
+    auto find = [](FarmInventory const& inventory, std::string const& name) -> InventoryPlot const&
+    {
+        auto const at = std::find_if(inventory.plots.begin(), inventory.plots.end(), [&](auto const& plot) { return plot.relative_path == name; });
+        require(at != inventory.plots.end(), "destination metadata fixture row disappeared"); return *at;
+    };
+    auto roundtrip = [](FarmInventory const& inventory)
+    { auto const bytes = farm_inventory_text(inventory); require(farm_inventory_text(parse_farm_inventory(bytes)) == bytes, "destination metadata produced an invalid inventory schema or changed canonical bytes"); };
+    for (bool replacement : {false, true})
+    {
+        auto const destination = root / (replacement ? "legacy-metadata-replace" : "legacy-metadata-insert"); fs::create_directory(destination);
+        auto const metadata = destination / "a-explicit-input", retained = destination / "z-retained-source";
+        write(retained, "unchanged legacy source bytes"); if (replacement) write(metadata, "previous typed input bytes");
+        std::array<fs::path, 1> roots{destination}; auto inventory = legacy(scan_farm_inventory(roots));
+        auto const original_root = inventory.roots[0]; auto const original = find(inventory, "z-retained-source");
+        write(metadata, "current explicitly validated inventory/profile input");
+        std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+        replot_destination_coverage(args, inventory, destination, supplied, &inventory);
+        auto const& recorded = find(inventory, "a-explicit-input");
+        require(inventory.version == 1 && inventory.roots.size() == 1 && !file_io::has_durable_identity(inventory.roots[0].durable) &&
+            !file_io::has_durable_identity(recorded.identity.durable) && replot_nonplot(recorded) &&
+            inventory.roots[0].path == original_root.path && inventory.roots[0].directory_identity == original_root.directory_identity &&
+            inventory.roots[0].device == original_root.device && inventory.roots[0].inode == original_root.inode &&
+            find(inventory, "z-retained-source").identity == original.identity,
+            "fresh typed metadata upgraded a legacy root, source row or generation authority");
+        roundtrip(inventory);
+        for (bool prospective : {false, true})
+        {
+            auto mismatched = scan_farm_inventory(roots);
+            if (!prospective) mismatched = legacy(std::move(mismatched));
+            else if (!file_io::has_durable_identity(mismatched.roots[0].durable)) continue;
+            mismatched.roots[0].device ^= UINT64_C(0x40000000);
+            for (auto& plot : mismatched.plots) plot.identity.stamp.device = mismatched.roots[0].device;
+            auto const before = farm_inventory_text(mismatched); auto const file_before = contents(metadata); bool refused = false;
+            try { replot_destination_coverage(args, mismatched, destination, supplied, &mismatched); } catch (std::exception const&) { refused = true; }
+            require(refused && farm_inventory_text(mismatched) == before && contents(metadata) == file_before,
+                "fresh metadata silently changed a retained native-device association or mutated a refused observation");
+        }
+    }
+    auto const source = root / "legacy-metadata-old-root", destination = root / "legacy-metadata-new-root";
+    fs::create_directory(source); fs::create_directory(destination); write(source / "z-retained-source", "retained original source");
+    std::array<fs::path, 1> roots{source}; auto inventory = legacy(scan_farm_inventory(roots));
+    auto const original_root = inventory.roots[0]; auto const original = inventory.plots[0];
+    auto const root_count = inventory.roots.size(), plot_count = inventory.plots.size();
+    auto const metadata = destination / "a-explicit-input"; write(metadata, "typed input on a newly observed destination root");
+    std::array<ReplotMetadataFile, 1> supplied{{{metadata, stream_state::stamp(metadata)}}};
+    replot_destination_coverage(args, inventory, destination, supplied, &inventory);
+    auto const& appended = inventory.plots.back(); bool const durable = file_io::has_durable_identity(inventory.roots.back().durable);
+    require(inventory.roots.size() == root_count + 1 && inventory.plots.size() == plot_count + 1 && appended.root == root_count && replot_nonplot(appended) &&
+        inventory.version == (durable ? 2u : 1u) && (!file_io::has_durable_identity(appended.identity.durable) || durable) &&
+        !file_io::has_durable_identity(inventory.roots[0].durable) && inventory.roots[0].device == original_root.device &&
+        inventory.roots[0].inode == original_root.inode && inventory.roots[0].directory_identity == original_root.directory_identity &&
+        inventory.plots[0].identity == original.identity, "new destination metadata lost its explicit schema or upgraded old native owners");
+    roundtrip(inventory);
+}
+
+void replot_execution_resource_bindings(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace group_grow::farm;
+    auto const base = root / "execution-resource-bindings"; fs::create_directories(base / "source"); fs::create_directory(base / "destination");
+    auto capture = [&](fs::path const& path)
+    {
+        inventory_detail::RootHandle pin(path); auto const native = inventory_detail::stat(pin.handle);
+        InventoryRoot owner{file_io::path_text(pin.path), farming_directory_identity(pin.path), storage_device(pin.path),
+            uint64_t(native.st_dev), uint64_t(native.st_ino)};
+        pin.matches(owner); (void)file_io::capture_durable_identity(pin.handle.fd, &owner.durable); pin.matches(owner); return owner;
+    };
+    auto const actual_source = capture(base / "source"), actual_destination = capture(base / "destination");
+    auto const host = profile_detail::host_name(); Arguments args;
+    auto text = [](Profile const& profile) { std::ostringstream out; write_profile_json(out, profile); return out.str(); };
+    auto rejected = [](auto operation, char const* message)
+    { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, message); };
+    auto resource = [&](std::string const& filesystem, uint64_t capacity)
+    {
+        Resource value; value.id = "storage:" + filesystem; value.host = host; value.kind = ResourceKind::storage;
+        value.capacity = capacity; value.capacity_known = true; return value;
+    };
+    auto input = [&](InventoryRoot const& source, InventoryRoot const& destination, Profile profile)
+    {
+        ReplotInputs value; value.inventory.host = host; value.inventory.roots = {source}; value.inventory.captured_at = "saved-native-fixture";
+        value.inventory.producer_build = GROW_IDENTITY; value.inventory.version = file_io::has_durable_identity(source.durable) ? 2 : 1;
+        value.resources = std::move(profile);
+        value.review.owned_roots = {destination}; FarmingDirectory lane; lane.directory = destination.path;
+        lane.directory_identity = destination.directory_identity; lane.filesystem = destination.storage.filesystem;
+        value.review.farm.directories = {lane}; value.review.sources = {0}; value.review.batches = {{0, 0, 0, 1, 64, 32, 0, 0}};
+        value.review.resources_json = text(value.resources); value.origin_review_body = "unchanged original review fixture";
+        ReplotRevalidation successor; successor.resources_json = value.review.resources_json; value.revalidation = successor;
+        return value;
+    };
+    Profile unchanged; unchanged.source = unchanged.producer = "native-resource-binding-fixture"; unchanged.native.host = host;
+    auto current = resource(actual_source.storage.filesystem, 1);
+    if (actual_source.storage.drives.empty()) current.aliases = {"storage:unknown:" + host};
+    else for (auto const& drive : actual_source.storage.drives) current.aliases.push_back("drive:" + drive);
+    unchanged.resources = {current};
+    auto legacy = input(actual_source, actual_source, unchanged); legacy.inventory.roots[0].durable = {}; legacy.inventory.version = 1; legacy.review.owned_roots.clear();
+    auto const strict_policy = text(legacy.resources);
+    bind_replot_execution_resources(args, legacy); check_replot_execution_resources(args, legacy);
+    require(!legacy.execution_resources && &replot_resources(legacy) == &legacy.resources && text(legacy.resources) == strict_policy,
+        "unchanged legacy roots copied or changed their already matching physical resource policy");
+    auto changed_legacy = legacy; changed_legacy.inventory.roots[0].device ^= UINT64_C(0x40000000);
+    rejected([&] { bind_replot_execution_resources(args, changed_legacy); }, "legacy source root retroactively recovered a changed native device");
+    changed_legacy = legacy; changed_legacy.review.farm.directories[0].filesystem = "unreviewed-current-storage";
+    rejected([&] { bind_replot_execution_resources(args, changed_legacy); }, "legacy destination borrowed prospective source-root authority for another storage association");
+    if (!file_io::has_durable_identity(actual_source.durable) || !file_io::has_durable_identity(actual_destination.durable))
+    { std::cout << "native root generation capture unavailable; strict legacy resource bindings checked\n"; return; }
+
+    // Historical native-device/storage fields are simulated; the opaque root
+    // generations and every current storage observation come from real pins.
+    auto source = actual_source; source.device ^= UINT64_C(0x40000000); source.storage.filesystem = std::to_string(source.device); source.storage.drives = {"reviewed-source-drive"};
+    auto destination = actual_destination; destination.device ^= UINT64_C(0x80000000); destination.storage.filesystem = std::to_string(destination.device); destination.storage.drives = {"reviewed-destination-drive"};
+    Profile reviewed; reviewed.source = reviewed.producer = "saved-native-storage-fixture"; reviewed.native.host = host;
+    auto source_resource = resource(source.storage.filesystem, 3), destination_resource = resource(destination.storage.filesystem, 1);
+    source_resource.aliases = {"drive:reviewed-source-drive"}; destination_resource.aliases = {"drive:reviewed-destination-drive"};
+    source_resource.conditional_shared = true; destination_resource.telemetry_required = true;
+    reviewed.resources = {source_resource, destination_resource};
+    reviewed.native.source_resources = {source_resource.id}; reviewed.native.output_resources = {destination_resource.id};
+    auto bound = input(source, destination, reviewed); auto const canonical = text(bound.resources), inventory_before = farm_inventory_text(bound.inventory);
+    auto const sources = bound.review.sources; auto const batches = bound.review.batches;
+    Stage demand; demand.name = "current-native-storage-reservations"; demand.scope_complete = true;
+    for (auto const& value : reviewed.resources) { Demand held; held.resource = value.id; held.reserved_units = 1; held.bounded = true; demand.construction.push_back(held); }
+    require(assess_stage(bound.resources, demand).feasible, "distinct saved storage fixture did not have its declared reservation capacity");
+    bind_replot_execution_resources(args, bound); check_replot_execution_resources(args, bound);
+    require(bound.execution_resources && text(bound.resources) == canonical && farm_inventory_text(bound.inventory) == inventory_before && bound.review.resources_json == canonical &&
+        bound.revalidation->resources_json == canonical && bound.origin_review_body == "unchanged original review fixture" &&
+        bound.review.sources == sources && bound.review.batches.size() == batches.size() && bound.review.batches[0].lane == batches[0].lane &&
+        bound.review.batches[0].ordinal == batches[0].ordinal, "runtime native aliases changed canonical policy bytes or fixed migration assignments");
+    resource_detail::Graph physical(replot_resources(bound));
+    auto const pool = physical.find(source_resource.id);
+    require(pool == physical.find(destination_resource.id) && pool == physical.find("storage:" + actual_source.storage.filesystem) &&
+        physical.resources[pool].capacity == 1 && physical.resources[pool].capacity_known && !physical.resources[pool].conditional_shared &&
+        physical.resources[pool].telemetry_required && !assess_stage(replot_resources(bound), demand).feasible,
+        "current aliases failed to coalesce physical pools at their conservative capacity and reservation envelope");
+    require(bound.storage_bindings.size() == 2 && bound.storage_bindings[0].reviewed_device == source.device &&
+        bound.storage_bindings[0].current_device == actual_source.device && bound.storage_bindings[0].inode == actual_source.inode &&
+        replot_filesystem(bound, source.storage.filesystem) == actual_source.storage.filesystem &&
+        replot_filesystem(bound, destination.storage.filesystem) == actual_destination.storage.filesystem &&
+        replot_filesystem(bound, "unbound-filesystem") == "unbound-filesystem", "verified root bindings lost current devices or changed an unbound filesystem label");
+    for (auto const& drive : actual_source.storage.drives) require(physical.find("drive:" + drive) == pool, "current physical drive alias escaped its verified root pool");
+    if (actual_source.storage.drives.empty()) require(physical.find("storage:unknown:" + host) == pool, "unknown current drive scope escaped conservative aliasing");
+
+    auto invalid = bound; invalid.inventory.roots[0].device = actual_source.device;
+    invalid.inventory.roots[0].durable.object.back() = invalid.inventory.roots[0].durable.object.back() == '0' ? '1' : '0';
+    auto wrong_generation = invalid;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "same native root stat accepted a substituted generation before resource binding");
+    rejected([&] { check_replot_execution_resources(args, wrong_generation); }, "same native root stat accepted a substituted generation after resource binding");
+    invalid = bound; invalid.inventory.roots[0].durable = {}; invalid.inventory.version = 1;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "missing saved root generation normalized a changed device");
+    invalid = bound; invalid.storage_bindings[0].current_device ^= UINT64_C(0x80000000);
+    rejected([&] { check_replot_execution_resources(args, invalid); }, "in-process current native-device drift was silently rebound");
+    invalid = bound; invalid.resources.resources[0].host = "another-physical-host";
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root mapping crossed its reviewed physical host");
+    invalid = bound; invalid.resources.resources[0].kind = ResourceKind::cpu;
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root mapping crossed its reviewed resource kind");
+    invalid = bound; invalid.inventory.roots[0].storage.filesystem = "absent-reviewed-resource";
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root invented a missing reviewed storage resource");
+    invalid = bound; invalid.resources.resources[0].aliases.clear();
+    for (unsigned index = 0; index < 32; ++index) invalid.resources.resources[0].aliases.push_back("reviewed-alias-" + std::to_string(index));
+    auto const full_policy = text(invalid.resources);
+    rejected([&] { bind_replot_execution_resources(args, invalid); }, "native root aliases exceeded the existing resource schema bound");
+    require(text(invalid.resources) == full_policy, "refused runtime alias expansion changed the saved resource policy");
+    auto const held = base / "source-held"; fs::rename(file_io::native_path(source.path), held); fs::create_directory(file_io::native_path(source.path));
+    rejected([&] { check_replot_execution_resources(args, bound); }, "replaced pinned root retained runtime resource authority");
+    fs::remove(file_io::native_path(source.path)); fs::rename(held, file_io::native_path(source.path)); check_replot_execution_resources(args, bound);
+
+    auto overlapping_destination = source; overlapping_destination.device = destination.device; overlapping_destination.storage.filesystem = destination.storage.filesystem;
+    auto overlapping = input(source, overlapping_destination, reviewed); bind_replot_execution_resources(args, overlapping);
+    resource_detail::Graph overlapping_pool(replot_resources(overlapping));
+    require(overlapping.storage_bindings.size() == 1 && overlapping_pool.find(source_resource.id) == overlapping_pool.find(destination_resource.id) &&
+        !assess_stage(replot_resources(overlapping), demand).feasible,
+        "shared source/destination root left a second historical storage association with independent capacity");
+
+    auto projection = bound; projection.inventory.roots.push_back(destination); projection.review.owned_roots = {source, destination};
+    auto second_lane = projection.review.farm.directories[0]; projection.review.farm.directories[0].directory = source.path;
+    projection.review.farm.directories[0].directory_identity = source.directory_identity; projection.review.farm.directories[0].filesystem = source.storage.filesystem;
+    projection.review.farm.directories.push_back(second_lane); projection.review.farm.headroom = 0;
+    projection.review.space = {{96, 0, 64, 32, 8}, {96, 0, 0, 0, 8}};
+    projection.inventory.plots.resize(1); projection.inventory.plots[0].root = 1; projection.inventory.plots[0].identity.allocated_bytes = 32;
+    projection.review.reclaim_before_bytes = 32; bind_replot_execution_resources(args, projection);
+    std::vector<std::vector<uint64_t>> early;
+    auto projected = [&](size_t batch, std::map<std::string, uint64_t> const& free, std::span<uint64_t const> selected)
+    {
+        auto const expected = projection.review.space[0].free_bytes - projection.review.space[0].metadata_allowance_bytes -
+            projection.review.space[1].metadata_allowance_bytes + projection.inventory.plots[0].identity.allocated_bytes;
+        require(!batch && free.size() == 1 && free.at(actual_source.storage.filesystem) == expected && selected.size() == 1 && selected[0] == 0,
+            "current filesystem projection multiplied shared free space, lost a replica reserve or credited the wrong source"); return true;
+    };
+    require(replot_prefix_capacity(projection, projected, {actual_source.storage.filesystem}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{0}}, "same current filesystem could not reclaim its whole reviewed source across historical labels");
+    projection.review.reclaim_before_bytes = 31;
+    require(!replot_prefix_capacity(projection).empty(), "coalesced current space escaped its indivisible predelete debt cap");
+}
+
 void replot_status_protocol(fs::path const& root)
 {
     using namespace group_grow::farm; using namespace grow_controller_test;
@@ -3204,7 +3540,13 @@ void replot_status_protocol(fs::path const& root)
         auto& directory = private_farm.directories[lane]; directory.directory = file_io::path_text(path);
         directory.directory_identity = farming_directory_identity(path); directory.filesystem = storage_device(path).filesystem;
         directory.extents.clear(); directory.sealed_files = 0;
+        inventory_detail::RootHandle pin(path); auto const native = inventory_detail::stat(pin.handle);
+        InventoryRoot owner{file_io::path_text(pin.path), directory.directory_identity, storage_device(path),
+            uint64_t(native.st_dev), uint64_t(native.st_ino)};
+        (void)file_io::capture_durable_identity(pin.handle.fd, &owner.durable); review.owned_roots.push_back(std::move(owner));
     }
+    if (std::none_of(review.owned_roots.begin(), review.owned_roots.end(), [](auto const& value)
+        { return file_io::has_durable_identity(value.durable); })) review.owned_roots.clear();
     review.farm = parse_farming_state(farming_state_text(private_farm, true), 16 * mib);
     review.sources = {0}; review.space.resize(destinations.size());
     uint64_t first = 0;
@@ -3251,7 +3593,17 @@ void replot_status_protocol(fs::path const& root)
     auto const& batch = review.batches.front(); auto const final = group_path(destinations[batch.lane], batch.ordinal, private_farm.job_id);
     auto const stage = migration_stage_path(final.parent_path(), private_farm.job_id, 0);
     { std::ofstream file(stage); file << "verified replacement native fixture"; }
-    advance([&](auto& value) { value.verified_stage = stream_state::stamp(stage); });
+    file_io::DurableIdentity stage_owner;
+    if (!review.owned_roots.empty())
+    {
+        inventory_detail::RootHandle pin(stage.parent_path()); inventory_detail::SourceHandle source(pin, file_io::path_text(stage.filename()));
+        (void)file_io::capture_durable_identity(source.handle.fd, &stage_owner);
+    }
+    advance([&](auto& value)
+    {
+        value.verified_stage = stream_state::stamp(stage); value.verified_stage_identity = stage_owner;
+        if (file_io::has_durable_identity(stage_owner)) value.verified_stage->device ^= UINT64_C(0x40000000);
+    });
     fs::rename(stage, final);
     auto renamed = status(); require(!renamed.first && renamed.second.find("verified-object-renamed-publication-pending") != renamed.second.npos &&
         renamed.second.find("saved_verified_stage_stamp") != renamed.second.npos, "status lost verified publication rename evidence");
@@ -3275,14 +3627,48 @@ void replot_status_protocol(fs::path const& root)
     auto const successor_text = replot_revalidation_text(successor);
     require(replot_revalidation_text(parse_replot_revalidation(successor_text, args.max_ram)) == successor_text, "flat successor roundtrip changed bytes");
     auto policy = next_replot_revision(journals.state, journals.digest, [](auto& value) { value.policy_digest = std::string(64, 'f'); });
-    require(replot_journal_text(policy).starts_with("ordinary-group-replot-journal-v2\n") &&
+    require(replot_journal_text(policy).starts_with(file_io::has_durable_identity(stage_owner) ?
+        "ordinary-group-replot-journal-v3\n" : "ordinary-group-replot-journal-v2\n") &&
         replot_journal_text(parse_replot_journal(replot_journal_text(policy), args.max_ram)) == replot_journal_text(policy), "active policy journal lost its version or bytes");
     auto reverted = policy; ++reverted.revision; reverted.parent_digest = stream_state::digest(replot_journal_text(policy)); reverted.policy_digest.clear();
     require(!valid_replot_revision(policy, reverted), "active policy silently reverted to the original review");
     require(replot_policy_activation(journals.state, journals.digest, std::string(64, 'f'), &successor), "exact reviewed successor boundary did not require activation");
     require(!replot_policy_activation(policy, stream_state::digest(replot_journal_text(policy)), policy.policy_digest, &successor), "already active policy required reactivation");
+    auto binding = [&](ReplotJournal const& state, std::string const& digest, std::string const& selected, ReplotRevalidation const* review)
+    { return std::string_view(replot_policy_binding(state, digest, selected, review)); };
+    require(binding(journals.state, journals.digest, {}, nullptr) == "origin" &&
+        binding(journals.state, journals.digest, policy.policy_digest, &successor) == "pending" &&
+        binding(journals.state, std::string(64, '0'), policy.policy_digest, &successor) == "stale-boundary",
+        "status confused original, matching pending and stale reviewed boundaries");
+    auto const policy_digest = stream_state::digest(replot_journal_text(policy));
+    require(binding(policy, policy_digest, policy.policy_digest, &successor) == "active" &&
+        binding(policy, policy_digest, {}, nullptr) == "origin-with-active-successor" &&
+        binding(policy, policy_digest, std::string(64, 'e'), &successor) == "different-active-policy",
+        "status invented prior activation history for an unactivated sibling or ignored the active policy");
+    auto next_successor = successor; next_successor.parent_policy_digest = policy.policy_digest; next_successor.journal_digest = policy_digest;
+    require(binding(policy, policy_digest, std::string(64, 'e'), &next_successor) == "pending" &&
+        replot_policy_activation(policy, policy_digest, std::string(64, 'e'), &next_successor),
+        "next reviewed successor classification differs from exact activation authorization");
     auto rejects = [&](auto operation)
     { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, "invalid successor or provenance was accepted"); };
+    auto construction_review = successor;
+    construction_review.construction = ReplotConstructionEvidence{0, "incremental", GROW_IDENTITY, std::string(64, 'b'), {1, 2, 4096, 3, 4, 5, 6}};
+    auto const construction_text = replot_revalidation_text(construction_review);
+    require(construction_text.starts_with("ordinary-group-replot-revalidation-v2\n") &&
+        replot_revalidation_text(parse_replot_revalidation(construction_text, args.max_ram)) == construction_text &&
+        parse_replot_revalidation(construction_text, args.max_ram).origin_review == successor.origin_review,
+        "construction successor lost its explicit version, original bytes or exact checkpoint binding");
+    auto legacy_again = construction_review; legacy_again.construction.reset();
+    require(successor_text.starts_with("ordinary-group-replot-revalidation-v1\n") && replot_revalidation_text(legacy_again) == successor_text,
+        "optional construction authority changed legacy successor bytes");
+    auto current_binding = construction_review.construction;
+    validate_replot_construction_binding(construction_review.construction, current_binding);
+    current_binding->inspection_digest[0] = 'c';
+    rejects([&] { validate_replot_construction_binding(construction_review.construction, current_binding); });
+    current_binding.reset(); rejects([&] { validate_replot_construction_binding(construction_review.construction, current_binding); });
+    auto damaged_binding = construction_review; damaged_binding.construction->stage.inode = 0;
+    rejects([&] { (void)replot_revalidation_text(damaged_binding); });
+    rejects([&] { (void)parse_replot_revalidation(construction_text.substr(0, construction_text.find_last_of('\n', construction_text.size() - 2) + 1), args.max_ram); });
     rejects([&] { (void)replot_policy_activation(policy, stream_state::digest(replot_journal_text(policy)), {}, nullptr); });
     rejects([&] { (void)replot_policy_activation(journals.state, std::string(64, '0'), std::string(64, 'f'), &successor); });
     auto changed_inventory = inputs.inventory; changed_inventory.plots[0].reader = "chia"; changed_inventory.plots[0].reader_version = "new";
@@ -3395,6 +3781,24 @@ void replot_capacity_prefix()
     oversized.review.sources.push_back(2); oversized.review.batches[0].sources = 3;
     require(replot_prefix_capacity(oversized, {}, {}, &early).empty() && early == std::vector<std::vector<uint64_t>>{{0, 2}},
         "a later fitting candidate lost remaining predelete allowance after an overflowing source");
+    auto fragmented = input; fragmented.review.space[0].free_bytes = 112;
+    fragmented.review.batches = {{0, 0, 0, 2, 64, 32, 0, 0}, {0, 1, 2, 0, 64, 32, 0, 0}};
+    auto exact_projection = [&](size_t batch, std::map<std::string, uint64_t> const& available, std::span<uint64_t const> prospective)
+    {
+        auto expected = fragmented.review.space[0].free_bytes - fragmented.review.space[0].metadata_allowance_bytes;
+        if (!batch)
+        {
+            for (auto source : prospective) expected += fragmented.inventory.plots.at(size_t(source)).identity.allocated_bytes;
+            require(available.at("output-fs") == expected, "an alternative trial retained credit from an earlier rejected source");
+            return std::find(prospective.begin(), prospective.end(), uint64_t(1)) != prospective.end();
+        }
+        for (auto const& plot : fragmented.inventory.plots) expected += plot.identity.allocated_bytes;
+        expected -= fragmented.review.batches[0].final_bound_bytes;
+        require(available.at("output-fs") == expected, "chosen trial release was credited more than once across the ready prefix");
+        return true;
+    };
+    require(replot_prefix_capacity(fragmented, exact_projection, {"output-fs"}, &early).empty() &&
+        early == std::vector<std::vector<uint64_t>>{{1}, {}}, "prefix admission did not retain only its feasible alternative predelete set");
 }
 
 void replot_source_selection(fs::path const& directory)
@@ -3469,6 +3873,64 @@ void replot_predelete_selection()
     try { (void)select_replot_predeletions(3, 32, 64, {1}, candidate, paired); }
     catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "shared predelete selection accepted debt beyond the saved allowance");
+    size_t zero_candidates = 0;
+    auto zero_source = [&](size_t) { ++zero_candidates; return ReplotPredeleteCandidate{0, true}; };
+    auto any_source = [](std::span<size_t const> selected) { return !selected.empty(); };
+    auto replacement_first = select_replot_predeletions(1, 0, 0, {}, zero_source, any_source);
+    require(!replacement_first.feasible && !replacement_first.search_exhausted && replacement_first.sources.empty() && !zero_candidates,
+        "zero-cap resource admission added an optional zero-allocation source");
+    auto pending_zero = select_replot_predeletions(1, 0, 0, {0}, zero_source, any_source);
+    require(pending_zero.feasible && pending_zero.sources == std::vector<size_t>{0} && !zero_candidates,
+        "replacement-first policy dropped an already-durable pending source");
+    auto explicit_release = select_replot_predeletions(1, 1, 0, {}, zero_source, any_source);
+    require(explicit_release.feasible && explicit_release.sources == std::vector<size_t>{0},
+        "explicit positive debt policy excluded a legitimate zero-allocation resource release");
+
+    auto fragmented = select_replot_predeletions(2, 64, 0, {},
+        [](size_t source) { return ReplotPredeleteCandidate{source ? 64u : 32u, true}; },
+        [](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), size_t(1)) != selected.end(); });
+    require(fragmented.feasible && fragmented.sources == std::vector<size_t>{1},
+        "a small greedy debt commitment hid a feasible later source");
+    size_t const count = replot_predelete_combination_checks + 8, last = count - 1;
+    auto late = select_replot_predeletions(count, 2, 0, {},
+        [&](size_t source) { return ReplotPredeleteCandidate{source == last ? 2u : 1u, true}; },
+        [&](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), last) != selected.end(); });
+    require(late.feasible && late.sources == std::vector<size_t>{last}, "singleton rescue stopped at the combination budget");
+    bool removed_choice = false; std::vector<size_t> previous;
+    auto combination = [&]
+    {
+        return select_replot_predeletions(4, 64, 0, {},
+            [](size_t source) { constexpr uint64_t bytes[]{32, 32, 48, 16}; return ReplotPredeleteCandidate{bytes[source], true}; },
+            [&](std::span<size_t const> selected)
+            {
+                for (auto source : previous) if (std::find(selected.begin(), selected.end(), source) == selected.end()) removed_choice = true;
+                previous.assign(selected.begin(), selected.end());
+                return std::find(selected.begin(), selected.end(), size_t(2)) != selected.end() &&
+                    std::find(selected.begin(), selected.end(), size_t(3)) != selected.end();
+            });
+    };
+    auto combined = combination(), repeated = combination();
+    require(combined.feasible && combined.sources == std::vector<size_t>({2, 3}) && repeated.sources == combined.sources && removed_choice,
+        "bounded combination search lost a legal subset, deterministic order, or replacement trial");
+    auto impossible = select_replot_predeletions(3, 3, 0, {}, [](size_t) { return ReplotPredeleteCandidate{2, true}; },
+        [](std::span<size_t const> selected) { return selected.size() >= 2; });
+    require(!impossible.feasible && !impossible.search_exhausted && impossible.sources.empty(),
+        "exhaustive infeasibility was confused with bounded search exhaustion");
+    size_t calls = 0, visits = 0, descriptors = 0;
+    auto worst = select_replot_predeletions(replot_maximum_batch_sources, replot_maximum_batch_sources, 0, {},
+        [&](size_t) { ++descriptors; return ReplotPredeleteCandidate{1, true}; },
+        [&](std::span<size_t const> selected) { ++calls; visits += std::max(size_t(1), selected.size()); return false; });
+    require(!worst.feasible && worst.search_exhausted && descriptors == replot_maximum_batch_sources &&
+        calls <= 2 * replot_maximum_batch_sources + 1 + replot_predelete_combination_checks &&
+        visits <= (replot_maximum_batch_sources + 1) * replot_maximum_batch_sources + replot_predelete_fallback_source_visits,
+        "worst-case greedy plus fallback exceeded its separate invocation/source-visit bounds");
+    std::vector<size_t> mandatory;
+    for (size_t source = 0; source < 127; ++source) mandatory.push_back(source);
+    auto exhausted = select_replot_predeletions(256, 128, 127, mandatory,
+        [](size_t) { return ReplotPredeleteCandidate{1, true}; },
+        [](std::span<size_t const> selected) { return std::find(selected.begin(), selected.end(), size_t(255)) != selected.end(); });
+    require(!exhausted.feasible && exhausted.search_exhausted && exhausted.sources == mandatory,
+        "pending commitments changed when source-visit budget prevented complete singleton coverage");
 }
 
 void replot_actionable_ranking()
@@ -3548,6 +4010,42 @@ void replot_source_mapping()
     map_replot_sources(locality.review, locality.inventory, {0, 1, 2}, 16 * mib);
     require(!locality.review.batches[0].sources && locality.review.batches[1].sources == locality.inventory.plots.size(),
         "source mapping ignored available same-filesystem replacement locality");
+
+    auto resources = input; resources.review.farm.directories[0].filesystem = "output-a";
+    resources.review.farm.directories[1].filesystem = "output-b"; resources.review.reclaim_before_bytes = 1;
+    resources.inventory.roots = {root, root}; resources.inventory.roots[0].storage.filesystem = "output-a";
+    resources.inventory.roots[1].storage.filesystem = "output-b";
+    size_t const hot = resources.inventory.plots.size() - 1;
+    for (size_t source = 0; source < resources.inventory.plots.size(); ++source)
+    { auto& plot = resources.inventory.plots[source]; plot.root = source == hot ? 1 : 0; plot.workload_id = source == hot ? "hot" : "local"; }
+    std::vector<uint64_t> global{hot}; for (size_t source = 0; source < hot; ++source) global.push_back(source);
+    auto requires_hot = [&](size_t batch, auto const&, std::span<uint64_t const> early)
+    { return batch || std::find(early.begin(), early.end(), uint64_t(hot)) != early.end(); };
+    auto old_locality = resources;
+    map_replot_sources(old_locality.review, old_locality.inventory, global, 16 * mib);
+    require(!replot_prefix_capacity(old_locality, requires_hot, {"output-a", "output-b"}).empty(),
+        "later-destination hot-cohort fixture unexpectedly fit locality-first mapping");
+    bool search_exhausted = false;
+    auto capacity = [&](size_t batch, std::span<uint64_t const> completed, std::span<uint64_t const> early)
+    {
+        if (batch) require(completed.size() == replot_maximum_batch_sources,
+            "resource mapping lost its completed full-batch source prefix");
+        return requires_hot(batch, completed, early);
+    };
+    auto deterministic = resources.review;
+    map_replot_sources(resources.review, resources.inventory, global, 16 * mib, capacity, &search_exhausted);
+    map_replot_sources(deterministic, resources.inventory, global, 16 * mib, capacity);
+    require(!search_exhausted && replot_prefix_capacity(resources, requires_hot, {"output-a", "output-b"}).empty() &&
+        resources.review.sources.front() == hot && resources.review.sources == deterministic.sources &&
+        resources.review.batches[0].sources == replot_maximum_batch_sources && resources.review.batches[1].sources == 1,
+        "resource-first mapping did not admit the later-filesystem hot source within source/debt slots");
+    auto identities = resources.review.sources; std::sort(identities.begin(), identities.end());
+    auto expected_identities = global; std::sort(expected_identities.begin(), expected_identities.end());
+    require(identities == expected_identities && resources.review.batches[0].lane == 0 && resources.review.batches[1].lane == 1,
+        "resource mapping changed selected source identities/count or immutable output order");
+    auto replacement_first = old_locality.review; replacement_first.reclaim_before_bytes = 0;
+    map_replot_sources(replacement_first, resources.inventory, global, 16 * mib, capacity);
+    require(replacement_first.sources == old_locality.review.sources, "zero-debt policy changed locality before any replacement was ready");
 }
 
 void replot_review_options(fs::path const& directory)
@@ -4956,6 +5454,23 @@ void farming_capacity_extents(fs::path const& root)
     require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
         "pending window fixture did not create its durable transaction");
     auto const pending_bytes = contents(pending_path);
+    ConstructionInspectionLimits inspection_limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+    require(!::chmod(pending_path.c_str(), 0400), "cannot make ordinary checkpoint read-only");
+    auto const inspected_pending = Engine::inspect(pending_path.string(), cfg, inspection_limits);
+    auto const inspected_again = Engine::inspect(pending_path.string(), cfg, inspection_limits);
+    require(inspected_pending.checkpoint && inspected_pending.identity.pending && inspected_pending.committed_members == 1 &&
+        inspected_pending.authority_digest == inspected_again.authority_digest && contents(pending_path) == pending_bytes,
+        "read-only ordinary inspection changed or did not bind its checkpoint");
+    for (unsigned failure = 0; failure < 3; ++failure)
+    {
+        auto denied = inspection_limits; std::atomic<bool> cancelled{failure == 2}; bool refused = false;
+        if (failure == 0) denied.memory_bytes = 1;
+        if (failure == 1) denied.deadline = std::chrono::steady_clock::now();
+        if (failure == 2) denied.cancelled = [&] { return cancelled.load(); };
+        try { (void)Engine::inspect(pending_path.string(), cfg, denied); } catch (std::runtime_error const&) { refused = true; }
+        require(refused && contents(pending_path) == pending_bytes, "ordinary inspection ignored its audit limits or mutated the checkpoint");
+    }
+    require(!::chmod(pending_path.c_str(), 0600), "cannot restore ordinary checkpoint permissions");
     {
         Engine output(pending_path.string(), cfg, true, identity()); output.confirm_identity();
         bool pending_rejected = false;
@@ -5609,10 +6124,15 @@ int main(int argc, char** argv) try
     replot_review_options(root);
     replot_source_mapping();
     replot_actionable_ranking();
+    if (argc == 1) { replot_legacy_destination_metadata(root); replot_execution_resource_bindings(root); }
     if (argc == 2 && std::string(argv[1]) == "--replot-capacity-only")
     {
         temporary_admission(root, identity()); replot_external_projection(root, identity()); replot_capacity_prefix();
         replot_status_protocol(root);
+        construction_inspection_recovery(root, input, cfg);
+        replot_bootstrap_inspection(root, input, cfg);
+        replot_output_native_owners(root, input, cfg);
+        replot_legacy_destination_metadata(root); replot_execution_resource_bindings(root);
         std::cout << "projected migration output/scratch admission checks passed\n"; return 0;
     }
     joined_worker_cpu(input);
@@ -5696,7 +6216,7 @@ int main(int argc, char** argv) try
     single_pass(root, input, cfg);
     contribution_pipeline(root, cfg);
     ordinary_prefix(root, cfg); balanced_traffic(root, cfg);
-    admission(root, input, cfg); recovery(root, input, cfg);
+    admission(root, input, cfg); recovery(root, input, cfg); construction_inspection_recovery(root, input, cfg); replot_bootstrap_inspection(root, input, cfg); replot_output_native_owners(root, input, cfg);
     auto four = root / "four-inputs"; fs::create_directory(four); cfg.merge_inputs = 4;
     cfg.memory_limit_bytes = MergeEngine::memory_bytes(18, cfg, 16);
     parity(four, input, cfg); admission(four, input, cfg); recovery(four, input, cfg);

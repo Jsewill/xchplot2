@@ -26,15 +26,17 @@ foreach(header Solver.hpp ParallelRadixSort.hpp ProofSolverTimings.hpp)
     configure_file("${POS2_PR118_DIR}/src/solve/${header}"
         "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver/solve/${header}" COPYONLY)
 endforeach()
-set(solver_patch "${CMAKE_CURRENT_SOURCE_DIR}/../pos2-solver-candidates.patch")
-# Keep Git from discovering the enclosing source repository and silently
-# skipping paths in these standalone copies when the build is inside it.
-execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
-    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-    "${GIT_EXECUTABLE}" apply --ignore-space-change "${solver_patch}"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver"
-    COMMAND_ERROR_IS_FATAL ANY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${solver_patch}")
+foreach(solver_patch_name pos2-solver-candidates.patch pos2-solver-thread-limit.patch)
+    set(solver_patch "${CMAKE_CURRENT_SOURCE_DIR}/../${solver_patch_name}")
+    # Keep Git from discovering the enclosing source repository and silently
+    # skipping paths in these standalone copies when the build is inside it.
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
+        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+        "${GIT_EXECUTABLE}" apply --ignore-space-change "${solver_patch}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/pos2-solver"
+        COMMAND_ERROR_IS_FATAL ANY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${solver_patch}")
+endforeach()
 
 add_executable(pos2_pr118_check reference.cpp "${POS2_PR118_DIR}/src/pos/sha/sha256.c")
 target_compile_features(pos2_pr118_check PRIVATE cxx_std_20)
@@ -140,8 +142,10 @@ foreach(source IN LISTS upstream_identity_sources)
     file(RELATIVE_PATH source_name "${POS2_PR118_DIR}" "${source}")
     string(APPEND upstream_identity_text "${source_name}:${source_hash}\n")
 endforeach()
-file(SHA256 "${solver_patch}" solver_patch_hash)
-string(APPEND upstream_identity_text "pos2-solver-candidates.patch:${solver_patch_hash}\n")
+foreach(solver_patch_name pos2-solver-candidates.patch pos2-solver-thread-limit.patch)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/../${solver_patch_name}" solver_patch_hash)
+    string(APPEND upstream_identity_text "${solver_patch_name}:${solver_patch_hash}\n")
+endforeach()
 file(SHA256 "${group_patch}" group_patch_hash)
 string(APPEND upstream_identity_text "plot-index-base.patch:${group_patch_hash}\n")
 string(SHA256 upstream_content_id "${upstream_identity_text}")

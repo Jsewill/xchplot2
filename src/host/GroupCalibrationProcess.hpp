@@ -11,6 +11,9 @@
 #include <psapi.h>
 #else
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace group_grow::calibration_process
@@ -245,14 +248,40 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     static std::atomic<uint64_t> generations{1};
     farm::SupervisedProcess observed; observed.generation = generations.fetch_add(1);
     check(observed.generation && observed.generation != UINT64_MAX, "bounded worker observation generation exhausted");
+    auto const poll_interval = std::chrono::milliseconds(20);
+#ifdef __linux__
+    struct ExitDescriptor
+    {
+        int value = -1;
+        ~ExitDescriptor() { if (value >= 0) ::close(value); }
+    } exit_signal;
+#endif
     auto monitor = [&]
     {
         if (!observe) return;
         try { if (!observe(observed)) throw WorkerPaused(); }
         catch (farm::ProcessObservationUnavailable const&)
         {
-            // Exit can race a last /proc/working-set read. Only this held
-            // process's confirmed exit makes that observation unnecessary.
+            // A terminating process can lose its counters before its exit
+            // becomes waitable. Converge only on native exit notification,
+            // within the existing observation cadence and operation deadline;
+            // missing counters never authorize another resource observation.
+            auto const exit_until = std::min(until, Clock::now() + poll_interval);
+            while (!observed.exited())
+            {
+                check_running(until, limits.cancelled);
+                auto const left = std::chrono::ceil<std::chrono::milliseconds>(exit_until - Clock::now()).count();
+                if (left <= 0) break;
+#ifdef _WIN32
+                (void)::WaitForSingleObject(observed.handle, DWORD(left));
+#elif defined(__linux__)
+                if (exit_signal.value < 0) break; // Unsupported/blocked pidfd: retain immediate fail-closed behavior.
+                pollfd descriptor{exit_signal.value, POLLIN, 0};
+                if (::poll(&descriptor, 1, int(left)) < 0 && errno == EINTR) continue;
+#endif
+                break;
+            }
+            check_running(until, limits.cancelled);
             if (!observed.exited()) throw WorkerPaused();
         }
     };
@@ -360,7 +389,7 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         // Inspect the pipe again after observing exit: its final write may
         // have raced with the previous PeekNamedPipe.
         if (waited == WAIT_OBJECT_0) { child.done = true; continue; }
-        ::WaitForSingleObject(child.process.hProcess, 20);
+        ::WaitForSingleObject(child.process.hProcess, DWORD(poll_interval.count()));
     }
     DWORD code = 0;
     check(::GetExitCodeProcess(child.process.hProcess, &code), "cannot read calibration worker exit code");
@@ -423,6 +452,12 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         cpu.restore();
     }
     observed.pid = child.pid;
+#ifdef SYS_pidfd_open
+    // The owned child is still unreaped, so this cannot attach to a reused PID.
+    // A missing syscall, sandbox restriction or descriptor failure preserves
+    // conservative pausing instead of weakening the observation requirement.
+    if (observe) exit_signal.value = int(::syscall(SYS_pidfd_open, child.pid, 0));
+#endif
     ::close(pipe.values[1]); pipe.values[1] = -1;
     bool eof = false;
     for (;;)
@@ -449,7 +484,7 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         }
         if (child.done && eof) break;
         pollfd descriptor{pipe.values[0], POLLIN, 0};
-        check(::poll(&descriptor, 1, 20) >= 0 || errno == EINTR, "cannot wait for calibration worker output");
+        check(::poll(&descriptor, 1, int(poll_interval.count())) >= 0 || errno == EINTR, "cannot wait for calibration worker output");
     }
     if (!WIFEXITED(child.status) || WEXITSTATUS(child.status)) throw std::runtime_error("calibration worker failed: " + output);
 #else

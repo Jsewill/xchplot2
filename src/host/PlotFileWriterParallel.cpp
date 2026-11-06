@@ -773,7 +773,7 @@ CanonicalGroupIndex read_canonical_group_index(std::string const& filename, uint
 } // namespace
 
 VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
-    uint64_t memory_bytes, std::function<void()> const& check_cancelled)
+    uint64_t memory_bytes, std::function<void()> const& check_cancelled, unsigned cpu_threads)
 {
     if (!budget.max_challenges || !budget.full_proofs || budget.full_proofs > budget.max_challenges)
         throw std::invalid_argument("invalid bounded plot verification challenge or solve budget");
@@ -805,7 +805,7 @@ VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerify
                 for (auto x : codec.get_x_bits_from_proof_fragment(fragment)) x_bits.at(index++) = x;
             if (index != x_bits.size()) throw std::runtime_error("Sampled quality chain has an invalid proof width");
             if (check_cancelled) check_cancelled();
-            Solver solver(member_params);
+            Solver solver(member_params, cpu_threads ? cpu_threads : std::thread::hardware_concurrency());
             ProofValidator validator(params, member.plot_index);
             for (auto const& proof : solver.solve(x_bits)) {
                 if (check_cancelled) check_cancelled();

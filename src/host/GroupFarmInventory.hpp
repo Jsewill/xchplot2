@@ -26,6 +26,7 @@ struct InventoryFileIdentity
     stream_state::Stamp stamp;
     uint64_t allocated_bytes = 0, links = 0, header_bytes = 0;
     std::string header_digest;
+    file_io::DurableIdentity durable;
     bool operator==(InventoryFileIdentity const&) const = default;
 };
 struct InventoryRoot
@@ -33,6 +34,7 @@ struct InventoryRoot
     std::string path, directory_identity;
     StorageDevice storage;
     uint64_t device = 0, inode = 0;
+    file_io::DurableIdentity durable;
 };
 struct InventoryPlot
 {
@@ -98,8 +100,11 @@ namespace inventory_detail
 inline void RootHandle::matches(InventoryRoot const& root) const
 {
     auto const s = stat(handle); RootHandle current(path); auto const now = stat(current.handle);
-    require(uint64_t(s.st_dev) == root.device && uint64_t(s.st_ino) == root.inode &&
+    bool const durable = file_io::has_durable_identity(root.durable);
+    require(file_io::valid_durable_identity(root.durable) && (uint64_t(s.st_dev) == root.device || durable) && uint64_t(s.st_ino) == root.inode &&
         s.st_dev == now.st_dev && s.st_ino == now.st_ino &&
+        (!durable || (file_io::matches_durable_identity(handle.fd, root.durable) &&
+            file_io::matches_durable_identity(current.handle.fd, root.durable))) &&
         file_io::path_text(path) == root.path && farming_directory_identity(path) == root.directory_identity,
         "farm inventory root identity changed");
 }
@@ -174,7 +179,7 @@ inline void header(InventoryPlot& p, std::span<uint8_t const> data)
         require(data.size() >= sizeof(PlotGroupFile::Header), "truncated ordinary group header");
         PlotGroupFile::Header h{}; std::memcpy(&h, data.data(), sizeof(h));
         require(h.version == PlotGroupFile::FORMAT_VERSION && h.k >= 18 && h.k <= 32 && h.strength <= 32 &&
-            h.group_size && h.meta_group <= 8 && h.chunk_index_offset >= sizeof(h) + h.memo_length &&
+            h.group_size && h.chunk_index_offset >= sizeof(h) + h.memo_length &&
             h.chunk_index_offset < p.identity.stamp.bytes && h.memo_length <= data.size() - sizeof(h), "invalid ordinary group header");
         p.algorithm = PlotAlgorithm::pos2; p.container = PlotContainer::pos2_group;
         p.plot_id = h.group_id.to_string(); p.k = h.k; p.strength = h.strength; p.meta_group = h.meta_group; p.members = h.group_size;
@@ -233,6 +238,7 @@ inline InventoryPlot observe_handle(Handle const& handle, std::string const& rel
         require(count > 0, "farm inventory header changed while reading"); at += size_t(count);
     }
     result.identity.header_bytes = bytes; result.identity.header_digest = group_tools::hex(grow_digest(data));
+    (void)file_io::capture_durable_identity(handle.fd, &result.identity.durable);
     require(stamp(stat(handle)) == result.identity.stamp, "farm inventory source changed while reading");
     try { header(result, data); }
     catch (std::exception const& error)
@@ -249,7 +255,7 @@ inline InventoryPlot observe(RootHandle const& root, std::string const& relative
 inline uint64_t plot_memory(InventoryPlot const& p)
 {
     uint64_t bytes = sizeof(p) + 256; // Native-identity map node and allocator overhead.
-    for (auto const* s : {&p.relative_path, &p.identity.header_digest, &p.compression_family, &p.plot_id, &p.farmer_public_key,
+    for (auto const* s : {&p.relative_path, &p.identity.header_digest, &p.identity.durable.filesystem, &p.identity.durable.object, &p.compression_family, &p.plot_id, &p.farmer_public_key,
         &p.pool_public_key, &p.pool_contract_puzzle_hash, &p.plot_public_key, &p.reader, &p.reader_version, &p.reader_identity, &p.checker_identity,
         &p.host, &p.harvester, &p.solver, &p.workload_id, &p.status, &p.reason})
         bytes += 2 * s->capacity();
@@ -260,7 +266,8 @@ inline uint64_t memory(FarmInventory const& value)
     uint64_t bytes = sizeof(value) + value.roots.capacity() * sizeof(InventoryRoot) + value.plots.capacity() * sizeof(InventoryPlot);
     auto charge = [&](std::string const& s) { require(s.capacity() <= (UINT64_MAX - bytes) / 2, "farm inventory memory overflow"); bytes += 2 * s.capacity(); };
     charge(value.host); charge(value.captured_at); charge(value.producer_build);
-    for (auto const& r : value.roots) { charge(r.path); charge(r.directory_identity); charge(r.storage.filesystem); for (auto const& d : r.storage.drives) charge(d); }
+    for (auto const& r : value.roots) { charge(r.path); charge(r.directory_identity); charge(r.storage.filesystem);
+        charge(r.durable.filesystem); charge(r.durable.object); for (auto const& d : r.storage.drives) charge(d); }
     for (auto const* s : {&value.network.network, &value.network.genesis_challenge, &value.network.source, &value.network.version, &value.network.captured_at,
         &value.network.target_route, &value.network.reader_version, &value.network.reader_identity,
         &value.network.farmer_version, &value.network.solver_version, &value.network.service_status}) charge(*s);
@@ -292,6 +299,19 @@ inline bool same_inventory_contents(InventoryFileIdentity const& a, InventoryFil
     return stream_state::same_output(a.stamp, b.stamp) && a.allocated_bytes == b.allocated_bytes && a.links == b.links &&
         a.header_bytes == b.header_bytes && a.header_digest == b.header_digest;
 }
+// Directional comparison: fresh evidence cannot upgrade a legacy saved row.
+// Callers first bind the current root and obtain current from its pinned file.
+inline bool matches_inventory_identity(InventoryFileIdentity const& saved, InventoryFileIdentity const& current, bool renamed = false)
+{
+    if (!file_io::valid_durable_identity(saved.durable) || !file_io::valid_durable_identity(current.durable)) return false;
+    auto observed = current.stamp;
+    bool const durable = file_io::has_durable_identity(saved.durable);
+    if (durable && saved.durable != current.durable) return false;
+    if (durable) observed.device = saved.stamp.device;
+    return (renamed ? stream_state::same_output(saved.stamp, observed) : saved.stamp == observed) &&
+        saved.allocated_bytes == current.allocated_bytes && saved.links == current.links &&
+        saved.header_bytes == current.header_bytes && saved.header_digest == current.header_digest;
+}
 class InventorySourcePin
 {
     InventoryRoot root_;
@@ -304,10 +324,8 @@ public:
           source_(root_handle_, current_relative.empty() ? plot.relative_path : current_relative, retirement)
     {
         inventory_detail::validate_limits(limits); root_handle_.matches(root_);
-        auto const held = inventory_detail::stamp(inventory_detail::stat(source_.handle));
         auto const current = inventory_detail::observe_handle(source_.handle, current_relative.empty() ? plot.relative_path : current_relative, limits);
-        inventory_detail::require((current_relative.empty() ? held == plot.identity.stamp : stream_state::same_output(plot.identity.stamp, held)) &&
-            (current_relative.empty() ? current.identity == plot.identity : same_inventory_contents(plot.identity, current.identity)),
+        inventory_detail::require(matches_inventory_identity(plot.identity, current.identity, !current_relative.empty()),
             "farm inventory source changed before retirement pin");
         recheck_parent(current_relative.empty() ? plot.relative_path : current_relative);
     }
@@ -350,13 +368,13 @@ public:
 #else
         auto const claimed = inventory_detail::observe(root_handle_, claimed_relative_path, limits);
 #endif
-        return stream_state::same_output(plot_.identity.stamp, held) && same_inventory_contents(plot_.identity, claimed.identity);
+        return stream_state::same_output(held, claimed.identity.stamp) && matches_inventory_identity(plot_.identity, claimed.identity, true);
     }
 };
 inline InventoryFileIdentity recheck_inventory_source(InventoryRoot const& root, InventoryPlot const& plot, InventoryLimits const& limits = {})
 {
     auto current = observe_inventory_file(root, plot.relative_path, limits);
-    inventory_detail::require(current.identity == plot.identity, "farm inventory source identity changed"); return current.identity;
+    inventory_detail::require(matches_inventory_identity(plot.identity, current.identity), "farm inventory source identity changed"); return current.identity;
 }
 inline uint64_t farm_inventory_memory(FarmInventory const& value) { return inventory_detail::memory(value); }
 
@@ -375,7 +393,7 @@ inline char const* name(PlotContainer value)
 }
 inline void validate(FarmInventory const& v, InventoryLimits const& limits)
 {
-    validate_limits(limits); require(v.version == 1 && !v.roots.empty() && v.roots.size() <= limits.max_roots &&
+    validate_limits(limits); require((v.version == 1 || v.version == 2) && !v.roots.empty() && v.roots.size() <= limits.max_roots &&
         v.plots.size() <= limits.max_files && memory(v) < limits.memory_bytes / 2, "farm inventory exceeds its schema or memory bound");
     for (auto const* text : {&v.host, &v.captured_at, &v.producer_build, &v.network.network, &v.network.genesis_challenge,
         &v.network.source, &v.network.version, &v.network.captured_at, &v.network.target_route, &v.network.reader_version, &v.network.reader_identity,
@@ -402,12 +420,13 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
             }
         }
     }
-    std::set<std::pair<uint64_t, uint64_t>> roots;
+    std::set<std::pair<uint64_t, uint64_t>> roots; bool durable = false;
     for (auto const& r : v.roots)
     {
         bounded_text(r.path); bounded_text(r.directory_identity); bounded_text(r.storage.filesystem);
         require(file_io::native_path(r.path).is_absolute() && r.inode && roots.emplace(r.device, r.inode).second &&
-            r.storage.drives.size() <= 128, "invalid or duplicate farm inventory root");
+            r.storage.drives.size() <= 128 && file_io::valid_durable_identity(r.durable), "invalid or duplicate farm inventory root");
+        durable = durable || file_io::has_durable_identity(r.durable);
         for (auto const& d : r.storage.drives) bounded_text(d);
     }
     std::map<std::pair<uint64_t, uint64_t>, size_t> identities;
@@ -418,7 +437,15 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
         (void)relative(p.relative_path); (void)name(p.algorithm); (void)name(p.container);
         require(p.root < v.roots.size() && paths.emplace(p.root, p.relative_path).second && (!p.alias_of || *p.alias_of < i) && id.header_bytes <= limits.max_header_bytes &&
             id.header_bytes <= id.stamp.bytes && (id.header_digest.empty() || hex(id.header_digest, 32)) &&
-            id.stamp.mtime_ns < 1000000000 && id.stamp.ctime_ns < 1000000000, "invalid farm inventory file identity");
+            id.stamp.mtime_ns < 1000000000 && id.stamp.ctime_ns < 1000000000 && file_io::valid_durable_identity(id.durable), "invalid farm inventory file identity");
+        if (file_io::has_durable_identity(id.durable))
+        {
+            auto const& root = v.roots[p.root];
+            require(file_io::has_durable_identity(root.durable) && root.durable.scheme == id.durable.scheme &&
+                root.durable.filesystem == id.durable.filesystem && root.device == id.stamp.device,
+                "inventory file evidence differs from its native root");
+            durable = true;
+        }
         for (auto const* text : {&p.compression_family, &p.plot_id, &p.farmer_public_key, &p.pool_public_key, &p.pool_contract_puzzle_hash, &p.plot_public_key,
             &p.reader, &p.reader_version, &p.reader_identity, &p.checker_identity, &p.host, &p.harvester, &p.solver, &p.workload_id, &p.status, &p.reason}) bounded_text(*text);
         require((p.plot_id.empty() || hex(p.plot_id, 32)) && (p.farmer_public_key.empty() || hex(p.farmer_public_key, 48)) &&
@@ -440,6 +467,13 @@ inline void validate(FarmInventory const& v, InventoryLimits const& limits)
             !p.reader.empty() && !p.reader_version.empty() && hex(p.reader_identity, 32) && !p.plot_public_key.empty() &&
             (p.pool_public_key.empty() != p.pool_contract_puzzle_hash.empty()) && !id.header_digest.empty()), "incomplete native inventory observation");
     }
+    require(v.version == (durable ? 2u : 1u), "farm inventory native evidence differs from its schema");
+}
+inline void write_durable_identity(std::ostream& out, file_io::DurableIdentity const& value)
+{
+    require(file_io::has_durable_identity(value), "invalid durable native identity");
+    out << "{\"scheme\":" << unsigned(value.scheme) << ",\"filesystem\":"; profile_detail::quote(out, value.filesystem);
+    out << ",\"handle_type\":" << value.handle_type << ",\"object\":"; profile_detail::quote(out, value.object); out << '}';
 }
 inline void write_identity(std::ostream& out, InventoryFileIdentity const& id)
 {
@@ -447,7 +481,9 @@ inline void write_identity(std::ostream& out, InventoryFileIdentity const& id)
     out << "{\"device\":" << s.device << ",\"inode\":" << s.inode << ",\"bytes\":" << s.bytes << ",\"mtime\":" << s.mtime
         << ",\"ctime\":" << s.ctime << ",\"mtime_ns\":" << s.mtime_ns << ",\"ctime_ns\":" << s.ctime_ns
         << ",\"allocated_bytes\":" << id.allocated_bytes << ",\"links\":" << id.links << ",\"header_bytes\":" << id.header_bytes << ",\"header_digest\":";
-    profile_detail::quote(out, id.header_digest); out << '}';
+    profile_detail::quote(out, id.header_digest);
+    if (file_io::has_durable_identity(id.durable)) { out << ",\"durable_identity\":"; write_durable_identity(out, id.durable); }
+    out << '}';
 }
 using Json = profile_detail::Json;
 inline Json const& required_field(Json const& object, char const* key)
@@ -461,13 +497,23 @@ inline int64_t signed_integer(Json const& object, char const* key)
     auto p = std::from_chars(value.scalar.data(), value.scalar.data() + value.scalar.size(), result);
     require(p.ec == std::errc{} && p.ptr == value.scalar.data() + value.scalar.size(), "invalid inventory time"); return result;
 }
-inline InventoryFileIdentity read_identity(Json const& j)
+inline file_io::DurableIdentity read_durable_identity(Json const& object, unsigned version)
+{
+    auto const* value = profile_detail::field(object, "durable_identity"); if (!value) return {};
+    require(version == 2 && value->kind == Json::object && value->fields.size() == 4, "invalid durable native identity schema");
+    auto const scheme = integer(*value, "scheme"), type = integer(*value, "handle_type");
+    require(scheme <= unsigned(file_io::DurableIdentity::Scheme::windows_file_id) && type <= UINT32_MAX, "invalid durable native identity representation");
+    file_io::DurableIdentity result{file_io::DurableIdentity::Scheme(scheme), string(*value, "filesystem"), string(*value, "object"), uint32_t(type)};
+    require(file_io::has_durable_identity(result), "invalid durable native identity"); return result;
+}
+inline InventoryFileIdentity read_identity(Json const& j, unsigned version = 1)
 {
     InventoryFileIdentity result; auto& s = result.stamp;
     s.device = integer(j, "device"); s.inode = integer(j, "inode"); s.bytes = integer(j, "bytes"); s.mtime = signed_integer(j, "mtime"); s.ctime = signed_integer(j, "ctime");
     auto m = integer(j, "mtime_ns"), c = integer(j, "ctime_ns"); require(m < 1000000000 && c < 1000000000, "invalid inventory time precision");
     s.mtime_ns = uint32_t(m); s.ctime_ns = uint32_t(c); result.allocated_bytes = integer(j, "allocated_bytes");
-    result.links = integer(j, "links"); result.header_bytes = integer(j, "header_bytes"); result.header_digest = string(j, "header_digest"); return result;
+    result.links = integer(j, "links"); result.header_bytes = integer(j, "header_bytes"); result.header_digest = string(j, "header_digest");
+    result.durable = read_durable_identity(j, version); return result;
 }
 class OutputLimit : public std::streambuf
 {
@@ -497,7 +543,7 @@ inline void write_farm_inventory_json(std::ostream& destination, FarmInventory c
     inventory_detail::OutputLimit buffer(destination, limits.max_output_bytes); std::ostream out(&buffer);
     auto quote = [&](std::string const& text) { profile_detail::quote(out, text); };
     auto text = [&](char const* key, std::string const& value) { out << ",\"" << key << "\":"; quote(value); };
-    out << "{\"schema_version\":1,\"kind\":\"farm-inventory\""; text("host", v.host); text("captured_at", v.captured_at); text("producer_build", v.producer_build);
+    out << "{\"schema_version\":" << v.version << ",\"kind\":\"farm-inventory\""; text("host", v.host); text("captured_at", v.captured_at); text("producer_build", v.producer_build);
     out << ",\"complete\":" << (v.complete ? "true" : "false") << ",\"network\":{\"available\":" << (v.network.available ? "true" : "false");
     text("network", v.network.network); text("genesis_challenge", v.network.genesis_challenge); text("source", v.network.source); text("version", v.network.version); text("captured_at", v.network.captured_at);
     text("target_route", v.network.target_route); text("reader_version", v.network.reader_version); text("reader_identity", v.network.reader_identity);
@@ -510,7 +556,9 @@ inline void write_farm_inventory_json(std::ostream& destination, FarmInventory c
         if (comma) out << ','; comma = true; out << "{\"path\":"; quote(r.path); text("directory_identity", r.directory_identity);
         text("filesystem", r.storage.filesystem); out << ",\"device\":" << r.device << ",\"inode\":" << r.inode
             << ",\"nonrotating\":" << (r.storage.nonrotating ? "true" : "false") << ",\"rotating\":" << (r.storage.rotating ? "true" : "false") << ",\"drives\":[";
-        bool drive_comma = false; for (auto const& d : r.storage.drives) { if (drive_comma) out << ','; drive_comma = true; quote(d); } out << "]}";
+        bool drive_comma = false; for (auto const& d : r.storage.drives) { if (drive_comma) out << ','; drive_comma = true; quote(d); } out << ']';
+        if (file_io::has_durable_identity(r.durable)) { out << ",\"durable_identity\":"; inventory_detail::write_durable_identity(out, r.durable); }
+        out << '}';
     }
     out << "],\"plots\":["; comma = false;
     for (auto const& p : v.plots)
@@ -564,8 +612,9 @@ inline FarmInventory read_farm_inventory(std::istream& in, InventoryLimits const
     using namespace inventory_detail;
     validate_limits(limits); auto input = profile_detail::read_text(in, limits.max_output_bytes);
     auto j = profile_detail::JsonReader(input, limits.memory_bytes / 2, limits.memory_bytes / 1024).read();
-    require(integer(j, "schema_version") == 1 && string(j, "kind") == "farm-inventory", "unsupported farm inventory schema");
-    FarmInventory result; result.host = string(j, "host"); result.captured_at = string(j, "captured_at"); result.producer_build = string(j, "producer_build");
+    auto const version = integer(j, "schema_version");
+    require((version == 1 || version == 2) && string(j, "kind") == "farm-inventory", "unsupported farm inventory schema");
+    FarmInventory result; result.version = unsigned(version); result.host = string(j, "host"); result.captured_at = string(j, "captured_at"); result.producer_build = string(j, "producer_build");
     result.complete = boolean(j, "complete"); auto const& n = required_field(j, "network"); result.network.available = boolean(n, "available");
     result.network.network = string(n, "network"); result.network.genesis_challenge = string(n, "genesis_challenge"); result.network.source = string(n, "source");
     result.network.version = string(n, "version"); result.network.captured_at = string(n, "captured_at"); result.network.hard_fork2_height = integer(n, "hard_fork2_height");
@@ -608,12 +657,13 @@ inline FarmInventory read_farm_inventory(std::istream& in, InventoryLimits const
     {
         InventoryRoot root; root.path = string(r, "path"); root.directory_identity = string(r, "directory_identity"); root.device = integer(r, "device"); root.inode = integer(r, "inode");
         root.storage.filesystem = string(r, "filesystem"); root.storage.nonrotating = boolean(r, "nonrotating"); root.storage.rotating = boolean(r, "rotating");
+        root.durable = read_durable_identity(r, result.version);
         auto const& drives = required_field(r, "drives"); require(drives.kind == Json::array && drives.items.size() <= 128, "invalid inventory physical drives");
         for (auto const& d : drives.items) root.storage.drives.push_back(profile_detail::text(d)); result.roots.push_back(std::move(root));
     }
     for (auto const& p : plots.items)
     {
-        InventoryPlot plot; plot.root = integer(p, "root"); plot.relative_path = string(p, "relative_path"); plot.identity = read_identity(required_field(p, "identity"));
+        InventoryPlot plot; plot.root = integer(p, "root"); plot.relative_path = string(p, "relative_path"); plot.identity = read_identity(required_field(p, "identity"), result.version);
         auto algorithm = string(p, "algorithm"); auto container = string(p, "container");
         bool found = false; for (auto a : {PlotAlgorithm::unknown, PlotAlgorithm::pos1, PlotAlgorithm::pos2}) if (algorithm == name(a)) { plot.algorithm = a; found = true; }
         require(found, "unsupported inventory algorithm"); found = false;
@@ -807,8 +857,11 @@ inline FarmInventory scan_farm_inventory(std::span<std::filesystem::path const> 
         check(limits, deadline); RootHandle root(path); auto const info = stat(root.handle);
         require(roots.emplace(uint64_t(info.st_dev), uint64_t(info.st_ino)).second, "farm inventory contains duplicate root identities");
         InventoryRoot recorded{file_io::path_text(root.path), farming_directory_identity(root.path), storage_device(root.path), uint64_t(info.st_dev), uint64_t(info.st_ino)};
+        (void)file_io::capture_durable_identity(root.handle.fd, &recorded.durable);
+        if (file_io::has_durable_identity(recorded.durable)) result.version = 2;
         root.matches(recorded); size_t const index = result.roots.size();
-        retained += 2 * (recorded.path.capacity() + recorded.directory_identity.capacity() + recorded.storage.filesystem.capacity()) + 256;
+        retained += 2 * (recorded.path.capacity() + recorded.directory_identity.capacity() + recorded.storage.filesystem.capacity() +
+            recorded.durable.filesystem.capacity() + recorded.durable.object.capacity()) + 256;
         for (auto const& d : recorded.storage.drives) retained += 2 * d.capacity() + sizeof(std::string);
         require(retained + 65536 < limits.memory_bytes / 2, "farm inventory roots exceed its memory budget");
         result.roots.push_back(recorded);
@@ -878,6 +931,7 @@ inline FarmInventory scan_farm_inventory(std::span<std::filesystem::path const> 
                     if (inspected && file_io::is_regular(info.st_mode)) { plot.identity.stamp = stamp(info); plot.identity.links = info.st_nlink;
                         if (info.st_blocks >= 0 && uint64_t(info.st_blocks) <= UINT64_MAX / 512) plot.identity.allocated_bytes = uint64_t(info.st_blocks) * 512; }
                 }
+                if (!file_io::has_durable_identity(recorded.durable)) plot.identity.durable = {};
                 if (plot.identity.stamp.inode)
                 {
                     auto [at, fresh] = files.emplace(std::pair(plot.identity.stamp.device, plot.identity.stamp.inode), result.plots.size());

@@ -66,6 +66,7 @@ void command_help_all(std::string_view command)
         "  --revalidate             plan: save a reviewed successor with an updated resource profile\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
+        "  --farm-adapter-timeout-ms N  inventory/migration adapter operation deadline, default 30000\n"
         "  --extend                 add destinations while preserving saved assignments\n"
         "  --allow-missing          with --resume, continue available members; incomplete exit 4\n"
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";

@@ -227,6 +227,15 @@ int fake_worker(std::vector<std::string> args)
         std::this_thread::sleep_for(std::chrono::seconds(10)); return 9;
     }
     process::Deadline watchdog(std::stoull(args[11]));
+    if (mode.starts_with("exit-gap-"))
+    {
+        auto ready = native(args[14]); ready += ".ready"; auto finish = native(args[14]); finish += ".exit";
+        { std::ofstream signal(ready); signal << '1'; check(bool(signal), "cannot announce controlled exit fixture"); }
+        while (!fs::exists(finish)) std::this_thread::yield();
+        if (mode == "exit-gap-failure") { std::cout << "{\"ok\":false}\n" << std::flush; return 7; }
+        if (mode == "exit-gap-empty") return 0;
+        if (mode == "exit-gap-flood") { for (unsigned i = 0; i < 64; ++i) std::cout.put('x'); std::cout.flush(); return 0; }
+    }
     if (mode == "observe-quiet" || mode == "observe-busy")
     {
         std::vector<uint8_t> resident(size_t(8) << 20, 0x5a);
@@ -325,6 +334,62 @@ void monitor_fixture(process::Limits const& limits)
     (void)limits;
 #endif
 }
+void exit_observation_fixture(process::Limits const& limits)
+{
+#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__)
+    // Unsupported or blocked exit notifications retain conservative pausing;
+    // only exercise successful convergence where the native facility exists.
+#ifdef SYS_pidfd_open
+    int const notification = int(::syscall(SYS_pidfd_open, ::getpid(), 0));
+    if (notification < 0) return;
+    ::close(notification);
+#else
+    return;
+#endif
+#endif
+    using namespace group_grow::farm;
+    auto const root = fs::temp_directory_path() / ("xchplot2-exit-observation-" + std::to_string(process::Clock::now().time_since_epoch().count()));
+    check(fs::create_directory(root), "cannot create controlled exit fixture directory");
+    struct Remove { fs::path path; ~Remove() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
+    for (auto const* mode : {"exit-gap-success", "exit-gap-failure", "exit-gap-empty", "exit-gap-flood"})
+    {
+        auto const input = root / mode; auto ready = input; ready += ".ready"; auto finish = input; finish += ".exit";
+        bool requested = false, rejected_output = false; std::string output;
+        auto bounded = limits; if (std::string_view(mode) == "exit-gap-flood") bounded.output_bytes = 32;
+        try
+        {
+            output = process::run_worker(input, 1, bounded, process::Worker::migration_proof, 0, 1, [&](SupervisedProcess const& held)
+            {
+                if (!fs::exists(ready)) return true;
+                check(!held.exited() && !requested, "controlled counter loss did not begin with the held live worker"); requested = true;
+                { std::ofstream signal(finish); signal << '1'; check(bool(signal), "cannot request controlled worker exit"); }
+                throw ProcessObservationUnavailable();
+            });
+        }
+        catch (process::WorkerPaused const&) { throw std::runtime_error("controlled worker exit was mistaken for unavailable live telemetry"); }
+        catch (std::runtime_error const&) { rejected_output = true; }
+        check(requested && (std::string_view(mode) == "exit-gap-success" ? !rejected_output && output == "{\"proof_worker\":true}\n" : rejected_output),
+            "exit convergence bypassed the successful-exit, nonempty-result or output-bound checks");
+    }
+    bool unavailable = false, cancelled = false;
+    auto cancellable = limits; cancellable.cancelled = [&] { return unavailable; };
+    try { process::run_worker("hang", 1, cancellable, process::Worker::migration_proof, 0, 1,
+        [&](SupervisedProcess const&) -> bool { unavailable = true; throw ProcessObservationUnavailable(); }); }
+    catch (std::runtime_error const& error) { cancelled = std::string_view(error.what()) == "calibration cancelled"; }
+    check(cancelled, "exit convergence suppressed cancellation after counter loss");
+    auto bounded = limits; bounded.timeout_ms = 200;
+    auto const started = process::Clock::now(); bool timed_out = false; unavailable = false;
+    try { process::run_worker("hang", 1, bounded, process::Worker::migration_proof, 0, 1, [&](SupervisedProcess const&) -> bool
+        {
+            unavailable = true; std::this_thread::sleep_until(started + std::chrono::milliseconds(195)); throw ProcessObservationUnavailable();
+        }); }
+    catch (std::runtime_error const& error) { timed_out = std::string_view(error.what()) == "calibration deadline expired"; }
+    check(unavailable && timed_out, "exit convergence extended the original worker deadline");
+#else
+    (void)limits;
+#endif
+}
 int launch_direct(std::string const& mode)
 {
     auto const self = process::executable(); auto const until = process::Clock::now() + std::chrono::seconds(5);
@@ -392,6 +457,7 @@ int main(int argc, char** argv) try
 #endif
     auto const before = handles();
     monitor_fixture(limits);
+    exit_observation_fixture(limits);
     for (unsigned i = 0; i < 8; ++i)
         check(process::run_worker(input, 1, limits) == "{\"ok\":true}\n", "final worker output was lost at process exit");
     rejected([&] { (void)process::run_worker("failure", 1, limits); });

@@ -84,6 +84,12 @@ int main() try
     gpu_worker.reservation.insert(gpu_worker.reservation.end(), {service("gpu", 1), memory("vram", 25, 100)});
     Stage gpu_stage; gpu_stage.name = "whole-gpu-service"; bind_native_stage(gpu_profile, gpu_request, 0, gpu_stage, false, true);
     check(assess_stage(gpu_profile, gpu_stage).feasible, "remote GPU worker acquired an unneeded local plotting GPU or lost standing residency");
+    auto gpu_preparation = prepare_resource_declarations(gpu_profile);
+    check(gpu_preparation.missing.empty() && std::any_of(gpu_preparation.facts.begin(), gpu_preparation.facts.end(), [](auto const& fact)
+        { return fact.basis == "unknown" && fact.scope.find("Local GPU execution requires") != std::string::npos && fact.scope.find("Broker generation instead") != std::string::npos; }),
+        "preparation mistook an unselected local GPU scope for a missing remote execution declaration");
+    auto unbound_local_request = gpu_request; unbound_local_request.compute_enabled = false;
+    rejects([&] { Stage stage; bind_native_stage(gpu_profile, unbound_local_request, 0, stage, true, false); });
     auto gpu_task = task; gpu_task.task.kind = pool::Kind::GenerateGpu; gpu_task.task.resources.gpu_bytes = 100;
     gpu_task.worker.capacity.gpu_bytes = gpu_task.worker.active.gpu_bytes = 100;
     require_compute_task(gpu_profile, gpu_task, 512, 256, "gpu");

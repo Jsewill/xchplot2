@@ -54,6 +54,55 @@ struct Identity
     uint16_t old_members = 0, target_members = 0;
     uint64_t pending_peak_bytes = 0;
 };
+// A stopped construction is reviewed through its existing loader, never a
+// writable engine. This evidence binds that inspection; the checkpoint remains
+// the authority for recovery and is not copied into another mutable manifest.
+struct ConstructionStamp
+{
+    uint64_t device = 0, inode = 0, bytes = 0, allocated = 0;
+    int64_t modified = 0, changed = 0;
+    uint32_t modified_ns = 0, changed_ns = 0;
+    bool operator==(ConstructionStamp const&) const = default;
+};
+struct ConstructionInspection
+{
+    Identity identity;
+    ConstructionStamp target;
+    std::array<uint8_t, 32> authority_digest{};
+    uint64_t inspection_memory_bytes = 0, recovery_memory_bytes = 0;
+    uint16_t committed_members = 0;
+    bool checkpoint = false, can_append = false;
+};
+struct ConstructionInspectionLimits
+{
+    uint64_t memory_bytes = 0;
+    std::chrono::steady_clock::time_point deadline{};
+    std::function<bool()> cancelled;
+    void check(uint64_t retained_bytes = 0) const
+    {
+        require(retained_bytes <= memory_bytes, "construction inspection exceeds its memory grant");
+        require(!cancelled || !cancelled(), "construction inspection was cancelled");
+        require(std::chrono::steady_clock::now() < deadline, "construction inspection exceeded its time limit");
+    }
+};
+inline ConstructionStamp construction_stamp(int fd, std::string const& path, bool directory = false)
+{
+    file_io::Stat opened{}, named{};
+    auto valid = [&](file_io::Stat const& value)
+    { return directory ? file_io::is_directory(value.st_mode) : file_io::is_regular(value.st_mode) && value.st_nlink == 1; };
+    require(!file_io::inspect_fd(fd, &opened) && valid(opened) &&
+        opened.st_size >= 0 && opened.st_blocks >= 0 && !file_io::inspect_link(path.c_str(), &named) &&
+        valid(named) && named.st_dev == opened.st_dev && named.st_ino == opened.st_ino,
+        "construction target filename or links changed during inspection");
+    require(uint64_t(opened.st_blocks) <= UINT64_MAX / 512, "construction allocation overflow");
+#ifdef __APPLE__
+    auto const modified = opened.st_mtimespec, changed = opened.st_ctimespec;
+#else
+    auto const modified = opened.st_mtim, changed = opened.st_ctim;
+#endif
+    return {uint64_t(opened.st_dev), uint64_t(opened.st_ino), uint64_t(opened.st_size), uint64_t(opened.st_blocks) * 512,
+        modified.tv_sec, changed.tv_sec, uint32_t(modified.tv_nsec), uint32_t(changed.tv_nsec)};
+}
 struct Plan
 {
     bool accepted = false;
@@ -173,6 +222,10 @@ public:
     // markers keep the existing serial recovery envelope. An orphan tail can
     // still be discovered while decoding an otherwise ordinary index.
     static bool pending(std::string const& path);
+    static ConstructionInspection inspect(std::string const& path, Config config, ConstructionInspectionLimits const& limits,
+        std::optional<Identity> const& initial = {});
+    static uint64_t inspection_memory_bytes(uint8_t k)
+    { return uint64_t(PlotGroupFile::getChunkCountForK(k)) * 32 + 65536; }
     static uint64_t memory_bytes(uint8_t k, Config const& config, uint16_t batch_members = 1,
                                  uint16_t wide_members = 0, uint16_t compact_members = 0);
     uint64_t memory_bytes(uint16_t batch_members = 1, uint16_t wide_members = 0,
@@ -208,6 +261,9 @@ public:
     }
 
 private:
+    struct ReadOnly {};
+    Engine(std::string path, Config config, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+           std::array<uint8_t, 32>& authority);
     static constexpr uint8_t construction_version = 0xf0, finalizing_version = 0xf1;
     static constexpr size_t record_bytes = 1024;
     static constexpr size_t max_tasks = 65536;
@@ -276,6 +332,7 @@ private:
     };
     std::string path_;
     Config config_;
+    ConstructionInspectionLimits const* inspection_limits_ = nullptr;
     Identity identity_;
     int fd_ = -1;
     uint64_t device_ = 0, inode_ = 0;
@@ -304,7 +361,8 @@ private:
     void release_clean(uint64_t begin, uint64_t end) const;
     uint64_t file_bytes() const;
     void check_path() const;
-    void discover(bool allow_resume, std::optional<Identity> const& initial);
+    void discover(bool allow_resume, std::optional<Identity> const& initial,
+                  std::array<uint8_t, 32>* authority = nullptr);
     uint64_t preallocate(uint64_t end, uint64_t minimum);
     void checkpoint(Record& record);
     uint64_t record_offset(uint64_t storage_bytes, unsigned slot) const;
@@ -345,6 +403,27 @@ inline uint64_t grow_add(uint64_t a, uint64_t b)
 {
     require(b <= uint64_t(INT64_MAX) && a <= uint64_t(INT64_MAX) - b, "group file offset overflow");
     return a + b;
+}
+inline std::array<uint8_t, 32> construction_digest(ConstructionInspection const& inspected,
+    std::array<uint8_t, 32> const& checkpoint, std::string_view protocol)
+{
+    struct sha256 context; sha256_init(&context);
+    sha256_update(&context, reinterpret_cast<uint8_t const*>(protocol.data()), protocol.size());
+    sha256_update(&context, checkpoint.data(), checkpoint.size());
+    auto number = [&](uint64_t value)
+    {
+        std::array<uint8_t, 8> bytes{};
+        for (auto& byte : bytes) { byte = uint8_t(value); value >>= 8; }
+        sha256_update(&context, bytes.data(), bytes.size());
+    };
+    auto const& stamp = inspected.target;
+    for (auto value : {stamp.device, stamp.inode, stamp.bytes, stamp.allocated,
+        uint64_t(stamp.modified), uint64_t(stamp.changed), uint64_t(stamp.modified_ns), uint64_t(stamp.changed_ns)}) number(value);
+    auto const& header = inspected.identity.header;
+    sha256_update(&context, reinterpret_cast<uint8_t const*>(&header), sizeof(header));
+    if (!inspected.identity.memo.empty()) sha256_update(&context, inspected.identity.memo.data(), inspected.identity.memo.size());
+    number(inspected.checkpoint); number(inspected.committed_members); number(inspected.can_append);
+    std::array<uint8_t, 32> result{}; sha256_sum(&context, result.data()); return result;
 }
 
 struct Engine::Record
@@ -468,6 +547,48 @@ inline Engine::~Engine()
         file_io::close_file(fd_);
     }
 }
+inline Engine::Engine(std::string path, Config config, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+                      std::array<uint8_t, 32>& authority)
+    : path_(std::move(path)), config_(config), inspection_limits_(&limits)
+{
+    limits.check(65536);
+    require(config_.window_bytes && config_.window_bytes <= SIZE_MAX && config_.codec_bytes && config_.checkpoint_bytes &&
+        config_.workers && config_.capacity_bytes <= uint64_t(INT64_MAX), "invalid growth budget");
+    require(config_.codec_bytes >= ChunkCodec::estimate_base(), "codec budget cannot hold one worker");
+    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    require(fd_ >= 0, "cannot inspect growth target: " + path_);
+    try
+    {
+        target = construction_stamp(fd_, path_); auto const& before = target;
+        device_ = before.device; inode_ = before.inode;
+        file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
+        require(!file_io::inspect_fd(fd_, &info) && !file_io::space_fd(fd_, &allocation) &&
+            allocation.f_bsize && info.st_blksize > 0 && page > 0, "cannot inspect growth record alignment");
+        record_alignment_ = std::max({uint64_t(record_bytes), uint64_t(info.st_blksize),
+            uint64_t(allocation.f_bsize), uint64_t(allocation.f_frsize), uint64_t(page)});
+        discover(true, initial, &authority);
+        require(!record_ || record_->largest_chunk <= config_.window_bytes,
+            "saved growth chunks exceed the current window grant; restore a compatible window before recovery");
+        require(before.bytes <= config_.capacity_bytes && identity_.bytes <= config_.capacity_bytes,
+            "saved growth workspace exceeds capacity");
+        require(construction_stamp(fd_, path_) == before, "growth target changed during inspection");
+    }
+    catch (...) { file_io::close_file(fd_); fd_ = -1; throw; }
+}
+inline ConstructionInspection Engine::inspect(std::string const& path, Config config, ConstructionInspectionLimits const& limits,
+                                              std::optional<Identity> const& initial)
+{
+    ConstructionInspection result; std::array<uint8_t, 32> authority{};
+    Engine engine(path, config, ReadOnly{}, limits, initial, result.target, authority); result.identity = engine.identity_;
+    result.checkpoint = bool(engine.record_); result.committed_members = engine.identity_.old_members;
+    result.can_append = !engine.identity_.pending;
+    result.inspection_memory_bytes = inspection_memory_bytes(result.identity.header.k);
+    result.recovery_memory_bytes = memory_bytes(result.identity.header.k, config,
+        uint16_t(result.identity.target_members - result.identity.old_members), 0,
+        uint16_t(result.identity.target_members - result.identity.old_members));
+    result.authority_digest = construction_digest(result, authority, "ordinary");
+    require(construction_stamp(engine.fd_, path) == result.target, "growth target changed during inspection"); return result;
+}
 inline uint64_t Engine::file_bytes() const
 {
     file_io::Stat info{};
@@ -483,9 +604,11 @@ inline void Engine::check_path() const
 }
 inline void Engine::read_at(uint64_t offset, std::span<uint8_t> bytes) const
 {
+    if (inspection_limits_) inspection_limits_->check();
     grow_add(offset, bytes.size());
     while (!bytes.empty())
     {
+        if (inspection_limits_) inspection_limits_->check();
         auto const begin = std::chrono::steady_clock::now();
         auto const n = file_io::read_at(fd_, bytes.data(), std::min(bytes.size(), size_t(file_io::max_transfer)), file_io::Offset(offset));
         stats_.read_ns += elapsed_ns(begin); ++stats_.read_calls;
@@ -657,6 +780,7 @@ inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector
     require(rice < 63, "invalid group index parameter");
     for (auto& size : sizes)
     {
+        if (inspection_limits_) inspection_limits_->check();
         bool const negative = bit();
         uint64_t remainder = 0;
         for (unsigned i = 0; i < rice; ++i) remainder |= uint64_t(bit()) << i;
@@ -677,7 +801,8 @@ inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector
             "group index is not canonical");
 }
 
-inline void Engine::discover(bool allow_resume, std::optional<Identity> const& initial)
+inline void Engine::discover(bool allow_resume, std::optional<Identity> const& initial,
+                             std::array<uint8_t, 32>* authority)
 {
     uint64_t const bytes = file_bytes();
     static_assert(sizeof(Record) <= record_bytes - 32);
@@ -686,6 +811,7 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
         require(header.magic == PlotGroupFile::MAGIC && header.k >= 18 && header.k <= 28 &&
             !(header.k & 1) && header.strength >= 2 && header.strength <= 63,
             "invalid ordinary upstream group identity");
+        if (inspection_limits_) inspection_limits_->check(inspection_memory_bytes(header.k));
         require(memory_bytes(header.k, config_, 0) <= config_.memory_limit_bytes,
                 "group index/windows/codec exceed the memory budget");
     };
@@ -710,7 +836,10 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
             require(candidate.build == expected_build,
                 "growth checkpoint requires the same codec/build identity");
             if (!record_ || candidate.sequence > record_->sequence)
+            {
                 record_ = std::make_unique<Record>(candidate);
+                if (authority) *authority = checksum;
+            }
         }
     }
     if (record_)

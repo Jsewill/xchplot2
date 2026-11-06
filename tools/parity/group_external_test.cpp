@@ -676,6 +676,31 @@ void bulk_checkpoints(fs::path const& root, Members input, ExternalConfig ext)
             "bulk summary recovery boundary was not reached: " + boundary);
         auto const saved = ExternalEngine::inspect(interrupted.string());
         {
+            auto const work = fs::path(interrupted.string() + ".external");
+            auto const before = contents(interrupted), checkpoint_before = contents(work / "checkpoint");
+            ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+            require(!::chmod(interrupted.c_str(), 0400), "cannot make external target read-only");
+            auto const inspected = ExternalEngine::inspect_construction(interrupted.string(), 64 * 1024 * 1024, limits);
+            auto const repeated = ExternalEngine::inspect_construction(interrupted.string(), 64 * 1024 * 1024, limits);
+            require(inspected.construction.checkpoint && inspected.members == saved.members &&
+                inspected.reserved_bytes == saved.reserved_bytes && inspected.occupied_bytes == saved.occupied_bytes &&
+                inspected.construction.authority_digest == repeated.construction.authority_digest &&
+                contents(interrupted) == before && contents(work / "checkpoint") == checkpoint_before,
+                "read-only external inspection changed or did not bind retained construction and scratch");
+            auto const orphan = work / "review-unowned";
+            { std::ofstream out(orphan, std::ios::binary); out << "retained unowned bytes"; require(bool(out), "cannot write inspection orphan fixture"); }
+            auto const changed = ExternalEngine::inspect_construction(interrupted.string(), 64 * 1024 * 1024, limits);
+            require(changed.construction.authority_digest != inspected.construction.authority_digest && fs::exists(orphan),
+                "external inspection omitted an orphan from its namespace binding or cleaned it");
+            fs::remove(orphan);
+            auto denied = limits; denied.memory_bytes = 1; bool refused = false;
+            try { (void)ExternalEngine::inspect_construction(interrupted.string(), 64 * 1024 * 1024, denied); }
+            catch (std::runtime_error const&) { refused = true; }
+            require(refused && contents(interrupted) == before && contents(work / "checkpoint") == checkpoint_before,
+                "external inspection ignored its separate binding grant or modified recovery authority");
+            require(!::chmod(interrupted.c_str(), 0600), "cannot restore external target permissions");
+        }
+        {
             ExternalEngine engine(interrupted.string(), config(), ext, true);
             require(saved.reserved_bytes == engine.scratch_reserved_bytes(), "unconfirmed bulk generations escaped scratch accounting");
             engine.confirm_identity();
@@ -2215,6 +2240,158 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
 }
 
+// Rewrite only native device fields through the documented legacy descriptor
+// layout. The fixture never changes actual mounts or grants new file authority.
+std::vector<uint8_t> native_checkpoint(std::vector<uint8_t> const& record, bool legacy, bool changed_device,
+    unsigned malformed_header = 0, unsigned malformed_progress = 0)
+{
+    using namespace external_detail;
+    CheckpointInput in(std::string_view(reinterpret_cast<char const*>(record.data() + 65), record.size() - 65));
+    std::ostringstream out(std::ios::binary);
+    require(get_string(in) == "xchplot2-external-4", "native checkpoint fixture needs captured owner evidence");
+    put_string(out, legacy ? "xchplot2-external-3" : "xchplot2-external-4");
+    auto text = [&] { auto value = get_string(in); put_string(out, value); return value; };
+    auto copy = [&]<class T>() { auto value = get<T>(in); put(out, value); return value; };
+    auto identity = [&]
+    {
+        auto value = get<ExternalEngine::FileIdentity>(in); if (changed_device && value.inode) value.device ^= UINT64_C(0x80000000);
+        put(out, value); return value;
+    };
+    auto native = [&] { auto value = get_native_identity(in); if (!legacy) put_native_identity(out, value); };
+    text(); text(); text();
+    for (unsigned owner = 0; owner < 3; ++owner) { identity(); native(); }
+    auto checkpoint = get<ExternalEngine::FileIdentity>(in); if (changed_device) checkpoint.device ^= UINT64_C(0x80000000);
+    auto checkpoint_native = get_native_identity(in); if (!legacy) { put(out, checkpoint); put_native_identity(out, checkpoint_native); }
+    auto header = get<Header>(in);
+    if (malformed_header == 1) ++header.version;
+    else if (malformed_header == 2) ++header.memo_length;
+    else if (malformed_header == 3) header.strength = 1;
+    put(out, header); text(); copy.template operator()<uint64_t>(); copy.template operator()<unsigned>(); copy.template operator()<unsigned>();
+    auto const roots = copy.template operator()<uint64_t>();
+    for (uint64_t root = 0; root < roots; ++root)
+    {
+        text(); identity(); identity(); copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); native(); native();
+    }
+    auto const phase = get<unsigned>(in); put(out, malformed_progress == 3 ? 4u : phase);
+    auto const members = copy.template operator()<uint16_t>();
+    auto next_id = get<uint64_t>(in); if (malformed_progress == 4) next_id = 1; put(out, next_id);
+    copy.template operator()<uint64_t>();
+    auto output_bytes = get<uint64_t>(in); if (malformed_progress == 1) --output_bytes; put(out, output_bytes);
+    auto packed_chunks = get<uint64_t>(in); if (malformed_progress == 2) packed_chunks = 1; put(out, packed_chunks);
+    copy.template operator()<Stats>();
+    struct SavedSegment { uint32_t root, ordinal; uint64_t capacity, bytes; ExternalEngine::Stamp stamp; };
+    static_assert(sizeof(SavedSegment) == 2 * sizeof(uint32_t) + 2 * sizeof(uint64_t) + sizeof(ExternalEngine::Stamp));
+    auto segments = [&]
+    {
+        auto const count = copy.template operator()<uint64_t>();
+        for (uint64_t index = 0; index < count; ++index)
+        {
+            auto value = get<SavedSegment>(in); if (changed_device) value.stamp.file.device ^= UINT64_C(0x80000000);
+            put(out, value); native();
+        }
+    };
+    auto const runs = copy.template operator()<uint64_t>();
+    for (uint64_t run = 0; run < runs; ++run)
+    {
+        copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>();
+        copy.template operator()<uint16_t>(); copy.template operator()<uint16_t>(); segments();
+    }
+    auto const summary_chunks = get<uint64_t>(in); put(out, malformed_progress == 3 ? uint64_t(0) : summary_chunks);
+    if (!phase && members)
+    { copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); segments(); copy.template operator()<std::array<uint8_t, 32>>(); }
+    copy.template operator()<uint64_t>(); copy.template operator()<uint32_t>(); copy.template operator()<uint32_t>(); identity(); text();
+    auto completed = get<ExternalEngine::Stamp>(in); if (changed_device && completed.file.inode) completed.file.device ^= UINT64_C(0x80000000); put(out, completed);
+    copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); copy.template operator()<uint64_t>(); native();
+    require(in.rdbuf()->in_avail() == 0, "native checkpoint fixture missed an authoritative field");
+    auto const body = out.str(); auto const digest = group_tools::hex(grow_digest({reinterpret_cast<uint8_t const*>(body.data()), body.size()}));
+    std::vector<uint8_t> result(digest.begin(), digest.end()); result.push_back('\n'); result.insert(result.end(), body.begin(), body.end()); return result;
+}
+void native_identity_recovery(fs::path const& root, Members input, ExternalConfig const& ext, std::vector<uint8_t> const& reference)
+{
+    auto replace = [](fs::path const& path, std::vector<uint8_t> const& bytes)
+    { std::ofstream out(path, std::ios::binary | std::ios::trunc); out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size()); require(bool(out), "native checkpoint fixture write failed"); };
+    for (bool legacy : {false, true}) for (bool changed : {false, true})
+    {
+        auto const path = root / (std::string("native-owner-") + (legacy ? "legacy-" : "prospective-") + (changed ? "changed" : "current"));
+        { ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "native owner fixture rejected input"); }
+        auto const checkpoint = fs::path(path.string() + ".external") / "checkpoint";
+        auto const original = contents(checkpoint);
+        external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(original.data() + 65), original.size() - 65));
+        if (external_detail::get_string(kind) != "xchplot2-external-4") continue;
+        auto const rewritten = native_checkpoint(original, legacy, changed); replace(checkpoint, rewritten); auto const before = contents(path);
+        bool inspected = false, resumed = false;
+        try { inspected = ExternalEngine::inspect(path.string()).members == input.size(); } catch (std::exception const&) {}
+        try { ExternalEngine engine(path.string(), config(), ext, true); resumed = true; if (!legacy || !changed) { engine.confirm_identity(); engine.finish(); } }
+        catch (std::exception const&) { require(!resumed, "native owner accepted resume but failed its ordinary durable publication"); }
+        require(inspected == (!legacy || !changed) && resumed == inspected, "prospective owner or strict legacy remount policy changed");
+        if (resumed) require(contents(path) == reference, "native recovery changed ordinary output bytes");
+        else require(contents(path) == before && contents(checkpoint) == rewritten, "refused legacy remount mutated native ownership");
+    }
+    auto const substitute = root / "native-checkpoint-substitute";
+    { ExternalEngine engine(substitute.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "checkpoint substitution fixture rejected"); }
+    auto const checkpoint = fs::path(substitute.string() + ".external") / "checkpoint", held = fs::path(checkpoint.string() + ".held");
+    auto const body = contents(checkpoint); external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(body.data() + 65), body.size() - 65));
+    if (external_detail::get_string(kind) == "xchplot2-external-4")
+    {
+        fs::rename(checkpoint, held); replace(checkpoint, body); bool rejected = false;
+        try { (void)ExternalEngine::inspect(substitute.string()); } catch (std::exception const&) { rejected = true; }
+        require(rejected && contents(checkpoint) == body && fs::exists(held), "same-byte checkpoint substitute gained native authority");
+        fs::remove(checkpoint); fs::rename(held, checkpoint);
+        require(ExternalEngine::inspect(substitute.string()).members == input.size(), "restoring the exact checkpoint lost native authority");
+        auto const before = contents(substitute);
+        for (unsigned malformed : {1, 2, 3})
+        {
+            auto const invalid = native_checkpoint(body, false, false, malformed); replace(checkpoint, invalid);
+            ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+            bool refused_inspection = false, refused_resume = false;
+            try { (void)ExternalEngine::inspect_construction(substitute.string(), 64 * 1024 * 1024, limits); } catch (std::exception const&) { refused_inspection = true; }
+            try { ExternalEngine engine(substitute.string(), config(), ext, true); } catch (std::exception const&) { refused_resume = true; }
+            require(refused_inspection && refused_resume && contents(substitute) == before && contents(checkpoint) == invalid,
+                "read-only inspector and writable recovery disagreed on a checksummed invalid external identity or changed its owner");
+        }
+        for (unsigned malformed : {1, 2})
+        {
+            auto const invalid = native_checkpoint(body, false, false, 0, malformed); replace(checkpoint, invalid);
+            ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+            bool refused = false;
+            try { (void)ExternalEngine::inspect_construction(substitute.string(), 64 * 1024 * 1024, limits); } catch (std::exception const&) { refused = true; }
+            require(refused && contents(substitute) == before && contents(checkpoint) == invalid, "read-only successor inspection authorized an invalid staged checkpoint shape");
+        }
+        replace(checkpoint, body);
+    }
+    for (unsigned malformed : {3, 4})
+    {
+        auto const path = root / ("native-initial-shape-" + std::to_string(malformed));
+        { ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); }
+        auto checkpoint = fs::path(path.string() + ".external") / "checkpoint"; auto const body = contents(checkpoint);
+        external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(body.data() + 65), body.size() - 65));
+        if (external_detail::get_string(kind) != "xchplot2-external-4") continue;
+        if (malformed == 4) { auto const partial = checkpoint.parent_path() / "checkpoint.partial.fixture"; fs::rename(checkpoint, partial); checkpoint = partial; }
+        auto const invalid = native_checkpoint(body, false, false, 0, malformed); replace(checkpoint, invalid); auto const before = contents(path);
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        bool refused_inspection = false, refused_resume = false;
+        try { (void)ExternalEngine::inspect_construction(path.string(), 64 * 1024 * 1024, limits); } catch (std::exception const&) { refused_inspection = true; }
+        try { ExternalEngine engine(path.string(), config(), ext, true); } catch (std::exception const&) { refused_resume = true; }
+        require(refused_inspection && refused_resume && contents(path) == before && contents(checkpoint) == invalid,
+            "initial or empty checkpoint shape gained successor authority or changed saved data");
+    }
+    auto tight = ext; for (auto& grant : tight.scratch) grant.capacity_bytes = 4096;
+    for (std::string const boundary : {"external-empty-before-checkpoint", "external-empty-after-checkpoint", "external-empty-ready-after-checkpoint"})
+    {
+        auto const path = root / ("native-" + boundary); auto const child = ::fork(); require(child >= 0, "fork failed");
+        if (!child)
+        {
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", boundary.c_str(), 1);
+            ExternalEngine engine(path.string(), config(), tight, false, initial_identity()); engine.confirm_identity();
+            require(!engine.append(input).accepted, "native empty fixture unexpectedly fit"); engine.finish(); std::_Exit(0);
+        }
+        int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86, "native empty interruption was not reached");
+        (void)ExternalEngine::inspect(path.string(), config().memory_limit_bytes);
+        { ExternalEngine engine(path.string(), config(), tight, true); engine.confirm_identity(); engine.finish(); engine.release_completed(); }
+        require(!ExternalEngine::pending(path.string()) && !fs::file_size(path), "native empty recovery changed the original durable transition");
+    }
+}
+
 int main(int argc, char** argv)
 try
 {
@@ -2223,8 +2400,8 @@ try
         io_trace(std::string(argv[1]) == "--io-trace-enabled"); std::cout << "external I/O tracing tests passed\n"; return 0;
     }
     bool const independent_io_only = argc == 3 && std::string(argv[1]) == "--independent-io-only";
-    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
-        "usage: grow-external-test [--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
+    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--native-identity-only" || std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
+        "usage: grow-external-test [--native-identity-only|--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
     if (independent_io_only)
     {
 #ifdef GROW_TEST_WRAP_PWRITE
@@ -2257,6 +2434,9 @@ try
     auto raw = members(retirement_only || windows_only ? 2 : 8); Members input(raw);
     { Engine engine((root / "reference").string(), config(), false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "reference append rejected"); }
     auto const reference = contents(root / "reference"); auto ext = external(root);
+    if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--native-identity-only")) native_identity_recovery(root, input, ext, reference);
+    if (argc == 2 && std::string(argv[1]) == "--native-identity-only")
+    { fs::remove_all(root); std::cout << "external native identity tests passed\n"; return 0; }
     if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--contribution-input-only")) contribution_inputs(root, raw, ext, reference);
     if (argc == 2 && std::string(argv[1]) == "--contribution-input-only")
     { fs::remove_all(root); std::cout << "external contribution input tests passed\n"; return 0; }
@@ -2433,7 +2613,7 @@ try
         auto const before = contents(path); bool rejected = false;
         try { (void)ExternalEngine::inspect(path.string(), 1); } catch (std::exception const&) { rejected = true; }
         require(rejected && contents(path) == before, "inspection bypassed its memory budget");
-        auto original = contents(checkpoint), corrupt = original; corrupt.back() ^= 1;
+        auto original = contents(checkpoint), corrupt = original; corrupt.back() = 0xff;
         auto const hash = group_tools::hex(grow_digest(std::span<uint8_t const>(corrupt).subspan(65)));
         std::copy(hash.begin(), hash.end(), corrupt.begin());
         { std::ofstream out(checkpoint, std::ios::binary | std::ios::trunc); out.write(reinterpret_cast<char const*>(corrupt.data()), corrupt.size()); }

@@ -5,6 +5,7 @@
 #include "host/GroupStorage.hpp"
 #include "host/GroupWriter.hpp"
 #include "host/GroupPolicy.hpp"
+#include "host/GroupNativeIdentity.hpp"
 #include <charconv>
 #include <cstdio>
 #include <iostream>
@@ -144,16 +145,20 @@ public:
     };
     struct Inspection
     {
+        ConstructionInspection construction;
         ExternalConfig external;
         Identity identity;
         std::vector<ScratchGrant> scratch;
         std::vector<uint64_t> reserved_bytes, peak_reserved_bytes, allocated_bytes, occupied_bytes;
         uint64_t target_bytes = 0, target_allocated_bytes = 0, metadata_reserved_bytes = 0, metadata_allocated_bytes = 0, metadata_occupied_bytes = 0, peak_bytes = 0;
+        uint64_t packing_source_bytes = 0, packing_work_bytes = 0, packet_count = 0;
         uint16_t members = 0;
         bool finishing = false, complete = false;
     };
     static bool pending(std::string const& path);
     static Inspection inspect(std::string const& path, uint64_t memory_limit_bytes = UINT64_MAX);
+    static Inspection inspect_construction(std::string const& path, uint64_t loader_memory_bytes,
+        ConstructionInspectionLimits const& limits);
     static Inspection inspect_retired(std::string const& path, std::string const& directory, uint64_t memory_limit_bytes = UINT64_MAX);
     static Inspection inspect_retired_published(std::string const& path, std::string const& directory,
         PublishedTarget const& published, uint64_t memory_limit_bytes = UINT64_MAX);
@@ -251,13 +256,19 @@ private:
         std::string path;
         FileIdentity directory, parent;
         uint64_t capacity = 0, alignment = 0, used = 0, peak = 0;
+        file_io::DurableIdentity directory_identity, parent_identity;
     };
-    struct Segment
+    // Keep the external-v3 native binary descriptor layout exactly intact.
+    struct LegacySegment
     {
         uint32_t root = 0, ordinal = 0;
         uint64_t capacity = 0, bytes = 0;
         Stamp stamp;
     };
+    static_assert(std::is_trivially_copyable_v<LegacySegment>);
+    static_assert(offsetof(LegacySegment, stamp) == 2 * sizeof(uint32_t) + 2 * sizeof(uint64_t));
+    static_assert(sizeof(LegacySegment) == offsetof(LegacySegment, stamp) + sizeof(Stamp));
+    struct Segment : LegacySegment { file_io::DurableIdentity identity; };
     struct Run
     {
         uint64_t id = 0, bytes = 0, consumed = 0;
@@ -274,6 +285,7 @@ private:
     ExternalConfig external_;
     Identity identity_;
     FileIdentity target_, work_identity_, parent_, checkpoint_identity_;
+    file_io::DurableIdentity target_identity_, work_native_identity_, parent_identity_, checkpoint_native_identity_, index_native_identity_;
     Stamp completed_;
     int fd_ = -1;
     bool created_ = false, confirmed_ = false, initialized_ = false, released_ = false, bootstrap_recovered_ = false;
@@ -296,7 +308,7 @@ private:
     CpuTime contribution_owner_cpu_, packing_owner_cpu_, contribution_driver_cpu_, packing_driver_cpu_;
     ExecutionIO execution_scratch_, execution_destination_;
     uint64_t packing_body_ns_ = 0;
-    struct Orphan { uint32_t root; std::string name; Stamp stamp; uint64_t reserved = 0; };
+    struct Orphan { uint32_t root; std::string name; Stamp stamp; uint64_t reserved = 0; file_io::DurableIdentity identity; };
     std::vector<Orphan> orphans_;
 
     class Reader;
@@ -328,7 +340,7 @@ private:
     static uint64_t packing_index_bytes(Config const& config)
     { return std::clamp<uint64_t>(config.window_bytes, 65536, 1024 * 1024); }
     static Inspection inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
-        PublishedTarget const* published = nullptr);
+                                 PublishedTarget const* published = nullptr, ConstructionInspectionLimits const* inspection = nullptr);
     static Inspection inspect_receipt(std::string const& path, std::string const& holder, uint64_t memory_limit_bytes,
         PublishedTarget const* published = nullptr);
     static void validate_publication(PublishedTarget const& published, Inspection const& retired);
@@ -338,9 +350,43 @@ private:
     { return multiply(bytes / alignment + (bytes % alignment != 0), alignment); }
     static FileIdentity file_identity(std::string const& path, bool directory);
     static FileIdentity file_identity(int fd);
+    static file_io::DurableIdentity capture_identity(int fd, std::string const& path, FileIdentity expected, bool directory = false);
+    static file_io::DurableIdentity capture_identity(std::string const& path, FileIdentity expected, bool directory = false);
+    static FileIdentity bind_identity(std::string const& path, bool directory, FileIdentity saved, file_io::DurableIdentity const& identity);
+    static Stamp bind_stamp(std::string const& path, Stamp saved, file_io::DurableIdentity const& identity);
+    static bool checkpoint_scope(std::istream& in, bool durable, std::string const& target, std::string const& work, std::string const& checkpoint);
+    template<class Output> static void put_segment(Output& out, Segment const& segment, bool durable);
+    static Segment get_segment(std::istream& in, bool durable);
+    static bool valid_identity(Header const& header, size_t memo_bytes)
+    {
+        return header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION && header.k >= 18 && header.k <= 28 &&
+            !(header.k & 1) && header.strength >= 2 && header.strength <= header.k - 3 && memo_bytes <= 255 && header.memo_length == memo_bytes;
+    }
+    static void validate_checkpoint_shape(Phase phase, uint16_t members, uint64_t next_id, uint64_t output_bytes,
+        uint64_t packed_chunks, uint64_t index_bytes, FileIdentity index, size_t runs, Header const& header, size_t memo_bytes, bool bootstrap)
+    {
+        auto const chunks = PlotGroupFile::getChunkCountForK(header.k);
+        require(unsigned(phase) <= unsigned(Phase::empty) && next_id <= UINT32_MAX && packed_chunks <= chunks,
+            "invalid external checkpoint progress");
+        require(index_bytes <= multiply(chunks, 8), "external index cursor exceeds its bound");
+        if (bootstrap) require(phase == Phase::stage && !members && !next_id && !packed_chunks && !runs &&
+            output_bytes == sizeof(Header) + memo_bytes,
+            "only an unacknowledged initial external checkpoint may be recovered from a temporary record");
+        if (phase == Phase::empty) require(!members && !runs && !output_bytes && !packed_chunks && !index.inode, "invalid empty external checkpoint");
+        if (phase == Phase::stage) require(!packed_chunks && !index_bytes && !index.inode && output_bytes == sizeof(Header) + memo_bytes,
+            "invalid external staging progress");
+    }
+    static void validate_packing_shape(uint8_t k, uint16_t members, uint64_t packets, uint64_t source, uint64_t work)
+    {
+        require(!members || (packets && packets <= members && source && work == ChunkCodec::estimate_work(k, source, 0)),
+            "invalid external packing admission record");
+    }
+    void capture_owned_identities();
+    bool native_evidence() const;
     static Stamp stamp(std::string const& path);
     static std::string digest(std::string_view body);
-    static std::string checkpoint_path(std::string const& work, std::string const& target, uint64_t limit);
+    static std::string checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
+        ConstructionInspectionLimits const* inspection = nullptr);
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
@@ -358,7 +404,8 @@ private:
     static std::array<uint8_t, segment_header_bytes> segment_header(std::string const& token, Run const& run, Segment const& segment);
     static void read_summary(std::vector<Root> const& roots, std::string const& token, Run const& run,
                              std::array<uint8_t, 32> const& checksum, std::span<uint8_t> destination = {}, Stats* stats = nullptr,
-                             external_detail::IOContext context = {}, CodecScheduler* scheduler = nullptr);
+                             external_detail::IOContext context = {}, CodecScheduler* scheduler = nullptr,
+                             ConstructionInspectionLimits const* inspection = nullptr);
     void write_summary(std::span<Summary const> summaries);
     bool reserve(Run& run, uint64_t bytes, char const* role = "contribution");
     void discard(Run const& run);
@@ -518,6 +565,32 @@ inline std::string get_string(std::istream& in, uint64_t limit = 4096)
     auto const bytes = get<uint64_t>(in); require(bytes <= limit, "external checkpoint string is too long");
     std::string value(size_t(bytes), '\0'); in.read(value.data(), value.size()); return value;
 }
+template<class Output> void put_native_identity(Output& out, file_io::DurableIdentity const& identity)
+{
+    require(file_io::valid_durable_identity(identity), "invalid external native identity");
+    put(out, uint8_t(identity.scheme)); put_string(out, identity.filesystem); put(out, identity.handle_type); put_string(out, identity.object);
+}
+inline file_io::DurableIdentity get_native_identity(std::istream& in)
+{
+    auto const scheme = get<uint8_t>(in);
+    require(scheme <= unsigned(file_io::DurableIdentity::Scheme::windows_file_id), "invalid external native identity scheme");
+    file_io::DurableIdentity result; result.scheme = file_io::DurableIdentity::Scheme(scheme);
+    result.filesystem = get_string(in, 256); result.handle_type = get<uint32_t>(in); result.object = get_string(in, 256);
+    require(file_io::valid_durable_identity(result), "invalid external native identity"); return result;
+}
+}
+
+template<class Output> inline void ExternalEngine::put_segment(Output& out, Segment const& segment, bool durable)
+{
+    external_detail::put(out, static_cast<LegacySegment const&>(segment));
+    if (durable) external_detail::put_native_identity(out, segment.identity);
+}
+inline ExternalEngine::Segment ExternalEngine::get_segment(std::istream& in, bool durable)
+{
+    Segment result;
+    auto const legacy = external_detail::get<LegacySegment>(in);
+    std::memcpy(static_cast<LegacySegment*>(&result), &legacy, sizeof(legacy));
+    if (durable) result.identity = external_detail::get_native_identity(in); return result;
 }
 
 inline ExternalEngine::FileIdentity ExternalEngine::file_identity(std::string const& path, bool directory)
@@ -532,6 +605,103 @@ inline ExternalEngine::FileIdentity ExternalEngine::file_identity(int fd)
     file_io::Stat value{};
     require(!file_io::inspect_fd(fd, &value) && file_io::is_regular(value.st_mode) && value.st_nlink == 1, "external file handle is not exclusively owned");
     return {uint64_t(value.st_dev), uint64_t(value.st_ino)};
+}
+inline file_io::DurableIdentity ExternalEngine::capture_identity(int fd, std::string const& path, FileIdentity expected, bool directory)
+{
+    file_io::Stat value{};
+    require(!file_io::inspect_fd(fd, &value) && (directory ? file_io::is_directory(value.st_mode) : (file_io::is_regular(value.st_mode) && value.st_nlink == 1)) &&
+        FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == expected && file_identity(path, directory) == expected,
+        "external native capture does not match its pinned owner");
+    file_io::DurableIdentity identity; (void)file_io::capture_durable_identity(fd, &identity);
+    require(file_identity(path, directory) == expected, "external native owner changed during capture"); return identity;
+}
+inline file_io::DurableIdentity ExternalEngine::capture_identity(std::string const& path, FileIdentity expected, bool directory)
+{
+    external_detail::Descriptor file(file_io::open_file(path, file_io::read_only | file_io::no_follow | file_io::close_on_exec | (directory ? file_io::directory : 0)));
+    return capture_identity(file.fd, path, expected, directory);
+}
+inline ExternalEngine::FileIdentity ExternalEngine::bind_identity(std::string const& path, bool directory, FileIdentity saved, file_io::DurableIdentity const& identity)
+{
+    require(file_io::valid_durable_identity(identity), "invalid external owner native evidence");
+    auto const current = file_identity(path, directory);
+    bool const durable = file_io::has_durable_identity(identity);
+    require(current.inode == saved.inode && (current.device == saved.device || durable), "external native owner changed");
+    external_detail::Descriptor file(file_io::open_file(path, file_io::read_only | file_io::no_follow | file_io::close_on_exec | (directory ? file_io::directory : 0)));
+    file_io::Stat value{};
+    require(!file_io::inspect_fd(file.fd, &value) && FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == current &&
+        (!durable || file_io::matches_durable_identity(file.fd, identity)) && file_identity(path, directory) == current,
+        "external owner generation or pinned path changed"); return current;
+}
+inline ExternalEngine::Stamp ExternalEngine::bind_stamp(std::string const& path, Stamp saved, file_io::DurableIdentity const& identity)
+{
+    auto const current = stamp(path);
+    saved.file = bind_identity(path, false, saved.file, identity);
+    require(saved == current && stamp(path) == current, "external native owner metadata changed"); return current;
+}
+inline bool ExternalEngine::checkpoint_scope(std::istream& in, bool durable, std::string const& target, std::string const& work, std::string const& checkpoint)
+{
+    using namespace external_detail;
+    try
+    {
+        auto const target_owner = get<FileIdentity>(in); auto const target_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+        (void)bind_identity(target, false, target_owner, target_native);
+        auto const work_owner = get<FileIdentity>(in); auto const work_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+        (void)bind_identity(work, true, work_owner, work_native);
+        auto const parent_owner = get<FileIdentity>(in); auto const parent_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+        (void)bind_identity(file_io::path_text(file_io::native_path(target).parent_path()), true, parent_owner, parent_native);
+        if (durable)
+        {
+            auto const owner = get<FileIdentity>(in); auto const native = get_native_identity(in);
+            (void)bind_identity(checkpoint, false, owner, native);
+        }
+        return true;
+    }
+    catch (std::runtime_error const&) { return false; }
+}
+inline bool ExternalEngine::native_evidence() const
+{
+    for (auto const* identity : {&target_identity_, &work_native_identity_, &parent_identity_, &index_native_identity_})
+        if (file_io::has_durable_identity(*identity)) return true;
+    for (auto const& root : roots_) if (file_io::has_durable_identity(root.directory_identity) || file_io::has_durable_identity(root.parent_identity)) return true;
+    for (auto const& run : runs_) for (auto const& segment : run.segments) if (file_io::has_durable_identity(segment.identity)) return true;
+    for (auto const* run : {&summary_run_, &pending_summary_}) for (auto const& segment : run->segments)
+        if (file_io::has_durable_identity(segment.identity)) return true;
+    return false;
+}
+inline void ExternalEngine::capture_owned_identities()
+{
+    auto capture = [&](std::string const& path, FileIdentity expected, bool directory, file_io::DurableIdentity& identity)
+    {
+        if (file_io::has_durable_identity(identity)) require(bind_identity(path, directory, expected, identity) == expected, "external owner changed during native publication");
+        else identity = capture_identity(path, expected, directory);
+    };
+    if (file_io::has_durable_identity(target_identity_)) require(file_io::matches_durable_identity(fd_, target_identity_), "external target native handle changed");
+    else target_identity_ = capture_identity(fd_, path_, target_);
+    capture(file_io::path_text(file_io::native_path(path_).parent_path()), parent_, true, parent_identity_);
+    capture(work_, work_identity_, true, work_native_identity_);
+    for (auto& root : roots_)
+    {
+        capture(root.path, root.directory, true, root.directory_identity);
+        capture(file_io::path_text(file_io::native_path(root.path).parent_path()), root.parent, true, root.parent_identity);
+    }
+    auto segments = [&](Run& run)
+    {
+        uint64_t position = 0;
+        for (auto& segment : run.segments)
+        {
+            position = grow_add(position, segment.bytes); auto const path = segment_path(run, segment); file_io::Stat value{};
+            if (file_io::inspect_link(path, &value)) { require(errno == ENOENT && position <= run.consumed, "required external owner is missing during native publication"); continue; }
+            require(stamp(path) == segment.stamp, "external segment changed before native publication");
+            capture(path, segment.stamp.file, false, segment.identity);
+        }
+    };
+    for (auto& run : runs_) segments(run); segments(summary_run_); segments(pending_summary_);
+    if (index_identity_.inode)
+    {
+        auto const path = work_ + '/' + index_name_; file_io::Stat value{};
+        if (file_io::inspect_link(path, &value)) require(errno == ENOENT && phase_ != Phase::pack, "required external index is missing during native publication");
+        else capture(path, index_identity_, false, index_native_identity_);
+    }
 }
 inline ExternalEngine::Stamp ExternalEngine::stamp(std::string const& path)
 {
@@ -597,8 +767,8 @@ inline uint64_t ExternalEngine::memory_bytes(uint8_t k, Config const& config,
 inline uint64_t ExternalEngine::checkpoint_buffer_bytes(ExternalConfig const& external)
 {
     uint64_t paths = 0;
-    for (auto const& grant : external.scratch) paths = grow_add(paths, multiply(grant.directory.size() + 256, 4));
-    return grow_add(1024 * 1024, grow_add(paths, multiply(descriptor_limit(external), 256)));
+    for (auto const& grant : external.scratch) paths = grow_add(paths, multiply(grant.directory.size() + 1024, 4));
+    return grow_add(1024 * 1024, grow_add(paths, multiply(descriptor_limit(external), 768)));
 }
 inline uint64_t ExternalEngine::phase_memory_bytes(uint8_t k, Config const& config,
     ExternalConfig const& external, MemoryPhase phase, uint16_t batch_members)
@@ -666,14 +836,15 @@ inline std::vector<uint64_t> ExternalEngine::scratch_peak_bytes() const
 inline void ExternalEngine::check_paths() const
 {
     require(!released_, "external construction was handed off to ordinary growth");
-    require(file_identity(file_io::path_text(file_io::native_path(path_).parent_path()), true) == parent_, "external destination parent directory was replaced");
-    require(file_identity(path_, false) == target_, "external destination was replaced");
+    require(bind_identity(file_io::path_text(file_io::native_path(path_).parent_path()), true, parent_, parent_identity_) == parent_, "external destination parent directory was replaced");
+    require(bind_identity(path_, false, target_, target_identity_) == target_ &&
+        (!file_io::has_durable_identity(target_identity_) || file_io::matches_durable_identity(fd_, target_identity_)), "external destination was replaced");
     if (!initialized_) return;
-    require(file_identity(work_, true) == work_identity_, "external checkpoint directory was replaced");
+    require(bind_identity(work_, true, work_identity_, work_native_identity_) == work_identity_, "external checkpoint directory was replaced");
     for (auto const& root : roots_)
     {
-        require(file_identity(file_io::path_text(file_io::native_path(root.path).parent_path()), true) == root.parent, "external scratch parent directory was replaced");
-        require(file_identity(root.path, true) == root.directory, "external scratch directory was replaced");
+        require(bind_identity(file_io::path_text(file_io::native_path(root.path).parent_path()), true, root.parent, root.parent_identity) == root.parent, "external scratch parent directory was replaced");
+        require(bind_identity(root.path, true, root.directory, root.directory_identity) == root.directory, "external scratch directory was replaced");
     }
 }
 inline void ExternalEngine::sync_target()
@@ -704,7 +875,8 @@ ExternalEngine::segment_header(std::string const& token, Run const& run, Segment
     std::copy(hash.begin(), hash.end(), result.begin()); return result;
 }
 inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::string const& token, Run const& run,
-    std::array<uint8_t, 32> const& checksum, std::span<uint8_t> destination, Stats* stats, external_detail::IOContext io, CodecScheduler* scheduler)
+    std::array<uint8_t, 32> const& checksum, std::span<uint8_t> destination, Stats* stats, external_detail::IOContext io, CodecScheduler* scheduler,
+    ConstructionInspectionLimits const* inspection)
 {
     using namespace external_detail;
     require(destination.empty() || destination.size() == run.bytes, "external summary destination coverage changed");
@@ -714,6 +886,7 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
     uint64_t position = 0; uint32_t ordinal = 0;
     for (auto const& segment : run.segments)
     {
+        if (inspection) inspection->check();
         require(segment.root < roots.size() && segment.ordinal == ordinal++ && segment.capacity > segment_header_bytes &&
             segment.bytes && segment.bytes <= segment.capacity - segment_header_bytes && segment.stamp.bytes == segment.capacity &&
             segment.stamp.file.inode && position <= run.bytes && segment.bytes <= run.bytes - position,
@@ -721,11 +894,13 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
         auto const path = roots[segment.root].path + "/run-" + std::to_string(run.id) + "-" + std::to_string(segment.ordinal);
         require(stamp(path) == segment.stamp, "external summary segment changed");
         Descriptor file(file_io::open_file(path.c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
-        require(file_identity(file.fd) == segment.stamp.file, "external summary handle was replaced");
+        require(file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
+            file_io::matches_durable_identity(file.fd, segment.identity)), "external summary handle was replaced");
         std::array<uint8_t, segment_header_bytes> header{}; read(file.fd, 0, header, stats, io);
         require(header == segment_header(token, run, segment), "external summary ownership header changed");
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
+            if (inspection) inspection->check();
             size_t const bytes = size_t(std::min<uint64_t>(65536, segment.bytes - offset));
             auto const part = destination.empty() ? std::span(buffer.get(), bytes) : destination.subspan(size_t(position + offset), bytes);
             read(file.fd, segment_header_bytes + offset, part, stats, io);
@@ -749,7 +924,8 @@ inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
         auto const path = segment_path(pending_summary_, segment);
         require(stamp(path) == segment.stamp, "external pending summary segment changed");
         Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
-        require(file_identity(file.fd) == segment.stamp.file && segment.bytes <= bytes.size(),
+        require(file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
+            file_io::matches_durable_identity(file.fd, segment.identity)) && segment.bytes <= bytes.size(),
             "external pending summary handle or coverage changed");
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
@@ -774,16 +950,21 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
     // A replacement summary stays charged alongside the previous immutable
     // generation until its referencing manifest is durable on the target.
     if (!pending_summary_.segments.empty()) write_summary(summaries);
+    capture_owned_identities();
     auto const& summary = pending_summary_.segments.empty() ? summary_run_ : pending_summary_;
-    CheckpointBuffer out(checkpoint_buffer_bytes(external_));
-    put_string(out, "xchplot2-external-3"); put_string(out, GROW_IDENTITY); put_string(out, path_);
-    put_string(out, token_); put(out, target_); put(out, work_identity_); put(out, parent_);
+    auto serialize = [&](CheckpointBuffer& out, bool durable, FileIdentity checkpoint, file_io::DurableIdentity const& checkpoint_identity)
+    {
+    put_string(out, durable ? "xchplot2-external-4" : "xchplot2-external-3"); put_string(out, GROW_IDENTITY); put_string(out, path_);
+    put_string(out, token_); put(out, target_); if (durable) put_native_identity(out, target_identity_);
+    put(out, work_identity_); if (durable) put_native_identity(out, work_native_identity_);
+    put(out, parent_); if (durable) { put_native_identity(out, parent_identity_); put(out, checkpoint); put_native_identity(out, checkpoint_identity); }
     put(out, identity_.header); put_string(out, {reinterpret_cast<char const*>(identity_.memo.data()), identity_.memo.size()});
     put(out, external_.segment_bytes); put(out, external_.fan_in); put(out, external_.packing_inputs);
     put(out, uint64_t(roots_.size()));
     for (auto const& root : roots_)
     {
         put_string(out, root.path); put(out, root.directory); put(out, root.parent); put(out, root.capacity); put(out, root.alignment); put(out, root.peak);
+        if (durable) { put_native_identity(out, root.directory_identity); put_native_identity(out, root.parent_identity); }
     }
     put(out, phase_); put(out, members_); put(out, next_id_); put(out, final_bound_);
     put(out, output_bytes_); put(out, packed_chunks_); put(out, stats_);
@@ -792,7 +973,7 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
     {
         put(out, run.id); put(out, run.bytes); put(out, run.consumed); put(out, run.first); put(out, run.count);
         put(out, uint64_t(run.segments.size()));
-        for (auto const& segment : run.segments) put(out, segment);
+        for (auto const& segment : run.segments) put_segment(out, segment, durable);
     }
     uint64_t const chunks = phase_ == Phase::stage ? PlotGroupFile::getChunkCountForK(identity_.header.k) : 0;
     put(out, chunks);
@@ -801,11 +982,13 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
         require(!summary.segments.empty() && summary.count == members_ && summary.bytes == multiply(chunks, sizeof(Summary)),
             "external summary has no durable scratch generation");
         put(out, summary.id); put(out, summary.bytes); put(out, uint64_t(summary.segments.size()));
-        for (auto const& segment : summary.segments) put(out, segment);
+        for (auto const& segment : summary.segments) put_segment(out, segment, durable);
         put(out, summary_digest_);
     }
     put(out, index_bytes_); put(out, index_carry_bits_); put(out, index_carry_value_); put(out, index_identity_); put_string(out, index_name_); put(out, completed_); put(out, packing_source_bytes_); put(out, packing_work_); put(out, packet_count_);
-    auto const record = out.record(config_.cpu_scheduler.get());
+    if (durable) put_native_identity(out, index_native_identity_);
+    return out.record(config_.cpu_scheduler.get());
+    };
     auto check_summary = [&]
     {
         if (phase_ == Phase::stage && members_) for (auto const& segment : summary.segments)
@@ -822,23 +1005,31 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
         }
         file_io::Space allocation{}; require(!file_io::space_path(work_.c_str(), &allocation), "cannot inspect external checkpoint allocation");
         uint64_t const alignment = allocation.f_frsize ? allocation.f_frsize : allocation.f_bsize;
-        require(alignment && grow_add(occupied, aligned(record.size(), alignment)) <= metadata_bytes(identity_.header.k, external_),
-            "external checkpoint directory exceeds its metadata reservation");
         std::string temporary = work_ + "/checkpoint.partial.XXXXXX";
         Descriptor handle(file_io::temp_file(temporary.data())); auto const temporary_identity = file_identity(handle.fd);
         try
         {
+            auto const native_checkpoint = capture_identity(handle.fd, temporary, temporary_identity);
+            bool const durable = native_evidence() || file_io::has_durable_identity(native_checkpoint);
+            CheckpointBuffer out(checkpoint_buffer_bytes(external_));
+            auto const record = serialize(out, durable, temporary_identity, native_checkpoint);
+            require(alignment && grow_add(occupied, aligned(record.size(), alignment)) <= metadata_bytes(identity_.header.k, external_),
+                "external checkpoint directory exceeds its metadata reservation");
             write(handle.fd, 0, record, &stats_, {"checkpoint_manifest", &path_, &execution_destination_});
             external_detail::sync(handle.fd, &stats_, {"checkpoint_manifest", &path_, &execution_destination_});
             auto const temporary_stamp = stamp(temporary); require(temporary_stamp.file == temporary_identity, "external temporary checkpoint was replaced");
             grow_failpoint(label + "-before-checkpoint"); check_paths(); check_summary();
             require(stamp(temporary) == temporary_stamp, "external temporary checkpoint changed before publication");
+            require(!file_io::has_durable_identity(native_checkpoint) || file_io::matches_durable_identity(handle.fd, native_checkpoint),
+                "external temporary checkpoint native handle changed before publication");
             file_io::Stat previous{}; int const exists = file_io::inspect_link((work_ + "/checkpoint").c_str(), &previous);
             if (checkpoint_identity_.inode) require(!exists && file_io::is_regular(previous.st_mode) && previous.st_nlink == 1 &&
-                FileIdentity{uint64_t(previous.st_dev), uint64_t(previous.st_ino)} == checkpoint_identity_, "external checkpoint was replaced");
+                FileIdentity{uint64_t(previous.st_dev), uint64_t(previous.st_ino)} == checkpoint_identity_ &&
+                bind_identity(work_ + "/checkpoint", false, checkpoint_identity_, checkpoint_native_identity_) == checkpoint_identity_, "external checkpoint was replaced");
             else require(exists && errno == ENOENT, "unrecognized file occupies external checkpoint path");
             require(!file_io::rename_file(temporary.c_str(), (work_ + "/checkpoint").c_str()), "cannot install external checkpoint");
-            checkpoint_identity_ = temporary_identity; sync_directory(work_, {"directory", &path_, &execution_destination_}); ++stats_.checkpoints;
+            checkpoint_identity_ = temporary_identity; checkpoint_native_identity_ = native_checkpoint;
+            sync_directory(work_, {"directory", &path_, &execution_destination_}); ++stats_.checkpoints;
             grow_failpoint(label + "-after-checkpoint");
         }
         catch (...)
@@ -877,18 +1068,27 @@ inline void ExternalEngine::load()
     require(record.size() >= 65 && record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)),
         "external checkpoint checksum mismatch");
     CheckpointInput in(std::string_view(record).substr(65));
-    require(get_string(in) == "xchplot2-external-3" && get_string(in) == GROW_IDENTITY,
+    auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
+    require((durable || version == "xchplot2-external-3") && get_string(in) == GROW_IDENTITY,
         "external checkpoint source/version mismatch");
     require(get_string(in) == path_, "external checkpoint destination mismatch");
     token_ = get_string(in); require(token_.size() == 64, "invalid external ownership token");
-    require(get<FileIdentity>(in) == target_, "external destination inode changed");
-    work_identity_ = get<FileIdentity>(in);
-    require(get<FileIdentity>(in) == parent_, "external destination parent inode changed");
-    require(file_identity(work_, true) == work_identity_, "external checkpoint directory inode changed");
+    auto const saved_target = get<FileIdentity>(in); if (durable) target_identity_ = get_native_identity(in);
+    require(bind_identity(path_, false, saved_target, target_identity_) == target_, "external destination inode changed");
+    auto const work = get<FileIdentity>(in); if (durable) work_native_identity_ = get_native_identity(in);
+    work_identity_ = bind_identity(work_, true, work, work_native_identity_);
+    auto const parent = get<FileIdentity>(in); if (durable) parent_identity_ = get_native_identity(in);
+    require(bind_identity(file_io::path_text(file_io::native_path(path_).parent_path()), true, parent, parent_identity_) == parent_, "external destination parent inode changed");
+    if (durable)
+    {
+        auto const owner = get<FileIdentity>(in); checkpoint_native_identity_ = get_native_identity(in);
+        require(bind_identity(checkpoint, false, owner, checkpoint_native_identity_) == info.file, "external checkpoint native owner changed");
+    }
     identity_.header = get<Header>(in);
     require(identity_.header.magic == PlotGroupFile::MAGIC && identity_.header.k >= 18 && identity_.header.k <= 28 && !(identity_.header.k & 1), "invalid external checkpoint header");
     auto memo = get_string(in, 255);
     identity_.memo.assign(memo.begin(), memo.end());
+    require(valid_identity(identity_.header, identity_.memo.size()), "invalid external group identity");
     require(get<uint64_t>(in) == external_.segment_bytes && get<unsigned>(in) == external_.fan_in &&
         get<unsigned>(in) == external_.packing_inputs, "external checkpoint segment/reader settings changed");
     auto const roots = get<uint64_t>(in); require(roots == external_.scratch.size(), "external scratch roots changed");
@@ -897,9 +1097,12 @@ inline void ExternalEngine::load()
     {
         auto& root = roots_[i]; root.path = get_string(in); root.directory = get<FileIdentity>(in); root.parent = get<FileIdentity>(in);
         root.capacity = get<uint64_t>(in); root.alignment = get<uint64_t>(in); root.peak = get<uint64_t>(in);
+        if (durable) { root.directory_identity = get_native_identity(in); root.parent_identity = get_native_identity(in); }
         require(root.capacity <= external_.scratch[i].capacity_bytes && root.alignment &&
             file_io::native_path(root.path).parent_path() == external_.scratch[i].directory,
             "external scratch grant or directory changed");
+        root.directory = bind_identity(root.path, true, root.directory, root.directory_identity);
+        root.parent = bind_identity(file_io::path_text(file_io::native_path(root.path).parent_path()), true, root.parent, root.parent_identity);
     }
     phase_ = get<Phase>(in); members_ = get<uint16_t>(in); next_id_ = get<uint64_t>(in);
     require(required_memory() <= config_.memory_limit_bytes, "saved external workspace exceeds memory budget");
@@ -915,9 +1118,16 @@ inline void ExternalEngine::load()
         run.id = get<uint64_t>(in); run.bytes = get<uint64_t>(in); run.consumed = get<uint64_t>(in); run.first = get<uint16_t>(in); run.count = get<uint16_t>(in);
         count = get<uint64_t>(in); segments = grow_add(segments, count);
         require(segments <= descriptor_limit(external_) && count && run.id < next_id_ && run.consumed <= run.bytes, "invalid external segment count/identity");
-        require(count <= uint64_t(in.rdbuf()->in_avail()) / sizeof(Segment), "external segment descriptors exceed the checkpoint record");
+        require(count <= uint64_t(in.rdbuf()->in_avail()) / sizeof(LegacySegment), "external segment descriptors exceed the checkpoint record");
         run.segments.resize(size_t(count));
-        for (auto& segment : run.segments) segment = get<Segment>(in);
+        uint64_t position = 0;
+        for (auto& segment : run.segments)
+        {
+            segment = get_segment(in, durable); require(segment.root < roots_.size(), "external segment root changed");
+            position = grow_add(position, segment.bytes); auto const path = segment_path(run, segment); file_io::Stat exists{};
+            if (file_io::inspect_link(path, &exists)) require(errno == ENOENT && position <= run.consumed, "required external segment is missing");
+            else segment.stamp = bind_stamp(path, segment.stamp, segment.identity);
+        }
     }
     count = get<uint64_t>(in);
     require(count == (phase_ == Phase::stage ? PlotGroupFile::getChunkCountForK(identity_.header.k) : 0), "external summary coverage changed");
@@ -925,37 +1135,45 @@ inline void ExternalEngine::load()
     {
         summary_run_.id = get<uint64_t>(in); summary_run_.bytes = get<uint64_t>(in); summary_run_.count = members_;
         count = get<uint64_t>(in); segments = grow_add(segments, count);
-        require(count && segments <= descriptor_limit(external_) && count <= uint64_t(in.rdbuf()->in_avail()) / sizeof(Segment) &&
+        require(count && segments <= descriptor_limit(external_) && count <= uint64_t(in.rdbuf()->in_avail()) / sizeof(LegacySegment) &&
             summary_run_.id < next_id_ && summary_run_.bytes == multiply(PlotGroupFile::getChunkCountForK(identity_.header.k), sizeof(Summary)) &&
             std::none_of(runs_.begin(), runs_.end(), [&](Run const& run) { return run.id == summary_run_.id; }),
             "invalid external summary generation");
         summary_run_.segments.resize(size_t(count));
-        for (auto& segment : summary_run_.segments) segment = get<Segment>(in);
+        for (auto& segment : summary_run_.segments)
+        {
+            segment = get_segment(in, durable); require(segment.root < roots_.size(), "external summary root changed");
+            segment.stamp = bind_stamp(segment_path(summary_run_, segment), segment.stamp, segment.identity);
+        }
         summary_digest_ = get<std::array<uint8_t, 32>>(in);
     }
     index_bytes_ = get<uint64_t>(in); index_carry_bits_ = get<uint32_t>(in); index_carry_value_ = get<uint32_t>(in);
     index_identity_ = get<FileIdentity>(in); index_name_ = get_string(in, 64); completed_ = get<Stamp>(in);
     require(index_name_.empty() || (index_name_.starts_with("index.") && file_io::native_path(index_name_).filename() == index_name_), "invalid external index name");
     packing_source_bytes_ = get<uint64_t>(in); packing_work_ = get<uint64_t>(in); packet_count_ = get<uint64_t>(in);
+    if (durable) index_native_identity_ = get_native_identity(in);
+    require(index_identity_.inode || !file_io::has_durable_identity(index_native_identity_), "absent external index has native authority");
+    require(!durable || native_evidence() || file_io::has_durable_identity(checkpoint_native_identity_), "external native checkpoint schema has no object evidence");
     require(index_carry_bits_ < 8 && (index_carry_bits_ ? index_carry_value_ < (1u << index_carry_bits_) : !index_carry_value_), "invalid external partial index byte");
+    if (index_identity_.inode)
+    {
+        auto const path = work_ + "/" + index_name_; file_io::Stat exists{};
+        if (file_io::inspect_link(path, &exists)) require(errno == ENOENT && phase_ != Phase::pack, "required external index is missing");
+        else index_identity_ = bind_identity(path, false, index_identity_, index_native_identity_);
+    }
     if (phase_ == Phase::pack)
     {
         auto const index = stamp(work_ + "/" + index_name_);
         require(index.file == index_identity_ && index.bytes >= ((packed_chunks_ || index_bytes_) ? grow_add(segment_header_bytes, index_bytes_) : 0), "external index is missing, replaced or truncated");
     }
     require(in.rdbuf()->in_avail() == 0, "external checkpoint has trailing data");
-    if (bootstrap_recovered_) require(phase_ == Phase::stage && !members_ && !next_id_ && !packed_chunks_ && runs_.empty() &&
-        output_bytes_ == sizeof(Header) + identity_.memo.size(),
-        "only an unacknowledged initial external checkpoint may be recovered from a temporary record");
+    validate_checkpoint_shape(phase_, members_, next_id_, output_bytes_, packed_chunks_, index_bytes_, index_identity_, runs_.size(),
+        identity_.header, identity_.memo.size(), bootstrap_recovered_);
     uint64_t const metadata = metadata_bytes(identity_.header.k, external_);
     require(metadata <= config_.capacity_bytes && final_bound_ <= config_.capacity_bytes - metadata,
         "saved external output/checkpoint reservation exceeds capacity");
-    require(index_bytes_ <= multiply(PlotGroupFile::getChunkCountForK(identity_.header.k), 8), "external index cursor exceeds its bound");
-    if (phase_ == Phase::empty) require(!members_ && runs_.empty() && !output_bytes_ && !packed_chunks_ && !index_identity_.inode, "invalid empty external checkpoint");
-    if (phase_ == Phase::stage) require(!packed_chunks_ && !index_bytes_ && !index_identity_.inode &&
-        output_bytes_ == sizeof(Header) + identity_.memo.size(), "invalid external staging progress");
-    require(!members_ || (packet_count_ && packet_count_ <= members_ && packing_source_bytes_ && packing_source_bytes_ <= config_.window_bytes &&
-        packing_work_ == ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, 0) && packing_work_ <= config_.codec_bytes),
+    validate_packing_shape(identity_.header.k, members_, packet_count_, packing_source_bytes_, packing_work_);
+    require(!members_ || (packing_source_bytes_ <= config_.window_bytes && packing_work_ <= config_.codec_bytes),
         "saved external packing workspace exceeds admission");
     initialized_ = true; check_paths(); validate_runs();
     if (!summary_run_.segments.empty())
@@ -974,7 +1192,7 @@ inline void ExternalEngine::load()
     file_io::Stat target{}; require(!file_io::inspect_fd(fd_, &target) && uint64_t(target.st_size) >= output_bytes_, "external output is truncated");
     if (phase_ == Phase::ready || phase_ == Phase::done)
         require(uint64_t(target.st_size) == output_bytes_, "published external output length changed");
-    if (phase_ == Phase::done) require(stamp(path_) == completed_, "completed external output changed");
+    if (phase_ == Phase::done || (phase_ == Phase::empty && completed_.file.inode)) completed_ = bind_stamp(path_, completed_, target_identity_);
     // All required inputs were checked before considering any uncommitted
     // scratch tail. Adopt only files carrying this namespace's ownership token.
     for (size_t i = 0; i < roots_.size(); ++i)
@@ -1015,7 +1233,8 @@ inline void ExternalEngine::load()
             if (header == segment_header(run, segment))
             {
                 require(grow_add(segments, orphans_.size()) < descriptor_limit(external_), "external orphan metadata exceeds its memory reservation");
-                orphans_.push_back({uint32_t(i), name, value, reserved});
+                orphans_.push_back({uint32_t(i), name, value, reserved,
+                    capture_identity(file.fd, file_io::path_text(entry.path()), value.file)});
             }
         }
         require(root.used <= root.capacity && root.peak <= root.capacity, "external scratch occupancy exceeds its saved grant");
@@ -1030,12 +1249,13 @@ inline void ExternalEngine::load()
         std::string partial(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(partial.data()), partial.size()}, nullptr, {"checkpoint_manifest", &path_, &execution_destination_});
         if (partial[64] != '\n' || std::string_view(partial).substr(0, 64) != digest(std::string_view(partial).substr(65))) continue;
         CheckpointInput candidate(std::string_view(partial).substr(65));
-        if (get_string(candidate) == "xchplot2-external-3" && get_string(candidate) == GROW_IDENTITY &&
-            get_string(candidate) == path_ && get_string(candidate) == token_ && get<FileIdentity>(candidate) == target_ &&
-            get<FileIdentity>(candidate) == work_identity_ && get<FileIdentity>(candidate) == parent_)
+        auto const version = get_string(candidate); bool const durable = version == "xchplot2-external-4";
+        if ((durable || version == "xchplot2-external-3") && get_string(candidate) == GROW_IDENTITY &&
+            get_string(candidate) == path_ && get_string(candidate) == token_ && checkpoint_scope(candidate, durable, path_, work_, file_io::path_text(entry.path())))
         {
             require(grow_add(segments, orphans_.size()) < descriptor_limit(external_), "external orphan metadata exceeds its memory reservation");
-            orphans_.push_back({uint32_t(roots_.size()), file_io::path_text(entry.path().filename()), saved});
+            orphans_.push_back({uint32_t(roots_.size()), file_io::path_text(entry.path().filename()), saved, 0,
+                capture_identity(file.fd, file_io::path_text(entry.path()), saved.file)});
         }
     }
 }
@@ -1056,7 +1276,7 @@ inline void ExternalEngine::validate_runs() const
             file_io::Stat value{};
             if (file_io::inspect_link(segment_path(run, segment).c_str(), &value))
                 require(errno == ENOENT && bytes <= run.consumed, "required external run segment is missing");
-            else require(stamp(segment_path(run, segment)) == segment.stamp, "external run segment changed");
+            else require(bind_stamp(segment_path(run, segment), segment.stamp, segment.identity) == segment.stamp, "external run segment changed");
         }
         require(bytes == run.bytes, "external run length changed");
     }
@@ -1108,9 +1328,7 @@ inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalC
             identity_.header.chunk_index_offset = sizeof(Header) + identity_.memo.size();
         }
         auto const& h = identity_.header;
-        require(h.magic == PlotGroupFile::MAGIC && h.version == PlotGroupFile::FORMAT_VERSION && h.k >= 18 && h.k <= 28 &&
-            !(h.k & 1) && h.strength >= 2 && h.strength <= h.k - 3 && identity_.memo.size() <= 255 &&
-            h.memo_length == identity_.memo.size(), "invalid external group identity");
+        require(valid_identity(h, identity_.memo.size()), "invalid external group identity");
         require(required_memory() <= config_.memory_limit_bytes, "external workspace exceeds memory budget");
         identity_.pending = phase_ != Phase::done && members_;
         identity_.old_members = 0; identity_.target_members = members_;
@@ -1181,7 +1399,7 @@ inline void ExternalEngine::confirm_identity()
     {
         auto target_guard = orphan.root < roots_.size() ? std::unique_lock<std::recursive_mutex>() : target_lock();
         auto const path = (orphan.root < roots_.size() ? roots_[orphan.root].path : work_) + "/" + orphan.name;
-        require(stamp(path) == orphan.stamp, "external uncommitted segment changed before cleanup");
+        require(bind_stamp(path, orphan.stamp, orphan.identity) == orphan.stamp, "external uncommitted segment changed before cleanup");
         require(!file_io::unlink_file(path.c_str()), "cannot discard uncommitted external segment");
         if (orphan.root < roots_.size())
         {
@@ -1215,7 +1433,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             if (capacity <= segment_header_bytes) continue;
             if (plan.size() >= limit - existing) return false;
             uint64_t const n = std::min(remaining, capacity - segment_header_bytes);
-            plan.push_back({uint32_t(index), uint32_t(plan.size()), capacity, n, {}});
+            plan.push_back({{uint32_t(index), uint32_t(plan.size()), capacity, n, {}}, {}});
             used[index] += capacity; remaining -= n; next_root = (index + 1) % roots_.size(); found = true; break;
         }
         if (!found) return false;
@@ -1243,11 +1461,15 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             auto const path = segment_path(run, segment);
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600));
             segment.stamp = stamp(path); // Preserve ownership even if the first write fails.
+            segment.identity = capture_identity(file.fd, path, segment.stamp.file);
             auto const header = segment_header(run, segment); external_detail::write(file.fd, 0, header, &stats_, {role, &path_, &execution_scratch_});
             external_detail::reserve_file(file.fd, segment.capacity);
             external_detail::sync(file.fd, &stats_, {role, &path_, &execution_scratch_});
             auto const current = stamp(path); require(current.file == segment.stamp.file && file_identity(file.fd) == current.file,
-                "external reservation path was replaced"); segment.stamp = current; roots_[segment.root].used += segment.capacity; ++charged;
+                "external reservation path was replaced");
+            require(!file_io::has_durable_identity(segment.identity) || file_io::matches_durable_identity(file.fd, segment.identity),
+                "external reservation native handle changed");
+            segment.stamp = current; roots_[segment.root].used += segment.capacity; ++charged;
             roots_[segment.root].peak = std::max(roots_[segment.root].peak, roots_[segment.root].used);
         }
         for (auto const& root : roots_) sync_directory(root.path, {"directory", &path_, &execution_scratch_});
@@ -1259,7 +1481,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             auto const& segment = run.segments[i];
             if (!segment.stamp.file.inode) continue;
             auto const path = segment_path(run, segment);
-            require(stamp(path).file == segment.stamp.file, "external reservation path was replaced");
+            require(bind_identity(path, false, segment.stamp.file, segment.identity) == segment.stamp.file, "external reservation path was replaced");
             require(!file_io::unlink_file(path.c_str()), "cannot remove failed external reservation");
             if (i < charged) roots_[segment.root].used -= segment.capacity;
         }
@@ -1278,7 +1500,7 @@ inline void ExternalEngine::discard(Run const& run)
         std::string const path = segment_path(run, segment); file_io::Stat exists{};
         if (file_io::inspect_link(path.c_str(), &exists))
         { require(errno == ENOENT && end <= run.consumed, "required external segment vanished"); continue; }
-        require(stamp(path) == segment.stamp, "external segment changed before reclamation");
+        require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp, "external segment changed before reclamation");
         require(!file_io::unlink_file(path.c_str()), "cannot reclaim external segment");
         roots_[segment.root].used -= segment.capacity; stats_.reclaimed_bytes += segment.capacity;
         grow_failpoint("external-segment-unlinked");
@@ -1328,7 +1550,8 @@ public:
             {
                 file_ = std::make_unique<external_detail::Descriptor>(file_io::open_file(engine_.segment_path(run_, segment).c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
                 require(engine_.stamp(engine_.segment_path(run_, segment)).file == segment.stamp.file &&
-                    engine_.file_identity(file_->fd) == segment.stamp.file, "external output segment was replaced"); opened_ = segment_;
+                    engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
+                    file_io::matches_durable_identity(file_->fd, segment.identity)), "external output segment was replaced"); opened_ = segment_;
             }
             external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
@@ -1353,7 +1576,8 @@ public:
             segment.bytes = std::min(remaining, segment.bytes); remaining -= segment.bytes;
             uint64_t const capacity = aligned(segment.bytes + segment_header_bytes, engine_.roots_[segment.root].alignment);
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
-            require(engine_.file_identity(file.fd) == segment.stamp.file, "external completed segment handle was replaced");
+            require(engine_.file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
+                file_io::matches_durable_identity(file.fd, segment.identity)), "external completed segment handle was replaced");
             require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution"); external_detail::sync(file.fd, &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
             engine_.roots_[segment.root].used -= segment.capacity - capacity; segment.capacity = capacity;
             segment.stamp = engine_.stamp(path); kept.push_back(segment);
@@ -1416,7 +1640,8 @@ private:
             {
                 file_ = std::make_unique<external_detail::Descriptor>(file_io::open_file(engine_.segment_path(run_, segment).c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
                 require(engine_.stamp(engine_.segment_path(run_, segment)) == segment.stamp &&
-                    engine_.file_identity(file_->fd) == segment.stamp.file, "external input segment changed");
+                    engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
+                    file_io::matches_durable_identity(file_->fd, segment.identity)), "external input segment changed");
                 opened_ = segment_; file_end_ = read_position_ + segment.bytes - offset_;
             }
             external_detail::read(file_->fd, segment_header_bytes + offset_, bytes.first(n), &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
@@ -1763,7 +1988,8 @@ inline void ExternalEngine::discard_input(Run& run, bool refresh)
         auto const path = segment_path(run, segment); auto const current = stamp(path);
         require(current.file == segment.stamp.file, "prepared input segment was replaced");
         external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
-        require(file_identity(file.fd) == current.file, "prepared input handle was replaced");
+        require(file_identity(file.fd) == current.file && (!file_io::has_durable_identity(segment.identity) ||
+            file_io::matches_durable_identity(file.fd, segment.identity)), "prepared input handle was replaced");
         std::array<uint8_t, segment_header_bytes> header{};
         external_detail::read(file.fd, 0, header, &stats_, {"compact_member", &path_});
         require(header == segment_header(run, segment), "prepared input ownership changed"); segment.stamp = current;
@@ -2545,6 +2771,7 @@ inline void ExternalEngine::start_packing()
             external_detail::Descriptor index(file_io::temp_file(name.data()));
             index_name_ = file_io::path_text(file_io::native_path(name).filename()); index_identity_ = stamp(name).file;
             require(file_identity(index.fd) == index_identity_, "external initial index path was replaced");
+            index_native_identity_ = capture_identity(index.fd, name, index_identity_);
             external_detail::sync(index.fd, &stats_, {"index", &path_, &execution_destination_}); sync_directory(work_, {"directory", &path_, &execution_destination_});
         }
         // Persist ownership before any index write. An interrupted write can
@@ -2569,7 +2796,8 @@ inline void ExternalEngine::pack()
     std::string const index_path = work_ + "/" + index_name_;
     require(stamp(index_path).file == index_identity_, "external index was replaced");
     external_detail::Descriptor index(file_io::open_file(index_path.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow));
-    require(file_identity(index.fd) == index_identity_, "external index handle was replaced");
+    require(file_identity(index.fd) == index_identity_ && (!file_io::has_durable_identity(index_native_identity_) ||
+        file_io::matches_durable_identity(index.fd, index_native_identity_)), "external index handle was replaced");
     Run marker; marker.id = UINT64_MAX; Segment marker_segment; auto const expected = segment_header(marker, marker_segment);
     {
         auto target_guard = target_lock();
@@ -2721,7 +2949,7 @@ inline void ExternalEngine::pack()
                 auto const path = segment_path(run, segment); file_io::Stat value{};
                 if (!file_io::inspect_link(path.c_str(), &value))
                 {
-                    require(stamp(path) == segment.stamp, "consumed external segment changed before reclamation");
+                    require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp, "consumed external segment changed before reclamation");
                     require(!file_io::unlink_file(path.c_str()), "cannot reclaim consumed external segment");
                     roots_[segment.root].used -= segment.capacity; stats_.reclaimed_bytes += segment.capacity;
                     changed[segment.root] = true;
@@ -2858,7 +3086,7 @@ inline void ExternalEngine::cleanup()
         std::string const path = work_ + "/" + index_name_; file_io::Stat exists{};
         if (!file_io::inspect_link(path.c_str(), &exists))
         {
-            require(stamp(path).file == index_identity_, "completed external index was replaced");
+            require(bind_identity(path, false, index_identity_, index_native_identity_) == index_identity_, "completed external index was replaced");
             require(!file_io::unlink_file(path.c_str()), "cannot remove completed external index"); sync_directory(work_, {"directory", &path_, &execution_destination_});
         }
         else require(errno == ENOENT, "cannot inspect completed external index");
@@ -2904,35 +3132,128 @@ inline Result ExternalEngine::finish()
 
 namespace group_grow
 {
+namespace external_detail
+{
+// Ephemeral evidence for a stopped-job review. The existing checkpoint parser
+// still decides ownership and recovery; every observed name, including its
+// permitted uncommitted leftovers, is fenced without cleaning the namespace.
+class InspectionBinding
+{
+    struct Entry { std::string path; ConstructionStamp stamp; bool directory = false; };
+    ConstructionInspectionLimits const& limits_;
+    std::vector<Entry> entries_;
+    uint64_t strings_ = 0, peak_ = 0;
+public:
+    explicit InspectionBinding(ConstructionInspectionLimits const& limits) : limits_(limits) { limits_.check(65536); }
+    void capture(std::string path, bool directory = false)
+    {
+        limits_.check(); require(path.size() <= 8192, "external inspection pathname is too long");
+        uint64_t const strings = grow_add(strings_, path.capacity() + 1);
+        if (entries_.size() == entries_.capacity())
+        {
+            size_t const next = entries_.capacity() ? entries_.capacity() * 2 : 8;
+            require(next > entries_.capacity() && next <= SIZE_MAX / sizeof(Entry), "external inspection namespace overflow");
+            uint64_t const peak = grow_add(grow_add(strings, uint64_t(entries_.capacity() + next) * sizeof(Entry)), 65536);
+            limits_.check(peak); peak_ = std::max(peak_, peak); entries_.reserve(next);
+        }
+        auto const retained = grow_add(grow_add(strings, entries_.capacity() * sizeof(Entry)), 65536);
+        limits_.check(retained); peak_ = std::max(peak_, retained);
+        Descriptor file(file_io::open_file(path.c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec |
+            (directory ? file_io::directory : 0)));
+        auto const saved = construction_stamp(file.fd, path, directory);
+        entries_.push_back({std::move(path), saved, directory}); strings_ = strings;
+    }
+    uint64_t memory_bytes() const { return peak_; }
+    std::array<uint8_t, 32> finish(std::string_view checkpoint)
+    {
+        limits_.check();
+        std::sort(entries_.begin(), entries_.end(), [&](auto const& left, auto const& right)
+        { limits_.check(); return left.path < right.path; });
+        struct sha256 context; sha256_init(&context);
+        sha256_update(&context, reinterpret_cast<uint8_t const*>(checkpoint.data()), checkpoint.size());
+        for (auto const& entry : entries_)
+        {
+            limits_.check(); Descriptor file(file_io::open_file(entry.path.c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec |
+                (entry.directory ? file_io::directory : 0)));
+            require(construction_stamp(file.fd, entry.path, entry.directory) == entry.stamp,
+                "external construction namespace changed during inspection");
+            ConstructionInspection observed; observed.target = entry.stamp;
+            auto const digest = construction_digest(observed, {}, entry.directory ? "directory" : "file");
+            auto const name = grow_digest({reinterpret_cast<uint8_t const*>(entry.path.data()), entry.path.size()});
+            sha256_update(&context, name.data(), name.size()); sha256_update(&context, digest.data(), digest.size());
+        }
+        // Check directories again after their children: newly created or
+        // removed names must not escape an earlier parent-first check.
+        for (auto const& entry : entries_) if (entry.directory)
+        {
+            limits_.check(); Descriptor directory(file_io::open_file(entry.path.c_str(),
+                file_io::read_only | file_io::no_follow | file_io::close_on_exec | file_io::directory));
+            require(construction_stamp(directory.fd, entry.path, true) == entry.stamp,
+                "external construction namespace changed during inspection");
+        }
+        std::array<uint8_t, 32> result{}; sha256_sum(&context, result.data()); limits_.check(); return result;
+    }
+};
+}
 inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
-                                                            PublishedTarget const* published)
+                                                            PublishedTarget const* published, ConstructionInspectionLimits const* inspection)
 {
     using namespace external_detail;
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
     require(!published || retired, "published aliases cannot recover active external construction");
     auto const& current = published ? published->path : target;
-    std::string const checkpoint = retired ? work + "/checkpoint" : checkpoint_path(work, target, memory_limit_bytes / 8);
+    std::optional<InspectionBinding> binding;
+    std::optional<Descriptor> target_pin;
+    ConstructionStamp target_stamp;
+    if (inspection)
+    {
+        require(!retired && !published, "construction binding is only supported for an active exact target");
+        binding.emplace(*inspection); binding->capture(work, true);
+        target_pin.emplace(file_io::open_file(current.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow));
+        target_stamp = construction_stamp(target_pin->fd, current); binding->capture(current);
+    }
+    std::string const checkpoint = retired ? work + "/checkpoint" : checkpoint_path(work, target, memory_limit_bytes / 8, inspection);
     auto const value = stamp(checkpoint);
     require(value.bytes <= uint64_t(SIZE_MAX) && value.bytes <= memory_limit_bytes / 8, "external checkpoint inspection exceeds memory budget");
     Descriptor file(file_io::open_file(checkpoint.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow));
+    if (binding)
+    {
+        binding->capture(checkpoint); (void)construction_stamp(file.fd, checkpoint);
+        require(stamp(checkpoint) == value, "external checkpoint changed before inspection");
+    }
     std::string record(size_t(value.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(record.data()), record.size()}, nullptr, {"checkpoint_manifest", &target});
+    if (inspection) inspection->check();
     require(record.size() >= 65 && record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)),
         "external checkpoint checksum mismatch");
     CheckpointInput in(std::string_view(record).substr(65));
-    require(get_string(in) == "xchplot2-external-3" && get_string(in) == GROW_IDENTITY && get_string(in) == target,
+    if (inspection) inspection->check();
+    auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
+    require((durable || version == "xchplot2-external-3") && get_string(in) == GROW_IDENTITY && get_string(in) == target,
         "external checkpoint source/version/destination mismatch");
     auto const token = get_string(in);
     require(token.size() == 64 && (!retired || work == target + ".external.retired-" + token),
         "retired external directory name does not match its ownership record");
-    require(get<FileIdentity>(in) == file_identity(current, false), "external destination was replaced");
-    require(get<FileIdentity>(in) == file_identity(work, true), "external checkpoint directory was replaced");
-    require(get<FileIdentity>(in) == file_identity(file_io::path_text(file_io::native_path(target).parent_path()), true), "external destination parent directory was replaced");
+    auto const target_owner = get<FileIdentity>(in); auto const target_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    (void)bind_identity(current, false, target_owner, target_native);
+    auto const work_owner = get<FileIdentity>(in); auto const work_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    (void)bind_identity(work, true, work_owner, work_native);
+    auto const parent_owner = get<FileIdentity>(in); auto const parent_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    (void)bind_identity(file_io::path_text(file_io::native_path(target).parent_path()), true, parent_owner, parent_native);
+    bool prospective = file_io::has_durable_identity(target_native) || file_io::has_durable_identity(work_native) || file_io::has_durable_identity(parent_native);
+    if (durable)
+    {
+        auto const owner = get<FileIdentity>(in); auto const native = get_native_identity(in);
+        require(bind_identity(checkpoint, false, owner, native) == value.file, "external checkpoint native owner changed");
+        prospective = prospective || file_io::has_durable_identity(native);
+    }
     auto const header = get<Header>(in);
     require(header.magic == PlotGroupFile::MAGIC && header.k >= 18 && header.k <= 28 && !(header.k & 1), "invalid external checkpoint header");
     auto const memo = get_string(in, 255);
+    require(valid_identity(header, memo.size()), "invalid external group identity");
     ExternalConfig external; external.segment_bytes = get<uint64_t>(in); external.fan_in = get<unsigned>(in);
     external.packing_inputs = get<unsigned>(in);
-    require(external.fan_in >= 2 && external.fan_in <= max_runs && (!external.packing_inputs ||
+    require(external.segment_bytes > segment_header_bytes && external.segment_bytes <= uint64_t(INT64_MAX) &&
+        external.fan_in >= 2 && external.fan_in <= max_runs && (!external.packing_inputs ||
         (external.packing_inputs >= external.fan_in && external.packing_inputs <= max_runs)),
         "invalid external checkpoint reader settings");
     auto const roots = get<uint64_t>(in); require(roots && roots <= max_roots, "invalid external scratch root count");
@@ -2940,19 +3261,28 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     Inspection result; result.identity.header = header; result.identity.memo.assign(memo.begin(), memo.end());
     for (uint64_t i = 0; i < roots; ++i)
     {
-        auto const root = get_string(in); auto const root_identity = get<FileIdentity>(in), root_parent = get<FileIdentity>(in);
+        if (inspection) inspection->check();
+        auto const root = get_string(in); auto root_identity = get<FileIdentity>(in), root_parent = get<FileIdentity>(in);
+        uint64_t const capacity = get<uint64_t>(in), alignment = get<uint64_t>(in), peak = get<uint64_t>(in);
+        auto const directory_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+        auto const parent_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+        prospective = prospective || file_io::has_durable_identity(directory_native) || file_io::has_durable_identity(parent_native);
         file_io::Stat root_exists{}; bool const exists = !file_io::inspect_link(root.c_str(), &root_exists);
         if (!exists) require(retired && errno == ENOENT, "external scratch directory is missing");
-        else require(root_identity == file_identity(root, true) &&
-            root_parent == file_identity(file_io::path_text(file_io::native_path(root).parent_path()), true), "external scratch namespace or parent was replaced");
-        uint64_t const capacity = get<uint64_t>(in), alignment = get<uint64_t>(in), peak = get<uint64_t>(in);
-        require(alignment && peak <= capacity, "invalid external scratch alignment/peak");
-        saved_roots.push_back({root, root_identity, root_parent, capacity, alignment, 0, peak});
+        else
+        {
+            root_identity = bind_identity(root, true, root_identity, directory_native);
+            root_parent = bind_identity(file_io::path_text(file_io::native_path(root).parent_path()), true, root_parent, parent_native);
+        }
+        if (binding && exists) binding->capture(root, true);
+        require(alignment && peak <= capacity && capacity <= uint64_t(INT64_MAX), "invalid external scratch alignment/peak");
+        saved_roots.push_back({root, root_identity, root_parent, capacity, alignment, 0, peak, directory_native, parent_native});
         ScratchGrant const grant{file_io::path_text(file_io::native_path(root).parent_path()), capacity};
         external.scratch.push_back(grant); result.scratch.push_back(grant);
         uint64_t bytes = 0, occupied = exists ? multiply(uint64_t(root_exists.st_blocks), 512) : 0;
         if (exists) for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(root)))
         {
+            if (binding) binding->capture(file_io::path_text(entry.path()));
             auto const saved = stamp(file_io::path_text(entry.path())); file_io::Stat allocation{};
             require(!file_io::inspect_link(entry.path().c_str(), &allocation), "cannot inspect external scratch allocation");
             uint64_t const allocated = multiply(uint64_t(allocation.st_blocks), 512);
@@ -2965,7 +3295,6 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     require(unsigned(phase) <= unsigned(Phase::empty), "invalid external checkpoint phase");
     if (retired) require(phase == Phase::done || phase == Phase::empty, "retired external record is not terminal");
     if (published) require(phase == Phase::done && result.members, "only a completed nonempty external target can be published");
-    if (checkpoint != work + "/checkpoint") require(phase == Phase::stage && !result.members, "only an initial external checkpoint can be recovered from a temporary record");
     result.finishing = phase != Phase::stage; result.complete = retired || phase == Phase::done; result.external = external;
     result.identity.pending = !result.complete && result.members; result.identity.target_members = result.members;
     if (result.complete) { result.identity.bytes = committed; result.identity.header.group_size = result.members; }
@@ -2981,6 +3310,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     std::vector<uint64_t> run_ids; run_ids.reserve(size_t(count));
     for (uint64_t i = 0; i < count; ++i)
     {
+        if (inspection) inspection->check();
         auto const id = get<uint64_t>(in), bytes = get<uint64_t>(in), consumed = get<uint64_t>(in);
         run_ids.push_back(id);
         auto const first = get<uint16_t>(in), members = get<uint16_t>(in);
@@ -2989,14 +3319,16 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
         require(!retired || consumed == bytes, "retired external record still needs unread scratch"); member += members;
         auto const segments = get<uint64_t>(in);
         descriptors = grow_add(descriptors, segments);
-        require(segments && descriptors <= descriptor_limit(external) && segments <= uint64_t(in.rdbuf()->in_avail()) / sizeof(Segment),
+        require(segments && descriptors <= descriptor_limit(external) && segments <= uint64_t(in.rdbuf()->in_avail()) / sizeof(LegacySegment),
             "external segment descriptors exceed checkpoint record");
         uint64_t position = 0;
         for (uint64_t ordinal = 0; ordinal < segments; ++ordinal)
         {
-            auto const segment = get<Segment>(in);
+            if (inspection) inspection->check();
+            auto segment = get_segment(in, durable);
+            prospective = prospective || file_io::has_durable_identity(segment.identity);
             require(segment.root < saved_roots.size() && segment.ordinal == ordinal && segment.capacity > segment_header_bytes &&
-                segment.bytes && segment.bytes <= segment.capacity - segment_header_bytes && segment.stamp.bytes == segment.capacity,
+                segment.bytes && segment.bytes <= segment.capacity - segment_header_bytes && segment.stamp.bytes == segment.capacity && segment.stamp.file.inode,
                 "invalid external segment descriptor");
             position = grow_add(position, segment.bytes);
             std::string const path = saved_roots[segment.root].path + "/run-" + std::to_string(id) + "-" + std::to_string(ordinal);
@@ -3004,7 +3336,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
             if (file_io::inspect_link(path.c_str(), &exists)) require(errno == ENOENT && position <= consumed, "required external segment is missing");
             else
             {
-                require(stamp(path) == segment.stamp, "external segment changed");
+                segment.stamp = bind_stamp(path, segment.stamp, segment.identity);
                 result.allocated_bytes[segment.root] = grow_add(result.allocated_bytes[segment.root],
                     std::min(segment.capacity, multiply(uint64_t(exists.st_blocks), 512)));
             }
@@ -3018,17 +3350,25 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     {
         Run summary; summary.id = get<uint64_t>(in); summary.bytes = get<uint64_t>(in); summary.count = result.members;
         auto const segments = get<uint64_t>(in); descriptors = grow_add(descriptors, segments);
-        require(segments && descriptors <= descriptor_limit(external) && segments <= uint64_t(in.rdbuf()->in_avail()) / sizeof(Segment) &&
+        require(segments && descriptors <= descriptor_limit(external) && segments <= uint64_t(in.rdbuf()->in_avail()) / sizeof(LegacySegment) &&
             summary.id < next_id && summary.bytes == multiply(chunks, sizeof(Summary)) &&
             std::find(run_ids.begin(), run_ids.end(), summary.id) == run_ids.end(), "invalid external summary generation");
         summary.segments.resize(size_t(segments));
-        for (auto& segment : summary.segments) segment = get<Segment>(in);
+        for (auto& segment : summary.segments)
+        {
+            if (inspection) inspection->check(); segment = get_segment(in, durable);
+            prospective = prospective || file_io::has_durable_identity(segment.identity);
+            require(segment.root < saved_roots.size(), "external summary root changed");
+            auto const path = saved_roots[segment.root].path + "/run-" + std::to_string(summary.id) + "-" + std::to_string(segment.ordinal);
+            segment.stamp = bind_stamp(path, segment.stamp, segment.identity);
+        }
         auto const checksum = get<std::array<uint8_t, 32>>(in);
         require(grow_add(multiply(value.bytes, 8), 65536) <= memory_limit_bytes,
             "external summary inspection exceeds memory budget");
-        read_summary(saved_roots, token, summary, checksum, {}, nullptr, {"checkpoint_summary", &target});
+        read_summary(saved_roots, token, summary, checksum, {}, nullptr, {"checkpoint_summary", &target}, nullptr, inspection);
         for (auto const& segment : summary.segments)
         {
+            if (inspection) inspection->check();
             file_io::Stat allocation{};
             auto const path = saved_roots[segment.root].path + "/run-" + std::to_string(summary.id) + "-" + std::to_string(segment.ordinal);
             require(!file_io::inspect_link(path.c_str(), &allocation), "cannot inspect external summary allocation");
@@ -3037,14 +3377,26 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
         }
     }
     auto const index_bytes = get<uint64_t>(in); auto const carry_bits = get<uint32_t>(in), carry_value = get<uint32_t>(in);
-    auto const index_identity = get<FileIdentity>(in); auto const index_name = get_string(in, 64); auto const completed = get<Stamp>(in);
+    auto index_identity = get<FileIdentity>(in); auto const index_name = get_string(in, 64); auto completed = get<Stamp>(in);
     require(index_name.empty() || (index_name.starts_with("index.") && file_io::native_path(index_name).filename() == index_name), "invalid external index name");
     auto const packing_source = get<uint64_t>(in), packing_work = get<uint64_t>(in), packets = get<uint64_t>(in);
-    require(!result.members || (packets && packets <= result.members && packing_source &&
-        packing_work == ChunkCodec::estimate_work(header.k, packing_source, 0)), "invalid external packing admission record");
+    result.packing_source_bytes = packing_source; result.packing_work_bytes = packing_work; result.packet_count = packets;
+    auto const index_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    prospective = prospective || file_io::has_durable_identity(index_native);
+    require(!durable || prospective, "external native checkpoint schema has no object evidence");
+    require(index_identity.inode || !file_io::has_durable_identity(index_native), "absent external index has native authority");
+    validate_packing_shape(header.k, result.members, packets, packing_source, packing_work);
+    validate_checkpoint_shape(phase, result.members, next_id, committed, chunk, index_bytes, index_identity, size_t(count), header,
+        memo.size(), checkpoint != work + "/checkpoint");
     require(index_bytes <= multiply(chunks, 8) && carry_bits < 8 && (carry_bits ? carry_value < (1u << carry_bits) : !carry_value),
         "invalid external index checkpoint");
     require(in.rdbuf()->in_avail() == 0, "external checkpoint has trailing data");
+    if (index_identity.inode)
+    {
+        auto const path = work + "/" + index_name; file_io::Stat exists{};
+        if (file_io::inspect_link(path, &exists)) require(errno == ENOENT && phase != Phase::pack, "required external index is missing");
+        else index_identity = bind_identity(path, false, index_identity, index_native);
+    }
     if (phase == Phase::pack)
     {
         auto const index = stamp(work + "/" + index_name);
@@ -3052,11 +3404,12 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     }
     if (!retired && (phase == Phase::ready || phase == Phase::done))
         require(chunk == chunks && uint64_t(target_info.st_size) == committed, "published external output changed length");
-    if (!retired && phase == Phase::done) require(stamp(target) == completed, "completed external output changed");
+    if (!retired && (phase == Phase::done || (phase == Phase::empty && completed.file.inode))) completed = bind_stamp(target, completed, target_native);
     result.metadata_reserved_bytes = metadata_bytes(header.k, external);
     uint64_t actual_metadata = 0;
     for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(work)))
     {
+        if (binding && file_io::path_text(entry.path()) != checkpoint) binding->capture(file_io::path_text(entry.path()));
         auto const saved = stamp(file_io::path_text(entry.path()));
         file_io::Stat allocation{}; require(!file_io::inspect_link(entry.path().c_str(), &allocation), "cannot inspect external metadata allocation");
         uint64_t const allocated = multiply(uint64_t(allocation.st_blocks), 512);
@@ -3069,6 +3422,16 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     result.metadata_occupied_bytes = grow_add(result.metadata_occupied_bytes, multiply(uint64_t(work_allocation.st_blocks), 512));
     result.metadata_reserved_bytes = retired ? result.metadata_occupied_bytes : std::max(result.metadata_reserved_bytes, actual_metadata);
     result.peak_bytes = grow_add(retired ? result.target_bytes : std::max(bound, result.target_bytes), result.metadata_reserved_bytes);
+    if (binding)
+    {
+        result.construction.target = target_stamp; result.construction.identity = result.identity;
+        result.construction.checkpoint = true; result.construction.committed_members = result.members;
+        result.construction.can_append = !result.finishing;
+        auto const namespace_digest = binding->finish(std::string_view(record).substr(0, 64));
+        result.construction.inspection_memory_bytes = grow_add(memory_limit_bytes, binding->memory_bytes());
+        result.construction.authority_digest = construction_digest(result.construction, namespace_digest, "external");
+        require(construction_stamp(target_pin->fd, current) == target_stamp, "external target changed during inspection");
+    }
     return result;
 }
 }
@@ -3117,14 +3480,15 @@ inline bool ExternalEngine::release_completed()
     if (!clean) { measure_remaining_metadata(holder, holder_identity); return false; }
     for (auto const& root : roots_)
     {
-        require(file_identity(file_io::path_text(file_io::native_path(root.path).parent_path()), true) == root.parent &&
-            file_identity(root.path, true) == root.directory && std::filesystem::is_empty(file_io::native_path(root.path)),
+        require(bind_identity(file_io::path_text(file_io::native_path(root.path).parent_path()), true, root.parent, root.parent_identity) == root.parent &&
+            bind_identity(root.path, true, root.directory, root.directory_identity) == root.directory && std::filesystem::is_empty(file_io::native_path(root.path)),
             "external scratch namespace changed before final cleanup");
         require(!file_io::remove_directory(root.path.c_str()), "cannot remove completed external scratch namespace");
         sync_directory(file_io::path_text(file_io::native_path(root.path).parent_path()), {"directory", &path_});
     }
     auto target_guard = target_lock();
-    require(file_identity(holder, true) == work_identity_ && stamp(holder + "/checkpoint") == checkpoint,
+    require(bind_identity(holder, true, work_identity_, work_native_identity_) == work_identity_ &&
+        bind_identity(holder + "/checkpoint", false, checkpoint.file, checkpoint_native_identity_) == checkpoint.file && stamp(holder + "/checkpoint") == checkpoint,
         "retired external checkpoint was replaced");
     // Keep the last ownership proof until an inode-resident receipt is
     // durable. Filesystems without user xattrs retain the compact record.
@@ -3138,7 +3502,8 @@ inline bool ExternalEngine::release_completed()
 
 namespace group_grow
 {
-inline std::string ExternalEngine::checkpoint_path(std::string const& work, std::string const& target, uint64_t limit)
+inline std::string ExternalEngine::checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
+                                                 ConstructionInspectionLimits const* inspection)
 {
     using namespace external_detail;
     file_io::Stat exists{}; std::string const ordinary = work + "/checkpoint";
@@ -3149,16 +3514,17 @@ inline std::string ExternalEngine::checkpoint_path(std::string const& work, std:
     // any cleanup. Later checkpoints are never inferred from temporary files.
     for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(work)))
     {
+        if (inspection) inspection->check();
         if (!file_io::path_text(entry.path().filename()).starts_with("checkpoint.partial.")) continue;
         auto const saved = stamp(file_io::path_text(entry.path())); if (saved.bytes < 65 || saved.bytes > limit) continue;
         Descriptor file(file_io::open_file(entry.path().c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
         std::string record(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(record.data()), record.size()}, nullptr, {"checkpoint_manifest", &target});
         if (record[64] != '\n' || std::string_view(record).substr(0, 64) != digest(std::string_view(record).substr(65))) continue;
         CheckpointInput in(std::string_view(record).substr(65));
-        if (get_string(in) != "xchplot2-external-3" || get_string(in) != GROW_IDENTITY || get_string(in) != target) continue;
+        auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
+        if ((!durable && version != "xchplot2-external-3") || get_string(in) != GROW_IDENTITY || get_string(in) != target) continue;
         (void)get_string(in);
-        if (get<FileIdentity>(in) == file_identity(target, false) && get<FileIdentity>(in) == file_identity(work, true) &&
-            get<FileIdentity>(in) == file_identity(file_io::path_text(file_io::native_path(target).parent_path()), true))
+        if (checkpoint_scope(in, durable, target, work, file_io::path_text(entry.path())))
             return file_io::path_text(entry.path());
     }
     throw std::runtime_error("external construction has no durable initial checkpoint; no members were acknowledged");
@@ -3171,6 +3537,12 @@ inline ExternalEngine::Inspection ExternalEngine::inspect(std::string const& pat
 {
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
     return inspect_at(target, target + ".external", memory_limit_bytes, false);
+}
+inline ExternalEngine::Inspection ExternalEngine::inspect_construction(std::string const& path, uint64_t loader_memory_bytes,
+                                                                      ConstructionInspectionLimits const& limits)
+{
+    std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
+    return inspect_at(target, target + ".external", loader_memory_bytes, false, nullptr, &limits);
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_retired(std::string const& path, std::string const& directory,
                                                                  uint64_t memory_limit_bytes)
@@ -3256,8 +3628,12 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
 #ifdef __linux__
     using namespace external_detail;
     std::ostringstream out(std::ios::binary); out.exceptions(std::ios::badbit | std::ios::failbit);
-    put_string(out, "xchplot2-external-retired-1"); put_string(out, GROW_IDENTITY); put_string(out, path_); put_string(out, token_);
-    put(out, holder_identity); put(out, target_); put(out, parent_); put(out, work_identity_);
+    bool const durable = file_io::has_durable_identity(work_native_identity_) || file_io::has_durable_identity(target_identity_) || file_io::has_durable_identity(parent_identity_);
+    put_string(out, durable ? "xchplot2-external-retired-2" : "xchplot2-external-retired-1"); put_string(out, GROW_IDENTITY); put_string(out, path_); put_string(out, token_);
+    put(out, holder_identity); if (durable) put_native_identity(out, work_native_identity_);
+    put(out, target_); if (durable) put_native_identity(out, target_identity_);
+    put(out, parent_); if (durable) put_native_identity(out, parent_identity_);
+    put(out, work_identity_); if (durable) put_native_identity(out, work_native_identity_);
     put(out, identity_.header); put_string(out, {reinterpret_cast<char const*>(identity_.memo.data()), identity_.memo.size()});
     put(out, members_); put(out, output_bytes_);
     std::string const body = out.str(), receipt = digest(body) + '\n' + body;
@@ -3265,6 +3641,8 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
     file_io::Stat value{}; require(!file_io::inspect_fd(directory.fd, &value) && file_io::is_directory(value.st_mode) &&
         FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == holder_identity && file_identity(holder, true) == holder_identity,
         "external retired holder was replaced before its ownership receipt");
+    require(!file_io::has_durable_identity(work_native_identity_) || file_io::matches_durable_identity(directory.fd, work_native_identity_),
+        "external retired holder generation changed before its ownership receipt");
     if (::fsetxattr(directory.fd, "user.xchplot2.external-retired", receipt.data(), receipt.size(), XATTR_CREATE))
     {
         require(errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENOSYS || errno == EPERM || errno == EACCES ||
@@ -3288,22 +3666,30 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string co
     require(::fgetxattr(directory.fd, "user.xchplot2.external-retired", record.data(), record.size()) == size &&
         record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)), "retired external ownership receipt is corrupt");
     CheckpointInput in(std::string_view(record).substr(65));
-    require(get_string(in) == "xchplot2-external-retired-1" && get_string(in) == GROW_IDENTITY && get_string(in) == path,
+    auto const version = get_string(in); bool const durable = version == "xchplot2-external-retired-2";
+    require((durable || version == "xchplot2-external-retired-1") && get_string(in) == GROW_IDENTITY && get_string(in) == path,
         "retired external receipt source/destination mismatch");
     auto const token = get_string(in); require(token.size() == 64 && holder == path + ".external.retired-" + token,
         "retired external receipt name mismatch");
-    auto const owner = get<FileIdentity>(in), target = get<FileIdentity>(in), parent = get<FileIdentity>(in), checkpoint_directory = get<FileIdentity>(in);
+    auto const saved_owner = get<FileIdentity>(in); auto const owner_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    auto const saved_target = get<FileIdentity>(in); auto const target_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    auto const saved_parent = get<FileIdentity>(in); auto const parent_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    auto const checkpoint_directory = get<FileIdentity>(in); auto const checkpoint_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    require(!durable || file_io::has_durable_identity(owner_native) || file_io::has_durable_identity(target_native) || file_io::has_durable_identity(parent_native),
+        "external native retired schema has no object evidence");
+    require(checkpoint_directory == saved_owner && checkpoint_native == owner_native, "retired receipt checkpoint directory differs from its holder");
+    auto const owner = bind_identity(holder, true, saved_owner, owner_native);
+    (void)bind_identity(published ? published->path : path, false, saved_target, target_native);
+    (void)bind_identity(file_io::path_text(file_io::native_path(path).parent_path()), true, saved_parent, parent_native);
     file_io::Stat value{}; require(!file_io::inspect_fd(directory.fd, &value) && file_io::is_directory(value.st_mode) &&
         FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == owner && file_identity(holder, true) == owner &&
-        file_identity(published ? published->path : path, false) == target && file_identity(file_io::path_text(file_io::native_path(path).parent_path()), true) == parent,
+        (!file_io::has_durable_identity(owner_native) || file_io::matches_durable_identity(directory.fd, owner_native)),
         "retired external receipt inode ownership mismatch");
-    require(checkpoint_directory == owner, "retired receipt checkpoint directory differs from its holder");
     Inspection result; result.identity.header = get<Header>(in); auto const memo = get_string(in, 255);
     result.identity.memo.assign(memo.begin(), memo.end()); result.members = get<uint16_t>(in);
     result.identity.bytes = get<uint64_t>(in); result.identity.target_members = result.members;
     auto const& header = result.identity.header;
-    require(header.magic == PlotGroupFile::MAGIC && header.version == PlotGroupFile::FORMAT_VERSION && header.k >= 18 && header.k <= 28 &&
-        !(header.k & 1) && header.group_size == result.members && header.memo_length == memo.size() &&
+    require(valid_identity(header, memo.size()) && header.group_size == result.members &&
         (result.members ? result.identity.bytes > header.chunk_index_offset : !result.identity.bytes) && in.rdbuf()->in_avail() == 0,
         "invalid terminal external ownership receipt");
     result.complete = result.finishing = true;

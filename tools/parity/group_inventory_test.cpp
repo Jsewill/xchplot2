@@ -1,4 +1,5 @@
 #include "host/GroupFarmAdapters.hpp"
+#include "host/GroupNativeIdentity.hpp"
 #include <iostream>
 
 using namespace group_grow;
@@ -24,6 +25,55 @@ std::vector<uint8_t> legacy(bool compressed)
 }
 void write(fs::path const& file, std::vector<uint8_t> const& bytes)
 { std::ofstream out(file, std::ios::binary); out.write(reinterpret_cast<char const*>(bytes.data()), bytes.size()); require(bool(out), "fixture write failed"); }
+void durable_native_identity(fs::path const& directory)
+{
+    using file_io::DurableIdentity;
+    require(file_io::valid_durable_identity({}) && !file_io::has_durable_identity({}), "absent native evidence gained authority");
+    DurableIdentity windows{DurableIdentity::Scheme::windows_file_id, "ntfs:12345678-1234-1234-1234-123456789abc:1", std::string(32, '1')};
+    require(file_io::has_durable_identity(windows), "full NTFS evidence failed its bounded shape");
+    for (char sentinel : {'0', 'f'})
+    {
+        auto invalid = windows; invalid.object.assign(32, sentinel);
+        require(!file_io::valid_durable_identity(invalid), "unsupported NTFS file-ID sentinel gained authority");
+        invalid = windows; std::string volume(36, sentinel); for (size_t index : {8, 13, 18, 23}) volume[index] = '-';
+        invalid.filesystem = "ntfs:" + volume + ":1";
+        require(!file_io::valid_durable_identity(invalid), "unsupported native volume UUID sentinel gained authority");
+        DurableIdentity native{DurableIdentity::Scheme::linux_handle, "btrfs:" + std::string(32, sentinel), "12345678", 1};
+        require(!file_io::valid_durable_identity(native), "unsupported filesystem UUID sentinel gained authority");
+        native.filesystem = "tmpfs:" + std::string(16, sentinel);
+        require(!file_io::valid_durable_identity(native), "unsupported tmpfs instance sentinel gained authority");
+    }
+    for (auto filesystem : {"ntfs:1234:1", "ntfs:12345678-1234-1234-1234-123456789abc:", "ntfs:12345678-1234-1234-1234-123456789abc:invalid"})
+    { auto invalid = windows; invalid.filesystem = filesystem; require(!file_io::valid_durable_identity(invalid), "malformed native volume evidence gained authority"); }
+    fs::create_directory(directory);
+    struct Remove { fs::path path; ~Remove() { std::error_code error; fs::remove_all(path, error); } } remove{directory};
+    auto const original = directory / "source", renamed = directory / "renamed";
+    write(original, {1, 2, 3});
+    struct Close { int fd; ~Close() { file_io::close_file(fd); } } source{
+        file_io::open_file(original, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(source.fd >= 0, "cannot pin durable-identity fixture");
+    DurableIdentity saved;
+    if (file_io::capture_durable_identity(source.fd, &saved))
+    {
+        require(saved == DurableIdentity{} && !file_io::matches_durable_identity(source.fd, saved),
+            "unsupported native capture retained partial authority");
+        return;
+    }
+    require(file_io::matches_durable_identity(source.fd, saved) && !file_io::matches_durable_identity(source.fd, {}),
+        "native evidence did not require an exact prospective capture");
+    auto altered = saved; altered.object.back() = altered.object.back() == '0' ? '1' : '0';
+    require(!file_io::matches_durable_identity(source.fd, altered), "tampered object handle gained authority");
+    require(!file_io::rename_file(original, renamed, false), "cannot rename durable-identity fixture");
+    Close reopened{file_io::open_file(renamed, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(reopened.fd >= 0 && file_io::matches_durable_identity(reopened.fd, saved), "rename lost its native generation handle");
+    write(original, {1, 2, 3});
+    Close substitute{file_io::open_file(original, file_io::read_only | file_io::no_follow | file_io::close_on_exec)};
+    require(substitute.fd >= 0 && !file_io::matches_durable_identity(substitute.fd, saved), "same-byte source substitute reused native authority");
+    Close root{file_io::open_file(directory, file_io::read_only | file_io::directory | file_io::no_follow | file_io::close_on_exec)};
+    DurableIdentity parent;
+    require(root.fd >= 0 && !file_io::capture_durable_identity(root.fd, &parent) && parent.filesystem == saved.filesystem &&
+        parent != saved && !file_io::matches_durable_identity(root.fd, saved), "filesystem token authorized a different native object");
+}
 void inventory(fs::path const& directory)
 {
     fs::create_directories(directory / "nested"); write(directory / "og.plot", legacy(false)); write(directory / "nested" / "bb.plot", legacy(true));
@@ -32,6 +82,13 @@ void inventory(fs::path const& directory)
     h.group_id = PlotGroupId(std::string(64, 'a')); h.k = 18; h.strength = 2; h.group_size = 4; h.memo_length = 112; h.chunk_index_offset = 200;
     std::vector<uint8_t> group(256); std::memcpy(group.data(), &h, sizeof(h));
     std::fill(group.begin() + sizeof(h), group.begin() + sizeof(h) + 112, uint8_t(0x7b)); write(directory / "group.gplot", group);
+    for (uint8_t meta : {128, 255})
+    {
+        auto header = h; header.meta_group = meta; auto bytes = group; std::memcpy(bytes.data(), &header, sizeof(header));
+        InventoryPlot plot; plot.identity.stamp.bytes = bytes.size(); inventory_detail::header(plot, bytes);
+        require(plot.header_validated && plot.algorithm == PlotAlgorithm::pos2 && plot.meta_group == meta && plot.members == h.group_size,
+            "valid ordinary-group meta byte was rejected or changed by inventory");
+    }
     std::array<fs::path, 1> roots{directory}; auto observed = scan_farm_inventory(roots);
     require(observed.complete && observed.plots.size() == 4, "bounded inventory omitted files");
     auto find = [&](std::string const& name) -> InventoryPlot const&
@@ -43,6 +100,41 @@ void inventory(fs::path const& directory)
     auto text = farm_inventory_text(observed); auto restored = parse_farm_inventory(text);
     require(farm_inventory_text(restored) == text && text.find(std::string(64, '9')) == std::string::npos &&
         text.find("9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a") == std::string::npos, "inventory lost determinism or exposed local memo secret");
+    {
+        auto legacy_catalog = observed; legacy_catalog.version = 1;
+        for (auto& root : legacy_catalog.roots) root.durable = {};
+        for (auto& plot : legacy_catalog.plots) plot.identity.durable = {};
+        auto const legacy_text = farm_inventory_text(legacy_catalog);
+        require(legacy_text.find("durable_identity") == legacy_text.npos && farm_inventory_text(parse_farm_inventory(legacy_text)) == legacy_text,
+            "strict legacy inventory bytes changed without native evidence");
+        auto const legacy_source = legacy_catalog.plots[size_t(&find("og.plot") - observed.plots.data())];
+        (void)recheck_inventory_source(legacy_catalog.roots[0], legacy_source);
+        if (file_io::has_durable_identity(observed.roots[0].durable) && file_io::has_durable_identity(og.identity.durable))
+        {
+            require(observed.version == 2 && restored.roots[0].durable == observed.roots[0].durable &&
+                restored.plots[size_t(&find("og.plot") - observed.plots.data())].identity.durable == og.identity.durable,
+                "prospective inventory evidence lost its explicit schema or roundtrip");
+            auto historical_root = observed.roots[0]; historical_root.device ^= UINT64_C(0x80000000);
+            auto historical = og; historical.identity.stamp.device = historical_root.device;
+            InventorySourcePin recovered(historical_root, historical);
+            require(matches_inventory_identity(historical.identity, recovered.identity(historical.relative_path, {})),
+                "verified native root and generation handle could not compare a simulated changed device");
+            auto strict_root = historical_root; strict_root.durable = {};
+            auto strict_source = historical; strict_source.identity.durable = {};
+            rejects([&] { InventorySourcePin pin(strict_root, strict_source); }, "legacy root retroactively recovered a changed native device");
+            rejects([&] { InventorySourcePin pin(historical_root, strict_source); }, "legacy source retroactively recovered a changed native device");
+            auto wrong = historical; wrong.identity.durable.object.back() = wrong.identity.durable.object.back() == '0' ? '1' : '0';
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "different object handle gained remount source authority");
+            wrong = historical; ++wrong.identity.allocated_bytes;
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "native handle bypassed exact source allocation");
+            wrong = historical; ++wrong.identity.stamp.mtime_ns;
+            rejects([&] { InventorySourcePin pin(historical_root, wrong); }, "native handle bypassed exact source timestamp");
+            auto missing = og.identity; missing.durable = {};
+            require(!matches_inventory_identity(og.identity, missing), "current missing evidence satisfied a prospective owner");
+            auto invalid = observed; invalid.version = 1;
+            rejects([&] { (void)farm_inventory_text(invalid); }, "legacy inventory schema accepted new native authority");
+        }
+    }
     Resource storage; storage.id = "fixture-storage"; storage.host = observed.host; storage.kind = ResourceKind::storage;
     observed.resource_template = make_profile_template({storage}, {{"known-header", 3}, {"protected-unknown", 1}}, observed.captured_at, observed.producer_build);
     text = farm_inventory_text(observed); restored = parse_farm_inventory(text);
@@ -135,6 +227,7 @@ int fake_adapter(int argc, char** argv)
     auto flag = [&](char const* name) { return fs::exists(root / name); };
     if (endpoint == "get_version")
     {
+        if (flag("version-delay")) std::this_thread::sleep_for(std::chrono::milliseconds(25));
         if (service == "farmer" && flag("farmer-unavailable")) return 1;
         std::string version = "fixture-native-1"; std::ifstream in(fs::path(argv[2]) / "version"); if (in) in >> version;
         if ((service == "farmer" && flag("farmer-version")) || (service == "solver" && flag("solver-version")) ||
@@ -400,7 +493,7 @@ void source_metadata_snapshot(fs::path const& directory, HarvesterAdapterOptions
         "unloaded recovery invented previously unobserved reader metadata");
     write(root / "known.plot", legacy(false));
     auto known = observe_inventory_file(catalog.roots[0], "known.plot");
-    FarmInventory known_catalog; known_catalog.roots = catalog.roots; known_catalog.plots = {known};
+    FarmInventory known_catalog; known_catalog.version = catalog.version; known_catalog.roots = catalog.roots; known_catalog.plots = {known};
     std::array<uint64_t, 1> known_index{0};
     auto legacy_known_catalog = known_catalog;
     observe_harvester_inventory(known_catalog, options);
@@ -446,6 +539,32 @@ void adapters(fs::path const& directory)
     write(directory / "native-source.plot", legacy(false));
     { std::ofstream config(root / "config" / "config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 2\n"; }
     HarvesterAdapterOptions options; options.executable = self; options.root = root;
+    {
+        auto bounded = options; bounded.limits.timeout_ms = 1000;
+        auto const config_before = stream_state::stamp(root / "config" / "config.yaml");
+        { std::ofstream flag(root / "version-delay"); flag << '1'; }
+        {
+            adapter_detail::Session individual(bounded);
+            require(adapter_detail::version(individual.rpc(AdapterOperation::harvester_version)) == "fixture-native-1",
+                "individual delayed RPC did not fit the adapter grant");
+        }
+        unsigned completed = 0; bool deadline = false;
+        try
+        {
+            adapter_detail::Session aggregate(bounded);
+            for (unsigned i = 0; i < 64; ++i)
+            {
+                require(adapter_detail::version(aggregate.rpc(AdapterOperation::harvester_version)) == "fixture-native-1",
+                    "delayed RPC returned an unexpected version");
+                ++completed;
+            }
+        }
+        catch (std::exception const& error) { deadline = std::string_view(error.what()).find("deadline") != std::string_view::npos; }
+        fs::remove(root / "version-delay");
+        require(completed >= 2 && deadline, "successful RPCs each received a fresh budget instead of sharing the adapter phase deadline");
+        require(stream_state::stamp(root / "config" / "config.yaml") == config_before,
+            "expired aggregate adapter phase changed its configuration");
+    }
     auto projection = observe_network_projection(options);
     require(projection.available && projection.network == "simulator0" && projection.genesis_challenge == std::string(64, 'a') && projection.plot_size == 28,
         "actual typed RPC projection was not observed");
@@ -644,7 +763,7 @@ void adapters(fs::path const& directory)
         out << ",\"size\":32,\"plot_id\":\"" << native_id << "\",\"file_size\":" << native_plot.identity.stamp.bytes << ",\"time_modified\":" << native_plot.identity.stamp.mtime
             << ",\"pool_contract_puzzle_hash\":\"" << std::string(64, '4') << "\",\"plot_public_key\":\"" << loaded_key << "\",\"compression_level\":7}]}";
     };
-    native_registry(); FarmInventory native_catalog; native_catalog.roots = observed.roots; native_catalog.plots = {native_plot}; native_catalog.complete = true;
+    native_registry(); FarmInventory native_catalog; native_catalog.version = observed.version; native_catalog.roots = observed.roots; native_catalog.plots = {native_plot}; native_catalog.complete = true;
     observe_harvester_inventory(native_catalog, options); native_plot = native_catalog.plots[0];
     require(native_plot.native_identified && native_plot.members == 1 && native_plot.status == "native-observed" && native_plot.farmer_public_key.empty() && native_plot.container == PlotContainer::unknown,
         "native observation invented undisclosed proprietary metadata");
@@ -933,6 +1052,6 @@ int main(int argc, char** argv)
 {
     if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
     auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { fs::create_directory(root); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
+    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
     catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }
 }

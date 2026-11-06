@@ -713,6 +713,13 @@ Registry calls, catalog traversal and native object reads have explicit time,
 memory and output limits. Retirement requires no vendor proof checker or GPU
 reconstruction of the old plot.
 
+`--farm-adapter-timeout-ms N` sets the native adapter operation timeout for
+inventory and migration commands (default `30000`, range `1..3600000`). Increase
+it explicitly if a complete reader or target-readiness snapshot times out.
+Supply the setting again when revalidating or resuming a saved review; it does
+not change the farming response deadline, process resource caps or the fresh
+service and catalog checks required before retirement.
+
 For different source and replacement readers, add a `farm_adapters` object
 beside `farm_resources` in the local `--harvester` profile:
 
@@ -939,11 +946,18 @@ and replacement work per destination, inspect the result, and save that review
 for execution. A saved review's exact source list remains authoritative.
 
 Replacement outputs retain the destination order in the review. Source mapping
-favors the same filesystem, spreads allocated bytes across its replacement
-outputs, and keeps reader workload cohorts together when the active batch can
-hold them. Bootstrap sources are mapped to the output that needs their space.
+first checks the reviewed construction and proof resource stages, placing
+needed early resource release in the current batch even when the source's own
+filesystem has a later destination. It then favors the same filesystem,
+spreads allocated bytes across replacement outputs, and keeps reader workload
+cohorts together when the active batch can hold them. Bootstrap sources are
+mapped to the output that needs their space.
 Every prefix must still pass the resource, scratch-space and outstanding
 pre-delete checks; execution proceeds sequentially through that fixed mapping.
+Selection tries bounded alternatives when the ranked choice cannot fit the
+debt limit. A search-bound refusal does not establish that no feasible subset
+exists. It permits no additional retirement; existing pending commitments and
+outstanding debt remain in the private journal.
 
 `--reclaim-before-bytes SIZE` belongs to the review and defaults to zero.
 Zero requires each mapped replacement to be ready before its sources are
@@ -1029,8 +1043,11 @@ Use `xchplot2 plan --status --from-plan migration.plan --json` for read-only
 progress. Status separates the durable phase, completed receipts, retirement
 states and outstanding pre-delete debt from current filesystem observations.
 It shows exact active claim and replacement paths, pending replica publication
-and the next safe action. It does not contact farming or compute services and
-does not diagnose their current health or the reason a previous process stopped.
+and the next safe action. It also distinguishes an active policy from a pending
+successor, a stale reviewed boundary or a different active policy, showing both
+the reviewed and current journal digests. It does not contact farming or compute
+services and does not diagnose their current health or the reason a previous
+process stopped.
 Missing replicas are reported as incomplete observations. No journal found is
 not proof that the job never ran; preserve remaining artifacts before recovery.
 
@@ -1054,15 +1071,22 @@ Claimed or retired files retain their original identification; separate current
 reader observations do not identify them again. Active opaque files must still
 be loaded and freshly identified by the current reader.
 
-A successor is bound to the exact stopped journal revision. If durable journal
-progress advances before activation, save a new review. After activation, resume
-through that successor; the original review cannot remove its policy. Further revalidation
+A successor is bound to the exact stopped journal revision and any retained
+unfinished construction checkpoint. If either advances before activation, save
+a new review, even when the journal itself has not changed. Valid unfinished
+checkpoints can be reviewed with the same engine build, compatible memory and
+I/O grants, and their complete target and scratch reservations. Review leaves
+the checkpoint and its scratch files intact. Empty bootstrap files, orphan tails
+without a valid checkpoint and saved external work without its exact stage
+target must first recover through the active review to a supported checkpoint
+or verified boundary.
+
+After activation, ordinary checkpoint progress can continue through that
+successor; the original review cannot remove its policy. Further revalidation
 uses the currently active successor. Preserve the original review because
-completed receipts remain bound to its identity. Unverified partial construction,
-including saved external work without its stage file, must first recover through
-its original exact-build checkpoint to a verified boundary. Handoff and completed
-jobs need status or ordinary recovery rather than revalidation. If activation
-is interrupted before local defaults are saved, a profile with multiple reader
+completed receipts remain bound to its identity. Handoff and completed jobs need
+status or ordinary recovery rather than revalidation. If activation is
+interrupted before local defaults are saved, a profile with multiple reader
 routes may need to be supplied explicitly once more.
 
 New reviews can record a removal-compatible fingerprint for conventional Chia
@@ -1078,15 +1102,26 @@ changing the other settings. Older reviews and unsupported configuration syntax
 retain the exact-configuration requirement; keep or restore the reviewed
 configuration to resume those jobs.
 
-Migration currently requires unchanged native file and device identifiers;
-device renumbering after a remount or reboot can prevent resume even when the
-filesystem's persistent identity is unchanged.
+New inventories and reviews can record persistent native object evidence on
+Linux Btrfs, ext4/XFS when native filesystem UUID and object-handle interfaces
+are available, and local Windows NTFS. Linux tmpfs evidence covers only the same
+live filesystem instance and cannot survive a reboot. This permits device
+renumbering after a remount when the same source, destination and scratch objects
+remain at their reviewed paths.
+Recovery checks the recorded filesystem and object generations, immutable file
+metadata and current physical storage sharing before using the reviewed resource
+bounds. It does not grant additional capacity. Keep all recorded paths and owned
+scratch files intact; explicitly selected temporary directories must belong to
+the review. Older records and filesystems without this evidence still require
+their original native device identifiers. A successor reviewed with unfinished
+construction retains its exact checkpoint snapshot; after a remount, save a
+fresh revalidation before its first activation.
 
 After all replacements and retirements pass the final audit, the job publishes
 ordinary `grow-farm.plan` copies. Completed replacement files retain their
 identities and fixed member counts; ordinary recovery never grows them.
-An unfinished migration must finish through its active reviewed plan before ordinary
-fill or extension can operate on its destinations.
+An unfinished migration must finish through its active reviewed plan before
+ordinary fill or extension can operate on its destinations.
 Reassess any remaining legacy workload before extending a completed ordinary job.
 
 ## Shared compute

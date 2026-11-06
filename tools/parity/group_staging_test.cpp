@@ -236,6 +236,27 @@ void recovery(fs::path const& root, std::vector<std::vector<uint64_t>> const& in
             }
             int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
                 "staging failpoint was not reached: " + name);
+            if (point == "stage-run-committed" || point == "stage-pack-committed" || point == "stage-compact-committed")
+            {
+                auto const before = contents(path); require(!::chmod(path.c_str(), 0400), "cannot make checkpoint read-only");
+                auto const inspected = StagingEngine::inspect(path.string(), config(), {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)});
+                auto const repeated = StagingEngine::inspect(path.string(), config(), {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)});
+                require(inspected.checkpoint && inspected.identity.pending && inspected.committed_members &&
+                    inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target && contents(path) == before,
+                    "read-only staged inspection changed or did not bind its checkpoint");
+                auto denied = config(); denied.capacity_bytes = inspected.target.bytes - 1; bool refused = false;
+                try { (void)StagingEngine::inspect(path.string(), denied, {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)}); } catch (std::runtime_error const&) { refused = true; }
+                require(refused && contents(path) == before, "staged inspection accepted a reduced retained target grant or mutated it");
+                require(!::chmod(path.c_str(), 0600), "cannot restore checkpoint permissions");
+            }
+            if (point == "stage-allocated" || point == "stage-bootstrap" || point == "stage-checkpoint-partial")
+            {
+                auto const before = contents(path);
+                auto const inspected = StagingEngine::inspect(path.string(), config(),
+                    {64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)}, initial_identity());
+                require(!inspected.checkpoint && contents(path) == before,
+                    "read-only staging bootstrap recovery invented checkpoint authority or changed retained bytes");
+            }
             complete(path, input, true);
             require(contents(path) == expected, "staging recovery changed canonical bytes: " + name);
             size_t entries = 0; for (auto const& entry : fs::directory_iterator(directory)) { (void)entry; ++entries; }

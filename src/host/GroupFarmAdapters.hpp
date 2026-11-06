@@ -1428,7 +1428,7 @@ inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions 
         auto const before_memory = inventory_detail::plot_memory(plot);
         auto const current = observe_inventory_file(inventory.roots[plot.root], plot.relative_path, session.remaining_limits());
         session.running();
-        inventory_detail::require(current.identity == plot.identity && inventory_detail::integer(native, "file_size") == plot.identity.stamp.bytes &&
+        inventory_detail::require(matches_inventory_identity(plot.identity, current.identity) && inventory_detail::integer(native, "file_size") == plot.identity.stamp.bytes &&
             inventory_detail::integer(native, "time_modified") == uint64_t(plot.identity.stamp.mtime), "native loaded plot differs from the observed file");
         auto const id = adapter_detail::hex_string(inventory_detail::required_field(native, "plot_id"), 32);
         inventory_detail::require(plot.plot_id.empty() || plot.plot_id == id, "native reader and public header disagree on plot identity");
@@ -1548,7 +1548,7 @@ public:
     {
         inventory_detail::require(!sources.empty() && sources.size() <= options.limits.max_files &&
             sources.size() <= options.limits.memory_bytes / 32768, "source snapshot exceeds its retained metadata grant");
-        current_.host = inventory.host; current_.captured_at = inventory_detail::timestamp(); current_.producer_build = GROW_IDENTITY;
+        current_.version = inventory.version; current_.host = inventory.host; current_.captured_at = inventory_detail::timestamp(); current_.producer_build = GROW_IDENTITY;
         current_.roots = inventory.roots; current_.complete = true;
         for (auto index : sources)
         {
@@ -1594,7 +1594,7 @@ public:
             inventory_detail::require(reviewed.reader_identity.empty() || adapter_detail::matches_reviewed_reader(session_, options_, reviewed, version_),
                 "previously observed source reader/configuration changed since review");
             auto observed = observe_inventory_file(root, reviewed.relative_path, session_.remaining_limits());
-            inventory_detail::require(observed.identity == reviewed.identity && observed.header_validated && observed.algorithm == reviewed.algorithm &&
+            inventory_detail::require(matches_inventory_identity(reviewed.identity, observed.identity) && observed.header_validated && observed.algorithm == reviewed.algorithm &&
                 observed.container == reviewed.container && observed.k == reviewed.k && observed.plot_id == reviewed.plot_id &&
                 observed.farmer_public_key == reviewed.farmer_public_key && observed.pool_public_key == reviewed.pool_public_key &&
                 observed.pool_contract_puzzle_hash == reviewed.pool_contract_puzzle_hash && observed.compression_level == reviewed.compression_level,
@@ -1617,7 +1617,7 @@ public:
             return observed;
         }
         inventory_detail::require(current.reader_identity == session_.reader_identity() && current.reader_version == version_ &&
-            current.reader == adapter_detail::name(options_.kind) && current.identity == reviewed.identity &&
+            current.reader == adapter_detail::name(options_.kind) && matches_inventory_identity(reviewed.identity, current.identity) &&
             current.plot_id == reviewed.plot_id && current.k == reviewed.k && current.algorithm == reviewed.algorithm &&
             (reviewed.plot_public_key.empty() || current.plot_public_key == reviewed.plot_public_key) && current.pool_public_key == reviewed.pool_public_key &&
             current.pool_contract_puzzle_hash == reviewed.pool_contract_puzzle_hash && current.compression_level == reviewed.compression_level &&
@@ -1880,7 +1880,8 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
 }
 inline SourceRetirementObservation observe_source_retired(HarvesterAdapterOptions const& options, InventoryRoot const& root, InventoryPlot const& plot)
 {
-    FarmInventory inventory; inventory.roots.push_back(root); inventory.plots.push_back(plot); inventory.plots[0].root = 0;
+    FarmInventory inventory; inventory.version = file_io::has_durable_identity(root.durable) ? 2 : 1;
+    inventory.roots.push_back(root); inventory.plots.push_back(plot); inventory.plots[0].root = 0;
     std::array<uint64_t, 1> indices{0}; return observe_sources_retired(options, inventory, indices);
 }
 // One bounded live observation for one prefix audit. Stream expectations into
@@ -1988,7 +1989,7 @@ public:
                 "replacement differs from the reviewed target snapshot parameters/provenance");
             inventory_detail::RootHandle root(expected.path.parent_path());
             auto file = inventory_detail::observe(root, file_io::path_text(expected.path.filename()), options_.limits);
-            inventory_detail::require(file.identity == expected.identity && file.header_validated && file.algorithm == PlotAlgorithm::pos2 &&
+            inventory_detail::require(matches_inventory_identity(expected.identity, file.identity) && file.header_validated && file.algorithm == PlotAlgorithm::pos2 &&
                 file.plot_id == expected.group_id && file.k == expected.k && file.strength == expected.strength && file.meta_group == expected.meta_group && file.members == expected.members &&
                 file.farmer_public_key == expected.farmer_public_key && file.pool_public_key == expected.pool_public_key && file.pool_contract_puzzle_hash == expected.pool_contract_puzzle_hash,
                 "replacement file/header/public keys differ from the reviewed exact output");
@@ -2017,7 +2018,7 @@ public:
                     "native harvester plot public key does not bind the reviewed farmer/pool/group identity");
             }
             auto after = inventory_detail::observe(root, file_io::path_text(expected.path.filename()), options_.limits);
-            inventory_detail::require(after.identity == expected.identity, "published replacement changed during live readiness observation");
+            inventory_detail::require(matches_inventory_identity(expected.identity, after.identity), "published replacement changed during live readiness observation");
             at->second.checked = expected.identity.stamp;
             current(); result.identity = file.identity; result.ready = true; result.status = "ready";
             result.reason = "new immutable publication matches the live harvester and connected farmer's completed sync, key route and solver prerequisites; finish the complete audit before retirement";

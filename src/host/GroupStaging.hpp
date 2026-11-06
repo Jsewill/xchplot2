@@ -125,6 +125,7 @@ class StagingEngine
     };
     std::string path_;
     Config config_;
+    ConstructionInspectionLimits const* inspection_limits_ = nullptr;
     Identity identity_;
     int fd_ = -1;
     uint64_t device_ = 0, inode_ = 0, alignment_ = record_bytes, expected_bytes_ = 0;
@@ -137,6 +138,11 @@ class StagingEngine
     // Self-written committed sources need no repeated decode. Resume and an
     // observed source change rebuild this trust during read-only admission.
     std::optional<file_io::Stat> validated_source_;
+    struct ReadOnly {};
+    StagingEngine(std::string path, Config config, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+                  std::array<uint8_t, 32>& authority);
+    void discover(bool resume, std::optional<Identity> const& initial,
+                  std::array<uint8_t, 32>* authority = nullptr);
 
     static uint64_t multiply(uint64_t a, uint64_t b)
     { require(!b || a <= uint64_t(INT64_MAX) / b, "staging size overflow"); return a * b; }
@@ -166,6 +172,7 @@ class StagingEngine
         grow_add(offset, bytes.size());
         while (!bytes.empty())
         {
+            if (inspection_limits_) inspection_limits_->check();
             auto const begin = std::chrono::steady_clock::now();
             auto n = file_io::read_at(fd_, bytes.data(), std::min(bytes.size(), size_t(file_io::max_transfer)), file_io::Offset(offset));
             stats_.read_ns += elapsed_ns(begin); ++stats_.read_calls;
@@ -229,7 +236,7 @@ class StagingEngine
         write_at(offset + record_bytes / 2, std::span(bytes).subspan(record_bytes / 2));
         sync(); ++stats_.checkpoints;
     }
-    std::optional<Record> load_record(uint64_t offset) const
+    std::optional<Record> load_record(uint64_t offset, std::array<uint8_t, 32>* authority = nullptr) const
     {
         if (offset > size() || size() - offset < record_bytes) return {};
         std::array<uint8_t, record_bytes> bytes{};
@@ -239,6 +246,7 @@ class StagingEngine
         Record saved{}; std::memcpy(&saved, bytes.data(), sizeof(saved));
         if (std::string_view(saved.magic.data(), saved.magic.size()) !=
             std::string_view("XCHPLOT2STAGEv1\0\0", 16)) return {};
+        if (authority) *authority = digest;
         return saved;
     }
     void load_index(Header const& header, uint64_t bytes)
@@ -256,6 +264,7 @@ class StagingEngine
         unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
         for (auto& value : old_sizes_)
         {
+            if (inspection_limits_) inspection_limits_->check();
             bool const negative = bits.read_u64(1);
             uint64_t const remainder = bits.read_u64(rice), quotient = bits.read_unary_64();
             require(quotient + rice + 2 <= 64, "invalid original staging size code");
@@ -275,6 +284,7 @@ class StagingEngine
     {
         require(header.magic == PlotGroupFile::MAGIC && header.k >= 18 && header.k <= 28 && !(header.k & 1) &&
             header.strength >= 2 && header.strength <= 63, "invalid staging group identity");
+        if (inspection_limits_) inspection_limits_->check(inspection_memory_bytes(header.k));
         require(memory_bytes(header.k, config_) <= config_.memory_limit_bytes,
                 "staging codec/index/windows exceed memory budget");
     }
@@ -453,6 +463,10 @@ public:
                 grow_add(multiply(UINT16_MAX, 128), multiply(batch_members, sizeof(size_t) * 2))));
     }
     StagingEngine(std::string path, Config config, bool resume = false, std::optional<Identity> initial = {});
+    static ConstructionInspection inspect(std::string const& path, Config config, ConstructionInspectionLimits const& limits,
+        std::optional<Identity> const& initial = {});
+    static uint64_t inspection_memory_bytes(uint8_t k)
+    { return grow_add(Engine::inspection_memory_bytes(k), uint64_t(UINT16_MAX) * sizeof(Run) * 2); }
     ~StagingEngine()
     {
         if (fd_ >= 0)
@@ -560,92 +574,7 @@ inline StagingEngine::StagingEngine(std::string path, Config config, bool resume
         struct statfs filesystem{}; require(!::fstatfs(fd_, &filesystem), "cannot inspect staging filesystem");
         cow_ = unsigned(filesystem.f_type) == 0x9123683eu;
 #endif
-        std::optional<Record> saved;
-        auto consider = [&](uint64_t offset)
-        {
-            auto candidate = load_record(offset);
-            if (candidate && (!saved || candidate->sequence > saved->sequence)) saved = *candidate;
-        };
-        if (size() >= alignment_ + record_bytes)
-        { uint64_t last = (size() - record_bytes) / alignment_ * alignment_; consider(last); consider(last - alignment_); }
-        Header header{};
-        if (!saved && size() >= sizeof(Header))
-        {
-            require(resume, "existing ordinary or staged groups require --resume");
-            header = read_value<Header>(0); validate_header(header);
-            require(header.version == PlotGroupFile::FORMAT_VERSION || header.version == construction_version,
-                "different construction protocol; recover it with ordinary growth first");
-            identity_.header = header;
-            identity_.header.version = PlotGroupFile::FORMAT_VERSION;
-            identity_.memo.resize(header.memo_length); read_at(sizeof(Header), identity_.memo);
-            if (header.group_size) load_index(identity_.header, size());
-            else
-            {
-                require(header.version == construction_version &&
-                    header.chunk_index_offset == sizeof(Header) + header.memo_length, "invalid staging bootstrap");
-                identity_.bytes = 0;
-            }
-            uint64_t const anchor = aligned(identity_.bytes ? identity_.bytes : sizeof(Header) + header.memo_length);
-            consider(anchor); consider(anchor + alignment_);
-            if (!saved)
-            {
-                require(resume || size() == identity_.bytes, "existing group requires --resume");
-                require(header.version != construction_version || resume, "staging bootstrap requires --resume");
-                require(header.version != construction_version || !header.group_size,
-                    "damaged staged group requires a valid construction checkpoint");
-                // A crash before the initial checkpoint leaves the original
-                // canonical bytes intact. Defer orphan trimming until confirmed.
-            }
-        }
-        if (saved)
-        {
-            require(resume, "in-progress staged group is not farmable; use --resume");
-            record_ = *saved; validate_header(record_.original); validate_header(record_.target);
-            std::array<char, 64> build{}; auto name = std::string_view(GROW_IDENTITY);
-            std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
-            require(record_.build == build, "staging checkpoint requires the same codec/build identity");
-            require(record_.alignment == alignment_ && record_.sequence &&
-                record_.storage_bytes >= slots_end(0) && record_.storage_bytes <= size() &&
-                record_.anchor <= record_.storage_bytes && multiply(alignment_, 2) <= record_.storage_bytes - record_.anchor &&
-                record_.original_bytes <= record_.anchor &&
-                record_.original.version == PlotGroupFile::FORMAT_VERSION &&
-                record_.target.version == PlotGroupFile::FORMAT_VERSION &&
-                record_.original.group_id == record_.target.group_id && record_.original.k == record_.target.k &&
-                record_.original.strength == record_.target.strength && record_.original.meta_group == record_.target.meta_group &&
-                record_.original.memo_length == record_.target.memo_length &&
-                (record_.original.group_size ? record_.original_bytes > record_.original.chunk_index_offset &&
-                    record_.original.chunk_index_offset >= sizeof(Header) + record_.original.memo_length : !record_.original_bytes) &&
-                record_.staged >= record_.original.group_size && record_.target.group_size == record_.staged &&
-                record_.anchor == aligned(record_.original_bytes ? record_.original_bytes : sizeof(Header) + record_.original.memo_length) &&
-                record_.staged_end >= record_.anchor + alignment_ * 2 &&
-                record_.staged_end <= tail_anchor(record_) && record_.canonical_bound <= tail_anchor(record_) - record_.staged_end &&
-                record_.packed_chunks <= PlotGroupFile::getChunkCountForK(record_.original.k) &&
-                uint8_t(record_.phase) <= uint8_t(Phase::compact) &&
-                record_.packed_bytes <= record_.canonical_bound && record_.final_bytes <= record_.canonical_bound &&
-                record_.compacted <= record_.final_bytes &&
-                (record_.phase != Phase::stage || (!record_.packed_chunks && !record_.packed_bytes && !record_.final_bytes && !record_.compacted)) &&
-                (record_.phase != Phase::pack || (record_.packed_bytes >= sizeof(Header) + record_.original.memo_length &&
-                    !record_.final_bytes && !record_.compacted)) &&
-                (record_.phase != Phase::compact || (record_.storage_bytes == size() &&
-                    record_.packed_chunks == PlotGroupFile::getChunkCountForK(record_.original.k) &&
-                    record_.target.chunk_index_offset == record_.packed_bytes && record_.final_bytes > record_.packed_bytes &&
-                    record_.packed_bytes >= sizeof(Header) + record_.original.memo_length)), "inconsistent staging checkpoint");
-            identity_ = {record_.original, {record_.memo.begin(), record_.memo.begin() + record_.original.memo_length},
-                record_.original_bytes, true, record_.original.group_size, record_.staged, record_.storage_bytes};
-            active_ = true; tail_records_ = record_.phase == Phase::compact;
-            if (record_.original.group_size && record_.phase != Phase::compact) load_index(record_.original, record_.original_bytes);
-            if (record_.phase != Phase::compact) (void)runs();
-        }
-        else if (!size())
-        {
-            require(initial.has_value(), "empty staging target needs identity"); identity_ = *initial;
-            validate_header(identity_.header);
-            require(!identity_.header.group_size && identity_.memo.size() <= 255 &&
-                identity_.header.memo_length == identity_.memo.size(), "invalid new staging identity");
-            identity_.header.version = PlotGroupFile::FORMAT_VERSION;
-            identity_.header.chunk_index_offset = sizeof(Header) + identity_.memo.size(); identity_.bytes = 0;
-        }
-        expected_bytes_ = size();
+        discover(resume, initial);
     }
     catch (...)
     {
@@ -654,6 +583,134 @@ inline StagingEngine::StagingEngine(std::string path, Config config, bool resume
             uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_) file_io::unlink_file(path_.c_str());
         file_io::close_file(fd_); fd_ = -1; throw;
     }
+}
+
+inline StagingEngine::StagingEngine(std::string path, Config config, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
+                                   std::array<uint8_t, 32>& authority)
+    : path_(std::move(path)), config_(config), inspection_limits_(&limits)
+{
+    limits.check(65536);
+    require(config.window_bytes >= sizeof(Header) && config.window_bytes <= SIZE_MAX && config.codec_bytes && config.checkpoint_bytes &&
+        config.workers && config.capacity_bytes <= uint64_t(INT64_MAX), "invalid staging budgets");
+    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    require(fd_ >= 0, "cannot inspect staging target: " + path_);
+    try
+    {
+        target = construction_stamp(fd_, path_); device_ = target.device; inode_ = target.inode;
+        file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
+        require(!file_io::inspect_fd(fd_, &info) && !file_io::space_fd(fd_, &allocation) &&
+            allocation.f_bsize && info.st_blksize > 0 && page > 0, "cannot inspect staging target allocation");
+        alignment_ = std::max({uint64_t(record_bytes), uint64_t(page), uint64_t(info.st_blksize),
+            uint64_t(allocation.f_bsize), uint64_t(allocation.f_frsize)});
+        discover(true, initial, &authority);
+        require(size() <= config_.capacity_bytes && identity_.bytes <= config_.capacity_bytes &&
+            (!active_ || record_.storage_bytes <= config_.capacity_bytes), "saved staging workspace exceeds capacity");
+        require(construction_stamp(fd_, path_) == target, "staging target changed during inspection");
+    }
+    catch (...) { file_io::close_file(fd_); fd_ = -1; throw; }
+}
+inline ConstructionInspection StagingEngine::inspect(std::string const& path, Config config, ConstructionInspectionLimits const& limits,
+                                                     std::optional<Identity> const& initial)
+{
+    ConstructionInspection result; std::array<uint8_t, 32> authority{};
+    StagingEngine engine(path, config, ReadOnly{}, limits, initial, result.target, authority);
+    result.identity = engine.identity_; result.checkpoint = engine.active_;
+    result.committed_members = engine.committed_member_count(); result.can_append = engine.can_append();
+    result.inspection_memory_bytes = inspection_memory_bytes(result.identity.header.k);
+    result.recovery_memory_bytes = memory_bytes(result.identity.header.k, config);
+    result.authority_digest = construction_digest(result, authority, "staged");
+    require(construction_stamp(engine.fd_, path) == result.target, "staging target changed during inspection"); return result;
+}
+inline void StagingEngine::discover(bool resume, std::optional<Identity> const& initial,
+                                     std::array<uint8_t, 32>* authority)
+{
+    std::optional<Record> saved;
+    auto consider = [&](uint64_t offset)
+    {
+        std::array<uint8_t, 32> digest{}; auto candidate = load_record(offset, &digest);
+        if (candidate && (!saved || candidate->sequence > saved->sequence))
+        { saved = *candidate; if (authority) *authority = digest; }
+    };
+    if (size() >= alignment_ + record_bytes)
+    { uint64_t last = (size() - record_bytes) / alignment_ * alignment_; consider(last); consider(last - alignment_); }
+    Header header{};
+    if (!saved && size() >= sizeof(Header))
+    {
+        require(resume, "existing ordinary or staged groups require --resume");
+        header = read_value<Header>(0); validate_header(header);
+        require(header.version == PlotGroupFile::FORMAT_VERSION || header.version == construction_version,
+            "different construction protocol; recover it with ordinary growth first");
+        identity_.header = header;
+        identity_.header.version = PlotGroupFile::FORMAT_VERSION;
+        identity_.memo.resize(header.memo_length); read_at(sizeof(Header), identity_.memo);
+        if (header.group_size) load_index(identity_.header, size());
+        else
+        {
+            require(header.version == construction_version &&
+                header.chunk_index_offset == sizeof(Header) + header.memo_length, "invalid staging bootstrap");
+            identity_.bytes = 0;
+        }
+        uint64_t const anchor = aligned(identity_.bytes ? identity_.bytes : sizeof(Header) + header.memo_length);
+        consider(anchor); consider(anchor + alignment_);
+        if (!saved)
+        {
+            require(resume || size() == identity_.bytes, "existing group requires --resume");
+            require(header.version != construction_version || resume, "staging bootstrap requires --resume");
+            require(header.version != construction_version || !header.group_size,
+                "damaged staged group requires a valid construction checkpoint");
+            // A crash before the initial checkpoint leaves the original
+            // canonical bytes intact. Defer orphan trimming until confirmed.
+        }
+    }
+    if (saved)
+    {
+        require(resume, "in-progress staged group is not farmable; use --resume");
+        record_ = *saved; validate_header(record_.original); validate_header(record_.target);
+        std::array<char, 64> build{}; auto name = std::string_view(GROW_IDENTITY);
+        std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
+        require(record_.build == build, "staging checkpoint requires the same codec/build identity");
+        require(record_.alignment == alignment_ && record_.sequence &&
+            record_.storage_bytes >= slots_end(0) && record_.storage_bytes <= size() &&
+            record_.anchor <= record_.storage_bytes && multiply(alignment_, 2) <= record_.storage_bytes - record_.anchor &&
+            record_.original_bytes <= record_.anchor &&
+            record_.original.version == PlotGroupFile::FORMAT_VERSION &&
+            record_.target.version == PlotGroupFile::FORMAT_VERSION &&
+            record_.original.group_id == record_.target.group_id && record_.original.k == record_.target.k &&
+            record_.original.strength == record_.target.strength && record_.original.meta_group == record_.target.meta_group &&
+            record_.original.memo_length == record_.target.memo_length &&
+            (record_.original.group_size ? record_.original_bytes > record_.original.chunk_index_offset &&
+                record_.original.chunk_index_offset >= sizeof(Header) + record_.original.memo_length : !record_.original_bytes) &&
+            record_.staged >= record_.original.group_size && record_.target.group_size == record_.staged &&
+            record_.anchor == aligned(record_.original_bytes ? record_.original_bytes : sizeof(Header) + record_.original.memo_length) &&
+            record_.staged_end >= record_.anchor + alignment_ * 2 &&
+            record_.staged_end <= tail_anchor(record_) && record_.canonical_bound <= tail_anchor(record_) - record_.staged_end &&
+            record_.packed_chunks <= PlotGroupFile::getChunkCountForK(record_.original.k) &&
+            uint8_t(record_.phase) <= uint8_t(Phase::compact) &&
+            record_.packed_bytes <= record_.canonical_bound && record_.final_bytes <= record_.canonical_bound &&
+            record_.compacted <= record_.final_bytes &&
+            (record_.phase != Phase::stage || (!record_.packed_chunks && !record_.packed_bytes && !record_.final_bytes && !record_.compacted)) &&
+            (record_.phase != Phase::pack || (record_.packed_bytes >= sizeof(Header) + record_.original.memo_length &&
+                !record_.final_bytes && !record_.compacted)) &&
+            (record_.phase != Phase::compact || (record_.storage_bytes == size() &&
+                record_.packed_chunks == PlotGroupFile::getChunkCountForK(record_.original.k) &&
+                record_.target.chunk_index_offset == record_.packed_bytes && record_.final_bytes > record_.packed_bytes &&
+                record_.packed_bytes >= sizeof(Header) + record_.original.memo_length)), "inconsistent staging checkpoint");
+        identity_ = {record_.original, {record_.memo.begin(), record_.memo.begin() + record_.original.memo_length},
+            record_.original_bytes, true, record_.original.group_size, record_.staged, record_.storage_bytes};
+        active_ = true; tail_records_ = record_.phase == Phase::compact;
+        if (record_.original.group_size && record_.phase != Phase::compact) load_index(record_.original, record_.original_bytes);
+        if (record_.phase != Phase::compact) (void)runs();
+    }
+    else if (!size())
+    {
+        require(initial.has_value(), "empty staging target needs identity"); identity_ = *initial;
+        validate_header(identity_.header);
+        require(!identity_.header.group_size && identity_.memo.size() <= 255 &&
+            identity_.header.memo_length == identity_.memo.size(), "invalid new staging identity");
+        identity_.header.version = PlotGroupFile::FORMAT_VERSION;
+        identity_.header.chunk_index_offset = sizeof(Header) + identity_.memo.size(); identity_.bytes = 0;
+    }
+    expected_bytes_ = size();
 }
 
 inline AppendResult StagingEngine::append(Members members)

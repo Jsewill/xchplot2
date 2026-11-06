@@ -55,7 +55,7 @@ function(pos2_grow_identity target upstream_dir)
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
                  GroupFarmPreview.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
-                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
+                 GroupCheckpoint.hpp GroupFormat.hpp GroupFile.hpp GroupNativeIdentity.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"
@@ -87,7 +87,8 @@ function(pos2_grow_identity target upstream_dir)
             "${repo_dir}/src/*.cpp" "${repo_dir}/src/*.cu" "${repo_dir}/src/*.c"
             "${repo_dir}/cmake/*.cmake")
         list(APPEND local_sources ${gpu_sources}
-            "${repo_dir}/contrib/pos2-solver-candidates.patch")
+            "${repo_dir}/contrib/pos2-solver-candidates.patch"
+            "${repo_dir}/contrib/pos2-solver-thread-limit.patch")
         if(XCHPLOT2_BUILD_CUDA)
             list(APPEND local_sources "${repo_dir}/contrib/cccl-arch-list.patch")
         endif()

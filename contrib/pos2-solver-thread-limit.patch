@@ -1,0 +1,121 @@
+--- a/solve/Solver.hpp
++++ b/solve/Solver.hpp
+@@ -83,8 +83,8 @@
+     using XBitsList = std::span<uint32_t const, TOTAL_XS_IN_PROOF / 2>;
+     using SolveResult = std::vector<std::array<uint32_t, TOTAL_XS_IN_PROOF>>;
+ 
+-    Solver(PlotProofParams const& params)
+-        : params_(params)
++    Solver(PlotProofParams const& params, unsigned max_threads = std::thread::hardware_concurrency())
++        : params_(params), max_threads_(max_threads)
+     {}
+ 
+     void setUsePrefetching(bool use_prefetching) { use_prefetching_ = use_prefetching; }
+@@ -209,7 +209,7 @@
+ 
+         // Phase 3: Sort x1 candidates using parallel radix sort.
+         timer.start("Sorting " + std::to_string(x1_hashes.size()) + " x1's");
+-        ParallelRadixSort radixSort;
++        ParallelRadixSort radixSort(max_threads_);
+         radixSort.sortByKey(x1_hashes, x1s, x1_hashes_sort_buffer, x1s_sort_buffer, num_k_bits_);
+         timings_.sorting_x1s += timer.stop();
+ 
+@@ -674,7 +674,7 @@
+                         std::lock_guard<std::mutex> lock(out_mutex);
+                         out.insert(out.end(), local_out.begin(), local_out.end());
+                     }
+-                });
++                }, max_threads_ ? max_threads_ : 4);
+ 
+             timings_.t2_gen_L_list += sub_timer.stop();
+ 
+@@ -880,7 +880,7 @@
+                         ++j;
+                     }
+                 }
+-            });
++            }, max_threads_);
+         }
+         else {
+             // this section splits execution into NUM_SECTIONS * num_task_bit_splits tasks
+@@ -954,7 +954,7 @@
+                             ++j;
+                         }
+                     }
+-                });
++                }, max_threads_ ? max_threads_ : 4);
+             }
+         }
+         timings_.match_x1_x2_sorted_lists += timer.stop();
+@@ -1144,7 +1144,7 @@
+         uint64_t const NUM_XS = (1ULL << num_k_bits);
+ 
+         // Determine “num_threads” much like TBB did
+-        unsigned num_threads = std::thread::hardware_concurrency();
++        unsigned num_threads = max_threads_;
+         if (num_threads == 0)
+             num_threads = 4; // fallback
+         uint64_t const per_thread = NUM_XS / num_threads;
+@@ -1307,7 +1307,7 @@
+                 } catch (...) {
+                     errors[t] = std::current_exception();
+                 }
+-            });
++            }, max_threads_ ? max_threads_ : 4);
+             for (auto const& error : errors) if (error) std::rethrow_exception(error);
+             timings_.chachafilterx2sbybitmask += timer.stop();
+         }
+@@ -1386,7 +1386,7 @@
+                     x1_hashes[write_idx] = hash;
+                 }
+             }
+-        });
++        }, max_threads_);
+ 
+         timings_.hashing_x1s += timer.stop();
+     }
+@@ -1436,6 +1436,7 @@
+     // Private member variables.
+     // ------------------------------------------------------------------------
+     PlotProofParams params_;
++    unsigned max_threads_;
+     ProofSolverTimings timings_;
+ 
+     int bitmask_shift_ = 0;
+--- a/solve/ParallelRadixSort.hpp
++++ b/solve/ParallelRadixSort.hpp
+@@ -9,6 +9,9 @@
+ 
+ class ParallelRadixSort {
+ public:
++    explicit ParallelRadixSort(unsigned max_threads = std::thread::hardware_concurrency())
++        : max_threads_(max_threads) {}
++
+     void sort(std::vector<uint32_t>& data, std::vector<uint32_t>& buffer, bool verbose = false)
+     {
+         int const num_bits = 32; // Assuming 32-bit integers
+@@ -16,7 +19,7 @@
+         int const radix = 1 << radix_bits; // Base (e.g., 8 bits at a time)
+         int const radix_mask = radix - 1;
+         int const num_passes = num_bits / radix_bits;
+-        int const num_threads = std::thread::hardware_concurrency();
++        int const num_threads = int(max_threads_);
+ 
+         Timer timer;
+         if (verbose) {
+@@ -161,7 +164,7 @@
+         int radix = 1 << radix_bits; // Base (e.g., 8 bits at a time)
+         int radix_mask = radix - 1;
+         int const num_passes = (num_bits + radix_bits - 1) / radix_bits;
+-        int const num_threads = std::thread::hardware_concurrency();
++        int const num_threads = int(max_threads_);
+ 
+         if (verbose) {
+             std::cout << "ParallelRadixSort: Sorting " << keys.size() << " key-value pairs with "
+@@ -271,4 +274,6 @@
+             std::swap(values, valueBuffer);
+         }
+     }
++private:
++    unsigned max_threads_;
+ };
