@@ -400,6 +400,7 @@ public:
 
 inline std::vector<MergeEngine::Summary> MergeEngine::summaries()
 {
+    config().check_running();
     std::vector<Summary> result(size_t(chunks()), Summary{});
     if (arena_.active && arena_.state.summary.bytes)
     {
@@ -509,6 +510,7 @@ inline MergeEngine::Admission MergeEngine::bounds(std::span<Summary const> summa
         std::vector<ChunkSummary> details; details.reserve(limit);
         for (size_t first = 0; first < summaries.size();)
         {
+            config().check_running();
             size_t const count = std::min(limit, summaries.size() - first);
             tasks.clear(); regions.clear(); details.resize(count);
             for (size_t i = 0; i < count; ++i)
@@ -530,6 +532,7 @@ inline MergeEngine::Admission MergeEngine::bounds(std::span<Summary const> summa
         std::vector<size_t> cursors(incoming.size(), 0);
         for (size_t chunk = 0; chunk < summaries.size(); ++chunk)
         {
+            config().check_running();
             ChunkSummary detail;
             if (!incoming.empty())
             {
@@ -558,6 +561,7 @@ inline MergeEngine::Admission MergeEngine::exact(std::span<Summary const> summar
     Admission result; result.growth = header_bytes(); uint64_t output = header_bytes(), consumed = 0;
     for (uint64_t chunk = 0; chunk < chunks(); ++chunk)
     {
+        config().check_running();
         uint64_t source = 0;
         if (input) source = gathered.read(*this, *input, chunk);
         else { gathered.payload.clear(); gathered.contributions.clear(); }
@@ -602,6 +606,7 @@ inline MergeEngine::Admission MergeEngine::compact(Admission plan, std::span<Sum
 }
 inline void MergeEngine::validate_remaining()
 {
+    config().check_running();
     if (!arena_.active) { minimum_final_bytes_ = 0; return; }
     if (trusted()) return;
     minimum_final_bytes_ = 0;
@@ -663,6 +668,7 @@ inline unsigned MergeEngine::encoding_workers(std::span<uint64_t const> costs, u
 inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> sizes,
                                           std::span<Summary> summary, MergeState::Writer* output)
 {
+    config().check_running();
     uint64_t const baseline = ChunkCodec::estimate_base();
     require(config().codec_bytes >= baseline && sizes.size() == chunks() &&
         (output || summary.size() == chunks()) && (summary.empty() || summary.size() == chunks()),
@@ -681,6 +687,7 @@ inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> s
     if (immutable)
         for (uint64_t chunk = 0; chunk < chunks(); ++chunk)
         {
+            config().check_running();
             uint64_t symbols = 0;
             for (size_t member = 0; member < members.size(); ++member)
             {
@@ -697,6 +704,7 @@ inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> s
     require(workers, "merged contribution requires a codec worker");
     auto prepare = [&](ContributionWindow& window, uint64_t first)
     {
+        config().check_running();
         auto& tasks = window.tasks; auto& costs = window.costs;
         tasks.clear(); window.regions.clear(); costs.clear(); costs.push_back(0);
         window.first = first;
@@ -760,6 +768,7 @@ inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> s
     prepare(*current, 0); encode(*current);
     for (;;)
     {
+        config().check_running();
         if (next && current->next < chunks())
         {
             prepare(*next, current->next);
@@ -827,6 +836,7 @@ inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> s
 
 inline AppendResult MergeEngine::append(Members members)
 {
+    config().check_running();
     require(confirmed_ && can_append(), "merge append requires confirmed staging phase"); arena_.check_path();
     if (!arena_.active)
     {
@@ -913,15 +923,18 @@ inline AppendResult MergeEngine::append(Members members)
     state.live_bytes = plan.live; state.growth_bound = plan.growth; state.chunk_bound = plan.largest;
     state.codec_required = plan.codec_required;
     arena_.checkpoint("merge-run"); minimum_final_bytes_ = plan.minimum;
+    config().check_running();
     output.evict(true); table_output.evict(true);
     encoding.finish();
     balance(packing_inputs(config()), false); remember();
     contribution_bytes_ = run_bytes;
+    config().check_running();
     result.result = {plan.canonical, state.storage_bytes, state.storage_bytes > plan.canonical ? state.storage_bytes - plan.canonical : 0, after};
     return result;
 }
 inline void MergeEngine::merge(size_t first, size_t count)
 {
+    config().check_running();
     PhaseTimer timing(arena_.stats, WorkPhase::merge);
     auto& state = arena_.state;
     if (state.phase != Phase::merge)
@@ -944,6 +957,7 @@ inline void MergeEngine::merge(size_t first, size_t count)
     uint64_t committed = state.output.bytes;
     for (uint64_t chunk = state.chunk; chunk < chunks(); ++chunk)
     {
+        config().check_running();
         for (size_t i = 0; i < input.size(); ++i)
         {
             auto const& run = input.run(i); uint32_t const end = uint32_t(run.first) + run.count;
@@ -1017,6 +1031,7 @@ inline void MergeEngine::balance(size_t limit, bool all)
 }
 inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, std::span<uint64_t> sizes)
 {
+    config().check_running();
     auto& state = arena_.state; uint64_t committed = state.output.bytes;
     uint64_t checkpoint_ns = 0, checkpoints = 0;
     std::array<uint64_t, MergeState::max_runs> completed{};
@@ -1030,6 +1045,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
         checkpoint_ns = grow_add(checkpoint_ns, elapsed_ns(begin)); ++checkpoints;
         for (size_t i = 0; i < input.size(); ++i) input.reader(i).evict(frontiers[i]);
         output.evict(); committed = state.output.bytes;
+        config().check_running();
     };
     auto emit = [&](uint64_t chunk, std::span<uint8_t const> bytes, std::span<uint64_t const> frontiers)
     {
@@ -1064,6 +1080,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
         std::array<uint64_t, MergeState::max_runs> frontiers{};
         for (uint64_t chunk = state.chunk; chunk < chunks(); ++chunk)
         {
+            config().check_running();
             (void)gathered.read(*this, input, chunk);
             codec.prepare(ChunkCodec::estimate_work(k(), gathered.payload.size(), 0));
             auto const begin = std::chrono::steady_clock::now();
@@ -1095,6 +1112,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
     };
     auto prepare = [&](Window& window, uint64_t first)
     {
+        config().check_running();
         auto& gathered = window.gathered; auto& tasks = window.tasks; auto& costs = window.costs;
         tasks.clear(); costs.clear(); window.frontiers.clear(); gathered.payload.clear(); gathered.contributions.clear(); costs.push_back(0);
         window.first = first; window.next = first; uint64_t source_bytes = 0;
@@ -1120,6 +1138,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
     prepare(*current, state.chunk);
     while (!current->tasks.empty())
     {
+        config().check_running();
         auto const first = current->first; auto const& tasks = current->tasks;
         unsigned const workers = encoding_workers(current->costs, encoding_budget);
         arena_.stats.packing_workers = std::max<uint64_t>(arena_.stats.packing_workers, workers);
@@ -1164,6 +1183,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
 }
 inline void MergeEngine::pack()
 {
+    config().check_running();
     PhaseTimer timing(arena_.stats, WorkPhase::pack);
     auto& state = arena_.state;
     if (state.phase == Phase::stage)
@@ -1217,6 +1237,7 @@ inline void MergeEngine::pack()
 }
 inline void MergeEngine::arrange()
 {
+    config().check_running();
     PhaseTimer timing(arena_.stats, WorkPhase::layout);
     auto& state = arena_.state;
     require(state.phase == Phase::layout, "invalid merged block arrangement");
@@ -1271,6 +1292,7 @@ inline void MergeEngine::arrange()
     };
     auto move = [&](uint32_t logical, uint32_t target)
     {
+        config().check_running();
         uint32_t const source = arena_.map[logical];
         require(source != target && target < state.block_limit && owner[target] == MergeState::free_block,
                 "final merge move would overwrite a live block");
@@ -1319,15 +1341,21 @@ inline void MergeEngine::arrange()
 }
 inline Result MergeEngine::finish()
 {
+    config().check_running();
     require(confirmed_, "merge finalization requires confirmed identity"); arena_.check_path();
     validate_remaining(); arena_.restore_extent();
     auto& state = arena_.state;
-    if (!arena_.active) return {arena_.identity.bytes, arena_.identity.bytes, 0, arena_.identity.header.group_size};
+    if (!arena_.active)
+    {
+        config().check_running();
+        return {arena_.identity.bytes, arena_.identity.bytes, 0, arena_.identity.header.group_size};
+    }
     if (state.members == state.original.group_size && state.phase == Phase::stage)
     {
         if (state.original_bytes) { arena_.value(0, state.original); arena_.sync(); }
         arena_.trim(state.original_bytes); arena_.sync(); arena_.active = false; arena_.identity.pending = false;
         arena_.identity.pending_peak_bytes = 0;
+        config().check_running();
         return {state.original_bytes, state.storage_bytes, state.storage_bytes - state.original_bytes, state.members};
     }
     if (!state.finishing) { state.finishing = true; arena_.checkpoint("merge-finishing"); }
@@ -1335,6 +1363,7 @@ inline Result MergeEngine::finish()
     if (state.phase == Phase::stage || state.phase == Phase::pack) pack();
     if (state.phase == Phase::layout) arrange();
     remember();
+    config().check_running();
     return {state.final_bytes, state.storage_bytes, state.storage_bytes - state.final_bytes, state.members};
 }
 } // namespace group_grow

@@ -1047,6 +1047,18 @@ def check_replot(binary, root, reference=None):
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         return result
 
+    # The caller's large memory grant must survive public serialization too.
+    large_root = directory / "large inventory"
+    large_root.mkdir()
+    for index in range(18000):
+        (large_root / f"entry-{index:05d}").touch()
+    large_before = snapshot(large_root)
+    large_file = directory / "large inventory.plan"
+    large = run("plan", "--inventory", large_root, "-M", "16G", "--save-plan", large_file, "--json")
+    large_catalog = json.loads(large.stdout)
+    assert len(large_catalog["plots"]) == 18000 and len(large_file.read_bytes()) > 16 * 1024 * 1024
+    assert snapshot(large_root) == large_before, "large inventory serialization changed its source entries"
+
     def saved_replacement_authority(path, phase=None):
         record = path.read_bytes()
         body = record[:-65]
@@ -1194,8 +1206,10 @@ def check_replot(binary, root, reference=None):
                              *adapter, *options, "--temp-dir", invalid_temp, "--reclaim-before-bytes", 1,
                              "--json", code=2).stdout)
     assert any("cannot inspect scratch/destination directory" in reason for reason in invalid["infeasibility_reasons"])
-    run("plan", farm, "--replot", inventory_file, "--harvester", temporary_file, *adapter, *options,
-        "--temp-dir", invalid_temp, "--reclaim-before-bytes", 1, "--save-plan", bad_temp_review, code=2)
+    invalid_saved = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", temporary_file, *adapter, *options,
+                                   "--temp-dir", invalid_temp, "--reclaim-before-bytes", 1, "--save-plan", bad_temp_review,
+                                   "--json", code=2).stdout)
+    assert invalid_saved["infeasibility_reasons"] == invalid["infeasibility_reasons"] and not invalid_saved["saved_plan"]
     assert not bad_temp_review.exists() and snapshot(farm) == guarded
     temporary_review = directory / "valid temporary.plan"
     valid = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", temporary_file,
@@ -1928,6 +1942,11 @@ def check_replot(binary, root, reference=None):
     refused = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
                             *resource_adapter, *options, "--json", code=2).stdout)
     assert not refused["feasible"] and any("response-deadline-exceeded" in reason for reason in refused["infeasibility_reasons"])
+    refused_file = directory / "infeasible resource review.plan"
+    refused_saved = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
+                                  *resource_adapter, *options, "--save-plan", refused_file, "--json", code=2).stdout)
+    assert refused_saved["infeasibility_reasons"] == refused["infeasibility_reasons"] and not refused_saved["saved_plan"]
+    assert not refused_file.exists() and snapshot(resource_farm) == before, "infeasible saved review changed the farm"
     resource_credit = resource_catalog["plots"][0]["identity"]["allocated_bytes"]
     resource_review = directory / "resource-only migration.plan"
     reviewed_resource = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,

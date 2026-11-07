@@ -386,7 +386,7 @@ private:
     static Stamp stamp(std::string const& path);
     static std::string digest(std::string_view body);
     static std::string checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
-        ConstructionInspectionLimits const* inspection = nullptr);
+        ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
@@ -405,7 +405,7 @@ private:
     static void read_summary(std::vector<Root> const& roots, std::string const& token, Run const& run,
                              std::array<uint8_t, 32> const& checksum, std::span<uint8_t> destination = {}, Stats* stats = nullptr,
                              external_detail::IOContext context = {}, CodecScheduler* scheduler = nullptr,
-                             ConstructionInspectionLimits const* inspection = nullptr);
+                             ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
     void write_summary(std::span<Summary const> summaries);
     bool reserve(Run& run, uint64_t bytes, char const* role = "contribution");
     void discard(Run const& run);
@@ -876,9 +876,12 @@ ExternalEngine::segment_header(std::string const& token, Run const& run, Segment
 }
 inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::string const& token, Run const& run,
     std::array<uint8_t, 32> const& checksum, std::span<uint8_t> destination, Stats* stats, external_detail::IOContext io, CodecScheduler* scheduler,
-    ConstructionInspectionLimits const* inspection)
+    ConstructionInspectionLimits const* inspection, Config const* runtime)
 {
     using namespace external_detail;
+    auto check_running = [&]
+    { if (inspection) inspection->check(); if (runtime) runtime->check_running(); };
+    check_running();
     require(destination.empty() || destination.size() == run.bytes, "external summary destination coverage changed");
     std::unique_ptr<uint8_t[]> buffer;
     if (destination.empty()) buffer.reset(new uint8_t[65536]);
@@ -886,7 +889,7 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
     uint64_t position = 0; uint32_t ordinal = 0;
     for (auto const& segment : run.segments)
     {
-        if (inspection) inspection->check();
+        check_running();
         require(segment.root < roots.size() && segment.ordinal == ordinal++ && segment.capacity > segment_header_bytes &&
             segment.bytes && segment.bytes <= segment.capacity - segment_header_bytes && segment.stamp.bytes == segment.capacity &&
             segment.stamp.file.inode && position <= run.bytes && segment.bytes <= run.bytes - position,
@@ -900,11 +903,11 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
         require(header == segment_header(token, run, segment), "external summary ownership header changed");
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
-            if (inspection) inspection->check();
+            check_running();
             size_t const bytes = size_t(std::min<uint64_t>(65536, segment.bytes - offset));
             auto const part = destination.empty() ? std::span(buffer.get(), bytes) : destination.subspan(size_t(position + offset), bytes);
             read(file.fd, segment_header_bytes + offset, part, stats, io);
-            { CodecScheduler::Lease compute(scheduler); sha256_update(&context, part.data(), part.size()); }
+            { CodecScheduler::Lease compute(scheduler, 1, check_running); sha256_update(&context, part.data(), part.size()); }
             offset += bytes;
         }
         require(stamp(path) == segment.stamp, "external summary changed while reading"); position += segment.bytes;
@@ -1053,9 +1056,10 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
 }
 inline void ExternalEngine::load()
 {
+    config_.check_running();
     using namespace external_detail;
     require(file_identity(work_, true).inode != 0, "invalid external checkpoint directory");
-    auto const checkpoint = checkpoint_path(work_, path_, config_.memory_limit_bytes / 8);
+    auto const checkpoint = checkpoint_path(work_, path_, config_.memory_limit_bytes / 8, nullptr, &config_);
     bootstrap_recovered_ = checkpoint != work_ + "/checkpoint";
     auto const info = stamp(checkpoint);
     require(info.bytes <= checkpoint_buffer_bytes(external_) && info.bytes <= config_.memory_limit_bytes / 8,
@@ -1095,6 +1099,7 @@ inline void ExternalEngine::load()
     roots_.resize(size_t(roots));
     for (size_t i = 0; i < roots_.size(); ++i)
     {
+        config_.check_running();
         auto& root = roots_[i]; root.path = get_string(in); root.directory = get<FileIdentity>(in); root.parent = get<FileIdentity>(in);
         root.capacity = get<uint64_t>(in); root.alignment = get<uint64_t>(in); root.peak = get<uint64_t>(in);
         if (durable) { root.directory_identity = get_native_identity(in); root.parent_identity = get_native_identity(in); }
@@ -1115,6 +1120,7 @@ inline void ExternalEngine::load()
     runs_.resize(size_t(count)); uint64_t segments = 0;
     for (auto& run : runs_)
     {
+        config_.check_running();
         run.id = get<uint64_t>(in); run.bytes = get<uint64_t>(in); run.consumed = get<uint64_t>(in); run.first = get<uint16_t>(in); run.count = get<uint16_t>(in);
         count = get<uint64_t>(in); segments = grow_add(segments, count);
         require(segments <= descriptor_limit(external_) && count && run.id < next_id_ && run.consumed <= run.bytes, "invalid external segment count/identity");
@@ -1123,6 +1129,7 @@ inline void ExternalEngine::load()
         uint64_t position = 0;
         for (auto& segment : run.segments)
         {
+            config_.check_running();
             segment = get_segment(in, durable); require(segment.root < roots_.size(), "external segment root changed");
             position = grow_add(position, segment.bytes); auto const path = segment_path(run, segment); file_io::Stat exists{};
             if (file_io::inspect_link(path, &exists)) require(errno == ENOENT && position <= run.consumed, "required external segment is missing");
@@ -1142,6 +1149,7 @@ inline void ExternalEngine::load()
         summary_run_.segments.resize(size_t(count));
         for (auto& segment : summary_run_.segments)
         {
+            config_.check_running();
             segment = get_segment(in, durable); require(segment.root < roots_.size(), "external summary root changed");
             segment.stamp = bind_stamp(segment_path(summary_run_, segment), segment.stamp, segment.identity);
         }
@@ -1178,12 +1186,13 @@ inline void ExternalEngine::load()
     initialized_ = true; check_paths(); validate_runs();
     if (!summary_run_.segments.empty())
     {
-        read_summary(roots_, token_, summary_run_, summary_digest_, {}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get());
+        read_summary(roots_, token_, summary_run_, summary_digest_, {}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
         for (auto const& segment : summary_run_.segments)
             roots_[segment.root].used = grow_add(roots_[segment.root].used, segment.capacity);
     }
     for (auto const& run : runs_) for (auto const& segment : run.segments)
     {
+        config_.check_running();
         file_io::Stat value{};
         if (!file_io::inspect_link(segment_path(run, segment).c_str(), &value))
             roots_[segment.root].used = grow_add(roots_[segment.root].used, segment.capacity);
@@ -1200,6 +1209,7 @@ inline void ExternalEngine::load()
         auto& root = roots_[i];
         for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(root.path)))
         {
+            config_.check_running();
             std::string const name = file_io::path_text(entry.path().filename());
             uint64_t id = 0; uint32_t ordinal = 0; auto const dash = name.find('-', 4);
             bool named = name.starts_with("run-") && dash != name.npos;
@@ -1242,6 +1252,7 @@ inline void ExternalEngine::load()
     }
     for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(work_)))
     {
+        config_.check_running();
         if (!file_io::path_text(entry.path().filename()).starts_with("checkpoint.partial.")) continue;
         auto const saved = stamp(file_io::path_text(entry.path()));
         if (saved.bytes < 65 || saved.bytes > checkpoint_buffer_bytes(external_) || saved.bytes > config_.memory_limit_bytes / 8) continue;
@@ -1261,6 +1272,7 @@ inline void ExternalEngine::load()
 }
 inline void ExternalEngine::validate_runs() const
 {
+    config_.check_running();
     uint32_t first = 0;
     for (auto const& run : runs_)
     {
@@ -1269,6 +1281,7 @@ inline void ExternalEngine::validate_runs() const
         first += run.count; uint64_t bytes = 0; uint32_t ordinal = 0;
         for (auto const& segment : run.segments)
         {
+            config_.check_running();
             require(segment.root < roots_.size() && segment.ordinal == ordinal++ && segment.capacity > segment_header_bytes &&
                 segment.bytes && segment.bytes <= segment.capacity - segment_header_bytes && segment.stamp.bytes == segment.capacity &&
                 segment.stamp.file.inode, "invalid external run segment descriptor");
@@ -1634,6 +1647,7 @@ private:
     {
         while (!bytes.empty())
         {
+            engine_.config_.check_running();
             auto const& segment = run_.segments.at(segment_);
             size_t const n = size_t(std::min<uint64_t>(bytes.size(), segment.bytes - offset_));
             if (opened_ != segment_)
@@ -1689,6 +1703,7 @@ public:
     void append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
     {
         std::lock_guard lock(mutex_);
+        if (engine_) engine_->config_.check_running();
         require(engine_ && !sealed_ && member < size() && count && count <= size() - member,
             "invalid contribution input member");
         claim(member, count);
@@ -1828,6 +1843,7 @@ public:
     }
     void begin_member(uint16_t member, uint64_t count)
     {
+        if (engine_) engine_->config_.check_running();
         require(engine_ && !sealed_ && !active_ && !failed_ && member == finished_ && member < size() && count &&
             count <= fragment_bound_ && count <= UINT32_MAX, "invalid prepared input member declaration");
         current_ = {}; current_.count = count; current_.word_offset = payload_.bytes + payload_writer_->buffered_bytes();
@@ -1836,6 +1852,7 @@ public:
     }
     void append_raw(std::span<uint64_t const> values)
     {
+        if (engine_) engine_->config_.check_running();
         require(engine_ && active_ && !sealed_ && !failed_ && !packed_ && values.size() <= current_.count - written_,
             "prepared raw input exceeds its declaration");
         failed_ = true;
@@ -1844,6 +1861,7 @@ public:
         uint64_t const maximum_delta = uint64_t(72 - engine_->identity_.header.k) * (178ull << (engine_->identity_.header.k - 8));
         while (!values.empty())
         {
+            engine_->config_.check_running();
             // A full buffer ends the compute slice. A boundary gap can span
             // buffers, so leave the current fragment unconsumed until all of
             // its preceding boundary entries have been emitted.
@@ -1875,6 +1893,7 @@ public:
     }
     void append_packed(PackedFragmentTile const& tile)
     {
+        if (engine_) engine_->config_.check_running();
         require(engine_ && active_ && !sealed_ && !failed_ && !written_, "prepared packed input follows raw fragments");
         failed_ = true;
         auto const chunks = PlotGroupFile::getChunkCountForK(engine_->identity_.header.k);
@@ -2245,6 +2264,7 @@ inline AppendResult ExternalEngine::append(PreparedInput& input, uint16_t prefix
 }
 inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t prefix)
 {
+    config_.check_running();
     std::lock_guard lock(input.mutex_);
     require(contributions_ == &input && input.engine_ == this && input.sealed_ &&
         input.frontier_ == members_ && confirmed_ && can_append(), "contribution input owner/frontier differs");
@@ -2272,7 +2292,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     std::vector<Summary> summaries(size_t(chunks), Summary{});
     if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
         {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_,
-        {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get());
+        {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
     auto codec = std::make_unique<ChunkCodec>(identity_.header.k, config_.codec_bytes, config_.cpu_scheduler);
     std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
     std::vector<EncodedChunk> parts; parts.reserve(UINT16_MAX);
@@ -2309,6 +2329,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     rewind(false);
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
+        config_.check_running();
         if (!read_chunk()) { fits = false; break; }
         auto& summary = summaries[size_t(chunk)];
         for (auto const& part : parts)
@@ -2339,6 +2360,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         uint64_t index_bits = 0; BitWriter field; fits = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
         {
+            config_.check_running();
             if (!read_chunk()) { fits = false; break; }
             uint64_t const work = ChunkCodec::estimate_work(identity_.header.k, payload.size(), 0);
             if (work > config_.codec_bytes) { fits = false; break; }
@@ -2378,10 +2400,12 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     identity_.pending = true; identity_.target_members = members_; identity_.pending_peak_bytes = peak;
     save("external-run", summaries); std::vector<Summary>().swap(summaries);
     release_contributions(); encoding.finish(); balance();
+    config_.check_running();
     return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
 }
 inline AppendResult ExternalEngine::append_source(Members members, PreparedInput* input, uint16_t count)
 {
+    config_.check_running();
     ThreadCpuTimer cpu(contribution_owner_cpu_);
     require(confirmed_ && can_append(), "external append requires confirmed staging phase"); check_paths();
     require(count && count <= UINT16_MAX - members_, "invalid external batch membership");
@@ -2401,7 +2425,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
     std::vector<Summary> summaries(size_t(chunks), Summary{});
     if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
-        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get());
+        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
     std::vector<size_t> cursors(count, 0);
     std::vector<FragmentRegion> regions(count);
     std::unique_ptr<InputReader> input_reader;
@@ -2464,6 +2488,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         std::vector<ChunkSummary> details; details.reserve(summary_limit);
         for (size_t first = 0; first < summaries.size();)
         {
+            config_.check_running();
             size_t const limit = std::min(summary_limit, summaries.size() - first);
             tasks.clear(); window_regions.clear(); input_words.clear();
             for (size_t i = 0; i < limit; ++i)
@@ -2489,6 +2514,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     }
     else for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
+        config_.check_running();
         input_words.clear(); read_regions(chunk, regions, input_words);
         maximum_input_words = std::max<uint64_t>(maximum_input_words, input_words.size());
         reduce(chunk, regions, ChunkCodec::fresh_summary(identity_.header.k, chunk, regions, config_.cpu_scheduler.get()));
@@ -2509,6 +2535,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         contribution_bound = 0; bool buffers = true, encodable = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
         {
+            config_.check_running();
             input_words.clear(); read_regions(chunk, regions, input_words);
             uint64_t symbols = 0; for (auto const& region : regions) symbols = grow_add(symbols, region.size());
             payload.clear(); contributions.clear();
@@ -2632,6 +2659,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         }
         auto prepare = [&](Window& window, uint64_t first)
         {
+            config_.check_running();
             window.regions.clear(); window.words.clear(); window.tasks.clear(); window.first = first;
             uint64_t const window_count = std::min<uint64_t>(window_chunks, chunks - first);
             for (uint64_t i = 0; i < window_count; ++i)
@@ -2661,6 +2689,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         if (worker) pending.get();
         for (;;)
         {
+            config_.check_running();
             if (next && current->next < chunks)
             {
                 pending = worker->submit([&, following = next.get()] { encode(*following); });
@@ -2705,10 +2734,12 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     save("external-run", summaries); std::vector<Summary>().swap(summaries);
     if (input) release_prepared();
     encoding.finish(); balance();
+    config_.check_running();
     return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
 }
 inline bool ExternalEngine::merge_range(size_t first, size_t count)
 {
+    config_.check_running();
     if (count < 2) return true;
     require(phase_ == Phase::stage && first <= runs_.size() && count <= runs_.size() - first, "invalid external premerge");
     PhaseTimer merging(stats_, WorkPhase::merge);
@@ -2725,6 +2756,7 @@ inline bool ExternalEngine::merge_range(size_t first, size_t count)
     for (uint64_t chunk = 0; chunk < PlotGroupFile::getChunkCountForK(identity_.header.k); ++chunk)
         for (size_t i = 0; i < count; ++i)
         {
+            config_.check_running();
             auto const& run = runs_[first + i];
             for (uint32_t member = run.first; member < uint32_t(run.first) + run.count;)
             {
@@ -2759,6 +2791,7 @@ inline void ExternalEngine::balance()
 }
 inline void ExternalEngine::start_packing()
 {
+    config_.check_running();
     require(!prepared_ && !contributions_, "external packing cannot overlap a prepared input");
     require(confirmed_, "external packing requires confirmed identity"); check_paths(); validate_runs();
     if (phase_ == Phase::stage && members_)
@@ -2781,6 +2814,7 @@ inline void ExternalEngine::start_packing()
 }
 inline void ExternalEngine::pack()
 {
+    config_.check_running();
     if (phase_ == Phase::stage) start_packing();
     else { check_paths(); validate_runs(); }
     PhaseTimer packing(stats_, WorkPhase::pack);
@@ -2970,9 +3004,11 @@ inline void ExternalEngine::pack()
         committed = output_bytes_;
         interval_codec_ns = stats_.codec_ns;
         interval_begin = std::chrono::steady_clock::now();
+        config_.check_running();
     };
     auto prepare = [&](Window& window, uint64_t first)
     {
+        config_.check_running();
         auto& payload = window.payload; auto& contributions = window.contributions;
         auto& tasks = window.tasks; auto& frontiers = window.frontiers;
         payload.clear(); contributions.clear(); tasks.clear(); frontiers.clear();
@@ -3023,6 +3059,7 @@ inline void ExternalEngine::pack()
     }
     while (packed_chunks_ < chunks)
     {
+        config_.check_running();
         if (next && current->next < chunks)
         {
             pending = worker->submit([&, following = next.get()] { encode(*following); });
@@ -3063,6 +3100,7 @@ inline void ExternalEngine::pack()
     auto& payload = current->payload; payload.resize(size_t(config_.window_bytes));
     for (uint64_t position = 0; position < index_bytes_;)
     {
+        config_.check_running();
         size_t const n = size_t(std::min<uint64_t>(payload.size(), index_bytes_ - position));
         { auto target_guard = target_lock();
           external_detail::read(index.fd, segment_header_bytes + position, std::span(payload).first(n), &stats_, {"index", &path_, &execution_destination_}); }
@@ -3094,6 +3132,7 @@ inline void ExternalEngine::cleanup()
 }
 inline Result ExternalEngine::finish()
 {
+    config_.check_running();
     require(confirmed_, "external finish requires confirmed identity"); check_paths();
     if (!members_ && phase_ == Phase::stage)
     {
@@ -3110,6 +3149,7 @@ inline Result ExternalEngine::finish()
     if (phase_ == Phase::stage || phase_ == Phase::pack) pack();
     if (phase_ == Phase::ready)
     {
+        config_.check_running();
         auto target_guard = target_lock();
         // Payload and index are already synced, with a durable ready record.
         // A crash around this header patch never makes resume trim the file.
@@ -3125,6 +3165,7 @@ inline Result ExternalEngine::finish()
     {
         runs_.clear(); save("external-retired");
     }
+    config_.check_running();
     return {output_bytes_, grow_add(final_bound_, metadata_bytes(identity_.header.k, external_)),
         metadata_bytes(identity_.header.k, external_), members_};
 }
@@ -3503,7 +3544,7 @@ inline bool ExternalEngine::release_completed()
 namespace group_grow
 {
 inline std::string ExternalEngine::checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
-                                                 ConstructionInspectionLimits const* inspection)
+                                                 ConstructionInspectionLimits const* inspection, Config const* runtime)
 {
     using namespace external_detail;
     file_io::Stat exists{}; std::string const ordinary = work + "/checkpoint";
@@ -3514,6 +3555,7 @@ inline std::string ExternalEngine::checkpoint_path(std::string const& work, std:
     // any cleanup. Later checkpoints are never inferred from temporary files.
     for (auto const& entry : std::filesystem::directory_iterator(file_io::native_path(work)))
     {
+        if (runtime) runtime->check_running();
         if (inspection) inspection->check();
         if (!file_io::path_text(entry.path().filename()).starts_with("checkpoint.partial.")) continue;
         auto const saved = stamp(file_io::path_text(entry.path())); if (saved.bytes < 65 || saved.bytes > limit) continue;

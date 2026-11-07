@@ -297,6 +297,8 @@ int fake_adapter(int argc, char** argv)
         { std::ofstream out(counter); out << value + 1; }
         std::ifstream in(fs::path(argv[2]) / "plots.json");
         if (in) std::cout << in.rdbuf(); else std::cout << "{\"success\":true,\"plots\":[]}";
+        if (flag("retirement-version-change")) { std::ofstream changed(root / "version"); changed << "fixture-native-2"; }
+        if (flag("retirement-config-change")) { std::ofstream changed(root / "config/config.yaml", std::ios::app); changed << "# changed during registry query\n"; }
     }
     else if (endpoint == "get_blockchain_state")
     {
@@ -1026,6 +1028,108 @@ void routes(fs::path const& directory)
     rejects([&] { (void)resolve_source(swapped, root, plot); }, "ambiguous source route accepted");
     root.path += "/missing"; rejects([&] { (void)resolve_source(table, root, plot); }, "missing source route inferred from a parent prefix");
 }
+void retired_workload_batches(fs::path const& directory)
+{
+    fs::create_directories(directory);
+    auto make_options = [&](char const* route)
+    {
+        HarvesterAdapterOptions options; options.root = directory / route; options.harvester = route;
+        options.executable = calibration_process::executable(); fs::create_directories(options.root / "config");
+        std::ofstream config(options.root / "config/config.yaml"); config << "self_hostname: localhost\nharvester:\n  num_threads: 1\n";
+        return options;
+    };
+    auto first = make_options("first"), second = make_options("second");
+    FarmInventory catalog; InventoryRoot root; root.path = file_io::path_text(directory / "sources"); catalog.roots = {root};
+    for (unsigned index = 0; index < 3; ++index)
+    {
+        InventoryPlot plot; plot.relative_path = "source-" + std::to_string(index) + ".plot";
+        plot.plot_id = std::string(63, 'a') + char('0' + index); plot.harvester = index == 2 ? second.harvester : first.harvester;
+        plot.workload_id = index == 1 ? "independent" : "shared";
+        plot.header_validated = true; plot.algorithm = PlotAlgorithm::pos1; plot.container = PlotContainer::chiapos_v1;
+        catalog.plots.push_back(plot);
+    }
+    auto registry = [&](HarvesterAdapterOptions const& options, std::optional<size_t> loaded = {}, bool duplicate = false)
+    {
+        std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
+        if (loaded) for (unsigned record = 0; record < (duplicate ? 2u : 1u); ++record)
+        {
+            if (record) out << ',';
+            auto const& plot = catalog.plots.at(*loaded); out << "{\"filename\":";
+            profile_detail::quote(out, file_io::path_text(file_io::native_path(root.path) / plot.relative_path));
+            out << ",\"plot_id\":\"" << plot.plot_id << "\"}";
+        }
+        out << "]}";
+    };
+    std::array<uint64_t, 1> a{0}, b{1}, c{2};
+    std::array<std::span<uint64_t const>, 2> batches{a, b};
+    std::array<std::span<uint64_t const>, 1> other{c};
+    RegistryScopeIndex scope(catalog);
+    registry(first, 0); registry(second);
+    auto observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    auto other_observed = observe_source_batches_retired(second, catalog, other, {}, &scope);
+    require(!observed.no_loaded_records[0] && observed.no_loaded_records[1] && other_observed.no_loaded_records[0],
+        "route snapshot conflated loaded and absent workloads or independent routes");
+    unsigned count = 0; { std::ifstream in(first.root / "registry-count"); in >> count; }
+    require(count == 1 && observed.observed != std::chrono::steady_clock::time_point{} && !observed.captured_at.empty(),
+        "independent workload results did not share one fresh route registry");
+    registry(first, 0, true);
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "duplicate registry path records released an independent absent workload");
+    registry(first, 0);
+    catalog.plots[1].plot_id = catalog.plots[0].plot_id;
+    observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(!observed.no_loaded_records[0] && !observed.no_loaded_records[1],
+        "a loaded duplicate plot ID released a different workload at another path");
+    registry(first); observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(observed.no_loaded_records[0] && observed.no_loaded_records[1],
+        "a later protected phase reused a stale loaded snapshot");
+    catalog.plots[1].plot_id.back() = '1';
+    { std::ofstream outside(first.root / "plots.json"); outside << "{\"success\":true,\"plots\":[{\"filename\":\"/unreviewed/source.plot\",\"plot_id\":\"" << std::string(64, 'b') << "\"}]}"; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "unexpected loaded arrivals were converted into a safe absent-workload result");
+    registry(first);
+    { std::ofstream changed(first.root / "retirement-version-change"); changed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "reader version changed during a grouped absence observation");
+    fs::remove(first.root / "retirement-version-change"); fs::remove(first.root / "version");
+    { std::ofstream changed(first.root / "retirement-config-change"); changed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
+        "reader configuration changed during a grouped absence observation");
+    fs::remove(first.root / "retirement-config-change");
+    {
+        auto bounded = first; bounded.limits.memory_bytes = 64 * 1024 * 1024;
+        FarmInventory large = catalog; large.plots.clear(); large.plots.reserve(3000);
+        std::vector<uint64_t> indices;
+        for (uint64_t index = 0; index < 3000; ++index)
+        {
+            auto plot = catalog.plots[0]; plot.relative_path = "large-" + std::to_string(index) + ".plot";
+            large.plots.push_back(std::move(plot)); indices.push_back(index);
+        }
+        auto all = std::span<uint64_t const>(indices);
+        std::array<std::span<uint64_t const>, 2> groups{all.first(1500), all.subspan(1500)};
+        require(all.size() > bounded.limits.memory_bytes / 32768 && groups[0].size() <= bounded.limits.memory_bytes / 32768,
+            "large-route fixture did not exceed the original per-batch aggregate bound");
+        { std::ofstream counter(first.root / "registry-count"); counter << 0; }
+        auto snapshot = observe_source_batches_retired(bounded, large, groups);
+        { std::ifstream counter(first.root / "registry-count"); counter >> count; }
+        require(count == 1 && snapshot.no_loaded_records[0] && snapshot.no_loaded_records[1],
+            "one fresh route snapshot refused independently admissible workload batches at its aggregate source count");
+        std::array<std::span<uint64_t const>, 2> oversized{all, all.first(1)};
+        snapshot = observe_source_batches_retired(bounded, large, oversized);
+        require(!snapshot.lookup_bounded[0] && !snapshot.no_loaded_records[0] && snapshot.lookup_bounded[1] && snapshot.no_loaded_records[1],
+            "one oversized workload blocked a bounded independent workload or released its unknown old arrivals");
+    }
+    auto tight = first; tight.limits.max_files = 1;
+    rejects([&] { (void)observe_source_batches_retired(tight, catalog, batches, {}, &scope); },
+        "grouped source lookup exceeded its aggregate count bound");
+    auto cancelled = first; cancelled.limits.cancelled = [] { return true; };
+    rejects([&] { (void)observe_source_batches_retired(cancelled, catalog, batches, {}, &scope); },
+        "grouped source lookup ignored cancellation");
+    auto expired = first; expired.limits.timeout_ms = 1;
+    { std::ofstream delayed(first.root / "version-delay"); delayed << '1'; }
+    rejects([&] { (void)observe_source_batches_retired(expired, catalog, batches, {}, &scope); },
+        "grouped source lookup ignored its bounded phase deadline");
+}
 void large_catalog(fs::path const& directory)
 {
     std::array<fs::path, 1> roots{directory}; auto catalog = scan_farm_inventory(roots);
@@ -1052,6 +1156,6 @@ int main(int argc, char** argv)
 {
     if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
     auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
+    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); retired_workload_batches(root / "retired-batches"); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
     catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }
 }

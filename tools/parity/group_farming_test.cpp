@@ -731,6 +731,111 @@ void test_small_exhaustive()
         drives[1] = drive;
     }
 }
+void test_cached_search_boundary()
+{
+    FarmingConfig config;
+    config.reader = FarmingReader::cached;
+    config.index_cache_bytes = 134217728;
+    config.harvester_cores = 2; config.lookup_workers = 5;
+    config.deadline_seconds = config.challenge_seconds = 1;
+    config.chain_seconds_per_member = 0.008L;
+    std::vector<FarmingDestination> drives(3);
+    auto storage = [&](size_t lane, uint64_t bytes, long double latency, long double bandwidth)
+    {
+        auto& drive = drives[lane]; drive.capacity_bytes = bytes; drive.resource = lane; drive.known_device = true;
+        drive.read_latency_seconds = latency; drive.read_bytes_per_second = bandwidth;
+    };
+    storage(0, 11000000000ull, 0.022L, 230000000);
+    storage(1, 4000000000ull, 0.014L, 110000000);
+    storage(2, 48000000000ull, 0.001L, 160000000);
+    for (auto objective : {FarmingObjective::energy, FarmingObjective::latency})
+    {
+        config.objective = objective;
+        auto selected = farming_plan(config, drives);
+        check(selected.feasible && selected.destinations[0].files == 1 && selected.destinations[1].files == 1 &&
+                  selected.destinations[2].files == 2,
+              "cached search missed the feasible heterogeneous warm layout");
+        auto live = farming_assess(config, drives, selected.destinations, extents(selected.destinations));
+        check(live.feasible && live.response_bound_seconds == selected.response_bound_seconds,
+              "cached extra descent differs from the exact final certificate");
+        auto frozen = selected.destinations.front();
+        auto with_empty = drives; with_empty.push_back(hdd(0));
+        auto expanded = farming_plan(config, with_empty, 64ull * 1024 * 1024, std::span(&frozen, 1));
+        check(expanded.feasible && expanded.destinations.front() == frozen && !expanded.destinations.back().files,
+              "cached extra descent changed a frozen schedule or populated an empty destination");
+        --config.index_cache_bytes;
+        check(!farming_plan(config, drives).feasible, "partial cache was treated as a complete warm layout");
+        ++config.index_cache_bytes;
+        auto shared = drives; shared[1].resource = shared[0].resource;
+        auto together = farming_plan(config, shared);
+        auto checked = farming_assess(config, shared, together.destinations, extents(together.destinations));
+        check(together.feasible == checked.feasible && together.response_bound_seconds == checked.response_bound_seconds &&
+                  together.destinations[0].resource_lanes == 2 && together.destinations[1].resource_rank == 1,
+              "cached descent changed shared-resource schedule or assessment semantics");
+        config.index_cache_bytes = 0;
+        auto cold = farming_plan(config, drives);
+        config.reader = FarmingReader::stateless;
+        auto stateless = farming_plan(config, drives);
+        check(cold.destinations == stateless.destinations && cold.candidates_evaluated == stateless.candidates_evaluated,
+              "a cache that cannot fit minimum counts added a redundant descent");
+        config.reader = FarmingReader::cached; config.index_cache_bytes = 134217728;
+    }
+    config = {}; config.group_members_override = 2;
+    auto bounded = hdd(10000000000ull); bounded.max_total_members = 2;
+    auto single = farming_plan(config, {bounded});
+    check(single.feasible && single.candidates_evaluated == 2,
+          "unchanged complete singleton sweep repeated its coordinate pass");
+}
+void test_extent_member_churn()
+{
+    FarmingConfig config;
+    config.meta_slots_override = 4; config.memory_bytes = 4000000000ull;
+    config.max_eligible_families_per_resource = 1000000;
+    config.deadline_seconds = config.challenge_seconds = 1000000;
+    std::vector<FarmingDestination> drives(2, hdd());
+    std::vector<FarmingDrivePlan> layouts(2);
+    std::vector<std::vector<uint16_t>> counts(2);
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    {
+        drives[lane].resource = 7;
+        layouts[lane].resource_rank = uint16_t(lane); layouts[lane].resource_lanes = 2; layouts[lane].meta_slots = 4;
+        for (unsigned file = 0; file < 4096; ++file) counts[lane].push_back(uint16_t(file + 1));
+    }
+    auto original = farming_assess(config, drives, layouts, counts);
+    // Reorder only mutually exclusive files within each family. A brute
+    // family map remains unchanged while adjacent sweep boundaries repeatedly
+    // expire one member size and introduce another.
+    for (auto& lane : counts)
+        for (size_t first = 0; first < lane.size(); first += 2) std::swap(lane[first], lane[first + 1]);
+    auto reordered = farming_assess(config, drives, layouts, counts);
+    check(original.feasible && reordered.feasible && original.response_bound_seconds == reordered.response_bound_seconds &&
+              original.dynamic_work_seconds_per_sp == reordered.dynamic_work_seconds_per_sp &&
+              original.reader_memory_bytes == reordered.reader_memory_bytes &&
+              original.max_eligible_families_per_resource == reordered.max_eligible_families_per_resource,
+          "member-size churn changed the family-union certificate");
+    // The same member size can finish and restart at one family boundary.
+    for (auto& lane : counts) std::fill(lane.begin(), lane.end(), 2);
+    auto repeated = farming_assess(config, drives, layouts, counts);
+    check(repeated.feasible && repeated.max_eligible_families_per_resource == original.max_eligible_families_per_resource,
+          "same-family starts and ends lost a live member-size entry");
+}
+void test_cached_comparison_bound()
+{
+    FarmingConfig config; config.objective = FarmingObjective::latency;
+    config.harvester_cores = config.lookup_workers = 1;
+    config.max_eligible_families_per_resource = 1024;
+    config.memory_bytes = 4000000000ull;
+    config.deadline_seconds = config.challenge_seconds = 1000000;
+    auto drive = hdd(1000000000000000ull);
+    drive.max_groups = drive.max_total_members = 262144;
+    auto small = hdd(10000000000ull); small.max_groups = small.max_total_members = 6;
+    auto cold = farming_plan(config, {drive, small});
+    config.reader = FarmingReader::cached; config.index_cache_bytes = 536870912;
+    auto cached = farming_plan(config, {drive, small});
+    check(cold.feasible && cached.feasible && cached.candidates_evaluated == farming_detail::maximum_candidates &&
+              !farming_detail::better(config, cold, cached),
+          "optional cache descent exceeded its comparison budget or discarded a certified baseline");
+}
 void test_fleet()
 {
     FarmingConfig c;
@@ -843,6 +948,9 @@ int main()
         test_planning_memory_boundaries();
         test_large_frozen_expansion();
         test_small_exhaustive();
+        test_cached_search_boundary();
+        test_cached_comparison_bound();
+        test_extent_member_churn();
         test_explicit_family_tradeoff();
         test_sparse_automatic_search();
         test_fleet();

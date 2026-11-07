@@ -333,11 +333,12 @@ inline void validate_replot_construction_binding(std::optional<ReplotConstructio
     require(current == reviewed,
         "construction checkpoint or native stage changed since review; repeat --revalidate at the current stopped boundary");
 }
-inline void validate_replot_reader_changes(farm::FarmInventory const& origin, farm::FarmInventory const& current)
+inline void validate_replot_reader_changes(farm::FarmInventory const& origin, farm::FarmInventory const& current,
+    farm::InventoryLimits const& limits = {})
 {
     require(origin.plots.size() == current.plots.size(), "revalidation changed the original inventory entry count");
-    auto const original = farm::farm_inventory_text(origin);
-    (void)farm::farm_inventory_text(current);
+    auto const original = farm::farm_inventory_text(origin, limits);
+    (void)farm::farm_inventory_text(current, limits);
     auto comparable = current;
     for (size_t index = 0; index < comparable.plots.size(); ++index)
     {
@@ -349,7 +350,7 @@ inline void validate_replot_reader_changes(farm::FarmInventory const& origin, fa
     network.reader_version = saved.reader_version; network.reader_identity = saved.reader_identity;
     network.farmer_version = saved.farmer_version; network.solver_version = saved.solver_version; network.service_status = saved.service_status;
     comparable.retirement_readers = origin.retirement_readers;
-    require(original == farm::farm_inventory_text(comparable),
+    require(original == farm::farm_inventory_text(comparable, limits),
         "revalidation changed original native objects, network, routes, workloads or protected inventory accounting");
     require(current.network.available && !current.network.reader_identity.empty() && !current.network.reader_version.empty(),
         "revalidation requires fresh target reader/network observations");

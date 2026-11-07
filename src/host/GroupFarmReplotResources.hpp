@@ -200,13 +200,19 @@ inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions cons
     result.cancelled = [cancelled = options.cancelled, until] { return (cancelled && cancelled()) || Clock::now() >= until; };
     return result;
 }
-inline Stage replot_stage(Profile const& profile, NativeRequest const& request, std::vector<Remaining> remaining,
+inline Stage replot_stage(AssessmentPreparation const& preparation, NativeRequest const& request, std::vector<Remaining> remaining,
     uint64_t ready_members, bool building, bool verifying, bool future, std::string name = {})
 {
     resource_detail::require(!building || !verifying, "migration construction and proof phases must be supervised sequentially");
     Stage result; result.name = name.empty() ? building ? "construction" : verifying ? "verification" : future ? "final-future" : "checkpoint" : std::move(name);
     result.future_filter = future; result.remaining = std::move(remaining);
-    bind_native_stage(profile, request, ready_members, result, building, verifying); return result;
+    bind_native_stage(preparation, request, ready_members, result, building, verifying); return result;
+}
+inline Stage replot_stage(Profile const& profile, NativeRequest const& request, std::vector<Remaining> remaining,
+    uint64_t ready_members, bool building, bool verifying, bool future, std::string name = {})
+{
+    resource_detail::require(!building || !verifying, "migration construction and proof phases must be supervised sequentially");
+    return replot_stage(AssessmentPreparation(profile), request, std::move(remaining), ready_members, building, verifying, future, std::move(name));
 }
 inline uint64_t replot_ready_members(FarmingState const& state, uint64_t ready_files)
 {
@@ -261,8 +267,9 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
         if (at->count > 1 || (known != can_confirm_unload.end() && known->second)) --at->count;
     };
     auto const restart_counts = remaining; AssessmentAccumulator accumulation(profile); std::string exhausted_selection;
+    auto& checks = accumulation.cache();
     auto phase = [&](std::vector<Remaining> const& counts, uint64_t ready, bool building, bool verifying, std::string const& name)
-    { for (bool future : {false, true}) accumulation.add(replot_stage(profile, request, counts, ready, building, verifying, future, name)); };
+    { for (bool future : {false, true}) accumulation.add(replot_stage(checks.preparation(), request, counts, ready, building, verifying, future, name)); };
     phase(remaining, ready_members, false, false, "current-confirmed-boundary-supervision");
     for (size_t index = size_t(journal.batch); index < review.batches.size(); ++index)
     {
@@ -296,8 +303,8 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
                 {
                     auto counts = remaining; for (auto source : prospective) reduce(counts, workload(batch, source));
                     for (bool future : {false, true})
-                        if (!assess_stage(profile, replot_stage(profile, request, counts, ready_members, true, false, future)).feasible ||
-                            !assess_stage(profile, replot_stage(profile, request, counts, ready_members, false, true, future)).feasible) return false;
+                        if (!checks.assess(replot_stage(checks.preparation(), request, counts, ready_members, true, false, future)).feasible ||
+                            !checks.assess(replot_stage(checks.preparation(), request, counts, ready_members, false, true, future)).feasible) return false;
                     return true;
                 });
             if (selected.search_exhausted && exhausted_selection.empty()) exhausted_selection = prefix + ":predelete-selection-search-bound-exhausted";
@@ -315,7 +322,7 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
             if (!retired && std::find(early.begin(), early.end(), source) == early.end()) reduce(remaining, workload(batch, source));
         }
     }
-    accumulation.add(replot_stage(profile, request, remaining, ready_members, false, false, true,
+    accumulation.add(replot_stage(checks.preparation(), request, remaining, ready_members, false, false, true,
         "remaining-final-after-conditional-confirmed-source-unload"));
     auto result = accumulation.finish();
     if (!exhausted_selection.empty()) fail(result, std::move(exhausted_selection));

@@ -1335,6 +1335,26 @@ void fixture(std::string const& path)
 void shared_scheduler()
 {
     rejects([] { CodecScheduler invalid(0); });
+    {
+#ifdef __linux__
+        auto thread_count = []
+        { return std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}); };
+        auto const before = thread_count();
+#endif
+        auto preview = std::make_shared<CodecScheduler>(2, CodecScheduler::Execution::preview);
+#ifdef __linux__
+        require(thread_count() == before, "read-only scheduler started worker threads");
+#endif
+        require(preview->workers() == 2, "read-only scheduler lost its modeled worker count");
+        bool ran = false;
+        rejects([&] { (void)preview->submit([&] { ran = true; }); });
+        rejects([&] { CodecScheduler::Lease invalid(preview.get()); ran = true; });
+        require(!ran, "read-only scheduler dispatched codec work");
+        Config modeled; modeled.workers = 2; modeled.cpu_scheduler = preview;
+        auto executing = modeled; executing.cpu_scheduler = std::make_shared<CodecScheduler>(2);
+        require(Engine::memory_bytes(18, modeled, 1) == Engine::memory_bytes(18, executing, 1),
+            "read-only scheduler changed the runtime memory admission model");
+    }
     for (unsigned workers : {1u, 2u})
     {
         auto scheduler = std::make_shared<CodecScheduler>(workers);

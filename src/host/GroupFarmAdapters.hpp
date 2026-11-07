@@ -257,6 +257,12 @@ struct SourceRetirementObservation
     std::string source, captured_at, reason;
     std::chrono::steady_clock::time_point observed;
 };
+struct SourceRetirementSnapshot
+{
+    std::vector<bool> no_loaded_records, lookup_bounded;
+    std::string source, captured_at;
+    std::chrono::steady_clock::time_point observed;
+};
 namespace adapter_detail
 {
 using inventory_detail::require;
@@ -1835,26 +1841,37 @@ inline void validate_replot_reader_observations(FarmInventory const& inventory,
     (void)adapter_detail::observe_replot_reader_observations(inventory, table, fallback, native_audited_nonactive,
         published, scope, working_memory_bytes, true);
 }
-inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
-    std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr)
+// Every batch receives its own absence result from the same fresh route
+// registry. No result survives a protected phase or grants retirement itself.
+inline SourceRetirementSnapshot observe_source_batches_retired(HarvesterAdapterOptions const& options,
+    FarmInventory const& inventory, std::span<std::span<uint64_t const> const> batches,
+    PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr)
 {
-    SourceRetirementObservation result; result.captured_at = inventory_detail::timestamp();
-    try
+    inventory_detail::require(!batches.empty() && batches.size() <= options.limits.max_files && batches.size() <= options.limits.memory_bytes / 1024,
+        "source registry batches exceed their bounded lookup memory");
+    SourceRetirementSnapshot result; result.captured_at = inventory_detail::timestamp();
+    result.no_loaded_records.resize(batches.size(), false);
+    result.lookup_bounded.reserve(batches.size());
     {
-        inventory_detail::require(!sources.empty() && sources.size() <= options.limits.max_files && sources.size() <= options.limits.memory_bytes / 32768,
-            "source registry batch exceeds its bounded lookup memory");
-        std::set<std::string> paths, ids;
-        for (auto index : sources)
-        {
-            inventory_detail::require(index < inventory.plots.size(), "source registry batch index is invalid"); auto const& p = inventory.plots[size_t(index)];
-            inventory_detail::require(p.root < inventory.roots.size() && !p.plot_id.empty() &&
-                (options.harvester.empty() || p.harvester.empty() || options.harvester == p.harvester), "source registry batch crosses a reviewed route or lacks plot identity");
-            paths.insert(file_io::path_text(file_io::native_path(inventory.roots[p.root].path) / inventory_detail::relative(p.relative_path))); ids.insert(p.plot_id);
-        }
         adapter_detail::Session session(options); result.source = session.source();
-        auto version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
-        for (auto index : sources)
+        for (auto sources : batches)
         {
+            session.running();
+            result.lookup_bounded.push_back(!sources.empty() && sources.size() <= options.limits.max_files && sources.size() <= options.limits.memory_bytes / 32768);
+            if (!result.lookup_bounded.back()) continue;
+            for (auto index : sources)
+            {
+                session.running();
+                inventory_detail::require(index < inventory.plots.size(), "source registry batch index is invalid"); auto const& p = inventory.plots[size_t(index)];
+                inventory_detail::require(p.root < inventory.roots.size() && !p.plot_id.empty() &&
+                    (options.harvester.empty() || p.harvester.empty() || options.harvester == p.harvester), "source registry batch crosses a reviewed route or lacks plot identity");
+            }
+        }
+        auto version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
+        adapter_detail::require_reviewed_reader(session, inventory, options, version, scope);
+        for (size_t batch = 0; batch < batches.size(); ++batch) if (result.lookup_bounded[batch]) for (auto index : batches[batch])
+        {
+            session.running();
             auto const& p = inventory.plots[size_t(index)];
             bool const header_only = p.reader_identity.empty() && p.header_validated && p.algorithm == PlotAlgorithm::pos1 &&
                 (p.container == PlotContainer::chiapos_v1 || p.container == PlotContainer::chiapos_v2);
@@ -1865,18 +1882,70 @@ inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptio
         inventory_detail::require(plots.kind == profile_detail::Json::array && plots.items.size() <= options.limits.max_files,
             "native source registry snapshot exceeds its bound");
         adapter_detail::require_registry_scope(session, response, inventory, options, published, scope);
+        // Keep lookup retention at the original per-workload bound, even when
+        // the whole route has many more sources. Only native RPC and its DOM
+        // are shared; each workload scans that same coherent snapshot.
+        std::set<std::string> loaded_paths;
         for (auto const& p : plots.items)
-            if (paths.contains(inventory_detail::string(p, "filename")) ||
-                ids.contains(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32)))
-            { result.reason = "a batch source path or plot ID is still registered; old arrivals remain reserved"; return result; }
+        {
+            session.running(); auto path = inventory_detail::string(p, "filename");
+#ifdef _WIN32
+            std::replace(path.begin(), path.end(), '\\', '/');
+#endif
+            inventory_detail::require(loaded_paths.insert(path).second, "native source registry repeats a source path");
+        }
+        // Discard duplicate-check path copies before building a source lookup.
+        loaded_paths.clear();
+        for (size_t batch = 0; batch < batches.size(); ++batch)
+        {
+            if (!result.lookup_bounded[batch]) continue;
+            session.running(); std::set<std::string> paths, ids;
+            for (auto index : batches[batch])
+            {
+                session.running(); auto const& p = inventory.plots[size_t(index)];
+                auto path = file_io::path_text(file_io::native_path(inventory.roots[p.root].path) / inventory_detail::relative(p.relative_path));
+#ifdef _WIN32
+                std::replace(path.begin(), path.end(), '\\', '/');
+#endif
+                paths.insert(std::move(path)); ids.insert(p.plot_id);
+            }
+            bool loaded = false;
+            for (auto const& p : plots.items)
+            {
+                session.running(); auto path = inventory_detail::string(p, "filename");
+#ifdef _WIN32
+                std::replace(path.begin(), path.end(), '\\', '/');
+#endif
+                if (paths.contains(path) || ids.contains(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32)))
+                { loaded = true; break; }
+            }
+            result.no_loaded_records[batch] = !loaded;
+        }
         inventory_detail::require(adapter_detail::version(session.rpc(AdapterOperation::harvester_version)) == version,
             "source registry reader version changed during absence observation; retain old reservations");
-        session.unchanged(); result.observed = std::chrono::steady_clock::now(); result.no_loaded_record = true;
-        result.reason = "one fresh native registry snapshot has no batch source paths/IDs; queued/resident/opaque reservations remain separate";
+        session.unchanged(); result.observed = std::chrono::steady_clock::now();
+    }
+    return result;
+}
+inline SourceRetirementObservation observe_sources_retired(HarvesterAdapterOptions const& options, FarmInventory const& inventory,
+    std::span<uint64_t const> sources, PublishedPlotAllowance const& published = {}, RegistryScopeIndex const* scope = nullptr)
+{
+    try
+    {
+        std::array<std::span<uint64_t const>, 1> batches{sources};
+        auto snapshot = observe_source_batches_retired(options, inventory, batches, published, scope);
+        SourceRetirementObservation result; result.no_loaded_record = snapshot.no_loaded_records.front();
+        result.source = std::move(snapshot.source); result.captured_at = std::move(snapshot.captured_at); result.observed = snapshot.observed;
+        result.reason = !snapshot.lookup_bounded.front() ? "source registry batch exceeds its bounded lookup memory; old arrivals remain reserved" :
+            result.no_loaded_record ? "one fresh native registry snapshot has no batch source paths/IDs; queued/resident/opaque reservations remain separate" :
+                "a batch source path or plot ID is still registered; old arrivals remain reserved";
+        return result;
     }
     catch (std::exception const& error)
-    { if (options.limits.cancelled && options.limits.cancelled()) throw; result.no_loaded_record = false; result.reason = error.what(); }
-    return result;
+    {
+        if (options.limits.cancelled && options.limits.cancelled()) throw;
+        SourceRetirementObservation result; result.captured_at = inventory_detail::timestamp(); result.reason = error.what(); return result;
+    }
 }
 inline SourceRetirementObservation observe_source_retired(HarvesterAdapterOptions const& options, InventoryRoot const& root, InventoryPlot const& plot)
 {

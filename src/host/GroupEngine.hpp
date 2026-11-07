@@ -29,6 +29,11 @@ namespace group_grow
 using group_tools::require;
 using Header = PlotGroupFile::Header;
 
+struct ConstructionInterrupted : std::runtime_error
+{
+    ConstructionInterrupted() : std::runtime_error("interrupted; repeat the command with --resume") {}
+};
+
 struct Config
 {
     uint64_t capacity_bytes = uint64_t(std::numeric_limits<int64_t>::max());
@@ -44,6 +49,12 @@ struct Config
     std::shared_ptr<RemoteEncoder> remote_encoder;
     unsigned merge_inputs = 2;
     uint64_t memory_limit_bytes = UINT64_MAX;
+    // Runtime controller authority, never serialized into a checkpoint. Check
+    // only before bounded work or after a recoverable transaction, and join
+    // borrowed windows before allowing the exception to leave their owner.
+    std::function<bool()> cancelled;
+    void check_running() const
+    { if (cancelled && cancelled()) throw ConstructionInterrupted{}; }
 };
 struct Identity
 {
@@ -604,6 +615,7 @@ inline void Engine::check_path() const
 }
 inline void Engine::read_at(uint64_t offset, std::span<uint8_t> bytes) const
 {
+    config_.check_running();
     if (inspection_limits_) inspection_limits_->check();
     grow_add(offset, bytes.size());
     while (!bytes.empty())
@@ -780,6 +792,7 @@ inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector
     require(rice < 63, "invalid group index parameter");
     for (auto& size : sizes)
     {
+        config_.check_running();
         if (inspection_limits_) inspection_limits_->check();
         bool const negative = bit();
         uint64_t remainder = 0;
@@ -955,7 +968,7 @@ inline void Engine::confirm_identity()
 
 inline void Engine::prepare_members(Members members, uint16_t first)
 {
-    CodecScheduler::Lease compute(config_.cpu_scheduler.get());
+    CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
     require(!members.empty() && members.size() <= size_t(UINT16_MAX - first), "invalid incoming membership");
     uint8_t const k = identity_.header.k;
     uint64_t const end = 1ull << (k * 2);
@@ -985,6 +998,7 @@ inline void Engine::prepare_members(Members members, uint16_t first)
     if (member_boundaries_.empty()) member_boundaries_.resize(members.size());
     for (size_t member = 0; member < members.size(); ++member)
     {
+        config_.check_running();
         auto const view = members[member];
         if (view.compact())
         {
@@ -1002,6 +1016,7 @@ inline void Engine::prepare_members(Members members, uint16_t first)
         uint64_t chunk_end = range;
         for (size_t i = 0; i < fragments.size(); ++i)
         {
+            if (i % digest_words == 0) config_.check_running();
             require(fragments[i] < end && (!i || fragments[i] >= fragments[i - 1]),
                     "empty, unsorted or out-of-range incoming member");
             while (fragments[i] >= chunk_end)
@@ -1015,7 +1030,7 @@ inline void Engine::prepare_members(Members members, uint16_t first)
 }
 inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBatchHash const* hash) const
 {
-    CodecScheduler::Lease compute(config_.cpu_scheduler.get());
+    CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
     bool same = digest_count_ != 0 && digest_count_ == members.size();
     for (size_t i = 0; same && i < members.size(); ++i)
         same = members[i].compact() && members[i].immutable_id() == digest_ids_[i];
@@ -1059,12 +1074,15 @@ inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBat
         uint64_t count = 0;
         std::array<uint64_t, digest_words> decoded;
         std::exception_ptr error;
+        Config const* config = nullptr;
     } reader{members, identity_.header.k};
+    reader.config = &config_;
     auto next = [](void* context, pos2_sha256_segment* segment) noexcept -> int
     {
         auto& reader = *static_cast<Reader*>(context);
         try
         {
+            reader.config->check_running();
             if (reader.member == reader.members.size()) return 0;
             auto const view = reader.members[reader.member];
             if (reader.prefix)
@@ -1078,9 +1096,11 @@ inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBat
             {
                 auto const raw = view.raw();
                 require(raw.size() <= SIZE_MAX / sizeof(uint64_t), "member hash length overflow");
-                *segment = {reinterpret_cast<uint8_t const*>(raw.data()), raw.size() * sizeof(uint64_t)};
-                ++reader.member;
-                reader.prefix = true;
+                auto const part = raw.subspan(reader.offset, std::min(raw.size() - reader.offset, reader.decoded.size()));
+                *segment = {reinterpret_cast<uint8_t const*>(part.data()), part.size_bytes()};
+                reader.offset += part.size();
+                if (reader.offset == raw.size())
+                { ++reader.member; reader.offset = 0; reader.prefix = true; }
                 return 1;
             }
             size_t const chunks = size_t(PlotGroupFile::getChunkCountForK(reader.k));
@@ -1202,6 +1222,7 @@ inline void Engine::admit_chunk(uint64_t work)
 
 inline uint64_t Engine::window_count(uint64_t edge, bool reverse, Members members, uint64_t stop)
 {
+    config_.check_running();
     uint64_t const chunks = old_sizes_.size();
     uint64_t const limit = reverse ? edge : std::min(chunks, stop) - edge;
     uint64_t const baseline = ChunkCodec::estimate_base();
@@ -1252,6 +1273,7 @@ inline uint64_t Engine::window_count(uint64_t edge, bool reverse, Members member
 
 inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
 {
+    config_.check_running();
     PhaseTimer timing(stats_, WorkPhase::plan);
     require(confirmed_, "caller must confirm requested identity and budgets before planning");
     require(!identity_.pending, "pending construction requires resume with its saved batch");
@@ -1273,6 +1295,7 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
     uint64_t old_offset = sizeof(Header) + identity_.memo.size(), new_offset = old_offset;
     for (uint64_t first = 0; first < chunks;)
     {
+        config_.check_running();
         uint64_t const count = window_count(first, false, members);
         encode_window(first, count, old_offset,
             std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
@@ -1339,6 +1362,7 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
 
 inline std::optional<Plan> Engine::plan_fresh(Members members, MemberBatchHash const* hash)
 {
+    config_.check_running();
     require(confirmed_, "caller must confirm requested identity and budgets before planning");
     if (identity_.pending || identity_.old_members) return std::nullopt;
     PhaseTimer timing(stats_, WorkPhase::plan);
@@ -1358,6 +1382,7 @@ inline std::optional<Plan> Engine::plan_fresh(Members members, MemberBatchHash c
     uint64_t offset = sizeof(Header) + identity_.memo.size();
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
+        config_.check_running();
         uint64_t incoming = 0;
         for (size_t member = 0; member < members.size(); ++member)
         {
@@ -1528,6 +1553,7 @@ inline AppendResult Engine::append(Members members, MemberBatchHash const* hash,
 
 inline Result Engine::apply_prepared(Plan& plan, Members members)
 {
+    config_.check_running();
     PhaseTimer timing(stats_, WorkPhase::encode);
     auto saved = std::make_unique<Record>();
     std::memcpy(saved->magic.data(), "XCHPLOT2GROWv1\0\0\0", saved->magic.size());
@@ -1634,6 +1660,7 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
     uint64_t buffered = 0;
     while (next.remaining)
     {
+        config_.check_running();
         uint64_t const first = chunks - next.remaining;
         auto window = pending.valid() ? pending.get() :
             encode_owned(first, window_count(first, false, members), 0, members);
@@ -1709,6 +1736,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
     };
     while (record.remaining)
     {
+        config_.check_running();
         std::unique_ptr<Window> window;
         if (pending.valid()) window = pending.get();
         else
@@ -1799,6 +1827,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
         commit_direct();
         for (uint64_t end = count; end;)
         {
+            config_.check_running();
             uint64_t begin = end;
             while (begin && new_prefix[size_t(end)] - new_prefix[size_t(begin - 1)] <= record.redo_capacity) --begin;
             require(begin < end, "recovery workspace cannot hold one encoded chunk");
@@ -1844,6 +1873,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
 
 inline void Engine::replay(Record& record)
 {
+    config_.check_running();
     if (!record.pending) return;
     require(record.redo_bytes && record.new_frontier <= record.target.chunk_index_offset &&
         record.redo_bytes <= record.target.chunk_index_offset - record.new_frontier,
@@ -1854,6 +1884,7 @@ inline void Engine::replay(Record& record)
     sha256_init(&context);
     for (uint64_t position = 0; position < record.redo_bytes;)
     {
+        config_.check_running();
         auto const bytes = std::min<uint64_t>(buffer.size(), record.redo_bytes - position);
         read_at(record.redo_offset + position, std::span(buffer).first(size_t(bytes)));
         sha256_update(&context, buffer.data(), size_t(bytes));
@@ -1863,6 +1894,7 @@ inline void Engine::replay(Record& record)
     require(checksum == record.redo_digest, "pending redo checksum mismatch; preserve this file");
     for (uint64_t position = 0; position < record.redo_bytes;)
     {
+        config_.check_running();
         auto const bytes = std::min<uint64_t>(buffer.size(), record.redo_bytes - position);
         read_at(record.redo_offset + position, std::span(buffer).first(size_t(bytes)));
         write_at(record.new_frontier + position, std::span<uint8_t const>(buffer).first(size_t(bytes)));
@@ -1884,6 +1916,7 @@ inline void Engine::scan_sizes(Header const& header, uint64_t first, uint64_t co
     uint64_t offset = begin, buffered_begin = begin, buffered_end = begin;
     for (uint64_t chunk = first; chunk < first + count; ++chunk)
     {
+        config_.check_running();
         auto refill = [&]
         {
             buffered_begin = offset;
@@ -1913,6 +1946,7 @@ inline void Engine::scan_sizes(Header const& header, uint64_t first, uint64_t co
 
 inline Result Engine::resume(Members members, MemberBatchHash const* hash)
 {
+    config_.check_running();
     PhaseTimer timing(stats_, WorkPhase::encode);
     require(confirmed_, "caller must confirm requested identity and budgets before recovery");
     require(identity_.pending, "no saved construction requires resume");
@@ -2026,6 +2060,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
 
 inline Result Engine::finish(Plan const& plan)
 {
+    config_.check_running();
     check_path();
     Header marker = plan.header;
     marker.version = finalizing_version;
@@ -2077,6 +2112,7 @@ inline Result Engine::finish(Plan const& plan)
     old_sizes_ = plan.sizes;
     record_.reset();
     finalizing_ = false;
+    config_.check_running();
     return {plan.final_bytes, plan.peak_file_bytes, plan.workspace_bytes, plan.new_members};
 }
 } // namespace group_grow

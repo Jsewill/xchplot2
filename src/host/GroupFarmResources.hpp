@@ -392,6 +392,30 @@ inline void fail(Assessment& result, std::string reason)
 { result.feasible = false; if (result.reasons.size() < 1024) result.reasons.push_back(std::move(reason)); }
 } // namespace resource_detail
 
+// Reuse only while this borrowed profile is immutable and alive. Native
+// resource rebinding or a refreshed declaration requires new preparation.
+class AssessmentPreparation
+{
+    Profile const& profile_;
+    resource_detail::Graph graph_;
+    static resource_detail::Graph prepare(Profile const& profile)
+    { resource_detail::validate(profile); return resource_detail::Graph(profile); }
+public:
+    explicit AssessmentPreparation(Profile const& profile) : profile_(profile), graph_(prepare(profile)) {}
+    Profile const& profile() const { return profile_; }
+    resource_detail::Graph const& graph() const { return graph_; }
+    uint64_t memory_bytes() const
+    {
+        using namespace resource_detail;
+        uint64_t bytes = add(sizeof(*this), multiply(graph_.resources.capacity(), sizeof(Resource)));
+        for (auto const& r : graph_.resources)
+            bytes = add(bytes, add(add(r.id.capacity(), r.host.capacity()), add(2, multiply(r.aliases.capacity(), sizeof(std::string)))));
+        for (auto const& [name, index] : graph_.names)
+            bytes = add(bytes, add(sizeof(decltype(graph_.names)::value_type) + 64, add(name.capacity(), 1)));
+        return bytes;
+    }
+};
+
 // Inventory coverage includes outside plots, not just replacement candidates.
 // A blank/unknown assignment is unsafe even if those files will be retained.
 inline void validate_inventory_coverage(Profile const& profile, std::vector<Remaining> const& counts)
@@ -419,11 +443,11 @@ inline void validate_inventory_coverage(Profile const& profile, std::vector<Rema
     resource_detail::require(actual.empty(), "inventory workload has no mixed farm profile");
 }
 
-inline void bind_native_stage(Profile const& profile, NativeRequest const& request, uint64_t ready_members,
+inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRequest const& request, uint64_t ready_members,
                               Stage& stage, bool building, bool verifying)
 {
     using namespace resource_detail;
-    validate(profile); Graph graph(profile); auto const& n = profile.native;
+    auto const& profile = preparation.profile(); auto const& graph = preparation.graph(); auto const& n = profile.native;
     require(n.bounded && n.scope_complete, "missing complete bounded native resource envelope");
     require(n.covers_future_filter && n.phase_totals_include_controller && request.controller_ram_bytes,
             "native envelope must explicitly cover future filters and phase-total controller residency");
@@ -609,6 +633,9 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
     }
     stage.scope_complete = true;
 }
+inline void bind_native_stage(Profile const& profile, NativeRequest const& request, uint64_t ready_members,
+                              Stage& stage, bool building, bool verifying)
+{ bind_native_stage(AssessmentPreparation(profile), request, ready_members, stage, building, verifying); }
 
 inline void require_target_pool_difficulty(Profile const& profile, uint64_t current, uint64_t protocol = 0)
 {
@@ -617,12 +644,12 @@ inline void require_target_pool_difficulty(Profile const& profile, uint64_t curr
         "current target pool difficulty is below the reviewed full-solver floor or its protocol differs");
 }
 
-inline Assessment assess_stage(Profile const& profile, Stage const& stage)
+inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage const& stage)
 {
     using namespace resource_detail;
-    validate(profile); text(stage.name, true);
+    auto const& profile = preparation.profile(); auto const& graph = preparation.graph(); text(stage.name, true);
     require(stage.remaining.size() <= max_workloads, "too many stage workload partitions");
-    Graph graph(profile); Assessment result;
+    Assessment result;
     if (!stage.scope_complete) fail(result, "incomplete-stage-resource-scope:" + stage.name);
     std::vector<bool> external_gpu(graph.resources.size()), own_gpu(graph.resources.size());
     std::vector<std::vector<size_t>> paths;
@@ -776,6 +803,8 @@ inline Assessment assess_stage(Profile const& profile, Stage const& stage)
     }
     return result;
 }
+inline Assessment assess_stage(Profile const& profile, Stage const& stage)
+{ return assess_stage(AssessmentPreparation(profile), stage); }
 inline void merge_stage_assessment(Assessment& result, Assessment next, std::string const& stage_name)
 {
     resource_detail::text(stage_name, true);
@@ -1438,15 +1467,27 @@ inline void write_assessment_json(std::ostream& out, Assessment const& result)
     out << "]}";
 }
 
-// Bounded streaming aggregation for farms with many output files. The profile
-// must remain immutable and alive. Cache only feasible normalized envelopes;
-// repeated positive cohort counts have identical retained burst/residency costs.
-class AssessmentAccumulator
+// Bounded reuse for one immutable, borrowed profile. Only feasible normalized
+// envelopes are cached; positive cohort counts have identical retained burst/
+// residency costs. Stage names are restored for every caller's exact report.
+class AssessmentCache
 {
-    Profile const& profile_;
-    Assessment result_;
-    bool present_ = false, final_future_ = false;
+    AssessmentPreparation preparation_;
     std::vector<std::pair<std::string, Assessment>> cache_;
+    static uint64_t assessment_memory(Assessment const& value)
+    {
+        using namespace resource_detail;
+        uint64_t bytes = add(multiply(value.reasons.capacity(), sizeof(std::string)), multiply(value.margins.capacity(), sizeof(Margin)));
+        auto string = [&](std::string const& s) { bytes = add(bytes, add(s.capacity(), 1)); };
+        for (auto const& reason : value.reasons) string(reason);
+        for (auto const& margin : value.margins)
+        {
+            string(margin.resource);
+            for (auto const& [field, stage] : margin.worst_stages)
+            { bytes = add(bytes, sizeof(decltype(margin.worst_stages)::value_type) + 64); string(field); string(stage); }
+        }
+        return bytes;
+    }
     std::string key(Stage const& stage) const
     {
         using namespace resource_detail;
@@ -1454,7 +1495,7 @@ class AssessmentAccumulator
         std::map<std::string, uint64_t> remaining;
         for (auto const& r : stage.remaining) require(remaining.emplace(r.workload, r.count).second, "duplicate streaming workload partition");
         std::ostringstream out; out << stage.future_filter << stage.scope_complete << ':';
-        for (auto const& w : profile_.workloads)
+        for (auto const& w : preparation_.profile().workloads)
         {
             auto at = remaining.find(w.id); auto const count = at == remaining.end() ? w.plot_count : at->second;
             require(count <= w.plot_count, "streaming stage increases existing workload count");
@@ -1473,23 +1514,64 @@ class AssessmentAccumulator
         auto result = out.str(); return result.size() <= 65536 ? result : std::string{};
     }
 public:
+    // One allowance covers preparation, retained keys/results, normalized
+    // stage copies, current assessment and provenance rewriting. Retention
+    // uses at most half, leaving the other half for the bounded working set.
     static constexpr uint64_t memory_bytes = 16 * 1024 * 1024;
-    explicit AssessmentAccumulator(Profile const& profile) : profile_(profile) { resource_detail::validate(profile); }
-    void add(Stage const& stage)
+    explicit AssessmentCache(Profile const& profile) : preparation_(profile)
+    {
+        cache_.reserve(8);
+        resource_detail::require(retained_memory_bytes() <= memory_bytes / 2, "mixed farm assessment preparation exceeds its memory allowance");
+    }
+    AssessmentPreparation const& preparation() const { return preparation_; }
+    uint64_t retained_memory_bytes() const
+    {
+        using namespace resource_detail;
+        uint64_t bytes = add(preparation_.memory_bytes(), add(sizeof(cache_), multiply(cache_.capacity(), sizeof(decltype(cache_)::value_type))));
+        for (auto const& [identity, value] : cache_)
+            bytes = add(bytes, add(add(identity.capacity(), 1), assessment_memory(value)));
+        return bytes;
+    }
+    Assessment assess(Stage const& stage)
     {
         auto const identity = key(stage); Assessment current;
         auto at = std::find_if(cache_.begin(), cache_.end(), [&](auto const& entry) { return !identity.empty() && entry.first == identity; });
         if (at == cache_.end())
         {
-            Stage normalized = stage; normalized.name = "resource-state"; current = assess_stage(profile_, normalized);
+            Stage normalized = stage; normalized.name = "resource-state"; current = assess_stage(preparation_, normalized);
             if (!identity.empty() && current.feasible)
-            { if (cache_.size() == 8) cache_.erase(cache_.begin()); cache_.emplace_back(identity, current); }
+            {
+                if (cache_.size() == 8) cache_.erase(cache_.begin());
+                uint64_t const bytes = resource_detail::add(resource_detail::add(identity.size(), 1), assessment_memory(current));
+                if (bytes <= memory_bytes / 2 - retained_memory_bytes())
+                {
+                    cache_.emplace_back(identity, current);
+                    if (retained_memory_bytes() > memory_bytes / 2) cache_.pop_back();
+                }
+            }
         }
         else current = at->second;
         for (auto& margin : current.margins) for (auto& [field, provenance] : margin.worst_stages) provenance = stage.name;
         for (auto& reason : current.reasons)
             if (reason.starts_with("response-deadline-exceeded:") || reason.starts_with("incomplete-stage-resource-scope:"))
                 reason = reason.substr(0, reason.find(':') + 1) + stage.name;
+        return current;
+    }
+};
+// Bounded streaming aggregation shares its cache with related feasibility
+// checks, rather than retaining another graph and result set for those stages.
+class AssessmentAccumulator
+{
+    AssessmentCache cache_;
+    Assessment result_;
+    bool present_ = false, final_future_ = false;
+public:
+    static constexpr uint64_t memory_bytes = AssessmentCache::memory_bytes;
+    explicit AssessmentAccumulator(Profile const& profile) : cache_(profile) {}
+    AssessmentCache& cache() { return cache_; }
+    void add(Stage const& stage)
+    {
+        auto current = cache_.assess(stage);
         merge_stage_assessment(result_, std::move(current), stage.name); present_ = true; final_future_ = stage.future_filter;
     }
     Assessment finish() const

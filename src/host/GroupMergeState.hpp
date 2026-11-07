@@ -308,6 +308,7 @@ inline void MergeState::check_path() const
 }
 inline void MergeState::read(uint64_t offset, std::span<uint8_t> bytes) const
 {
+    config.check_running();
     require(grow_add(offset, bytes.size()) <= size(), "read outside merged destination");
     while (!bytes.empty())
     {
@@ -448,6 +449,7 @@ inline void MergeState::load_ordinary(Header header)
     unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
     for (auto& bytes : sizes)
     {
+        config.check_running();
         if (inspection_limits_) inspection_limits_->check();
         bool const negative = bits.read_u64(1);
         uint64_t const remainder = bits.read_u64(rice), quotient = bits.read_unary_64();
@@ -946,6 +948,7 @@ inline void MergeState::relocate_checkpoint()
 }
 inline void MergeState::publish()
 {
+    config.check_running();
     require(confirmed_ && tail_records && state.layout_done == state.layout_blocks, "incomplete merge publication");
     Header marker = state.target; marker.version = 0xf1;
     auto bytes = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(&marker), sizeof(marker));
@@ -958,5 +961,6 @@ inline void MergeState::publish()
     uint8_t const version = PlotGroupFile::FORMAT_VERSION; write(offsetof(Header, version), {&version, 1}); sync();
     grow_failpoint("merge-published"); active = false; tail_records = false;
     identity = {state.target, identity.memo, state.final_bytes, false, state.members, state.members, 0};
+    config.check_running();
 }
 } // namespace group_grow

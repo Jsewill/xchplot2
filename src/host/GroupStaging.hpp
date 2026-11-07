@@ -169,6 +169,7 @@ class StagingEngine
     { require(!file_io::resize_file(fd_, file_io::Offset(bytes)), "cannot resize staging workspace"); expected_bytes_ = bytes; }
     void read_at(uint64_t offset, std::span<uint8_t> bytes) const
     {
+        config_.check_running();
         grow_add(offset, bytes.size());
         while (!bytes.empty())
         {
@@ -264,6 +265,7 @@ class StagingEngine
         unsigned const rice = unsigned(gsz_rice_k_for_g(header.group_size));
         for (auto& value : old_sizes_)
         {
+            config_.check_running();
             if (inspection_limits_) inspection_limits_->check();
             bool const negative = bits.read_u64(1);
             uint64_t const remainder = bits.read_u64(rice), quotient = bits.read_unary_64();
@@ -715,6 +717,7 @@ inline void StagingEngine::discover(bool resume, std::optional<Identity> const& 
 
 inline AppendResult StagingEngine::append(Members members)
 {
+    config_.check_running();
     require(confirmed_ && (!active_ || record_.phase == Phase::stage), "staging append requires confirmed stage phase");
     check_path();
     if (!active_ && identity_.header.group_size && old_sizes_.empty()) load_index(identity_.header, identity_.bytes);
@@ -809,6 +812,7 @@ inline AppendResult StagingEngine::append(Members members)
     uint64_t old_position = sizeof(Header) + identity_.memo.size();
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
+        config_.check_running();
         prepare(chunk); auto bytes = codec.encoded_size(chunk, {}, 0, regions); ++stats_.sized_chunks;
         uint64_t const incoming_symbols = codec.symbol_count();
         require(bytes <= config_.window_bytes, "staged contribution exceeds source window");
@@ -965,6 +969,7 @@ inline AppendResult StagingEngine::append(Members members)
     uint64_t flushed = begin + sizeof(RunHeader);
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
+        config_.check_running();
         prepare(chunk); auto bytes = codec.encode(chunk, {}, 0, regions); ++stats_.encode_chunks;
         require(bytes.size() == sizes[size_t(chunk)], "staged member changed after measurement");
         uint64_t const length = bytes.size();
@@ -985,17 +990,20 @@ inline AppendResult StagingEngine::append(Members members)
     validated_source_ = committed;
     identity_.pending = true; identity_.old_members = record_.original.group_size;
     identity_.target_members = after; identity_.pending_peak_bytes = storage;
+    config_.check_running();
     result.result = {bound, storage, storage - bound, after}; return result;
 }
 
 inline Result StagingEngine::finish()
 {
+    config_.check_running();
     require(confirmed_, "staging finalization requires confirmed identity");
     check_path();
     validated_source_.reset();
     if (!active_)
     {
         if (size() != identity_.bytes) { truncate(identity_.bytes); sync(); }
+        config_.check_running();
         return {identity_.bytes, identity_.bytes, 0, identity_.header.group_size};
     }
     if (record_.staged == record_.original.group_size)
@@ -1004,6 +1012,7 @@ inline Result StagingEngine::finish()
         if (record_.original_bytes) { write_value(0, record_.original); sync(); }
         truncate(record_.original_bytes); sync();
         active_ = false; identity_.pending = false; identity_.pending_peak_bytes = 0;
+        config_.check_running();
         return {identity_.bytes, record_.storage_bytes, record_.storage_bytes - identity_.bytes, record_.staged};
     }
     if (record_.phase != Phase::compact)
@@ -1042,6 +1051,7 @@ inline Result StagingEngine::finish()
         require(baseline <= config_.codec_bytes, "staging codec budget cannot hold one worker");
         for (uint64_t first = 0; first < chunks;)
         {
+            config_.check_running();
             fragments.clear(); regions.clear(); tasks.clear(); costs.clear(); frontiers.clear(); old_frontiers.clear();
             costs.push_back(0);
             uint64_t source_bytes = 0, estimated_work = baseline, next = first;
@@ -1126,6 +1136,7 @@ inline Result StagingEngine::finish()
                     {
                         output.flush(); sync(); grow_failpoint("stage-pack-flushed"); record_.packed_chunks = chunk + 1; record_.packed_bytes = packed;
                         checkpoint(); grow_failpoint("stage-pack-committed");
+                        config_.check_running();
                         for (size_t i = 0; i < inputs.size(); ++i)
                         {
                             uint64_t const end = frontiers[task * inputs.size() + i];
@@ -1156,6 +1167,7 @@ inline Result StagingEngine::finish()
     std::vector<uint8_t> buffer(size_t(std::min(window, record_.final_bytes)), 0);
     while (record_.compacted < record_.final_bytes)
     {
+        config_.check_running();
         uint64_t const begin = record_.compacted;
         uint64_t const end = grow_add(begin, std::min(transaction, record_.final_bytes - begin));
         uint64_t position = begin;
@@ -1178,6 +1190,7 @@ inline Result StagingEngine::finish()
         grow_failpoint("stage-compact-committed"); evict(begin, end - begin); evict(record_.staged_end + begin, end - begin);
     }
     Header marker = record_.target; marker.version = finalizing_version;
+    config_.check_running();
     auto header = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(&marker), sizeof(marker));
     write_at(0, header.first(sizeof(Header) / 2)); grow_failpoint("stage-final-header-partial");
     write_at(sizeof(Header) / 2, header.subspan(sizeof(Header) / 2)); sync(); grow_failpoint("stage-finalizing");
@@ -1193,6 +1206,7 @@ inline Result StagingEngine::finish()
     identity_.old_members = identity_.target_members = record_.staged; identity_.pending_peak_bytes = 0; active_ = false;
     tail_records_ = false;
     old_sizes_.clear();
+    config_.check_running();
     return {record_.final_bytes, record_.storage_bytes, record_.storage_bytes - record_.final_bytes, record_.staged};
 }
 } // namespace group_grow

@@ -109,10 +109,7 @@ void validate(Identity const& identity)
 }
 
 using Arguments = pos2gpu::GroupOptions;
-struct Interrupted : std::runtime_error
-{
-    Interrupted() : std::runtime_error("interrupted; repeat the command with --resume") {}
-};
+using Interrupted = group_grow::ConstructionInterrupted;
 void check_cancel(Arguments const& args)
 {
     if (args.cancelled && args.cancelled()) throw Interrupted{};
@@ -630,6 +627,7 @@ struct Backend
         cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
         auto receive = [&](group_grow::PackedFragmentTile const& tile, uint64_t count)
             {
+                check_cancel(args);
                 group_grow::CodecScheduler::Lease compute(cpu_scheduler.get(), 1, [cancel] { cancel.check(); });
                 require(count && count <= bound && (!receiver || count == received_count),
                     "remote member count exceeds admitted bound or changed during transfer");
@@ -655,6 +653,7 @@ struct Backend
         };
         for (;;)
         {
+            check_cancel(args);
             cancel.check();
             require(attempt < UINT64_MAX, "pool task attempt exhausted"); task.attempt = ++attempt;
             try
@@ -663,6 +662,7 @@ struct Backend
                     receive, cancel, task);
                 break;
             }
+            catch (Interrupted const&) { throw; }
             catch (group_grow::WorkerAdmissionRejected const&) { throw; }
             catch (group_grow::pool::TransientTransport const&)
             { if (!retry()) break; }
@@ -680,6 +680,7 @@ struct Backend
             }
         }
         cancel.check();
+        check_cancel(args);
         require(receiver.has_value(), "remote producer did not deliver a member");
         group_grow::CodecScheduler::Lease compute(cpu_scheduler.get(), 1, [cancel] { cancel.check(); });
         auto result = receiver->finish();
@@ -867,6 +868,7 @@ struct Backend
                                 Arguments const& args, MemberLease* lease,
                                 group_grow::MemberBatchHash* hash)
     {
+        check_cancel(args);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (mode == "pool") return generate_pool(identity, index, args);
 #endif
@@ -912,11 +914,31 @@ struct Backend
         (void)hash;
 #endif
         require(mode == "cpu", "member producer was not initialized");
+        // Use the same reference progress boundary as local compute workers.
+        // Upstream reports cancellation by returning partial data, so retain
+        // the stop until it has been converted to the controller exception.
+        struct CancelProgress final : IProgressSink
+        {
+            Arguments const& args;
+            bool stopped = false;
+            std::exception_ptr failure;
+            explicit CancelProgress(Arguments const& value) : args(value) {}
+            bool on_event(ProgressEvent const&) noexcept override
+            {
+                try { stopped = stopped || (args.cancelled && args.cancelled()); }
+                catch (...) { stopped = true; failure = std::current_exception(); }
+                return !stopped;
+            }
+        } progress(args);
         Plotter::Options options{};
         options.validate = false;
         options.verbose = false;
-        return group_grow::Member(
-            Plotter(identity.params.get_plot_params_for_index(index)).run(options).t3_proof_fragments);
+        options.sink = &progress;
+        auto result = Plotter(identity.params.get_plot_params_for_index(index)).run(options).t3_proof_fragments;
+        if (progress.failure) std::rethrow_exception(progress.failure);
+        if (progress.stopped) throw Interrupted{};
+        check_cancel(args);
+        return group_grow::Member(std::move(result));
     }
 };
 
@@ -1095,6 +1117,7 @@ struct Producer
                                 cancel.check(); client->contributions_local(k, strength, ids, receive, cancel);
                                 backend.pool_local_fallbacks.fetch_add(1); break;
                             }
+                            catch (Interrupted const&) { throw; }
                             catch (std::exception const&)
                             {
                                 reset();
@@ -1972,6 +1995,7 @@ group_grow::Config configuration(Arguments const& args, uint64_t capacity, uint6
     config.checkpoint_bytes = args.checkpoint_bytes;
     config.io_overlap = args.io_overlap;
     config.release_cache = args.cache_release;
+    config.cancelled = args.cancelled;
     require(caller_fixed < args.max_ram, "caller metadata exceeds --max-ram");
     config.memory_limit_bytes = args.max_ram - caller_fixed;
     return config;
@@ -2528,6 +2552,7 @@ struct Construction
     }
     group_grow::Result finish()
     {
+        config.check_running();
         if (external)
         {
             auto const before = external->checkpoint_tuning_changes();
@@ -3808,6 +3833,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         finished = join_consumer(pending, reason);
     }
     else finished = finish();
+    check_cancel(args);
     finish_io.reset();
     metrics.members = finished.members;
     metrics.final_bytes = finished.final_bytes;
@@ -3840,6 +3866,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     static_cast<group_grow::Stats&>(metrics) = engine.stats();
     if (scratch_pool && engine.scratch_cleanup_complete)
         scratch_pool->release_after_cleanup(0, sum(allocated_bytes(target), engine.remaining_metadata_bytes));
+    check_cancel(args);
     return metrics;
 }
 
@@ -4061,7 +4088,7 @@ fs::path group_output_path(fs::path const& directory, Output const& output)
 fs::path migration_stage_path(fs::path const& directory, std::string const& job, uint64_t batch)
 { return directory / (".xchplot2-stage-" + job + '-' + std::to_string(batch) + ".building"); }
 std::optional<uint64_t> rollover_entry(fs::path const& directory, fs::path const& path, uint64_t memory_limit,
-                                     std::optional<uint64_t> writer_owned = {})
+                                     std::optional<uint64_t> writer_owned = {}, bool inspect_metadata = true)
 {
     auto const name = file_io::path_text(path.filename());
     std::string const prefix = "grow-group-";
@@ -4084,7 +4111,7 @@ std::optional<uint64_t> rollover_entry(fs::path const& directory, fs::path const
     if (name.size() == length) return ordinal;
     // A live engine owns its checkpoint and scratch turnover until its future
     // joins. Validate names here, then audit that metadata after ownership ends.
-    bool const inspect = !writer_owned || *writer_owned != ordinal;
+    bool const inspect = inspect_metadata && (!writer_owned || *writer_owned != ordinal);
     if (name == file_io::path_text(target.filename()) + ".external")
     {
         if (inspect) (void)group_grow::ExternalEngine::inspect(file_io::path_text(target), memory_limit);
@@ -5053,13 +5080,13 @@ struct FarmingRun
             audited = Construction::add_stats(audited, stats);
         }
     }
-    void check(std::span<uint8_t const> active = {}) const
+    void check(std::span<uint8_t const> active = {}, uint64_t occupied = 0,
+        FarmingStageSubmit const& submit = {})
     {
         for (auto const& [path, stamp] : manifests)
             require(stream_state::stamp(path) == stamp, "farming plan changed during the run");
-        for (size_t i = 0; i < lanes.size(); ++i)
+        auto audit_lane = [&](size_t i, bool inspect_metadata, bool metadata_only = false)
         {
-            if (!available.empty() && !available[i]) continue;
             if (!locks.empty() && locks[i]) locks[i]->check();
             auto const& lane = lanes[i];
             auto const& directory = state.directories[i].directory;
@@ -5069,18 +5096,25 @@ struct FarmingRun
             auto const successor = writing ? lane.successor_ordinal : std::nullopt;
             std::string const successor_name = successor ? file_io::path_text(group_path(file_io::native_path(directory), *successor).filename()) : "";
             size_t seen = 0;
+            bool auxiliary = false;
             for (auto const& entry : fs::directory_iterator(file_io::native_path(directory)))
             {
                 auto owned = writing ? std::optional(lane.ordinal) : std::nullopt;
                 if (successor && file_io::path_text(entry.path().filename()).starts_with(successor_name)) owned = successor;
                 auto const ordinal = rollover_entry(directory, entry.path(), memory_limit,
-                    owned);
-                if (!ordinal) continue;
+                    owned, inspect_metadata);
+                if (!ordinal)
+                {
+                    auxiliary = auxiliary || file_io::path_text(entry.path().filename()).starts_with("grow-group-");
+                    continue;
+                }
+                if (metadata_only) continue;
                 require(*ordinal < lane.outputs.size() ||
                     (writing && *ordinal == lane.ordinal) || (successor && *ordinal == *successor),
                     "unplanned farming output appeared during the run");
                 ++seen;
             }
+            if (metadata_only) return auxiliary;
             size_t expected = lane.outputs.size();
             if (writing && lane.ordinal == expected) ++expected;
             if (successor && *successor == expected) ++expected;
@@ -5094,7 +5128,34 @@ struct FarmingRun
                     now.modified_nanoseconds == saved.modified_nanoseconds && now.changed_seconds == saved.changed_seconds &&
                     now.changed_nanoseconds == saved.changed_nanoseconds, "saved farming output changed during the run");
             }
+            return auxiliary;
+        };
+        auto serial = [&]
+        {
+            for (size_t i = 0; i < lanes.size(); ++i)
+                if (available.empty() || available[i]) (void)audit_lane(i, true);
+        };
+        unsigned workers = unsigned(std::min(size_t(metadata_workers), staging_resources.size()));
+        // Full external checkpoint parsers retain their existing serial RAM
+        // envelope. Parallel work only owns directory entries, native stamps
+        // and the helper's bounded task descriptors on the shared CPU pool.
+        while (workers > 1 && (!submit || occupied >= memory_limit ||
+            sum(farming_staging_memory(state, workers, false), product(workers, mib)) > memory_limit - occupied)) --workers;
+        if (workers <= 1 || staging_resources.size() != lanes.size()) { serial(); return; }
+        std::vector<uint8_t> selected(lanes.size(), 1);
+        if (!available.empty()) selected = available;
+        workers = farming_staging_workers(staging_resources, selected, workers);
+        if (workers > 1)
+        {
+            auto const scratch = sum(farming_staging_memory(state, workers, false), product(workers, mib));
+            planning_peak = std::max(planning_peak, sum(occupied, scratch));
+            std::vector<uint8_t> auxiliary(lanes.size(), 0);
+            farming_resource_tasks(staging_resources, selected, workers, [&](size_t i)
+            { auxiliary[i] = audit_lane(i, false); }, submit);
+            for (size_t i = 0; i < lanes.size(); ++i) if (selected[i] && auxiliary[i])
+                (void)audit_lane(i, true, true);
         }
+        else serial();
     }
 
     void select_available()
@@ -6113,6 +6174,42 @@ std::string json_estimate(long double value)
     std::ostringstream out; out << std::setprecision(std::numeric_limits<long double>::max_digits10) << value;
     return out.str();
 }
+std::string replot_diagnostic_label(std::string_view value)
+{
+    constexpr size_t limit = 96;
+    if (value.size() <= limit) return json_string(value);
+    auto end = limit;
+    while (end && (uint8_t(value[end]) & 0xc0) == 0x80) --end;
+    return json_string(std::string(value.substr(0, end)) + "...");
+}
+std::string replot_pause_reason(group_grow::farm::Admission const& admission)
+{
+    auto const& assessment = admission.assessment;
+    if (assessment.reasons.empty()) return "waiting for resource recovery samples and hold time";
+    auto const& reason = assessment.reasons.front();
+    std::string result = replot_diagnostic_label(reason);
+    for (auto const& margin : assessment.margins) if (reason.ends_with(':' + margin.resource))
+    {
+        result += "; declared capacity=" + std::to_string(margin.capacity) + ", occupied=" + std::to_string(margin.occupied_units) +
+            ", remaining=" + std::to_string(margin.remaining_units) + ", drain_us=" + std::to_string(margin.drain_us) +
+            ", deadline_us=" + std::to_string(margin.deadline_us);
+        break;
+    }
+    return result;
+}
+std::string replot_unload_reason(std::string_view reason)
+{
+    // Adapter child output stays private. Report fixed categories rather than
+    // arbitrary external exception text, paths, configuration or credentials.
+    if (reason.find("still registered") != reason.npos) return "source path or plot ID is still registered; old arrivals remain reserved";
+    if (reason.find("version") != reason.npos) return "reviewed reader version changed; retain old reservations";
+    if (reason.find("configuration") != reason.npos || reason.find("config") != reason.npos) return "reader configuration changed or is unavailable; retain old reservations";
+    if (reason.find("executable") != reason.npos || reason.find("implementation") != reason.npos) return "reviewed reader implementation changed or is unavailable; retain old reservations";
+    if (reason.find("scope") != reason.npos || reason.find("route") != reason.npos) return "reader registry is outside its reviewed scope; retain old reservations";
+    if (reason.find("deadline") != reason.npos || reason.find("timeout") != reason.npos) return "reader registry observation reached its deadline; retain old reservations";
+    if (reason.find("memory") != reason.npos || reason.find("bound") != reason.npos) return "reader registry observation exceeded its bounded grant; retain old reservations";
+    return "native reader registry observation is unavailable; retain old reservations";
+}
 group_grow::farm::InventoryLimits replot_inventory_limits(Arguments const& args)
 {
     group_grow::farm::InventoryLimits limits;
@@ -6324,7 +6421,7 @@ int print_farm_inventory(Arguments const& args)
             }
         }
     }
-    auto const body = farm_inventory_text(inventory);
+    auto const body = farm_inventory_text(inventory, replot_inventory_limits(args));
     require(body.size() < args.max_ram / 16, "saved farm inventory exceeds --max-ram");
     if (!args.save_plan.empty()) stream_state::atomic_save(args.save_plan, body, false);
     if (args.json) std::cout << body << '\n';
@@ -6547,7 +6644,7 @@ ReplotInputs load_replot_review(Arguments const& args)
         result.review = group_grow::parse_replot_review(result.revalidation->origin_review, args.max_ram);
         auto const original = group_grow::farm::parse_farm_inventory(result.review.inventory_json, replot_inventory_limits(args));
         result.inventory = group_grow::farm::parse_farm_inventory(result.revalidation->inventory_json, replot_inventory_limits(args));
-        group_grow::validate_replot_reader_changes(original, result.inventory);
+        group_grow::validate_replot_reader_changes(original, result.inventory, replot_inventory_limits(args));
         for (auto const& reader : result.revalidation->readers) require(reader.root < result.inventory.roots.size(), "revalidation reader selects an absent original root");
     }
     else
@@ -6664,13 +6761,14 @@ ReplotMappingCapacity replot_mapping_capacity(group_grow::farm::Profile const& p
     group_grow::farm::NativeRequest request, std::function<void()> check = {})
 {
     using namespace group_grow::farm;
+    auto cache = std::make_shared<AssessmentCache>(profile);
     auto remaining = replot_inventory_counts(inventory); std::map<std::string, bool> can_confirm_unload;
     for (auto const& plot : inventory.plots) if (!plot.alias_of && !replot_nonplot(plot))
     {
         bool const known = plot.header_validated || (!plot.reader_identity.empty() && !plot.reader_version.empty());
         auto [at, fresh] = can_confirm_unload.emplace(plot.workload_id, known); if (!fresh) at->second = at->second && known;
     }
-    return [&, request = std::move(request), check = std::move(check), remaining = std::move(remaining),
+    return [&, cache = std::move(cache), request = std::move(request), check = std::move(check), remaining = std::move(remaining),
         can_confirm_unload = std::move(can_confirm_unload), consumed = size_t(0)]
         (size_t batch, std::span<uint64_t const> completed, std::span<uint64_t const> early) mutable
     {
@@ -6690,8 +6788,8 @@ ReplotMappingCapacity replot_mapping_capacity(group_grow::farm::Profile const& p
         for (bool future : {false, true})
         {
             if (check) check();
-            if (!assess_stage(profile, replot_stage(profile, request, counts, ready, true, false, future)).feasible ||
-                !assess_stage(profile, replot_stage(profile, request, counts, ready, false, true, future)).feasible) return false;
+            if (!cache->assess(replot_stage(cache->preparation(), request, counts, ready, true, false, future)).feasible ||
+                !cache->assess(replot_stage(cache->preparation(), request, counts, ready, false, true, future)).feasible) return false;
         }
         return true;
     };
@@ -7022,7 +7120,7 @@ ReplotInputs make_replot_review(Arguments const& args)
             review.batches.push_back(batch);
         }
     }
-    result.inventory.resource_template.reset(); result.inventory.resource_preparation.reset(); review.inventory_json = farm_inventory_text(result.inventory);
+    result.inventory.resource_template.reset(); result.inventory.resource_preparation.reset(); review.inventory_json = farm_inventory_text(result.inventory, replot_inventory_limits(args));
     std::ostringstream resource_text; write_profile_json(resource_text, result.resources); review.resources_json = resource_text.str();
     for (size_t lane = 0; lane < directories.size(); ++lane)
     {
@@ -7035,6 +7133,7 @@ ReplotInputs make_replot_review(Arguments const& args)
     {
         // Keep native capture failures inside the final assessment's
         // structured diagnostics without admitting an incomplete owner scope.
+        check_cancel(args);
         result.native_scope_error = error.what();
     }
     review.sources = candidates; replot_input_memory(result, args);
@@ -7044,7 +7143,9 @@ ReplotInputs make_replot_review(Arguments const& args)
         try
         {
             auto request = replot_request(args, result);
-            resource_memory = product(profile_memory(result.resources), 4);
+            // Preserve the existing request/count/lookup working allowance;
+            // immutable preparation and its bounded cache are additional.
+            resource_memory = sum(product(profile_memory(result.resources), 4), AssessmentCache::memory_bytes);
             resource_capacity = replot_mapping_capacity(result.resources, result.inventory, review, std::move(request), [&] { check_cancel(args); });
         }
         catch (Interrupted const&) { throw; }
@@ -7052,6 +7153,7 @@ ReplotInputs make_replot_review(Arguments const& args)
         {
             // Preserve the ordinary final assessment's structured diagnostics
             // when native binding is unavailable; mapping grants no admission.
+            check_cancel(args);
             resource_memory = 0;
         }
     }
@@ -7212,7 +7314,9 @@ bool replot_external_capacity(Arguments const& args, Identity const& identity, u
     uint64_t retained = sum(metadata, sum(pool.memory_bytes(), sizeof(ConstructionHistory)));
     if (scratch) retained = sum(retained, external_metadata(*scratch));
     uint64_t caller = sum(retained, sum(mib, sum(2 * sizeof(Member), batch_hash_bytes(args, 1))));
-    auto scheduler = std::make_shared<CodecScheduler>(unsigned(args.workers));
+    // Admission uses only engine memory models and in-memory scratch grants.
+    // Keep runtime scheduler memory charged above without starting its workers.
+    auto scheduler = std::make_shared<CodecScheduler>(unsigned(args.workers), CodecScheduler::Execution::preview);
     auto const remote = replot_preview_encoder(args, scheduler);
     auto config = configuration(args, capacity, caller, scheduler, remote);
     if (!scratch)
@@ -7308,7 +7412,8 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
     uint64_t const caller_fixed = sum(retained, sum(mib, sum(2 * sizeof(group_grow::Member), batch_hash_bytes(bounded, 1))));
     uint64_t capacity = 0;
     for (auto const& batch : inputs.review.batches) capacity = std::max(capacity, sum(batch.final_bound_bytes, batch.workspace_bound_bytes));
-    auto scheduler = std::make_shared<group_grow::CodecScheduler>(unsigned(request.cpu_threads));
+    // This config is read only by memory models; execution owns its scheduler.
+    auto scheduler = std::make_shared<group_grow::CodecScheduler>(unsigned(request.cpu_threads), group_grow::CodecScheduler::Execution::preview);
     auto const remote = replot_preview_encoder(bounded, scheduler);
     auto config = configuration(bounded, capacity, caller_fixed, scheduler, remote);
     uint64_t workspace = 0;
@@ -7387,6 +7492,8 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
             };
         }
         auto storage_capacity = std::move(external_capacity);
+        AssessmentAccumulator accumulation(replot_resources(inputs));
+        auto& cache = accumulation.cache();
         auto projected_counts = remaining; uint64_t projected_ready = 0; size_t projected_batch = 0;
         auto phase_capacity = [&](size_t index, std::map<std::string, uint64_t> const& available, std::span<uint64_t const> early)
         {
@@ -7402,8 +7509,8 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
             for (auto source : early) reduce(counts, inputs.inventory.plots.at(size_t(source)).workload_id);
             for (bool future : {false, true})
             {
-                if (!assess_stage(replot_resources(inputs), replot_stage(replot_resources(inputs), result.request, counts, projected_ready, true, false, future)).feasible ||
-                    !assess_stage(replot_resources(inputs), replot_stage(replot_resources(inputs), result.request, counts, projected_ready, false, true, future)).feasible) return false;
+                if (!cache.assess(replot_stage(cache.preparation(), result.request, counts, projected_ready, true, false, future)).feasible ||
+                    !cache.assess(replot_stage(cache.preparation(), result.request, counts, projected_ready, false, true, future)).feasible) return false;
             }
             return true;
         };
@@ -7415,23 +7522,23 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
         auto capacity_reasons = replot_prefix_capacity(inputs, phase_capacity, construction_filesystems, &early_retirements);
         result.feasible = result.feasible && capacity_reasons.empty();
         result.reasons.insert(result.reasons.end(), capacity_reasons.begin(), capacity_reasons.end());
-        uint64_t ready = 0; AssessmentAccumulator accumulation(replot_resources(inputs));
+        uint64_t ready = 0;
         auto const original = remaining;
         for (size_t index = 0; index < inputs.review.batches.size(); ++index)
         {
-            for (bool future : {false, true}) accumulation.add(replot_stage(replot_resources(inputs), result.request, remaining, ready, false, false, future,
+            for (bool future : {false, true}) accumulation.add(replot_stage(cache.preparation(), result.request, remaining, ready, false, false, future,
                 "batch-" + std::to_string(index) + "-before-early-retirement"));
             for (auto source : early_retirements[index]) reduce(remaining, inputs.inventory.plots.at(size_t(source)).workload_id);
             for (bool future : {false, true})
             {
-                accumulation.add(replot_stage(replot_resources(inputs), result.request, remaining, ready, true, false, future, "batch-" + std::to_string(index) + "-build"));
-                accumulation.add(replot_stage(replot_resources(inputs), result.request, remaining, ready, false, true, future, "batch-" + std::to_string(index) + "-verify"));
+                accumulation.add(replot_stage(cache.preparation(), result.request, remaining, ready, true, false, future, "batch-" + std::to_string(index) + "-build"));
+                accumulation.add(replot_stage(cache.preparation(), result.request, remaining, ready, false, true, future, "batch-" + std::to_string(index) + "-verify"));
             }
             auto const& batch = inputs.review.batches[index];
             ready = sum(ready, inputs.review.farm.directories[size_t(batch.lane)].layout.file_members(batch.ordinal));
-            for (bool future : {false, true}) accumulation.add(replot_stage(replot_resources(inputs), result.request, original, ready, false, false, future,
+            for (bool future : {false, true}) accumulation.add(replot_stage(cache.preparation(), result.request, original, ready, false, false, future,
                 "batch-" + std::to_string(index) + "-restart-with-unconfirmed-old-registries"));
-            for (bool future : {false, true}) accumulation.add(replot_stage(replot_resources(inputs), result.request, remaining, ready, false, false, future,
+            for (bool future : {false, true}) accumulation.add(replot_stage(cache.preparation(), result.request, remaining, ready, false, false, future,
                 "batch-" + std::to_string(index) + "-replacement-overlap"));
             for (uint64_t source = 0; source < batch.sources; ++source)
             {
@@ -7440,11 +7547,12 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
                     reduce(remaining, inputs.inventory.plots.at(size_t(selected)).workload_id);
             }
         }
-        auto final = replot_stage(replot_resources(inputs), result.request, remaining, ready, false, false, true, "final-after-confirmed-source-unload");
+        auto final = replot_stage(cache.preparation(), result.request, remaining, ready, false, false, true, "final-after-confirmed-source-unload");
         accumulation.add(final); result.resources = accumulation.finish(); result.feasible = result.feasible && result.resources.feasible;
         for (auto const& reason : result.resources.reasons) if (result.reasons.size() < 1024) result.reasons.push_back(reason);
     }
-    catch (std::runtime_error const& error) { result.feasible = false; if (result.reasons.size() < 1024) result.reasons.push_back(error.what()); }
+    catch (Interrupted const&) { throw; }
+    catch (std::runtime_error const& error) { check_cancel(args); result.feasible = false; if (result.reasons.size() < 1024) result.reasons.push_back(error.what()); }
     if (!result.feasible && inputs.mapping_search_exhausted)
     {
         if (result.reasons.size() == 1024) result.reasons.pop_back();
@@ -7482,22 +7590,36 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
     bool const metadata = args.metadata_only || successor;
     ReplotAssessment assessment;
     if (!metadata) assessment = assess_replot_review(replot_review_options(args, inputs.review), inputs);
+    bool plan_saved = false;
     if (!args.save_plan.empty())
     {
         require(!saved && !args.metadata_only, "save a fresh replot review from its inventory");
-        require(assessment.feasible, "cannot save an infeasible migration review");
-        auto body = replot_review_text(inputs.review);
-        auto const filesystem = storage_device(args.save_plan.parent_path()).filesystem;
-        uint64_t const reserve = sum(body.size(), 65536 + 65);
-        for (size_t lane = 0; lane < inputs.review.farm.directories.size(); ++lane)
-            if (inputs.review.farm.directories[lane].filesystem == filesystem)
+        std::string body;
+        if (assessment.feasible) try
+        {
+            body = replot_review_text(inputs.review);
+            auto const filesystem = storage_device(args.save_plan.parent_path()).filesystem;
+            uint64_t const reserve = sum(body.size(), 65536 + 65);
+            for (size_t lane = 0; lane < inputs.review.farm.directories.size(); ++lane)
+                if (inputs.review.farm.directories[lane].filesystem == filesystem)
+                {
+                    require(inputs.review.space[lane].free_bytes >= reserve, "saved migration review does not fit beside its planned replacement");
+                    inputs.review.space[lane].free_bytes -= reserve;
+                }
+            assessment = assess_replot_review(replot_review_options(args, inputs.review), inputs);
+            if (!assessment.feasible && assessment.reasons.size() < 1024)
+                assessment.reasons.push_back("saved migration review would consume required prefix space");
+            if (assessment.feasible)
             {
-                require(inputs.review.space[lane].free_bytes >= reserve, "saved migration review does not fit beside its planned replacement");
-                inputs.review.space[lane].free_bytes -= reserve;
+                body = replot_review_text(inputs.review); body += stream_state::digest(body) + '\n';
+                check_farming_state_size(body.size(), args.max_ram);
             }
-        assessment = assess_replot_review(replot_review_options(args, inputs.review), inputs); require(assessment.feasible, "saved migration review would consume required prefix space");
-        body = replot_review_text(inputs.review); body += stream_state::digest(body) + '\n';
-        check_farming_state_size(body.size(), args.max_ram); stream_state::atomic_save(args.save_plan, body, false);
+        }
+        catch (Interrupted const&) { throw; }
+        catch (std::runtime_error const& error)
+        { check_cancel(args); assessment.feasible = false; if (assessment.reasons.size() < 1024) assessment.reasons.push_back(error.what()); }
+        if (assessment.feasible)
+        { stream_state::atomic_save(args.save_plan, body, false); plan_saved = true; }
     }
     auto const& review = inputs.review; auto const& state = review.farm;
     uint64_t selected_bytes = 0, inventory_bytes = 0;
@@ -7561,7 +7683,7 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
         if (successor) std::cout << ",\"origin_review_digest\":" << json_string(inputs.digest) << ",\"selected_policy_digest\":" << json_string(inputs.policy_digest)
             << ",\"parent_policy_digest\":" << json_string(inputs.revalidation->parent_policy_digest) << ",\"reviewed_journal_digest\":" << json_string(inputs.revalidation->journal_digest)
             << ",\"next_safe_action\":\"Use --status for durable progress; activate the unchanged reviewed boundary with fill --from-plan, or use --revalidate for a fresh suffix review.\"";
-        std::cout << ",\"saved_plan\":" << json_string(file_io::path_text(args.save_plan.empty() ? args.from_plan : args.save_plan)) << "}\n";
+        std::cout << ",\"saved_plan\":" << json_string(file_io::path_text(plan_saved ? args.save_plan : args.from_plan)) << "}\n";
     }
     else if (!args.quiet)
     {
@@ -8727,14 +8849,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 "inactive destination appeared during the run");
         }
     };
-    auto check_farm = [&]
+    auto check_farm = [&](uint64_t retained_bytes = 0)
     {
         if (!farm) return;
         std::vector<uint8_t> active(destinations.size());
         for (size_t i = 0; i < destinations.size(); ++i) active[i] = bool(destinations[i]->engine) ||
             bool(destinations[i]->successor && destinations[i]->successor->engine);
         if (active.size() < farm->lanes.size()) active.resize(farm->lanes.size());
-        farm->check(active);
+        farm->check(active, sum(sum(fixed, retained_bytes), backend->retained()),
+            [&](size_t, std::function<void()> operation) { return cpu_scheduler->submit(std::move(operation)); });
     };
     std::vector<uint64_t> farm_capacities(paths.size(), 0);
     if (farm)
@@ -9334,7 +9457,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const host = available_host_bytes();
         uint64_t const growth = generation > backend->retained() ? generation - backend->retained() : 0;
         if (host && sum(lease, growth) > host) return defer();
-        check_farm();
+        check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
         auto options = args; options.workers = share;
         std::optional<group_grow::ScratchPool::IoLease> io;
@@ -9476,7 +9599,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         require(!file_io::space_path(d.path.parent_path().c_str(), &available), "cannot inspect next farming-output capacity");
         if (product(available.f_bavail, available.f_frsize) <= args.headroom)
         { lane.no_capacity = true; d.metrics.stop_reason = "capacity"; discard_farm_future(d); return false; }
-        check_farm();
+        check_farm(retained());
         accumulate(d.metrics, d.mode);
         d.path = farm->path(d.owner); d.requested = farm->identity(*keys, d.owner, lane.ordinal);
         d.saved = initial_identity(d.requested); d.guard.reset(); d.scratch.reset(); d.metrics = {};
@@ -9658,7 +9781,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (d.pending->generating.valid()) return blocked(ControllerWait::consumer);
 #endif
-        check_farm();
+        check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
         auto* task = d.pending.get();
         if (task->work == Work::finish && d.engine->external && !d.engine->terminal_packing)
@@ -9777,7 +9900,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto const done = [&]
         { return (*packing)->ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready; };
         if (done()) return false;
-        check_farm();
+        check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
         uint64_t const held = retained();
         auto options = args; options.workers = (*packing)->workers;
@@ -11270,6 +11393,9 @@ ReplotCurrentCounts replot_current_counts(Arguments const& args, ReplotInputs co
     group_grow::farm::PublishedPlotAllowance const& published)
 {
     using namespace group_grow; using namespace group_grow::farm;
+    auto const until = replot_operation_deadline(product(args.farm_adapter_timeout_ms, 1000));
+    auto running = [&]
+    { check_cancel(args); require(std::chrono::steady_clock::now() < until, "revalidation source registry phase exceeded its bounded deadline"); };
     ReplotCurrentCounts result; result.remaining = replot_inventory_counts(inputs.inventory);
     std::map<std::string, uint64_t> retired;
     for (uint64_t source = 0; source < journal.retired_prefix; ++source)
@@ -11280,24 +11406,39 @@ ReplotCurrentCounts replot_current_counts(Arguments const& args, ReplotInputs co
         for (size_t source = 0; source < journal.retirements.size(); ++source) if (journal.retirements[source].state == ReplotRetirement::retired)
             ++retired[inputs.inventory.plots.at(size_t(inputs.review.sources.at(size_t(first) + source))).workload_id];
     }
+    using Route = std::tuple<HarvesterAdapterKind, fs::path, fs::path, std::string>;
+    std::map<Route, std::pair<HarvesterAdapterOptions, std::map<std::string_view, std::vector<uint64_t>>>> routes;
     for (auto& count : result.remaining) if (auto at = retired.find(count.workload); at != retired.end())
     {
+        running();
         require(at->second <= count.count, "revalidation retirement count exceeds original workload accounting");
         if (at->second < count.count) { count.count -= at->second; continue; }
-        std::map<std::tuple<fs::path, fs::path, std::string>, std::pair<HarvesterAdapterOptions, std::vector<uint64_t>>> routes;
-        for (uint64_t index = 0; index < inputs.inventory.plots.size(); ++index)
-        {
-            auto const& plot = inputs.inventory.plots[size_t(index)];
-            if (plot.alias_of || replot_nonplot(plot) || plot.workload_id != count.workload) continue;
-            auto options = source_options(plot); auto& route = routes[{options.executable, options.root, options.harvester}];
-            route.first = std::move(options); route.second.push_back(index);
-        }
-        bool unloaded = true;
-        for (auto const& [key, route] : routes)
-        { check_cancel(args); unloaded = observe_sources_retired(route.first, inputs.inventory, route.second, published).no_loaded_record && unloaded; }
-        if (unloaded) result.unloaded.insert(count.workload);
-        count.count = unloaded ? 0 : 1;
+        result.unloaded.insert(count.workload);
+        count.count = 1;
     }
+    for (uint64_t index = 0; index < inputs.inventory.plots.size(); ++index)
+    {
+        running(); auto const& plot = inputs.inventory.plots[size_t(index)];
+        if (plot.alias_of || replot_nonplot(plot) || !result.unloaded.contains(plot.workload_id)) continue;
+        auto options = source_options(plot); auto& route = routes[{options.kind, options.executable, options.root, options.harvester}];
+        route.first = std::move(options); route.second[plot.workload_id].push_back(index);
+    }
+    for (auto const& [key, route] : routes)
+    {
+        (void)key; check_cancel(args);
+        auto options = route.first;
+        std::vector<std::span<uint64_t const>> batches; batches.reserve(route.second.size());
+        for (auto const& [workload, indices] : route.second) { (void)workload; running(); batches.emplace_back(indices); }
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
+        require(left > 0, "revalidation source registry phase exceeded its bounded deadline");
+        options.limits.timeout_ms = std::min(options.limits.timeout_ms, uint64_t(left));
+        auto observations = observe_source_batches_retired(options, inputs.inventory, batches, published);
+        size_t batch = 0;
+        for (auto const& [workload, indices] : route.second)
+        { (void)indices; running(); if (!observations.no_loaded_records.at(batch++)) result.unloaded.erase(std::string(workload)); }
+    }
+    running();
+    for (auto& count : result.remaining) if (result.unloaded.contains(count.workload)) count.count = 0;
     return result;
 }
 void replot_revalidate_target(Arguments const& args, ReplotInputs const& inputs, group_grow::ReplotJournal const& journal,
@@ -11403,7 +11544,7 @@ int revalidate_replot(Arguments const& supplied, ReplotInputs inputs)
     fallback.limits = refresh_limits;
     for (auto& route : routes.routes) route.options.limits = refresh_limits;
     auto readers = refresh_replot_reader_observations(inputs.inventory, routes, fallback, audit.nonactive, published, nullptr, refresh_working);
-    validate_replot_reader_changes(origin, inputs.inventory); validate_replot_nonactive_provenance(origin, inputs.inventory, audit.nonactive);
+    validate_replot_reader_changes(origin, inputs.inventory, replot_inventory_limits(args)); validate_replot_nonactive_provenance(origin, inputs.inventory, audit.nonactive);
     ReplotRevalidation successor{inputs.revalidation ? inputs.revalidation->origin_review : inputs.origin_review_body,
         farm_inventory_text(inputs.inventory, replot_inventory_limits(args)), std::move(canonical_resources), inputs.policy_digest, journal.digest, std::move(readers)};
     if (audit.construction) successor.construction = audit.construction->evidence;
@@ -12025,11 +12166,11 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     // state reserves map nodes, nested route vectors and allocator overhead;
     // no catalog path or identifier strings are copied into these indexes.
     std::map<std::string_view, uint64_t> retired_counts;
-    std::map<std::string_view, std::map<std::string_view, std::vector<uint64_t>>> workload_sources;
+    std::map<HarvesterAdapterOptions const*, std::map<std::string_view, std::vector<uint64_t>>> route_workloads;
     std::set<std::string_view> confirmed_unloaded;
     for (auto const& count : original_counts) if (revalidated_unloaded.contains(count.workload)) confirmed_unloaded.insert(count.workload);
     for (auto index : review.sources)
-    { auto const& plot = inventory.plots.at(size_t(index)); workload_sources[plot.workload_id][plot.harvester].push_back(index); }
+    { auto const& plot = inventory.plots.at(size_t(index)); route_workloads[&source_options(plot)][plot.workload_id].push_back(index); }
     auto record_retired = [&](uint64_t index) { ++retired_counts[inventory.plots.at(size_t(index)).workload_id]; };
     for (uint64_t source = 0; source < journal.state.retired_prefix; ++source) record_retired(review.sources.at(size_t(source)));
     if (journal.state.batch < review.batches.size())
@@ -12039,25 +12180,60 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             if (journal.state.retirements[source].state == ReplotRetirement::retired)
                 record_retired(review.sources.at(size_t(batch.first_source) + source));
     }
+    std::string unload_blocker, reported_unload;
+    auto report_unload = [&]
+    {
+        if (reported_unload == unload_blocker) return;
+        if (!args.quiet) std::cerr << (unload_blocker.empty() ? "[fill] retired source readers unloaded\n" :
+            "[fill] waiting for retired source readers: " + unload_blocker + '\n');
+        reported_unload = unload_blocker;
+    };
     auto refresh_source_registries = [&](std::optional<std::chrono::steady_clock::time_point> deadline = {})
     {
         auto const until = deadline.value_or(replot_operation_deadline(request.adapter_timeout_us));
-        registry_scope(until, published_allowance);
-        confirmed_unloaded.clear();
+        confirmed_unloaded.clear(); std::string next_blocker;
         for (auto const& count : original_counts)
         {
             auto const at = retired_counts.find(count.workload);
-            if (at == retired_counts.end() || at->second != count.count) continue;
-            bool gone = true;
-            for (auto const& [route, indices] : workload_sources.at(count.workload))
-            {
-                auto const& plot = inventory.plots.at(size_t(indices.front()));
-                auto options = bounded_adapter(source_options(plot), until);
-                gone = gone && observe_sources_retired(options, inventory, indices,
-                    target_route(options) ? published_allowance : PublishedPlotAllowance{}, &registry_index).no_loaded_record;
-            }
-            if (gone) confirmed_unloaded.insert(count.workload);
+            if (at != retired_counts.end() && at->second == count.count) confirmed_unloaded.insert(count.workload);
         }
+        bool target_seen = false;
+        for (auto const* route : source_routes)
+        {
+            bool const target = target_route(*route); target_seen = target_seen || target;
+            std::vector<std::string_view> workloads; std::vector<std::span<uint64_t const>> batches;
+            if (auto at = route_workloads.find(route); at != route_workloads.end())
+                for (auto const& [workload, indices] : at->second) if (confirmed_unloaded.contains(workload))
+                { check_cancel(args); (void)bounded_adapter(*route, until); workloads.push_back(workload); batches.emplace_back(indices); }
+            auto options = bounded_adapter(*route, until);
+            if (batches.empty())
+            {
+                observe_registry_scope(options, inventory, target ? published_allowance : PublishedPlotAllowance{}, &registry_index);
+                continue;
+            }
+            SourceRetirementSnapshot observations;
+            try { observations = observe_source_batches_retired(options, inventory, batches,
+                target ? published_allowance : PublishedPlotAllowance{}, &registry_index); }
+            catch (Interrupted const&) { throw; }
+            catch (std::exception const& error)
+            {
+                check_cancel(args);
+                unload_blocker = "route=" + replot_diagnostic_label(options.harvester) + ": " + replot_unload_reason(error.what());
+                report_unload(); throw std::runtime_error("migration source registry unavailable: " + unload_blocker);
+            }
+            for (size_t batch = 0; batch < batches.size(); ++batch)
+                if (!observations.no_loaded_records.at(batch))
+                {
+                    confirmed_unloaded.erase(workloads[batch]);
+                    if (next_blocker.empty()) next_blocker = "workload=" + replot_diagnostic_label(workloads[batch]) +
+                        ", route=" + replot_diagnostic_label(options.harvester) + ": " +
+                        replot_unload_reason(observations.lookup_bounded.at(batch) ? "still registered" : "bounded lookup memory");
+                }
+        }
+        if (!target_seen) observe_registry_scope(bounded_adapter(target_options, until), inventory, published_allowance, &registry_index);
+        (void)bounded_adapter(target_options, until);
+        unload_blocker = std::move(next_blocker);
+        report_unload();
     };
     auto remaining = [&]
     {
@@ -12081,8 +12257,10 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         auto wait = [&](Stage const& stage)
         { auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
           require(left > 0, "migration admission/registry phase exceeded its bounded deadline");
+          bool paused = false;
           gate.wait(stage, uint64_t(left), args.cancelled,
-              [&](auto const&) { if (!args.quiet) std::cerr << "[fill] migration paused for its reviewed farm resource envelope\n"; }); };
+              [&](auto const& admission) { paused = true; if (!args.quiet) std::cerr << "[fill] migration paused: " << replot_pause_reason(admission) << '\n'; });
+          if (paused && !args.quiet) std::cerr << "[fill] migration resource admission resumed\n"; };
         for (bool future : {false, true})
             wait(replot_stage(replot_resources(inputs), request, last_remaining, ready, false, false, future, "observe-live-farm-resources"));
         auto counts = remaining();
@@ -12097,10 +12275,18 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             bool const pending_unload = std::any_of(original_counts.begin(), original_counts.end(), [&](auto const& original)
             { auto at = retired_counts.find(original.workload); return at != retired_counts.end() && at->second == original.count && !confirmed_unloaded.contains(original.workload); });
             if (!pending_unload) break;
-            refresh_source_registries(until); counts = remaining();
+            try { refresh_source_registries(until); }
+            catch (Interrupted const&) { throw; }
+            catch (std::runtime_error const&)
+            {
+                require(unload_blocker.empty() || std::chrono::steady_clock::now() < until,
+                    "retired source readers have not unloaded before the reviewed phase deadline: " + unload_blocker);
+                throw;
+            }
+            counts = remaining();
             if (fits()) break;
             check_cancel(args); require(std::chrono::steady_clock::now() < until,
-                "retired source readers have not unloaded before the reviewed phase deadline");
+                "retired source readers have not unloaded before the reviewed phase deadline: " + unload_blocker);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         last_remaining = counts;
@@ -12454,6 +12640,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 auto bounded = replot_execution_options(effective, request, construction_until);
                 bounded.resume = fs::exists(stage_path(index)); bounded.report_metrics = false; bounded.on_output = {};
                 auto const original_cancel = bounded.cancelled; std::atomic<bool> resource_pause{false};
+                std::string pause_reason;
                 auto const current = replot_stage(replot_resources(inputs), request, last_remaining, service_members(), true, false, false);
                 auto const future = replot_stage(replot_resources(inputs), request, last_remaining, service_members(), true, false, true);
                 // This monitor retains the original controller CPU set. All
@@ -12465,10 +12652,19 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                     {
                         try
                         {
-                            if (!gate.poll_active(current).allowed || !gate.poll_active(future).allowed)
-                            { resource_pause.store(true, std::memory_order_release); return; }
+                            auto admission = gate.poll_active(current);
+                            if (admission.allowed) admission = gate.poll_active(future);
+                            if (!admission.allowed)
+                            {
+                                pause_reason = replot_pause_reason(admission);
+                                resource_pause.store(true, std::memory_order_release); return;
+                            }
                         }
-                        catch (...) { resource_pause.store(true, std::memory_order_release); return; }
+                        catch (...)
+                        {
+                            pause_reason = "resource observation failed";
+                            resource_pause.store(true, std::memory_order_release); return;
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
                 });
@@ -12498,7 +12694,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                     monitor.request_stop(); monitor.join();
                     if (!resource_pause.load(std::memory_order_acquire) || (args.cancelled && args.cancelled()) ||
                         std::chrono::steady_clock::now() >= construction_until) throw;
-                    if (!args.quiet) std::cerr << "[fill] protected construction drained and checkpointed; waiting for farm resources\n";
+                    if (!args.quiet) std::cerr << "[fill] protected construction drained; waiting for farm resources: " << pause_reason << '\n';
                     checkpoint_gate(); admit(true, false, service_members());
                 }
             }
@@ -12517,12 +12713,17 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 calibration_process::Limits limits{request.verification_ram_bytes, uint64_t(left), 65536, args.cancelled};
                 auto const current = replot_stage(replot_resources(inputs), request, last_remaining, service_members(), false, true, false);
                 auto const future = replot_stage(replot_resources(inputs), request, last_remaining, service_members(), false, true, true);
+                std::string pause_reason;
                 try
                 {
                     auto raw = calibration_process::run_worker(stage_path(index), 100, limits, calibration_process::Worker::migration_proof,
                         replot_resources(inputs).native.verification_cpu_threads, 1, [&](SupervisedProcess const& worker)
-                        { return gate.poll_verification(current, worker, request.verification_ram_bytes).allowed &&
-                            gate.poll_verification(future, worker, request.verification_ram_bytes).allowed; });
+                        {
+                            auto admission = gate.poll_verification(current, worker, request.verification_ram_bytes);
+                            if (admission.allowed) admission = gate.poll_verification(future, worker, request.verification_ram_bytes);
+                            if (!admission.allowed) pause_reason = replot_pause_reason(admission);
+                            return admission.allowed;
+                        });
                     auto proof = group_grow::profile_detail::JsonReader(raw, 8 * limits.output_bytes).read();
                     require(inventory_detail::integer(proof, "replot_proof_worker") == 1 && inventory_detail::integer(proof, "full_proofs_validated") == 1 &&
                         inventory_detail::integer(proof, "trials") <= 100 &&
@@ -12533,7 +12734,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 }
                 catch (calibration_process::WorkerPaused const&)
                 {
-                    if (!args.quiet) std::cerr << "[fill] protected verification stopped; waiting for farm resources before a fresh proof attempt\n";
+                    if (!args.quiet) std::cerr << "[fill] protected verification stopped; waiting for farm resources before a fresh proof attempt: " << pause_reason << '\n';
                 }
             }
             bool const capture_owner = !review.owned_roots.empty() && file_io::has_durable_identity(review.owned_roots.at(size_t(plan.lane)).durable);

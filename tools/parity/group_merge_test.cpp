@@ -31,6 +31,15 @@ std::atomic<bool> replace_unlinked{false};
 std::string replacement_target;
 std::function<void(int, char const*, int, char const*)> retirement_rename_hook;
 std::atomic<bool> fail_retired_xattr{false};
+std::function<void(int, size_t, off_t)> construction_write_observer;
+std::function<void(int, size_t, off_t)> construction_read_observer;
+extern "C" ssize_t __real_pread(int, void*, size_t, off_t);
+extern "C" ssize_t __wrap_pread(int fd, void* bytes, size_t count, off_t offset)
+{
+    auto const result = __real_pread(fd, bytes, count, offset);
+    if (result >= 0 && construction_read_observer) construction_read_observer(fd, count, offset);
+    return result;
+}
 extern "C" int __real_fsetxattr(int, char const*, void const*, size_t, int);
 extern "C" int __wrap_fsetxattr(int fd, char const* name, void const* value, size_t bytes, int flags)
 {
@@ -77,7 +86,9 @@ extern "C" ssize_t __wrap_pwrite(int fd, void const* bytes, size_t count, off_t 
     if (fail_write.load(std::memory_order_acquire) && uint64_t(offset) >= fail_write_begin.load(std::memory_order_relaxed) &&
         uint64_t(offset) < fail_write_end.load(std::memory_order_relaxed) && fail_write.exchange(false, std::memory_order_acq_rel))
     { errno = EIO; return -1; }
-    return __real_pwrite(fd, bytes, count, offset);
+    auto const result = __real_pwrite(fd, bytes, count, offset);
+    if (result >= 0 && construction_write_observer) construction_write_observer(fd, count, offset);
+    return result;
 }
 extern "C" int __real_lstat(char const*, struct stat*);
 extern "C" int __wrap_lstat(char const* path, struct stat* info)
@@ -318,6 +329,53 @@ void replot_external_projection(fs::path const& directory, group_grow::Identity 
     auto capped = args; capped.temporary_capacity = 1;
     require(!replot_external_capacity(capped, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
         "projected external migration ignored the ordinary scratch cap");
+}
+void replot_preview_models(fs::path const& directory, group_grow::Identity const& initial)
+{
+    using namespace grow_controller_test;
+    Arguments args; args.max_ram = 512 * mib; args.workers = 2; args.window = 65536;
+    auto live = std::make_shared<CodecScheduler>(unsigned(args.workers));
+    auto preview = std::make_shared<CodecScheduler>(unsigned(args.workers), CodecScheduler::Execution::preview);
+    auto const executing = configuration(args, 128 * mib, mib, live, replot_preview_encoder(args, live));
+    auto const modeled = configuration(args, 128 * mib, mib, preview, replot_preview_encoder(args, preview));
+    ExternalConfig scratch; scratch.scratch.push_back({directory.string(), 128 * mib}); scratch.segment_bytes = mib;
+    for (uint8_t k : {18, 28}) for (uint16_t batch : {1, 4})
+    {
+        require(Engine::memory_bytes(k, executing, batch) == Engine::memory_bytes(k, modeled, batch) &&
+            MergeEngine::memory_bytes(k, executing, batch) == MergeEngine::memory_bytes(k, modeled, batch) &&
+            StagingEngine::memory_bytes(k, executing, batch) == StagingEngine::memory_bytes(k, modeled, batch) &&
+            ExternalEngine::memory_bytes(k, executing, scratch, batch) == ExternalEngine::memory_bytes(k, modeled, scratch, batch),
+            "read-only migration scheduler changed an engine memory model");
+        for (auto phase : {ExternalEngine::MemoryPhase::staging, ExternalEngine::MemoryPhase::packing, ExternalEngine::MemoryPhase::publication})
+            require(ExternalEngine::phase_memory_bytes(k, executing, scratch, phase, batch) ==
+                ExternalEngine::phase_memory_bytes(k, modeled, scratch, phase, batch), "read-only migration scheduler changed recovery phase memory");
+    }
+    auto const requested = identity_from(initial);
+    for (auto const* engine : {"incremental", "merged", "staged", "external"})
+    {
+        args.construction = engine;
+        require(prefetch_memory(args, requested, executing, 1, true, scratch) == prefetch_memory(args, requested, modeled, 1, true, scratch),
+            "read-only migration preview changed drive-specific prefetch admission");
+    }
+}
+void replot_diagnostics()
+{
+    using namespace grow_controller_test; using namespace farm;
+    Admission paused; paused.assessment.reasons = {"capacity-exceeded:cpu"};
+    Margin margin; margin.resource = "cpu"; margin.capacity = 2; margin.occupied_units = 3; paused.assessment.margins = {margin};
+    auto const reason = replot_pause_reason(paused);
+    require(reason.find("capacity-exceeded:cpu") != reason.npos && reason.find("declared capacity=2") != reason.npos &&
+        reason.find("occupied=3") != reason.npos, "resource pause lost its existing cause or declared margin");
+    paused.assessment.reasons = {std::string(4096, '\n')};
+    require(replot_pause_reason(paused).size() < 1024 && replot_pause_reason(paused).find('\n') == std::string::npos,
+        "resource diagnostics escaped their bounded single-line form");
+    require(replot_diagnostic_label(std::string(95, 'x') + "\xc3\xa9-tail") == json_string(std::string(95, 'x') + "..."),
+        "bounded diagnostic label split a Unicode character");
+    require(replot_unload_reason("RPC failure with private-memo-must-never-be-logged").find("private-memo") == std::string::npos &&
+        replot_unload_reason("config changed: private-memo-must-never-be-logged").find("private-memo") == std::string::npos,
+        "source-unload diagnostics exposed arbitrary adapter exception text");
+    paused.assessment.reasons.clear();
+    require(replot_pause_reason(paused).find("recovery") != std::string::npos, "recovery hysteresis pause has no diagnostic cause");
 }
 
 // Exercise actual controller lifecycle with synthetic known drive identities;
@@ -600,6 +658,145 @@ Result complete(fs::path const& path, Members input, bool resume, Config cfg, si
     }
     return output.finish();
 }
+void construction_cancellation(fs::path const& root, Members input, Config cfg)
+{
+#ifdef GROW_TEST_WRAP_PWRITE
+    using grow_controller_test::Construction;
+    cfg.capacity_bytes = 128 * 1024 * 1024; cfg.memory_limit_bytes = 512 * 1024 * 1024;
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 65536; cfg.io_overlap = true;
+    auto const reference = root / "cancel-reference"; direct(reference, input, cfg);
+    auto const expected = contents(reference);
+    for (auto const* mode : {"incremental", "staged", "merged", "external"})
+        for (auto const* phase : {"fresh", "append", "summary", "pack", "compact", "layout"})
+        {
+            bool const ordinary = std::string_view(mode) == "incremental";
+            bool const layout = std::string_view(phase) == "layout";
+            bool const compaction = std::string_view(phase) == "compact";
+            bool const summary = std::string_view(phase) == "summary";
+            bool const packing = std::string_view(phase) == "pack" || layout || compaction;
+            if ((ordinary && packing) || (layout && std::string_view(mode) != "merged") ||
+                (compaction && std::string_view(mode) != "staged") ||
+                (summary && std::string_view(mode) != "external")) continue;
+            auto const path = root / (std::string("cancel-") + mode + '-' + phase);
+            auto const scratch = fs::absolute(root / (path.filename().string() + "-scratch")); fs::create_directory(scratch);
+            ExternalConfig external; external.scratch.push_back({scratch.string(), cfg.capacity_bytes}); external.segment_bytes = 65536;
+            std::atomic<bool> requested{false}; Construction* live = nullptr;
+            auto bounded = cfg;
+            bounded.cancelled = [&]
+            {
+                if (layout && live && live->merged && live->merged->stats().layout_moves) requested = true;
+                return requested.load();
+            };
+            bool stopped = false;
+            {
+                Construction output(path.string(), bounded, false, identity(), mode,
+                    std::string_view(mode) == "external" ? std::optional(external) : std::nullopt, 0, false);
+                output.confirm_identity(); live = &output;
+                bool const prefix = std::string_view(phase) == "append" || summary;
+                if (packing || prefix)
+                    require(output.append(packing ? input : input.subspan(0, 1)).accepted, "cancellation prefix did not fit");
+                auto const before = output.stats().encode_chunks;
+                auto const target = grow_controller_test::Construction::snapshot(path.string());
+                construction_read_observer = [&](int fd, size_t bytes, off_t offset)
+                {
+                    if (!summary || !offset || bytes <= sizeof(Header)) return;
+                    std::array<char, PATH_MAX> name{};
+                    auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+                    if (count > 0 && std::string_view(name.data(), size_t(count)).starts_with(scratch.string() + '/') &&
+                        std::string_view(name.data(), size_t(count)).ends_with("/run-1-0")) requested = true;
+                };
+                construction_write_observer = [&, target](int fd, size_t bytes, off_t offset)
+                {
+                    if (layout || summary || bytes <= sizeof(Header)) return;
+                    if (compaction && offset) return;
+                    // Same-file writers and contribution staging run on this
+                    // calling thread. External packing may have its own target
+                    // consumer, so its hook only reads immutable identities.
+                    if ((!packing || std::string_view(mode) != "external") && output.stats().encode_chunks == before) return;
+                    struct stat current{}; require(!::fstat(fd, &current), "cannot inspect cancellation write");
+                    bool matches = current.st_dev == target.st_dev && current.st_ino == target.st_ino;
+                    if (!packing && std::string_view(mode) == "external")
+                    {
+                        std::array<char, PATH_MAX> name{};
+                        auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+                        matches = count > 0 && std::string_view(name.data(), size_t(count)).starts_with(scratch.string() + '/');
+                    }
+                    if (matches) requested = true;
+                };
+                try
+                {
+                    if (packing) (void)output.finish();
+                    else (void)output.append(prefix ? input.subspan(1) : input);
+                }
+                catch (ConstructionInterrupted const&) { stopped = true; }
+                require(stopped && requested && (layout || summary || output.stats().encode_chunks > before),
+                    std::string("construction ignored payload cancellation: ") + mode + '/' + phase);
+                construction_write_observer = {}; construction_read_observer = {}; live = nullptr;
+            }
+            requested = false;
+            Construction resumed(path.string(), cfg, true, identity(), mode,
+                std::string_view(mode) == "external" ? std::optional(external) : std::nullopt, 0, false);
+            resumed.confirm_identity();
+            if (!resumed.is_staging() && resumed.identity().pending)
+            {
+                auto const saved = resumed.identity();
+                (void)resumed.resume(input.subspan(saved.old_members, saved.target_members - saved.old_members));
+            }
+            while (resumed.can_append() && resumed.member_count() < input.size())
+                require(resumed.append(input.subspan(resumed.member_count())).accepted, "cancelled construction prefix could not resume");
+            auto const result = resumed.finish();
+            require(result.members == input.size() && result.final_bytes == expected.size() && contents(path) == expected,
+                std::string("cancelled construction changed canonical resumed bytes: ") + mode + '/' + phase);
+        }
+    auto const planning = root / "cancel-planning"; direct(planning, input.subspan(0, 1), cfg);
+    auto const original = contents(planning); bool requested = false;
+    auto bounded = cfg; bounded.cancelled = [&] { return requested; };
+    Engine engine(planning.string(), bounded, true); engine.confirm_identity(); requested = true;
+    bool stopped = false;
+    try { (void)engine.plan(input.subspan(1)); } catch (ConstructionInterrupted const&) { stopped = true; }
+    require(stopped && contents(planning) == original, "cancelled planning changed its source");
+
+    // Exercise the actual run_group final pack, with its original reviewed
+    // deadline expiring inside a successful target payload syscall.
+    using namespace grow_controller_test;
+    auto const controller_path = fs::absolute(root / "cancel-controller.gplot");
+    auto const controller_scratch = fs::absolute(root / "cancel-controller-scratch"); fs::create_directory(controller_scratch);
+    auto const controller_identity = identity_from(::identity());
+    Fixtures fixture{controller_identity, {}, 0};
+    for (uint16_t member = 0; member < input.size(); ++member)
+    {
+        PlotData data; auto const raw = input[member].raw(); data.t3_proof_fragments.assign(raw.begin(), raw.end());
+        auto const path = root / ("cancel-controller-member-" + std::to_string(member));
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, controller_identity.params, member, controller_identity.memo));
+        fixture.paths.push_back(path);
+    }
+    Arguments args; args.backend = "cpu"; args.construction = "external"; args.command = "test";
+    args.max_ram = 512 * mib; args.window = args.checkpoint_bytes = 65536; args.workers = 2;
+    args.batch = args.max_members = input.size(); args.headroom = 0; args.temporary_capacity = 128 * mib;
+    args.temporary = {controller_scratch};
+    using Clock = std::chrono::steady_clock;
+    std::atomic<Clock::duration::rep> deadline{Clock::duration::max().count()};
+    args.cancelled = [&] { return Clock::now().time_since_epoch().count() >= deadline.load(); };
+    construction_write_observer = [&](int fd, size_t bytes, off_t offset)
+    {
+        if (!offset || bytes <= 1024) return;
+        std::array<char, PATH_MAX> name{};
+        auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
+        if (count > 0 && std::string_view(name.data(), size_t(count)) == controller_path.string())
+            deadline = Clock::now().time_since_epoch().count();
+    };
+    std::unique_ptr<Backend> backend; stopped = false;
+    try { (void)run_group(args, controller_path, &fixture, controller_identity, uint16_t(input.size()), cfg.capacity_bytes, 0, backend); }
+    catch (ConstructionInterrupted const&) { stopped = true; }
+    construction_write_observer = {};
+    require(stopped, "run_group returned success after its construction deadline expired during payload packing");
+    args.resume = true; args.cancelled = {}; backend.reset();
+    auto const result = run_group(args, controller_path, &fixture, controller_identity, uint16_t(input.size()), cfg.capacity_bytes, 0, backend);
+    require(result.members == input.size() && contents(controller_path) == expected,
+        "controller deadline recovery changed canonical output");
+#endif
+}
+
 void parity(fs::path const& root, Members input, Config cfg)
 {
     auto reference = root / "reference.gplot"; direct(reference, input, cfg); auto expected = contents(reference);
@@ -3219,6 +3416,100 @@ FarmingState farming_format_fixture(unsigned version)
     }
     return state;
 }
+void replot_save_diagnostics(fs::path const& root)
+{
+    using namespace grow_controller_test; using namespace farm;
+    auto const directory = root / "replot-save-diagnostics"; fs::create_directory(directory);
+    auto const source = directory / "source.plot";
+    { std::ofstream out(source); out << "protected synthetic source bytes"; }
+    Arguments args; args.max_ram = 2 * 1024 * mib; args.workers = args.batch = 1;
+    args.construction = "incremental"; args.backend = "cpu"; args.destination_temp = "off";
+    args.window = 65536; args.json = true; args.compute_mode = "off";
+    ReplotInputs inputs; auto& review = inputs.review;
+    review.farm = farming_format_fixture(6); auto& state = review.farm;
+    state.capacity_fill = false;
+    state.seed.assign(64, '0'); state.seed_owner.clear(); state.farmer.assign(96, '0'); state.pool.assign(64, '0');
+    state.config = FarmingConfig{}; state.config.k = 18; state.config.strength = 2;
+    state.config.group_members_override = state.config.meta_slots_override = 1;
+    state.capacity = 4 * 1024 * mib; state.headroom = 0; state.max_groups = state.max_total_members = 1;
+    state.directories.resize(1); auto& destination = state.directories.front();
+    auto const device = storage_device(directory); auto const host = profile_detail::host_name(); auto const disk = replot_storage_id(device);
+    destination.directory = file_io::path_text(directory); destination.directory_identity = farming_directory_identity(directory);
+    destination.filesystem = device.filesystem; destination.capacity_bytes = state.capacity;
+    destination.resource = destination.identity_resource = 0; destination.identity_resources = 1;
+    destination.extents.clear(); destination.sealed_files = 0;
+    destination.storage = farming_destination_profile(device); destination.storage.capacity_bytes = state.capacity;
+    destination.storage.max_groups = destination.storage.max_total_members = 1; destination.storage.resource = 0;
+    state.estimate = farming_plan(state.config, {destination.storage}); require(state.estimate.feasible, "save diagnostic native fixture is infeasible");
+    destination.layout = state.estimate.destinations.front();
+    std::array<fs::path, 1> roots{directory}; inputs.inventory = scan_farm_inventory(roots, replot_inventory_limits(args));
+    inputs.inventory.plots.front().workload_id = "old";
+    auto& profile = inputs.resources; profile.source = profile.producer = "declared-save-diagnostic-fixture";
+    Resource cpu; cpu.id = "cpu"; cpu.host = host; cpu.kind = ResourceKind::cpu; cpu.capacity = 64; cpu.capacity_known = true;
+    Resource ram = cpu; ram.id = "ram"; ram.kind = ResourceKind::host_memory; ram.capacity = 64 * 1024 * mib;
+    Resource storage = cpu; storage.id = disk; storage.kind = ResourceKind::storage; storage.capacity = 1; storage.conditional_shared = true;
+    if (device.drives.empty()) storage.aliases = {"storage:unknown:" + host};
+    else for (auto const& drive : device.drives) storage.aliases.push_back("drive:" + drive);
+    profile.resources = {cpu, ram, storage};
+    Workload old; old.id = "old"; old.plot_count = 1; old.cost = CostKind::serialized; old.bounded = old.scope_complete = true;
+    old.format = old.decoder = old.decoder_version = old.backend = old.pool_difficulty = old.source = "declared";
+    old.quality_burst = old.proof_burst = old.future_quality_burst = old.future_proof_burst = 1;
+    old.period_us = old.deadline_us = 100000000;
+    Use use; use.resource = "cpu"; use.required_units = use.quality_us = use.proof_us = 1; old.uses = {use}; profile.workloads = {old};
+    auto service = [&](std::string resource)
+    { Demand d; d.resource = std::move(resource); d.required_units = 2; d.work_us = 1000; d.period_us = d.deadline_us = 100000000; d.bounded = true; return d; };
+    auto memory = [](uint64_t bytes) { Demand d; d.resource = "ram"; d.transient_units = bytes; d.bounded = true; return d; };
+    auto& native = profile.native;
+    native.bounded = native.scope_complete = native.covers_future_filter = native.phase_totals_include_controller = true;
+    native.host = host; native.k = 18; native.strength = 2; native.reader = "stateless"; native.backend = "cpu"; native.engine = "incremental";
+    native.max_ram_bytes = args.max_ram; native.max_cpu_threads = 2; native.max_batch_members = native.max_group_members = 1;
+    native.max_construction_us = native.max_verification_us = 100000000; native.verification_cpu_threads = 1;
+    native.output_resources = native.source_resources = {disk};
+    auto io = service(disk); io.required_units = 1;
+    native.construction = native.verification = native.supervision = {service("cpu"), memory(8 * 1024 * mib), io};
+    NativeCohort cohort; cohort.max_members = 1; cohort.new_farming = cohort.proof_reserve = {service("cpu"), memory(mib), io}; native.cohorts = {cohort};
+    review.memory_limit_bytes = args.max_ram; review.sources = {0};
+    auto const bound = canonical_bound(replot_bound_identity(state.config), 1);
+    file_io::Space space{}; require(!file_io::space_path(directory, &space), "cannot inspect save diagnostic allocation unit");
+    auto const unit = std::max({uint64_t(space.f_bsize), uint64_t(space.f_frsize), uint64_t(file_io::page_size())});
+    review.batches = {{0, 0, 0, 1, bound, args.max_ram, product(unit, 5), unit}};
+    review.space = {{64 * 1024 * mib, 0, bound, args.max_ram, replot_metadata_allowance(state, unit)}};
+    review.inventory_json = farm_inventory_text(inputs.inventory, replot_inventory_limits(args));
+    std::ostringstream resources; write_profile_json(resources, profile); review.resources_json = resources.str();
+    replot_input_memory(inputs, args);
+    auto const initial = assess_replot_review(args, inputs);
+    require(initial.feasible, initial.reasons.empty() ? "save diagnostic review did not initially fit" : initial.reasons.front().c_str());
+    auto render = [&](ReplotInputs value)
+    {
+        std::ostringstream output; auto* previous = std::cout.rdbuf(output.rdbuf()); int code = 0;
+        try { code = print_replot_review(args, std::move(value), false); }
+        catch (...) { std::cout.rdbuf(previous); throw; }
+        std::cout.rdbuf(previous); return std::pair{code, profile_detail::JsonReader(output.str()).read()};
+    };
+    args.save_plan = directory / "refused.plan";
+    auto constrained = inputs;
+    constrained.review.space[0].free_bytes = sum(constrained.review.space[0].metadata_allowance_bytes,
+        sum(bound, sum(args.max_ram, sum(product(unit, 5), unit))));
+    require(assess_replot_review(args, constrained).feasible, "metadata-reserve refusal fixture was already infeasible");
+    auto const refused = render(constrained);
+    auto const& reasons = inventory_detail::required_field(refused.second, "infeasibility_reasons");
+    require(refused.first == 2 && !profile_detail::boolean(inventory_detail::required_field(refused.second, "feasible")) &&
+        !reasons.items.empty() && inventory_detail::string(refused.second, "saved_plan").empty() && !fs::exists(args.save_plan),
+        "metadata reservation failure lost structured reasons or wrote an infeasible review");
+    require(std::any_of(reasons.items.begin(), reasons.items.end(), [](auto const& reason)
+        { return profile_detail::text(reason) == "saved migration review would consume required prefix space"; }),
+        "metadata-reserve reassessment dropped its specific refusal cause");
+    args.save_plan = directory / "saved.plan";
+    auto expected = inputs.review; expected.space[0].free_bytes -= sum(replot_review_text(expected).size(), 65536 + 65);
+    auto expected_body = replot_review_text(expected); expected_body += stream_state::digest(expected_body) + '\n';
+    auto const accepted = render(inputs); auto const actual = contents(args.save_plan);
+    require(accepted.first == 0 && std::string(actual.begin(), actual.end()) == expected_body &&
+        inventory_detail::string(accepted.second, "saved_plan") == file_io::path_text(args.save_plan),
+        "feasible review changed its compatible saved bytes or reported path");
+    auto const source_bytes = contents(source);
+    require(std::string(source_bytes.begin(), source_bytes.end()) == "protected synthetic source bytes" &&
+        !fs::exists(directory / "grow-replot.plan"), "save diagnostic rendering changed the source or published a private journal");
+}
 
 void replot_journal_protocol(fs::path const& root)
 {
@@ -3713,6 +4004,22 @@ void replot_status_protocol(fs::path const& root)
     validate_replot_reader_changes(identified, updated);
     require(farm_inventory_text(identified) == identified_bytes && farm_inventory_text(updated) == updated_bytes,
         "reader invariant comparison changed actual native identification metadata");
+    {
+        auto large = identified; auto prototype = large.plots.front(); prototype.identity.durable = {};
+        large.plots.clear(); large.plots.reserve(18000);
+        for (uint64_t index = 0; index < 18000; ++index)
+        {
+            auto plot = prototype; plot.relative_path = "large-" + std::to_string(index) + ".plot"; plot.identity.stamp.inode = index + 1;
+            large.plots.push_back(std::move(plot));
+        }
+        Arguments large_args; large_args.max_ram = 16 * 1024 * mib;
+        auto const limits = replot_inventory_limits(large_args); auto const bytes = farm_inventory_text(large, limits);
+        require(bytes.size() > InventoryLimits{}.max_output_bytes, "large successor fixture did not cross the default serialization bound");
+        auto current = parse_farm_inventory(bytes, limits); current.network.reader_version = "updated-reader";
+        rejects([&] { validate_replot_reader_changes(large, current); });
+        validate_replot_reader_changes(large, current, limits);
+        require(farm_inventory_text(large, limits) == bytes, "large successor validation changed original compatible inventory bytes");
+    }
     auto malformed = updated; malformed.plots.front().reader_identity.clear();
     rejects([&] { validate_replot_reader_changes(identified, malformed); });
     malformed = identified; malformed.plots.back().reader_version.clear();
@@ -4864,6 +5171,91 @@ void farming_parallel_audits(fs::path const& root, Members input)
     require(observed_failure && draining && joined && error == "group index/windows/codec exceed the memory budget",
         "changed-header audit exceeded its actual-k memory bound or escaped before its peer joined");
     restore(second_path, second_bytes);
+
+    // Live audits share the admitted codec pool, and keep inactive external
+    // parsers at their serial full-envelope boundary after every lane joins.
+    auto live_fixture = [&]
+    { auto run = fixture(); run.staging_resources = physical; return run; };
+    auto live = live_fixture();
+    std::array<std::promise<void>, 2> live_started;
+    auto live_first = live_started[0].get_future(), live_second = live_started[1].get_future();
+    std::promise<void> live_release; auto live_released = live_release.get_future().share();
+    FarmingStageSubmit live_submit = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        { live_started[lane].set_value(); live_released.wait(); operation(); });
+    };
+    auto live_audit = std::async(std::launch::async, [&] { live.check({}, live.metadata, live_submit); });
+    bool const live_overlap = live_first.wait_for(std::chrono::seconds(10)) == std::future_status::ready &&
+        live_second.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    live_release.set_value(); live_audit.get();
+    require(live_overlap && live.planning_peak > live.metadata && live.planning_peak <= live.memory_limit,
+        "live independent-lane audits lost overlap or their runtime memory admission");
+    auto scheduler = std::make_shared<CodecScheduler>(2);
+    std::promise<void> encoding_started, encoding_release;
+    auto encoding_ready = encoding_started.get_future(); auto encoding_released = encoding_release.get_future().share();
+    auto encoding = scheduler->submit([&]
+    {
+        ChunkCodec codec(18, write_cfg.codec_bytes, scheduler);
+        auto const raw = input[0].raw();
+        auto const end = std::lower_bound(raw.begin(), raw.end(), 1ull << (18 + PlotGroupFile::PROOFS_PER_CHUNK_BITS));
+        std::array<FragmentRegion, 1> regions{input[0].region(0, 0, size_t(end - raw.begin()))};
+        codec.prepare(ChunkCodec::estimate_work(18, 0, regions[0].size()));
+        (void)codec.encode(0, {}, 0, regions);
+        encoding_started.set_value(); encoding_released.wait();
+    });
+    require(encoding_ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+        "live audit encoder fixture did not acquire its real shared CPU permit");
+    auto shared_cpu = live_fixture();
+    auto shared_audit = std::async(std::launch::async, [&]
+    {
+        shared_cpu.check({}, shared_cpu.metadata, [&](size_t, std::function<void()> operation)
+        { return scheduler->submit(std::move(operation)); });
+    });
+    bool const shared_progress = shared_audit.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    encoding_release.set_value(); encoding.get(); shared_audit.get();
+    require(shared_progress, "live audit deadlocked with outstanding work on the real shared codec scheduler");
+    submissions = 0;
+    auto live_shared = live_fixture(); live_shared.staging_resources = shared;
+    live_shared.check({}, live_shared.metadata, counted);
+    auto live_tight = live_fixture(); live_tight.check({}, live_tight.memory_limit, counted);
+    require(!submissions, "shared-storage or tight-RAM live audit launched unadmitted work");
+    auto changed = live_fixture(); auto const directory_time = fs::last_write_time(directories[0]);
+    set_byte(first_path, sizeof(Header), uint8_t(first_bytes[sizeof(Header)] ^ 1));
+    rejected = false;
+    try { changed.check({}, changed.metadata, counted); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected && fs::last_write_time(directories[0]) == directory_time,
+        "live audit missed an in-place output change with an unchanged directory mtime");
+    restore(first_path, first_bytes);
+    auto inactive = live_fixture(); fs::create_directory(first_path.string() + ".external");
+    rejected = false;
+    try { inactive.check({}, inactive.metadata, counted); } catch (std::runtime_error const&) { rejected = true; }
+    require(rejected, "parallel live audit skipped an inactive external parser failure");
+    fs::remove(first_path.string() + ".external");
+    auto malformed = live_fixture();
+    auto const invalid = second_path.string() + ".external.retired-invalid"; fs::create_directory(invalid);
+    std::promise<void> live_failed, live_finish_peer;
+    auto live_failure = live_failed.get_future(); auto live_peer = live_finish_peer.get_future().share(); joined = false;
+    FarmingStageSubmit live_fail = [&](size_t lane, std::function<void()> operation)
+    {
+        return std::async(std::launch::async, [&, lane, operation = std::move(operation)]
+        {
+            if (!lane) { live_peer.wait(); operation(); joined = true; return; }
+            try { operation(); } catch (...) { live_failed.set_value(); throw; }
+        });
+    };
+    auto failed_live = std::async(std::launch::async, [&]
+    {
+        try { malformed.check({}, malformed.metadata, live_fail); }
+        catch (std::runtime_error const& error) { return std::string(error.what()); }
+        return std::string{};
+    });
+    bool const live_failed_ready = live_failure.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    bool const live_draining = failed_live.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    live_finish_peer.set_value(); auto const live_error = failed_live.get();
+    require(live_failed_ready && live_draining && joined && live_error == "ambiguous rollover output name",
+        "malformed live metadata escaped without joining its independent peer");
+    fs::remove(invalid);
 }
 
 void farming_replica_staging(fs::path const& root)
@@ -6104,7 +6496,7 @@ void prepared_producer(fs::path const& root, Members input)
 int main(int argc, char** argv) try
 {
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--prefetch-only" ||
-        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--replot-capacity-only|--prepared-input-only]");
+        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
@@ -6113,17 +6505,29 @@ int main(int argc, char** argv) try
     metadata_options();
     external_batch_selection();
     phase_worker_demand();
+    replot_diagnostics();
     require(filesystem_file_bound(0xef53, 4096) == uint64_t(UINT32_MAX) * 4096 &&
         filesystem_file_bound(0x9123683e, 4096) == uint64_t(INT64_MAX), "filesystem file-size admission differs");
     auto name = (fs::temp_directory_path() / "xchplot2-merge-XXXXXX").string();
     require(::mkdtemp(name.data()), "cannot create merge test directory");
     fs::path root(name); struct Cleanup { fs::path root; ~Cleanup() { fs::remove_all(root); } } cleanup{root};
     auto input = members(); auto cfg = configuration();
+    if (argc == 1 || std::string(argv[1]) == "--cancellation-only")
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto cancellation_name = (parent / "construction-cancellation-XXXXXX").string();
+        require(::mkdtemp(cancellation_name.data()), "cannot create construction cancellation fixture");
+        Cleanup cancellation_cleanup{fs::path(cancellation_name)};
+        construction_cancellation(cancellation_cleanup.root, input, cfg);
+        if (argc != 1) { std::cout << "construction cancellation and byte-identical recovery checks passed\n"; return 0; }
+    }
     replot_source_selection(root);
     replot_predelete_selection();
     replot_review_options(root);
     replot_source_mapping();
     replot_actionable_ranking();
+    replot_preview_models(root, identity());
+    replot_save_diagnostics(root);
     if (argc == 1) { replot_legacy_destination_metadata(root); replot_execution_resource_bindings(root); }
     if (argc == 2 && std::string(argv[1]) == "--replot-capacity-only")
     {

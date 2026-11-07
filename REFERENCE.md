@@ -999,6 +999,9 @@ acknowledged replacements. Construction or proof work invalidates that phase;
 changed generations require a fresh exact prefix audit. Completed synchronization
 can remain valid while services are idle. Imported JSON cannot assert readiness.
 Missing capabilities, changed populations or stale observations pause work.
+Pause messages report bounded resource causes and declared margins; source-unload
+waits identify the reviewed workload and reader route. These transient diagnostics
+do not change journal authority or make `--status` a live service-health check.
 An authorized pre-deletion still requires the live target network and fresh
 readiness of previously credited replacements.
 General service and configured public pool-route prerequisites apply before private
@@ -1010,14 +1013,19 @@ Resource admission includes the old farm, completed replacements, construction,
 verification and separate full-proof demand, under current and future filter
 conditions. Retiring a plot does not release a foreign decoder's resident
 memory or queued work. Telemetry restricts native admissions and interrupts
-construction or proof work if protected headroom is lost. Construction saves a
-checkpoint; a paused proof attempt restarts against the sealed replacement
-within its original verification deadline. Telemetry does not stop or
+construction or proof work if protected headroom is lost. Construction stops at
+recoverable boundaries and resumes through checkpoint recovery; already-running
+native I/O must return before cancellation can be observed, and already-admitted
+backend work may finish at its existing completion or timeout boundary. A paused
+proof attempt restarts against the sealed replacement within its original
+verification deadline. Telemetry does not stop or
 reconfigure the farmer, harvester, remote solver or their services.
 The reviewed envelope must also allow fresh observations after a restart while
 conservatively retaining the original arrivals until their removal is confirmed.
 The first complete target farming and full-proof cohort is reserved even when
 no replacement exists, covering the services that must already be running.
+An infeasible review requested with `--save-plan --json` still reports its
+structured reasons and leaves the requested save path unwritten.
 
 Keep the original `migration.plan`, any active reviewed successor, every private
 `grow-replot.plan` copy and any `.next` file, receipts and owned temporary files.

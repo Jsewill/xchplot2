@@ -343,8 +343,9 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
                 else ++item->second;
             } while (position < events.size() && events[position].resource == resource &&
                 events[position].schedule == schedule && events[position].family == family);
+            std::erase_if(active, [](auto const& entry) { return !entry.second; });
             uint16_t largest = 0;
-            for (auto const& entry : active) if (entry.second) largest = std::max(largest, entry.first);
+            for (auto const& entry : active) largest = std::max(largest, entry.first);
             if (largest && position < events.size() && events[position].resource == resource && events[position].schedule == schedule)
             {
                 uint64_t const span = events[position].family - family;
@@ -496,6 +497,8 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
     validate(config, destinations);
     farming_require(frozen.size() <= destinations.size(), "saved farming layout exceeds destination count");
     PlanningMemory memory{planning_memory_limit};
+    // The per-lane working allowance includes selected/seed/retained-original
+    // layouts, the search's chosen/original copies and topology/sweep scratch.
     memory.add(64 * 1024 + destinations.size() * 1024);
     auto topology_value = topology(destinations);
     uint64_t schedule = 0;
@@ -591,13 +594,14 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
     auto const assessment = assessment_topology(topology_value, selected);
     FarmingPlan result;
     auto best = assess(config, destinations, selected, nullptr, memory, &assessment); ++result.candidates_evaluated;
-    std::vector<bool> swept(destinations.size());
+    bool optional_search = false;
     auto search = [&](std::vector<size_t> const& unit)
     {
         auto chosen = selected; auto original = selected;
         bool improved = false;
         for (auto const& option : *tables[unit.front()])
         {
+            if (optional_search && result.candidates_evaluated == maximum_candidates) break;
             bool matched = true;
             for (auto lane : unit)
             {
@@ -617,31 +621,67 @@ inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<Farming
         selected = chosen;
         return improved;
     };
-    // Joint identical-drive sweeps avoid a starting-layout plateau; every
-    // balanced file count is compared. Resource-lane moves retain frozen meta
-    // identities and refine heterogeneous assignments without sampled ranking.
     std::vector<size_t> independent;
     for (size_t lane = frozen.size(); lane < destinations.size(); ++lane)
         if (topology_value.lanes[lane] == 1 && tables[lane]->front().files) independent.push_back(lane);
-    // Match each lane's own capacity forecast at a common file count. Small
-    // capacity differences (including the farm manifest) must not split a
-    // nearly identical fleet onto a dominated coordinate-search plateau.
+    auto coordinates = [&]
+    {
+        bool improved;
+        do
+        {
+            improved = false;
+            for (size_t lane = frozen.size(); lane < destinations.size(); ++lane)
+                if (search({lane})) improved = true;
+        } while (improved);
+    };
+    // Match each lane's capacity forecast at a common file count. Small
+    // capacity differences must not split a nearly identical fleet onto
+    // a dominated coordinate-search plateau.
     if (independent.size() > 1) search(independent);
+    std::vector<bool> swept(destinations.size());
+    bool initial_improved = false, initial_coordinates = true;
+    for (size_t lane = frozen.size(); lane < destinations.size(); ++lane)
+        if (topology_value.lanes[lane] != 1) initial_coordinates = false;
     for (size_t first = frozen.size(); first < destinations.size(); ++first)
     {
         if (swept[first] || topology_value.lanes[first] != 1) continue;
         std::vector<size_t> unit;
         for (size_t next = first; next < destinations.size(); ++next)
             if (tables[first] == tables[next]) { unit.push_back(next); swept[next] = true; }
-        search(unit);
+        if (unit.size() != 1) initial_coordinates = false;
+        if (search(unit)) initial_improved = true;
     }
-    bool improved;
-    do
+    // An unchanged sweep of singleton independent tables is already a
+    // complete coordinate pass. Joint/shared-resource sweeps still need
+    // the ordinary individual refinement.
+    if (initial_improved || !initial_coordinates) coordinates();
+    if (config.reader == FarmingReader::cached)
     {
-        improved = false;
-        for (size_t lane = frozen.size(); lane < destinations.size(); ++lane)
-            if (search({lane})) improved = true;
-    } while (improved);
+        auto seed = selected; uint64_t files = 0;
+        for (size_t lane = 0; lane < destinations.size(); ++lane)
+        {
+            if (lane >= frozen.size())
+            {
+                seed[lane] = tables[lane]->front();
+                seed[lane].schedule = schedule + topology_value.resource[lane];
+            }
+            add(files, seed[lane].files);
+        }
+        // Cold and fully cached layouts have a discontinuous service cost.
+        // A descent from the minimum nonempty file counts can cross the warm
+        // boundary that single-lane moves from a cold layout cannot reach.
+        // This additional bounded descent does not establish a global optimum.
+        if (seed != selected && files && files * std::ldexp(8.0L, config.k - 6) <= config.index_cache_bytes &&
+            result.candidates_evaluated < maximum_candidates)
+        {
+            auto original = selected; auto previous = best;
+            selected = std::move(seed);
+            best = assess(config, destinations, selected, nullptr, memory, &assessment); ++result.candidates_evaluated;
+            optional_search = true;
+            coordinates();
+            if (!better(config, best, previous)) { selected = std::move(original); best = std::move(previous); }
+        }
+    }
     // Each retained lane is checked once more as the exact proposed forecast.
     best = assess(config, destinations, selected, nullptr, memory, &assessment);
     static_cast<FarmingAssessment&>(result) = best;

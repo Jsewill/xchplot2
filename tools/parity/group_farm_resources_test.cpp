@@ -256,6 +256,71 @@ int main()
         AssessmentAccumulator repeated(stages_profile);
         for (unsigned i = 0; i < 10000; ++i) { auto stage = start; stage.name = "batch-" + std::to_string(i); stage.remaining = {{"original-pos1", i % 9 + 1}}; repeated.add(stage); }
         repeated.add(end); check(repeated.finish().feasible, "repeated cohort streaming assessment failed");
+        AssessmentCache checks(stages_profile);
+        auto equal_cached = [&](Stage const& stage)
+        {
+            std::ostringstream expected, actual;
+            write_assessment_json(expected, assess_stage(stages_profile, stage));
+            write_assessment_json(actual, checks.assess(stage));
+            check(expected.str() == actual.str(), "prepared/cache assessment changed exact resource result or stage provenance");
+            check(checks.retained_memory_bytes() <= AssessmentCache::memory_bytes / 2,
+                  "prepared/cache retention exceeded its declared memory allowance");
+        };
+        for (unsigned pass = 0; pass < 2; ++pass)
+            for (unsigned variant = 0; variant < 12; ++variant)
+            {
+                auto stage = initial(); stage.name = "candidate-" + std::to_string(pass) + '-' + std::to_string(variant);
+                stage.remaining = {{"original-pos1", variant % 10 + 1}};
+                stage.future_filter = variant % 2; stage.construction = {service("cpu", 1, variant + 1)};
+                equal_cached(stage);
+            }
+        auto cached = initial(); equal_cached(cached);
+        cached.name = "renamed-cached-positive-count"; cached.remaining = {{"original-pos1", 1}}; equal_cached(cached);
+        cached.remaining[0].count = 0; equal_cached(cached);
+        cached.scope_complete = false; equal_cached(cached);
+        cached.scope_complete = true; cached.construction = {memory("ram", 100001)}; equal_cached(cached);
+        cached.name = "renamed-infeasible"; equal_cached(cached);
+        cached = initial(); cached.construction.assign(300, service("cpu", 0, 0)); equal_cached(cached);
+        cached.construction.back().resource = "unknown";
+        rejects([&] { checks.assess(cached); }, "oversized uncached stage bypassed unknown-resource validation");
+        cached = initial(); cached.remaining = {{"original-pos1", 11}};
+        rejects([&] { checks.assess(cached); }, "cached positive count bypassed immutable inventory maximum");
+        cached.remaining = {{"original-pos1", 1}, {"original-pos1", 2}};
+        rejects([&] { checks.assess(cached); }, "cached stage bypassed duplicate remaining validation");
+        cached.remaining = {{"unknown", 1}};
+        rejects([&] { checks.assess(cached); }, "cached stage bypassed unknown remaining validation");
+        cached = initial(); cached.construction = {memory("ram", UINT64_MAX)};
+        rejects([&] { checks.assess(cached); }, "prepared assessment bypassed resource overflow validation");
+        AssessmentPreparation binding(stages_profile);
+        for (auto ready : {0, 1, 10}) for (bool building : {false, true})
+        {
+            auto direct = initial(), prepared = initial();
+            bind_native_stage(stages_profile, request(), ready, direct, building, !building);
+            bind_native_stage(binding, request(), ready, prepared, building, !building);
+            std::ostringstream expected, actual;
+            write_assessment_json(expected, assess_stage(stages_profile, direct));
+            write_assessment_json(actual, checks.assess(prepared));
+            check(expected.str() == actual.str(), "prepared native binding changed its exact assessment");
+        }
+        auto external_cache_profile = stages_profile;
+        auto& outside = external_cache_profile.workloads.front(); outside.external_service_node_id = std::string(64, 'a');
+        outside.external_service_host = "harvester"; outside.external_service_members = outside.plot_count;
+        AssessmentCache external_checks(external_cache_profile);
+        check(external_checks.assess(initial()).feasible, "prepared external reservation rejected");
+        cached = initial(); cached.remaining = {{outside.id, 1}};
+        rejects([&] { external_checks.assess(cached); }, "cached stage reduced an unscanned external service reservation");
+        auto maximum_profile = stages_profile; maximum_profile.resources.clear(); maximum_profile.workloads.clear(); maximum_profile.native = {};
+        for (size_t index = 0; index < max_resources; ++index)
+        {
+            auto r = resource(std::to_string(index) + std::string(1000, 'r'), ResourceKind::storage, 1);
+            r.host = std::string(1024, 'h');
+            for (unsigned alias = 0; alias < 32; ++alias)
+                r.aliases.push_back(std::to_string(index) + ':' + std::to_string(alias) + std::string(1000, 'a'));
+            maximum_profile.resources.push_back(std::move(r));
+        }
+        AssessmentCache maximum_checks(maximum_profile);
+        check(maximum_checks.assess(initial()).feasible && maximum_checks.retained_memory_bytes() <= AssessmentCache::memory_bytes / 2,
+              "maximum-schema resource graph exceeded the existing assessment cache allowance");
         check(reason(assess_transition(stages_profile, {start}), "missing-final-future-filter"), "final future filter omitted");
         modeled_gpu(stages_profile); stages_profile.workloads[0].future_proof_burst = 1000;
         check(reason(assess_transition(stages_profile, {start, end}), "deadline"), "future proof burst not checked");

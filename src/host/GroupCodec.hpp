@@ -71,6 +71,7 @@ public:
         {
             if (wait_check) wait_check();
             if (!owner_) return;
+            group_tools::require(!owner_->threads_.empty(), "read-only codec scheduler cannot execute work");
             group_tools::require(permits_ && permits_ <= owner_->workers(), "invalid CPU permit request");
             if (current_ == owner_)
             {
@@ -139,9 +140,13 @@ public:
             "codec scheduler memory estimate overflow");
         return sizeof(CodecScheduler) + uint64_t(workers) * per_worker;
     }
-    explicit CodecScheduler(unsigned workers) : jobs_(workers)
+    enum class Execution { enabled, preview };
+    explicit CodecScheduler(unsigned workers, Execution execution = Execution::enabled) : jobs_(workers)
     {
         group_tools::require(workers, "codec worker count must be positive");
+        // Admission previews retain the same scheduler shape and memory model,
+        // but cannot borrow permits or queue work.
+        if (execution == Execution::preview) return;
         threads_.reserve(workers);
         try
         {
@@ -156,6 +161,7 @@ public:
 
     std::future<void> submit(std::function<void()> operation)
     {
+        group_tools::require(!threads_.empty(), "read-only codec scheduler cannot execute work");
         // A compute task must never wait for a task on its own bounded pool.
         group_tools::require(current_ != this, "codec task cannot submit nested work");
         auto job = std::make_shared<std::packaged_task<void()>>(std::move(operation));
