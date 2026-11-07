@@ -1,5 +1,6 @@
 #include "host/BatchPlotter.hpp"
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/GroupFarmMetadata.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -50,6 +51,8 @@ void validate_batch_entry(BatchEntry const& e)
         throw std::invalid_argument("plot ID does not match group/index/meta group");
     if (e.memo.size() > 255) throw std::invalid_argument("memo exceeds 255 bytes");
     if (e.out_dir.empty()) throw std::invalid_argument("output directory is empty");
+    if (group_grow::farming_metadata_namespace(std::filesystem::path(e.out_dir)))
+        throw std::invalid_argument("output directory is in the reserved .xchplot2 recovery namespace");
     if (e.out_name.empty() || e.out_name == "." || e.out_name == ".." ||
         e.out_name.find_first_of("/\\") != std::string::npos ||
         std::filesystem::path(e.out_name).has_root_path())

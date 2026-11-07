@@ -161,18 +161,27 @@ bool file_safety(bool raw)
     if (verification.proofs_found == 0 || verification.full_proofs_validated != verification.proofs_found) return false;
     if (!raw) {
         constexpr uint64_t memory_bytes = uint64_t(512) << 20;
+        pos2gpu::check_plot_file_structure_bounded(path.string(), memory_bytes);
         auto const bounded = pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes);
         if (bounded.full_proofs_validated != 1 || !bounded.trials || bounded.trials > 100) return false;
         auto rejects = [](auto operation) {
             try { operation(); } catch (std::exception const&) { return true; }
             return false;
         };
+        if (!rejects([&] { pos2gpu::check_plot_file_structure_bounded(path.string(), 0); })) return false;
+        if (!rejects([&] { pos2gpu::check_plot_file_structure_bounded(path.string(), 1); })) return false;
+        if (!rejects([&] { pos2gpu::check_plot_file_structure_bounded(path.string(), memory_bytes,
+            [] { throw std::runtime_error("cancelled structural check"); }); })) return false;
+        unsigned cancellation_checks = 0;
+        if (!rejects([&] { pos2gpu::check_plot_file_structure_bounded(path.string(), memory_bytes,
+            [&] { if (++cancellation_checks == 2) throw std::runtime_error("cancelled structural check"); }); })) return false;
         if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, 1); })) return false;
         if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes,
             [] { throw std::runtime_error("cancelled proof sample"); }); })) return false;
         // A zero tail can decode to the same chunk sizes; production validation
         // must still reject a noncanonical index instead of accepting padding.
         { std::ofstream append(path, std::ios::binary | std::ios::app); append.put(0); }
+        if (!rejects([&] { pos2gpu::check_plot_file_structure_bounded(path.string(), memory_bytes); })) return false;
         if (!rejects([&] { pos2gpu::verify_plot_file_bounded(path.string(), {100, 1}, memory_bytes); })) return false;
         write();
     }
@@ -181,7 +190,11 @@ bool file_safety(bool raw)
         uint64_t const impossible = ~uint64_t{0};
         file.seekp(offset); file.write(reinterpret_cast<char const*>(&impossible), sizeof(impossible));
         file.close();
-        bool const rejected = !pos2gpu::plot_file_matches(path.string(), entry);
+        bool rejected = !pos2gpu::plot_file_matches(path.string(), entry);
+        if (!raw) {
+            try { pos2gpu::check_plot_file_structure_bounded(path.string(), uint64_t(512) << 20); rejected = false; }
+            catch (std::exception const&) {}
+        }
         write();
         return rejected;
     };
@@ -199,6 +212,10 @@ bool file_safety(bool raw)
     auto const size = std::filesystem::file_size(path);
     std::filesystem::resize_file(path, size - 1);
     if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
+    if (!raw) {
+        try { pos2gpu::check_plot_file_structure_bounded(path.string(), uint64_t(512) << 20); return false; }
+        catch (std::exception const&) {}
+    }
     { std::ofstream junk(path); junk << "pos2" << std::string(60, 'x'); }
     if (pos2gpu::plot_file_matches(path.string(), entry)) return false;
     std::printf("  OK exclusive temp, concurrent writers, resume identity/bounds, and %zu full proofs\n",

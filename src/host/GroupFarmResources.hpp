@@ -456,7 +456,8 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
             "native resource envelope differs from selected plot/reader/backend/engine");
     require(request.ram_bytes && request.ram_bytes <= n.max_ram_bytes && request.cpu_threads && request.cpu_threads <= n.max_cpu_threads &&
             request.gpu_bytes <= n.max_gpu_bytes && request.batch_members && request.batch_members <= n.max_batch_members &&
-            request.construction_us && request.construction_us <= n.max_construction_us && request.verification_us && request.verification_us <= n.max_verification_us,
+            request.construction_us && request.construction_us <= n.max_construction_us &&
+            (!verifying || (request.verification_us && request.verification_us <= n.max_verification_us)),
             "selected native construction or verification exceeds reviewed resource envelope");
     require(request.group_members && request.group_members <= n.max_group_members,
             "selected whole-file membership exceeds reviewed construction and verification phase bounds");
@@ -564,7 +565,7 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     {
         uint64_t const cpu = request.verification_cpu_threads ? request.verification_cpu_threads : request.cpu_threads;
         uint64_t const ram = request.verification_ram_bytes ? request.verification_ram_bytes : request.ram_bytes;
-        require(cpu <= n.max_cpu_threads && ram <= n.max_ram_bytes && request.verification_gpu_bytes <= n.max_gpu_bytes,
+        require(cpu && cpu <= request.cpu_affinity_lanes && cpu <= n.max_cpu_threads && ram <= n.max_ram_bytes && request.verification_gpu_bytes <= n.max_gpu_bytes,
                 "selected verifier exceeds reviewed native capacity envelope");
         require(!n.verification_cpu_threads || cpu == n.verification_cpu_threads, "verifier CPU cap differs from reviewed affinity envelope");
         coverage(stage.verification, concurrent_cpu(cpu), add(ram, request.controller_ram_bytes), request.verification_gpu_bytes, false, true);
@@ -960,8 +961,8 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
     need(!native.k || !native.strength || native.host.empty() || native.reader.empty() || native.backend.empty() || native.engine.empty(),
         "replacement-scope", path, "Set k, strength, host, reader, backend and engine to the intended replacement execution; observed reader provenance does not select construction settings.");
     need(!native.max_ram_bytes || !native.max_cpu_threads || !native.max_batch_members || !native.max_group_members ||
-        !native.max_construction_us || !native.max_verification_us, "whole-file-bounds", path,
-        "Declare max_ram_bytes, max_cpu_threads, max_batch_members, max_group_members, max_construction_us and max_verification_us. Bounds cover a whole output file and its proof verification, not one batch or a timeout sample.");
+        !native.max_construction_us, "whole-file-bounds", path,
+        "Declare max_ram_bytes, max_cpu_threads, max_batch_members, max_group_members and max_construction_us for a whole output file. Optional sampled/strict migration proof checks also require max_verification_us and verification phase demands; routine structural checks use the bounded supervision envelope.");
     need(native.output_resources.empty(), "physical-bindings", path + ".output_resources",
         "Map every intended output filesystem to its actual storage resource; reuse drive aliases for physically shared storage.");
     auto demands = [&](std::vector<Demand> const& values, std::string const& field)
@@ -986,7 +987,8 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
         { (void)host; missing_host = missing_host || !kinds.contains(ResourceKind::cpu) || !kinds.contains(ResourceKind::host_memory); }
         need(missing_host, "physical-bindings", field, "Include CPU and host-memory demands on every physical execution host used by this phase; solver/GPU work also requires its host CPU and RAM scope.");
     };
-    demands(native.construction, path + ".construction"); demands(native.verification, path + ".verification");
+    demands(native.construction, path + ".construction");
+    if (!native.verification.empty() || native.max_verification_us) demands(native.verification, path + ".verification");
     demands(native.supervision, path + ".supervision");
     need(native.cohorts.empty(), "farming-and-proofs", path + ".cohorts",
         "Declare increasing max_members cohorts, each with complete new_farming and separate proof_reserve demands for the harvester/farmer/full node/solver. Quality calibration cannot supply a full-proof reserve.");

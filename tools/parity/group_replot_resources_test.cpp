@@ -61,6 +61,21 @@ int main() try
     ReplotSupervision supervision{mib, 8 * mib, 1, 100000}; supervision.source_roots = {directory}; native.source_resources = {disk};
     auto request = replot_native_request(args, profile, state, {}, 0, 16 * mib, supervision);
     {
+        ReplotVerification sampled{ReplotVerificationMode::sampled, 1, 3};
+        require(replot_requires_proof(sampled, 0) && !replot_requires_proof(sampled, 1) && replot_requires_proof(sampled, 2) &&
+            !replot_requires_proof(sampled, 3) && replot_requires_proof(sampled, 5), "saved proof schedule changed its global group ordinals");
+        require(replot_requires_proof(replot_verification_policy({}), 0) &&
+            !replot_requires_proof(ReplotVerification{}, 0), "legacy absence and explicit structural policy were conflated");
+        rejects([&] { validate_replot_verification({ReplotVerificationMode::sampled}); }, "empty proof sample schedule accepted");
+        rejects([&] { validate_replot_verification({ReplotVerificationMode::strict, 1}); }, "strict mode ignored a sample schedule");
+        require(replot_verification_retry_delay(profile.gate, 0) == profile.gate.recovery_hold_ms &&
+            replot_verification_retry_delay(profile.gate, profile.gate.max_age_ms) == profile.gate.max_age_ms,
+            "verification retries lost their reviewed cooldown or maximum");
+        auto exhausted = profile.gate; exhausted.recovery_hold_ms = 0; exhausted.max_age_ms = 1;
+        require(replot_verification_retry_delay(exhausted, 0) == 1 && replot_verification_retry_delay(exhausted, UINT64_MAX) == 1,
+            "verification retry cooldown overflowed or spun with a zero recovery hold");
+    }
+    {
         ReplotReview review; review.farm = state; review.inventory_json = review.resources_json = "resource-fixture";
         review.farm.fingerprint = review.farm.seed = std::string(64, '0'); review.farm.farmer = std::string(96, '0'); review.farm.pool = std::string(64, '0');
         review.farm.job_id = std::string(64, 'a'); review.farm.directories[0].layout.families = 1;
@@ -93,12 +108,64 @@ int main() try
         journal.phase = ReplotPhase::replacing; journal.retirements = {{ReplotRetirement::active, false}};
         FarmInventory inventory; InventoryPlot source; source.workload_id = "legacy"; source.header_validated = true;
         source.identity.allocated_bytes = 64; source.identity.links = 1; inventory.plots = {source};
+        {
+            auto structural = review; structural.verification = ReplotVerification{};
+            auto const text = replot_review_text(structural);
+            require(text.starts_with("ordinary-group-replot-review-v3\n") && replot_review_text(parse_replot_review(text, 64 * mib)) == text,
+                "explicit structural policy lost its canonical review representation");
+            auto const legacy_text = replot_review_text(review);
+            ReplotRevalidation successor{legacy_text, review.inventory_json, review.resources_json, {}, std::string(64, 'a')};
+            successor.verification = ReplotVerification{ReplotVerificationMode::sampled, 1, 3};
+            auto const successor_text = replot_revalidation_text(successor);
+            auto const parsed_successor = parse_replot_revalidation(successor_text, 64 * mib);
+            require(successor_text.starts_with("ordinary-group-replot-revalidation-v3\n") &&
+                parsed_successor.origin_review == legacy_text && parsed_successor.verification == successor.verification &&
+                replot_revalidation_text(parsed_successor) == successor_text && replot_review_text(review) == legacy_text,
+                "explicit successor changed its embedded origin or saved proof schedule");
+            auto without_proof = profile; without_proof.native.verification.clear(); without_proof.native.max_verification_us = 0;
+            without_proof.native.verification_cpu_threads = 0;
+            auto const bounded = replot_native_request(args, without_proof, state, {}, 0, 16 * mib, supervision, false);
+            require(bounded.verification_cpu_threads == 1 &&
+                assess_replot_remaining(without_proof, bounded, inventory, structural, journal, {{"legacy", 1}}, 0).feasible,
+                "routine structural policy required a migration proof service or inherited all CPU lanes");
+            rejects([&] { (void)replot_stage(without_proof, bounded, {{"legacy", 1}}, 0, false, true, false); },
+                "selected proof work silently downgraded without its reviewed envelope");
+            structural.verification = ReplotVerification{ReplotVerificationMode::sampled, 0, 2};
+            require(assess_replot_remaining(without_proof, bounded, inventory, structural, journal, {{"legacy", 1}}, 0).feasible,
+                "unsampled group was charged for another group's proof");
+            structural.verification = ReplotVerification{ReplotVerificationMode::sampled, 1, 0};
+            rejects([&] { (void)assess_replot_remaining(without_proof, bounded, inventory, structural, journal, {{"legacy", 1}}, 0); },
+                "selected initial sample omitted its required proof work");
+            structural.verification = ReplotVerification{};
+            auto sealed = journal; stream_state::Stamp stamp; stamp.bytes = 1; sealed.verified_stage = stamp;
+            rejects([&] { validate_replot_progress(structural, sealed); }, "new policy stage accepted absent legacy-like proof evidence");
+            sealed.full_proof_validated = false;
+            auto const body = replot_journal_text(sealed);
+            require(body.starts_with("ordinary-group-replot-journal-v4\n") && replot_journal_text(parse_replot_journal(body, 64 * mib)) == body,
+                "structural completion lost its explicit false evidence");
+            auto changed = sealed; ++changed.revision; changed.parent_digest = stream_state::digest(body); changed.full_proof_validated = true;
+            require(!valid_replot_revision(sealed, changed), "completed structural work was relabeled as a validated full proof");
+            changed.full_proof_validated.reset();
+            require(!valid_replot_revision(sealed, changed), "completed structural work dropped evidence into legacy proof semantics");
+            ReplotReceipt receipt; receipt.review_digest = sealed.review_digest; receipt.candidates = 1; receipt.replacement = stamp;
+            rejects([&] { validate_replot_receipt(structural, sealed.review_digest, 0, {}, receipt); },
+                "new policy receipt accepted missing explicit verification evidence");
+            receipt.full_proof_validated = false;
+            auto const receipt_body = replot_receipt_text(receipt);
+            require(receipt_body.starts_with("ordinary-group-replot-receipt-v3\n") &&
+                parse_replot_receipt(receipt_body).full_proof_validated == false && replot_receipt_text(parse_replot_receipt(receipt_body)) == receipt_body,
+                "structural receipt claimed a positive full proof or lost canonical bytes");
+            require(assess_replot_remaining(without_proof, bounded, inventory, structural, sealed, {{"legacy", 1}}, 0,
+                ReplotVerification{ReplotVerificationMode::sampled, 1, 0}).feasible,
+                "already completed sample was charged again in a stopped suffix");
+        }
         auto completed = profile; completed.native.construction[0].work_us = UINT64_MAX / 4;
         stream_state::Stamp sealed; sealed.bytes = 1; journal.verified_stage = sealed;
         {
             auto const legacy = replot_journal_text(journal);
             require(legacy.starts_with("ordinary-group-replot-journal-v1\n") &&
-                replot_journal_text(parse_replot_journal(legacy, 64 * mib)) == legacy, "legacy migration journal bytes changed without native evidence");
+                replot_journal_text(parse_replot_journal(legacy, 64 * mib)) == legacy &&
+                !parse_replot_journal(legacy, 64 * mib).full_proof_validated.has_value(), "legacy migration journal bytes changed without native evidence");
             auto native = journal; native.verified_stage->inode = 1;
             native.verified_stage_identity = {file_io::DurableIdentity::Scheme::windows_file_id,
                 "ntfs:12345678-1234-1234-1234-123456789abc:1", std::string(32, '1')};
@@ -164,6 +231,8 @@ int main() try
             auto const strict = replot_receipt_text(receipt);
             require(strict.starts_with("ordinary-group-replot-receipt-v1\n") && replot_receipt_text(parse_replot_receipt(strict)) == strict,
                 "legacy receipt bytes changed without native evidence");
+            require(!parse_replot_receipt(strict).full_proof_validated.has_value() &&
+                parse_replot_receipt(strict).full_proof_validated.value_or(true), "legacy receipt absence lost its required-proof interpretation");
         }
         require(assess_replot_remaining(completed, request, inventory, review, journal, {{"legacy", 1}}, 0).feasible,
             "successor replayed construction already covered by an exact verified stage");

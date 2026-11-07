@@ -95,6 +95,13 @@ struct VerifyResult {
 // every returned chain; a chain without a valid full proof throws.
 VerifyResult verify_plot_file(std::string const& filename, size_t n_trials, bool full = false);
 
+// Check a complete ordinary v2 group's header, payload bounds and canonical
+// chunk index without reading quality chains or reconstructing full proofs.
+// Does not check an expected identity or certify compressed payloads. Run inside
+// the worker's OS memory/CPU/time caps; success is not a full-proof result.
+void check_plot_file_structure_bounded(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled = {});
+
 // Production smoke validation is separate from verify's all-returned-chain
 // semantics. Each fresh challenge contributes at most one uniformly selected
 // full reconstruction. full_proofs is both the required positive sample count

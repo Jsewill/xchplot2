@@ -504,6 +504,18 @@ int main(int argc, char** argv)
         try { pos2gpu::validate_batch_entry(invalid); } catch (std::exception const&) { refused = true; }
         assert(refused);
     }
+    for (auto const& parent : {dir / ".xchplot2", dir / ".xchplot2" / "replot-absent"}) {
+        for (auto invalid : {entry, grouped_entry}) {
+            invalid.out_dir = parent.string(); refused = false;
+            try { pos2gpu::validate_batch_entry(invalid); }
+            catch (std::invalid_argument const& error) { refused = std::string(error.what()).find("reserved .xchplot2") != std::string::npos; }
+            assert(refused && !std::filesystem::exists(parent));
+            invalid.raw = true; invalid.grouped = false; invalid.group_members = 1; refused = false;
+            try { pos2gpu::validate_batch_entry(invalid); }
+            catch (std::invalid_argument const& error) { refused = std::string(error.what()).find("reserved .xchplot2") != std::string::npos; }
+            assert(refused && !std::filesystem::exists(parent));
+        }
+    }
     for (auto const* suffix : {"", " 0", " 65536", " 2junk", " 2 extra"}) {
         auto text = line("18 2 0 0 gplot-v2-grouped"); text.pop_back(); text += suffix; text += '\n';
         put(manifest, text); refused = false;

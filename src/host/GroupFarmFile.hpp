@@ -151,8 +151,8 @@ inline bool is_replot_review(fs::path const& path)
     require(fields(stat(source.handle)) == saved && fields(observed(path)) == saved, "saved plan changed during its type check");
     auto const first = std::string_view(line.data(), read);
     auto const header = first.substr(0, first.find('\n'));
-    return header == "ordinary-group-replot-review-v1" || header == "ordinary-group-replot-review-v2" || header == "ordinary-group-replot-revalidation-v1" ||
-        header == "ordinary-group-replot-revalidation-v2";
+    return header == "ordinary-group-replot-review-v1" || header == "ordinary-group-replot-review-v2" || header == "ordinary-group-replot-review-v3" ||
+        header == "ordinary-group-replot-revalidation-v1" || header == "ordinary-group-replot-revalidation-v2" || header == "ordinary-group-replot-revalidation-v3";
 }
 } // namespace inventory_detail
 } // namespace group_grow::farm

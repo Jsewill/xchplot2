@@ -277,6 +277,7 @@ void metadata_options()
     reject("plan", {"plan", "--assess-jobs", "saved.plan", "--calibrate"});
     reject("fill", {"fill", "unread.plot2", "--replot-proof-solves", "1"});
     reject("plan", {"plan", "--calibrate", "unread.plot2", "--replot-proof-solves", "1"});
+    reject("plan", {"plan", "--calibrate", "--calibration-worker", "unread.plot2", "--replot-structure-worker", "--replot-proof-solves", "1", "--json"});
 #ifndef XCHPLOT2_GROUP_COMMANDS
     reject("plan", {"plan", "--calibrate", "not-read.gplot", "--json"});
     reject("plan", {"plan", "--calibrate", "--calibration-worker", "not-read.gplot", "--json"});
@@ -315,6 +316,21 @@ void replot_external_projection(fs::path const& directory, group_grow::Identity 
     auto const capacity = sum(canonical_bound(requested, 4), args.max_ram);
     require(replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
         "ordinary scratch policy could not admit a projected external migration");
+    auto const fresh_root = directory / "fresh-private-external-projection"; fs::create_directory(fresh_root);
+    auto fresh = group_grow::ScratchRoot::inspect(fresh_root); fresh.available_bytes = target.available_bytes;
+    auto const stage = migration_stage_path(fresh_root, std::string(64, 'a'), 0, false);
+    require(replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0, true) &&
+        fs::is_empty(fresh_root), "fresh external projection required or created a private construction namespace");
+    bool strict = false;
+    try { (void)replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0); }
+    catch (std::runtime_error const&) { strict = true; }
+    require(strict && fs::is_empty(fresh_root), "runtime external inspection ignored a missing construction parent");
+    {
+        FarmingMetadataDirectory metadata(fresh_root); metadata.create(); metadata.require_fresh();
+        require(replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0, true) &&
+            fs::is_empty(metadata.path) && !fs::exists(stage.parent_path()),
+            "external projection populated an empty metadata ancestor");
+    }
     auto empty = target; empty.available_bytes = 0;
     require(!replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {empty}, empty, 0),
         "external migration admitted scratch/output without actual or reviewed prospective space");
@@ -1034,6 +1050,7 @@ void replot_output_native_owners(fs::path const& root, Members input, Config cfg
     auto const path = directory / "replacement.gplot"; input = input.subspan(0, 2); direct(path, input, cfg);
     auto const bytes = contents(path); auto const original = stream_state::stamp(path);
     ReplotReview review; auto& lane = review.farm.directories.emplace_back();
+    lane.directory = file_io::path_text(directory); lane.directory_identity = farming_directory_identity(directory);
     lane.layout.files = 1; lane.layout.total_members = lane.layout.group_members = input.size(); lane.layout.fixed_members = true;
     review.batches.push_back({0, 0, 0, 0, cfg.capacity_bytes, 0, 0, 0});
     auto const fixed = identity_from(identity());
@@ -1064,16 +1081,18 @@ void replot_bootstrap_inspection(fs::path const& root, Members input, Config cfg
     using namespace grow_controller_test;
     auto const directory = root / "replot-bootstrap"; fs::create_directory(directory); input = input.subspan(0, 2);
     auto const reference = directory / "reference.gplot"; direct(reference, input, cfg); auto const bytes = contents(reference);
-    for (std::string const engine : {"incremental", "staged", "merged", "external"})
+    for (bool legacy : {true, false}) for (std::string const engine : {"incremental", "staged", "merged", "external"})
         for (std::string const state : {"empty", "ordinary", "orphan"})
         {
             ReplotInputs inputs; auto& review = inputs.review; review.farm.job_id = stream_state::digest(engine + state);
             review.farm.config.k = 18; review.farm.config.strength = 2;
             auto& destination = review.farm.directories.emplace_back(); destination.directory = file_io::path_text(directory);
+            destination.directory_identity = farming_directory_identity(directory);
             destination.layout.files = 1; destination.layout.total_members = 2; destination.layout.group_members = 2; destination.layout.fixed_members = true;
             review.batches.resize(1); review.batches[0].final_bound_bytes = cfg.capacity_bytes;
             inputs.resources.native.engine = engine; ReplotJournal journal; journal.farm = review.farm;
-            auto const path = migration_stage_path(directory, review.farm.job_id, 0);
+            FarmingReplotDirectory metadata(directory, review.farm.job_id, true, legacy);
+            auto const path = migration_stage_path(directory, review.farm.job_id, 0, legacy);
             if (state == "empty") { std::ofstream empty(path, std::ios::binary); }
             else
             {
@@ -1082,12 +1101,12 @@ void replot_bootstrap_inspection(fs::path const& root, Members input, Config cfg
             }
             auto const before = contents(path); Arguments args; args.max_ram = 2 * 1024 * mib; args.workers = cfg.workers;
             args.window = cfg.window_bytes; args.checkpoint_bytes = cfg.checkpoint_bytes; args.io_overlap = false;
-            auto const inspected = inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, false);
+            auto const inspected = inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, false, legacy);
             auto const expected_engine = state != "orphan" && (engine == "staged" || engine == "merged") ? engine : "incremental";
             require(!inspected.inspected.checkpoint && inspected.evidence.source_build.empty() && inspected.evidence.engine == expected_engine && contents(path) == before,
                 "migration bootstrap inspection changed original dispatch, invented build authority or modified bytes");
             bool refused = false;
-            try { (void)inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, true); }
+            try { (void)inspect_replot_construction(args, inputs, journal, identity_from(identity()), nullptr, true, legacy); }
             catch (std::runtime_error const&) { refused = true; }
             require(refused && contents(path) == before, "checkpoint-free bootstrap authorized a reviewed successor or changed bytes");
             {
@@ -3486,6 +3505,33 @@ void replot_save_diagnostics(fs::path const& root)
         catch (...) { std::cout.rdbuf(previous); throw; }
         std::cout.rdbuf(previous); return std::pair{code, profile_detail::JsonReader(output.str()).read()};
     };
+    {
+        auto structural = inputs; structural.review.verification = ReplotVerification{};
+        structural.resources.native.verification.clear(); structural.resources.native.max_verification_us = 0;
+        structural.resources.native.verification_cpu_threads = 0;
+        std::ostringstream resource_text; write_profile_json(resource_text, structural.resources);
+        structural.review.resources_json = resource_text.str();
+        auto const bounded = replot_request(args, structural);
+        require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)) &&
+            assess_replot_review(args, structural).feasible, "structural mapping required a migration proof grant");
+        structural.review.verification = ReplotVerification{ReplotVerificationMode::sampled, 0, 2};
+        require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)),
+            "unsampled mapping required another group's proof grant");
+        for (auto policy : {ReplotVerification{ReplotVerificationMode::strict}, ReplotVerification{ReplotVerificationMode::sampled, 1, 0}})
+        {
+            auto selected = structural; selected.review.verification = policy;
+            bool rejected = false;
+            try { (void)replot_mapping_capacity(selected.resources, selected.inventory, selected.review, bounded); }
+            catch (std::runtime_error const&) { rejected = true; }
+            require(rejected, "selected proof binding escaped mapper initialization's refusal boundary");
+            args.save_plan = directory / "missing-proof-grant.plan";
+            auto const refused = render(selected);
+            require(refused.first == 2 && !inventory_detail::boolean(refused.second, "feasible") &&
+                !inventory_detail::required_field(refused.second, "infeasibility_reasons").items.empty() && !fs::exists(args.save_plan),
+                "missing selected proof grant lost structured infeasibility or wrote a refused plan");
+        }
+        args.save_plan.clear();
+    }
     args.save_plan = directory / "refused.plan";
     auto constrained = inputs;
     constrained.review.space[0].free_bytes = sum(constrained.review.space[0].metadata_allowance_bytes,
@@ -3508,7 +3554,7 @@ void replot_save_diagnostics(fs::path const& root)
         "feasible review changed its compatible saved bytes or reported path");
     auto const source_bytes = contents(source);
     require(std::string(source_bytes.begin(), source_bytes.end()) == "protected synthetic source bytes" &&
-        !fs::exists(directory / "grow-replot.plan"), "save diagnostic rendering changed the source or published a private journal");
+        !fs::exists(directory / ".xchplot2"), "save diagnostic rendering changed the source or published a private journal");
 }
 
 void replot_journal_protocol(fs::path const& root)
@@ -3814,6 +3860,74 @@ void replot_execution_resource_bindings(fs::path const& root)
     require(!replot_prefix_capacity(projection).empty(), "coalesced current space escaped its indivisible predelete debt cap");
 }
 
+void replot_status_receipt_evidence(fs::path const& root)
+{
+    using namespace group_grow::farm; using namespace grow_controller_test;
+    auto const base = root / "replot-status-receipts";
+    fs::create_directories(base / "source"); fs::create_directory(base / "destination");
+    { std::ofstream file(base / "source" / "old.plot"); file << "old synthetic source"; }
+    std::array<fs::path, 1> inventory_roots{base / "source"};
+    ReplotInputs inputs; inputs.inventory = scan_farm_inventory(inventory_roots);
+    auto& review = inputs.review; review.inventory_json = farm_inventory_text(inputs.inventory); review.resources_json = "{}";
+    review.memory_limit_bytes = 16 * mib; review.sources = {0}; review.space.resize(1);
+    auto farm = farming_format_fixture(6); farm.capacity_fill = false; farm.directories.resize(1); farm.estimate.destinations.resize(1);
+    auto& directory = farm.directories.front(); directory.directory = file_io::path_text(base / "destination");
+    directory.directory_identity = farming_directory_identity(base / "destination"); directory.filesystem = storage_device(base / "destination").filesystem;
+    directory.extents.clear(); directory.sealed_files = 0; directory.identity_resources = 1;
+    review.farm = parse_farming_state(farming_state_text(farm, true), 16 * mib);
+    review.batches = {{0, 0, 0, 1, 4096, 8192, 16384, 4096}, {0, 1, 1, 0, 4096, 8192, 16384, 4096}};
+    inputs.digest = stream_state::digest(replot_review_text(review));
+    Arguments args; args.max_ram = 16 * mib; args.json = true;
+    auto status = [&]
+    {
+        std::ostringstream output; auto* previous = std::cout.rdbuf(output.rdbuf()); int result;
+        try { result = print_replot_status(args, inputs); } catch (...) { std::cout.rdbuf(previous); throw; }
+        std::cout.rdbuf(previous); return std::pair{result, profile_detail::JsonReader(output.str()).read()};
+    };
+    auto absent = status(); require(!absent.first && inventory_detail::integer(absent.second, "completed_full_proof_validated_groups") == 0,
+        "status without a journal reported unknown completed proof history");
+    auto const output_path = group_path(base / "destination", 0, farm.job_id);
+    { std::ofstream file(output_path); file << "replacement native fixture"; }
+    FarmingReplotDirectory metadata(base / "destination", farm.job_id, true);
+    auto const receipt_path = metadata.path / "receipt-0", journal_path = metadata.metadata.path / "grow-replot.plan";
+    ReplotReceipt receipt{inputs.digest, {}, 0, 0, 1, stream_state::stamp(output_path)};
+    auto const receipt_body = replot_receipt_text(receipt), receipt_digest = stream_state::digest(receipt_body);
+    stream_state::atomic_save(receipt_path, receipt_body + receipt_digest + '\n', false);
+    ReplotJournal journal; journal.review_digest = inputs.digest; journal.farm = farm; journal.phase = ReplotPhase::replacing;
+    journal.batch = 1; journal.retired_prefix = 1; journal.receipt_digest = receipt_digest;
+    auto save_journal = [&](bool existing)
+    { auto const body = replot_journal_text(journal); stream_state::atomic_save(journal_path, body + stream_state::digest(body) + '\n', existing); };
+    auto known = [](profile_detail::Json const& value)
+    {
+        auto const& outputs = inventory_detail::required_field(value, "completed_outputs").items;
+        return inventory_detail::boolean(value, "completed_receipt_chain_verified") &&
+            inventory_detail::integer(value, "completed_full_proof_validated_groups") == 1 && outputs.size() == 1 &&
+            inventory_detail::boolean(outputs.front(), "full_proof_validated");
+    };
+    auto unknown = [](profile_detail::Json const& value)
+    {
+        if (inventory_detail::boolean(value, "completed_receipt_chain_verified") ||
+            inventory_detail::required_field(value, "completed_full_proof_validated_groups").kind != profile_detail::Json::null) return false;
+        for (auto const& output : inventory_detail::required_field(value, "completed_outputs").items)
+            if (inventory_detail::required_field(output, "full_proof_validated").kind != profile_detail::Json::null) return false;
+        return true;
+    };
+    save_journal(false); auto anchored = status();
+    require(!anchored.first && known(anchored.second), "anchored legacy receipt lost its required-proof history");
+    { std::ofstream file(output_path, std::ios::app); file << " changed"; }
+    auto changed = status(); require(changed.first && known(changed.second), "changed native file erased independently anchored proof history");
+    journal.receipt_digest = std::string(64, 'f'); save_journal(true);
+    auto unanchored = status(); require(unanchored.first && unknown(unanchored.second), "internally valid unanchored receipts claimed completed proof evidence");
+    journal.batch = 2; journal.receipt_digest = receipt_digest; save_journal(true);
+    auto missing = status(); require(missing.first && unknown(missing.second), "missing zero-source receipt inherited the prior valid receipt root");
+    journal.batch = 1; save_journal(true);
+    stream_state::atomic_save(receipt_path, "corrupt receipt\n", true);
+    auto corrupt = status(); require(corrupt.first && unknown(corrupt.second), "corrupt receipt history claimed known proof evidence");
+    journal.batch = journal.retired_prefix = 0; journal.receipt_digest.clear(); journal.phase = ReplotPhase::preparing; journal.retirements.resize(1); save_journal(true);
+    auto empty = status(); require(inventory_detail::integer(empty.second, "completed_full_proof_validated_groups") == 0,
+        "empty journal reported unknown completed proof history");
+}
+
 void replot_status_protocol(fs::path const& root)
 {
     using namespace group_grow::farm; using namespace grow_controller_test;
@@ -3824,6 +3938,13 @@ void replot_status_protocol(fs::path const& root)
     auto& review = inputs.review; review.inventory_json = farm_inventory_text(inputs.inventory); review.resources_json = "{}";
     review.memory_limit_bytes = 16 * mib; review.reclaim_before_bytes = inputs.inventory.plots.front().identity.allocated_bytes;
     auto private_farm = farming_format_fixture(6); private_farm.capacity_fill = false;
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    private_farm.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Arguments key_args; key_args.seed = private_farm.seed; key_args.seed_owner = private_farm.seed_owner;
+    key_args.farmer = private_farm.farmer; key_args.pool_ph = private_farm.pool;
+    key_args.k = private_farm.config.k; key_args.strength = private_farm.config.strength; key_args.meta = private_farm.config.meta_group_override;
+    Keys keys(key_args); private_farm.fingerprint = farming_fingerprint(keys);
+#endif
     std::vector<fs::path> destinations;
     for (size_t lane = 0; lane < private_farm.directories.size(); ++lane)
     {
@@ -3853,10 +3974,18 @@ void replot_status_protocol(fs::path const& root)
         std::cout.rdbuf(previous); return std::pair{result, output.str()};
     };
     auto fresh = status(); require(!fresh.first && fresh.second.find("\"durable_phase\":\"no-journal-found\"") != fresh.second.npos &&
-        !fs::exists(destinations.front() / "grow-replot.plan"), "read-only status started a migration");
+        fresh.second.find("\"active_full_proof_validated\":null") != fresh.second.npos &&
+        fresh.second.find("\"mode\":\"strict\"") != fresh.second.npos &&
+        !fs::exists(destinations.front() / ".xchplot2"), "read-only status started a migration");
     ReplotJournal initial; initial.review_digest = inputs.digest; initial.farm = private_farm; initial.retirements.resize(1);
     auto journals = load_replot_journals(destinations, inputs.digest, args.max_ram);
     publish_replot_journals(journals, initial, args.max_ram, [] {});
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    auto const preparing = audit_replot_objects(args, inputs, journals.state, keys);
+    require(!preparing.construction && preparing.publications.empty() && replot_journals_unchanged(journals) &&
+        !fs::exists(farming_replot_directory(destinations.front(), private_farm.job_id, false)),
+        "preparing journal audit required or created an unstarted construction namespace");
+#endif
     auto advance = [&](auto change)
     { auto next = next_replot_revision(journals.state, journals.digest, change); publish_replot_journals(journals, next, args.max_ram, [] {}); };
     advance([](auto& value) { value.phase = ReplotPhase::replacing; });
@@ -3882,6 +4011,7 @@ void replot_status_protocol(fs::path const& root)
     require(!status().first, "status rejected exact rolled-back claimed source");
     (void)claim_replot_source(source_root, source, private_farm.job_id, 0, {}, true);
     auto const& batch = review.batches.front(); auto const final = group_path(destinations[batch.lane], batch.ordinal, private_farm.job_id);
+    FarmingReplotDirectory stage_directory(final.parent_path(), private_farm.job_id, true);
     auto const stage = migration_stage_path(final.parent_path(), private_farm.job_id, 0);
     { std::ofstream file(stage); file << "verified replacement native fixture"; }
     file_io::DurableIdentity stage_owner;
@@ -3897,6 +4027,7 @@ void replot_status_protocol(fs::path const& root)
     });
     fs::rename(stage, final);
     auto renamed = status(); require(!renamed.first && renamed.second.find("verified-object-renamed-publication-pending") != renamed.second.npos &&
+        renamed.second.find("\"active_full_proof_validated\":true") != renamed.second.npos &&
         renamed.second.find("saved_verified_stage_stamp") != renamed.second.npos, "status lost verified publication rename evidence");
     fs::remove(final);
     require(status().first, "status accepted missing verified replacement");
@@ -3949,6 +4080,13 @@ void replot_status_protocol(fs::path const& root)
         replot_revalidation_text(parse_replot_revalidation(construction_text, args.max_ram)) == construction_text &&
         parse_replot_revalidation(construction_text, args.max_ram).origin_review == successor.origin_review,
         "construction successor lost its explicit version, original bytes or exact checkpoint binding");
+    auto verification_review = construction_review; verification_review.verification = ReplotVerification{ReplotVerificationMode::sampled, 1, 7};
+    auto const verification_text = replot_revalidation_text(verification_review);
+    auto const parsed_verification = parse_replot_revalidation(verification_text, args.max_ram);
+    require(verification_text.starts_with("ordinary-group-replot-revalidation-v3\n") &&
+        parsed_verification.origin_review == successor.origin_review && parsed_verification.construction == construction_review.construction &&
+        parsed_verification.verification == verification_review.verification && replot_revalidation_text(parsed_verification) == verification_text,
+        "verification successor changed its origin, checkpoint or explicit sample schedule");
     auto legacy_again = construction_review; legacy_again.construction.reset();
     require(successor_text.starts_with("ordinary-group-replot-revalidation-v1\n") && replot_revalidation_text(legacy_again) == successor_text,
         "optional construction authority changed legacy successor bytes");
@@ -4028,6 +4166,7 @@ void replot_status_protocol(fs::path const& root)
     rejects([&] { validate_replot_reader_changes(identified, changed_native); });
     auto changed_count = updated; changed_count.plots.pop_back();
     rejects([&] { validate_replot_reader_changes(identified, changed_count); });
+    replot_status_receipt_evidence(root);
 }
 
 void replot_capacity_prefix()
@@ -4365,7 +4504,7 @@ void replot_review_options(fs::path const& directory)
     };
     auto reject = [&](std::string_view action, std::vector<std::string> options)
     {
-        bool rejected = false; try { (void)parse(action, std::move(options)); } catch (std::runtime_error const&) { rejected = true; }
+        bool rejected = false; try { (void)parse(action, std::move(options)); } catch (std::exception const&) { rejected = true; }
         require(rejected, "migration review/display options accepted an unrelated mode or profile");
     };
     auto const profile = directory / "resource-only.json", origin = directory / "migration.plan", ordinary = directory / "ordinary.plan";
@@ -4375,6 +4514,23 @@ void replot_review_options(fs::path const& directory)
     auto const resource_only = parse("plan", {"destination", "--replot", "inventory.plan", "--harvester", profile.string(), "--compute", "off"});
     require(resource_only.farming_profile_set && !resource_only.farming_profile,
         "resource-only migration input invented an ordinary reader calibration");
+    require(!resource_only.replot_verification && grow_controller_test::requested_replot_verification(resource_only).mode == ReplotVerificationMode::structural,
+        "new migration review did not default to structural verification");
+    auto sampled = parse("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--compute", "off"});
+    require(grow_controller_test::requested_replot_verification(sampled) == ReplotVerification{ReplotVerificationMode::sampled, 1, 0},
+        "sampled policy did not default to the initial group");
+    auto periodic = parse("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled",
+        "--replot-proof-first-groups", "0", "--replot-proof-every-groups", "7", "--compute", "off"});
+    require(grow_controller_test::requested_replot_verification(periodic) == ReplotVerification{ReplotVerificationMode::sampled, 0, 7},
+        "explicit periodic-only sample schedule was changed");
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--replot-proof-first-groups", "0"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "strict", "--replot-proof-every-groups", "7"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-proof-first-groups", "1"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "unknown"});
+    reject("plan", {"destination", "--replot", "inventory.plan", "--replot-verification", "sampled", "--replot-proof-first-groups", "18446744073709551616"});
+    reject("plan", {"--from-plan", origin.string(), "--replot-verification", "structural"});
+    reject("fill", {"--from-plan", origin.string(), "--replot-verification", "structural"});
+    reject("plan", {"--status", origin.string(), "--replot-verification", "structural"});
     reject("plan", {"destination", "--harvester", profile.string()});
     reject("plan", {"--from-plan", ordinary.string(), "--harvester", profile.string()});
     auto const saved = parse("plan", {"--from-plan", origin.string(), "--harvester", profile.string(), "--compute", "off"});
@@ -4447,6 +4603,47 @@ void replot_destination_namespace(fs::path const& root)
     { std::ofstream out(metadata, std::ios::app); out << " stale"; }
     reject([&] { replot_destination_coverage(args, catalog, destination, supplied); },
         "changed metadata received an unverified destination exemption");
+
+    auto const writers = root / "reserved-writers"; fs::create_directory(writers);
+    FarmingMetadataDirectory private_metadata(writers); private_metadata.create();
+    FarmingReplotDirectory private_job(writers, std::string(64, 'e'), true);
+    for (auto const& path : {private_metadata.path, private_job.path})
+    {
+        reject([&] { require_unmanaged_group_directory(path); }, "standalone writer adopted private migration bookkeeping");
+        auto fresh = args; fresh.target = path; fresh.plan_only = true;
+        reject([&] { (void)farming_arguments(fresh); }, "ordinary farming adopted private migration bookkeeping");
+    }
+    require(fs::is_empty(private_job.path) && !fs::exists(private_metadata.path / "grow-farm.plan"),
+        "reserved destination refusal changed private migration bookkeeping");
+    require_unmanaged_group_directory(writers);
+    { std::ofstream journal(writers / "grow-replot.plan"); journal << "legacy managed marker"; }
+    reject([&] { require_unmanaged_group_directory(writers); }, "legacy migration destination lost its standalone guard");
+
+    for (bool nested : {false, true})
+    {
+        auto const base = root / (nested ? "legacy-namespace-ancestor" : "legacy-namespace-member");
+        auto path = base / ".xchplot2"; if (nested) path /= "lane";
+        fs::create_directories(path);
+        auto state = farming_format_fixture(6); state.directories.resize(1); state.estimate.destinations.resize(1);
+        state.directories[0].directory = file_io::path_text(path); state.directories[0].directory_identity = farming_directory_identity(path);
+        state.directories[0].identity_resources = 1;
+        auto const body = farming_state_text(state), bytes = body + stream_state::digest(body) + '\n';
+        stream_state::atomic_save(path / "grow-farm.plan", bytes, false);
+        auto legacy = args; legacy.target = path; legacy.plan_only = true;
+        auto saved = farming_arguments(legacy);
+        require(saved.saved && saved.legacy_metadata.value_or(false) && saved.directories.front() == path &&
+            contents(path / "grow-farm.plan") == std::vector<uint8_t>(bytes.begin(), bytes.end()),
+            "legacy saved job under a reserved-name ancestor could not be inspected unchanged");
+        reject([&] { require_unmanaged_group_directory(path); }, "standalone writer inherited a legacy job's namespace exception");
+        if (!nested)
+        {
+            auto const moved = root / "relocated-legacy-namespace" / ".xchplot2"; fs::create_directory(moved.parent_path()); fs::rename(path, moved);
+            legacy.target = moved; legacy.relocations.emplace_back(path, moved);
+            auto relocated = farming_arguments(legacy);
+            require(relocated.saved && relocated.relocated.contains(0) && relocated.directories.front() == moved,
+                "explicit legacy reserved-name relocation lost its saved authority");
+        }
+    }
 }
 
 void replot_retirement_protocol(fs::path const& root)
@@ -5301,13 +5498,13 @@ void farming_replica_staging(fs::path const& root)
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
     {
         auto const directory = file_io::native_path(state.directories[lane].directory);
-        require(!fs::exists(directory / "grow-farm.plan"), "replica staging published before its all-staged barrier");
+        require(!fs::exists(directory / ".xchplot2" / "grow-farm.plan"), "replica staging published before its all-staged barrier");
         if (lane < 2)
         {
-            auto const bytes = contents(directory / "grow-farm.plan.next");
+            auto const bytes = contents(directory / ".xchplot2" / "grow-farm.plan.next");
             require(bytes == std::vector<uint8_t>(body.begin(), body.end()),
                 "replica staging failure left an incomplete private copy");
-            fs::remove(directory / "grow-farm.plan.next");
+            fs::remove(directory / ".xchplot2" / "grow-farm.plan.next");
         }
     }
     std::vector<size_t> submissions;
@@ -5333,13 +5530,13 @@ void farming_replica_staging(fs::path const& root)
         "replica staging created parallel operations for the same physical resource");
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
     {
-        auto const path = file_io::native_path(state.directories[lane].directory) / "grow-farm.plan.next";
+        auto const path = file_io::native_path(state.directories[lane].directory) / ".xchplot2" / "grow-farm.plan.next";
         require(stamps[lane] && stream_state::stamp(path) == *stamps[lane] &&
             contents(path) == std::vector<uint8_t>(body.begin(), body.end()),
             "replica all-staged barrier omitted a complete durable copy");
     }
     for (size_t lane : {0u, 1u})
-        fs::remove(file_io::native_path(state.directories[lane].directory) / "grow-farm.plan.next");
+        fs::remove(file_io::native_path(state.directories[lane].directory) / ".xchplot2" / "grow-farm.plan.next");
     std::promise<void> operation_failed, finish_peer;
     auto operation_failure = operation_failed.get_future(); auto peer_finished = finish_peer.get_future().share();
     joined = false;
@@ -5404,7 +5601,7 @@ void farming_replica_staging(fs::path const& root)
     require(std::all_of(capped_stamps.begin(), capped_stamps.end(), [](auto const& stamp) { return stamp.has_value(); }),
         "bounded replica staging omitted a later resource chain");
     for (auto const& directory : capped.directories)
-        fs::remove(file_io::native_path(directory.directory) / "grow-farm.plan.next");
+        fs::remove(file_io::native_path(directory.directory) / ".xchplot2" / "grow-farm.plan.next");
     std::promise<void> slow_started, later_started, release_slow;
     auto slow = slow_started.get_future(), later = later_started.get_future();
     auto slow_release = release_slow.get_future().share();
@@ -5455,6 +5652,15 @@ void farming_preview_handoff(fs::path const& root)
         try { (void)farming_run(reserved, nullptr, job); }
         catch (std::exception const& error) { refused = std::string(error.what()).find("filename is reserved") != std::string::npos; }
         require(refused && fs::is_empty(a), "saved preview claimed the private job recovery filename");
+    }
+    {
+        FarmingMetadataDirectory metadata(a); metadata.create();
+        auto reserved = options; reserved.save_plan = metadata.path / "preview.plan";
+        bool refused = false;
+        try { (void)farming_run(reserved, nullptr, job); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("reserved .xchplot2") != std::string::npos; }
+        require(refused && fs::is_empty(metadata.path), "reserved preview output wrote private recovery bookkeeping");
+        fs::remove(metadata.path);
     }
     {
         FarmingProfile public_profile;
@@ -5628,7 +5834,7 @@ void farming_preview_handoff(fs::path const& root)
     executing.from_plan = path; executing.max_ram = options.max_ram;
     auto admitted = farming_arguments(executing);
     auto published = farming_run(executing, nullptr, admitted);
-    require(published->feasible() && fs::exists(a / "grow-farm.plan") && fs::exists(b / "grow-farm.plan"),
+    require(published->feasible() && fs::exists(farming_metadata_path(a, "grow-farm.plan", false)) && fs::exists(farming_metadata_path(b, "grow-farm.plan", false)),
         "saved-preview execution did not use ordinary replicated publication");
     published.reset();
     refused = false;
@@ -5657,14 +5863,14 @@ void farming_preview_handoff(fs::path const& root)
     auto revised = *source_job.saved;
     ++revised.revision; revised.parent_digest = source_job.digest;
     auto revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
-    stream_state::atomic_save(a / "grow-farm.plan", revision);
-    stream_state::atomic_save(b / "grow-farm.plan", revision);
+    stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
+    stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
     source_inspection.target.clear(); source_inspection.destinations.clear(); source_inspection.manifest.clear();
     source_inspection.extend = false;
     refused = false;
     try { (void)farming_arguments(source_inspection); }
     catch (std::exception const& error) { refused = std::string(error.what()).find("stale") != std::string::npos; }
-    require(refused && contents(a / "grow-farm.plan") == std::vector<uint8_t>(revision.begin(), revision.end()),
+    require(refused && contents(farming_metadata_path(a, "grow-farm.plan", false)) == std::vector<uint8_t>(revision.begin(), revision.end()),
         "changed source revision was accepted or rewritten by a saved preview");
 
     auto text = farming_preview_text(saved.preview) + "unexpected\n";
@@ -6180,7 +6386,7 @@ void farming_extent_admission(fs::path const& root)
         options.capacity = 64 * mib; options.headroom = 0; options.max_ram = 512 * mib;
         options.max_groups = options.max_total_members = 1;
         auto job = farming_arguments(options);
-        auto const pending = right / "grow-farm.plan.next", published = left / "grow-farm.plan";
+        auto const pending = farming_metadata_path(right, "grow-farm.plan.next", false), published = farming_metadata_path(left, "grow-farm.plan", false);
         std::promise<void> started, release;
         auto ready = started.get_future();
         producer_thread = std::this_thread::get_id();
@@ -6208,7 +6414,7 @@ void farming_extent_admission(fs::path const& root)
         require(paused && !background_write_timed_out &&
             error.find(pending_source ? "pending farming revision changed" : "farming job appeared") != std::string::npos,
             "concurrent farming metadata change bypassed its publication audit: " + error);
-        require(!fs::exists(right / "grow-farm.plan") && (!pending_source || !fs::exists(published)),
+        require(!fs::exists(farming_metadata_path(right, "grow-farm.plan", false)) && (!pending_source || !fs::exists(published)),
             "farming metadata conflict published part of the job before rejection");
         require(contents(changed) == std::vector<uint8_t>(replacement.begin(), replacement.end()),
             "farming publication overwrote concurrently replaced metadata");
@@ -6269,7 +6475,7 @@ void output_reservations(fs::path const& root, Members input, Config cfg)
         "ordinary output inspection retained an unrelated reservation or metadata charge");
 }
 
-void published_retired_external(fs::path const& root, Members input, Config cfg)
+void published_retired_external_layout(fs::path const& root, Members input, Config cfg, bool legacy)
 {
     using namespace grow_controller_test;
     auto const scratch = root / "published-retired-scratch"; fs::create_directory(scratch);
@@ -6295,9 +6501,11 @@ void published_retired_external(fs::path const& root, Members input, Config cfg)
     {
         auto directory = root / ("published-retired-" + std::to_string(lane)); fs::create_directory(directory); directories.push_back(directory);
         auto& saved = state.directories[lane]; saved.directory = file_io::path_text(directory);
+        saved.directory_identity = farming_directory_identity(directory);
         saved.identity_resources = state.directories.size(); saved.identity_resource = lane;
         saved.layout.files = saved.layout.total_members = saved.layout.group_members = 1;
-        auto const target = migration_stage_path(directory, state.job_id, lane);
+        FarmingReplotDirectory metadata(directory, state.job_id, true, legacy);
+        auto const target = migration_stage_path(directory, state.job_id, lane, legacy);
         ExternalConfig external; external.scratch.push_back({scratch.string(), 128 * mib}); external.segment_bytes = mib;
         auto construct = [&]
         {
@@ -6330,26 +6538,50 @@ void published_retired_external(fs::path const& root, Members input, Config cfg)
         else
 #endif
             construct();
-        for (auto const& entry : fs::directory_iterator(directory))
+        for (auto const& entry : fs::directory_iterator(target.parent_path()))
             if (file_io::path_text(entry.path().filename()).starts_with(file_io::path_text(target.filename()) + ".external.retired-"))
                 holders.push_back(entry.path());
         require(holders.size() == lane + 1, "published fixture lost its retained terminal record");
         if (lane == 2) require(!fs::exists(holders.back() / "checkpoint"), "inode receipt fixture retained its ordinary checkpoint");
+        else require(fs::exists(holders.back() / "checkpoint"), "checkpoint publication fixture lost its terminal checkpoint");
         auto const published = group_path(directory, 0, state.job_id);
         require(!file_io::rename_file(target, published, false), "cannot publish external alias fixture");
-        auto alias = retired_farming_publication(state, target, &keys);
+        auto alias = retired_farming_publication(state, target, &keys, {}, nullptr, legacy);
         require(alias.has_value(), "fixed saved assignment lost its terminal publication alias");
         auto inspected = ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias, cfg.memory_limit_bytes);
         require(inspected.complete && inspected.members == 1 && (lane == 2 || inspected.metadata_occupied_bytes),
             "published terminal ownership lost its metadata allocation");
         auto output = snapshot(published, 0);
-        auto resolve = [&](fs::path const& original, fs::path const& requested) { return retired_farming_publication(state, original, &keys, requested); };
-        require(!output_auxiliary(published, output, cfg.memory_limit_bytes, resolve) &&
+        auto resolve = [&](fs::path const& original, fs::path const& requested) { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy); };
+        require(!output_auxiliary(published, output, cfg.memory_limit_bytes, resolve, legacy) &&
             output.retired == inspected.metadata_occupied_bytes && output.auxiliary_allocated == inspected.metadata_occupied_bytes,
             "ordinary fixed-farm accounting omitted published stage metadata");
         auto rejects = [&](auto operation)
         { bool rejected = false; try { operation(); } catch (std::runtime_error const&) { rejected = true; }
           require(rejected, "unreviewed terminal publication alias was accepted"); };
+        require(alias->parent.has_value() != legacy, "migration alias did not retain its explicit publication parent authority");
+        auto const misplaced = scratch / holders.back().filename(); fs::rename(holders.back(), misplaced);
+        rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), misplaced.string(), *alias); });
+        fs::rename(misplaced, holders.back());
+        if (!legacy)
+        {
+            auto missing = *alias; missing.parent.reset();
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), missing); });
+            auto wrong = *alias; wrong.parent->file.inode ^= UINT64_C(1);
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), wrong); });
+            wrong = *alias; wrong.path = file_io::path_text(scratch / "unreviewed.plot2");
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), wrong); });
+            auto const expected_root = saved.directory_identity; saved.directory_identity = "unreviewed destination";
+            rejects([&] { (void)retired_farming_publication(state, target, &keys, {}, nullptr, legacy); });
+            saved.directory_identity = expected_root;
+            auto const original_parent = target.parent_path(), retained_parent = original_parent.parent_path() / "retained-stage-parent";
+            fs::rename(original_parent, retained_parent); fs::create_directory(original_parent);
+            fs::permissions(original_parent, fs::perms::owner_all);
+            fs::rename(retained_parent / holders.back().filename(), holders.back());
+            rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *alias); });
+            fs::rename(holders.back(), retained_parent / holders.back().filename()); fs::remove(original_parent);
+            fs::rename(retained_parent, original_parent);
+        }
         auto bad = *alias; ++bad.stamp.bytes;
         rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), bad); });
         bad = *alias; ++bad.identity.header.group_size;
@@ -6359,16 +6591,24 @@ void published_retired_external(fs::path const& root, Members input, Config cfg)
         fs::remove(target);
         auto const retained = directory / "original-publication"; fs::rename(published, retained);
         fs::copy_file(retained, published);
-        auto substitute = retired_farming_publication(state, target, &keys);
+        auto substitute = retired_farming_publication(state, target, &keys, {}, nullptr, legacy);
         rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *substitute); });
         fs::remove(published); fs::rename(retained, published);
     }
     PublishedRetirements publications{directories, [&](fs::path const& original, fs::path const& requested)
-        { return retired_farming_publication(state, original, &keys, requested); }};
+        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy); }, state.job_id, legacy};
     ScratchPool pool(std::vector<fs::path>{scratch}, 0, 1);
     preserve_published_retired(pool, publications, cfg.memory_limit_bytes);
     bool rejected = false; try { pool.seal_recovery(); } catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "another destination's preserved scratch bypassed the shared temporary cap");
+}
+void published_retired_external(fs::path const& root, Members input, Config cfg)
+{
+    for (bool legacy : {true, false})
+    {
+        auto const directory = root / (legacy ? "legacy-retired-publications" : "private-retired-publications");
+        fs::create_directory(directory); published_retired_external_layout(directory, input, cfg, legacy);
+    }
 }
 
 void farming_active_audit(fs::path const& root, Members input, Config cfg)

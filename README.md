@@ -104,9 +104,12 @@ for reusable options. `xchplot2 --help` prints command syntax.
 
 To replace an existing farm, use the separate
 [inventory and migration workflow](REFERENCE.md#replacing-an-existing-farm).
-Ordinary `fill` uses free space and does not remove existing plots. Migration
-requires an explicit review, exact replacement acknowledgement and complete
-resource bounds for the old and replacement farming services.
+Ordinary `fill` uses free space and does not remove existing plots. Retiring old
+plots before building their replacements requires an explicit saved review and
+`--reclaim-before-bytes` allowance, with complete farming resource bounds.
+New reviews use bounded structural checks on replacement groups; optional
+`sampled` or `strict` verification adds full proofs. Those later checks cannot
+recover old plots already deleted under the allowance.
 
 ### Shared compute
 

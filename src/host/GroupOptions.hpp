@@ -30,6 +30,8 @@ struct GroupOptions
     std::vector<std::filesystem::path> replot_source_roots, replot_exclude_roots;
     uint64_t replot_max_source_files = 0, replot_max_source_bytes = 0;
     bool replot_status = false, replot_revalidate = false;
+    std::optional<std::string> replot_verification;
+    std::optional<uint64_t> replot_proof_first_groups, replot_proof_every_groups;
     std::vector<std::filesystem::path> assessment_plans;
     std::vector<std::filesystem::path> calibration_plots;
     uint64_t calibration_samples = 16, calibration_timeout_ms = 30000, calibration_memory_bytes = 512 * 1024 * 1024;
@@ -55,7 +57,7 @@ struct GroupOptions
     bool backend_set = false;
     bool resume = false, group_auto = false, plan_only = false, directory_farm = false, metadata_only = false, assess_jobs = false;
     bool calibrate = false, calibration_worker = false;
-    bool replot_proof_worker = false;
+    bool replot_proof_worker = false, replot_structure_worker = false;
     uint64_t replot_proof_cpus = 0, replot_proof_solves = 1;
     bool protected_resources = false;
     uint64_t protected_gpu_bytes = 0;

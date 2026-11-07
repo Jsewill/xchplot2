@@ -260,19 +260,27 @@ available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
 per filesystem; `--headroom-bytes SIZE` leaves space free (default 64 MiB).
 Sizes accept bytes or suffixes such as `512M` and `14G`.
 
-Every member directory contains a private, checksummed `grow-farm.plan` with
-the seed, farmer/pool identity, complete destination list, limits and farming
-profile. Each copy describes the whole job. New jobs store shared storage
-settings and the resolved farming configuration once within each copy; the
+New jobs keep a private, checksummed `.xchplot2/grow-farm.plan` in every member
+directory with the seed, farmer/pool identity, complete destination list, limits
+and farming profile. Each copy describes the whole job. New jobs store shared
+storage settings and the resolved farming configuration once within each copy; the
 capacity allowance includes recovery files and space for their replacements.
 Keep these files with the outputs; the seed derives private plot keys
-and must not be shared. It is not a wallet seed. A temporary `grow-farm.plan.next`
-may remain after interruption; keep it for recovery too. New farming plans
-record their creating build as provenance and can resume completed ordinary
-groups with a build supporting the same plan schema, farming model,
+and must not be shared. It is not a wallet seed. A temporary
+`.xchplot2/grow-farm.plan.next` may remain after interruption; keep it for recovery
+too. New farming plans record their creating build as provenance and can resume
+completed ordinary groups with a build supporting their metadata layout,
+plan schema, farming model,
 key-derivation identity and numeric representation. In-progress construction
 checkpoints and legacy plans still require their original build. A compatible
 plan does not make an incompatible construction checkpoint resumable.
+Existing jobs with top-level `grow-farm.plan` or `grow-replot.plan` records
+retain their complete original layout, including interrupted `.next` copies.
+Keep those records where they are. Conflicting top-level and private records,
+including mixed layouts across destinations, are refused before changes.
+Read-only planning and status do not create `.xchplot2` directories.
+Save portable plans, migration reviews and successors outside this reserved
+recovery namespace. New plot and farm destinations must also stay outside `.xchplot2`.
 
 `plan --metadata-only PLAN` reads a saved keyless preview, and
 `plan --metadata-only --manifest FILE` reads one private job copy. This mode
@@ -285,8 +293,8 @@ To assess several managed jobs under one harvester budget, refresh a keyless
 summary for each job, then assess the summaries together:
 
 ```bash
-xchplot2 plan --manifest /disk-a/plots/grow-farm.plan --save-plan job-a.plan
-xchplot2 plan --manifest /disk-b/plots/grow-farm.plan --save-plan job-b.plan
+xchplot2 plan --manifest /disk-a/plots/.xchplot2/grow-farm.plan --save-plan job-a.plan
+xchplot2 plan --manifest /disk-b/plots/.xchplot2/grow-farm.plan --save-plan job-b.plan
 xchplot2 plan --assess-jobs job-a.plan job-b.plan --json
 ```
 
@@ -308,7 +316,7 @@ topology is shared conservatively; outside plots and services remain unmodeled.
 
 Resume searches every supplied directory and loads the full job. Directory
 order and omitted arguments do not change its scope. `fill -r` from a member
-directory, or `fill -r --manifest /disk-b/plots/grow-farm.plan`, also works.
+directory, or `fill -r --manifest /disk-b/plots/.xchplot2/grow-farm.plan`, also works.
 Different jobs, conflicting revisions, corrupt copies or mismatching explicit
 keys are rejected before output changes. Resume audits existing outputs,
 preserves completed files, and recovers partial construction. Plotting RAM,
@@ -802,10 +810,11 @@ host and ID from the inventory:
 The zero capacity and false flags are deliberately unknown placeholders.
 Complete the existing `farm_resources` object in a copy of the inventory using
 the checklist: declare offered CPU/RAM/storage capacity, existing service and
-whole-queue bounds, output/scratch mappings, whole-file construction and proof
-verification bounds, and replacement farming/full-proof cohorts. If a decoder
-or solver uses a GPU or another host, add its physical resources and complete
-service/network demands. A local topology does not exempt those workloads.
+whole-queue bounds, output/scratch mappings, whole-file construction bounds,
+supervision for structural checks and replacement farming/full-proof cohorts.
+Add proof verification bounds when selecting sampled or strict migration checks.
+If a decoder or solver uses a GPU or another host, add its physical resources
+and complete service/network demands. A local topology does not exempt those workloads.
 Keep the original observations for comparison and save the completed copy as
 `farm-resources.json`. Reuse the declarations during another inventory without
 reentering the resource graph:
@@ -835,7 +844,7 @@ That classification never makes the file a retirement candidate.
 | `resources` | Physical host, CPU, host memory, GPU compute and memory, storage, controllers, network and solvers actually shared by the work. Aliases identify one resource, not extra capacity. Memory capacities are bytes; other capacities are concurrent service lanes. |
 | `workloads` | Format, decoder/version, backend, pool difficulty, current and future quality/full-proof bursts, response deadline, provenance and complete resource costs for each existing cohort. |
 | `uses` | Resident and transient memory, full carried-in queue bounds, and either explicit reserved lanes or bounded service times. Service times are microseconds; memory use is bytes. |
-| `native` | Bounds for the selected construction and verification settings, physical output/scratch/source mappings, controller and RPC supervision, and increasing member cohorts with separate new-farming and full-proof reserves. |
+| `native` | Bounds for construction, structural supervision and selected proof checks, physical output/scratch/source mappings, controller and RPC supervision, and increasing member cohorts with separate new-farming and full-proof reserves. |
 | `gate` | Maximum telemetry age and the recovery interval/sample count required before admitting work again. |
 
 `native.service_hosts` maps service roles to their physical resource hosts;
@@ -865,9 +874,15 @@ can support forecasts but do not grant control over remote services.
 
 Native envelopes must explicitly cover future filters and the controller's
 memory in each phase (`covers_future_filter` and
-`phase_totals_include_controller`). Construction, proof verification and RPC
-supervision run sequentially. The proof worker has a memory and time limit;
-`verification_cpu_threads` can additionally limit its CPU affinity.
+`phase_totals_include_controller`). Construction, verification and RPC
+supervision run sequentially. Mandatory structural checks use the
+`native.supervision` CPU, RAM and storage envelope and an isolated worker
+restricted to one CPU, with memory and time limits. Selected full-proof checks
+also require `native.verification` and `max_verification_us` bounds;
+`verification_cpu_threads` defaults to one for new reviews.
+Structural-only reviews do not need those proof-phase declarations. The
+replacement farming cohort's `proof_reserve` remains required for the running
+farm's full-proof service, independently of the migration check policy.
 Each phase's CPU envelope includes its concurrent controller or monitor and
 capped worker, within the inherited CPU set.
 GPU session envelopes cover the full inherited CPU set in every phase:
@@ -908,12 +923,18 @@ permit it. Ordinary plotting retains its shared owner/worker gate.
 Local GPU worker reservations also cover the complete inherited CPU affinity
 for runtime helpers, as well as offered task CPUs and GPU allocation/residency.
 
-Review destinations and the completed profile, then save the resulting plan:
+To retire old plots before constructing their replacement group, explicitly
+choose the allocated-byte deletion debt you accept as `PREDELETE_LIMIT`, then
+review and save the plan. The limit must cover the old files needed by the
+active replacement batch. When the plan uses this allowance, the old files
+are removed before construction. Later checks on the new group cannot protect
+or recover the deleted data.
 
 ```bash
 xchplot2 plan /disk-a/plots /disk-b/plots --replot inventory.plan \
   --harvester mixed-farm.json --compute off --devices cpu \
   --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --reclaim-before-bytes "$PREDELETE_LIMIT" \
   --save-plan migration.plan --json
 xchplot2 fill migration.plan --compute off --devices cpu \
   --harvester mixed-farm.json \
@@ -946,8 +967,8 @@ and replacement work per destination, inspect the result, and save that review
 for execution. A saved review's exact source list remains authoritative.
 
 Replacement outputs retain the destination order in the review. Source mapping
-first checks the reviewed construction and proof resource stages, placing
-needed early resource release in the current batch even when the source's own
+first checks the reviewed construction and selected verification resource stages,
+placing needed early resource release in the current batch even when the source's own
 filesystem has a later destination. It then favors the same filesystem,
 spreads allocated bytes across replacement outputs, and keeps reader workload
 cohorts together when the active batch can hold them. Bootstrap sources are
@@ -959,7 +980,8 @@ debt limit. A search-bound refusal does not establish that no feasible subset
 exists. It permits no additional retirement; existing pending commitments and
 outstanding debt remain in the private journal.
 
-`--reclaim-before-bytes SIZE` belongs to the review and defaults to zero.
+`--reclaim-before-bytes SIZE` belongs to the review and defaults to zero;
+the pre-delete example above requires an explicit positive allowance.
 Zero requires each mapped replacement to be ready before its sources are
 removed. A positive value permits that many allocated source bytes to be
 retired while their mapped replacements are not yet ready, across interruptions
@@ -980,10 +1002,34 @@ quarantine frees no capacity; open handles, snapshots or filesystem behavior
 can delay its release after deletion. Extra free space does not enlarge the
 reviewed replacement schedule.
 
-For replacement-first retirement, execution seals and checks the exact replacement,
-runs bounded full-proof samples that must yield a valid complete proof, and
-publishes a new immutable `.plot2` file. Sampling does not inspect every chain
-or prove every byte of the file correct.
+Every replacement must match its expected identity, memo and parameters and
+pass bounded header, payload bounds and canonical chunk index checks before
+publication as an immutable `.plot2` file. These structural checks are the
+default for new reviews. They do not walk quality chains, solve full proofs or
+validate every compressed payload. Old source plots are never proof-solved by
+this workflow.
+
+Set `--replot-verification sampled` during review to add bounded full-proof
+checks for selected groups. It defaults to the first group only. Use
+`--replot-proof-first-groups N` for an initial prefix and
+`--replot-proof-every-groups N` for periodic checks; a periodic value of zero
+disables that part of the schedule. Group numbers are one-based across the
+entire reviewed output order, including all destinations. A group is selected
+if it belongs to the prefix or its number is divisible by the periodic value.
+The schedule is saved and remains the same across interruptions. A sampled
+policy must select a nonzero prefix or period. `--replot-verification strict`
+requires a positive bounded full-proof sample for every new group.
+
+Each selected group must yield a valid complete proof within its challenge,
+solver, CPU, memory and time budgets. A failed or exhausted sample stops the
+replacement; it does not undo pre-deletion. Sampling does not inspect every
+chain or prove every byte correct. Isolated check workers request lower CPU
+and I/O scheduling priority when supported. These preferences do not replace
+resource admission or impose service guarantees. Proof solving remains local.
+
+Without pre-delete credit, these checks and exact farming readiness precede
+retirement of the mapped old files. With credit, the same replacement checks
+complete the batch after its authorized early retirement.
 The configured harvester must report that exact path with matching plot
 identity, public-key route, size and modification time. The target network
 must be synced, active for PoS2 and compatible with the replacement parameters.
@@ -1013,11 +1059,11 @@ Resource admission includes the old farm, completed replacements, construction,
 verification and separate full-proof demand, under current and future filter
 conditions. Retiring a plot does not release a foreign decoder's resident
 memory or queued work. Telemetry restricts native admissions and interrupts
-construction or proof work if protected headroom is lost. Construction stops at
-recoverable boundaries and resumes through checkpoint recovery; already-running
+construction or verification work if protected headroom is lost. Construction
+stops at recoverable boundaries and resumes through checkpoint recovery; already-running
 native I/O must return before cancellation can be observed, and already-admitted
 backend work may finish at its existing completion or timeout boundary. A paused
-proof attempt restarts against the sealed replacement within its original
+verification attempt restarts against the sealed replacement within its original
 verification deadline. Telemetry does not stop or
 reconfigure the farmer, harvester, remote solver or their services.
 The reviewed envelope must also allow fresh observations after a restart while
@@ -1028,8 +1074,16 @@ An infeasible review requested with `--save-plan --json` still reports its
 structured reasons and leaves the requested save path unwritten.
 
 Keep the original `migration.plan`, any active reviewed successor, every private
-`grow-replot.plan` copy and any `.next` file, receipts and owned temporary files.
+`.xchplot2/grow-replot.plan` copy and any `.next` file, receipts and owned
+temporary files.
 The private journal contains the seed and assignments from preparation onward.
+New jobs keep local reader bindings, `receipt-N` files and `stage-N.building`
+files with their construction sidecars under `.xchplot2/replot-JOB/` in each
+relevant destination. Existing jobs retain their original top-level journals,
+`.xchplot2-replot-JOB/` artifacts and `.xchplot2-stage-JOB-N.building` paths.
+Source claims remain under `.xchplot2-retire-JOB/` in the source root.
+Ordinary construction recovery files remain beside their output file, and
+directory locks retain their existing paths.
 Resume with `xchplot2 fill --from-plan migration.plan`, using the active successor
 in place of that filename after revalidation. Private state restores the keys.
 Accepted local reader paths, adapter kind and profile selection are also saved
@@ -1051,7 +1105,9 @@ Use `xchplot2 plan --status --from-plan migration.plan --json` for read-only
 progress. Status separates the durable phase, completed receipts, retirement
 states and outstanding pre-delete debt from current filesystem observations.
 It shows exact active claim and replacement paths, pending replica publication
-and the next safe action. It also distinguishes an active policy from a pending
+and the next safe action. It reports the selected verification policy and each
+group's actual full-proof evidence separately; structural completion never
+appears as a validated proof. It also distinguishes an active policy from a pending
 successor, a stale reviewed boundary or a different active policy, showing both
 the reviewed and current journal digests. It does not contact farming or compute
 services and does not diagnose their current health or the reason a previous
@@ -1068,6 +1124,15 @@ xchplot2 plan --revalidate --from-plan migration.plan \
   --harvester updated-farm.json --save-plan migration-successor.plan --json
 xchplot2 fill --from-plan migration-successor.plan --harvester updated-farm.json
 ```
+
+Verification policy changes also require a saved successor: add
+`--replot-verification structural|sampled|strict` and any sampled schedule to
+the revalidation command. Execution and status cannot override a saved policy.
+Older reviews without an explicit policy retain their original strict proof
+requirement until a successor explicitly changes it. Completed groups and
+already recorded full-proof results keep their actual evidence across policy
+changes; selecting strict later does not relabel earlier structural completion
+as a solved proof.
 
 Revalidation audits every original inventory entry, exact claims, completed
 receipts and sealed replacements, then refreshes reader observations and current
@@ -1126,7 +1191,8 @@ construction retains its exact checkpoint snapshot; after a remount, save a
 fresh revalidation before its first activation.
 
 After all replacements and retirements pass the final audit, the job publishes
-ordinary `grow-farm.plan` copies. Completed replacement files retain their
+ordinary `.xchplot2/grow-farm.plan` copies for new jobs, or top-level copies for
+legacy jobs. Completed replacement files retain their
 identities and fixed member counts; ordinary recovery never grows them.
 An unfinished migration must finish through its active reviewed plan before
 ordinary fill or extension can operate on its destinations.

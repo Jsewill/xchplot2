@@ -242,6 +242,14 @@ def snapshot(root):
             for p in root.rglob("*")}
 
 
+def private_record(directory, name):
+    return directory / ".xchplot2" / name
+
+
+def replot_artifacts(directory, job_id):
+    return private_record(directory, f"replot-{job_id}")
+
+
 def check(binary, root, reference=None):
     counter = 0
 
@@ -555,10 +563,10 @@ def check(binary, root, reference=None):
     run("fill", "-r", review_a, "--compute", "off", "-d", "cpu", "--quiet")
     assert (snapshot(review_a), snapshot(review_b)) == completed
     refreshed = root / "completed job forecast.plan"
-    run("plan", "--manifest", review_a / "grow-farm.plan", "--save-plan", refreshed, "--json")
+    run("plan", "--manifest", private_record(review_a, "grow-farm.plan"), "--save-plan", refreshed, "--json")
     refreshed_joint = json.loads(run("plan", "--assess-jobs", refreshed, "--json").stdout)
     assert refreshed_joint["jobs"][0]["members"] >= sum(header(path)[3] for path in reviewed_paths)
-    assert refreshed_joint["jobs"][0]["source_job_digest"] == (review_a / "grow-farm.plan").read_bytes()[-65:-1].decode()
+    assert refreshed_joint["jobs"][0]["source_job_digest"] == private_record(review_a, "grow-farm.plan").read_bytes()[-65:-1].decode()
     assert (snapshot(review_a), snapshot(review_b)) == completed
     for path in reviewed_paths:
         verify(path)
@@ -617,6 +625,10 @@ def check(binary, root, reference=None):
     capacity_options = [capacity_dir, "-k", 18, *construction, "--compute", "off",
                         "--construction", "incremental", "--capacity-bytes", 5110000,
                         "--window-bytes", 1536, "--batch-members", 2]
+    capacity_plan = json.loads(run("plan", *capacity_options, "--json").stdout)
+    # Preserve the original plot-space boundary, which reserved 8192 bytes for
+    # top-level plan copies, while including the private metadata reservation.
+    capacity_options += ["--capacity-bytes", 5110000 + capacity_plan["manifest_reserved_bytes"] - 8192]
     capacity_plan = json.loads(run("plan", *capacity_options, "--json").stdout)
     assert capacity_plan["destinations"][0]["members"] == 7
     capacity_fill = run("fill", *capacity_options, *keys, "--seed", "aa" * 32, "--json")
@@ -781,7 +793,7 @@ def check(binary, root, reference=None):
     farm_outputs = [Path(line) for line in produced.stdout.splitlines()]
     assert sorted(header(p)[3] for p in farm_outputs) == [1, 1, 2, 2]
     assert {p.parent for p in farm_outputs} == {preview, preview_peer}
-    assert (preview / "grow-farm.plan").is_file()
+    assert private_record(preview, "grow-farm.plan").is_file()
     farm_hashes = {p: digest(p) for p in farm_outputs}
     assert set(run(*fill, "-r").stdout.splitlines()) == set(map(str, farm_outputs))
     assert all(digest(p) == value for p, value in farm_hashes.items())
@@ -805,15 +817,15 @@ def check(binary, root, reference=None):
     recovered = run(*resume, b)
     farm_paths = [Path(line) for line in recovered.stdout.splitlines()]
     assert len(farm_paths) == 4 and {p.parent for p in farm_paths} == {a, b}
-    original_plan = (a / "grow-farm.plan").read_bytes()
-    assert original_plan == (b / "grow-farm.plan").read_bytes()
+    original_plan = private_record(a, "grow-farm.plan").read_bytes()
+    assert original_plan == private_record(b, "grow-farm.plan").read_bytes()
     # A compatible creating build is provenance. The normal executable must
     # still audit saved keys/identities and completed ordinary output files.
     foreign_producer = "e" * 64
     original_plan = rewrite_plan(original_plan, producer=foreign_producer)
     for directory in (a, b):
-        (directory / "grow-farm.plan").write_bytes(original_plan)
-    metadata = json.loads(run("plan", "--metadata-only", "--manifest", a / "grow-farm.plan", "--json").stdout)
+        private_record(directory, "grow-farm.plan").write_bytes(original_plan)
+    metadata = json.loads(run("plan", "--metadata-only", "--manifest", private_record(a, "grow-farm.plan"), "--json").stdout)
     assert metadata["producer_build"] == foreign_producer and metadata["plan_compatible"]
     legacy = root / "legacy foreign farm.plan"
     legacy.write_bytes(rewrite_plan(original_plan, legacy=True))
@@ -861,12 +873,12 @@ def check(binary, root, reference=None):
     unsupported.write_bytes(rewrite_plan(original_plan, model="unknown-farming-model"))
     run("plan", "--metadata-only", "--manifest", unsupported, "--json", code=2)
     for directory in (a, b):
-        assert not (directory / "grow-farm.plan.next").exists()
+        assert not private_record(directory, "grow-farm.plan.next").exists()
         if os.name != "nt":
-            assert (directory / "grow-farm.plan").stat().st_mode & 0o777 == 0o600
+            assert private_record(directory, "grow-farm.plan").stat().st_mode & 0o777 == 0o600
     before = snapshot(a), snapshot(b)
     assert set(run(*resume, b, a).stdout.splitlines()) == set(map(str, farm_paths))
-    assert set(run(*resume, "--manifest", b / "grow-farm.plan").stdout.splitlines()) == set(map(str, farm_paths))
+    assert set(run(*resume, "--manifest", private_record(b, "grow-farm.plan")).stdout.splitlines()) == set(map(str, farm_paths))
     assert set(run(*resume, cwd=b).stdout.splitlines()) == set(map(str, farm_paths))
     assert (snapshot(a), snapshot(b)) == before, "keyless recovery rewrote the saved job or completed plots"
     for path in farm_paths:
@@ -942,8 +954,8 @@ def check(binary, root, reference=None):
     all_paths = [Path(line) for line in extended.stdout.splitlines()]
     assert len(all_paths) == 6 and {p.parent for p in all_paths} == set(members)
     assert all(digest(p) == value for p, value in original_hashes.items())
-    revised = (c / "grow-farm.plan").read_bytes()
-    assert revised != original_plan and all((d / "grow-farm.plan").read_bytes() == revised for d in members)
+    revised = private_record(c, "grow-farm.plan").read_bytes()
+    assert revised != original_plan and all(private_record(d, "grow-farm.plan").read_bytes() == revised for d in members)
     identities = {(header(p)[0], header(p)[4], index) for p in all_paths for index in range(header(p)[3])}
     assert len(identities) == sum(header(p)[3] for p in all_paths), "expansion reused an existing plot identity"
     for path in all_paths:
@@ -951,17 +963,17 @@ def check(binary, root, reference=None):
             verify(path)
     # Mixed direct-parent publication was recovered above. Older ancestors no
     # longer describe the sealed extents and cannot replace the current job.
-    (b / "grow-farm.plan").write_bytes(original_plan)
+    private_record(b, "grow-farm.plan").write_bytes(original_plan)
     run(*resume, b, code=2)
-    (b / "grow-farm.plan").write_bytes(revised)
+    private_record(b, "grow-farm.plan").write_bytes(revised)
     run("fill", "--from-plan", expansion_review, "-d", "cpu", "--quiet", code=2)
     corrupt = bytearray(revised)
     corrupt[-2] = ord("0") if corrupt[-2] != ord("0") else ord("1")
-    (b / "grow-farm.plan").write_bytes(corrupt)
+    private_record(b, "grow-farm.plan").write_bytes(corrupt)
     before_a = snapshot(a)
     run(*resume, a, code=2)
     assert snapshot(a) == before_a
-    (b / "grow-farm.plan").write_bytes(revised)
+    private_record(b, "grow-farm.plan").write_bytes(revised)
     print("PASS expansion preserves old plots, accounts for the whole farm and recovers partial publication", flush=True)
 
     relocated = farm / "disk a moved"
@@ -977,7 +989,7 @@ def check(binary, root, reference=None):
     assert len(moved_paths) == 6 and all(p.exists() for p in moved_paths)
     for path, value in original_hashes.items():
         assert digest(relocated / path.name if path.parent == a else path) == value
-    assert (relocated / "grow-farm.plan").read_bytes() == (c / "grow-farm.plan").read_bytes()
+    assert private_record(relocated, "grow-farm.plan").read_bytes() == private_record(c, "grow-farm.plan").read_bytes()
     run(*resume, c)
     other_job = farm / "different job"
     other_job.mkdir()
@@ -1001,8 +1013,8 @@ def check(binary, root, reference=None):
         if point == "farm-plan-before-publication":
             # The controller failpoint follows joined staging. Remove one
             # copy to retain recovery coverage for a partially staged job.
-            assert (left / "grow-farm.plan.next").read_bytes() == (right / "grow-farm.plan.next").read_bytes()
-            (right / "grow-farm.plan.next").unlink()
+            assert private_record(left, "grow-farm.plan.next").read_bytes() == private_record(right, "grow-farm.plan.next").read_bytes()
+            private_record(right, "grow-farm.plan.next").unlink()
         pending = interrupted / "offline"
         right.rename(pending)
         before = snapshot(left)
@@ -1018,11 +1030,30 @@ def check(binary, root, reference=None):
         finished = run(*resume, left if point == "farm-plan-before-publication" else right)
         paths = [Path(line) for line in finished.stdout.splitlines()]
         assert len(paths) == 2 and all(header(path)[3] == 1 for path in paths)
-        assert (left / "grow-farm.plan").read_bytes() == (right / "grow-farm.plan").read_bytes()
-        assert not (left / "grow-farm.plan.next").exists() and not (right / "grow-farm.plan.next").exists()
+        assert private_record(left, "grow-farm.plan").read_bytes() == private_record(right, "grow-farm.plan").read_bytes()
+        assert not private_record(left, "grow-farm.plan.next").exists() and not private_record(right, "grow-farm.plan.next").exists()
         if point == "initialized":
             for path in paths:
                 verify(path)
+        if point == "farm-plan-before-publication":
+            # Completed jobs from the top-level layout keep that layout even
+            # when an empty private metadata directory is already present.
+            private_record(left, "grow-farm.plan").rename(left / "grow-farm.plan")
+            mixed = snapshot(left), snapshot(right)
+            refused = run(*resume, left, code=2)
+            assert "conflicting metadata layouts" in refused.stdout + refused.stderr
+            assert (snapshot(left), snapshot(right)) == mixed, "mixed layouts changed a completed job"
+            private_record(right, "grow-farm.plan").rename(right / "grow-farm.plan")
+            legacy_before = snapshot(left), snapshot(right)
+            assert set(run(*resume, right).stdout.splitlines()) == set(map(str, paths))
+            assert (snapshot(left), snapshot(right)) == legacy_before, "legacy completed recovery moved or rewrote records"
+            private_record(left, "grow-farm.plan").write_bytes((left / "grow-farm.plan").read_bytes())
+            conflict = snapshot(left), snapshot(right)
+            for operation in (("plan", left, "--json"), (*resume, left)):
+                refused = run(*operation, code=2)
+                assert "both legacy and private farming metadata" in refused.stdout + refused.stderr
+            assert (snapshot(left), snapshot(right)) == conflict, "conflicting private/top-level records changed the job"
+            private_record(left, "grow-farm.plan").unlink()
     print("PASS staged-job recovery and unfinished partial recovery preserve the saved extent", flush=True)
 
 
@@ -1066,16 +1097,17 @@ def check_replot(binary, root, reference=None):
         rows = farming_plan_rows(body)
         if phase is not None:
             assert rows[0] in (b"ordinary-group-replot-journal-v1\n", b"ordinary-group-replot-journal-v2\n",
-                               b"ordinary-group-replot-journal-v3\n")
-            if rows[0] != b"ordinary-group-replot-journal-v3\n":
+                               b"ordinary-group-replot-journal-v3\n", b"ordinary-group-replot-journal-v4\n")
+            if rows[0] not in (b"ordinary-group-replot-journal-v3\n", b"ordinary-group-replot-journal-v4\n"):
                 return "stamp"
-            identities = dict(zip(("verified_stage", "published", "ready"), rows[-3:]))
+            identities = dict(zip(("verified_stage", "published", "ready"),
+                                  rows[-4:-1] if rows[0] == b"ordinary-group-replot-journal-v4\n" else rows[-3:]))
             identity = identities[phase]
         else:
-            assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n")
+            assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n", b"ordinary-group-replot-receipt-v3\n")
             if rows[0] == b"ordinary-group-replot-receipt-v1\n":
                 return "stamp"
-            identity = rows[-1]
+            identity = rows[-2] if rows[0] == b"ordinary-group-replot-receipt-v3\n" else rows[-1]
         scheme, filesystem, handle_type, object_id = shlex.split(identity.decode("utf-8"))
         assert scheme in ("0", "1", "2")
         if phase is None:
@@ -1187,13 +1219,43 @@ def check_replot(binary, root, reference=None):
     malformed_reader.write_text(json.dumps(malformed_profile), encoding="utf-8")
     run("plan", farm, "--replot", inventory_file, "--harvester", malformed_reader, *adapter, *options, code=2)
     assert snapshot(farm) == guarded, "malformed ordinary reader inputs changed the farm"
+    scratch_guarded = snapshot(external_scratch)
     accepted = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", external_file,
                               *adapter, *external_options, "--reclaim-before-bytes", positive_credit,
                               "--save-plan", external_review, "--json").stdout)
     assert accepted["feasible"] and accepted["reclaim_before_bytes"] == positive_credit and snapshot(farm) == guarded
+    assert snapshot(external_scratch) == scratch_guarded
+    external_assessment = ["plan", "--from-plan", external_review, "--harvester", external_file,
+                           *adapter, *external_options, "--json"]
+    metadata_directory = farm / ".xchplot2"
+    assert not metadata_directory.exists()
+    absent_metadata = json.loads(run(*external_assessment).stdout)
+    assert absent_metadata["feasible"] and absent_metadata["reclaim_before_bytes"] == positive_credit
+    assert absent_metadata["batches"] == accepted["batches"]
+    assert snapshot(farm) == guarded and snapshot(external_scratch) == scratch_guarded
+    metadata_directory.mkdir(mode=0o700)
+    orphan = metadata_directory / "orphan-bookkeeping-fixture"
+    try:
+        empty_before = snapshot(farm), snapshot(external_scratch)
+        empty_metadata = json.loads(run(*external_assessment).stdout)
+        assert empty_metadata["feasible"] and empty_metadata["reclaim_before_bytes"] == positive_credit
+        assert empty_metadata["batches"] == accepted["batches"]
+        assert (snapshot(farm), snapshot(external_scratch)) == empty_before
+        with orphan.open("xb") as stream:
+            stream.write(b"preserve owned orphan bookkeeping")
+        orphan.chmod(0o600)
+        orphaned_before = snapshot(farm), snapshot(external_scratch)
+        orphaned_metadata = json.loads(run(*external_assessment, code=2).stdout)
+        assert not orphaned_metadata["feasible"]
+        assert any("bookkeeping without its saved job" in reason for reason in orphaned_metadata["infeasibility_reasons"])
+        assert (snapshot(farm), snapshot(external_scratch)) == orphaned_before, "saved external review changed orphan bookkeeping or scratch"
+    finally:
+        orphan.unlink(missing_ok=True)
+        metadata_directory.rmdir()
+    assert snapshot(farm) == guarded and snapshot(external_scratch) == scratch_guarded
     run("fill", external_review, "--harvester", external_file, *adapter, *external_options, *keys,
         "--temp-capacity-bytes", 1, code=2)
-    assert snapshot(farm) == guarded and not (farm / "grow-replot.plan").exists(), "joint scratch refusal claimed a source or published a journal"
+    assert snapshot(farm) == guarded and not private_record(farm, "grow-replot.plan").exists(), "joint scratch refusal claimed a source or published a journal"
     temporary_profile = json.loads(json.dumps(profile))
     temporary_profile["farm_resources"]["native"]["scratch_resources"] = disks
     temporary_file = directory / "temporary profile.json"
@@ -1221,14 +1283,14 @@ def check_replot(binary, root, reference=None):
     assert any("cannot inspect scratch/destination directory" in reason for reason in imported["infeasibility_reasons"])
     run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options, "--temp-dir", invalid_temp, *keys, code=2)
     assert snapshot(farm) == guarded, "invalid temporary root changed the farm before predelete admission"
-    if temporary_review.read_bytes().startswith(b"ordinary-group-replot-review-v2\n"):
+    if temporary_review.read_bytes().startswith((b"ordinary-group-replot-review-v2\n", b"ordinary-group-replot-review-v3\n")):
         temporary_before = snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)
         unreviewed = json.loads(run("plan", temporary_review, "--harvester", temporary_file, *adapter, *options,
                                    "--temp-dir", external_scratch, "--json", code=2).stdout)
         assert any("keep the reviewed scratch scope" in reason for reason in unreviewed["infeasibility_reasons"])
         run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options,
             "--temp-dir", external_scratch, *keys, code=2)
-        assert snapshot(farm) == guarded and not (farm / "grow-replot.plan").exists()
+        assert snapshot(farm) == guarded and not private_record(farm, "grow-replot.plan").exists()
         assert (snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)) == temporary_before
     protected_root = directory / "protected old plots"
     protected_root.mkdir()
@@ -1268,13 +1330,24 @@ def check_replot(binary, root, reference=None):
             *adapter, *options, *selectors, "--json", code=2)
         assert snapshot(farm) == before, "source selection refusal changed the farm"
     review = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", profile_file,
-                            *adapter, *options, *selection, "--save-plan", review_file, "--json").stdout)
+                            *adapter, *options, *selection, "--replot-verification", "strict",
+                            "--save-plan", review_file, "--json").stdout)
     assert review["replot_review"] and review["feasible"] and not review["live_readiness_checked"]
     assert review["reclaim_before_bytes"] == 0 and review["farming_value_preserved"] is None
     assert len(review["sources"]) == len(review["batches"]) == 1 and snapshot(farm) == before
     assert review["inventory_entries"] == len(catalog["plots"]) and review["selected_source_files"] == 1
     assert review["selected_source_allocated_bytes"] == positive_credit
     assert review["protected_inventory_entries"] == review["protected_allocated_bytes"] == 0
+    assert review["verification_policy"]["mode"] == "strict" and review["batches"][0]["full_proof_required"]
+    legacy_review = directory / "legacy strict migration.plan"
+    legacy_rows = farming_plan_rows(review_file.read_bytes()[:-65])
+    assert legacy_rows[0] == b"ordinary-group-replot-review-v3\n"
+    legacy_rows[0] = b"ordinary-group-replot-review-v2\n"
+    legacy_body = b"".join(legacy_rows[:-1])
+    legacy_review.write_bytes(legacy_body + hashlib.sha256(legacy_body).hexdigest().encode() + b"\n")
+    legacy_metadata = json.loads(run("plan", "--from-plan", legacy_review, "--json").stdout)
+    assert legacy_metadata["verification_policy"]["mode"] == "strict"
+    assert legacy_metadata["batches"][0]["full_proof_required"] and snapshot(farm) == before
     final = Path(review["batches"][0]["path"])
     assert final.suffix == ".plot2" and review["job_id"] in final.name
     assert SEED not in review_file.read_text(encoding="utf-8")
@@ -1284,12 +1357,19 @@ def check_replot(binary, root, reference=None):
     review_file.write_bytes(review_body + hashlib.sha256(review_body).hexdigest().encode() + b"\n")
     saved_review = review_file.read_bytes(), review_file.stat().st_mtime_ns
     execute = ["fill", review_file, "--harvester", profile_file, *adapter, *options]
+    for controls in (["--replot-verification", "structural"], ["--replot-proof-first-groups", 1]):
+        run(*execute, *keys, *controls, code=2)
+        run("plan", "--status", "--from-plan", review_file, *controls, "--json", code=2)
+        assert snapshot(farm) == before, "execution-time verification override changed the saved review"
+    run("plan", farm, "--replot", inventory_file, "--harvester", profile_file, *adapter, *options,
+        "--replot-verification", "sampled", "--replot-proof-first-groups", 0, "--replot-proof-every-groups", 0, code=2)
+    assert snapshot(farm) == before
     public_only = run("fill", "--from-plan", review_file, *options, *keys, code=2)
     assert "explicit installed target reader" in public_only.stdout + public_only.stderr and snapshot(farm) == before
     for failure in ("farmer_unavailable", "solver_unavailable", "farmer_disconnected", "solver_stopped", "pool_external", "pool_mismatch", "node_mismatch"):
         flags(**{failure: True})
         unavailable = run(*execute, *keys, code=2)
-        assert snapshot(farm) == before and not (farm / "grow-replot.plan").exists()
+        assert snapshot(farm) == before and not private_record(farm, "grow-replot.plan").exists()
         if failure == "pool_external":
             assert "pool" in (unavailable.stdout + unavailable.stderr).lower()
     flags()
@@ -1300,6 +1380,20 @@ def check_replot(binary, root, reference=None):
     flags()
     run(*execute, *keys, point="replot-journal-all-staged", code=86)
     staged_private = snapshot(farm)
+    # A durable preparing journal can precede its per-job directory. Reviewing
+    # an unchanged successor must not create that directory or activate policy.
+    assert private_record(farm, "grow-replot.plan.next").is_file()
+    preparing_artifacts = replot_artifacts(farm, review["job_id"])
+    assert not preparing_artifacts.exists()
+    preparing_before = staged_private, snapshot(external_scratch), review_file.read_bytes(), review_file.stat().st_mtime_ns
+    preparing_successor = directory / "preparing journal successor.plan"
+    prepared_review = json.loads(run("plan", "--revalidate", "--from-plan", review_file, "--harvester", profile_file,
+                                    *adapter, *options, "--save-plan", preparing_successor, "--json").stdout)
+    assert prepared_review["replot_revalidation"] and not prepared_review["activated"] and preparing_successor.is_file()
+    preparing_status = json.loads(run("plan", "--status", "--from-plan", preparing_successor, "--json").stdout)
+    assert preparing_status["durable_phase"] == "preparing" and preparing_status["selected_policy_binding"] == "pending"
+    assert not preparing_artifacts.exists() and digest(source) == source_hash
+    assert (snapshot(farm), snapshot(external_scratch), review_file.read_bytes(), review_file.stat().st_mtime_ns) == preparing_before
     run(*execute, "-f", FARMER, "--pool-pk", FARMER, "-S", SEED, code=2)
     assert snapshot(farm) == staged_private, "different supplied pool route changed a prepared NFT journal"
     for failure in ("farmer_disconnected", "solver_stopped"):
@@ -1307,9 +1401,11 @@ def check_replot(binary, root, reference=None):
         run(*execute, code=2)
         assert snapshot(farm) == staged_private, "keyless service refusal changed an interrupted private journal or source"
     flags()
+    # Continue through the original review; the saved preparing successor was
+    # only inspected and remains unactivated.
     run(*execute, *keys, point="replot-journal-one-published", code=86)
-    assert digest(source) == source_hash and not (farm / "grow-farm.plan").exists()
-    saved_work = farm / f".xchplot2-stage-{review['job_id']}-0.building.external"
+    assert digest(source) == source_hash and not private_record(farm, "grow-farm.plan").exists()
+    saved_work = replot_artifacts(farm, review["job_id"]) / "stage-0.building.external"
     saved_work.mkdir(mode=0o700)
     partial_before = snapshot(farm)
     partial_review = run("plan", "--revalidate", "--from-plan", review_file, "--harvester", profile_file,
@@ -1343,14 +1439,16 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == guarded, "another group entrypoint changed the active migration"
     run(*execute, point="replot-replacement-verified", code=86)
     assert digest(source) == source_hash and not final.exists()
-    local_bindings, = farm.glob(".xchplot2-replot-*/local-bindings")
+    local_bindings, = farm.glob(".xchplot2/replot-*/local-bindings")
     assert local_bindings.stat().st_mode & 0o777 == 0o600
+    assert not list(farm.glob(".xchplot2-stage-*")) and not list(farm.glob(".xchplot2-replot-*"))
     before_status = snapshot(farm)
     flags(farmer_unavailable=True, solver_unavailable=True)
     status = json.loads(run("fill", "--status", "--from-plan", review_file, "--json").stdout)
     assert status["durable_phase"] == "replacing" and status["active_verified_stage"]
+    assert status["active_full_proof_validated"] and status["active_replacement"]["full_proof_validated"]
     assert status["live_service_health"] == "not-queried" and status["blocking_reason"] is None
-    verified_authority = saved_replacement_authority(farm / "grow-replot.plan", "verified_stage")
+    verified_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "verified_stage")
     assert status["active_replacement"]["current_native_observation"] == f"matching-verified-stage-native-{verified_authority}"
     assert snapshot(farm) == before_status, "status changed saved progress or native objects"
     flags()
@@ -1393,11 +1491,25 @@ def check_replot(binary, root, reference=None):
     # Saved private defaults restore the accepted local profile and reader;
     # no keys, --harvester or installed-reader flags are repeated.
     execute = ["fill", "--from-plan", review_file, *options]
-    staged, = farm.glob(".xchplot2-stage-*.building")
+    staged, = farm.glob(".xchplot2/replot-*/stage-*.building")
     guarded = snapshot(farm)
     direct = run("grow", staged, "--max-members", 2, "--devices", "cpu", "--compute", "off", "-M", ram, code=2)
     assert "migration-managed directory" in direct.stdout + direct.stderr
     assert snapshot(farm) == guarded, "direct growth changed an active migration's sealed stage"
+    staged_group, staged_k, staged_strength, _, staged_meta, staged_memo = header(staged)
+    for index, reserved in enumerate((farm / ".xchplot2", staged.parent)):
+        assert reserved.is_dir()
+        raw_manifest = directory / f"reserved raw batch-{index}.tsv"
+        raw_manifest.write_text(f"{staged_k} {staged_strength} 0 {staged_meta} raw-v2 {staged_group} {staged_memo} " +
+                                json.dumps(str(reserved), ensure_ascii=False) + ' "ordinary.plot2"\n', encoding="utf-8")
+        for operation in (
+                ("fill", reserved, *keys, *options),
+                ("plot", "-k", 18, "-n", 1, *keys, "-o", reserved,
+                 "--devices", "cpu", "--compute", "off", "-M", ram),
+                ("batch", raw_manifest, "--devices", "cpu", "--compute", "off", "-M", ram)):
+            refused = run(*operation, code=2)
+            assert "reserved .xchplot2" in refused.stdout + refused.stderr
+            assert snapshot(farm) == guarded, "ordinary fill, plot or raw batch changed reserved migration bookkeeping"
     run(*execute, point="replot-replacement-published", code=86)
     replacement_hash = digest(final)
     before_status = snapshot(farm)
@@ -1412,7 +1524,7 @@ def check_replot(binary, root, reference=None):
     before_status = snapshot(farm)
     published_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
     assert published_status["active_published"] and not published_status["active_ready_history"]
-    published_authority = saved_replacement_authority(farm / "grow-replot.plan", "published")
+    published_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "published")
     assert published_status["active_replacement"]["current_native_observation"] == f"matching-published-native-{published_authority}"
     assert published_status["journal_digest"] != stale["reviewed_journal_digest"] and digest(final) == replacement_hash
     assert snapshot(farm) == before_status, "published replacement status changed saved progress or native objects"
@@ -1435,7 +1547,7 @@ def check_replot(binary, root, reference=None):
         flags(**{failure: True})
         run(*execute, code=2)
         assert digest(source) == source_hash and digest(final) == replacement_hash
-        assert not (farm / "grow-farm.plan").exists()
+        assert not private_record(farm, "grow-farm.plan").exists()
     flags()
     run(*execute, point="replot-replacement-ready", code=86)
     run(*execute, point="replot-retirement-intent", code=86)
@@ -1498,10 +1610,10 @@ def check_replot(binary, root, reference=None):
         run(*execute, point=point, code=86)
         assert digest(final) == replacement_hash
     run(*execute)
-    assert not source.exists() and (farm / "grow-farm.plan").is_file() and (farm / "grow-replot.plan").is_file()
+    assert not source.exists() and private_record(farm, "grow-farm.plan").is_file() and private_record(farm, "grow-replot.plan").is_file()
     assert (review_file.read_bytes(), review_file.stat().st_mtime_ns) == saved_review
     for name in ("grow-farm.plan", "grow-replot.plan"):
-        assert (farm / name).stat().st_mode & 0o777 == 0o600
+        assert private_record(farm, name).stat().st_mode & 0o777 == 0o600
     proof = run("verify", final, "--full", "--trials", 100)
     found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
     assert found and int(found[1]) > 0
@@ -1554,11 +1666,20 @@ def check_replot(binary, root, reference=None):
     chain_profile_file.write_text(json.dumps(chain_profile), encoding="utf-8")
     chain_options = list(options)
     chain_review_file = directory / "successor chain origin.plan"
+    chain_before = tuple(snapshot(path) for path in [chain_old, *chain_destinations])
+    sampled = json.loads(run("plan", *chain_destinations, "--replot", chain_inventory, "--harvester", chain_profile_file,
+                             *chain_adapter, *chain_options, "--replot-verification", "sampled", "--json").stdout)
+    assert sampled["verification_policy"]["first_groups"] == 1 and sampled["verification_policy"]["every_groups"] == 0
+    assert [batch["full_proof_required"] for batch in sampled["batches"]] == [True, False]
     chain_review = json.loads(run("plan", *chain_destinations, "--replot", chain_inventory, "--harvester", chain_profile_file,
-                                  *chain_adapter, *chain_options, "--save-plan", chain_review_file, "--json").stdout)
+                                  *chain_adapter, *chain_options, "--replot-verification", "sampled",
+                                  "--replot-proof-first-groups", 0, "--replot-proof-every-groups", 2,
+                                  "--save-plan", chain_review_file, "--json").stdout)
+    assert [batch["full_proof_required"] for batch in chain_review["batches"]] == [False, True]
+    assert tuple(snapshot(path) for path in [chain_old, *chain_destinations]) == chain_before
     assert [batch["source_count"] for batch in chain_review["batches"]] == [2, 0]
     assert {Path(batch["path"]).parent for batch in chain_review["batches"]} == set(chain_destinations)
-    replicas = [Path(item["directory"]) / "grow-replot.plan" for item in chain_review["space"]]
+    replicas = [private_record(Path(item["directory"]), "grow-replot.plan") for item in chain_review["space"]]
     run("fill", "--from-plan", chain_review_file, "--harvester", chain_profile_file, *chain_adapter, *chain_options, *keys,
         point=f"replot-journal-one-published:{len(replicas)}", code=86)
 
@@ -1584,7 +1705,7 @@ def check_replot(binary, root, reference=None):
         point="replot-policy-activated", code=86)
     run("fill", "--from-plan", chain_first_file, *chain_options, point="replot-receipt-synced", code=86)
     chain_outputs = [Path(batch["path"]) for batch in chain_review["batches"]]
-    receipt = chain_outputs[0].parent / f".xchplot2-replot-{chain_review['job_id']}" / "receipt-0"
+    receipt = replot_artifacts(chain_outputs[0].parent, chain_review["job_id"]) / "receipt-0"
     receipt_bytes, prefix_hash = receipt.read_bytes(), digest(chain_outputs[0])
     # Receipt publication precedes prefix advancement. Here the next journal
     # update is exactly complete_replot_batch; stop after every replica commits.
@@ -1594,8 +1715,9 @@ def check_replot(binary, root, reference=None):
     assert prefix["completed_replacements"] == 1 and prefix["completed_retirements"] == len(chain_sources)
     assert prefix["completed_receipt_chain_verified"] and not prefix["replica_publication_pending"]
     completed_output, = prefix["completed_outputs"]
+    assert not completed_output["full_proof_validated"] and prefix["completed_full_proof_validated_groups"] == 0
     assert completed_output["current_native_observation"] == f"matching-saved-native-{saved_replacement_authority(receipt)}"
-    assert not list(chain_outputs[1].parent.glob(".xchplot2-stage-*.building"))
+    assert not list(chain_outputs[1].parent.glob(".xchplot2/replot-*/stage-*.building"))
     assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
     assert all(body == private_farm for body in chain_private_farms()), "completed prefix changed private farm identity"
 
@@ -1605,11 +1727,13 @@ def check_replot(binary, root, reference=None):
     chain_second_file = directory / "successor chain second.plan"
     before = tuple(snapshot(path) for path in [chain_old, *chain_destinations])
     chain_second = json.loads(run("plan", "--revalidate", "--from-plan", chain_first_file, "--harvester", chain_second_profile,
-                                  *chain_adapter, *chain_options, "--save-plan", chain_second_file, "--json").stdout)
+                                  *chain_adapter, *chain_options, "--replot-verification", "strict",
+                                  "--save-plan", chain_second_file, "--json").stdout)
+    assert chain_second["verification_policy"]["mode"] == "strict"
     assert chain_second["parent_policy_digest"] == chain_first["successor_digest"]
     assert chain_second["origin_review_digest"] == chain_first["origin_review_digest"] and chain_second["completed_replacements"] == 1
     successor_text = chain_second_file.read_text(encoding="utf-8")
-    assert sum(successor_text.count("ordinary-group-replot-review-v" + version) for version in ("1", "2")) == 1
+    assert sum(successor_text.count("ordinary-group-replot-review-v" + version) for version in ("1", "2", "3")) == 1
     embedded_origin = shlex.split(farming_plan_rows(chain_second_file.read_bytes()[:-65])[1].decode("utf-8"))[0].encode("utf-8")
     assert embedded_origin == chain_review_file.read_bytes()[:-65]
     assert hashlib.sha256(embedded_origin).hexdigest() == chain_second["origin_review_digest"]
@@ -1633,6 +1757,9 @@ def check_replot(binary, root, reference=None):
     assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
     assert all(body == private_farm for body in chain_private_farms()), "successor policy changed saved keys or fixed assignments"
     run("fill", "--from-plan", chain_second_file, "--harvester", chain_second_profile, *chain_adapter, *chain_options)
+    chain_complete = json.loads(run("plan", "--status", "--from-plan", chain_second_file, "--json").stdout)
+    assert [output["full_proof_validated"] for output in chain_complete["completed_outputs"]] == [False, True]
+    assert chain_complete["completed_full_proof_validated_groups"] == 1
     assert not any(path.exists() for path in chain_sources)
     assert receipt.read_bytes() == receipt_bytes and digest(chain_outputs[0]) == prefix_hash
     assert all(body == private_farm for body in chain_private_farms())
@@ -1677,7 +1804,7 @@ def check_replot(binary, root, reference=None):
             point=initial_point, code=86)
         initial_status = json.loads(run("plan", "--status", "--from-plan", partial_origin, "--json").stdout)
         assert not initial_status["active_verified_stage"] and not initial_status["active_published"]
-        private_path = partial_farm / "grow-replot.plan"
+        private_path = private_record(partial_farm, "grow-replot.plan")
         partial_private_farm = private_replot_farm(private_path)
         partial_threads(2)
         partial_successor = directory / (engine + " partial successor.plan")
@@ -1760,7 +1887,7 @@ def check_replot(binary, root, reference=None):
     assert reviewed["feasible"] and reviewed["reclaim_before_bytes"] > 0
     before = snapshot(routed_farm)
     run("fill", routed_review, *keys, "--harvester", routed_file, *external_options, "--temp-capacity-bytes", 1, code=2)
-    assert snapshot(routed_farm) == before and not (routed_farm / "grow-replot.plan").exists()
+    assert snapshot(routed_farm) == before and not private_record(routed_farm, "grow-replot.plan").exists()
     target_fixture = Path(route_specs[1]["root"]) / "fixture.json"
     target_original = target_fixture.read_bytes()
     for change in ({"pool_difficulty": 16}, {"pool_protocol_version": 1}, {"pool_uninitialized": True}):
@@ -1798,7 +1925,7 @@ def check_replot(binary, root, reference=None):
     run("fill", routed_review, "--harvester", routed_file, *external_options)
     routed_final = Path(reviewed["batches"][0]["path"])
     assert not routed_source.exists() and digest(routed_final) == replacement_hash
-    assert (routed_farm / "grow-farm.plan").is_file()
+    assert private_record(routed_farm, "grow-farm.plan").is_file()
     print("PASS distinct source/target adapters, initialized RewardPuzzle v2 pooling, external positive credit and reviewed difficulty/protocol gates", flush=True)
 
     # Mutate only the old reader while this invocation constructs its real
@@ -1846,7 +1973,7 @@ def check_replot(binary, root, reference=None):
                 assert guarded_source.exists() and digest(guarded_source) == guarded_hash and not claims
             else:
                 assert not guarded_source.exists() and len(claims) == 1 and digest(claims[0]) == guarded_hash
-            assert not (guarded_farm / "grow-farm.plan").exists()
+            assert not private_record(guarded_farm, "grow-farm.plan").exists()
     print("PASS in-process source configuration/version/population fences before claim and unlink", flush=True)
 
     # A native plots-remove operation rewrites YAML as well as unloading the
@@ -1902,7 +2029,7 @@ def check_replot(binary, root, reference=None):
         # Public review alone cannot authorize a changed reader context.
         (old_reader / "config" / "config.yaml").write_text(after, encoding="utf-8")
         run("fill", unload_review, "--harvester", unload_file, *options, *keys, code=2)
-        assert old_source.exists() and digest(old_source) == old_hash and not (destination / "grow-replot.plan").exists()
+        assert old_source.exists() and digest(old_source) == old_hash and not private_record(destination, "grow-replot.plan").exists()
         (old_reader / "config" / "config.yaml").write_text(original_config, encoding="utf-8")
         run("fill", unload_review, "--harvester", unload_file, *options, *keys, point="replot-retirement-intent", code=86)
         assert old_source.exists() and digest(old_source) == old_hash
@@ -1910,7 +2037,7 @@ def check_replot(binary, root, reference=None):
         (old_reader / "fixture.json").write_text(json.dumps({**old_settings, "roots": [str(destination)] if shared else []}), encoding="utf-8")
         run("fill", unload_review, "--harvester", unload_file, *options)
         final_unload = Path(planned["batches"][0]["path"])
-        assert not old_source.exists() and digest(final_unload) == replacement_hash and (destination / "grow-farm.plan").is_file()
+        assert not old_source.exists() and digest(final_unload) == replacement_hash and private_record(destination, "grow-farm.plan").is_file()
     print("PASS durable reviewed source-directory removal with distinct and shared target configurations", flush=True)
 
     # Resource-only bootstrap: actual disk space is ample. Complete serialized
@@ -1940,18 +2067,19 @@ def check_replot(binary, root, reference=None):
     resource_file.write_text(json.dumps(resource_profile), encoding="utf-8")
     before = snapshot(resource_farm)
     refused = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
-                            *resource_adapter, *options, "--json", code=2).stdout)
+                            *resource_adapter, *options, "--replot-verification", "strict", "--json", code=2).stdout)
     assert not refused["feasible"] and any("response-deadline-exceeded" in reason for reason in refused["infeasibility_reasons"])
     refused_file = directory / "infeasible resource review.plan"
     refused_saved = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
-                                  *resource_adapter, *options, "--save-plan", refused_file, "--json", code=2).stdout)
+                                  *resource_adapter, *options, "--replot-verification", "strict",
+                                  "--save-plan", refused_file, "--json", code=2).stdout)
     assert refused_saved["infeasibility_reasons"] == refused["infeasibility_reasons"] and not refused_saved["saved_plan"]
     assert not refused_file.exists() and snapshot(resource_farm) == before, "infeasible saved review changed the farm"
     resource_credit = resource_catalog["plots"][0]["identity"]["allocated_bytes"]
     resource_review = directory / "resource-only migration.plan"
     reviewed_resource = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
                                       *resource_adapter, *options, "--reclaim-before-bytes", resource_credit,
-                                      "--save-plan", resource_review, "--json").stdout)
+                                      "--replot-verification", "strict", "--save-plan", resource_review, "--json").stdout)
     assert reviewed_resource["feasible"] and snapshot(resource_farm) == before
     import shutil
     assert shutil.disk_usage(resource_farm).free > ram + 256 * mib, "resource-only fixture unexpectedly depends on disk pressure"
@@ -1959,12 +2087,12 @@ def check_replot(binary, root, reference=None):
     run("fill", resource_review, "--harvester", resource_file, *resource_adapter, *options, *keys,
         point="replot-source-unlinked", code=86)
     assert not resource_source.exists() and not resource_final.exists()
-    assert not list(resource_farm.glob(".xchplot2-stage-*.building")), "resource-only predelete followed construction instead of enabling it"
+    assert not list(resource_farm.glob(".xchplot2/replot-*/stage-*.building")), "resource-only predelete followed construction instead of enabling it"
     unlinked = json.loads(run("plan", "--status", "--from-plan", resource_review, "--json").stdout)
     assert unlinked["active_sources"][0]["durable_state"] == "claimed"
     assert unlinked["active_sources"][0]["current_native_observation"] == "original-and-claim-absent"
     assert unlinked["outstanding_predelete_bytes"] == unlinked["predelete_limit_bytes"] == resource_credit
-    resource_private_farm = private_replot_farm(resource_farm / "grow-replot.plan")
+    resource_private_farm = private_replot_farm(private_record(resource_farm, "grow-replot.plan"))
     # Review a changed native phase envelope after unlink but before retirement
     # is recorded. The old workload bounds remain; current unconfirmed demand
     # still fits, while the original physical deletion debt cannot disappear.
@@ -1986,16 +2114,16 @@ def check_replot(binary, root, reference=None):
     debt = json.loads(run("plan", "--status", "--from-plan", unlinked_successor_file, "--json").stdout)
     assert debt["selected_policy_binding"] == "active" and debt["active_sources"][0]["durable_state"] == "claimed"
     assert debt["outstanding_predelete_bytes"] == debt["predelete_limit_bytes"] == resource_credit
-    assert private_replot_farm(resource_farm / "grow-replot.plan") == resource_private_farm
+    assert private_replot_farm(private_record(resource_farm, "grow-replot.plan")) == resource_private_farm
     before = snapshot(resource_farm)
     run("fill", "--from-plan", resource_review, *options, code=2)
     assert snapshot(resource_farm) == before, "original review changed an activated unlink-before-retirement successor"
     run("fill", "--from-plan", unlinked_successor_file, *options)
-    assert digest(resource_final) == replacement_hash and (resource_farm / "grow-farm.plan").is_file()
+    assert digest(resource_final) == replacement_hash and private_record(resource_farm, "grow-farm.plan").is_file()
     complete = json.loads(run("plan", "--status", "--from-plan", unlinked_successor_file, "--json").stdout)
     assert complete["outstanding_predelete_bytes"] == 0 and complete["completed_receipt_chain_verified"]
-    assert private_replot_farm(resource_farm / "grow-replot.plan") == resource_private_farm
-    resource_receipt = resource_final.parent / f".xchplot2-replot-{reviewed_resource['job_id']}" / "receipt-0"
+    assert private_replot_farm(private_record(resource_farm, "grow-replot.plan")) == resource_private_farm
+    resource_receipt = replot_artifacts(resource_final.parent, reviewed_resource["job_id"]) / "receipt-0"
     completed_output, = complete["completed_outputs"]
     assert completed_output["current_native_observation"] == f"matching-saved-native-{saved_replacement_authority(resource_receipt)}"
     assert shlex.split(resource_receipt.read_bytes()[:-65].decode("utf-8"))[1] == unlinked_successor["origin_review_digest"]
@@ -2003,6 +2131,63 @@ def check_replot(binary, root, reference=None):
     found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
     assert found and int(found[1]) > 0
     print("PASS resource-only predelete despite ample disk, exact source unload, post-unlink recovery, byte parity and full proofs", flush=True)
+
+    # Routine migration does not need an expensive proof-phase reservation.
+    # Explicit pre-delete debt still authorizes removal before construction;
+    # structural success cannot claim that the removed plot is recoverable.
+    structural_farm = directory / "structural predelete migration"
+    structural_farm.mkdir()
+    structural_source = structural_farm / "legacy.plot"
+    structural_source.write_bytes(legacy)
+    structural_reader = directory / "structural predelete reader"
+    (structural_reader / "config").mkdir(parents=True)
+    (structural_reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+    (structural_reader / "fixture.json").write_text(json.dumps({"roots": [str(structural_farm)]}), encoding="utf-8")
+    structural_adapter = ["--chia-root", structural_reader, "--chia-executable", executable]
+    structural_inventory = directory / "structural predelete inventory.plan"
+    structural_catalog = json.loads(run("plan", "--inventory", structural_farm, *structural_adapter,
+                                        "--save-plan", structural_inventory, "--json").stdout)
+    structural_profile = json.loads(json.dumps(resource_profile))
+    for field in ("verification", "max_verification_us", "verification_cpu_threads"):
+        structural_profile["farm_resources"]["native"].pop(field)
+    structural_profile_file = directory / "structural without proof grant.json"
+    structural_profile_file.write_text(json.dumps(structural_profile), encoding="utf-8")
+    structural_credit = structural_catalog["plots"][0]["identity"]["allocated_bytes"]
+    structural_review = directory / "structural predelete migration.plan"
+    before = snapshot(structural_farm)
+    no_credit = json.loads(run("plan", structural_farm, "--replot", structural_inventory, "--harvester", structural_profile_file,
+                              *structural_adapter, *options, "--json", code=2).stdout)
+    assert not no_credit["feasible"] and snapshot(structural_farm) == before
+    planned = json.loads(run("plan", structural_farm, "--replot", structural_inventory, "--harvester", structural_profile_file,
+                             *structural_adapter, *options, "--reclaim-before-bytes", structural_credit,
+                             "--save-plan", structural_review, "--json").stdout)
+    assert planned["feasible"] and planned["verification_policy"]["mode"] == "structural"
+    assert not planned["batches"][0]["full_proof_required"] and snapshot(structural_farm) == before
+    strict_without_grant = json.loads(run("plan", structural_farm, "--replot", structural_inventory, "--harvester", structural_profile_file,
+                                          *structural_adapter, *options, "--reclaim-before-bytes", structural_credit,
+                                          "--replot-verification", "strict", "--json", code=2).stdout)
+    assert not strict_without_grant["feasible"] and snapshot(structural_farm) == before
+    run("fill", structural_review, "--harvester", structural_profile_file, *structural_adapter, *options, *keys,
+        point="replot-source-unlinked", code=86)
+    structural_final = Path(planned["batches"][0]["path"])
+    assert not structural_source.exists() and not structural_final.exists()
+    assert not list(replot_artifacts(structural_farm, planned["job_id"]).glob("stage-*.building"))
+    debt_before = snapshot(structural_farm)
+    debt_status = json.loads(run("plan", "--status", "--from-plan", structural_review, "--json").stdout)
+    assert debt_status["outstanding_predelete_bytes"] == structural_credit and debt_status["active_full_proof_validated"] is None
+    assert snapshot(structural_farm) == debt_before, "structural predelete status changed recovery state"
+    run("fill", structural_review, *options, point="replot-replacement-verified", code=86)
+    verified = json.loads(run("plan", "--status", "--from-plan", structural_review, "--json").stdout)
+    assert verified["active_verified_stage"] and verified["active_full_proof_validated"] is False
+    assert verified["active_replacement"]["full_proof_validated"] is False
+    run("fill", structural_review, *options)
+    structural_complete = json.loads(run("plan", "--status", "--from-plan", structural_review, "--json").stdout)
+    assert structural_complete["completed_receipt_chain_verified"] and structural_complete["outstanding_predelete_bytes"] == 0
+    assert structural_complete["completed_full_proof_validated_groups"] == 0
+    assert structural_complete["completed_outputs"][0]["full_proof_validated"] is False
+    assert digest(structural_final) == replacement_hash and private_record(structural_farm, "grow-farm.plan").is_file()
+    assert not (structural_farm / "grow-replot.plan").exists() and not (structural_farm / "grow-farm.plan").exists()
+    print("PASS default structural migration without a proof grant, explicit predelete interruption/resume and truthful saved evidence", flush=True)
 
     # Key-free review does not prescribe NFT versus OG. Once prepared, keys
     # are immutable, as checked above; a first preparation may choose OG.
@@ -2117,12 +2302,12 @@ def check_replot(binary, root, reference=None):
     huge_offer[huge_offer.index("--compute-offer-cpus") + 1] = 1025
     refused_huge = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *huge_offer, *keys, code=2)
     assert "local compute offer exceeds CPU or slot bounds" in refused_huge.stdout + refused_huge.stderr
-    assert snapshot(compute_farm) == before and not (compute_farm / "grow-replot.plan").exists()
+    assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists()
     bad_offer = list(compute_options)
     bad_offer[bad_offer.index("--compute-offer-ram") + 1] = "2G"
     refusal = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *bad_offer, *keys, code=2)
     assert "local compute offer exceeds" in refusal.stdout + refusal.stderr
-    assert snapshot(compute_farm) == before and not (compute_farm / "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
+    assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
     run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options, *keys,
         point="replot-journal-all-staged", code=86)
     run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options,

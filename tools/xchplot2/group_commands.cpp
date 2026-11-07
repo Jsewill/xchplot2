@@ -58,12 +58,15 @@ void command_help_all(std::string_view command)
         "  --assess-jobs             plan: assess saved keyless job forecasts under one harvester budget\n"
         "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
         "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
+        "  --replot-verification MODE  plan/revalidate: structural (new default), sampled or strict\n"
+        "  --replot-proof-first-groups N  sampled: initial groups to proof-check; default 1\n"
+        "  --replot-proof-every-groups N  sampled: global one-based proof period; default 0\n"
         "  --replot-source-root ROOT  select an exact inventory root; repeat for more roots\n"
         "  --replot-exclude-root ROOT  protect an exact inventory root; repeat for more roots\n"
         "  --replot-max-source-files N  maximum old files selected for this review\n"
         "  --replot-max-source-bytes SIZE  maximum allocated old-file bytes selected\n"
         "  --status                 read saved migration progress without plotting or farm RPCs\n"
-        "  --revalidate             plan: save a reviewed successor with an updated resource profile\n"
+        "  --revalidate             plan: save a successor for updated resources or verification policy\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
         "  --farm-adapter-timeout-ms N  inventory/migration adapter operation deadline, default 30000\n"
@@ -143,8 +146,9 @@ void command_help_all(std::string_view command)
         "and any owned temporary files together until completion.\n";
     else std::cout <<
         "Construction state is recovered with the same build. Keep every private\n"
-        "grow-farm.plan copy with its plots; it contains the seed for private plot keys.\n"
-        "Keep any grow-farm.plan.next and owned temporary files for recovery too.\n";
+        ".xchplot2/grow-farm.plan copy with its plots; it contains private plot seeds.\n"
+        "Keep .next copies and owned temporary files for recovery too.\n"
+        "Existing jobs retain their top-level metadata layout; leave those copies in place.\n";
 }
 
 void command_help(std::string_view command, bool all)
@@ -163,13 +167,17 @@ void command_help(std::string_view command, bool all)
             "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n"
             "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
             "  --replot INVENTORY       review migration into DEST...; save with --save-plan\n"
+            "  --replot-verification MODE  structural (new default), sampled or strict\n"
+            "  --replot-proof-first-groups N  sampled proof prefix; default 1\n"
+            "  --replot-proof-every-groups N  sampled global one-based proof period; default 0\n"
             "  --replot-source-root ROOT  select old files from this exact inventory root\n"
             "  --replot-exclude-root ROOT  protect old files in this exact inventory root\n"
             "  --replot-max-source-files N  bound old-file selection for a trial run\n"
             "  --replot-max-source-bytes SIZE  bound selected allocated old-file bytes\n"
             "  --status PLAN            inspect saved migration progress\n"
-            "  --revalidate              review a resource-profile successor; use --from-plan and --save-plan\n"
-            "  --reclaim-before-bytes SIZE  physical bytes retired before replacement readiness\n";
+            "  --revalidate              review updated resources or verification; use --from-plan and --save-plan\n"
+            "  --reclaim-before-bytes SIZE  explicit bytes retired before construction/readiness; default zero\n"
+            "Early retirement is irreversible; later replacement checks cannot recover deleted plots.\n";
     else
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n"

@@ -1,4 +1,4 @@
-// Private, bounded self-workers for explicit calibration and migration proofs.
+// Private, bounded self-workers for explicit calibration and migration checks.
 #pragma once
 #include "host/GroupFarmResources.hpp"
 #include <atomic>
@@ -12,6 +12,7 @@
 #else
 #include <sys/resource.h>
 #ifdef __linux__
+#include <linux/ioprio.h>
 #include <sys/syscall.h>
 #endif
 #endif
@@ -31,6 +32,49 @@ struct MemoryCap
 };
 inline void check(bool condition, char const* message)
 { if (!condition) throw std::runtime_error(message); }
+struct BackgroundPriority
+{
+    // Applied preferences are not CPU or device-service guarantees.
+    bool cpu_applied = false, io_applied = false;
+};
+// Best effort only: admission and OS caps remain mandatory when priority
+// lowering is unavailable. Use only in an isolated migration worker before
+// its verifier creates threads; Linux nice/I/O settings are thread-local and
+// inherited by new workers. Never change the construction owner's priority.
+inline BackgroundPriority install_background_priority() noexcept
+{
+    BackgroundPriority result;
+#ifdef _WIN32
+    bool const applied = ::SetPriorityClass(::GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) ||
+        ::GetLastError() == ERROR_PROCESS_MODE_ALREADY_BACKGROUND;
+    result.cpu_applied = result.io_applied = applied;
+#elif defined(__linux__)
+    errno = 0;
+    int const before = ::getpriority(PRIO_PROCESS, 0);
+    if (before != -1 || !errno)
+    {
+        // Unlike BatchPlotter's relative adjustment between plotting peers,
+        // background checks must stay below normal even when the owner was
+        // promoted. Preserve an inherited lower priority.
+        int const target = std::max(10, before);
+        (void)::setpriority(PRIO_PROCESS, 0, target);
+        errno = 0;
+        int const actual = ::getpriority(PRIO_PROCESS, 0);
+        result.cpu_applied = (actual != -1 || !errno) && actual >= target;
+    }
+#if defined(SYS_ioprio_get) && defined(SYS_ioprio_set)
+    auto const previous = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+    if (previous >= 0)
+    {
+        int const target = IOPRIO_PRIO_CLASS(previous) == IOPRIO_CLASS_IDLE ? int(previous) :
+            IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NR - 1);
+        if (previous == target || !::syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, target))
+            result.io_applied = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) == target;
+    }
+#endif
+#endif
+    return result;
+}
 inline uint64_t install_cpu_cap(uint64_t requested)
 {
 #ifdef _WIN32
@@ -221,7 +265,7 @@ inline std::filesystem::path executable()
 #endif
 }
 
-enum class Worker { calibration, migration_proof };
+enum class Worker { calibration, migration_proof, migration_structure };
 class WorkerPaused : public std::runtime_error
 {
 public:
@@ -231,8 +275,11 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
                               Worker worker = Worker::calibration, uint64_t proof_cpus = 0, uint64_t proof_solves = 1,
                               std::function<bool(farm::SupervisedProcess const&)> const& observe = {})
 {
-    check(worker == Worker::calibration || worker == Worker::migration_proof, "invalid bounded plot worker mode");
-    check(!proof_cpus || (worker == Worker::migration_proof && proof_cpus <= 1024), "invalid bounded proof CPU request");
+    check(worker == Worker::calibration || worker == Worker::migration_proof || worker == Worker::migration_structure,
+        "invalid bounded plot worker mode");
+    check(!proof_cpus || (worker != Worker::calibration && proof_cpus <= 1024), "invalid bounded proof CPU request");
+    check(worker != Worker::migration_structure || (proof_cpus == 1 && samples == 1),
+        "structural worker requires a single CPU and structural check");
 #if !defined(__linux__) && !defined(_WIN32)
     check(!proof_cpus, "explicit proof CPU affinity is unsupported on this platform");
 #endif
@@ -320,6 +367,7 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         std::to_wstring(samples) + L" --calibration-memory-bytes " + std::to_wstring(limits.memory_bytes) +
         L" --calibration-timeout-ms " + std::to_wstring(limits.timeout_ms) +
         (worker == Worker::migration_proof ? L" --replot-proof-worker --replot-proof-solves " + std::to_wstring(proof_solves) : L"") +
+        (worker == Worker::migration_structure ? L" --replot-structure-worker" : L"") +
         (proof_cpus ? L" --replot-proof-cpus " + std::to_wstring(proof_cpus) : L"") + L" --json -- " + quote(absolute.wstring());
     STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdOutput = write.value; startup.StartupInfo.hStdError = write.value; startup.StartupInfo.hStdInput = input.value;
@@ -425,6 +473,7 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
         "--calibration-timeout-ms", std::to_string(limits.timeout_ms)};
     if (worker == Worker::migration_proof)
         arguments.insert(arguments.end(), {"--replot-proof-worker", "--replot-proof-solves", std::to_string(proof_solves)});
+    if (worker == Worker::migration_structure) arguments.push_back("--replot-structure-worker");
     if (proof_cpus) arguments.insert(arguments.end(), {"--replot-proof-cpus", std::to_string(proof_cpus)});
     arguments.insert(arguments.end(), {"--json", "--", absolute.string()});
     std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data()); argv.push_back(nullptr);

@@ -5,6 +5,11 @@
 #include <shellapi.h>
 #else
 #include <sys/mman.h>
+#ifdef __linux__
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -84,6 +89,70 @@ void scoped_cpu_fixture()
 }
 int direct(std::string const& mode)
 {
+    if (mode == "--direct-priority-unavailable")
+    {
+#if defined(__linux__) && defined(SYS_ioprio_get) && defined(SYS_ioprio_set)
+        // A real unsupported-system-call response must leave priority hints
+        // unapplied without preventing the worker's mandatory checks.
+        sock_filter rules[]{
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpriority, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ioprio_get, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ioprio_set, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+        sock_fprog filter{static_cast<unsigned short>(std::size(rules)), rules};
+        if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter))
+        { std::cout << "background priority fallback fixture skipped: syscall filtering unavailable\n"; return 0; }
+        auto const priority = process::install_background_priority();
+        check(!priority.cpu_applied && !priority.io_applied, "unsupported priority calls claimed a background setting");
+#endif
+        return 0;
+    }
+    if (mode == "--direct-priority")
+    {
+#ifdef __linux__
+        errno = 0; int const before = ::getpriority(PRIO_PROCESS, 0);
+        check(before != -1 || !errno, "cannot read direct priority fixture baseline");
+        auto const priority = process::install_background_priority();
+        errno = 0; int const after = ::getpriority(PRIO_PROCESS, 0);
+        check((after != -1 || !errno) && after >= before, "background worker raised its inherited CPU priority");
+        if (priority.cpu_applied) check(after >= 10, "background CPU setting was reported without enforcement");
+#if defined(SYS_ioprio_get) && defined(SYS_ioprio_set)
+        auto const io = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+        if (priority.io_applied) check(io >= 0 && (IOPRIO_PRIO_CLASS(io) == IOPRIO_CLASS_IDLE ||
+            (IOPRIO_PRIO_CLASS(io) == IOPRIO_CLASS_BE && IOPRIO_PRIO_DATA(io) == IOPRIO_BE_NR - 1)),
+            "background I/O setting was reported without enforcement");
+        long inherited_io = -1; int inherited_cpu = 0;
+        std::thread worker([&] { inherited_cpu = ::getpriority(PRIO_PROCESS, 0); inherited_io = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0); });
+        worker.join();
+        if (priority.cpu_applied) check(inherited_cpu == after, "solver thread did not inherit background CPU priority");
+        if (priority.io_applied) check(inherited_io == io, "solver thread did not inherit background I/O priority");
+        if (!::syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)))
+        {
+            auto const retained = process::install_background_priority();
+            check(retained.io_applied && IOPRIO_PRIO_CLASS(::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0)) == IOPRIO_CLASS_IDLE,
+                "background worker raised an inherited idle I/O priority");
+        }
+#endif
+#elif defined(_WIN32)
+        auto const priority = process::install_background_priority();
+        check(priority.cpu_applied == priority.io_applied, "Windows background mode reported a partial resource preference");
+        if (priority.cpu_applied)
+        {
+            check(!::SetPriorityClass(::GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) &&
+                ::GetLastError() == ERROR_PROCESS_MODE_ALREADY_BACKGROUND, "Windows background setting was reported without enforcement");
+            auto const retained = process::install_background_priority();
+            check(retained.cpu_applied && retained.io_applied, "inherited Windows background mode was not retained");
+        }
+#else
+        auto const priority = process::install_background_priority();
+        check(!priority.cpu_applied && !priority.io_applied, "unsupported platform reported background settings");
+#endif
+        return 0;
+    }
 #ifdef __linux__
     if (mode == "--direct-active-pressure")
     {
@@ -201,11 +270,13 @@ int direct(std::string const& mode)
 int fake_worker(std::vector<std::string> args)
 {
     bool const proof_worker = args.size() >= 18 && args[12] == "--replot-proof-worker";
-    if (proof_worker) args.erase(args.begin() + 12);
+    bool const structure_worker = args.size() >= 18 && args[12] == "--replot-structure-worker";
+    if (proof_worker || structure_worker) args.erase(args.begin() + 12);
     bool const solve_budget = proof_worker && args.size() >= 17 && args[12] == "--replot-proof-solves" && args[13] == "1";
     check(!proof_worker || solve_budget, "proof worker omitted its explicit solve budget");
     if (solve_budget) args.erase(args.begin() + 12, args.begin() + 14);
     bool const cpu_cap = args.size() == 17 && args[12] == "--replot-proof-cpus" && args[13] == "1";
+    check(!structure_worker || cpu_cap, "structural worker omitted its single-CPU cap");
     if (cpu_cap) args.erase(args.begin() + 12, args.begin() + 14);
     check(args.size() == 15 && args[1] == "plan" && args[2] == "--config" &&
 #ifdef _WIN32
@@ -247,7 +318,8 @@ int fake_worker(std::vector<std::string> args)
     if (mode == "flood") { for (unsigned i = 0; i < 65536; ++i) std::cout.put('x'); std::cout.flush(); return 0; }
     if (mode == "failure") { std::cerr << "fixture failure\n"; return 7; }
     if (mode == "empty") return 0;
-    std::cout << (cpu_cap ? "{\"proof_worker\":true,\"cpu_cap\":1}\n" : proof_worker ? "{\"proof_worker\":true}\n" : "{\"ok\":true}\n") << std::flush; return 0;
+    std::cout << (structure_worker ? "{\"structure_worker\":true,\"cpu_cap\":1}\n" : cpu_cap ?
+        "{\"proof_worker\":true,\"cpu_cap\":1}\n" : proof_worker ? "{\"proof_worker\":true}\n" : "{\"ok\":true}\n") << std::flush; return 0;
 }
 void monitor_fixture(process::Limits const& limits)
 {
@@ -448,9 +520,37 @@ int main(int argc, char** argv) try
 #if defined(__linux__) || defined(_WIN32)
     check(process::run_worker(input, 1, limits, process::Worker::migration_proof, 1) == "{\"proof_worker\":true,\"cpu_cap\":1}\n",
         "bounded migration proof worker did not enforce its CPU request");
+    check(process::run_worker(input, 1, limits, process::Worker::migration_structure, 1) == "{\"structure_worker\":true,\"cpu_cap\":1}\n",
+        "bounded structural worker confused structural success with full proofs");
 #endif
+    rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_structure); });
+    rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_structure, 2); });
+    rejected([&] { (void)process::run_worker(input, 2, limits, process::Worker::migration_structure, 1); });
     rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_proof, 1, 0); });
     rejected([&] { (void)process::run_worker(input, 1, limits, process::Worker::migration_proof, 1, 2); });
+#ifdef _WIN32
+    DWORD const owner_priority = ::GetPriorityClass(::GetCurrentProcess());
+    int const owner_thread_priority = ::GetThreadPriority(::GetCurrentThread());
+    check(owner_priority && owner_thread_priority != THREAD_PRIORITY_ERROR_RETURN, "cannot inspect owner priority");
+#elif defined(__linux__)
+    errno = 0; int const owner_priority = ::getpriority(PRIO_PROCESS, 0);
+    check(owner_priority != -1 || !errno, "cannot inspect owner CPU priority");
+#if defined(SYS_ioprio_get)
+    auto const owner_io_priority = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+#endif
+#endif
+    check(launch_direct("--direct-priority") == 0 && launch_direct("--direct-priority-unavailable") == 0,
+        "isolated background priority enforcement or unsupported fallback failed");
+#ifdef _WIN32
+    check(::GetPriorityClass(::GetCurrentProcess()) == owner_priority && ::GetThreadPriority(::GetCurrentThread()) == owner_thread_priority,
+        "background worker changed its owner's priority");
+#elif defined(__linux__)
+    errno = 0; int const actual_owner_priority = ::getpriority(PRIO_PROCESS, 0);
+    check((actual_owner_priority != -1 || !errno) && actual_owner_priority == owner_priority, "background worker changed its owner's CPU priority");
+#if defined(SYS_ioprio_get)
+    check(::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) == owner_io_priority, "background worker changed its owner's I/O priority");
+#endif
+#endif
     check(launch_direct("--direct-cpu") == 0, "direct proof CPU-affinity enforcement failed");
 #ifdef __linux__
     check(launch_direct("--direct-active-pressure") == 0, "active/inactive default pressure enforcement failed");

@@ -137,11 +137,19 @@ public:
     // Read-only authority for terminal metadata whose original target was
     // published by rename. The controller supplies its durable native stamp
     // and the exact fixed assignment; active construction never uses aliases.
+    struct PublicationParent
+    {
+        FileIdentity file;
+        file_io::DurableIdentity identity;
+    };
     struct PublishedTarget
     {
         std::string path;
         Stamp stamp;
         Identity identity;
+        // A different publication directory requires explicit controller
+        // authority. Terminal records still bind their original parent.
+        std::optional<PublicationParent> parent;
     };
     struct Inspection
     {
@@ -3643,10 +3651,40 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_retired_published(std:
     auto const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
     auto const holder = file_io::path_text(std::filesystem::absolute(file_io::native_path(directory)).lexically_normal());
     auto const actual = file_io::native_path(published.path);
+    auto const original_parent = file_io::native_path(target).parent_path();
+    if (published.parent)
+    {
+        uint64_t const parent_memory = grow_add(sizeof(PublicationParent) + sizeof(external_detail::Descriptor) +
+            sizeof(FileIdentity) + 2 * sizeof(std::filesystem::path),
+            grow_add(multiply(grow_add(published.path.capacity(), target.capacity()), 4 * sizeof(std::filesystem::path::value_type)),
+                grow_add(published.parent->identity.filesystem.capacity(), published.parent->identity.object.capacity())));
+        require(parent_memory < memory_limit_bytes, "published external parent authority exceeds inspection memory budget");
+        memory_limit_bytes -= parent_memory;
+    }
     require(actual.is_absolute() && actual == actual.lexically_normal() && actual != file_io::native_path(target) &&
-        actual.parent_path() == file_io::native_path(target).parent_path() &&
-        file_io::native_path(holder).parent_path() == actual.parent_path() && file_identity(holder, true).inode,
+        (actual.parent_path() == original_parent || published.parent) &&
+        file_io::native_path(holder).parent_path() == original_parent && file_identity(holder, true).inode,
         "published external alias is outside its original target directory");
+    std::optional<external_detail::Descriptor> parent_pin;
+    FileIdentity parent_owner;
+    auto const parent_path = file_io::path_text(actual.parent_path());
+    if (published.parent)
+    {
+        require(published.parent->file.inode, "published external alias has no publication parent owner");
+        parent_owner = bind_identity(parent_path, true, published.parent->file, published.parent->identity);
+        parent_pin.emplace(file_io::open_file(parent_path, file_io::read_only | file_io::directory | file_io::no_follow | file_io::close_on_exec));
+    }
+    auto check_parent = [&]
+    {
+        if (!parent_pin) return;
+        file_io::Stat value{};
+        require(!file_io::inspect_fd(parent_pin->fd, &value) && file_io::is_directory(value.st_mode) &&
+            FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == parent_owner &&
+            file_identity(parent_path, true) == parent_owner && file_identity(file_io::path_text(original_parent), true).device == parent_owner.device &&
+            (!file_io::has_durable_identity(published.parent->identity) || file_io::matches_durable_identity(parent_pin->fd, published.parent->identity)),
+            "published external alias publication parent changed or crossed filesystems");
+    };
+    check_parent();
     file_io::Stat original{}, checkpoint{};
     require(file_io::inspect_link(target, &original) && errno == ENOENT,
         "original external target reappeared beside its publication");
@@ -3658,7 +3696,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_retired_published(std:
         result = inspect_receipt(target, holder, memory_limit_bytes, &published);
     }
     else result = inspect_at(target, holder, memory_limit_bytes, true, &published);
-    validate_publication(published, result); return result;
+    validate_publication(published, result); check_parent(); return result;
 }
 }
 

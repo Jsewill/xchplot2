@@ -85,6 +85,10 @@ def outputs(directory):
     return sorted(directory.glob("grow-group-*.gplot"))
 
 
+def farming_record(directory, name="grow-farm.plan"):
+    return directory / ".xchplot2" / name
+
+
 def snapshot(directories):
     result = {}
     for directory in directories:
@@ -111,11 +115,17 @@ def charge(path):
     return max(path.stat().st_size, path.stat().st_blocks * 512)
 
 
+def occupied_bytes(directories):
+    # Files retain the existing logical/allocation charge; private metadata
+    # directories add their actual allocation without charging the farm roots.
+    return sum(charge(path) if path.is_file() else path.stat().st_blocks * 512
+               for directory in directories for path in directory.rglob("*"))
+
+
 def bounded(result, directories, maximum_ram):
     assert result["peak_modeled_bytes"] <= maximum_ram, result
     assert result["peak_file_bytes"] <= result["capacity_bytes"], result
-    actual = sum(charge(path) for directory in directories for path in directory.iterdir()
-                 if path.is_file())
+    actual = occupied_bytes(directories)
     assert actual <= result["capacity_bytes"], (actual, result)
     assert actual <= result["accounted_file_bytes"] <= result["capacity_bytes"], (actual, result)
 
@@ -227,14 +237,14 @@ def saved_external_pairs(args, root, references, results, construction):
         name = "external-pair-" + ("partial" if following else "empty")
         directory, scratch, next_path, command = fixture(name, following=following)
         work = [directory, *scratch]
-        manifest = directory / "grow-farm.plan"
+        manifest = farming_record(directory, "grow-farm.plan")
         original_plan = digest(manifest)
         before = snapshot(work)
         assert plan(run([*command, "--plan-only"]))["feasible"]
         assert snapshot(work) == before, "saved-pair preview modified owned files"
         reject_unchanged([*command, "--max-total-members", 2], work)
         reject_unchanged([*command, "--max-groups", 1], work)
-        capacity = sum(charge(path) for path in directory.iterdir() if path.is_file()) - 1
+        capacity = occupied_bytes([directory]) - 1
         reject_unchanged([*command, "--capacity-bytes", capacity], work)
 
         def next_snapshot():
@@ -285,7 +295,13 @@ def compatible_builds(original, replacement, root, maximum_ram):
     keys = ["--farmer-pk", FARMER, "--pool-ph", POOL]
     run([original, original_job, *limits, *policy, *keys, "--seed", SEED])
     run([replacement, replacement_job, *limits, *policy, *keys, "--seed", OTHER_SEED])
-    manifests = [directory / "grow-farm.plan" for directory in (original_job, replacement_job)]
+    # This compatibility fixture deliberately accepts either producer layout.
+    # Ordinary new-job cases below require the private path explicitly.
+    manifests = []
+    for directory in (original_job, replacement_job):
+        copies = [path for path in (farming_record(directory), directory / "grow-farm.plan") if path.is_file()]
+        assert len(copies) == 1, (directory, copies)
+        manifests.append(copies[0])
     records = [farming_copy(path) for path in manifests]
     producers = [json.loads(record.splitlines()[1]) for record in records]
     assert producers[0] != producers[1], "compatibility fixture requires different source build identities"
@@ -353,6 +369,19 @@ def check(args, root):
     assert all(lane["group_members"] == 2 and lane["members"] == 5 for lane in forecast["destinations"]), forecast
     results["plans"].append({"case": "keyless same-resource shared-capacity preview", **forecast})
 
+    orphaned = directories("orphaned-metadata", 2)
+    reserved = orphaned[0] / ".xchplot2"
+    reserved.mkdir(mode=0o700)
+    (reserved / "retained-bookkeeping").write_bytes(b"preserve this unfinished job")
+    orphaned_command = [args.grow, *options(orphaned), *keys, *construction,
+                        "--group-members", 1, "--max-total-members", 1, "--max-groups", 1]
+    before = snapshot(orphaned)
+    for extra in (["--plan-only"], []):
+        refused = run([*orphaned_command, *extra], 1)
+        assert "bookkeeping without its saved job" in refused.stdout + refused.stderr
+        assert snapshot(orphaned) == before, "orphaned metadata refusal changed a destination"
+    results["rejections"].append("orphaned private bookkeeping preserved before preview and apply")
+
     # Fixed layout makes these quantitative comparisons about reader work,
     # rather than asserting a particular heuristic's chosen group size.
     profiles = directories("profiles")
@@ -413,7 +442,7 @@ def check(args, root):
                      "--farming-io-work-weight", 3, "--farming-max-eligible-groups", 2]
     opted_preview = plan(run([*opted_command, "--plan-only"]))
     opted_result = run([*opted_command, *keys])
-    assert plan(opted_result) == opted_preview and (opted[0] / "grow-farm.plan").exists()
+    assert plan(opted_result) == opted_preview and farming_record(opted[0], "grow-farm.plan").exists()
     assert opted_preview["objective"] == "latency" and opted_preview["cpu_work_weight"] == 2
     assert opted_preview["io_work_weight"] == 3 and opted_preview["max_eligible_groups"] == 2
     before = snapshot(opted)
@@ -440,7 +469,7 @@ def check(args, root):
     assert snapshot(pending) == before, "pending saved protocol was modified by mismatching fixed N"
     recovered = run([*pending_command, "--resume"])
     assert plan(recovered)["objective"] == "latency" and header(outputs(pending[0])[0])[3] == 1
-    assert (pending[0] / "grow-farm.plan").exists() and not (pending[0] / "grow-farm.plan.next").exists()
+    assert farming_record(pending[0], "grow-farm.plan").exists() and not farming_record(pending[0], "grow-farm.plan.next").exists()
     results["recovery"].append("published and pending fixed-N farm resumes retain omitted saved farming options")
 
     # Each extra family would fit separately, but the simultaneous requested
@@ -471,9 +500,9 @@ def check(args, root):
     single_plan = plan(first)
     bounded(metrics(first), single, args.max_ram)
     counts, _ = memberships(single, single_plan)
-    assert sum(counts[0]) == 3 and (single[0] / "grow-farm.plan").is_file()
-    assert (single[0] / "grow-farm.plan").stat().st_mode & 0o777 == 0o600
-    assert SEED in (single[0] / "grow-farm.plan").read_text()
+    assert sum(counts[0]) == 3 and farming_record(single[0], "grow-farm.plan").is_file()
+    assert farming_record(single[0], "grow-farm.plan").stat().st_mode & 0o777 == 0o600
+    assert SEED in farming_record(single[0], "grow-farm.plan").read_text()
 
     automatic = directories("automatic-multiple", 2)
     automatic_result = run([args.grow, *options(automatic), *keys, *construction,
@@ -489,7 +518,8 @@ def check(args, root):
                "--group-members", 2, "--max-total-members", 3])
     assert not any(value.get("farming_plan") for value in reports(old))
     assert [header(path)[3] for path in outputs(legacy[0])] == [2, 1]
-    assert not (legacy[0] / "grow-farm.plan").exists()
+    assert not farming_record(legacy[0], "grow-farm.plan").exists()
+    assert not (legacy[0] / "grow-farm.plan").exists() and not (legacy[0] / ".xchplot2").exists()
     explicit_file = root / "explicit.gplot"
     file_result = run([args.grow, explicit_file, *keys, *construction, "--max-members", 1])
     assert not any(value.get("farming_plan") for value in reports(file_result))
@@ -509,8 +539,10 @@ def check(args, root):
     if saved_plan["destinations"][0]["meta_slots"] > 1:
         assert any(len(values) > 1 for values in families.values()), "planned shared families were not emitted"
     for directory in multiple:
-        assert set(directory.iterdir()) == {*outputs(directory), directory / "grow-farm.plan"}
-        assert (directory / "grow-farm.plan").read_bytes() == (multiple[0] / "grow-farm.plan").read_bytes()
+        assert set(directory.iterdir()) == {*outputs(directory), directory / ".xchplot2"}
+        assert set((directory / ".xchplot2").iterdir()) == {farming_record(directory)}
+        assert (directory / ".xchplot2").stat().st_mode & 0o777 == 0o700
+        assert farming_record(directory, "grow-farm.plan").read_bytes() == farming_record(multiple[0], "grow-farm.plan").read_bytes()
     before = snapshot(multiple)
     repeated = run([*command, "--resume", "--backend", "gpu", "--device", 2147483647])
     assert metrics(repeated)["generated_members"] == 0 and snapshot(multiple) == before
@@ -532,8 +564,7 @@ def check(args, root):
         applied = run([*boundary_command, *keys])
         assert plan(applied) == preview, "keyless preview differs from applied plan"
         before = snapshot(boundary)
-        exact_capacity = sum(charge(path) for directory in boundary for path in directory.iterdir()
-                             if path.is_file())
+        exact_capacity = occupied_bytes(boundary)
         idle = run([*boundary_command, *keys, "--resume", "--capacity-bytes", exact_capacity,
                     "--max-total-members", 3, "--max-groups", 3,
                     "--backend", "gpu", "--device", 2147483647])
@@ -564,8 +595,7 @@ def check(args, root):
         results["recovery"].append("preview, exact capacity and idle lane with " + mode)
 
     limited = directories("capacity", 2)
-    capacity = sum(charge(path) for directory in multiple for path in directory.iterdir()
-                   if path.is_file()) - min(charge(outputs(directory)[-1]) for directory in multiple)
+    capacity = occupied_bytes(multiple) - min(charge(outputs(directory)[-1]) for directory in multiple)
     limited_result = run([args.grow, *options(limited), *keys, *construction,
                           "--group-members", 2, "--max-total-members", 5,
                           "--max-groups", 3, "--capacity-bytes", capacity])
@@ -596,7 +626,7 @@ def check(args, root):
                        "--max-total-members", 1, "--max-groups", 2]
     initial = run(partial_command)
     initial_plan = plan(initial)
-    manifest = partial[0] / "grow-farm.plan"
+    manifest = farming_record(partial[0], "grow-farm.plan")
     saved_manifest = digest(manifest), manifest.stat().st_mtime_ns
     bounded_ram = min(args.max_ram, 268435456)
     unrelated = root / "unrelated-allocation"
@@ -654,8 +684,7 @@ def check(args, root):
     results["rejections"].extend(["changed keys/profile/layout", "changed destination order",
                                   "late corrupt output before mutation", "corrupt plan checksum"])
 
-    existing_charge = sum(charge(path) for directory in partial for path in directory.iterdir()
-                          if path.is_file())
+    existing_charge = occupied_bytes(partial)
     before = snapshot(partial)
     run([*continuation, "--capacity-bytes", existing_charge - 1], 1)
     assert snapshot(partial) == before, "lowered capacity below saved charges changed outputs"
@@ -690,7 +719,7 @@ def check(args, root):
                             "--max-groups", 2, "--batch-members", 1,
                             "--construction", "staged" if point.startswith("stage-") else "incremental"]
         run(recovery_command, 86, point)
-        manifest = interrupted[0] / "grow-farm.plan"
+        manifest = farming_record(interrupted[0], "grow-farm.plan")
         original_plan = digest(manifest)
         recovered = run([*recovery_command, "--resume"])
         assert digest(manifest) == original_plan
@@ -720,20 +749,20 @@ def check(args, root):
                             "--group-members", 2, "--max-total-members", 1, "--max-groups", 1]
         run(recovery_command, 86, point)
         assert all(not outputs(directory) for directory in interrupted), "plan publication started plotting early"
-        published = interrupted[0] / "grow-farm.plan"
+        published = farming_record(interrupted[0], "grow-farm.plan")
         if point != "farm-plan-published":
-            pending = interrupted[0] / "grow-farm.plan.next"
+            pending = farming_record(interrupted[0], "grow-farm.plan.next")
             assert pending.is_file() and SEED in pending.read_text()
             assert pending.stat().st_mode & 0o777 == 0o600
             assert not published.exists()
         else:
-            assert published.is_file() and (interrupted[1] / "grow-farm.plan.next").read_bytes() == published.read_bytes()
+            assert published.is_file() and farming_record(interrupted[1], "grow-farm.plan.next").read_bytes() == published.read_bytes()
         if point == "farm-plan-all-staged":
-            copies = [farming_copy(directory / "grow-farm.plan.next") for directory in interrupted]
+            copies = [farming_copy(farming_record(directory, "grow-farm.plan.next")) for directory in interrupted]
             assert all(value == copies[0] for value in copies), "all-staged barrier omitted a complete plan replica"
         recovered = run([*recovery_command, "--resume"])
-        assert all((directory / "grow-farm.plan").read_bytes() == published.read_bytes() and
-                   not (directory / "grow-farm.plan.next").exists() for directory in interrupted)
+        assert all(farming_record(directory, "grow-farm.plan").read_bytes() == published.read_bytes() and
+                   not farming_record(directory, "grow-farm.plan.next").exists() for directory in interrupted)
         memberships(interrupted, plan(recovered), [[1], [1]])
         bounded(metrics(recovered), interrupted, args.max_ram)
         for lane, directory in enumerate(interrupted):
@@ -749,8 +778,8 @@ def check(args, root):
         forecast = plan(run([*recovery_command, "--plan-only"]))
         assert forecast["fill_policy"] == "capacity-with-joint-admission", forecast
         run(recovery_command, 86, point)
-        published = [directory / "grow-farm.plan" for directory in interrupted]
-        pending = [directory / "grow-farm.plan.next" for directory in interrupted]
+        published = [farming_record(directory, "grow-farm.plan") for directory in interrupted]
+        pending = [farming_record(directory, "grow-farm.plan.next") for directory in interrupted]
         current = [farming_copy(path) for path in published]
         if point == "farm-extent-all-staged":
             staged = [farming_copy(path) for path in pending]

@@ -114,7 +114,7 @@ inline uint64_t replot_milliseconds(uint64_t microseconds)
 }
 inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Profile const& profile,
     FarmingState const& state, std::string gpu_identity = {}, uint64_t gpu_bytes = 0, uint64_t verification_ram_bytes = 0,
-    ReplotSupervision supervision = {})
+    ReplotSupervision supervision = {}, bool legacy_verification = true)
 {
     using namespace resource_detail;
     validate(profile); auto const& native = profile.native;
@@ -140,12 +140,9 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     require((result.compute_enabled && !gpu_bytes) || (args.backend == "cpu" && !gpu_bytes) || (args.backend == "gpu" && gpu_bytes && result.gpu_binding_verified),
             "migration backend requires exact bounded CPU or physically identified GPU execution");
     result.construction_us = native.max_construction_us; result.verification_us = native.max_verification_us;
-    // The existing verifier may create hardware-concurrency solver threads.
-    // An explicit proof affinity is installed before solver threads are made.
-    // Otherwise reserve the entire inherited CPU set; an ordinary worker count
-    // alone is not an OS affinity limit. The self-worker also caps RAM/time.
-    result.verification_cpu_threads = native.verification_cpu_threads ? native.verification_cpu_threads : cpus;
-    require(result.verification_cpu_threads <= cpus, "migration verifier CPU cap exceeds inherited affinity");
+    // New policies install a conservative worker affinity before solver fanout.
+    // Legacy absence retains its reviewed inherited-affinity interpretation.
+    result.verification_cpu_threads = native.verification_cpu_threads ? native.verification_cpu_threads : legacy_verification ? cpus : 1;
 #if !defined(__linux__) && !defined(_WIN32)
     require(!native.verification_cpu_threads, "explicit migration verifier CPU affinity is unsupported on this platform");
 #endif
@@ -175,10 +172,11 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     result.output_resources = replot_physical_storage(profile, outputs, result.host);
     result.scratch_resources = replot_physical_storage(profile, scratch, result.host);
     result.source_resources = replot_physical_storage(profile, supervision.source_roots, result.host);
-    (void)replot_milliseconds(result.construction_us); (void)replot_milliseconds(result.verification_us);
+    (void)replot_milliseconds(result.construction_us);
     Stage check; check.name = "native-execution-binding";
     bind_native_stage(profile, result, 0, check, true, false);
-    bind_native_stage(profile, result, 0, check, false, true);
+    // Proof envelopes are checked only for batches selected by the saved policy.
+    // A completed earlier sample cannot charge proof work to the remaining suffix.
     bind_native_stage(profile, result, 0, check, false, false);
     return result;
 }
@@ -188,6 +186,12 @@ inline Clock::time_point replot_operation_deadline(uint64_t duration_us)
     auto const maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now).count();
     resource_detail::require(maximum > 0 && ms <= uint64_t(maximum), "migration operation deadline overflows its monotonic clock");
     return now + std::chrono::milliseconds(ms);
+}
+inline uint64_t replot_verification_retry_delay(GatePolicy const& policy, uint64_t previous_ms)
+{
+    uint64_t const first = std::max<uint64_t>(1, policy.recovery_hold_ms);
+    uint64_t const maximum = std::max(first, policy.max_age_ms);
+    return previous_ms ? std::min(maximum, resource_detail::add(previous_ms, std::min(previous_ms, maximum - std::min(previous_ms, maximum)))) : first;
 }
 inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions const& options, NativeRequest const& request,
     Clock::time_point until = Clock::time_point::max())
@@ -238,10 +242,12 @@ inline uint64_t replot_ready_members(FarmingState const& state, uint64_t ready_f
 // cohort away. Future whole-cohort reductions retain the ordinary forecast's
 // explicit conditional unload assumption for fully observable inventories.
 inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest const& request, FarmInventory const& inventory,
-    ReplotReview const& review, ReplotJournal const& journal, std::vector<Remaining> remaining, uint64_t ready_members)
+    ReplotReview const& review, ReplotJournal const& journal, std::vector<Remaining> remaining, uint64_t ready_members,
+    std::optional<ReplotVerification> verification = {})
 {
     using namespace resource_detail;
-    validate_replot_review(review); validate_replot_journal(journal);
+    validate_replot_review(review); validate_replot_progress(review, journal);
+    auto const policy = verification.value_or(replot_verification_policy(review.verification));
     require(journal.batch <= review.batches.size() && remaining.size() <= max_workloads,
         "remaining replot assessment exceeds its immutable boundary");
     require(journal.retired_prefix == (journal.batch < review.batches.size() ? review.batches[size_t(journal.batch)].first_source : review.sources.size()),
@@ -274,6 +280,7 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
     for (size_t index = size_t(journal.batch); index < review.batches.size(); ++index)
     {
         auto const& batch = review.batches[index]; bool const current = index == journal.batch;
+        bool const proof = replot_requires_proof(policy, index);
         bool const sealed = current && (journal.verified_stage || journal.published || journal.ready);
         require(!current || journal.retirements.size() == batch.sources, "remaining replot assessment lacks its exact current retirement ledger");
         auto const prefix = "remaining-batch-" + std::to_string(index);
@@ -304,14 +311,14 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
                     auto counts = remaining; for (auto source : prospective) reduce(counts, workload(batch, source));
                     for (bool future : {false, true})
                         if (!checks.assess(replot_stage(checks.preparation(), request, counts, ready_members, true, false, future)).feasible ||
-                            !checks.assess(replot_stage(checks.preparation(), request, counts, ready_members, false, true, future)).feasible) return false;
+                            !checks.assess(replot_stage(checks.preparation(), request, counts, ready_members, false, proof, future)).feasible) return false;
                     return true;
                 });
             if (selected.search_exhausted && exhausted_selection.empty()) exhausted_selection = prefix + ":predelete-selection-search-bound-exhausted";
             early = std::move(selected.sources);
             for (auto source : early) reduce(remaining, workload(batch, source));
             phase(remaining, ready_members, true, false, prefix + "-conditional-build-after-confirmed-unload");
-            phase(remaining, ready_members, false, true, prefix + "-conditional-verify-after-confirmed-unload");
+            phase(remaining, ready_members, false, proof, prefix + (proof ? "-conditional-proof" : "-conditional-structure") + "-after-confirmed-unload");
         }
         ready_members = std::max(ready_members, replot_ready_members(review.farm, uint64_t(index) + 1));
         phase(restart_counts, ready_members, false, false, prefix + "-restart-with-unconfirmed-future-registries");
@@ -396,8 +403,9 @@ class ReplotGate
     {
         using namespace resource_detail;
         bool const constructing = active && !proof;
-        require(!proof || (active && !stage.verification.empty() && stage.construction.empty() && stage.supervision.empty() && proof_ram_bytes),
-            "active proof monitoring requires its one capped verification phase");
+        require(!proof || (active && stage.construction.empty() &&
+            (!stage.verification.empty() != !stage.supervision.empty()) && proof_ram_bytes),
+            "active worker monitoring requires its one capped verification or supervision phase");
         auto memory = [&](std::vector<Demand> const& demands)
         { uint64_t bytes = 0; for (auto const& d : demands)
           { auto const& r = graph_.resources[graph_.find(d.resource)];
@@ -460,7 +468,9 @@ public:
     // This is not admission of new work: static envelopes remain fully charged.
     Admission poll_active(Stage const& stage) { return poll_impl(stage, true); }
     Admission poll_verification(Stage const& stage, SupervisedProcess const& proof, uint64_t proof_ram_bytes)
-    { return poll_impl(stage, true, &proof, proof_ram_bytes); }
+    { resource_detail::require(!stage.verification.empty(), "proof worker has no verification reservation"); return poll_impl(stage, true, &proof, proof_ram_bytes); }
+    Admission poll_structure(Stage const& stage, SupervisedProcess const& worker, uint64_t worker_ram_bytes)
+    { resource_detail::require(!stage.supervision.empty(), "structural worker has no supervision reservation"); return poll_impl(stage, true, &worker, worker_ram_bytes); }
     Admission wait(Stage const& stage, uint64_t timeout_ms, std::function<bool()> const& cancelled = {},
                    std::function<void(Admission const&)> const& on_pause = {})
     {

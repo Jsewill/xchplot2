@@ -772,6 +772,13 @@ CanonicalGroupIndex read_canonical_group_index(std::string const& filename, uint
 }
 } // namespace
 
+void check_plot_file_structure_bounded(std::string const& filename, uint64_t memory_bytes,
+    std::function<void()> const& check_cancelled)
+{
+    if (!memory_bytes) throw std::invalid_argument("invalid structural plot verification memory cap");
+    (void)read_canonical_group_index(filename, memory_bytes, check_cancelled);
+}
+
 VerifyResult verify_plot_file_bounded(std::string const& filename, BoundedVerifyBudget const& budget,
     uint64_t memory_bytes, std::function<void()> const& check_cancelled, unsigned cpu_threads)
 {

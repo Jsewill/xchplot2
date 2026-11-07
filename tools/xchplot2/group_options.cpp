@@ -1,6 +1,7 @@
 #include "group_commands.hpp"
 #include "host/GroupHarvesterProfile.hpp"
 #include "host/GroupFarmFile.hpp"
+#include "host/GroupFarmMetadata.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
 #endif
@@ -188,7 +189,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     };
     // Validate inspection's narrow input scope before options such as path
     // lists or local harvester detection can read anything beyond its source.
-    bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false, inventory = false, proof_worker = false, proof_options = false, replot_status = false;
+    bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false, inventory = false, proof_worker = false, structure_worker = false, proof_options = false, proof_solves = false, replot_status = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string_view const key = argv[i];
@@ -205,7 +206,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         else if (key == "--no-calibrate") calibrate = false;
         if (key == "--calibration-worker") calibration_worker = true;
         if (key == "--replot-proof-worker") proof_worker = true;
+        if (key == "--replot-structure-worker") structure_worker = true;
         if (key == "--replot-proof-cpus" || key == "--replot-proof-solves") proof_options = true;
+        if (key == "--replot-proof-solves") proof_solves = true;
         if (key.starts_with("--calibration-")) calibration_options = true;
         i += int(group_option_values(key));
     }
@@ -224,14 +227,16 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             require(i + int(values) < argc, "missing value for " + std::string(key)); i += int(values);
         }
     }
-    if (metadata_only || assess_jobs || calibrate || calibration_options || inventory || proof_worker || proof_options)
+    if (metadata_only || assess_jobs || calibrate || calibration_options || inventory || proof_worker || structure_worker || proof_options)
     {
         require(command == "plan", "saved metadata and joint assessment modes require plan");
         require(unsigned(metadata_only) + unsigned(assess_jobs) + unsigned(calibrate) + unsigned(inventory) == 1,
             "choose one of --metadata-only, --assess-jobs, --calibrate or --inventory");
         require(!calibration_options || calibrate, "calibration controls require --calibrate");
-        require(!proof_worker || (calibrate && calibration_worker), "private proof verification requires the capped calibration worker scope");
-        require(!proof_options || proof_worker, "proof controls require the private proof worker");
+        require(!(proof_worker && structure_worker), "choose one private migration verification worker");
+        require(!(proof_worker || structure_worker) || (calibrate && calibration_worker), "private migration verification requires the capped calibration worker scope");
+        require(!proof_options || proof_worker || structure_worker, "proof controls require the private migration verification worker");
+        require(!proof_solves || proof_worker, "proof solve controls require the private proof worker");
 #ifndef XCHPLOT2_GROUP_COMMANDS
         require(!calibrate, "reader calibration requires the installed xchplot2 plan command");
 #endif
@@ -241,7 +246,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (key == "--") break;
             if (!key.starts_with('-')) continue;
             bool const worker_option = key == "--calibration-worker" || key == "--calibration-samples" ||
-                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes" || key == "--replot-proof-worker" || key == "--replot-proof-cpus" || key == "--replot-proof-solves";
+                key == "--calibration-timeout-ms" || key == "--calibration-memory-bytes" || key == "--replot-proof-worker" || key == "--replot-structure-worker" || key == "--replot-proof-cpus" || key == "--replot-proof-solves";
             bool const calibration_input = !calibration_worker && (key == "--save-profile" || key == "--harvester" ||
                 key == "--chia-root" || key == "--chia-executable" || key.starts_with("--farming-"));
             require(key == "--metadata-only" || key == "--no-metadata-only" || key == "--assess-jobs" || key == "--no-assess-jobs" ||
@@ -280,6 +285,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--no-calibrate") { result.calibrate = false; continue; }
         if (key == "--calibration-worker") { result.calibration_worker = true; continue; }
         if (key == "--replot-proof-worker") { result.replot_proof_worker = true; continue; }
+        if (key == "--replot-structure-worker") { result.replot_structure_worker = true; continue; }
         if (key == "--extend") { result.extend = true; continue; }
         if (key == "--allow-missing") { result.allow_missing = true; continue; }
         if (!command.empty())
@@ -307,6 +313,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--save-plan") result.save_plan = path(value);
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
             else if (key == "--replot") result.replot_inventory = path(value);
+            else if (key == "--replot-verification") result.replot_verification = value;
+            else if (key == "--replot-proof-first-groups") result.replot_proof_first_groups = number(value.c_str());
+            else if (key == "--replot-proof-every-groups") result.replot_proof_every_groups = number(value.c_str());
             else if (key == "--farm-adapter") { result.farm_adapter = value; result.farm_adapter_set = true; }
             else if (key == "--farm-adapter-timeout-ms")
             { result.farm_adapter_timeout_ms = number(value.c_str()); result.farm_adapter_timeout_set = true; }
@@ -537,6 +546,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         result.directory_farm = true;
         if (result.calibrate)
         {
+            require(!result.replot_structure_worker || (result.replot_proof_cpus == 1 && result.calibration_samples == 1),
+                "structural worker requires one CPU and one structural inspection");
             require(result.calibration_plots.size() <= 64 && result.calibration_samples && result.calibration_samples <= 1024 &&
                 result.calibration_timeout_ms && result.calibration_timeout_ms <= UINT_MAX && result.calibration_memory_bytes,
                 "invalid calibration plot count, sample count, timeout or worker-memory limit");
@@ -557,6 +568,15 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();
     }
+    bool const verification_options = result.replot_verification || result.replot_proof_first_groups || result.replot_proof_every_groups;
+    require(!verification_options || (command == "plan" && (!result.replot_inventory.empty() || result.replot_revalidate)),
+        "migration verification policy requires a fresh --replot review or saved --revalidate successor");
+    require(!result.replot_verification || *result.replot_verification == "structural" || *result.replot_verification == "sampled" ||
+        *result.replot_verification == "strict", "--replot-verification requires structural, sampled or strict");
+    require(!(result.replot_proof_first_groups || result.replot_proof_every_groups) || result.replot_verification == "sampled",
+        "migration proof group schedules require --replot-verification sampled");
+    require(result.replot_verification != "sampled" || result.replot_proof_first_groups.value_or(1) || result.replot_proof_every_groups.value_or(0),
+        "sampled migration verification requires a nonzero first or periodic group count");
     require(result.farm_adapter == "chia" || !result.replot_inventory.empty() || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
     require(!result.farm_adapter_timeout_set || !result.replot_inventory.empty() ||
@@ -616,7 +636,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
 #endif
     bool saved_farm = false;
     if (result.resume && directory_target)
-        saved_farm = fs::exists(result.target / "grow-farm.plan") || fs::exists(result.target / "grow-farm.plan.next");
+    {
+        group_grow::FarmingMetadataDirectory metadata(fs::weakly_canonical(result.target));
+        saved_farm = fs::exists(metadata.path / "grow-farm.plan") || fs::exists(metadata.path / "grow-farm.plan.next");
+    }
     result.directory_farm = farm_command || (directory_target &&
         (!result.group_members || !result.destinations.empty() || result.plan_only || farming_options || saved_farm));
     require(!result.group_auto || result.directory_farm, "--group-members auto requires a directory target");

@@ -31,11 +31,15 @@ private; redact them before sharing logs or reproductions. Retain a manifest
 while recovery may be needed. Deleting it can prevent recovery of an unseeded
 job's identities.
 
-`fill` keeps a `grow-farm.plan` copy in each destination. These files and any
-`grow-farm.plan.next` copies contain the plot seed, which derives private plot
-keys, together with the farmer/pool identity and recovery settings. Protect
-every copy and retain them with the plots for recovery. The saved seed is not
-a wallet seed. See [directory recovery](REFERENCE.md#grouped-plotting-and-drive-filling).
+New `fill` jobs keep a `.xchplot2/grow-farm.plan` copy in each destination.
+These files and any `.xchplot2/grow-farm.plan.next` copies contain the plot seed,
+which derives private plot keys, together with the farmer/pool identity and
+recovery settings. Protect every copy and retain them with the plots for recovery.
+The saved seed is not a wallet seed.
+See [directory recovery](REFERENCE.md#grouped-plotting-and-drive-filling).
+Private migration journals and local reader bindings also live under
+`.xchplot2/`. Existing jobs retain their original top-level metadata layout;
+protect and preserve every legacy copy too.
 
 New manifests and their publication temporaries use owner-only permissions
 on Linux and protected owner-only ACLs on Windows. Farm revisions may replace
