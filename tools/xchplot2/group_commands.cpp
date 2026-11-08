@@ -57,6 +57,9 @@ void command_help_all(std::string_view command)
     else
         std::cout << "Plan and populate destination directories. --plan-only is the same preview as plan.\n"
             "Resume through any member, --manifest FILE, or the current member directory.\n";
+    if (command == "plan") std::cout <<
+        "  --alternative NAMES      review assessed resource changes, or capacity alone\n"
+        "  --upgrade-job            review a stopped job's recovery-metadata allowance upgrade\n";
     if (command != "grow") std::cout <<
         "  --paths-from FILE        literal destination paths, one per line; - reads stdin\n"
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"
@@ -191,8 +194,10 @@ void command_help(std::string_view command, bool all)
             "Without a selector, use the current member directory.\n"
             "Without --destination, apply the action to the whole job.\n\n"
             "A running coordinator applies the action at its next recovery boundary.\n"
-            "An idle job records the action; use fill DIR to start plotting.\n\n"
+            "Available drives honor controls while unrelated drives are missing.\n"
+            "Resume starts an idle job, or shows the running coordinator.\n\n"
             "  --destination DIR        select a saved destination; repeat for more destinations\n"
+            "  --policy-only            record the intent and return without starting an idle job\n"
             "  --manifest FILE          locate the saved farming job directly\n"
             "  --json                    machine-readable result\n"
             "  -q, --quiet               suppress informational summaries\n"
@@ -207,6 +212,8 @@ void command_help(std::string_view command, bool all)
             "  xchplot2 plan /disk-a/plots /disk-b/plots --harvester local --save-plan farm.plan\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n\n"
             "  --save-plan FILE          save a keyless plan for fill\n"
+            "  --alternative NAMES       review assessed memory, eligible-groups, deadline, cpu-cores or lookup-workers changes; capacity alone\n"
+            "  --upgrade-job             review a stopped job's recovery-metadata allowance upgrade\n"
             "  -F, --from-plan FILE      inspect a saved plan (also accepts positional PLAN)\n"
             "  --save-profile FILE       export harvester settings; omit destinations\n"
             "  --metadata-only           read saved PLAN or --manifest FILE without live checks\n"

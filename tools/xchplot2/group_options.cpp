@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <thread>
 #ifdef _WIN32
 #include <io.h>
@@ -225,10 +226,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (!key.starts_with('-')) continue;
             require((replot_status && (key == "--status" || key == "--no-status" || key == "--from-plan" || key == "-F" ||
                     key == "--watch" || key == "--no-watch" || key == "--inspect" || key == "--no-inspect")) ||
-                (action && key == "--destination") || key == "--manifest" ||
+                (action && (key == "--destination" || key == "--policy-only" || key == "--no-policy-only")) || key == "--manifest" ||
                 key == "--max-ram" || key == "-M" || key == "--json" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v",
-                action ? "farm control accepts only one job selector, --destination and display or memory controls" :
+                action ? "farm control accepts only one job selector, --destination, --policy-only and display or memory controls" :
                     "farm status accepts only a destination, saved plan or manifest and display or memory controls");
             auto const values = group_option_values(key);
             require(i + int(values) < argc, "missing value for " + std::string(key)); i += int(values);
@@ -300,6 +301,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--extend") { result.extend = true; continue; }
         if (key == "--update") { result.update = true; continue; }
         if (key == "--cancel-update") { result.cancel_update = true; continue; }
+        if (key == "--policy-only") { result.policy_only = true; continue; }
+        if (key == "--upgrade-job") { result.upgrade_job = true; continue; }
         if (key == "--allow-missing") { result.allow_missing = true; continue; }
         if (!command.empty())
         {
@@ -308,6 +311,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (key == "--no-extend") { result.extend = false; continue; }
             if (key == "--no-update") { result.update = false; continue; }
             if (key == "--no-cancel-update") { result.cancel_update = false; continue; }
+            if (key == "--no-policy-only") { result.policy_only = false; continue; }
+            if (key == "--no-upgrade-job") { result.upgrade_job = false; continue; }
             if (key == "--no-allow-missing") { result.allow_missing = false; continue; }
             if (key == "--json") { result.json = true; continue; }
             if (key == "--no-json") { result.json = false; continue; }
@@ -324,8 +329,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             require(i + 1 < argc, "missing value for " + key);
             std::string const value = argv[++i];
             if (key == "--group-id") result.group = value;
+            else if (key == "--alternative")
+            {
+                require(!value.empty(), "--alternative requires explicit names");
+                result.farming_alternative = value;
+            }
             else if (key == "--manifest") result.manifest = path(value);
-            else if (key == "--destination")
+            else if (key == "--destination" && !command.empty())
             {
                 require(!value.empty() && result.action_destinations.size() < 1024, "invalid destination selector");
                 result.action_destinations.push_back(path(value));
@@ -518,6 +528,30 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     bool const farm_command = command == "fill" || command == "plan";
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(result.action_destinations.empty() || action, "--destination requires pause, drain, resume or retire");
+    require(!result.policy_only || action, "--policy-only requires pause, drain, resume or retire");
+    bool const guided = !result.farming_alternative.empty() || result.upgrade_job;
+    require(!guided || (command == "plan" && result.from_plan.empty() && !result.replot_status && !result.metadata_only &&
+        !result.assess_jobs && !result.inventory && !result.calibrate && result.replot_inventory.empty() && !result.replot_revalidate &&
+        !result.policy_only && !result.update && !result.extend && !result.cancel_update && result.relocations.empty() &&
+        (!result.target.empty() || !result.manifest.empty() || !result.mounts_under.empty())),
+        "--alternative and --upgrade-job require an ordinary plan with destinations or --manifest");
+    require(!result.upgrade_job || result.farming_alternative.empty(), "--alternative and --upgrade-job are mutually exclusive");
+    if (!result.farming_alternative.empty())
+    {
+        std::set<std::string> names;
+        size_t first = 0;
+        do
+        {
+            auto const last = result.farming_alternative.find(',', first);
+            auto const name = result.farming_alternative.substr(first, last == std::string::npos ? last : last - first);
+            require((name == "memory" || name == "eligible-groups" || name == "deadline" || name == "cpu-cores" ||
+                name == "lookup-workers" || name == "capacity") && names.insert(name).second,
+                "--alternative requires distinct memory, eligible-groups, deadline, cpu-cores, lookup-workers or capacity names");
+            if (last == std::string::npos) break;
+            first = last + 1;
+        } while (true);
+        require(!names.contains("capacity") || names.size() == 1, "capacity must be the only --alternative choice");
+    }
     require(result.mounts_under.empty() || (farm_command && result.from_plan.empty() && !result.inventory &&
         !result.metadata_only && !result.assess_jobs && !result.calibrate && !result.replot_status),
         "--discover-drives selects plan or fill destinations; omit saved previews and inspection modes");
@@ -603,6 +637,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     }
     if (farm_command && !result.target.empty() && fs::is_regular_file(result.target))
     {
+        require(!guided, "--alternative and --upgrade-job require destinations or --manifest, without a saved preview");
         require(result.from_plan.empty() && result.destinations.empty(),
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();

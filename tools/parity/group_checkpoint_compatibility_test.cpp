@@ -201,6 +201,13 @@ void refuses_unchanged(std::string const& engine, fs::path const& path, fs::path
 {
     auto const before = snapshot(root); bool refused = false;
     try { (void)inspect(engine, path); }
+    catch (LegacyConstructionBuildError const& error)
+    {
+        refused = true;
+        require(error.producer_build == "checkpoint-source-a" && error.engine == (engine == "grow" ? "growth" :
+            engine == "stage" ? "staging" : engine) && std::string(error.what()).find(expected) != std::string::npos,
+            "legacy checkpoint diagnostic lost its original build or engine");
+    }
     catch (std::exception const& error) { refused = true; require(std::string(error.what()).find(expected) != std::string::npos, error.what()); }
     require(refused && snapshot(root) == before, "incompatible checkpoint inspection changed saved bytes");
     refused = false;

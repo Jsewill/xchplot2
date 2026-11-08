@@ -5,6 +5,9 @@
 #include "host/GroupPlotter.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h"
+#ifdef XCHPLOT2_GROUP_COMMANDS
+#include "../xchplot2/group_commands.hpp"
+#endif
 #include <cassert>
 #include <algorithm>
 #include <filesystem>
@@ -236,7 +239,8 @@ int main(int argc, char** argv)
         auto const [code, script] = capture({"completions", shell, "--config", config.string()});
         assert(code == 0 && script.find("verify") != std::string::npos);
         for (auto const* option : {"save-plan", "from-plan", "save-profile", "harvester", "help-all",
-                "discover-drives", "mounts-under", "leave-free", "headroom-bytes", "watch", "inspect", "destination", "retire"})
+                "discover-drives", "mounts-under", "leave-free", "headroom-bytes", "watch", "inspect", "destination", "retire",
+                "policy-only", "alternative", "upgrade-job"})
             assert(script.find(option) != std::string::npos);
         assert(script.find("farming-detect-local") == std::string::npos && script.find("farming-profile") == std::string::npos);
         if (std::string(shell) == "zsh") {
@@ -550,6 +554,16 @@ int main(int argc, char** argv)
     auto const third = dir / "third destination";
     std::filesystem::create_directory(other);
     std::filesystem::create_directory(third);
+    {
+        std::vector<std::string> arguments{"pos2_pr118_grow", dir.string(), "--plan-only",
+            "--destination", other.string(), "--destination", third.string()};
+        std::vector<char*> argv;
+        for (auto& argument : arguments) argv.push_back(argument.data());
+        auto const standalone = pos2gpu::parse_group_options(static_cast<int>(argv.size()), argv.data());
+        assert(standalone.command.empty() && standalone.farm_action.empty() && standalone.action_destinations.empty());
+        assert(standalone.plan_only && standalone.directory_farm && standalone.target == std::filesystem::canonical(dir));
+        assert((standalone.destinations == std::vector{std::filesystem::canonical(other), std::filesystem::canonical(third)}));
+    }
     assert(cli({"fill", "--config", config.string(), "-r", "-d", "gpu2:tiny", "-M", "768M",
                 "-j", "2", "-t", other.string(), "--temp-dir", third.string(),
                 "--", dir.string(), other.string(), third.string()}) == 0);
@@ -665,6 +679,7 @@ int main(int argc, char** argv)
     {
         auto const [action_help_code, action_help] = capture({action, "--config", config.string(), "--help"});
         assert(action_help_code == 0 && action_help.find("--destination") != std::string::npos && action_help.find("--construction") == std::string::npos);
+        assert(action_help.find("--policy-only") != std::string::npos && action_help.find("Resume starts an idle job") != std::string::npos);
         assert(cli({action, "--config", config.string(), other.string(), "--destination", other.string(), "--destination", third.string()}) == 0);
         assert(last_group_options.farm_action == action && last_group_options.target == other &&
             last_group_options.directory_farm && last_group_options.resume && !last_group_options.resume_set &&
@@ -673,6 +688,8 @@ int main(int argc, char** argv)
         assert((last_group_options.action_destinations == std::vector{other, third}));
         assert(cli({action, "--config", config.string(), "--manifest", status_manifest.string()}) == 0);
         assert(last_group_options.action_destinations.empty() && last_group_options.manifest == status_manifest);
+        assert(cli({action, "--config", config.string(), other.string(), "--policy-only"}) == 0 && last_group_options.policy_only);
+        assert(cli({action, "--config", config.string(), other.string(), "--policy-only", "--no-policy-only"}) == 0 && !last_group_options.policy_only);
         assert(cli({action, "--config", config.string()}) == 0 && last_group_options.target.empty());
         assert(cli({action, "--config", config.string(), status_plan.string()}) != 0);
         assert(cli({action, "--config", config.string(), other.string(), third.string()}) != 0);
@@ -683,6 +700,35 @@ int main(int argc, char** argv)
     assert(last_group_options.manifest.filename() == "--help" && last_group_options.action_destinations.front().filename() == "--config" &&
         last_group_options.action_destinations.back().filename() == "@literal");
     assert(cli({"plan", "--config", config.string(), other.string(), "--destination", third.string()}) != 0);
+    assert(cli({"fill", "--config", config.string(), other.string(), "--policy-only"}) != 0);
+    for (auto const* name : {"memory", "eligible-groups", "deadline", "cpu-cores", "lookup-workers", "capacity", "memory,eligible-groups"})
+    {
+        assert(cli({"plan", "--config", config.string(), other.string(), "--alternative", name}) == 0);
+        assert(last_group_options.farming_alternative == name && !last_group_options.upgrade_job);
+    }
+    assert(cli({"plan", "--config", config.string(), "--manifest", status_manifest.string(), "--alternative", "memory"}) == 0);
+    assert(last_group_options.manifest == status_manifest && last_group_options.farming_alternative == "memory");
+    for (auto const* value : {"", "unknown", "memory,memory", "memory,", ",memory", "memory,,deadline", "capacity,memory"})
+        assert(cli({"plan", "--config", config.string(), other.string(), "--alternative", value}) != 0);
+    for (auto const* mode : {"fill", "grow", "status", "pause", "resume"})
+    {
+        assert(cli({mode, "--config", config.string(), other.string(), "--alternative", "memory"}) != 0);
+        assert(cli({mode, "--config", config.string(), other.string(), "--upgrade-job"}) != 0);
+    }
+    assert(cli({"plan", "--config", config.string(), "--alternative", "memory"}) != 0);
+    assert(cli({"plan", "--config", config.string(), status_plan.string(), "--alternative", "memory"}) != 0);
+    assert(cli({"plan", "--config", config.string(), "--from-plan", status_plan.string(), "--upgrade-job"}) != 0);
+    assert(cli({"plan", "--config", config.string(), "--manifest", status_manifest.string(), "--upgrade-job"}) == 0);
+    assert(last_group_options.upgrade_job && !last_group_options.update && last_group_options.farming_alternative.empty());
+    assert(cli({"plan", "--config", config.string(), other.string(), "--upgrade-job", "--alternative", "memory"}) != 0);
+    for (auto const* scope : {"--metadata-only", "--inventory", "--assess-jobs", "--calibrate", "--status"})
+        assert(cli({"plan", "--config", config.string(), other.string(), "--alternative", "memory", scope}) != 0);
+    put(config, "[plan]\nalternative=\"memory\"\nupgrade-job=false\n");
+    assert(cli({"plan", "--config", config.string(), other.string(), "--alternative", "capacity"}) == 0);
+    assert(last_group_options.farming_alternative == "capacity" && !last_group_options.upgrade_job);
+    put(config, "[resume]\npolicy-only=true\n");
+    assert(cli({"resume", "--config", config.string(), other.string()}) == 0 && last_group_options.policy_only);
+    assert(cli({"resume", "--config", config.string(), other.string(), "--no-policy-only"}) == 0 && !last_group_options.policy_only);
     put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);

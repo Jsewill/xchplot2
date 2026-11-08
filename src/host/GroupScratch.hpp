@@ -175,6 +175,19 @@ public:
         directory.check(); size_t const root = add_root(std::move(directory), false);
         fs_for(root).scratch = grow_add(fs_for(root).scratch, occupied);
     }
+    // Retain a farming journal's admitted replacement allowance without
+    // creating an I/O owner or lending it to temporary plot construction.
+    // Already allocated bytes are absent from the free-space snapshot.
+    void reserve_metadata(ScratchRoot directory, uint64_t peak, uint64_t allocated)
+    {
+        std::lock_guard lock(mutex_);
+        require(!sealed_ && allocated <= peak, "invalid farming metadata reservation");
+        directory.check(); size_t const root = add_root(std::move(directory), false);
+        auto& filesystem = fs_for(root);
+        filesystem.reserved = grow_add(filesystem.reserved, peak - allocated);
+    }
+    void reserve_metadata(std::filesystem::path const& directory, uint64_t peak, uint64_t allocated)
+    { reserve_metadata(ScratchRoot::inspect(file_io::native_path(directory)), peak, allocated); }
 
     std::optional<ExternalConfig> grant(uint64_t owner, uint64_t desired, uint64_t minimum,
                                         uint64_t segment_bytes, unsigned fan_in, bool automatic = false,

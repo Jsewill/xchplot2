@@ -32,6 +32,8 @@ struct GroupOptions
     bool replot_status = false, replot_revalidate = false;
     bool status_watch = false, status_inspect = false;
     std::string farm_action;
+    std::string farming_alternative;
+    bool policy_only = false, upgrade_job = false;
     std::vector<std::filesystem::path> action_destinations;
     std::optional<std::string> replot_verification;
     std::optional<uint64_t> replot_proof_first_groups, replot_proof_every_groups;

@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import struct
 import subprocess
@@ -20,6 +21,14 @@ SEED = "aa" * 32
 OTHER_SEED = "bb" * 32
 POOL = "42" * 32
 HEADER = struct.Struct("<4sB32sBBHBQB")
+_farming_fixtures = None
+
+
+def farming_fixtures():
+    global _farming_fixtures
+    if _farming_fixtures is None:
+        _farming_fixtures = runpy.run_path(str(Path(__file__).with_name("group-cli.py")))
+    return _farming_fixtures
 
 
 def digest(path):
@@ -28,6 +37,7 @@ def digest(path):
 
 
 def farming_copy(path):
+    assert not path.is_symlink() and path.is_file(), path
     value = path.read_bytes()
     assert len(value) >= 65 and value.endswith(b"\n"), path
     assert hashlib.sha256(value[:-65]).hexdigest().encode() == value[-65:-1], path
@@ -40,6 +50,7 @@ def run(command, code=0, point=None, **kwargs):
     env.pop("XCHPLOT2_GROW_FAILPOINT", None)
     if point:
         env["XCHPLOT2_GROW_FAILPOINT"] = point
+    kwargs.setdefault("timeout", 180)
     result = subprocess.run([str(value) for value in command], capture_output=True,
                             text=True, env=env, **kwargs)
     output = result.stdout + result.stderr
@@ -58,9 +69,17 @@ def plan(result):
     value = values[0]
     assert not any(name.startswith(("trace_", "validation_")) for name in value), value
     assert "deadline_risk" not in value and "tail_seconds" not in value, value
+    current = value.get("extent_assessment", value)
+    assert value["required_max_eligible_groups"] == current["certified_max_eligible_groups"], value
+    assert value["required_response_seconds"] == current["response_bound_seconds"], value
+    if "extent_assessment" not in value:
+        assert value["required_reader_memory_bytes"] == value["reader_memory_bytes"], value
     if value["feasible"]:
         assert 0 <= value["response_bound_seconds"] <= min(value["deadline_seconds"], value["challenge_seconds"]), value
         assert value["certified_max_eligible_groups"] <= value["max_eligible_groups"], value
+        assert 0 <= value["required_reader_memory_bytes"] <= value["memory_bytes"], value
+        assert 0 <= value["required_max_eligible_groups"] <= value["max_eligible_groups"], value
+        assert 0 <= value["required_response_seconds"] <= min(value["deadline_seconds"], value["challenge_seconds"]), value
     else:
         assert value["infeasibility_reason"], value
     return value
@@ -68,10 +87,13 @@ def plan(result):
 
 def frozen_plan(value):
     # The source label changes on resume; the saved inputs and initial layout
-    # stay fixed while live extent admission has its own assessment.
-    result = {name: field for name, field in value.items() if name not in ("extent_assessment", "profile_input")}
+    # stay fixed while live extent admission and its required resources have
+    # their own assessment, checked against the declarations by plan().
+    result = {name: field for name, field in value.items() if name not in (
+        "extent_assessment", "profile_input", "required_reader_memory_bytes",
+        "required_max_eligible_groups", "required_response_seconds")}
     result["destinations"] = [{name: field for name, field in lane.items()
-                               if name not in ("admitted_files", "sealed_files", "fill_stop")}
+                               if name not in ("admitted_files", "admitted_members", "sealed_files", "fill_stop")}
                               for lane in value["destinations"]]
     return result
 
@@ -90,7 +112,110 @@ def farming_record(directory, name="grow-farm.plan"):
     return directory / ".xchplot2" / name
 
 
-def snapshot(directories):
+def progress_record(path):
+    lines = [row.removesuffix(b"\n") for row in farming_fixtures()["farming_plan_rows"](farming_copy(path)[:-65])]
+    assert lines[0] in (b"ordinary-group-farming-progress-v1", b"ordinary-group-farming-progress-v2"), path
+    version = int(lines[0][-1:])
+    assert shlex.split(lines[1].decode()) == ["group-farming-5", "directory-farming-keys-2"], path
+    binding = shlex.split(lines[2].decode())
+    assert len(binding) == 4 and all(binding), path
+    assert all(re.fullmatch(r"[0-9a-fA-F]{64}", binding[index]) for index in (0, 1, 3)), path
+    fields = lines[3].split()
+    assert len(fields) == 6 and all(value.isdigit() for value in fields), path
+    revision, policy, sequence, capacity, allowance, headroom = map(int, fields)
+    assert revision and sequence and policy <= revision and allowance <= capacity, path
+
+    def extents(index):
+        row = shlex.split(lines[index].decode())
+        assert len(row) == 3 and row[0].isdigit() and row[2].isdigit(), path
+        sealed, count = int(row[0]), int(row[2])
+        values = tuple(map(int, lines[index + 1].split()))
+        assert len(values) == count and sealed <= count <= 262144 and all(0 < value <= 65535 for value in values), path
+        assert row[1] in ("", "capacity", "farming-limit", "group-limit", "total-member-limit", "metadata-capacity"), path
+        return sealed, row[1], values
+
+    granted_sealed, granted_stop, granted = extents(4)
+    sealed, stop, admitted = extents(6)
+    assert granted_sealed <= sealed and len(admitted) <= len(granted), path
+    assert not stop or sealed == len(admitted), path
+    assert version >= 2 or len(admitted) == len(granted) or stop, path
+    assert not granted_stop or (granted_stop == stop and granted_sealed == sealed and (version >= 2 or granted == admitted)), path
+    for file, members in enumerate(admitted):
+        assert members <= granted[file], path
+        assert file >= granted_sealed or members == granted[file], path
+        assert version >= 2 or file < sealed or members == granted[file], path
+    assignments = int(lines[8])
+    assert 0 <= assignments <= 1025 and bool(assignments) == bool(granted), path
+    assert len(lines) == 10 + assignments, path
+    previous = None
+    for row in lines[9:9 + assignments]:
+        values = row.split()
+        assert len(values) == 12 and all(value.isdigit() for value in values), path
+        first, resources, resource, epoch, k, strength, schedule, slots, bits, meta, rank, lanes = map(int, values)
+        assert first < len(granted) and (first == 0 if previous is None else first > previous), path
+        assert 0 < resources <= 1024 and resource < resources and epoch < revision, path
+        assert 18 <= k <= 28 and k % 2 == 0 and 2 <= strength <= min(17, k - 3), path
+        assert bits <= 8 and 0 < slots <= 1 << bits and meta <= 255 and 0 < lanes <= 1024 and rank < lanes, path
+        previous = first
+    summary = shlex.split(lines[-1].decode())
+    assert len(summary) == 7 and summary[1] and (not summary[0] or summary[0].isdigit()), path
+    assert all(value.isdigit() for value in summary[2:]), path
+    completed, members, pending, charged, reserved = map(int, summary[2:])
+    assert completed <= sealed and members == sum(admitted[:completed]) and pending <= len(admitted) - completed, path
+    assert charged + reserved <= capacity, path
+    immutable = (tuple(lines[:3]), tuple(fields[:2] + fields[3:]), tuple(lines[4:-1]))
+    return {"immutable": immutable, "sequence": sequence, "binding": tuple(binding), "version": version,
+            "source_revision": revision, "sealed": sealed, "admitted": admitted, "granted": granted, "summary": summary}
+
+
+def observation_binding(metadata, binding, source_revision=None):
+    manifest = metadata / "grow-farm.plan"
+    rows = farming_fixtures()["farming_plan_rows"](farming_copy(manifest)[:-65])
+    assert rows[0] in (b"ordinary-group-farming-v8\n", b"ordinary-group-farming-v9\n"), manifest
+    job = shlex.split(rows[5].decode())
+    assert binding[:2] == (job[0], shlex.split(rows[4].decode())[0]), manifest
+    if source_revision is not None:
+        assert source_revision <= int(job[1]), manifest
+    directory = metadata.parent if metadata.name == ".xchplot2" else metadata
+    for index, row in enumerate(rows):
+        tokens = shlex.split(row.decode())
+        if len(tokens) == 4 and tokens[0] == str(directory):
+            assert binding[2] == shlex.split(rows[index + 1].decode())[0], manifest
+            return
+    raise AssertionError(("observation lacks its saved native destination", directory))
+
+
+def owner_observations(metadata):
+    owner, heartbeat = metadata / "grow-farm.owner", metadata / "grow-farm.heartbeat"
+    if not owner.is_file():
+        assert not heartbeat.exists(), heartbeat
+        return {}
+    record = farming_copy(owner)
+    assert len(record) <= 4096, owner
+    lines = [row.removesuffix(b"\n") for row in farming_fixtures()["farming_plan_rows"](record[:-65])]
+    assert len(lines) == 3 and lines[0] in (b"ordinary-group-farming-owner-v1", b"ordinary-group-farming-owner-v2"), owner
+    binding = shlex.split(lines[1].decode())
+    process = shlex.split(lines[2].decode())
+    assert len(binding) == 4 and all(binding) and all(re.fullmatch(r"[0-9a-fA-F]{64}", binding[index]) for index in (0, 1, 3)), owner
+    assert len(process) == (6 if lines[0].endswith(b"v2") else 5) and process[3].isdigit() and int(process[3]) > 0, owner
+    assert all(len(value.encode()) <= 256 for value in (*binding[2:3], *process[:3], process[4])), owner
+    if len(process) == 6:
+        assert re.fullmatch(r"-?\d+", process[5]) and int(process[5]) >= -1, owner
+    observation_binding(metadata, tuple(binding[:3]))
+    result = {str(owner): ("owner", tuple(binding[:3]))}
+    if heartbeat.exists():
+        record = farming_copy(heartbeat)
+        assert len(record) <= 4096, heartbeat
+        lines = [row.removesuffix(b"\n") for row in farming_fixtures()["farming_plan_rows"](record[:-65])]
+        assert len(lines) == 2 and lines[0] == b"ordinary-group-farming-heartbeat-v1", heartbeat
+        values = shlex.split(lines[1].decode())
+        assert len(values) == 5 and values[0] == binding[3] and re.fullmatch(r"[0-9a-fA-F]{64}", values[1]), heartbeat
+        assert all(value.isdigit() and int(value) > 0 for value in values[2:4]) and values[4] in ("running", "stopped"), heartbeat
+        result[str(heartbeat)] = ("heartbeat", tuple(binding[:3]), values[1])
+    return result
+
+
+def snapshot(directories, *, observations=True):
     result = {}
     for directory in directories:
         for path in directory.rglob("*"):
@@ -98,6 +223,24 @@ def snapshot(directories):
             result[str(path)] = (digest(path) if path.is_file() else None,
                                  status.st_size, status.st_mtime_ns, status.st_ino,
                                  status.st_mode, os.readlink(path) if path.is_symlink() else None)
+    if not observations:
+        for directory in directories:
+            for metadata in (directory, directory / ".xchplot2"):
+                if not metadata.is_dir():
+                    continue
+                progress = metadata / "grow-farm.progress"
+                mutable = False
+                if progress.is_file():
+                    observed = progress_record(progress)
+                    observation_binding(metadata, observed["binding"][:3], observed["source_revision"])
+                    result[str(progress)] = ("progress", observed["immutable"])
+                    mutable = True
+                owners = owner_observations(metadata)
+                result.update(owners)
+                mutable = mutable or bool(owners)
+                if mutable and metadata != directory and str(metadata) in result:
+                    stamp = result[str(metadata)]
+                    result[str(metadata)] = (stamp[0], None, None, *stamp[3:])
     return result
 
 
@@ -306,20 +449,11 @@ def compatible_builds(original, replacement, root, maximum_ram):
     records = [farming_copy(path) for path in manifests]
     producers = [json.loads(record.splitlines()[1]) for record in records]
     assert producers[0] != producers[1], "compatibility fixture requires different source build identities"
-    schemas = tuple(f"ordinary-group-farming-v{version}\n".encode() for version in (6, 7, 8))
+    schemas = tuple(f"ordinary-group-farming-v{version}\n".encode() for version in (6, 7, 8, 9))
     assert all(record.startswith(schemas) for record in records)
 
     def stable_snapshot():
-        result = snapshot([original_job, replacement_job])
-        for path in list(result):
-            if Path(path).name == "grow-farm.progress":
-                del result[path]
-            elif Path(path) in {manifest.parent for manifest in manifests} and Path(path).is_dir():
-                # Atomic progress observations can update only this directory's
-                # size/mtime; keep its native object, mode and every other file.
-                stamp = result[path]
-                result[path] = (stamp[0], None, None, *stamp[3:])
-        return result
+        return snapshot([original_job, replacement_job], observations=False)
 
     def progress_snapshot():
         result = {}
@@ -327,24 +461,16 @@ def compatible_builds(original, replacement, root, maximum_ram):
             path = manifest.with_name("grow-farm.progress")
             if not path.is_file():
                 continue
-            lines = farming_copy(path)[:-65].splitlines()
-            assert lines[0] == b"ordinary-group-farming-progress-v1", path
-            fields = lines[3].split()
-            assert len(fields) == 6 and all(value.isdigit() for value in fields), path
-            summary = shlex.split(lines[-1].decode())
-            assert len(summary) == 7 and summary[0].isdigit() and summary[1], path
-            completed, members, pending, charged, reserved = map(int, summary[2:])
-            assert min(completed, members, pending, charged, reserved) >= 0
-            assert charged + reserved <= int(fields[3]), path
-            immutable = (tuple(lines[:3]), tuple(fields[:2] + fields[3:]), tuple(lines[4:-1]))
-            result[path] = (immutable, int(fields[2]))
+            observed = progress_record(path)
+            assert observed["summary"][0].isdigit() and observed["summary"][1], path
+            result[path] = (observed["immutable"], observed["sequence"])
         return result
 
     before = stable_snapshot()
     observations = progress_snapshot()
     resumed = run([replacement, original_job, "--resume", *limits, *policy])
     assert metrics(resumed)["generated_members"] == 0
-    assert stable_snapshot() == before, "compatible build changed stable completed-job files or native metadata owners"
+    assert stable_snapshot() == before, "compatible build changed stable completed files, native roots or observation bindings"
     current_observations = progress_snapshot()
     for path, (immutable, sequence) in observations.items():
         assert path in current_observations and current_observations[path][0] == immutable
@@ -835,8 +961,18 @@ def check(args, root):
                             "--max-total-members", 2, "--max-groups", 2]
         forecast = plan(run([*recovery_command, "--plan-only"]))
         assert forecast["fill_policy"] == "capacity-with-joint-admission", forecast
-        run(recovery_command, 86, point)
         published = [farming_record(directory, "grow-farm.plan") for directory in interrupted]
+        # Retain the original replicated v8 extent-publication contract. Stop
+        # after both initial copies exist but before construction, then encode
+        # the qualified older fixture without dropping any identity or extent.
+        run(recovery_command, 86, "farm-plan-published:2")
+        initial = [farming_copy(path) for path in published]
+        assert all(value == initial[0] for value in initial) and not any(outputs(path) for path in interrupted)
+        legacy = farming_fixtures()["rewrite_plan"](initial[0], schema=8)
+        for path in published:
+            path.write_bytes(legacy)
+        legacy_command = [*recovery_command, "--resume"]
+        run(legacy_command, 86, point)
         pending = [farming_record(directory, "grow-farm.plan.next") for directory in interrupted]
         current = [farming_copy(path) for path in published]
         if point == "farm-extent-all-staged":
@@ -849,7 +985,7 @@ def check(args, root):
             assert current[0] != current[1], "extent interruption did not preserve its unpublished parent replica"
         else:
             assert all(value == current[0] for value in current) and all(not path.exists() for path in pending)
-        recovered = run([*recovery_command, "--resume"])
+        recovered = run(legacy_command)
         assert frozen_plan(plan(recovered)) == frozen_plan(forecast)
         copies = [farming_copy(path) for path in published]
         assert all(value == copies[0] for value in copies) and all(not path.exists() for path in pending)
@@ -860,11 +996,62 @@ def check(args, root):
             for ordinal, path in enumerate(outputs(directory)):
                 results["parity"].append({"point": point, "lane": lane, "file": ordinal,
                                            **canonical(args, path, references / f"{point}-{lane}-{ordinal}")})
-        before = snapshot(interrupted)
-        idle = run([*recovery_command, "--resume"])
-        assert metrics(idle)["generated_members"] == 0 and snapshot(interrupted) == before
-        results["recovery"].append({"point": point, "members": metrics(recovered)["members"]})
-    print("PASS replicated capacity-extent interruption recovery and ordinary parity", flush=True)
+        before = snapshot(interrupted, observations=False)
+        idle = run(legacy_command)
+        assert metrics(idle)["generated_members"] == 0 and snapshot(interrupted, observations=False) == before
+        results["recovery"].append({"point": point, "schema": 8, "members": metrics(recovered)["members"]})
+    print("PASS legacy replicated capacity-extent interruption recovery and ordinary parity", flush=True)
+
+    for point in ("farm-progress-staged", "farm-progress-renamed", "farm-progress-published", "published"):
+        interrupted = directories("local-" + point, 2)
+        recovery_command = [args.plotter, "fill", *interrupted, "--compute", "off", "--json", *keys, *construction,
+                            "--construction", "incremental", "--max-total-members", 2, "--max-groups", 2]
+        forecast = plan(run([*recovery_command, "--plan-only"]))
+        run(recovery_command, 86, "farm-plan-published:2")
+        published = [farming_record(directory, "grow-farm.plan") for directory in interrupted]
+        originals = [farming_copy(path) for path in published]
+        assert all(record.startswith(b"ordinary-group-farming-v9\n") and record == originals[0] for record in originals)
+        continuation = [*recovery_command, "--resume"]
+        committed = {}
+        if point in ("farm-progress-renamed", "farm-progress-published"):
+            # Replace an existing journal after native work has committed;
+            # the staged case above also covers first journal creation.
+            run(continuation, 86, "published")
+            committed = {path: (digest(path), path.stat().st_ino)
+                         for directory in interrupted for path in outputs(directory)}
+            assert committed, "native publication interruption committed no ordinary file"
+            run(continuation, 86, point)
+        else:
+            run(continuation, 86, point)
+        assert all((digest(path), path.stat().st_ino) == saved for path, saved in committed.items())
+        assert [farming_copy(path) for path in published] == originals, "local progress interruption republished the global grant"
+        assert all(not farming_record(directory, "grow-farm.plan.next").exists() for directory in interrupted)
+        pending = [farming_record(directory, "grow-farm.progress.next") for directory in interrupted]
+        if point == "farm-progress-staged":
+            assert any(path.is_file() for path in pending), "local journal staging left no durable replacement"
+        observed = [progress_record(path) for directory in interrupted
+                    for path in (farming_record(directory, "grow-farm.progress"), farming_record(directory, "grow-farm.progress.next"))
+                    if path.is_file()]
+        assert observed and all(item["version"] == 2 for item in observed)
+        recovered = run(continuation)
+        assert all((digest(path), path.stat().st_ino) == saved for path, saved in committed.items())
+        assert frozen_plan(plan(recovered)) == frozen_plan(forecast)
+        assert [farming_copy(path) for path in published] == originals, "local journal recovery republished the global grant"
+        assert all(not path.exists() for path in pending)
+        bounded(metrics(recovered), interrupted, args.max_ram)
+        counts, _ = memberships(interrupted, plan(recovered))
+        assert all(sum(lane) == 2 for lane in counts), counts
+        for lane, directory in enumerate(interrupted):
+            journal = progress_record(farming_record(directory, "grow-farm.progress"))
+            assert journal["version"] == 2 and int(journal["summary"][3]) == sum(counts[lane])
+            for ordinal, path in enumerate(outputs(directory)):
+                results["parity"].append({"point": point, "schema": 9, "lane": lane, "file": ordinal,
+                    **canonical(args, path, references / f"local-{point}-{lane}-{ordinal}")})
+        before = snapshot(interrupted, observations=False)
+        idle = run(continuation)
+        assert metrics(idle)["generated_members"] == 0 and snapshot(interrupted, observations=False) == before
+        results["recovery"].append({"point": point, "schema": 9, "members": metrics(recovered)["members"]})
+    print("PASS independent v9 journal/native interruption recovery, bounded observations and ordinary parity", flush=True)
     return results
 
 

@@ -11,6 +11,8 @@
 // controller fixture shares this translation unit with the engine fixtures.
 #include "host/GroupPlotter.cpp"
 #include "group_farm_progress_test.hpp"
+#include "group_farm_control_test.hpp"
+#include "group_farm_membership_test.hpp"
 #include "../xchplot2/group_commands.hpp"
 
 using namespace group_grow;
@@ -4829,7 +4831,13 @@ void farming_compatibility_format(fs::path const& root)
         state.producer_build = std::string(64, 'e');
         auto const foreign = farming_state_text(state);
         if (version < 6)
-            reject([&] { (void)parse_farming_state(foreign); }, "legacy recovery accepted a foreign producer build");
+        {
+            bool refused = false;
+            try { (void)parse_farming_state(foreign); }
+            catch (LegacyFarmingPlanBuildError const& error)
+            { refused = error.producer_build == state.producer_build; }
+            require(refused, "legacy recovery lost its exact-build guard or original producer diagnostic");
+        }
         else require(farming_state_text(parse_farming_state(foreign)) == foreign,
             "compatible farming plan did not preserve foreign producer provenance");
         auto inspected = parse_farming_state(foreign, mib, FarmingStateLoad::metadata_only);
@@ -5702,6 +5710,12 @@ void farming_preview_handoff(fs::path const& root)
         uint64_t progress_memory = 0;
         for (size_t lane = 0; lane < reference->state.directories.size(); ++lane)
             progress_memory = sum(progress_memory, farming_progress_memory_bound(reference->state, lane));
+        if (reference->state.version >= 9)
+        {
+            progress_memory = sum(progress_memory, farming_control_memory_bound(reference->state));
+            for (auto const& directory : source.directories)
+                progress_memory = sum(progress_memory, farming_owner_memory_bound(directory));
+        }
         memory.max_ram = sum(reference->metadata - progress_memory, product(text.size(), 3));
         bool refused = false;
         try { (void)farming_run(memory, nullptr, source); }
@@ -5870,6 +5884,7 @@ void farming_preview_handoff(fs::path const& root)
 
     auto revised = *source_job.saved;
     ++revised.revision; revised.parent_digest = source_job.digest;
+    if (revised.version >= 9) farming_record_parent(revised, revised.revision - 1, revised.parent_digest);
     auto revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
     stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
     stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
@@ -5892,6 +5907,7 @@ void farming_preview_handoff(fs::path const& root)
     { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
     require(refused, "legacy preview lost its exact source-revision requirement");
     revised.parent_digest = stream_state::digest(farming_state_text(revised)); ++revised.revision;
+    if (revised.version >= 9) farming_record_parent(revised, revised.revision - 1, revised.parent_digest);
     revised.policy_revision = revised.revision; ++revised.max_groups;
     revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
     stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
@@ -6802,8 +6818,14 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
         mailbox.compact();
         require(!fs::exists(legacy_path) && mailbox.records().empty(), "acknowledged legacy request retained authority");
     }
+    auto advance_policy = [&](FarmingState& after, FarmingState const& before)
+    {
+        after.revision = before.revision + 1; after.policy_revision = after.revision;
+        after.parent_digest = stream_state::digest(farming_state_text(before));
+        if (after.version >= 9) farming_record_parent(after, before.revision, after.parent_digest);
+    };
     auto unrelated = state; ++unrelated.headroom; unrelated.request_floor = 7;
-    ++unrelated.revision; unrelated.policy_revision = unrelated.revision;
+    advance_policy(unrelated, state);
     require(farming_policy_digest(state) == farming_policy_digest([&] { auto copy = state; copy.request_floor = 7; return copy; }()),
         "history compaction invalidated policy identity");
     auto rebased = farming_update_rebase(changed, unrelated);
@@ -6846,12 +6868,12 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
         auto pause = farming_update_snapshot(state); pause.capacity = changed.capacity; pause.action = "pause";
         farming_update_preconditions(pause, state, {"control"});
         auto const pause_id = mailbox.submit(pause);
-        auto resume = farming_update_snapshot(state); resume.action = "resume";
-        farming_update_preconditions(resume, state, {"control"});
-        auto const resume_id = mailbox.submit(resume);
+        auto const resume_id = mailbox.submit_control("resume");
         next = mailbox.next(state);
-        require(next && next->update.id == resume_id && next->update.action == "resume" && next->update.capacity == changed.capacity &&
-            mailbox.receipt(pause_id)->status == "superseded", "queued resume did not replace pause while preserving its capacity edit");
+        auto const effective = farming_control_view(state, mailbox.records(), mailbox.control_state());
+        require(next && next->update.id == pause_id && next->update.action == "pause" && next->update.capacity == changed.capacity &&
+            effective.control == "active" && !resume_id.empty() && mailbox.receipt(pause_id)->status == "accepted",
+            "local resume changed a separate pending policy request or lost its effective control");
         mailbox.cancel(); mailbox.compact();
         auto control = [&](std::string action, std::vector<std::string> targets)
         {
@@ -6869,7 +6891,7 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
         auto const full_id = mailbox.submit(resume_both);
         require(mailbox.pending().size() == farming_update_slots && mailbox.submit(resume_both) == full_id,
             "idempotent request was refused at the unresolved queue bound");
-        auto paused = state; ++paused.revision; paused.policy_revision = paused.revision;
+        auto paused = state; advance_policy(paused, state);
         paused.directories.front().control = "paused"; paused.directories.back().control = "draining";
         for (auto const& record : mailbox.records()) if (record.file.update.id == full_id)
             require(farming_update_rebase(record.file.update, paused).action == "resume",
@@ -6897,7 +6919,7 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
     fs::rename(offline_second, second);
     auto commit = [&](FarmingUpdate const& update)
     {
-        auto const parent = stream_state::digest(farming_state_text(state));
+        auto const before = state;
         state.config = update.config; state.profile_metadata = update.profile;
         state.capacity = update.capacity; state.headroom = update.headroom;
         state.max_groups = update.max_groups; state.max_total_members = update.max_total_members;
@@ -6908,7 +6930,7 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
                 if (std::find(update.action_destinations.begin(), update.action_destinations.end(), directory.directory_identity) != update.action_destinations.end())
                     directory.control = farming_update_control(update.action);
         }
-        ++state.revision; state.policy_revision = state.revision; state.parent_digest = parent; state.applied_update = update.id; save();
+        advance_policy(state, before); state.applied_update = update.id; save();
     };
     {
         DirectoryLock first_writer(first), second_writer(second);
@@ -6960,6 +6982,7 @@ void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t 
     auto const crash_partial = fs::path(file_io::path_text(crash_request) + ".partial.Ab12Cd");
     fs::create_hard_link(crash_request, crash_partial);
     auto tight = state; tight.update_reserved_bytes = 1;
+    if (tight.version >= 9) advance_policy(tight, state);
     state = tight; save();
     bool bounded = false;
     {
@@ -7194,6 +7217,64 @@ void farming_evolution(fs::path const& root, Members input, Config cfg)
     auto source = farming_arguments(from);
     require(!source.changed && farming_run(from, &keys, source)->state.revision == before.revision,
         "unchanged saved preview invented a policy revision");
+    {
+        auto current = args; current.target = root / "evolution-progress-review"; fs::create_directory(current.target);
+        auto source = farming_arguments(current); auto writer = farming_run(current, &keys, source);
+        require(writer->state.version == 9, "new progress review fixture did not use independent grants");
+        auto complete_file = [&](FarmingRun& run, uint64_t ordinal)
+        {
+            Construction output(group_path(current.target, ordinal).string(), cfg, false,
+                initial_identity(run.identity(keys, 0, ordinal)), "incremental");
+            output.confirm_identity(); require(output.append(input.subspan(0, 2)).accepted, "progress review fixture member did not fit");
+            run.seal_extent(0, ordinal, 2, "", run.metadata);
+        };
+        complete_file(*writer, 0); writer.reset();
+        auto review = current; review.command = "plan"; review.plan_only = review.resume = true;
+        review.save_plan = root / "evolution-current-progress.plan";
+        auto reviewed_job = farming_arguments(review); auto planned = farming_run(review, &keys, reviewed_job);
+        require(planned->state.directories.front().sealed_files == 1, "review omitted authenticated local progress");
+        save_farming_review(review, reviewed_job, *planned); auto const policy_revision = planned->state.policy_revision;
+        planned.reset();
+        auto continued = current; continued.resume = true;
+        auto continued_job = farming_arguments(continued); writer = farming_run(continued, &keys, continued_job);
+        complete_file(*writer, 1); auto const latest = writer->state.directories.front(); auto const revision = writer->state.revision; writer.reset();
+        std::vector<std::pair<fs::path, std::vector<uint8_t>>> preserved;
+        for (auto const* name : {"grow-farm.plan", "grow-farm.progress", "grow-farm.owner", "grow-farm.heartbeat"})
+        {
+            auto const path = farming_metadata_path(current.target, name, false);
+            if (fs::exists(path)) preserved.emplace_back(path, contents(path));
+        }
+        for (uint64_t file = 0; file < 2; ++file) preserved.emplace_back(group_path(current.target, file), contents(group_path(current.target, file)));
+        auto unchanged_files = [&]
+        {
+            for (auto const& [path, bytes] : preserved) require(contents(path) == bytes, "review execution changed protected metadata or payload bytes");
+        };
+        Arguments inspect_review; inspect_review.command = "plan"; inspect_review.plan_only = inspect_review.directory_farm = true;
+        inspect_review.from_plan = review.save_plan; inspect_review.max_ram = current.max_ram;
+        auto loaded = farming_arguments(inspect_review); auto accepted = farming_run(inspect_review, &keys, loaded);
+        require(!loaded.policy_changed && accepted->state.revision == revision && accepted->state.policy_revision == policy_revision &&
+            accepted->state.directories.front().sealed_files == latest.sealed_files && accepted->state.directories.front().extents == latest.extents,
+            "stale unchanged review rewound authenticated local progress or invented a policy revision");
+        accepted.reset(); unchanged_files();
+        auto const saved_review = load_farming_preview(review.save_plan, current.max_ram);
+        for (unsigned alteration = 0; alteration < 4; ++alteration)
+        {
+            auto forged = saved_review.preview; auto& destination = forged.state.directories.front();
+            if (!alteration) destination.sealed_files = destination.extents.size();
+            else if (alteration == 1) destination.extents.back() = 1;
+            else if (alteration == 2) { destination.extents.back() = 1; destination.grant_extents.back() = 1; }
+            else ++forged.state.owner_reserved_bytes;
+            auto const path = root / ("evolution-forged-progress-" + std::to_string(alteration) + ".plan");
+            auto body = farming_preview_text(forged); stream_state::atomic_save(path, body + stream_state::digest(body) + '\n');
+            Arguments execute; execute.command = "fill"; execute.directory_farm = true; execute.from_plan = path;
+            execute.max_ram = current.max_ram; execute.backend = "cpu"; execute.workers = execute.batch = 1;
+            bool refused = false;
+            try { auto source = farming_arguments(execute); (void)farming_run(execute, &keys, source); }
+            catch (std::runtime_error const&) { refused = true; }
+            require(refused, "unchanged review accepted fabricated progress or altered independent grants");
+            unchanged_files();
+        }
+    }
 
     auto proposed = args; proposed.update = proposed.resume = true;
     proposed.capacity = 96 * mib; proposed.capacity_set = true;
@@ -7207,7 +7288,7 @@ void farming_evolution(fs::path const& root, Members input, Config cfg)
         revised = inspect(proposed);
     }
     auto const& after = revised->state; auto const& d = after.directories.front();
-    require(revised->feasible() && after.version == 8 && d.layout_first == 2 && d.policy_files == 2 && d.cohorts.size() == 1 &&
+    require(revised->feasible() && after.version == 9 && d.layout_first == 2 && d.policy_files == 2 && d.cohorts.size() == 1 &&
         d.extents == std::vector<uint16_t>{2, 2, 3, 3} && d.sealed_files == 1 && valid_farming_policy_revision(before, after),
         "future policy failed to preserve completed and active reservations");
     require(after.estimate.max_eligible_families_per_resource == 2 && after.estimate.index_bytes && after.estimate.cpu_utilization > 0,
@@ -7400,7 +7481,7 @@ void prepared_producer(fs::path const& root, Members input)
 int main(int argc, char** argv) try
 {
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--prefetch-only" ||
-        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--farming-rebinding-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--farming-rebinding-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
+        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--farming-membership-only" || std::string(argv[1]) == "--farming-controls-only" || std::string(argv[1]) == "--farming-rebinding-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--farming-membership-only|--farming-controls-only|--farming-rebinding-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
@@ -7416,6 +7497,14 @@ int main(int argc, char** argv) try
     require(::mkdtemp(name.data()), "cannot create merge test directory");
     fs::path root(name); struct Cleanup { fs::path root; ~Cleanup() { fs::remove_all(root); } } cleanup{root};
     auto input = members(); auto cfg = configuration();
+    if (argc == 2 && std::string(argv[1]) == "--farming-controls-only")
+    {
+        group_farm_control_test::run(root); return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--farming-membership-only")
+    {
+        group_farm_membership_test::run(root); return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--farming-rebinding-only")
     {
         auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
@@ -7486,6 +7575,8 @@ int main(int argc, char** argv) try
         farming_extent_admission(external_cleanup.root);
         farming_preview_handoff(external_cleanup.root);
         group_farm_progress_test::run(external_cleanup.root);
+        group_farm_control_test::run(external_cleanup.root);
+        group_farm_membership_test::run(external_cleanup.root);
         group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
         farming_evolution(external_cleanup.root, input, cfg);
         farming_active_audit(external_cleanup.root, input, cfg);
@@ -7527,6 +7618,8 @@ int main(int argc, char** argv) try
         farming_extent_admission(external_cleanup.root);
         farming_preview_handoff(external_cleanup.root);
         group_farm_progress_test::run(external_cleanup.root);
+        group_farm_control_test::run(external_cleanup.root);
+        group_farm_membership_test::run(external_cleanup.root);
         group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
         farming_evolution(external_cleanup.root, input, cfg);
         farming_active_audit(external_cleanup.root, input, cfg);

@@ -26,6 +26,14 @@ inline constexpr char farming_cohort_model_identity[] = "group-farming-4";
 inline constexpr char farming_current_model_identity[] = "group-farming-5";
 inline constexpr char farming_cohort_key_identity[] = "directory-farming-keys-2";
 enum class FarmingStateLoad { recovery, metadata_only };
+class LegacyFarmingPlanBuildError : public std::runtime_error
+{
+public:
+    std::string const producer_build;
+    explicit LegacyFarmingPlanBuildError(std::string source) :
+        std::runtime_error("farming plan requires its original grow build; plan --metadata-only can inspect its saved metadata"),
+        producer_build(std::move(source)) {}
+};
 inline constexpr size_t farming_profile_metadata_bytes = 65536;
 inline void check_farming_state_size(uint64_t bytes, uint64_t memory_limit)
 { require(bytes < memory_limit / 16, "saved farming plan exceeds --max-ram"); }
@@ -55,6 +63,17 @@ struct FarmingDirectory
     uint64_t layout_first = 0, policy_files = 0;
     std::vector<FarmingCohort> cohorts;
     std::string control = "active";
+    // Membership and obligations differ: a disconnected former writer may
+    // still consume its approved grant. Detaching it never refunds that grant.
+    std::string membership = "member";
+    uint64_t detached_at = 0;
+    uint64_t detached_source_revision = 0;
+    std::string detached_source_digest;
+    bool detached_acknowledged = false;
+    bool detached_reclaimed = false;
+    std::vector<uint16_t> grant_extents;
+    std::optional<FarmingConfig> grant_config;
+    bool operator==(FarmingDirectory const&) const = default;
 };
 struct FarmingState
 {
@@ -72,6 +91,13 @@ struct FarmingState
     uint64_t request_floor = 0;
     uint64_t manifest_reserved_bytes = 0;
     uint64_t update_reserved_bytes = 0, progress_reserved_bytes = 0;
+    uint64_t owner_reserved_bytes = 0;
+    // Once scratch can be delegated outside the durable output quotas,
+    // disconnected recovery must retain those possibly outstanding grants.
+    bool shared_scratch_possible = false;
+    // New storage cannot be proven separate from an unavailable retired
+    // resource. Fold service costs conservatively without changing key lanes.
+    bool conservative_storage_topology = false;
     std::string fingerprint;
     FarmingPlan estimate;
     std::vector<FarmingDirectory> directories;
@@ -86,6 +112,9 @@ struct FarmingState
     std::string profile_json;
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024;
     uint64_t max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
+    // Retained policy ancestry authenticates a former member's old replica
+    // when it returns after more than one independently published revision.
+    std::vector<std::pair<uint64_t, std::string>> ancestors;
 };
 inline char const* farming_state_model(FarmingState const& state)
 { return state.version >= 8 ? farming_current_model_identity : state.version >= 7 ? farming_cohort_model_identity : farming_model_identity; }
@@ -93,10 +122,17 @@ inline bool farming_control_valid(std::string_view value)
 { return value == "active" || value == "paused" || value == "draining" || value == "retired"; }
 inline char const* farming_state_keys(FarmingState const& state)
 { return state.version >= 7 ? farming_cohort_key_identity : farming_key_derivation_identity; }
+inline bool farming_member(FarmingDirectory const& directory)
+{ return directory.membership == "member"; }
+inline bool farming_reclaimed_tombstone(FarmingDirectory const& directory)
+{ return !farming_member(directory) && directory.detached_acknowledged && directory.detached_reclaimed; }
+inline std::vector<uint16_t> const& farming_grants(FarmingState const& state, FarmingDirectory const& directory)
+{ return state.version >= 9 ? directory.grant_extents : directory.extents; }
 inline FarmingCohort farming_cohort(FarmingState const& state, FarmingDirectory const& d, uint64_t ordinal)
 {
     if (ordinal >= d.layout_first)
-        return {d.layout_first, state.config, d.layout, d.identity_resources, d.identity_resource, d.identity_epoch};
+        return {d.layout_first, d.grant_config.value_or(state.config), d.layout,
+            d.identity_resources, d.identity_resource, d.identity_epoch};
     for (size_t i = d.cohorts.size(); i-- > 0;)
         if (ordinal >= d.cohorts[i].first_file) return d.cohorts[i];
     throw std::runtime_error("saved farming cohort does not cover its file ordinal");
@@ -122,22 +158,43 @@ inline bool same_farming_assignment(FarmingState const& before, FarmingDirectory
 }
 inline bool valid_farming_policy_revision(FarmingState const& before, FarmingState const& after)
 {
-    if (after.version < 7 || after.version > 8 || after.version < before.version ||
+    if (after.version < 7 || after.version > 9 || after.version < before.version ||
         after.policy_revision != after.revision || after.policy_revision <= before.policy_revision ||
         !before.capacity_fill || !after.capacity_fill || !after.fixed_extent ||
         after.directories.size() < before.directories.size() || before.producer_build != after.producer_build ||
         after.identity_k != (before.version >= 7 ? before.identity_k : before.config.k) ||
-        after.identity_strength != (before.version >= 7 ? before.identity_strength : before.config.strength)) return false;
+        after.identity_strength != (before.version >= 7 ? before.identity_strength : before.config.strength) ||
+        (before.shared_scratch_possible && !after.shared_scratch_possible) ||
+        (before.conservative_storage_topology && !after.conservative_storage_topology)) return false;
     for (size_t lane = 0; lane < before.directories.size(); ++lane)
     {
         auto const& a = before.directories[lane]; auto const& b = after.directories[lane];
-        if (b.policy_files < a.sealed_files || b.policy_files > a.extents.size() || b.policy_files > b.extents.size() ||
+        if ((farming_reclaimed_tombstone(a) && a != b) ||
+            (b.detached_reclaimed && !a.detached_reclaimed &&
+                (before.version < 9 || !a.detached_acknowledged || farming_member(a)))) return false;
+        if (after.version >= 9 && farming_member(a) && !farming_member(b) && b.detached_acknowledged) return false;
+        // An absent member's outstanding allocation is not reclaimable by a
+        // policy change. Its native owner, identity and service costs remain.
+        if (before.version >= 9 && !farming_member(a) &&
+            (farming_member(b) || (a.detached_acknowledged && !b.detached_acknowledged) ||
+             a.detached_at != b.detached_at || a.directory != b.directory ||
+             a.detached_source_revision != b.detached_source_revision || a.detached_source_digest != b.detached_source_digest ||
+             a.directory_identity != b.directory_identity || a.filesystem != b.filesystem || a.resource != b.resource)) return false;
+        if (before.version >= 9 && !farming_member(a) && !a.detached_acknowledged &&
+            (a.capacity_bytes != b.capacity_bytes || a.storage != b.storage || a.layout != b.layout ||
+             a.layout_first != b.layout_first || a.cohorts != b.cohorts || a.identity_resources != b.identity_resources ||
+             a.identity_resource != b.identity_resource || a.identity_epoch != b.identity_epoch ||
+             a.grant_extents != b.grant_extents || a.grant_config != b.grant_config)) return false;
+        auto const& source_grants = farming_grants(before, a);
+        if (b.policy_files < a.sealed_files || b.policy_files > source_grants.size() || b.policy_files > b.extents.size() ||
             (after.version < 8 ? a.sealed_files != b.sealed_files :
                 (b.sealed_files < a.sealed_files || b.sealed_files > b.policy_files))) return false;
         for (uint64_t file = 0; file < b.policy_files; ++file)
         {
             bool const newly_sealed = after.version >= 8 && file >= a.sealed_files && file < b.sealed_files;
-            if (!b.extents[size_t(file)] || (newly_sealed ? b.extents[size_t(file)] > a.extents[size_t(file)] :
+            bool const delegated = before.version >= 9 && file >= a.sealed_files;
+            if (!b.extents[size_t(file)] || (delegated ? b.extents[size_t(file)] > source_grants[size_t(file)] :
+                newly_sealed ? b.extents[size_t(file)] > a.extents[size_t(file)] :
                 a.extents[size_t(file)] != b.extents[size_t(file)]) || !same_farming_assignment(before, a, after, b, file)) return false;
         }
     }
@@ -185,6 +242,7 @@ inline FarmingAssessment farming_assess_state(FarmingState const& state,
                 envelope.lookup_memory_per_member = std::max(envelope.lookup_memory_per_member, cohort.config.lookup_memory_per_member);
             }
             configs.push_back(cohort.config); layouts.push_back(cohort.layout); destinations.push_back(d.storage);
+            if (state.version >= 9 && state.conservative_storage_topology) destinations.back().resource = 0;
             extents.emplace_back(members[lane].begin() + first, members[lane].begin() + last);
         }
     }
@@ -325,19 +383,24 @@ inline uint64_t farming_extent_memory(FarmingState const& state)
     uint64_t bytes = grow_add(state.profile_json.capacity(), state.producer_build.capacity());
     if (state.profile_metadata) bytes = grow_add(bytes, farming_profile_metadata_memory(*state.profile_metadata));
     for (auto const& d : state.directories)
-        bytes = grow_add(bytes, grow_add(d.extents.capacity() * sizeof(uint16_t),
-            grow_add(d.cohorts.capacity() * sizeof(FarmingCohort), d.fill_stop.capacity())));
+        bytes = grow_add(bytes, grow_add((d.extents.capacity() + d.grant_extents.capacity()) * sizeof(uint16_t),
+            grow_add(d.cohorts.capacity() * sizeof(FarmingCohort),
+                grow_add(d.fill_stop.capacity(), grow_add(d.membership.capacity(), d.detached_source_digest.capacity())))));
+    for (auto const& [revision, digest] : state.ancestors)
+        bytes = grow_add(bytes, grow_add(sizeof(std::pair<uint64_t, std::string>), digest.capacity()));
     return bytes;
 }
 inline uint64_t farming_revision_margin(FarmingState const& state)
 {
     // Every lane can seal its current extent and record its terminal reason,
     // including decimal count growth, after the last successful admission.
-    return grow_add(128, state.directories.size() * 64);
+    return state.version >= 9 ? grow_add(256, state.directories.size() * 192) :
+        grow_add(128, state.directories.size() * 64);
 }
 inline bool farming_revision_fits(FarmingState const& state, uint64_t bytes)
 {
-    uint64_t const auxiliary = state.version >= 8 ? grow_add(state.update_reserved_bytes, state.progress_reserved_bytes) : 0;
+    uint64_t const auxiliary = state.version >= 8 ? grow_add(grow_add(state.update_reserved_bytes, state.progress_reserved_bytes),
+        state.version >= 9 ? state.owner_reserved_bytes : 0) : 0;
     if (auxiliary > state.manifest_reserved_bytes) return false;
     uint64_t const capacity = (state.manifest_reserved_bytes - auxiliary) / (state.version == 7 ? 4 : 2);
     return bytes <= capacity && farming_revision_margin(state) <= capacity - bytes;
@@ -349,12 +412,20 @@ inline bool valid_farming_extent_revision(FarmingState const& before, FarmingSta
         (before.version >= 7 && (before.identity_k != after.identity_k || before.identity_strength != after.identity_strength)) ||
         before.applied_update != after.applied_update || before.policy_revision != after.policy_revision ||
         before.control != after.control || before.request_floor != after.request_floor ||
-        before.update_reserved_bytes != after.update_reserved_bytes || before.progress_reserved_bytes != after.progress_reserved_bytes) return false;
+        before.update_reserved_bytes != after.update_reserved_bytes || before.progress_reserved_bytes != after.progress_reserved_bytes ||
+        before.owner_reserved_bytes != after.owner_reserved_bytes ||
+        before.shared_scratch_possible != after.shared_scratch_possible ||
+        before.conservative_storage_topology != after.conservative_storage_topology) return false;
     for (size_t lane = 0; lane < before.directories.size(); ++lane)
     {
         auto const& a = before.directories[lane]; auto const& b = after.directories[lane];
+        if (farming_reclaimed_tombstone(a) && a != b) return false;
         if (a.cohorts != b.cohorts || a.layout_first != b.layout_first || a.policy_files != b.policy_files ||
-            a.control != b.control) return false;
+            a.control != b.control || a.membership != b.membership || a.detached_at != b.detached_at ||
+            a.detached_source_revision != b.detached_source_revision || a.detached_source_digest != b.detached_source_digest ||
+            a.detached_acknowledged != b.detached_acknowledged ||
+            a.detached_reclaimed != b.detached_reclaimed ||
+            a.grant_extents != b.grant_extents || a.grant_config != b.grant_config) return false;
         if (b.sealed_files < a.sealed_files || (before.version < 8 && b.sealed_files > a.sealed_files + 1) ||
             b.extents.size() < a.sealed_files || b.extents.size() > a.extents.size() + 1 ||
             (!a.fill_stop.empty() && (a.fill_stop != b.fill_stop || a.extents != b.extents))) return false;
@@ -458,7 +529,7 @@ inline FarmingDestination farming_storage_read(std::istream& in, FarmingDestinat
 }
 inline std::string farming_state_text(FarmingState const& state, bool keyless = false)
 {
-    require(state.version >= 3 && state.version <= 8, "unsupported saved farming plan version");
+    require(state.version >= 3 && state.version <= 9, "unsupported saved farming plan version");
     require(state.profile_json.size() <= farming_profile_metadata_bytes,
         "saved farming profile metadata exceeds its bound");
     require(state.version < 5 || state.profile_json.empty(), "saved farming profile duplicates its configuration");
@@ -494,6 +565,12 @@ inline std::string farming_state_text(FarmingState const& state, bool keyless = 
         << std::quoted(state.applied_update) << ' ' << state.policy_revision << '\n';
     if (state.version >= 8) out << std::quoted(state.control) << ' ' << state.request_floor << ' '
         << state.update_reserved_bytes << ' ' << state.progress_reserved_bytes << '\n';
+    if (state.version >= 9)
+    {
+        out << state.owner_reserved_bytes << ' ' << state.shared_scratch_possible << ' ' << state.conservative_storage_topology << '\n';
+        out << state.ancestors.size() << '\n';
+        for (auto const& [revision, digest] : state.ancestors) out << revision << ' ' << std::quoted(digest) << '\n';
+    }
     auto const& e = state.estimate;
     out << e.feasible << ' ' << e.index_bytes << ' ' << e.reader_memory_bytes << ' ' << e.planning_memory_bytes << ' '
         << e.candidates_evaluated << ' ' << e.cpu_utilization << ' ' << e.worker_utilization << '\n'
@@ -545,6 +622,24 @@ inline std::string farming_state_text(FarmingState const& state, bool keyless = 
             }
         }
         if (state.version >= 8) out << std::quoted(d.control) << '\n';
+        if (state.version >= 9)
+        {
+            out << std::quoted(d.membership) << ' ' << d.detached_at << ' ' << d.detached_source_revision << ' '
+                << std::quoted(d.detached_source_digest) << ' ' << d.detached_acknowledged << ' ' << d.detached_reclaimed << ' '
+                << d.grant_config.has_value() << '\n';
+            if (d.grant_config) farming_config_write(out, *d.grant_config);
+            size_t runs = 0;
+            for (size_t file = 0; file < d.grant_extents.size(); ++file)
+                if (!file || d.grant_extents[file] != d.grant_extents[file - 1]) ++runs;
+            out << d.grant_extents.size() << ' ' << runs;
+            for (size_t first = 0; first < d.grant_extents.size();)
+            {
+                size_t last = first + 1;
+                while (last < d.grant_extents.size() && d.grant_extents[last] == d.grant_extents[first]) ++last;
+                out << ' ' << d.grant_extents[first] << ' ' << last - first; first = last;
+            }
+            out << '\n';
+        }
     }
     return out.str();
 }
@@ -598,15 +693,15 @@ inline FarmingState parse_farming_state(std::string const& body, uint64_t memory
     std::getline(in, version); in >> std::quoted(build);
     require(version == "ordinary-group-farming-v3" || version == "ordinary-group-farming-v4" ||
         version == "ordinary-group-farming-v5" || version == "ordinary-group-farming-v6" || version == "ordinary-group-farming-v7" ||
-        version == "ordinary-group-farming-v8",
+        version == "ordinary-group-farming-v8" || version == "ordinary-group-farming-v9",
         "unsupported saved farming plan version");
     FarmingState state;
     state.version = version == "ordinary-group-farming-v3" ? 3 : version == "ordinary-group-farming-v4" ? 4 :
         version == "ordinary-group-farming-v5" ? 5 : version == "ordinary-group-farming-v6" ? 6 :
-        version == "ordinary-group-farming-v7" ? 7 : 8;
+        version == "ordinary-group-farming-v7" ? 7 : version == "ordinary-group-farming-v8" ? 8 : 9;
     require(!build.empty() && build.size() <= 128, "invalid saved farming producer build");
-    require(state.version >= 6 || mode == FarmingStateLoad::metadata_only || build == GROW_IDENTITY,
-        "farming plan requires its original grow build; plan --metadata-only can inspect its saved metadata");
+    if (state.version < 6 && mode != FarmingStateLoad::metadata_only && build != GROW_IDENTITY)
+        throw LegacyFarmingPlanBuildError(build);
     state.producer_build = std::move(build);
     in >> std::quoted(model); require(model == farming_state_model(state), "saved farming model differs from this build");
     if (state.version >= 6)
@@ -660,6 +755,27 @@ inline FarmingState parse_farming_state(std::string const& body, uint64_t memory
             state.progress_reserved_bytes <= state.manifest_reserved_bytes - state.update_reserved_bytes,
             "invalid saved farming job control or metadata reservation");
     }
+    uint64_t ancestry_memory = 0;
+    if (state.version >= 9)
+    {
+        size_t count = 0; in >> state.owner_reserved_bytes >> state.shared_scratch_possible >> state.conservative_storage_topology >> count;
+        require(in && state.owner_reserved_bytes <= state.manifest_reserved_bytes -
+            state.update_reserved_bytes - state.progress_reserved_bytes,
+            "invalid saved farming owner metadata reservation");
+        require(in && count <= 1 && count * (sizeof(std::pair<uint64_t, std::string>) + 64) < memory_limit / 4,
+            "saved farming ancestry exceeds its work or memory bound");
+        state.ancestors.reserve(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            uint64_t revision = 0; std::string digest; in >> revision >> std::quoted(digest);
+            require(in && revision && revision < state.revision && encoded(digest, 32) &&
+                (!i || revision > state.ancestors.back().first), "invalid saved farming ancestry");
+            ancestry_memory = grow_add(ancestry_memory, grow_add(sizeof(std::pair<uint64_t, std::string>), digest.capacity()));
+            state.ancestors.emplace_back(revision, std::move(digest));
+        }
+        require(state.revision == 1 || (!state.ancestors.empty() && state.ancestors.back().first == state.revision - 1 &&
+            state.ancestors.back().second == state.parent_digest), "saved farming ancestry omits its direct parent");
+    }
     if (state.profile_metadata) validate_reader_calibration_scope(*state.profile_metadata, state.config);
     auto& e = state.estimate;
     auto real = [&]
@@ -675,12 +791,13 @@ inline FarmingState parse_farming_state(std::string const& body, uint64_t memory
     in >> e.max_eligible_families_per_resource;
     size_t count = 0; in >> count;
     require(in && count && count <= 1024, "invalid saved farming destination count");
-    uint64_t expanded = grow_add(sizeof(FarmingState), grow_add(body.size() * 4, count * sizeof(FarmingDirectory)));
+    uint64_t expanded = grow_add(ancestry_memory,
+        grow_add(sizeof(FarmingState), grow_add(body.size() * 4, count * sizeof(FarmingDirectory))));
     if (state.profile_metadata) expanded = grow_add(expanded, farming_profile_metadata_memory(*state.profile_metadata));
     require(expanded < memory_limit, "saved farming state exceeds its parsing memory budget");
     state.directories.resize(count);
     FarmingDestination const defaults = state.version >= 5 ? farming_storage_read(in, {}, true) : FarmingDestination{};
-    uint64_t extent_count = 0;
+    uint64_t extent_count = 0, grant_count = 0;
     for (auto& d : state.directories)
     {
         auto& p = d.layout; unsigned members, slots, bits, meta, rank, lanes;
@@ -741,7 +858,8 @@ inline FarmingState parse_farming_state(std::string const& body, uint64_t memory
             size_t cohorts = 0;
             in >> d.layout_first >> d.policy_files >> cohorts;
             require(in && cohorts <= 1024 && d.layout_first <= d.policy_files && d.policy_files <= d.extents.size() &&
-                (cohorts != 0 || d.layout_first == 0) && (!d.fill_stop.empty() || farming_layout_files(d) <= d.extents.size()),
+                (cohorts != 0 || d.layout_first == 0) &&
+                (state.version >= 9 || !d.fill_stop.empty() || farming_layout_files(d) <= d.extents.size()),
                 "invalid saved farming cohort boundaries");
             auto const bytes = cohorts * sizeof(FarmingCohort);
             require(bytes < memory_limit - expanded, "saved farming cohorts exceed their parsing memory budget");
@@ -764,14 +882,52 @@ inline FarmingState parse_farming_state(std::string const& body, uint64_t memory
                 farming_detail::validate(cohort.config, {});
                 d.cohorts.push_back(std::move(cohort));
             }
-            for (uint64_t file = d.policy_files; file < d.extents.size(); ++file)
-                require(!state.config.group_members_override || d.extents[size_t(file)] <= state.config.group_members_override,
-                    "future farming extent exceeds its revised group limit");
+            if (state.version < 9)
+                for (uint64_t file = d.policy_files; file < d.extents.size(); ++file)
+                    require(!state.config.group_members_override || d.extents[size_t(file)] <= state.config.group_members_override,
+                        "future farming extent exceeds its revised group limit");
         }
         if (state.version >= 8)
         {
             in >> std::quoted(d.control);
             require(in && farming_control_valid(d.control), "invalid saved farming destination control");
+        }
+        if (state.version >= 9)
+        {
+            bool config = false; in >> std::quoted(d.membership) >> d.detached_at >> d.detached_source_revision
+                >> std::quoted(d.detached_source_digest) >> d.detached_acknowledged >> d.detached_reclaimed >> config;
+            require(in && (d.membership == "member" ? !d.detached_at && !d.detached_source_revision &&
+                d.detached_source_digest.empty() && !d.detached_acknowledged && !d.detached_reclaimed :
+                d.membership == "detached" && d.detached_at && d.detached_at <= state.revision &&
+                d.detached_source_revision && d.detached_source_revision < d.detached_at && encoded(d.detached_source_digest, 32)) && config,
+                "invalid saved farming membership or allocation configuration");
+            require(!d.detached_reclaimed || d.detached_acknowledged, "saved farming reclamation lacks its retirement acknowledgement");
+            require(!farming_member(d) || !d.fill_stop.empty() || farming_layout_files(d) <= d.extents.size(),
+                "saved farming extent omitted an initial assignment");
+            d.grant_config = farming_config_read(in); farming_detail::validate(*d.grant_config, {});
+            size_t files = 0, runs = 0; in >> files >> runs;
+            require(in && files <= farming_detail::maximum_files - grant_count && files >= d.extents.size() && runs <= files &&
+                bool(files) == bool(runs), "invalid saved farming allocation grants");
+            auto const bytes = files * sizeof(uint16_t);
+            require(bytes <= memory_limit - expanded, "saved farming grants exceed their parsing memory budget");
+            expanded = grow_add(expanded, bytes); d.grant_extents.reserve(files);
+            grant_count += files;
+            for (size_t run = 0; run < runs; ++run)
+            {
+                unsigned extent = 0; size_t length = 0; in >> extent >> length;
+                require(in && extent && extent <= UINT16_MAX && length && length <= files - d.grant_extents.size(),
+                    "invalid saved farming member grant");
+                d.grant_extents.insert(d.grant_extents.end(), length, uint16_t(extent));
+            }
+            require(d.grant_extents.size() == files, "incomplete saved farming allocation grants");
+            for (size_t file = 0; file < d.grant_extents.size(); ++file)
+            {
+                if (file < d.extents.size()) require(d.extents[file] <= d.grant_extents[file],
+                    "saved farming extent exceeds its independent allocation grant");
+                require(file < d.policy_files || !d.grant_config->group_members_override ||
+                    d.grant_extents[file] <= d.grant_config->group_members_override,
+                    "future farming allocation exceeds its group limit");
+            }
         }
         state.estimate.destinations.push_back(p);
     }

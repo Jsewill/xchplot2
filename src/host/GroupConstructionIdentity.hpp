@@ -77,16 +77,22 @@ inline void check_construction_compatibility(ConstructionCompatibility const& sa
     group_tools::require(saved.representation == expected.representation, engine +
         " checkpoint native representation is incompatible; resume on a matching platform/build or restart this construction");
 }
+class LegacyConstructionBuildError : public std::runtime_error
+{
+public:
+    std::string const producer_build, engine;
+    LegacyConstructionBuildError(std::string saved, std::string source) :
+        std::runtime_error(source + " legacy checkpoint requires its original exact build (" + saved +
+            "); resume with that binary or restart this construction"),
+        producer_build(std::move(saved)), engine(std::move(source)) {}
+};
 inline void check_construction_build(std::string const& saved, std::string_view expected, std::string const& engine)
 {
-    group_tools::require(saved == expected, engine +
-        " legacy checkpoint requires its original exact build (" + saved + "); resume with that binary or restart this construction");
+    if (saved != expected) throw LegacyConstructionBuildError(saved, engine);
 }
 inline void check_construction_build(std::array<char, 64> const& saved, std::string_view expected, std::string const& engine)
 {
-    group_tools::require(saved == construction_build(expected), engine +
-        " legacy checkpoint requires its original exact build (" + construction_build_text(saved) +
-        "); resume with that binary or restart this construction");
+    if (saved != construction_build(expected)) throw LegacyConstructionBuildError(construction_build_text(saved), engine);
 }
 inline void check_construction_format(bool supported, std::string const& engine)
 {

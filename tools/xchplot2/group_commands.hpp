@@ -24,6 +24,7 @@ inline unsigned group_option_values(std::string_view option)
         option == "--progress" || option == "--no-progress" || option == "--help" || option == "--help-all" || option == "-h" ||
         option == "--extend" || option == "--no-extend" || option == "--update" || option == "--no-update" ||
         option == "--cancel-update" || option == "--no-cancel-update" ||
+        option == "--policy-only" || option == "--no-policy-only" || option == "--upgrade-job" || option == "--no-upgrade-job" ||
         option == "--allow-missing" || option == "--no-allow-missing") return 0;
     return 1;
 }

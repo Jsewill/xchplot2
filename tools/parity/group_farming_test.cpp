@@ -961,6 +961,8 @@ void test_numerical_adjustments()
     bool memory = false, eligible = false, deadline = false;
     for (auto const& alternative : suggestions.alternatives)
     {
+        auto const& selected = farming_adjustment(suggestions, farming_adjustment_name(alternative.kind));
+        check(&selected == &alternative, "named alternative did not retain its complete assessed setting");
         farming_detail::PlanningMemory scratch{64ull << 20};
         auto actual = farming_detail::assess(alternative.config, drives, plans, &counts, scratch, nullptr, configs);
         check(actual.feasible == alternative.assessment.feasible && actual.response_bound_seconds == alternative.assessment.response_bound_seconds &&
@@ -995,10 +997,12 @@ void test_numerical_adjustments()
         }
     }
     check(memory && eligible && deadline, "numerical diagnostics omitted an exact required budget");
+    rejects([&] { farming_adjustment(suggestions, "unknown"); }, "unknown named farming alternative was accepted");
     auto limited = farming_adjustments(shared, drives, plans, counts, 64ull << 20, configs, true, 1);
     check(limited.evaluations == 1 && limited.search_limited && limited.alternatives.empty() &&
               limited.baseline.response_bound_seconds == suggestions.baseline.response_bound_seconds,
           "bounded diagnostic search hid its exhaustion or changed the baseline");
+    rejects([&] { farming_adjustment(limited, "memory"); }, "unassessed named farming alternative was accepted");
     rejects<FarmingResourceError>([&] { farming_adjustments(shared, drives, plans, counts, 1, configs); },
                                   "diagnostic alternatives ignored their planning-memory budget");
     shared = {}; shared.memory_bytes = 4000000000ull;

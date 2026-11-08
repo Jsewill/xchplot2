@@ -294,6 +294,11 @@ reports saved assignments and compatibility without probing destinations,
 starting services or inspecting construction checkpoints. It can inspect a
 supported legacy plan from another build without making that plan executable.
 The report does not establish current availability or farming readiness.
+Plan and metadata reports label layout counts as forecasts or fixed assignments.
+Saved target counts (`admitted_files` and `admitted_members` in JSON) can grow
+beyond an original forecast. Status reports completed observations separately.
+Metadata-only inspection reads the supplied record; refresh a preview with
+`plan` to include validated local progress before inspecting that preview.
 
 To assess several managed jobs under one harvester budget, refresh a keyless
 summary for each job, then assess the summaries together:
@@ -411,19 +416,61 @@ report required resources and, where the bounded search finds them, assessed
 alternative settings with any remaining constraint failures. Suggestions do
 not change the declared harvester automatically.
 
+Select those settings by name to produce a normal keyless preview:
+
+```bash
+xchplot2 plan /disk/plots --alternative memory,eligible-groups --save-plan resources.plan
+xchplot2 plan /disk/plots --alternative capacity --save-plan capacity.plan
+xchplot2 fill --from-plan resources.plan
+```
+
+Resource names are `memory`, `eligible-groups`, `deadline`, `cpu-cores`, and
+`lookup-workers`. Selecting a resource alternative explicitly changes the
+displayed harvester declarations; provide those resources when farming the plan.
+A lookup-worker alternative can also require a higher core budget, and its
+additional reader-memory demand is reassessed.
+Comma-separated selections are reassessed in order. The report shows the
+original and selected file/member counts, resource budgets, required reader
+memory and response bound. A selection that remains infeasible cannot be saved.
+`capacity` keeps the declared harvester and lowers only the future member cap,
+preserving completed plots and started reservations. Its bounded search offers
+an assessed cap without claiming that it found the largest feasible cap.
+Selected previews use the usual source-policy, native-directory and progress
+checks when applied with `fill`.
+
 During an active fill, requests and their receipts are saved on available
 matching job members. There is no required first destination. The coordinator
 reaches a recoverable construction boundary, applies the revision once all
-members are available, and continues automatically. Repeating a request is
+required members are available, and continues automatically. Repeating a request is
 idempotent; editing a waiting request preserves compatible earlier changes.
 Requests made on disconnected members are reconciled when the drives return.
 Conflicting edits receive a field-specific refusal. `status` reports waiting,
 applied, superseded, cancelled or refused requests and their reasons. A queued
 request is not a promise of feasibility; refusal leaves the active fill on its
-saved policy. A legacy job with insufficient request metadata may need its
-current coordinator to finish before upgrading that allowance.
+saved policy. To review an older job's recovery-metadata allowance, stop its
+foreground coordinator at a durable boundary, then use:
 
-`fill --cancel-update DIR` cancels waiting requests. A refused request can be
+```bash
+xchplot2 plan /disk/plots --upgrade-job --save-plan upgrade.plan
+xchplot2 fill --from-plan upgrade.plan
+```
+
+The review takes nonblocking locks on every required destination, retains the saved
+harvester and outer limits, and audits completed plots and started reservations.
+It saves a preview; applying that preview publishes the upgraded allowance under
+the normal writer fences. A busy coordinator must stop before this review can
+finish. Metadata-only inspection remains available while it is running.
+If an active checkpoint needs its original build, the recovery report gives
+that build, target and quoted continuation/drain commands. Choose a trusted
+original binary yourself, record drain intent if it supports that mode, then
+use its shown `fill --resume` command to finish started files and repeat the
+review. An original-build-only plan still needs that build's
+supported upgrade/export path. Saved sealed/unsealed counts include unstarted
+forecast and do not establish live checkpoint completion. These commands do
+not run another binary automatically or discard unfinished construction.
+
+`fill --cancel-update DIR` cancels waiting policy requests. Local plotting
+controls remain in force until an explicit control changes them. A refused request can be
 replaced by another `fill`; committed revisions cannot be cancelled.
 Use `plan` to review proposed changes without submitting them.
 
@@ -437,12 +484,34 @@ xchplot2 resume /disk-a/plots
 ```
 
 `pause` stops at a recoverable boundary. `drain` finishes started files without
-starting another; `retire` keeps the destination out of future allocation while
-preserving its plots and recovery records. `resume` enables work again; an idle
-job starts plotting on the next `fill`. Destination controls remain in force
-until that destination is resumed. Controls sent to a running job take effect
-at the next recovery boundary, and wait for missing members like other policy
-updates.
+starting another. `resume` reopens paused or drained work and starts an idle job,
+or reports its current coordinator. It uses the normal execution defaults; use
+`fill --resume` to supply backend, workspace or temporary-directory options.
+Add `--policy-only` to record intent without starting an idle job. A destination
+pause or drain remains in force until that destination is resumed.
+Available drives honor controls at the next recovery boundary even while other
+members are missing; unavailable destinations show pending intent. Controls use
+a compact causal snapshot, so repeated actions do not fill the policy request
+queue. Concurrent conflicting actions remain restricted until the drives are
+reconnected and an explicit action resolves the affected scope.
+
+`retire` removes a destination from required membership while preserving its
+plots and recovery records. Available started files finish before detachment.
+A missing destination can be detached, but its outstanding storage and farming
+grants remain reserved until it returns and acknowledges retirement under its
+native writer lock. Remaining members can spend their existing grants; they
+cannot enlarge or reshape shared allocations while that obligation is unfenced.
+Status distinguishes requested retirement, detachment, acknowledgement and
+reclamation. After reclamation, the retired metadata remains a fixed historical
+record. `resume` never rejoins a detached destination. A fully retired job cannot
+accept new members; plan a separate job for future allocation.
+
+Older v8 jobs can detach a missing member only when the retirement records fit
+their existing metadata grant. This preserves every original allocation and
+does not create new independent work or ownership-record allowances. If the
+grant is too small, the command reports that retirement was not applied; restore
+the original destinations for `--upgrade-job`, or retain the old job and review
+a separate recovery job. Upgrade before losing a drive when possible.
 
 `status DIR` reports saved progress without opening plots for writing or
 acquiring construction locks. New jobs use each drive's durable progress record,
@@ -453,18 +522,30 @@ completed files and members, pending construction, remaining allowance,
 unavailable destinations and a next action. Available filesystem space is
 separate because directories can share it. A concurrent write can make deep
 inspection incomplete; retry after that write. Saved writer state is not a live
-health check, and status does not establish full payload integrity.
+health check. Current local owner checks combine the held immutable ownership
+record, exact process generation and a bound heartbeat. Remote or ambiguous
+ownership remains unknown; a PID or recent timestamp alone does not establish
+liveness. A stopped owner and a stale record left by a killed owner are reported
+separately. These checks do not establish full payload integrity.
 
-For new ordinary jobs, `fill DIR` continues reserved work on available drives
-while a peer is missing, records completion locally, and waits for the peer to
+For new ordinary jobs, `fill DIR` continues work on available drives while a peer
+is missing. Saved per-drive grants can cover growth beyond the initial forecast,
+including another file, without republishing the whole job. These grants are
+finite while a peer is missing. When all required writers are available and
+retirement obligations are fenced, filling reassesses remaining capacity under
+the saved limits.
+Completion is recorded locally, and the coordinator waits for required peers to
 return. Returning drives are checked before progress is merged and work resumes.
 `fill -r --allow-missing DIR` performs available work and exits with status 4
 while peers remain unavailable. New shared reservations and policy changes
-still require all members. Legacy jobs retain their stricter recovery limits.
+still require all remaining members and respect retained retirement obligations.
+Legacy jobs retain their stricter recovery limits.
 A mountpoint containing a different native directory is treated as unavailable.
-Before new external construction, all fixed-job destinations must be available
-to account for preserved scratch and its ownership records. This does not
-prevent read-only inspection or resuming available members without new scratch.
+Jobs that may have outstanding shared scratch grants require every original
+writer to be available or durably retired before admitting fresh construction.
+Available recorded transactions can finish within their saved grants. Enabling
+temporary scratch on a job that did not reserve it requires `fill --update` with
+the coordinator stopped and all required destinations available.
 
 If a drive appears at another path, supply the new path or discover it with
 `--discover-drives`. Matching persistent directory identity lets the job use

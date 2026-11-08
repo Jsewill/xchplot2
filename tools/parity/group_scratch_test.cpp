@@ -125,6 +125,24 @@ void saved_only_roots(fs::path const& directory)
     require(aliases.try_reserve_output(0, target, unit), "allowed alias output reservation failed");
     std::array<fs::path, 1> alias{directory / "alias-a"}; aliases.restrict_grants(alias); aliases.seal_recovery();
     require(aliases.grant(0, unit, unit, unit, 2).has_value(), "enabled scratch alias lost its original directory grant");
+
+    ScratchPool frozen({saved_root, enabled}, 0);
+    require(frozen.try_reserve_output(0, target, unit, 0, true) && frozen.try_reserve_output(1, target, unit),
+        "independent saved-scratch output reservation failed");
+    frozen.restore(0, saved, occupied); frozen.restrict_grants({}); frozen.seal_recovery();
+    require(frozen.try_io(0).has_value() && !frozen.grant(1, unit, unit, unit, 2),
+        "independent scratch restriction blocked exact recovery or spent an unavailable writer's possible quota");
+    frozen.release_scratch_after_cleanup(0);
+    require(!frozen.grant(1, unit, unit, unit, 2), "local scratch cleanup reopened unaccounted shared storage grants");
+
+    ScratchPool journals({saved_root}, 0);
+    journals.reserve_metadata(saved_root, 20 * unit, 5 * unit);
+    require(journals.try_reserve_output(0, saved_root, 20 * unit), "metadata-protected output reservation failed");
+    journals.seal_recovery();
+    auto bounded = journals.grant(0, 100 * unit, unit, unit, 2);
+    require(bounded && quota(*bounded) == 65 * unit,
+        "scratch borrowed the durable journal's unused replacement allowance or credited allocated metadata twice");
+    rejected([&] { journals.reserve_metadata(saved_root, unit, 0); }, "journal promise changed after scratch admission");
 }
 void saved_aliases(fs::path const& directory)
 {

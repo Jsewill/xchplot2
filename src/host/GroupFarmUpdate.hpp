@@ -2,6 +2,7 @@
 #pragma once
 #include "host/GroupFarmState.hpp"
 #include "host/GroupFarmMetadata.hpp"
+#include "host/GroupFarmControlState.hpp"
 #include "host/GroupStorage.hpp"
 #include <map>
 #include <set>
@@ -29,7 +30,7 @@ inline std::string farming_policy_digest(FarmingState state)
     // Progress revisions must not invalidate an otherwise current request.
     // Keys, topology, limits, forecasts and cohort identity assignments remain
     // bound; only durable progress and the request receipt are omitted.
-    state.revision = 1; state.parent_digest.clear(); state.applied_update.clear(); state.request_floor = 0;
+    state.revision = 1; state.parent_digest.clear(); state.applied_update.clear(); state.request_floor = 0; state.ancestors.clear();
     for (auto& d : state.directories) { d.extents.clear(); d.sealed_files = 0; d.fill_stop.clear(); }
     return stream_state::digest(farming_state_text(state));
 }
@@ -136,6 +137,12 @@ inline std::map<std::string, std::string> farming_update_state_fields(FarmingSta
     result.emplace("control", state.control);
     for (auto const& directory : state.directories) result.emplace("control:" + directory.directory_identity, directory.control);
     return result;
+}
+inline bool farming_update_control_only(FarmingUpdate const& update)
+{
+    return update.version >= 3 && !update.action.empty() && !update.expected.empty() &&
+        std::all_of(update.expected.begin(), update.expected.end(), [](auto const& field)
+        { return field.first == "control" || field.first.starts_with("control:"); });
 }
 inline void farming_update_preconditions(FarmingUpdate& update, FarmingState const& state,
     std::set<std::string> const& explicit_fields = {})
@@ -317,6 +324,11 @@ inline uint64_t farming_update_reservation(uint64_t request_bytes, uint64_t alig
     require(slots <= UINT64_MAX / per_request, "farming update reservation overflow");
     return grow_add(slots * per_request, grow_add(receipt, std::max(request, receipt)));
 }
+inline uint64_t farming_control_reservation(FarmingState const& state, uint64_t alignment)
+{
+    auto const record = farming_update_aligned(grow_add(farming_control_size_bound(state), 65), alignment);
+    require(record <= UINT64_MAX / 2, "farming control reservation overflow"); return record * 2;
+}
 struct FarmingUpdateSpaceError : std::runtime_error
 {
     uint64_t const required, available;
@@ -325,7 +337,7 @@ struct FarmingUpdateSpaceError : std::runtime_error
             std::to_string(remaining) + " reserved bytes remain; retry after the coordinator reaches a recovery boundary"),
         required(needed), available(remaining) {}
 };
-inline uint64_t farming_update_allocation(std::filesystem::path const& metadata)
+inline uint64_t farming_update_allocation(std::filesystem::path const& metadata, bool controls_only = false)
 {
     file_io::Stat directory{};
     if (file_io::inspect_link(metadata, &directory))
@@ -334,10 +346,23 @@ inline uint64_t farming_update_allocation(std::filesystem::path const& metadata)
     uint64_t bytes = 0; size_t files = 0;
     for (auto const& entry : std::filesystem::directory_iterator(metadata))
     {
-        if (!file_io::path_text(entry.path().filename()).starts_with("grow-farm.update")) continue;
+        auto const name = file_io::path_text(entry.path().filename());
+        if (!name.starts_with("grow-farm.update")) continue;
+        if (controls_only && name != "grow-farm.update.controls" && name != "grow-farm.update.controls.next" &&
+            !name.starts_with("grow-farm.update.controls.partial.") && !name.starts_with("grow-farm.update.controls.next.partial.")) continue;
         require(++files <= farming_update_history * 4 + 16, "farming update metadata exceeds its file bound");
         file_io::Stat info{};
-        require(!file_io::inspect_link(entry.path(), &info) && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
+        int const inspected = file_io::inspect_link(entry.path(), &info);
+        if (inspected && errno == ENOENT && (name == "grow-farm.update.controls.next" || name.find(".partial.") != name.npos)) continue;
+        bool private_links = info.st_nlink == 1;
+        auto const split = name.find(".partial.");
+        if (!inspected && info.st_nlink == 2 && split != name.npos)
+        {
+            file_io::Stat published{};
+            private_links = !file_io::inspect_link(metadata / name.substr(0, split), &published) &&
+                file_io::is_regular(published.st_mode) && published.st_dev == info.st_dev && published.st_ino == info.st_ino;
+        }
+        require(!inspected && file_io::is_regular(info.st_mode) && private_links &&
             info.st_size >= 0 && info.st_blocks >= 0 && uint64_t(info.st_blocks) <= UINT64_MAX / 512,
             "invalid farming update allocation");
         bytes = grow_add(bytes, std::max(uint64_t(info.st_size), uint64_t(info.st_blocks) * 512));
@@ -395,7 +420,9 @@ class FarmingUpdateMailbox
     FarmingState state_;
     uint64_t memory_;
     bool acquired_ = false;
+    bool terminal_ = false;
     std::vector<std::unique_ptr<Replica>> replicas_;
+    std::vector<FarmingControlNativeBinding> control_bindings_;
     mutable uint64_t floor_ = 0;
     mutable bool legacy_floor_ = false;
     static std::string request_name(std::string const& id) { return "grow-farm.update-" + id + ".request"; }
@@ -403,7 +430,8 @@ class FarmingUpdateMailbox
     { return "grow-farm.update-" + id + '.' + status; }
     static bool record_name(std::string const& name)
     {
-        if (name == "grow-farm.update" || name == "grow-farm.update.error" || name == "grow-farm.update.floor") return true;
+        if (name == "grow-farm.update" || name == "grow-farm.update.error" || name == "grow-farm.update.floor" ||
+            name == "grow-farm.update.controls" || name == "grow-farm.update.controls.next") return true;
         constexpr std::string_view prefix = "grow-farm.update-";
         if (!name.starts_with(prefix) || name.size() <= prefix.size() + 64) return false;
         auto const id = name.substr(prefix.size(), 64), suffix = name.substr(prefix.size() + 64);
@@ -464,13 +492,15 @@ class FarmingUpdateMailbox
             "cannot inspect farming update allocation units");
         return space.f_frsize;
     }
-    void admit(Replica const& replica, uint64_t bytes) const
+    void admit(Replica const& replica, uint64_t bytes, bool control = false) const
     {
         uint64_t const updates = farming_update_allocation(replica.metadata->path);
         uint64_t used = grow_add(replica.metadata->allocation(), updates);
         uint64_t reserved = state_.manifest_reserved_bytes;
         uint64_t update_reserved = state_.update_reserved_bytes;
-        uint64_t progress_reserved = state_.progress_reserved_bytes, largest_plan = 0;
+        uint64_t control_reserved = state_.version >= 9 ? farming_control_reservation(state_, alignment(replica)) : 0;
+        bool control_separated = state_.version >= 9;
+        uint64_t progress_reserved = state_.progress_reserved_bytes, owner_reserved = state_.owner_reserved_bytes, largest_plan = 0;
         size_t plans = 0;
         bool separated = state_.version >= 8;
         for (auto const* name : {"grow-farm.plan", "grow-farm.plan.next"})
@@ -490,14 +520,30 @@ class FarmingUpdateMailbox
             {
                 separated = true; update_reserved = std::max(update_reserved, source.update_reserved_bytes);
                 progress_reserved = std::max(progress_reserved, source.progress_reserved_bytes);
+                owner_reserved = std::max(owner_reserved, source.owner_reserved_bytes);
+            }
+            if (source.version >= 9)
+            {
+                control_separated = true;
+                control_reserved = std::max(control_reserved, farming_control_reservation(source, alignment(replica)));
             }
         }
         uint64_t available = reserved > used ? reserved - used : 0;
         if (separated)
         {
-            auto const protected_bytes = grow_add(progress_reserved, plans < 2 ? largest_plan : 0);
+            auto const protected_bytes = grow_add(grow_add(progress_reserved, owner_reserved), plans < 2 ? largest_plan : 0);
             available = available > protected_bytes ? available - protected_bytes : 0;
-            available = std::min(available, update_reserved > updates ? update_reserved - updates : 0);
+            if (control_separated)
+            {
+                auto const controls = farming_update_allocation(replica.metadata->path, true);
+                require(controls <= updates, "farming control allocation exceeds total request bookkeeping");
+                auto const category_reserved = control ? std::min(control_reserved, update_reserved) :
+                    update_reserved > control_reserved ? update_reserved - control_reserved : 0;
+                auto const category_used = control ? controls : updates - controls;
+                require(category_used <= category_reserved, "farming request metadata exceeds its protected control or policy allowance; review plan --upgrade-job");
+                available = std::min(available, category_reserved - category_used);
+            }
+            else available = std::min(available, update_reserved > updates ? update_reserved - updates : 0);
         }
         auto const needed = farming_update_aligned(bytes, alignment(replica));
         if (needed > available) throw FarmingUpdateSpaceError(needed, available);
@@ -555,16 +601,63 @@ class FarmingUpdateMailbox
             if (successor != saved.end()) finish(record.file.update.id, "superseded", "replaced by a later accepted request", successor->file.update.id);
         }
     }
+    std::string replace_controls(FarmingControlState const& value, std::vector<std::optional<stream_state::Stamp>> const& expected)
+    {
+        require_writer(); require(expected.size() == replicas_.size(), "incomplete farming control replacement stamps");
+        auto const body = farming_control_state_text(value), contents = checked(body);
+        require(contents.size() <= grow_add(farming_control_size_bound(state_), 65), "farming control snapshot exceeds its allocation bound");
+        (void)parse_farming_controls(state_, body, memory_);
+        for (size_t i = 0; i < replicas_.size(); ++i)
+        {
+            auto const& replica = replicas_[i]; auto const path = replica->metadata->path / "grow-farm.update.controls";
+            auto const pending = replica->metadata->path / "grow-farm.update.controls.next";
+            if (farm_metadata_detail::present(pending))
+            {
+                require(stream_state::stamp(pending).bytes <= grow_add(farming_control_handoff_size_bound(state_, control_bindings_), 65),
+                    "interrupted farming control exceeds its read bound");
+                (void)parse_farming_controls(state_, read_farming_state(pending, memory_).body, memory_, control_bindings_);
+                require(!file_io::unlink_file(pending), "cannot reclaim unpublished farming control snapshot");
+                stream_state::sync_path(replica->metadata->path, true);
+            }
+            auto unchanged = [&]
+            {
+                require(expected[i] ? farm_metadata_detail::present(path) && stream_state::stamp(path) == *expected[i] :
+                    !farm_metadata_detail::present(path), "farming control snapshot changed before replacement");
+            };
+            unchanged();
+            if (expected[i] && read_farming_state(path, memory_).body == body) continue;
+            admit(*replica, contents.size(), true); replica->metadata->check();
+            auto const staged = stage_farming_state(path, contents, false);
+            require(farming_update_allocation(replica->metadata->path) <= state_.update_reserved_bytes,
+                "staged farming controls exceed their reserved update metadata allowance");
+            file_io::Space staged_space{};
+            require(!file_io::space_path(replica->metadata->root, &staged_space) && staged_space.f_frsize &&
+                staged_space.f_bavail <= UINT64_MAX / staged_space.f_frsize &&
+                staged_space.f_bavail * staged_space.f_frsize >= state_.headroom,
+                "staged farming controls consumed declared filesystem headroom");
+            grow_failpoint("farm-control-before-publication");
+            unchanged(); replica->metadata->check();
+            require(!file_io::rename_file(staged, path, expected[i].has_value()), "cannot publish farming control snapshot");
+            stream_state::sync_path(replica->metadata->path, true); replica->metadata->check();
+            grow_failpoint("farm-control-published");
+        }
+        return stream_state::digest(body);
+    }
 public:
     FarmingUpdateMailbox(FarmingState const& state, std::optional<bool> legacy, bool acquire, uint64_t memory = UINT64_MAX,
-        std::span<std::filesystem::path const> runtime_paths = {}) :
-        state_(state), memory_(memory)
+        std::span<std::filesystem::path const> runtime_paths = {}, std::span<FarmingControlNativeBinding const> control_bindings = {}) :
+        state_(state), memory_(memory), control_bindings_(control_bindings.begin(), control_bindings.end())
     {
+        if (!control_bindings_.empty()) (void)farming_control_source_shape(state_, control_bindings_);
         std::map<std::string, std::filesystem::path> ordered;
         require(runtime_paths.empty() || runtime_paths.size() >= state.directories.size(), "farming update runtime bindings are incomplete");
+        bool const has_members = std::any_of(state.directories.begin(), state.directories.end(), farming_member);
+        terminal_ = !has_members;
+        if (terminal_) return;
         for (size_t i = 0; i < state.directories.size(); ++i)
         {
             auto const& directory = state.directories[i];
+            if (has_members && !farming_member(directory)) continue;
             require(!directory.directory_identity.empty() && directory.directory_identity.size() <= 256 &&
                 ordered.emplace(directory.directory_identity, runtime_paths.empty() ? file_io::native_path(directory.directory) : runtime_paths[i]).second,
                 "invalid farming update member identity");
@@ -603,15 +696,97 @@ public:
         check(); if (acquired_) cleanup_partials(); read_floor();
     }
     bool locked() const { return acquired_; }
-    bool complete() const { return replicas_.size() == state_.directories.size(); }
+    bool terminal() const { return terminal_; }
+    bool complete() const
+    {
+        auto const members = size_t(std::count_if(state_.directories.begin(), state_.directories.end(), farming_member));
+        return !members || replicas_.size() == members;
+    }
     std::filesystem::path manifest() const
     {
+        require(!replicas_.empty(), "retired farming job has no writable policy member");
         auto const path = replicas_.front()->metadata->path / "grow-farm.plan";
         return farm_metadata_detail::present(path) ? path : replicas_.front()->metadata->path / "grow-farm.plan.next";
     }
     uint64_t floor() const { read_floor(); return floor_; }
+    FarmingControlState control_state(std::vector<std::optional<stream_state::Stamp>>* stamps = nullptr) const
+    {
+        check();
+        FarmingControlState result;
+        result.job_id = state_.job_id; result.fingerprint = state_.fingerprint;
+        result.native_members = farming_control_native_members(state_);
+        result.native_binding = farming_control_native_digest(state_);
+        result.source_revision = state_.policy_revision; result.source_policy = farming_policy_digest(state_);
+        if (stamps) stamps->clear();
+        for (auto const& replica : replicas_)
+        {
+            auto const path = replica->metadata->path / "grow-farm.update.controls";
+            if (!farm_metadata_detail::present(path)) { if (stamps) stamps->push_back({}); continue; }
+            require(stream_state::stamp(path).bytes <= grow_add(farming_control_handoff_size_bound(state_, control_bindings_), 65),
+                "farming control snapshot exceeds its read bound");
+            FarmingStateFile file;
+            for (unsigned attempt = 0; ; ++attempt)
+            {
+                auto const before = stream_state::stamp(path);
+                try { file = read_farming_state(path, memory_); break; }
+                catch (std::runtime_error const&)
+                {
+                    if (attempt >= 2 || stream_state::stamp(path) == before) throw;
+                }
+            }
+            auto const incoming = parse_farming_controls(state_, file.body, memory_, control_bindings_);
+            result = merge_farming_controls(state_, result, incoming);
+            if (stamps) stamps->push_back(file.stamp);
+        }
+        check(); return result;
+    }
+    std::string submit_control(std::string_view action, std::vector<std::string> const& destinations = {})
+    {
+        if (terminal_)
+        {
+            require(action == "pause" || action == "drain" || action == "resume" || action == "retire", "invalid local farming control action");
+            for (auto const& destination : destinations)
+                require(std::any_of(state_.directories.begin(), state_.directories.end(),
+                    [&](auto const& directory) { return directory.directory_identity == destination; }), "farming control target is not a saved destination");
+            return stream_state::digest("retired farming intent " + state_.job_id);
+        }
+        require_writer();
+        std::vector<std::optional<stream_state::Stamp>> expected;
+        auto current = control_state(&expected);
+        std::string actor;
+        for (auto const& replica : replicas_)
+        {
+            auto const identity = farming_directory_identity(replica->metadata->root);
+            auto const member = std::find_if(state_.directories.begin(), state_.directories.end(),
+                [&](auto const& directory) { return directory.directory_identity == identity && farming_member(directory); });
+            if (member != state_.directories.end() && (actor.empty() || identity < actor)) actor = identity;
+        }
+        require(!actor.empty(), "no active native member can retain farming control intent");
+        require(action == "pause" || action == "drain" || action == "resume" || action == "retire", "invalid local farming control action");
+        auto const desired = farming_update_control(action);
+        auto same = [&](std::string const& field)
+        {
+            auto const at = current.fields.find(field);
+            return at != current.fields.end() && at->second.size() == 1 && at->second.front().value == desired;
+        };
+        bool const repeated = destinations.empty() ? same("control") :
+            std::all_of(destinations.begin(), destinations.end(), [&](auto const& destination) { return same("control:" + destination); });
+        auto next = repeated ? current : advance_farming_controls(state_, std::move(current), actor, action, destinations, farming_policy_digest(state_));
+        return replace_controls(next, expected);
+    }
+    std::string handoff_controls()
+    {
+        if (terminal_) return {};
+        require_writer(); require(complete(), "native farming control handoff requires every active member");
+        require(!control_bindings_.empty(), "native farming control handoff lacks approved source bindings");
+        std::vector<std::optional<stream_state::Stamp>> expected;
+        auto const current = control_state(&expected);
+        if (current.context.empty()) return {};
+        return replace_controls(current, expected);
+    }
     std::vector<FarmingUpdateRecord> records() const
     {
+        if (terminal_) return {};
         check(); read_floor();
         std::map<std::string, FarmingUpdateRecord> requests;
         std::map<std::string, FarmingUpdateReceipt> receipts;
@@ -774,6 +949,7 @@ public:
     }
     bool cancel()
     {
+        if (terminal_) return false;
         require_writer(); bool found = false;
         for (auto const& record : records()) if (!record.receipt || !farming_update_terminal(record.receipt->status))
         { finish(record.file.update.id, "cancelled"); found = true; }
@@ -867,6 +1043,7 @@ public:
             if (!active(record)) continue;
             ++waiting;
             if (old.version < 3) continue;
+            if (farming_update_control_only(old) != farming_update_control_only(update)) continue;
             auto const previous = farming_update_fields(old);
             for (auto const& [field, expected] : old.expected)
             {
@@ -884,7 +1061,8 @@ public:
         for (auto const& record : saved)
         {
             auto const& old = record.file.update;
-            if (old.version < 3 || !active(record) || std::any_of(old.expected.begin(), old.expected.end(), [&](auto const& field)
+            if (old.version < 3 || !active(record) || farming_update_control_only(old) != farming_update_control_only(update) ||
+                std::any_of(old.expected.begin(), old.expected.end(), [&](auto const& field)
                 { return contested.contains(field.first) && !user_fields.contains(field.first); })) continue;
             FarmingUpdate merged;
             try { merged = farming_update_rebase(old, state_); }

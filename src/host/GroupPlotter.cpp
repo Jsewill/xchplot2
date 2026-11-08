@@ -9,8 +9,11 @@
 #include "host/GroupFarming.hpp"
 #include "host/GroupHarvesterProfile.hpp"
 #include "host/GroupFarmState.hpp"
+#include "host/GroupFarmMembership.hpp"
 #include "host/GroupFarmPreview.hpp"
 #include "host/GroupFarmUpdate.hpp"
+#include "host/GroupFarmControl.hpp"
+#include "host/GroupFarmOwner.hpp"
 #include "host/GroupFarmProgress.hpp"
 #include "host/GroupFarmMigration.hpp"
 #include "host/GroupFarmInventory.hpp"
@@ -4674,9 +4677,31 @@ Identity farming_identity(Keys const& keys, group_grow::FarmingState const& stat
 
 uint64_t farming_update_charge(fs::path const& metadata)
 { return group_grow::farming_update_allocation(metadata); }
+uint64_t farming_auxiliary_charge(group_grow::FarmingMetadataDirectory const& metadata)
+{
+    return sum(sum(farming_update_charge(metadata.path), group_grow::farming_progress_allocation(metadata)),
+        group_grow::farming_owner_allocation(metadata));
+}
+bool farming_members_available(group_grow::FarmingState const& state, std::span<uint8_t const> available)
+{
+    require(available.size() >= state.directories.size(), "farming availability omits a saved destination");
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+        if (group_grow::farming_member(state.directories[lane]) && !available[lane]) return false;
+    return true;
+}
 
 struct FarmingRun
 {
+    struct Review
+    {
+        std::string alternative;
+        group_grow::FarmingConfig original_config;
+        group_grow::FarmingAssessment original_assessment;
+        uint64_t original_files = 0, original_members = 0, evaluations = 0;
+        uint64_t original_manifest_bytes = 0, original_update_bytes = 0, original_progress_bytes = 0;
+        uint64_t original_owner_bytes = 0;
+        bool metadata_upgrade = false;
+    };
     struct Lane
     {
         std::vector<Output> outputs;
@@ -4690,6 +4715,10 @@ struct FarmingRun
     std::vector<Lane> lanes;
     std::vector<std::unique_ptr<DirectoryLock>> locks;
     std::vector<std::shared_ptr<group_grow::FarmingMetadataDirectory>> metadata_directories;
+    std::vector<uint8_t> metadata_writable;
+    group_grow::FarmingControlView controls;
+    std::unique_ptr<group_grow::FarmingUpdateMailbox> membership_mailbox;
+    std::vector<std::unique_ptr<group_grow::FarmingOwner>> owners;
     std::vector<fs::path> bound_directories;
     std::vector<group_grow::ConstructionPathBinding> relocation_bindings;
     std::vector<std::optional<group_grow::FarmingProgressFile>> progress;
@@ -4700,12 +4729,18 @@ struct FarmingRun
     group_grow::Stats audited;
     uint64_t metadata = 0, memory_limit = 0, manifest_charge = 0, planning_peak = 0, replacement_peak_bytes = 0;
     std::optional<group_grow::FarmingAssessment> admission;
+    std::optional<Review> review;
     std::vector<std::vector<uint16_t>> certified_members;
     bool all_replicas = true;
+    bool membership_changed = false, membership_reconciled = false, grant_exhausted = false;
     unsigned metadata_workers = 1;
     FarmingStageSubmit stage_submit;
     std::vector<size_t> staging_resources;
     bool migration_managed = false;
+    // Set from the full membership before unavailable lanes leave this
+    // scheduler. Their saved temporary grants may still spend shared space.
+    bool scratch_grants_frozen = false;
+    bool recovery_only() const { return scratch_grants_frozen && (state.version < 9 || state.shared_scratch_possible); }
 
     fs::path directory_path(size_t lane) const
     { return bound_directories.empty() ? file_io::native_path(state.directories.at(lane).directory) : bound_directories.at(lane); }
@@ -4757,19 +4792,28 @@ struct FarmingRun
         manifest_charge = sum(manifest_charge - old, charge);
     }
 
-    void bind_progress()
+    void bind_progress(bool rebind_policy = true, group_grow::FarmingState const* published = nullptr)
     {
         if (state.version < 8 || !state.capacity_fill) return;
         if (progress.empty()) progress.resize(lanes.size());
         auto const policy = group_grow::farming_policy_digest(state);
         for (size_t lane = 0; lane < lanes.size(); ++lane) if (available.empty() || available[lane])
         {
+            if (!metadata_writable.empty() && !metadata_writable[lane]) continue;
             require(lane < locks.size() && locks[lane], "farming progress requires its destination writer lock");
             locks[lane]->check();
             auto const old = progress[lane] ? progress[lane]->allocated_bytes :
                 group_grow::farming_progress_allocation(*metadata_directories[lane]);
             auto grant = group_grow::capture_farming_progress(state, lane, policy);
-            if (progress[lane] && all_replicas && !group_grow::farming_progress_detail::immutable(progress[lane]->progress, grant))
+            bool const same_policy = progress[lane] && progress[lane]->progress.source_policy == policy;
+            // Recovery may publish an already prepared policy without planning
+            // it again. Its canonical head must cover the journal; a local
+            // overlay alone cannot authorize retiring unseen detached work.
+            bool const incorporated = progress[lane] && published &&
+                published->policy_revision > progress[lane]->progress.source_revision &&
+                group_grow::farming_progress_detail::covered(*published, lane, progress[lane]->progress);
+            if (progress[lane] && all_replicas && (rebind_policy || incorporated) && !same_policy &&
+                !group_grow::farming_progress_detail::immutable(progress[lane]->progress, grant))
             {
                 group_grow::retire_farming_progress(*metadata_directories[lane], state, lane, *progress[lane], policy);
                 progress[lane].reset();
@@ -4780,8 +4824,8 @@ struct FarmingRun
             lanes[lane].completed_charge = sum(lanes[lane].completed_charge - old, charge);
             lanes[lane].manifest_charge = sum(lanes[lane].manifest_charge - old, charge);
             manifest_charge = sum(manifest_charge - old, charge);
-            observe_progress(lane, state.control != "active" ? state.control : state.directories[lane].control != "active" ?
-                state.directories[lane].control : "ready");
+            auto const control = effective_control(lane);
+            observe_progress(lane, control != "active" ? control : "ready");
         }
     }
 
@@ -4810,6 +4854,11 @@ struct FarmingRun
         uint16_t members = state.version < 7 && ordinal < layout.files ? layout.file_members(ordinal) : 0;
         auto const& extents = state.directories[lane].extents;
         if (state.capacity_fill && ordinal < extents.size()) members = std::max(members, extents[size_t(ordinal)]);
+        if (state.version >= 9)
+        {
+            auto const& grant = state.directories[lane].grant_extents;
+            if (ordinal < grant.size()) members = std::max(members, grant[size_t(ordinal)]);
+        }
         if (ordinal < current.outputs.size())
             members = std::max({members, current.outputs[ordinal].members, current.outputs[ordinal].pending_members});
         if (ordinal == current.ordinal) members = std::max(members, current.reserved_members);
@@ -4819,8 +4868,10 @@ struct FarmingRun
     uint64_t membership_files(size_t lane) const
     {
         auto const& current = lanes[lane];
-        uint64_t files = std::max(uint64_t(current.outputs.size()), group_grow::farming_layout_files(state.directories[lane]));
+        uint64_t files = std::max(uint64_t(current.outputs.size()), state.version >= 9 ? uint64_t(0) :
+            group_grow::farming_layout_files(state.directories[lane]));
         if (state.capacity_fill) files = std::max(files, uint64_t(state.directories[lane].extents.size()));
+        if (state.version >= 9) files = std::max(files, uint64_t(state.directories[lane].grant_extents.size()));
         if (current.reserved_members) files = std::max(files, sum(current.ordinal, 1));
         if (current.next_reserved_members) files = std::max(files, sum(current.ordinal, 2));
         while (files && !membership(lane, files - 1)) --files;
@@ -4899,7 +4950,7 @@ struct FarmingRun
             require(stream_state::stamp(path) == stamp, "farming plan changed before extent admission");
         ++state.revision; state.parent_digest = parent;
         auto contents = group_grow::farming_state_text(state);
-        auto const auxiliary = state.version >= 8 ? sum(state.update_reserved_bytes, state.progress_reserved_bytes) : 0;
+        auto const auxiliary = state.version >= 8 ? sum(sum(state.update_reserved_bytes, state.progress_reserved_bytes), state.owner_reserved_bytes) : 0;
         require(auxiliary <= state.manifest_reserved_bytes &&
             contents.size() + 65 <= (state.manifest_reserved_bytes - auxiliary) / (state.version == 7 ? 4 : 2),
             "capacity-fill revision exceeds its reserved farming metadata");
@@ -4961,7 +5012,7 @@ struct FarmingRun
             auto const path = metadata_directories[lane]->path / "grow-farm.plan";
             require(!file_io::inspect_link(path.c_str(), &info), "cannot inspect revised farming allocation");
             auto const charge = sum(sum(std::max(uint64_t(info.st_size), product(uint64_t(info.st_blocks), 512)), metadata_directories[lane]->allocation()),
-                sum(farming_update_charge(metadata_directories[lane]->path), group_grow::farming_progress_allocation(*metadata_directories[lane])));
+                farming_auxiliary_charge(*metadata_directories[lane]));
             lanes[lane].completed_charge = sum(lanes[lane].completed_charge - lanes[lane].manifest_charge, charge);
             lanes[lane].manifest_charge = charge; manifest_charge = sum(manifest_charge, charge);
         }
@@ -4988,6 +5039,69 @@ struct FarmingRun
         using Kind = ExtentChange::Kind;
         if (changes.empty()) return;
         require(state.capacity_fill && (all_replicas || state.version >= 8), "capacity filling waits for all saved farming destinations");
+        if (state.version >= 9)
+        {
+            // The replicated policy already assessed every lane's complete
+            // service envelope and reserved its byte and journal allowance.
+            // Spending this lane's grant never republishes unrelated members.
+            std::vector<uint8_t> seen(lanes.size());
+            uint64_t extra = sum(product(changes.capacity(), sizeof(ExtentChange)), seen.capacity());
+            for (auto const& change : changes)
+            {
+                require(change.lane < lanes.size() && !seen[change.lane] &&
+                    (available.empty() || available[change.lane]) && change.lane < progress.size() && progress[change.lane],
+                    "independent farming transition lacks its unique destination journal");
+                seen[change.lane] = 1; auto const& directory = state.directories[change.lane];
+                require(!group_grow::farming_reclaimed_tombstone(directory), "reclaimed farming destination is immutable");
+                require(change.kind == Kind::stop || (change.ordinal >= directory.sealed_files &&
+                    change.ordinal <= directory.extents.size()), "invalid independent farming ordinal");
+                if (change.kind == Kind::seal)
+                    require(change.ordinal == directory.sealed_files && change.ordinal < directory.extents.size() &&
+                        change.members <= directory.extents[size_t(change.ordinal)], "invalid independent farming completion");
+                if (change.kind == Kind::reserve)
+                {
+                    require(directory.fill_stop.empty() && change.members && (change.ordinal == directory.extents.size() ||
+                        change.members >= directory.extents[size_t(change.ordinal)]), "invalid independent farming reservation");
+                    if (directory.grant_extents.size() > directory.extents.capacity())
+                        extra = sum(extra, product(directory.grant_extents.size() - directory.extents.capacity(), sizeof(uint16_t)));
+                }
+            }
+            if (occupied >= memory_limit || extra >= memory_limit - occupied)
+                throw group_grow::FarmingResourceError("independent farming transition exceeds --max-ram", true);
+            auto const old = group_grow::farming_extent_memory(state);
+            for (auto& change : changes)
+            {
+                auto& directory = state.directories[change.lane]; auto kind = change.kind; auto members = change.members;
+                if (kind == Kind::reserve)
+                {
+                    change.accepted = !recovery_only() && group_grow::farming_grant_covers(state, change.lane, change.ordinal, members);
+                    if (change.accepted)
+                    {
+                        directory.extents.reserve(directory.grant_extents.size());
+                        if (change.ordinal == directory.extents.size()) directory.extents.push_back(members);
+                        else directory.extents[size_t(change.ordinal)] = members;
+                        lanes[change.lane].reserved_members = std::max(lanes[change.lane].reserved_members, members);
+                        observe_progress(change.lane, "running", true); continue;
+                    }
+                    grant_exhausted = grant_exhausted || accepts_future(change.lane);
+                    kind = change.rejected; members = change.sealed_members;
+                    if (kind == Kind::reserve) continue;
+                }
+                if (kind == Kind::seal)
+                {
+                    require(change.ordinal == directory.sealed_files && change.ordinal < directory.extents.size() &&
+                        members <= directory.extents[size_t(change.ordinal)], "invalid independent farming completion");
+                    if (members) { directory.extents[size_t(change.ordinal)] = members; ++directory.sealed_files; }
+                    else directory.extents.resize(size_t(change.ordinal));
+                    if (!change.reason.empty()) directory.extents.resize(size_t(directory.sealed_files));
+                }
+                if (kind == Kind::stop || !change.reason.empty()) directory.fill_stop = change.reason;
+                observe_progress(change.lane, "running", members != 0);
+            }
+            metadata = sum(metadata - old, group_grow::farming_extent_memory(state));
+            planning_peak = std::max(planning_peak, sum(occupied, extra));
+            return;
+        }
         if (!all_replicas)
         {
             for (auto& change : changes)
@@ -5187,8 +5301,10 @@ struct FarmingRun
     { return farming_identity(keys, state, state.directories[lane], ordinal); }
     std::string stop_reason(Arguments const& args) const
     {
-        if (state.control != "active") return state.control == "draining" ? "drained" : state.control;
-        if (std::all_of(state.directories.begin(), state.directories.end(), [](auto const& d) { return d.control != "active"; }))
+        auto const control = job_control();
+        if (control != "active") return control == "draining" ? "drained" : control;
+        if (std::all_of(state.directories.begin(), state.directories.end(), [&](auto const& d)
+            { return !group_grow::farming_member(d) || effective_control(size_t(&d - state.directories.data())) != "active"; }))
             return "destinations-paused";
         if (std::any_of(lanes.begin(), lanes.end(), [](auto const& lane) { return lane.no_capacity; })) return "capacity";
         for (auto const& directory : state.directories) if (directory.fill_stop == "capacity") return directory.fill_stop;
@@ -5198,8 +5314,15 @@ struct FarmingRun
             return "total-member-limit";
         return "group-limit";
     }
+    std::string job_control() const
+    { return controls.destinations.size() == state.directories.size() ? controls.control : state.control; }
+    std::string effective_control(size_t lane) const
+    {
+        if (controls.destinations.size() == state.directories.size()) return controls.effective(lane);
+        return group_grow::restrictive_farming_control(state.control, state.directories.at(lane).control);
+    }
     bool accepts_future(size_t lane) const
-    { return state.control == "active" && state.directories[lane].control == "active"; }
+    { return !recovery_only() && group_grow::farming_member(state.directories[lane]) && effective_control(lane) == "active"; }
     fs::path path(size_t lane) const
     {
         auto const& current = lanes[lane]; auto const directory = directory_path(lane);
@@ -5223,8 +5346,10 @@ struct FarmingRun
         auto const& current = lanes[lane];
         auto const& directory = state.directories[lane];
         bool const started = current.ordinal < current.outputs.size();
-        if (state.control == "paused" || directory.control == "paused") return 0;
-        if ((state.control != "active" || directory.control != "active") && !started) return 0;
+        if (recovery_only() && !started) return 0;
+        auto const control = effective_control(lane);
+        if ((!group_grow::farming_member(directory) && (directory.detached_acknowledged || !started)) || control == "paused") return 0;
+        if (control != "active" && !started) return 0;
         if (state.fixed_extent && current.ordinal >= (state.capacity_fill ? state.directories[lane].extents.size() :
             state.directories[lane].layout.files)) return 0;
         // A lower future target never revokes construction already recorded
@@ -5269,7 +5394,7 @@ struct FarmingRun
                 }
                 std::unique_ptr<Construction> audit;
                 Construction::Inspection inspected;
-                if (args.plan_only)
+                if (args.plan_only || group_grow::farming_reclaimed_tombstone(state.directories[i]))
                 {
                     group_grow::ConstructionInspectionLimits limits{cfg.memory_limit_bytes,
                         std::chrono::steady_clock::now() + std::chrono::seconds(30), args.cancelled};
@@ -5462,16 +5587,21 @@ struct FarmingRun
 
     void select_available()
     {
-        all_replicas = std::find(available.begin(), available.end(), uint8_t(0)) == available.end();
+        all_replicas = farming_members_available(state, available);
         auto const certificate_bytes = certificate_memory();
         bool const complete_certificate = certified_members.size() == lanes.size();
-        for (size_t i = available.size(); i-- > 0;) if (!available[i])
+        for (size_t i = available.size(); i-- > 0;) if (!available[i] ||
+            (!group_grow::farming_member(state.directories[i]) &&
+                (state.directories[i].detached_acknowledged || lanes[i].ordinal >= lanes[i].outputs.size())))
         {
             if (complete_certificate) certified_members.erase(certified_members.begin() + i);
+            if (!owners.empty()) owners.erase(owners.begin() + i);
+            if (!controls.destinations.empty()) controls.destinations.erase(controls.destinations.begin() + i);
             state.directories.erase(state.directories.begin() + i);
             lanes.erase(lanes.begin() + i);
             if (!locks.empty()) locks.erase(locks.begin() + i);
             if (!metadata_directories.empty()) metadata_directories.erase(metadata_directories.begin() + i);
+            if (!metadata_writable.empty()) metadata_writable.erase(metadata_writable.begin() + i);
             if (!bound_directories.empty()) bound_directories.erase(bound_directories.begin() + i);
             if (!progress.empty()) progress.erase(progress.begin() + i);
             available.erase(available.begin() + i);
@@ -5844,6 +5974,7 @@ FarmingJob farming_arguments(Arguments& args)
         directories.push_back(path);
     }
     std::map<std::string, group_grow::FarmingState> revisions;
+    uint64_t revisions_memory = 0;
     std::set<fs::path> visited;
     auto read = [&](fs::path path, bool pending)
     {
@@ -5871,7 +6002,9 @@ FarmingJob farming_arguments(Arguments& args)
         if (!revisions.empty()) require(revisions.begin()->second.job_id == state.job_id,
             "destinations contain different farming jobs; select one job with --manifest and its own destinations");
         if (revisions.contains(digest)) return;
-        require(revisions.size() < 2, "conflicting farming revisions; restore a consistent job before continuing");
+        require(revisions.size() < 2050, "farming revision discovery exceeds its member bound");
+        revisions_memory = sum(revisions_memory, sum(product(file.body.size(), 4), group_grow::farming_extent_memory(state)));
+        require(revisions_memory < args.max_ram / 2, "farming revision discovery exceeds --max-ram");
         for (auto const& d : state.directories) directories.push_back(file_io::native_path(d.directory));
         revisions.emplace(digest, std::move(state));
     };
@@ -5951,25 +6084,74 @@ FarmingJob farming_arguments(Arguments& args)
         auto selected = revisions.begin();
         for (auto at = revisions.begin(); at != revisions.end(); ++at)
             if (at->second.revision > selected->second.revision) selected = at;
-        if (revisions.size() == 2)
+        auto valid_transition = [](group_grow::FarmingState const& before, std::string const& digest,
+            group_grow::FarmingState const& after)
         {
-            auto const previous = selected == revisions.begin() ? std::next(selected) : revisions.begin();
-            auto const& before = previous->second; auto const& after = selected->second;
             bool const policy = group_grow::valid_farming_policy_revision(before, after);
-            require(before.revision < UINT64_MAX && after.revision == before.revision + 1 &&
-                after.parent_digest == previous->first && after.seed == before.seed && after.seed_owner == before.seed_owner &&
-                after.farmer == before.farmer && after.pool == before.pool && after.pool_public_key == before.pool_public_key &&
-                after.fingerprint == before.fingerprint && after.fixed_extent == before.fixed_extent &&
-                after.directories.size() >= before.directories.size() &&
-                (policy || (after.config == before.config && group_grow::valid_farming_extent_revision(before, after))),
-                "conflicting farming revisions; no files were changed");
+            if (before.revision == UINT64_MAX || after.revision != before.revision + 1 || after.parent_digest != digest ||
+                after.seed != before.seed || after.seed_owner != before.seed_owner || after.farmer != before.farmer ||
+                after.pool != before.pool || after.pool_public_key != before.pool_public_key ||
+                after.fingerprint != before.fingerprint || after.fixed_extent != before.fixed_extent ||
+                after.directories.size() < before.directories.size() ||
+                !(policy || (after.config == before.config && group_grow::valid_farming_extent_revision(before, after)))) return false;
             for (size_t i = 0; !policy && i < before.directories.size(); ++i)
             {
                 auto const& a = before.directories[i]; auto const& b = after.directories[i];
-                require(a.layout == b.layout && a.identity_resource == b.identity_resource &&
-                    a.identity_resources == b.identity_resources && a.identity_epoch == b.identity_epoch,
-                    "farming revision changed an existing identity assignment");
+                if (a.layout != b.layout || a.identity_resource != b.identity_resource ||
+                    a.identity_resources != b.identity_resources || a.identity_epoch != b.identity_epoch) return false;
             }
+            return true;
+        };
+        auto relocation_source = revisions.end();
+        for (auto previous = revisions.begin(); previous != revisions.end(); ++previous)
+        {
+            if (previous == selected) continue;
+            auto const& before = previous->second; auto const& after = selected->second;
+            bool const parent = before.revision < UINT64_MAX && after.revision == before.revision + 1 &&
+                after.parent_digest == previous->first;
+            if (!parent)
+            {
+                require(after.version >= 9 && before.revision < after.revision,
+                    "conflicting farming revisions; no files were changed");
+                for (auto const& copy : job.copies) if (copy.stamp && copy.digest == previous->first)
+                {
+                    auto root = copy.path.parent_path();
+                    if (root.filename() == ".xchplot2") root = root.parent_path();
+                    auto const native = group_grow::farming_directory_identity(root);
+                    auto const at = std::find_if(after.directories.begin(), after.directories.end(),
+                        [&](auto const& directory) { return !group_grow::farming_member(directory) && directory.directory_identity == native; });
+                    require(at != after.directories.end(), "an old farming revision is not an authenticated detached destination");
+                    auto const lane = size_t(at - after.directories.begin());
+                    auto authenticated = [&](auto const& candidate)
+                    {
+                        return (at->detached_source_revision == candidate.second.revision && at->detached_source_digest == candidate.first) ||
+                            group_grow::farming_detached_replica_matches(candidate.second, after, lane);
+                    };
+                    bool related = authenticated(*previous);
+                    // A detached drive may retain both the published parent
+                    // and a durable successor from its last partial update.
+                    // Follow only present, validated edges back from one of
+                    // this exact member's authenticated source records.
+                    for (auto candidate = revisions.begin(); !related && candidate != revisions.end(); ++candidate)
+                    {
+                        if (candidate->second.revision <= before.revision || !authenticated(*candidate)) continue;
+                        auto child = candidate;
+                        while (child->second.revision > before.revision)
+                        {
+                            auto parent = revisions.find(child->second.parent_digest);
+                            if (parent == revisions.end() || !valid_transition(parent->second, parent->first, child->second)) break;
+                            if (parent == previous) { related = true; break; }
+                            child = parent;
+                        }
+                    }
+                    require(related,
+                        "returning farming destination has an unrelated source policy; no files were changed");
+                }
+                continue;
+            }
+            bool const policy = group_grow::valid_farming_policy_revision(before, after);
+            require(valid_transition(before, previous->first, after),
+                "conflicting farming revisions; no files were changed");
             bool relocation = false;
             for (size_t i = 0; i < before.directories.size(); ++i)
                 relocation = relocation || before.directories[i].directory != after.directories[i].directory ||
@@ -5977,14 +6159,19 @@ FarmingJob farming_arguments(Arguments& args)
             if (relocation && after.version >= 8)
             {
                 require(policy, "native farming relocation requires its reviewed policy revision");
-                job.progress_source = std::move(previous->second);
+                relocation_source = previous;
             }
         }
+        if (relocation_source != revisions.end()) job.progress_source = std::move(relocation_source->second);
         job.digest = selected->first; job.saved = std::move(selected->second);
         auto const& saved = *job.saved;
         for (auto const& copy : job.copies) if (copy.stamp)
         {
-            job.pending = job.pending || copy.pending || copy.digest != job.digest;
+            auto root = copy.path.parent_path();
+            if (root.filename() == ".xchplot2") root = root.parent_path();
+            bool const detached = std::any_of(saved.directories.begin(), saved.directories.end(), [&](auto const& directory)
+                { return !group_grow::farming_member(directory) && group_grow::farming_directory_identity(root) == directory.directory_identity; });
+            job.pending = job.pending || (!detached && (copy.pending || copy.digest != job.digest));
             job.published = job.published || (!copy.pending && copy.digest == job.digest);
         }
         require(args.resume || args.plan_only || automatic, "farming job exists; use fill DIR to continue it, or --resume for the saved policy");
@@ -6027,7 +6214,6 @@ FarmingJob farming_arguments(Arguments& args)
         limit(args.max_groups_set, args.max_groups, saved.max_groups, "--max-groups");
         limit(args.max_total_members_set, args.max_total_members, saved.max_total_members, "--max-total-members");
         job.policy_changed = revisable && ((!job.preview && (args.update || args.extend)) ||
-            !args.farm_action.empty() ||
             (job.preview && job.preview->preview.state.policy_revision > saved.policy_revision) ||
             farming_configuration(args) != saved.config ||
             args.capacity != saved.capacity || args.headroom != saved.headroom || args.max_groups != saved.max_groups ||
@@ -6133,14 +6319,33 @@ FarmingJob farming_arguments(Arguments& args)
                 preview.state.max_total_members == job.saved->max_total_members &&
                 preview.state.parent_digest == (job.changed ? job.digest : job.saved->parent_digest),
                 "saved farming preview changed the source job policy");
+            if (job.saved->version >= 9)
+                require(preview.state.control == job.saved->control && preview.state.request_floor == job.saved->request_floor &&
+                    preview.state.manifest_reserved_bytes == job.saved->manifest_reserved_bytes &&
+                    preview.state.update_reserved_bytes == job.saved->update_reserved_bytes &&
+                    preview.state.progress_reserved_bytes == job.saved->progress_reserved_bytes &&
+                    preview.state.owner_reserved_bytes == job.saved->owner_reserved_bytes &&
+                    preview.state.shared_scratch_possible == job.saved->shared_scratch_possible &&
+                    preview.state.conservative_storage_topology == job.saved->conservative_storage_topology &&
+                    preview.state.ancestors == job.saved->ancestors,
+                    "saved farming preview changed the source job allocation policy");
             for (size_t i = 0; i < job.saved->directories.size(); ++i)
             {
                 auto const& before = job.saved->directories[i]; auto const& after = preview.state.directories[i];
                 require(before.layout == after.layout && before.identity_resources == after.identity_resources &&
                     before.identity_resource == after.identity_resource && before.identity_epoch == after.identity_epoch &&
-                    before.extents == after.extents && before.sealed_files == after.sealed_files && before.fill_stop == after.fill_stop &&
+                    (job.saved->version >= 9 || (before.extents == after.extents && before.sealed_files == after.sealed_files &&
+                        before.fill_stop == after.fill_stop)) &&
                     before.cohorts == after.cohorts && before.layout_first == after.layout_first && before.policy_files == after.policy_files,
                     "saved farming preview changed an existing identity or extent assignment");
+                if (job.saved->version >= 9)
+                    require(before.directory_identity == after.directory_identity && before.filesystem == after.filesystem &&
+                        before.resource == after.resource && before.capacity_bytes == after.capacity_bytes && before.storage == after.storage &&
+                        before.control == after.control && before.membership == after.membership && before.detached_at == after.detached_at &&
+                        before.detached_source_revision == after.detached_source_revision && before.detached_source_digest == after.detached_source_digest &&
+                        before.detached_acknowledged == after.detached_acknowledged && before.detached_reclaimed == after.detached_reclaimed &&
+                        before.grant_extents == after.grant_extents && before.grant_config == after.grant_config,
+                        "saved farming preview changed an independently protected destination grant");
                 require(after.capacity_bytes <= before.capacity_bytes,
                     "saved farming preview enlarged an existing destination quota");
             }
@@ -6187,11 +6392,14 @@ uint64_t farming_manifest_reservation(group_grow::FarmingState& state, uint64_t 
     // Keep independent allowances: a live requester must never consume the
     // next plan copy or the local writer's progress replacement.
     state.update_reserved_bytes = std::max(state.update_reserved_bytes,
-        group_grow::farming_update_reservation(sum(product(text_bytes, 2), 4096), alignment));
+        sum(group_grow::farming_update_reservation(sum(product(text_bytes, 2), 4096), alignment),
+            state.version >= 9 ? group_grow::farming_control_reservation(state, alignment) : 0));
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
         state.progress_reserved_bytes = std::max(state.progress_reserved_bytes,
             product(group_grow::farming_update_aligned(group_grow::farming_progress_size_bound(state, lane), alignment), 2));
-    return sum(copies, sum(state.update_reserved_bytes, state.progress_reserved_bytes));
+    if (state.version >= 9) state.owner_reserved_bytes = std::max(state.owner_reserved_bytes,
+        group_grow::farming_owner_reservation(alignment));
+    return sum(copies, sum(sum(state.update_reserved_bytes, state.progress_reserved_bytes), state.owner_reserved_bytes));
 }
 void revise_farming_policy(Arguments const& args, FarmingJob const& job, FarmingRun& run,
     std::span<group_grow::StorageDevice const> devices, std::span<std::string const> identities,
@@ -6204,7 +6412,10 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
     require(before.capacity_fill, "only ordinary capacity-fill jobs support future-policy revisions");
     state.identity_k = before.version >= 7 ? before.identity_k : before.config.k;
     state.identity_strength = before.version >= 7 ? before.identity_strength : before.config.strength;
-    state.version = 8; state.policy_revision = state.revision; state.config = farming_configuration(args);
+    state.version = 9; state.policy_revision = state.revision; state.config = farming_configuration(args);
+    farming_record_parent(state, before.revision, job.digest);
+    state.shared_scratch_possible = before.version < 9 || before.shared_scratch_possible ||
+        !args.temporary.empty() || args.destination_temp != "off";
     if (!job.requested_update.empty()) state.applied_update = job.requested_update;
     set_farming_state_profile(state, farming_profile(args, state.config));
     state.capacity = args.capacity; state.headroom = args.headroom;
@@ -6231,7 +6442,35 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
     bool const parameters = state.config.k != before.config.k || state.config.strength != before.config.strength ||
         state.config.group_members_override != before.config.group_members_override || state.config.fixed_meta != before.config.fixed_meta ||
         state.config.meta_group_override != before.config.meta_group_override || state.config.meta_slots_override != before.config.meta_slots_override;
-    auto const resources = writer_groups(devices);
+    if (farming_membership_obligations(before).unfenced)
+    {
+        // Each disconnected partition may use only the rights it already
+        // holds. Harvester declarations can be reassessed, but a surviving
+        // subset cannot create new storage, identity or service grants.
+        require(!parameters && job.directories.size() == before.directories.size() &&
+            state.capacity == before.capacity && state.headroom == before.headroom &&
+            state.max_groups <= before.max_groups && state.max_total_members <= before.max_total_members &&
+            state.shared_scratch_possible == before.shared_scratch_possible, farming_independent_policy_reason());
+        for (size_t lane = 0; lane < state.directories.size(); ++lane)
+            if (run.available[lane] && !farming_reclaimed_tombstone(state.directories[lane]))
+                state.directories[lane].policy_files = run.lanes[lane].outputs.size();
+        std::vector<std::vector<uint16_t>> grants;
+        for (auto const& directory : state.directories) grants.push_back(directory.grant_extents);
+        static_cast<FarmingAssessment&>(state.estimate) = farming_assess_state(state, grants, args.max_ram - run.metadata);
+        run.planning_peak = std::max(run.planning_peak, sum(run.metadata, state.estimate.planning_memory_bytes));
+        auto const text = farming_state_text(state);
+        auto needed = farming_manifest_reservation(state, text.size(), alignment);
+        if (!job.legacy_metadata.value_or(false)) needed = sum(needed, product(alignment, 2));
+        require(needed <= state.manifest_reserved_bytes,
+            "the revised policy needs more metadata than the detached writer's saved grant; acknowledge its retirement before resizing");
+        require(valid_farming_policy_revision(before, state) && valid_farming_independent_policy_revision(before, state),
+            farming_independent_policy_reason());
+        return;
+    }
+    for (size_t lane = 0; lane < before.directories.size(); ++lane)
+        if (!farming_member(before.directories[lane]) && !run.available[lane]) state.conservative_storage_topology = true;
+    auto resources = writer_groups(devices);
+    if (state.conservative_storage_topology) std::fill(resources.begin(), resources.end(), 0);
     auto const resource_count = *std::max_element(resources.begin(), resources.end()) + 1;
     uint64_t schedule = 0;
     for (auto const& d : before.directories)
@@ -6246,6 +6485,7 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
     for (size_t i = 0; i < count; ++i)
     {
         auto& d = state.directories[i];
+        if (!farming_member(d)) continue;
         auto const& lane = run.lanes[i];
         first[i] = lane.outputs.size();
         for (size_t file = 0; file < lane.outputs.size(); ++file)
@@ -6280,6 +6520,13 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
         std::map<std::string, size_t> shares;
         for (size_t i = 0; i < count; ++i)
         {
+            if (!farming_member(state.directories[i]))
+            {
+                auto const& directory = state.directories[i];
+                if (space_available.contains(directory.filesystem))
+                    minimum[directory.filesystem] = sum(minimum[directory.filesystem], directory.capacity_bytes);
+                continue;
+            }
             minimum[devices[i].filesystem] = sum(minimum[devices[i].filesystem], sum(owned[i], state.manifest_reserved_bytes));
             ++shares[devices[i].filesystem];
         }
@@ -6301,6 +6548,7 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
         for (size_t i = 0; i < count; ++i)
         {
             auto& d = state.directories[i]; auto const& filesystem = devices[i].filesystem;
+            if (!farming_member(d)) continue;
             d.capacity_bytes = sum(sum(owned[i], state.manifest_reserved_bytes),
                 (budgets.at(filesystem) - minimum.at(filesystem)) / shares.at(filesystem));
             d.storage.capacity_bytes = d.capacity_bytes - state.manifest_reserved_bytes;
@@ -6322,7 +6570,9 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
         }
         for (size_t i = 0; i < count; ++i)
         {
-            auto& d = state.directories[i]; d.extents.resize(size_t(first[i]));
+            auto& d = state.directories[i];
+            if (!farming_member(d)) continue;
+            d.extents.resize(size_t(first[i]));
             FarmingDrivePlan addition = d.layout;
             if (!fresh[i])
             {
@@ -6371,13 +6621,19 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
             }
             run.lanes[i].no_capacity = false;
         }
+        initialize_farming_grants(state);
         auto const current_memory = farming_extent_memory(state);
         run.metadata = sum(run.metadata - retained_memory, current_memory); retained_memory = current_memory;
         require(run.metadata < args.max_ram, "revised farming metadata exceeds --max-ram");
         std::vector<std::vector<uint16_t>> members;
-        for (auto const& d : state.directories) members.push_back(d.extents);
+        for (auto const& d : state.directories) members.push_back(farming_member(d) ? d.extents : d.grant_extents);
         state.estimate = planned;
         static_cast<FarmingAssessment&>(state.estimate) = farming_assess_state(state, members, args.max_ram - run.metadata);
+        if (state.estimate.feasible)
+            static_cast<FarmingAssessment&>(state.estimate) = expand_farming_grants(state, args.max_ram - run.metadata);
+        auto const granted_memory = farming_extent_memory(state);
+        run.metadata = sum(run.metadata - retained_memory, granted_memory); retained_memory = granted_memory;
+        require(run.metadata < args.max_ram, "farming allocation grants exceed --max-ram");
         auto k = state.config.k;
         for (auto const& d : state.directories) for (auto const& cohort : d.cohorts) k = std::max(k, cohort.config.k);
         state.estimate.index_bytes = (uint64_t(1) << (k - 6)) * 8;
@@ -6410,6 +6666,7 @@ std::vector<std::unique_ptr<DirectoryLock>> farming_writer_locks(FarmingJob cons
     for (size_t lane = 0; lane < job.saved->directories.size(); ++lane)
     {
         auto const& directory = job.saved->directories[lane];
+        if (!group_grow::farming_member(directory)) continue;
         auto const& path = job.directories[lane];
         require(fs::is_directory(path) && group_grow::farming_directory_identity(path) == directory.directory_identity,
             "future-policy changes wait for the saved destination: " + file_io::path_text(path));
@@ -6426,10 +6683,125 @@ std::vector<std::unique_ptr<DirectoryLock>> farming_writer_locks(FarmingJob cons
     job.check();
     return locks;
 }
+void settle_farming_membership(Arguments const& args, FarmingJob const& job, FarmingRun& run, uint64_t alignment)
+{
+    using namespace group_grow;
+    if (args.plan_only || !job.saved || job.changed || job.pending || run.state.version < 8 || !run.state.capacity_fill) return;
+    {
+        FarmingUpdateMailbox observed(*job.saved, job.legacy_metadata, false, args.max_ram, job.directories);
+        auto const controls = farming_control_view(run.state, observed.records(), observed.control_state());
+        bool pending = false;
+        for (size_t lane = 0; lane < run.state.directories.size(); ++lane)
+            pending = pending || (farming_member(run.state.directories[lane]) ?
+                controls.control == "retired" || controls.destinations[lane] == "retired" :
+                !farming_reclaimed_tombstone(run.state.directories[lane]));
+        if (!pending) return;
+    }
+    // Recheck under the request locks before publishing retirement. Ordinary
+    // resumes with no retirement intent do not create a request-lock record.
+    auto mailbox = std::make_unique<FarmingUpdateMailbox>(*job.saved, job.legacy_metadata, true, args.max_ram, job.directories);
+    if (!mailbox->locked() && !mailbox->terminal()) return;
+    job.check();
+    run.controls = farming_control_view(run.state, mailbox->records(), mailbox->control_state());
+    auto const& before = *job.saved;
+    std::vector<size_t> detach, acknowledge, reclaim;
+    auto drained = [&](size_t lane)
+    {
+        return run.available[lane] && run.lanes[lane].ordinal >= run.lanes[lane].outputs.size() &&
+            run.state.directories[lane].sealed_files >= run.lanes[lane].outputs.size();
+    };
+    for (size_t lane = 0; lane < run.state.directories.size(); ++lane)
+    {
+        auto const& directory = run.state.directories[lane];
+        if (farming_member(directory))
+        {
+            bool const retiring = run.controls.control == "retired" || run.controls.destinations[lane] == "retired";
+            // All members that remain in the job participate. A retiring
+            // missing writer keeps its complete outstanding allocation.
+            if (!run.available[lane] && !retiring) return;
+            if (retiring && (!run.available[lane] || drained(lane))) detach.push_back(lane);
+            continue;
+        }
+        if (farming_reclaimed_tombstone(directory) || !drained(lane)) continue;
+        auto const path = run.metadata_directories[lane]->path / "grow-farm.plan";
+        auto const published = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& copy)
+            { return copy.path == path && copy.stamp && !copy.pending && copy.digest == job.digest; });
+        // The exact native lock plus the already durable v9 tombstone fences
+        // old writers. Keep acknowledgement separate from releasing a grant.
+        if (!directory.detached_acknowledged)
+        {
+            if (published != job.copies.end()) acknowledge.push_back(lane);
+            continue;
+        }
+        uint64_t charge = run.state.manifest_reserved_bytes;
+        for (auto const& output : run.lanes[lane].outputs) charge = sum(charge, output.charge());
+        require(charge <= directory.capacity_bytes, "retirement metadata exceeds its retained destination grant");
+        reclaim.push_back(lane);
+    }
+    if (detach.empty() && acknowledge.empty() && reclaim.empty()) return;
+    require(run.state.revision < UINT64_MAX, "farming job revision exhausted");
+    bool const legacy_upgrade = run.state.version == 8;
+    if (legacy_upgrade)
+    {
+        uint64_t grants = 0;
+        for (auto const& directory : before.directories) grants = sum(grants, product(directory.extents.size(), sizeof(uint16_t)));
+        require(run.metadata < args.max_ram && grants < args.max_ram - run.metadata,
+            "legacy retirement grants exceed --max-ram; retirement was not applied");
+    }
+    ++run.state.revision; run.state.policy_revision = run.state.revision; run.state.parent_digest = job.digest;
+    if (legacy_upgrade) initialize_farming_retirement_upgrade(before, run.state);
+    else farming_record_parent(run.state, before.revision, job.digest);
+    for (size_t lane = 0; lane < run.state.directories.size(); ++lane)
+        if (!farming_reclaimed_tombstone(run.state.directories[lane])) run.state.directories[lane].policy_files =
+            std::max(run.state.directories[lane].policy_files, run.state.directories[lane].sealed_files);
+    for (auto lane : detach) detach_farming_member(run.state, lane);
+    for (auto lane : acknowledge) acknowledge_farming_detachment(run.state, lane);
+    for (auto lane : reclaim)
+    {
+        auto& directory = run.state.directories[lane];
+        directory.extents.resize(run.lanes[lane].outputs.size()); directory.grant_extents = directory.extents;
+        directory.capacity_bytes = run.state.manifest_reserved_bytes;
+        for (auto const& output : run.lanes[lane].outputs) directory.capacity_bytes = sum(directory.capacity_bytes, output.charge());
+        directory.storage.capacity_bytes = directory.capacity_bytes - run.state.manifest_reserved_bytes;
+        directory.detached_reclaimed = true;
+    }
+    require(valid_farming_policy_revision(before, run.state), "farming retirement changed a protected identity or unfenced allocation");
+    if (!legacy_upgrade && (farming_membership_obligations(before).unfenced || farming_membership_obligations(run.state).unfenced))
+        require(valid_farming_independent_policy_revision(before, run.state), farming_independent_policy_reason());
+    auto const contents = farming_state_text(run.state);
+    auto const refusal = "retirement was not applied: the saved metadata grant cannot hold its durable retirement record; "
+        "restore the original destinations and review plan --upgrade-job, or preserve this job and use a separately reviewed recovery job";
+    require(farming_revision_fits(run.state, contents.size() + 65), refusal);
+    if (legacy_upgrade)
+    {
+        auto const copies = product(farming_update_aligned(sum(contents.size() + 65,
+            std::max(uint64_t(1024), farming_revision_margin(run.state))), alignment), 2);
+        auto const reserved = sum(sum(copies, sum(run.state.update_reserved_bytes, run.state.progress_reserved_bytes)),
+            job.legacy_metadata.value_or(false) ? 0 : product(alignment, 2));
+        require(reserved <= run.state.manifest_reserved_bytes, refusal);
+        auto const controls = farming_control_reservation(run.state, alignment);
+        require(controls <= run.state.update_reserved_bytes, refusal);
+        for (size_t lane = 0; lane < run.state.directories.size(); ++lane)
+        {
+            auto const progress = product(farming_update_aligned(farming_progress_size_bound(run.state, lane), alignment), 2);
+            require(progress <= run.state.progress_reserved_bytes, refusal);
+            if (!run.available[lane]) continue;
+            require(lane < run.locks.size() && run.locks[lane], "legacy retirement lacks a native destination writer lock");
+            run.locks[lane]->check();
+            auto const used = farming_update_allocation(run.metadata_directories[lane]->path);
+            require(used <= run.state.update_reserved_bytes && controls / 2 <= run.state.update_reserved_bytes - used, refusal);
+        }
+    }
+    run.membership_changed = true;
+    run.membership_mailbox = std::move(mailbox);
+    run.all_replicas = farming_members_available(run.state, run.available);
+}
 std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys, FarmingJob const& job,
     std::vector<std::unique_ptr<DirectoryLock>> held_locks = {})
 {
     auto run = std::make_unique<FarmingRun>();
+    require(!job.saved || !job.policy_changed || group_grow::farming_member_count(*job.saved),
+        "retired farming job has no policy writer; plan a new ordinary job for future allocation");
     if (job.saved) run->state = *job.saved;
     run->migration_managed = job.migration_managed;
     auto const& directories = job.directories;
@@ -6439,6 +6811,9 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
     size_t const previous = job.saved ? job.saved->directories.size() : 0;
     run->previous_destinations = previous;
     run->lanes.resize(directories.size()); run->available.resize(directories.size());
+    run->metadata_writable.resize(directories.size(), 1);
+    if (job.saved) for (size_t lane = 0; lane < previous; ++lane)
+        run->metadata_writable[lane] = !group_grow::farming_reclaimed_tombstone(job.saved->directories[lane]);
     run->metadata = sum(product(directories.size(), mib), path_metadata(directories));
     if (job.saved) run->metadata = sum(run->metadata, group_grow::farming_extent_memory(*job.saved));
     if (job.progress_source)
@@ -6468,7 +6843,8 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         if (!present)
         {
             require(i < previous, "new destination must be an existing directory: " + file_io::path_text(directories[i]));
-            missing.push_back(directories[i]);
+            identities[i] = job.saved->directories[i].directory_identity;
+            if (group_grow::farming_member(job.saved->directories[i])) missing.push_back(directories[i]);
         }
         else
         {
@@ -6485,7 +6861,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             (!job.pending || job.published)), message + " Independent recovery can use --resume --allow-missing.");
     }
     run->all_replicas = missing.empty();
-    if (!args.plan_only)
+    if (!args.plan_only || !held_locks.empty())
     {
         std::vector<size_t> order;
         for (size_t i = 0; i < directories.size(); ++i) if (run->available[i]) order.push_back(i);
@@ -6495,11 +6871,18 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         run->locks = std::move(held_locks); run->locks.resize(directories.size());
         for (auto i : order)
         {
-            if (!run->locks[i]) run->locks[i] = std::make_unique<DirectoryLock>(directories[i]);
+            if (!run->locks[i])
+                try { run->locks[i] = std::make_unique<DirectoryLock>(directories[i]); }
+                catch (DirectoryBusy const&)
+                {
+                    if (i >= previous || group_grow::farming_member(job.saved->directories[i])) throw;
+                    run->available[i] = 0; continue;
+                }
             require(run->locks[i]->path == directories[i], "farming update destination changed after locking");
             run->locks[i]->check();
         }
     }
+    if (job.saved) run->all_replicas = farming_members_available(*job.saved, run->available);
     job.check();
     if (!job.requested_identities.empty())
         require(job.requested_identities == identities,
@@ -6509,6 +6892,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             "farming destination changed while acquiring its lock");
     auto const* progress_source = job.progress_source ? &*job.progress_source : job.saved ? &*job.saved : nullptr;
     std::vector<std::optional<group_grow::FarmingProgressNativeBinding>> progress_bindings(directories.size());
+    std::vector<group_grow::FarmingControlNativeBinding> control_bindings;
     bool const relocation_handoff = !job.relocated.empty() || job.progress_source.has_value();
     if (progress_source) for (size_t lane = 0; lane < progress_source->directories.size(); ++lane)
     {
@@ -6519,7 +6903,10 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         if (!approved) continue;
         require(run->all_replicas, "native farming relocation waits for every saved destination");
         if (source.directory_identity != identities[lane])
+        {
             progress_bindings[lane] = group_grow::FarmingProgressNativeBinding{source.directory_identity, identities[lane]};
+            control_bindings.push_back({source.directory_identity, identities[lane]});
+        }
         run->relocation_bindings.push_back({source.directory, file_io::path_text(directories[lane]), identities[lane]});
     }
     for (auto const& directory : directories)
@@ -6565,7 +6952,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             plan_charges[i] = sum(plan_charges[i], std::max(uint64_t(info.st_size), product(uint64_t(info.st_blocks), 512)));
         }
         plan_charges[i] = sum(sum(plan_charges[i], run->metadata_directories[i]->allocation()),
-            sum(farming_update_charge(run->metadata_directories[i]->path), group_grow::farming_progress_allocation(*run->metadata_directories[i])));
+            farming_auxiliary_charge(*run->metadata_directories[i]));
         allocated[devices[i].filesystem] = sum(allocated[devices[i].filesystem], plan_charges[i]);
         file_io::Space space{};
         require(!file_io::space_path(directories[i].c_str(), &space), "cannot inspect farming destination capacity");
@@ -6601,8 +6988,9 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         run->state.capacity_fill = run->state.fixed_extent;
         if (run->state.capacity_fill)
         {
-            run->state.version = 8; run->state.policy_revision = run->state.revision;
+            run->state.version = 9; run->state.policy_revision = run->state.revision;
             run->state.identity_k = run->state.config.k; run->state.identity_strength = run->state.config.strength;
+            run->state.shared_scratch_possible = !args.temporary.empty() || args.destination_temp != "off";
         }
         run->state.capacity = args.capacity; run->state.headroom = args.headroom;
         run->state.max_groups = args.max_groups; run->state.max_total_members = args.max_total_members;
@@ -6615,6 +7003,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         auto const policy = group_grow::farming_policy_digest(job.progress_source ? *job.progress_source : run->state);
         for (size_t lane = 0; lane < previous; ++lane) if (run->available[lane])
         {
+            if (!run->metadata_writable[lane]) continue;
             auto const bytes = group_grow::farming_progress_memory_bound(run->state, lane);
             progress_memory = sum(progress_memory, bytes); run->metadata = sum(run->metadata, bytes);
             require(run->metadata < args.max_ram, "local farming progress exceeds --max-ram");
@@ -6645,6 +7034,26 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
     uint64_t extent_metadata = group_grow::farming_extent_memory(run->state);
     run->metadata = sum(run->metadata, extent_metadata);
     require(run->metadata < args.max_ram, "saved farming extents exceed --max-ram");
+    if (job.preview && job.saved && !job.policy_changed && run->state.version >= 9)
+        for (size_t lane = 0; lane < previous; ++lane)
+        {
+            // An unchanged review can include local progress absent from the
+            // global manifest. Only the authenticated current journal may
+            // justify it; a preview cannot invent a seal or future allocation.
+            auto const& source = job.saved->directories[lane];
+            auto const& reviewed = job.preview->preview.state.directories[lane];
+            auto const& current = run->state.directories[lane];
+            require(reviewed.sealed_files >= source.sealed_files && reviewed.sealed_files <= current.sealed_files &&
+                (!reviewed.fill_stop.empty() || reviewed.extents.size() >= source.extents.size()) &&
+                (reviewed.fill_stop.empty() || (reviewed.fill_stop == current.fill_stop && reviewed.extents == current.extents)),
+                "saved farming preview progress is not covered by the current destination journal");
+            for (size_t file = 0; file < reviewed.extents.size(); ++file)
+                require(file < reviewed.sealed_files ? reviewed.extents[file] == current.extents[file] :
+                    (file >= source.extents.size() || reviewed.extents[file] >= source.extents[file]) &&
+                    (file < current.sealed_files || !current.fill_stop.empty() ||
+                        (file < current.extents.size() && reviewed.extents[file] <= current.extents[file])),
+                    "saved farming preview progress is not covered by the current destination journal");
+        }
     // Audit every saved output before writing the plan or confirming a group.
     auto audit_args = args;
     if (job.policy_changed)
@@ -6654,15 +7063,23 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         audit_args.headroom = job.saved->headroom;
     }
     run->audit_outputs(audit_args, keys, directories, devices, group_grow::writer_groups(devices), space_available, previous);
-    if (job.changed || (local_progress && run->all_replicas))
+    settle_farming_membership(args, job, *run, alignment);
+    if (run->membership_changed)
+    {
+        auto const changed_extents = group_grow::farming_extent_memory(run->state);
+        run->metadata = sum(run->metadata - extent_metadata, changed_extents); extent_metadata = changed_extents;
+        require(run->metadata < args.max_ram, "farming retirement metadata exceeds --max-ram");
+    }
+    bool const publish_progress = local_progress && run->all_replicas && run->state.version < 9;
+    if (job.changed || publish_progress)
     {
         require(run->state.revision < UINT64_MAX, "farming job revision exhausted");
         ++run->state.revision; run->state.parent_digest = job.digest;
     }
-    if (local_progress && run->all_replicas && !job.changed)
+    if (publish_progress && !job.changed)
         require(group_grow::valid_farming_extent_revision(*job.saved, run->state),
             "local farming progress changed a globally protected grant");
-    bool const planning = !job.saved || job.changed;
+    bool const planning = !job.saved || job.changed || run->membership_changed;
     std::string preview_filesystem;
     uint64_t preview_reservation = 0;
     if (!args.save_plan.empty())
@@ -6675,7 +7092,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             "saved preview already exists or is unavailable; choose another --save-plan path");
         require(fs::is_directory(args.save_plan.parent_path()), "saved preview parent directory must exist");
         auto const name = file_io::path_text(args.save_plan.filename());
-        for (auto const& directory : directories) if (fs::equivalent(args.save_plan.parent_path(), directory))
+        for (size_t lane = 0; lane < directories.size(); ++lane) if (run->available[lane] && fs::equivalent(args.save_plan.parent_path(), directories[lane]))
             require(name != ".xchplot2" && name != "grow-farm.plan" && name != "grow-farm.plan.next" && !name.starts_with("grow-group-"),
                 "saved preview filename is reserved for farming job recovery or outputs");
         preview_filesystem = group_grow::storage_device(args.save_plan.parent_path()).filesystem;
@@ -6684,7 +7101,14 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
     if (job.preview && job.policy_changed && job.preview->preview.version >= 2 && job.saved &&
         job.preview->preview.source_policy == group_grow::farming_policy_digest(*job.saved))
         for (size_t lane = 0; lane < previous; ++lane)
-            review_rebased = review_rebased || job.preview->preview.state.directories[lane].policy_files != run->lanes[lane].outputs.size();
+        {
+            auto const& reviewed = job.preview->preview.state.directories[lane];
+            auto const& current = run->state.directories[lane];
+            review_rebased = review_rebased || reviewed.policy_files != run->lanes[lane].outputs.size() ||
+                reviewed.sealed_files < current.sealed_files;
+            for (size_t file = 0; file < run->lanes[lane].outputs.size(); ++file)
+                review_rebased = review_rebased || file >= reviewed.extents.size() || reviewed.extents[file] < current.extents[file];
+        }
     if (review_rebased && !args.quiet && !args.json)
         std::cerr << "[fill] construction advanced since review; rechecking the same requested policy against current reservations.\n";
     if (job.preview && !review_rebased)
@@ -6694,19 +7118,25 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             for (size_t i = 0; i < previous; ++i)
                 require(job.preview->preview.state.directories[i].policy_files == run->lanes[i].outputs.size(),
                     "saved policy preview is stale; output construction started after review, so save a fresh preview");
-        auto fingerprint = std::move(run->state.fingerprint), job_id = std::move(run->state.job_id);
-        auto seed = std::move(run->state.seed), seed_owner = std::move(run->state.seed_owner);
-        auto farmer = std::move(run->state.farmer), pool = std::move(run->state.pool);
-        bool const pool_public_key = run->state.pool_public_key;
-        run->state = job.preview->preview.state;
-        run->state.fingerprint = std::move(fingerprint); run->state.job_id = std::move(job_id);
-        run->state.seed = std::move(seed); run->state.seed_owner = std::move(seed_owner);
-        run->state.farmer = std::move(farmer); run->state.pool = std::move(pool);
-        run->state.pool_public_key = pool_public_key;
+        if (!job.saved || job.policy_changed || run->state.version < 9)
+        {
+            auto fingerprint = std::move(run->state.fingerprint), job_id = std::move(run->state.job_id);
+            auto seed = std::move(run->state.seed), seed_owner = std::move(run->state.seed_owner);
+            auto farmer = std::move(run->state.farmer), pool = std::move(run->state.pool);
+            bool const pool_public_key = run->state.pool_public_key;
+            run->state = job.preview->preview.state;
+            run->state.fingerprint = std::move(fingerprint); run->state.job_id = std::move(job_id);
+            run->state.seed = std::move(seed); run->state.seed_owner = std::move(seed_owner);
+            run->state.farmer = std::move(farmer); run->state.pool = std::move(pool);
+            run->state.pool_public_key = pool_public_key;
+        }
+        // An unchanged independent policy keeps the authenticated current
+        // journal overlay, including progress made after the review.
         auto const reviewed_extents = group_grow::farming_extent_memory(run->state);
         run->metadata = sum(run->metadata - extent_metadata, reviewed_extents); extent_metadata = reviewed_extents;
         require(run->metadata < args.max_ram, "reviewed farming extents exceed --max-ram");
-        auto const resources = group_grow::writer_groups(devices);
+        auto resources = group_grow::writer_groups(devices);
+        if (run->state.conservative_storage_topology) std::fill(resources.begin(), resources.end(), 0);
         auto const resource_count = *std::max_element(resources.begin(), resources.end()) + 1;
         uint64_t schedule = 0;
         for (size_t i = 0; i < previous; ++i)
@@ -6715,8 +7145,16 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         for (size_t i = 0; i < directories.size(); ++i)
         {
             auto& directory = run->state.directories[i];
+            if (!run->available[i])
+            {
+                require(!group_grow::farming_member(directory) && i < previous &&
+                    group_grow::farming_detached_replica_matches(*job.saved, run->state, i),
+                    "saved preview changed an unavailable detached destination");
+                continue;
+            }
             require(directory.directory_identity == identities[i] && directory.filesystem == devices[i].filesystem &&
-                directory.resource == resources[i], "saved farming preview storage identity or topology changed");
+                (directory.resource == resources[i] || (!group_grow::farming_member(directory) &&
+                    run->state.conservative_storage_topology)), "saved farming preview storage identity or topology changed");
             auto const current = farming_destination_profile(devices[i], directory.storage);
             require(current.known_device == directory.storage.known_device && current.nonrotating == directory.storage.nonrotating,
                 "saved farming preview storage profile changed");
@@ -6768,7 +7206,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         revise_farming_policy(args, job, *run, devices, identities, space_available, allocated, alignment, preview_filesystem);
         extent_metadata = group_grow::farming_extent_memory(run->state);
     }
-    else if (planning)
+    else if (planning && !run->membership_changed)
     {
         require(missing.empty(), "all existing destinations must be available to plan an expansion or relocation");
         auto const resources = group_grow::writer_groups(devices);
@@ -6847,6 +7285,13 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             require(run->planning_peak <= args.max_ram, "farming planner exceeds --max-ram");
             for (size_t i = 0; i < directories.size(); ++i) run->state.directories[i].layout = run->state.estimate.destinations[i];
             group_grow::initialize_farming_extents(run->state, previous);
+            if (run->state.version >= 9)
+            {
+                group_grow::initialize_farming_grants(run->state, previous);
+                if (run->state.estimate.feasible)
+                    static_cast<group_grow::FarmingAssessment&>(run->state.estimate) =
+                        group_grow::expand_farming_grants(run->state, args.max_ram - run->metadata);
+            }
             auto const planned_extents = group_grow::farming_extent_memory(run->state);
             run->metadata = sum(run->metadata - extent_metadata, planned_extents); extent_metadata = planned_extents;
             require(run->metadata < args.max_ram, "planned farming extents exceed --max-ram");
@@ -6886,11 +7331,16 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         auto const resources = group_grow::writer_groups(present);
         for (size_t i = 0; i < indices.size(); ++i)
             for (size_t j = 0; j < i; ++j)
-                require((resources[i] == resources[j]) ==
+                require(run->state.conservative_storage_topology || (resources[i] == resources[j]) ==
                     (run->state.directories[indices[i]].resource == run->state.directories[indices[j]].resource),
                     "destination storage topology changed; inspect the saved job before continuing");
     }
     std::map<std::string, uint64_t> preflight_charge, replacement_bytes;
+    run->scratch_grants_frozen = run->state.capacity_fill &&
+        (!run->all_replicas || group_grow::farming_membership_obligations(run->state).unfenced != 0);
+    if (run->state.version >= 9 && (!args.temporary.empty() || args.destination_temp != "off"))
+        require(run->state.shared_scratch_possible,
+            "temporary scratch was not authorized by this saved job; run fill --update with every required destination available before enabling it");
     if (run->state.version >= 8)
     {
         uint64_t bound = 0;
@@ -6899,12 +7349,20 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         if (bound > progress_memory) run->metadata = sum(run->metadata, bound - progress_memory);
         require(run->metadata < args.max_ram, "farming progress records exceed --max-ram");
     }
+    if (run->state.version >= 9)
+    {
+        run->metadata = sum(run->metadata, group_grow::farming_control_memory_bound(run->state));
+        for (size_t lane = 0; lane < directories.size(); ++lane) if (run->available[lane])
+            run->metadata = sum(run->metadata, group_grow::farming_owner_memory_bound(directories[lane]));
+        require(run->metadata < args.max_ram, "farming ownership observations exceed --max-ram");
+    }
     for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
     {
         auto const path = run->metadata_directories[i]->path / "grow-farm.plan";
         auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
         bool const publishing = planning || job.pending || copy == job.copies.end() || !copy->stamp;
-        uint64_t const metadata_charge = publishing || local_progress ? std::max(plan_charges[i], run->state.manifest_reserved_bytes) : plan_charges[i];
+        uint64_t const metadata_charge = run->metadata_writable[i] && (publishing || local_progress) ?
+            std::max(plan_charges[i], run->state.manifest_reserved_bytes) : plan_charges[i];
         uint64_t charge = metadata_charge;
         for (auto const& output : run->lanes[i].outputs) charge = sum(charge, output.charge());
         require(charge <= run->state.directories[i].capacity_bytes, "farming job and outputs exceed destination capacity");
@@ -6934,6 +7392,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
     {
         job.check();
         std::string digest;
+        std::unique_ptr<group_grow::FarmingUpdateMailbox> relocation_mailbox;
         std::vector<std::optional<stream_state::Stamp>> pending_stamps(directories.size());
         std::vector<group_grow::StorageDevice> present;
         std::vector<size_t> indices;
@@ -6946,7 +7405,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         // revision commits the addition; an interruption leaves complete .next
         // copies for the remaining members. Partial recovery never changes scope.
         {
-            auto const& publication = local_progress && !run->all_replicas ? *job.saved : run->state;
+            auto const& publication = local_progress && !planning && !publish_progress ? *job.saved : run->state;
             auto contents = group_grow::farming_state_text(publication);
             digest = stream_state::digest(contents);
             contents += digest + '\n';
@@ -6958,10 +7417,27 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             std::vector<uint8_t> selected(directories.size(), 0);
             for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
             {
+                if (!run->metadata_writable[i]) continue;
                 auto const path = run->metadata_directories[i]->path / "grow-farm.plan";
                 auto const pending = run->metadata_directories[i]->path / "grow-farm.plan.next";
                 auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
                 auto next = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == pending; });
+                if (next != job.copies.end() && next->stamp && next->digest != digest &&
+                    !group_grow::farming_member(run->state.directories[i]))
+                {
+                    // Detached replicas can remain offline while required
+                    // members commit later policies. Their old unpublished
+                    // successor cannot block adopting the authenticated head.
+                    require(job.saved && !group_grow::farming_member(job.saved->directories[i]) &&
+                        i < run->locks.size() && run->locks[i], "stale detached farming preparation lacks its native writer lock");
+                    run->locks[i]->check(); run->metadata_directories[i]->check(); next->check();
+                    // Discovery already authenticated every older copy as
+                    // this member's source or retained retirement certificate.
+                    // Its pinned stamp avoids another full-plan allocation.
+                    require(!file_io::unlink_file(pending), "cannot retire an obsolete detached farming preparation");
+                    stream_state::sync_path(run->metadata_directories[i]->path, true);
+                    next = job.copies.end();
+                }
                 if (next != job.copies.end()) pending_stamps[i] = next->stamp;
                 if (copy != job.copies.end() && copy->stamp && copy->digest == digest) continue;
                 if (next != job.copies.end() && next->stamp)
@@ -6988,12 +7464,28 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             // sole record of an acknowledged seal or terminal decision.
             for (size_t lane = 0; lane < directories.size(); ++lane)
             {
+                if (!run->metadata_writable[lane]) continue;
                 auto const path = run->metadata_directories[lane]->path / "grow-farm.plan";
                 auto const copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
                 require((copy != job.copies.end() && copy->stamp && copy->digest == digest) || pending_stamps[lane],
                     "farming relocation lacks a complete durable successor set");
             }
             group_grow::grow_failpoint("farm-relocation-all-staged");
+            if (!control_bindings.empty())
+            {
+                relocation_mailbox = std::make_unique<group_grow::FarmingUpdateMailbox>(run->state,
+                    job.legacy_metadata, true, args.max_ram - run->metadata, run->bound_directories, control_bindings);
+                require(relocation_mailbox->locked() && relocation_mailbox->complete(),
+                    "farming relocation waits for all control request locks");
+                auto const requests = relocation_mailbox->records();
+                require(std::none_of(requests.begin(), requests.end(), [](auto const& record)
+                    { return !record.receipt || !group_grow::farming_update_terminal(record.receipt->status); }),
+                    "pending updates must settle before relocating a job; inspect status or cancel them");
+                relocation_mailbox->handoff_controls();
+                for (size_t lane = 0; lane < progress_bindings.size(); ++lane) if (progress_bindings[lane])
+                    group_grow::handoff_farming_owner(*run->metadata_directories[lane], run->state, lane,
+                        progress_bindings[lane]->source_identity, run->state.owner_reserved_bytes, args.max_ram - run->metadata);
+            }
             auto const policy = group_grow::farming_policy_digest(run->state);
             for (size_t lane = 0; lane < run->progress.size(); ++lane) if (run->progress[lane])
             {
@@ -7007,6 +7499,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         std::vector<uint8_t> publish_selected(directories.size(), 0);
         for (size_t i = 0; i < directories.size(); ++i) if (run->available[i])
         {
+            if (!run->metadata_writable[i]) continue;
             auto const path = run->metadata_directories[i]->path / "grow-farm.plan";
             auto const pending = run->metadata_directories[i]->path / "grow-farm.plan.next";
             auto copy = std::find_if(job.copies.begin(), job.copies.end(), [&](auto const& value) { return value.path == path; });
@@ -7035,6 +7528,8 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             require(pending_stamps[i] && stream_state::stamp(pending) == *pending_stamps[i],
                 "pending farming revision changed during publication");
             group_grow::publish_farming_state(pending, path, copy != job.copies.end() && copy->stamp.has_value());
+            if (!group_grow::farming_member(run->state.directories[i]) && !run->state.directories[i].detached_acknowledged)
+                run->membership_reconciled = true;
         };
         auto const first = std::find(publish_selected.begin(), publish_selected.end(), uint8_t(1));
         if (first != publish_selected.end())
@@ -7057,7 +7552,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
             require(!file_io::inspect_link(path.c_str(), &plan) && file_io::is_regular(plan.st_mode) &&
                 plan.st_nlink == 1 && plan.st_blocks >= 0, "invalid published farming-job allocation");
             plan_charges[i] = sum(sum(std::max(uint64_t(plan.st_size), product(uint64_t(plan.st_blocks), 512)), run->metadata_directories[i]->allocation()),
-                sum(farming_update_charge(run->metadata_directories[i]->path), group_grow::farming_progress_allocation(*run->metadata_directories[i])));
+                farming_auxiliary_charge(*run->metadata_directories[i]));
             require(plan_charges[i] <= run->state.manifest_reserved_bytes, "farming job exceeds its metadata reservation");
             run->metadata = sum(run->metadata, product(uint64_t(plan.st_size), 4));
         }
@@ -7086,7 +7581,32 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         for (auto const& [filesystem, charge] : charged)
             require(charge <= args.capacity, "saved farming outputs and job exceed --capacity-bytes");
     require(run->metadata < args.max_ram, "farming job and output metadata exceed --max-ram");
-    if (!args.plan_only && run->feasible()) run->bind_progress();
+    if (run->state.capacity_fill && (!args.plan_only || job.saved))
+    {
+        group_grow::FarmingUpdateMailbox mailbox(run->state, job.legacy_metadata, false, args.max_ram,
+            run->bound_directories, control_bindings);
+        run->controls = group_grow::farming_control_view(run->state, mailbox.records(), mailbox.control_state());
+    }
+    if (!args.plan_only && run->feasible())
+    {
+        run->bind_progress(planning || publish_progress, job.saved ? &*job.saved : nullptr);
+        if (run->state.version >= 9 && run->state.owner_reserved_bytes)
+        {
+            run->owners.resize(directories.size());
+            for (size_t lane = 0; lane < directories.size(); ++lane)
+                if (run->available[lane] && group_grow::farming_member(run->state.directories[lane]))
+                {
+                    auto const old = group_grow::farming_owner_allocation(*run->metadata_directories[lane]);
+                    run->owners[lane] = std::make_unique<group_grow::FarmingOwner>(*run->metadata_directories[lane],
+                        run->state, lane, run->controls.digest, run->state.owner_reserved_bytes, args.max_ram - run->metadata);
+                    auto const charge = group_grow::farming_owner_allocation(*run->metadata_directories[lane]);
+                    auto& current = run->lanes[lane];
+                    current.completed_charge = sum(current.completed_charge - old, charge);
+                    current.manifest_charge = sum(current.manifest_charge - old, charge);
+                    run->manifest_charge = sum(run->manifest_charge - old, charge);
+                }
+        }
+    }
     else for (size_t lane = 0; lane < run->progress.size(); ++lane) if (run->progress[lane])
         require(stream_state::stamp(run->metadata_directories[lane]->path / "grow-farm.progress") == run->progress[lane]->stamp,
             "farming progress changed during review; retry with the current observations");
@@ -7096,8 +7616,8 @@ void save_farming_review(Arguments const& args, FarmingJob const& job, FarmingRu
 {
     if (args.save_plan.empty()) return;
     require(args.plan_only && run.feasible() && !job.pending &&
-        std::find(run.available.begin(), run.available.end(), uint8_t(0)) == run.available.end(),
-        "only a feasible preview with every destination available can be saved");
+        farming_members_available(run.state, run.available),
+        "only a feasible preview with every required destination available can be saved");
     job.check(); run.check();
     auto text = farming_review_text(args, job, run.state);
     text += stream_state::digest(text) + '\n';
@@ -7159,11 +7679,35 @@ std::string queue_farming_update(Arguments const& args, FarmingJob const& job)
     require(job.saved->fingerprint == farming_fingerprint(original),
         "owner, seed, farmer and pool keys are immutable; use a new job for different keys");
     FarmingUpdateMailbox mailbox(*job.saved, job.legacy_metadata, true, args.max_ram, job.directories);
+    if (mailbox.terminal())
+    {
+        require(!args.farm_action.empty(), "retired farming job has no policy writer; plan a new ordinary job for future allocation");
+        std::vector<std::string> targets;
+        for (auto const& path : args.action_destinations)
+        {
+            auto const selected = fs::weakly_canonical(path);
+            auto const at = std::find_if(job.saved->directories.begin(), job.saved->directories.end(), [&](auto const& directory)
+            {
+                auto const lane = size_t(&directory - job.saved->directories.data());
+                return file_io::native_path(directory.directory) == selected || job.directories[lane] == selected;
+            });
+            require(at != job.saved->directories.end(), "control destination does not belong to this job: " + file_io::path_text(path));
+            targets.push_back(at->directory_identity);
+        }
+        job.check(); return mailbox.submit_control(args.farm_action, targets);
+    }
     require(mailbox.locked(), "another farming update is being applied; inspect status and retry after it completes");
+    job.check();
     auto const current = group_grow::load_farming_state(mailbox.manifest(), args.max_ram);
     auto const policy = group_grow::farming_policy_digest(*job.saved);
-    require(current.job_id == job.saved->job_id && group_grow::farming_policy_digest(current) == policy,
-        "farming policy changed while preparing the request; inspect --status and retry");
+    if (!args.farm_action.empty())
+        require(current.job_id == job.saved->job_id && current.fingerprint == job.saved->fingerprint &&
+            current.policy_revision <= job.saved->policy_revision && current.directories.size() <= job.saved->directories.size() &&
+            std::equal(current.directories.begin(), current.directories.end(), job.saved->directories.begin(),
+                [](auto const& before, auto const& after) { return before.directory_identity == after.directory_identity; }),
+            "farming control source changed its job or native member binding; inspect status before retrying");
+    else require(current.job_id == job.saved->job_id && group_grow::farming_policy_digest(current) == policy,
+            "farming policy changed while preparing the request; inspect --status and retry");
     group_grow::FarmingUpdate update;
     update.job_id = current.job_id; update.source_policy = policy;
     update.config = farming_configuration(args); update.profile = farming_profile(args, update.config);
@@ -7192,6 +7736,8 @@ std::string queue_farming_update(Arguments const& args, FarmingJob const& job)
         if (std::find(update.action_destinations.begin(), update.action_destinations.end(), saved->directory_identity) == update.action_destinations.end())
             update.action_destinations.push_back(saved->directory_identity);
     }
+    if (update.action == "pause" || update.action == "drain" || update.action == "resume" || update.action == "retire")
+        return mailbox.submit_control(update.action, update.action_destinations);
     std::set<std::string> explicit_fields;
     auto explicit_field = [&](bool set, char const* field) { if (set) explicit_fields.insert(field); };
     explicit_field(args.k_set, "k"); explicit_field(args.strength_set, "strength");
@@ -8915,18 +9461,24 @@ struct FarmingJointAssessment
     std::vector<Source> sources;
     uint64_t planning_memory_bytes = 0, destinations = 0, offline_destinations = 0, resources = 0;
 };
-uint64_t farming_joint_source_memory(group_grow::FarmingPreviewFile const& saved)
+uint64_t farming_state_retained_memory(group_grow::FarmingState const& state)
 {
-    auto const& preview = saved.preview; auto const& state = preview.state;
-    uint64_t bytes = sum(sizeof(saved), group_grow::farming_extent_memory(state));
+    uint64_t bytes = sum(sizeof(state), group_grow::farming_extent_memory(state));
     bytes = sum(bytes, product(state.directories.capacity(), sizeof(group_grow::FarmingDirectory)));
     bytes = sum(bytes, product(state.estimate.destinations.capacity(), sizeof(group_grow::FarmingDrivePlan)));
     auto string = [&](std::string const& value) { bytes = sum(bytes, value.capacity() + 1); };
-    auto path = [&](fs::path const& value) { bytes = sum(bytes, product(value.native().capacity() + 1, 2)); };
     for (auto const* value : {&state.fingerprint, &state.job_id, &state.parent_digest, &state.seed,
-        &state.seed_owner, &state.farmer, &state.pool, &state.estimate.reason, &preview.source_digest, &saved.digest}) string(*value);
+        &state.seed_owner, &state.farmer, &state.pool, &state.estimate.reason, &state.applied_update, &state.control}) string(*value);
     for (auto const& directory : state.directories)
         for (auto const* value : {&directory.directory, &directory.filesystem, &directory.directory_identity}) string(*value);
+    return bytes;
+}
+uint64_t farming_joint_source_memory(group_grow::FarmingPreviewFile const& saved)
+{
+    auto const& preview = saved.preview; auto const& state = preview.state;
+    auto bytes = sum(sizeof(saved) - sizeof(state), farming_state_retained_memory(state));
+    for (auto const* value : {&preview.source_digest, &saved.digest}) bytes = sum(bytes, value->capacity() + 1);
+    auto path = [&](fs::path const& value) { bytes = sum(bytes, product(value.native().capacity() + 1, 2)); };
     path(preview.source);
     bytes = sum(bytes, product(preview.relocations.capacity(), sizeof(std::pair<fs::path, fs::path>)));
     for (auto const& relocation : preview.relocations) { path(relocation.first); path(relocation.second); }
@@ -9147,14 +9699,150 @@ int print_farming_joint_assessment(Arguments const& args)
     std::cout << "]}\n";
     return assessment.feasible ? 0 : 2;
 }
+std::string farming_next_command(std::vector<std::string> const& arguments)
+{
+    std::string result;
+#ifdef _WIN32
+    result = "& ";
+#endif
+    for (auto const& argument : arguments)
+    {
+        if (!result.empty() && result.back() != ' ') result += ' ';
+        result += '\'';
+        for (char c : argument)
+        {
+#ifdef _WIN32
+            if (c == '\'') result += '\'';
+#else
+            if (c == '\'') result += "'\\'";
+#endif
+            result += c;
+        }
+        result += '\'';
+    }
+    return result;
+}
+fs::path farming_recovery_source(Arguments const& args, FarmingJob const& job)
+{
+    auto source = std::find_if(job.copies.begin(), job.copies.end(),
+        [&](auto const& copy) { return copy.stamp && !copy.pending && copy.digest == job.digest; });
+    if (source == job.copies.end()) source = std::find_if(job.copies.begin(), job.copies.end(),
+        [&](auto const& copy) { return copy.stamp && copy.digest == job.digest; });
+    return source == job.copies.end() ? args.manifest : source->path;
+}
+void print_farming_membership(std::ostream& out, group_grow::FarmingState const& state,
+    group_grow::FarmingDirectory const& directory, bool json)
+{
+    auto const& grant = group_grow::farming_grants(state, directory);
+    uint64_t members = 0; for (auto count : grant) members = sum(members, count);
+    uint64_t admitted = 0; for (auto count : directory.extents) admitted = sum(admitted, count);
+    bool const retained = !group_grow::farming_member(directory) && !directory.detached_acknowledged;
+    if (json)
+    {
+        out << ",\"membership\":" << json_string(directory.membership) << ",\"detached_at\":" << directory.detached_at
+            << ",\"detached_acknowledged\":" << (directory.detached_acknowledged ? "true" : "false")
+            << ",\"detached_reclaimed\":" << (directory.detached_reclaimed ? "true" : "false")
+            << ",\"allocation_grant_files\":" << grant.size() << ",\"allocation_grant_members\":" << members
+            << ",\"admitted_files\":" << directory.extents.size() << ",\"admitted_members\":" << admitted
+            << ",\"retained_obligation\":" << (retained ? "true" : "false");
+        return;
+    }
+    out << "  Membership: " << directory.membership << "; allocation grant " << grant.size() << " files, " << members << " members";
+    if (state.capacity_fill) out << "; saved targets " << directory.extents.size() << " files, " << admitted << " members";
+    if (!group_grow::farming_member(directory)) out << "; detached at revision " << directory.detached_at
+        << (retained ? "; native acknowledgement pending, full obligation retained" : "; native detachment acknowledged");
+    if (directory.detached_reclaimed) out << "; unused grants reclaimed, retirement metadata frozen";
+    out << '\n';
+}
+void print_farming_recovery(std::ostream& out, group_grow::FarmingState const& state,
+    fs::path const& source, fs::path const& requested_preview, std::string const& checkpoint_build,
+    std::string const& checkpoint_path, bool json)
+{
+    bool const compatible = state.version >= 6 || state.producer_build == GROW_IDENTITY;
+    bool const upgrade = compatible && state.capacity_fill && !source.empty();
+    auto const target = requested_preview.empty() ? fs::absolute("farm-upgrade.plan") : fs::absolute(requested_preview);
+    auto const source_text = file_io::path_text(source);
+    auto const review = upgrade ? farming_next_command({"xchplot2", "plan", "--upgrade-job", "--manifest", source_text,
+        "--save-plan", file_io::path_text(target)}) : "";
+    auto const apply = upgrade ? farming_next_command({"xchplot2", "fill", "--from-plan", file_io::path_text(target)}) : "";
+    auto const original_build = checkpoint_build.empty() && !compatible ? state.producer_build : checkpoint_build;
+    auto const original = !original_build.empty() && !source.empty() ? farming_next_command({"ORIGINAL_XCHPLOT2", "fill", "--resume", "--manifest", source_text}) : "";
+    auto const drain = !original_build.empty() && !source.empty() ? farming_next_command({"ORIGINAL_XCHPLOT2", "drain", "--manifest", source_text}) : "";
+    uint64_t completed = 0, unfinished_files = 0, unfinished_members = 0;
+    for (auto const& directory : state.directories)
+    {
+        completed = sum(completed, directory.sealed_files);
+        if (state.capacity_fill)
+        {
+            unfinished_files = sum(unfinished_files, directory.extents.size() - directory.sealed_files);
+            for (size_t file = size_t(directory.sealed_files); file < directory.extents.size(); ++file)
+                unfinished_members = sum(unfinished_members, directory.extents[file]);
+            continue;
+        }
+        auto const files = group_grow::farming_layout_files(directory);
+        auto const sealed = std::min(directory.sealed_files, files);
+        unfinished_files = sum(unfinished_files, files - sealed);
+        uint64_t members = group_grow::farming_layout_members(directory);
+        if (files && sealed)
+            members -= directory.layout.fixed_members ? std::min(members, product(sealed, directory.layout.group_members)) :
+                sum(product(sealed, members / files), std::min(sealed, members % files));
+        unfinished_members = sum(unfinished_members, members);
+    }
+    auto const kind = !checkpoint_build.empty() ? "original-checkpoint-build-required" : !compatible ?
+        "original-plan-build-required" : upgrade ? "metadata-upgrade-review-supported" : "saved-preview-only";
+    if (json)
+    {
+        out << "{\"kind\":" << json_string(kind) << ",\"metadata_upgrade_review_supported\":" << (upgrade ? "true" : "false")
+            << ",\"metadata_upgrade_applied\":false,\"requires_stopped_writers\":true"
+            << ",\"required_original_build\":" << json_string(original_build)
+            << ",\"blocked_checkpoint_path\":" << json_string(checkpoint_path)
+            << ",\"saved_sealed_files\":" << completed << ",\"saved_unsealed_files\":" << unfinished_files
+            << ",\"saved_unsealed_members\":" << unfinished_members
+            << ",\"remaining_scope\":" << json_string(state.capacity_fill ?
+                "saved-extents-include-unstarted-forecast-not-live-completion" : state.fixed_extent ?
+                "fixed-assignments-not-live-completion" : "layout-forecast-not-live-completion")
+            << ",\"upgrade_review_command\":" << json_string(review) << ",\"apply_review_command\":" << json_string(apply)
+            << ",\"original_resume_command\":" << json_string(original)
+            << ",\"original_drain_command_if_supported\":" << json_string(drain)
+            << ",\"original_binary_execution\":\"user-selected-trusted-binary-only\""
+            << ",\"plan_requires_original_build\":" << (compatible ? "false" : "true")
+            << ",\"checkpoint_action\":" << json_string(original_build.empty() ? "inspect construction before applying the review" :
+                "finish the active checkpoint with its exact original build before retrying the upgrade; preserve all native checkpoint files and scratch") << '}';
+        return;
+    }
+    out << "Recovery: " << kind << "; " << completed << " saved sealed files, " << unfinished_files
+        << " saved unsealed files, " << unfinished_members << " unsealed reserved members.\n"
+        << "These saved counts include unstarted forecast; they do not establish live checkpoint completion.\n";
+    if (!original_build.empty())
+    {
+        out << "Required original build: " << original_build;
+        if (!checkpoint_path.empty()) out << "; checkpoint target " << checkpoint_path;
+        out << ". Preserve its target, checkpoints and scratch at their original native locations.\n"
+            << "Replace ORIGINAL_XCHPLOT2 below with your trusted binary for that exact build. No binary is run automatically.\n";
+        if (!original.empty()) out << "Original-build continuation: " << original << '\n'
+            << "If that binary supports drain, record drain intent before continuing: " << drain << '\n'
+            << "Then use the continuation command above to finish started files under that policy.\n";
+        out << "If the original binary cannot drain, keep its durable checkpoint; this build cannot resume it. "
+            << "An explicit unfinished-work restart requires a separate reviewed recovery action.\n";
+        if (!compatible) out << "The plan itself also requires its original build after checkpoint completion. "
+            << "This build cannot upgrade it; use the original binary's supported upgrade/export path, or a separately reviewed recovery action.\n";
+    }
+    if (upgrade) out << "After stopping every coordinator and finishing incompatible checkpoints, review the metadata allowance with:\n  "
+        << review << "\nApply that saved review only after it succeeds:\n  " << apply << '\n';
+}
 int print_farming_metadata(Arguments const& args)
 {
     require(args.command == "plan" && args.plan_only && (args.from_plan.empty() != args.manifest.empty()),
         "metadata inspection requires plan with one saved PLAN or --manifest FILE");
     auto const& path = args.from_plan.empty() ? args.manifest : args.from_plan;
-    auto state = args.from_plan.empty() ?
-        group_grow::load_farming_state(path, args.max_ram, group_grow::FarmingStateLoad::metadata_only) :
-        group_grow::load_farming_preview(path, args.max_ram, group_grow::FarmingStateLoad::metadata_only).preview.state;
+    auto source = args.manifest;
+    group_grow::FarmingState state;
+    if (args.from_plan.empty()) state = group_grow::load_farming_state(path, args.max_ram, group_grow::FarmingStateLoad::metadata_only);
+    else
+    {
+        auto saved = group_grow::load_farming_preview(path, args.max_ram, group_grow::FarmingStateLoad::metadata_only);
+        source = saved.preview.source; state = std::move(saved.preview.state);
+    }
     bool const compatible = state.version >= 6 || state.producer_build == GROW_IDENTITY;
     auto const profile = group_grow::farming_state_profile(state, args.max_ram / 8);
     if (!args.json)
@@ -9163,10 +9851,17 @@ int print_farming_metadata(Arguments const& args)
             << "\nSchema: " << state.version << "; model: " << group_grow::farming_state_model(state)
             << "\nProducer build: " << state.producer_build << "\nRevision: " << state.revision
             << "\nPlan compatibility: " << (compatible ? "supported" : "legacy plan requires its original build")
+            << "\nSaved recovery allowance: " << state.manifest_reserved_bytes << " bytes per destination; requests "
+            << state.update_reserved_bytes << ", progress " << state.progress_reserved_bytes << ", coordinator ownership " << state.owner_reserved_bytes
             << "\nMetadata only: destination availability, output/checkpoint recovery and current farming readiness were not checked.\n";
         for (auto const& directory : state.directories)
+        {
             std::cout << directory.directory << ": " << group_grow::farming_layout_files(directory) << " planned files, "
                 << group_grow::farming_layout_members(directory) << " planned members, " << directory.sealed_files << " sealed files\n";
+            print_farming_membership(std::cout, state, directory, false);
+        }
+        std::cout << group_grow::farming_member_count(state) << " required destinations; detached destinations do not authorize new work.\n";
+        print_farming_recovery(std::cout, state, source, args.save_plan, "", "", false);
         if (args.verbose && profile) print_farming_profile(std::cout, *profile, true, "saved metadata");
         return 0;
     }
@@ -9183,25 +9878,50 @@ int print_farming_metadata(Arguments const& args)
         << ",\"max_exponent\":" << std::numeric_limits<long double>::max_exponent << '}';
     else std::cout << "null";
     std::cout << ",\"job_id\":" << json_string(state.job_id) << ",\"revision\":" << state.revision
+        << ",\"required_destinations\":" << group_grow::farming_member_count(state)
+        << ",\"manifest_reserved_bytes\":" << state.manifest_reserved_bytes
+        << ",\"update_reserved_bytes\":" << state.update_reserved_bytes
+        << ",\"progress_reserved_bytes\":" << state.progress_reserved_bytes
+        << ",\"owner_reserved_bytes\":" << state.owner_reserved_bytes
         << ",\"parent_digest\":" << json_string(state.parent_digest)
         << ",\"saved_feasible\":" << (state.estimate.feasible ? "true" : "false")
         << ",\"saved_response_bound_seconds\":" << json_estimate(state.estimate.response_bound_seconds)
         << ",\"farming_profile\":";
     if (profile) group_grow::write_farming_profile_json(std::cout, *profile);
     else std::cout << "null";
+    std::cout << ",\"recovery\":";
+    print_farming_recovery(std::cout, state, source, args.save_plan, "", "", true);
     std::cout << ",\"destinations\":[";
     bool comma = false;
     for (auto const& directory : state.directories)
     {
         if (comma) std::cout << ','; comma = true;
-        std::cout << "{\"directory\":" << json_string(directory.directory)
-            << ",\"capacity_bytes\":" << directory.capacity_bytes
+        std::cout << "{\"directory\":" << json_string(directory.directory);
+        print_farming_membership(std::cout, state, directory, true);
+        std::cout << ",\"capacity_bytes\":" << directory.capacity_bytes
             << ",\"files\":" << group_grow::farming_layout_files(directory) << ",\"members\":" << group_grow::farming_layout_members(directory)
-            << ",\"admitted_files\":" << directory.extents.size() << ",\"sealed_files\":" << directory.sealed_files
+            << ",\"count_scope\":" << json_string(state.capacity_fill || !state.fixed_extent ? "layout-forecast" : "fixed-assignment")
+            << ",\"forecast_files\":" << group_grow::farming_layout_files(directory)
+            << ",\"forecast_members\":" << group_grow::farming_layout_members(directory)
+            << ",\"sealed_files\":" << directory.sealed_files
             << ",\"fill_stop\":" << json_string(directory.fill_stop) << '}';
     }
     std::cout << "]}\n";
     return 0;
+}
+int print_legacy_farming_plan(Arguments args)
+{
+    int const refusal = args.command.empty() ? 1 : 2;
+    args.command = "plan"; args.plan_only = args.metadata_only = true;
+    if (args.from_plan.empty() && args.manifest.empty())
+    {
+        require(!args.target.empty(), "legacy recovery metadata needs its member directory or --manifest FILE");
+        group_grow::FarmingMetadataDirectory metadata(args.target);
+        args.manifest = metadata.path / "grow-farm.plan";
+        if (!fs::exists(args.manifest)) args.manifest = metadata.path / "grow-farm.plan.next";
+    }
+    (void)print_farming_metadata(args);
+    return refusal;
 }
 int print_farming_status_once(Arguments args)
 {
@@ -9239,42 +9959,149 @@ int print_farming_status_once(Arguments args)
     require(expected_job.empty() || expected_job == job.saved->job_id, "saved preview belongs to a different farming job");
     auto state = *job.saved;
     auto const policy = group_grow::farming_policy_digest(state);
+    std::vector<std::optional<group_grow::FarmingProgressNativeBinding>> native_bindings(state.directories.size());
+    std::vector<group_grow::FarmingControlNativeBinding> control_bindings;
+    if (job.progress_source) for (size_t lane = 0; lane < job.progress_source->directories.size(); ++lane)
+    {
+        auto const& source = job.progress_source->directories[lane]; auto const& target = state.directories[lane];
+        if (source.directory_identity == target.directory_identity) continue;
+        native_bindings[lane] = group_grow::FarmingProgressNativeBinding{source.directory_identity, target.directory_identity};
+        control_bindings.push_back({source.directory_identity, target.directory_identity});
+    }
     bool const inspect = args.status_inspect || state.version < 8;
     std::optional<Keys> keys; if (inspect) keys.emplace(args);
     struct Status
     {
         std::string directory, state, reason, next, observed_at, writer_state;
+        std::string control, control_status = "pending-drive";
+        group_grow::FarmingOwnerHealth owner;
+        std::string inspected_path, legacy_build, legacy_engine;
         std::vector<group_grow::ConstructionCheckpointIdentity> checkpoints;
         uint64_t files = 0, members = 0, active = 0, charged = 0, allowance = 0, free = 0;
         bool available = false, observed = false;
     };
     std::vector<Status> destinations;
+    uint64_t retained = sum(farming_state_retained_memory(*job.saved), product(farming_state_retained_memory(state), 3));
+    for (auto const& directory : state.directories)
+        retained = sum(retained, product(directory.grant_extents.capacity(), sizeof(uint16_t)));
+    retained = sum(retained, sum(path_metadata(job.directories), product(state.directories.size(), 2 * sizeof(Status))));
+    retained = sum(retained, product(job.copies.capacity(), sizeof(FarmingJob::Copy)));
+    for (auto const& copy : job.copies) retained = sum(retained, product(copy.path.native().capacity() + 1, 2));
+    if (job.progress_source) retained = sum(retained, farming_state_retained_memory(*job.progress_source));
+    if (job.preview) retained = sum(retained, farming_joint_source_memory(*job.preview));
+    if (args.farming_profile) retained = sum(retained, group_grow::farming_profile_memory(*args.farming_profile));
+    retained = sum(retained, sum(product(native_bindings.capacity(), sizeof(native_bindings.front()) + 512),
+        product(control_bindings.capacity(), sizeof(control_bindings.front()) + 512)));
+    auto const controls_memory = group_grow::farming_control_handoff_memory_bound(state, control_bindings);
+    require(retained < args.max_ram && controls_memory < (args.max_ram - retained) / 8,
+        "saved farming status and control observations exceed --max-ram; use a larger inspection budget");
+    // Retained controls/requests/report details and one lane's metadata,
+    // progress, output list, inspection and path bindings have disjoint grants.
+    uint64_t const observation_memory = (args.max_ram - retained) / 8;
+    uint64_t report_memory = 0;
+    auto status_memory = [&](Status const& status)
+    {
+        uint64_t bytes = product(status.checkpoints.capacity(), sizeof(group_grow::ConstructionCheckpointIdentity));
+        auto string = [&](std::string const& value) { bytes = sum(bytes, value.capacity() + 1); };
+        for (auto const* value : {&status.directory, &status.state, &status.reason, &status.next, &status.observed_at, &status.writer_state,
+            &status.control, &status.control_status, &status.inspected_path, &status.legacy_build, &status.legacy_engine,
+            &status.owner.status, &status.owner.instance, &status.owner.host, &status.owner.control_digest, &status.owner.last_state}) string(*value);
+        for (auto const& identity : status.checkpoints)
+            for (auto const* value : {&identity.format, &identity.producer_build, &identity.algorithm, &identity.representation}) string(*value);
+        return bytes;
+    };
+    auto retain_status = [&](Status const& status)
+    {
+        report_memory = sum(report_memory, status_memory(status));
+        require(report_memory < observation_memory, "status report details exceed --max-ram; use a larger inspection budget");
+    };
     bool incomplete = false;
-    auto cfg = configuration(args, uint64_t(INT64_MAX), args.max_ram / 8);
+    auto controls = group_grow::farming_control_view(state, {});
+    std::string update_status = state.applied_update.empty() ? "none" : "applied", update_reason;
+    std::vector<group_grow::FarmingUpdateRecord> updates;
+    try
+    {
+        FarmingUpdateMailbox mailbox(*job.saved, job.legacy_metadata, false, observation_memory, job.directories, control_bindings);
+        updates = mailbox.records();
+        controls = group_grow::farming_control_view(state, updates, mailbox.control_state());
+        auto waiting = mailbox.pending();
+        if (!waiting.empty())
+        {
+            update_status = mailbox.complete() ? "queued" : "waiting-for-drives";
+            if (!mailbox.complete()) update_reason = "available members retain the request; policy admission waits for every saved drive";
+        }
+        else if (!updates.empty())
+        {
+            auto const& latest = updates.back();
+            update_status = latest.receipt ? latest.receipt->status : latest.file.update.id == state.applied_update ? "applied" : "queued";
+            if (latest.receipt) update_reason = latest.receipt->reason;
+        }
+    }
+    catch (std::runtime_error const& error) { incomplete = true; update_status = "unavailable"; update_reason = error.what(); }
+    auto cfg = configuration(args, uint64_t(INT64_MAX), args.max_ram - observation_memory);
+    if (job.progress_source) for (size_t lane = 0; lane < job.progress_source->directories.size(); ++lane)
+    {
+        auto const& source = job.progress_source->directories[lane]; auto const& target = state.directories[lane];
+        if (source.directory != target.directory || source.directory_identity != target.directory_identity)
+            cfg.path_bindings.push_back({source.directory, file_io::path_text(job.directories[lane]), target.directory_identity});
+    }
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
         if (file_io::native_path(state.directories[lane].directory) != job.directories[lane] &&
             fs::is_directory(job.directories[lane]) &&
             group_grow::farming_directory_identity(job.directories[lane]) == state.directories[lane].directory_identity)
             cfg.path_bindings.push_back({state.directories[lane].directory, file_io::path_text(job.directories[lane]),
                 state.directories[lane].directory_identity});
+    uint64_t binding_memory = product(cfg.path_bindings.capacity(), sizeof(group_grow::ConstructionPathBinding));
+    for (auto const& binding : cfg.path_bindings)
+        for (auto const* value : {&binding.saved_root, &binding.current_root, &binding.directory_identity})
+            binding_memory = sum(binding_memory, value->capacity() + 1);
+    require(binding_memory < observation_memory, "status path bindings exceed --max-ram; use a larger inspection budget");
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
     {
         auto const& d = state.directories[lane];
         auto const directory = job.directories[lane];
-        Status status; status.directory = file_io::path_text(directory);
+        Status status; status.directory = file_io::path_text(directory); status.control = controls.effective(lane);
+        status.owner.status = "unavailable";
         try
         {
             status.available = fs::is_directory(directory) && group_grow::farming_directory_identity(directory) == d.directory_identity;
             if (!status.available)
             {
-                status.state = "unavailable"; status.reason = "saved destination is missing or replaced";
-                status.next = "mount the original destination, or use fill --relocate OLD NEW after stopping the coordinator";
-                incomplete = true; destinations.push_back(std::move(status)); continue;
+                if (!group_grow::farming_member(d))
+                {
+                    status.state = d.detached_acknowledged ? "detached" : "retirement-unacknowledged";
+                    status.control_status = status.state;
+                    status.reason = d.detached_reclaimed ? "historical destination unavailable; final outputs are preserved and no future allocation remains" :
+                        "historical destination unavailable; its saved allocation remains retained until native acknowledgement and reclamation";
+                    status.next = d.detached_reclaimed ? "continue through a remaining member; restore this historical destination for optional inspection" :
+                        "continue through a remaining member; restore this historical destination for inspection and acknowledgement";
+                }
+                else
+                {
+                    status.state = "unavailable"; status.reason = "saved destination is missing or replaced";
+                    status.next = "mount the original destination, or use fill --relocate OLD NEW after stopping the coordinator";
+                }
+                incomplete = true; retain_status(status); destinations.push_back(std::move(status)); continue;
             }
+            require(group_grow::farming_metadata_memory_bound(directory) < observation_memory,
+                "status native metadata pins exceed --max-ram; use a larger inspection budget");
             group_grow::FarmingMetadataDirectory metadata(directory, job.legacy_metadata);
-            auto progress = group_grow::load_farming_progress(metadata, args.max_ram / 4);
-            if (progress) (void)group_grow::overlay_farming_progress(state, lane, progress->progress, policy);
-            status.charged = sum(metadata.allocation(), sum(farming_update_charge(metadata.path), group_grow::farming_progress_allocation(metadata)));
+            status.owner = group_grow::observe_farming_owner(metadata, state, lane, observation_memory,
+                native_bindings[lane] ? std::optional(native_bindings[lane]->source_identity) : std::nullopt);
+            status.control_status = status.owner.status == "not-recorded" ? "intent-recorded" :
+                status.owner.lock_held && status.owner.control_digest != controls.digest ? "pending-boundary" : "effective";
+            auto progress = group_grow::load_farming_progress(metadata, observation_memory, native_bindings[lane]);
+            if (progress)
+            {
+                if (job.progress_source)
+                {
+                    (void)group_grow::validate_farming_progress(*job.progress_source, lane, progress->progress);
+                    require(group_grow::farming_progress_detail::covered(state, lane, progress->progress),
+                        "staged relocation omitted committed local farming progress");
+                }
+                else (void)group_grow::overlay_farming_progress(state, lane, progress->progress, policy);
+            }
+            status.charged = sum(metadata.allocation(), farming_auxiliary_charge(metadata));
             for (auto const* name : {"grow-farm.plan", "grow-farm.plan.next"})
             {
                 auto const path = metadata.path / name;
@@ -9289,27 +10116,36 @@ int print_farming_status_once(Arguments args)
                 std::vector<std::pair<uint64_t, fs::path>> outputs;
                 uint64_t output_memory = 0;
                 for (auto const& entry : fs::directory_iterator(directory))
-                    if (auto ordinal = rollover_entry(directory, entry.path(), args.max_ram / 4, {}, true, cfg.path_bindings))
+                {
+                    status.inspected_path = file_io::path_text(entry.path());
+                    if (auto ordinal = rollover_entry(directory, entry.path(), observation_memory, {}, true, cfg.path_bindings))
                     {
                         output_memory = sum(output_memory, sum(2 * sizeof(outputs.front()), product(entry.path().native().size(), 8)));
-                        require(output_memory < args.max_ram / 8, "status output metadata exceeds --max-ram");
+                        require(output_memory < observation_memory, "status output metadata exceeds --max-ram");
                         outputs.emplace_back(*ordinal, entry.path());
                     }
+                }
                 std::sort(outputs.begin(), outputs.end());
                 for (size_t file = 0; file < outputs.size(); ++file)
                 {
                     require(outputs[file].first == file, "saved output sequence has a missing file");
                     check_cancel(args);
+                    status.inspected_path = file_io::path_text(outputs[file].second);
                     auto output = snapshot(outputs[file].second, file);
-                    output_auxiliary(outputs[file].second, output, args.max_ram / 4,
+                    output_auxiliary(outputs[file].second, output, observation_memory,
                         [&](fs::path const& original, fs::path const& requested)
                         { return retired_farming_publication(state, original, &*keys, requested, nullptr, job.legacy_metadata, job.directories); },
                         job.legacy_metadata, cfg.path_bindings);
-                    group_grow::ConstructionInspectionLimits limits{args.max_ram / 4,
+                    group_grow::ConstructionInspectionLimits limits{observation_memory,
                         std::chrono::steady_clock::now() + std::chrono::seconds(30), args.cancelled};
                     auto const expected = farming_identity(*keys, state, d, file);
                     auto inspected = Construction::inspect(file_io::path_text(outputs[file].second), cfg, limits, initial_identity(expected));
-                    if (!inspected.saved.checkpoint_identity.format.empty()) status.checkpoints.push_back(inspected.saved.checkpoint_identity);
+                    if (!inspected.saved.checkpoint_identity.format.empty())
+                    {
+                        status.checkpoints.push_back(inspected.saved.checkpoint_identity);
+                        require(sum(report_memory, status_memory(status)) < observation_memory,
+                            "status checkpoint identities exceed --max-ram; use a larger inspection budget");
+                    }
                     same_identity(expected, identity_from(inspected.saved.identity));
                     require(!state.capacity_fill || file < d.extents.size(), "output has no saved membership reservation");
                     auto const maximum = state.capacity_fill ? d.extents[file] : d.layout.file_members(file);
@@ -9349,24 +10185,45 @@ int print_farming_status_once(Arguments args)
             status.allowance = d.capacity_bytes > status.charged ? d.capacity_bytes - status.charged : 0;
             status.state = status.active ? "construction-pending" : !d.fill_stop.empty() ? "stopped" : "ready";
             if (status.observed) status.reason = d.fill_stop;
-            auto const control = state.control == "active" ? d.control : state.control;
+            auto const& control = status.control;
             if (control != "active") { status.state = control; status.reason = control == "draining" ? "only already started files may finish" : "future allocation is disabled"; }
             if (status.next.empty()) status.next = control != "active" ? "use resume DIR to allow future work again" :
                 !d.fill_stop.empty() ? "repeat fill DIR to recheck capacity, or set new future limits" : "continue with fill DIR";
-            if (!status.observed) status.state = "observations-unavailable";
-            if (job.pending) { status.reason = "replicated revision needs recovery"; status.next = "resume with fill -r DIR"; }
+            if (!status.observed && control == "active") status.state = "observations-unavailable";
+            if (!group_grow::farming_member(d))
+            {
+                status.state = "detached"; status.control_status = d.detached_acknowledged ? "detached" : "retirement-unacknowledged";
+                status.reason = d.detached_acknowledged ? "historical output remains preserved; this destination has no future allocation" :
+                    "detachment is recorded; the full saved grant remains retained until native acknowledgement";
+                status.next = "continue the job through a remaining member; preserve this destination's plots and bookkeeping";
+                if (status.owner.lock_held) status.owner.status = "historical-owner-present";
+            }
+            else if (control == "retired")
+            {
+                status.state = "retiring";
+                status.reason = "retirement requested; started files may drain while membership remains required until detachment is published";
+                status.next = "continue fill through an available member to finish started files and publish detachment";
+            }
+            if (job.pending && group_grow::farming_member(d))
+            { status.reason = "replicated revision needs recovery"; status.next = "resume with fill -r DIR"; }
             metadata.check();
         }
         catch (Interrupted const&) { throw; }
+        catch (group_grow::LegacyConstructionBuildError const& error)
+        {
+            status.state = "legacy-checkpoint-blocked"; status.reason = error.what();
+            status.legacy_build = error.producer_build; status.legacy_engine = error.engine;
+            status.next = "finish this checkpoint with its exact original build, preserve its native target and scratch, "
+                "then review plan --upgrade-job before applying the saved upgrade";
+            incomplete = true;
+        }
         catch (std::runtime_error const& error)
         {
             status.state = "inspection-incomplete"; status.reason = error.what();
-            status.next = status.reason.find("legacy checkpoint") != std::string::npos ?
-                "resume with the original build named in the checkpoint reason" :
-                "retry after the current write; inspect the reported constraint before resuming";
+            status.next = "retry after the current write; inspect the reported constraint before resuming";
             incomplete = true;
         }
-        destinations.push_back(std::move(status));
+        retain_status(status); destinations.push_back(std::move(status));
     }
     try { job.check(); }
     catch (std::runtime_error const& error)
@@ -9378,32 +10235,18 @@ int print_farming_status_once(Arguments args)
             status.next = "retry status after the current saved revision is published";
         }
     }
-    std::string update_status = state.applied_update.empty() ? "none" : "applied", update_reason;
-    std::vector<group_grow::FarmingUpdateRecord> updates;
-    try
-    {
-        FarmingUpdateMailbox mailbox(*job.saved, job.legacy_metadata, false, args.max_ram, job.directories);
-        updates = mailbox.records();
-        auto waiting = mailbox.pending();
-        if (!waiting.empty())
-        {
-            update_status = mailbox.complete() ? "queued" : "waiting-for-drives";
-            if (!mailbox.complete()) update_reason = "available members retain the request; policy admission waits for every saved drive";
-        }
-        else if (!updates.empty())
-        {
-            auto const& latest = updates.back();
-            update_status = latest.receipt ? latest.receipt->status : latest.file.update.id == state.applied_update ? "applied" : "queued";
-            if (latest.receipt) update_reason = latest.receipt->reason;
-        }
-    }
-    catch (std::runtime_error const& error) { incomplete = true; update_status = "unavailable"; update_reason = error.what(); }
     if (args.json)
     {
         std::cout << "{\"farming_status\":true,\"read_only\":true,\"job_id\":" << json_string(state.job_id)
             << ",\"revision\":" << state.revision << ",\"inspection_complete\":" << (incomplete ? "false" : "true")
+            << ",\"required_destinations\":" << group_grow::farming_member_count(state)
             << ",\"inspection_kind\":" << json_string(inspect ? "construction" : "saved-progress")
-            << ",\"live_writer_health_checked\":false,\"control\":" << json_string(state.control)
+            << ",\"live_writer_health_checked\":" << (std::all_of(destinations.begin(), destinations.end(),
+                [](auto const& destination) { return destination.owner.checked; }) ? "true" : "false")
+            << ",\"control\":" << json_string(controls.control) << ",\"saved_control\":" << json_string(state.control)
+            << ",\"control_digest\":" << json_string(controls.digest) << ",\"control_conflicts\":[";
+        for (size_t i = 0; i < controls.conflicts.size(); ++i) { if (i) std::cout << ','; std::cout << json_string(controls.conflicts[i]); }
+        std::cout << ']'
             << ",\"update_status\":" << json_string(update_status) << ",\"update_reason\":" << json_string(update_reason)
             << ",\"future_k\":" << unsigned(state.config.k) << ",\"future_strength\":" << unsigned(state.config.strength)
             << ",\"future_group_members\":" << state.config.group_members_override << ",\"updates\":[";
@@ -9420,13 +10263,23 @@ int print_farming_status_once(Arguments args)
         for (auto const& d : destinations)
         {
             if (comma) std::cout << ','; comma = true;
-            std::cout << "{\"directory\":" << json_string(d.directory) << ",\"available\":" << (d.available ? "true" : "false")
+            std::cout << "{\"directory\":" << json_string(d.directory);
+            print_farming_membership(std::cout, state, state.directories[size_t(&d - destinations.data())], true);
+            std::cout << ",\"available\":" << (d.available ? "true" : "false")
                 << ",\"status\":" << json_string(d.state) << ",\"completed_files\":" << d.files << ",\"completed_members\":" << d.members
+                << ",\"control\":" << json_string(d.control) << ",\"control_status\":" << json_string(d.control_status)
                 << ",\"pending_files\":" << d.active << ",\"charged_bytes\":" << d.charged << ",\"remaining_allowance_bytes\":" << d.allowance
                 << ",\"available_after_headroom_bytes\":" << d.free << ",\"reason\":" << json_string(d.reason)
                 << ",\"observation_available\":" << (d.observed ? "true" : "false")
                 << ",\"observed_at_unix_seconds\":" << json_string(d.observed_at)
                 << ",\"last_writer_state\":" << json_string(d.writer_state)
+                << ",\"owner\":{\"status\":" << json_string(d.owner.status) << ",\"checked\":" << (d.owner.checked ? "true" : "false")
+                << ",\"lock_held\":" << (d.owner.lock_held ? "true" : "false")
+                << ",\"local_process_proven\":" << (d.owner.local_process_proven ? "true" : "false")
+                << ",\"heartbeat_current\":" << (d.owner.heartbeat_current ? "true" : "false")
+                << ",\"instance\":" << json_string(d.owner.instance) << ",\"host\":" << json_string(d.owner.host)
+                << ",\"heartbeat_at_unix_ms\":" << d.owner.heartbeat_at_ms << ",\"heartbeat_sequence\":" << d.owner.heartbeat_sequence
+                << ",\"acknowledged_control_digest\":" << json_string(d.owner.control_digest) << '}'
                 << ",\"next_action\":" << json_string(d.next) << ",\"checkpoints\":[";
             for (size_t i = 0; i < d.checkpoints.size(); ++i)
             {
@@ -9437,7 +10290,14 @@ int print_farming_status_once(Arguments args)
                     << ",\"representation\":" << json_string(checkpoint.representation)
                     << ",\"legacy_exact_build\":" << (checkpoint.legacy_exact_build ? "true" : "false") << '}';
             }
-            std::cout << "]}";
+            std::cout << ']';
+            if (!d.legacy_build.empty())
+            {
+                std::cout << ",\"blocked_checkpoint_engine\":" << json_string(d.legacy_engine) << ",\"recovery\":";
+                print_farming_recovery(std::cout, state, farming_recovery_source(args, job),
+                    args.save_plan, d.legacy_build, d.inspected_path, true);
+            }
+            std::cout << '}';
         }
         std::cout << "]}\n";
     }
@@ -9446,19 +10306,28 @@ int print_farming_status_once(Arguments args)
         std::cout << "Farm revision " << state.revision << "; future groups: k" << unsigned(state.config.k)
             << ", strength " << unsigned(state.config.strength) << ", "
             << (state.config.group_members_override ? std::to_string(state.config.group_members_override) : "automatic") << " members per file\n";
-        if (!inspect) std::cout << "Saved progress observations; writer state and storage charges may have advanced. Use --inspect for construction checks.\n";
+        std::cout << group_grow::farming_member_count(state) << " required destinations.\n";
+        if (!inspect) std::cout << "Saved progress observations; storage charges may have advanced. Owner checks are reported separately. Use --inspect for construction checks.\n";
+        if (!controls.conflicts.empty()) std::cout << "Concurrent control intent remains restricted. Reconnect peers and submit an explicit action for each conflicting scope.\n";
         if (update_status != "none") std::cout << "Update: " << update_status << (update_reason.empty() ? "" : ": " + update_reason)
-            << "\nUse fill --cancel-update to cancel a waiting request; fill with new settings edits waiting future work.\n";
+            << "\nUse fill --cancel-update to cancel waiting policy requests; saved local controls require an explicit pause, drain or resume action.\n";
         for (auto const& d : destinations)
         {
             std::cout << d.directory << ": " << d.state << "; " << d.files << " completed files, " << d.members << " completed members, "
                 << d.active << " pending files; " << d.allowance << " bytes of allowance remain\n";
+            print_farming_membership(std::cout, state, state.directories[size_t(&d - destinations.data())], false);
             if (d.observed) std::cout << "  Observed at " << d.observed_at << " Unix seconds; last writer state " << d.writer_state << '\n';
+            std::cout << "  Owner: " << d.owner.status << "; control " << d.control << " (" << d.control_status << ")\n";
             for (auto const& checkpoint : d.checkpoints)
                 std::cout << "  Checkpoint " << checkpoint.format << "; " << (checkpoint.legacy_exact_build ? "exact original build " : "compatible algorithm " )
                     << (checkpoint.legacy_exact_build ? checkpoint.producer_build : checkpoint.algorithm) << '\n';
             if (!d.reason.empty()) std::cout << "  Reason: " << d.reason << '\n';
             std::cout << "  Next: " << d.next << '\n';
+            if (!d.legacy_build.empty())
+            {
+                print_farming_recovery(std::cout, state, farming_recovery_source(args, job),
+                    args.save_plan, d.legacy_build, d.inspected_path, false);
+            }
         }
     }
     return incomplete ? 2 : 0;
@@ -9488,8 +10357,40 @@ template <typename Observe> int print_watched_status(Arguments const& args, Obse
     }
 }
 int print_farming_status(Arguments args)
-{ return print_watched_status(args, [&] { return print_farming_status_once(args); }); }
+{
+    try { return print_watched_status(args, [&] { return print_farming_status_once(args); }); }
+    catch (group_grow::LegacyFarmingPlanBuildError const&) { return print_legacy_farming_plan(std::move(args)); }
+}
 
+group_grow::FarmingAdjustments farming_model_alternatives(FarmingRun const& run, Arguments const& args)
+{
+    std::vector<std::vector<uint16_t>> members(run.lanes.size());
+    uint64_t input_bytes = product(run.lanes.size(), 2 * sizeof(std::vector<uint16_t>));
+    for (size_t lane = 0; lane < run.lanes.size(); ++lane)
+    {
+        auto const files = run.membership_files(lane);
+        input_bytes = sum(input_bytes, product(files, 2 * sizeof(uint16_t)));
+        if (sum(run.metadata, input_bytes) >= args.max_ram)
+            throw group_grow::FarmingResourceError("model alternatives exceed --max-ram", true);
+        members[lane].reserve(size_t(files));
+        for (uint64_t file = 0; file < files; ++file) members[lane].push_back(run.membership(lane, file));
+    }
+    group_grow::FarmingAdjustments result;
+    (void)group_grow::farming_assess_state(run.state, members, args.max_ram - run.metadata - input_bytes, &result);
+    return result;
+}
+void print_farming_choice_json(std::ostream& out, group_grow::FarmingConfig const& config,
+    group_grow::FarmingAssessment const& assessment, uint64_t files, uint64_t members)
+{
+    out << "{\"files\":" << files << ",\"members\":" << members
+        << ",\"memory_bytes\":" << config.memory_bytes << ",\"required_reader_memory_bytes\":" << assessment.reader_memory_bytes
+        << ",\"max_eligible_groups\":" << config.max_eligible_families_per_resource
+        << ",\"harvester_cores\":" << config.harvester_cores << ",\"lookup_workers\":" << config.lookup_workers
+        << ",\"deadline_seconds\":" << json_estimate(config.deadline_seconds)
+        << ",\"response_bound_seconds\":" << json_estimate(assessment.response_bound_seconds)
+        << ",\"dynamic_work_seconds_per_sp\":" << json_estimate(assessment.dynamic_work_seconds_per_sp)
+        << ",\"feasible\":" << (assessment.feasible ? "true" : "false") << '}';
+}
 void print_farming_plan(FarmingRun const& run, Arguments const& args)
 {
     auto const& c = run.state.config; auto const& e = run.state.estimate;
@@ -9501,19 +10402,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
     {
         try
         {
-            std::vector<std::vector<uint16_t>> members(run.lanes.size());
-            uint64_t input_bytes = product(run.lanes.size(), 2 * sizeof(std::vector<uint16_t>));
-            for (size_t lane = 0; lane < run.lanes.size(); ++lane)
-            {
-                auto const files = run.membership_files(lane);
-                input_bytes = sum(input_bytes, product(files, 2 * sizeof(uint16_t)));
-                if (sum(run.metadata, input_bytes) >= args.max_ram)
-                    throw group_grow::FarmingResourceError("model alternatives exceed --max-ram", true);
-                members[lane].reserve(size_t(files));
-                for (uint64_t file = 0; file < files; ++file) members[lane].push_back(run.membership(lane, file));
-            }
-            adjustments.emplace();
-            (void)group_grow::farming_assess_state(run.state, members, args.max_ram - run.metadata - input_bytes, &*adjustments);
+            adjustments = farming_model_alternatives(run, args);
         }
         catch (group_grow::FarmingResourceError const& error) { adjustments.reset(); adjustment_limit = error.what(); }
     }
@@ -9530,20 +10419,48 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             files = sum(files, group_grow::farming_layout_files(d)); members = sum(members, group_grow::farming_layout_members(d));
             capacity = sum(capacity, d.capacity_bytes);
         }
-        bool const available = std::find(run.available.begin(), run.available.end(), uint8_t(0)) == run.available.end();
+        bool const available = farming_members_available(run.state, run.available);
         out << "Plan: " << (!run.feasible() ? "infeasible" : available ? "feasible" : "destinations unavailable")
             << "; k" << unsigned(c.k) << (c.k == 28 ? "" : " (test only)")
             << "; " << run.state.directories.size() << " destinations, " << files << " files, " << members << " members"
             << (run.state.capacity_fill ? " initially" : "") << "; " << farming_size(capacity) << " budget\n";
+        out << group_grow::farming_member_count(run.state) << " required destinations.\n";
+        if (run.review)
+        {
+            auto const& review = *run.review; auto const& before = review.original_config;
+            if (review.metadata_upgrade)
+                out << "Metadata upgrade review: " << review.original_manifest_bytes << " -> " << run.state.manifest_reserved_bytes
+                    << " reserved bytes per destination; request allowance " << review.original_update_bytes << " -> "
+                    << run.state.update_reserved_bytes << "; progress allowance " << review.original_progress_bytes << " -> "
+                    << run.state.progress_reserved_bytes << "; owner allowance " << review.original_owner_bytes << " -> "
+                    << run.state.owner_reserved_bytes << ". Publication requires every writer to be stopped.\n";
+            else
+            {
+                out << "Selected alternative: " << review.alternative << "; " << review.original_files << " -> " << files
+                    << " files, " << review.original_members << " -> " << members << " members.\n"
+                    << "Declared harvester: memory " << before.memory_bytes << " -> " << c.memory_bytes
+                    << " bytes; eligible groups " << before.max_eligible_families_per_resource << " -> " << c.max_eligible_families_per_resource
+                    << "; CPU cores " << before.harvester_cores << " -> " << c.harvester_cores
+                    << "; lookup workers " << before.lookup_workers << " -> " << c.lookup_workers
+                    << "; deadline " << json_estimate(before.deadline_seconds) << " -> " << json_estimate(c.deadline_seconds) << " seconds.\n"
+                    << "Required reader memory " << review.original_assessment.reader_memory_bytes << " -> " << assessment.reader_memory_bytes
+                    << " bytes; response bound " << json_estimate(review.original_assessment.response_bound_seconds) << " -> "
+                    << json_estimate(assessment.response_bound_seconds) << " seconds.\n";
+                if (review.alternative == "capacity")
+                    out << "Capacity uses a bounded descending member-cap search; a larger feasible cap may exist. Started work is retained.\n";
+                else out << "This selection explicitly changes the declared harvester; provide these resources when farming the saved plan.\n";
+            }
+        }
         if (run.migration_managed) out << "Migration-managed destinations; a saved forecast does not establish live readiness.\n";
         for (auto const& d : run.state.directories)
         {
             size_t const index = size_t(&d - run.state.directories.data());
-            out << "  " << d.directory << ": " << group_grow::farming_layout_files(d) << " files, " << group_grow::farming_layout_members(d)
+            out << "  " << d.directory << ": planned " << group_grow::farming_layout_files(d) << " files, " << group_grow::farming_layout_members(d)
                 << " members; " << farming_size(d.capacity_bytes) << " budget";
             if (!run.available[index]) out << " [unavailable]";
             else if (run.previous_destinations && index >= run.previous_destinations) out << " [new]";
             out << '\n';
+            print_farming_membership(out, run.state, d, false);
             if (run.available[index] && index < run.previous_destinations)
             {
                 auto const& lane = run.lanes[index];
@@ -9560,7 +10477,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
                 }
             }
             if (args.verbose)
-                out << "    Up to " << d.layout.group_members << " members/file; " << d.layout.families
+                out << "    Forecast file shape: " << d.layout.group_members << " members/file; " << d.layout.families
                     << " identity families, " << d.layout.meta_slots << " meta slots; storage resource " << d.resource
                     << "\n    Storage model: " << json_estimate(d.storage.read_bytes_per_second) << " B/s, "
                     << json_estimate(d.storage.read_latency_seconds) << " s latency, " << d.storage.read_concurrency
@@ -9587,20 +10504,17 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             if (adjustments) for (auto const& alternative : adjustments->alternatives)
             {
                 auto const& proposed = alternative.config;
-                out << "  plan";
-                if (proposed.memory_bytes != c.memory_bytes) out << " --farming-memory-bytes " << proposed.memory_bytes;
-                if (proposed.max_eligible_families_per_resource != c.max_eligible_families_per_resource)
-                    out << " --farming-max-eligible-groups " << proposed.max_eligible_families_per_resource;
-                if (proposed.harvester_cores != c.harvester_cores) out << " --farming-cores " << proposed.harvester_cores;
-                if (proposed.lookup_workers != c.lookup_workers) out << " --farming-lookup-workers " << proposed.lookup_workers;
-                if (proposed.deadline_seconds != c.deadline_seconds)
-                    out << " --farming-deadline-ms " << json_estimate(std::ceil(proposed.deadline_seconds * 1000));
-                out << " DIR: " << (alternative.assessment.feasible ? "joint model fits" : "still constrained: " + alternative.assessment.reason) << '\n';
+                out << "  plan --alternative " << group_grow::farming_adjustment_name(alternative.kind) << " DIR: "
+                    << (alternative.assessment.feasible ? "joint model fits" : "still constrained: " + alternative.assessment.reason)
+                    << "; memory " << proposed.memory_bytes << " bytes, eligible groups " << proposed.max_eligible_families_per_resource
+                    << ", CPU cores " << proposed.harvester_cores << ", lookup workers " << proposed.lookup_workers
+                    << ", deadline " << json_estimate(proposed.deadline_seconds) << " seconds\n";
             }
+            out << "  plan --alternative capacity DIR: review less future work under the same declared harvester.\n";
             if (!adjustment_limit.empty()) out << "Alternative search: " << adjustment_limit << '\n';
             else if (adjustments && adjustments->search_limited) out << "Alternative search reached its work bound; other settings may also fit.\n";
         }
-        else if (!available) out << "Available drives can finish saved reservations; further grants wait for missing drives.\n";
+        else if (!available) out << "Available members can spend their saved grants; new shared grants wait for required peers and retained obligations.\n";
         else if (run.state.capacity_fill)
             out << "Fill uses remaining budget when another member fits; compressed sizes determine the final result.\n";
         if (args.plan_only && run.feasible() && available)
@@ -9608,7 +10522,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             auto const& saved = args.save_plan.empty() ? args.from_plan : args.save_plan;
             if (!saved.empty())
             {
-                out << "Saved plan: " << file_io::path_text(saved) << "\nNext: xchplot2 fill PLAN";
+                out << "Saved plan: " << file_io::path_text(saved) << "\nNext: " << farming_next_command({"xchplot2", "fill", "--from-plan", file_io::path_text(saved)});
                 if (!run.previous_destinations) out << " -f FARMER_KEY -c POOL_ADDRESS";
                 out << '\n';
             }
@@ -9617,6 +10531,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
         return;
     }
     std::cout << "{\"farming_plan\":true,\"model\":" << json_string(group_grow::farming_state_model(run.state))
+        << ",\"required_destinations\":" << group_grow::farming_member_count(run.state)
         << ",\"reader\":" << json_string(c.reader == group_grow::FarmingReader::cached ? "cached" : "stateless")
         << ",\"objective\":" << json_string(c.objective == group_grow::FarmingObjective::latency ? "latency" : "energy")
         << ",\"energy_model\":\"expected_dynamic_work\""
@@ -9649,7 +10564,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
         << ",\"assessment_scope\":\"this-job\",\"outside_job_workload\":\"unmodeled\""
         << ",\"migration_managed\":" << (run.migration_managed ? "true" : "false")
         << ",\"fill_policy\":" << json_string(run.state.capacity_fill ? "capacity-with-joint-admission" : "saved-extent")
-        << ",\"saved_preview\":" << json_string(file_io::path_text(args.save_plan))
+        << ",\"saved_preview\":" << json_string(run.feasible() ? file_io::path_text(args.save_plan) : "")
         << ",\"profile_input\":" << json_string(profile_input)
         << ",\"farming_profile\":";
     group_grow::write_farming_profile_json(std::cout, profile);
@@ -9661,13 +10576,41 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
     if (adjustments) for (size_t i = 0; i < adjustments->alternatives.size(); ++i)
     {
         if (i) std::cout << ','; auto const& alternative = adjustments->alternatives[i]; auto const& proposed = alternative.config;
-        std::cout << "{\"memory_bytes\":" << proposed.memory_bytes << ",\"max_eligible_groups\":" << proposed.max_eligible_families_per_resource
+        std::cout << "{\"name\":" << json_string(group_grow::farming_adjustment_name(alternative.kind))
+            << ",\"memory_bytes\":" << proposed.memory_bytes << ",\"max_eligible_groups\":" << proposed.max_eligible_families_per_resource
             << ",\"harvester_cores\":" << proposed.harvester_cores << ",\"lookup_workers\":" << proposed.lookup_workers
             << ",\"deadline_seconds\":" << json_estimate(proposed.deadline_seconds)
+            << ",\"required_reader_memory_bytes\":" << alternative.assessment.reader_memory_bytes
+            << ",\"response_bound_seconds\":" << json_estimate(alternative.assessment.response_bound_seconds)
+            << ",\"dynamic_work_seconds_per_sp\":" << json_estimate(alternative.assessment.dynamic_work_seconds_per_sp)
             << ",\"feasible\":" << (alternative.assessment.feasible ? "true" : "false")
             << ",\"remaining_reason\":" << json_string(alternative.assessment.reason) << '}';
     }
     std::cout << ']';
+    if (run.review)
+    {
+        auto const& review = *run.review;
+        uint64_t files = 0, members = 0;
+        for (auto const& directory : run.state.directories)
+        {
+            files = sum(files, group_grow::farming_layout_files(directory));
+            members = sum(members, group_grow::farming_layout_members(directory));
+        }
+        std::cout << ",\"selected_alternative\":" << json_string(review.alternative)
+            << ",\"alternative_evaluations\":" << review.evaluations
+            << ",\"capacity_search\":" << json_string(review.alternative == "capacity" ? "bounded-descending-nonmaximal" : "not-requested")
+            << ",\"metadata_upgrade\":" << (review.metadata_upgrade ? "true" : "false")
+            << ",\"original_manifest_reserved_bytes\":" << review.original_manifest_bytes
+            << ",\"original_update_reserved_bytes\":" << review.original_update_bytes
+            << ",\"original_progress_reserved_bytes\":" << review.original_progress_bytes
+            << ",\"original_owner_reserved_bytes\":" << review.original_owner_bytes
+            << ",\"update_reserved_bytes\":" << run.state.update_reserved_bytes
+            << ",\"progress_reserved_bytes\":" << run.state.progress_reserved_bytes
+            << ",\"owner_reserved_bytes\":" << run.state.owner_reserved_bytes << ",\"alternative_before\":";
+        print_farming_choice_json(std::cout, review.original_config, review.original_assessment, review.original_files, review.original_members);
+        std::cout << ",\"alternative_after\":";
+        print_farming_choice_json(std::cout, c, assessment, files, members);
+    }
     if (run.admission)
     {
         auto const& a = *run.admission;
@@ -9686,17 +10629,21 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
         if (comma) std::cout << ','; comma = true;
         size_t const index = size_t(&d - run.state.directories.data());
         auto const& p = d.layout; auto const& storage = d.storage;
-        std::cout << "{\"directory\":" << json_string(d.directory) << ",\"capacity_bytes\":" << d.capacity_bytes
+        std::cout << "{\"directory\":" << json_string(d.directory);
+        print_farming_membership(std::cout, run.state, d, true);
+        std::cout << ",\"capacity_bytes\":" << d.capacity_bytes
             << ",\"available\":" << (run.available[index] ? "true" : "false")
             << ",\"resource\":" << d.resource << ",\"resource_rank\":" << p.resource_rank << ",\"resource_lanes\":" << p.resource_lanes
             << ",\"members\":" << group_grow::farming_layout_members(d) << ",\"files\":" << group_grow::farming_layout_files(d) << ",\"group_bytes\":" << p.group_bytes
+            << ",\"count_scope\":" << json_string(run.state.capacity_fill || !run.state.fixed_extent ? "layout-forecast" : "fixed-assignment")
+            << ",\"forecast_files\":" << group_grow::farming_layout_files(d) << ",\"forecast_members\":" << group_grow::farming_layout_members(d)
             << ",\"group_members\":" << p.group_members << ",\"meta_slots\":" << p.meta_slots << ",\"families\":" << p.families
             << ",\"known_device\":" << (storage.known_device ? "true" : "false")
             << ",\"nonrotating\":" << (storage.nonrotating ? "true" : "false")
             << ",\"read_bytes_per_second\":" << json_estimate(storage.read_bytes_per_second)
             << ",\"read_latency_seconds\":" << json_estimate(storage.read_latency_seconds)
             << ",\"read_concurrency\":" << storage.read_concurrency
-            << ",\"admitted_files\":" << d.extents.size() << ",\"sealed_files\":" << d.sealed_files
+            << ",\"sealed_files\":" << d.sealed_files
             << ",\"fill_stop\":" << json_string(d.fill_stop) << '}';
     }
     std::cout << "]}\n";
@@ -10070,6 +11017,7 @@ struct NamedGroup
 int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* farm = nullptr,
                           std::span<NamedGroup const> named = {})
 {
+    bool const recovery_only = farm && farm->recovery_only();
     if (farm && farm->state.capacity_fill && farm->all_replicas)
     {
         std::vector<FarmingRun::ExtentChange> changes; changes.reserve(farm->lanes.size());
@@ -10118,9 +11066,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 report_output(args, group_output_path(farm->directory_path(size_t(&lane - farm->lanes.data())),
                     output), uint16_t(output.members), output.bytes, true);
         print_metrics(args, total, backend, groups, last_members, accounted);
-        return total.members || farm->state.control != "active" ||
+        return total.members || farm->job_control() != "active" ||
             std::all_of(farm->state.directories.begin(), farm->state.directories.end(),
-                [](auto const& directory) { return directory.control != "active"; }) ? 0 : 2;
+                [&](auto const& directory) { return !group_grow::farming_member(directory) ||
+                    farm->effective_control(size_t(&directory - farm->state.directories.data())) != "active"; }) ? 0 : 2;
     }
     std::vector<fs::path> paths;
     if (farm) for (size_t i = 0; i < farm->lanes.size(); ++i) paths.push_back(farm->path(i));
@@ -10236,6 +11185,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         require(!farm || farm->all_replicas || !published_retirements.resolve,
             "all fixed-farm destinations must be available to inspect preserved scratch before new construction");
         scratch_pool = std::make_unique<group_grow::ScratchPool>(roots, args.headroom, args.temporary_capacity);
+        if (farm && farm->state.version >= 9)
+            for (size_t lane = 0; lane < paths.size(); ++lane)
+                scratch_pool->reserve_metadata(paths[lane].parent_path(), farm->state.manifest_reserved_bytes,
+                    farm->lanes[lane].manifest_charge);
         for (auto const& path : paths) preserve_retired(*scratch_pool, path, args.max_ram - metadata, farm != nullptr, {}, false, path_bindings);
         preserve_published_retired(*scratch_pool, published_retirements, args.max_ram - metadata, {}, path_bindings);
         for (size_t i = 0; i < paths.size(); ++i)
@@ -10419,6 +11372,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     uint64_t const replacement = farm->state.manifest_reserved_bytes - lane.manifest_charge;
                     quota = quota > replacement ? quota - replacement : 0;
                 }
+                if (recovery_only) quota = std::min(quota, saved);
                 require(saved <= quota, "saved farming output exceeds its remaining directory quota");
                 farm_capacities[i] = saved; minimum = sum(minimum, saved);
                 shares.emplace_back(quota - saved, i);
@@ -10465,6 +11419,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         require(farm || !args.capacity || share <= file_limit,
                 "destination share exceeds the filesystem or process single-file limit; use a smaller capacity");
         uint64_t capacity = std::min(share, file_limit);
+        if (recovery_only)
+        {
+            require(guards[i].has_value(), "independent scratch recovery requires its exact saved output");
+            capacity = std::min(capacity, guards[i]->charge());
+            require(minimum_peaks[i] <= capacity, "saved scratch recovery exceeds its original target reservation");
+        }
         auto destination = std::make_unique<Destination>(paths[i], farm ? farm->identity(*keys, i, farm->lanes[i].ordinal) : named.empty() ? keys->derive(i) : named[i].identity); auto& d = *destination;
         d.writer = groups[i]; d.owner = d.scratch_owner = i; d.maximum = farm ? farm->maximum(args, i) : (named.empty() ? uint16_t(args.max_members) : named[i].members);
         if (farm)
@@ -10512,6 +11472,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             require(audit_peak <= args.max_ram, "saved destination workspace exceeds --max-ram");
             static_cast<group_grow::Stats&>(d.metrics) = audit.stats();
         }
+        if (recovery_only)
+        {
+            // A missing writer may still own an unallocated scratch quota on
+            // this filesystem. Recover only the exact already recorded member
+            // transaction and target peak; an ordinary top-up is new spending.
+            d.maximum = d.saved.pending ? d.saved.target_members : uint16_t(d.metrics.members);
+            if (!d.maximum) d.complete = true;
+        }
         same_identity(d.requested, identity_from(d.saved));
         if (!farm) requested_identity(args, d.requested);
         require(d.saved.bytes <= capacity - retired && (!d.saved.pending || d.saved.pending_peak_bytes <= capacity - retired),
@@ -10529,7 +11497,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     for (auto const& destination : destinations) check_guard(*destination);
     if (scratch_pool)
     {
-        scratch_pool->restrict_grants(std::span(roots).first(fresh_roots));
+        scratch_pool->restrict_grants(farm && farm->scratch_grants_frozen ? std::span<fs::path const>{} :
+            std::span<fs::path const>(roots).first(fresh_roots));
         scratch_pool->seal_recovery();
     }
     if (scratch_pool) for (auto const& d : destinations) if (d->complete && d->output_reserved)
@@ -10678,6 +11647,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     auto activate = [&](Destination& d)
     {
         if (d.engine) return true;
+        require(!farm || !farm->scratch_grants_frozen || args.construction != "external" || d.scratch || d.guard,
+            "fresh temporary scratch requires every outstanding farming writer grant to be accounted for; "
+            "restore the saved members or use --construction auto for ordinary in-file construction");
         if (farm && farm->state.capacity_fill && args.construction == "external" && !d.guard && !d.metrics.members)
         {
             // Even a fresh external group retains its index spool and durable
@@ -10866,7 +11838,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (!plan.active) return false;
         // Saved roots only recover their existing jobs. Fresh roots come from
         // explicit directories and the enabled destination policy.
-        if (fresh_roots && scratch_pool && !d.guard && !d.scratch && plan.active &&
+        if (fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) && !d.guard && !d.scratch && plan.active &&
             (args.construction == "external" || (args.construction == "auto" && plan.batch < d.maximum)))
         {
             auto options = args; options.workers = plan.workers;
@@ -11196,13 +12168,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         lane.successor_ordinal.reset(); ++lane.ordinal; d.farm_counted = true;
         lane.reserved_members = lane.next_reserved_members; lane.next_reserved_members = 0;
         { auto const before = farm->metadata; farm->observe_progress(d.owner, "running"); sync_farm(before); }
+        if (recovery_only) { discard_farm_future(d); return false; }
         uint16_t maximum = farm->maximum(args, d.owner);
         auto const quota = std::min(farm->state.directories[d.owner].capacity_bytes, d.farm_capacity);
         require(lane.completed_charge <= quota, "completed farming outputs exceed their planned capacity");
         uint64_t const room = std::min(quota - lane.completed_charge,
             group_grow::maximum_file_bytes(file_io::path_text(d.path.parent_path())));
         if (!room) { lane.no_capacity = true; d.metrics.stop_reason = "capacity"; discard_farm_future(d); return false; }
-        if (!maximum && farm->state.capacity_fill && farm->all_replicas && farm->accepts_future(d.owner) &&
+        if (!maximum && farm->state.capacity_fill && (farm->all_replicas || farm->state.version >= 9) && farm->accepts_future(d.owner) &&
             farm->state.directories[d.owner].fill_stop.empty())
         {
             d.awaiting_extent = true; return true;
@@ -11572,7 +12545,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto const cohort = group_grow::farming_cohort(farm->state, directory, lane.ordinal);
                 auto const bound = cohort.config.group_members_override ? cohort.config.group_members_override : UINT16_MAX;
                 bool const terminal = lane.ordinal + 1 >= group_grow::farming_layout_files(directory);
-                bool const can_add = farm->all_replicas && farm->accepts_future(d.owner) && lane.ordinal >= directory.policy_files && terminal && d.metrics.stop_reason.empty() && !d.needs_finish &&
+                bool const can_add = (farm->all_replicas || farm->state.version >= 9) && farm->accepts_future(d.owner) && lane.ordinal >= directory.policy_files && terminal && d.metrics.stop_reason.empty() && !d.needs_finish &&
                     d.metrics.members == d.maximum && d.maximum < bound &&
                     lane.completed_members + d.metrics.members < args.max_total_members &&
                     group_grow::farming_detail::shape(cohort.config, unsigned(d.maximum) + 1);
@@ -14610,21 +15583,154 @@ Arguments farming_resume_arguments(Arguments args, group_grow::FarmingState cons
     args.capacity_set = args.headroom_set = args.max_groups_set = args.max_total_members_set = false;
     return args;
 }
+std::vector<std::string> farming_alternative_names(std::string const& requested)
+{
+    std::vector<std::string> result;
+    size_t first = 0;
+    while (first < requested.size())
+    {
+        auto const comma = requested.find(',', first);
+        auto name = requested.substr(first, comma == std::string::npos ? std::string::npos : comma - first);
+        bool const known = name == "capacity" || name == "memory" || name == "eligible-groups" ||
+            name == "deadline" || name == "cpu-cores" || name == "lookup-workers";
+        require(known && std::find(result.begin(), result.end(), name) == result.end(),
+            "--alternative requires distinct assessed resource names, or capacity alone");
+        result.push_back(std::move(name));
+        if (comma == std::string::npos) break;
+        first = comma + 1;
+        require(first < requested.size(), "--alternative has an empty name");
+    }
+    require(!result.empty() && (result.size() == 1 || std::find(result.begin(), result.end(), "capacity") == result.end()),
+        "capacity must be selected alone; resource alternatives can be comma-separated");
+    return result;
+}
+FarmingRun::Review farming_review_summary(FarmingRun const& run)
+{
+    FarmingRun::Review review;
+    review.original_config = run.state.config;
+    review.original_assessment = run.admission ? *run.admission :
+        static_cast<group_grow::FarmingAssessment const&>(run.state.estimate);
+    for (auto const& directory : run.state.directories)
+    {
+        review.original_files = sum(review.original_files, group_grow::farming_layout_files(directory));
+        review.original_members = sum(review.original_members, group_grow::farming_layout_members(directory));
+    }
+    review.original_manifest_bytes = run.state.manifest_reserved_bytes;
+    review.original_update_bytes = run.state.update_reserved_bytes;
+    review.original_progress_bytes = run.state.progress_reserved_bytes;
+    review.original_owner_bytes = run.state.owner_reserved_bytes;
+    review.evaluations = 1;
+    return review;
+}
+std::unique_ptr<FarmingRun> farming_guided_plan(Arguments& args, FarmingJob& job,
+    std::vector<std::unique_ptr<DirectoryLock>> held_locks = {})
+{
+    require(args.plan_only && args.from_plan.empty() && args.relocations.empty() && !job.migration_managed,
+        "guided alternatives and metadata upgrades require an ordinary plan without relocation or --from-plan");
+    auto const names = args.farming_alternative.empty() ? std::vector<std::string>{} : farming_alternative_names(args.farming_alternative);
+    if (args.upgrade_job)
+    {
+        require(job.saved && job.saved->capacity_fill && !job.pending,
+            "--upgrade-job requires a recovered ordinary saved job with every required destination available");
+        require(farming_configuration(args) == job.saved->config && args.capacity == job.saved->capacity &&
+            args.headroom == job.saved->headroom && args.max_groups == job.saved->max_groups &&
+            args.max_total_members == job.saved->max_total_members && job.directories.size() == job.saved->directories.size(),
+            "--upgrade-job preserves the saved harvester and outer limits; review policy changes with plan separately");
+        try { held_locks = farming_writer_locks(job); }
+        catch (DirectoryBusy const&)
+        {
+            std::ostringstream guidance;
+            guidance << "metadata upgrade review needs a stopped coordinator; interrupt its foreground fill at a recovery boundary "
+                "and preserve every plot and checkpoint.\n";
+            print_farming_recovery(guidance, *job.saved, farming_recovery_source(args, job), args.save_plan, "", "", false);
+            throw std::runtime_error(guidance.str());
+        }
+    }
+    auto run = farming_run(args, nullptr, job, std::move(held_locks));
+    require(run->all_replicas && !job.pending,
+        "guided plan review requires every required destination and a recovered source revision");
+    auto review = farming_review_summary(*run);
+    review.alternative = args.farming_alternative; review.metadata_upgrade = args.upgrade_job;
+    auto replan = [&]
+    {
+        held_locks = std::move(run->locks); run.reset();
+        args.update = job.saved.has_value();
+        job = farming_arguments(args);
+        run = farming_run(args, nullptr, job, std::move(held_locks));
+        ++review.evaluations;
+    };
+    if (args.upgrade_job) replan();
+    else if (names.front() == "capacity")
+    {
+        uint64_t cap = 0;
+        for (auto const& directory : run->state.directories)
+            cap = std::max(cap, group_grow::farming_layout_members(directory));
+        bool selected = false;
+        // Each candidate goes through the normal planner, output audit and
+        // retained-reservation admission. This bounded descent certifies only
+        // the offered cap; cache transitions need not be monotone.
+        for (unsigned evaluation = 0; evaluation < 64; ++evaluation)
+        {
+            check_cancel(args); cap /= 2;
+            args.max_total_members = cap; args.max_total_members_set = true;
+            replan();
+            bool nonempty = false;
+            for (auto const& directory : run->state.directories)
+                nonempty = nonempty || group_grow::farming_layout_members(directory);
+            if (run->feasible() && (job.saved || nonempty)) { selected = true; break; }
+            if (!cap) break;
+        }
+        require(selected, "no assessed capacity alternative preserves the started work and fits the declared harvester; "
+            "review the resource alternatives or resume its original policy");
+    }
+    else for (auto const& name : names)
+    {
+        check_cancel(args);
+        // Assessment can normalize filter defaults or use a legacy cohort's
+        // worst service envelope. Only the explicitly selected budgets may
+        // become new harvester declarations.
+        auto proposed = run->state.config;
+        {
+            auto const alternatives = farming_model_alternatives(*run, args);
+            auto const& selected = group_grow::farming_adjustment(alternatives, name).config;
+            proposed.memory_bytes = selected.memory_bytes;
+            proposed.max_eligible_families_per_resource = selected.max_eligible_families_per_resource;
+            proposed.harvester_cores = selected.harvester_cores; proposed.lookup_workers = selected.lookup_workers;
+            proposed.deadline_seconds = selected.deadline_seconds;
+        }
+        auto profile = farming_profile(args, proposed);
+        profile.source = "explicit " + name + " alternative from " + profile.source;
+        args.farming_profile = std::make_shared<group_grow::FarmingProfile const>(std::move(profile));
+        // The freshly assessed config holds the exact deadline and selected
+        // resource declarations. Existing CLI overrides must not overwrite it.
+        args.farming_memory.reset(); args.farming_max_eligible_groups.reset();
+        args.farming_cores.reset(); args.farming_lookup_workers.reset(); args.farming_deadline_ms.reset();
+        args.farming_profile_set = true;
+        replan();
+    }
+    run->review = std::move(review);
+    return run;
+}
 int run_farming(Arguments args)
 {
     auto const cancelled = args.cancelled;
     auto discovery_scopes = args.mounts_under;
     for (auto& root : discovery_scopes) root = fs::weakly_canonical(root).lexically_normal();
     bool const control_command = !args.farm_action.empty();
+    bool const start_control = (args.farm_action == "resume" || args.farm_action == "retire") && !args.policy_only;
     bool const automatic = args.command == "fill" && !args.resume_set && args.from_plan.empty() &&
         args.farm_action.empty() && !args.cancel_update;
     bool const independent_requested = args.allow_missing;
-    auto job = farming_arguments(args);
+    FarmingJob job;
+    try { job = farming_arguments(args); }
+    catch (group_grow::LegacyFarmingPlanBuildError const&) { return print_legacy_farming_plan(std::move(args)); }
     if (job.saved && !args.plan_only) farming_continuation_selectors(args, *job.saved, job.directories);
-    bool independent = independent_requested || (automatic && job.saved && job.saved->version >= 8 && job.saved->capacity_fill);
+    bool independent = independent_requested || ((automatic || control_command) && job.saved && job.saved->version >= 8 && job.saved->capacity_fill);
     args.allow_missing = independent;
     std::string queued;
     std::vector<std::unique_ptr<DirectoryLock>> held_locks;
+    std::optional<uint64_t> grant_refresh_members;
+    bool renewing_grants = false, grant_refresh_pending = false;
     auto available = [](group_grow::FarmingState const& state, std::span<fs::path const> paths)
     {
         std::vector<uint8_t> present;
@@ -14647,11 +15753,14 @@ int run_farming(Arguments args)
     };
     auto attached = [&]
     {
-        if (!queued.empty()) return print_queued_farming_update(args, queued);
-        if (!args.quiet && !args.json) std::cerr << "[fill] the saved job already has a coordinator; showing its current progress.\n";
+        if (!queued.empty() && !control_command) return print_queued_farming_update(args, queued);
+        if (!args.quiet && !args.json)
+            std::cerr << (args.policy_only && control_command ? "[fill] control intent recorded; showing saved progress.\n" :
+                "[fill] the saved job already has a coordinator; showing its current progress.\n");
         auto status = args; status.from_plan.clear(); status.update = status.extend = false;
         status.farm_action.clear(); status.action_destinations.clear(); status.replot_status = true;
-        return print_farming_status(std::move(status));
+        auto const result = print_farming_status(std::move(status));
+        return control_command && !queued.empty() ? 0 : result;
     };
     // Recover a partially published revision before interpreting another
     // future-policy request. Construction remains at its existing boundary.
@@ -14672,27 +15781,63 @@ int run_farming(Arguments args)
     if (!args.plan_only && automatic && job.saved && job.saved->capacity_fill && !job.changed && !job.pending)
     {
         auto const present = available(*job.saved, job.directories);
-        if (std::all_of(present.begin(), present.end(), [](auto value) { return value; }))
+        bool settling = false;
+        if (std::any_of(present.begin(), present.end(), [](auto value) { return value; }))
+        {
+            FarmingUpdateMailbox mailbox(*job.saved, job.legacy_metadata, false, args.max_ram, job.directories);
+            auto const controls = group_grow::farming_control_view(*job.saved, mailbox.records(), mailbox.control_state());
+            for (size_t lane = 0; lane < job.saved->directories.size(); ++lane)
+            {
+                auto const& directory = job.saved->directories[lane];
+                settling = settling || (group_grow::farming_member(directory) ?
+                    controls.control == "retired" || controls.destinations[lane] == "retired" :
+                    present[lane] && !directory.detached_reclaimed);
+            }
+        }
+        if (farming_members_available(*job.saved, present) && !settling && group_grow::farming_member_count(*job.saved))
         {
             try { held_locks = farming_writer_locks(job); }
             catch (DirectoryBusy const&) { return attached(); }
             args.update = true; job = farming_reload_arguments(args, *job.saved, job.directories);
         }
     }
+    if (!args.plan_only && args.from_plan.empty() && held_locks.empty() && job.saved && job.policy_changed &&
+        job.saved->version >= 9 && !job.saved->shared_scratch_possible &&
+        (!args.temporary.empty() || args.destination_temp != "off"))
+    {
+        // Scratch roots are runtime inputs, not queued policy fields. Enabling
+        // their durable shared-space obligation requires the stopped job.
+        try { held_locks = farming_writer_locks(job); }
+        catch (DirectoryBusy const&)
+        {
+            throw std::runtime_error("enabling temporary scratch requires a stopped coordinator; "
+                "stop at a durable recovery boundary, then repeat fill --update with the scratch options");
+        }
+    }
     if (!args.plan_only && args.from_plan.empty() && held_locks.empty() &&
-        (args.update || args.extend || !args.farm_action.empty()) && job.policy_changed)
+        (args.update || args.extend || !args.farm_action.empty()) && (job.policy_changed || control_command))
     {
         try { queued = queue_farming_update(args, job); }
         catch (group_grow::FarmingUpdateSpaceError const& error)
         {
+            if (control_command)
+                throw std::runtime_error(std::string(error.what()) +
+                    "; the control was not recorded. Preserve the saved job, stop its coordinator at a recovery boundary, "
+                    "review plan DIR --upgrade-job --save-plan UPGRADE, apply fill UPGRADE, then repeat the control action");
             // Legacy plans did not reserve replicated request history. A
             // stopped job can upgrade directly while all writers are fenced.
             try { held_locks = farming_writer_locks(job); }
             catch (DirectoryBusy const&)
-            { throw std::runtime_error(std::string(error.what()) + "; this older job must finish its current coordinator before its metadata allowance can be upgraded"); }
+            {
+                std::ostringstream guidance;
+                guidance << error.what() << "; stop the current coordinator at a durable recovery boundary before upgrading its metadata allowance.\n";
+                print_farming_recovery(guidance, *job.saved, farming_recovery_source(args, job), args.save_plan, "", "", false);
+                throw std::runtime_error(guidance.str());
+            }
         }
         if (held_locks.empty())
         {
+            if (args.policy_only) return attached();
             auto const source = std::find_if(job.copies.begin(), job.copies.end(),
                 [](auto const& copy) { return copy.stamp && !copy.pending; });
             require(source != job.copies.end(), "saved farming request has no published source");
@@ -14712,7 +15857,7 @@ int run_farming(Arguments args)
             resume(*job.saved, manifest);
             mailbox.reset(); held_locks.clear(); job = farming_reload_arguments(args, *job.saved, job.directories);
         };
-        if (!args.plan_only && job.saved && job.saved->capacity_fill)
+        if (!args.plan_only && job.saved && job.saved->capacity_fill && job.relocated.empty() && !job.progress_source)
         {
             FarmingUpdateMailbox observed(*job.saved, job.legacy_metadata, false, args.max_ram, job.directories);
             auto const records = observed.records();
@@ -14731,7 +15876,7 @@ int run_farming(Arguments args)
                 }
                 if (!mailbox->complete())
                 {
-                    if (!queued.empty()) return print_queued_farming_update(args, queued);
+                    if (!queued.empty() && !control_command) return print_queued_farming_update(args, queued);
                     mailbox.reset();
                 }
                 else
@@ -14770,7 +15915,22 @@ int run_farming(Arguments args)
         std::unique_ptr<FarmingRun> farm;
         try
         {
-            farm = farming_run(args, keys ? &*keys : nullptr, job, std::move(held_locks));
+            farm = args.upgrade_job || !args.farming_alternative.empty() ? farming_guided_plan(args, job, std::move(held_locks)) :
+                farming_run(args, keys ? &*keys : nullptr, job, std::move(held_locks));
+            if (renewing_grants && !update && !farm->feasible())
+            {
+                // Renewal is optional capacity admission. An infeasible
+                // future forecast leaves the already feasible stopped
+                // policy and completed plots intact.
+                if (!args.quiet && !args.json)
+                    std::cerr << "[fill] further grants do not fit the saved harvester: " << farm->infeasibility_reason() << '\n';
+                resume(*job.saved, farm->manifest, job.directories);
+                farm.reset(); renewing_grants = false;
+                job = farming_reload_arguments(args, *job.saved, job.directories);
+                continue;
+            }
+            if (job.policy_changed) grant_refresh_pending = false;
+            renewing_grants = false;
             if (farm->feasible()) save_farming_review(args, job, *farm);
             print_farming_plan(*farm, args);
             require(farm->feasible(), "farming profile or requested extent is infeasible: " + farm->infeasibility_reason() +
@@ -14797,14 +15957,29 @@ int run_farming(Arguments args)
                     if (queued.empty()) { farm.reset(); continue_saved_policy(error.what()); continue; }
                 }
             }
+            if (dynamic_cast<group_grow::LegacyConstructionBuildError const*>(&error))
+            {
+                auto status = args; status.status_inspect = true; status.replot_status = true;
+                status.farming_alternative.clear(); status.upgrade_job = false;
+                (void)print_farming_status(std::move(status));
+                return args.command.empty() ? 1 : 2;
+            }
+            if (dynamic_cast<group_grow::LegacyFarmingPlanBuildError const*>(&error))
+                return print_legacy_farming_plan(std::move(args));
             throw;
         }
-        bool const missing = std::find(farm->available.begin(), farm->available.end(), uint8_t(0)) != farm->available.end();
+        bool const missing = !farming_members_available(farm->state, farm->available);
         if (args.plan_only) return missing ? 2 : 0;
-        independent = independent_requested || (automatic && farm->state.version >= 8 && farm->state.capacity_fill);
+        if (automatic && missing && farm->state.version >= 9)
+            for (size_t lane = 0; lane < farm->state.directories.size(); ++lane)
+                if (group_grow::farming_member(farm->state.directories[lane]) && farm->effective_control(lane) == "active" &&
+                    farm->state.directories[lane].fill_stop == "farming-limit")
+                    grant_refresh_pending = true;
+        independent = independent_requested || ((automatic || control_command) && farm->state.version >= 8 && farm->state.capacity_fill);
         args.allow_missing = independent;
         if (update && !recover_before_update && farm->state.applied_update == update->update.id)
         {
+            grant_refresh_pending = false;
             mailbox->finish(update->update.id, "applied");
             if (!args.quiet && !args.json) std::cerr << "[fill] farm update applied; completed and active groups retain their parameters.\n";
             queued.clear();
@@ -14812,30 +15987,86 @@ int run_farming(Arguments args)
         mailbox.reset();
         args.update = args.extend = false; args.farm_action.clear(); args.action_destinations.clear();
         auto const manifest = farm->manifest;
-        if (recover_before_update)
+        if (recover_before_update || farm->membership_changed || farm->membership_reconciled)
         {
             resume(farm->state, manifest);
             auto recovered = farming_reload_arguments(args, farm->state, farm->bound_directories);
             farm.reset(); job = std::move(recovered); continue;
         }
-        if (control_command)
+        if (control_command && !start_control)
         {
             resume(farm->state, manifest); farm.reset(); args.replot_status = true;
-            return print_farming_status(args);
+            auto const result = print_farming_status(args);
+            return !queued.empty() ? 0 : result;
         }
         if (!args.command.empty() && !args.quiet)
             std::cerr << '[' << args.command << "] saved job: " << file_io::path_text(manifest)
                 << " (continue with fill and any member directory)\n";
-        for (size_t i = 0; i < farm->available.size(); ++i) if (!farm->available[i])
+        for (size_t i = 0; i < farm->available.size(); ++i)
+            if (!farm->available[i] && group_grow::farming_member(farm->state.directories[i]))
             std::cerr << "[fill] waiting for destination: " << farm->state.directories[i].directory << '\n';
         auto const watched = std::make_shared<group_grow::FarmingState const>(farm->state);
         auto const present = farm->available;
         auto const bindings = farm->bound_directories;
         auto const legacy = job.legacy_metadata;
         auto const memory = args.max_ram;
+        auto const control_digest = farm->controls.digest;
+        std::vector<std::array<std::optional<stream_state::Stamp>, 2>> policy_heads;
+        auto const head_names = std::array{"grow-farm.plan", "grow-farm.plan.next"};
+        if (automatic && independent && missing)
+        {
+            policy_heads.resize(watched->directories.size());
+            for (size_t lane = 0; lane < policy_heads.size(); ++lane)
+                if (present[lane] && group_grow::farming_member(watched->directories[lane]))
+                    for (size_t head = 0; head < head_names.size(); ++head)
+                    {
+                        auto const path = group_grow::farming_metadata_path(bindings[lane], head_names[head], legacy);
+                        if (group_grow::farm_metadata_detail::present(path)) policy_heads[lane][head] = stream_state::stamp(path);
+                    }
+        }
+        std::vector<std::pair<size_t, uint64_t>> retiring;
+        bool can_finalize = true;
+        for (size_t lane = 0; lane < watched->directories.size(); ++lane)
+        {
+            bool const requested = farm->controls.control == "retired" ||
+                (lane < farm->controls.destinations.size() && farm->controls.destinations[lane] == "retired");
+            if (group_grow::farming_member(watched->directories[lane]) && !present[lane] && !requested) can_finalize = false;
+            if (present[lane] && (requested || !group_grow::farming_member(watched->directories[lane])) &&
+                lane < farm->progress.size() && farm->progress[lane] && farm->progress[lane]->progress.summary.pending_files)
+                retiring.emplace_back(lane, farm->progress[lane]->progress.sequence);
+        }
+        if (!can_finalize) retiring.clear();
+        auto retirement_complete = [watched, bindings, legacy, memory, retiring]
+        {
+            for (auto const& [lane, sequence] : retiring)
+            {
+                group_grow::FarmingMetadataDirectory metadata(bindings[lane], legacy);
+                auto const progress = group_grow::load_farming_progress(metadata, memory);
+                if (progress && progress->progress.sequence > sequence && !progress->progress.summary.pending_files)
+                    return true;
+            }
+            return false;
+        };
+        auto boundary_pending = [watched, legacy, memory, control_digest, retirement_complete](
+            std::span<fs::path const> paths, std::span<uint8_t const> reachable)
+        {
+            bool authority = false;
+            for (size_t lane = 0; lane < watched->directories.size(); ++lane)
+                authority = authority || (reachable[lane] && group_grow::farming_member(watched->directories[lane]));
+            if (!authority) return false;
+            try
+            {
+                FarmingUpdateMailbox current(*watched, legacy, false, memory, paths);
+                return current.actionable() || (watched->capacity_fill &&
+                    group_grow::farming_control_view(*watched, current.records(), current.control_state()).digest != control_digest) ||
+                    retirement_complete();
+            }
+            catch (std::runtime_error const&)
+            { return true; } // Validate changed or invalid metadata at the owned recovery boundary.
+        };
         auto noticed = std::make_shared<std::atomic<bool>>(false);
         auto next_check = std::make_shared<std::atomic<int64_t>>(0);
-        args.cancelled = [cancelled, watched, present, legacy, memory, noticed, next_check, available, bindings, discovery_scopes]
+        args.cancelled = [cancelled, watched, present, noticed, next_check, available, bindings, discovery_scopes, boundary_pending]
         {
             if (cancelled && cancelled()) return true;
             if (noticed->load()) return true;
@@ -14845,11 +16076,7 @@ int run_farming(Arguments args)
             {
                 if (available(*watched, bindings) != present) noticed->store(true);
                 else if (farming_runtime_bindings(*watched, bindings, discovery_scopes, cancelled) != bindings) noticed->store(true);
-                else if (std::all_of(present.begin(), present.end(), [](auto value) { return value; }))
-                {
-                    FarmingUpdateMailbox current(*watched, legacy, false, memory, bindings);
-                    if (current.actionable()) noticed->store(true);
-                }
+                else if (boundary_pending(bindings, present)) noticed->store(true);
             }
             return (cancelled && cancelled()) || noticed->load();
         };
@@ -14857,6 +16084,7 @@ int run_farming(Arguments args)
         // its available lanes enter the construction scheduler.
         farm->metadata = sum(farm->metadata, sum(group_grow::farming_extent_memory(*watched),
             product(group_grow::farming_state_text(*watched).size(), 4)));
+        farm->metadata = sum(farm->metadata, product(policy_heads.capacity(), sizeof(policy_heads.front())));
         require(farm->metadata < args.max_ram, "farming recovery observations exceed --max-ram");
         farm->select_available();
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -14876,11 +16104,53 @@ int run_farming(Arguments args)
             if (!args.quiet) std::cerr << "[fill] destination availability changed; recovering available reserved work.\n";
         }
         args.cancelled = cancelled;
+        // Keep this intent through availability recovery, including a saved
+        // automatic fill restarted while its exhausted lane waits for a peer.
+        grant_refresh_pending = grant_refresh_pending || farm->grant_exhausted;
+        bool const refresh_grants = grant_refresh_pending && !farm->scratch_grants_frozen &&
+            std::any_of(farm->lanes.begin(), farm->lanes.end(), [&](auto const& lane)
+                { return farm->accepts_future(size_t(&lane - farm->lanes.data())); });
+        uint64_t completed_members = 0;
+        if (refresh_grants)
+            for (auto const& saved : watched->directories)
+            {
+                auto const current = std::find_if(farm->state.directories.begin(), farm->state.directories.end(),
+                    [&](auto const& directory) { return directory.directory_identity == saved.directory_identity; });
+                auto const& directory = current == farm->state.directories.end() ? saved : *current;
+                for (uint64_t file = 0; file < directory.sealed_files; ++file)
+                    completed_members = sum(completed_members, directory.extents.at(size_t(file)));
+            }
         args.compute_session.reset(); farm.reset();
         auto current_bindings = farming_runtime_bindings(*watched, bindings, discovery_scopes, cancelled);
         check_cancel(args);
         auto now = available(*watched, current_bindings);
         interrupted = interrupted || current_bindings != bindings;
+        // Construction resources are released before observing a changed
+        // policy head. The ordinary reload validates its lineage and locks;
+        // this read-only observation never adopts another writer's policy.
+        auto policy_changed = [&]
+        {
+            try
+            {
+                for (size_t lane = 0; lane < policy_heads.size(); ++lane)
+                    if (now[lane] && group_grow::farming_member(watched->directories[lane]))
+                        for (size_t head = 0; head < head_names.size(); ++head)
+                        {
+                            auto const path = group_grow::farming_metadata_path(current_bindings[lane], head_names[head], legacy);
+                            std::optional<stream_state::Stamp> stamp;
+                            if (group_grow::farm_metadata_detail::present(path)) stamp = stream_state::stamp(path);
+                            if (stamp == policy_heads[lane][head]) continue;
+                            if (watched->version >= 9) return true;
+                            policy_heads[lane][head] = stamp;
+                            // Older jobs published progress in the plan itself.
+                            if (stamp && group_grow::farming_policy_digest(group_grow::load_farming_state(path, memory)) !=
+                                group_grow::farming_policy_digest(*watched)) return true;
+                        }
+                return false;
+            }
+            catch (std::runtime_error const&)
+            { return true; } // A staged head may disappear during publication; reload validates the resulting head.
+        };
         if (independent && !automatic && std::none_of(now.begin(), now.end(), [](auto value) { return value; })) return 4;
         if (automatic && independent && std::none_of(now.begin(), now.end(), [](auto value) { return value; }))
         {
@@ -14894,20 +16164,41 @@ int run_farming(Arguments args)
             }
             interrupted = true;
         }
-        bool pending = false;
-        if (std::any_of(now.begin(), now.end(), [](auto value) { return value; }))
-        { FarmingUpdateMailbox current(*watched, legacy, false, memory, current_bindings); pending = current.actionable(); }
+        bool pending = boundary_pending(current_bindings, now) || policy_changed();
         if (!pending && !interrupted && missing && automatic && watched->control == "active")
         {
             if (!args.quiet && !args.json) std::cerr << "[fill] available reservations are complete; waiting for saved drives to return. Ctrl-C keeps the job resumable.\n";
-            while (current_bindings == bindings && now == present)
+            while (!pending && current_bindings == bindings && now == present)
             {
                 check_cancel(args);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 current_bindings = farming_runtime_bindings(*watched, current_bindings, discovery_scopes, cancelled);
                 check_cancel(args); now = available(*watched, current_bindings);
+                pending = boundary_pending(current_bindings, now) || policy_changed();
             }
             interrupted = true;
+        }
+        if (!pending && !interrupted && refresh_grants && farming_members_available(*watched, now) &&
+            (!grant_refresh_members || completed_members > *grant_refresh_members))
+        {
+            // Offline grants are finite, but a connected job may reassess
+            // its remaining capacity through the ordinary fenced policy
+            // path. Do not publish the scheduler's filtered membership or
+            // retry a real model limit without completed-member progress.
+            resume(*watched, manifest, current_bindings);
+            job = farming_reload_arguments(args, *watched, current_bindings);
+            try { held_locks = farming_writer_locks(job); }
+            catch (DirectoryBusy const&) { return attached(); }
+            // A coordinator that acquired the job while these locks were
+            // released may have left a successor to recover first.
+            if (job.pending) continue;
+            grant_refresh_pending = false;
+            grant_refresh_members = completed_members;
+            renewing_grants = true;
+            args.update = true;
+            job = farming_reload_arguments(args, *job.saved, job.directories);
+            if (!args.quiet && !args.json) std::cerr << "[fill] reassessing remaining capacity after the saved grants were used.\n";
+            continue;
         }
         if (!pending && !interrupted) return !result && missing ? 4 : result;
         if (!args.quiet && !args.json) std::cerr << "[fill] recovering the saved job at a construction boundary.\n";

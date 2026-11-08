@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -131,6 +132,26 @@ struct FarmingAdjustments
     uint64_t evaluations = 0;
     bool search_limited = false;
 };
+inline char const* farming_adjustment_name(FarmingAdjustmentKind kind)
+{
+    switch (kind)
+    {
+    case FarmingAdjustmentKind::memory: return "memory";
+    case FarmingAdjustmentKind::eligible_families: return "eligible-groups";
+    case FarmingAdjustmentKind::deadline: return "deadline";
+    case FarmingAdjustmentKind::cpu_cores: return "cpu-cores";
+    case FarmingAdjustmentKind::lookup_workers: return "lookup-workers";
+    }
+    throw std::runtime_error("invalid farming alternative kind");
+}
+inline FarmingAdjustment const& farming_adjustment(FarmingAdjustments const& choices, std::string_view name)
+{
+    auto const selected = std::find_if(choices.alternatives.begin(), choices.alternatives.end(),
+        [&](auto const& alternative) { return name == farming_adjustment_name(alternative.kind); });
+    if (selected == choices.alternatives.end())
+        throw std::runtime_error("selected farming alternative is unavailable for this assessment: " + std::string(name));
+    return *selected;
+}
 inline FarmingRequirements farming_requirements(FarmingConfig const& config, FarmingAssessment const& assessment)
 {
     return {assessment.reader_memory_bytes, assessment.max_eligible_families_per_resource, assessment.response_bound_seconds,

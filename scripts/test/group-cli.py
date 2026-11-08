@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -213,42 +214,70 @@ def farming_plan_rows(body):
     return rows
 
 
-def rewrite_plan(record, *, producer=None, legacy=False, model=None):
+def rewrite_plan(record, *, producer=None, legacy=False, model=None, schema=None, request_allowance=None):
     body = record[:-65]
     assert record[-65:] == hashlib.sha256(body).hexdigest().encode() + b"\n"
     rows = farming_plan_rows(body)
-    version = re.fullmatch(rb"ordinary-group-farming-v([678])\n", rows[0])
+    version = re.fullmatch(rb"ordinary-group-farming-v([6789])\n", rows[0])
     assert version, rows[0]
     version = int(version[1])
+    assert not legacy or schema is None, "choose one fixture schema"
+    target = 5 if legacy else schema if schema is not None else version
+    assert 5 <= target <= version, "unsupported fixture downgrade"
     if producer is not None:
         rows[1] = json.dumps(producer).encode() + b"\n"
     if model is not None:
         rows[2] = json.dumps(model).encode() + b"\n"
-    if legacy:
-        metadata = rows[8].split()
-        assert len(metadata) == 2 and metadata[1] in (b"0", b"1")
-        if version >= 7:
-            config = 10 + (5 if metadata[1] == b"1" else 0)
-            identity = shlex.split(rows[config + 1].decode())
-            assert identity[:2] == rows[config].decode().split()[:2] and not identity[2], "revised identities cannot become a legacy fixture"
-            estimate = config + 2
+    metadata = rows[8].split()
+    assert len(metadata) == 2 and metadata[1] in (b"0", b"1")
+    config = 10 + (5 if metadata[1] == b"1" else 0)
+    if version >= 9 and target < 9:
+        owner = rows[config + 3].split()
+        assert len(owner) == 3 and owner[1:] == [b"0", b"0"], "v9 topology/scratch policy has no older representation"
+        ancestry = int(rows[config + 4])
+        estimate = config + 5 + ancestry
+        count = int(rows[estimate + 2])
+        flattened = rows[:config + 3] + rows[estimate:estimate + 4]
+        cursor = estimate + 4
+        for _ in range(count):
+            cohorts = int(rows[cursor + 5].split()[2])
+            control = cursor + 6 + 3 * cohorts
+            flattened.extend(rows[cursor:control + 1])
+            membership = shlex.split(rows[control + 1].decode())
+            assert membership == ["member", "0", "0", "", "0", "0", "1"], "detached obligations cannot become an older fixture"
+            assert rows[control + 2] == rows[config], "frozen grant service parameters cannot become an older fixture"
+            cursor = control + 4  # membership, config, and run-length grant rows
+        assert cursor == len(rows), "unexpected v9 rows during fixture conversion"
+        rows = flattened
+        rows[0] = b"ordinary-group-farming-v8\n"
+        version = 8
+    if target < 7 and version >= 7:
+        identity = shlex.split(rows[config + 1].decode())
+        assert identity[:2] == rows[config].decode().split()[:2] and not identity[2], "revised identities cannot become a legacy fixture"
+        estimate = config + 2
+        if version >= 8:
+            assert shlex.split(rows[estimate].decode())[0] == "active", "job controls cannot become a legacy fixture"
+            estimate += 1
+        count = int(rows[estimate + 2])
+        flattened = rows[:config + 1] + rows[estimate:estimate + 4]
+        cursor = estimate + 4
+        for _ in range(count):
+            flattened.extend(rows[cursor:cursor + 5])
+            first, _, cohorts = rows[cursor + 5].split()
+            assert first == b"0" and cohorts == b"0", "parameter cohorts cannot become a legacy fixture"
+            cursor += 6
             if version >= 8:
-                assert shlex.split(rows[estimate].decode())[0] == "active", "job controls cannot become a legacy fixture"
-                estimate += 1
-            count = int(rows[estimate + 2])
-            flattened = rows[:config + 1] + rows[estimate:estimate + 4]
-            cursor = estimate + 4
-            for _ in range(count):
-                flattened.extend(rows[cursor:cursor + 5])
-                first, _, cohorts = rows[cursor + 5].split()
-                assert first == b"0" and cohorts == b"0", "parameter cohorts cannot become a legacy fixture"
-                cursor += 6
-                if version >= 8:
-                    assert shlex.split(rows[cursor].decode())[0] == "active", "destination controls cannot become a legacy fixture"
-                    cursor += 1
-            assert cursor == len(rows), "unexpected ordinary plan rows during legacy conversion"
-            rows = flattened
-            rows[2] = b'"group-farming-3"\n'
+                assert shlex.split(rows[cursor].decode())[0] == "active", "destination controls cannot become a legacy fixture"
+                cursor += 1
+        assert cursor == len(rows), "unexpected ordinary plan rows during legacy conversion"
+        rows = flattened
+        rows[0] = b"ordinary-group-farming-v6\n"
+        rows[2] = b'"group-farming-3"\n'
+        keys, representation = rows[3].split(b" ", 1)
+        assert keys == b'"directory-farming-keys-2"'
+        rows[3] = b'"directory-farming-keys-1" ' + representation
+        version = 6
+    if target == 5:
         if metadata[1] == b"1":
             # v5 metadata ends after its assumptions row. A calibrated v6
             # profile has no legacy representation and must not lose scope.
@@ -256,6 +285,12 @@ def rewrite_plan(record, *, producer=None, legacy=False, model=None):
             del rows[13]
         rows[0] = b"ordinary-group-farming-v5\n"
         del rows[3]  # v6 key-derivation and numeric compatibility row
+    if request_allowance is not None:
+        assert target >= 8 and request_allowance >= 0, "request allowances require the v8 fixture contract"
+        control = shlex.split(rows[config + 2].decode())
+        assert len(control) == 4
+        control[2] = str(request_allowance)
+        rows[config + 2] = ('"' + control[0] + '" ' + ' '.join(control[1:]) + '\n').encode()
     rewritten = b"".join(rows)
     return rewritten + hashlib.sha256(rewritten).hexdigest().encode() + b"\n"
 
@@ -265,15 +300,21 @@ def snapshot(root, *, observations=True):
                                        digest(p) if p.is_file() else None)
               for p in root.rglob("*")}
     if not observations:
-        for name in ("grow-farm.progress", ".xchplot2/grow-farm.progress"):
-            progress = root / name
-            if progress.is_file():
-                record = progress.read_bytes()
-                assert not progress.is_symlink() and record.startswith(b"ordinary-group-farming-progress-v1\n")
-                assert record[-65:] == hashlib.sha256(record[:-65]).hexdigest().encode() + b"\n"
-                if os.name != "nt":
-                    assert progress.stat().st_mode & 0o777 == 0o600
-                del result[str(Path(name))]
+        records = {
+            "grow-farm.progress": (b"ordinary-group-farming-progress-v1\n", b"ordinary-group-farming-progress-v2\n"),
+            "grow-farm.owner": (b"ordinary-group-farming-owner-v1\n", b"ordinary-group-farming-owner-v2\n"),
+            "grow-farm.heartbeat": (b"ordinary-group-farming-heartbeat-v1\n",),
+        }
+        for base, headers in records.items():
+            for name in (base, ".xchplot2/" + base):
+                observation = root / name
+                if observation.is_file():
+                    record = observation.read_bytes()
+                    assert not observation.is_symlink() and record.startswith(headers)
+                    assert record[-65:] == hashlib.sha256(record[:-65]).hexdigest().encode() + b"\n"
+                    if os.name != "nt":
+                        assert observation.stat().st_mode & 0o777 == 0o600
+                    del result[str(Path(name))]
         # An atomic observation replacement updates its parent directory too.
         # All other names, file bytes and private permissions remain checked.
         if ".xchplot2" in result:
@@ -310,6 +351,462 @@ def watch_status(command, log, *selectors):
     return samples
 
 
+def check_farm_guided_plans(run, command, verify, root):
+    directory = root / "guided ' farm"
+    directory.mkdir()
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 1,
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    limits = ["-k", 18, "--group-members", 2, "--meta-group", 0, "--max-groups", 2,
+              "--max-total-members", 3, "--capacity-bytes", "32M", "--leave-free", 0]
+    constrained = [*limits, "--farming-memory-bytes", 1]
+    before = snapshot(directory)
+    baseline = json.loads(run("plan", directory, *constrained, "--json", code=2).stdout)
+    assert not baseline["feasible"] and {item["name"] for item in baseline["model_alternatives"]} >= {"memory", "eligible-groups"}
+    partial = root / "still constrained.plan"
+    incomplete = json.loads(run("plan", directory, *constrained, "--alternative", "memory",
+                                "--save-plan", partial, "--json", code=2).stdout)
+    assert not incomplete["feasible"] and incomplete["saved_preview"] == "" and not partial.exists()
+    for name in ("", "unknown", "memory,", "memory,memory", "capacity,memory"):
+        run("plan", directory, *constrained, "--alternative", name, "--save-plan", partial, code=2)
+        assert not partial.exists() and snapshot(directory) == before
+    review = root / "guided resources.plan"
+    selected = json.loads(run("plan", directory, *constrained, "--alternative", "memory,eligible-groups",
+                              "--save-plan", review, "--json").stdout)
+    assert selected["feasible"] and selected["selected_alternative"] == "memory,eligible-groups"
+    assert selected["alternative_before"]["memory_bytes"] == 1
+    assert selected["alternative_after"]["memory_bytes"] >= selected["reader_memory_bytes"]
+    assert selected["alternative_after"]["max_eligible_groups"] >= selected["certified_max_eligible_groups"]
+    assert snapshot(directory) == before and SEED not in review.read_text(encoding="utf-8")
+    variants = root / "guided resource variants"
+    variants.mkdir()
+    # The complete joint model supplies the storage service bound; use its
+    # response rather than assuming the test filesystem has a fixed latency.
+    deadline_ms = int(selected["response_bound_seconds"] * 1000) + 1
+    for name, options in (
+            ("deadline", ["--farming-deadline-ms", 1]),
+            ("cpu-cores", ["--farming-cores", 1, "--farming-deadline-ms", deadline_ms]),
+            ("lookup-workers", ["--farming-cores", 1, "--farming-lookup-workers", 1,
+                                "--farming-deadline-ms", deadline_ms])):
+        alternative = root / f"guided {name}.plan"
+        offered = json.loads(run("plan", variants, *limits, "--farming-max-eligible-groups", 2,
+                                 *options, "--alternative", name, "--save-plan", alternative, "--json").stdout)
+        prior, following = offered["alternative_before"], offered["alternative_after"]
+        assert offered["feasible"] and offered["selected_alternative"] == name
+        assert prior["files"] == following["files"] and prior["members"] == following["members"]
+        assert prior["memory_bytes"] == following["memory_bytes"] and prior["max_eligible_groups"] == following["max_eligible_groups"]
+        if name == "deadline":
+            assert following["deadline_seconds"] > prior["deadline_seconds"]
+        else:
+            assert following["harvester_cores"] > prior["harvester_cores"]
+            assert following["deadline_seconds"] == prior["deadline_seconds"]
+        if name == "lookup-workers":
+            assert following["lookup_workers"] > prior["lookup_workers"]
+            assert following["required_reader_memory_bytes"] > prior["required_reader_memory_bytes"]
+        else:
+            assert following["lookup_workers"] == prior["lookup_workers"]
+        assert not list(variants.iterdir()) and SEED not in alternative.read_text(encoding="utf-8")
+    held = root / "guided original directory"
+    directory.rename(held)
+    directory.mkdir()
+    try:
+        run("fill", review, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, *runtime, code=2)
+        assert not list(directory.iterdir()), "a guided preview adopted a replacement native directory"
+    finally:
+        directory.rmdir()
+        held.rename(directory)
+    run("fill", review, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, *runtime, "--quiet")
+    paths = sorted(directory.glob("*.gplot"))
+    assert [header(path)[3] for path in paths] == [2, 1]
+    hashes = {path: digest(path) for path in paths}
+    for path in paths:
+        verify(path)
+
+    capacity_dir = root / "guided capacity"
+    capacity_dir.mkdir()
+    capacity_options = [*limits, "--group-members", 1, "--max-groups", 8, "--max-total-members", 8]
+    capacity_review = root / "guided capacity.plan"
+    capacity = json.loads(run("plan", capacity_dir, *capacity_options, "--alternative", "capacity",
+                              "--save-plan", capacity_review, "--json").stdout)
+    assert capacity["feasible"] and capacity["capacity_search"] == "bounded-descending-nonmaximal"
+    assert capacity["alternative_after"]["members"] < capacity["alternative_before"]["members"]
+    for field in ("memory_bytes", "max_eligible_groups", "harvester_cores", "lookup_workers", "deadline_seconds"):
+        assert capacity["alternative_after"][field] == capacity["alternative_before"][field]
+    assert not list(capacity_dir.iterdir())
+    run("fill", capacity_review, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, *runtime, "--quiet")
+    assert sum(header(path)[3] for path in capacity_dir.glob("*.gplot")) == capacity["alternative_after"]["members"]
+
+    before = snapshot(directory)
+    upgrade = root / "guided metadata upgrade.plan"
+    if os.name != "nt":
+        import fcntl
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            busy = run("plan", directory, "--upgrade-job", "--save-plan", upgrade, code=2)
+            assert "stopped coordinator" in busy.stdout + busy.stderr and not upgrade.exists()
+        finally:
+            os.close(descriptor)
+        assert snapshot(directory) == before
+    upgraded = json.loads(run("plan", directory, "--upgrade-job", "--save-plan", upgrade, "--json").stdout)
+    assert upgraded["feasible"] and upgraded["metadata_upgrade"]
+    assert upgraded["manifest_reserved_bytes"] >= upgraded["original_manifest_reserved_bytes"]
+    assert upgraded["update_reserved_bytes"] and upgraded["progress_reserved_bytes"]
+    assert snapshot(directory) == before and all(digest(path) == value for path, value in hashes.items())
+    metadata = json.loads(run("plan", "--metadata-only", "--manifest", private_record(directory, "grow-farm.plan"), "--json").stdout)
+    recovery = metadata["recovery"]
+    assert recovery["metadata_upgrade_review_supported"] and not recovery["metadata_upgrade_applied"]
+    assert recovery["saved_sealed_files"] <= len(paths) and recovery["upgrade_review_command"] and recovery["apply_review_command"]
+    assert recovery["remaining_scope"] == "saved-extents-include-unstarted-forecast-not-live-completion"
+    inspected = json.loads(run("status", directory, "--inspect", "--json").stdout)
+    assert inspected["destinations"][0]["completed_files"] == len(paths)
+    if os.name != "nt":
+        assert shlex.split(recovery["upgrade_review_command"])[-3] == str(private_record(directory, "grow-farm.plan"))
+    run("fill", upgrade, *runtime, "--quiet")
+    assert all(digest(path) == value for path, value in hashes.items())
+    before = snapshot(directory)
+    run("fill", upgrade, *runtime, code=2)
+    assert snapshot(directory) == before, "a stale metadata-upgrade preview changed its source policy"
+
+    # Build an older stopped fixture from the acknowledged completed policy.
+    # v8 has no owner/grant schema; removing its v9-only progress observation
+    # avoids inventing a matching old-policy observation or weakening guards.
+    manifest = private_record(directory, "grow-farm.plan")
+    current = manifest.read_bytes()
+    assert rewrite_plan(current) == current
+    manifest.write_bytes(rewrite_plan(current, schema=8, request_allowance=0))
+    private_record(directory, "grow-farm.progress").unlink()
+    native = directory.stat().st_dev, directory.stat().st_ino
+    plot_native = {path: (path.stat().st_dev, path.stat().st_ino, path.stat().st_mode) for path in paths}
+    before = snapshot(directory)
+    older = json.loads(run("plan", "--metadata-only", "--manifest", manifest, "--json").stdout)
+    assert older["schema_version"] == 8 and older["update_reserved_bytes"] == 0 and older["owner_reserved_bytes"] == 0
+    older_review = root / "older request allowance upgrade.plan"
+    reviewed_upgrade = json.loads(run("plan", directory, "--upgrade-job", "--save-plan", older_review, "--json").stdout)
+    assert reviewed_upgrade["metadata_upgrade"] and reviewed_upgrade["original_update_reserved_bytes"] == 0
+    assert reviewed_upgrade["original_owner_reserved_bytes"] == 0
+    assert reviewed_upgrade["update_reserved_bytes"] and reviewed_upgrade["owner_reserved_bytes"]
+    assert snapshot(directory) == before and SEED not in older_review.read_text(encoding="utf-8")
+    run("fill", older_review, *runtime, "--quiet")
+    applied_upgrade = json.loads(run("plan", "--metadata-only", "--manifest", manifest, "--json").stdout)
+    assert applied_upgrade["schema_version"] == 9 and applied_upgrade["update_reserved_bytes"] and applied_upgrade["owner_reserved_bytes"]
+    assert SEED in manifest.read_text(encoding="utf-8") and manifest.stat().st_nlink == 1
+    if os.name != "nt":
+        assert manifest.stat().st_mode & 0o777 == 0o600
+    assert (directory.stat().st_dev, directory.stat().st_ino) == native
+    assert all((path.stat().st_dev, path.stat().st_ino, path.stat().st_mode) == plot_native[path]
+               and digest(path) == value for path, value in hashes.items())
+    for schema in (6, 5):
+        compatible_fixture = root / ("converted schema " + str(schema) + ".plan")
+        converted = rewrite_plan(current, schema=schema)
+        compatible_fixture.write_bytes(converted)
+        compatible_fixture.chmod(0o600)
+        inspected = json.loads(run("plan", "--metadata-only", "--manifest", compatible_fixture, "--json").stdout)
+        assert inspected["schema_version"] == schema and compatible_fixture.read_bytes() == converted
+
+    legacy_dir = root / "guided legacy ' checkpoint"
+    legacy_dir.mkdir()
+    run("fill", legacy_dir, *limits, "--max-groups", 1, "--max-total-members", 1,
+        "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime, "--construction", "incremental",
+        point="initialized", code=86)
+    target = next(legacy_dir.glob("*.gplot"))
+    original = target.read_bytes()
+    producer = json.loads(run("plan", "--metadata-only", "--manifest", private_record(legacy_dir, "grow-farm.plan"), "--json").stdout)["producer_build"]
+    foreign = "guided-legacy-original"
+    changed = bytearray(original)
+    marker = b"XCHPLOT2GROWv1".ljust(16, b"\0")
+    cursor = changed.find(marker)
+    converted = False
+    # Use the same valid-record conversion as the cross-build checkpoint
+    # fixture: retain native ownership, switch the schema, clear its compatible
+    # extension, replace only provenance, and recompute the record checksum.
+    while cursor >= 0:
+        record = bytearray(changed[cursor:cursor + 1024])
+        if len(record) == 1024 and hashlib.sha256(record[:-32]).digest() == record[-32:]:
+            build = record.find(producer.encode())
+            compatibility = record.find(b"ordinary-group-construction-1")
+            assert build >= 0 and compatibility >= 0
+            struct.pack_into("<I", record, 24, 1)
+            record[build:build + 64] = foreign.encode().ljust(64, b"\0")
+            extension = 64 + hashlib.sha256().digest_size
+            record[compatibility:compatibility + extension] = b"\0" * extension
+            record[-32:] = hashlib.sha256(record[:-32]).digest()
+            changed[cursor:cursor + len(record)] = record
+            converted = True
+        cursor = changed.find(marker, cursor + len(marker))
+    assert converted
+    target.write_bytes(changed)
+    blocked_review = root / "blocked legacy upgrade.plan"
+    before = snapshot(legacy_dir)
+    blocked = json.loads(run("status", legacy_dir, "--inspect", "--json", code=2).stdout)
+    assert not blocked["inspection_complete"]
+    blocked_destination = blocked["destinations"][0]
+    recovery = blocked_destination["recovery"]
+    assert blocked_destination["status"] == "legacy-checkpoint-blocked" and blocked_destination["blocked_checkpoint_engine"] == "growth"
+    assert recovery["required_original_build"] == foreign and recovery["blocked_checkpoint_path"] == str(target)
+    assert recovery["original_drain_command_if_supported"] and not recovery["metadata_upgrade_applied"]
+    refused = json.loads(run("plan", legacy_dir, "--upgrade-job", "--save-plan", blocked_review, "--json", code=2).stdout)
+    assert refused["farming_status"] and not blocked_review.exists() and snapshot(legacy_dir) == before
+    target.write_bytes(original)
+    run("fill", legacy_dir, "--resume", *runtime, "--quiet")
+    verify(target)
+    print("PASS selectable resource/capacity previews, native bindings, fenced metadata upgrade and stale-policy refusal", flush=True)
+
+
+def check_farm_membership_lifecycle(run, command, verify, root):
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 1,
+               "--construction", "incremental", "--batch-members", 1,
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    directory = root / "independent allocation grant"
+    directory.mkdir()
+    first, second, offline = (directory / name for name in ("first", "second", "offline second"))
+    first.mkdir()
+    second.mkdir()
+    options = [first, second, "-k", 18, "--strength", 4, "--group-members", 8, "--max-groups", 1,
+               "--max-total-members", 8, "--leave-free", 0]
+    forecast = json.loads(run("plan", *options, "--capacity-bytes", "8M", "--json").stdout)
+    # This deterministic strength/meta cohort packs below the next forecast
+    # boundary. Keep the independently reserved metadata outside its tested
+    # plot-byte budget, including when a platform rounds that metadata up.
+    for _ in range(3):
+        capacity = 10212432 + 2 * forecast["manifest_reserved_bytes"]
+        assessed = json.loads(run("plan", *options, "--capacity-bytes", capacity, "--json").stdout)
+        if assessed["manifest_reserved_bytes"] == forecast["manifest_reserved_bytes"]:
+            forecast = assessed
+            break
+        forecast = assessed
+    else:
+        raise AssertionError("beyond-forecast fixture metadata reservation did not settle")
+    options += ["--capacity-bytes", capacity]
+    initial = forecast["destinations"][1]
+    assert 0 < initial["members"] < 8 and initial["allocation_grant_members"] > initial["members"]
+    run("fill", *options, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
+        "--quiet", point="initialized", code=86)
+    original = private_record(first, "grow-farm.plan").read_bytes()
+    offline_outputs = {path.name: digest(path) for path in first.glob("*.gplot")}
+    first.rename(offline)
+    try:
+        run("fill", "--resume", "--allow-missing", second, *runtime, "--quiet", code=4)
+        completed = sum(header(path)[3] for path in second.glob("*.gplot"))
+        assert completed > initial["members"] and completed <= initial["allocation_grant_members"]
+        assert private_record(second, "grow-farm.plan").read_bytes() == original
+        assert private_record(offline, "grow-farm.plan").read_bytes() == original
+        status = json.loads(run("status", second, "--inspect", "--json", code=2).stdout)
+        observed = next(item for item in status["destinations"] if item["directory"] == str(second))
+        assert observed["completed_members"] == completed and observed["allocation_grant_members"] == initial["allocation_grant_members"]
+        assert {path.name: digest(path) for path in offline.glob("*.gplot")} == offline_outputs, "an absent member's outputs changed"
+    finally:
+        offline.rename(first)
+    run("fill", "--resume", second, *runtime, "--quiet")
+    assert private_record(first, "grow-farm.plan").read_bytes() == private_record(second, "grow-farm.plan").read_bytes()
+    for path in [*first.glob("*.gplot"), *second.glob("*.gplot")]:
+        verify(path)
+    progress_review = root / "beyond forecast saved progress.plan"
+    run("plan", second, "--save-plan", progress_review)
+    saved_progress = json.loads(run("plan", "--metadata-only", progress_review, "--json").stdout)
+    assert saved_progress["recovery"]["saved_unsealed_members"] == 0
+    admitted = sum(item["admitted_members"] for item in saved_progress["destinations"])
+    actual = sum(header(path)[3] for destination in (first, second) for path in destination.glob("*.gplot"))
+    assert admitted == actual
+    saved_available = next(item for item in saved_progress["destinations"] if item["directory"] == str(second))
+    assert saved_available["count_scope"] == "layout-forecast" and saved_available["admitted_members"] > saved_available["forecast_members"]
+
+    retired = root / "retired member returns"
+    retired.mkdir()
+    survivor, member, absent = (retired / name for name in ("survivor", "retiring", "absent retiring"))
+    survivor.mkdir()
+    member.mkdir()
+    run("fill", survivor, member, "-k", 18, "--group-members", 1, "--max-groups", 1,
+        "--max-total-members", 1, "--capacity-bytes", "32M", "--leave-free", 0,
+        "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime, "--quiet")
+    member_output = next(member.glob("*.gplot"))
+    member_hash = digest(member_output)
+    old_replica = private_record(member, "grow-farm.plan").read_bytes()
+    member.rename(absent)
+    try:
+        run("retire", survivor, "--destination", member, "--quiet", code=(0, 2))
+        metadata = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
+        removed = next(item for item in metadata["destinations"] if item["directory"] == str(member))
+        assert metadata["required_destinations"] == 1 and removed["membership"] == "detached"
+        assert removed["retained_obligation"] and not removed["detached_acknowledged"]
+        detached_revision = metadata["revision"]
+        previous_revision = detached_revision
+        for _ in range(3):
+            run("fill", survivor, *runtime, "--quiet")
+            current = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
+            assert current["revision"] > previous_revision and current["required_destinations"] == 1
+            previous_revision = current["revision"]
+            retained = next(item for item in current["destinations"] if item["directory"] == str(member))
+            assert retained["membership"] == "detached" and retained["retained_obligation"]
+            assert retained["allocation_grant_members"] == removed["allocation_grant_members"]
+            assert private_record(absent, "grow-farm.plan").read_bytes() == old_replica
+        assert previous_revision > detached_revision
+    finally:
+        absent.rename(member)
+    run("fill", survivor, *runtime, "--quiet")
+    returned = json.loads(run("status", survivor, "--inspect", "--json").stdout)
+    removed = next(item for item in returned["destinations"] if item["directory"] == str(member))
+    assert returned["required_destinations"] == 1 and removed["membership"] == "detached"
+    assert removed["detached_acknowledged"] and not removed["retained_obligation"]
+    assert list(member.glob("*.gplot")) == [member_output] and digest(member_output) == member_hash
+    run("fill", member, "--resume", *runtime, "--quiet", code=(0, 2))
+    assert list(member.glob("*.gplot")) == [member_output] and digest(member_output) == member_hash
+
+    for _ in range(3):
+        run("fill", survivor, *runtime, "--quiet")
+        frozen = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
+        removed = next(item for item in frozen["destinations"] if item["directory"] == str(member))
+        if removed["detached_reclaimed"]:
+            break
+    else:
+        raise AssertionError("returned retirement did not reach its acknowledged reclamation boundary")
+    frozen_quota = removed["capacity_bytes"]
+    frozen_metadata = snapshot(member)
+    member.rename(absent)
+    added = [retired / ("added allocation member " + str(index)) for index in range(4)]
+    for path in added:
+        path.mkdir()
+    try:
+        run("fill", "--extend", survivor, *added, "--farming-max-eligible-groups", 8, *runtime, "--quiet")
+        grown = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
+        assert grown["manifest_reserved_bytes"] > frozen["manifest_reserved_bytes"]
+        still_retired = next(item for item in grown["destinations"] if item["directory"] == str(member))
+        assert still_retired["capacity_bytes"] == frozen_quota and still_retired["detached_reclaimed"]
+        assert snapshot(absent) == frozen_metadata, "active membership growth expanded a retired member's frozen metadata"
+    finally:
+        absent.rename(member)
+    run("fill", "--resume", survivor, *runtime, "--quiet")
+    assert snapshot(member) == frozen_metadata and digest(member_output) == member_hash
+    returned = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
+    still_retired = next(item for item in returned["destinations"] if item["directory"] == str(member))
+    assert still_retired["capacity_bytes"] == frozen_quota and still_retired["membership"] == "detached"
+    for destination in added:
+        for path in destination.glob("*.gplot"):
+            verify(path)
+
+    controlled = root / "resume starts idle work"
+    controlled.mkdir()
+    run("fill", controlled, "-k", 18, "--group-members", 1, "--max-groups", 1,
+        "--max-total-members", 1, "--capacity-bytes", "32M", "--leave-free", 0,
+        "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime, "--quiet")
+    existing = next(controlled.glob("*.gplot"))
+    existing_hash = digest(existing)
+    run("pause", controlled, "--quiet")
+    run("fill", controlled, "--max-groups", 2, "--max-total-members", 2, *runtime, "--quiet")
+    run("resume", controlled, "--policy-only", "-M", "512M", "--quiet")
+    assert list(controlled.glob("*.gplot")) == [existing] and digest(existing) == existing_hash
+    run("pause", controlled, "--quiet")
+    # Resume starts the default construction workspace; the earlier fill's
+    # small window/checkpoint overrides are not saved execution settings.
+    run("resume", controlled, "-M", "2G", "--quiet")
+    paths = sorted(controlled.glob("*.gplot"))
+    assert sum(header(path)[3] for path in paths) == 2 and digest(existing) == existing_hash
+    for path in paths:
+        verify(path)
+
+    terminal_added = root / "terminal add candidate"
+    terminal_added.mkdir()
+    terminal_review = root / "terminal earlier expansion.plan"
+    run("plan", controlled, terminal_added, "--farming-max-eligible-groups", 8, "--save-plan", terminal_review)
+
+    run("retire", controlled, "--quiet")
+    terminal = json.loads(run("status", controlled, "--inspect", "--json").stdout)
+    assert terminal["required_destinations"] == 0
+    terminal_member = terminal["destinations"][0]
+    assert terminal_member["membership"] == "detached" and terminal_member["detached_acknowledged"] and terminal_member["detached_reclaimed"]
+    frozen_terminal = snapshot(controlled)
+    for action in ("pause", "drain", "resume", "retire"):
+        run(action, controlled, "--policy-only", "--quiet")
+        assert snapshot(controlled) == frozen_terminal, "terminal policy-only control changed frozen retirement evidence"
+    run("resume", controlled, "-M", "2G", "--quiet")
+    assert snapshot(controlled) == frozen_terminal, "terminal resume reactivated retired membership or rewrote its evidence"
+    rejected_review = root / "terminal rejected expansion.plan"
+    run("plan", controlled, terminal_added, "--save-plan", rejected_review, code=2)
+    run("fill", "--extend", controlled, terminal_added, *runtime, "--quiet", code=2)
+    run("fill", "--from-plan", terminal_review, *runtime, "--quiet", code=2)
+    assert not rejected_review.exists() and not list(terminal_added.iterdir())
+    assert snapshot(controlled) == frozen_terminal, "terminal extension changed frozen retirement evidence"
+    print("PASS offline grants beyond forecast, detached-member ancestry/return and resume start/policy-only behavior", flush=True)
+
+
+def check_farm_v8_retirement(run, command, verify, root, legacy_run=None):
+    directory = root / "older missing retirement"
+    directory.mkdir()
+    first, second, offline = (directory / name for name in ("remaining", "missing", "offline missing"))
+    first.mkdir()
+    second.mkdir()
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 1,
+               "--construction", "incremental", "--batch-members", 1,
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    create = ["fill", first, second, "-k", 18, "--group-members", 1, "--max-groups", 1,
+              "--max-total-members", 1, "--capacity-bytes", "32M", "--leave-free", 0,
+              "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime, "--quiet"]
+    if legacy_run:
+        legacy_run(*create)
+    else:
+        run(*create)
+        # The installed suite has one producer. Capture its complete native
+        # policy, then encode the representable older contract; private
+        # qualification supplies the actual older executable instead.
+        prepared = root / "older retirement preparation.plan"
+        run("plan", first, "--upgrade-job", "--save-plan", prepared)
+        run("fill", prepared, *runtime, "--quiet")
+        original = rewrite_plan(private_record(first, "grow-farm.plan").read_bytes(), schema=8)
+        # Original v8 extent publications can finish files after the initial
+        # future-policy boundary. Reproduce that real producer's sealed prefix
+        # without treating completed files as a newer future-policy request.
+        rows = farming_plan_rows(original[:-65])
+        config = 10 + (5 if rows[8].split()[1] == b"1" else 0)
+        identity = shlex.split(rows[config + 1].decode())
+        assert not identity[2]
+        rows[config + 1] = (identity[0] + " " + identity[1] + ' "" 1\n').encode()
+        cursor = config + 7
+        for _ in range(int(rows[config + 5])):
+            first_file, _, cohorts = rows[cursor + 5].split()
+            assert first_file == b"0" and cohorts == b"0"
+            rows[cursor + 5] = b"0 0 0\n"
+            cursor += 7
+        assert cursor == len(rows)
+        body = b"".join(rows)
+        original = body + hashlib.sha256(body).hexdigest().encode() + b"\n"
+        for destination in (first, second):
+            private_record(destination, "grow-farm.plan").write_bytes(original)
+            private_record(destination, "grow-farm.progress").unlink()
+    manifest = private_record(first, "grow-farm.plan")
+    source = json.loads(run("plan", "--metadata-only", "--manifest", manifest, "--json").stdout)
+    assert source["schema_version"] == 8 and source["required_destinations"] == 2
+    original_quota = {item["directory"]: item["capacity_bytes"] for item in source["destinations"]}
+    old_missing = snapshot(second)
+    hashes = {path: digest(path) for destination in (first, second) for path in destination.glob("*.gplot")}
+    second.rename(offline)
+    try:
+        run("retire", first, "--destination", second, "--quiet", code=(0, 2))
+        retired = json.loads(run("plan", "--metadata-only", "--manifest", manifest, "--json").stdout)
+        assert retired["schema_version"] == 9 and retired["required_destinations"] == 1
+        assert retired["manifest_reserved_bytes"] == source["manifest_reserved_bytes"] and retired["owner_reserved_bytes"] == 0
+        assert all(item["capacity_bytes"] == original_quota[item["directory"]] for item in retired["destinations"])
+        removed = next(item for item in retired["destinations"] if item["directory"] == str(second))
+        assert removed["membership"] == "detached" and removed["retained_obligation"] and not removed["detached_acknowledged"]
+        assert snapshot(offline) == old_missing, "legacy missing retirement rewrote the unfenced source"
+        inspected = json.loads(run("status", first, "--inspect", "--json", code=(0, 2)).stdout)
+        assert inspected["required_destinations"] == 1
+        assert next(item for item in inspected["destinations"] if item["directory"] == str(second))["membership"] == "detached"
+    finally:
+        offline.rename(second)
+    for _ in range(3):
+        run("retire", first, "--destination", second, "--quiet", code=(0, 2))
+        returned = json.loads(run("plan", "--metadata-only", "--manifest", manifest, "--json").stdout)
+        removed = next(item for item in returned["destinations"] if item["directory"] == str(second))
+        if removed["detached_acknowledged"] and removed["detached_reclaimed"]:
+            break
+    else:
+        raise AssertionError("older retired native source did not reach acknowledgement and reclamation")
+    assert returned["required_destinations"] == 1 and removed["membership"] == "detached"
+    assert all(digest(path) == value for path, value in hashes.items())
+    for path in hashes:
+        verify(path)
+    print("PASS older v8 missing-member retirement retains original grants and fences native return", flush=True)
+
+
 def check_farm_updates(run, command, verify, root):
     directory = root / "future policy"
     directory.mkdir()
@@ -323,7 +820,9 @@ def check_farm_updates(run, command, verify, root):
     before = snapshot(directory)
     status = json.loads(run("status", directory, "--json").stdout)
     assert status["read_only"] and status["inspection_complete"] and status["update_status"] == "none"
-    assert status["inspection_kind"] == "saved-progress" and not status["live_writer_health_checked"]
+    assert status["inspection_kind"] == "saved-progress" and status["live_writer_health_checked"]
+    assert status["destinations"][0]["owner"]["status"] == "stopped"
+    assert not status["destinations"][0]["owner"]["lock_held"]
     assert status["destinations"][0]["completed_files"] == 1 and status["destinations"][0]["completed_members"] == 2
     assert status["destinations"][0]["next_action"] and snapshot(directory) == before
     status_review = root / "status.plan"
@@ -437,13 +936,16 @@ def check_farm_updates(run, command, verify, root):
     try:
         status = json.loads(run("fill", "--status", status_review, "--json", code=2).stdout)
         assert not status["inspection_complete"] and not status["destinations"][0]["available"]
+        assert not status["live_writer_health_checked"] and not status["destinations"][0]["owner"]["checked"]
+        assert status["destinations"][0]["owner"]["status"] == "unavailable"
+        assert status["destinations"][1]["owner"]["checked"] and status["destinations"][1]["owner"]["status"] == "stopped"
         assert status["destinations"][1]["completed_members"] == 5
     finally:
         offline.rename(directory)
     assert (snapshot(directory), snapshot(added)) == before
 
     protected = {path: digest(path) for path in [*paths, *additions]}
-    for action, intent in (("pause", "paused"), ("drain", "draining"), ("retire", "retired")):
+    for action, intent in (("pause", "paused"), ("drain", "draining")):
         run(action, directory, "--quiet")
         controlled = json.loads(run("status", added, "--json").stdout)
         assert controlled["control"] == intent
@@ -464,6 +966,12 @@ def check_farm_updates(run, command, verify, root):
     samples = watch_status(command, root / "status-watch.log", added)
     assert all(sample["read_only"] and sample["inspection_kind"] == "saved-progress" for sample in samples)
     assert (snapshot(directory), snapshot(added)) == watched_before, "status watch mutated saved work"
+    run("retire", directory, "--destination", added, "--quiet")
+    retired = json.loads(run("status", directory, "--json").stdout)
+    by_directory = {entry["directory"]: entry for entry in retired["destinations"]}
+    assert by_directory[str(added)]["membership"] == "detached" and by_directory[str(added)]["control"] == "retired"
+    assert by_directory[str(directory)]["membership"] == "member" and by_directory[str(directory)]["control"] == "active"
+    assert {path: digest(path) for path in protected} == protected, "retirement removed or rewrote a completed plot"
 
     progressing = root / "progress-only review"
     progressing.mkdir()
@@ -512,7 +1020,9 @@ def check_farm_updates(run, command, verify, root):
                     stopped = True
                     attached = run("fill", live, *runtime, "--json", code=(0, 2))
                     attached_status = json.loads(attached.stdout.splitlines()[-1])
-                    assert attached_status["farming_status"] and attached_status["read_only"] and not attached_status["live_writer_health_checked"]
+                    assert attached_status["farming_status"] and attached_status["read_only"] and attached_status["live_writer_health_checked"]
+                    owner = attached_status["destinations"][0]["owner"]
+                    assert owner["lock_held"] and owner["local_process_proven"] and owner["status"] in ("live", "unresponsive-owner")
                 request = run("fill", "--update", live, "--group-members", 3, "--strength", 3,
                               "--max-groups", 3, "--max-total-members", 11 if refused_update else 14,
                               "--capacity-bytes", 1 if refused_update else "128M", *runtime, "--json",
@@ -591,9 +1101,18 @@ def check_farm_returning_drives(run, command, verify, root):
             stopped = False
             try:
                 if dynamic:
-                    wait_for(lambda: all(private_record(member, "grow-farm.progress").is_file() for member in (first, second)), process, log)
+                    def active_started():
+                        try:
+                            observed = json.loads(run("status", second, "--json", code=(0, 2)).stdout)
+                            return all(item["owner"]["status"] == "live" and item["owner"]["local_process_proven"]
+                                       for item in observed["destinations"]) and any(header(path)[3] > 0 for path in first.glob("*.gplot"))
+                        except (OSError, AssertionError, ValueError, struct.error):
+                            return False
+                    wait_for(active_started, process, log)
                     process.send_signal(signal.SIGSTOP)
                     stopped = True
+                    stopped_pid, stopped_status = os.waitpid(process.pid, os.WUNTRACED)
+                    assert stopped_pid == process.pid and os.WIFSTOPPED(stopped_status)
                     first.rename(offline)
                     first.mkdir()
                     process.send_signal(signal.SIGCONT)
@@ -1197,18 +1716,23 @@ def check(binary, root, reference=None):
                "--max-groups", 2, "--farming-max-eligible-groups", 4, *construction,
                "--construction", "incremental", "--quiet", "--", a, b]
     run(*initial, point="farm-plan-published", code=86)
+    # A compatible creating build is provenance. Establish that source before
+    # constructing files so their authoritative journals bind the same policy.
+    foreign_producer = "e" * 64
+    for directory in (a, b):
+        assert not private_record(directory, "grow-farm.progress").exists()
+        for name in ("grow-farm.plan", "grow-farm.plan.next"):
+            path = private_record(directory, name)
+            if path.exists():
+                path.write_bytes(rewrite_plan(path.read_bytes(), producer=foreign_producer))
     resume = ["fill", "-r", "-d", "cpu", "-M", "512M", "-j", 2, "--compute", "off", "--quiet"]
     recovered = run(*resume, b)
     farm_paths = [Path(line) for line in recovered.stdout.splitlines()]
     assert len(farm_paths) == 4 and {p.parent for p in farm_paths} == {a, b}
     original_plan = private_record(a, "grow-farm.plan").read_bytes()
     assert original_plan == private_record(b, "grow-farm.plan").read_bytes()
-    # A compatible creating build is provenance. The normal executable must
-    # still audit saved keys/identities and completed ordinary output files.
-    foreign_producer = "e" * 64
-    original_plan = rewrite_plan(original_plan, producer=foreign_producer)
-    for directory in (a, b):
-        private_record(directory, "grow-farm.plan").write_bytes(original_plan)
+    # The normal executable must still audit saved keys, identities and
+    # completed ordinary output files from this compatible source policy.
     metadata = json.loads(run("plan", "--metadata-only", "--manifest", private_record(a, "grow-farm.plan"), "--json").stdout)
     assert metadata["producer_build"] == foreign_producer and metadata["plan_compatible"]
     legacy = root / "legacy foreign farm.plan"
@@ -1216,7 +1740,13 @@ def check(binary, root, reference=None):
     legacy_before = snapshot(a), snapshot(b), legacy.read_bytes()
     legacy_metadata = json.loads(run("plan", "--metadata-only", "--manifest", legacy, "--json").stdout)
     assert legacy_metadata["schema_version"] == 5 and not legacy_metadata["plan_compatible"]
-    run("plan", "--manifest", legacy, "--json", code=2)
+    assert legacy_metadata["recovery"]["required_original_build"] == foreign_producer
+    assert not legacy_metadata["recovery"]["metadata_upgrade_review_supported"]
+    refused_legacy = json.loads(run("plan", "--manifest", legacy, "--json", code=2).stdout)
+    assert refused_legacy["metadata_only"] and refused_legacy["recovery"]["plan_requires_original_build"]
+    blocked_upgrade = root / "foreign legacy upgrade.plan"
+    run("plan", "--manifest", legacy, "--upgrade-job", "--save-plan", blocked_upgrade, "--json", code=2)
+    assert not blocked_upgrade.exists()
     assert (snapshot(a), snapshot(b), legacy.read_bytes()) == legacy_before
     def checksummed(rows):
         body = b"".join(rows)
@@ -1260,16 +1790,17 @@ def check(binary, root, reference=None):
         assert not private_record(directory, "grow-farm.plan.next").exists()
         if os.name != "nt":
             assert private_record(directory, "grow-farm.plan").stat().st_mode & 0o777 == 0o600
-    # Rewriting the producer makes the old observation policy digest foreign.
-    # Refuse that incoherent fixture without writes, then remove only its
-    # disposable observations to exercise completed-file audit without them.
+    # Rewriting only the producer makes the journal's policy digest foreign.
+    # Refuse that incoherent fixture without writes, then restore the exact
+    # original plans. Local seals are authoritative and must remain intact.
+    for directory in (a, b):
+        private_record(directory, "grow-farm.plan").write_bytes(rewrite_plan(original_plan, producer="f" * 64))
     foreign_before = snapshot(a), snapshot(b)
     foreign_progress = run(*resume, b, a, code=2)
     assert "farming progress belongs to a foreign source policy" in foreign_progress.stderr
     assert (snapshot(a), snapshot(b)) == foreign_before
     for directory in (a, b):
-        snapshot(directory, observations=False)  # Validate the disposable record before removal.
-        private_record(directory, "grow-farm.progress").unlink()
+        private_record(directory, "grow-farm.plan").write_bytes(original_plan)
     foreign_outputs = {path: digest(path) for path in farm_paths}
     assert set(run(*resume, b, a).stdout.splitlines()) == set(map(str, farm_paths))
     assert all(private_record(directory, "grow-farm.plan").read_bytes() == original_plan for directory in (a, b))
@@ -1362,8 +1893,34 @@ def check(binary, root, reference=None):
     for path in all_paths:
         if path.parent == c:
             verify(path)
-    # Mixed direct-parent publication was recovered above. Older ancestors no
-    # longer describe the sealed extents and cannot replace the current job.
+    # Independent seals stay in local journals, so the original policy is
+    # still the expansion's exact parent after the added drive finishes.
+    original_revision = shlex.split(farming_plan_rows(original_plan[:-65])[5].decode("utf-8"))
+    expanded_revision = shlex.split(farming_plan_rows(revised[:-65])[5].decode("utf-8"))
+    assert int(expanded_revision[1]) == int(original_revision[1]) + 1
+    assert expanded_revision[2] == hashlib.sha256(original_plan[:-65]).hexdigest()
+    expanded_hashes = {path: digest(path) for path in all_paths}
+    private_record(b, "grow-farm.plan").write_bytes(original_plan)
+    assert set(run(*resume, b).stdout.splitlines()) == set(map(str, all_paths))
+    assert all(private_record(directory, "grow-farm.plan").read_bytes() == revised for directory in members)
+    assert {path: digest(path) for path in all_paths} == expanded_hashes
+
+    # Advance through a normal reviewed objective change under the same
+    # storage, membership and harvester limits. The original is now an actual
+    # non-parent ancestor; an active member cannot roll the current job back.
+    lineage_review = farm / "lineage.plan"
+    lineage_before = tuple(snapshot(directory) for directory in members)
+    lineage = json.loads(run("plan", c, "--farming-objective", "latency", "--save-plan", lineage_review, "--json").stdout)
+    assert lineage["feasible"] and lineage["objective"] == "latency"
+    assert tuple(snapshot(directory) for directory in members) == lineage_before
+    run("fill", "--from-plan", lineage_review, "--compute", "off", "-d", "cpu", "-M", "512M", "-j", 2, "--quiet")
+    newer = private_record(c, "grow-farm.plan").read_bytes()
+    newer_revision = shlex.split(farming_plan_rows(newer[:-65])[5].decode("utf-8"))
+    assert int(newer_revision[1]) == int(expanded_revision[1]) + 1
+    assert newer_revision[2] == hashlib.sha256(revised[:-65]).hexdigest()
+    assert all(private_record(directory, "grow-farm.plan").read_bytes() == newer for directory in members)
+    assert {path: digest(path) for path in all_paths} == expanded_hashes
+    revised = newer
     private_record(b, "grow-farm.plan").write_bytes(original_plan)
     ancestor_before = tuple(snapshot(directory) for directory in members)
     run(*resume, b, code=2)
@@ -1403,6 +1960,41 @@ def check(binary, root, reference=None):
     run("plan", relocated, other_job, code=2)
     assert (snapshot(relocated), snapshot(other_job)) == before
     print("PASS explicit relocation and conflicting-job rejection", flush=True)
+
+    # A copied destination changes native identity. Its control intent and
+    # stopped owner must survive interruption while the approved move commits.
+    for index, point in enumerate(("farm-control-published", "farm-owner-handoff-heartbeat")):
+        run("pause", relocated, "--destination", relocated, "--quiet")
+        copied = farm / ("copied native destination " + str(index))
+        source = farm / ("offline copy source " + str(index))
+        shutil.copytree(relocated, copied)
+        assert copied.stat().st_ino != relocated.stat().st_ino
+        relocated.rename(source)
+        source_snapshot = snapshot(source)
+        copied_hashes = {path.name: digest(path) for path in copied.glob("*.gplot")}
+        review_path = farm / ("native handoff " + str(index) + ".plan")
+        before = tuple(snapshot(directory) for directory in (copied, b, c))
+        review = json.loads(run("plan", "--relocate", relocated, copied, "--save-plan", review_path, "--json").stdout)
+        assert review["feasible"] and tuple(snapshot(directory) for directory in (copied, b, c)) == before
+        run("fill", "--from-plan", review_path, "--compute", "off", *construction, "--quiet", point=point, code=86)
+        pending_before = tuple(snapshot(directory) for directory in (copied, b, c))
+        pending = json.loads(run("status", copied, "--json", code=(0, 2)).stdout)
+        assert tuple(snapshot(directory) for directory in (copied, b, c)) == pending_before
+        assert pending["update_status"] != "unavailable", pending
+        run(*resume, copied)
+        status = json.loads(run("status", copied, "--inspect", "--json").stdout)
+        moved = next(item for item in status["destinations"] if item["directory"] == str(copied))
+        assert moved["control"] == "paused" and moved["owner"]["status"] == "stopped"
+        assert not moved["owner"]["lock_held"] and not moved["owner"]["local_process_proven"]
+        assert {path.name: digest(path) for path in copied.glob("*.gplot")} == copied_hashes
+        assert snapshot(source) == source_snapshot, "native handoff changed the offline source copy"
+        run("resume", copied, "--destination", copied, "--policy-only", "--quiet")
+        status = json.loads(run("status", copied, "--json").stdout)
+        moved = next(item for item in status["destinations"] if item["directory"] == str(copied))
+        assert moved["control"] == "active"
+        verify(next(copied.glob("*.gplot")))
+        relocated = copied
+    print("PASS interrupted native copies preserve controls, owner observations and plot proofs", flush=True)
 
     # An offline member cannot commit an incomplete preparation. Once the
     # grants are published, its peer may finish only its saved assignments
@@ -1472,6 +2064,9 @@ def check(binary, root, reference=None):
             assert (snapshot(left), snapshot(right)) == conflict, "conflicting private/top-level records changed the job"
             private_record(left, "grow-farm.plan").unlink()
     print("PASS staged-job recovery and unfinished partial recovery preserve the saved extent", flush=True)
+    check_farm_guided_plans(run, command, verify, root)
+    check_farm_membership_lifecycle(run, command, verify, root)
+    check_farm_v8_retirement(run, command, verify, root)
     check_farm_updates(run, command, verify, root)
     check_farm_returning_drives(run, command, verify, root)
 

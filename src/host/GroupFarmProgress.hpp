@@ -22,6 +22,7 @@ struct FarmingProgressAssignment
 };
 struct FarmingProgress
 {
+    unsigned version = 1;
     std::string job_id, fingerprint, directory_identity, source_policy;
     uint64_t source_revision = 0, source_policy_revision = 0, sequence = 1, capacity_bytes = 0, progress_reserved_bytes = 0, headroom_bytes = 0;
     std::vector<uint16_t> granted_extents, extents;
@@ -106,6 +107,7 @@ inline bool protected_assignments(FarmingState const& state, FarmingDirectory co
 }
 inline void validate(FarmingProgress const& value)
 {
+    require(value.version == 1 || value.version == 2, "unsupported farming progress journal");
     require(farming_update_digest(value.job_id) && farming_update_digest(value.source_policy) &&
         !value.fingerprint.empty() && !value.directory_identity.empty() && value.source_revision && value.sequence &&
         value.source_policy_revision <= value.source_revision, "invalid farming progress binding");
@@ -115,10 +117,10 @@ inline void validate(FarmingProgress const& value)
         value.granted_sealed_files <= value.sealed_files && value.sealed_files <= value.extents.size() &&
         value.granted_sealed_files <= value.granted_extents.size() && stop(value.granted_fill_stop) && stop(value.fill_stop) &&
         (value.fill_stop.empty() || value.sealed_files == value.extents.size()) &&
-        (value.extents.size() == value.granted_extents.size() || !value.fill_stop.empty()),
+        (value.version >= 2 || value.extents.size() == value.granted_extents.size() || !value.fill_stop.empty()),
         "farming progress exceeds its globally admitted prefix");
     require(value.granted_fill_stop.empty() || (value.granted_fill_stop == value.fill_stop &&
-        value.granted_extents == value.extents && value.granted_sealed_files == value.sealed_files),
+        (value.version >= 2 || value.granted_extents == value.extents) && value.granted_sealed_files == value.sealed_files),
         "farming progress reopened a stopped grant");
     for (size_t file = 0; file < value.granted_extents.size(); ++file)
     {
@@ -126,7 +128,7 @@ inline void validate(FarmingProgress const& value)
         if (file >= value.extents.size()) continue;
         auto const extent = value.extents[file];
         require(extent && extent <= value.granted_extents[file] &&
-            (file < value.sealed_files || extent == value.granted_extents[file]) &&
+            (value.version >= 2 || file < value.sealed_files || extent == value.granted_extents[file]) &&
             (file >= value.granted_sealed_files || extent == value.granted_extents[file]),
             "farming progress enlarged or changed an immutable member grant");
     }
@@ -152,7 +154,7 @@ inline void validate(FarmingProgress const& value)
 }
 inline bool immutable(FarmingProgress const& a, FarmingProgress const& b)
 {
-    return a.job_id == b.job_id && a.fingerprint == b.fingerprint && a.directory_identity == b.directory_identity &&
+    return a.version == b.version && a.job_id == b.job_id && a.fingerprint == b.fingerprint && a.directory_identity == b.directory_identity &&
         a.source_policy == b.source_policy && a.source_revision == b.source_revision && a.source_policy_revision == b.source_policy_revision &&
         a.capacity_bytes == b.capacity_bytes && a.progress_reserved_bytes == b.progress_reserved_bytes && a.headroom_bytes == b.headroom_bytes &&
         a.granted_extents == b.granted_extents &&
@@ -161,10 +163,14 @@ inline bool immutable(FarmingProgress const& a, FarmingProgress const& b)
 inline bool monotone(FarmingProgress const& before, FarmingProgress const& after)
 {
     if (!immutable(before, after) || before.sequence == UINT64_MAX || after.sequence != before.sequence + 1 ||
-        after.sealed_files < before.sealed_files || after.extents.size() > before.extents.size() ||
+        after.sealed_files < before.sealed_files || (before.version < 2 && after.extents.size() > before.extents.size()) ||
+        (before.version >= 2 && after.extents.size() < before.extents.size() && after.fill_stop.empty()) ||
         (!before.fill_stop.empty() && (after.fill_stop != before.fill_stop || after.extents != before.extents))) return false;
     for (size_t file = 0; file < before.sealed_files; ++file)
         if (after.extents[file] != before.extents[file]) return false;
+    if (before.version >= 2)
+        for (size_t file = size_t(before.sealed_files); file < std::min(before.extents.size(), after.extents.size()); ++file)
+            if (after.extents[file] < before.extents[file] && file >= after.sealed_files) return false;
     return true;
 }
 inline bool native_binding(FarmingProgress const& value, std::string const& target,
@@ -180,6 +186,7 @@ inline void binding(FarmingState const& state, size_t lane, FarmingProgress cons
     require(state.version >= 8 && lane < state.directories.size() && state.job_id == value.job_id && state.fingerprint == value.fingerprint &&
         native_binding(value, state.directories[lane].directory_identity, native) && value.source_revision <= state.revision,
         "farming progress belongs to a foreign job, destination or future revision");
+    require(value.version < 2 || state.version >= 9, "independent farming progress requires its allocation schema");
     require((policy.empty() ? farming_policy_digest(state) : policy) == value.source_policy || state.policy_revision > value.source_revision,
         "farming progress belongs to a foreign source policy");
 }
@@ -190,6 +197,13 @@ inline bool covered(FarmingState const& state, size_t lane, FarmingProgress cons
         !protected_assignments(state, current, value, value.sealed_files)) return false;
     for (size_t file = 0; file < value.sealed_files; ++file)
         if (current.extents[file] != value.extents[file]) return false;
+    if (value.version >= 2 && (state.policy_revision <= value.source_revision ||
+        (!farming_member(current) && !current.detached_acknowledged)))
+    {
+        if (current.extents.size() < value.extents.size()) return false;
+        for (size_t file = size_t(value.sealed_files); file < value.extents.size(); ++file)
+            if (current.extents[file] < value.extents[file]) return false;
+    }
     return value.fill_stop.empty() || (current.fill_stop == value.fill_stop && current.extents == value.extents) ||
         state.policy_revision > value.source_revision;
 }
@@ -235,15 +249,18 @@ inline FarmingProgress capture_farming_progress(FarmingState const& state, size_
 {
     require(state.version >= 8 && lane < state.directories.size(), "local farming progress requires a current saved job");
     auto const& directory = state.directories[lane]; FarmingProgress result;
+    result.version = state.version >= 9 ? 2 : 1;
     result.job_id = state.job_id; result.fingerprint = state.fingerprint; result.directory_identity = directory.directory_identity;
     result.source_policy = policy.empty() ? farming_policy_digest(state) : policy;
     result.source_revision = state.revision; result.source_policy_revision = state.policy_revision;
     result.capacity_bytes = directory.capacity_bytes; result.progress_reserved_bytes = state.progress_reserved_bytes;
     result.headroom_bytes = state.headroom;
-    result.granted_extents = result.extents = directory.extents;
+    result.granted_extents = farming_grants(state, directory); result.extents = directory.extents;
+    if (result.version >= 2)
+        for (size_t file = 0; file < directory.sealed_files; ++file) result.granted_extents[file] = directory.extents[file];
     result.granted_sealed_files = result.sealed_files = directory.sealed_files;
     result.granted_fill_stop = result.fill_stop = directory.fill_stop;
-    result.assignments = farming_progress_detail::assignments(state, directory, directory.extents.size());
+    result.assignments = farming_progress_detail::assignments(state, directory, result.granted_extents.size());
     farming_progress_detail::validate(result); return result;
 }
 inline FarmingProgress advance_farming_progress(FarmingProgress const& previous, FarmingDirectory const& directory,
@@ -264,6 +281,22 @@ inline FarmingProgressOverlay validate_farming_progress(FarmingState const& stat
     binding(state, lane, progress, policy);
     if (covered(state, lane, progress)) return FarmingProgressOverlay::covered;
     auto const& current = state.directories[lane];
+    if (progress.version >= 2)
+    {
+        require(current.sealed_files >= progress.granted_sealed_files && current.sealed_files <= progress.sealed_files &&
+            current.grant_extents.size() >= progress.granted_extents.size() && current.capacity_bytes >= progress.capacity_bytes &&
+            state.progress_reserved_bytes >= progress.progress_reserved_bytes && current.fill_stop.empty() &&
+            protected_assignments(state, current, progress, progress.granted_extents.size()),
+            "farming progress no longer has its independently protected allocation grants");
+        for (size_t file = 0; file < progress.granted_extents.size(); ++file)
+        {
+            require(current.grant_extents[file] >= progress.granted_extents[file],
+                "farming progress conflicts with a revoked allocation grant");
+            if (file < current.sealed_files) require(current.extents[file] == progress.extents[file],
+                "farming progress conflicts with a sealed member extent");
+        }
+        return FarmingProgressOverlay::applied;
+    }
     require(current.sealed_files >= progress.granted_sealed_files && current.sealed_files <= progress.sealed_files &&
         current.extents.size() >= progress.granted_extents.size() && current.capacity_bytes >= progress.capacity_bytes &&
         state.progress_reserved_bytes >= progress.progress_reserved_bytes &&
@@ -281,6 +314,7 @@ inline FarmingProgressOverlay overlay_farming_progress(FarmingState& state, size
     auto const checked = validate_farming_progress(state, lane, progress, policy);
     if (checked == FarmingProgressOverlay::covered) return checked;
     auto& current = state.directories[lane];
+    if (progress.version >= 2 && current.extents.size() < progress.extents.size()) current.extents.resize(progress.extents.size());
     for (size_t file = 0; file < progress.extents.size(); ++file) current.extents[file] = progress.extents[file];
     if (!progress.fill_stop.empty()) { current.extents.resize(progress.extents.size()); current.fill_stop = progress.fill_stop; }
     current.sealed_files = progress.sealed_files;
@@ -288,15 +322,15 @@ inline FarmingProgressOverlay overlay_farming_progress(FarmingState& state, size
 }
 inline uint64_t farming_progress_size_bound(FarmingState const& state, size_t lane)
 {
-    require(lane < state.directories.size() && state.directories[lane].extents.size() <= farming_detail::maximum_files &&
+    require(lane < state.directories.size() && farming_grants(state, state.directories[lane]).size() <= farming_detail::maximum_files &&
         state.directories[lane].cohorts.size() <= 1024, "farming progress size exceeds its work bound");
     auto const& directory = state.directories[lane];
-    return 8192 + directory.extents.size() * 16 + (directory.cohorts.size() + 1) * 512;
+    return 8192 + farming_grants(state, directory).size() * 16 + (directory.cohorts.size() + 1) * 512;
 }
 inline uint64_t farming_progress_memory_bound(FarmingState const& state, size_t lane)
 {
     auto const bytes = farming_progress_size_bound(state, lane); auto const& directory = state.directories[lane];
-    return 64 * 1024 + bytes * 4 + directory.extents.size() * sizeof(uint16_t) * 4 +
+    return 64 * 1024 + bytes * 4 + farming_grants(state, directory).size() * sizeof(uint16_t) * 4 +
         (directory.cohorts.size() + 1) * sizeof(FarmingProgressAssignment) * 4;
 }
 inline uint64_t farming_progress_memory_bound(FarmingProgress const& progress)
@@ -311,7 +345,7 @@ inline std::string farming_progress_text(FarmingProgress const& value)
 {
     farming_progress_detail::validate(value);
     std::ostringstream out;
-    out << "ordinary-group-farming-progress-v1\n" << std::quoted(farming_current_model_identity) << ' '
+    out << "ordinary-group-farming-progress-v" << value.version << '\n' << std::quoted(farming_current_model_identity) << ' '
         << std::quoted(farming_cohort_key_identity) << '\n' << std::quoted(value.job_id) << ' ' << std::quoted(value.fingerprint) << ' '
         << std::quoted(value.directory_identity) << ' ' << std::quoted(value.source_policy) << '\n'
         << value.source_revision << ' ' << value.source_policy_revision << ' ' << value.sequence << ' ' << value.capacity_bytes << ' '
@@ -341,9 +375,11 @@ inline FarmingProgress parse_farming_progress(std::string const& body, uint64_t 
 {
     require(body.size() < memory_limit / 4, "farming progress exceeds its parsing memory budget");
     std::istringstream in(body); std::string magic, model, keys; std::getline(in, magic); in >> std::quoted(model) >> std::quoted(keys);
-    require(magic == "ordinary-group-farming-progress-v1" && model == farming_current_model_identity && keys == farming_cohort_key_identity,
+    require((magic == "ordinary-group-farming-progress-v1" || magic == "ordinary-group-farming-progress-v2") &&
+        model == farming_current_model_identity && keys == farming_cohort_key_identity,
         "unsupported farming progress journal");
     FarmingProgress result;
+    result.version = magic == "ordinary-group-farming-progress-v2" ? 2 : 1;
     in >> std::quoted(result.job_id) >> std::quoted(result.fingerprint) >> std::quoted(result.directory_identity) >> std::quoted(result.source_policy)
         >> result.source_revision >> result.source_policy_revision >> result.sequence >> result.capacity_bytes >> result.progress_reserved_bytes >> result.headroom_bytes;
     uint64_t expanded = body.size() * 4 + 64 * 1024;
@@ -449,9 +485,12 @@ inline FarmingProgressFile save_farming_progress(FarmingMetadataDirectory& metad
             uint64_t(staged_space.f_bavail) <= UINT64_MAX / uint64_t(staged_space.f_frsize) &&
             uint64_t(staged_space.f_bavail) * uint64_t(staged_space.f_frsize) >= progress.headroom_bytes,
             "staged farming progress consumed declared filesystem headroom");
+        grow_failpoint("farm-progress-staged");
         if (expected_stamp) require(stream_state::stamp(path) == *expected_stamp, "farming progress changed during staging");
         require(!file_io::rename_file(pending, path, expected_stamp.has_value()), "cannot publish farming progress");
+        grow_failpoint("farm-progress-renamed");
         stream_state::sync_path(metadata.path, true); metadata.check();
+        grow_failpoint("farm-progress-published");
     }
     catch (...)
     {
