@@ -28,6 +28,9 @@ cargo install --path . --locked --root "$PWD/build-native-install/cargo" \
 # cargo install --git can discard its temporary target directory. Runtime
 # libraries must remain available after that cleanup.
 rm -rf build-native-install/cargo-target
+# Runtime checks are CPU-only. Vendor backend files and tools are checked
+# below; probing their drivers on a hosted runner is not a hardware test.
+export ACPP_VISIBILITY_MASK=omp
 build-native-install/cargo/bin/xchplot2 --help
 
 test -f "$acpp_prefix/lib/hipSYCL/librt-backend-$backend.so"
@@ -43,14 +46,13 @@ cmake -S . -B build-native-install/cmake -G Ninja \
 cmake --build build-native-install/cmake --parallel "$CARGO_BUILD_JOBS" \
     --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
 build-native-install/cmake/tools/xchplot2/xchplot2 --help
-ACPP_VISIBILITY_MASK=omp ctest --test-dir build-native-install/cmake \
+ctest --test-dir build-native-install/cmake \
     --output-on-failure --no-tests=error \
     -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
 
-python3 scripts/test/recovery.py build-native-install/cargo/bin/xchplot2
-python3 scripts/test/recovery.py build-native-install/cmake/tools/xchplot2/xchplot2
-
-python3 scripts/test/group-cli.py build-native-install/cargo/bin/xchplot2 --automatic-compute
-python3 scripts/test/group-cli.py build-native-install/cmake/tools/xchplot2/xchplot2 --automatic-compute
-python3 scripts/test/compute-cli.py build-native-install/cargo/bin/xchplot2
-python3 scripts/test/compute-cli.py build-native-install/cmake/tools/xchplot2/xchplot2
+for binary in build-native-install/cargo/bin/xchplot2 build-native-install/cmake/tools/xchplot2/xchplot2; do
+    echo "Checking installed binary: $binary"
+    python3 scripts/test/recovery.py "$binary"
+    python3 scripts/test/group-cli.py "$binary" --automatic-compute
+    python3 scripts/test/compute-cli.py "$binary"
+done

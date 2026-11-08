@@ -1,61 +1,52 @@
 name: install-matrix
 
-# Verifies clean native installs as well as SYCL Containerfile builds.
-# Linux and WSL2 run the public dependency installer, Cargo install, and
-# CMake build with no cached toolchains. Container builds cover the documented
-# backend matrix (NVIDIA / AMD / Intel / CPU). Each job exercises a
-# different ACPP_TARGETS configuration via the existing production
-# Containerfile — the same one users build via scripts/build-container.sh.
-#
-# No actual accelerator hardware needed for the build; nvcc / hipcc
-# / icx etc. all compile fine without a runtime device present. The
-# assertion is that the container builds, the installed binary starts, and
-# CPU plot/proof checks pass. GPU kernel execution needs GPU runners;
-# generic SYCL builds defer vendor device compilation until runtime.
+# Clean Linux / WSL2 installs and production Containerfile builds.
+# Check installed backends and CPU plotting; GPU execution lives in gpu.yml.
 
 on:
   pull_request:
-    paths-ignore:
-      # Docs & metadata
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      # Runtime scripts not exercised by the install matrix.
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      # docker-compose isn't exercised by CI (we drive podman build
-      # directly).
-      - 'compose.yaml'
-      # Sibling CI workflows.
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/arch-matrix.yml'
+    paths:
+      - .github/workflows/install-matrix.yml
+      - .dockerignore
+      - Containerfile
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - cmake/**
+      - keygen-rs/**
+      - src/**
+      - tools/**
+      - contrib/**
+      - ci/release/adaptivecpp-*.patch
+      - scripts/install-deps.sh
+      - scripts/test/native-install.sh
+      - scripts/test/recovery.py
+      - scripts/test/group-cli.py
+      - scripts/test/compute-cli.py
+      - scripts/test/group-pool-test.py
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      - 'compose.yaml'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/arch-matrix.yml'
+    paths:
+      - .github/workflows/install-matrix.yml
+      - .dockerignore
+      - Containerfile
+      - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - cmake/**
+      - keygen-rs/**
+      - src/**
+      - tools/**
+      - contrib/**
+      - ci/release/adaptivecpp-*.patch
+      - scripts/install-deps.sh
+      - scripts/test/native-install.sh
+      - scripts/test/recovery.py
+      - scripts/test/group-cli.py
+      - scripts/test/compute-cli.py
+      - scripts/test/group-pool-test.py
   workflow_dispatch:
   schedule:
     # Package repositories can break a fresh install without source changes.
@@ -63,6 +54,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   native:
@@ -172,27 +167,22 @@ jobs:
   build:
     name: build / ${{ matrix.target.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         target:
-          # NVIDIA — default base, CUDA 13.x for Turing+; sets sm_75 so
-          # we don't trip the preflight that bans pre-Turing on 13.x.
+          # CUDA 13.x covers Turing and newer GPUs; Pascal requires 12.9.
           - name: nvidia-cuda13
             backend: cuda
             extra_args: "--build-arg CUDA_ARCH=75"
-          # NVIDIA Pascal (sm_61) — must use the 12.9 base because
-          # CUDA 13.x dropped Pascal codegen. Catches preflight
-          # regressions.
           - name: nvidia-cuda12-pascal
             backend: cuda
             extra_args: >-
               --build-arg BASE_DEVEL=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
               --build-arg BASE_RUNTIME=docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
               --build-arg CUDA_ARCH=61
-          # CPU-only — AdaptiveCpp OpenMP backend. No CUDA toolkit in
-          # the runtime image; build still wants cuda_fp16.h headers,
-          # supplied by INSTALL_CUDA_HEADERS=1.
+          # CPU-only OpenMP runtime on the plain Ubuntu base.
           - name: cpu-omp
             backend: omp
             extra_args: >-
@@ -201,24 +191,8 @@ jobs:
               --build-arg ACPP_TARGETS=omp
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
-          # AMD ROCm — AdaptiveCpp generic (SSCP JIT). Two reasons for
-          # `generic` instead of `hip:gfxNNNN` AOT compilation in CI:
-          #
-          #   1. rocm/dev-ubuntu-24.04:latest ships device bitcode
-          #      (ocml.bc) built with rolling LLVM 22+. AdaptiveCpp's
-          #      install-deps.sh pins clang/lld to LLVM 18 for
-          #      compatibility with its own build. The LLVM-18 clang
-          #      can't link bitcode produced by LLVM-22 (attribute
-          #      kind 102 added in LLVM 22) — hard build error.
-          #
-          #   2. CI has no AMD GPU anyway, so AOT-for-gfxNNNN doesn't
-          #      give us runtime signal. SSCP defers device codegen
-          #      to runtime, lets the build prove "the SYCL TUs
-          #      compile against ROCm headers + libs" which is the
-          #      meaningful CI assertion.
-          #
-          # Same pattern the README recommends for RDNA1 cards
-          # (gfx101x) and matches the Intel oneAPI entry below.
+          # Generic SYCL defers vendor codegen to runtime and avoids mixing
+          # the rolling ROCm bitcode with the installer's pinned LLVM.
           - name: amd-rocm
             backend: hip
             extra_args: >-
@@ -227,9 +201,7 @@ jobs:
               --build-arg ACPP_TARGETS=generic
               --build-arg XCHPLOT2_BUILD_CUDA=OFF
               --build-arg INSTALL_CUDA_HEADERS=1
-          # Intel oneAPI — AdaptiveCpp generic (SSCP) → Level Zero.
-          # README flags this path as experimental / not perf-tested;
-          # CI's role is "the build still works", not "it runs well".
+          # Intel generic SYCL requires the Level Zero backend.
           - name: intel-oneapi
             backend: ze
             extra_args: >-

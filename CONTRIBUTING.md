@@ -114,13 +114,33 @@ The user-facing tier models are in [REFERENCE.md](REFERENCE.md#memory-requiremen
 Measured throughput and memory use are in
 [BENCHMARKS.md](BENCHMARKS.md).
 
+## CI workflows
+
+Keep each workflow focused on its own checks:
+
+| Workflow | Purpose |
+| --- | --- |
+| `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, Python harness checks, and container-installer fixtures |
+| `arch-matrix` | Compile CUDA objects for the documented GPU architectures |
+| `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
+| `Binary release` | Package and test Linux and Windows archives on both host architectures |
+| `GPU hardware` | Execute correctness and memory suites on the trusted GPU fleet |
+
+Build workflows filter changes to their inputs; lightweight CI runs on every
+PR and `main` push. CI, architecture and installation workflows cancel older
+runs for the same event and ref. Release builds cancel superseded PR runs only;
+running tag and manual release builds are not cancelled.
+GPU execution remains separate from hosted build and CPU checks.
+Update path filters when adding a build input or a script called by a workflow.
+
 ## Install CI
 
 `install-matrix` runs the dependency installer on fresh OS images, followed
 by `cargo install --path . --locked`, a complete CMake CLI build, and the
 existing CPU-safe plot/proof tests. It checks that the requested AdaptiveCpp
 backend exists and that Intel's SPIR-V translator runs. No installed
-toolchains are restored from cache in these jobs.
+toolchains are restored from cache in these jobs. Runtime checks select the
+OpenMP backend because hosted runners have no GPU drivers or devices.
 
 | Platform | NVIDIA | AMD | Intel |
 | --- | --- | --- | --- |

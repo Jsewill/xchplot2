@@ -20,6 +20,51 @@ subprocess.run([sys.executable, "-B", script, "--help"], stdout=subprocess.DEVNU
 
 with tempfile.TemporaryDirectory(prefix="xchplot2-benchmark-") as directory:
     root = Path(directory)
+    # /proc can deny a child's exe, final I/O and fd samples after it exits.
+    # Keep allocation measurements and report unavailable counters as absent.
+    original_read_text, original_iterdir = Path.read_text, Path.iterdir
+    proc = Path(f"/proc/{os.getpid()}")
+    sampled_file = root / "allocated"
+    sampled_file.write_bytes(b"sample" * 1024)
+
+    def restricted_read_text(path, *args, **kwargs):
+        if path == proc / "io":
+            raise PermissionError("process counters unavailable")
+        return original_read_text(path, *args, **kwargs)
+
+    def restricted_iterdir(path):
+        if path == proc / "fd":
+            raise PermissionError("process descriptors unavailable")
+        return original_iterdir(path)
+
+    for error in (FileNotFoundError, PermissionError):
+        with patch.object(Path, "samefile", side_effect=error("process executable unavailable")), \
+             patch.object(Path, "read_text", restricted_read_text), \
+             patch.object(Path, "iterdir", restricted_iterdir):
+            memory, io, space = common.sample(os.getpid(), Path(sys.executable), root)
+        assert memory is None and io == {} and space == sampled_file.stat().st_blocks * 512
+
+    # Descriptor access can also disappear between enumeration and stat.
+    # A permission failure on the benchmark's own files must still fail.
+    original_stat = Path.stat
+    descriptor = proc / "fd/123456"
+
+    def restricted_stat(path, *args, **kwargs):
+        if path == descriptor:
+            raise PermissionError("process descriptor unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    with patch.object(Path, "stat", restricted_stat):
+        assert common.allocated([sampled_file], [descriptor]) == sampled_file.stat().st_blocks * 512
+    with patch.object(Path, "stat", side_effect=PermissionError("work file unavailable")):
+        try:
+            common.allocated([sampled_file])
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("benchmark hid a file allocation error")
+    sampled_file.unlink()
+
     marker = root / "finish"
     fixture = root / "fixture.py"
     fixture.write_text("""import json

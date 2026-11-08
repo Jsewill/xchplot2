@@ -5,6 +5,10 @@ on:
     paths:
       - .github/workflows/release.yml
       - CMakeLists.txt
+      - Cargo.toml
+      - Cargo.lock
+      - LICENSE
+      - NOTICE
       - cmake/**
       - ci/release/**
       - keygen-rs/**
@@ -15,6 +19,9 @@ on:
       - scripts/build-release.ps1
       - scripts/test/recovery.py
       - scripts/test/release.py
+      - scripts/test/group-cli.py
+      - scripts/test/compute-cli.py
+      - scripts/test/group-pool-test.py
   push:
     tags: ['v*', '!v*-cuda-only']
   workflow_dispatch:
@@ -33,6 +40,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.architecture || 'all' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   linux-sycl:
     if: inputs.platform != 'windows'
@@ -41,6 +52,7 @@ jobs:
       matrix:
         arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - name: Build release image
@@ -213,6 +225,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [linux-sycl, windows-sycl]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     concurrency:
       group: binary-release
       cancel-in-progress: false

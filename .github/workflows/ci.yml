@@ -4,26 +4,31 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   shell:
     name: ShellCheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint scripts/
-        # Recurse so scripts/test/install-container-deps/run.sh and any
-        # future helpers under scripts/ stay covered.
         run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
 
   actions:
     name: actionlint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: reviewdog/action-actionlint@v1
@@ -33,6 +38,7 @@ jobs:
   rust:
     name: Rust (keygen-rs)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: keygen-rs
@@ -57,17 +63,9 @@ jobs:
   host-tests:
     name: C++ host tests (${{ matrix.mode }})
     runs-on: ubuntu-latest
-    # Until this job existed CI compiled no C++ at all: arch-matrix builds only
-    # pos2_gpu_cuda_obj (the .cu TUs), so GpuPipeline.cpp, BatchPlotter.cpp and
-    # HostRamPolicy.cpp had never been through a compiler on a runner, and the
-    # host test binaries were built only when someone typed their names. The
-    # spill path in particular shipped ~4700 lines with no automated check.
-    #
-    # These targets need CMake and a C++20 compiler — no SYCL, no CUDA,
-    # no GPU. The sanitizer arms are not decoration: the spill I/O engine is a
-    # worker pool over a ticket protocol, and TSan is what caught the
-    # unsynchronised high-water update in TempFile::pwrite_at that the pool
-    # introduced.
+    timeout-minutes: 30
+    # Shared host targets need no GPU toolchain; sanitizers cover host memory
+    # and concurrency separately from the hardware suites.
     strategy:
       fail-fast: false
       matrix:
@@ -81,53 +79,57 @@ jobs:
           else
             scripts/test/host-tests.sh "${{ matrix.mode }}"
           fi
+
+  python:
+    name: Python harness checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
       - name: Check build target selection
-        if: matrix.mode == 'plain'
         run: python3 scripts/test/build-selection.py
       - name: Check GPU CI admission logic
-        if: matrix.mode == 'plain'
         run: python3 scripts/test/gpu-ci-test.py
       - name: Check growth benchmark measurement
-        if: matrix.mode == 'plain'
-        run: python3 -B scripts/test/group-benchmark-test.py
+        run: python3 scripts/test/group-benchmark-test.py
+      - name: Check compute network harness
+        run: python3 scripts/test/compute-network-test.py
 
   hadolint:
     name: hadolint Containerfile
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: Containerfile
-          # CUDA / ROCm base images make version-pinning warnings (DL3008,
-          # DL3009) impractical — package versions shift between base image
-          # rolls and the toolkit pin lives in BASE_DEVEL. Same for the
-          # `set -o pipefail` warnings on RUN-with-pipe (DL4006) — those
-          # pipes are bootstrap-time noise, not runtime data paths. Filter
-          # to errors so we still catch real bugs (root, ADD vs COPY,
-          # missing && \, COPY --chown typos, etc.).
+          # Package versions follow the selected CUDA / ROCm base image.
           failure-threshold: error
 
   compose-config:
     name: docker compose config validate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: docker compose config --quiet
-        # Catches typos in service names / build-arg keys / unresolvable
-        # ${VAR} placeholders without ever pulling a base image. ~5s.
         run: docker compose -f compose.yaml config --quiet
 
   typos:
     name: typos
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: crate-ci/typos@master
+      - uses: crate-ci/typos@v1.52.0
 
   markdownlint:
     name: Markdown documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: List tracked Markdown
@@ -149,18 +151,16 @@ jobs:
   install-container-deps-dryrun:
     name: install-container-deps.sh — dry-run fixtures
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Diff --dry-run output against fixtures
-        # Runs --dry-run for every (distro × engine × gpu) tuple in
-        # arch / ubuntu / fedora containers and diffs against the
-        # checked-in fixtures under scripts/test/install-container-deps/.
-        # No mutating sudo calls — completes in ~60s.
         run: scripts/test/install-container-deps/run.sh
 
   install-container-deps-smoke:
     name: install-container-deps.sh smoke (${{ matrix.engine }} ${{ matrix.gpu }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -180,9 +180,6 @@ jobs:
         env:
           ENGINE: ${{ matrix.engine }}
           GPU: ${{ matrix.gpu }}
-        # Validates that engine + GPU-runtime packages actually install
-        # from the real apt repos (catches package-name drift / repo
-        # availability), and that re-running the script is a no-op.
         run: |
           docker run --rm \
               -e ENGINE -e GPU \

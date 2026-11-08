@@ -3601,6 +3601,17 @@ def check_automatic_compute(binary, root):
         for process, path in same_host:
             assert len(finish(process, path)) == 2
         print("PASS dedicated broker selection and concurrent local plotting jobs", flush=True)
+    except Exception:
+        # Temporary fixture directories are removed on failure. Preserve the
+        # broker, worker and owner diagnostics in the install/release job log.
+        for process, stream, path in processes:
+            try:
+                stream.flush()
+                print(f"Automatic compute process {path.name} (exit={process.poll()}):\n" +
+                      path.read_text(encoding="utf-8", errors="replace"), file=sys.stderr, flush=True)
+            except OSError as error:
+                print(f"Cannot read process log {path.name}:", error, file=sys.stderr, flush=True)
+        raise
     finally:
         for process, stream, _ in reversed(processes):
             stop(process)

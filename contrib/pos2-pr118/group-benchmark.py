@@ -38,15 +38,20 @@ def filesystem(path):
     return max(matches, key=lambda entry: len(entry["mount"]))
 
 
-def allocated(paths):
+def allocated(paths, transient_paths=()):
     files = {}
-    for path in paths:
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            continue  # A consumed segment or checkpoint temporary was removed.
-        if stat.S_ISREG(info.st_mode):
-            files[info.st_dev, info.st_ino] = info.st_blocks * 512
+    for sources, transient in ((paths, False), (transient_paths, True)):
+        for path in sources:
+            try:
+                info = path.stat()
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # A consumed segment or checkpoint temporary was removed.
+            except PermissionError:
+                if not transient:
+                    raise
+                continue  # Access to a sampled /proc fd changed after enumeration.
+            if stat.S_ISREG(info.st_mode):
+                files[info.st_dev, info.st_ino] = info.st_blocks * 512
     return sum(files.values())
 
 
@@ -61,28 +66,29 @@ def sample(pid, executable, work):
             for line in (proc / "status").read_text().splitlines():
                 if line.startswith("VmHWM:"):
                     memory = int(line.split()[1]) * 1024
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
+    # A zombie has no exe/mm. Final I/O counters can remain readable, but
+    # some kernels deny access after exit; unavailable samples stay absent.
+    try:
         io = {key: int(value) for key, value in
               (line.split(":", 1) for line in (proc / "io").read_text().splitlines())}
-    except (FileNotFoundError, ProcessLookupError):
-        # A zombie has no exe/mm, but its final I/O counters remain readable.
-        try:
-            io = {key: int(value) for key, value in
-                  (line.split(":", 1) for line in (proc / "io").read_text().splitlines())}
-        except (FileNotFoundError, ProcessLookupError):
-            pass
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
     paths = list(work.rglob("*"))
     # Include the direct assembler's open, unlinked index spool, once per inode.
+    descriptors = []
     try:
         for fd in (proc / "fd").iterdir():
             try:
                 target = os.readlink(fd)
                 if target.startswith(str(work) + "/"):
-                    paths.append(fd)
-            except FileNotFoundError:
+                    descriptors.append(fd)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
                 pass
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
         pass
-    return memory, io, allocated(paths)
+    return memory, io, allocated(paths, descriptors)
 
 
 def sync_output(path):

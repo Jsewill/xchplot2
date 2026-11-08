@@ -17,3 +17,6 @@ hge = "hge"
 Collet = "Collet"
 # POSIX / Windows CRT file-open mode.
 WRONLY = "WRONLY"
+# C++20 trailing-bit count and POSIX ancillary message length.
+countr = "countr"
+controllen = "controllen"

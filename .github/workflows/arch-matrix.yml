@@ -1,74 +1,46 @@
 name: arch-matrix
 
-# Verifies the README-documented CUDA arch matrix stays buildable
-# under the SYCL build (XCHPLOT2_BUILD_CUDA=ON, the default when
-# nvcc is present). Each job sets CMAKE_CUDA_ARCHITECTURES to one
-# of the documented targets and runs cmake configure + builds the
-# CUDA TUs. No accelerator needed.
-#
-# Arch coverage mirrors the README "Common values" line:
-#   61  GTX 10-series   (Pascal)   — needs CUDA 12.x (12.9 last)
-#   75  Turing
-#   86  RTX 30-series   (Ampere)
-#   89  RTX 40-series   (Ada)      — also the default
-#   120 RTX 50-series   (Blackwell) — needs CUDA 12.8+
+# Compile CUDA objects for the documented GPU architectures without a GPU.
+# install-matrix covers complete CLI builds and CPU runtime checks.
 
 on:
   pull_request:
-    paths-ignore:
-      # Docs & metadata
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      # Runtime scripts not exercised by the arch matrix (it runs
-      # cmake configure + builds pos2_gpu_cuda_obj only).
-      - 'scripts/test/**'
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      # Containerfile / compose are install-matrix-only — arch
-      # matrix uses a stock nvidia/cuda image and never touches them.
-      - 'Containerfile'
-      - 'compose.yaml'
-      # Sibling CI workflows.
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/install-matrix.yml'
+    paths:
+      - .github/workflows/arch-matrix.yml
+      - CMakeLists.txt
+      - cmake/**
+      - keygen-rs/**
+      - src/**
+      - tools/**
+      - contrib/**
+      - scripts/install-deps.sh
+      - ci/release/adaptivecpp-*.patch
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      - 'scripts/test/**'
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      - 'Containerfile'
-      - 'compose.yaml'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/install-matrix.yml'
+    paths:
+      - .github/workflows/arch-matrix.yml
+      - CMakeLists.txt
+      - cmake/**
+      - keygen-rs/**
+      - src/**
+      - tools/**
+      - contrib/**
+      - scripts/install-deps.sh
+      - ci/release/adaptivecpp-*.patch
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: arch / sm_${{ matrix.arch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     container:
       image: ${{ matrix.image }}
     strategy:
@@ -76,6 +48,7 @@ jobs:
       matrix:
         include:
           - arch: 61
+            # CUDA 12.9 is the last toolkit supporting Pascal.
             image: nvidia/cuda:12.9.1-devel-ubuntu24.04
           - arch: 75
             image: nvidia/cuda:13.0.1-devel-ubuntu24.04
@@ -91,10 +64,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git
-          # scripts/install-deps.sh calls `sudo` throughout; we're
-          # already root in the container, so wire `sudo` to exec the
-          # rest of the args directly. Cheaper than `apt install sudo`
-          # which pulls a chunk of policy / pam state we don't need.
+          # install-deps.sh uses sudo; the container already runs as root.
           cat > /usr/local/bin/sudo <<'EOF'
           #!/bin/sh
           exec "$@"
@@ -106,29 +76,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /opt/adaptivecpp
-          # Key components — invalidate the cache when any of these change:
-          #   matrix.image     LLVM version in the base image differs
-          #                    between CUDA 12.9 and 13.0 → ABI-relevant
-          #                    for AdaptiveCpp's built-against-LLVM bits
-          #   install-deps.sh  ACPP_REF default + apt package list live
-          #                    here; any edit means rebuild
-          #   Level Zero patch Runtime event allocation must match the source
-          # Restore is best-effort; install-deps.sh detects an existing
-          # /opt/adaptivecpp and skips its build, so a partial / stale
-          # cache that lands the dir but is corrupt would only show as
-          # a downstream link error — at which point bumping
-          # install-deps.sh's hash naturally re-keys the cache.
+          # The base image, installer and runtime patches determine the toolchain.
           key: acpp-${{ matrix.image }}-${{ hashFiles('scripts/install-deps.sh', 'ci/release/adaptivecpp-level-zero-*.patch') }}
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
-          # Distro-aware bootstrap: apt-installs build-essential, cmake,
-          # llvm-18 / clang-18 / lld-18, boost, then builds AdaptiveCpp
-          # v25.10.0 from source at /opt/adaptivecpp. ~15-20 min cold,
-          # ~2 min on a cache hit (the apt-installed LLVM bits still
-          # need to land but the AdaptiveCpp build itself is skipped
-          # because the dir already exists from cache restore).
-          # --gpu nvidia tells it to skip the AMD-only ROCm headers
-          # path (we're inside a nvidia/cuda image already).
           export PATH="$HOME/.cargo/bin:$PATH"
           if [ "${{ steps.cache-adaptivecpp.outputs.cache-hit }}" = "true" ]; then
             echo "[ci] AdaptiveCpp restored from cache; install-deps.sh"
@@ -138,18 +89,8 @@ jobs:
       - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # Compile CUDA for every architecture and the complete SYCL binary
-          # for the representative sm_89 target.
-          # AdaptiveCpp is already installed at /opt/adaptivecpp by
-          # install-deps.sh — CMake's probe picks it up automatically.
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DXCHPLOT2_BUILD_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
-          cmake --build build -j --target pos2_gpu_cuda_obj
-          if [ "${{ matrix.arch }}" = "89" ]; then
-            # Compile and link every host/SYCL TU as well as the CUDA objects.
-            cmake --build build -j 2 --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
-            ACPP_VISIBILITY_MASK=omp ctest --test-dir build --output-on-failure \
-              --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
-          fi
+          cmake --build build --parallel 2 --target pos2_gpu_cuda_obj
