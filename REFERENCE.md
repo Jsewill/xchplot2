@@ -159,11 +159,22 @@ sharing a known subsystem share a writer group; distinct known subsystems can
 run independently. Unsupported or unknown NVMe identities retain conservative
 whole-job serialization.
 
-The grouped engine supports one local CPU or GPU producer, or a shared compute
-pool. Select `--devices cpu`, `--devices gpu0`, or `--backend auto`; automatic
-selection can fall back to CPU. Multi-device selectors, CPU NUMA selectors,
-`--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`, and
-`--max-host-ram min` belong to the single-member batch engine. Use
+Ordinary grouped plotting, filling and growth accept the same `--devices`
+selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
+combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
+Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
+CPU allowance and `--max-host-ram` budget. Three quarters of that RAM is divided
+equally among the producers; the remainder covers receiving and construction.
+Each producer must fit its share. These explicit local executors need no pool
+enrollment or network listener and cannot be combined with shared compute
+connection/offer options. Repeat the device selection when resuming; it is an
+execution choice, separate from saved plot identities and farming policy.
+
+Single local CPU/GPU selection and `--backend auto` retain automatic shared
+compute when enrolled; automatic local GPU selection can fall back to CPU.
+Migration still requires its reviewed single-producer resources: select
+`--backend cpu` or `--devices gpuN`. `--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
+and `--max-host-ram min` belong to the single-member batch engine. Use
 `--compute off` to keep that engine for ordinary plotting after enrolling a
 machine in shared compute.
 
@@ -432,9 +443,12 @@ additional reader-memory demand is reassessed.
 Comma-separated selections are reassessed in order. The report shows the
 original and selected file/member counts, resource budgets, required reader
 memory and response bound. A selection that remains infeasible cannot be saved.
-`capacity` keeps the declared harvester and lowers only the future member cap,
-preserving completed plots and started reservations. Its bounded search offers
-an assessed cap without claiming that it found the largest feasible cap.
+`capacity` keeps every declared harvester setting and lowers only the future
+member cap, preserving completed plots and started reservations. It samples
+across the allowed interval and refines above the best feasible cap, because
+cache and file-layout changes can make feasibility nonmonotonic. The bounded
+search reports the best cap it assessed and whether a larger feasible cap may
+remain. The selected result receives a fresh complete assessment before saving.
 Selected previews use the usual source-policy, native-directory and progress
 checks when applied with `fill`.
 
@@ -527,6 +541,30 @@ record, exact process generation and a bound heartbeat. Remote or ambiguous
 ownership remains unknown; a PID or recent timestamp alone does not establish
 liveness. A stopped owner and a stale record left by a killed owner are reported
 separately. These checks do not establish full payload integrity.
+
+Add `--live` to include read-only shared-compute and migration-service
+diagnostics in the same report:
+
+```bash
+xchplot2 status /disk/plots --live --timeout-ms 5000
+xchplot2 status migration.plan --live --harvester local-migration.json --json
+```
+
+`--timeout-ms` is the overall live-query budget (`100..60000`, default `5000`).
+Reports distinguish saved intent, current observations, unavailable checks and
+remaining unknowns, with the affected work and next action. Compute inspection
+checks enrollment expiry, compatible advertised workers and admission state;
+it does not start services, acquire leases or import membership policies. Use a
+numeric `--compute-broker ADDRESS:PORT` if discovery is unavailable; hostname
+resolution is excluded from this bounded probe. Exact task admission remains an
+execution check. `--compute off` disables shared-compute inspection.
+
+Migration service probes use an explicitly selected local `--harvester` profile,
+explicit reader flags, or the executing job's private local bindings. Public
+plans do not authorize executables. Before a private execution journal exists,
+key-specific farming prerequisites remain unknown. A successful probe does not
+grant permission to retire plots or replace the execution-time resource and
+reader checks. Ordinary status remains offline unless `--live` is requested.
 
 For new ordinary jobs, `fill DIR` continues work on available drives while a peer
 is missing. Saved per-drive grants can cover growth beyond the initial forecast,
@@ -643,9 +681,9 @@ xchplot2 plan /disk-a/plots --harvester harvester.json --save-plan farm.plan
 xchplot2 fill farm.plan -f "$FARMER_PK" -c "$POOL_ADDRESS"
 ```
 
-`--save-profile` writes only the requested profile, refuses to overwrite an
-existing file and needs no destination. Explicit farming overrides are included
-in the export. A saved plan already contains its harvester profile; execution
+`--save-profile` refuses to overwrite an existing file and needs no destination.
+It also works alongside an ordinary destination preview, including explicit
+farming overrides in the reusable export. A saved plan already contains its harvester profile; execution
 does not need the profile file again. A file literally named `local` can be
 selected as `--harvester ./local`.
 
@@ -996,8 +1034,42 @@ host and ID from the inventory:
 ```
 
 The zero capacity and false flags are deliberately unknown placeholders.
-Complete the existing `farm_resources` object in a copy of the inventory using
-the checklist: declare offered CPU/RAM/storage capacity, existing service and
+Use `--save-profile` during inventory or migration setup to retain reusable
+declarations and explicitly selected local reader bindings:
+
+```bash
+xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  --save-plan inventory.plan --save-profile farm-setup.json
+xchplot2 plan /disk-a/plots --replot inventory.plan --harvester farm-setup.json \
+  --save-profile migration-setup.json
+```
+
+Setup gathers selected destination/scratch resources and execution settings,
+retains completed declarations, and prints remaining `--resource-setting`
+templates plus the next command. Replace their uppercase placeholders with
+reviewed values. For example, using the actual resource ID from the report:
+
+```bash
+xchplot2 plan /disk-a/plots --replot inventory.plan \
+  --harvester migration-setup.json \
+  --resource-setting 'resources[memory:HOST_ID].capacity=8589934592,capacity_known=true' \
+  --save-profile migration-setup-next.json
+```
+
+Memory fields use bytes, service capacities use parallel lanes, and service,
+queue, period and deadline bounds use microseconds. Selectors address stable
+resource/workload IDs; settings cannot create physical resources, alter catalog
+counts or select reader executables. JSON exposes `resource_settings`,
+`settings_limited`, `continue_setup_command` and `next_command`. Setup exports
+can remain incomplete and are not executable migration reviews. Once complete,
+use the suggested `--save-plan` command to run normal admission. An ordinary
+harvester profile can also seed setup; missing migration declarations remain
+explicit. Keep profiles containing `farm_adapters` private and local to the
+machine where their executable and configuration paths are authorized.
+
+You can also edit the existing `farm_resources` object in a copy of the inventory
+using the checklist: declare offered CPU/RAM/storage capacity, existing service and
 whole-queue bounds, output/scratch mappings, whole-file construction bounds,
 supervision for structural checks and replacement farming/full-proof cohorts.
 Add proof verification bounds when selecting sampled or strict migration checks.
@@ -1471,8 +1543,12 @@ xchplot2 compute resume
 
 `pause` stops new task admission while accepted tasks finish. `drain` also
 changes to `drained` after accepted work finishes; `resume` reopens admission.
-Only the worker's own enrolled identity can control it. These settings last
-for that worker process. Use `--worker HOST:PORT` to query or control a worker
+Only the worker's own enrolled identity can control it. Enrolled workers save
+pause/drain/resume intent privately before acknowledging it. Intent survives
+service restarts, automatic-executor replacement and certificate renewal; a
+restarted draining worker is drained until explicitly resumed. Controls on
+unmanaged workers using explicit TLS files last only for that process. Status
+reports this distinction. Use `--worker HOST:PORT` to query or control a worker
 when discovery is unavailable. Explicit endpoints select the services to
 query; otherwise status uses saved broker settings and LAN discovery.
 `--limit` bounds each broker section (default 128, maximum 4096);
@@ -1480,10 +1556,16 @@ query; otherwise status uses saved broker settings and LAN discovery.
 truncation indicators. Live pages can change while being read.
 
 Discovery advertisements are untrusted hints. Status and work connections
-require mutual TLS in the enrolled pool. Use the same build on collaborating
-machines; incompatible compute formats are not scheduled. Upgrade brokers,
-workers and plotting hosts together, then restart their services. Preserve
-the saved enrollment directory when upgrading.
+require mutual TLS in the enrolled pool. Builds can collaborate when their
+wire protocol and explicit task, generation, codec and representation contracts
+agree. Source-build identity is diagnostic provenance. Generation and codec
+eligibility are checked separately; incompatible work is not scheduled.
+Compatible releases can be rolled through workers without rebuilding every
+machine together. A wire-protocol change requires upgrading brokers, workers
+and plotting hosts together. This version uses compute protocol 5 and does not
+interoperate with protocol 4. Drain before replacing services, preserve the
+saved enrollment directory, restart services, then explicitly resume workers
+whose drain intent is still saved.
 
 ### Background workers and brokers
 

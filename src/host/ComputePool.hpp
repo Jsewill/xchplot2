@@ -9,7 +9,7 @@
 
 namespace group_grow::pool
 {
-inline constexpr uint32_t protocol_version = 4;
+inline constexpr uint32_t protocol_version = 5;
 inline constexpr size_t max_retry_failures = 16;
 inline constexpr uint32_t max_generation_batch_members = 8;
 inline constexpr size_t max_generation_profiles = 512;
@@ -76,6 +76,9 @@ enum class WorkerAdmission : uint8_t { Accepting = 1, Paused, Draining, Drained 
 struct WorkerOffer
 {
     std::string instance, compatibility;
+    // Generation and codec contracts are negotiated independently. The
+    // producer's source identity is retained as provenance, never eligibility.
+    std::string codec_compatibility, producer_build;
     Endpoint endpoint;
     Resources capacity;
     uint64_t capacity_revision = 1;
@@ -159,6 +162,8 @@ struct StatusRequest
 struct BrokerWorkerStatus
 {
     std::string identity, instance, compatibility;
+    std::string codec_compatibility, producer_build;
+    uint32_t capabilities = 0;
     Endpoint endpoint;
     Resources capacity, reserved{0, 0, 0, 0};
     WorkerAdmission admission = WorkerAdmission::Accepting;

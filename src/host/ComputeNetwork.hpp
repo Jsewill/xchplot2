@@ -44,7 +44,13 @@ struct TlsOptions
     // Saved enrollment enforces local revocation; policies are exchanged when
     // both authenticated peers advertise saved enrollment.
     std::string membership_directory;
+    // Diagnostic probes enforce saved membership without learning/persisting
+    // peer policies. No policy exchange is negotiated on these channels.
+    bool read_only_membership = false;
 };
+// A numeric route avoids the synchronous hostname resolver. Scoped IPv6
+// interface suffixes are local routing information and are accepted here.
+bool numeric_host(std::string const&);
 // Network integers are big-endian. Strings and blobs carry bounded lengths;
 // decoders must call finish() to reject unrecognized trailing fields.
 class Writer

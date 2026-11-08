@@ -32,6 +32,11 @@ struct PoolMember
     std::string node_id, name, certificate;
     bool revoked = false;
 };
+enum class WorkerIntent : uint8_t { Active = 1, Paused, Draining };
+// Local operator intent is bound to the enrolled pool/node, not a renewable
+// certificate or transient worker instance. Only the owning worker applies it.
+WorkerIntent load_worker_intent(PoolIdentity const&);
+void save_worker_intent(PoolIdentity const&, WorkerIntent);
 std::filesystem::path pool_directory();
 std::optional<PoolIdentity> load_pool(std::filesystem::path const&);
 PoolIdentity create_pool(std::filesystem::path const&, std::string const& name);

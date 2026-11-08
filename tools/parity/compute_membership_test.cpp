@@ -67,9 +67,11 @@ struct Connection
 {
     Channel client, server;
 };
-Connection connect_members(PoolIdentity const& server, PoolIdentity const& client, bool saved_server = true, bool saved_client = true)
+Connection connect_members(PoolIdentity const& server, PoolIdentity const& client, bool saved_server = true, bool saved_client = true,
+    bool read_only_client = false)
 {
     auto server_tls = server.tls, client_tls = client.tls; server_tls.timeout_ms = client_tls.timeout_ms = 1000;
+    client_tls.read_only_membership = read_only_client;
     if (!saved_server) server_tls.membership_directory.clear();
     if (!saved_client) client_tls.membership_directory.clear();
     server_tls.listen_interfaces = {"lo"};
@@ -87,6 +89,7 @@ void lifecycle()
     invite_pool(authority, root / "second.invite", "second"); auto second = join_pool(root / "second.invite", root / "second");
     auto defaults = first.defaults; defaults.cpus = 2; defaults.broker = "127.0.0.1:12345"; configure_pool(first, defaults);
     auto before = certificate_identity(first.tls.cert_file);
+    save_worker_intent(first, WorkerIntent::Paused);
     request_pool_renewal(first, root / "first.request");
     request_pool_renewal(first, root / "duplicate.request"); request_pool_renewal(first, root / "first.request");
     require(read(root / "first.request") == read(root / "duplicate.request"), "retry replaced the pending key or signed request");
@@ -134,6 +137,7 @@ void lifecycle()
     rejects([&] { sign_pool_renewal(authority, root / "first.request", root / "replay.renewal"); });
     write(first.directory / "renewal.key", pending_before_import);
     import_pool_renewal(first, root / "first.renewal");
+    require(load_worker_intent(*load_pool(first.directory)) == WorkerIntent::Paused, "renewal changed node-owned worker intent");
     import_pool_renewal(first, root / "first.renewal");
     write(first.directory / "renewal.key", pending_before_import);
     request_pool_renewal(renewed, root / "next.request");
@@ -241,13 +245,35 @@ void mixed_tls()
         rejects([&] { (void)connect_members(server, client, saved_server, !saved_server); });
     }
 }
+void read_only_membership()
+{
+    pool_test::Directory directory; auto root = directory.path;
+    auto authority = create_pool(root / "authority", "authority");
+    invite_pool(authority, root / "probe.invite", "probe"); auto probe = join_pool(root / "probe.invite", root / "probe");
+    auto const credentials = read(probe.tls.cert_file), profile = read(probe.directory / "profile");
+    auto const policy = pool_policy(probe.tls.membership_directory);
+    // The server has a newer policy. Diagnostic traffic must enforce the
+    // probe's saved policy without learning or saving the newer registry.
+    invite_pool(authority, root / "new.invite", "new member");
+    auto channel = connect_members(authority, probe, true, true, true);
+    Writer payload; payload.string("read-only probe"); channel.client.send(Message::Control, payload.data());
+    require(channel.server.receive().payload == payload.data(), "read-only membership broke authenticated traffic");
+    channel.server.send(Message::Reply, payload.data());
+    require(channel.client.receive().payload == payload.data() && read(probe.tls.cert_file) == credentials &&
+        read(probe.directory / "profile") == profile && pool_policy(probe.tls.membership_directory) == policy,
+        "read-only diagnostic traffic persisted a peer's newer signed policy");
+    revoke_pool_member(authority, probe.node_id);
+    accept_pool_policy(probe.tls.membership_directory, pool_policy(authority.tls.membership_directory));
+    rejects([&] { channel.client.send(Message::Control, payload.data()); });
+    rejects([&] { (void)connect_members(authority, probe, true, true, true); });
+}
 } // namespace
 int main(int argc, char** argv)
 {
     try
     {
         lifecycle();
-        if (argc > 1 && std::string_view(argv[1]) == "--network") { live_revocation(); mixed_tls(); }
+        if (argc > 1 && std::string_view(argv[1]) == "--network") { live_revocation(); mixed_tls(); read_only_membership(); }
         std::cout << "signed pool policy, revocation, credential rotation and legacy recovery passed\n"; return 0;
     }
     catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }

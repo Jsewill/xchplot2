@@ -96,6 +96,9 @@ void broker_json(BrokerSnapshot const& value)
         if (comma) std::cout << ','; comma = true;
         std::cout << "{\"identity\":"; string(worker.identity);
         std::cout << ",\"instance\":"; string(worker.instance);
+        std::cout << ",\"generation_compatibility\":"; string(worker.compatibility);
+        std::cout << ",\"codec_compatibility\":"; string(worker.codec_compatibility);
+        std::cout << ",\"producer_build\":"; string(worker.producer_build);
         std::cout << ",\"endpoint\":"; string(address(worker.endpoint));
         std::cout << ",\"admission\":"; string(pool::admission_name(worker.admission));
         std::cout << ",\"capacity\":"; resources(worker.capacity);
@@ -132,6 +135,10 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
     std::cout << ",\"authenticated\":true,\"identity\":"; string(value.identity);
     std::cout << ",\"node_id\":"; string(value.node_id);
     std::cout << ",\"instance\":"; string(value.instance);
+    std::cout << ",\"generation_compatibility\":"; string(value.compatibility);
+    std::cout << ",\"codec_compatibility\":"; string(value.codec_compatibility);
+    std::cout << ",\"producer_build\":"; string(value.producer_build);
+    std::cout << ",\"durable_control\":" << (value.durable_control ? "true" : "false");
     std::cout << ",\"admission\":"; string(pool::admission_name(value.admission));
     std::cout << ",\"capacity\":"; resources(value.capacity);
     std::cout << ",\"active\":"; resources(value.active);
@@ -154,7 +161,9 @@ void broker_text(BrokerSnapshot const& value, bool verbose)
             << pool::admission_name(worker.admission) << ": reserved " << worker.reserved.slots << '/' << worker.capacity.slots
             << " slots, " << worker.reserved.cpu_threads << '/' << worker.capacity.cpu_threads << " CPUs, "
             << worker.reserved.host_bytes << '/' << worker.capacity.host_bytes << " host bytes, "
-            << worker.reserved.gpu_bytes << '/' << worker.capacity.gpu_bytes << " GPU bytes\n";
+            << worker.reserved.gpu_bytes << '/' << worker.capacity.gpu_bytes << " GPU bytes\n"
+            << "    Generation: " << worker.compatibility << "; codec: " << worker.codec_compatibility
+            << "; producer: " << worker.producer_build << '\n';
     for (auto const& owner : value.owners)
         std::cout << "  Owner " << owner.owner_id << ": " << owner.queued << " queued, " << owner.granted
             << " granted, " << owner.running << " running\n";
@@ -174,6 +183,9 @@ void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
             << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
             << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes";
     std::cout << '\n';
+    std::cout << "  Admission intent " << (value.durable_control ? "survives service restarts." : "lasts for this process only (unmanaged TLS credentials).") << '\n';
+    if (verbose) std::cout << "  Generation: " << value.compatibility << "; codec: " << value.codec_compatibility
+        << "; producer: " << value.producer_build << '\n';
     if (value.broker_saturated) std::cout << "  Broker limit reached; use compute worker --max-brokers to change the bounded limit.\n";
 }
 } // namespace
@@ -203,6 +215,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
                 << compute_output_help
                 << "Without addresses, use saved broker and LAN discovery. Mutations require the worker's own identity.\n";
             if (command == "drain") std::cout << "Draining becomes drained when all accepted tasks finish; resume reopens admission.\n";
+            if (control) std::cout << "Enrolled workers save pause, drain and resume across standalone and automatic service restarts.\n";
             return 0;
         }
         if (option == "--json") { json = true; continue; }

@@ -1020,6 +1020,19 @@ void routes(fs::path const& directory)
     InventoryRoot root; root.path = file_io::path_text(directory); InventoryPlot plot; plot.harvester = "old-gh";
     require(resolve_source(table, root, plot).kind == HarvesterAdapterKind::gigahorse && resolve_target(table, "new-chia").kind == HarvesterAdapterKind::chia,
         "mixed old/new native readers were conflated");
+    {
+        auto local = table;
+        FarmServiceBinding service; service.root = local.routes[0].options.root; service.rpc_host = "127.0.0.1";
+        service.host = local.routes[0].options.host; service.node_id = std::string(64, 'a'); service.farmer_node_id = std::string(64, 'b');
+        local.routes[0].options.services.emplace("harvester", service);
+        std::ostringstream exported; exported << "{\"farm_adapters\":"; write_farm_adapters_json(exported, local); exported << '}';
+        std::istringstream saved(exported.str()); auto reused = read_farm_adapters(saved);
+        auto const selected = resolve_source(reused, root, plot);
+        require(reused.target_route == local.target_route && selected.executable == self && selected.root == service.root &&
+            selected.rpc_host == service.rpc_host && selected.services.at("harvester").node_id == service.node_id &&
+            selected.services.at("harvester").farmer_node_id == service.farmer_node_id,
+            "private reusable adapter export changed its exact local executable, root, route or authenticated service binding");
+    }
     auto swapped = table; swapped.target_route = "old-gh";
     rejects([&] { (void)resolve_target(swapped, "new-chia"); }, "swapped target route escaped review binding");
     swapped = table; swapped.routes[0].source_roots.clear(); swapped.routes[1].source_roots.push_back(root.path);

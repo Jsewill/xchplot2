@@ -26,6 +26,7 @@
 #include "plot/Plotter.hpp"
 #include "pos2_keygen.h"
 #include "host/GroupPlotter.hpp"
+#include "gpu/DeviceIds.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
 #include "host/GroupCalibrationProcess.hpp"
@@ -424,7 +425,7 @@ uint64_t resident(std::span<group_grow::Member const> values)
 uint64_t batch_hash_bytes(Arguments const& args, size_t count)
 {
     // A generation-overlap batch can coexist with the batch being consumed.
-    return args.member_storage == "compact" && args.pool_broker.empty() ?
+    return args.member_storage == "compact" && !args.local_compute && args.pool_broker.empty() ?
         product(2, group_grow::MemberBatchHash::memory_bytes(count)) : 0;
 }
 uint64_t filesystem_capacity(fs::path const& target, uint64_t headroom, uint64_t metadata_allocated = 0)
@@ -478,12 +479,15 @@ struct MemberLease
     }
 };
 bool controller_profile();
+bool has_compute(Arguments const& args)
+{ return args.local_compute || !args.pool_broker.empty(); }
 
 struct Backend
 {
     std::shared_ptr<group_grow::CodecScheduler> cpu_scheduler;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     std::unique_ptr<group_grow::WorkerService> pool_service;
+    std::vector<std::shared_ptr<group_grow::WorkerService>> local_services;
     std::shared_ptr<group_grow::WorkerClient> pool_client;
     group_grow::WorkerClientConfig pool_client_config;
     std::shared_ptr<group_grow::PoolRemoteEncoder> pool_remote;
@@ -524,6 +528,55 @@ struct Backend
         std::lock_guard lock(pool_mutex);
         if (!pool_client) pool_client = std::make_shared<group_grow::WorkerClient>(pool_client_config);
         return pool_client;
+    }
+
+    void initialize_local(Arguments const& args)
+    {
+        require(!args.protected_resources && !args.local_devices.empty(),
+            "multiple local producers require an ordinary construction job; migration uses its reviewed producer resources");
+        require(cpu_scheduler && args.pool_offer_ram && args.pool_offer_cpus,
+            "selected local producers have no shared CPU and RAM allowance");
+        uint64_t const host_bytes = args.pool_offer_ram / args.local_devices.size();
+        unsigned const threads = unsigned(std::max<uint64_t>(1, args.pool_offer_cpus / args.local_devices.size()));
+        for (auto const& device : args.local_devices)
+        {
+            group_grow::WorkerConfig config;
+            config.capacity = {threads, 1, host_bytes, 0};
+            config.backend = pos2gpu::is_cpu_device(device.device) ? "cpu" : "gpu";
+            config.device = device.device; config.tier = device.tier;
+            config.cpu_affinity = device.cpu_affinity;
+            config.generation_threads = threads; config.max_batch_members = 1;
+            config.cpu_scheduler = cpu_scheduler;
+            config.max_brokers = 1; config.tls.max_frame_bytes = uint32_t(args.pool_frame_bytes);
+            config.max_task_bytes = sum(args.window, args.pool_frame_bytes);
+            config.task_timeout_ms = unsigned(args.pool_timeout_ms);
+            group_grow::default_worker_resources(config);
+            require(group_grow::worker_service_baseline_bytes(config) < host_bytes,
+                "selected local producers exceed the RAM allowance; increase --max-host-ram or select fewer devices");
+            // These services are never started: no listener, enrollment,
+            // discovery or network worker identity is needed for local work.
+            local_services.push_back(std::make_shared<group_grow::WorkerService>(std::move(config)));
+        }
+        group_grow::WorkerClientConfig client;
+        client.local_only = true; client.cpu_scheduler = cpu_scheduler;
+        client.generation_kind = group_grow::pool::Kind::GenerateAny;
+        client.task_timeout_ms = unsigned(args.pool_timeout_ms);
+        client.max_task_bytes = sum(args.window, args.pool_frame_bytes);
+        client.max_active_generation = unsigned(std::min<uint64_t>(args.pool_inflight, local_services.size()));
+        auto next = std::make_shared<std::atomic<size_t>>(0);
+        client.local_service_provider = [services = local_services, next]
+        { return services[next->fetch_add(1) % services.size()]; };
+        client.observe = observe_pool_task;
+        { std::lock_guard lock(pool_mutex); pool_client_config = std::move(client); }
+        (void)acquire_pool_client();
+        pool_retained = sum(group_grow::WorkerClient::memory_bytes(), product(args.local_devices.size(), 4096));
+        mode = "pool"; generation_overlap = args.generation_overlap;
+        if (!args.quiet)
+        {
+            std::cerr << "Local producers:";
+            for (auto const& device : args.local_devices) std::cerr << ' ' << pos2gpu::device_label(device.device);
+            std::cerr << "; " << host_bytes << " buffer bytes per producer, " << args.pool_offer_cpus << " shared CPU threads\n";
+        }
     }
 
     void initialize_pool(Arguments const& args)
@@ -707,9 +760,10 @@ struct Backend
     void configure_network(Arguments const& args)
     {
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        if (!args.pool_broker.empty())
+        if (has_compute(args))
             pool_retained = sum(group_grow::WorkerClient::memory_bytes(),
-                group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)));
+                args.local_compute ? product(args.local_devices.size(), 4096) :
+                    group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)));
         configure_pool_codec(args);
 #else
         (void)args;
@@ -777,6 +831,7 @@ struct Backend
         mode = "cpu";
         if (fixture) { mode = "fixture"; return; }
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (args.local_compute) { initialize_local(args); return; }
         if (!args.pool_broker.empty()) { initialize_pool(args); return; }
 #endif
         if (args.backend == "cpu") { generation_overlap = false; return; }
@@ -1347,7 +1402,7 @@ struct Producer
         // backend is unavailable. Keep an already filled batch equally idle.
         if (before >= wanted) return 0;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        if (!args.pool_broker.empty())
+        if (has_compute(args))
         {
             // Packed network members use the engine's existing digest path.
             // Only CompactMemberBuilder can commit a producer prefix cache.
@@ -1733,7 +1788,7 @@ size_t prefetch_group(GroupPrefetch& batch, Producer& producer, Identity const& 
     if (!producer.fits(0, retained)) { producer.fill_stop = Producer::FillStop::memory; return 0; }
     if (!group_prefetch_enabled(producer.args, producer.backend)) return 0;
     batch.owner = owner; batch.identity = identity; batch.capacity = capacity;
-    if (producer.args.pool_broker.empty()) batch.hash = std::make_unique<group_grow::MemberBatchHash>(capacity);
+    if (!has_compute(producer.args)) batch.hash = std::make_unique<group_grow::MemberBatchHash>(capacity);
     batch.members.reserve(capacity);
     require(batch.members.capacity() <= capacity, "next group batch exceeds admitted metadata capacity");
     auto const added = producer.fill(batch.members, 0, capacity, retained, batch.hash.get(), nullptr,
@@ -3400,7 +3455,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     unsigned const cpu_workers = args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency());
     external_bytes = sum(external_bytes, group_grow::CodecScheduler::memory_bytes(cpu_workers));
     require(external_bytes < args.max_ram, "codec scheduler metadata exceeds --max-ram");
-    if (backend && args.pool_broker.empty()) backend->cpu_scheduler.reset();
+    if (backend && !has_compute(args)) backend->cpu_scheduler.reset();
     auto cpu_scheduler = backend && backend->cpu_scheduler ? backend->cpu_scheduler :
         std::make_shared<group_grow::CodecScheduler>(cpu_workers);
     if (!backend) backend = std::make_unique<Backend>();
@@ -3663,7 +3718,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     else if (!engine.is_staging() && saved.pending)
     {
         std::vector<group_grow::Member> incoming;
-        auto hash = compact && args.pool_broker.empty() ? std::make_unique<group_grow::MemberBatchHash>(batch_cap) : nullptr;
+        auto hash = compact && !has_compute(args) ? std::make_unique<group_grow::MemberBatchHash>(batch_cap) : nullptr;
         MemberLease borrowed;
         incoming.reserve(pending_count);
         require(incoming.capacity() <= batch_cap, "member container exceeds admitted capacity");
@@ -3715,7 +3770,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         }
         auto incoming = std::move(prefetched);
         auto hash = std::move(prefetched_hash);
-        if (compact && args.pool_broker.empty() && !engine.is_staging() && !hash && incoming.empty())
+        if (compact && !has_compute(args) && !engine.is_staging() && !hash && incoming.empty())
             hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
         MemberLease borrowed;
         std::unique_ptr<group_grow::ExternalEngine::ContributionInput> contribution_input;
@@ -3762,7 +3817,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             // Observe its completed phases only after the consumer has joined.
             auto const external_before = engine.external ?
                 std::optional(engine.external->stats()) : std::optional<group_grow::Stats>{};
-            bool const need_prefetch_hash = compact && args.pool_broker.empty() && !engine.is_staging();
+            bool const need_prefetch_hash = compact && !has_compute(args) && !engine.is_staging();
             size_t const prefetch_count = size_t(std::min({args.batch, uint64_t(batch_cap), uint64_t(maximum - next),
                 selected_batch ? selected_batch : uint64_t(batch_cap)}));
             uint64_t received = resident(incoming);
@@ -3951,7 +4006,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
                       << metrics.final_bytes << " bytes; " << metrics.stop_reason << '\n';
             if (args.verbose)
             {
-                std::cerr << "Backend: " << backend.mode;
+                std::cerr << "Backend: " << (args.local_compute && backend.mode == "pool" ? "local" : backend.mode);
                 if (!backend.tier.empty()) std::cerr << "; tier " << backend.tier;
                 if (!backend.fallback.empty()) std::cerr << "; fallback " << backend.fallback;
                 std::cerr << "; construction " << metrics.construction_selected
@@ -3977,7 +4032,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
     struct rusage usage{}; require(!::getrusage(RUSAGE_SELF, &usage), "cannot inspect process memory peak");
     uint64_t const peak_rss_bytes = product(uint64_t(usage.ru_maxrss), 1024);
 #endif
-    std::cout << "{\"mode\":\"" << backend.mode
+    std::cout << "{\"mode\":\"" << (args.local_compute && backend.mode == "pool" ? "local" : backend.mode)
               << "\",\"members\":" << metrics.members << ",\"final_bytes\":" << metrics.final_bytes
               << ",\"capacity_bytes\":" << metrics.capacity_bytes
               << ",\"scratch_peak_bytes\":" << metrics.scratch_peak_bytes
@@ -3994,7 +4049,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
               << ",\"pool_generation_peak_bytes\":" << metrics.pool_generation_peak_bytes
               << ",\"pool_offered_ram_bytes\":" << args.pool_offer_ram
               << ",\"pool_codec_ram_bytes\":" << args.pool_codec_ram
-              << ",\"gpu_retained_host_bytes\":" << (args.pool_broker.empty() ? backend.retained() : 0)
+              << ",\"gpu_retained_host_bytes\":" << (!has_compute(args) ? backend.retained() : 0)
               << ",\"gpu_device_resident_bytes\":" << backend.device_bytes()
               << ",\"backend_requested\":\"" << args.backend
               << "\",\"backend_fallback\":\"" << backend.fallback
@@ -4063,6 +4118,8 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
               << ",\"generation_overlap_members\":" << metrics.generation_overlap_members
               << ",\"recovered\":" << (metrics.recovered ? "true" : "false")
               << ",\"stop_reason\":\"" << metrics.stop_reason << '"';
+    std::cout << ",\"devices_requested\":";
+    pos2gpu::write_json_string(std::cout, args.devices);
     std::cout << ",\"controller_wait_seconds\":{";
     for (size_t i = 0; i < controller_wait_names.size(); ++i)
     {
@@ -4102,7 +4159,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
         std::cout.precision(precision);
     }
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-    if (!args.pool_broker.empty())
+    if (has_compute(args))
     {
         std::cout << ",\"pool_packed_members\":" << backend.pool_members.load()
                   << ",\"pool_contribution_members\":" << backend.pool_contribution_members.load()
@@ -4700,7 +4757,8 @@ struct FarmingRun
         uint64_t original_files = 0, original_members = 0, evaluations = 0;
         uint64_t original_manifest_bytes = 0, original_update_bytes = 0, original_progress_bytes = 0;
         uint64_t original_owner_bytes = 0;
-        bool metadata_upgrade = false;
+        uint64_t selected_capacity_cap = 0;
+        bool metadata_upgrade = false, capacity_search_limited = false;
     };
     struct Lane
     {
@@ -7963,6 +8021,107 @@ std::vector<group_grow::farm::Remaining> replot_inventory_counts(group_grow::far
     for (auto const& [workload, count] : counts) result.push_back({workload, count});
     return result;
 }
+std::string farming_next_command(std::vector<std::string> const& arguments);
+std::optional<group_grow::farm::Profile> replot_setup_resources(Arguments const& args)
+{
+    using namespace group_grow; using namespace group_grow::farm; using namespace group_grow::profile_detail;
+    if (args.farming_profile_path.empty()) return {};
+    auto file = replot_text_file(args.farming_profile_path);
+    auto const document = JsonReader(read_text(file, std::min(profile_byte_limit, args.max_ram / 64)), args.max_ram / 16).read();
+    if (field(document, "farm_resources") || (field(document, "schema") && field(document, "resources") && field(document, "workloads")))
+    {
+        auto profile = parse_profile(document);
+        require(profile_memory(profile) <= args.max_ram / 32, "migration setup profile exceeds its retained memory grant");
+        return profile;
+    }
+    // A reusable ordinary reader profile can seed migration preparation, but
+    // supplies no foreign-service, construction or full-proof envelopes.
+    (void)parse_farming_profile(document); return {};
+}
+group_grow::farm::FarmResourceBindings replot_setup_bindings(Arguments const& args,
+    group_grow::farm::FarmInventory const& inventory, group_grow::farm::FarmAdapterTable const& adapters)
+{
+    using namespace group_grow::farm;
+    FarmResourceBindings bindings;
+    if (!adapters.routes.empty()) bindings.target_hosts = target_service_hosts(resolve_target(adapters));
+    else if (!args.chia_executable.empty()) bindings.target_hosts = target_service_hosts(replot_adapter(args));
+    for (auto const& plot : inventory.plots) if (!plot.alias_of && !plot.reader_identity.empty() &&
+        (!adapters.routes.empty() || !args.chia_executable.empty()))
+    {
+        auto const options = adapters.routes.empty() ? replot_adapter(args) : resolve_source(adapters, inventory.roots.at(plot.root), plot);
+        for (auto const& [role, host] : target_service_hosts(options))
+        { (void)role; bindings.workload_hosts[plot.workload_id].insert(host); }
+    }
+    return bindings;
+}
+group_grow::farm::FarmAdapterTable replot_setup_adapters(Arguments const& args,
+    group_grow::farm::FarmInventory const& inventory, group_grow::farm::FarmAdapterTable adapters)
+{
+    if (!adapters.routes.empty() || args.chia_executable.empty()) return adapters;
+    auto options = replot_adapter(args);
+    require(options.root.is_absolute() && options.executable.is_absolute(),
+        "reusable local reader selection requires explicit absolute --chia-root and --chia-executable paths");
+    group_grow::farm::FarmAdapterRoute route; route.id = options.harvester; route.options = std::move(options);
+    for (auto const& root : inventory.roots) route.source_roots.push_back(root.path);
+    adapters.target_route = route.id; adapters.routes.push_back(std::move(route)); return adapters;
+}
+void save_replot_setup_profile(Arguments const& args, group_grow::farm::FarmInventory const& inventory,
+    group_grow::farm::FarmAdapterTable const& selected)
+{
+    using namespace group_grow; using namespace group_grow::farm;
+    require(inventory.resource_template && inventory.resource_preparation, "reusable migration profile lost its preparation");
+    auto profile = farming_profile(args, farming_configuration(args));
+    // Inventory parsing does not import ordinary policy automatically. Retain
+    // its optional reader declarations/calibration without confusing them with
+    // the independently reviewed mixed-farm service envelope.
+    if (!args.farming_profile && !args.farming_profile_path.empty())
+    {
+        auto file = replot_text_file(args.farming_profile_path);
+        if (auto saved = read_replot_farming_profile(file, args.max_ram / 8))
+        { auto contextual = args; contextual.farming_profile = std::make_shared<FarmingProfile const>(std::move(*saved));
+          profile = farming_profile(contextual, farming_configuration(contextual)); }
+    }
+    if (profile.host_name.empty()) profile.host_name = inventory.host;
+    if (profile.captured_at.empty()) profile.captured_at = inventory.captured_at;
+    profile.detected_logical_cpus = profile_detail::logical_cpus();
+    profile.detected_available_memory_bytes = profile_detail::available_memory();
+    auto const adapters = replot_setup_adapters(args, inventory, selected);
+    uint64_t const exported = sum(sum(profile_memory(*inventory.resource_template), resource_preparation_memory(*inventory.resource_preparation)),
+        sum(farming_profile_memory(profile), replot_adapter_memory(adapters)));
+    uint64_t const retained = sum(farm_inventory_memory(inventory), sum(farming_profile_memory(profile), replot_adapter_memory(adapters)));
+    auto const text_bound = sum(product(exported, 6), 65536);
+    require(sum(retained, product(text_bound, 2)) < args.max_ram,
+        "reusable migration profile export exceeds --max-ram");
+    std::ostringstream out; out << "{\"farming_profile\":"; write_farming_profile_json(out, profile);
+    out << ",\"farm_resources\":"; write_profile_json(out, *inventory.resource_template);
+    out << ",\"resource_preparation\":"; write_resource_preparation_json(out, *inventory.resource_preparation);
+    if (!adapters.routes.empty()) { out << ",\"farm_adapters\":"; write_farm_adapters_json(out, adapters); }
+    out << "}\n"; auto const text = out.str();
+    require(sum(retained, product(text.capacity(), 4)) < args.max_ram, "reusable migration profile export exceeds --max-ram");
+    check_cancel(args); stream_state::atomic_save(args.save_profile, text, false);
+}
+void print_replot_setup_decisions(group_grow::farm::ResourcePreparation const& preparation)
+{
+    for (auto const& need : preparation.missing)
+        std::cout << "  [" << need.group << "] " << need.path << ": " << need.action << '\n';
+    if (!preparation.resource_settings.empty())
+        std::cout << "Supply only the remaining declarations below. Replace uppercase placeholders with reviewed bounds; "
+            "bytes describe memory, lanes describe offered service capacity, and times use microseconds. "
+            "The serialized cost example may instead be replaced by a complete reservation envelope.\n";
+    for (auto const& setting : preparation.resource_settings)
+        std::cout << "  " << farming_next_command({"--resource-setting", setting}) << '\n';
+    if (preparation.settings_limited)
+        std::cout << "Additional setting templates exceed the bounded report; save these declarations and repeat setup for the remaining decisions.\n";
+}
+void record_replot_resource_settings(Arguments const& args, group_grow::farm::ResourcePreparation& preparation)
+{
+    if (args.farming_resource_settings.empty()) return;
+    for (auto& fact : preparation.facts) if (fact.path == "farm_resources")
+    { fact.basis = "declared"; fact.scope = "Named explicit resource settings applied; other imported declarations retained. Observations do not revalidate service bounds or physical scope; full admission remains required."; }
+    require(preparation.facts.size() < group_grow::farm::max_preparation_entries, "too many explicit resource-setting observations");
+    preparation.facts.push_back({"resource_settings", "explicit typed declarations", "declared", "command-line",
+        "Only named policy fields were changed. Imported bounds remain declarations; local observations do not validate their whole-service scope or worst-case costs."});
+}
 int print_farm_inventory(Arguments const& args)
 {
     using namespace group_grow::farm;
@@ -7983,23 +8142,19 @@ int print_farm_inventory(Arguments const& args)
             inventory_detail::name(plot.container) + "-k" + std::to_string(plot.k) + "-s" + std::to_string(plot.strength) +
             "-c" + std::to_string(plot.compression_level) : "opaque-unclassified";
     }
-    FarmResourceBindings bindings;
-    if (!adapters.routes.empty()) bindings.target_hosts = target_service_hosts(resolve_target(adapters));
-    else if (!args.chia_executable.empty()) bindings.target_hosts = target_service_hosts(replot_adapter(args));
-    for (auto const& plot : inventory.plots) if (!plot.alias_of && !plot.reader_identity.empty())
+    auto const bindings = replot_setup_bindings(args, inventory, adapters);
+    auto supplied_resources = replot_setup_resources(args);
+    bool const imported_resources = supplied_resources.has_value();
+    if (supplied_resources)
     {
-        auto const options = adapters.routes.empty() ? replot_adapter(args) : resolve_source(adapters, inventory.roots.at(plot.root), plot);
-        for (auto const& [role, host] : target_service_hosts(options))
-        { (void)role; bindings.workload_hosts[plot.workload_id].insert(host); }
-    }
-    if (!args.farming_profile_path.empty())
-    {
-        auto file = replot_text_file(args.farming_profile_path);
-        inventory.resource_template = read_profile(file, args.max_ram / 8);
+        inventory.resource_template = std::move(*supplied_resources);
         validate_inventory_coverage(*inventory.resource_template, replot_inventory_counts(inventory));
     }
     else inventory.resource_template = make_inventory_resource_template(inventory, replot_inventory_counts(inventory), bindings);
-    inventory.resource_preparation = prepare_farm_inventory_resources(inventory, bindings, !args.farming_profile_path.empty());
+    if (!args.farming_resource_settings.empty())
+        inventory.resource_template = apply_resource_settings(std::move(*inventory.resource_template), args.farming_resource_settings);
+    inventory.resource_preparation = prepare_farm_inventory_resources(inventory, bindings, imported_resources);
+    record_replot_resource_settings(args, *inventory.resource_preparation);
     inventory.resource_preparation->facts.insert(inventory.resource_preparation->facts.end(),
         std::make_move_iterator(reader_facts.begin()), std::make_move_iterator(reader_facts.end()));
     if (!args.farming_profile_path.empty())
@@ -8024,14 +8179,189 @@ int print_farm_inventory(Arguments const& args)
     auto const body = farm_inventory_text(inventory, replot_inventory_limits(args));
     require(body.size() < args.max_ram / 16, "saved farm inventory exceeds --max-ram");
     if (!args.save_plan.empty()) stream_state::atomic_save(args.save_plan, body, false);
+    if (!args.save_profile.empty()) save_replot_setup_profile(args, inventory, adapters);
     if (args.json) std::cout << body << '\n';
     else if (!args.quiet) std::cout << "Farm inventory: " << inventory.roots.size() << " roots, " << inventory.plots.size()
         << " entries. Public headers and native identities observed; no files changed.\n"
         << "Resource preparation: " << inventory.resource_preparation->missing.size()
         << " declaration items need review. Observations and exact missing fields are saved in resource_preparation.\n"
-        << "Supply reviewed bounds in farm_resources and reuse them with --harvester FILE. Samples and OS availability do not grant capacity.\n";
-    if (!args.json && !args.quiet) for (auto const& need : inventory.resource_preparation->missing)
-        std::cout << "  [" << need.group << "] " << need.path << ": " << need.action << '\n';
+        << "Reuse declarations with --harvester FILE and save a local profile with --save-profile FILE. Samples and OS availability do not grant capacity.\n";
+    if (!args.json && !args.quiet)
+    {
+        print_replot_setup_decisions(*inventory.resource_preparation);
+        if (!args.save_profile.empty()) std::cout << "Saved reusable local profile: " << file_io::path_text(args.save_profile) << '\n';
+    }
+    return 0;
+}
+int print_replot_setup(Arguments const& args)
+{
+    using namespace group_grow; using namespace group_grow::farm;
+    auto const limits = replot_inventory_limits(args);
+    auto const inventory_stamp = stream_state::stamp(args.replot_inventory);
+    std::optional<stream_state::Stamp> profile_stamp;
+    if (!args.farming_profile_path.empty()) profile_stamp = stream_state::stamp(args.farming_profile_path);
+    FarmInventory inventory;
+    { auto file = replot_text_file(args.replot_inventory); inventory = read_farm_inventory(file, limits); }
+    auto const adapters = replot_adapter_table(args); std::vector<ResourcePreparationFact> facts;
+    std::string reader_error;
+    try
+    {
+        if (!adapters.routes.empty()) observe_harvester_inventory(inventory, adapters, &facts);
+        else if (!args.chia_executable.empty())
+        {
+            auto const options = replot_adapter(args); observe_harvester_inventory(inventory, options, true, &facts);
+            inventory.network = observe_network_projection(options, &inventory);
+        }
+    }
+    catch (Interrupted const&) { throw; }
+    catch (std::runtime_error const& error)
+    { check_cancel(args); reader_error = std::string(error.what()).substr(0, 2048); }
+    FarmResourceBindings bindings;
+    try { bindings = replot_setup_bindings(args, inventory, adapters); }
+    catch (Interrupted const&) { throw; }
+    catch (std::runtime_error const& error)
+    { check_cancel(args); if (reader_error.empty()) reader_error = std::string(error.what()).substr(0, 2048); }
+    auto supplied_resources = replot_setup_resources(args); bool const imported = supplied_resources.has_value();
+    if (supplied_resources) inventory.resource_template = std::move(*supplied_resources);
+    else if (!inventory.resource_template)
+        inventory.resource_template = make_inventory_resource_template(inventory, replot_inventory_counts(inventory), bindings);
+    auto& profile = *inventory.resource_template; auto& native = profile.native;
+    // Copy software execution selections and observed physical mappings. They
+    // select the scope to be reviewed; every capacity and service bound keeps
+    // its existing declaration or remains explicitly unanswered.
+    auto const config = farming_configuration(args);
+    if (!native.k) native.k = config.k;
+    if (!native.strength) native.strength = config.strength;
+    if (native.host.empty()) native.host = inventory.host;
+    if (native.reader.empty()) native.reader = config.reader == FarmingReader::cached ? "cached" : "stateless";
+    if (native.backend.empty() && args.backend != "auto") native.backend = args.backend;
+    if (native.engine.empty() && args.construction != "auto") native.engine = args.construction;
+    if (!native.max_ram_bytes) native.max_ram_bytes = args.max_ram;
+    if (!native.max_cpu_threads && args.workers) native.max_cpu_threads = args.workers;
+    if (!native.max_group_members && args.group_members) native.max_group_members = args.group_members;
+    if (!native.max_batch_members) native.max_batch_members = args.group_members ? std::min(args.batch, args.group_members) : args.batch;
+    std::vector<fs::path> directories{args.target}; directories.insert(directories.end(), args.destinations.begin(), args.destinations.end());
+    require(!args.target.empty() && directories.size() <= limits.max_roots, "migration setup requires explicit destination directories");
+    std::vector<std::string> output, scratch; std::vector<ResourcePreparationFact> storage_facts;
+    auto storage = [&](fs::path const& path, std::vector<std::string>& selected, std::string_view role)
+    {
+        check_cancel(args); inventory_detail::RootHandle pin(path); auto const device = storage_device(pin.path);
+        auto const id = replot_storage_resource(device); resource_detail::Graph existing(profile);
+        if (!existing.names.contains(id))
+        {
+            require(profile.resources.size() < max_resources, "migration setup exceeds the physical resource count");
+            Resource resource; resource.id = id; resource.host = inventory.host; resource.kind = ResourceKind::storage;
+            if (device.drives.empty()) resource.aliases.push_back("storage:unknown:" + inventory.host);
+            else for (auto const& drive : device.drives) resource.aliases.push_back("drive:" + drive);
+            profile.resources.push_back(std::move(resource));
+        }
+        resource_detail::Graph graph(profile); auto const& canonical = graph.resources[graph.find(id)].id;
+        if (std::find(selected.begin(), selected.end(), canonical) == selected.end()) selected.push_back(canonical);
+        file_io::Space space{}; require(!file_io::space_fd(pin.handle.fd, &space), "cannot inspect migration setup destination space");
+        storage_facts.push_back({"selected." + std::string(role) + '[' + canonical + ']', file_io::path_text(pin.path), "observed",
+            "native-filesystem-and-drive-topology", "Selected local path and physical sharing; available bytes " +
+                std::to_string(product(space.f_bavail, space.f_frsize)) + " are a snapshot, not a service grant or a future free-space guarantee."});
+    };
+    for (auto const& path : directories) storage(path, output, "output");
+    auto temporary = args.temporary;
+    for (auto const& path : directories) add_destination_temporary(temporary, args.destination_temp, path, storage_device(path));
+    for (auto const& path : temporary) storage(path, scratch, "scratch");
+    native.output_resources = output; native.scratch_resources = scratch;
+    auto add_demands = [&](std::vector<Demand>& values, std::vector<std::string> const& resources)
+    {
+        resource_detail::Graph graph(profile);
+        for (auto const& id : resources) if (std::none_of(values.begin(), values.end(), [&](auto const& demand)
+            { return graph.find(demand.resource) == graph.find(id); }))
+        { require(values.size() < max_resources * 4, "migration setup exceeds the phase demand bound"); Demand demand; demand.resource = id; values.push_back(std::move(demand)); }
+    };
+    std::vector<std::string> execution{"cpu:" + inventory.host, "memory:" + inventory.host};
+    for (auto const& id : execution)
+    {
+        resource_detail::Graph graph(profile);
+        require(graph.names.contains(id), "migration setup profile omits the local execution CPU or memory identity");
+    }
+    add_demands(native.construction, execution); add_demands(native.construction, output); add_demands(native.construction, scratch);
+    add_demands(native.supervision, execution); add_demands(native.supervision, native.source_resources); add_demands(native.supervision, output);
+    if (args.replot_verification && *args.replot_verification != "structural")
+    { add_demands(native.verification, execution); add_demands(native.verification, output); }
+    if (native.cohorts.empty())
+    {
+        uint64_t per_lane = args.max_total_members;
+        if (per_lane == UINT64_MAX && args.max_groups != UINT64_MAX && args.group_members) per_lane = product(args.max_groups, args.group_members);
+        if (per_lane != UINT64_MAX)
+        { NativeCohort cohort; cohort.max_members = product(per_lane, directories.size()); native.cohorts.push_back(std::move(cohort)); }
+    }
+    std::vector<std::string> farming = output;
+    for (auto const& [role, host] : bindings.target_hosts)
+    { (void)role; farming.push_back("cpu:" + host); farming.push_back("memory:" + host); }
+    if (bindings.target_hosts.empty()) farming.insert(farming.end(), execution.begin(), execution.end());
+    for (auto& cohort : native.cohorts)
+    { add_demands(cohort.new_farming, farming); add_demands(cohort.proof_reserve, farming); }
+    if (!args.farming_resource_settings.empty()) profile = apply_resource_settings(std::move(profile), args.farming_resource_settings);
+    validate_inventory_coverage(profile, replot_inventory_counts(inventory));
+    inventory.resource_preparation = prepare_farm_inventory_resources(inventory, bindings, imported);
+    auto& preparation = *inventory.resource_preparation;
+    record_replot_resource_settings(args, preparation);
+    preparation.facts.insert(preparation.facts.end(), std::make_move_iterator(facts.begin()), std::make_move_iterator(facts.end()));
+    preparation.facts.insert(preparation.facts.end(), std::make_move_iterator(storage_facts.begin()), std::make_move_iterator(storage_facts.end()));
+    preparation.facts.push_back({"selected.execution", "k=" + std::to_string(config.k) + ";strength=" + std::to_string(config.strength) +
+        ";backend=" + args.backend + ";engine=" + args.construction + ";max_ram_bytes=" + std::to_string(args.max_ram) + ";workers=" + std::to_string(args.workers),
+        "declared", "command-line-and-documented-defaults", "Software selections and allocation limits; no measured spare capacity, worst-case service cost or full-proof bound is inferred."});
+    if (!reader_error.empty()) preparation.missing.push_back({"local-reader", "farm_adapters", "Refresh the selected reader/configuration observation: " + reader_error});
+    if (adapters.routes.empty() && args.chia_executable.empty()) preparation.missing.push_back({"local-reader", "farm_adapters",
+        "Select the installed target/source reader with explicit --chia-root and --chia-executable, or --harvester LOCAL_PROFILE containing farm_adapters."});
+    if (!inventory.network.available) preparation.missing.push_back({"network", "inventory.network",
+        "Refresh inventory with the selected installed reader to observe the actual network and replacement plot parameters."});
+    if (!inventory.complete) preparation.missing.push_back({"inventory", "inventory.complete", "Repeat inventory until the complete active farm scope is observed before saving an executable migration review."});
+    require(stream_state::stamp(args.replot_inventory) == inventory_stamp, "migration setup inventory changed while gathering its selections");
+    if (profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *profile_stamp, "migration setup local profile changed while gathering its selections");
+    save_replot_setup_profile(args, inventory, adapters);
+    std::vector<std::string> command{"xchplot2", "plan"};
+    for (auto const& path : directories) command.push_back(file_io::path_text(path));
+    command.insert(command.end(), {"--replot", file_io::path_text(args.replot_inventory), "--harvester", file_io::path_text(args.save_profile),
+        "--k", std::to_string(config.k), "--strength", std::to_string(config.strength), "--max-ram", std::to_string(args.max_ram),
+        "--headroom-bytes", std::to_string(args.headroom), "--batch-members", std::to_string(args.batch), "--destination-temp", args.destination_temp,
+        "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", std::to_string(args.checkpoint_bytes), "--member-storage", args.member_storage,
+        "--io-overlap", args.io_overlap ? "on" : "off", "--generation-overlap", args.generation_overlap_auto ? "auto" : args.generation_overlap ? "on" : "off",
+        "--cache-release", args.cache_release ? "on" : "off"});
+    auto limit = [&](char const* option, uint64_t value, uint64_t omitted)
+    { if (value != omitted) command.insert(command.end(), {option, std::to_string(value)}); };
+    limit("--workers", args.workers, 0); limit("--capacity-bytes", args.capacity, 0);
+    limit("--temp-capacity-bytes", args.temporary_capacity, 0);
+    limit("--max-groups", args.max_groups, UINT64_MAX); limit("--max-total-members", args.max_total_members, UINT64_MAX);
+    limit("--group-members", args.group_members, 0); limit("--reclaim-before-bytes", args.reclaim_before_bytes, 0);
+    limit("--replot-max-source-files", args.replot_max_source_files, 0); limit("--replot-max-source-bytes", args.replot_max_source_bytes, 0);
+    if (args.backend != "auto") command.insert(command.end(), {"--backend", args.backend});
+    if (!args.devices.empty()) command.insert(command.end(), {"--devices", args.devices});
+    else if (args.backend != "cpu") command.insert(command.end(), {"--device", std::to_string(args.device)});
+    if (args.tier != "auto") command.insert(command.end(), {"--tier", args.tier});
+    if (args.meta) command.insert(command.end(), {"--meta-group", std::to_string(*args.meta)});
+    if (args.construction != "auto") command.insert(command.end(), {"--construction", args.construction});
+    if (args.compute_mode == "off") command.insert(command.end(), {"--compute", "off"});
+    for (auto const& path : args.temporary) command.insert(command.end(), {"--temp-dir", file_io::path_text(path)});
+    for (auto const& path : args.replot_source_roots) command.insert(command.end(), {"--replot-source-root", file_io::path_text(path)});
+    for (auto const& path : args.replot_exclude_roots) command.insert(command.end(), {"--replot-exclude-root", file_io::path_text(path)});
+    if (args.replot_verification) command.insert(command.end(), {"--replot-verification", *args.replot_verification});
+    if (args.replot_proof_first_groups) command.insert(command.end(), {"--replot-proof-first-groups", std::to_string(*args.replot_proof_first_groups)});
+    if (args.replot_proof_every_groups) command.insert(command.end(), {"--replot-proof-every-groups", std::to_string(*args.replot_proof_every_groups)});
+    auto setup_command = command; setup_command.insert(setup_command.end(), {"--save-profile", "UPDATED_PROFILE"});
+    command.insert(command.end(), {"--save-plan", "MIGRATION_PLAN"});
+    auto const next = farming_next_command(command), continue_setup = farming_next_command(setup_command);
+    if (args.json)
+    {
+        std::cout << "{\"migration_setup\":true,\"assessment_required\":true,\"feasible\":null,\"saved_profile\":" << json_string(file_io::path_text(args.save_profile))
+            << ",\"resource_preparation\":"; write_resource_preparation_json(std::cout, preparation);
+        std::cout << ",\"farm_resources\":"; write_profile_json(std::cout, profile);
+        std::cout << ",\"continue_setup_command\":" << json_string(continue_setup) << ",\"next_command\":" << json_string(next) << "}\n";
+    }
+    else if (!args.quiet)
+    {
+        std::cout << "Saved reusable local migration profile: " << file_io::path_text(args.save_profile)
+            << ". A setup profile requires a complete migration review before execution.\n";
+        print_replot_setup_decisions(preparation);
+        if (!preparation.missing.empty()) std::cout << "Keep completed declarations and apply the remaining settings with:\n  " << continue_setup << " [--resource-setting ...]\n";
+        std::cout << "After the remaining declarations are reviewed, save a concrete migration plan with:\n  " << next << '\n';
+    }
     return 0;
 }
 struct ReplotInputs
@@ -8687,6 +9017,8 @@ ReplotInputs make_replot_review(Arguments const& args)
         require(result.inventory.resource_template.has_value(), "replot review requires a completed farming_profile/farm_resources profile");
         result.resources = *result.inventory.resource_template;
     }
+    if (!args.farming_resource_settings.empty())
+        result.resources = apply_resource_settings(std::move(result.resources), args.farming_resource_settings);
     auto& review = result.review; auto& state = review.farm;
     review.verification = requested_replot_verification(args);
     state.config = farming_configuration(args); state.fixed_extent = true; state.capacity_fill = false;
@@ -9923,9 +10255,178 @@ int print_legacy_farming_plan(Arguments args)
     (void)print_farming_metadata(args);
     return refusal;
 }
+struct StatusDiagnosis
+{
+    std::string status = "unknown", condition, affected_work, evidence, unknowns, next;
+    bool blocking = false;
+};
+void print_status_diagnosis(std::ostream& out, StatusDiagnosis const& value, bool json)
+{
+    if (json)
+        out << "{\"status\":" << json_string(value.status) << ",\"blocking\":" << (value.blocking ? "true" : "false")
+            << ",\"condition\":" << json_string(value.condition) << ",\"affected_work\":" << json_string(value.affected_work)
+            << ",\"evidence\":" << json_string(value.evidence) << ",\"unknowns\":" << json_string(value.unknowns)
+            << ",\"next_safe_action\":" << json_string(value.next) << '}';
+    else
+    {
+        out << "Diagnosis: " << value.status << (value.condition.empty() ? "" : ": " + value.condition) << '\n'
+            << "  Affected work: " << value.affected_work << "\n  Evidence: " << value.evidence << '\n';
+        if (!value.unknowns.empty()) out << "  Unknown: " << value.unknowns << '\n';
+        out << "  Next: " << value.next << '\n';
+    }
+}
+StatusDiagnosis farming_status_diagnosis(std::string const& state, std::string const& reason, std::string const& next,
+    std::string const& control, std::string const& control_status, std::string const& last_writer_state, group_grow::FarmingOwnerHealth const& owner,
+    bool observed, bool inspected)
+{
+    StatusDiagnosis result; result.status = state; result.condition = reason; result.next = next;
+    result.affected_work = "this destination's saved grants and future allocation";
+    result.evidence = inspected && observed ? "current bounded construction inspection" :
+        observed ? "last-known saved progress" : "no progress observation";
+    result.evidence += owner.checked ? "; current local owner observation" : "; owner not checked";
+    result.unknowns = "compute admission and farming service readiness are separate live observations";
+    if (state == "detached" || state == "retirement-unacknowledged") return result;
+    if (state == "unavailable" || state == "inspection-incomplete" || state == "legacy-checkpoint-blocked")
+    { result.blocking = true; return result; }
+    if (control != "active")
+    {
+        result.blocking = true; result.affected_work = control == "draining" || control == "retired" ?
+            "new files; already started files retain their grants" : "future allocation";
+        if (control_status == "pending-boundary")
+        { result.status = "control-pending"; result.condition = "the owner has not acknowledged the current control at a safe boundary";
+          result.next = "inspect the owner and wait for its control acknowledgement; preserve started work"; }
+        return result;
+    }
+    if (last_writer_state == "waiting-for-drives")
+    {
+        result.status = "waiting-for-drives"; result.blocking = true;
+        result.affected_work = "new global grants and policy changes; existing local grants remain preserved";
+        result.next = "restore the original required destinations, then continue fill through an available member"; return result;
+    }
+    if (!observed)
+    { result.status = "observations-unavailable"; return result; }
+    if (owner.status == "live")
+    {
+        result.status = "running"; result.condition = "a current local owner holds the saved destination";
+        result.next = "use status --watch to follow progress; use status --live for bounded compute and service diagnostics";
+    }
+    else if (owner.lock_held)
+    {
+        result.blocking = true;
+        if (owner.status == "stopping")
+        {
+            result.status = "coordinator-stopping";
+            result.condition = "the local owner published its stopped heartbeat and still holds the destination lock";
+            result.next = "wait for the owner to release the destination, then continue fill when intended";
+        }
+        else
+        {
+            result.status = owner.status == "unresponsive-owner" ? "unresponsive-owner" : "owner-unconfirmed";
+            result.condition = owner.status == "unresponsive-owner" ? "the local owner still holds its lock, but its heartbeat is stale or cannot establish freshness" :
+                "an owner lock is held without current local process proof";
+            result.next = "inspect the owning process or host and its write errors; preserve its locks, plots and recovery files";
+        }
+    }
+    else if (owner.checked)
+    {
+        result.status = owner.status == "stale-owner" || owner.status == "relocated-stale-owner" ? "stale-owner" : "coordinator-stopped";
+        result.condition = owner.status == "not-recorded" ? "no owner record exists; saved progress does not prove a running coordinator" :
+            "the prior owner lock is released; saved progress does not prove a running coordinator";
+        result.next = "continue with fill DIR to acquire the destination safely and recheck admission; preserve plots and recovery files";
+    }
+    else
+    { result.status = "owner-unavailable"; result.condition = "current owner evidence is unavailable"; result.blocking = true; }
+    if (!reason.empty() && reason != "no durable progress observation is available yet")
+    {
+        result.condition += "; saved stop reason: " + reason;
+        result.next = next;
+    }
+    return result;
+}
+struct StatusComputeObservation
+{
+    StatusDiagnosis diagnosis;
+    bool complete = true;
+#if defined(XCHPLOT2_GROUP_COMMANDS) && defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    std::optional<pos2gpu::ComputeInspection> live;
+#endif
+};
+StatusComputeObservation inspect_status_compute(Arguments const& args, std::chrono::steady_clock::time_point deadline)
+{
+    StatusComputeObservation result;
+    result.diagnosis.status = "not-queried";
+    result.diagnosis.affected_work = "new shared generation and encoding tasks";
+    result.diagnosis.evidence = "no live compute probe";
+    result.diagnosis.unknowns = "current broker routes, worker contracts, admission and exact task resource fit";
+    result.diagnosis.next = "use status --live for a bounded authenticated compute observation";
+    if (!args.status_live) return result;
+#if defined(XCHPLOT2_GROUP_COMMANDS) && defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    result.live = pos2gpu::inspect_group_compute(args, deadline); check_cancel(args);
+    auto const& live = *result.live;
+    result.complete = live.complete; result.diagnosis.status = live.status;
+    result.diagnosis.blocking = live.blocking; result.diagnosis.condition = live.reason;
+    result.diagnosis.evidence = live.checked ? "current authenticated broker registrations; discovery alone is not compute availability" :
+        "selected local compute settings; no authenticated live broker observation";
+    result.diagnosis.unknowns = live.unknowns; result.diagnosis.next = live.next_action;
+#else
+    (void)deadline; result.complete = false;
+    result.diagnosis.status = "unavailable"; result.diagnosis.condition = "this build has no installed shared compute inspection interface";
+    result.diagnosis.next = "use the installed xchplot2 status --live command with shared compute support";
+#endif
+    return result;
+}
+void print_status_compute(std::ostream& out, StatusComputeObservation const& value, bool json)
+{
+    if (json) { out << "{\"diagnosis\":"; print_status_diagnosis(out, value.diagnosis, true); }
+    else { out << "Compute "; print_status_diagnosis(out, value.diagnosis, false); }
+#if defined(XCHPLOT2_GROUP_COMMANDS) && defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (value.live)
+    {
+        auto const& live = *value.live;
+        if (json)
+        {
+            out << ",\"configured\":" << (live.configured ? "true" : "false") << ",\"authenticated_observation\":" << (live.checked ? "true" : "false")
+                << ",\"complete\":" << (live.complete ? "true" : "false") << ",\"observed_at_unix_ms\":" << live.observed_at_unix_ms
+                << ",\"brokers_observed\":" << live.brokers << ",\"workers_observed\":" << live.workers
+                << ",\"oldest_worker_registration_age_ms\":" << live.oldest_worker_registration_age_ms
+                << ",\"compatible_accepting_generation_workers\":" << live.accepting_generation
+                << ",\"compatible_accepting_codec_workers\":" << live.accepting_codec << ",\"paused_workers\":" << live.paused
+                << ",\"draining_workers\":" << live.draining << ",\"drained_workers\":" << live.drained
+                << ",\"contract_mismatch_workers\":" << live.incompatible << ",\"discovery\":" << json_string(live.discovery)
+                << ",\"certificate_expired\":" << (live.certificate_expired ? "true" : "false")
+                << ",\"authority_expired\":" << (live.authority_expired ? "true" : "false")
+                << ",\"certificate_expires\":" << json_string(live.certificate_expires) << ",\"authority_expires\":" << json_string(live.authority_expires)
+                << ",\"service_lifecycle\":" << json_string(live.service_lifecycle)
+                << ",\"local_worker_intent\":" << json_string(live.local_worker_intent)
+                << ",\"local_worker_intent_action\":" << json_string(live.local_worker_intent_action)
+                << ",\"issues\":[";
+            for (size_t i = 0; i < live.issues.size(); ++i)
+            { if (i) out << ','; out << "{\"endpoint\":" << json_string(live.issues[i].endpoint) << ",\"reason\":" << json_string(live.issues[i].reason) << '}'; }
+            out << ']';
+        }
+        else
+        {
+            out << "  Authenticated broker observation: " << (live.checked ? "yes" : "no") << "; " << (live.complete ? "complete" : "partial")
+                << "; observed at " << live.observed_at_unix_ms << " Unix milliseconds\n"
+                << "  Broker registrations: " << live.workers << " workers across " << live.brokers << " brokers; accepting compatible generation "
+                << live.accepting_generation << ", encoding " << live.accepting_codec << "; paused " << live.paused
+                << ", draining " << live.draining << ", drained " << live.drained << ", contract mismatch " << live.incompatible << '\n'
+                << "  Oldest observed worker registration: " << live.oldest_worker_registration_age_ms << " milliseconds since broker contact\n"
+                << "  Discovery: " << live.discovery << '\n';
+            if (!live.certificate_expires.empty()) out << "  Certificate expires: " << live.certificate_expires << (live.certificate_expired ? " (renewal required)" : "") << '\n';
+            if (!live.authority_expires.empty()) out << "  Pool authority expires: " << live.authority_expires << (live.authority_expired ? " (re-enrollment required)" : "") << '\n';
+            if (!live.service_lifecycle.empty()) out << "  Service lifecycle: " << live.service_lifecycle << '\n';
+            if (live.local_worker_intent != "not-selected") out << "  Saved local worker intent: " << live.local_worker_intent << "; " << live.local_worker_intent_action << '\n';
+            for (auto const& issue : live.issues) out << "  " << issue.endpoint << ": " << issue.reason << '\n';
+        }
+    }
+#endif
+    if (json) out << '}';
+}
 int print_farming_status_once(Arguments args)
 {
     args.plan_only = args.resume = true;
+    auto const observed_at = group_grow::farming_owner_detail::now_ms();
     std::string expected_job;
     if (!args.from_plan.empty())
     {
@@ -9945,11 +10446,19 @@ int print_farming_status_once(Arguments args)
             bool const unstarted = available && preview.preview.source_digest.empty();
             auto const status = unstarted ? "not-started" : "unavailable";
             auto const next = unstarted ? "fill PLAN" : "mount a saved destination and restore its job metadata before resuming";
+            StatusDiagnosis diagnosis{status, unstarted ? "no started farm metadata was found" : "saved member metadata is unavailable",
+                "the saved preview's farm", "saved preview and current destination identity observations",
+                "coordinator, construction and live compute availability", next, !unstarted};
+            auto compute_args = args; compute_args.max_ram = args.max_ram / 8;
+            auto compute = inspect_status_compute(compute_args, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.status_timeout_ms));
             if (args.json) std::cout << "{\"farming_status\":true,\"read_only\":true,\"inspection_complete\":"
-                << (unstarted ? "true" : "false") << ",\"status\":" << json_string(status)
-                << ",\"next_action\":" << json_string(next) << "}\n";
-            else std::cout << "Saved farm: " << status << ". Next: " << next << '\n';
-            return unstarted ? 0 : 2;
+                << (unstarted && compute.complete ? "true" : "false") << ",\"status\":" << json_string(status)
+                << ",\"next_action\":" << json_string(next) << ",\"observed_at_unix_ms\":" << observed_at << ",\"diagnosis\":";
+            print_status_diagnosis(std::cout, diagnosis, args.json);
+            if (args.json) std::cout << ",\"compute\":";
+            print_status_compute(std::cout, compute, args.json);
+            if (args.json) std::cout << "}\n";
+            return unstarted && compute.complete ? 0 : 2;
         }
         if (!preview.preview.source_digest.empty()) expected_job = preview.preview.state.job_id;
         args.from_plan.clear();
@@ -9975,9 +10484,10 @@ int print_farming_status_once(Arguments args)
         std::string directory, state, reason, next, observed_at, writer_state;
         std::string control, control_status = "pending-drive";
         group_grow::FarmingOwnerHealth owner;
+        StatusDiagnosis diagnosis;
         std::string inspected_path, legacy_build, legacy_engine;
         std::vector<group_grow::ConstructionCheckpointIdentity> checkpoints;
-        uint64_t files = 0, members = 0, active = 0, charged = 0, allowance = 0, free = 0;
+        uint64_t files = 0, members = 0, active = 0, charged = 0, allowance = 0, free = 0, owner_observed_at_ms = 0;
         bool available = false, observed = false;
     };
     std::vector<Status> destinations;
@@ -10006,6 +10516,8 @@ int print_farming_status_once(Arguments args)
         for (auto const* value : {&status.directory, &status.state, &status.reason, &status.next, &status.observed_at, &status.writer_state,
             &status.control, &status.control_status, &status.inspected_path, &status.legacy_build, &status.legacy_engine,
             &status.owner.status, &status.owner.instance, &status.owner.host, &status.owner.control_digest, &status.owner.last_state}) string(*value);
+        for (auto const* value : {&status.diagnosis.status, &status.diagnosis.condition, &status.diagnosis.affected_work,
+            &status.diagnosis.evidence, &status.diagnosis.unknowns, &status.diagnosis.next}) string(*value);
         for (auto const& identity : status.checkpoints)
             for (auto const* value : {&identity.format, &identity.producer_build, &identity.algorithm, &identity.representation}) string(*value);
         return bytes;
@@ -10014,6 +10526,13 @@ int print_farming_status_once(Arguments args)
     {
         report_memory = sum(report_memory, status_memory(status));
         require(report_memory < observation_memory, "status report details exceed --max-ram; use a larger inspection budget");
+    };
+    auto diagnose = [&](Status& status)
+    {
+        status.diagnosis = farming_status_diagnosis(status.state, status.reason, status.next, status.control,
+            status.control_status, status.writer_state, status.owner, status.observed, inspect);
+        status.next = status.diagnosis.next;
+        if (status.state == "ready" || status.state == "construction-pending") status.state = status.diagnosis.status;
     };
     bool incomplete = false;
     auto controls = group_grow::farming_control_view(state, {});
@@ -10081,13 +10600,14 @@ int print_farming_status_once(Arguments args)
                     status.state = "unavailable"; status.reason = "saved destination is missing or replaced";
                     status.next = "mount the original destination, or use fill --relocate OLD NEW after stopping the coordinator";
                 }
-                incomplete = true; retain_status(status); destinations.push_back(std::move(status)); continue;
+                incomplete = true; diagnose(status); retain_status(status); destinations.push_back(std::move(status)); continue;
             }
             require(group_grow::farming_metadata_memory_bound(directory) < observation_memory,
                 "status native metadata pins exceed --max-ram; use a larger inspection budget");
             group_grow::FarmingMetadataDirectory metadata(directory, job.legacy_metadata);
             status.owner = group_grow::observe_farming_owner(metadata, state, lane, observation_memory,
                 native_bindings[lane] ? std::optional(native_bindings[lane]->source_identity) : std::nullopt);
+            status.owner_observed_at_ms = group_grow::farming_owner_detail::now_ms();
             status.control_status = status.owner.status == "not-recorded" ? "intent-recorded" :
                 status.owner.lock_held && status.owner.control_digest != controls.digest ? "pending-boundary" : "effective";
             auto progress = group_grow::load_farming_progress(metadata, observation_memory, native_bindings[lane]);
@@ -10223,7 +10743,7 @@ int print_farming_status_once(Arguments args)
             status.next = "retry after the current write; inspect the reported constraint before resuming";
             incomplete = true;
         }
-        retain_status(status); destinations.push_back(std::move(status));
+        diagnose(status); retain_status(status); destinations.push_back(std::move(status));
     }
     try { job.check(); }
     catch (std::runtime_error const& error)
@@ -10233,12 +10753,56 @@ int print_farming_status_once(Arguments args)
         {
             status.state = "inspection-incomplete"; status.reason = error.what();
             status.next = "retry status after the current saved revision is published";
+            diagnose(status);
         }
     }
+    report_memory = 0;
+    for (auto const& status : destinations) retain_status(status);
+    StatusDiagnosis diagnosis;
+    diagnosis.affected_work = "the saved farm";
+    diagnosis.condition = "no destination observation is available";
+    diagnosis.evidence = "saved farm policy";
+    diagnosis.unknowns = "current progress, owner and compute admission";
+    diagnosis.next = "restore a saved destination and retry status";
+    for (auto const& status : destinations)
+    {
+        if (diagnosis.status != "unknown" && (!status.diagnosis.blocking || diagnosis.blocking)) continue;
+        diagnosis = status.diagnosis; diagnosis.affected_work = status.directory + ": " + diagnosis.affected_work;
+    }
+    if (!controls.conflicts.empty())
+    {
+        diagnosis.status = "control-conflict"; diagnosis.blocking = true;
+        diagnosis.condition = "concurrent control intent remains restricted";
+        diagnosis.affected_work = "future allocation in the conflicting scopes";
+        diagnosis.next = "reconnect the saved peers and submit an explicit pause, drain or resume action for each conflicting scope";
+    }
+    else if (job.pending)
+    {
+        diagnosis.status = "publication-pending"; diagnosis.blocking = true;
+        diagnosis.condition = "replicated farm revision needs recovery";
+        diagnosis.affected_work = "publication of the saved farm revision before further policy admission";
+        diagnosis.next = "resume with fill -r DIR through an original saved member";
+    }
+    else if (!diagnosis.blocking && (update_status == "waiting-for-drives" || update_status == "unavailable"))
+    {
+        diagnosis.status = update_status; diagnosis.blocking = true; diagnosis.condition = update_reason;
+        diagnosis.affected_work = "queued policy changes; existing local grants remain preserved";
+        diagnosis.next = update_status == "waiting-for-drives" ? "restore every original required destination before retrying policy admission" :
+            "inspect the update observation error and retry status before changing the saved policy";
+    }
+    auto compute_args = args; compute_args.max_ram = observation_memory;
+    auto compute = inspect_status_compute(compute_args, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.status_timeout_ms));
+    incomplete = incomplete || !compute.complete;
+    if (args.status_live && !diagnosis.blocking && (compute.diagnosis.blocking || !compute.complete)) diagnosis = compute.diagnosis;
+    else if (args.status_live) diagnosis.unknowns = compute.diagnosis.unknowns + "; ordinary farming services are not inspected by farm status";
     if (args.json)
     {
         std::cout << "{\"farming_status\":true,\"read_only\":true,\"job_id\":" << json_string(state.job_id)
             << ",\"revision\":" << state.revision << ",\"inspection_complete\":" << (incomplete ? "false" : "true")
+            << ",\"observed_at_unix_ms\":" << observed_at << ",\"diagnosis\":";
+        print_status_diagnosis(std::cout, diagnosis, true);
+        std::cout << ",\"compute\":"; print_status_compute(std::cout, compute, true);
+        std::cout
             << ",\"required_destinations\":" << group_grow::farming_member_count(state)
             << ",\"inspection_kind\":" << json_string(inspect ? "construction" : "saved-progress")
             << ",\"live_writer_health_checked\":" << (std::all_of(destinations.begin(), destinations.end(),
@@ -10273,7 +10837,12 @@ int print_farming_status_once(Arguments args)
                 << ",\"observation_available\":" << (d.observed ? "true" : "false")
                 << ",\"observed_at_unix_seconds\":" << json_string(d.observed_at)
                 << ",\"last_writer_state\":" << json_string(d.writer_state)
+                << ",\"progress_evidence\":" << json_string(d.observed ? inspect ? "current-construction-inspection" : "last-known-saved-progress" : "unavailable")
+                << ",\"diagnosis\":";
+            print_status_diagnosis(std::cout, d.diagnosis, true);
+            std::cout
                 << ",\"owner\":{\"status\":" << json_string(d.owner.status) << ",\"checked\":" << (d.owner.checked ? "true" : "false")
+                << ",\"observed_at_unix_ms\":" << d.owner_observed_at_ms
                 << ",\"lock_held\":" << (d.owner.lock_held ? "true" : "false")
                 << ",\"local_process_proven\":" << (d.owner.local_process_proven ? "true" : "false")
                 << ",\"heartbeat_current\":" << (d.owner.heartbeat_current ? "true" : "false")
@@ -10303,6 +10872,8 @@ int print_farming_status_once(Arguments args)
     }
     else
     {
+        print_status_diagnosis(std::cout, diagnosis, false);
+        print_status_compute(std::cout, compute, false);
         std::cout << "Farm revision " << state.revision << "; future groups: k" << unsigned(state.config.k)
             << ", strength " << unsigned(state.config.strength) << ", "
             << (state.config.group_members_override ? std::to_string(state.config.group_members_override) : "automatic") << " members per file\n";
@@ -10318,11 +10889,11 @@ int print_farming_status_once(Arguments args)
             print_farming_membership(std::cout, state, state.directories[size_t(&d - destinations.data())], false);
             if (d.observed) std::cout << "  Observed at " << d.observed_at << " Unix seconds; last writer state " << d.writer_state << '\n';
             std::cout << "  Owner: " << d.owner.status << "; control " << d.control << " (" << d.control_status << ")\n";
+            if (d.owner.checked) std::cout << "  Owner observed at " << d.owner_observed_at_ms << " Unix milliseconds; heartbeat at " << d.owner.heartbeat_at_ms << " Unix milliseconds\n";
             for (auto const& checkpoint : d.checkpoints)
                 std::cout << "  Checkpoint " << checkpoint.format << "; " << (checkpoint.legacy_exact_build ? "exact original build " : "compatible algorithm " )
                     << (checkpoint.legacy_exact_build ? checkpoint.producer_build : checkpoint.algorithm) << '\n';
-            if (!d.reason.empty()) std::cout << "  Reason: " << d.reason << '\n';
-            std::cout << "  Next: " << d.next << '\n';
+            print_status_diagnosis(std::cout, d.diagnosis, false);
             if (!d.legacy_build.empty())
             {
                 print_farming_recovery(std::cout, state, farming_recovery_source(args, job),
@@ -10447,10 +11018,14 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
                     << " bytes; response bound " << json_estimate(review.original_assessment.response_bound_seconds) << " -> "
                     << json_estimate(assessment.response_bound_seconds) << " seconds.\n";
                 if (review.alternative == "capacity")
-                    out << "Capacity uses a bounded descending member-cap search; a larger feasible cap may exist. Started work is retained.\n";
+                    out << "Best assessed member cap per destination: " << review.selected_capacity_cap
+                        << ". Whole-interval probes and refinement retain started work; "
+                        << (review.capacity_search_limited ? "a larger feasible cap may exist.\n" : "every larger cap in the reviewed interval was assessed.\n");
                 else out << "This selection explicitly changes the declared harvester; provide these resources when farming the saved plan.\n";
             }
         }
+        if (!args.devices.empty()) out << "Plotting devices: " << args.devices
+            << (args.local_devices.empty() ? "\n" : "; shared local CPU and RAM budget\n");
         if (run.migration_managed) out << "Migration-managed destinations; a saved forecast does not establish live readiness.\n";
         for (auto const& d : run.state.directories)
         {
@@ -10519,10 +11094,13 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             out << "Fill uses remaining budget when another member fits; compressed sizes determine the final result.\n";
         if (args.plan_only && run.feasible() && available)
         {
+            if (!args.save_profile.empty()) out << "Saved reusable harvester profile: " << file_io::path_text(args.save_profile) << '\n';
             auto const& saved = args.save_plan.empty() ? args.from_plan : args.save_plan;
             if (!saved.empty())
             {
-                out << "Saved plan: " << file_io::path_text(saved) << "\nNext: " << farming_next_command({"xchplot2", "fill", "--from-plan", file_io::path_text(saved)});
+                std::vector<std::string> next{"xchplot2", "fill", "--from-plan", file_io::path_text(saved)};
+                if (!args.devices.empty()) next.insert(next.end(), {"--devices", args.devices});
+                out << "Saved plan: " << file_io::path_text(saved) << "\nNext: " << farming_next_command(next);
                 if (!run.previous_destinations) out << " -f FARMER_KEY -c POOL_ADDRESS";
                 out << '\n';
             }
@@ -10565,6 +11143,8 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
         << ",\"migration_managed\":" << (run.migration_managed ? "true" : "false")
         << ",\"fill_policy\":" << json_string(run.state.capacity_fill ? "capacity-with-joint-admission" : "saved-extent")
         << ",\"saved_preview\":" << json_string(run.feasible() ? file_io::path_text(args.save_plan) : "")
+        << ",\"saved_profile\":" << json_string(file_io::path_text(args.save_profile))
+        << ",\"devices_requested\":" << json_string(args.devices)
         << ",\"profile_input\":" << json_string(profile_input)
         << ",\"farming_profile\":";
     group_grow::write_farming_profile_json(std::cout, profile);
@@ -10598,7 +11178,9 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
         }
         std::cout << ",\"selected_alternative\":" << json_string(review.alternative)
             << ",\"alternative_evaluations\":" << review.evaluations
-            << ",\"capacity_search\":" << json_string(review.alternative == "capacity" ? "bounded-descending-nonmaximal" : "not-requested")
+            << ",\"capacity_search\":" << json_string(review.alternative == "capacity" ? "bounded-interval-refinement" : "not-requested")
+            << ",\"capacity_member_cap\":" << review.selected_capacity_cap
+            << ",\"capacity_search_limited\":" << (review.capacity_search_limited ? "true" : "false")
             << ",\"metadata_upgrade\":" << (review.metadata_upgrade ? "true" : "false")
             << ",\"original_manifest_reserved_bytes\":" << review.original_manifest_bytes
             << ",\"original_update_reserved_bytes\":" << review.original_update_bytes
@@ -10649,9 +11231,9 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
     std::cout << "]}\n";
 }
 
-int save_harvester_profile(Arguments const& args)
+int save_harvester_profile(Arguments const& args, bool report = true, group_grow::FarmingProfile const* selected = nullptr)
 {
-    auto const profile = farming_profile(args, farming_configuration(args));
+    auto const profile = selected ? *selected : farming_profile(args, farming_configuration(args));
     uint64_t const retained = args.farming_profile ? group_grow::farming_profile_memory(*args.farming_profile) : 0;
     uint64_t const metadata = sum(retained, group_grow::farming_profile_memory(profile));
     // A string byte can expand to a six-byte JSON escape. Reserve the fixed
@@ -10668,6 +11250,7 @@ int save_harvester_profile(Arguments const& args)
         "harvester profile export exceeds --max-ram");
     check_cancel(args);
     stream_state::atomic_save(args.save_profile, text, false);
+    if (!report) return 0;
     if (args.json)
         std::cout << "{\"saved_profile\":" << json_string(file_io::path_text(args.save_profile))
             << ",\"farming_profile\":" << text << "}\n";
@@ -11695,7 +12278,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             return false;
         };
-        bool const pooled_generation = !args.pool_broker.empty();
+        bool const pooled_generation = has_compute(args);
         // A remote receiver owns bounded RAM independently of its final
         // physical writer. The writer queue still serializes all publication.
         if (!pooled_generation)
@@ -13116,7 +13699,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (!producer.fits(first, held))
                 { d.pending.reset(); blocked(ControllerWait::producer_memory); continue; }
             }
-            if (args.member_storage == "compact" && args.pool_broker.empty() && !d.engine->is_staging() && !task.select_merged &&
+            if (args.member_storage == "compact" && !has_compute(args) && !d.engine->is_staging() && !task.select_merged &&
                 !task.hash && task.members.empty())
                 task.hash = std::make_unique<group_grow::MemberBatchHash>(d.batch_cap);
             task.members.reserve(wanted);
@@ -13289,9 +13872,60 @@ group_grow::file_io::DurableIdentity audit_replot_replacement(group_grow::Replot
     return capture_identity ? native : file_io::DurableIdentity{};
 }
 #if defined(__linux__) || defined(_WIN32)
+struct StatusServiceObservation
+{
+    struct Reader { std::string route, role, status, reason; uint64_t observed_at_unix_ms = 0; };
+    StatusDiagnosis diagnosis{"not-queried", "", "migration reader and farming service prerequisites", "no live service probe",
+        "current source readers, target farmer/node/solver prerequisites and exact replacement acknowledgements",
+        "use status --live with trusted local reader bindings for bounded prerequisite checks", false};
+    std::vector<Reader> readers;
+    bool checked = false, complete = true;
+};
+#ifdef XCHPLOT2_GROUP_COMMANDS
+StatusServiceObservation inspect_status_replot_services(Arguments const&, ReplotInputs const&, group_grow::ReplotJournal const*,
+    std::chrono::steady_clock::time_point);
+#else
+StatusServiceObservation inspect_status_replot_services(Arguments const& args, ReplotInputs const&, group_grow::ReplotJournal const*,
+    std::chrono::steady_clock::time_point)
+{
+    StatusServiceObservation result;
+    if (args.status_live)
+    {
+        result.complete = false; result.diagnosis.status = "unavailable";
+        result.diagnosis.condition = "this build has no installed migration reader inspection interface";
+        result.diagnosis.next = "use the installed xchplot2 status --live command";
+    }
+    return result;
+}
+#endif
+void print_status_services(std::ostream& out, StatusServiceObservation const& value, bool json)
+{
+    if (json)
+    {
+        out << "{\"diagnosis\":"; print_status_diagnosis(out, value.diagnosis, true);
+        out << ",\"checked\":" << (value.checked ? "true" : "false") << ",\"complete\":" << (value.complete ? "true" : "false") << ",\"readers\":[";
+        for (size_t i = 0; i < value.readers.size(); ++i)
+        {
+            if (i) out << ','; auto const& reader = value.readers[i];
+            out << "{\"route\":" << json_string(reader.route) << ",\"role\":" << json_string(reader.role)
+                << ",\"status\":" << json_string(reader.status) << ",\"reason\":" << json_string(reader.reason)
+                << ",\"observed_at_unix_ms\":" << reader.observed_at_unix_ms << '}';
+        }
+        out << "]}";
+    }
+    else
+    {
+        out << "Services "; print_status_diagnosis(out, value.diagnosis, false);
+        for (auto const& reader : value.readers)
+            out << "  " << reader.role << " route " << reader.route << ": " << reader.status << "; " << reader.reason
+                << "; observed at " << reader.observed_at_unix_ms << " Unix milliseconds\n";
+    }
+}
 int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
 {
     using namespace group_grow; using namespace group_grow::farm;
+    auto const observed_at = farming_owner_detail::now_ms();
+    auto const live_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.status_timeout_ms);
     auto const& review = inputs.review; std::vector<fs::path> destinations;
     for (auto const& directory : review.farm.directories) destinations.push_back(file_io::native_path(directory.directory));
     auto output_path = [&](uint64_t batch)
@@ -13517,9 +14151,64 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
             "Use --revalidate with the currently active reviewed plan to save a fresh successor; durable progress advanced after the selected successor was reviewed.";
         else if (policy_binding == "pending") next = "Activate this reviewed successor with xchplot2 fill --from-plan; its exact durable journal boundary still matches, and live checks will run before activation.";
         else next = "Resume xchplot2 fill --from-plan with the active reviewed plan; the coordinator will recheck live readers, farming readiness and resources before protected actions.";
+        StatusDiagnosis diagnosis{"current-prerequisites-unknown", "the durable migration phase does not establish current service readiness",
+            "the next migration phase and its protected actions", "consistent saved journal plus current native object and receipt observations",
+            "current readers, farming services, compute admission and protected-action resource availability", next, false};
+        if (!available)
+        { diagnosis.status = "destinations-unavailable"; diagnosis.blocking = true; diagnosis.condition = "a reviewed destination replica is unavailable and may contain newer durable progress"; }
+        else if (!observations_ok)
+        { diagnosis.status = "native-observation-blocked"; diagnosis.blocking = true; diagnosis.condition = "a current native object, source root or receipt chain is unavailable or differs from its saved identity"; }
+        else if (!saved.present)
+        { diagnosis.status = "history-unknown"; diagnosis.condition = "no private journal was found; its absence does not establish that this reviewed migration has never run"; }
+        else if (saved.state.phase == ReplotPhase::complete)
+        { diagnosis.status = "migration-complete"; diagnosis.condition = "migration completion is recorded in the private journal"; }
+        else if (policy_binding == "origin-with-active-successor" || policy_binding == "different-active-policy" || policy_binding == "stale-boundary")
+        { diagnosis.status = "review-binding-blocked"; diagnosis.blocking = true; diagnosis.condition = "the selected review does not match the active policy or its current journal boundary"; }
+        else if (reconcile)
+        {
+            diagnosis.status = "publication-pending"; diagnosis.blocking = true;
+            diagnosis.condition = "the saved journal revision still needs replica publication recovery";
+            diagnosis.affected_work = "replicated journal publication before new protected migration work";
+            diagnosis.next = "resume the active reviewed plan to reconcile the saved journal revision before new protected work";
+        }
+        auto services = StatusServiceObservation{};
+        if (!args.status_live || (available && observations_ok))
+            services = inspect_status_replot_services(args, inputs, saved.present ? &saved.state : nullptr, live_deadline);
+        else
+        {
+            services.complete = false;
+            services.diagnosis.condition = "live probes were skipped because the current native snapshot has a blocking issue";
+            services.diagnosis.next = next;
+        }
+        auto compute_args = args;
+        require(inputs.memory_bytes < args.max_ram, "live status has no retained inspection memory allowance");
+        compute_args.max_ram = (args.max_ram - inputs.memory_bytes) / 8;
+        auto compute = inspect_status_compute(compute_args, live_deadline);
+        bool const live_complete = !args.status_live || (services.complete && compute.complete);
+        if (args.status_live)
+        {
+            if (!diagnosis.blocking && saved.present && saved.state.phase != ReplotPhase::complete)
+            {
+                if (services.diagnosis.blocking || !services.complete) diagnosis = services.diagnosis;
+                else if (compute.diagnosis.blocking || !compute.complete) diagnosis = compute.diagnosis;
+                else
+                {
+                    diagnosis.status = "live-prerequisites-observed";
+                    diagnosis.condition = "bounded reader/service prerequisites and compute observations completed; no protected action was authorized";
+                }
+            }
+            diagnosis.unknowns = services.diagnosis.unknowns + "; " + compute.diagnosis.unknowns;
+        }
+        next = diagnosis.next;
+        if (!replot_journals_unchanged(saved) || (inputs.stamp && stream_state::stamp(args.from_plan) != *inputs.stamp)) continue;
         if (args.json)
         {
-            std::cout << "{\"replot_status\":true,\"job_id\":" << json_string(review.farm.job_id) << ",\"origin_review_digest\":" << json_string(inputs.digest)
+            std::cout << "{\"replot_status\":true,\"read_only\":true,\"observed_at_unix_ms\":" << observed_at
+                << ",\"inspection_complete\":" << (available && observations_ok && live_complete ? "true" : "false") << ",\"diagnosis\":";
+            print_status_diagnosis(std::cout, diagnosis, true);
+            std::cout << ",\"compute\":"; print_status_compute(std::cout, compute, true);
+            std::cout << ",\"services\":"; print_status_services(std::cout, services, true);
+            std::cout << ",\"job_id\":" << json_string(review.farm.job_id) << ",\"origin_review_digest\":" << json_string(inputs.digest)
                 << ",\"selected_policy_digest\":" << json_string(inputs.policy_digest) << ",\"active_policy_digest\":" << json_string(saved.present ? saved.state.policy_digest : "")
                 << ",\"selected_policy_binding\":" << json_string(policy_binding)
                 << ",\"reviewed_journal_digest\":" << json_string(inputs.revalidation ? inputs.revalidation->journal_digest : "")
@@ -13534,8 +14223,10 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
             if (completed_proofs_known) std::cout << completed_proof_groups; else std::cout << "null";
             std::cout << ",\"active_full_proof_validated\":" << (saved.present && saved.state.verified_stage ?
                     saved.state.full_proof_validated.value_or(true) ? "true" : "false" : "null")
-                << ",\"completed_receipt_chain_verified\":" << (receipts_verified ? "true" : "false") << ",\"live_service_health\":\"not-queried\",\"blocking_reason\":null"
-                << ",\"replicas\":[" << replicas.str() << "],\"completed_outputs\":[" << replacements.str() << "],\"active_sources\":[" << sources.str()
+                << ",\"completed_receipt_chain_verified\":" << (receipts_verified ? "true" : "false")
+                << ",\"live_service_health\":" << json_string(services.diagnosis.status) << ",\"blocking_reason\":";
+            if (diagnosis.blocking) std::cout << json_string(diagnosis.condition); else std::cout << "null";
+            std::cout << ",\"replicas\":[" << replicas.str() << "],\"completed_outputs\":[" << replacements.str() << "],\"active_sources\":[" << sources.str()
                 << "],\"active_replacement\":" << (active_output.tellp() ? active_output.str() : "null")
                 << ",\"verification_policy\":";
             write_replot_verification_json(std::cout, inputs);
@@ -13544,17 +14235,21 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
         }
         else if (!args.quiet)
         {
+            print_status_diagnosis(std::cout, diagnosis, false);
+            print_status_compute(std::cout, compute, false); print_status_services(std::cout, services, false);
             std::cout << "Migration durable phase: " << phase << "; " << (saved.present ? saved.state.batch : 0) << " replacements and " << retired << " retirements completed.\n"
                 << "Selected policy: " << policy_binding << ".\n"
                 << "Verification policy: " << replot_verification_name(replot_verification(inputs).mode)
                 << "; completed groups with a validated full proof: " << (!saved.present || !saved.state.batch || receipts_verified ? std::to_string(completed_proof_groups) : "unknown") << ".\n"
                 << "Outstanding pre-delete debt: " << debt << " bytes; limit " << review.reclaim_before_bytes << " bytes.\n"
-                << "Current filesystem observations are separate from saved history. Live service health and the current blocking reason have not been queried.\n";
+                << "Current filesystem observations are separate from saved history. "
+                << (args.status_live ? "Live prerequisite observations are bounded; execution still rechecks protected actions.\n" :
+                    "Live service health and current compute admission have not been queried; use --live for bounded diagnostics.\n");
             if (reconcile) std::cout << "Journal replica publication is pending; resume reconciles the saved revision before new work.\n";
             if (!available) std::cout << "Some destination replicas are unavailable; reported progress is from the available replicas.\n";
-            std::cout << details.str() << next << '\n';
+            std::cout << details.str();
         }
-        return available && observations_ok ? 0 : 2;
+        return available && observations_ok && live_complete ? 0 : 2;
     }
     throw std::runtime_error("migration progress changed during the bounded read-only status snapshot; retry --status");
 }
@@ -13719,6 +14414,168 @@ void restore_replot_keys(Arguments& args, group_grow::FarmingState const& state)
     if (!args.pool_pk && !args.pool_ph && !args.pool_address)
     { if (state.pool_public_key) args.pool_pk = state.pool; else args.pool_ph = state.pool; }
     args.seed_owner = state.seed_owner;
+}
+std::string status_service_issue(std::string_view reason, bool deadline)
+{
+    // Native adapter output and configuration stay private. These categories
+    // retain a concrete next step without publishing child exception text.
+    if (deadline || reason.find("deadline") != reason.npos || reason.find("timeout") != reason.npos)
+        return "reader/service probe exhausted the overall live inspection budget";
+    if (reason.find("config") != reason.npos) return "selected reader configuration changed or is unavailable";
+    for (auto const* role : {"harvester", "farmer", "full_node", "solver"})
+        if (reason.find(std::string("native ") + role + " RPC") != reason.npos)
+            return std::string("selected ") + role + " RPC is unavailable or did not report success";
+    if (reason.find("version") != reason.npos || reason.find("implementation") != reason.npos || reason.find("executable") != reason.npos)
+        return "installed reader or service implementation differs from the reviewed binding or is unavailable";
+    if (reason.find("solver") != reason.npos && reason.find("start") != reason.npos)
+        return "target PoS2 solver has not completed startup";
+    if (reason.find("sync") != reason.npos) return "target full node or farmer/harvester synchronization is incomplete";
+    if (reason.find("pool") != reason.npos) return "target public pool route or pool service prerequisites are unavailable or differ from the review";
+    if (reason.find("key") != reason.npos) return "target public farming identity is not acknowledged by the selected services";
+    if (reason.find("connection") != reason.npos || reason.find("receiver") != reason.npos || reason.find("link") != reason.npos)
+        return "required farmer, harvester, full-node or solver connection is unavailable or changed";
+    if (reason.find("route") != reason.npos || reason.find("binding") != reason.npos)
+        return "selected local reader route is missing, ambiguous or differs from the reviewed route";
+    if (reason.find("memory") != reason.npos || reason.find("bound") != reason.npos)
+        return "reader/service inspection exceeded its bounded memory or response grant";
+    return "selected installed reader or farming service RPC is unavailable";
+}
+StatusServiceObservation inspect_status_replot_services(Arguments const& supplied, ReplotInputs const& inputs,
+    group_grow::ReplotJournal const* journal, std::chrono::steady_clock::time_point deadline)
+{
+    using namespace group_grow; using namespace group_grow::farm;
+    StatusServiceObservation result;
+    if (!supplied.status_live) return result;
+    result.diagnosis.status = "unavailable";
+    result.diagnosis.evidence = "bounded installed-reader and read-only service RPC attempts; failed probes do not establish readiness";
+    result.diagnosis.unknowns = "source registry load/unload, exact published replacement acknowledgements and protected-action resource admission remain execution checks";
+    auto args = supplied;
+    auto issue = [&](std::string const& reason)
+    {
+        result.complete = false; result.diagnosis.blocking = true;
+        if (result.diagnosis.condition.empty()) result.diagnosis.condition = reason;
+        result.diagnosis.next = "restore the selected installed reader, configuration and farming services, then retry status --live; use --revalidate if the reviewed reader or service binding intentionally changed";
+    };
+    try
+    {
+        bool const explicit_connections = (args.farm_adapter_set && args.chia_root_set && args.chia_executable_set) ||
+            (args.farming_profile_set && !args.farming_profile_path.empty() && !replot_adapter_table(args).routes.empty());
+        auto local = load_replot_local_bindings(inputs, explicit_connections);
+        if (local && local->usable) apply_replot_local_bindings(args, local->bindings, inputs.policy_digest);
+        if (!explicit_connections && (!local || !local->usable))
+        {
+            result.complete = false;
+            result.diagnosis.evidence = "local binding inspection only; no installed executable was probed";
+            result.diagnosis.condition = "no trusted local reader binding was selected; public review paths do not authorize executable probes";
+            result.diagnosis.next = "supply --farm-adapter, --chia-root and --chia-executable, or a local --harvester profile with complete farm_adapters routes";
+            return result;
+        }
+        auto const profile_stamp = args.farming_profile_path.empty() ? std::optional<stream_state::Stamp>{} : std::optional{stream_state::stamp(args.farming_profile_path)};
+        auto table = replot_adapter_table(args);
+        auto target = table.routes.empty() ? replot_adapter(args) : resolve_target(table, inputs.inventory.network.target_route);
+        require(inputs.inventory.network.target_route.empty() || !table.routes.empty(), "saved target route requires complete local bindings");
+        auto limits = replot_inventory_limits(args);
+        auto const retained = sum(inputs.memory_bytes, sum(replot_adapter_memory(table), target_readiness_supervision_bytes(limits)));
+        require(retained < args.max_ram - args.max_ram / 4, "reader/service inspection exceeds its retained memory grant");
+        auto bounded_options = [&](HarvesterAdapterOptions options)
+        {
+            check_cancel(supplied);
+            auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            require(left > 0, "overall reader/service inspection deadline expired");
+            options.limits = limits; options.limits.timeout_ms = std::min(uint64_t(left), options.limits.timeout_ms);
+            // Nested service contexts and child probes retain this same
+            // absolute ceiling instead of resetting one timeout per service.
+            options.limits.cancelled = [cancelled = supplied.cancelled, deadline]
+            { return std::chrono::steady_clock::now() >= deadline || (cancelled && cancelled()); };
+            return options;
+        };
+        struct SourceRoute { HarvesterAdapterOptions options; std::vector<size_t> roots; };
+        using Route = std::tuple<HarvesterAdapterKind, fs::path, fs::path, std::string>;
+        std::map<Route, SourceRoute> sources;
+        for (size_t root = 0; root < inputs.inventory.roots.size(); ++root)
+        {
+            bool const data = std::any_of(inputs.inventory.plots.begin(), inputs.inventory.plots.end(),
+                [&](auto const& plot) { return plot.root == root && !replot_nonplot(plot); });
+            if (!data) continue;
+            InventoryPlot probe; probe.root = root;
+            auto options = table.routes.empty() ? target : resolve_source(table, inputs.inventory.roots[root], probe);
+            auto& route = sources[{options.kind, options.executable, options.root, options.harvester}];
+            route.options = std::move(options); route.roots.push_back(root);
+        }
+        for (auto const& [key, route] : sources)
+        {
+            (void)key; StatusServiceObservation::Reader reader;
+            reader.role = "source"; reader.route = replot_diagnostic_label(route.options.harvester);
+            try
+            {
+                auto options = bounded_options(route.options); adapter_detail::Session session(options);
+                auto const version = adapter_detail::version(session.rpc(AdapterOperation::harvester_version));
+                for (auto root : route.roots)
+                {
+                    auto const current = inputs.revalidation ? std::find_if(inputs.revalidation->readers.begin(), inputs.revalidation->readers.end(),
+                        [&](auto const& value) { return value.root == root; }) : std::vector<ReplotReaderObservation>::const_iterator{};
+                    if (inputs.revalidation && current != inputs.revalidation->readers.end())
+                        require(session.matches_reader_identity(current->identity) && version == current->version && current->reader == adapter_detail::name(options.kind),
+                            "reviewed source reader implementation or version changed");
+                    else for (auto const& plot : inputs.inventory.plots) if (plot.root == root && !plot.reader_identity.empty())
+                        require(adapter_detail::matches_reviewed_reader(session, options, plot, version), "reviewed source reader implementation or version changed");
+                }
+                session.unchanged(); result.checked = true; reader.status = "reader-binding-observed";
+                reader.reason = "installed source reader matches its reviewed identity and version; registry load/unload was not queried";
+            }
+            catch (std::exception const& error)
+            {
+                check_cancel(supplied); reader.status = "unavailable";
+                reader.reason = status_service_issue(error.what(), std::chrono::steady_clock::now() >= deadline); issue(reader.reason);
+            }
+            reader.observed_at_unix_ms = farming_owner_detail::now_ms(); result.readers.push_back(std::move(reader));
+        }
+        StatusServiceObservation::Reader reader; reader.role = "target"; reader.route = replot_diagnostic_label(target.harvester);
+        try
+        {
+            auto options = bounded_options(target); TargetServiceExpectation expected;
+            if (journal)
+            {
+                expected.farmer_public_key = journal->farm.farmer;
+                if (journal->farm.pool_public_key) expected.pool_public_key = journal->farm.pool;
+                else expected.pool_contract_puzzle_hash = journal->farm.pool;
+            }
+            if (expected.farmer_public_key.empty() || (expected.pool_public_key.empty() && expected.pool_contract_puzzle_hash.empty()))
+            {
+                auto observation = observe_target_network(options, inputs.inventory.network, inputs.review.farm.config.k, inputs.review.farm.config.strength);
+                require(observation.ready, observation.reason); result.checked = true; result.complete = false;
+                reader.status = "network-observed"; reader.reason = "reviewed target reader and network are synced and active; key-specific farming service prerequisites remain unknown";
+                result.diagnosis.next = "restore this job's existing private journal if it has run; its saved public farming identity is required for key-specific service diagnostics";
+            }
+            else
+            {
+                auto observation = observe_target_prerequisites(options, inputs.inventory.network,
+                    inputs.review.farm.config.k, inputs.review.farm.config.strength, expected);
+                require(observation.ready, observation.reason); result.checked = true;
+                reader.status = "prerequisites-observed";
+                reader.reason = "reviewed target reader/network, farmer/node/solver connections, completed harvester sync and public pool route observed; no replacement acknowledged";
+            }
+        }
+        catch (std::exception const& error)
+        {
+            check_cancel(supplied); reader.status = "unavailable";
+            reader.reason = status_service_issue(error.what(), std::chrono::steady_clock::now() >= deadline); issue(reader.reason);
+        }
+        reader.observed_at_unix_ms = farming_owner_detail::now_ms(); result.readers.push_back(std::move(reader));
+        if (local) require(stream_state::stamp(local->path) == local->stamp, "private local reader bindings changed during inspection");
+        if (profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *profile_stamp, "selected local reader configuration profile changed during inspection");
+        if (result.diagnosis.condition.empty())
+        {
+            result.diagnosis.status = result.complete ? "prerequisites-observed" : "partial";
+            result.diagnosis.condition = result.complete ? "current reader bindings and target farming prerequisites were observed" :
+                "current reader/network observations do not establish the selected public farming service identity";
+            result.diagnosis.evidence = "bounded installed-reader and read-only service RPC observations";
+            if (result.complete) result.diagnosis.next = "resume the active reviewed plan when intended; execution rechecks exact objects, replacement acknowledgement and resources before every protected action";
+        }
+    }
+    catch (std::exception const& error)
+    { check_cancel(supplied); issue(status_service_issue(error.what(), std::chrono::steady_clock::now() >= deadline)); }
+    return result;
 }
 ReplotObjectAudit audit_replot_objects(Arguments const& args, ReplotInputs const& inputs, group_grow::ReplotJournal const& journal, Keys const& keys,
     group_grow::farm::NativeRequest const* request = nullptr, bool active_policy = false)
@@ -15662,26 +16519,41 @@ std::unique_ptr<FarmingRun> farming_guided_plan(Arguments& args, FarmingJob& job
     if (args.upgrade_job) replan();
     else if (names.front() == "capacity")
     {
-        uint64_t cap = 0;
-        for (auto const& directory : run->state.directories)
-            cap = std::max(cap, group_grow::farming_layout_members(directory));
-        bool selected = false;
-        // Each candidate goes through the normal planner, output audit and
-        // retained-reservation admission. This bounded descent certifies only
-        // the offered cap; cache transitions need not be monotone.
-        for (unsigned evaluation = 0; evaluation < 64; ++evaluation)
+        uint64_t upper = 0, lower = 1;
+        for (size_t lane = 0; lane < run->state.directories.size(); ++lane)
         {
-            check_cancel(args); cap /= 2;
-            args.max_total_members = cap; args.max_total_members_set = true;
-            replan();
+            auto const& directory = run->state.directories[lane];
+            upper = std::max(upper, group_grow::farming_layout_members(directory));
+            uint64_t promised = 0;
+            for (size_t file = 0; file < run->lanes[lane].outputs.size(); ++file)
+                promised = sum(promised, directory.extents.at(file));
+            lower = std::max(lower, promised);
+        }
+        require(lower <= upper, "no nonempty capacity alternative is available within the requested storage limits");
+        auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        bool baseline = true;
+        auto const search = group_grow::farming_capacity_search(lower, upper, [&](uint64_t cap) -> std::optional<bool>
+        {
+            check_cancel(args);
+            if (!baseline && std::chrono::steady_clock::now() >= until) return {};
+            if (baseline) baseline = false;
+            else
+            {
+                args.max_total_members = cap; args.max_total_members_set = true;
+                replan();
+            }
             bool nonempty = false;
             for (auto const& directory : run->state.directories)
                 nonempty = nonempty || group_grow::farming_layout_members(directory);
-            if (run->feasible() && (job.saved || nonempty)) { selected = true; break; }
-            if (!cap) break;
-        }
-        require(selected, "no assessed capacity alternative preserves the started work and fits the declared harvester; "
+            return run->feasible() && (job.saved || nonempty);
+        });
+        require(search.feasible, "no assessed capacity alternative preserves the started work and fits the declared harvester within the bounded search; "
             "review the resource alternatives or resume its original policy");
+        args.max_total_members = search.member_cap; args.max_total_members_set = true;
+        replan();
+        require(run->feasible(), "the selected capacity alternative changed during review; save a fresh plan");
+        require(run->state.config == review.original_config, "capacity review changed the declared harvester; save a fresh plan");
+        review.selected_capacity_cap = search.member_cap; review.capacity_search_limited = search.search_limited;
     }
     else for (auto const& name : names)
     {
@@ -15931,6 +16803,18 @@ int run_farming(Arguments args)
             }
             if (job.policy_changed) grant_refresh_pending = false;
             renewing_grants = false;
+            if (farm->feasible() && args.plan_only && !args.save_profile.empty())
+            {
+                auto const profile = farming_profile(args, farm->state.config);
+                save_harvester_profile(args, false, &profile);
+                // An export on a destination filesystem consumes real free
+                // space. Reuse the normal planner after it is durable before
+                // promising a reviewed extent or saving that plan.
+                auto review = std::move(farm->review); held_locks = std::move(farm->locks); farm.reset();
+                job = farming_arguments(args); farm = farming_run(args, nullptr, job, std::move(held_locks));
+                if (review) ++review->evaluations;
+                farm->review = std::move(review);
+            }
             if (farm->feasible()) save_farming_review(args, job, *farm);
             print_farming_plan(*farm, args);
             require(farm->feasible(), "farming profile or requested extent is infeasible: " + farm->infeasibility_reason() +
@@ -16237,7 +17121,11 @@ int run(Arguments const& supplied)
         require(!selected.empty(), "no eligible drives found; inspect plan --verbose or provide destination directories");
     }
     if (args.inventory) return print_farm_inventory(args);
-    if (!args.replot_inventory.empty()) return print_replot_review(args, make_replot_review(args), false);
+    if (!args.replot_inventory.empty())
+    {
+        if (!args.save_profile.empty()) return print_replot_setup(args);
+        return print_replot_review(args, make_replot_review(args), false);
+    }
     if (!args.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(args.from_plan))
     {
         auto migration = load_replot_review(args);

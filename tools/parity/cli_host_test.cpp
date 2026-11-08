@@ -673,7 +673,14 @@ int main(int argc, char** argv)
     assert(cli({"status", "--config", config.string(), "--discover-drives", other.string()}) != 0);
     std::string status_scope_error;
     int const status_scope_code = capture({"status", "--config", config.string(), "--paths-from", "missing-path-list"}, &status_scope_error).first;
-    assert(status_scope_code != 0 && status_scope_error.find("farm status accepts only") != std::string::npos);
+    assert(status_scope_code != 0 && status_scope_error.find("farm status accepts a job selector") != std::string::npos);
+    assert(cli({"status", "--config", config.string(), other.string(), "--live", "--timeout-ms", "1500", "--compute", "off"}) == 0);
+    assert(last_group_options.status_live && last_group_options.status_timeout_ms == 1500 && last_group_options.compute_mode == "off");
+    assert(cli({"status", "--config", config.string(), other.string(), "--live", "--no-live"}) == 0 && !last_group_options.status_live);
+    for (auto const* timeout : {"0", "99", "60001"})
+        assert(cli({"status", "--config", config.string(), other.string(), "--live", "--timeout-ms", timeout}) != 0);
+    assert(cli({"status", "--config", config.string(), other.string(), "--timeout-ms", "1500"}) != 0);
+    assert(cli({"plan", "--config", config.string(), other.string(), "--live"}) != 0);
     assert(cli({"plan", "--config", config.string(), other.string(), "--watch"}) != 0);
     for (auto const* action : {"pause", "drain", "resume", "retire"})
     {
@@ -737,7 +744,14 @@ int main(int argc, char** argv)
     put(argfile, "--group-members 3\n--max-host-ram 768M\n");
     assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);
     assert(last_group_options.plan_only && last_group_options.group_members == 3 && last_group_options.max_ram == 768ull * 1024 * 1024);
-    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) != 0);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) == 0);
+    assert(last_group_options.devices == "all" && last_group_options.backend == "cpu");
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "cpu,cpu"}) == 0);
+    assert(last_group_options.backend == "cpu");
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all", "--backend", "gpu", "--device", "2"}) == 0);
+    assert(last_group_options.devices.empty() && last_group_options.backend == "gpu" && last_group_options.device == 2);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "cpu:tiny"}) != 0);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "gpu2:tiny,gpu2:plain"}) != 0);
     int const before_missing_value = group_calls;
     for (auto const* option : {"-d", "-M", "-j", "-t", "--paths-from", "--paths0-from", "--manifest", "--relocate", "--discover-drives", "--leave-free", "--destination"})
         assert(cli({"plan", dir.string(), "--config", config.string(), option}) != 0);

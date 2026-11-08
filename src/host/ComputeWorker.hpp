@@ -92,7 +92,8 @@ struct WorkerIdentityReservation;
 
 // Compatibility covers canonical generation and encoding, independently of
 // machine/backend selection and the owner's persisted construction identity.
-std::string worker_compatibility();
+std::string worker_compatibility(pool::Kind = pool::Kind::GenerateAny);
+std::string worker_producer_build();
 uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength);
 
 struct WorkerConfig
@@ -114,6 +115,9 @@ struct WorkerConfig
     pool::Resources capacity;
     std::string backend = "cpu", tier = "auto";
     int device = 0;
+    // Optional CPU/NUMA selection. CPU generation restores the caller's mask
+    // after scoped pinning; GPU runtime/codec threads keep their own policy.
+    std::vector<int> cpu_affinity;
     unsigned generation_threads = 0, max_batch_members = 4, max_window_chunks = pool::default_max_codec_chunks;
     unsigned task_timeout_ms = 3600000;
     // Codec input/output windows and count-derived initial-contribution scratch.
@@ -132,6 +136,10 @@ enum class WorkerControl : uint8_t { Pause = 1, Drain, Resume };
 struct WorkerStatus
 {
     std::string identity, node_id, instance;
+    std::string compatibility, codec_compatibility, producer_build;
+    // Saved enrollment owns admission intent across standalone and automatic
+    // executors. Direct unmanaged TLS controls last for this process only.
+    bool durable_control = false;
     pool::WorkerAdmission admission = pool::WorkerAdmission::Accepting;
     pool::Resources capacity, active{0, 0, 0, 0};
     uint64_t accepted_tasks = 0, waiting_cpu = 0, baseline_host_bytes = 0;
@@ -203,8 +211,12 @@ struct WorkerClientConfig
 {
     pool::Endpoint broker;
     pool::TlsOptions tls;
-    std::string owner_id, compatibility;
+    std::string owner_id, compatibility, codec_compatibility;
     bool ephemeral_owner = false;
+    // Private local executors use the same admission and cancellation gates
+    // without a broker, TLS identity, listener or enrollment. Encoding remains
+    // an owner codec responsibility in this mode.
+    bool local_only = false;
     pool::Kind generation_kind = pool::Kind::GenerateAny;
     unsigned generation_threads = 0, max_window_chunks = pool::default_max_codec_chunks;
     uint64_t max_task_bytes = pool::default_codec_task_bytes;

@@ -94,6 +94,7 @@ Task pack_task(std::string id, uint64_t sequence = 1)
 WorkerOffer offer(std::string instance, uint16_t port)
 {
     WorkerOffer result; result.instance = std::move(instance); result.compatibility = "test-format";
+    result.codec_compatibility = "test-format";
     result.endpoint = {"127.0.0.1", port}; result.capacity = {2, 1, 4096, 0};
     result.capabilities = capability(Kind::GenerateCpu) | capability(Kind::Pack); return result;
 }
@@ -114,6 +115,8 @@ void codecs()
     rejects([&] { Writer blob; blob.string("hello"); Reader input(blob.data()); (void)input.string(4); });
     rejects([&] { Writer nul; nul.string(std::string("a\0b", 3)); Reader input(nul.data()); (void)input.string(); });
     require(parse_endpoint("[::1]:443") == Endpoint{"::1", 443}, "IPv6 endpoint changed");
+    require(numeric_host("127.0.0.1") && numeric_host("::1") && numeric_host("fe80::1%lo") &&
+        !numeric_host("localhost") && !numeric_host("::1%") && !numeric_host("127.0.0.1%lo"), "numeric diagnostic routes changed");
     rejects([] { (void)parse_endpoint("::1:443"); }); rejects([] { (void)parse_endpoint("host:65536"); });
     rejects([] { (void)parse_endpoint("host:000000000000000000000000000000000000000000000000000000000000000000000000001"); });
 }
@@ -1060,6 +1063,10 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
     auto alternate = endpoint; alternate.server_name = "localhost";
     BrokerClient routed(alternate, worker_tls);
     require(routed.register_worker(offered) == first_epoch, "alternate route changed authenticated broker epoch");
+    offered.producer_build = "source-build-a"; worker.register_worker(offered);
+    offered.producer_build = "source-build-b"; worker.register_worker(offered);
+    require(owner.status().worker_records.front().producer_build == offered.producer_build,
+        "source provenance became a registration gate or was not retained for diagnostics");
     auto task_control = worker.with_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     auto const before_reroute = worker.metrics().connections; worker.reroute(alternate);
     require(task_control.heartbeat(offered.instance, offered.capacity_revision) && worker.metrics().connections == before_reroute + 1,

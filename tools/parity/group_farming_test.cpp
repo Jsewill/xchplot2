@@ -1386,6 +1386,59 @@ void test_fleet()
            << " bound_s=" << failed.response_bound_seconds << " reason=" << failed.reason << '\n';
     std::cout << "fleet exhaustive/certificate/objective checks passed; elapsed_ms=" << elapsed << '\n';
 }
+void test_capacity_refinement()
+{
+    std::set<uint64_t> observed;
+    auto boundary = farming_capacity_search(1, 1000, [&](uint64_t cap)
+    { check(observed.insert(cap).second, "capacity search reassessed an unchanged cap"); return cap <= 731; });
+    check(boundary.feasible && boundary.member_cap == 731 && boundary.evaluations <= 64,
+          "capacity search lost the near-boundary feasible extent");
+    observed.clear();
+    auto islands = farming_capacity_search(40, 1000, [&](uint64_t cap)
+    {
+        check(cap >= 40 && cap <= 1000, "capacity search exceeded its committed or requested limits");
+        observed.insert(cap);
+        return cap <= 81 || (cap >= 697 && cap <= 719);
+    });
+    check(islands.feasible && islands.member_cap == 719 && islands.search_limited && observed.contains(40),
+          "nonmonotone capacity search stopped at the first feasible island or claimed an optimum");
+    auto exhaustive = farming_capacity_search(40, 47, [](uint64_t cap) { return cap == 45; });
+    check(exhaustive.feasible && exhaustive.member_cap == 45 && !exhaustive.search_limited,
+          "small nonmonotone capacity interval was not exhausted above the selected cap");
+    unsigned calls = 0;
+    auto interrupted = farming_capacity_search(40, 1000, [&](uint64_t cap) -> std::optional<bool>
+    { if (++calls > 3) return {}; return cap == 40; });
+    check(interrupted.feasible && interrupted.member_cap == 40 && interrupted.evaluations == 3 && interrupted.search_limited,
+          "capacity wall-clock exhaustion discarded a feasible committed-prefix candidate");
+    auto none = farming_capacity_search(40, 47, [](uint64_t) { return false; });
+    check(!none.feasible && !none.search_limited, "exhaustive failed capacity search hid its coverage");
+    rejects([&] { farming_capacity_search(41, 40, [](uint64_t) { return true; }); },
+            "capacity search accepted a lower bound beyond the requested extent");
+
+    FarmingConfig shared; shared.k = 18; shared.reader = FarmingReader::cached;
+    shared.harvester_cores = shared.lookup_workers = 2;
+    shared.max_eligible_families_per_resource = 2; shared.index_cache_bytes = 262144;
+    auto old = shared; old.k = 20; old.strength = 3;
+    std::vector<FarmingConfig> const configs{old, shared}; auto const original = configs;
+    std::vector<FarmingDestination> drives(2, hdd());
+    std::vector<FarmingDrivePlan> layouts(2);
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    { drives[lane].resource = 7; layouts[lane].schedule = lane; layouts[lane].meta_slots = 256; }
+    auto assess = [&](uint64_t cap)
+    {
+        std::vector<std::vector<uint16_t>> counts{{4}, std::vector<uint16_t>(size_t(cap / 4), 4)};
+        if (cap % 4) counts[1].push_back(uint16_t(cap % 4));
+        farming_detail::PlanningMemory memory{64ull << 20};
+        return farming_detail::assess(shared, drives, layouts, &counts, memory, nullptr, configs);
+    };
+    auto const warm = assess(16), cold = assess(17);
+    check(warm.response_bound_seconds < cold.response_bound_seconds,
+          "mixed-cohort capacity fixture lost its complete-cache transition");
+    shared.deadline_seconds = (warm.response_bound_seconds + cold.response_bound_seconds) / 2;
+    auto cached = farming_capacity_search(4, 128, [&](uint64_t cap) { return assess(cap).feasible; });
+    check(cached.feasible && cached.member_cap == 16 && assess(cached.member_cap).feasible && configs == original,
+          "capacity refinement changed committed cohort costs or missed their cache boundary");
+}
 int main()
 {
     try
@@ -1402,6 +1455,7 @@ int main()
         test_cohort_replacement_scheduler();
         test_large_cohort_assessment();
         test_numerical_adjustments();
+        test_capacity_refinement();
         test_large_frozen_expansion();
         test_small_exhaustive();
         test_cached_search_boundary();

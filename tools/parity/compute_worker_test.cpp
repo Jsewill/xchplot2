@@ -222,8 +222,15 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
 {
     tls.timeout_ms = 3000;
     pool::BrokerOptions broker_options; broker_options.listen = {"127.0.0.1", 0}; broker_options.tls = tls;
+    std::optional<pool::PoolIdentity> enrollment;
+    if (!tls.membership_directory.empty())
+    {
+        enrollment = pool::load_pool(std::filesystem::path(reinterpret_cast<char8_t const*>(tls.membership_directory.c_str())));
+        broker_options.listen.server_name = enrollment->server_name;
+    }
     RunningBroker broker(broker_options);
     auto options = config(); options.broker = broker.server.endpoint(); options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    if (enrollment) options.listen.server_name = options.server_name = enrollment->server_name;
     options.capacity.cpu_threads = options.capacity.slots = 1;
     WorkerService service(options); service.start();
     auto endpoint = service.endpoint();
@@ -233,7 +240,7 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
     payload.u16(0); payload.u16(1); payload.u32(3); payload.u64(1); payload.u64(2); payload.u64(3);
     pool::BrokerClient owner(options.broker, tls); auto session = owner.open_owner("control-inflight-codec");
-    pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(); task.kind = pool::Kind::Pack;
+    pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack); task.kind = pool::Kind::Pack;
     task.k = 18; task.strength = 2; task.work_units = payload.data().size(); task.chunk_count = 1; task.max_output_bytes = 4096;
     task.resources = {1, 1, add(multiply(payload.data().size(), 20), ChunkCodec::estimate_work(18, 0, 0)), 0};
     auto lease = owner.acquire(session, task); require(bool(lease), "control fixture did not acquire codec work");
@@ -247,11 +254,16 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     require(busy.accepted_tasks == 1 && busy.active.slots == 1 && busy.active.host_bytes,
         "live worker status blocked behind its occupied execution slot");
     auto paused = WorkerService::remote_control(endpoint, tls, WorkerControl::Pause);
+    require(paused.durable_control == enrollment.has_value() && paused.compatibility == worker_compatibility() &&
+        paused.codec_compatibility == worker_compatibility(pool::Kind::Pack) && paused.producer_build == worker_producer_build(),
+        "authenticated status omitted contract, producer or control ownership");
+    if (enrollment) require(pool::load_worker_intent(*enrollment) == pool::WorkerIntent::Paused, "pause was acknowledged before saving intent");
     require(paused.admission == pool::WorkerAdmission::Paused && paused.accepted_tasks == 1 && paused.active.host_bytes == busy.active.host_bytes,
         "pause discarded accepted work or released its memory accounting");
     std::array<uint8_t, 32> id{};
     rejects([&] { service.generate_local(18, 2, id, [](auto const&, auto) {}); });
     auto draining = WorkerService::remote_control(endpoint, tls, WorkerControl::Drain);
+    if (enrollment) require(pool::load_worker_intent(*enrollment) == pool::WorkerIntent::Draining, "drain was acknowledged before saving intent");
     require(draining.admission == pool::WorkerAdmission::Draining && draining.accepted_tasks == 1,
         "drain failed to retain the accepted codec request");
     channel.send(pool::Message::Data, payload.data()); bool ended = false;
@@ -267,6 +279,36 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
         "drained worker retained task resources or accepted state");
     require(WorkerService::remote_control(endpoint, tls, WorkerControl::Resume).admission == pool::WorkerAdmission::Accepting,
         "resume did not reopen worker admission");
+    if (enrollment)
+    {
+        require(pool::load_worker_intent(*enrollment) == pool::WorkerIntent::Active, "resume did not persist accepting intent");
+        service.control(WorkerControl::Pause); service.stop();
+        WorkerService restarted(options);
+        require(restarted.status().admission == pool::WorkerAdmission::Paused, "automatic local executor ignored saved pause before starting");
+        rejects([&] { restarted.generate_local(18, 2, id, [](auto const&, auto) {}); });
+        restarted.start();
+        auto restored = WorkerService::remote_status(restarted.endpoint(), tls);
+        require(restored.admission == pool::WorkerAdmission::Paused && !restored.accepted_tasks && !restored.active.slots,
+            "restarted service reopened paused admission or restored dead tasks");
+        auto page = owner.status();
+        require(page.worker_records.size() == 1 && page.worker_records.front().admission == pool::WorkerAdmission::Paused,
+            "restarted service advertised accepting capacity before restoring pause");
+        auto const control = enrollment->directory / "worker-control", saved = enrollment->directory / "held-control";
+        std::filesystem::rename(control, saved); std::filesystem::create_directory(control);
+        rejects([&] { (void)WorkerService::remote_control(restarted.endpoint(), tls, WorkerControl::Resume); });
+        require(restarted.status().admission == pool::WorkerAdmission::Paused,
+            "failed durable save reopened admission");
+        std::filesystem::remove(control); std::filesystem::rename(saved, control);
+        require(restarted.control(WorkerControl::Drain).admission == pool::WorkerAdmission::Drained, "idle drain failed");
+        restarted.stop();
+        WorkerService drained(options);
+        require(drained.status().admission == pool::WorkerAdmission::Drained && !drained.status().accepted_tasks,
+            "restart lost drain intent or invented surviving accepted work");
+        rejects([&] { drained.generate_local(18, 2, id, [](auto const&, auto) {}); });
+        drained.control(WorkerControl::Resume); drained.stop();
+        WorkerService accepting(options);
+        require(accepting.status().admission == pool::WorkerAdmission::Accepting, "restart lost explicit resume intent");
+    }
 }
 
 void broker_authority(pool::TlsOptions tls, pool::TlsOptions const& other)
@@ -276,6 +318,7 @@ void broker_authority(pool::TlsOptions tls, pool::TlsOptions const& other)
     RunningBroker real(options);
     pool::BrokerClient probe(real.server.endpoint(), other);
     pool::WorkerOffer offered; offered.instance = "authority-probe"; offered.compatibility = worker_compatibility();
+    offered.codec_compatibility = worker_compatibility(pool::Kind::Pack);
     offered.endpoint = {"127.0.0.1", 9999}; offered.capacity = {1, 1, uint64_t(1) << 20, 0};
     offered.capabilities = pool::capability(pool::Kind::Pack);
     auto const epoch = probe.register_worker(offered); probe.unregister_worker(offered.instance);
@@ -697,6 +740,10 @@ int main(int argc, char** argv)
           multiple_brokers(pool_test::utf8_path(ca.cert_file).c_str(), pool_test::utf8_path(identity.cert_file).c_str(), pool_test::utf8_path(identity.key_file).c_str());
           auto other = pool_test::issue(directory.path, "other-worker-host", &ca);
           live_controls(pool_test::tls(ca, identity), pool_test::tls(ca, other));
+          auto enrolled = pool::create_pool(directory.path / "enrolled-worker", "worker");
+          pool::invite_pool(enrolled, directory.path / "reader.invite", "reader");
+          auto reader = pool::join_pool(directory.path / "reader.invite", directory.path / "reader");
+          live_controls(enrolled.tls, reader.tls);
           broker_authority(pool_test::tls(ca, identity), pool_test::tls(ca, other));
           broker_rotation(pool_test::tls(ca, identity));
           many_brokers(pool_test::tls(ca, identity)); }

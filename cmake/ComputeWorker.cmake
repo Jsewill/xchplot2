@@ -33,9 +33,9 @@ function(pos2_worker_prepare upstream_dir output_include)
     set(${output_include} "${worker_dir}" PARENT_SCOPE)
 endfunction()
 
-# Canonical task compatibility is intentionally independent of GPU build flags,
-# target architectures and machine-selected tiers. Both builds hash the same
-# generation/codec source content, including the GPU implementation sources.
+# Source content identifies the producer for diagnostics only. Scheduling uses
+# the explicit task/generation/codec/representation contracts in
+# ComputeCompatibility.cpp, independently of backend, tier and source build.
 function(pos2_worker_identity target upstream_dir)
     get_filename_component(repo_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
     file(GLOB_RECURSE upstream_sources CONFIGURE_DEPENDS
@@ -50,7 +50,7 @@ function(pos2_worker_identity target upstream_dir)
         "${repo_dir}/contrib/pos2-worker-thread-limit.patch"
         "${repo_dir}/contrib/pos2-plotter-output-move.patch"
         "${repo_dir}/contrib/pos2-arm-cuda.patch")
-    set(identity "ordinary-group-network-compute-v1\n")
+    set(identity "ordinary-group-network-compute-producer-v1\n")
     foreach(source IN LISTS upstream_sources)
         file(SHA256 "${source}" digest)
         file(RELATIVE_PATH name "${upstream_dir}" "${source}")
@@ -64,5 +64,5 @@ function(pos2_worker_identity target upstream_dir)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         ${upstream_sources} ${gpu_sources} ${local_sources})
     string(SHA256 identity "${identity}")
-    target_compile_definitions(${target} PRIVATE "GROW_COMPUTE_COMPATIBILITY=\"${identity}\"")
+    target_compile_definitions(${target} PRIVATE "GROW_COMPUTE_PRODUCER_BUILD=\"${identity}\"")
 endfunction()

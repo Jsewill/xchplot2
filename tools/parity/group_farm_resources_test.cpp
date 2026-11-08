@@ -77,10 +77,65 @@ resource_detail::CpuObservation cpu_observation(uint64_t ms, uint64_t total, uin
     value.before_wall = value.at + std::chrono::milliseconds(1); value.after_wall = value.at + std::chrono::milliseconds(2);
     value.own_before_ns = own_ns; value.own_after_ns = own_ns + 1000000; value.own_scope_known = true; return value;
 }
+void guided_resource_settings()
+{
+    auto declared = fixture();
+    auto generated = make_profile_template({declared.resources[0], declared.resources[1], declared.resources[4]},
+        {{"original-pos1", 10}}, "observed", "fixture");
+    generated.native.output_resources = {"disk"};
+    auto original = generated; std::vector<std::string> settings;
+    for (auto const& resource : generated.resources)
+        settings.push_back("resources[" + resource.id + "].capacity=" + std::to_string(resource.capacity) + ",capacity_known=true");
+    settings.push_back("workloads[original-pos1].format=chiapos-v1-c0,decoder=chiapos,decoder_version=fixture,backend=cpu,pool_difficulty=solo,source=declared-fixture,cost=serialized,bounded=true,scope_complete=true,quality_burst=4,proof_burst=12,future_quality_burst=4,future_proof_burst=12,period_us=20000,deadline_us=10000");
+    for (auto const* resource : {"cpu", "disk"}) settings.push_back("workloads[original-pos1].uses[" + std::string(resource) +
+        "].required_units=1,quality_us=10,proof_us=20,blocking_us=30");
+    settings.push_back("workloads[original-pos1].uses[ram].resident_units=1000,transient_units=100");
+    settings.push_back("native.bounded=true,scope_complete=true,covers_future_filter=true,phase_totals_include_controller=true,k=18,strength=2,host=harvester,reader=stateless,backend=cpu,engine=reference,max_ram_bytes=4096,max_cpu_threads=4,max_batch_members=2,max_group_members=2,max_construction_us=1000,max_verification_us=1000");
+    auto add_demands = [&](std::string const& target, std::vector<Demand> const& demands)
+    {
+        for (auto const& demand : demands) settings.push_back(target + '[' + demand.resource + "].resident_units=" +
+            std::to_string(demand.resident_units) + ",transient_units=" + std::to_string(demand.transient_units) +
+            ",required_units=" + std::to_string(demand.required_units) + ",work_us=" + std::to_string(demand.work_us) +
+            ",period_us=" + std::to_string(demand.period_us) + ",deadline_us=" + std::to_string(demand.deadline_us) + ",bounded=true");
+    };
+    add_demands("native.construction", declared.native.construction);
+    add_demands("native.verification", declared.native.verification);
+    add_demands("native.supervision", declared.native.supervision);
+    add_demands("native.cohorts[10].new_farming", declared.native.cohorts[0].new_farming);
+    add_demands("native.cohorts[10].proof_reserve", declared.native.cohorts[0].proof_reserve);
+    auto partial = apply_resource_settings(generated, std::span<std::string const>(settings).first(1));
+    auto remaining = prepare_resource_declarations(partial);
+    check(!remaining.missing.empty() && !remaining.resource_settings.empty() && !assess_stage(partial, initial()).feasible &&
+        !generated.resources[0].capacity_known && partial.resources[0].capacity_known,
+        "partial settings lost declarations, changed their source or admitted incomplete bounds");
+    check(std::none_of(remaining.resource_settings.begin(), remaining.resource_settings.end(), [](auto const& setting)
+        { return setting.starts_with("resources[cpu]."); }), "setup requested an already declared physical capacity again");
+    auto aliases = generated; auto cpu_alias = aliases.resources.front(); cpu_alias.id = "same-host-cpu"; aliases.resources.push_back(cpu_alias);
+    auto alias_settings = apply_resource_settings(aliases, std::vector<std::string>{"resources[same-host-cpu].capacity=3,capacity_known=true"});
+    check(!alias_settings.resources.front().capacity_known && alias_settings.resources.front().capacity == aliases.resources.front().capacity &&
+        alias_settings.resources.back().capacity_known && alias_settings.resources.back().capacity == 3 && !assess_stage(alias_settings, initial()).feasible,
+        "a stable resource ID changed a different alias declaration or multiplied shared capacity");
+    auto completed = apply_resource_settings(generated, settings); auto stage = initial();
+    bind_native_stage(completed, request(), 0, stage, true, true);
+    auto preparation = prepare_resource_declarations(completed);
+    check(assess_stage(completed, stage).feasible && preparation.missing.empty() && preparation.resource_settings.empty(),
+        "stable-ID declarations cannot complete the established CPU migration envelope");
+    std::ostringstream text; write_profile_json(text, completed); std::istringstream input(text.str());
+    auto reused = read_profile(input); stage = initial(); bind_native_stage(reused, request(), 0, stage, true, true);
+    check(assess_stage(reused, stage).feasible, "saved guided declarations did not survive profile reuse");
+    for (auto const* invalid : {"resources[invented].capacity=99,capacity_known=true", "resources[cpu].capacity=1,capcity_known=true",
+        "resources[cpu].capacity_known=yes", "resources[cpu].capacity=-1", "resources[cpu].capacity=18446744073709551616",
+        "workloads[original-pos1].plot_count=0", "workloads[invented].cost=reservation", "native.executable=/tmp/reader",
+        "native.construction[invented].bounded=true", "native.cohorts[0].proof_reserve[cpu].bounded=true", "resources[0].capacity=16"})
+        rejects([&] { apply_resource_settings(generated, std::vector<std::string>{invalid}); }, "unsafe, mistyped or unbounded resource setting was accepted");
+    std::ostringstream before, after; write_profile_json(before, original); write_profile_json(after, generated);
+    check(before.str() == after.str(), "a rejected or successful setup mutated its source declarations");
+}
 int main()
 {
     try
     {
+        guided_resource_settings();
         auto p = fixture(); auto s = initial();
         validate_inventory_coverage(p, {{"original-pos1", 4}, {"original-pos1", 6}});
         rejects([&] { validate_inventory_coverage(p, {{"original-pos1", 9}}); }, "outside inventory omitted");
@@ -438,7 +493,7 @@ int main()
         prepared.facts[0].basis = "measured-worst-case";
         rejects([&] { write_resource_preparation_json(preparation_roundtrip, prepared); }, "unsupported preparation provenance accepted");
         auto complete_preparation = prepare_resource_declarations(fixture());
-        check(complete_preparation.missing.empty(), "complete declared fixture needs invented preparation inputs");
+        check(complete_preparation.missing.empty() && complete_preparation.resource_settings.empty(), "complete declared fixture needs invented preparation inputs");
         Profile broad; broad.source = broad.producer = "declared-stress-fixture";
         for (size_t i = 0; i < max_resources; ++i) broad.resources.push_back(resource("storage-" + std::to_string(i), ResourceKind::storage, 1));
         for (size_t i = 0; i < max_workloads; ++i)

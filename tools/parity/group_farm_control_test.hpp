@@ -358,6 +358,17 @@ inline void run(fs::path const& parent)
     auto health = observe_farming_owner(metadata, state, 0, memory);
     check(health.status == "live" && health.lock_held && health.local_process_proven && health.heartbeat_current,
         "status did not distinguish the current local owner from saved progress");
+    auto diagnosis = [&](FarmingOwnerHealth const& owner, std::string control = "active", std::string acknowledgement = "effective")
+    {
+        return grow_controller_test::farming_status_diagnosis("ready", "", "continue with fill DIR", control,
+            acknowledgement, "ready", owner, true, false);
+    };
+    auto live_diagnosis = diagnosis(health);
+    check(live_diagnosis.status == "running" && !live_diagnosis.blocking && live_diagnosis.evidence.find("last-known") != std::string::npos,
+        "current ownership incorrectly promoted saved progress to a current construction inspection");
+    auto pending_control = diagnosis(health, "draining", "pending-boundary");
+    check(pending_control.status == "control-pending" && pending_control.blocking && pending_control.affected_work.find("already started") != std::string::npos,
+        "unacknowledged drain intent was reported as completed drain or lost started work");
     auto const owner_stamp = stream_state::stamp(metadata.path / "grow-farm.owner");
     {
         auto body = farming_owner_detail::read_record(metadata.path / "grow-farm.owner", memory).body;
@@ -381,6 +392,10 @@ inline void run(fs::path const& parent)
     health = observe_farming_owner(metadata, state, 0, memory);
     check(health.status == "stale-owner" && !health.lock_held && !health.local_process_proven,
         "killed owner remained live through its old PID or heartbeat timestamp");
+    auto killed_diagnosis = diagnosis(health);
+    check(killed_diagnosis.status == "stale-owner" && killed_diagnosis.next.find("fill DIR") != std::string::npos &&
+        killed_diagnosis.condition.find("lock is released") != std::string::npos,
+        "killed owner's saved ready record produced live readiness or no safe recovery action");
     {
         DirectoryLock writer(left); FarmingOwner replacement(metadata, state, 0, view.digest, allowance, memory);
         check(observe_farming_owner(metadata, state, 0, memory).status == "live", "stale owner prevented an authorized replacement");
@@ -527,6 +542,9 @@ inline void run(fs::path const& parent)
         health = observe_farming_owner(metadata, state, 0, memory);
         check(health.status == "remote-or-unknown-owner" && health.lock_held && health.heartbeat_current && !health.local_process_proven,
             "a matching PID and fresh remote heartbeat were reported as proven local liveness");
+        auto unknown = diagnosis(health);
+        check(unknown.status == "owner-unconfirmed" && unknown.blocking && unknown.next.find("preserve") != std::string::npos,
+            "remote or unproven ownership supplied local liveness or unsafe lock-removal guidance");
     }
     auto other_job = state; other_job.job_id = std::string(64, 'f');
     rejects([&] { (void)observe_farming_owner(metadata, other_job, 0, memory); }, "owner status accepted a foreign job binding");

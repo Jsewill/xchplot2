@@ -10,6 +10,7 @@
                                   // `devices` subcommand below. Plain
                                   // types only; the SYCL include lives
                                   // in SyclDeviceList.cpp (acpp-built).
+#include "device_options.hpp"
 #include "gpu/DeviceIds.hpp"   // device_label() — never print a raw device id
 #include "host/GpuPlotter.hpp"
 #include "host/BatchPlotter.hpp"
@@ -200,7 +201,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "Usage:\n"
         << "  " << prog << " plan [OPTIONS] [--] [DIR...]\n"
         << "  " << prog << " fill [OPTIONS] [-r|--resume] [--] [DIR...]\n"
-        << "  " << prog << " status [DIR|PLAN|--manifest FILE] [--watch] [--inspect]\n"
+        << "  " << prog << " status [DIR|PLAN|--manifest FILE] [--watch] [--inspect] [--live]\n"
         << "  " << prog << " pause|drain|resume|retire [DIR|--manifest FILE] [--destination DIR]...\n"
         << "  " << prog << " grow FILE [--max-members N] [OPTIONS]\n"
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
@@ -516,18 +517,6 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
     return true;
 }
 
-// Parse a --devices value into BatchOptions.
-//
-// Accepted forms:
-//   "all"              → use every GPU visible at runtime (sets
-//                        use_all_devices; device_ids stays empty).
-//   "0"                → use only GPU id 0.
-//   "0,2,3"            → use these specific device ids, in sorted order.
-//
-// Zero-configuration default (no flag) produces device_ids.empty() and
-// use_all_devices=false — which triggers the single-device
-// gpu_selector_v path, identical to pre-multi-GPU behavior.
-//
 // --cpu-workers N: how many CPU plots run concurrently ON EACH SELECTED CPU NODE.
 //
 // Per node, not per host, so it means the same thing on a 1-socket box as on a
@@ -575,152 +564,6 @@ bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
     return opt_in(static_cast<int>(v));
 }
 
-// Returns false on malformed input (caller prints usage + exits 1).
-bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
-{
-    // Accept comma-separated mix of:
-    //   "all"             → all GPUs + CPU worker
-    //   "gpu"             → all GPUs
-    //   "cpu"             → CPU worker (CPU-only; suppresses the implicit
-    //                       default GPU that a bare run would otherwise add)
-    //   "<int>"           → explicit GPU id
-    //   "gpu:<tier>"      → all GPUs default to <tier>
-    //   "all:<tier>"      → all GPUs default to <tier>, plus CPU worker
-    //   "<int>:<tier>"    → explicit GPU id + per-GPU tier override
-    //
-    // <tier> is one of plain/compact/minimal/tiny/pinned/auto. The "auto"
-    // sentinel explicitly opts back into auto-pick — useful for
-    // overriding `gpu:<tier>` or global `--tier` on one specific GPU.
-    //
-    // Compose freely: `gpu,2:tiny` = all GPUs auto-pick except GPU 2
-    // which uses tiny. `gpu:tiny,2:plain` = all GPUs tiny except GPU 2
-    // which uses plain. `cpu:<tier>` is rejected — CPU worker has no
-    // streaming tier.
-    auto is_valid_tier = [](std::string const& t) {
-        return t == "plain" || t == "compact" || t == "minimal" ||
-               t == "tiny"  || t == "pinned"  || t == "auto";
-    };
-    auto bad = [&](char const* why) {
-        std::cerr << "Error: --devices: " << why
-                  << " (token list: \"" << s << "\")\n";
-        return false;
-    };
-
-    // A --devices list REPLACES any earlier one, so every selection it can
-    // express resets here — CPU included. Leaving the CPU selection standing
-    // would make `--devices all --devices gpu` keep a CPU nobody asked for.
-    // cpu_workers is deliberately NOT reset: it is a count, not a selection,
-    // and an explicit --cpu-workers must survive a later --devices.
-    opts.device_ids.clear();
-    opts.use_all_devices = false;
-    opts.per_device_tier.clear();
-    opts.all_gpus_tier.clear();
-    opts.cpu_node_ids.clear();
-    opts.use_all_cpu_nodes = false;
-    bool any_token = false;
-    bool any_gpu_token = false;
-    size_t start = 0;
-    while (start <= s.size()) {
-        size_t const end = s.find(',', start);
-        std::string const tok = s.substr(
-            start, end == std::string::npos ? std::string::npos : end - start);
-        if (tok.empty()) return false;
-        any_token = true;
-
-        std::string selector = tok;
-        std::string tier_suffix;
-        if (size_t const colon = tok.find(':'); colon != std::string::npos) {
-            selector    = tok.substr(0, colon);
-            tier_suffix = tok.substr(colon + 1);
-            if (tier_suffix.empty())  return bad("empty tier after `:`");
-            if (!is_valid_tier(tier_suffix)) {
-                return bad("invalid tier (expect plain|compact|minimal|tiny|pinned|auto)");
-            }
-        }
-
-        // "gpu7" / "cpu1" — a kind plus an index. Bare "7" is the historical
-        // spelling of "gpu7" and still parses, below.
-        auto indexed = [](std::string const& tok, char const* kind) -> std::optional<int> {
-            std::string const prefix(kind);
-            if (tok.size() <= prefix.size() || tok.compare(0, prefix.size(), prefix) != 0) {
-                return std::nullopt;
-            }
-            std::string const digits = tok.substr(prefix.size());
-            char* endp = nullptr;
-            errno = 0;
-            long const v = std::strtol(digits.c_str(), &endp, 10);
-            if (endp == digits.c_str() || endp != digits.c_str() + digits.size() || errno == ERANGE || v < 0 || v > 1023) {
-                return std::nullopt;
-            }
-            return static_cast<int>(v);
-        };
-
-        auto add_gpu = [&](int id) -> bool {
-            opts.device_ids.push_back(id);
-            any_gpu_token = true;
-            if (!tier_suffix.empty()) {
-                auto const it = opts.per_device_tier.find(id);
-                if (it != opts.per_device_tier.end() && it->second != tier_suffix) {
-                    return bad("same GPU id given two different :tier overrides");
-                }
-                opts.per_device_tier[id] = tier_suffix;
-            }
-            return true;
-        };
-
-        if (selector == "all") {
-            opts.use_all_devices  = true;
-            opts.use_all_cpu_nodes = true;  // "all" means every GPU *and* every CPU node
-            any_gpu_token = true;
-            if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
-        } else if (selector == "gpu") {
-            opts.use_all_devices = true;
-            any_gpu_token = true;
-            if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
-        } else if (selector == "cpu") {
-            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
-            // Every CPU node, exactly as `gpu` means every GPU. It is a
-            // SELECTION, not a count: --cpu-workers says how many plots run per
-            // node. So repeats dedup — `cpu,cpu` names the same hardware twice
-            // and cannot mean more of it, any more than `0,0` means two cards.
-            opts.use_all_cpu_nodes = true;
-        } else if (auto const node = indexed(selector, "cpu")) {
-            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
-            opts.cpu_node_ids.push_back(*node);
-        } else if (auto const id = indexed(selector, "gpu")) {
-            if (!add_gpu(*id)) return false;
-        } else {
-            char* endp = nullptr;
-            errno = 0;
-            long const v = std::strtol(selector.c_str(), &endp, 10);
-            if (endp == selector.c_str() || endp != selector.c_str() + selector.size() || errno == ERANGE || v < 0 || v > 1023) {
-                return bad("unrecognised device token "
-                           "(expect all|gpu|cpu|gpu<n>|cpu<n>|<id>)");
-            }
-            if (!add_gpu(static_cast<int>(v))) return false;
-        }
-        if (end == std::string::npos) break;
-        start = end + 1;
-    }
-    if (!any_token) return false;
-    bool const any_cpu_token = opts.use_all_cpu_nodes || !opts.cpu_node_ids.empty();
-    if (!any_gpu_token && !any_cpu_token) return false;
-
-    // `cpu` covers every node, so listing nodes as well is redundant.
-    if (opts.use_all_cpu_nodes) opts.cpu_node_ids.clear();
-
-    auto dedup = [](std::vector<int>& v) {
-        std::sort(v.begin(), v.end());
-        v.erase(std::unique(v.begin(), v.end()), v.end());
-    };
-    dedup(opts.device_ids);
-    dedup(opts.cpu_node_ids);
-    // Any successful --devices — even a CPU-only one that left device_ids empty —
-    // is an explicit selection. resolve_batch_devices keys off this to avoid
-    // materialising a default GPU on top of an explicit CPU-only request.
-    opts.devices_specified = true;
-    return true;
-}
 
 std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 {
@@ -1441,22 +1284,6 @@ std::vector<std::string> group_arguments(std::vector<std::string> const& input)
             i += 2;
             continue;
         }
-        if (key == "--devices" || key == "-d") {
-            if (++i == input.size()) throw std::invalid_argument("--devices requires a value");
-            pos2gpu::BatchOptions options;
-            if (!parse_devices_arg(input[i], options) || options.use_all_devices ||
-                options.device_ids.size() > 1 || !options.cpu_node_ids.empty() ||
-                (options.cpu_selected() && !options.device_ids.empty()))
-                throw std::invalid_argument("group construction accepts --devices cpu or gpuN; use shared compute for multiple producers");
-            result.insert(result.end(), {"--backend", options.cpu_selected() ? "cpu" : "gpu"});
-            if (!options.device_ids.empty()) {
-                auto const device = options.device_ids.front();
-                result.insert(result.end(), {"--device", std::to_string(device)});
-                if (auto const tier = options.per_device_tier.find(device); tier != options.per_device_tier.end())
-                    result.insert(result.end(), {"--tier", tier->second});
-            }
-            continue;
-        }
         if (key == "--max-host-ram" || key == "--max-ram" || key == "-M" || key == "--leave-free" || key.ends_with("-bytes") ||
             key == "--compute-offer-ram" || key == "--compute-offer-vram" || key == "--compute-codec-ram") {
             if (++i == input.size()) throw std::invalid_argument(key + " requires a size");
@@ -1577,7 +1404,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
                     "--no-auto-spill", "--keep", "--compute-only", "--full", "--json", "--plan-only",
-                    "--extend", "--update", "--cancel-update", "--policy-only", "--upgrade-job", "--status", "--watch", "--inspect", "--revalidate", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
+                    "--extend", "--update", "--cancel-update", "--policy-only", "--upgrade-job", "--status", "--watch", "--inspect", "--live", "--revalidate", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
                 auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
@@ -1907,7 +1734,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 opts.auto_host_ram_spill = false;
             }
             else if ((a == "--devices" || a == "-d") && need(1)) {
-                if (!parse_devices_arg(argv[++i], opts)) {
+                if (!pos2gpu::parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: invalid --devices value\n";
                     return 1;
                 }
@@ -2376,7 +2203,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 opts.auto_host_ram_spill = false;
             }
             else if ((a == "--devices" || a == "-d") && i + 1 < argc) {
-                if (!parse_devices_arg(argv[++i], opts)) {
+                if (!pos2gpu::parse_devices_arg(argv[++i], opts)) {
                     std::cerr << "Error: --devices expects 'all', 'cpu', or a "
                                  "comma-separated list of device ids "
                                  "(got '" << argv[i] << "')\n";
@@ -2773,7 +2600,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if ((a == "--devices" || a == "-d") && need(1)) {
                 pos2gpu::BatchOptions tmp;
-                if (!parse_devices_arg(argv[++i], tmp)) {
+                if (!pos2gpu::parse_devices_arg(argv[++i], tmp)) {
                     std::cerr << "Error: --devices expects 'all', 'gpu', 'cpu', "
                                  "'gpu<n>', 'cpu<n>', or a comma-separated list "
                                  "of device ids (got '" << argv[i] << "')\n";
@@ -3098,7 +2925,7 @@ _xchplot2() {
                     --) literal=1; break ;;
                     --relocate) values=2 ;;
                     --policy-only|--no-policy-only|--upgrade-job|--no-upgrade-job) ;;
-                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--watch|--no-watch|--inspect|--no-inspect|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--update|--no-update|--cancel-update|--no-cancel-update|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
+                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--watch|--no-watch|--inspect|--no-inspect|--live|--no-live|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--update|--no-update|--cancel-update|--no-cancel-update|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
                     -*) values=1 ;;
                 esac
             fi
@@ -3152,7 +2979,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --destination --revalidate --no-revalidate --replot --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
@@ -3226,6 +3053,7 @@ _xchplot2() {
         '--status[Inspect saved farm progress]' \
         '--watch[Refresh status until interrupted]' '--no-watch[Print status once]' \
         '--inspect[Include deep live status checks]' '--no-inspect[Read saved status]' \
+        '--live[Inspect compute and migration service prerequisites]' '--no-live[Use saved status only]' \
         '*--destination[Saved destination to control]:directory:_files -/' \
         '--policy-only[Record control intent without starting an idle job]' \
         '--revalidate[Review updated migration resources or verification policy]' \
@@ -3275,7 +3103,8 @@ _xchplot2() {
         '--alternative[Review assessed resource choices, or capacity alone]:names:(memory eligible-groups deadline cpu-cores lookup-workers capacity)' \
         '--upgrade-job[Review a stopped job recovery metadata upgrade]' \
         '-F[Use a saved plan]:file:_files' '--from-plan[Use a saved plan]:file:_files' \
-        '--save-profile[Export harvester settings]:file:_files' \
+        '--save-profile[Export reusable harvester or migration setup]:file:_files' \
+        '*--resource-setting[Declare a remaining inventory/replot bound by stable ID]:setting:' \
         '--help-all[All planning and recovery options]' \
         "--harvester[Intended harvester]:harvester:_alternative 'local\:local harvester\:(local)' 'profile\:profile file\:_files'" \
         '--chia-root[Local Chia configuration root]:directory:_files -/' \
@@ -3410,6 +3239,8 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-every
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l status -d 'Inspect saved farm progress'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l watch -d 'Refresh status until interrupted'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l inspect -d 'Include deep live status checks'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l live -d 'Inspect compute and migration service prerequisites'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l timeout-ms -r -d 'Overall live inspection budget'
 complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l destination -r -a '(__fish_complete_directories)' -d 'Saved destination to control'
 complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l policy-only -d 'Record control intent without starting an idle job'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status pause drain resume retire; and not __fish_seen_subcommand_from compute' -l manifest -r -F -d 'Saved farming job'
@@ -3422,7 +3253,8 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-max-source-
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l reclaim-before-bytes -r -d 'Outstanding pre-delete limit'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-plan -r -F -d 'Save a keyless plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -s F -l from-plan -r -F -d 'Use a saved plan'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-profile -r -F -d 'Export harvester settings'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-profile -r -F -d 'Export reusable harvester or migration setup'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l resource-setting -r -d 'Declare an inventory/replot bound by stable ID'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -l help-all -d 'Full command reference'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l harvester -r -F -a local -d 'Local harvester or profile file'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l chia-root -r -a '(__fish_complete_directories)' -d 'Local Chia configuration root'

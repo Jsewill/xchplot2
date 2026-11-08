@@ -1,4 +1,6 @@
 #include "host/ComputeWorker.hpp"
+#include "host/ComputeIdentity.hpp"
+#include "host/NumaTopology.hpp"
 #include "host/GroupCodec.hpp"
 #include "host/ComputeThreads.hpp"
 #include "plot/Plotter.hpp"
@@ -10,6 +12,7 @@
 
 #include <condition_variable>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -43,6 +46,7 @@ enum class WorkerError : uint8_t { Permanent = 0, Unsupported = 1, Transport = 2
 void write_worker_status(pool::Writer& out, WorkerStatus const& value)
 {
     out.string(value.identity); out.string(value.node_id); out.string(value.instance); out.u8(uint8_t(value.admission));
+    out.string(value.compatibility); out.string(value.codec_compatibility); out.string(value.producer_build); out.u8(value.durable_control);
     for (auto const& resources : {value.capacity, value.active})
     { out.u32(resources.cpu_threads); out.u32(resources.slots); out.u64(resources.host_bytes); out.u64(resources.gpu_bytes); }
     out.u64(value.accepted_tasks); out.u64(value.waiting_cpu); out.u64(value.baseline_host_bytes);
@@ -52,6 +56,8 @@ void write_worker_status(pool::Writer& out, WorkerStatus const& value)
 WorkerStatus read_worker_status(pool::Reader& in)
 {
     WorkerStatus value; value.identity = in.string(64); value.node_id = in.string(64); value.instance = in.string(64); value.admission = pool::WorkerAdmission(in.u8());
+    value.compatibility = in.string(256); value.codec_compatibility = in.string(256); value.producer_build = in.string(128);
+    auto const durable = in.u8(); require(durable <= 1, "invalid worker durable control flag"); value.durable_control = durable;
     for (auto resources : {&value.capacity, &value.active})
     { resources->cpu_threads = in.u32(); resources->slots = in.u32(); resources->host_bytes = in.u64(); resources->gpu_bytes = in.u64(); }
     value.accepted_tasks = in.u64(); value.waiting_cpu = in.u64(); value.baseline_host_bytes = in.u64();
@@ -388,15 +394,6 @@ void WorkerCancellation::check() const
     if (service_stop && service_stop->load(std::memory_order_acquire)) throw TaskCancelled("worker service stopped");
     if (Clock::now() >= deadline) throw TaskCancelled("worker task deadline expired");
 }
-std::string worker_compatibility()
-{
-#ifdef GROW_COMPUTE_COMPATIBILITY
-    return "pos2-compute-v1:" GROW_COMPUTE_COMPATIBILITY;
-#else
-    // Builds must define the consumed-source identity before network use.
-    return {};
-#endif
-}
 uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
 {
     worker_detail::require(!config.cpu_scheduler || config.capacity.cpu_threads <= config.cpu_scheduler->workers(),
@@ -557,6 +554,7 @@ struct WorkerService::Impl
     std::condition_variable dispatch_ready;
     mutable std::mutex admission_mutex;
     pool::WorkerAdmission admission = pool::WorkerAdmission::Accepting;
+    std::optional<pool::PoolIdentity> control_identity;
     uint64_t accepted_tasks = 0;
     std::atomic<bool> gpu_active{false};
     std::mutex jobs_mutex, heartbeat_mutex;
@@ -601,6 +599,15 @@ struct WorkerService::Impl
         require(config.broker_rotation_ms >= 100 && config.broker_rotation_ms <= 3600000, "invalid broker rotation interval");
         require(config.brokers.size() + bool(config.broker.port) <= config.max_brokers,
             "configured brokers exceed worker registration budget");
+        if (!config.tls.membership_directory.empty())
+        {
+            control_identity = pool::load_pool(std::filesystem::path(reinterpret_cast<char8_t const*>(config.tls.membership_directory.c_str())));
+            require(control_identity && control_identity->node_id == pool::certificate_node_id(config.tls.cert_file) &&
+                control_identity->pool_id == pool::certificate_identity(config.tls.ca_file), "worker control enrollment differs from its TLS identity");
+            auto const intent = pool::load_worker_intent(*control_identity);
+            admission = intent == pool::WorkerIntent::Paused ? pool::WorkerAdmission::Paused :
+                intent == pool::WorkerIntent::Draining ? pool::WorkerAdmission::Drained : pool::WorkerAdmission::Accepting;
+        }
         if (config.admit_start) config.admit_start(config);
         scheduler = config.cpu_scheduler ? config.cpu_scheduler : std::make_shared<CodecScheduler>(config.capacity.cpu_threads);
         require(config.capacity.cpu_threads <= scheduler->workers(), "worker offer exceeds shared CPU gate");
@@ -682,6 +689,8 @@ struct WorkerService::Impl
     WorkerStatus status() const
     {
         WorkerStatus value; value.identity = config.tls.cert_file.empty() ? "" : pool::certificate_identity(config.tls.cert_file); value.instance = instance;
+        value.compatibility = worker_compatibility(); value.codec_compatibility = worker_compatibility(pool::Kind::Pack);
+        value.producer_build = worker_producer_build(); value.durable_control = control_identity.has_value();
         if (!config.tls.cert_file.empty()) value.node_id = pool::certificate_node_id(config.tls.cert_file);
         value.capacity = current_capacity();
         auto const memory = budget->active(); auto const cpu = offered_cpu.active();
@@ -697,6 +706,12 @@ struct WorkerService::Impl
     {
         {
             std::lock_guard lock(admission_mutex);
+            require(operation >= WorkerControl::Pause && operation <= WorkerControl::Resume, "invalid worker control operation");
+            // Complete the private atomic save before changing live admission
+            // or acknowledging control. A failed save leaves accepted work and
+            // admission untouched. PoolLock never acquires admission_mutex.
+            if (control_identity) pool::save_worker_intent(*control_identity, operation == WorkerControl::Pause ? pool::WorkerIntent::Paused :
+                operation == WorkerControl::Drain ? pool::WorkerIntent::Draining : pool::WorkerIntent::Active);
             switch (operation)
             {
             case WorkerControl::Pause: admission = pool::WorkerAdmission::Paused; break;
@@ -1098,6 +1113,14 @@ struct WorkerService::Impl
             else
 #endif
             {
+                std::optional<pos2gpu::ScopedThreadAffinity> affinity;
+                if (!config.cpu_affinity.empty())
+                {
+                    affinity.emplace();
+                    if (!pos2gpu::pin_thread_to_cpus(config.cpu_affinity))
+                        std::fprintf(stderr, "Compute CPU worker could not pin to CPUs %s; running unpinned\n",
+                            pos2gpu::format_cpu_list(config.cpu_affinity).c_str());
+                }
                 owned.reserve(ids.size());
                 for (auto const& id : ids)
                 {
@@ -1305,7 +1328,7 @@ struct WorkerService::Impl
         {
             require(frame.type == pool::Message::Work, "worker expected leased task");
             pool::Reader in(frame.payload); lease = pool::read_lease(in);
-            require(lease->worker_instance == instance && lease->task.compatibility == worker_compatibility(), "worker lease targets another executor or codec");
+            require(lease->worker_instance == instance && lease->task.compatibility == worker_compatibility(lease->task.kind), "worker lease targets another executor or codec");
             auto const task_timeout = in.u32();
             require(task_timeout && task_timeout <= config.task_timeout_ms, "worker task timeout exceeds configured limit");
             WorkerCancellation cancel{&cancelled, Clock::now() + std::chrono::milliseconds(task_timeout), &stopping};
@@ -1468,6 +1491,7 @@ struct WorkerService::Impl
     pool::WorkerOffer offer() const
     {
         pool::WorkerOffer value; value.instance = instance; value.compatibility = worker_compatibility();
+        value.codec_compatibility = worker_compatibility(pool::Kind::Pack); value.producer_build = worker_producer_build();
         value.endpoint = config.advertise.port ? config.advertise : listener->endpoint();
         if (!config.server_name.empty()) value.endpoint.server_name = config.server_name;
         { std::lock_guard lock(advertisement_mutex);
@@ -1570,7 +1594,7 @@ void WorkerService::start() { impl_->start(); }
 void WorkerService::stop() { impl_->stop(); }
 pool::Endpoint WorkerService::endpoint() const { return impl_->listener ? impl_->listener->endpoint() : impl_->config.listen; }
 bool WorkerService::owns(pool::Lease const& lease) const
-{ return lease.worker_instance == impl_->instance && lease.task.compatibility == worker_compatibility(); }
+{ return lease.worker_instance == impl_->instance && lease.task.compatibility == worker_compatibility(lease.task.kind); }
 WorkerStatus WorkerService::status() const { return impl_->status(); }
 WorkerStatus WorkerService::control(WorkerControl operation) { return impl_->control(operation); }
 WorkerStatus WorkerService::remote_status(pool::Endpoint const& endpoint, pool::TlsOptions const& tls)
@@ -1927,7 +1951,11 @@ struct WorkerClient::Impl
         generation_admission(0, config.max_active_generation, 0), planning(config.task_timeout_ms)
     {
         if (config.compatibility.empty()) config.compatibility = worker_compatibility();
-        require(!config.compatibility.empty() && !config.owner_id.empty(), "compute client requires a compatibility identity and persistent owner ID");
+        if (config.codec_compatibility.empty()) config.codec_compatibility = worker_compatibility(pool::Kind::Pack);
+        require(!config.compatibility.empty() && (config.local_only || !config.owner_id.empty()),
+            "compute client requires a compatibility identity and persistent owner ID");
+        require(!config.local_only || config.local_service || config.local_service_provider,
+            "local-only compute client requires a local executor");
         require(config.max_task_bytes && config.max_task_bytes <= UINT32_MAX && config.max_window_chunks &&
             config.task_timeout_ms && config.max_active_generation && config.max_active_generation <= 4096,
             "invalid compute client bounds");
@@ -2011,9 +2039,44 @@ struct WorkerClient::Impl
         if (!config.admit_task) return {};
         return [this](WorkerTaskAdmission value)
         {
-            value.owner_identity = pool::certificate_identity(config.tls.cert_file); value.owner_id = config.owner_id;
+            value.owner_identity = config.local_only ? "" : pool::certificate_identity(config.tls.cert_file); value.owner_id = config.owner_id;
             admit(value);
         };
+    }
+    void generate_private(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
+        WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink, WorkerCancellation cancel)
+    {
+        auto const begin = Clock::now(); auto selected_at = begin, first_output = Clock::time_point{};
+        WorkerTaskObservation value; value.local_direct = true;
+        auto admission = [&](WorkerTaskAdmission task)
+        {
+            task.local_fallback = false; task.owner_id = config.owner_id;
+            value.worker_identity = task.worker.identity; value.worker_instance = task.worker.instance;
+            value.kind = task.task.kind; value.k = task.task.k; value.strength = task.task.strength; value.work_units = task.task.work_units;
+            selected_at = Clock::now(); admit(task);
+            if (config.selected) config.selected(value);
+            cancel.check();
+        };
+        auto output = [&] { if (first_output == Clock::time_point{}) first_output = Clock::now(); };
+        try
+        {
+            auto local = local_service(); require(bool(local), "local-only compute executor is unavailable");
+            if (packed_sink) local->generate_local(k, strength, ids.front(), [&](PackedFragmentTile const& tile, uint64_t count)
+                { output(); packed_sink(tile, count); }, cancel, config.generation_kind, admission);
+            else local->contributions_local(k, strength, ids, [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+                { output(); contribution_sink(ordinal, bytes, members); }, cancel, config.generation_kind, admission);
+            cancel.check();
+        }
+        catch (WorkerAdmissionRejected const&) { throw; }
+        catch (WorkerTaskDeclined const&) { throw; }
+        catch (...) { failures.fetch_add(1); throw; }
+        auto const end = Clock::now(); auto const boundary = first_output == Clock::time_point{} ? end : first_output;
+        value.elapsed_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        value.execution_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(boundary - selected_at).count());
+        value.transfer_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - boundary).count());
+        if (packed_sink) generations.fetch_add(1); else contributions.fetch_add(1);
+        local_tasks.fetch_add(1); task_elapsed_ns.fetch_add(value.elapsed_ns);
+        if (config.observe) try { config.observe(value); } catch (...) {}
     }
     struct Connection
     {
@@ -2091,7 +2154,8 @@ struct WorkerClient::Impl
         require(task.task_id.size() <= 256 && identity.attempt, "invalid compute task identity");
         task.kind = kind; task.k = k; task.strength = strength; task.work_units = work_units;
         task.chunk_count = chunk_count; task.max_output_bytes = max_output_bytes;
-        task.compatibility = config.compatibility; task.resources.cpu_threads = kind == pool::Kind::Pack ? 1 : config.generation_threads;
+        task.compatibility = kind == pool::Kind::Pack ? config.codec_compatibility : config.compatibility;
+        task.resources.cpu_threads = kind == pool::Kind::Pack ? 1 : config.generation_threads;
         task.resources.host_bytes = host_bytes; task.resources.slots = 1;
         std::optional<pool::Lease> lease;
         pool::OwnerSession session;
@@ -2306,6 +2370,7 @@ struct WorkerClient::Impl
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members,
             "invalid compute generation batch");
         GenerationLease admission(*this, ids.size(), cancel);
+        if (config.local_only) { generate_private(k, strength, ids, packed_sink, contribution_sink, cancel); return; }
         if (identity.task_id.empty()) identity.task_id = pool::random_token();
         for (unsigned failed = 0;; ++failed)
         {
@@ -2325,7 +2390,11 @@ struct WorkerClient::Impl
 
 WorkerClient::WorkerClient(WorkerClientConfig config) : impl_(std::make_unique<Impl>(std::move(config))) {}
 WorkerClient::~WorkerClient() = default;
-bool WorkerClient::local_available() const { return bool(impl_->local_service()); }
+bool WorkerClient::local_available() const
+{
+    if (impl_->config.local_only) return impl_->config.local_service || bool(impl_->config.local_service_provider);
+    return bool(impl_->local_service());
+}
 void WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
 { impl_->generate(k, strength, {&id, 1}, sink, {}, cancel, std::move(identity)); }
@@ -2352,6 +2421,7 @@ std::vector<std::vector<uint8_t>> WorkerClient::encode(uint8_t k, std::span<Work
     uint64_t maximum, WorkerCancellation cancel, WorkerTaskIdentity identity, WorkerEncodedValidator const& validator,
     WorkerTaskOptions const& options)
 {
+    require(!impl_->config.local_only, "local-only compute client does not support remote encoding");
     cancel = impl_->cancellation(cancel); (void)parameters(k, 2);
     require(!chunks.empty() && chunks.size() <= impl_->config.max_window_chunks &&
         maximum && maximum <= impl_->config.max_task_bytes,
@@ -2437,6 +2507,7 @@ uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_by
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {
     (void)parameters(k, strength); if (!maximum) return 0;
+    if (impl_->config.local_only) return 1;
     unsigned value;
     { std::lock_guard lock(impl_->planning_mutex); value = impl_->planning.suggested(k, strength, impl_->config.generation_kind).batch; }
     // Hints share the control pool and use a short optional deadline. Failure
@@ -2461,6 +2532,7 @@ unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsi
 unsigned WorkerClient::suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const
 {
     (void)parameters(k, strength); if (!maximum) return 0;
+    if (impl_->config.local_only) return std::min(maximum, impl_->config.max_active_generation);
     std::lock_guard lock(impl_->planning_mutex);
     return std::max(1u, std::min(maximum, impl_->planning.suggested(k, strength, impl_->config.generation_kind).concurrency));
 }

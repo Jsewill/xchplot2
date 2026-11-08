@@ -3980,6 +3980,16 @@ void replot_status_protocol(fs::path const& root)
         fresh.second.find("\"active_full_proof_validated\":null") != fresh.second.npos &&
         fresh.second.find("\"mode\":\"strict\"") != fresh.second.npos &&
         !fs::exists(destinations.front() / ".xchplot2"), "read-only status started a migration");
+    auto const fresh_json = profile_detail::JsonReader(fresh.second).read();
+    auto const& fresh_diagnosis = inventory_detail::required_field(fresh_json, "diagnosis");
+    require(inventory_detail::string(fresh_diagnosis, "status") == "history-unknown" &&
+        inventory_detail::string(fresh_diagnosis, "condition").find("does not establish") != std::string::npos &&
+        inventory_detail::string(fresh_diagnosis, "next_safe_action").find("only if this reviewed job has never run") != std::string::npos,
+        "missing migration journal was reported as authorization to start or discard prior recovery artifacts");
+    args.json = false; auto fresh_human = status(); args.json = true;
+    require(!fresh_human.first && fresh_human.second.find(inventory_detail::string(fresh_diagnosis, "condition")) != std::string::npos &&
+        fresh_human.second.find(inventory_detail::string(fresh_diagnosis, "next_safe_action")) != std::string::npos,
+        "human and JSON migration diagnostics disagree about missing private history or its safe next action");
     ReplotJournal initial; initial.review_digest = inputs.digest; initial.farm = private_farm; initial.retirements.resize(1);
     auto journals = load_replot_journals(destinations, inputs.digest, args.max_ram);
     publish_replot_journals(journals, initial, args.max_ram, [] {});

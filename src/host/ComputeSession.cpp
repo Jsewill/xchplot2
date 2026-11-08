@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace pos2gpu
@@ -74,6 +75,23 @@ bool saved_compute_available(std::filesystem::path const& directory)
 void prepare_group_compute(GroupOptions& args)
 {
     require(args.compute_mode == "auto" || args.compute_mode == "off", "--compute requires auto or off");
+    if (!args.local_devices.empty())
+    {
+        require(args.pool_broker.empty() && args.pool_ca.empty() && args.pool_cert.empty() && args.pool_key.empty() &&
+            args.pool_listen.empty() && args.pool_advertise.empty() && args.pool_directory.empty() && args.automatic_local_compute &&
+            !args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_offer_backend_set,
+            "selected local producers cannot also use shared compute connection or offer options");
+        args.local_compute = true;
+        auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency());
+        args.pool_offer_cpus = std::max(1u, workers - 1);
+        // The complete executor partition includes every service baseline,
+        // retained device buffer and active task. Receiving/assembly keep the
+        // remaining quarter, with their existing per-task memory admission.
+        args.pool_offer_ram = args.max_ram / 4 * 3;
+        args.pool_offer_slots = args.local_devices.size();
+        args.pool_codec_auto = false; args.pool_codec_ram = 0;
+        return;
+    }
     if (args.compute_mode == "off")
     {
         require(args.pool_broker.empty() && args.pool_ca.empty() && args.pool_cert.empty() && args.pool_key.empty() &&
@@ -114,6 +132,187 @@ void prepare_group_compute(GroupOptions& args)
     if (identity->defaults.cpus) args.pool_offer_cpus = std::min<uint64_t>(args.pool_offer_cpus, identity->defaults.cpus);
     if (!args.pool_offer_vram) args.pool_offer_vram = identity->defaults.gpu_bytes;
     if (!args.pool_offer_backend_set) args.pool_offer_backend = args.backend_set ? args.backend : identity->defaults.backend;
+}
+
+ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::steady_clock::time_point deadline)
+{
+    using Clock = std::chrono::steady_clock;
+    ComputeInspection result;
+    auto const now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    if (now >= 0) result.observed_at_unix_ms = uint64_t(now);
+    result.unknowns = "direct worker reachability, exact plot parameters, resource fit and new lease admission are not tested; broker pages may advance during inspection";
+    result.next_action = "use compute status --verbose to inspect authenticated task wait reasons";
+    auto expired = [&] { return Clock::now() >= deadline || (args.cancelled && args.cancelled()); };
+    auto issue = [&](std::string endpoint, std::string reason)
+    {
+        result.complete = false;
+        if (result.issues.size() < 128) result.issues.push_back({std::move(endpoint), std::move(reason)});
+    };
+    try
+    {
+        if (args.local_compute || !args.local_devices.empty())
+        {
+            result.status = "local-execution-selected";
+            result.reason = "explicit local producers are selected; status does not initialize them or consult unrelated shared enrollment";
+            result.unknowns = "current selected-device and exact task admission are not tested; saved farm progress does not prove a running local producer";
+            result.next_action = "review plan with the selected devices, then continue fill when intended; execution rechecks device and task admission";
+            return result;
+        }
+        if (args.compute_mode == "off")
+        {
+            result.status = "disabled"; result.reason = "shared compute is disabled for this command";
+            result.next_action = "continue with local execution, or select --compute auto when shared compute is intended"; return result;
+        }
+        bool const explicit_tls = !args.automatic_compute &&
+            (!args.pool_ca.empty() || !args.pool_cert.empty() || !args.pool_key.empty());
+        auto identity = explicit_tls ? std::optional<pool::PoolIdentity>{} : pool::load_pool(args.pool_directory.empty() ? pool::pool_directory() :
+            std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())));
+        result.configured = bool(identity) || explicit_tls;
+        if (!result.configured)
+        {
+            result.status = "not-configured"; result.reason = "no saved compute enrollment or explicit connection was selected";
+            result.next_action = "continue with local execution, or use compute init or compute join to enroll this machine"; return result;
+        }
+#ifdef _WIN32
+        result.service_lifecycle = "background compute uses Task Scheduler for the logged-in user; changed defaults, executable or imported credentials require compute service restart; manager state was not queried";
+#else
+        result.service_lifecycle = "background compute requires an active systemd user manager and follows its login policy; changed defaults, executable or imported credentials require compute service restart; manager state was not queried";
+#endif
+        pool::TlsOptions tls;
+        if (!explicit_tls && identity)
+        {
+            tls = identity->tls; result.certificate_expired = identity->certificate_expired;
+            result.authority_expired = identity->authority_expired; result.certificate_expires = identity->certificate_expires;
+            result.authority_expires = identity->authority_expires;
+            auto const intent = pool::load_worker_intent(*identity);
+            result.local_worker_intent = intent == pool::WorkerIntent::Paused ? "paused" : intent == pool::WorkerIntent::Draining ? "draining" : "active";
+            result.local_worker_intent_action = intent == pool::WorkerIntent::Active ?
+                "saved local intent permits admission; it does not prove a running worker" :
+                "saved local pause/drain intent survives service restarts; use compute resume on the intended running local worker to reopen admission";
+            if (identity->authority_expired || identity->certificate_expired)
+            {
+                result.status = identity->authority_expired ? "authority-expired" : "renewal-required";
+                result.reason = identity->authority_expired ? "the saved pool authority has expired" : "this machine's enrolled certificate has expired";
+                result.blocking = true;
+                result.next_action = identity->authority_expired ? "create a new pool and re-enroll its members" :
+                    "use compute renew-request, have the authority sign it with compute renew-sign, then use compute renew-import and restart active compute services";
+                return result;
+            }
+        }
+        else
+        {
+            tls.ca_file = args.pool_ca; tls.cert_file = args.pool_cert; tls.key_file = args.pool_key;
+        }
+        tls.read_only_membership = true; tls.max_frame_bytes = 65536; tls.deadline = deadline;
+        tls.timeout_ms = 1000;
+        require(args.max_ram > pool::BrokerClient::memory_bytes(1) + (4ULL << 20),
+            "compute inspection transport and bounded records exceed the available host memory");
+        std::vector<pool::Endpoint> brokers;
+        auto route = args.pool_broker;
+        if (route.empty() && identity) route = identity->defaults.broker;
+        if (!route.empty() && route != "auto") brokers.push_back(pool::parse_endpoint(route));
+        result.discovery = "not requested; explicit broker selected";
+        if (brokers.empty() && identity && identity->defaults.discovery && !expired())
+        {
+            pool::ComputeDiscovery discovery(discovery_options(*identity));
+            auto const until = std::min(deadline, Clock::now() + std::chrono::seconds(1));
+            while (!expired() && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            brokers = discovery.brokers(); result.discovery = discovery.status();
+        }
+        else if (brokers.empty()) result.discovery = "disabled in saved compute settings";
+        if (brokers.size() > 128) { brokers.resize(128); issue("", "broker discovery exceeded the bounded endpoint listing"); }
+        std::set<std::string> endpoints, workers;
+        bool generation_compatible = false, codec_compatible = false;
+        auto const generation_contract = group_grow::worker_compatibility(pool::Kind::GenerateAny);
+        auto const codec_contract = group_grow::worker_compatibility(pool::Kind::Pack);
+        require(!generation_contract.empty() && !codec_contract.empty(), "this build has no shared compute contract identities");
+        for (auto endpoint : brokers)
+        {
+            auto const address = endpoint_text(endpoint);
+            if (!endpoints.insert(address).second) continue;
+            if (expired()) { issue(address, "overall live inspection time budget exhausted"); break; }
+            if (!pool::numeric_host(endpoint.host))
+            {
+                issue(address, "hostname resolution is not deadline bounded; select a numeric broker route with its enrolled TLS server name"); continue;
+            }
+            endpoint.server_name = args.pool_server_name.empty() && identity ? identity->server_name : args.pool_server_name;
+            try
+            {
+                pool::BrokerClient base(endpoint, tls, 1); auto client = base.with_deadline(deadline);
+                uint64_t cursor = 0; unsigned remaining = 128;
+                do
+                {
+                    if (expired()) { issue(address, "overall live inspection time budget exhausted"); break; }
+                    auto page = client.status({pool::StatusSection::Workers, cursor, std::min(remaining, pool::max_status_page_size)});
+                    if (!cursor) { ++result.brokers; result.checked = true; }
+                    require(page.worker_records.size() <= remaining && (!page.next_cursor || page.next_cursor > cursor),
+                        "broker inspection exceeded its bounded status page");
+                    remaining -= unsigned(page.worker_records.size()); cursor = page.next_cursor;
+                    for (auto const& worker : page.worker_records)
+                    {
+                        if (workers.size() >= 128 && !workers.contains(worker.identity + ':' + worker.instance))
+                        { issue(address, "worker listing exceeded the bounded combined row limit"); break; }
+                        result.oldest_worker_registration_age_ms = std::max(result.oldest_worker_registration_age_ms, worker.seen_ms);
+                        if (!workers.insert(worker.identity + ':' + worker.instance).second) continue;
+                        ++result.workers;
+                        bool const offers_generation = worker.capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu));
+                        bool const offers_codec = worker.capabilities & pool::capability(pool::Kind::Pack);
+                        bool const generation = offers_generation && worker.compatibility == generation_contract;
+                        bool const codec = offers_codec && worker.codec_compatibility == codec_contract;
+                        generation_compatible = generation_compatible || generation; codec_compatible = codec_compatible || codec;
+                        if ((offers_generation && !generation) || (offers_codec && !codec)) ++result.incompatible;
+                        if (worker.admission == pool::WorkerAdmission::Accepting)
+                        { if (generation) ++result.accepting_generation; if (codec) ++result.accepting_codec; }
+                        else if (worker.admission == pool::WorkerAdmission::Paused) ++result.paused;
+                        else if (worker.admission == pool::WorkerAdmission::Draining) ++result.draining;
+                        else if (worker.admission == pool::WorkerAdmission::Drained) ++result.drained;
+                    }
+                    if (cursor && !remaining) issue(address, "worker listing truncated at the bounded row limit");
+                } while (cursor && remaining);
+            }
+            catch (std::exception const& error) { issue(address, error.what()); }
+        }
+        if (!result.checked)
+        {
+            result.status = "unavailable"; result.complete = false;
+            result.reason = brokers.empty() ? "no running broker route was observed; a future automatic session is not current availability" :
+                "no selected broker supplied an authenticated live observation";
+            result.next_action = "use compute service status and inspect the saved broker route, enrollment and network; retry status --live";
+        }
+        else if (!result.complete)
+        {
+            result.status = "partial"; result.reason = "the bounded live observation is incomplete; unobserved capacity remains unknown";
+        }
+        else if (!result.workers)
+        {
+            result.status = "no-workers"; result.blocking = true;
+            result.reason = "the authenticated brokers currently report no registered workers";
+            result.next_action = "inspect compute service status on the enrolled worker machines and restore the intended worker connection";
+        }
+        else if (!generation_compatible || !codec_compatible)
+        {
+            result.status = result.incompatible ? "incompatible-workers" : "work-capability-unavailable"; result.blocking = true;
+            result.reason = "the observed worker capabilities and contracts do not cover this build's generation and encoding work";
+            result.next_action = "use compatible worker generation and codec contracts, then retry status --live; producer build differences alone do not block compatible contracts";
+        }
+        else if (!result.accepting_generation || !result.accepting_codec)
+        {
+            result.status = "admission-closed"; result.blocking = true;
+            result.reason = "compatible workers were observed, but their paused or draining admission does not cover new generation and encoding work";
+            result.next_action = "use compute resume on the intended worker machine when it should accept new work; accepted tasks keep their reservations";
+        }
+        else
+        {
+            result.status = "compatible-workers-observed";
+            result.reason = "authenticated brokers report accepting workers with compatible generation and codec contracts";
+        }
+    }
+    catch (std::exception const& error)
+    {
+        result.status = "unavailable"; result.complete = false; result.reason = error.what();
+        result.next_action = "inspect compute status and the selected local enrollment, then retry status --live";
+    }
+    return result;
 }
 
 struct ComputeSession::Impl

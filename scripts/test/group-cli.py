@@ -34,6 +34,8 @@ def replot_rpc_fixture(args):
     assert len(args) in (5, 6) and args[0] == "--root-path" and args[2] == "rpc", args
     root = Path(args[1])
     fixture = json.loads((root / "fixture.json").read_text(encoding="utf-8"))
+    if fixture.get("rpc_delay_seconds"):
+        time.sleep(fixture["rpc_delay_seconds"])
     service, endpoint = args[3:5]
     assert service in ("harvester", "full_node", "farmer", "solver"), service
     assert service == "harvester" or not fixture.get("source_only"), "source reader used as a target service"
@@ -423,17 +425,24 @@ def check_farm_guided_plans(run, command, verify, root):
 
     capacity_dir = root / "guided capacity"
     capacity_dir.mkdir()
-    capacity_options = [*limits, "--group-members", 1, "--max-groups", 8, "--max-total-members", 8]
+    capacity_options = [*limits, "--group-members", 1, "--max-groups", 8, "--max-total-members", 8,
+                        "--farming-max-eligible-groups", 3]
+    capacity_baseline = json.loads(run("plan", capacity_dir, *capacity_options, "--json", code=2).stdout)
     capacity_review = root / "guided capacity.plan"
     capacity = json.loads(run("plan", capacity_dir, *capacity_options, "--alternative", "capacity",
                               "--save-plan", capacity_review, "--json").stdout)
-    assert capacity["feasible"] and capacity["capacity_search"] == "bounded-descending-nonmaximal"
+    assert capacity["feasible"] and capacity["capacity_search"] == "bounded-interval-refinement"
+    assert capacity["capacity_member_cap"] == capacity["alternative_after"]["members"] == 3
+    assert capacity["farming_profile"] == capacity_baseline["farming_profile"]
     assert capacity["alternative_after"]["members"] < capacity["alternative_before"]["members"]
     for field in ("memory_bytes", "max_eligible_groups", "harvester_cores", "lookup_workers", "deadline_seconds"):
         assert capacity["alternative_after"][field] == capacity["alternative_before"][field]
     assert not list(capacity_dir.iterdir())
     run("fill", capacity_review, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, *runtime, "--quiet")
     assert sum(header(path)[3] for path in capacity_dir.glob("*.gplot")) == capacity["alternative_after"]["members"]
+    completed_capacity = snapshot(capacity_dir)
+    run("fill", capacity_review, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, *runtime, "--quiet", code=2)
+    assert snapshot(capacity_dir) == completed_capacity, "a stale capacity preview changed committed work"
 
     before = snapshot(directory)
     upgrade = root / "guided metadata upgrade.plan"
@@ -1325,8 +1334,12 @@ def check(binary, root, reference=None):
     profile_before = profile_file.read_bytes(), profile_file.stat().st_mtime_ns
     run("plan", "--save-profile", profile_file, code=2)
     assert (profile_file.read_bytes(), profile_file.stat().st_mtime_ns) == profile_before
-    run("plan", *options, "--save-profile", root / "invalid profile.json", code=2)
-    assert not (root / "invalid profile.json").exists()
+    destination_profile = root / "destination profile.json"
+    destination_export = json.loads(run("plan", *options, "--save-profile", destination_profile, "--json").stdout)
+    assert json.loads(destination_profile.read_text(encoding="utf-8")) == destination_export["farming_profile"]
+    destination_before = snapshot(preview), snapshot(preview_peer)
+    run("plan", *options, "--save-profile", destination_profile, code=2)
+    assert (snapshot(preview), snapshot(preview_peer)) == destination_before
     imported = json.loads(run("plan", *options, "--harvester", profile_file, "--json").stdout)
     assert imported["harvester_cores"] == 3 and imported["memory_bytes"] == 256 * 1024 * 1024
     assert imported["farming_profile"] == exported["farming_profile"]
@@ -1627,6 +1640,33 @@ def check(binary, root, reference=None):
         assert digest(recovered) == expected, mode
         verify(recovered)
     print("PASS all construction engines recover to identical ordinary bytes and full proofs", flush=True)
+
+    # Explicit NUMA and mixed local selectors share the bounded executor path,
+    # without changing plot identity or requiring enrollment/listeners.
+    cpu = re.search(r"\[(cpu\d+)\]", devices).group(1)
+    selectors = [cpu]
+    gpu = re.search(r"^\s*\[(\d+)\].*MiB VRAM", devices, re.MULTILINE)
+    if gpu:
+        selectors.append("gpu" + gpu.group(1) + "," + cpu)
+    for selector in selectors:
+        memory = "8G" if "gpu" in selector else "512M"
+        local = ["plot", "-k", 18, *keys, "-S", SEED, "-o", root / ("local " + selector),
+                 "--group-members", 3, "--batch-members", 2, "--construction", "staged",
+                 *construction, "--devices", selector, "-M", memory, "--compute", "off", "--quiet"]
+        run(*local, point="stage-run-committed", code=86)
+        recovered = Path(run(*local, "--resume").stdout.strip())
+        assert digest(recovered) == expected, selector
+        verify(recovered)
+        manifest, = recovered.parent.glob("xchplot2-job-*.tsv")
+        run("batch", manifest, "--resume", *construction, "--devices", selector, "-M", memory, "--compute", "off", "--quiet")
+        assert digest(recovered) == expected
+    local_before = snapshot(preview), snapshot(preview_peer)
+    local_plan = json.loads(run("plan", *options, "--devices", cpu, "--json").stdout)
+    assert local_plan["feasible"] and local_plan["devices_requested"] == cpu
+    assert (snapshot(preview), snapshot(preview_peer)) == local_before
+    run("plan", *options, "--devices", cpu, "--compute-broker", "127.0.0.1:1", code=2)
+    run("plan", *options, "--devices", cpu, "--compute-local", "off", code=2)
+    print("PASS local device selection, shared limits, staged recovery and ordinary byte parity", flush=True)
 
     concise_grow = run("grow", grouped_one, "--max-members", 3, *construction)
     assert "[grow] 3 members" in concise_grow.stderr
@@ -2165,8 +2205,9 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == inventory_before and digest(source) == source_hash
 
     profile_file = directory / "mixed farm.json"
+    ordinary_reader_file = directory / "ordinary reader profile.json"
     profile = json.loads(run("plan", "--farming-cores", 1, "--farming-memory-bytes", "256M",
-                             "--save-profile", profile_file, "--json").stdout)["farming_profile"]
+                             "--save-profile", ordinary_reader_file, "--json").stdout)["farming_profile"]
     resources = catalog["farm_resources"]
     mib, ram = 1024 * 1024, 2 * 1024 * 1024 * 1024
     phase_cpu = min(2, len(os.sched_getaffinity(0)))
@@ -2208,6 +2249,102 @@ def check_replot(binary, root, reference=None):
                "--workers", 1, "--batch-members", 1, "--construction", "incremental", "--destination-temp", "off",
                "--devices", "cpu", "--compute", "off", "-M", ram, "--headroom-bytes", 0,
                "--capacity-bytes", ram + 256 * mib, "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    # Complete the same synthetic envelope through guided stable-ID settings.
+    # Its deliberately supplied bounds are fixture declarations, never local
+    # OS measurements or inferred proof/queue service costs.
+    setup_file = directory / "partial guided profile.json"
+    setup_options = [*options, "--max-total-members", resources["native"]["cohorts"][0]["max_members"],
+                     "--farming-cores", 1, "--farming-memory-bytes", "256M"]
+    cpu_setting = f"resources[{cpu}].capacity={phase_cpu},capacity_known=true,conditional_shared=true"
+    inventory_profile_file = directory / "ordinary reader and inventory profile.json"
+    ordinary_inventory = json.loads(run("plan", "--inventory", farm, "--harvester", ordinary_reader_file,
+                                        "--save-profile", inventory_profile_file, "--json").stdout)
+    inventory_profile = json.loads(inventory_profile_file.read_text(encoding="utf-8"))
+    assert inventory_profile["farming_profile"]["memory_bytes"] == profile["memory_bytes"]
+    assert all(not resource["capacity_known"] for resource in ordinary_inventory["farm_resources"]["resources"])
+    setup = json.loads(run("plan", farm, "--replot", inventory_file, *setup_options, "--harvester", ordinary_reader_file,
+                           "--resource-setting", cpu_setting, "--save-profile", setup_file, "--json").stdout)
+    assert setup["migration_setup"] and setup["feasible"] is None and setup["assessment_required"]
+    assert setup["resource_preparation"]["missing"]
+    continue_setup = shlex.split(setup["continue_setup_command"])
+    assert continue_setup[continue_setup.index("--harvester") + 1] == str(setup_file)
+    assert continue_setup[continue_setup.index("--max-total-members") + 1] == str(resources["native"]["cohorts"][0]["max_members"])
+    assert not any(setting.startswith(f"resources[{cpu}].") for setting in setup["resource_preparation"]["resource_settings"])
+    assert any(fact["basis"] == "observed" and fact["path"] == "local.available_memory_bytes"
+               for fact in setup["resource_preparation"]["facts"])
+    saved_setup = setup_file.read_bytes(), setup_file.stat().st_mtime_ns
+    reader_inputs = json.loads(setup_file.read_text(encoding="utf-8"))["farming_profile"]
+    for field in ("memory_bytes", "harvester_cores", "lookup_workers", "reader", "index_cache_bytes",
+                  "chain_seconds_per_member", "index_seconds_per_entry", "assumptions"):
+        assert reader_inputs[field] == profile[field]
+    guarded_setup = snapshot(farm)
+    invalid_setup = directory / "invalid guided profile.json"
+    run("plan", farm, "--replot", inventory_file, *setup_options, "--harvester", setup_file,
+        "--resource-setting", "resources[invented-capacity].capacity=999,capacity_known=true",
+        "--save-profile", invalid_setup, code=2)
+    assert not invalid_setup.exists() and snapshot(farm) == guarded_setup
+
+    def setting_fields(target, values):
+        return target + "." + ",".join(f"{name}={str(value).lower() if isinstance(value, bool) else value}"
+                                       for name, value in values.items())
+
+    settings = [setting_fields("profile", {name: resources[name] for name in ("source", "producer", "captured_at")}),
+                setting_fields("gate", resources["gate"])]
+    for resource in resources["resources"]:
+        settings.append(setting_fields(f"resources[{resource['id']}]", {
+            name: resource[name] for name in ("capacity", "capacity_known", "conditional_shared", "telemetry_required")}))
+    for workload in resources["workloads"]:
+        settings.append(setting_fields(f"workloads[{workload['id']}]", {
+            name: value for name, value in workload.items() if name not in ("id", "plot_count", "uses")}))
+        for use in workload["uses"]:
+            settings.append(setting_fields(f"workloads[{workload['id']}].uses[{use['resource']}]", {
+                name: value for name, value in use.items() if name != "resource"}))
+    native = resources["native"]
+    settings.append(setting_fields("native", {name: value for name, value in native.items() if not isinstance(value, (list, dict))}))
+    for name in ("output_resources", "source_resources"):
+        settings.append(setting_fields("native", {name: "|".join(native[name])}))
+    for name in ("construction", "verification", "supervision"):
+        for demand in native[name]:
+            settings.append(setting_fields(f"native.{name}[{demand['resource']}]", {
+                name: value for name, value in demand.items() if name != "resource"}))
+    for cohort in native["cohorts"]:
+        for name in ("new_farming", "proof_reserve"):
+            for demand in cohort[name]:
+                settings.append(setting_fields(f"native.cohorts[{cohort['max_members']}].{name}[{demand['resource']}]", {
+                    name: value for name, value in demand.items() if name != "resource"}))
+    guided_profile_file = directory / "completed guided profile.json"
+    guided = json.loads(run("plan", farm, "--replot", inventory_file, *setup_options, "--harvester", setup_file,
+                            *(argument for setting in settings for argument in ("--resource-setting", setting)),
+                            "--save-profile", guided_profile_file, "--json").stdout)
+    assert not guided["resource_preparation"]["resource_settings"]
+    assert all(need["group"] == "local-reader" for need in guided["resource_preparation"]["missing"])
+    assert (setup_file.read_bytes(), setup_file.stat().st_mtime_ns) == saved_setup and snapshot(farm) == guarded_setup
+    assert "farm_adapters" not in json.loads(guided_profile_file.read_text(encoding="utf-8"))
+    # This generated policy supplies the ordinary execution/recovery path below;
+    # the existing explicit CLI reader selection remains its local authority.
+    profile_file = guided_profile_file
+    bound_profile_file = directory / "saved local reader selection.json"
+    bound = json.loads(run("plan", farm, "--replot", inventory_file, *setup_options, *adapter,
+                           "--harvester", guided_profile_file, "--save-profile", bound_profile_file, "--json").stdout)
+    bound_profile = json.loads(bound_profile_file.read_text(encoding="utf-8"))
+    assert not bound["resource_preparation"]["missing"] and bound_profile["farm_adapters"]["routes"][0]["executable"] == str(executable)
+    bound_review_file = directory / "guided local reader review.plan"
+    bound_review = json.loads(run("plan", farm, "--replot", inventory_file, *options, "--harvester", bound_profile_file,
+                                  "--save-plan", bound_review_file, "--json").stdout)
+    assert bound_review["feasible"] and '"farm_adapters"' not in bound_review_file.read_text(encoding="utf-8")
+    assert "farm_adapters" not in catalog and snapshot(farm) == guarded_setup
+    gpu_setup_options = list(setup_options)
+    selected = gpu_setup_options.index("--devices")
+    del gpu_setup_options[selected:selected + 2]
+    gpu_setup = json.loads(run("plan", farm, "--replot", inventory_file, *gpu_setup_options,
+                               "--harvester", ordinary_reader_file, "--backend", "gpu", "--device", 7, "--tier", "compact",
+                               "--save-profile", directory / "unqualified gpu setup.json", "--json").stdout)
+    for field in ("next_command", "continue_setup_command"):
+        next_arguments = shlex.split(gpu_setup[field])
+        assert next_arguments[next_arguments.index("--device") + 1] == "7"
+        assert next_arguments[next_arguments.index("--tier") + 1] == "compact"
+    assert gpu_setup["feasible"] is None and not gpu_setup["farm_resources"]["native"]["max_gpu_bytes"]
+    assert snapshot(farm) == guarded_setup, "unqualified GPU setup started work or changed the farm"
     keys = ["-f", FARMER, "--pool-ph", POOL, "-S", SEED]
     external_profile = json.loads(json.dumps(profile))
     external_profile["farm_resources"]["native"].update(engine="external", scratch_resources=disks)
@@ -2373,6 +2510,17 @@ def check_replot(binary, root, reference=None):
     review_body = review_file.read_bytes()[:-65] + b"\n"
     review_file.write_bytes(review_body + hashlib.sha256(review_body).hexdigest().encode() + b"\n")
     saved_review = review_file.read_bytes(), review_file.stat().st_mtime_ns
+    status_options = ["plan", "--status", "--from-plan", review_file]
+    unstarted = json.loads(run(*status_options, "--json").stdout)
+    assert unstarted["diagnosis"]["status"] == "history-unknown" and unstarted["live_service_health"] == "not-queried"
+    unbound = json.loads(run(*status_options, "--live", "--compute", "off", "--json", code=2).stdout)
+    assert not unbound["services"]["checked"] and "no trusted local reader binding" in unbound["services"]["diagnosis"]["condition"]
+    public_live = json.loads(run(*status_options, "--live", "--compute", "off", "--farm-adapter", "chia", *adapter,
+                                 "--timeout-ms", 10000, "--json", code=2).stdout)
+    assert public_live["diagnosis"]["status"] == "history-unknown" and public_live["services"]["checked"]
+    assert not public_live["services"]["complete"] and public_live["services"]["diagnosis"]["status"] == "partial"
+    assert next(row for row in public_live["services"]["readers"] if row["role"] == "target")["status"] == "network-observed"
+    assert snapshot(farm) == before and (review_file.read_bytes(), review_file.stat().st_mtime_ns) == saved_review
     execute = ["fill", review_file, "--harvester", profile_file, *adapter, *options]
     for controls in (["--replot-verification", "structural"], ["--replot-proof-first-groups", 1]):
         run(*execute, *keys, *controls, code=2)
@@ -2465,6 +2613,26 @@ def check_replot(binary, root, reference=None):
     assert status["durable_phase"] == "replacing" and status["active_verified_stage"]
     assert status["active_full_proof_validated"] and status["active_replacement"]["full_proof_validated"]
     assert status["live_service_health"] == "not-queried" and status["blocking_reason"] is None
+    live_status_options = [*status_options, "--live", "--compute", "off", "--timeout-ms", 10000]
+    for failure, role in (("farmer_unavailable", "farmer"), ("solver_unavailable", "solver"), ("solver_stopped", "solver")):
+        flags(**{failure: True})
+        unavailable = json.loads(run(*live_status_options, "--json", code=2).stdout)
+        assert unavailable["read_only"] and not unavailable["inspection_complete"] and unavailable["diagnosis"]["blocking"]
+        assert role in unavailable["blocking_reason"] and unavailable["services"]["diagnosis"]["status"] == "unavailable"
+        assert unavailable["compute"]["diagnosis"]["status"] == "disabled" and snapshot(farm) == before_status
+    flags()
+    live_status = json.loads(run(*live_status_options, "--json").stdout)
+    assert live_status["inspection_complete"] and live_status["live_service_health"] == "prerequisites-observed"
+    assert live_status["diagnosis"]["status"] == "live-prerequisites-observed" and live_status["blocking_reason"] is None
+    assert "replacement acknowledgements" in live_status["services"]["diagnosis"]["unknowns"]
+    human_status = run(*live_status_options).stdout
+    assert live_status["diagnosis"]["condition"] in human_status and live_status["diagnosis"]["next_safe_action"] in human_status
+    flags(rpc_delay_seconds=5)
+    began = time.monotonic()
+    timed_out = json.loads(run(*status_options, "--live", "--compute", "off", "--timeout-ms", 100, "--json", code=2).stdout)
+    assert time.monotonic() - began < 2 and not timed_out["inspection_complete"]
+    assert "budget" in timed_out["services"]["diagnosis"]["condition"] and snapshot(farm) == before_status
+    flags(farmer_unavailable=True, solver_unavailable=True)
     verified_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "verified_stage")
     assert status["active_replacement"]["current_native_observation"] == f"matching-verified-stage-native-{verified_authority}"
     assert snapshot(farm) == before_status, "status changed saved progress or native objects"

@@ -51,6 +51,8 @@ function(pos2_pool_targets upstream_dir grow_include)
     target_link_libraries(compute_discovery_test PRIVATE pos2_pr118_grow_network)
 
     add_library(pos2_pr118_grow_worker_host STATIC "${repo_dir}/src/host/ComputeWorker.cpp"
+        "${repo_dir}/src/host/ComputeCompatibility.cpp"
+        "${repo_dir}/src/host/NumaTopology.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
     add_executable(pos2_pr118_grow_worker "${repo_dir}/tools/xchplot2/compute_worker.cpp")
     target_link_libraries(pos2_pr118_grow_worker PRIVATE pos2_pr118_grow_worker_host)
@@ -89,6 +91,9 @@ function(pos2_pool_targets upstream_dir grow_include)
     endif()
     target_link_options(pos2_pr118_grow_worker_test PRIVATE ${multiple_definitions})
     foreach(target pos2_pr118_grow_worker_host pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test)
+        if(NOT target STREQUAL "pos2_pr118_grow_worker_host")
+            target_sources(${target} PRIVATE "${repo_dir}/src/host/ComputeCompatibility.cpp" "${repo_dir}/src/host/NumaTopology.cpp")
+        endif()
         target_compile_features(${target} PRIVATE cxx_std_20)
         target_include_directories(${target} BEFORE PRIVATE "${worker_include}"
             "${upstream_dir}/src" "${upstream_dir}/src/plot" "${repo_dir}/keygen-rs/include")
@@ -117,4 +122,37 @@ function(pos2_pool_targets upstream_dir grow_include)
             target_compile_options(${target} PRIVATE -march=armv8-a+crypto)
         endif()
     endforeach()
+    # The construction cross-build fixture uses a real fork/exec boundary on
+    # Unix. Independently compiled contracts let a differently identified
+    # worker exercise the ordinary broker and bulk data paths.
+    if(UNIX)
+        add_executable(compute_compatibility_test "${repo_dir}/tools/parity/compute_compatibility_test.cpp"
+            $<TARGET_OBJECTS:pos2_pr118_grow_worker_reference>)
+        target_compile_features(compute_compatibility_test PRIVATE cxx_std_20)
+        target_include_directories(compute_compatibility_test BEFORE PRIVATE
+            "${worker_include}" "${upstream_dir}/src" "${repo_dir}/keygen-rs/include")
+        target_link_libraries(compute_compatibility_test PRIVATE pos2_pr118_grow_worker_host)
+        target_link_options(compute_compatibility_test PRIVATE ${multiple_definitions})
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+            target_compile_options(compute_compatibility_test PRIVATE -maes -msse4.1 -mssse3 -msse2)
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+            target_compile_options(compute_compatibility_test PRIVATE -march=armv8-a+crypto)
+        endif()
+        foreach(variant compatible generation task codec representation)
+            set(target "compute_compatibility_${variant}")
+            add_executable(${target} "${repo_dir}/tools/parity/compute_compatibility_test.cpp"
+                "${repo_dir}/src/host/ComputeCompatibility.cpp")
+            target_compile_features(${target} PRIVATE cxx_std_20)
+            target_include_directories(${target} BEFORE PRIVATE "${worker_include}" "${upstream_dir}/src")
+            target_link_libraries(${target} PRIVATE pos2_pr118_grow_worker_host)
+            target_compile_definitions(${target} PRIVATE GROW_COMPUTE_FIXTURE_WORKER=1
+                "GROW_COMPUTE_PRODUCER_BUILD=\"compute-fixture-${variant}\"")
+            if(NOT variant STREQUAL "compatible")
+                string(TOUPPER "${variant}" contract)
+                target_compile_definitions(${target} PRIVATE "GROW_COMPUTE_${contract}_IDENTITY=\"incompatible-${variant}\"")
+            endif()
+            set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+            add_dependencies(compute_compatibility_test ${target})
+        endforeach()
+    endif()
 endfunction()

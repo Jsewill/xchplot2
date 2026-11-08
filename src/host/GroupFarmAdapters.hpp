@@ -673,7 +673,7 @@ public:
         calibration_process::Limits limits{options_.limits.memory_bytes / 2, std::min(uint64_t(remaining), options_.limits.timeout_ms),
             std::min(options_.limits.max_output_bytes, options_.limits.memory_bytes / 64), options_.limits.cancelled};
         auto result = run_farm_adapter(command, limits);
-        require(result.exit_code == 0, "native farm RPC failed (native output withheld)"); unchanged();
+        require(result.exit_code == 0, "native " + std::string(service) + " RPC failed (native output withheld)"); unchanged();
         if (command.operation == AdapterOperation::reader_cli_version)
         {
             auto text = std::string_view(result.output);
@@ -686,7 +686,7 @@ public:
         }
         auto parsed = profile_detail::JsonReader(result.output, options_.limits.memory_bytes / 8, options_.limits.memory_bytes / 4096).read();
         auto const* success = profile_detail::field(parsed, "success");
-        require(success && profile_detail::boolean(*success), "native farm RPC did not report success"); return parsed;
+        require(success && profile_detail::boolean(*success), "native " + std::string(service) + " RPC did not report success"); return parsed;
     }
     std::string source() const
     {
@@ -1215,6 +1215,41 @@ inline FarmAdapterTable read_farm_adapters(std::istream& in, InventoryLimits con
 {
     inventory_detail::validate_limits(limits); auto text = profile_detail::read_text(in, std::min(limits.max_output_bytes, limits.memory_bytes / 16));
     auto parsed = profile_detail::JsonReader(text, limits.memory_bytes / 2).read(); return parse_farm_adapters(parsed, limits);
+}
+// Local profile export only. Public inventories and migration reviews retain
+// reader provenance but never serialize executable/configuration authority.
+inline void write_farm_adapters_json(std::ostream& out, FarmAdapterTable const& table)
+{
+    inventory_detail::require(!table.routes.empty() && table.routes.size() <= 64, "invalid local farm adapter export scope");
+    auto quote = [&](std::string const& text) { pos2gpu::write_json_string(out, text); };
+    out << "{\"schema\":1,\"target_route\":"; quote(table.target_route); out << ",\"routes\":["; bool comma = false;
+    for (auto const& route : table.routes)
+    {
+        if (comma) out << ','; comma = true;
+        auto const& options = route.options;
+        inventory_detail::require(options.root.is_absolute() && options.executable.is_absolute(), "local farm adapter export requires explicit absolute reader/configuration paths");
+        out << "{\"id\":"; quote(route.id); out << ",\"kind\":";
+        quote(options.kind == HarvesterAdapterKind::gigahorse ? "gigahorse" : options.kind == HarvesterAdapterKind::drchia ? "drchia" : "chia");
+        out << ",\"root\":"; quote(file_io::path_text(options.root)); out << ",\"executable\":"; quote(file_io::path_text(options.executable));
+        out << ",\"host\":"; quote(options.host); out << ",\"source_roots\":["; bool source_comma = false;
+        for (auto const& root : route.source_roots) { if (source_comma) out << ','; source_comma = true; quote(root); }
+        out << ']';
+        if (!options.services.empty())
+        {
+            out << ",\"services\":{"; bool service_comma = false;
+            for (auto const& [role, binding] : options.services)
+            {
+                if (service_comma) out << ','; service_comma = true; quote(role); out << ":{\"root\":"; quote(file_io::path_text(binding.root));
+                out << ",\"rpc_host\":"; quote(binding.rpc_host); out << ",\"host\":"; quote(binding.host);
+                if (!binding.node_id.empty()) { out << ",\"node_id\":"; quote(binding.node_id); }
+                if (!binding.farmer_node_id.empty()) { out << ",\"farmer_node_id\":"; quote(binding.farmer_node_id); }
+                out << '}';
+            }
+            out << '}';
+        }
+        out << '}';
+    }
+    out << "]}";
 }
 inline HarvesterAdapterOptions resolve_source(FarmAdapterTable const& table, InventoryRoot const& root, InventoryPlot const& plot)
 {

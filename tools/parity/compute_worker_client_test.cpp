@@ -274,6 +274,7 @@ void network_deadlines()
         RunningBroker broker(options);
         StalledPeer peer(tls);
         pool::WorkerOffer offer; offer.instance = pool::random_token(); offer.compatibility = worker_compatibility();
+        offer.codec_compatibility = worker_compatibility(pool::Kind::Pack);
         offer.endpoint = peer.listener.endpoint(); offer.capacity = {1, 1, uint64_t(128) << 20, 0};
         offer.capabilities = pool::capability(pool::Kind::Pack);
         pool::BrokerClient control(broker.server.endpoint(), tls); control.register_worker(offer);
@@ -447,13 +448,14 @@ void expired_cleanup()
     auto offer = [&]
     {
         pool::WorkerOffer value; value.instance = pool::random_token(); value.compatibility = worker_compatibility();
+        value.codec_compatibility = worker_compatibility(pool::Kind::Pack);
         value.endpoint = {"127.0.0.1", 1}; value.capacity = {1, 1, uint64_t(128) << 20, 0};
         value.capabilities = pool::capability(pool::Kind::Pack); return value;
     };
     auto following = [&](pool::BrokerClient& controller, uint64_t bytes)
     {
         auto owner = controller.open_owner("following-cleanup-owner");
-        pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility();
+        pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack);
         task.kind = pool::Kind::Pack; task.k = 18; task.strength = 2; task.resources = {1, 1, bytes, 0};
         task.chunk_count = 1; task.max_output_bytes = 1;
         task.work_units = pool::codec_window_header_bytes + pool::codec_chunk_header_bytes;
@@ -543,6 +545,7 @@ void generation_admission()
     pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
     RunningBroker broker(options); StalledPeer peer(tls);
     pool::WorkerOffer offer; offer.instance = pool::random_token(); offer.compatibility = worker_compatibility();
+    offer.codec_compatibility = worker_compatibility(pool::Kind::Pack);
     offer.endpoint = peer.listener.endpoint(); offer.capacity = {2, 2, uint64_t(2) << 30, 0};
     offer.capabilities = pool::capability(pool::Kind::GenerateCpu);
     pool::BrokerClient controller(broker.server.endpoint(), tls); controller.register_worker(offer);
@@ -623,6 +626,7 @@ void protected_admission()
     auto unregistered_config = offered; unregistered_config.broker = {};
     WorkerService unregistered(unregistered_config); unregistered.start();
     pool::WorkerOffer stale; stale.instance = pool::random_token(); stale.compatibility = worker_compatibility();
+    stale.codec_compatibility = worker_compatibility(pool::Kind::Pack);
     stale.endpoint = unregistered.endpoint(); stale.capacity = unregistered.status().capacity;
     stale.capabilities = pool::capability(pool::Kind::GenerateCpu); stale.generation_threads = 1;
     pool::BrokerClient controller(broker.server.endpoint(), tls); controller.register_worker(stale);
@@ -726,6 +730,113 @@ void codec_window_limits()
     service.stop();
 }
 
+void local_only_parallel()
+{
+    auto scheduler = std::make_shared<CodecScheduler>(1);
+    WorkerConfig offer; offer.capacity = {1, 1, uint64_t(256) << 20, 0}; offer.generation_threads = 1;
+    offer.max_task_bytes = uint64_t(1) << 20; offer.tls.max_frame_bytes = 4096; offer.cpu_scheduler = scheduler;
+    auto const original_affinity = pos2gpu::current_thread_cpus();
+    if (!original_affinity.empty()) offer.cpu_affinity = {original_affinity.front()};
+    std::array<std::shared_ptr<WorkerService>, 2> services{
+        std::make_shared<WorkerService>(offer), std::make_shared<WorkerService>(offer)};
+    std::atomic<unsigned> next{0}, selected{0}, observed{0}, entered{0};
+    WorkerClientConfig config; config.local_only = true; config.max_active_generation = 2;
+    config.local_service_provider = [&] { return services[next.fetch_add(1) % services.size()]; };
+    config.admit_task = [&](WorkerTaskAdmission const& value)
+    {
+        require(value.worker.identity.empty() && value.owner_identity.empty() && value.broker_identity.empty() &&
+            !value.local_fallback && value.task.resources.cpu_threads == 1 && value.task.resources.host_bytes,
+            "private local admission acquired an identity or lost its concrete resource bound");
+    };
+    config.selected = [&](WorkerTaskObservation const& value)
+    { require(value.local_direct && value.kind == pool::Kind::GenerateCpu, "private local selection lost its backend"); ++selected; };
+    config.observe = [&](WorkerTaskObservation const& value)
+    { require(value.local_direct && value.elapsed_ns && !value.input_bytes && !value.output_bytes,
+        "private local observation counted nonexistent transport traffic"); ++observed; };
+    WorkerClient client(config);
+    require(client.local_available() && !next.load(), "private local availability advanced its lane provider");
+    require(client.suggested_batch_members(18, 2, 8) == 1 && client.suggested_generation_concurrency(18, 2, 8) == 2,
+        "private local hints did not preserve singleton lane concurrency");
+    auto missing = config; missing.local_service_provider = {}; rejects([&] { WorkerClient invalid(missing); });
+    std::array<uint8_t, 32> id{};
+    std::promise<void> release; auto finish = release.get_future().share();
+    auto collect = [&]
+    {
+        std::unique_ptr<CompactMemberReceiver> receiver;
+        client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t count)
+        {
+            if (!receiver)
+            { receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count)); ++entered; finish.wait(); }
+            receiver->append(tile);
+        });
+        require(bool(receiver), "private local generation emitted no member"); return receiver->finish();
+    };
+    std::future<Member> first, second; bool shared_gate = false;
+    {
+        CodecScheduler::Lease pressure(scheduler.get());
+        first = std::async(std::launch::async, collect); second = std::async(std::launch::async, collect);
+        auto const until = Clock::now() + std::chrono::seconds(1);
+        while (selected.load() != 2 && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        shared_gate = selected.load() == 2 && !entered.load();
+    }
+    auto const until = Clock::now() + std::chrono::seconds(3);
+    while (entered.load() != 2 && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    bool const parallel = entered.load() == 2;
+    bool bounded = true;
+    for (auto const& service : services)
+    {
+        auto const status = service->status();
+        bounded = bounded && status.accepted_tasks == 1 && status.active.slots == 1 && status.active.host_bytes &&
+            status.active.host_bytes <= offer.capacity.host_bytes - status.baseline_host_bytes;
+    }
+    release.set_value(); auto left = first.get(), right = second.get();
+    require(shared_gate && parallel && bounded, "private local lanes bypassed shared CPUs, serialized consumers or exceeded RAM partitions");
+    auto values = [](Member const& member)
+    {
+        std::vector<uint64_t> result; auto view = member.view();
+        for (uint64_t ordinal = 0; ordinal < PlotGroupFile::getChunkCountForK(18); ++ordinal)
+            for (auto value : view.region(ordinal)) result.push_back(value);
+        return result;
+    };
+    require(!left.empty() && values(left) == values(right), "private local parallel output disagreed between lanes");
+    auto stats = client.stats();
+    require(stats.completed_generation == 2 && stats.local_tasks == 2 && stats.peak_active_generation == 2 &&
+        !stats.input_bytes && !stats.output_bytes && !stats.failed_tasks && observed.load() == 2,
+        "private local completion or parallel admission statistics changed");
+    auto view = left.view(); ChunkCodec canonical(18, uint64_t(4) << 20); uint64_t chunks = 0;
+    client.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+    {
+        auto region = view.region(ordinal); auto expected = canonical.encode(ordinal, {}, 0, {&region, 1});
+        require(ordinal == chunks++ && members == 1 && std::ranges::equal(bytes, expected),
+            "private local contribution changed canonical encoding");
+    });
+    require(chunks == PlotGroupFile::getChunkCountForK(18) && client.stats().completed_contributions == 1 &&
+        pos2gpu::current_thread_cpus() == original_affinity, "private local CPU affinity leaked or contributions were truncated");
+    std::future<bool> cancelled; bool completed = false;
+    {
+        CodecScheduler::Lease pressure(scheduler.get());
+        cancelled = std::async(std::launch::async, [&]
+        {
+            auto const affinity = pos2gpu::current_thread_cpus(); bool rejected = false;
+            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
+            try { client.generate(18, 2, id, [](auto const&, auto) {}, cancel); }
+            catch (worker_detail::TaskCancelled const&) { rejected = true; }
+            return rejected && pos2gpu::current_thread_cpus() == affinity;
+        });
+        completed = cancelled.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
+    require(cancelled.get() && completed, "private local CPU admission ignored cancellation or leaked affinity");
+    rejects([&] { (void)client.encode(18, {}, 4096); });
+    auto const before_pause = client.stats();
+    for (auto const& service : services) service->control(WorkerControl::Pause);
+    rejects([&] { client.generate(18, 2, id, [](auto const&, auto) {}); });
+    for (auto const& service : services)
+    { auto status = service->status(); require(!status.accepted_tasks && !status.active.slots && !status.active.host_bytes,
+        "private local pause or completion retained task resources"); }
+    require(client.stats().completed_generation == stats.completed_generation && client.stats().failed_tasks == before_pause.failed_tasks + 1,
+        "paused private local task was counted as a completion");
+}
+
 void renewal_fence()
 {
     pool_test::Directory directory;
@@ -776,11 +887,76 @@ void renewal_fence()
     require(bool(following), "fenced renewal left compute resources charged after worker completion");
     controller.cancel(owner, task.task_id, task.attempt); service.stop();
 }
+void status_inspection()
+{
+    using pos2gpu::inspect_group_compute;
+    pool_test::Directory directory;
+    pos2gpu::GroupOptions args; args.max_ram = uint64_t(64) << 20;
+    args.pool_directory = pool_test::utf8_path(directory.path / "unconfigured");
+    auto inspect = [&] { return inspect_group_compute(args, Clock::now() + std::chrono::seconds(1)); };
+    auto absent = inspect();
+    require(!absent.configured && absent.status == "not-configured" && !std::filesystem::exists(directory.path / "unconfigured"),
+        "read-only compute inspection created enrollment for a missing setup");
+    auto enrolled = pool::create_pool(directory.path / "saved-intent", "status-intent");
+    auto defaults = enrolled.defaults; defaults.discovery = false; pool::configure_pool(enrolled, defaults);
+    pool::save_worker_intent(enrolled, pool::WorkerIntent::Paused);
+    args.pool_directory = pool_test::utf8_path(enrolled.directory);
+    auto local_intent = inspect();
+    require(local_intent.local_worker_intent == "paused" && !local_intent.checked && local_intent.status == "unavailable" &&
+        pool::load_worker_intent(enrolled) == pool::WorkerIntent::Paused,
+        "saved admission intent was reported as live capacity or changed by inspection");
+    auto ca = pool_test::issue(directory.path, "status-ca");
+    auto identity = pool_test::issue(directory.path, "status-host", &ca);
+    auto tls = pool_test::tls(ca, identity);
+    args.pool_ca = tls.ca_file; args.pool_cert = tls.cert_file; args.pool_key = tls.key_file;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    RunningBroker broker(options);
+    args.pool_broker = "127.0.0.1:" + std::to_string(broker.server.endpoint().port);
+    pool::BrokerClient control(broker.server.endpoint(), tls);
+    auto empty = inspect();
+    require(empty.checked && empty.complete && empty.blocking && empty.status == "no-workers",
+        "authenticated empty broker was reported as current compute capacity");
+    pool::WorkerOffer offer; offer.instance = pool::random_token(); offer.endpoint = {"127.0.0.1", 49101};
+    offer.capacity = {1, 1, uint64_t(32) << 20, 0};
+    offer.capabilities = pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::Pack);
+    offer.compatibility = "other-generation-contract"; offer.codec_compatibility = "other-codec-contract";
+    control.register_worker(offer);
+    auto incompatible = inspect();
+    require(incompatible.checked && incompatible.complete && incompatible.status == "incompatible-workers" && incompatible.blocking && incompatible.incompatible == 1,
+        "incompatible broker registrations appeared available to the selected build");
+    control.unregister_worker(offer.instance);
+    offer.compatibility = worker_compatibility(); offer.codec_compatibility = worker_compatibility(pool::Kind::Pack);
+    offer.admission = pool::WorkerAdmission::Paused; control.register_worker(offer);
+    auto paused = inspect();
+    require(paused.status == "admission-closed" && paused.paused == 1 && !paused.accepting_generation && !paused.accepting_codec && paused.next_action.find("compute resume") != std::string::npos,
+        "paused compatible workers appeared open to new work or lacked a concrete resume action");
+    control.worker_admission(offer.instance, pool::WorkerAdmission::Drained);
+    auto drained = inspect();
+    require(drained.status == "admission-closed" && drained.drained == 1 && !drained.accepting_generation,
+        "drained worker registration appeared open to new work");
+    control.worker_admission(offer.instance, pool::WorkerAdmission::Accepting);
+    auto accepting = inspect(); auto after = control.status();
+    require(accepting.status == "compatible-workers-observed" && accepting.accepting_generation == 1 && accepting.accepting_codec == 1 &&
+        !after.owners && !after.jobs, "status inspection created owner sessions/tasks or failed to report compatible admission");
+    args.pool_broker = "localhost:" + std::to_string(broker.server.endpoint().port);
+    auto hostname = inspect();
+    require(!hostname.complete && !hostname.checked && !hostname.issues.empty() && hostname.issues.front().reason.find("numeric") != std::string::npos,
+        "bounded inspection silently used unbounded hostname resolution");
+    {
+        StalledPeer peer(tls); args.pool_broker = "127.0.0.1:" + std::to_string(peer.listener.endpoint().port);
+        auto const began = Clock::now();
+        auto stalled = inspect_group_compute(args, began + std::chrono::milliseconds(100));
+        require(!stalled.checked && !stalled.complete && Clock::now() - began < std::chrono::seconds(1),
+            "live compute inspection waited beyond its overall budget for an unresponsive authenticated broker");
+    }
+    auto untouched = control.status();
+    require(!untouched.owners && !untouched.jobs, "failed inspection changed broker owner or work state");
+}
 } // namespace
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); session_memory_ownership(); codec_window_limits(); renewal_fence();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

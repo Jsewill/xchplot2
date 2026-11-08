@@ -616,6 +616,36 @@ void configure_pool(PoolIdentity const& pool, ComputeDefaults const& defaults)
     }
     catch (...) { std::error_code ignored; fs::remove(temporary, ignored); throw; }
 }
+WorkerIntent load_worker_intent(PoolIdentity const& pool)
+{
+    auto const path = pool.directory / "worker-control";
+    if (!fs::exists(fs::symlink_status(path))) return WorkerIntent::Active;
+    std::istringstream input(read_private(path));
+    std::string version, pool_id, node, intent;
+    require(bool(input >> version >> pool_id >> node >> intent) && version == "xchplot2-compute-control-1" &&
+        pool_id == pool.pool_id && node == pool.node_id, "worker control belongs to another pool or node");
+    input >> std::ws; require(input.eof(), "invalid saved worker control");
+    if (intent == "active") return WorkerIntent::Active;
+    if (intent == "paused") return WorkerIntent::Paused;
+    require(intent == "draining", "invalid saved worker intent"); return WorkerIntent::Draining;
+}
+void save_worker_intent(PoolIdentity const& pool, WorkerIntent intent)
+{
+    require(intent >= WorkerIntent::Active && intent <= WorkerIntent::Draining, "invalid worker intent");
+    PoolLock lock(pool.directory);
+    auto const current = load_pool(pool.directory);
+    require(current && current->pool_id == pool.pool_id && current->node_id == pool.node_id,
+        "worker control enrollment changed");
+    auto const value = intent == WorkerIntent::Active ? "active" : intent == WorkerIntent::Paused ? "paused" : "draining";
+    auto const encoded = "xchplot2-compute-control-1\n" + pool.pool_id + '\n' + pool.node_id + '\n' + value + '\n';
+    auto const temporary = pool.directory / ("worker-control.partial." + random_token());
+    try
+    {
+        write_private(temporary, encoded);
+        replace_file(temporary, pool.directory / "worker-control");
+    }
+    catch (...) { std::error_code ignored; fs::remove(temporary, ignored); throw; }
+}
 std::vector<PoolMember> pool_members(PoolIdentity const& pool)
 {
     auto ca = read_certificate(read_private(pool.directory / "ca.pem")); return saved_policy(pool.directory, ca.get()).members;

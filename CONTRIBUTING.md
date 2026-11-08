@@ -63,6 +63,17 @@ completed output with the pinned CPU reference. Legacy plans and checkpoints
 retain their original exact-build requirement, including after a compatible
 reader saves them again.
 
+Compute compatibility uses explicit identities in
+`src/host/ComputeCompatibility.cpp`. Bump `pool::protocol_version` for wire-format
+changes, the task identity for task semantics, the generation identity for
+canonical CPU/GPU output, the codec identity for chunk encoding/join behavior,
+and the representation identity for packed-field interpretation. Generation
+also depends on the codec contract because it can produce coencoded
+contributions. Source hashes identify producer provenance, not eligibility;
+resource profiles and supported task kinds are negotiated separately. The
+compatibility fixture independently links differing producer/contract variants,
+checks real generation/codec parity, and rejects incompatible leases.
+
 Kernel, sort, and plot-format changes must pass parity at k=22 and k=28.
 Output bytes must remain identical to the pinned CPU reference. The
 [GPU suites](#gpu-ci) cover tiers, spill variants, and capacity boundaries;

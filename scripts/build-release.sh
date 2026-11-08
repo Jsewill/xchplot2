@@ -141,6 +141,7 @@ host_tests=(
     group_farm_resources_test group_farm_metadata_test group_compute_resources_test
     compute_identity_test compute_membership_test compute_discovery_test
     compute_membership_network_test compute_worker_network_test
+    compute_compatibility_test
     pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test
     pos2_pr118_grow_external_test pos2_pr118_grow_checkpoint_compatibility_test
     pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test

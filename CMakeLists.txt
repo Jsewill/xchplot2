@@ -1229,7 +1229,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     set_target_properties(pos2_pr118_grow_gpu_packed_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
     target_link_libraries(pos2_pr118_grow_pool_owner_test PRIVATE pos2_keygen)
-    foreach(target pos2_pr118_grow_worker pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test)
+    foreach(target pos2_pr118_grow_worker pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test
+                   compute_compatibility_test compute_compatibility_compatible compute_compatibility_generation
+                   compute_compatibility_task compute_compatibility_codec compute_compatibility_representation)
+        if(NOT TARGET ${target})
+            continue()
+        endif()
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:xchplot2_group_gpu>)
         if(XCHPLOT2_BUILD_CUDA)
             target_sources(${target} PRIVATE $<TARGET_OBJECTS:pos2_gpu_cuda_obj>)

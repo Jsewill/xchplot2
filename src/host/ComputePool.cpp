@@ -76,7 +76,8 @@ std::vector<GenerationProfile> read_profiles(Reader& reader)
 }
 void write_offer(Writer& writer, WorkerOffer const& offer)
 {
-    writer.string(offer.instance); writer.string(offer.compatibility); write_endpoint(writer, offer.endpoint);
+    writer.string(offer.instance); writer.string(offer.compatibility); writer.string(offer.codec_compatibility);
+    writer.string(offer.producer_build); write_endpoint(writer, offer.endpoint);
     write_resources(writer, offer.capacity); writer.u64(offer.capacity_revision); writer.u32(offer.generation_threads); writer.u32(offer.capabilities); writer.u8(offer.min_k); writer.u8(offer.max_k);
     write_profiles(writer, offer.generation_profiles);
     writer.u32(offer.codec_limits.max_chunks); writer.u64(offer.codec_limits.max_task_bytes); writer.u8(uint8_t(offer.admission));
@@ -84,6 +85,7 @@ void write_offer(Writer& writer, WorkerOffer const& offer)
 WorkerOffer read_offer(Reader& reader)
 {
     WorkerOffer result; result.instance = reader.string(64); result.compatibility = reader.string(256);
+    result.codec_compatibility = reader.string(256); result.producer_build = reader.string(128);
     result.endpoint = read_endpoint(reader); result.capacity = read_resources(reader); result.capacity_revision = reader.u64(); result.generation_threads = reader.u32(); result.capabilities = reader.u32();
     result.min_k = reader.u8(); result.max_k = reader.u8(); result.generation_profiles = read_profiles(reader);
     result.codec_limits.max_chunks = reader.u32(); result.codec_limits.max_task_bytes = reader.u64();
@@ -349,6 +351,8 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
         if (result.section == StatusSection::Workers)
         {
             BrokerWorkerStatus value; value.identity = in.string(64); value.instance = in.string(64); value.compatibility = in.string(256);
+            value.codec_compatibility = in.string(256); value.producer_build = in.string(128);
+            value.capabilities = in.u32();
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
             result.worker_records.push_back(std::move(value));
@@ -558,7 +562,8 @@ struct BrokerServer::Impl
         auto const& task = job.requested;
         auto const& offer = worker.offer;
         auto reject = [&](WaitReason value) -> std::optional<Candidate> { if (reason) *reason = value; return {}; };
-        if (task.compatibility != offer.compatibility) return reject(WaitReason::Incompatible);
+        if (task.compatibility != (task.kind == Kind::Pack ? offer.codec_compatibility : offer.compatibility))
+            return reject(WaitReason::Incompatible);
         if (task.k < offer.min_k || task.k > offer.max_k) return reject(WaitReason::UnsupportedParameters);
         auto candidate = [&](Kind kind) -> std::optional<Candidate>
         {
@@ -855,6 +860,8 @@ struct BrokerServer::Impl
             {
                 auto reserved_capacity = worker.offer.capacity; subtract(reserved_capacity, capacity.at(identity));
                 response.string(identity); response.string(worker.offer.instance); response.string(worker.offer.compatibility);
+                response.string(worker.offer.codec_compatibility); response.string(worker.offer.producer_build);
+                response.u32(worker.offer.capabilities);
                 write_endpoint(response, worker.offer.endpoint);
                 write_resources(response, worker.offer.capacity); write_resources(response, reserved_capacity);
                 response.u8(uint8_t(worker.offer.admission));
@@ -999,7 +1006,9 @@ struct BrokerServer::Impl
         case Operation::Register:
         {
             auto offer = read_offer(reader); reader.finish();
-            require(identifier(offer.instance, 64) && identifier(offer.compatibility, 256) && !offer.endpoint.host.empty() &&
+            require(identifier(offer.instance, 64) && identifier(offer.compatibility, 256) &&
+                (!(offer.capabilities & capability(Kind::Pack)) || identifier(offer.codec_compatibility, 256)) &&
+                offer.producer_build.size() <= 128 && !offer.endpoint.host.empty() &&
                 offer.endpoint.port && offer.endpoint.host != "0.0.0.0" && offer.endpoint.host != "::" &&
                 offer.capacity.cpu_threads && offer.capacity.slots && offer.capacity.host_bytes && offer.capacity_revision &&
                 offer.admission >= WorkerAdmission::Accepting && offer.admission <= WorkerAdmission::Drained &&
@@ -1027,7 +1036,7 @@ struct BrokerServer::Impl
             else
             {
                 auto& saved = it->second.offer;
-                require(saved.compatibility == offer.compatibility &&
+                require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
                     saved.capabilities == offer.capabilities && saved.generation_threads == offer.generation_threads &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
                     "worker registration changed without a new instance");
@@ -1042,7 +1051,7 @@ struct BrokerServer::Impl
                 else if (offer.capacity_revision == saved.capacity_revision)
                     require(saved.capacity == offer.capacity && saved.generation_profiles == offer.generation_profiles &&
                         saved.endpoint == offer.endpoint, "capacity revision changed its value");
-                saved.admission = offer.admission; it->second.seen = Clock::now();
+                saved.admission = offer.admission; saved.producer_build = offer.producer_build; it->second.seen = Clock::now();
             }
             response.string(epoch); schedule(); break;
         }

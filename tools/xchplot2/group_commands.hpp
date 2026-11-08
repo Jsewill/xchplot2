@@ -18,6 +18,7 @@ inline unsigned group_option_values(std::string_view option)
         option == "--inventory" || option == "--no-inventory" ||
         option == "--status" || option == "--no-status" || option == "--revalidate" || option == "--no-revalidate" ||
         option == "--watch" || option == "--no-watch" || option == "--inspect" || option == "--no-inspect" ||
+        option == "--live" || option == "--no-live" ||
         option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" || option == "--replot-proof-worker" || option == "--replot-structure-worker" ||
         option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
         option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||

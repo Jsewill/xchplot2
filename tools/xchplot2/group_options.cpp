@@ -1,9 +1,15 @@
 #include "group_commands.hpp"
+#include "device_options.hpp"
 #include "host/GroupHarvesterProfile.hpp"
 #include "host/GroupFarmFile.hpp"
 #include "host/GroupFarmMetadata.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
+#include "host/NumaTopology.hpp"
+#include "gpu/DeviceIds.hpp"
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "gpu/SyclDeviceList.hpp"
+#endif
 #endif
 #include <algorithm>
 #include <climits>
@@ -36,6 +42,84 @@ uint64_t sum(uint64_t a, uint64_t b)
 { require(b <= UINT64_MAX - a, "byte count overflow"); return a + b; }
 uint64_t product(uint64_t a, uint64_t b)
 { require(!b || a <= UINT64_MAX / b, "byte count overflow"); return a * b; }
+void resolve_group_devices(pos2gpu::GroupOptions& result)
+{
+    if (result.devices.empty()) return;
+    pos2gpu::BatchOptions selection;
+    require(pos2gpu::parse_devices_arg(result.devices, selection), "invalid --devices selection");
+    // A single explicit GPU keeps the existing deferred admission: saved
+    // plans and publication-only recovery need not initialize that device.
+    if (!selection.use_all_devices && !selection.cpu_selected() && selection.device_ids.size() == 1)
+    {
+        result.backend = "gpu"; result.backend_set = true;
+        result.device = uint64_t(selection.device_ids.front());
+        if (auto const tier = selection.per_device_tier.find(int(result.device)); tier != selection.per_device_tier.end()) result.tier = tier->second;
+        return;
+    }
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    std::vector<pos2gpu::GroupLocalDevice> devices;
+    bool const cpu_nodes_explicit = !selection.cpu_node_ids.empty();
+    auto gpu_ids = selection.device_ids;
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (selection.use_all_devices || !gpu_ids.empty())
+    {
+        auto const available = pos2gpu::list_gpu_devices();
+        if (selection.use_all_devices)
+            for (auto const& device : available)
+                if (device.auto_dispatchable) gpu_ids.push_back(int(device.id));
+        std::sort(gpu_ids.begin(), gpu_ids.end());
+        gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
+        std::set<std::string> physical;
+        for (int id : gpu_ids)
+        {
+            auto const found = std::find_if(available.begin(), available.end(), [&](auto const& value) { return value.id == size_t(id); });
+            require(found != available.end(), "selected GPU is unavailable: " + pos2gpu::device_label(id));
+            require(found->physical_identity.empty() || physical.insert(found->physical_identity).second,
+                "selected GPU devices share one physical allocation; select one device per physical GPU");
+        }
+    }
+#else
+    require(gpu_ids.empty(), "selected GPU is unavailable in this build");
+#endif
+    for (int id : gpu_ids)
+    {
+        auto const tier = selection.per_device_tier.find(id);
+        devices.push_back({id, tier != selection.per_device_tier.end() ? tier->second :
+            selection.all_gpus_tier.empty() ? result.tier : selection.all_gpus_tier, {}});
+    }
+    if (selection.cpu_selected())
+    {
+        auto const nodes = pos2gpu::host_numa_nodes();
+        if (selection.use_all_cpu_nodes)
+            for (auto const& node : nodes) devices.push_back({pos2gpu::cpu_device_id(node.node_id), "auto", node.cpus});
+        else for (int id : selection.cpu_node_ids)
+        {
+            auto const found = std::find_if(nodes.begin(), nodes.end(), [&](auto const& node) { return node.node_id == id; });
+            require(found != nodes.end(), "selected CPU node is unavailable: cpu" + std::to_string(id));
+            devices.push_back({pos2gpu::cpu_device_id(id), "auto", found->cpus});
+        }
+    }
+    require(!devices.empty(), "no selected local producers are available; inspect xchplot2 devices");
+    require(devices.size() <= 1024, "too many selected local producers");
+    bool const cpu = std::any_of(devices.begin(), devices.end(), [](auto const& value) { return pos2gpu::is_cpu_device(value.device); });
+    bool const gpu = std::any_of(devices.begin(), devices.end(), [](auto const& value) { return !pos2gpu::is_cpu_device(value.device); });
+    result.backend = cpu && gpu ? "auto" : cpu ? "cpu" : "gpu"; result.backend_set = true;
+    if (devices.size() == 1 && !cpu_nodes_explicit)
+    {
+        if (gpu) { result.device = uint64_t(devices.front().device); result.tier = devices.front().tier; }
+    }
+    else result.local_devices = std::move(devices);
+#else
+    require(!selection.use_all_devices && selection.device_ids.size() <= 1 && selection.cpu_node_ids.empty() &&
+        !(selection.cpu_selected() && !selection.device_ids.empty()), "multiple local producers require the installed xchplot2 command");
+    result.backend = selection.cpu_selected() ? "cpu" : "gpu"; result.backend_set = true;
+    if (!selection.device_ids.empty())
+    {
+        result.device = uint64_t(selection.device_ids.front());
+        if (auto const tier = selection.per_device_tier.find(int(result.device)); tier != selection.per_device_tier.end()) result.tier = tier->second;
+    }
+#endif
+}
 void load_harvester_profile(pos2gpu::GroupOptions& result)
 {
     if (result.farming_detect_local)
@@ -178,6 +262,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     if (action) result.farm_action = command;
     bool literal = false;
     int progress = -1;
+    bool status_timeout_set = false;
     auto path = [](std::string const& value)
     { return fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal(); };
     auto destination = [&](std::string const& value)
@@ -194,6 +279,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     // Validate inspection's narrow input scope before options such as path
     // lists or local harvester detection can read anything beyond its source.
     bool metadata_only = false, assess_jobs = false, calibrate = false, calibration_worker = false, calibration_options = false, inventory = false, proof_worker = false, structure_worker = false, proof_options = false, proof_solves = false, replot_status = result.replot_status;
+    bool status_live = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string_view const key = argv[i];
@@ -206,6 +292,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         else if (key == "--no-inventory") inventory = false;
         else if (key == "--status") replot_status = true;
         else if (key == "--no-status") replot_status = command == "status";
+        else if (key == "--live") status_live = true;
+        else if (key == "--no-live") status_live = false;
         else if (key == "--calibrate") calibrate = true;
         else if (key == "--no-calibrate") calibrate = false;
         if (key == "--calibration-worker") calibration_worker = true;
@@ -225,12 +313,15 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             std::string_view const key = argv[i]; if (key == "--") break;
             if (!key.starts_with('-')) continue;
             require((replot_status && (key == "--status" || key == "--no-status" || key == "--from-plan" || key == "-F" ||
-                    key == "--watch" || key == "--no-watch" || key == "--inspect" || key == "--no-inspect")) ||
+                    key == "--watch" || key == "--no-watch" || key == "--inspect" || key == "--no-inspect" ||
+                    key == "--live" || key == "--no-live" || key == "--timeout-ms")) ||
+                (replot_status && status_live && (key == "--compute" || key == "--compute-directory" || key == "--compute-broker" ||
+                    key == "--harvester" || key == "--farm-adapter" || key == "--chia-root" || key == "--chia-executable")) ||
                 (action && (key == "--destination" || key == "--policy-only" || key == "--no-policy-only")) || key == "--manifest" ||
                 key == "--max-ram" || key == "-M" || key == "--json" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v",
                 action ? "farm control accepts only one job selector, --destination, --policy-only and display or memory controls" :
-                    "farm status accepts only a destination, saved plan or manifest and display or memory controls");
+                    "farm status accepts a job selector, display or memory controls, and explicit --live query inputs");
             auto const values = group_option_values(key);
             require(i + int(values) < argc, "missing value for " + std::string(key)); i += int(values);
         }
@@ -261,6 +352,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
                 (inventory && (key == "--inventory" || key == "--no-inventory" || key == "--save-plan" ||
                     key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable")) ||
+                (inventory && (key == "--resource-setting" || key == "--save-profile")) ||
                 (inventory && (key == "--farm-adapter" || key == "--farm-adapter-timeout-ms")) ||
                 (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
                 key == "--json" || (!calibration_worker && (key == "--max-ram" || key == "-M" || key == "--no-json" ||
@@ -291,6 +383,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--no-watch") { result.status_watch = false; continue; }
         if (key == "--inspect") { result.status_inspect = true; continue; }
         if (key == "--no-inspect") { result.status_inspect = false; continue; }
+        if (key == "--live") { result.status_live = true; continue; }
+        if (key == "--no-live") { result.status_live = false; continue; }
         if (key == "--revalidate") { result.replot_revalidate = true; continue; }
         if (key == "--no-revalidate") { result.replot_revalidate = false; continue; }
         if (key == "--calibrate") { result.calibrate = true; continue; }
@@ -363,6 +457,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 limit = number(value.c_str()); require(limit, key + " must be positive");
             }
             else if (key == "--save-profile") result.save_profile = path(value);
+            else if (key == "--resource-setting")
+            {
+                require(!value.empty() && value.size() <= 4096 && result.farming_resource_settings.size() < 4096,
+                    "invalid resource setting or too many resource settings");
+                result.farming_resource_settings.push_back(value);
+            }
+            else if (key == "--timeout-ms")
+            { result.status_timeout_ms = number(value.c_str()); status_timeout_set = true; }
             else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str());
             else if (key == "--replot-proof-cpus") result.replot_proof_cpus = number(value.c_str());
             else if (key == "--replot-proof-solves") result.replot_proof_solves = number(value.c_str());
@@ -496,8 +598,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--max-groups") { result.max_groups = number(value.c_str()); result.max_groups_set = true; }
             else if (key == "--max-total-members") { result.max_total_members = number(value.c_str()); result.max_total_members_set = true; }
             else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str()); result.checkpoint_set = true; }
-            else if (key == "--backend") { result.backend = value; result.backend_set = true; }
-            else if (key == "--device") result.device = number(value.c_str());
+            else if (key == "--backend") { result.backend = value; result.backend_set = true; result.devices.clear(); }
+            else if (key == "--device") { result.device = number(value.c_str()); result.devices.clear(); }
+            else if (key == "--devices" || key == "-d")
+            {
+                BatchOptions selection;
+                require(parse_devices_arg(value, selection), "invalid --devices selection");
+                result.devices = value;
+            }
             else if (key == "--tier") result.tier = value;
             else if (key == "--member-storage") result.member_storage = value;
             else if (key == "--construction") result.construction = value;
@@ -527,6 +635,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     }
     bool const farm_command = command == "fill" || command == "plan";
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
+    require(!result.status_live || result.replot_status, "--live requires status");
+    require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
+    require(result.status_timeout_ms >= 100 && result.status_timeout_ms <= 60000, "status timeout must be in 100..60000 ms");
+    require(result.farming_resource_settings.empty() || (command == "plan" && (result.inventory || !result.replot_inventory.empty()) &&
+        result.from_plan.empty() && !result.replot_status && !result.metadata_only && !result.assess_jobs && !result.calibrate),
+        "--resource-setting requires plan --inventory or a fresh plan --replot setup");
     require(result.action_destinations.empty() || action, "--destination requires pause, drain, resume or retire");
     require(!result.policy_only || action, "--policy-only requires pause, drain, resume or retire");
     bool const guided = !result.farming_alternative.empty() || result.upgrade_job;
@@ -557,6 +671,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--discover-drives selects plan or fill destinations; omit saved previews and inspection modes");
     if (result.replot_status || action)
     {
+        require(result.compute_mode == "auto" || result.compute_mode == "off", "--compute requires auto or off");
+        require(result.farm_adapter == "chia" || result.farm_adapter == "gigahorse" || result.farm_adapter == "drchia",
+            "--farm-adapter requires chia, gigahorse or drchia");
         require(result.destinations.empty() && (result.target.empty() || (result.from_plan.empty() && result.manifest.empty())) &&
             (result.from_plan.empty() || result.manifest.empty()), action ? "farm control requires one job selector" :
                 "farm status requires one destination or saved plan");
@@ -679,10 +796,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.from_plan.empty() || (result.target.empty() && result.destinations.empty() &&
         result.manifest.empty() && result.relocations.empty() && !result.resume && !result.extend && !result.update && !result.allow_missing),
         "--from-plan supplies the saved destinations and action; omit other job selectors");
-    require(result.save_profile.empty() || (farm_command && result.plan_only && result.target.empty() &&
-        result.destinations.empty() && result.mounts_under.empty() && result.save_plan.empty() && result.from_plan.empty() && result.manifest.empty() &&
+    require(result.save_profile.empty() || (command == "plan" && result.plan_only &&
+        (result.replot_inventory.empty() || result.save_plan.empty()) && result.from_plan.empty() && result.manifest.empty() &&
         result.relocations.empty() && !result.resume && !result.extend && !result.update && !result.allow_missing),
-        "export a harvester profile with plan --save-profile FILE, without a destination or saved job");
+        "export a harvester profile with plan --save-profile FILE, without an existing job; migration setup cannot also save a reviewed plan");
     require((!result.farming_detect_local && result.farming_profile_path.empty() &&
         result.chia_root.empty() && result.chia_executable.empty()) || farm_command,
         "harvester profiles require plan or fill");
@@ -757,21 +874,25 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(!result.strength || *result.strength <= 255, "invalid strength");
     require(!result.meta || *result.meta <= 255, "invalid meta group");
     load_harvester_profile(result);
+    resolve_group_devices(result);
+    require(result.local_devices.empty() || (result.replot_inventory.empty() &&
+        (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
+        "migration uses its reviewed single-producer resources; select --backend cpu or --devices gpuN for migration");
 #ifdef XCHPLOT2_GROUP_COMMANDS
-    if (result.save_profile.empty()) prepare_group_compute(result);
+    if (result.save_profile.empty() || !result.local_devices.empty()) prepare_group_compute(result);
 #endif
     bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
         !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||
         result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram || !result.pool_codec_auto;
-    require(!pool_options || !result.pool_broker.empty(), command.empty() ? "network compute options require --pool-broker" : "network compute options require --compute-broker");
-    if (!result.pool_broker.empty())
+    require(!pool_options || !result.pool_broker.empty() || result.local_compute, command.empty() ? "network compute options require --pool-broker" : "network compute options require --compute-broker");
+    if (!result.pool_broker.empty() || result.local_compute)
     {
         if (!result.backend_set) result.backend = "auto";
 #if !defined(GROW_POOL_NETWORK) || !GROW_POOL_NETWORK
         require(false, "network compute is unavailable in this build");
 #endif
-        require(!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
-            !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty(),
+        require(result.local_compute || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
+            !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty()),
             command.empty() ? "network compute requires a stable --pool-owner-id and mutual TLS credentials" : "network compute requires a stable --compute-owner-id and mutual TLS credentials");
         require(result.fixtures.empty(), "network compute cannot use fixture inputs");
         require(result.pool_inflight && result.pool_inflight <= 1024 && result.pool_timeout_ms &&
@@ -782,7 +903,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "network codec source window exceeds the portable task bound");
         bool const offer = !result.pool_listen.empty() || !result.pool_advertise.empty() ||
             result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram;
-        require(!offer || ((result.automatic_compute || (!result.pool_listen.empty() && !result.pool_advertise.empty())) &&
+        require(!offer || ((result.local_compute || result.automatic_compute || (!result.pool_listen.empty() && !result.pool_advertise.empty())) &&
             result.pool_offer_ram && result.pool_offer_cpus),
             "offering local compute requires listen, advertise, RAM and CPU grants");
         unsigned const workers = result.workers ? unsigned(result.workers) : std::max(1u, std::thread::hardware_concurrency());
@@ -795,7 +916,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "local compute offer must leave CPU capacity for receiving and storage");
         require(result.pool_offer_backend == "cpu" || result.pool_offer_backend == "gpu" || result.pool_offer_backend == "auto",
             command.empty() ? "--pool-offer-backend requires cpu, gpu or auto" : "--compute-offer-backend requires cpu, gpu or auto");
-        require(!offer || result.automatic_compute || result.pool_offer_backend == "cpu" || result.pool_offer_vram,
+        require(!offer || result.local_compute || result.automatic_compute || result.pool_offer_backend == "cpu" || result.pool_offer_vram,
             command.empty() ? "a local GPU offer requires --pool-offer-vram" : "a local GPU offer requires --compute-offer-vram");
         require(result.pool_offer_ram < result.max_ram && result.max_ram - result.pool_offer_ram >= 16 * mib,
             "local compute offer leaves insufficient owner RAM");

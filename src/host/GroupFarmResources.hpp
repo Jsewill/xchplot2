@@ -163,6 +163,8 @@ struct ResourcePreparation
 {
     std::vector<ResourcePreparationFact> facts;
     std::vector<ResourcePreparationNeed> missing;
+    std::vector<std::string> resource_settings;
+    bool settings_limited = false;
 };
 inline constexpr size_t max_preparation_entries = 4096;
 struct Stage
@@ -896,12 +898,15 @@ inline uint64_t resource_preparation_memory(ResourcePreparation const& value)
         for (auto const* field : {&fact.path, &fact.value, &fact.basis, &fact.source, &fact.scope}) string(*field);
     for (auto const& need : value.missing)
         for (auto const* field : {&need.group, &need.path, &need.action}) string(*field);
+    bytes = add(bytes, multiply(value.resource_settings.capacity(), sizeof(std::string)));
+    for (auto const& setting : value.resource_settings) string(setting);
     return bytes;
 }
 inline void validate_resource_preparation(ResourcePreparation const& value)
 {
     using namespace resource_detail;
-    require(value.facts.size() <= max_preparation_entries && value.missing.size() <= max_preparation_entries,
+    require(value.facts.size() <= max_preparation_entries && value.missing.size() <= max_preparation_entries &&
+        value.resource_settings.size() <= max_preparation_entries,
         "resource preparation report exceeds its entry bound");
     auto field_text = [&](std::string const& value)
     { require(!value.empty() && value.size() <= 4096, "invalid resource preparation text"); };
@@ -913,6 +918,112 @@ inline void validate_resource_preparation(ResourcePreparation const& value)
     }
     for (auto const& need : value.missing)
         for (auto const* field : {&need.group, &need.path, &need.action}) field_text(*field);
+    for (auto const& setting : value.resource_settings) field_text(setting);
+}
+inline void prepare_resource_settings(Profile const& profile, ResourcePreparation& result)
+{
+    using namespace resource_detail;
+    Graph graph(profile);
+    auto offer = [&](std::string const& target, std::vector<std::pair<std::string_view, std::string>> const& fields)
+    {
+        if (fields.empty()) return;
+        if (result.resource_settings.size() == max_preparation_entries) { result.settings_limited = true; return; }
+        std::string setting = target + '.';
+        for (auto const& [field, value] : fields) { if (setting.back() != '.') setting += ','; setting += field; setting += '='; setting += value; }
+        if (setting.size() > 4096) { result.settings_limited = true; return; }
+        result.resource_settings.push_back(std::move(setting));
+    };
+    for (auto const& resource : profile.resources) if (!resource.capacity_known)
+        offer("resources[" + resource.id + "]", {{"capacity", memory(resource.kind) ? "OFFERED_BYTES" : "OFFERED_LANES"}, {"capacity_known", "true"}});
+    auto unknown = [](std::string const& value) { return value.empty() || value == "unknown"; };
+    for (auto const& workload : profile.workloads)
+    {
+        auto const target = "workloads[" + workload.id + "]";
+        std::vector<std::pair<std::string_view, std::string>> fields;
+        if (workload.cost == CostKind::unknown) fields.emplace_back("cost", "serialized");
+        if (!workload.bounded) fields.emplace_back("bounded", "true");
+        if (!workload.scope_complete) fields.emplace_back("scope_complete", "true");
+        for (auto const& [name, value] : {std::pair{"format", &workload.format}, {"decoder", &workload.decoder},
+            {"decoder_version", &workload.decoder_version}, {"backend", &workload.backend}, {"pool_difficulty", &workload.pool_difficulty}})
+            if (unknown(*value) || (std::string_view(name) == "format" && value->ends_with("/unknown"))) fields.emplace_back(name, "DECLARED_VALUE");
+        if (unknown(workload.source) || workload.source == "inventory-template") fields.emplace_back("source", "DECLARATION_SOURCE");
+        if (workload.plot_count)
+            for (auto const& [name, value] : {std::pair{"quality_burst", workload.quality_burst}, {"proof_burst", workload.proof_burst},
+                {"future_quality_burst", workload.future_quality_burst}, {"future_proof_burst", workload.future_proof_burst},
+                {"period_us", workload.period_us}, {"deadline_us", workload.deadline_us}})
+                if (!value) fields.emplace_back(name, std::string_view(name).ends_with("_us") ? "BOUND_US" : "MAX_REQUESTS");
+        if (workload.cost == CostKind::reservation && !workload.response_tail_us) fields.emplace_back("response_tail_us", "WHOLE_RESPONSE_BOUND_US");
+        offer(target, fields);
+        for (auto const& use : workload.uses)
+        {
+            fields.clear(); auto const kind = graph.resources[graph.find(use.resource)].kind;
+            if (memory(kind))
+            {
+                if (!workload.bounded && !use.resident_units && !use.transient_units) fields.emplace_back("resident_units", "RESIDENT_BYTES");
+            }
+            else if (workload.cost == CostKind::reservation)
+            { if (!use.reserved_units) fields.emplace_back("reserved_units", "WHOLE_SERVICE_LANES"); }
+            else
+            {
+                if (!use.required_units) fields.emplace_back("required_units", "REQUEST_LANES");
+                if (!use.quality_us && !use.proof_us)
+                { fields.emplace_back("quality_us", "WHOLE_QUALITY_BOUND_US"); fields.emplace_back("proof_us", "WHOLE_PROOF_BOUND_US"); }
+                if (!workload.bounded && !use.blocking_us) fields.emplace_back("blocking_us", "WHOLE_QUEUE_BOUND_US");
+            }
+            offer(target + ".uses[" + use.resource + "]", fields);
+        }
+    }
+    auto const& n = profile.native;
+    std::vector<std::pair<std::string_view, std::string>> fields;
+    for (auto const& [name, value] : {std::pair{"bounded", n.bounded}, {"scope_complete", n.scope_complete},
+        {"covers_future_filter", n.covers_future_filter}, {"phase_totals_include_controller", n.phase_totals_include_controller}})
+        if (!value) fields.emplace_back(name, "true");
+    for (auto const& [name, value] : {std::pair{"k", n.k}, {"strength", n.strength}, {"max_ram_bytes", n.max_ram_bytes},
+        {"max_cpu_threads", n.max_cpu_threads}, {"max_batch_members", n.max_batch_members}, {"max_group_members", n.max_group_members},
+        {"max_construction_us", n.max_construction_us}})
+        if (!value) fields.emplace_back(name, std::string_view(name).ends_with("_us") ? "WHOLE_FILE_BOUND_US" :
+            std::string_view(name).ends_with("_bytes") ? "EXECUTION_BYTES" : "EXECUTION_LIMIT");
+    for (auto const& [name, value] : {std::pair{"host", &n.host}, {"reader", &n.reader}, {"backend", &n.backend}, {"engine", &n.engine}})
+        if (value->empty()) fields.emplace_back(name, "SELECTED_VALUE");
+    if (!n.verification.empty() && !n.max_verification_us) fields.emplace_back("max_verification_us", "WHOLE_FILE_BOUND_US");
+    offer("native", fields);
+    auto demands = [&](std::string const& target, std::vector<Demand> const& values)
+    {
+        for (auto const& demand : values)
+        {
+            fields.clear(); auto const kind = graph.resources[graph.find(demand.resource)].kind;
+            if (!demand.bounded) fields.emplace_back("bounded", "true");
+            if (memory(kind))
+            { if (!demand.resident_units && !demand.transient_units) fields.emplace_back("transient_units", "PHASE_TOTAL_BYTES"); }
+            else if (!demand.reserved_units)
+            {
+                if (!demand.required_units) fields.emplace_back("required_units", "REQUEST_LANES");
+                if (!demand.work_us) fields.emplace_back("work_us", "WHOLE_OPERATION_BOUND_US");
+                if (!demand.bounded && !demand.blocking_us) fields.emplace_back("blocking_us", "WHOLE_QUEUE_BOUND_US");
+                if (!demand.period_us) fields.emplace_back("period_us", "MIN_PERIOD_US");
+                if (!demand.deadline_us) fields.emplace_back("deadline_us", "RESPONSE_DEADLINE_US");
+            }
+            offer(target + '[' + demand.resource + ']', fields);
+        }
+    };
+    demands("native.construction", n.construction); demands("native.verification", n.verification); demands("native.supervision", n.supervision);
+    for (auto const& cohort : n.cohorts)
+    {
+        auto const target = "native.cohorts[" + std::to_string(cohort.max_members) + "]";
+        demands(target + ".new_farming", cohort.new_farming); demands(target + ".proof_reserve", cohort.proof_reserve);
+    }
+    if (n.cohorts.empty())
+    {
+        std::set<size_t> resources;
+        for (auto const& id : n.output_resources) resources.insert(graph.find(id));
+        std::set<std::string> hosts{n.host}; for (auto const& [role, host] : n.service_hosts) { (void)role; hosts.insert(host); }
+        for (auto const& host : hosts) for (auto const& prefix : {"cpu:", "memory:"})
+        { auto found = graph.names.find(prefix + host); if (found != graph.names.end()) resources.insert(found->second); }
+        std::vector<Demand> missing;
+        for (auto index : resources) { Demand demand; demand.resource = graph.resources[index].id; missing.push_back(std::move(demand)); }
+        demands("native.cohorts[COHORT_MEMBER_BOUND].new_farming", missing);
+        demands("native.cohorts[COHORT_MEMBER_BOUND].proof_reserve", missing);
+    }
 }
 // A checklist of absent declarations, not a second feasibility model. The
 // normal review still binds the concrete execution and assesses every stage.
@@ -926,12 +1037,12 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
     for (size_t i = 0; i < profile.resources.size(); ++i)
     {
         auto const& resource = profile.resources[i];
-        need(!resource.capacity_known, "physical-capacity", "farm_resources.resources[" + std::to_string(i) + "]",
+        need(!resource.capacity_known, "physical-capacity", "farm_resources.resources[" + resource.id + "]",
             "Declare capacity and capacity_known for " + resource.id + "; bytes for memory, offered parallel lanes otherwise. Observed availability is not a grant.");
     }
     for (size_t i = 0; i < profile.workloads.size(); ++i)
     {
-        auto const& workload = profile.workloads[i]; auto const path = "farm_resources.workloads[" + std::to_string(i) + "]";
+        auto const& workload = profile.workloads[i]; auto const path = "farm_resources.workloads[" + workload.id + "]";
         need(workload.cost == CostKind::unknown || !workload.bounded || !workload.scope_complete,
             "existing-services", path, "For " + workload.id + ", declare cost (reservation or serialized), bounded and scope_complete only after covering all services, queues, resident/transient memory and full proofs.");
         need(workload.uses.empty(), "existing-services", path + ".uses", "Map this workload's physical CPU, memory, storage, solver and any network/GPU resources; include shared services.");
@@ -994,7 +1105,7 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
         "Declare increasing max_members cohorts, each with complete new_farming and separate proof_reserve demands for the harvester/farmer/full node/solver. Quality calibration cannot supply a full-proof reserve.");
     for (size_t i = 0; i < native.cohorts.size(); ++i)
     {
-        auto const cohort = path + ".cohorts[" + std::to_string(i) + "]";
+        auto const cohort = path + ".cohorts[" + std::to_string(native.cohorts[i].max_members) + "]";
         demands(native.cohorts[i].new_farming, cohort + ".new_farming"); demands(native.cohorts[i].proof_reserve, cohort + ".proof_reserve");
         need(!native.cohorts[i].proof_reserve.empty() && std::none_of(native.cohorts[i].proof_reserve.begin(), native.cohorts[i].proof_reserve.end(), [&](auto const& demand)
             { return !memory(graph.resources[graph.find(demand.resource)].kind) && (demand.work_us || demand.reserved_units); }),
@@ -1004,7 +1115,7 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
         !native.max_gpu_bytes || !native.standing_gpu_bytes))
         result.facts.push_back({path, "GPU execution scope depends on the selected local or broker execution path", "unknown", "resource-preparation-checklist",
             "Local GPU execution requires gpu_compute_resource, gpu_memory_resource, max_gpu_bytes and standing_gpu_bytes. Broker generation instead requires complete reviewed compute_workers and compute_services. Worker records alone do not select either path; the concrete request still must pass admission."});
-    validate_resource_preparation(result); return result;
+    prepare_resource_settings(profile, result); validate_resource_preparation(result); return result;
 }
 inline void write_resource_preparation_json(std::ostream& out, ResourcePreparation const& value)
 {
@@ -1022,7 +1133,9 @@ inline void write_resource_preparation_json(std::ostream& out, ResourcePreparati
         if (comma) out << ','; comma = true; out << "{\"group\":"; quote(need.group); out << ",\"path\":"; quote(need.path);
         out << ",\"action\":"; quote(need.action); out << '}';
     }
-    out << "]}";
+    out << "],\"resource_settings\":["; comma = false;
+    for (auto const& setting : value.resource_settings) { if (comma) out << ','; comma = true; quote(setting); }
+    out << "],\"settings_limited\":" << (value.settings_limited ? "true" : "false") << '}';
 }
 inline ResourcePreparation parse_resource_preparation(profile_detail::Json const& object)
 {
@@ -1038,6 +1151,12 @@ inline ResourcePreparation parse_resource_preparation(profile_detail::Json const
     for (auto const& fact : facts.items) result.facts.push_back({text(required(fact, "path")), text(required(fact, "value")),
         text(required(fact, "basis")), text(required(fact, "source")), text(required(fact, "scope"))});
     for (auto const& need : missing.items) result.missing.push_back({text(required(need, "group")), text(required(need, "path")), text(required(need, "action"))});
+    if (auto const* settings = field(object, "resource_settings"))
+    {
+        resource_detail::require(settings->kind == Json::array && settings->items.size() <= max_preparation_entries, "too many resource setting suggestions");
+        for (auto const& setting : settings->items) result.resource_settings.push_back(text(setting));
+    }
+    if (auto const* limited = field(object, "settings_limited")) result.settings_limited = boolean(*limited);
     validate_resource_preparation(result); return result;
 }
 namespace resource_detail
@@ -1279,6 +1398,167 @@ inline Profile read_profile(std::istream& input, uint64_t max_memory_bytes = pro
     auto result = parse_profile(object);
     resource_detail::require(profile_memory(result) <= max_memory_bytes / 4, "mixed farm profile exceeds its retained memory grant");
     return result;
+}
+namespace resource_detail
+{
+inline void setting_value(std::string_view text, uint64_t& value)
+{
+    auto const parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size(), "resource setting requires an unsigned integer in the stated units");
+}
+inline void setting_value(std::string_view text, bool& value)
+{ require(text == "true" || text == "false", "resource setting requires true or false"); value = text == "true"; }
+inline void setting_value(std::string_view text, std::string& value)
+{ require(!text.empty() && text.size() <= 1024, "invalid resource setting text"); value = text; }
+inline void setting_value(std::string_view text, CostKind& value)
+{
+    require(text == "unknown" || text == "reservation" || text == "serialized", "resource setting cost requires unknown, reservation or serialized");
+    value = text == "reservation" ? CostKind::reservation : text == "serialized" ? CostKind::serialized : CostKind::unknown;
+}
+}
+// Typed declarations target stable workload/resource identities. They cannot
+// add an invented physical resource, change catalog assignments or authorize a
+// reader executable. The caller retains the original profile if any setting
+// fails; only a completely parsed, schema-valid copy is returned.
+inline Profile apply_resource_settings(Profile profile, std::span<std::string const> settings)
+{
+    using namespace resource_detail;
+    require(settings.size() <= max_preparation_entries, "too many resource settings");
+    Graph graph(profile);
+    for (auto const& setting : settings)
+    {
+        require(!setting.empty() && setting.size() <= 4096, "invalid resource setting length");
+        auto const equals = setting.find('='); require(equals != setting.npos, "resource setting requires TARGET.FIELD=VALUE");
+        auto const dot = setting.rfind('.', equals); require(dot != setting.npos, "resource setting requires TARGET.FIELD=VALUE");
+        std::string_view target(setting.data(), dot), assignments(setting.data() + dot + 1, setting.size() - dot - 1);
+        auto selector = [&](std::string_view& path, std::string_view name) -> std::optional<std::string_view>
+        {
+            if (!path.starts_with(name) || path.size() <= name.size() || path[name.size()] != '[') return {};
+            auto const end = path.find(']', name.size() + 1);
+            require(end != path.npos && end > name.size() + 1, "resource setting has an invalid stable identity selector");
+            auto const id = path.substr(name.size() + 1, end - name.size() - 1); path.remove_prefix(end + 1); return id;
+        };
+        auto physical = [&](std::string_view id) { return graph.find(std::string(id)); };
+        auto demand_for = [&](std::vector<Demand>& values, std::string_view id) -> Demand*
+        {
+            auto const index = physical(id);
+            auto found = std::find_if(values.begin(), values.end(), [&](auto const& value) { return physical(value.resource) == index; });
+            if (found == values.end())
+            { require(values.size() < max_resources * 4, "too many native resource setting demands"); Demand value; value.resource = graph.resources[index].id;
+              values.push_back(std::move(value)); found = std::prev(values.end()); }
+            return &*found;
+        };
+        Resource* resource = nullptr; Workload* workload = nullptr; Use* use = nullptr; Demand* demand = nullptr;
+        bool const native = target == "native", metadata = target == "profile", gate = target == "gate";
+        auto path = target;
+        if (auto id = selector(path, "resources"))
+        {
+            require(path.empty(), "resource setting has an unsupported resource selector suffix");
+            auto found = std::find_if(profile.resources.begin(), profile.resources.end(), [&](auto const& value) { return value.id == *id; });
+            if (found == profile.resources.end())
+            {
+                auto const index = physical(*id);
+                found = std::find_if(profile.resources.begin(), profile.resources.end(), [&](auto const& value) { return value.id == graph.resources[index].id; });
+            }
+            require(found != profile.resources.end(), "resource setting lost its physical resource"); resource = &*found;
+        }
+        else if (auto id = selector(path, "workloads"))
+        {
+            auto found = std::find_if(profile.workloads.begin(), profile.workloads.end(), [&](auto const& value) { return value.id == *id; });
+            require(found != profile.workloads.end(), "resource setting workload is not in the complete inventory/profile");
+            if (path.empty()) workload = &*found;
+            else
+            {
+                require(path.starts_with('.'), "resource setting has an unsupported workload suffix"); path.remove_prefix(1);
+                auto const id = selector(path, "uses"); require(id && path.empty(), "resource setting requires uses[RESOURCE_ID]");
+                auto const index = physical(*id);
+                auto entry = std::find_if(found->uses.begin(), found->uses.end(), [&](auto const& value) { return physical(value.resource) == index; });
+                if (entry == found->uses.end())
+                { require(found->uses.size() < max_resources, "too many workload resource setting uses"); Use value; value.resource = graph.resources[index].id;
+                  found->uses.push_back(std::move(value)); entry = std::prev(found->uses.end()); }
+                use = &*entry;
+            }
+        }
+        else if (path.starts_with("native."))
+        {
+            path.remove_prefix(std::string_view("native.").size());
+            if (auto id = selector(path, "cohorts"))
+            {
+                uint64_t members = 0; setting_value(*id, members); require(members, "native resource setting cohort requires a positive member bound");
+                auto& cohorts = profile.native.cohorts;
+                auto cohort = std::lower_bound(cohorts.begin(), cohorts.end(), members, [](auto const& value, uint64_t bound) { return value.max_members < bound; });
+                if (cohort == cohorts.end() || cohort->max_members != members)
+                { require(cohorts.size() < 256, "too many native resource setting cohorts"); NativeCohort value; value.max_members = members; cohort = cohorts.insert(cohort, std::move(value)); }
+                require(path.starts_with('.'), "cohort resource setting requires new_farming[RESOURCE_ID] or proof_reserve[RESOURCE_ID]"); path.remove_prefix(1);
+                if (auto resource = selector(path, "new_farming")) demand = demand_for(cohort->new_farming, *resource);
+                else if (auto resource = selector(path, "proof_reserve")) demand = demand_for(cohort->proof_reserve, *resource);
+            }
+            else if (auto id = selector(path, "construction")) demand = demand_for(profile.native.construction, *id);
+            else if (auto id = selector(path, "verification")) demand = demand_for(profile.native.verification, *id);
+            else if (auto id = selector(path, "supervision")) demand = demand_for(profile.native.supervision, *id);
+            require(demand && path.empty(), "unsupported native resource setting target");
+        }
+        require(resource || workload || use || demand || native || metadata || gate, "unsupported resource setting target");
+        std::set<std::string_view> assigned;
+        while (!assignments.empty())
+        {
+            auto const comma = assignments.find(','); auto const assignment = assignments.substr(0, comma);
+            auto const equals = assignment.find('='); require(equals != assignment.npos && equals && equals + 1 < assignment.size(), "resource setting requires FIELD=VALUE assignments");
+            auto const field = assignment.substr(0, equals), value = assignment.substr(equals + 1);
+            require(assigned.insert(field).second, "resource setting repeats a field");
+            auto set = [&](std::string_view name, auto& destination)
+            { if (field != name) return false; setting_value(value, destination); return true; };
+            bool known = false;
+            if (resource) known = set("capacity", resource->capacity) || set("capacity_known", resource->capacity_known) ||
+                set("conditional_shared", resource->conditional_shared) || set("telemetry_required", resource->telemetry_required);
+            if (workload) known = set("format", workload->format) || set("decoder", workload->decoder) || set("decoder_version", workload->decoder_version) ||
+                set("backend", workload->backend) || set("pool_difficulty", workload->pool_difficulty) || set("source", workload->source) ||
+                set("captured_at", workload->captured_at) || set("cost", workload->cost) || set("bounded", workload->bounded) ||
+                set("scope_complete", workload->scope_complete) || set("quality_burst", workload->quality_burst) || set("proof_burst", workload->proof_burst) ||
+                set("future_quality_burst", workload->future_quality_burst) || set("future_proof_burst", workload->future_proof_burst) ||
+                set("filter_bits", workload->filter_bits) || set("future_filter_bits", workload->future_filter_bits) ||
+                set("period_us", workload->period_us) || set("deadline_us", workload->deadline_us) || set("response_tail_us", workload->response_tail_us);
+            if (use) known = set("resident_units", use->resident_units) || set("reserved_units", use->reserved_units) || set("transient_units", use->transient_units) ||
+                set("required_units", use->required_units) || set("quality_us", use->quality_us) || set("proof_us", use->proof_us) || set("blocking_us", use->blocking_us);
+            if (demand) known = set("resident_units", demand->resident_units) || set("reserved_units", demand->reserved_units) || set("transient_units", demand->transient_units) ||
+                set("required_units", demand->required_units) || set("work_us", demand->work_us) || set("blocking_us", demand->blocking_us) ||
+                set("period_us", demand->period_us) || set("deadline_us", demand->deadline_us) || set("bounded", demand->bounded);
+            if (metadata) known = set("source", profile.source) || set("captured_at", profile.captured_at) || set("producer", profile.producer);
+            if (gate) known = set("max_age_ms", profile.gate.max_age_ms) || set("recovery_hold_ms", profile.gate.recovery_hold_ms) ||
+                set("recovery_samples", profile.gate.recovery_samples) || set("max_cpu_busy_permille", profile.gate.max_cpu_busy_permille);
+            if (native)
+            {
+                auto& n = profile.native;
+                known = set("bounded", n.bounded) || set("scope_complete", n.scope_complete) || set("covers_future_filter", n.covers_future_filter) ||
+                    set("phase_totals_include_controller", n.phase_totals_include_controller) || set("k", n.k) || set("strength", n.strength) ||
+                    set("host", n.host) || set("reader", n.reader) || set("backend", n.backend) || set("engine", n.engine) ||
+                    set("max_ram_bytes", n.max_ram_bytes) || set("max_cpu_threads", n.max_cpu_threads) || set("max_gpu_bytes", n.max_gpu_bytes) ||
+                    set("standing_gpu_bytes", n.standing_gpu_bytes) || set("gpu_compute_resource", n.gpu_compute_resource) || set("gpu_memory_resource", n.gpu_memory_resource) ||
+                    set("max_batch_members", n.max_batch_members) || set("max_group_members", n.max_group_members) ||
+                    set("max_construction_us", n.max_construction_us) || set("max_verification_us", n.max_verification_us) ||
+                    set("verification_cpu_threads", n.verification_cpu_threads) || set("min_pool_difficulty", n.min_pool_difficulty) || set("pool_protocol_version", n.pool_protocol_version);
+                for (auto const& [name, mappings] : {std::pair{"output_resources", &n.output_resources},
+                    {"scratch_resources", &n.scratch_resources}, {"source_resources", &n.source_resources}}) if (field == name)
+                {
+                    mappings->clear(); auto remaining = value;
+                    while (!remaining.empty())
+                    {
+                        auto const separator = remaining.find('|'); auto const id = remaining.substr(0, separator);
+                        auto const& canonical = graph.resources[physical(id)].id;
+                        require(std::find(mappings->begin(), mappings->end(), canonical) == mappings->end(), "resource setting repeats a physical mapping");
+                        mappings->push_back(canonical);
+                        if (separator == remaining.npos) break;
+                        remaining.remove_prefix(separator + 1); require(!remaining.empty(), "resource setting has an empty physical mapping");
+                    }
+                    known = true;
+                }
+            }
+            if (!known) throw std::runtime_error("unsupported resource setting field: " + std::string(target) + '.' + std::string(field));
+            if (comma == assignments.npos) break;
+            assignments.remove_prefix(comma + 1); require(!assignments.empty(), "resource setting has an empty assignment");
+        }
+    }
+    validate(profile); return profile;
 }
 // A scan can emit this editable skeleton beside its inventory. Discovery fills
 // identities/counts, never grants capacity or invents a decoder/proof cost.

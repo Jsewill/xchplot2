@@ -32,6 +32,16 @@ int main()
         invite_pool(authority, invitation, "shared worker");
         rejects([&] { invite_pool(authority, invitation, "replacement"); });
         auto worker = join_pool(invitation, root / "worker");
+        require(load_worker_intent(worker) == WorkerIntent::Active && !std::filesystem::exists(worker.directory / "worker-control"),
+            "default worker intent was not read-only or accepting");
+        save_worker_intent(worker, WorkerIntent::Paused);
+        require(load_worker_intent(*load_pool(worker.directory)) == WorkerIntent::Paused,
+            "private worker control did not survive enrollment reload");
+        rejects([&] { save_worker_intent(worker, WorkerIntent(0)); });
+        require(load_worker_intent(worker) == WorkerIntent::Paused, "invalid control changed saved intent");
+        std::filesystem::copy_file(worker.directory / "worker-control", authority.directory / "worker-control");
+        rejects([&] { (void)load_worker_intent(authority); });
+        std::filesystem::remove(authority.directory / "worker-control");
         require(worker.pool_id == authority.pool_id && worker.server_name == authority.server_name &&
             worker.node_id != authority.node_id && worker.name == "shared worker" && !worker.can_invite &&
             certificate_identity(worker.tls.cert_file) != certificate_identity(authority.tls.cert_file),

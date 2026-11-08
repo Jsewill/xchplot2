@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -132,6 +133,71 @@ struct FarmingAdjustments
     uint64_t evaluations = 0;
     bool search_limited = false;
 };
+struct FarmingCapacitySearch
+{
+    bool feasible = false, search_limited = false;
+    uint64_t member_cap = 0, evaluations = 0;
+};
+// Feasibility is not monotone: crossing a complete-cache boundary or changing
+// a file/family layout can make a smaller cap more expensive. Sample the whole
+// interval before refining above the largest feasible observation, and retain
+// periodic global probes rather than discarding an infeasible subinterval.
+// The callback may return no observation when its wall-clock budget expires.
+template<class Evaluate>
+FarmingCapacitySearch farming_capacity_search(uint64_t lower, uint64_t upper, Evaluate evaluate,
+    uint64_t maximum_evaluations = 64)
+{
+    if (lower > upper || maximum_evaluations < 2 || maximum_evaluations > 256)
+        throw std::runtime_error("invalid bounded farming capacity search");
+    struct Observation { uint64_t cap; bool feasible; };
+    std::vector<Observation> observations; observations.reserve(size_t(maximum_evaluations));
+    FarmingCapacitySearch result;
+    auto observe = [&](uint64_t cap)
+    {
+        std::optional<bool> const feasible = evaluate(cap);
+        if (!feasible) return false;
+        observations.push_back({cap, *feasible}); ++result.evaluations;
+        if (*feasible && (!result.feasible || cap > result.member_cap))
+        { result.feasible = true; result.member_cap = cap; }
+        return true;
+    };
+    bool running = observe(upper);
+    if (result.feasible) return result;
+    if (running && lower != upper) running = observe(lower);
+    while (running && result.evaluations < maximum_evaluations)
+    {
+        std::sort(observations.begin(), observations.end(), [](auto const& a, auto const& b) { return a.cap < b.cap; });
+        bool const global = !result.feasible || result.evaluations < maximum_evaluations / 2 || result.evaluations % 4 == 0;
+        uint64_t first = 0, last = 0;
+        auto select = [&](bool all)
+        {
+            for (size_t index = 1; index < observations.size(); ++index)
+            {
+                auto const left = observations[index - 1].cap, right = observations[index].cap;
+                if (right - left <= 1 || (result.feasible && right <= result.member_cap)) continue;
+                if (!all && left != result.member_cap) continue;
+                if (right - left > last - first) { first = left; last = right; }
+            }
+        };
+        select(global);
+        if (last == first && !global) select(true);
+        if (last == first) break;
+        running = observe(first + (last - first) / 2);
+    }
+    std::sort(observations.begin(), observations.end(), [](auto const& a, auto const& b) { return a.cap < b.cap; });
+    // Exhaustive coverage above the selected observation can prove that no
+    // larger feasible cap exists in this integer interval. Otherwise report
+    // the search limit, including an expired callback budget.
+    uint64_t covered = result.feasible ? result.member_cap : lower;
+    for (auto const& observation : observations) if (observation.cap >= covered)
+    {
+        if (observation.cap - covered > 1) result.search_limited = true;
+        covered = observation.cap;
+    }
+    result.search_limited = result.search_limited || observations.empty() ||
+        observations.front().cap > (result.feasible ? result.member_cap : lower) || covered < upper;
+    return result;
+}
 inline char const* farming_adjustment_name(FarmingAdjustmentKind kind)
 {
     switch (kind)

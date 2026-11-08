@@ -34,6 +34,7 @@ struct RejectingWorker
     {
         pool::WorkerOffer offer;
         offer.instance = pool::random_token(); offer.compatibility = worker_compatibility();
+        offer.codec_compatibility = worker_compatibility(pool::Kind::Pack);
         offer.endpoint = listener.endpoint(); offer.capacity = {1, 1, uint64_t(128) << 20, 0};
         offer.capabilities = pool::capability(pool::Kind::Pack); offer.min_k = 18; offer.max_k = 28;
         broker.register_worker(offer);

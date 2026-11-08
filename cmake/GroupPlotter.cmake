@@ -60,6 +60,7 @@ function(pos2_grow_identity target upstream_dir)
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"
         "${repo_dir}/tools/xchplot2/group_commands.cpp" "${repo_dir}/tools/xchplot2/group_commands.hpp"
+        "${repo_dir}/tools/xchplot2/device_options.hpp"
         "${repo_dir}/contrib/pos2-plotter-output-move.patch"
         "${repo_dir}/cmake/GroupPlotter.cmake")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -67,7 +68,7 @@ function(pos2_grow_identity target upstream_dir)
     endif()
     if(grow_NETWORK OR XCHPLOT2_BUILD_GROUP_POOL)
         foreach(name ComputeNetwork.hpp ComputeNetwork.cpp ComputePool.hpp ComputePool.cpp
-                     ComputeWorker.hpp ComputeWorker.cpp ComputeThreads.hpp GroupRemoteCodec.hpp GroupFarmComputeResources.hpp)
+                     ComputeWorker.hpp ComputeWorker.cpp ComputeCompatibility.cpp ComputeThreads.hpp NumaTopology.hpp NumaTopology.cpp GroupRemoteCodec.hpp GroupFarmComputeResources.hpp)
             list(APPEND local_sources "${host_dir}/${name}")
         endforeach()
         list(APPEND local_sources "${repo_dir}/cmake/ComputeWorker.cmake"

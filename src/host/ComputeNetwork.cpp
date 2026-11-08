@@ -467,14 +467,15 @@ struct Channel::Impl
         membership_exchange = true;
         try
         {
-            Writer offer(5); offer.u32(0x47504d34); offer.u8(!options.membership_directory.empty());
+            bool const exchange = !options.membership_directory.empty() && !options.read_only_membership;
+            Writer offer(5); offer.u32(0x47504d34); offer.u8(exchange);
             std::array<uint8_t, 5> remote{};
             auto send_offer = [&] { transfer({const_cast<uint8_t*>(offer.data().data()), offer.data().size()}, true, until); };
             if (server) { transfer(remote, false, until); send_offer(); }
             else { send_offer(); transfer(remote, false, until); }
             Reader input(remote); require(input.u32() == 0x47504d34, "incompatible network membership protocol");
             auto saved = input.u8(); require(saved <= 1, "invalid network membership capability"); input.finish();
-            policy_exchange = saved && !options.membership_directory.empty();
+            policy_exchange = saved && exchange;
             if (policy_exchange)
             {
                 auto policy = pool_policy(options.membership_directory);
@@ -508,6 +509,7 @@ Channel Channel::connect(Endpoint const& endpoint, TlsOptions const& options, st
     impl->context = context(options, false);
     check_deadline(ceiling);
     addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    if (numeric_host(endpoint.host)) hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     addrinfo* addresses = nullptr;
     int const resolved = ::getaddrinfo(endpoint.host.c_str(), std::to_string(endpoint.port).c_str(), &hints, &addresses);
     if (resolved == EAI_AGAIN
@@ -775,6 +777,15 @@ std::string certificate_node_id(std::string const& path)
     require(bool(file), "cannot read network certificate");
     std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
     return node_identity(certificate.get());
+}
+bool numeric_host(std::string const& value)
+{
+    std::array<uint8_t, 16> binary{};
+    auto const scope = value.find('%');
+    if (scope != value.npos)
+        return scope + 1 < value.size() && value.find('%', scope + 1) == value.npos &&
+            ::inet_pton(AF_INET6, value.substr(0, scope).c_str(), binary.data()) == 1;
+    return ::inet_pton(AF_INET, value.c_str(), binary.data()) == 1 || ::inet_pton(AF_INET6, value.c_str(), binary.data()) == 1;
 }
 Endpoint parse_endpoint(std::string const& value)
 {

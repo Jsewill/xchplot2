@@ -19,7 +19,7 @@ void command_usage(std::string_view command)
 {
     if (command == "status")
     {
-        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--watch] [--inspect]\n";
+        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--watch] [--inspect] [--live]\n";
         return;
     }
     if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
@@ -68,7 +68,8 @@ void command_help_all(std::string_view command)
         "  --manifest FILE          locate an existing farming job directly\n"
         "  --save-plan FILE         save a keyless plan, e.g. farm.plan\n"
         "  -F, --from-plan FILE     explicit alternative to supplying PLAN directly\n"
-        "  --save-profile FILE      export harvester settings without destinations\n"
+        "  --save-profile FILE      export reusable harvester or migration setup\n"
+        "  --resource-setting SETTING  inventory/replot setup: declare a resource bound by its stable ID; repeatable\n"
         "  --metadata-only          plan: inspect saved metadata without checking destinations or recovery\n"
         "  --assess-jobs             plan: assess saved keyless job forecasts under one harvester budget\n"
         "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
@@ -83,6 +84,8 @@ void command_help_all(std::string_view command)
         "  --status                 read ordinary job or migration progress without writer locks\n"
         "  --watch                  refresh status until interrupted\n"
         "  --inspect                status: include deep live checks\n"
+        "  --live                   status: also inspect compute and migration service prerequisites\n"
+        "  --timeout-ms N           status --live: overall query budget, default 5000\n"
         "  --revalidate             plan: save a successor for updated resources or verification policy\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
@@ -111,7 +114,8 @@ void command_help_all(std::string_view command)
         "  -S, --seed HEX            optional 32-byte seed; otherwise generated and saved privately\n";
     std::cout <<
         "  --backend cpu|gpu|auto    producer selection, default auto\n"
-        "  -d, --devices cpu|gpuN    select one local producer\n"
+        "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
+        "                           combine with commas; GPU selectors accept :tier\n"
         "  --device N --tier NAME    local GPU and production tier\n"
         "  -M, --max-host-ram SIZE   shared construction/producer RAM budget (e.g. 14G)\n"
         "  -j, --workers N           shared compression CPU allowance\n"
@@ -179,6 +183,11 @@ void command_help(std::string_view command, bool all)
             "Without a selector, use the current member directory.\n\n"
             "  --watch                  refresh until interrupted\n"
             "  --inspect                include deep live checks\n"
+            "  --live                   also inspect compute and migration service prerequisites\n"
+            "  --timeout-ms N           overall live query budget, default 5000 (100..60000)\n"
+            "  --compute off|auto       select whether live status inspects shared compute\n"
+            "  --compute-directory DIR  saved pool to inspect\n"
+            "  --harvester FILE          local migration setup, including authorized reader bindings\n"
             "  -F, --from-plan FILE     inspect a saved plan\n"
             "  --manifest FILE          locate a saved farming job directly\n"
             "  -M, --max-host-ram SIZE   inspection memory budget\n"
@@ -215,7 +224,8 @@ void command_help(std::string_view command, bool all)
             "  --alternative NAMES       review assessed memory, eligible-groups, deadline, cpu-cores or lookup-workers changes; capacity alone\n"
             "  --upgrade-job             review a stopped job's recovery-metadata allowance upgrade\n"
             "  -F, --from-plan FILE      inspect a saved plan (also accepts positional PLAN)\n"
-            "  --save-profile FILE       export harvester settings; omit destinations\n"
+            "  --save-profile FILE       export reusable harvester or migration setup\n"
+            "  --resource-setting SETTING  declare a remaining inventory/replot resource bound; repeatable\n"
             "  --metadata-only           read saved PLAN or --manifest FILE without live checks\n"
             "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n"
             "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
@@ -249,7 +259,7 @@ void command_help(std::string_view command, bool all)
             "  --plan-only               preview without plotting\n"
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
-            "  -d, --devices cpu|gpuN    choose one local plot producer\n"
+            "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
             "  -M, --max-host-ram SIZE   plotting buffer budget, e.g. 14G\n"
             "  -t, --temp-dir DIR        optional construction scratch\n";
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -278,9 +288,6 @@ void command_help(std::string_view command, bool all)
 
 pos2gpu::GroupOptions pos2gpu::group_batch_options(pos2gpu::BatchOptions const& options, std::vector<std::string> const& extra)
 {
-    require(!options.use_all_devices && options.device_ids.size() <= 1 &&
-                options.cpu_node_ids.empty() && !(options.cpu_selected() && !options.device_ids.empty()),
-            "group construction uses one local producer; select --devices cpu or gpuN, or use shared compute");
     require(!options.shard_plot && !options.pipeline_plot && options.pipeline_tiers.empty() &&
                 options.strategy == pos2gpu::BatchStrategy::Auto,
             "group construction does not use single-member sharding or pipeline strategies");
@@ -290,16 +297,25 @@ pos2gpu::GroupOptions pos2gpu::group_batch_options(pos2gpu::BatchOptions const& 
     require(!options.has_max_host_ram || options.max_host_ram,
             "group construction requires a positive --max-host-ram size; spill-to-min is only available for single-member plotting");
     std::vector<std::string> tokens{"xchplot2-group.gplot"};
-    if (options.cpu_selected() || !options.device_ids.empty())
-        tokens.insert(tokens.end(), {"--backend", options.cpu_selected() ? "cpu" : "gpu"});
-    if (!options.device_ids.empty())
+    if (!options.streaming_tier.empty()) tokens.insert(tokens.end(), {"--tier", options.streaming_tier});
+    if (options.devices_specified || options.use_all_devices || options.cpu_selected() || !options.device_ids.empty())
     {
-        tokens.insert(tokens.end(), {"--device", std::to_string(options.device_ids.front())});
-        auto const tier = options.per_device_tier.find(options.device_ids.front());
-        if (tier != options.per_device_tier.end()) tokens.insert(tokens.end(), {"--tier", tier->second});
-        else if (!options.streaming_tier.empty()) tokens.insert(tokens.end(), {"--tier", options.streaming_tier});
+        std::string selection;
+        auto append = [&](std::string const& value) { if (!selection.empty()) selection += ','; selection += value; };
+        if (options.use_all_devices) append("gpu" + (options.all_gpus_tier.empty() ? "" : ':' + options.all_gpus_tier));
+        for (int device : options.device_ids)
+        {
+            auto const tier = options.per_device_tier.find(device);
+            append("gpu" + std::to_string(device) + (tier == options.per_device_tier.end() ? "" : ':' + tier->second));
+        }
+        if (options.cpu_selected())
+        {
+            if (options.use_all_cpu_nodes || options.cpu_node_ids.empty()) append("cpu");
+            else for (int node : options.cpu_node_ids) append("cpu" + std::to_string(node));
+        }
+        require(!selection.empty(), "no local devices selected");
+        tokens.insert(tokens.end(), {"--devices", selection});
     }
-    else if (!options.streaming_tier.empty()) tokens.insert(tokens.end(), {"--tier", options.streaming_tier});
     if (options.has_max_host_ram) tokens.insert(tokens.end(), {"--max-ram", std::to_string(options.max_host_ram)});
     if (options.skip_existing) tokens.emplace_back("--resume");
     if (options.quiet) tokens.emplace_back("--quiet");

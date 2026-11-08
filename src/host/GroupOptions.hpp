@@ -13,6 +13,12 @@ namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct Worker
 
 namespace pos2gpu {
 class ComputeSession;
+struct GroupLocalDevice
+{
+    int device = 0;
+    std::string tier = "auto";
+    std::vector<int> cpu_affinity;
+};
 
 struct GroupOptions
 {
@@ -30,9 +36,11 @@ struct GroupOptions
     std::vector<std::filesystem::path> replot_source_roots, replot_exclude_roots;
     uint64_t replot_max_source_files = 0, replot_max_source_bytes = 0;
     bool replot_status = false, replot_revalidate = false;
-    bool status_watch = false, status_inspect = false;
+    bool status_watch = false, status_inspect = false, status_live = false;
+    uint64_t status_timeout_ms = 5000;
     std::string farm_action;
     std::string farming_alternative;
+    std::vector<std::string> farming_resource_settings;
     bool policy_only = false, upgrade_job = false;
     std::vector<std::filesystem::path> action_destinations;
     std::optional<std::string> replot_verification;
@@ -52,6 +60,9 @@ struct GroupOptions
     uint64_t window = 16 * 1024 * 1024, workers = 0, batch = 65535, max_members = 65535;
     uint64_t group_members = 0, max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
     uint64_t checkpoint_bytes = 256 * 1024 * 1024, device = 0;
+    std::string devices;
+    std::vector<GroupLocalDevice> local_devices;
+    bool local_compute = false;
     std::string backend = "cpu";
     std::string tier = "auto";
     std::string member_storage = "compact";
