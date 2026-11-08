@@ -63,7 +63,8 @@ struct Observed
 // Chunk CPU work is interleaved, including final chaining in its declared total.
 // No policy family sweep or scheduling inequalities are reused here.
 Observed simulate(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
-                  std::vector<Job> const& jobs, uint64_t files)
+                  std::vector<Job> const& jobs, uint64_t files,
+                  std::span<FarmingConfig const> configs = {}, std::span<uint64_t const> lane_files = {})
 {
     struct Device
     {
@@ -107,9 +108,18 @@ Observed simulate(FarmingConfig const& config, std::vector<FarmingDestination> c
             shared.slots.resize(std::min<size_t>(shared.slots.size(), profile.read_concurrency));
         }
     }
-    long double const entries = std::ldexp(1.0L, config.k - 6);
-    bool const warm =
-        config.reader == FarmingReader::cached && files * entries * 8 <= config.index_cache_bytes;
+    long double indexes = files * std::ldexp(8.0L, config.k - 6);
+    if (!configs.empty())
+    {
+        check(configs.size() == destinations.size() && configs.size() == lane_files.size(),
+              "independent cohort reader count differs");
+        indexes = 0;
+        for (size_t lane = 0; lane < configs.size(); ++lane)
+        {
+            indexes += lane_files[lane] * std::ldexp(8.0L, configs[lane].k - 6);
+        }
+    }
+    bool const warm = config.reader == FarmingReader::cached && indexes <= config.index_cache_bytes;
     std::vector<long double> cores(std::min(config.harvester_cores, config.lookup_workers));
     std::vector<Running> running;
     uint64_t sequence = 0;
@@ -118,13 +128,15 @@ Observed simulate(FarmingConfig const& config, std::vector<FarmingDestination> c
     auto schedule = [&](Running& active, unsigned stage)
     {
         auto const& job = jobs[active.job];
+        auto const& parameters = configs.empty() ? config : configs[job.lane];
+        long double const entries = std::ldexp(1.0L, parameters.k - 6);
         long double end;
         if (stage & 1)
         {
             long double cost;
             if (stage < 4)
             {
-                cost = entries * config.index_seconds_per_entry * (stage == 1 ? 0.1L : 0.9L);
+                cost = entries * parameters.index_seconds_per_entry * (stage == 1 ? 0.1L : 0.9L);
             }
             else
             {
@@ -132,7 +144,7 @@ Observed simulate(FarmingConfig const& config, std::vector<FarmingDestination> c
                 long double const share = job.cpu_pattern == 4       ? 0.25L
                                           : job.cpu_pattern == chunk ? 0.85L
                                                                      : 0.05L;
-                cost = job.members * config.chain_seconds_per_member * share;
+                cost = job.members * parameters.chain_seconds_per_member * share;
             }
             auto core = std::min_element(cores.begin(), cores.end());
             end = *core = std::max(now, *core) + cost;
@@ -140,8 +152,8 @@ Observed simulate(FarmingConfig const& config, std::vector<FarmingDestination> c
         else
         {
             long double const bytes = stage == 0   ? 306
-                                      : stage == 2 ? entries * config.compressed_index_bytes_per_entry
-                                                   : 64 * (config.k + 1.45L) / 8 * job.members;
+                                      : stage == 2 ? entries * parameters.compressed_index_bytes_per_entry
+                                                   : 64 * (parameters.k + 1.45L) / 8 * job.members;
             auto& device = devices[resources[job.lane]];
             auto slot = std::min_element(device.slots.begin(), device.slots.end());
             end = std::max(std::max(now, *slot) + device.latency, device.transfer) + bytes / device.bandwidth;
@@ -227,6 +239,14 @@ FarmingAssessment forecast(FarmingConfig const& config, std::vector<FarmingDesti
 {
     farming_detail::PlanningMemory memory{64ull * 1024 * 1024};
     return farming_detail::assess(config, drives, plans, nullptr, memory);
+}
+FarmingAssessment forecast_cohorts(FarmingConfig const& config, std::vector<FarmingDestination> const& drives,
+                                   std::vector<FarmingDrivePlan> const& plans, std::span<FarmingConfig const> configs,
+                                   bool costs = true)
+{
+    farming_detail::PlanningMemory memory{64ull * 1024 * 1024};
+    auto counts = extents(plans);
+    return farming_detail::assess(config, drives, plans, &counts, memory, nullptr, configs, costs);
 }
 void test_layout_and_limits()
 {
@@ -582,6 +602,433 @@ void test_planning_memory_boundaries()
             farming_assess(config, drives, original.destinations, counts, live.planning_memory_bytes - 1);
         }, "assessment memory boundary was bypassed");
     }
+}
+void test_cohort_costs()
+{
+    FarmingConfig shared;
+    shared.lookup_workers = 2;
+    auto small = shared;
+    small.k = 18; small.strength = 4;
+    small.chain_seconds_per_member = 0.001L;
+    small.index_seconds_per_entry = 0.00000001L;
+    small.compressed_index_bytes_per_entry = 2;
+    small.lookup_memory_per_member = 512;
+    std::vector<FarmingConfig> configs{shared, small, small, small};
+    std::vector<FarmingDestination> drives(configs.size(), hdd(10000000000ull));
+    std::vector<FarmingDrivePlan> plans;
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        drives[lane].max_total_members = 2; drives[lane].max_groups = 1; drives[lane].resource = lane;
+        auto plan = farming_plan(configs[lane], {drives[lane]});
+        check(plan.feasible && plan.destinations[0].files == 1, "cohort fixture is infeasible");
+        plan.destinations[0].schedule = lane;
+        plans.push_back(plan.destinations[0]);
+    }
+    auto mixed = forecast_cohorts(shared, drives, plans, configs);
+    auto uniform_configs = std::vector<FarmingConfig>(configs.size(), shared);
+    auto uniform = forecast_cohorts(shared, drives, plans, uniform_configs);
+    auto counts = extents(plans);
+    auto original = farming_assess(shared, drives, plans, counts);
+    check(uniform.feasible == original.feasible && uniform.response_bound_seconds == original.response_bound_seconds &&
+              uniform.dynamic_work_seconds_per_sp == original.dynamic_work_seconds_per_sp &&
+              uniform.reader_memory_bytes == original.reader_memory_bytes &&
+              uniform.planning_memory_bytes == original.planning_memory_bytes,
+          "equal-shape cohorts changed the existing certificate");
+    auto legacy = forecast_cohorts(shared, drives, plans, configs, false);
+    check(legacy.response_bound_seconds == original.response_bound_seconds &&
+              legacy.dynamic_work_seconds_per_sp == original.dynamic_work_seconds_per_sp &&
+              legacy.reader_memory_bytes == original.reader_memory_bytes,
+          "legacy cohort assessment changed its envelope costs");
+    check(mixed.feasible && mixed.response_bound_seconds < uniform.response_bound_seconds &&
+              mixed.cpu_work_seconds_per_sp < uniform.cpu_work_seconds_per_sp &&
+              mixed.io_work_seconds_per_sp < uniform.io_work_seconds_per_sp &&
+              mixed.reader_memory_bytes < uniform.reader_memory_bytes,
+          "mixed shapes still pay the worst cohort costs throughout the farm");
+    long double expected_cpu = 0, expected_io = 0;
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        auto one = forecast_cohorts(shared, {drives[lane]}, {plans[lane]}, std::span(configs).subspan(lane, 1));
+        expected_cpu += one.cpu_work_seconds_per_sp; expected_io += one.io_work_seconds_per_sp;
+    }
+    check(mixed.cpu_work_seconds_per_sp == expected_cpu && mixed.io_work_seconds_per_sp == expected_io,
+          "joint expected work changed an individual cohort's filter probability or service cost");
+    farming_detail::PlanningMemory forecast_memory{64ull * 1024 * 1024};
+    auto projected = farming_detail::assess(shared, drives, plans, nullptr, forecast_memory, nullptr, configs);
+    check(projected.feasible == mixed.feasible && projected.response_bound_seconds == mixed.response_bound_seconds &&
+              projected.dynamic_work_seconds_per_sp == mixed.dynamic_work_seconds_per_sp &&
+              projected.reader_memory_bytes == mixed.reader_memory_bytes,
+          "cohort forecast differs from the exact extent assessment");
+    shared.memory_bytes = mixed.reader_memory_bytes;
+    check(forecast_cohorts(shared, drives, plans, configs).feasible &&
+              !forecast_cohorts(shared, drives, plans, uniform_configs).feasible,
+          "mixed-shape memory advantage was not usable within the declared budget");
+    --shared.memory_bytes;
+    auto memory_failure = forecast_cohorts(shared, drives, plans, configs);
+    check(!memory_failure.feasible && memory_failure.reason.find(std::to_string(mixed.reader_memory_bytes)) != std::string::npos &&
+              memory_failure.reason.find(std::to_string(shared.memory_bytes)) != std::string::npos,
+          "joint working-memory failure omitted its requirement or budget");
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        check(forecast_cohorts(shared, {drives[lane]}, {plans[lane]}, std::span(configs).subspan(lane, 1)).feasible,
+              "joint memory fixture does not fit individually");
+    }
+    shared = {};
+    shared.harvester_cores = shared.lookup_workers = 1;
+    auto joint = forecast_cohorts(shared, drives, plans, configs);
+    long double single = 0;
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        auto one = forecast_cohorts(shared, {drives[lane]}, {plans[lane]}, std::span(configs).subspan(lane, 1));
+        single = std::max(single, one.response_bound_seconds);
+    }
+    check(joint.response_bound_seconds > single, "joint CPU/deadline fixture does not share worker demand");
+    shared.deadline_seconds = (single + joint.response_bound_seconds) / 2;
+    auto deadline_failure = forecast_cohorts(shared, drives, plans, configs);
+    check(!deadline_failure.feasible && deadline_failure.reason.find("declared response deadline") != std::string::npos &&
+              deadline_failure.reason.find(farming_detail::service_amount(shared.deadline_seconds)) != std::string::npos,
+          "joint deadline failure omitted its declared limit");
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        check(forecast_cohorts(shared, {drives[lane]}, {plans[lane]}, std::span(configs).subspan(lane, 1)).feasible,
+              "joint deadline fixture does not fit individually");
+    }
+    shared.deadline_seconds = 20;
+    shared.challenge_seconds = (single + joint.response_bound_seconds) / 2;
+    auto cadence_failure = forecast_cohorts(shared, drives, plans, configs);
+    check(!cadence_failure.feasible && cadence_failure.reason.find("signage-point interval") != std::string::npos,
+          "heterogeneous batch escaped the shared signage-point cadence");
+    shared = {};
+    for (auto& drive : drives) drive.resource = 9;
+    auto family_failure = forecast_cohorts(shared, drives, plans, configs);
+    check(!family_failure.feasible && family_failure.max_eligible_families_per_resource == configs.size() &&
+              family_failure.reason.find("storage resource 9") != std::string::npos &&
+              family_failure.reason.find(std::to_string(configs.size())) != std::string::npos,
+          "independent cohorts escaped shared-resource family admission");
+    shared.max_eligible_families_per_resource = configs.size();
+    shared.reader = FarmingReader::cached;
+    long double indexes = 0;
+    for (auto const& parameters : configs) indexes += std::ldexp(8.0L, parameters.k - 6);
+    shared.index_cache_bytes = farming_detail::size(indexes);
+    auto warm = forecast_cohorts(shared, drives, plans, configs);
+    auto envelope = forecast_cohorts(shared, drives, plans, uniform_configs);
+    --shared.index_cache_bytes;
+    auto cold = forecast_cohorts(shared, drives, plans, configs);
+    check(warm.feasible && warm.response_bound_seconds < cold.response_bound_seconds &&
+              warm.cpu_work_seconds_per_sp < cold.cpu_work_seconds_per_sp &&
+              warm.cpu_work_seconds_per_sp < envelope.cpu_work_seconds_per_sp,
+          "shared cache did not use the cohorts' actual expanded index sizes");
+    // Different metas in one identity schedule remain mutually exclusive
+    // when their declared service costs differ at the same plot parameters.
+    drives.resize(2); plans.resize(2); configs.resize(2);
+    configs[1].k = configs[0].k; configs[1].strength = configs[0].strength;
+    for (size_t lane = 0; lane < plans.size(); ++lane)
+    {
+        plans[lane].schedule = 0; plans[lane].resource_rank = uint16_t(lane); plans[lane].resource_lanes = uint16_t(plans.size());
+    }
+    shared = {};
+    auto exclusive = forecast_cohorts(shared, drives, plans, configs);
+    check(exclusive.feasible && exclusive.max_eligible_families_per_resource == 1,
+          "differently calibrated metas lost their family exclusion");
+    configs[1].meta_group_override = plans[1].meta_base = 1;
+    rejects([&] { forecast_cohorts(shared, drives, plans, configs); },
+            "heterogeneous family schedules accepted incompatible meta identities");
+    configs[1].meta_group_override = plans[1].meta_base = 0;
+    configs[1].k = 26;
+    rejects([&] { forecast_cohorts(shared, drives, plans, configs); },
+            "cohort family exclusion accepted different k values in one identity schedule");
+    configs[1].k = configs[0].k; configs[1].strength = 3;
+    rejects([&] { forecast_cohorts(shared, drives, plans, configs); },
+            "cohort family exclusion accepted different strengths in one identity schedule");
+    // Explicit equal filters can make different strengths have identical
+    // modeled service costs. The homogeneous fast path must reject that
+    // identity mismatch as well as the heterogeneous cost path.
+    shared.filter_bits = 9; shared.future_filter_bits = 8;
+    configs = {shared, shared}; configs[1].strength = 3;
+    rejects([&] { forecast_cohorts(shared, drives, plans, configs); },
+            "equal service costs concealed incompatible strength identities");
+}
+void test_cohort_scheduler()
+{
+    FarmingConfig shared;
+    shared.max_eligible_families_per_resource = 4;
+    auto small = shared;
+    small.k = 18; small.strength = 4;
+    small.chain_seconds_per_member = 0.001L;
+    small.index_seconds_per_entry = 0.00000001L;
+    small.compressed_index_bytes_per_entry = 2;
+    std::vector<FarmingConfig> configs{shared, small, small, small};
+    std::vector<FarmingDestination> drives(configs.size(), hdd(10000000000ull));
+    std::vector<FarmingDrivePlan> plans;
+    std::vector<uint64_t> files(configs.size(), 1);
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        drives[lane].max_total_members = 2; drives[lane].max_groups = 1;
+        auto plan = farming_plan(configs[lane], {drives[lane]});
+        plan.destinations[0].schedule = lane;
+        plans.push_back(plan.destinations[0]);
+    }
+    for (bool combined : {false, true})
+    {
+        for (size_t lane = 0; lane < drives.size(); ++lane) drives[lane].resource = combined ? 9 : lane;
+        for (auto reader : {FarmingReader::stateless, FarmingReader::cached})
+        {
+            shared.reader = reader; shared.index_cache_bytes = 134217728;
+            for (unsigned cores : {1u, 2u, 4u})
+            {
+                shared.harvester_cores = cores;
+                for (unsigned workers : {1u, 2u, 4u})
+                {
+                    shared.lookup_workers = workers;
+                    auto certificate = forecast_cohorts(shared, drives, plans, configs);
+                    std::vector<size_t> order{0, 1, 2, 3};
+                    do
+                    {
+                        for (unsigned pattern = 0; pattern <= 4; ++pattern)
+                        {
+                            std::vector<Job> jobs;
+                            for (auto lane : order) jobs.push_back({lane, 0, 2, 0, unsigned((lane + pattern) % 5)});
+                            auto actual = simulate(shared, drives, jobs, configs.size(), configs, files);
+                            check(actual.tail <= certificate.response_bound_seconds,
+                                  "mixed-shape independent scheduler exceeded the joint certificate");
+                        }
+                    } while (std::next_permutation(order.begin(), order.end()));
+                }
+            }
+        }
+    }
+}
+void test_cohort_replacement_scheduler()
+{
+    FarmingConfig shared;
+    shared.deadline_seconds = shared.challenge_seconds = 1000000;
+    shared.max_eligible_families_per_resource = 1000000;
+    shared.memory_bytes = 4000000000ull;
+    std::vector<FarmingConfig> configs(4, shared);
+    configs[0].chain_seconds_per_member = 0.08L;
+    configs[0].index_seconds_per_entry = 0.00000001L;
+    configs[0].compressed_index_bytes_per_entry = 2;
+    configs[0].lookup_memory_per_member = 65536;
+    configs[1].chain_seconds_per_member = 0.00001L;
+    configs[1].index_seconds_per_entry = 0.000004L;
+    configs[2].strength = 4;
+    configs[2].chain_seconds_per_member = 0.000001L;
+    configs[2].index_seconds_per_entry = 0;
+    configs[2].compressed_index_bytes_per_entry = 0.5L;
+    configs[3].k = 18; configs[3].strength = 5;
+    configs[3].chain_seconds_per_member = 0.0001L;
+    configs[3].index_seconds_per_entry = 0.00000001L;
+    configs[3].compressed_index_bytes_per_entry = 2;
+    std::vector<FarmingDestination> drives(4, hdd());
+    drives[0].resource = drives[1].resource = drives[3].resource = 9;
+    drives[2].resource = 10;
+    drives[0].read_bytes_per_second = 250000; drives[0].read_latency_seconds = 0.02L; drives[0].read_concurrency = 1;
+    drives[1].read_bytes_per_second = 500000; drives[1].read_latency_seconds = 0.005L; drives[1].read_concurrency = 4;
+    drives[2].read_bytes_per_second = 50000; drives[2].read_latency_seconds = 0.001L; drives[2].read_concurrency = 2;
+    drives[3].read_bytes_per_second = 200000; drives[3].read_latency_seconds = 0.04L; drives[3].read_concurrency = 2;
+    std::vector<std::vector<uint16_t>> counts{{240, 1, 2, 1, 3}, {1, 32, 1, 24},
+                                             {72, 1, 48, 2, 96, 3}, {2, 1, 2, 2, 1, 2, 1, 2, 2}};
+    std::vector<FarmingDrivePlan> plans(4);
+    std::vector<uint64_t> files;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::vector<Job>> choices;
+    for (size_t lane = 0; lane < plans.size(); ++lane)
+    {
+        auto& plan = plans[lane];
+        plan.schedule = lane < 2 ? 0 : lane - 1;
+        plan.resource_rank = lane == 1 ? 1 : 0; plan.resource_lanes = lane < 2 ? 2 : 1;
+        plan.meta_slots = lane == 3 ? 4 : 2;
+        files.push_back(counts[lane].size());
+        for (size_t file = 0; file < counts[lane].size(); ++file)
+        {
+            choices[{drives[lane].resource, plan.schedule, plan.family(file)}].push_back({lane, file, counts[lane][file]});
+        }
+    }
+    // Each selection chooses one possible eligible meta per family. Both
+    // overlapping lanes, asymmetric independent families, replacement jobs,
+    // admission orders and interleaved chunk CPU patterns vary independently.
+    for (auto reader : {FarmingReader::stateless, FarmingReader::cached})
+    {
+        shared.reader = reader; shared.index_cache_bytes = 4000000000ull;
+        for (unsigned cores : {1u, 2u, 4u})
+        {
+            shared.harvester_cores = cores;
+            for (unsigned workers : {1u, 2u, 4u, 8u})
+            {
+                shared.lookup_workers = workers;
+                farming_detail::PlanningMemory memory{64ull * 1024 * 1024};
+                auto certificate = farming_detail::assess(shared, drives, plans, &counts, memory, nullptr, configs);
+                check(certificate.feasible, "asymmetric cohort scheduler fixture is infeasible");
+                for (unsigned selection = 0; selection < 64; ++selection)
+                {
+                    std::vector<Job> jobs; size_t family = 0;
+                    for (auto const& item : choices)
+                    {
+                        auto const& alternatives = item.second;
+                        jobs.push_back(alternatives[(selection >> (family++ % 5)) % alternatives.size()]);
+                    }
+                    std::rotate(jobs.begin(), jobs.begin() + selection % jobs.size(), jobs.end());
+                    if (selection & 1) std::reverse(jobs.begin(), jobs.end());
+                    for (unsigned pattern = 0; pattern <= 4; ++pattern)
+                    {
+                        for (size_t job = 0; job < jobs.size(); ++job)
+                            jobs[job].cpu_pattern = unsigned((job + selection + pattern) % 5);
+                        auto actual = simulate(shared, drives, jobs, 0, configs, files);
+                        check(!actual.late && actual.tail <= certificate.response_bound_seconds,
+                              "asymmetric mixed-shape replacement scheduler exceeded its certificate");
+                    }
+                }
+            }
+        }
+    }
+}
+void test_large_cohort_assessment()
+{
+    FarmingConfig shared;
+    shared.harvester_cores = shared.lookup_workers = 16;
+    shared.memory_bytes = 4000000000ull;
+    shared.max_eligible_families_per_resource = 1000000;
+    shared.deadline_seconds = shared.challenge_seconds = 1000000;
+    std::vector<FarmingDestination> drives(1024, hdd());
+    std::vector<FarmingDrivePlan> plans(drives.size());
+    std::vector<FarmingConfig> configs(drives.size(), shared);
+    std::vector<std::vector<uint16_t>> counts(drives.size());
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        auto const cohort = lane / 8;
+        auto const shape = (cohort + cohort / 64) % 4;
+        drives[lane].resource = cohort % 64;
+        auto& plan = plans[lane];
+        plan.schedule = cohort; plan.resource_rank = uint16_t(lane % 8); plan.resource_lanes = 8; plan.meta_slots = 256;
+        configs[lane].k = uint8_t(28 - 2 * shape);
+        configs[lane].strength = uint8_t(2 + shape);
+        configs[lane].chain_seconds_per_member /= 1 + lane % 4;
+        for (unsigned file = 0; file < 128; ++file) counts[lane].push_back(uint16_t(1 + (file + lane) % 128));
+    }
+    auto start = std::chrono::steady_clock::now();
+    farming_detail::PlanningMemory memory{64ull << 20};
+    auto original = farming_detail::assess(shared, drives, plans, &counts, memory, nullptr, configs);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    check(original.feasible && original.planning_memory_bytes <= memory.limit,
+          "large multi-cohort assessment exceeded the existing planning budget");
+    farming_detail::PlanningMemory exact_memory{original.planning_memory_bytes};
+    auto exact = farming_detail::assess(shared, drives, plans, &counts, exact_memory, nullptr, configs);
+    check(exact.feasible && exact.response_bound_seconds == original.response_bound_seconds &&
+              exact.planning_memory_bytes == original.planning_memory_bytes,
+          "exact large-cohort planning memory changed the certificate");
+    rejects<FarmingResourceError>([&]
+    {
+        farming_detail::PlanningMemory short_memory{original.planning_memory_bytes - 1};
+        farming_detail::assess(shared, drives, plans, &counts, short_memory, nullptr, configs);
+    }, "large-cohort assessment bypassed its declared planning budget");
+    for (auto& lane : counts)
+        for (size_t file = 0; file < lane.size(); file += 2) std::swap(lane[file], lane[file + 1]);
+    farming_detail::PlanningMemory reordered_memory{64ull << 20};
+    auto reordered = farming_detail::assess(shared, drives, plans, &counts, reordered_memory, nullptr, configs);
+    check(reordered.feasible && reordered.response_bound_seconds == original.response_bound_seconds &&
+              reordered.dynamic_work_seconds_per_sp == original.dynamic_work_seconds_per_sp &&
+              reordered.reader_memory_bytes == original.reader_memory_bytes &&
+              reordered.max_eligible_families_per_resource == original.max_eligible_families_per_resource,
+          "large cohort lane/member churn changed an unchanged family demand");
+    start = std::chrono::steady_clock::now();
+    farming_detail::PlanningMemory legacy_memory{64ull << 20};
+    auto legacy = farming_detail::assess(shared, drives, plans, &counts, legacy_memory, nullptr, configs, false);
+    auto legacy_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    check(legacy.feasible && legacy.max_eligible_families_per_resource == original.max_eligible_families_per_resource,
+          "large cohort assessment changed the legacy physical family union");
+    std::cout << "large_cohort_assessment planning_bytes=" << original.planning_memory_bytes << " elapsed_ms=" << elapsed
+              << " legacy_planning_bytes=" << legacy.planning_memory_bytes << " legacy_elapsed_ms=" << legacy_elapsed << '\n';
+}
+void test_numerical_adjustments()
+{
+    FarmingConfig shared; shared.lookup_workers = 2; shared.harvester_cores = 1;
+    auto small = shared; small.k = 18; small.strength = 4;
+    small.chain_seconds_per_member = 0.001L; small.index_seconds_per_entry = 0.00000001L;
+    small.compressed_index_bytes_per_entry = 2; small.lookup_memory_per_member = 512;
+    std::vector<FarmingConfig> configs{shared, small, small, small}; auto const original_configs = configs;
+    std::vector<FarmingDestination> drives(4, hdd());
+    std::vector<FarmingDrivePlan> plans(4);
+    std::vector<std::vector<uint16_t>> counts(4, {2});
+    for (size_t lane = 0; lane < drives.size(); ++lane)
+    {
+        drives[lane].resource = 9; plans[lane].schedule = lane; plans[lane].meta_slots = 256;
+    }
+    shared.memory_bytes = 1; shared.deadline_seconds = 0.001L; shared.challenge_seconds = 0.002L;
+    auto original = shared;
+    auto suggestions = farming_adjustments(shared, drives, plans, counts, 64ull << 20, configs, true, 8);
+    auto const& need = suggestions.requirements;
+    check(need.memory_limited && need.eligible_limited && need.deadline_limited && need.cadence_limited && !need.overflow &&
+              suggestions.evaluations <= 8 && configs == original_configs && shared == original,
+          "numerical diagnostics lost a joint constraint, exceeded work or modified declared inputs");
+    bool memory = false, eligible = false, deadline = false;
+    for (auto const& alternative : suggestions.alternatives)
+    {
+        farming_detail::PlanningMemory scratch{64ull << 20};
+        auto actual = farming_detail::assess(alternative.config, drives, plans, &counts, scratch, nullptr, configs);
+        check(actual.feasible == alternative.assessment.feasible && actual.response_bound_seconds == alternative.assessment.response_bound_seconds &&
+                  actual.reader_memory_bytes == alternative.assessment.reader_memory_bytes &&
+                  actual.dynamic_work_seconds_per_sp == alternative.assessment.dynamic_work_seconds_per_sp,
+              "offered alternative differs from the same full joint assessment");
+        auto unchanged = alternative.config;
+        unchanged.memory_bytes = shared.memory_bytes; unchanged.max_eligible_families_per_resource = shared.max_eligible_families_per_resource;
+        unchanged.deadline_seconds = shared.deadline_seconds; unchanged.harvester_cores = shared.harvester_cores;
+        unchanged.lookup_workers = shared.lookup_workers;
+        check(unchanged == shared, "budget advice changed a cohort service envelope, cache or plot identity");
+        if (alternative.kind == FarmingAdjustmentKind::memory)
+        {
+            memory = true;
+            check(alternative.config.memory_bytes == need.memory_bytes && !alternative.remaining.memory_limited &&
+                      alternative.remaining.eligible_limited && alternative.remaining.deadline_limited && !actual.feasible,
+                  "memory advice hid remaining family/deadline failures or used an arbitrary budget");
+        }
+        else if (alternative.kind == FarmingAdjustmentKind::eligible_families)
+        {
+            eligible = true;
+            check(alternative.config.max_eligible_families_per_resource == need.eligible_families_per_resource &&
+                      !alternative.remaining.eligible_limited && alternative.remaining.memory_limited && !actual.feasible,
+                  "family advice hid remaining memory failure or exceeded the needed limit");
+        }
+        else if (alternative.kind == FarmingAdjustmentKind::deadline)
+        {
+            deadline = true;
+            check(alternative.config.deadline_seconds == need.response_seconds && !alternative.remaining.deadline_limited &&
+                      alternative.remaining.cadence_limited && !actual.feasible,
+                  "deadline advice incorrectly certified an undrainable signage-point batch");
+        }
+    }
+    check(memory && eligible && deadline, "numerical diagnostics omitted an exact required budget");
+    auto limited = farming_adjustments(shared, drives, plans, counts, 64ull << 20, configs, true, 1);
+    check(limited.evaluations == 1 && limited.search_limited && limited.alternatives.empty() &&
+              limited.baseline.response_bound_seconds == suggestions.baseline.response_bound_seconds,
+          "bounded diagnostic search hid its exhaustion or changed the baseline");
+    rejects<FarmingResourceError>([&] { farming_adjustments(shared, drives, plans, counts, 1, configs); },
+                                  "diagnostic alternatives ignored their planning-memory budget");
+    shared = {}; shared.memory_bytes = 4000000000ull;
+    shared.harvester_cores = 1; shared.lookup_workers = 4;
+    for (size_t lane = 0; lane < drives.size(); ++lane) drives[lane].resource = lane;
+    auto assess = [&](FarmingConfig const& proposed)
+    {
+        farming_detail::PlanningMemory scratch{64ull << 20};
+        return farming_detail::assess(proposed, drives, plans, &counts, scratch, nullptr, configs);
+    };
+    auto slow = assess(shared); auto parallel = shared; parallel.harvester_cores = parallel.lookup_workers;
+    auto fast = assess(parallel);
+    check(fast.response_bound_seconds < slow.response_bound_seconds, "core adjustment fixture has no CPU interference");
+    shared.deadline_seconds = (slow.response_bound_seconds + fast.response_bound_seconds) / 2;
+    auto cores = farming_adjustments(shared, drives, plans, counts, 64ull << 20, configs);
+    auto core_choice = std::find_if(cores.alternatives.begin(), cores.alternatives.end(),
+        [](FarmingAdjustment const& value) { return value.kind == FarmingAdjustmentKind::cpu_cores; });
+    check(core_choice != cores.alternatives.end() && core_choice->assessment.feasible && core_choice->config.lookup_workers == shared.lookup_workers &&
+              core_choice->config.harvester_cores > shared.harvester_cores && assess(core_choice->config).feasible,
+          "numerical core proposal did not pass the complete joint certificate");
+    shared.harvester_cores = shared.lookup_workers = 1; shared.deadline_seconds = 8;
+    slow = assess(shared); parallel = shared; parallel.harvester_cores = parallel.lookup_workers = 4; fast = assess(parallel);
+    check(fast.response_bound_seconds < slow.response_bound_seconds, "worker adjustment fixture has no queue delay");
+    shared.deadline_seconds = (slow.response_bound_seconds + fast.response_bound_seconds) / 2;
+    auto workers = farming_adjustments(shared, drives, plans, counts, 64ull << 20, configs);
+    auto worker_choice = std::find_if(workers.alternatives.begin(), workers.alternatives.end(),
+        [](FarmingAdjustment const& value) { return value.kind == FarmingAdjustmentKind::lookup_workers; });
+    check(worker_choice != workers.alternatives.end() && worker_choice->assessment.feasible && worker_choice->config.lookup_workers > shared.lookup_workers &&
+              assess(worker_choice->config).feasible && configs == original_configs,
+          "numerical worker proposal failed joint assessment or mutated old cohort parameters");
 }
 void test_large_frozen_expansion()
 {
@@ -946,6 +1393,11 @@ int main()
         test_frozen_expansion();
         test_extent_admission();
         test_planning_memory_boundaries();
+        test_cohort_costs();
+        test_cohort_scheduler();
+        test_cohort_replacement_scheduler();
+        test_large_cohort_assessment();
+        test_numerical_adjustments();
         test_large_frozen_expansion();
         test_small_exhaustive();
         test_cached_search_boundary();

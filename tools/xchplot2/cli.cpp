@@ -200,6 +200,8 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "Usage:\n"
         << "  " << prog << " plan [OPTIONS] [--] [DIR...]\n"
         << "  " << prog << " fill [OPTIONS] [-r|--resume] [--] [DIR...]\n"
+        << "  " << prog << " status [DIR|PLAN|--manifest FILE] [--watch] [--inspect]\n"
+        << "  " << prog << " pause|drain|resume|retire [DIR|--manifest FILE] [--destination DIR]...\n"
         << "  " << prog << " grow FILE [--max-members N] [OPTIONS]\n"
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
         << "    Farming-layout preview, capacity-driven plotting, group growth and shared compute.\n"
@@ -1376,8 +1378,7 @@ std::vector<std::string> expand_argfiles(int argc, char* argv[])
         }
         return p;
     };
-    bool group = argc > 1 && (std::string_view(argv[1]) == "plan" ||
-        std::string_view(argv[1]) == "fill" || std::string_view(argv[1]) == "grow");
+    bool group = argc > 1 && pos2gpu::is_group_command(argv[1]);
     bool literal = false;
     unsigned values = 0;
     auto append = [&](std::string token) {
@@ -1387,7 +1388,7 @@ std::vector<std::string> expand_argfiles(int argc, char* argv[])
             else if (group) values = pos2gpu::group_option_values(token);
         }
         out.push_back(std::move(token));
-        if (out.size() == 2) group = out[1] == "plan" || out[1] == "fill" || out[1] == "grow";
+        if (out.size() == 2) group = pos2gpu::is_group_command(out[1]);
     };
     for (int i = 0; i < argc; ++i) {
         std::string tok = argv[i];
@@ -1417,7 +1418,7 @@ bool group_value_option(std::string_view option)
 {
     static constexpr std::string_view options[] = {
         "--backend", "--device", "--max-ram", "--workers", "-j", "--batch-members",
-        "--capacity-bytes", "--headroom-bytes", "--temp-capacity-bytes", "--destination-temp",
+        "--capacity-bytes", "--headroom-bytes", "--leave-free", "--temp-capacity-bytes", "--destination-temp",
         "--construction", "--member-storage", "--window-bytes", "--checkpoint-bytes",
         "--io-overlap", "--generation-overlap", "--cache-release"
     };
@@ -1456,7 +1457,7 @@ std::vector<std::string> group_arguments(std::vector<std::string> const& input)
             }
             continue;
         }
-        if (key == "--max-host-ram" || key == "--max-ram" || key == "-M" || key.ends_with("-bytes") ||
+        if (key == "--max-host-ram" || key == "--max-ram" || key == "-M" || key == "--leave-free" || key.ends_with("-bytes") ||
             key == "--compute-offer-ram" || key == "--compute-offer-vram" || key == "--compute-codec-ram") {
             if (++i == input.size()) throw std::invalid_argument(key + " requires a size");
             if (key == "--compute-codec-ram" && input[i] == "auto") {
@@ -1519,8 +1520,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
     std::vector<char*> argv_stripped;
     {
         argv_stripped.reserve(argc);
-        bool group = argc > 1 && (std::string_view(argv[1]) == "plan" ||
-            std::string_view(argv[1]) == "fill" || std::string_view(argv[1]) == "grow");
+        bool group = argc > 1 && pos2gpu::is_group_command(argv[1]);
         bool literal = false;
         unsigned values = 0;
         for (int i = 0; i < argc; ++i) {
@@ -1535,7 +1535,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 else if (group && i >= 2) values = pos2gpu::group_option_values(a);
             }
             argv_stripped.push_back(argv[i]);
-            if (argv_stripped.size() == 2) group = a == "plan" || a == "fill" || a == "grow";
+            if (argv_stripped.size() == 2) group = pos2gpu::is_group_command(a);
         }
         strip_argc = static_cast<int>(argv_stripped.size());
     }
@@ -1577,7 +1577,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
                     "--no-auto-spill", "--keep", "--compute-only", "--full", "--json", "--plan-only",
-                    "--extend", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
+                    "--extend", "--update", "--cancel-update", "--status", "--watch", "--inspect", "--revalidate", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;
                 auto const as_bool = std::find(std::begin(bool_flags), std::end(bool_flags), bool_flag)
@@ -1645,7 +1645,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         print_usage(argv[0], std::cout);
         return 0;
     }
-    if (mode == "plan" || mode == "fill" || mode == "grow") {
+    if (pos2gpu::is_group_command(mode)) {
         if (!group_commands_available()) return 1;
 #ifdef XCHPLOT2_GROUP_COMMANDS
         try {
@@ -3084,10 +3084,10 @@ _xchplot2() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local subcmds="plan plot fill grow compute batch bench test devices verify parity-check completions"
+    local subcmds="plan plot fill status pause drain resume retire grow compute batch bench test devices verify parity-check completions"
     local tiers="plain compact minimal tiny pinned auto"
     local devices_tokens="all gpu cpu 0 1 2 3"
-    if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill ]]; then
+    if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
         local i option values=0 literal=0
         for ((i=2; i<COMP_CWORD; ++i)); do
             if ((values)); then
@@ -3097,7 +3097,7 @@ _xchplot2() {
                 case "${COMP_WORDS[i]}" in
                     --) literal=1; break ;;
                     --relocate) values=2 ;;
-                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
+                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--watch|--no-watch|--inspect|--no-inspect|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--update|--no-update|--cancel-update|--no-cancel-update|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
                     -*) values=1 ;;
                 esac
             fi
@@ -3119,10 +3119,10 @@ _xchplot2() {
         --backend|--compute-offer-backend) COMPREPLY=( $(compgen -W "auto cpu gpu" -- "$cur") ); return 0 ;;
         --construction)    COMPREPLY=( $(compgen -W "auto incremental staged merged external" -- "$cur") ); return 0 ;;
         --replot-verification) COMPREPLY=( $(compgen -W "structural sampled strict" -- "$cur") ); return 0 ;;
-        -o|--out|-t|--temp-dir|--relocate|--chia-root|--directory|--compute-directory|--replot-source-root|--replot-exclude-root)
+        -o|--out|-t|--temp-dir|--relocate|--discover-drives|--mounts-under|--destination|--chia-root|--directory|--compute-directory|--replot-source-root|--replot-exclude-root)
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -d -- "$cur")
             return 0 ;;
-        -M|--max-host-ram|-j|--workers|--farm-adapter-timeout-ms|--replot-proof-first-groups|--replot-proof-every-groups) return 0 ;;
+        -M|--max-host-ram|--leave-free|--headroom-bytes|-j|--workers|--farm-adapter-timeout-ms|--replot-proof-first-groups|--replot-proof-every-groups) return 0 ;;
         --harvester)
             COMPREPLY=( $(compgen -W "local" -- "$cur") )
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
@@ -3150,10 +3150,10 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --revalidate --no-revalidate --replot --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --extend --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --destination --revalidate --no-revalidate --replot --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
-    if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill ]]; then
+    if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
         while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
     fi
 }
@@ -3164,7 +3164,7 @@ complete -F _xchplot2 xchplot2
 _xchplot2() {
     local -a subcmds
     local positional='*:: :->args'
-    subcmds=(plan:"Preview farming layout" fill:"Fill destination drives" grow:"Extend an existing group" compute:"Share compute" batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
+    subcmds=(plan:"Preview farming layout" fill:"Fill destination drives" status:"Inspect farm progress" pause:"Pause plotting" drain:"Drain plotting" resume:"Resume plotting" retire:"Retire plotting intent" grow:"Extend an existing group" compute:"Share compute" batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
     if (( CURRENT == 2 )); then
         _describe 'subcommand' subcmds
         return
@@ -3186,7 +3186,7 @@ _xchplot2() {
             '--config[Configuration file]:file:_files' '2:plot file:_files'
         return
     fi
-    if [[ "${words[2]}" == plan || "${words[2]}" == fill ]]; then
+    if [[ "${words[2]}" == plan || "${words[2]}" == fill || "${words[2]}" == status || "${words[2]}" == pause || "${words[2]}" == drain || "${words[2]}" == resume || "${words[2]}" == retire ]]; then
         positional='*:destination directory or saved plan:_files'
     fi
     _arguments \
@@ -3221,7 +3221,10 @@ _xchplot2() {
         '--replot-verification[Replacement verification policy]:mode:(structural sampled strict)' \
         '--replot-proof-first-groups[Sampled initial proof-checked groups]:count:' \
         '--replot-proof-every-groups[Sampled global one-based proof period]:count:' \
-        '--status[Inspect saved migration progress]' \
+        '--status[Inspect saved farm progress]' \
+        '--watch[Refresh status until interrupted]' '--no-watch[Print status once]' \
+        '--inspect[Include deep live status checks]' '--no-inspect[Read saved status]' \
+        '*--destination[Saved destination to control]:directory:_files -/' \
         '--revalidate[Review updated migration resources or verification policy]' \
         '*--replot-source-root[Exact inventory root to select]:dir:_files -/' \
         '*--replot-exclude-root[Exact inventory root to protect]:dir:_files -/' \
@@ -3238,7 +3241,11 @@ _xchplot2() {
         '--calibration-memory-bytes[Reader worker memory limit]:size:' \
         '--paths-from[Literal destination list]:file:_files' \
         '--paths0-from[NUL-delimited destination list]:file:_files' \
-        '--extend[Add destinations to a saved farm]' \
+        '*--discover-drives[Discover mounted storage below a directory]:directory:_files -/' \
+        '*--mounts-under[Alias for discover-drives]:directory:_files -/' \
+        '--extend[Add destinations or refresh farm capacity]' \
+        '--update[Revise future farm policy]' \
+        '--cancel-update[Cancel a queued farm update]' \
         '--allow-missing[Resume available destinations]' \
         '--relocate[Move a saved destination]:old directory:_files -/:new directory:_files -/' \
         '--construction[Group construction method]:value:' \
@@ -3251,7 +3258,8 @@ _xchplot2() {
         '--max-groups[File limit per directory]:value:' \
         '--max-total-members[Member limit per directory]:value:' \
         '--capacity-bytes[Output capacity]:value:' \
-        '--headroom-bytes[Space to leave free]:value:' \
+        '--leave-free[Space to leave free; binary unit suffixes accepted]:size:' \
+        '--headroom-bytes[Alias for leave-free]:size:' \
         '--destination-temp[Destination scratch permission]:value:' \
         '--temp-capacity-bytes[Scratch cap]:value:' \
         '--member-storage[Retained fragment storage]:value:' \
@@ -3357,6 +3365,8 @@ _xchplot2 "$@"
 complete -c xchplot2 -f
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plan' -d 'Preview farming layout'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'fill' -d 'Fill destination drives'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'status' -d 'Inspect farm progress'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'pause drain resume retire' -d 'Control saved plotting intent'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'grow' -d 'Extend an existing group'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'compute' -d 'Share compute'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
@@ -3390,7 +3400,12 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot -r -F -d 'R
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-verification -r -a 'structural sampled strict' -d 'Replacement verification policy'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-first-groups -r -d 'Sampled initial proof-checked groups'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-every-groups -r -d 'Sampled global one-based proof period'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l status -d 'Inspect saved migration progress'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l status -d 'Inspect saved farm progress'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l watch -d 'Refresh status until interrupted'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l inspect -d 'Include deep live status checks'
+complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l destination -r -a '(__fish_complete_directories)' -d 'Saved destination to control'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status pause drain resume retire; and not __fish_seen_subcommand_from compute' -l manifest -r -F -d 'Saved farming job'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status pause drain resume retire; and not __fish_seen_subcommand_from compute' -a '(__fish_complete_path)' -d 'Saved job directory or plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l revalidate -d 'Review updated migration resources or verification policy'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-source-root -r -a '(__fish_complete_directories)' -d 'Exact inventory root to select'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-exclude-root -r -a '(__fish_complete_directories)' -d 'Exact inventory root to protect'
@@ -3406,7 +3421,11 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l chia-root -r 
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l chia-executable -r -F -d 'Installed Chia CLI'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l paths-from -r -d 'Literal destination list'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l paths0-from -r -d 'NUL-delimited destination list'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l extend -d 'Add destinations to a saved farm'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l discover-drives -r -a '(__fish_complete_directories)' -d 'Discover mounted storage below a directory'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l mounts-under -r -a '(__fish_complete_directories)' -d 'Alias for discover-drives'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l extend -d 'Add destinations or refresh farm capacity'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l update -d 'Revise future farm policy'
+complete -c xchplot2 -n '__fish_seen_subcommand_from fill' -l cancel-update -d 'Cancel a queued farm update'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l allow-missing -d 'Resume available destinations'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l relocate -r -d 'Old and new destination directories'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -a '(__fish_complete_path)' -d 'Destination directory or saved plan'
@@ -3420,7 +3439,8 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' 
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-groups -r -d 'File limit per directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-total-members -r -d 'Member limit per directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l capacity-bytes -r -d 'Output capacity'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l headroom-bytes -r -d 'Space to leave free'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l leave-free -r -d 'Space to leave free; binary unit suffixes accepted'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l headroom-bytes -r -d 'Alias for leave-free'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l destination-temp -r -d 'Destination scratch permission'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l temp-capacity-bytes -r -d 'Scratch cap'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l member-storage -r -d 'Retained fragment storage'

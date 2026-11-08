@@ -15,6 +15,25 @@ function(pos2_group_tests upstream_dir grow_include)
             "${upstream_dir}/src/pos/sha/sha256.c")
         target_compile_definitions(pos2_pr118_grow_merge_test PRIVATE GROW_TEST_CONSTRUCTION=1)
         target_include_directories(pos2_pr118_grow_merge_test PRIVATE "${upstream_dir}/src/plot")
+        # Independent binaries exercise real interrupted jobs across different
+        # source builds while retaining the same declared construction contract.
+        foreach(variant fixture compatibility_test)
+            add_executable(pos2_pr118_grow_checkpoint_${variant}
+                "${repo_dir}/tools/parity/group_checkpoint_compatibility_test.cpp"
+                "${upstream_dir}/src/pos/sha/sha256.c")
+        endforeach()
+        foreach(variant fixture recovery)
+            add_executable(pos2_pr118_stream_checkpoint_${variant}
+                "${repo_dir}/contrib/pos2-pr118/stream.cpp" "${upstream_dir}/src/pos/sha/sha256.c")
+        endforeach()
+        target_compile_definitions(pos2_pr118_grow_checkpoint_fixture PRIVATE
+            GROW_IDENTITY="checkpoint-source-a" STREAM_IDENTITY="checkpoint-source-a")
+        target_compile_definitions(pos2_pr118_grow_checkpoint_compatibility_test PRIVATE
+            GROW_IDENTITY="checkpoint-source-b" STREAM_IDENTITY="checkpoint-source-b")
+        target_compile_definitions(pos2_pr118_stream_checkpoint_fixture PRIVATE STREAM_IDENTITY="checkpoint-source-a")
+        target_compile_definitions(pos2_pr118_stream_checkpoint_recovery PRIVATE STREAM_IDENTITY="checkpoint-source-b")
+        add_dependencies(pos2_pr118_grow_checkpoint_compatibility_test pos2_pr118_grow_checkpoint_fixture
+            pos2_pr118_stream_checkpoint_fixture pos2_pr118_stream_checkpoint_recovery)
     endif()
     add_executable(pos2_pr118_grow_scratch_test "${repo_dir}/tools/parity/group_scratch_test.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
@@ -31,7 +50,9 @@ function(pos2_group_tests upstream_dir grow_include)
         target_compile_definitions(pos2_pr118_grow_merge_test PRIVATE GROW_TEST_WRAP_PWRITE=1)
         target_link_options(pos2_pr118_grow_merge_test PRIVATE "-Wl,--wrap=pwrite" "-Wl,--wrap=pread" "-Wl,--wrap=unlink" "-Wl,--wrap=lstat" "-Wl,--wrap=renameat2" "-Wl,--wrap=fsetxattr")
     endif()
-    foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test pos2_pr118_grow_replot_resources_test)
+    foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test pos2_pr118_grow_replot_resources_test
+                   pos2_pr118_grow_checkpoint_fixture pos2_pr118_grow_checkpoint_compatibility_test
+                   pos2_pr118_stream_checkpoint_fixture pos2_pr118_stream_checkpoint_recovery)
         if(NOT TARGET ${target})
             continue()
         endif()
@@ -56,7 +77,9 @@ function(pos2_group_tests upstream_dir grow_include)
     endif()
     foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test
                    pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test pos2_pr118_grow_replot_resources_test
-                   pos2_pr118_grow_merge_test pos2_pr118_grow_gpu_output_test pos2_pr118_grow_farming_test)
+                   pos2_pr118_grow_merge_test pos2_pr118_grow_gpu_output_test pos2_pr118_grow_farming_test
+                   pos2_pr118_grow_checkpoint_fixture pos2_pr118_grow_checkpoint_compatibility_test
+                   pos2_pr118_stream_checkpoint_fixture pos2_pr118_stream_checkpoint_recovery)
         if(NOT TARGET ${target})
             continue()
         endif()

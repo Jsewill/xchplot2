@@ -29,6 +29,19 @@ class StagingEngine
         uint16_t first = 0, count = 0;
         uint32_t reserved = 0;
     };
+    static bool compatible_record(Record const& record)
+    { return !std::memcmp(record.magic.data(), "XCHPLOT2STAGEv2\0\0", 16); }
+    static ConstructionCompatibility checkpoint_compatibility()
+    {
+        return construction_compatibility({sizeof(Record), alignof(Record), offsetof(Record, sequence),
+            offsetof(Record, original), offsetof(Record, target), offsetof(Record, original_bytes),
+            offsetof(Record, alignment), offsetof(Record, anchor), offsetof(Record, staged_end),
+            offsetof(Record, symbols), offsetof(Record, canonical_bound), offsetof(Record, storage_bytes),
+            offsetof(Record, packed_chunks), offsetof(Record, packed_bytes), offsetof(Record, final_bytes),
+            offsetof(Record, compacted), offsetof(Record, staged), offsetof(Record, phase),
+            offsetof(Record, memo), offsetof(Record, build), sizeof(Phase), sizeof(RunHeader), alignof(RunHeader),
+            offsetof(RunHeader, first), offsetof(RunHeader, count), offsetof(RunHeader, reserved)});
+    }
     struct Run { uint64_t consumed, end, cursor; uint16_t first, count; };
     // Parsing cursors, durable consumption and cached read-ahead are separate.
     // All readers borrow disjoint slices of one aggregate input allocation.
@@ -228,6 +241,11 @@ class StagingEngine
         ++record_.sequence;
         std::array<uint8_t, record_bytes> bytes{};
         std::memcpy(bytes.data(), &record_, sizeof(record_));
+        if (compatible_record(record_))
+        {
+            auto const compatibility = checkpoint_compatibility();
+            std::memcpy(bytes.data() + sizeof(record_), &compatibility, sizeof(compatibility));
+        }
         auto digest = grow_digest(std::span(bytes).first(record_bytes - 32));
         std::copy(digest.begin(), digest.end(), bytes.end() - 32);
         uint64_t const anchor = tail_records_ ? tail_anchor(record_) : record_.anchor;
@@ -245,8 +263,16 @@ class StagingEngine
         auto digest = grow_digest(std::span(bytes).first(record_bytes - 32));
         if (!std::equal(digest.begin(), digest.end(), bytes.end() - 32)) return {};
         Record saved{}; std::memcpy(&saved, bytes.data(), sizeof(saved));
-        if (std::string_view(saved.magic.data(), saved.magic.size()) !=
-            std::string_view("XCHPLOT2STAGEv1\0\0", 16)) return {};
+        if (!std::string_view(saved.magic.data(), saved.magic.size()).starts_with("XCHPLOT2STAGEv")) return {};
+        bool const compatible = compatible_record(saved);
+        check_construction_format(compatible || !std::memcmp(saved.magic.data(), "XCHPLOT2STAGEv1\0\0", 16), "staging");
+        if (compatible)
+        {
+            ConstructionCompatibility compatibility{};
+            std::memcpy(&compatibility, bytes.data() + sizeof(saved), sizeof(compatibility));
+            check_construction_compatibility(compatibility, checkpoint_compatibility(), "staging");
+        }
+        else check_construction_build(saved.build, GROW_IDENTITY, "staging");
         if (authority) *authority = digest;
         return saved;
     }
@@ -533,7 +559,7 @@ public:
             if (!read(offset, bytes)) continue;
             auto digest = grow_digest(std::span(bytes).first(record_bytes - 32));
             if (std::equal(digest.begin(), digest.end(), bytes.end() - 32) &&
-                !std::memcmp(bytes.data(), "XCHPLOT2STAGEv1\0\0", 16)) return true;
+                std::string_view(reinterpret_cast<char const*>(bytes.data()), 16).starts_with("XCHPLOT2STAGEv")) return true;
         }
         return false;
     }
@@ -553,7 +579,7 @@ public:
 inline StagingEngine::StagingEngine(std::string path, Config config, bool resume, std::optional<Identity> initial)
     : path_(std::move(path)), config_(config)
 {
-    static_assert(sizeof(Record) <= record_bytes - 32);
+    static_assert(sizeof(Record) + sizeof(ConstructionCompatibility) <= record_bytes - 32);
     require(config.window_bytes >= sizeof(Header) && config.window_bytes <= SIZE_MAX && config.codec_bytes && config.checkpoint_bytes && config.workers &&
         config.capacity_bytes <= uint64_t(INT64_MAX), "invalid staging budgets");
     if (initial && !resume)
@@ -617,6 +643,9 @@ inline ConstructionInspection StagingEngine::inspect(std::string const& path, Co
     ConstructionInspection result; std::array<uint8_t, 32> authority{};
     StagingEngine engine(path, config, ReadOnly{}, limits, initial, result.target, authority);
     result.identity = engine.identity_; result.checkpoint = engine.active_;
+    if (engine.active_) result.checkpoint_identity = construction_checkpoint_identity(
+        compatible_record(engine.record_) ? "xchplot2-stage-2" : "xchplot2-stage-1",
+        construction_build_text(engine.record_.build), !compatible_record(engine.record_), checkpoint_compatibility());
     result.committed_members = engine.committed_member_count(); result.can_append = engine.can_append();
     result.inspection_memory_bytes = inspection_memory_bytes(result.identity.header.k);
     result.recovery_memory_bytes = memory_bytes(result.identity.header.k, config);
@@ -668,9 +697,6 @@ inline void StagingEngine::discover(bool resume, std::optional<Identity> const& 
     {
         require(resume, "in-progress staged group is not farmable; use --resume");
         record_ = *saved; validate_header(record_.original); validate_header(record_.target);
-        std::array<char, 64> build{}; auto name = std::string_view(GROW_IDENTITY);
-        std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
-        require(record_.build == build, "staging checkpoint requires the same codec/build identity");
         require(record_.alignment == alignment_ && record_.sequence &&
             record_.storage_bytes >= slots_end(0) && record_.storage_bytes <= size() &&
             record_.anchor <= record_.storage_bytes && multiply(alignment_, 2) <= record_.storage_bytes - record_.anchor &&
@@ -940,7 +966,7 @@ inline AppendResult StagingEngine::append(Members members)
     if (!active_)
     {
         tail_records_ = false;
-        record_ = {}; std::memcpy(record_.magic.data(), "XCHPLOT2STAGEv1\0\0", 16);
+        record_ = {}; std::memcpy(record_.magic.data(), "XCHPLOT2STAGEv2\0\0", 16);
         record_.original = identity_.header; record_.target = identity_.header;
         record_.original_bytes = identity_.bytes; record_.alignment = alignment_; record_.anchor = anchor;
         record_.staged_end = begin; record_.staged = before;

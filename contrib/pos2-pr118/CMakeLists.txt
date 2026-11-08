@@ -106,7 +106,8 @@ add_custom_command(OUTPUT "${keygen_lib}"
     VERBATIM)
 add_custom_target(pos2_pr118_keygen DEPENDS "${keygen_lib}")
 if(TARGET pos2_pr118_grow)
-    foreach(target pos2_pr118_grow pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test)
+    foreach(target pos2_pr118_grow pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test
+                   pos2_pr118_grow_checkpoint_fixture pos2_pr118_grow_checkpoint_compatibility_test)
         add_dependencies(${target} pos2_pr118_keygen)
         target_include_directories(${target} PRIVATE "${keygen_dir}/include")
         target_link_libraries(${target} PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
@@ -153,6 +154,7 @@ if(TARGET pos2_pr118_stream)
     set(stream_identity "${upstream_identity_text}")
     foreach(source "${CMAKE_CURRENT_SOURCE_DIR}/stream.cpp"
                    "${XCHPLOT2_SOURCE_DIR}/src/host/GroupCheckpoint.hpp"
+                   "${XCHPLOT2_SOURCE_DIR}/src/host/GroupConstructionIdentity.hpp"
                    "${XCHPLOT2_SOURCE_DIR}/src/host/GroupFormat.hpp")
         file(SHA256 "${source}" source_hash)
         file(RELATIVE_PATH source_name "${XCHPLOT2_SOURCE_DIR}" "${source}")

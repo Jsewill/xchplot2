@@ -214,10 +214,13 @@ Execution preserves those assignments and checks the current storage,
 available space and joint farming workload before creating the private job.
 The reviewed capacity must still be available; additional free space does not
 enlarge its quota. Execution options such as plotting RAM, workers and scratch
-may change. Different layout inputs, destination selectors or a changed source
-job require a new review. New previews and completed-job recovery require
-matching plan schema, farming model, key derivation and numeric representation.
-Legacy plans and in-progress construction checkpoints retain their
+may change. Different layout inputs, destination identities or source policy
+require a new review. For new ordinary jobs, construction progress alone does
+not invalidate a preview: execution checks the current committed work and
+reassesses the remaining proposal under the reviewed limits. New previews and
+job recovery require matching plan schema, farming model, key derivation and
+numeric representation. New construction checkpoints have their own format,
+algorithm and representation checks. Legacy plans and checkpoints retain their
 original-build requirement.
 
 With no directories, `plan` lists candidate mounted data volumes with available
@@ -246,8 +249,8 @@ reproducible identities:
 
 ```bash
 xchplot2 fill -f "$FARMER_PK" -c "$POOL_ADDRESS" -- /disk-{a,b}/plots
-# Resume the entire job through either member, without repeating keys or paths:
-xchplot2 fill -r /disk-b/plots
+# Continue the entire job through either member, without repeating keys or paths:
+xchplot2 fill /disk-b/plots
 ```
 
 `fill` always plans a farming layout, including with an explicit
@@ -257,7 +260,8 @@ shared-ID families and meta groups across physical storage resources.
 `--max-groups N` limits files per directory, and `--max-total-members N`
 limits membership per directory. Without those limits, the initial layout uses
 available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
-per filesystem; `--headroom-bytes SIZE` leaves space free (default 64 MiB).
+per filesystem; `--leave-free SIZE` leaves space free (default 64 MiB).
+`--headroom-bytes` remains an alias.
 Sizes accept bytes or suffixes such as `512M` and `14G`.
 
 New jobs keep a private, checksummed `.xchplot2/grow-farm.plan` in every member
@@ -271,9 +275,11 @@ and must not be shared. It is not a wallet seed. A temporary
 too. New farming plans record their creating build as provenance and can resume
 completed ordinary groups with a build supporting their metadata layout,
 plan schema, farming model,
-key-derivation identity and numeric representation. In-progress construction
-checkpoints and legacy plans still require their original build. A compatible
-plan does not make an incompatible construction checkpoint resumable.
+key-derivation identity and numeric representation. New in-progress checkpoints
+also require compatible construction format, algorithm and native representation;
+the creating build remains provenance. Legacy checkpoints and plans still require
+their original build. A compatible plan does not make an incompatible checkpoint
+resumable. `status --inspect` reports the checkpoint compatibility identities.
 Existing jobs with top-level `grow-farm.plan` or `grow-replot.plan` records
 retain their complete original layout, including interrupted `.next` copies.
 Keep those records where they are. Conflicting top-level and private records,
@@ -320,8 +326,11 @@ directory, or `fill -r --manifest /disk-b/plots/.xchplot2/grow-farm.plan`, also 
 Different jobs, conflicting revisions, corrupt copies or mismatching explicit
 keys are rejected before output changes. Resume audits existing outputs,
 preserves completed files, and recovers partial construction. Plotting RAM,
-workers and compute selection can change; the saved identity namespace, farming
-profile, initial assignments and quotas stay fixed.
+workers and compute selection can change. `fill -r` explicitly keeps the saved
+future policy. Repeating `fill DIR` also checks newly available capacity when
+the job is idle; if a coordinator is already running, it shows that job's status.
+Explicit future-policy options request a [revision](#revising-a-running-fill).
+Use `--no-resume` when an existing job should be an error.
 
 The initial member count is a size forecast. As compression leaves room, new
 jobs can extend the final unsealed file or admit another file within the
@@ -336,8 +345,8 @@ recorded stop reason. Construction methods and configured I/O windows can
 stop filling before the output budget is exhausted, so some unused capacity
 can remain. Existing jobs retain their saved fill policy.
 `metadata-capacity` means another extent would exceed the job's reserved
-recovery metadata. That limit can also leave space unused; resume does not
-retry an addition already recorded as stopped.
+recovery metadata. That limit can also leave space unused. `fill -r` retains
+the stop; repeating `fill DIR` reassesses future capacity and metadata needs.
 
 To add another destination, preview it together with any existing member,
 then explicitly extend the job:
@@ -347,29 +356,126 @@ xchplot2 plan /disk-b/plots /disk-c/plots --save-plan expansion.plan
 xchplot2 fill expansion.plan
 ```
 
-The preview includes all saved destinations. Existing plot identities and
-assignments stay fixed; the new layout must fit the combined farm's CPU,
+The preview includes all saved destinations. Completed and started files keep
+their plot identities and membership reservations; the new layout must fit the combined farm's CPU,
 memory, storage and response limits. An expansion can be infeasible even when
 the new disk has room. The assessment covers plots belonging to this job;
 unmanaged plots consume disk space but their farming workload is not modeled.
-`fill --extend /disk-b/plots /disk-c/plots` plans and executes an expansion
-directly. All original destinations must be available for expansion. A new revision is
+`fill --extend /disk-b/plots /disk-c/plots` requests an expansion directly.
+All original destinations must be available for expansion. A new revision is
 saved across the members before new plotting starts; interrupted publication
 is completed with ordinary `fill -r`.
 
-If a saved directory is unavailable or its mountpoint now refers to a different
-directory, normal resume stops and lists it. `fill -r --allow-missing DIR`
-continues already admitted construction on available members and exits
-with status 4 while other members remain unavailable. It cannot change the
-job, admit another extent, seal an unfinished file or commit an incompletely
-staged revision. Restore the original mounts
-and resume normally to finish the whole job.
+Use `--discover-drives DIR` to select writable supported local filesystems mounted
+at or below a directory, at any depth. The option is repeatable and combines
+with explicit destinations or `--extend`. It reads the operating system's
+mount list; ordinary subdirectories are not treated as additional drives.
+Aliases of the same mounted directory are deduplicated. Shared filesystems
+still share one capacity budget. `-v` explains skipped mounts. A selection with
+no eligible drives or explicit destinations is an error. `--mounts-under` remains
+an alias.
+
+```bash
+xchplot2 plan --discover-drives /mnt/farm --save-plan farm.plan
+xchplot2 fill /existing/plots --discover-drives /mnt/new-drives
+```
+
+### Revising a running fill
+
+`fill DIR` with explicit options revises an ordinary job's future capacity,
+free-space target, file and member limits, group size, strength, or harvester
+assumptions. Extra destination paths add storage. `--update` and `--extend`
+remain explicit alternatives. An expanded filesystem can be used without
+adding another directory. `fill -r` retains the saved policy.
+
+```bash
+xchplot2 plan /disk/plots --capacity-bytes 8T --save-plan resize.plan
+xchplot2 fill resize.plan
+xchplot2 fill /disk/plots --group-members 8 --strength 3 \
+  --farming-max-eligible-groups 2
+xchplot2 status /disk/plots
+```
+
+Completed plots and started groups retain their identities and reservations.
+Parameter changes start with later groups; resizing replaces only the unstarted
+forecast. File and member targets may be lowered below existing work; that
+stops future allocation while started files keep their original reservations.
+A hard byte cap must still cover committed work and recovery metadata; a
+refusal reports the required allowance. Updates do not delete or move plots.
+Different parameter cohorts are assessed together under the current harvester
+budget using their own service costs and shared physical resources. Additional identity
+families may require a higher declared eligible-group limit; changing that
+limit still requires the joint memory and response checks to pass. A calibration
+for one plot shape cannot silently be reused for another shape. Infeasible plans
+report required resources and, where the bounded search finds them, assessed
+alternative settings with any remaining constraint failures. Suggestions do
+not change the declared harvester automatically.
+
+During an active fill, requests and their receipts are saved on available
+matching job members. There is no required first destination. The coordinator
+reaches a recoverable construction boundary, applies the revision once all
+members are available, and continues automatically. Repeating a request is
+idempotent; editing a waiting request preserves compatible earlier changes.
+Requests made on disconnected members are reconciled when the drives return.
+Conflicting edits receive a field-specific refusal. `status` reports waiting,
+applied, superseded, cancelled or refused requests and their reasons. A queued
+request is not a promise of feasibility; refusal leaves the active fill on its
+saved policy. A legacy job with insufficient request metadata may need its
+current coordinator to finish before upgrading that allowance.
+
+`fill --cancel-update DIR` cancels waiting requests. A refused request can be
+replaced by another `fill`; committed revisions cannot be cancelled.
+Use `plan` to review proposed changes without submitting them.
+
+Control either the whole job or a destination with these commands:
+
+```bash
+xchplot2 pause /disk-a/plots
+xchplot2 drain /disk-a/plots --destination /disk-b/plots
+xchplot2 retire /disk-a/plots --destination /disk-b/plots
+xchplot2 resume /disk-a/plots
+```
+
+`pause` stops at a recoverable boundary. `drain` finishes started files without
+starting another; `retire` keeps the destination out of future allocation while
+preserving its plots and recovery records. `resume` enables work again; an idle
+job starts plotting on the next `fill`. Destination controls remain in force
+until that destination is resumed. Controls sent to a running job take effect
+at the next recovery boundary, and wait for missing members like other policy
+updates.
+
+`status DIR` reports saved progress without opening plots for writing or
+acquiring construction locks. New jobs use each drive's durable progress record,
+including its observation time and last writer state. `--watch` repeats the
+report; `--inspect` also scans outputs and checks construction metadata.
+`plan --status DIR` and `fill --status DIR` remain supported. Reports include
+completed files and members, pending construction, remaining allowance,
+unavailable destinations and a next action. Available filesystem space is
+separate because directories can share it. A concurrent write can make deep
+inspection incomplete; retry after that write. Saved writer state is not a live
+health check, and status does not establish full payload integrity.
+
+For new ordinary jobs, `fill DIR` continues reserved work on available drives
+while a peer is missing, records completion locally, and waits for the peer to
+return. Returning drives are checked before progress is merged and work resumes.
+`fill -r --allow-missing DIR` performs available work and exits with status 4
+while peers remain unavailable. New shared reservations and policy changes
+still require all members. Legacy jobs retain their stricter recovery limits.
+A mountpoint containing a different native directory is treated as unavailable.
 Before new external construction, all fixed-job destinations must be available
 to account for preserved scratch and its ownership records. This does not
 prevent read-only inspection or resuming available members without new scratch.
 
-For an intentional move, keep the output and saved job together, take the old
-path offline, then use `fill -r --relocate OLD NEW`. The new directory locates
+If a drive appears at another path, supply the new path or discover it with
+`--discover-drives`. Matching persistent directory identity lets the job use
+that path without rewriting its saved policy. A running `fill` also rescans its
+requested discovery roots for missing members and reconnects matching identities.
+A copied directory has a different identity and needs explicit relocation.
+Drain a destination before copying it so its started files can finish.
+Unfinished construction still requires its original files and scratch
+directories; copying them changes their checked identities.
+For an intentional copy or move to a new directory, keep the output and saved
+job together, take the old path offline, then use `fill -r --relocate OLD NEW`. The new directory locates
 the job; another existing member or `--manifest FILE` can also serve that purpose.
 All members must be available after applying the relocation. Replacement
 outputs are audited before the new location is saved.
@@ -415,7 +521,8 @@ progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
 and clean-cache release. `--window-bytes SIZE` and `--checkpoint-bytes SIZE`
 set fixed I/O and durability windows instead of the automatic choices.
 
-Construction checkpoints are private and tied to the same build. Retain the
+Construction checkpoints are private. New records require a compatible format,
+algorithm and native representation; legacy records require their original build. Retain the
 in-progress file, plan and any owned scratch/checkpoint directory together;
 do not move or edit them during recovery. A file being constructed is not a
 farmable completed output. Stop gracefully with Ctrl-C, then repeat the
@@ -1147,7 +1254,7 @@ be loaded and freshly identified by the current reader.
 A successor is bound to the exact stopped journal revision and any retained
 unfinished construction checkpoint. If either advances before activation, save
 a new review, even when the journal itself has not changed. Valid unfinished
-checkpoints can be reviewed with the same engine build, compatible memory and
+checkpoints can be reviewed with a compatible engine build, compatible memory and
 I/O grants, and their complete target and scratch reservations. Review leaves
 the checkpoint and its scratch files intact. Empty bootstrap files, orphan tails
 without a valid checkpoint and saved external work without its exact stage

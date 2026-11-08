@@ -164,12 +164,15 @@ public:
         bool finishing = false, complete = false;
     };
     static bool pending(std::string const& path);
-    static Inspection inspect(std::string const& path, uint64_t memory_limit_bytes = UINT64_MAX);
+    static Inspection inspect(std::string const& path, uint64_t memory_limit_bytes = UINT64_MAX,
+        std::span<ConstructionPathBinding const> path_bindings = {});
     static Inspection inspect_construction(std::string const& path, uint64_t loader_memory_bytes,
-        ConstructionInspectionLimits const& limits);
-    static Inspection inspect_retired(std::string const& path, std::string const& directory, uint64_t memory_limit_bytes = UINT64_MAX);
+        ConstructionInspectionLimits const& limits, std::span<ConstructionPathBinding const> path_bindings = {});
+    static Inspection inspect_retired(std::string const& path, std::string const& directory, uint64_t memory_limit_bytes = UINT64_MAX,
+        std::span<ConstructionPathBinding const> path_bindings = {});
     static Inspection inspect_retired_published(std::string const& path, std::string const& directory,
-        PublishedTarget const& published, uint64_t memory_limit_bytes = UINT64_MAX);
+        PublishedTarget const& published, uint64_t memory_limit_bytes = UINT64_MAX,
+        std::span<ConstructionPathBinding const> path_bindings = {});
     static uint64_t memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
                                  uint16_t batch_members = 1);
     enum class MemoryPhase { staging, packing, publication };
@@ -289,6 +292,8 @@ private:
     static constexpr uint64_t segment_header_bytes = 64;
     static constexpr size_t max_runs = 64, max_roots = 1024;
     std::string path_, work_, token_;
+    std::string producer_build_ = GROW_IDENTITY;
+    bool legacy_checkpoint_ = false;
     Config config_;
     ExternalConfig external_;
     Identity identity_;
@@ -348,9 +353,11 @@ private:
     static uint64_t packing_index_bytes(Config const& config)
     { return std::clamp<uint64_t>(config.window_bytes, 65536, 1024 * 1024); }
     static Inspection inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
-                                 PublishedTarget const* published = nullptr, ConstructionInspectionLimits const* inspection = nullptr);
+                                 PublishedTarget const* published = nullptr, ConstructionInspectionLimits const* inspection = nullptr,
+                                 std::span<ConstructionPathBinding const> path_bindings = {});
+    static std::string bound_path(std::string const& saved, std::span<ConstructionPathBinding const> path_bindings, bool storing = false);
     static Inspection inspect_receipt(std::string const& path, std::string const& holder, uint64_t memory_limit_bytes,
-        PublishedTarget const* published = nullptr);
+        PublishedTarget const* published = nullptr, std::span<ConstructionPathBinding const> path_bindings = {});
     static void validate_publication(PublishedTarget const& published, Inspection const& retired);
     bool save_retired_receipt(std::string const& holder, FileIdentity holder_identity);
     void measure_remaining_metadata(std::string const& holder, FileIdentity holder_identity);
@@ -363,6 +370,16 @@ private:
     static FileIdentity bind_identity(std::string const& path, bool directory, FileIdentity saved, file_io::DurableIdentity const& identity);
     static Stamp bind_stamp(std::string const& path, Stamp saved, file_io::DurableIdentity const& identity);
     static bool checkpoint_scope(std::istream& in, bool durable, std::string const& target, std::string const& work, std::string const& checkpoint);
+    struct CheckpointHeader
+    {
+        bool durable = false, legacy = false;
+        ConstructionCheckpointIdentity identity;
+        ConstructionCompatibility compatibility;
+    };
+    static ConstructionCompatibility checkpoint_compatibility();
+    static CheckpointHeader read_checkpoint_header(std::istream& in, bool retired = false, bool candidate = false);
+    static void check_checkpoint_header(CheckpointHeader const& header, bool retired = false);
+    template<class Output> void write_checkpoint_header(Output& out, bool durable, bool retired = false) const;
     template<class Output> static void put_segment(Output& out, Segment const& segment, bool durable);
     static Segment get_segment(std::istream& in, bool durable);
     static bool valid_identity(Header const& header, size_t memo_bytes)
@@ -394,7 +411,8 @@ private:
     static Stamp stamp(std::string const& path);
     static std::string digest(std::string_view body);
     static std::string checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
-        ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
+        ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr,
+        std::span<ConstructionPathBinding const> path_bindings = {});
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
@@ -588,6 +606,61 @@ inline file_io::DurableIdentity get_native_identity(std::istream& in)
 }
 }
 
+inline ConstructionCompatibility ExternalEngine::checkpoint_compatibility()
+{
+    return construction_compatibility({sizeof(Phase), sizeof(FileIdentity), alignof(FileIdentity), offsetof(FileIdentity, inode),
+        sizeof(Stamp), alignof(Stamp), offsetof(Stamp, bytes), offsetof(Stamp, modified), offsetof(Stamp, changed),
+        offsetof(Stamp, modified_ns), offsetof(Stamp, changed_ns), sizeof(LegacySegment), alignof(LegacySegment),
+        offsetof(LegacySegment, ordinal), offsetof(LegacySegment, capacity), offsetof(LegacySegment, bytes), offsetof(LegacySegment, stamp),
+        sizeof(Packet), alignof(Packet), offsetof(Packet, count), offsetof(Packet, bytes), sizeof(Summary), alignof(Summary),
+        offsetof(Summary, bytes), sizeof(ChunkSummary), alignof(ChunkSummary), offsetof(ChunkSummary, low_bits),
+        offsetof(ChunkSummary, min_ans_bits), offsetof(ChunkSummary, max_ans_bits), offsetof(ChunkSummary, last),
+        sizeof(Stats), alignof(Stats), offsetof(Stats, encode_chunks), offsetof(Stats, sized_chunks), offsetof(Stats, write_calls),
+        offsetof(Stats, checkpoints), offsetof(Stats, syncs), offsetof(Stats, overlap_windows), offsetof(Stats, read_calls),
+        offsetof(Stats, read_bytes), offsetof(Stats, written_bytes), offsetof(Stats, read_ns), offsetof(Stats, write_ns),
+        offsetof(Stats, sync_ns), offsetof(Stats, merge_passes), offsetof(Stats, reclaimed_bytes), offsetof(Stats, max_active_runs),
+        offsetof(Stats, codec_ns), offsetof(Stats, decode_ns), offsetof(Stats, layout_moves), offsetof(Stats, layout_bytes),
+        offsetof(Stats, layout_batches), offsetof(Stats, placed_blocks), offsetof(Stats, contribution_workers),
+        offsetof(Stats, packing_workers), offsetof(Stats, packing_overlap_windows), offsetof(Stats, merge_inputs),
+        offsetof(Stats, phases), sizeof(PhaseStats), alignof(PhaseStats), offsetof(PhaseStats, read_ns), offsetof(PhaseStats, write_ns),
+        offsetof(PhaseStats, sync_ns), offsetof(PhaseStats, codec_ns), offsetof(PhaseStats, decode_ns), offsetof(PhaseStats, read_bytes),
+        offsetof(PhaseStats, written_bytes), offsetof(PhaseStats, read_calls), offsetof(PhaseStats, write_calls), offsetof(PhaseStats, syncs)});
+}
+inline void ExternalEngine::check_checkpoint_header(CheckpointHeader const& header, bool retired)
+{
+    auto const engine = retired ? "retired external" : "external";
+    if (header.legacy) check_construction_build(header.identity.producer_build, GROW_IDENTITY, engine);
+    else check_construction_compatibility(header.compatibility, checkpoint_compatibility(), engine);
+}
+inline ExternalEngine::CheckpointHeader ExternalEngine::read_checkpoint_header(std::istream& in, bool retired, bool candidate)
+{
+    using namespace external_detail;
+    auto const version = get_string(in);
+    bool const legacy = retired ? version == "xchplot2-external-retired-1" || version == "xchplot2-external-retired-2" :
+        version == "xchplot2-external-3" || version == "xchplot2-external-4";
+    bool const stable = retired ? version == "xchplot2-external-retired-3" || version == "xchplot2-external-retired-4" :
+        version == "xchplot2-external-5" || version == "xchplot2-external-6";
+    if (candidate && !legacy && !stable) return {};
+    check_construction_format(legacy || stable, retired ? "retired external" : "external");
+    auto const producer = get_string(in);
+    auto const compatibility = legacy ? ConstructionCompatibility{} : get<ConstructionCompatibility>(in);
+    bool const durable = retired ? version == "xchplot2-external-retired-2" || version == "xchplot2-external-retired-4" :
+        version == "xchplot2-external-4" || version == "xchplot2-external-6";
+    CheckpointHeader result{durable, legacy, construction_checkpoint_identity(version, producer, legacy, compatibility), compatibility};
+    if (!candidate) check_checkpoint_header(result, retired);
+    return result;
+}
+template<class Output> inline void ExternalEngine::write_checkpoint_header(Output& out, bool durable, bool retired) const
+{
+    using namespace external_detail;
+    put_string(out, retired ? (legacy_checkpoint_ ? (durable ? "xchplot2-external-retired-2" : "xchplot2-external-retired-1") :
+        (durable ? "xchplot2-external-retired-4" : "xchplot2-external-retired-3")) :
+        (legacy_checkpoint_ ? (durable ? "xchplot2-external-4" : "xchplot2-external-3") :
+        (durable ? "xchplot2-external-6" : "xchplot2-external-5")));
+    put_string(out, producer_build_);
+    if (!legacy_checkpoint_) put(out, checkpoint_compatibility());
+}
+
 template<class Output> inline void ExternalEngine::put_segment(Output& out, Segment const& segment, bool durable)
 {
     external_detail::put(out, static_cast<LegacySegment const&>(segment));
@@ -601,6 +674,31 @@ inline ExternalEngine::Segment ExternalEngine::get_segment(std::istream& in, boo
     if (durable) result.identity = external_detail::get_native_identity(in); return result;
 }
 
+inline std::string ExternalEngine::bound_path(std::string const& saved, std::span<ConstructionPathBinding const> path_bindings, bool storing)
+{
+    auto const path = file_io::native_path(saved).lexically_normal();
+    ConstructionPathBinding const* selected = nullptr;
+    std::filesystem::path relative;
+    size_t depth = 0;
+    for (auto const& binding : path_bindings)
+    {
+        auto const root = file_io::native_path(storing ? binding.current_root : binding.saved_root).lexically_normal();
+        require(file_io::native_path(binding.saved_root).is_absolute() && file_io::native_path(binding.current_root).is_absolute(),
+            "external path binding roots must be absolute");
+        auto const suffix = path.lexically_relative(root);
+        if (suffix.empty() || suffix.is_absolute() || *suffix.begin() == "..") continue;
+        auto const count = size_t(std::distance(root.begin(), root.end()));
+        if (selected && count < depth) continue;
+        require(!selected || count != depth || (storing ? binding.saved_root == selected->saved_root : binding.current_root == selected->current_root),
+            "external path bindings are ambiguous");
+        selected = &binding; relative = suffix; depth = count;
+    }
+    if (!selected) return saved;
+    require(!selected->directory_identity.empty() && farming_directory_identity(file_io::native_path(selected->current_root)) == selected->directory_identity,
+        "external path rebinding requires the original persistent directory identity");
+    auto const root = file_io::native_path(storing ? selected->saved_root : selected->current_root);
+    return file_io::path_text((root / relative).lexically_normal());
+}
 inline ExternalEngine::FileIdentity ExternalEngine::file_identity(std::string const& path, bool directory)
 {
     file_io::Stat value{};
@@ -965,7 +1063,9 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
     auto const& summary = pending_summary_.segments.empty() ? summary_run_ : pending_summary_;
     auto serialize = [&](CheckpointBuffer& out, bool durable, FileIdentity checkpoint, file_io::DurableIdentity const& checkpoint_identity)
     {
-    put_string(out, durable ? "xchplot2-external-4" : "xchplot2-external-3"); put_string(out, GROW_IDENTITY); put_string(out, path_);
+    // Runtime aliases do not replace the recorded path authority. A later
+    // mount needs only the saved root and its current checked native binding.
+    write_checkpoint_header(out, durable); put_string(out, bound_path(path_, config_.path_bindings, true));
     put_string(out, token_); put(out, target_); if (durable) put_native_identity(out, target_identity_);
     put(out, work_identity_); if (durable) put_native_identity(out, work_native_identity_);
     put(out, parent_); if (durable) { put_native_identity(out, parent_identity_); put(out, checkpoint); put_native_identity(out, checkpoint_identity); }
@@ -974,7 +1074,8 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
     put(out, uint64_t(roots_.size()));
     for (auto const& root : roots_)
     {
-        put_string(out, root.path); put(out, root.directory); put(out, root.parent); put(out, root.capacity); put(out, root.alignment); put(out, root.peak);
+        put_string(out, bound_path(root.path, config_.path_bindings, true));
+        put(out, root.directory); put(out, root.parent); put(out, root.capacity); put(out, root.alignment); put(out, root.peak);
         if (durable) { put_native_identity(out, root.directory_identity); put_native_identity(out, root.parent_identity); }
     }
     put(out, phase_); put(out, members_); put(out, next_id_); put(out, final_bound_);
@@ -1080,10 +1181,10 @@ inline void ExternalEngine::load()
     require(record.size() >= 65 && record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)),
         "external checkpoint checksum mismatch");
     CheckpointInput in(std::string_view(record).substr(65));
-    auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
-    require((durable || version == "xchplot2-external-3") && get_string(in) == GROW_IDENTITY,
-        "external checkpoint source/version mismatch");
-    require(get_string(in) == path_, "external checkpoint destination mismatch");
+    auto const checkpoint_header = read_checkpoint_header(in); bool const durable = checkpoint_header.durable;
+    producer_build_ = checkpoint_header.identity.producer_build; legacy_checkpoint_ = checkpoint_header.legacy;
+    auto const recorded_target = get_string(in); bool const rebinding = recorded_target != path_;
+    require(!rebinding || bound_path(recorded_target, config_.path_bindings) == path_, "external checkpoint destination mismatch");
     token_ = get_string(in); require(token_.size() == 64, "invalid external ownership token");
     auto const saved_target = get<FileIdentity>(in); if (durable) target_identity_ = get_native_identity(in);
     require(bind_identity(path_, false, saved_target, target_identity_) == target_, "external destination inode changed");
@@ -1108,7 +1209,8 @@ inline void ExternalEngine::load()
     for (size_t i = 0; i < roots_.size(); ++i)
     {
         config_.check_running();
-        auto& root = roots_[i]; root.path = get_string(in); root.directory = get<FileIdentity>(in); root.parent = get<FileIdentity>(in);
+        auto& root = roots_[i]; root.path = bound_path(get_string(in), config_.path_bindings);
+        root.directory = get<FileIdentity>(in); root.parent = get<FileIdentity>(in);
         root.capacity = get<uint64_t>(in); root.alignment = get<uint64_t>(in); root.peak = get<uint64_t>(in);
         if (durable) { root.directory_identity = get_native_identity(in); root.parent_identity = get_native_identity(in); }
         require(root.capacity <= external_.scratch[i].capacity_bytes && root.alignment &&
@@ -1268,10 +1370,13 @@ inline void ExternalEngine::load()
         std::string partial(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(partial.data()), partial.size()}, nullptr, {"checkpoint_manifest", &path_, &execution_destination_});
         if (partial[64] != '\n' || std::string_view(partial).substr(0, 64) != digest(std::string_view(partial).substr(65))) continue;
         CheckpointInput candidate(std::string_view(partial).substr(65));
-        auto const version = get_string(candidate); bool const durable = version == "xchplot2-external-4";
-        if ((durable || version == "xchplot2-external-3") && get_string(candidate) == GROW_IDENTITY &&
-            get_string(candidate) == path_ && get_string(candidate) == token_ && checkpoint_scope(candidate, durable, path_, work_, file_io::path_text(entry.path())))
+        auto const candidate_header = read_checkpoint_header(candidate, false, true); bool const durable = candidate_header.durable;
+        if (candidate_header.identity.format.empty()) continue;
+        auto const candidate_target = get_string(candidate);
+        if ((candidate_target == path_ || bound_path(candidate_target, config_.path_bindings) == path_) &&
+            get_string(candidate) == token_ && checkpoint_scope(candidate, durable, path_, work_, file_io::path_text(entry.path())))
         {
+            check_checkpoint_header(candidate_header);
             require(grow_add(segments, orphans_.size()) < descriptor_limit(external_), "external orphan metadata exceeds its memory reservation");
             orphans_.push_back({uint32_t(roots_.size()), file_io::path_text(entry.path().filename()), saved, 0,
                 capture_identity(file.fd, file_io::path_text(entry.path()), saved.file)});
@@ -3245,7 +3350,8 @@ public:
 };
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
-                                                            PublishedTarget const* published, ConstructionInspectionLimits const* inspection)
+                                                            PublishedTarget const* published, ConstructionInspectionLimits const* inspection,
+                                                            std::span<ConstructionPathBinding const> path_bindings)
 {
     using namespace external_detail;
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
@@ -3261,7 +3367,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
         target_pin.emplace(file_io::open_file(current.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow));
         target_stamp = construction_stamp(target_pin->fd, current); binding->capture(current);
     }
-    std::string const checkpoint = retired ? work + "/checkpoint" : checkpoint_path(work, target, memory_limit_bytes / 8, inspection);
+    std::string const checkpoint = retired ? work + "/checkpoint" : checkpoint_path(work, target, memory_limit_bytes / 8, inspection, nullptr, path_bindings);
     auto const value = stamp(checkpoint);
     require(value.bytes <= uint64_t(SIZE_MAX) && value.bytes <= memory_limit_bytes / 8, "external checkpoint inspection exceeds memory budget");
     Descriptor file(file_io::open_file(checkpoint.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow));
@@ -3276,9 +3382,9 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
         "external checkpoint checksum mismatch");
     CheckpointInput in(std::string_view(record).substr(65));
     if (inspection) inspection->check();
-    auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
-    require((durable || version == "xchplot2-external-3") && get_string(in) == GROW_IDENTITY && get_string(in) == target,
-        "external checkpoint source/version/destination mismatch");
+    auto const checkpoint_header = read_checkpoint_header(in); bool const durable = checkpoint_header.durable;
+    auto const recorded_target = get_string(in); bool const rebinding = recorded_target != target;
+    require(!rebinding || bound_path(recorded_target, path_bindings) == target, "external checkpoint destination mismatch");
     auto const token = get_string(in);
     require(token.size() == 64 && (!retired || work == target + ".external.retired-" + token),
         "retired external directory name does not match its ownership record");
@@ -3308,10 +3414,12 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     auto const roots = get<uint64_t>(in); require(roots && roots <= max_roots, "invalid external scratch root count");
     std::vector<Root> saved_roots; saved_roots.reserve(size_t(roots));
     Inspection result; result.identity.header = header; result.identity.memo.assign(memo.begin(), memo.end());
+    result.construction.checkpoint_identity = checkpoint_header.identity;
     for (uint64_t i = 0; i < roots; ++i)
     {
         if (inspection) inspection->check();
-        auto const root = get_string(in); auto root_identity = get<FileIdentity>(in), root_parent = get<FileIdentity>(in);
+        auto root = bound_path(get_string(in), path_bindings);
+        auto root_identity = get<FileIdentity>(in), root_parent = get<FileIdentity>(in);
         uint64_t const capacity = get<uint64_t>(in), alignment = get<uint64_t>(in), peak = get<uint64_t>(in);
         auto const directory_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
         auto const parent_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
@@ -3552,9 +3660,11 @@ inline bool ExternalEngine::release_completed()
 namespace group_grow
 {
 inline std::string ExternalEngine::checkpoint_path(std::string const& work, std::string const& target, uint64_t limit,
-                                                 ConstructionInspectionLimits const* inspection, Config const* runtime)
+                                                 ConstructionInspectionLimits const* inspection, Config const* runtime,
+                                                 std::span<ConstructionPathBinding const> path_bindings)
 {
     using namespace external_detail;
+    if (runtime) path_bindings = runtime->path_bindings;
     file_io::Stat exists{}; std::string const ordinary = work + "/checkpoint";
     if (!file_io::inspect_link(ordinary.c_str(), &exists)) return ordinary;
     require(errno == ENOENT, "cannot inspect external checkpoint");
@@ -3571,11 +3681,16 @@ inline std::string ExternalEngine::checkpoint_path(std::string const& work, std:
         std::string record(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(record.data()), record.size()}, nullptr, {"checkpoint_manifest", &target});
         if (record[64] != '\n' || std::string_view(record).substr(0, 64) != digest(std::string_view(record).substr(65))) continue;
         CheckpointInput in(std::string_view(record).substr(65));
-        auto const version = get_string(in); bool const durable = version == "xchplot2-external-4";
-        if ((!durable && version != "xchplot2-external-3") || get_string(in) != GROW_IDENTITY || get_string(in) != target) continue;
+        auto const checkpoint_header = read_checkpoint_header(in, false, true); bool const durable = checkpoint_header.durable;
+        if (checkpoint_header.identity.format.empty()) continue;
+        auto const recorded_target = get_string(in);
+        if (recorded_target != target && bound_path(recorded_target, path_bindings) != target) continue;
         (void)get_string(in);
         if (checkpoint_scope(in, durable, target, work, file_io::path_text(entry.path())))
+        {
+            check_checkpoint_header(checkpoint_header);
             return file_io::path_text(entry.path());
+        }
     }
     throw std::runtime_error("external construction has no durable initial checkpoint; no members were acknowledged");
 }
@@ -3583,19 +3698,22 @@ inline std::string ExternalEngine::checkpoint_path(std::string const& work, std:
 
 namespace group_grow
 {
-inline ExternalEngine::Inspection ExternalEngine::inspect(std::string const& path, uint64_t memory_limit_bytes)
+inline ExternalEngine::Inspection ExternalEngine::inspect(std::string const& path, uint64_t memory_limit_bytes,
+    std::span<ConstructionPathBinding const> path_bindings)
 {
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
-    return inspect_at(target, target + ".external", memory_limit_bytes, false);
+    return inspect_at(target, target + ".external", memory_limit_bytes, false, nullptr, nullptr, path_bindings);
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_construction(std::string const& path, uint64_t loader_memory_bytes,
-                                                                      ConstructionInspectionLimits const& limits)
+                                                                      ConstructionInspectionLimits const& limits,
+                                                                      std::span<ConstructionPathBinding const> path_bindings)
 {
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
-    return inspect_at(target, target + ".external", loader_memory_bytes, false, nullptr, &limits);
+    return inspect_at(target, target + ".external", loader_memory_bytes, false, nullptr, &limits, path_bindings);
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_retired(std::string const& path, std::string const& directory,
-                                                                 uint64_t memory_limit_bytes)
+                                                                 uint64_t memory_limit_bytes,
+                                                                 std::span<ConstructionPathBinding const> path_bindings)
 {
     std::string const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
     std::string const holder = file_io::path_text(std::filesystem::absolute(file_io::native_path(directory)).lexically_normal());
@@ -3605,9 +3723,9 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_retired(std::string co
     if (file_io::inspect_link((holder + "/checkpoint").c_str(), &checkpoint))
     {
         require(errno == ENOENT, "cannot inspect retired external checkpoint");
-        return inspect_receipt(target, holder, memory_limit_bytes);
+        return inspect_receipt(target, holder, memory_limit_bytes, nullptr, path_bindings);
     }
-    return inspect_at(target, holder, memory_limit_bytes, true);
+    return inspect_at(target, holder, memory_limit_bytes, true, nullptr, nullptr, path_bindings);
 }
 inline void ExternalEngine::validate_publication(PublishedTarget const& published, Inspection const& retired)
 {
@@ -3646,7 +3764,7 @@ inline void ExternalEngine::validate_publication(PublishedTarget const& publishe
         "published external target changed during retired inspection");
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_retired_published(std::string const& path, std::string const& directory,
-    PublishedTarget const& published, uint64_t memory_limit_bytes)
+    PublishedTarget const& published, uint64_t memory_limit_bytes, std::span<ConstructionPathBinding const> path_bindings)
 {
     auto const target = file_io::path_text(std::filesystem::absolute(file_io::native_path(path)).lexically_normal());
     auto const holder = file_io::path_text(std::filesystem::absolute(file_io::native_path(directory)).lexically_normal());
@@ -3693,9 +3811,9 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_retired_published(std:
     if (file_io::inspect_link(holder + "/checkpoint", &checkpoint))
     {
         require(errno == ENOENT, "cannot inspect published retired external checkpoint");
-        result = inspect_receipt(target, holder, memory_limit_bytes, &published);
+        result = inspect_receipt(target, holder, memory_limit_bytes, &published, path_bindings);
     }
-    else result = inspect_at(target, holder, memory_limit_bytes, true, &published);
+    else result = inspect_at(target, holder, memory_limit_bytes, true, &published, nullptr, path_bindings);
     validate_publication(published, result); check_parent(); return result;
 }
 }
@@ -3709,7 +3827,7 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
     using namespace external_detail;
     std::ostringstream out(std::ios::binary); out.exceptions(std::ios::badbit | std::ios::failbit);
     bool const durable = file_io::has_durable_identity(work_native_identity_) || file_io::has_durable_identity(target_identity_) || file_io::has_durable_identity(parent_identity_);
-    put_string(out, durable ? "xchplot2-external-retired-2" : "xchplot2-external-retired-1"); put_string(out, GROW_IDENTITY); put_string(out, path_); put_string(out, token_);
+    write_checkpoint_header(out, durable, true); put_string(out, bound_path(path_, config_.path_bindings, true)); put_string(out, token_);
     put(out, holder_identity); if (durable) put_native_identity(out, work_native_identity_);
     put(out, target_); if (durable) put_native_identity(out, target_identity_);
     put(out, parent_); if (durable) put_native_identity(out, parent_identity_);
@@ -3735,7 +3853,8 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
 #endif
 }
 inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string const& path, std::string const& holder,
-                                                                 uint64_t memory_limit_bytes, PublishedTarget const* published)
+                                                                 uint64_t memory_limit_bytes, PublishedTarget const* published,
+                                                                 std::span<ConstructionPathBinding const> path_bindings)
 {
 #ifdef __linux__
     using namespace external_detail;
@@ -3746,9 +3865,9 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string co
     require(::fgetxattr(directory.fd, "user.xchplot2.external-retired", record.data(), record.size()) == size &&
         record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)), "retired external ownership receipt is corrupt");
     CheckpointInput in(std::string_view(record).substr(65));
-    auto const version = get_string(in); bool const durable = version == "xchplot2-external-retired-2";
-    require((durable || version == "xchplot2-external-retired-1") && get_string(in) == GROW_IDENTITY && get_string(in) == path,
-        "retired external receipt source/destination mismatch");
+    auto const checkpoint_header = read_checkpoint_header(in, true); bool const durable = checkpoint_header.durable;
+    auto const recorded_target = get_string(in);
+    require(recorded_target == path || bound_path(recorded_target, path_bindings) == path, "retired external receipt destination mismatch");
     auto const token = get_string(in); require(token.size() == 64 && holder == path + ".external.retired-" + token,
         "retired external receipt name mismatch");
     auto const saved_owner = get<FileIdentity>(in); auto const owner_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
@@ -3765,7 +3884,8 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_receipt(std::string co
         FileIdentity{uint64_t(value.st_dev), uint64_t(value.st_ino)} == owner && file_identity(holder, true) == owner &&
         (!file_io::has_durable_identity(owner_native) || file_io::matches_durable_identity(directory.fd, owner_native)),
         "retired external receipt inode ownership mismatch");
-    Inspection result; result.identity.header = get<Header>(in); auto const memo = get_string(in, 255);
+    Inspection result; result.construction.checkpoint_identity = checkpoint_header.identity;
+    result.identity.header = get<Header>(in); auto const memo = get_string(in, 255);
     result.identity.memo.assign(memo.begin(), memo.end()); result.members = get<uint16_t>(in);
     result.identity.bytes = get<uint64_t>(in); result.identity.target_members = result.members;
     auto const& header = result.identity.header;

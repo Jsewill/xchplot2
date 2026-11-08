@@ -217,7 +217,9 @@ def rewrite_plan(record, *, producer=None, legacy=False, model=None):
     body = record[:-65]
     assert record[-65:] == hashlib.sha256(body).hexdigest().encode() + b"\n"
     rows = farming_plan_rows(body)
-    assert rows[0] == b"ordinary-group-farming-v6\n"
+    version = re.fullmatch(rb"ordinary-group-farming-v([678])\n", rows[0])
+    assert version, rows[0]
+    version = int(version[1])
     if producer is not None:
         rows[1] = json.dumps(producer).encode() + b"\n"
     if model is not None:
@@ -225,6 +227,28 @@ def rewrite_plan(record, *, producer=None, legacy=False, model=None):
     if legacy:
         metadata = rows[8].split()
         assert len(metadata) == 2 and metadata[1] in (b"0", b"1")
+        if version >= 7:
+            config = 10 + (5 if metadata[1] == b"1" else 0)
+            identity = shlex.split(rows[config + 1].decode())
+            assert identity[:2] == rows[config].decode().split()[:2] and not identity[2], "revised identities cannot become a legacy fixture"
+            estimate = config + 2
+            if version >= 8:
+                assert shlex.split(rows[estimate].decode())[0] == "active", "job controls cannot become a legacy fixture"
+                estimate += 1
+            count = int(rows[estimate + 2])
+            flattened = rows[:config + 1] + rows[estimate:estimate + 4]
+            cursor = estimate + 4
+            for _ in range(count):
+                flattened.extend(rows[cursor:cursor + 5])
+                first, _, cohorts = rows[cursor + 5].split()
+                assert first == b"0" and cohorts == b"0", "parameter cohorts cannot become a legacy fixture"
+                cursor += 6
+                if version >= 8:
+                    assert shlex.split(rows[cursor].decode())[0] == "active", "destination controls cannot become a legacy fixture"
+                    cursor += 1
+            assert cursor == len(rows), "unexpected ordinary plan rows during legacy conversion"
+            rows = flattened
+            rows[2] = b'"group-farming-3"\n'
         if metadata[1] == b"1":
             # v5 metadata ends after its assumptions row. A calibrated v6
             # profile has no legacy representation and must not lose scope.
@@ -236,10 +260,25 @@ def rewrite_plan(record, *, producer=None, legacy=False, model=None):
     return rewritten + hashlib.sha256(rewritten).hexdigest().encode() + b"\n"
 
 
-def snapshot(root):
-    return {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_size, p.stat().st_mtime_ns,
-                                     digest(p) if p.is_file() else None)
-            for p in root.rglob("*")}
+def snapshot(root, *, observations=True):
+    result = {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_size, p.stat().st_mtime_ns,
+                                       digest(p) if p.is_file() else None)
+              for p in root.rglob("*")}
+    if not observations:
+        for name in ("grow-farm.progress", ".xchplot2/grow-farm.progress"):
+            progress = root / name
+            if progress.is_file():
+                record = progress.read_bytes()
+                assert not progress.is_symlink() and record.startswith(b"ordinary-group-farming-progress-v1\n")
+                assert record[-65:] == hashlib.sha256(record[:-65]).hexdigest().encode() + b"\n"
+                if os.name != "nt":
+                    assert progress.stat().st_mode & 0o777 == 0o600
+                del result[str(Path(name))]
+        # An atomic observation replacement updates its parent directory too.
+        # All other names, file bytes and private permissions remain checked.
+        if ".xchplot2" in result:
+            result[".xchplot2"] = (result[".xchplot2"][0], None, None, None)
+    return result
 
 
 def private_record(directory, name):
@@ -248,6 +287,345 @@ def private_record(directory, name):
 
 def replot_artifacts(directory, job_id):
     return private_record(directory, f"replot-{job_id}")
+
+
+def watch_status(command, log, *selectors):
+    with log.open("w", encoding="utf-8") as output:
+        watcher = subprocess.Popen(command("status", *selectors, "--watch", "--json"), stdout=output, stderr=subprocess.STDOUT,
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                samples = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("{") and line.endswith("}")]
+                if len(samples) >= 2:
+                    break
+                assert watcher.poll() is None and time.monotonic() < deadline, log.read_text(encoding="utf-8")
+                time.sleep(0.05)
+            watcher.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            assert watcher.wait(timeout=30) == 4, log.read_text(encoding="utf-8")
+        finally:
+            if watcher.poll() is None:
+                watcher.kill()
+                watcher.wait(timeout=30)
+    return samples
+
+
+def check_farm_updates(run, command, verify, root):
+    directory = root / "future policy"
+    directory.mkdir()
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 1,
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    run("fill", directory, *runtime, "-k", 18, "--group-members", 2,
+        "--max-groups", 1, "--max-total-members", 2, "--capacity-bytes", "32M", "--headroom-bytes", 0,
+        "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, "--quiet")
+    original = next(directory.glob("*.gplot"))
+    original_hash = digest(original)
+    before = snapshot(directory)
+    status = json.loads(run("status", directory, "--json").stdout)
+    assert status["read_only"] and status["inspection_complete"] and status["update_status"] == "none"
+    assert status["inspection_kind"] == "saved-progress" and not status["live_writer_health_checked"]
+    assert status["destinations"][0]["completed_files"] == 1 and status["destinations"][0]["completed_members"] == 2
+    assert status["destinations"][0]["next_action"] and snapshot(directory) == before
+    status_review = root / "status.plan"
+    run("plan", directory, "--save-plan", status_review)
+    offline = root / "offline future policy"
+    directory.rename(offline)
+    try:
+        status = json.loads(run("plan", "--status", status_review, "--json", code=2).stdout)
+        assert status["read_only"] and not status["inspection_complete"] and status["status"] == "unavailable"
+    finally:
+        offline.rename(directory)
+    assert snapshot(directory) == before
+    if os.name != "nt":
+        import fcntl
+        fd = os.open(directory, os.O_RDONLY)
+        with original.open("rb") as output:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(output, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = json.loads(run("fill", "--status", directory, "--json").stdout)
+                assert locked["inspection_complete"]
+                run("plan", directory, "--json")
+            finally:
+                os.close(fd)
+        assert snapshot(directory) == before, "inspection under writer locks changed saved data"
+    run("plan", directory, "--capacity-bytes", 1, "--json", code=2)
+    assert snapshot(directory) == before, "refused storage preview changed saved work"
+    lowered = json.loads(run("plan", directory, "--max-total-members", 1, "--json").stdout)
+    assert lowered["feasible"] and lowered["destinations"][0]["members"] >= header(original)[3]
+    assert snapshot(directory) == before, "lower future target preview changed saved work"
+    run("fill", directory, "--max-total-members", 1, *runtime, "--quiet")
+    assert digest(original) == original_hash and list(directory.glob("*.gplot")) == [original]
+    run("fill", directory, "--max-total-members", 2, *runtime, "--quiet")
+    before = snapshot(directory)
+    run("fill", "-r", directory, *runtime, "--strength", 3, code=2)
+    assert snapshot(directory) == before
+
+    # Save a future parameter set while the old limits leave no new groups,
+    # then grow the allowance in a separate revision.
+    run("fill", "--update", directory, "--group-members", 3, "--strength", 3,
+        "--farming-max-eligible-groups", 2, *runtime, "--quiet")
+    assert digest(original) == original_hash
+    before = snapshot(directory)
+
+    review = root / "revised future.plan"
+    planned = json.loads(run("plan", directory, "--capacity-bytes", "64M", "--headroom-bytes", "1M",
+                             "--group-members", 3, "--strength", 3, "--max-groups", 2, "--max-total-members", 5,
+                             "--farming-max-eligible-groups", 2, "--save-plan", review, "--json").stdout)
+    assert planned["feasible"] and planned["model"] == "group-farming-5"
+    assert planned["destinations"][0]["files"] == 2 and planned["destinations"][0]["members"] == 5
+    assert planned["destinations"][0]["group_members"] == 3
+    assert json.loads(run("plan", "--assess-jobs", review, "--json").stdout)["feasible"]
+    assert snapshot(directory) == before and SEED not in review.read_text(encoding="utf-8")
+    run("fill", review, *runtime, "--quiet", point="farm-plan-all-staged", code=86)
+    assert digest(original) == original_hash and private_record(directory, "grow-farm.plan.next").is_file()
+    run("fill", "-r", directory, *runtime, "--quiet")
+    paths = sorted(directory.glob("*.gplot"))
+    assert len(paths) == 2 and [header(path)[2:4] for path in paths] == [(2, 2), (3, 3)]
+    assert digest(original) == original_hash
+    verify(paths[1])
+    status = json.loads(run("fill", "--status", directory, "--json").stdout)
+    assert status["destinations"][0]["completed_members"] == 5 and status["future_strength"] == 3
+    before = snapshot(directory)
+    run("fill", review, *runtime, code=2)
+    assert snapshot(directory) == before, "stale revision preview changed a newer job"
+
+    saved_hashes = [digest(path) for path in paths]
+    # Refused requests remain inspectable and can be replaced deliberately.
+    run("fill", "--update", directory, "--capacity-bytes", 1, *runtime, code=2)
+    status = json.loads(run("plan", "--status", directory, "--json").stdout)
+    assert status["update_status"] == "refused" and status["update_reason"]
+    run("fill", "--update", directory, "--capacity-bytes", "72M", *runtime, "--quiet")
+    status = json.loads(run("plan", "--status", directory, "--json").stdout)
+    assert status["update_status"] == "applied" and status["destinations"][0]["completed_members"] == 5
+    assert [digest(path) for path in paths] == saved_hashes
+    if os.name != "nt":
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            queued = json.loads(run("fill", "--update", directory, "--capacity-bytes", "80M", *runtime, "--json").stdout)
+            assert queued["status"] == "queued"
+            assert json.loads(run("plan", "--status", directory, "--json").stdout)["update_status"] == "queued"
+            run("fill", "--cancel-update", directory)
+            cancelled = json.loads(run("status", directory, "--json").stdout)
+            assert cancelled["update_status"] == "cancelled"
+            assert next(record for record in cancelled["updates"] if record["id"] == queued["request_id"])["status"] == "cancelled"
+        finally:
+            os.close(fd)
+    empty = root / "no mounted descendants"
+    empty.mkdir()
+    refused = run("plan", "--discover-drives", empty, "--json", code=2)
+    assert "no eligible drives found" in refused.stdout + refused.stderr and not list(empty.iterdir())
+
+    added = root / "added future policy"
+    added.mkdir()
+    run("fill", "--extend", directory, added, "--farming-max-eligible-groups", 4,
+        *runtime, "--quiet", point="farm-plan-all-staged", code=86)
+    assert list(private_record(directory, "grow-farm.plan").parent.glob("grow-farm.update-*.request"))
+    run("fill", "-r", added, *runtime, "--quiet")
+    applied = json.loads(run("status", added, "--json").stdout)
+    assert applied["update_status"] == "applied" and any(record["status"] == "applied" for record in applied["updates"])
+    assert [digest(path) for path in paths] == saved_hashes
+    additions = sorted(added.glob("*.gplot"))
+    assert [header(path)[2:4] for path in additions] == [(3, 3), (3, 2)]
+    assert digest(private_record(directory, "grow-farm.plan")) == digest(private_record(added, "grow-farm.plan"))
+    verify(additions[0])
+    status_review = root / "expanded status.plan"
+    run("plan", added, "--save-plan", status_review)
+    before = (snapshot(directory), snapshot(added))
+    directory.rename(offline)
+    try:
+        status = json.loads(run("fill", "--status", status_review, "--json", code=2).stdout)
+        assert not status["inspection_complete"] and not status["destinations"][0]["available"]
+        assert status["destinations"][1]["completed_members"] == 5
+    finally:
+        offline.rename(directory)
+    assert (snapshot(directory), snapshot(added)) == before
+
+    protected = {path: digest(path) for path in [*paths, *additions]}
+    for action, intent in (("pause", "paused"), ("drain", "draining"), ("retire", "retired")):
+        run(action, directory, "--quiet")
+        controlled = json.loads(run("status", added, "--json").stdout)
+        assert controlled["control"] == intent
+        run("resume", added, "--quiet")
+        assert json.loads(run("status", directory, "--json").stdout)["control"] == "active"
+        run(action, directory, "--destination", added, "--quiet")
+        controlled = json.loads(run("status", directory, "--json").stdout)
+        by_directory = {entry["directory"]: entry for entry in controlled["destinations"]}
+        assert controlled["control"] == "active" and by_directory[str(added)]["status"] == intent
+        assert by_directory[str(directory)]["status"] != intent
+        run("resume", directory, "--destination", added, "--quiet")
+        assert {path: digest(path) for path in protected} == protected, "idle lifecycle command changed completed plots"
+    run("fill", directory, *runtime, "--quiet")
+    assert {path: digest(path) for path in protected} == protected, "repeat fill regenerated completed work"
+    deep = json.loads(run("status", added, "--inspect", "--json").stdout)
+    assert deep["inspection_kind"] == "construction" and deep["inspection_complete"]
+    watched_before = snapshot(directory), snapshot(added)
+    samples = watch_status(command, root / "status-watch.log", added)
+    assert all(sample["read_only"] and sample["inspection_kind"] == "saved-progress" for sample in samples)
+    assert (snapshot(directory), snapshot(added)) == watched_before, "status watch mutated saved work"
+
+    progressing = root / "progress-only review"
+    progressing.mkdir()
+    run("fill", progressing, *runtime, "-k", 18, "--construction", "incremental", "--batch-members", 1,
+        "--group-members", 3, "--max-groups", 1, "--max-total-members", 3, "--capacity-bytes", "32M", "--leave-free", 0,
+        "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, "--quiet", point="published", code=86)
+    active = next(progressing.glob("*.gplot"))
+    assert header(active)[3] < 3
+    progress_review = root / "progress-tolerant.plan"
+    run("plan", progressing, "--save-plan", progress_review, "--json")
+    assert progress_review.read_text(encoding="utf-8").startswith("ordinary-group-farming-preview-v2\n")
+    run("fill", "-r", progressing, *runtime, "--quiet")
+    completed_hash = digest(active)
+    assert header(active)[3] == 3
+    run("fill", progress_review, *runtime, "--quiet")
+    assert digest(active) == completed_hash and list(progressing.glob("*.gplot")) == [active], "progress-only review rebase changed completed plots"
+
+    for refused_update in (False, True):
+        live = root / ("refused active policy" if refused_update else "active future policy")
+        live.mkdir()
+        live_log = root / ("refused-live-policy.log" if refused_update else "live-policy.log")
+        with live_log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(command("fill", live, *runtime, "-k", 18, "--strength", 2,
+                                               "--construction", "incremental", "--batch-members", 1,
+                                               "--group-members", 8, "--max-groups", 2, "--max-total-members", 11,
+                                               "--capacity-bytes", "128M", "--headroom-bytes", 0,
+                                               "--farming-max-eligible-groups", 4, "--seed", SEED,
+                                               "-f", FARMER, "--pool-ph", POOL, "--quiet"),
+                                       stdout=output, stderr=subprocess.STDOUT)
+            try:
+                stopped = False
+                deadline = time.monotonic() + 30
+                started = False
+                while process.poll() is None and time.monotonic() < deadline:
+                    for path in live.glob("*.gplot"):
+                        try:
+                            started = header(path)[3] > 0
+                        except (OSError, AssertionError, struct.error):
+                            pass  # A header being committed is not yet a stable active group.
+                    if started:
+                        break
+                    time.sleep(0.01)
+                assert process.poll() is None and started, live_log.read_text(encoding="utf-8")
+                if os.name != "nt":
+                    process.send_signal(signal.SIGSTOP)
+                    stopped = True
+                    attached = run("fill", live, *runtime, "--json", code=(0, 2))
+                    attached_status = json.loads(attached.stdout.splitlines()[-1])
+                    assert attached_status["farming_status"] and attached_status["read_only"] and not attached_status["live_writer_health_checked"]
+                request = run("fill", "--update", live, "--group-members", 3, "--strength", 3,
+                              "--max-groups", 3, "--max-total-members", 11 if refused_update else 14,
+                              "--capacity-bytes", 1 if refused_update else "128M", *runtime, "--json",
+                              code=(0, 2) if refused_update else 0)
+                # The original writer can release its boundary while the
+                # requester is acquiring it, letting either process apply or
+                # refuse the request. Both must preserve the original work.
+                if request.returncode:
+                    assert "completed plots, active reservations and recovery metadata" in request.stderr
+                else:
+                    assert '"status":"queued"' in request.stdout or '"farming_plan":true' in request.stdout
+                if stopped and not refused_update:
+                    first_request = json.loads(request.stdout)["request_id"]
+                    second_request = json.loads(run("fill", "--update", live, "--leave-free", "1M", *runtime, "--json").stdout)
+                    repeated = json.loads(run("fill", "--update", live, "--leave-free", "1M", *runtime, "--json").stdout)
+                    assert second_request["status"] == "queued" and repeated["request_id"] == second_request["request_id"]
+                    waiting = json.loads(run("status", live, "--json").stdout)
+                    receipts = {record["id"]: record for record in waiting["updates"]}
+                    assert receipts[first_request]["status"] == "superseded" and receipts[second_request["request_id"]]["status"] == "accepted"
+                if stopped:
+                    process.send_signal(signal.SIGCONT)
+                    stopped = False
+                assert process.wait(timeout=180) == 0, live_log.read_text(encoding="utf-8")
+            finally:
+                if stopped and process.poll() is None:
+                    process.send_signal(signal.SIGCONT)
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=30)
+        paths = sorted(live.glob("*.gplot"))
+        expected = [(2, 8), (2, 3)] if refused_update else [(2, 8), (3, 3), (3, 3)]
+        assert [header(path)[2:4] for path in paths] == expected, live_log.read_text(encoding="utf-8")
+        status = json.loads(run("fill", "--status", live, "--json").stdout)
+        assert status["update_status"] == ("refused" if refused_update else "applied")
+        assert status["destinations"][0]["completed_members"] == (11 if refused_update else 14)
+        assert any(record["status"] == ("refused" if refused_update else "applied") for record in status["updates"])
+        if refused_update:
+            assert status["update_reason"]
+        else:
+            verify(paths[0])
+            verify(paths[-1])
+    print("PASS resizing, future parameter cohorts, live updates, refusal/cancellation, read-only status and revision recovery", flush=True)
+
+
+def check_farm_returning_drives(run, command, verify, root):
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 2,
+               "--construction", "incremental", "--batch-members", 1,
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+
+    def wait_for(test, process, log):
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if test():
+                return
+            assert process.poll() is None, log.read_text(encoding="utf-8")
+            time.sleep(0.05)
+        raise AssertionError(("returning-drive deadline", log.read_text(encoding="utf-8")))
+
+    for dynamic in ((False,) if os.name == "nt" else (False, True)):
+        directory = root / ("drive lost during fill" if dynamic else "drive missing at start")
+        directory.mkdir()
+        first, second, offline = (directory / name for name in ("a", "b", "a-offline"))
+        first.mkdir()
+        second.mkdir()
+        create = ["fill", first, second, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED,
+                  "-k", 18, "--group-members", 4, "--max-groups", 2, "--max-total-members", 8,
+                  "--farming-max-eligible-groups", 8, "--capacity-bytes", "64M", "--leave-free", 0, *runtime]
+        if not dynamic:
+            run(*create, point="initialized", code=86)
+            first.rename(offline)
+            first.mkdir()
+            create = ["fill", second, *runtime]
+        log = directory / "coordinator.log"
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(command(*create), stdout=output, stderr=subprocess.STDOUT)
+            stopped = False
+            try:
+                if dynamic:
+                    wait_for(lambda: all(private_record(member, "grow-farm.progress").is_file() for member in (first, second)), process, log)
+                    process.send_signal(signal.SIGSTOP)
+                    stopped = True
+                    first.rename(offline)
+                    first.mkdir()
+                    process.send_signal(signal.SIGCONT)
+                    stopped = False
+                old_plan = private_record(offline, "grow-farm.plan").read_bytes()
+
+                def finished_available():
+                    status = json.loads(run("status", second, "--json", code=(0, 2)).stdout)
+                    available = next(item for item in status["destinations"] if item["directory"] == str(second))
+                    return available["completed_members"] == 8
+
+                wait_for(finished_available, process, log)
+                assert process.poll() is None, log.read_text(encoding="utf-8")
+                assert private_record(offline, "grow-farm.plan").read_bytes() == old_plan
+                assert private_record(second, "grow-farm.plan").read_bytes() == old_plan, "offline progress rewrote the global policy"
+                assert not list(first.iterdir()), "replacement mountpoint was modified"
+                assert [header(path)[3] for path in sorted(second.glob("*.gplot"))] == [4, 4]
+                first.rmdir()
+                offline.rename(first)
+                assert process.wait(timeout=180) == 0, log.read_text(encoding="utf-8")
+            finally:
+                if stopped and process.poll() is None:
+                    process.send_signal(signal.SIGCONT)
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=30)
+        status = json.loads(run("status", second, "--inspect", "--json").stdout)
+        assert status["inspection_complete"] and [item["completed_members"] for item in status["destinations"]] == [8, 8]
+        assert private_record(first, "grow-farm.plan").read_bytes() == private_record(second, "grow-farm.plan").read_bytes()
+        for path in [*first.glob("*.gplot"), *second.glob("*.gplot")]:
+            verify(path)
+    print("PASS missing and returning destinations preserve policy, healthy progress, identity and full proofs", flush=True)
 
 
 def check(binary, root, reference=None):
@@ -267,7 +645,7 @@ def check(binary, root, reference=None):
         counter += 1
         (root / f"{counter:03d}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         assert SEED not in result.stdout + result.stderr, "private seed exposed in diagnostics"
-        assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
+        assert result.returncode in ((code,) if isinstance(code, int) else code), (args, result.returncode, result.stdout, result.stderr)
         return result
 
     def verify(path):
@@ -279,7 +657,7 @@ def check(binary, root, reference=None):
     construction = ["-d", "cpu", "-M", "512M", "-j", 2,
                     "--window-bytes", "64K", "--checkpoint-bytes", "64K",
                     "--capacity-bytes", "64M", "--headroom-bytes", 0]
-    for subcommand in [("plan",), ("plot",), ("fill",), ("grow",), ("batch",),
+    for subcommand in [("plan",), ("plot",), ("fill",), ("status",), ("pause",), ("drain",), ("resume",), ("retire",), ("grow",), ("batch",),
                        ("bench",), ("test",), ("verify",), ("devices",), ("parity-check",),
                        ("compute",), ("compute", "broker"), ("compute", "worker"),
                        *(("compute", command) for command in ("init", "invite", "join", "configure", "status"))]:
@@ -411,6 +789,11 @@ def check(binary, root, reference=None):
     for subcommand in [("plan",), ("fill", "--plan-only")]:
         refused = json.loads(run(*subcommand, *options, "--farming-deadline-ms", 1, "--json", code=2).stdout)
         assert not refused["feasible"] and (snapshot(preview), snapshot(preview_peer)) == before
+        assert refused["required_reader_memory_bytes"] > 0 and refused["required_max_eligible_groups"] > 0
+        assert refused["model_alternatives"] or refused["alternative_search_limited"]
+        for alternative in refused["model_alternatives"]:
+            assert isinstance(alternative["feasible"], bool) and isinstance(alternative["remaining_reason"], str)
+            assert alternative["feasible"] or alternative["remaining_reason"]
     print("PASS plan/fill preview equivalence and no writes on infeasibility", flush=True)
 
     # A portable profile contains harvester inputs, independent of destination
@@ -559,15 +942,16 @@ def check(binary, root, reference=None):
                                             for d in (review_a, review_b))
     frozen_profile = json.loads(run("plan", review_a, "--json").stdout)["farming_profile"]
     assert frozen_profile == reviewed["farming_profile"]
-    completed = snapshot(review_a), snapshot(review_b)
+    completed = snapshot(review_a, observations=False), snapshot(review_b, observations=False)
     run("fill", "-r", review_a, "--compute", "off", "-d", "cpu", "--quiet")
-    assert (snapshot(review_a), snapshot(review_b)) == completed
+    assert (snapshot(review_a, observations=False), snapshot(review_b, observations=False)) == completed
+    read_only_completed = snapshot(review_a), snapshot(review_b)
     refreshed = root / "completed job forecast.plan"
     run("plan", "--manifest", private_record(review_a, "grow-farm.plan"), "--save-plan", refreshed, "--json")
     refreshed_joint = json.loads(run("plan", "--assess-jobs", refreshed, "--json").stdout)
     assert refreshed_joint["jobs"][0]["members"] >= sum(header(path)[3] for path in reviewed_paths)
     assert refreshed_joint["jobs"][0]["source_job_digest"] == private_record(review_a, "grow-farm.plan").read_bytes()[-65:-1].decode()
-    assert (snapshot(review_a), snapshot(review_b)) == completed
+    assert (snapshot(review_a), snapshot(review_b)) == read_only_completed
     for path in reviewed_paths:
         verify(path)
     print("PASS portable profiles, offline detection, saved review execution and private recovery", flush=True)
@@ -637,10 +1021,10 @@ def check(binary, root, reference=None):
     assert header(capacity_path)[3] == capacity_metrics["members"] == 8
     assert capacity_metrics["stop_reason"] == "capacity"
     assert capacity_metrics["peak_file_bytes"] <= capacity_metrics["capacity_bytes"]
-    completed = snapshot(capacity_dir)
+    completed = snapshot(capacity_dir, observations=False)
     resumed = run("fill", "-r", *capacity_options, "--json")
     assert json.loads(resumed.stdout.splitlines()[-1])["generated_members"] == 0
-    assert snapshot(capacity_dir) == completed, "completed capacity fill retried or changed files"
+    assert snapshot(capacity_dir, observations=False) == completed, "completed capacity fill retried or changed files"
     verify(capacity_path)
     print("PASS compression top-up, window-limited sealing and unchanged resume", flush=True)
 
@@ -876,11 +1260,25 @@ def check(binary, root, reference=None):
         assert not private_record(directory, "grow-farm.plan.next").exists()
         if os.name != "nt":
             assert private_record(directory, "grow-farm.plan").stat().st_mode & 0o777 == 0o600
-    before = snapshot(a), snapshot(b)
+    # Rewriting the producer makes the old observation policy digest foreign.
+    # Refuse that incoherent fixture without writes, then remove only its
+    # disposable observations to exercise completed-file audit without them.
+    foreign_before = snapshot(a), snapshot(b)
+    foreign_progress = run(*resume, b, a, code=2)
+    assert "farming progress belongs to a foreign source policy" in foreign_progress.stderr
+    assert (snapshot(a), snapshot(b)) == foreign_before
+    for directory in (a, b):
+        snapshot(directory, observations=False)  # Validate the disposable record before removal.
+        private_record(directory, "grow-farm.progress").unlink()
+    foreign_outputs = {path: digest(path) for path in farm_paths}
     assert set(run(*resume, b, a).stdout.splitlines()) == set(map(str, farm_paths))
+    assert all(private_record(directory, "grow-farm.plan").read_bytes() == original_plan for directory in (a, b))
+    assert {path: digest(path) for path in farm_paths} == foreign_outputs
+    before = snapshot(a, observations=False), snapshot(b, observations=False)
     assert set(run(*resume, "--manifest", private_record(b, "grow-farm.plan")).stdout.splitlines()) == set(map(str, farm_paths))
     assert set(run(*resume, cwd=b).stdout.splitlines()) == set(map(str, farm_paths))
-    assert (snapshot(a), snapshot(b)) == before, "keyless recovery rewrote the saved job or completed plots"
+    assert (snapshot(a, observations=False), snapshot(b, observations=False)) == before, "keyless recovery rewrote the saved job or completed plots"
+    before = snapshot(a), snapshot(b)
     for path in farm_paths:
         verify(path)
     run(*resume, b, "-S", "cd" * 32, code=2)
@@ -922,9 +1320,12 @@ def check(binary, root, reference=None):
     b.rename(offline)
     before_a = snapshot(a)
     run(*resume, a, code=2)
+    assert snapshot(a) == before_a
+    available_before = snapshot(a, observations=False)
     partial = run(*resume, "--allow-missing", a, code=4)
     assert set(partial.stdout.splitlines()) == {str(p) for p in farm_paths if p.parent == a}
-    assert "unavailable" in partial.stderr and snapshot(a) == before_a
+    assert f"waiting for destination: {b}" in partial.stderr
+    assert snapshot(a, observations=False) == available_before
     unavailable = json.loads(run("plan", "--json", a, code=2).stdout)
     assert [d["available"] for d in unavailable["destinations"]] == [True, False]
     # An empty directory at an absent mountpoint is not the saved volume.
@@ -964,15 +1365,19 @@ def check(binary, root, reference=None):
     # Mixed direct-parent publication was recovered above. Older ancestors no
     # longer describe the sealed extents and cannot replace the current job.
     private_record(b, "grow-farm.plan").write_bytes(original_plan)
+    ancestor_before = tuple(snapshot(directory) for directory in members)
     run(*resume, b, code=2)
+    assert tuple(snapshot(directory) for directory in members) == ancestor_before
     private_record(b, "grow-farm.plan").write_bytes(revised)
+    revision_before = tuple(snapshot(directory) for directory in members)
     run("fill", "--from-plan", expansion_review, "-d", "cpu", "--quiet", code=2)
+    assert tuple(snapshot(directory) for directory in members) == revision_before
     corrupt = bytearray(revised)
     corrupt[-2] = ord("0") if corrupt[-2] != ord("0") else ord("1")
     private_record(b, "grow-farm.plan").write_bytes(corrupt)
-    before_a = snapshot(a)
+    corrupt_before = tuple(snapshot(directory) for directory in members)
     run(*resume, a, code=2)
-    assert snapshot(a) == before_a
+    assert tuple(snapshot(directory) for directory in members) == corrupt_before
     private_record(b, "grow-farm.plan").write_bytes(revised)
     print("PASS expansion preserves old plots, accounts for the whole farm and recovers partial publication", flush=True)
 
@@ -999,8 +1404,9 @@ def check(binary, root, reference=None):
     assert (snapshot(relocated), snapshot(other_job)) == before
     print("PASS explicit relocation and conflicting-job rejection", flush=True)
 
-    # Recovery also completes an interrupted preparation before any replica
-    # is published. An offline member cannot commit an incomplete preparation.
+    # An offline member cannot commit an incomplete preparation. Once the
+    # grants are published, its peer may finish only its saved assignments
+    # while retaining the exact global policy until both members return.
     for point in ("farm-plan-before-publication", "farm-plan-all-staged", "initialized"):
         interrupted = farm / point
         interrupted.mkdir()
@@ -1018,12 +1424,22 @@ def check(binary, root, reference=None):
         pending = interrupted / "offline"
         right.rename(pending)
         before = snapshot(left)
+        available_hashes = {}
         if point != "initialized":
             run(*resume, "--allow-missing", left, code=2)
             assert snapshot(left) == before
         else:
+            saved_plan = private_record(left, "grow-farm.plan").read_bytes()
+            offline_before = snapshot(pending)
             available = run(*resume, "--allow-missing", left, code=4)
-            assert not available.stdout.strip() and "waits for all saved farming destinations" in available.stderr
+            available_paths = [Path(line) for line in available.stdout.splitlines()]
+            assert len(available_paths) == 1 and available_paths[0].parent == left and header(available_paths[0])[3] == 1
+            assert sorted(left.glob("*.gplot")) == available_paths and not right.exists()
+            assert f"waiting for destination: {right}" in available.stderr
+            assert private_record(left, "grow-farm.plan").read_bytes() == saved_plan
+            assert not private_record(left, "grow-farm.plan.next").exists()
+            assert snapshot(pending) == offline_before, "partial recovery changed an unavailable member"
+            available_hashes = {path: digest(path) for path in available_paths}
         pending.rename(right)
         if point == "farm-plan-before-publication":
             run(*resume, right, code=2)  # This member has no recovery copy.
@@ -1032,6 +1448,7 @@ def check(binary, root, reference=None):
         assert len(paths) == 2 and all(header(path)[3] == 1 for path in paths)
         assert private_record(left, "grow-farm.plan").read_bytes() == private_record(right, "grow-farm.plan").read_bytes()
         assert not private_record(left, "grow-farm.plan.next").exists() and not private_record(right, "grow-farm.plan.next").exists()
+        assert all(digest(path) == value for path, value in available_hashes.items()), "returning member changed healthy completed output"
         if point == "initialized":
             for path in paths:
                 verify(path)
@@ -1044,9 +1461,9 @@ def check(binary, root, reference=None):
             assert "conflicting metadata layouts" in refused.stdout + refused.stderr
             assert (snapshot(left), snapshot(right)) == mixed, "mixed layouts changed a completed job"
             private_record(right, "grow-farm.plan").rename(right / "grow-farm.plan")
-            legacy_before = snapshot(left), snapshot(right)
+            legacy_before = snapshot(left, observations=False), snapshot(right, observations=False)
             assert set(run(*resume, right).stdout.splitlines()) == set(map(str, paths))
-            assert (snapshot(left), snapshot(right)) == legacy_before, "legacy completed recovery moved or rewrote records"
+            assert (snapshot(left, observations=False), snapshot(right, observations=False)) == legacy_before, "legacy completed recovery moved or rewrote records"
             private_record(left, "grow-farm.plan").write_bytes((left / "grow-farm.plan").read_bytes())
             conflict = snapshot(left), snapshot(right)
             for operation in (("plan", left, "--json"), (*resume, left)):
@@ -1055,6 +1472,8 @@ def check(binary, root, reference=None):
             assert (snapshot(left), snapshot(right)) == conflict, "conflicting private/top-level records changed the job"
             private_record(left, "grow-farm.plan").unlink()
     print("PASS staged-job recovery and unfinished partial recovery preserve the saved extent", flush=True)
+    check_farm_updates(run, command, verify, root)
+    check_farm_returning_drives(run, command, verify, root)
 
 
 def check_replot(binary, root, reference=None):
@@ -1064,13 +1483,16 @@ def check_replot(binary, root, reference=None):
     directory.mkdir()
     counter = 0
 
+    def command(*args):
+        return [str(binary), str(args[0]), "--config", os.devnull, *map(str, args[1:])]
+
     def run(*args, code=0, point=None):
         nonlocal counter
         env = dict(os.environ)
         env.pop("XCHPLOT2_GROW_FAILPOINT", None)
         if point:
             env["XCHPLOT2_GROW_FAILPOINT"] = point
-        result = subprocess.run([str(binary), str(args[0]), "--config", os.devnull, *map(str, args[1:])],
+        result = subprocess.run(command(*args),
                                 capture_output=True, text=True, encoding="utf-8", env=env, timeout=180)
         counter += 1
         (directory / f"{counter:03d}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
@@ -1451,6 +1873,10 @@ def check_replot(binary, root, reference=None):
     verified_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "verified_stage")
     assert status["active_replacement"]["current_native_observation"] == f"matching-verified-stage-native-{verified_authority}"
     assert snapshot(farm) == before_status, "status changed saved progress or native objects"
+    samples = watch_status(command, directory / "migration-status-watch.log", "--from-plan", review_file)
+    assert all(sample["replot_status"] and sample["durable_phase"] == "replacing" and sample["active_verified_stage"] and
+               sample["live_service_health"] == "not-queried" for sample in samples)
+    assert snapshot(farm) == before_status, "migration status watch changed saved progress or native objects"
     flags()
     run("fill", "--from-plan", review_file, "--chia-executable", directory / "missing-reader", *options, code=2)
     assert snapshot(farm) == before_status, "explicit local override was ignored or changed progress on refusal"
@@ -1855,7 +2281,7 @@ def check_replot(binary, root, reference=None):
         proof = run("verify", output, "--full", "--trials", 100)
         found = re.search(r"(\d+) full proofs validated", (proof.stdout + proof.stderr).lower())
         assert found and int(found[1]) > 0
-    print("PASS unfinished exact-build checkpoints bind successors and continue after reviewed activation", flush=True)
+    print("PASS unfinished checkpoints bind successors and continue after reviewed activation", flush=True)
 
     # Source and target implementations use distinct explicit local routes.
     # The old route deliberately has no compatible target full-node interface.

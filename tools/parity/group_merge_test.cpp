@@ -10,6 +10,7 @@
 // Upstream and group-common headers define non-inline helpers, so the
 // controller fixture shares this translation unit with the engine fixtures.
 #include "host/GroupPlotter.cpp"
+#include "group_farm_progress_test.hpp"
 #include "../xchplot2/group_commands.hpp"
 
 using namespace group_grow;
@@ -1029,7 +1030,7 @@ void construction_inspection_recovery(fs::path const& root, Members input, Confi
         require(inspected.authority_digest == repeated.authority_digest && inspected.target == repeated.target && contents(path) == before,
             "read-only ordinary bootstrap/orphan inspection changed retained bytes");
         if (point == "bootstrap" || point == "allocated" || point == "checkpoint-partial" || point == "retired")
-            require(!inspected.checkpoint, "uncheckpointed ordinary recovery invented exact-build authority");
+            require(!inspected.checkpoint, "uncheckpointed ordinary recovery invented checkpoint authority");
         require(!::chmod(path.c_str(), 0600), "cannot restore ordinary bootstrap permissions");
         {
             Engine output(path.string(), cfg, true, identity()); output.confirm_identity(); auto const saved = output.identity();
@@ -4567,7 +4568,9 @@ void replot_review_options(fs::path const& directory)
         status.chia_root.empty() && status.chia_executable.empty(), "migration status initialized local farming or compute services");
     reject("plan", {"--status", origin.string(), "--harvester", "unread-profile"});
     reject("plan", {"--status", origin.string(), "--metadata-only"});
-    reject("plan", {"--status", ordinary.string()});
+    auto const ordinary_status = parse("plan", {"--status", ordinary.string()});
+    require(ordinary_status.replot_status && ordinary_status.from_plan == ordinary && !ordinary_status.automatic_compute,
+        "ordinary status initialized services or lost its selector");
     reject("plan", {"--revalidate", "--from-plan", origin.string()});
     reject("fill", {"--revalidate", "--from-plan", origin.string(), "--harvester", profile.string(), "--save-plan", "next.plan"});
 }
@@ -4914,7 +4917,8 @@ void farming_joint_forecasts(fs::path const& root)
         state.directories.push_back(std::move(lane));
         FarmingProfile profile; profile.config = config; profile.source = "fixture-" + name;
         profile.captured_at = "2026-11-03T00:00:00Z"; profile.host_name = name; set_farming_state_profile(state, profile);
-        FarmingPreview preview{std::move(state), std::string(64, 'e'), base / (name + "-private-source"), {}};
+        FarmingPreview preview; preview.state = std::move(state); preview.source_digest.assign(64, 'e');
+        preview.source = base / (name + "-private-source");
         auto const path = base / (name + ".plan"); save(path, preview); return path;
     };
     auto options = [&](std::initializer_list<fs::path> paths)
@@ -5695,7 +5699,10 @@ void farming_preview_handoff(fs::path const& root)
         auto const text = farming_state_text(reference->state);
         // This leaves room for the search and retained inputs, but not the
         // serialization buffers that must coexist while sizing private copies.
-        memory.max_ram = sum(reference->metadata, product(text.size(), 3));
+        uint64_t progress_memory = 0;
+        for (size_t lane = 0; lane < reference->state.directories.size(); ++lane)
+            progress_memory = sum(progress_memory, farming_progress_memory_bound(reference->state, lane));
+        memory.max_ram = sum(reference->metadata - progress_memory, product(text.size(), 3));
         bool refused = false;
         try { (void)farming_run(memory, nullptr, source); }
         catch (std::exception const& error) { refused = std::string(error.what()).find("reservation serialization exceeds --max-ram") != std::string::npos; }
@@ -5839,7 +5846,8 @@ void farming_preview_handoff(fs::path const& root)
     published.reset();
     refused = false;
     try { (void)inspect(); }
-    catch (std::exception const& error) { refused = std::string(error.what()).find("stale") != std::string::npos; }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
     require(refused, "fresh-job preview accepted a subsequently published job");
 
     auto source_options = options; source_options.save_plan = directory / "saved-job-review.plan";
@@ -5867,11 +5875,35 @@ void farming_preview_handoff(fs::path const& root)
     stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
     source_inspection.target.clear(); source_inspection.destinations.clear(); source_inspection.manifest.clear();
     source_inspection.extend = false;
+    auto progressed = farming_arguments(source_inspection);
+    require(progressed.preview_rebased &&
+        contents(farming_metadata_path(a, "grow-farm.plan", false)) == std::vector<uint8_t>(revision.begin(), revision.end()),
+        "progress-only revision invalidated its compatible preview or changed saved work");
+    auto legacy_preview = load_farming_preview(source_options.save_plan, options.max_ram).preview;
+    legacy_preview.version = 1; legacy_preview.source_policy.clear();
+    auto legacy_text = farming_preview_text(legacy_preview);
+    auto const legacy_path = directory / "legacy-job-review.plan";
+    stream_state::atomic_save(legacy_path, legacy_text + stream_state::digest(legacy_text) + '\n', false);
+    Arguments legacy_inspection; legacy_inspection.command = "plan"; legacy_inspection.plan_only = legacy_inspection.directory_farm = true;
+    legacy_inspection.from_plan = legacy_path; legacy_inspection.max_ram = options.max_ram;
+    refused = false;
+    try { (void)farming_arguments(legacy_inspection); }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
+    require(refused, "legacy preview lost its exact source-revision requirement");
+    revised.parent_digest = stream_state::digest(farming_state_text(revised)); ++revised.revision;
+    revised.policy_revision = revised.revision; ++revised.max_groups;
+    revision = farming_state_text(revised); revision += stream_state::digest(revision) + '\n';
+    stream_state::atomic_save(farming_metadata_path(a, "grow-farm.plan", false), revision);
+    stream_state::atomic_save(farming_metadata_path(b, "grow-farm.plan", false), revision);
+    source_inspection.target.clear(); source_inspection.destinations.clear(); source_inspection.manifest.clear();
+    source_inspection.extend = false;
     refused = false;
     try { (void)farming_arguments(source_inspection); }
-    catch (std::exception const& error) { refused = std::string(error.what()).find("stale") != std::string::npos; }
+    catch (std::exception const& error)
+    { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
     require(refused && contents(farming_metadata_path(a, "grow-farm.plan", false)) == std::vector<uint8_t>(revision.begin(), revision.end()),
-        "changed source revision was accepted or rewritten by a saved preview");
+        "changed source policy was accepted or rewritten by a saved preview");
 
     auto text = farming_preview_text(saved.preview) + "unexpected\n";
     refused = false;
@@ -6106,7 +6138,7 @@ void farming_extent_admission(fs::path const& root)
             auto const directory = root / (std::string(name) + "-" + std::to_string(lane));
             fs::create_directory(directory);
             farm.state.directories.push_back({directory.string(), "test", storage.capacity_bytes, 0, layout, storage});
-            farm.state.directories.back().directory_identity = "test:" + std::to_string(lane);
+            farm.state.directories.back().directory_identity = farming_directory_identity(directory);
         }
         auto const initial = farming_assess(config, destinations, layouts,
             std::vector<std::vector<uint16_t>>(2, std::vector<uint16_t>(size_t(files), 1)));
@@ -6254,6 +6286,93 @@ void farming_extent_admission(fs::path const& root)
             limited.state.directories[0].fill_stop == (reason.empty() ? "metadata-capacity" : reason),
             "metadata fallback changed explicit terminal-limit reason precedence");
     }
+
+    // Compact plan extents must not hide growth of the destination journal.
+    auto progress_limited = make_farm("progress-bound-admission", 1, 1000000);
+    progress_limited.state.version = 8; progress_limited.state.policy_revision = 1;
+    progress_limited.state.identity_k = 18; progress_limited.state.headroom = 0;
+    progress_limited.state.fixed_extent = progress_limited.state.capacity_fill = true;
+    progress_limited.state.config.deadline_seconds = progress_limited.state.config.challenge_seconds = 1000000;
+    progress_limited.state.manifest_reserved_bytes = mib;
+    uint64_t alignment = 1;
+    for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+    {
+        auto& directory = progress_limited.state.directories[lane]; directory.extents = {1}; directory.sealed_files = 1;
+        directory.capacity_bytes = directory.storage.capacity_bytes = 512 * mib;
+        auto const path = file_io::native_path(directory.directory);
+        progress_limited.locks.push_back(std::make_unique<DirectoryLock>(path));
+        auto metadata = std::make_shared<FarmingMetadataDirectory>(path, false); metadata->create();
+        progress_limited.metadata_directories.push_back(std::move(metadata));
+        file_io::Space space{}; require(!file_io::space_path(path, &space), "cannot inspect progress-bound admission fixture");
+        alignment = std::max({alignment, uint64_t(space.f_bsize), uint64_t(space.f_frsize)});
+    }
+    auto progress_bound = [&]
+    {
+        uint64_t bytes = 0;
+        for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+            bytes = sum(bytes, farming_progress_memory_bound(progress_limited.state, lane));
+        return bytes;
+    };
+    auto& progress_directory = progress_limited.state.directories[0];
+    progress_limited.state.progress_reserved_bytes = product(farming_update_aligned(
+        farming_progress_size_bound(progress_limited.state, 0), alignment), 2);
+    while (true)
+    {
+        progress_directory.extents.push_back(1);
+        if (product(farming_update_aligned(farming_progress_size_bound(progress_limited.state, 0), alignment), 2) >
+            progress_limited.state.progress_reserved_bytes) { progress_directory.extents.pop_back(); break; }
+        require(progress_directory.extents.size() < farming_detail::maximum_files - 1,
+            "progress-bound fixture exhausted the permanent file limit");
+    }
+    progress_directory.extents.reserve(progress_directory.extents.size() + 1);
+    for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+    {
+        auto& directory = progress_limited.state.directories[lane]; directory.sealed_files = directory.extents.size();
+        progress_limited.lanes[lane].ordinal = progress_limited.lanes[lane].completed_members = directory.sealed_files;
+    }
+    progress_limited.metadata = sum(progress_limited.metadata,
+        sum(farming_extent_memory(progress_limited.state), progress_bound()));
+    auto save_progress_parent = [&]
+    {
+        auto body = farming_state_text(progress_limited.state); body += stream_state::digest(body) + '\n';
+        progress_limited.manifests.clear(); progress_limited.manifest_charge = 0;
+        for (size_t lane = 0; lane < progress_limited.lanes.size(); ++lane)
+        {
+            auto const manifest = progress_limited.metadata_directories[lane]->path / "grow-farm.plan";
+            stream_state::atomic_save(manifest, body);
+            progress_limited.manifests.emplace_back(manifest, stream_state::stamp(manifest));
+            auto& current = progress_limited.lanes[lane];
+            current.manifest_charge = current.completed_charge = snapshot(manifest, 0).charge();
+            progress_limited.manifest_charge = sum(progress_limited.manifest_charge, current.manifest_charge);
+        }
+    };
+    save_progress_parent();
+    auto const progress_parent = farming_state_text(progress_limited.state);
+    auto const progress_stamps = progress_limited.manifests;
+    auto const metadata_before_rejection = progress_limited.metadata;
+    auto const next_ordinal = progress_directory.extents.size();
+    std::vector<Change> progress_add{{Kind::reserve, 0, next_ordinal, 1}};
+    progress_limited.revise_extents(progress_add, progress_limited.metadata);
+    require(!progress_add[0].accepted && progress_add[0].metadata_rejected &&
+        farming_state_text(progress_limited.state) == progress_parent && progress_limited.manifests == progress_stamps &&
+        progress_limited.metadata == metadata_before_rejection &&
+        !fs::exists(progress_limited.metadata_directories[0]->path / "grow-farm.progress"),
+        "future grant bypassed progress bytes or retained provisional journal memory before publication");
+    progress_directory.extents.push_back(1);
+    progress_limited.state.progress_reserved_bytes = product(farming_update_aligned(
+        farming_progress_size_bound(progress_limited.state, 0), alignment), 2);
+    progress_directory.extents.pop_back(); save_progress_parent();
+    auto const before_progress_memory = progress_bound();
+    auto const before_progress_extents = farming_extent_memory(progress_limited.state);
+    auto const before_progress_certificate = progress_limited.certificate_memory();
+    auto const before_progress_metadata = progress_limited.metadata;
+    progress_add = {{Kind::reserve, 0, next_ordinal, 1}};
+    progress_limited.revise_extents(progress_add, progress_limited.metadata);
+    require(progress_add[0].accepted && progress_limited.metadata ==
+        before_progress_metadata + (progress_bound() - before_progress_memory) +
+        (farming_extent_memory(progress_limited.state) - before_progress_extents) +
+        (progress_limited.certificate_memory() - before_progress_certificate),
+        "admitted future grant did not retain its larger journal and certificate memory allowance");
 
     auto saved = make_farm("saved", 1, 3);
     saved.state.version = 5; // Retain strict legacy replica-build coverage.
@@ -6496,6 +6615,8 @@ void published_retired_external_layout(fs::path const& root, Members input, Conf
     args.k = state.config.k; args.strength = state.config.strength; Keys keys(args);
     std::vector<fs::path> directories;
     std::vector<fs::path> holders;
+    std::vector<fs::path> runtime_roots(state.directories.size());
+    std::vector<ConstructionPathBinding> root_bindings;
     cfg.capacity_bytes = 128 * mib; cfg.memory_limit_bytes = 512 * mib;
     for (size_t lane = 0; lane < state.directories.size(); ++lane)
     {
@@ -6594,11 +6715,31 @@ void published_retired_external_layout(fs::path const& root, Members input, Conf
         auto substitute = retired_farming_publication(state, target, &keys, {}, nullptr, legacy);
         rejects([&] { (void)ExternalEngine::inspect_retired_published(target.string(), holders.back().string(), *substitute); });
         fs::remove(published); fs::rename(retained, published);
+        auto const current = root / ("published-retired-current-" + std::to_string(lane));
+        auto const relative_holder = holders.back().lexically_relative(directory);
+        fs::rename(directory, current); fs::create_directory(directory); directories[lane] = runtime_roots[lane] = current;
+        holders.back() = current / relative_holder;
+        root_bindings.push_back({directory.string(), current.string(), saved.directory_identity});
+        auto const current_stage = migration_stage_path(current, state.job_id, lane, legacy);
+        auto const current_published = group_path(current, 0, state.job_id);
+        auto rebound = retired_farming_publication(state, current_stage, &keys, {}, nullptr, legacy, runtime_roots);
+        require(rebound && saved.directory == directory.string(), "retired migration runtime alias changed its immutable saved assignment");
+        auto rebound_inspection = ExternalEngine::inspect_retired_published(current_stage.string(), holders.back().string(), *rebound,
+            cfg.memory_limit_bytes, root_bindings);
+        auto current_output = snapshot(current_published, 0);
+        auto current_resolve = [&](fs::path const& original, fs::path const& requested)
+        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy, runtime_roots); };
+        require(!output_auxiliary(current_published, current_output, cfg.memory_limit_bytes, current_resolve, legacy, root_bindings) &&
+            current_output.retired == rebound_inspection.metadata_occupied_bytes,
+            "moved retired migration alias lost its checked native metadata reservation");
+        auto wrong_roots = runtime_roots; wrong_roots[lane] = scratch;
+        rejects([&] { (void)retired_farming_publication(state, migration_stage_path(scratch, state.job_id, lane, legacy),
+            &keys, {}, nullptr, legacy, wrong_roots); });
     }
     PublishedRetirements publications{directories, [&](fs::path const& original, fs::path const& requested)
-        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy); }, state.job_id, legacy};
+        { return retired_farming_publication(state, original, &keys, requested, nullptr, legacy, runtime_roots); }, state.job_id, legacy};
     ScratchPool pool(std::vector<fs::path>{scratch}, 0, 1);
-    preserve_published_retired(pool, publications, cfg.memory_limit_bytes);
+    preserve_published_retired(pool, publications, cfg.memory_limit_bytes, {}, root_bindings);
     bool rejected = false; try { pool.seal_recovery(); } catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "another destination's preserved scratch bypassed the shared temporary cap");
 }
@@ -6608,6 +6749,529 @@ void published_retired_external(fs::path const& root, Members input, Config cfg)
     {
         auto const directory = root / (legacy ? "legacy-retired-publications" : "private-retired-publications");
         fs::create_directory(directory); published_retired_external_layout(directory, input, cfg, legacy);
+    }
+}
+
+void farming_update_protocol(fs::path const& root, FarmingState state, uint64_t memory)
+{
+    using namespace grow_controller_test;
+    require(!farming_update_allocation(root / "absent-update-metadata"), "read-only destination preview required private mailbox creation");
+    auto const first = root / "update-first", second = root / "update-second";
+    fs::create_directory(first); fs::create_directory(second);
+    state.version = 8; state.applied_update.clear(); state.request_floor = 0;
+    state.directories = {state.directories.front(), state.directories.front()};
+    for (size_t i = 0; i < state.directories.size(); ++i)
+    {
+        auto& directory = state.directories[i]; auto const path = i ? second : first;
+        directory.directory = file_io::path_text(path); directory.directory_identity = farming_directory_identity(path);
+        FarmingMetadataDirectory metadata(path, false); metadata.create();
+    }
+    state.update_reserved_bytes = farming_update_reservation(farming_update_text(farming_update_snapshot(state)).size() + 4096, 4096);
+    state.manifest_reserved_bytes = 2 * mib;
+    auto save = [&]
+    {
+        auto body = farming_state_text(state); body += stream_state::digest(body) + '\n';
+        for (auto const& directory : state.directories)
+            stream_state::atomic_save(farming_metadata_path(file_io::native_path(directory.directory), "grow-farm.plan", false), body);
+    };
+    save();
+    auto propose = [&](uint64_t capacity, uint64_t headroom)
+    {
+        auto update = farming_update_snapshot(state); update.capacity = capacity; update.headroom = headroom;
+        farming_update_preconditions(update, state); return update;
+    };
+    auto changed = propose(state.capacity + mib, state.headroom);
+    auto legacy = changed; legacy.version = 2; legacy.id = std::string(64, 'f');
+    auto legacy_body = farming_update_text(legacy); legacy_body += stream_state::digest(legacy_body) + '\n';
+    auto const legacy_path = farming_metadata_path(first, "grow-farm.update", false);
+    stream_state::atomic_save(legacy_path, legacy_body, false);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        auto pending = mailbox.next(state);
+        require(pending && pending->update.version == 2 && pending->update.id == legacy.id,
+            "existing legacy waiting request was not imported");
+    }
+    std::ostringstream old_error;
+    old_error << "ordinary-group-farming-update-error-v1\n" << std::quoted(legacy.id) << ' ' << std::quoted("legacy refusal") << '\n';
+    auto error_body = old_error.str(); error_body += stream_state::digest(error_body) + '\n';
+    stream_state::atomic_save(farming_metadata_path(first, "grow-farm.update.error", false), error_body, false);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.receipt(legacy.id)->status == "refused" && mailbox.receipt(legacy.id)->reason == "legacy refusal",
+            "legacy terminal refusal was lost during import");
+        mailbox.compact();
+        require(!fs::exists(legacy_path) && mailbox.records().empty(), "acknowledged legacy request retained authority");
+    }
+    auto unrelated = state; ++unrelated.headroom; unrelated.request_floor = 7;
+    ++unrelated.revision; unrelated.policy_revision = unrelated.revision;
+    require(farming_policy_digest(state) == farming_policy_digest([&] { auto copy = state; copy.request_floor = 7; return copy; }()),
+        "history compaction invalidated policy identity");
+    auto rebased = farming_update_rebase(changed, unrelated);
+    require(rebased.capacity == changed.capacity && rebased.headroom == unrelated.headroom,
+        "disjoint queued fields did not rebase");
+    unrelated.capacity += 2 * mib;
+    bool conflict = false;
+    try { (void)farming_update_rebase(changed, unrelated); }
+    catch (std::runtime_error const& error) { conflict = std::string(error.what()).find("capacity-bytes") != std::string::npos; }
+    require(conflict, "queued scalar conflict lacked its exact field");
+    std::string replay_body, replay_id;
+    auto const interrupted = farming_metadata_path(first, "grow-farm.update.floor.partial.Ab12Cd", false);
+    { std::ofstream out(interrupted); out << "interrupted private replacement"; }
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(!fs::exists(interrupted), "interrupted atomic-save allocation was not reclaimed under its request lock");
+        require(mailbox.locked() && mailbox.complete(), "complete update replicas were not locked");
+        auto const first_id = mailbox.submit(changed);
+        require(mailbox.submit(changed) == first_id && mailbox.receipt(first_id)->status == "accepted",
+            "duplicate request changed identity or lost its durable acceptance");
+        auto independent = propose(state.capacity, state.headroom + mib);
+        auto const merged_id = mailbox.submit(independent);
+        require(merged_id != first_id && mailbox.receipt(first_id)->status == "superseded" && mailbox.submit(independent) == merged_id,
+            "compatible queued edits did not converge to one idempotent replacement");
+        auto next = mailbox.next(state);
+        require(next && next->update.id == merged_id && next->update.capacity == changed.capacity && next->update.headroom == independent.headroom,
+            "queued replacement discarded an earlier compatible field");
+        auto reset = propose(state.capacity, state.headroom);
+        farming_update_preconditions(reset, state, {"capacity-bytes"});
+        auto const reset_id = mailbox.submit(reset);
+        next = mailbox.next(state);
+        require(next && next->update.id == reset_id && next->update.capacity == state.capacity && next->update.headroom == independent.headroom,
+            "explicit queued reset discarded an unrelated waiting field");
+        for (auto const& record : mailbox.records()) if (record.file.update.id == reset_id)
+        { replay_body = record.body; replay_id = reset_id; }
+        require(mailbox.cancel() && mailbox.receipt(reset_id)->status == "cancelled" && !mailbox.actionable(),
+            "cancelled requests retained actionable policy authority");
+        mailbox.compact();
+        require(mailbox.records().empty() && mailbox.floor(), "acknowledged terminal history did not compact");
+        auto pause = farming_update_snapshot(state); pause.capacity = changed.capacity; pause.action = "pause";
+        farming_update_preconditions(pause, state, {"control"});
+        auto const pause_id = mailbox.submit(pause);
+        auto resume = farming_update_snapshot(state); resume.action = "resume";
+        farming_update_preconditions(resume, state, {"control"});
+        auto const resume_id = mailbox.submit(resume);
+        next = mailbox.next(state);
+        require(next && next->update.id == resume_id && next->update.action == "resume" && next->update.capacity == changed.capacity &&
+            mailbox.receipt(pause_id)->status == "superseded", "queued resume did not replace pause while preserving its capacity edit");
+        mailbox.cancel(); mailbox.compact();
+        auto control = [&](std::string action, std::vector<std::string> targets)
+        {
+            auto update = farming_update_snapshot(state); update.action = std::move(action); update.action_destinations = std::move(targets);
+            std::set<std::string> fields;
+            if (update.action_destinations.empty()) fields.insert("control");
+            else for (auto const& id : update.action_destinations) fields.insert("control:" + id);
+            farming_update_preconditions(update, state, fields); return update;
+        };
+        auto const a = state.directories.front().directory_identity, b = state.directories.back().directory_identity;
+        (void)mailbox.submit(control("pause", {a}));
+        (void)mailbox.submit(control("drain", {b}));
+        (void)mailbox.submit(control("retire", {}));
+        auto resume_both = control("resume", {a, b});
+        auto const full_id = mailbox.submit(resume_both);
+        require(mailbox.pending().size() == farming_update_slots && mailbox.submit(resume_both) == full_id,
+            "idempotent request was refused at the unresolved queue bound");
+        auto paused = state; ++paused.revision; paused.policy_revision = paused.revision;
+        paused.directories.front().control = "paused"; paused.directories.back().control = "draining";
+        for (auto const& record : mailbox.records()) if (record.file.update.id == full_id)
+            require(farming_update_rebase(record.file.update, paused).action == "resume",
+                "overlapping queued controls lost their reviewed predecessor field values");
+        mailbox.cancel(); mailbox.compact();
+    }
+    auto const offline_first = root / "update-first-offline", offline_second = root / "update-second-offline";
+    fs::rename(first, offline_first); fs::create_directory(first);
+    std::string pause_id, headroom_id;
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.locked() && !mailbox.complete() && mailbox.manifest().parent_path().parent_path() == second,
+            "missing original destination prevented another matching member from accepting intent");
+        auto pause = farming_update_snapshot(state); pause.action = "pause";
+        pause.action_destinations = {state.directories.front().directory_identity};
+        farming_update_preconditions(pause, state);
+        pause_id = mailbox.submit(pause);
+        require(!mailbox.actionable() && mailbox.pending().size() == 1, "offline policy request repeatedly interrupted local progress");
+    }
+    fs::remove(first); fs::rename(offline_first, first); fs::rename(second, offline_second);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        headroom_id = mailbox.submit(propose(state.capacity, state.headroom + mib));
+    }
+    fs::rename(offline_second, second);
+    auto commit = [&](FarmingUpdate const& update)
+    {
+        auto const parent = stream_state::digest(farming_state_text(state));
+        state.config = update.config; state.profile_metadata = update.profile;
+        state.capacity = update.capacity; state.headroom = update.headroom;
+        state.max_groups = update.max_groups; state.max_total_members = update.max_total_members;
+        if (!update.action.empty())
+        {
+            if (update.action_destinations.empty()) state.control = farming_update_control(update.action);
+            else for (auto& directory : state.directories)
+                if (std::find(update.action_destinations.begin(), update.action_destinations.end(), directory.directory_identity) != update.action_destinations.end())
+                    directory.control = farming_update_control(update.action);
+        }
+        ++state.revision; state.policy_revision = state.revision; state.parent_digest = parent; state.applied_update = update.id; save();
+    };
+    {
+        DirectoryLock first_writer(first), second_writer(second);
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(mailbox.records().size() == 2 && mailbox.actionable(), "partitioned requests were lost on convergence");
+        std::set<std::string> waiting{pause_id, headroom_id};
+        while (!waiting.empty())
+        {
+            auto next = mailbox.next(state); require(next.has_value(), "disjoint partitioned request was not replayable");
+            require(waiting.erase(next->update.id) == 1, "partitioned request was applied twice");
+            commit(next->update); mailbox.finish(next->update.id, "applied");
+        }
+        require(state.headroom == mib && state.directories.front().control == "paused" && !mailbox.next(state) &&
+            mailbox.receipt(pause_id)->status == "applied" && mailbox.receipt(headroom_id)->status == "applied",
+            "partitioned disjoint edits did not apply exactly once");
+        mailbox.compact();
+    }
+    std::string conflict_first, conflict_second;
+    fs::rename(first, offline_first);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        conflict_first = mailbox.submit(propose(state.capacity + mib, state.headroom));
+    }
+    fs::rename(offline_first, first); fs::rename(second, offline_second);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        conflict_second = mailbox.submit(propose(state.capacity + 2 * mib, state.headroom));
+    }
+    fs::rename(offline_second, second);
+    {
+        DirectoryLock first_writer(first), second_writer(second);
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        auto selected = mailbox.next(state);
+        require(selected && selected->update.id == std::min(conflict_first, conflict_second),
+            "conflicting partitions did not choose a deterministic request order");
+        auto const winner = selected->update.id;
+        commit(selected->update); mailbox.finish(winner, "applied");
+        require(!mailbox.next(state), "conflicting partitioned changes were both applied");
+        auto const loser = winner == conflict_first ? conflict_second : conflict_first;
+        require(mailbox.receipt(loser)->status == "refused" && mailbox.receipt(loser)->reason.find("capacity-bytes") != std::string::npos,
+            "partitioned conflict did not retain its field-specific refusal");
+        mailbox.compact();
+        auto contents = replay_body; contents += stream_state::digest(contents) + '\n';
+        stream_state::atomic_save(farming_metadata_path(first, "grow-farm.update-" + replay_id + ".request", false), contents, false);
+        require(!mailbox.next(state) && mailbox.receipt(replay_id)->status == "refused",
+            "request below the acknowledged floor regained policy authority");
+    }
+    auto const crash_request = farming_metadata_path(first, "grow-farm.update-" + replay_id + ".request", false);
+    auto const crash_partial = fs::path(file_io::path_text(crash_request) + ".partial.Ab12Cd");
+    fs::create_hard_link(crash_request, crash_partial);
+    auto tight = state; tight.update_reserved_bytes = 1;
+    state = tight; save();
+    bool bounded = false;
+    {
+        group_grow::FarmingUpdateMailbox mailbox(state, false, true, memory);
+        require(!fs::exists(crash_partial) && fs::exists(crash_request), "interrupted immutable hard-link publication was not recoverable");
+        try { (void)mailbox.submit(propose(state.capacity + mib, state.headroom)); }
+        catch (FarmingUpdateSpaceError const& error) { bounded = error.required > error.available; }
+    }
+    require(bounded, "update mailbox bypassed its dedicated allocation allowance");
+}
+
+void farming_path_rebinding(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    auto const first = root / "native-rebind-first", second = root / "native-rebind-second";
+    auto const current = root / "native-rebind-current", offline = root / "native-rebind-offline";
+    fs::create_directory(first); fs::create_directory(second); fs::create_directory(first / "scratch");
+    Arguments args; args.command = "fill"; args.directory_farm = true; args.target = first; args.destinations = {second};
+    args.max_ram = 512 * mib; args.headroom = 0; args.capacity = 128 * mib;
+    args.k = 18; args.strength = 2; args.group_members = 2; args.max_groups = 2; args.max_total_members = 4;
+    args.farming_max_eligible_groups = 8; args.backend = "cpu"; args.workers = args.batch = 1;
+    args.window = 65536; args.checkpoint_bytes = 65536;
+    args.seed = std::string(64, 'a'); args.pool_ph = std::string(64, 'b');
+    args.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Keys keys(args); auto source = farming_arguments(args); auto initial = farming_run(args, &keys, source);
+    require(initial->feasible(), "native rebind fixture was infeasible");
+    auto const state = initial->state; auto const text = farming_state_text(state);
+    auto const digest = stream_state::digest(text); auto const requested = initial_identity(initial->identity(keys, 0, 0));
+    auto const first_plan = contents(farming_metadata_path(first, "grow-farm.plan", false));
+    auto const second_plan = contents(farming_metadata_path(second, "grow-farm.plan", false)); initial.reset();
+    cfg.capacity_bytes = 64 * mib; cfg.memory_limit_bytes = args.max_ram;
+    auto const target = group_path(first, 0); auto const child = ::fork(); require(child >= 0, "cannot fork native rebind construction");
+    if (!child)
+    {
+        ::setenv("XCHPLOT2_GROW_FAILPOINT", "external-run-after-checkpoint", 1);
+        ExternalConfig ext; ext.segment_bytes = 65536; ext.fan_in = 2; ext.scratch.push_back({(first / "scratch").string(), 16 * mib});
+        Construction output(target.string(), cfg, false, requested, "external", ext); output.confirm_identity();
+        require(output.append(input.subspan(0, 1)).accepted, "native rebind contribution was rejected"); std::_Exit(0);
+    }
+    int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+        "native rebind construction did not stop at its checkpoint");
+    fs::rename(first, current); fs::create_directory(first); fs::rename(second, offline);
+    auto resumed = args; resumed.target.clear(); resumed.destinations.clear(); resumed.resume = resumed.allow_missing = true;
+    resumed.manifest = farming_metadata_path(current, "grow-farm.plan", false);
+    auto bound = farming_arguments(resumed);
+    require(bound.rebound == std::set<size_t>{0} && !bound.changed && bound.directories.front() == current &&
+        bound.digest == digest && farming_state_text(*bound.saved) == text,
+        "persistent native identity rebinding changed the saved policy or inferred another root");
+    auto partial = farming_run(resumed, &keys, bound);
+    require(partial->available == std::vector<uint8_t>{1, 0} && partial->directory_path(0) == current &&
+        partial->state.directories.front().directory == first.string() && partial->state.revision == state.revision &&
+        partial->feasible(), "available native rebound root could not independently recover its saved grant");
+    auto rebound_cfg = cfg; rebound_cfg.path_bindings = partial->construction_bindings(0);
+    auto const moved = group_path(current, 0);
+    { Construction output(moved.string(), rebound_cfg, true, requested, "external"); output.confirm_identity(); output.finish(); }
+    auto const reference = root / "native-rebind-reference.gplot";
+    { Engine output(reference.string(), cfg, false, requested); output.confirm_identity();
+      require(output.append(input.subspan(0, 1)).accepted, "native rebind reference rejected"); }
+    require(contents(moved) == contents(reference) && contents(resumed.manifest) == first_plan &&
+        contents(farming_metadata_path(offline, "grow-farm.plan", false)) == second_plan && fs::is_empty(first),
+        "native rebind rewrote a global replica, followed the replacement mountpoint or changed canonical bytes");
+    partial.reset(); fs::rename(offline, second);
+    auto returning = farming_arguments(resumed); auto recovered = farming_run(resumed, &keys, returning);
+    require(returning.rebound.contains(0) && returning.digest == digest && recovered->available == std::vector<uint8_t>{1, 1} &&
+        contents(resumed.manifest) == first_plan && contents(farming_metadata_path(second, "grow-farm.plan", false)) == second_plan,
+        "returning peer conflicted with immutable policy after native directory rebinding");
+    recovered.reset();
+    auto foreign_farm = [&](fs::path const& directory, char seed)
+    {
+        auto foreign = args; foreign.target = directory; foreign.destinations.clear(); foreign.manifest.clear();
+        foreign.seed = std::string(64, seed); Keys owner(foreign);
+        auto selected = farming_arguments(foreign); auto run = farming_run(foreign, &owner, selected);
+        require(run->feasible() && run->state.job_id != state.job_id, "foreign continuation fixture did not create an independent job");
+    };
+    foreign_farm(first, 'c'); auto const foreign_first = contents(farming_metadata_path(first, "grow-farm.plan", false));
+    auto const lost_alias = root / "native-rebind-lost-alias"; fs::rename(current, lost_alias); fs::create_directory(current);
+    foreign_farm(current, 'd'); auto const foreign_alias = contents(farming_metadata_path(current, "grow-farm.plan", false));
+    std::array<fs::path, 2> prior_paths{current, second};
+    auto strict = resumed; strict.manifest.clear(); strict.target = current; strict.destinations = {second}; bool refused = false;
+    try { (void)farming_arguments(strict); } catch (std::runtime_error const&) { refused = true; }
+    require(refused, "explicit user selection silently combined different farming jobs");
+    auto continuation = farming_resume_arguments(resumed, state, resumed.manifest, prior_paths);
+    continuation.allow_missing = true;
+    auto rebound_job = farming_reload_arguments(continuation, state, prior_paths);
+    require(continuation.target == second && continuation.manifest.empty() && rebound_job.directories[0] == current &&
+        rebound_job.rebound.contains(0) && rebound_job.digest == digest && farming_state_text(*rebound_job.saved) == text,
+        "internal continuation adopted a foreign locator or forgot its unavailable checked alias");
+    auto healthy = farming_run(continuation, &keys, rebound_job);
+    require(healthy->available == std::vector<uint8_t>{0, 1} && healthy->feasible(), "foreign former locator blocked the healthy peer's grant");
+    healthy.reset();
+    auto const foreign_alias_root = root / "native-rebind-foreign-alias"; fs::rename(current, foreign_alias_root);
+    auto absent = farming_reload_arguments(continuation, state, prior_paths); auto absent_run = farming_run(continuation, &keys, absent);
+    require(absent.directories[0] == current && absent_run->available == std::vector<uint8_t>{0, 1},
+        "an absent runtime alias was replaced by the historical mount path");
+    absent_run.reset(); fs::rename(lost_alias, current);
+    auto restored = farming_reload_arguments(continuation, state, prior_paths); auto restored_run = farming_run(continuation, &keys, restored);
+    require(restored.directories[0] == current && restored_run->available == std::vector<uint8_t>{1, 1} &&
+        contents(farming_metadata_path(current, "grow-farm.plan", false)) == first_plan &&
+        contents(farming_metadata_path(second, "grow-farm.plan", false)) == second_plan &&
+        contents(farming_metadata_path(first, "grow-farm.plan", false)) == foreign_first &&
+        contents(farming_metadata_path(foreign_alias_root, "grow-farm.plan", false)) == foreign_alias,
+        "native continuation convergence changed its source policy or a foreign job");
+    restored_run.reset();
+    auto const scope = root / "native-rebind-discovery", other_scope = root / "native-rebind-other-scope";
+    auto const nested = scope / "rack", returned_first = nested / "first", returned_second = nested / "second";
+    auto const unrelated = scope / "unrelated";
+    fs::create_directories(nested); fs::create_directory(other_scope); fs::create_directory(unrelated);
+    std::array<fs::path, 1> scopes{scope}; size_t scans = 0;
+    auto discover = [&](fs::path const& requested_scope)
+    {
+        require(requested_scope == scope || requested_scope == other_scope, "live rediscovery escaped its original scopes");
+        ++scans; FarmingDestinationDiscovery found;
+        found.selected = {unrelated, first, returned_first, returned_second}; return found;
+    };
+    require(farming_runtime_bindings(state, prior_paths, scopes, {}, discover) ==
+        std::vector<fs::path>(prior_paths.begin(), prior_paths.end()) && !scans,
+        "live rediscovery scanned while every known native member was available");
+    fs::rename(current, returned_first); fs::rename(foreign_alias_root, current);
+    auto const unchanged_paths = std::vector<fs::path>(prior_paths.begin(), prior_paths.end());
+    std::array<fs::path, 1> outside{other_scope};
+    require(farming_runtime_bindings(state, prior_paths, outside, {}, discover) == unchanged_paths,
+        "live rediscovery accepted a native identity outside an authorized scope");
+    auto const partial_return = farming_runtime_bindings(state, prior_paths, scopes, {}, discover);
+    require(partial_return == std::vector<fs::path>{returned_first, second} &&
+        std::vector<fs::path>(prior_paths.begin(), prior_paths.end()) == unchanged_paths &&
+        farming_state_text(state) == text && fs::is_empty(unrelated),
+        "live rediscovery changed policy, an immutable binding input or an unrelated directory");
+    fs::rename(second, returned_second); fs::create_directory(second);
+    bool cancel_scan = false;
+    auto cancelled_discovery = [&](fs::path const& requested_scope)
+    { auto found = discover(requested_scope); cancel_scan = true; return found; };
+    require(farming_runtime_bindings(state, prior_paths, scopes, [&] { return cancel_scan; }, cancelled_discovery) == unchanged_paths,
+        "cancelled rediscovery applied a partially observed binding");
+    auto const all_returned = farming_runtime_bindings(state, prior_paths, scopes, {}, discover);
+    require(all_returned == std::vector<fs::path>{returned_first, returned_second},
+        "live rediscovery could not recover known identities when every former path was absent or replaced");
+    auto const before_no_scan = scans;
+    std::array<fs::path, 1> absent_scope{scope / "absent"};
+    require(farming_runtime_bindings(state, prior_paths, absent_scope, {}, discover) == unchanged_paths &&
+        farming_runtime_bindings(state, all_returned, scopes, {}, discover) == all_returned && scans == before_no_scan,
+        "live rediscovery enumerated an absent scope or rescanned healthy returned members");
+    auto live_resume = resumed; live_resume.mounts_under.assign(scopes.begin(), scopes.end());
+    auto const original_scopes = live_resume.mounts_under;
+    live_resume = farming_resume_arguments(live_resume, state, resumed.manifest, all_returned);
+    require(live_resume.mounts_under.empty() && original_scopes == std::vector<fs::path>(scopes.begin(), scopes.end()),
+        "internal resume changed the retained discovery scopes");
+    auto live_job = farming_reload_arguments(live_resume, state, all_returned);
+    auto live_run = farming_run(live_resume, &keys, live_job);
+    require(live_run->available == std::vector<uint8_t>{1, 1} && live_job.directories == all_returned &&
+        live_job.digest == digest && farming_state_text(*live_job.saved) == text &&
+        contents(farming_metadata_path(returned_first, "grow-farm.plan", false)) == first_plan &&
+        contents(farming_metadata_path(returned_second, "grow-farm.plan", false)) == second_plan &&
+        contents(farming_metadata_path(first, "grow-farm.plan", false)) == foreign_first &&
+        contents(farming_metadata_path(current, "grow-farm.plan", false)) == foreign_alias &&
+        fs::is_empty(second) && fs::is_empty(unrelated),
+        "live rediscovery rewrote a global replica, adopted a foreign job or lost a returned native member");
+    live_run.reset();
+    auto const copied = root / "native-rebind-copy"; fs::create_directory(copied);
+    FarmingJob copy; copy.saved = state; for (auto const& directory : state.directories) copy.directories.push_back(file_io::native_path(directory.directory));
+    std::array<fs::path, 1> candidates{copied}; rebind_farming_directories(copy, candidates);
+    require(copy.rebound.empty(), "another directory acquired a saved native identity without explicit relocation");
+}
+
+void farming_evolution(fs::path const& root, Members input, Config cfg)
+{
+    using namespace grow_controller_test;
+    farming_path_rebinding(root, input, cfg);
+    std::istringstream mounts("1 0 8:1 / /mnt/farm rw - ext4 /dev/a rw\n"
+        "2 1 8:2 / /mnt/farm/rack/deep\\040disk rw,nosuid - xfs /dev/b rw\n"
+        "3 1 8:3 / /mnt/farm/read-only ro - ext4 /dev/c ro\n");
+    auto const paths = farming_mount_paths(mounts);
+    require(paths == std::vector<fs::path>{"/mnt/farm", "/mnt/farm/rack/deep disk"} &&
+        farming_mount_within(paths[0], "/mnt/farm") && farming_mount_within(paths[1], "/mnt/farm") &&
+        !farming_mount_within("/mnt/farm-other/disk", "/mnt/farm") && !farming_mount_within("/mnt", "/mnt/farm"),
+        "mount selection lost escaped or nested paths, or crossed a directory boundary");
+
+    auto const directory = root / "evolving-farm", added = root / "evolving-added";
+    fs::create_directory(directory); fs::create_directory(added);
+    Arguments args; args.command = "fill"; args.directory_farm = true; args.target = directory;
+    args.max_ram = 512 * mib; args.headroom = 0; args.capacity = 64 * mib;
+    args.k = 18; args.strength = 2; args.group_members = 2; args.max_groups = 3; args.max_total_members = 6;
+    args.farming_max_eligible_groups = 8; args.backend = "cpu"; args.workers = args.batch = 1;
+    args.seed = std::string(64, 'a'); args.pool_ph = std::string(64, 'b');
+    args.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    Keys keys(args);
+    auto job = farming_arguments(args);
+    auto initial = farming_run(args, &keys, job);
+    require(initial->feasible(), "evolving farm fixture was infeasible");
+    farming_update_protocol(root, initial->state, args.max_ram);
+    cfg.capacity_bytes = 64 * mib; cfg.memory_limit_bytes = args.max_ram;
+    auto const empty = group_path(directory, 0);
+    { std::ofstream placeholder(empty); }
+    auto const empty_stamp = stream_state::stamp(empty);
+    initial->observe_progress(0, "ready");
+    auto const observation = initial->progress.front()->progress.sequence;
+    initial.reset();
+    auto recover = args; recover.resume = true;
+    auto saved_job = farming_arguments(recover);
+    auto read_only = recover; read_only.plan_only = true; read_only.command = "plan";
+    require(farming_run(read_only, nullptr, saved_job)->lanes.front().outputs.front().members == 0 &&
+        stream_state::stamp(empty) == empty_stamp, "read-only preview changed an empty reserved output");
+    initial = farming_run(recover, &keys, saved_job);
+    require(initial->lanes.front().outputs.front().members == 0 && stream_state::stamp(empty) == empty_stamp,
+        "saved job could not audit its pre-header output without changing it");
+    require(initial->progress.front()->progress.sequence > observation,
+        "unchanged global grant rewound its local observation sequence");
+    for (size_t file = 0; file < 2; ++file)
+    {
+        Construction output(group_path(directory, file).string(), cfg, !file, initial_identity(initial->identity(keys, 0, file)), "incremental");
+        output.confirm_identity();
+        require(output.append(input.subspan(0, file ? 1 : 2)).accepted, "evolving farm prefix did not fit");
+    }
+    initial->seal_extent(0, 0, 2, "", initial->metadata);
+    auto const before = initial->state; initial.reset();
+    auto const manifest = farming_metadata_path(directory, "grow-farm.plan", false);
+    auto const original = contents(manifest), first_bytes = contents(group_path(directory, 0)), second_bytes = contents(group_path(directory, 1));
+    auto inspect = [&](Arguments proposed)
+    {
+        proposed.command = "plan"; proposed.plan_only = true;
+        auto source = farming_arguments(proposed);
+        return farming_run(proposed, &keys, source);
+    };
+    auto unchanged = args; unchanged.resume = true;
+    unchanged.save_plan = root / "unchanged-evolution.plan";
+    {
+        unchanged.plan_only = true; unchanged.command = "plan";
+        auto source = farming_arguments(unchanged); auto planned = farming_run(unchanged, &keys, source);
+        save_farming_review(unchanged, source, *planned);
+    }
+    Arguments from; from.command = "plan"; from.plan_only = from.directory_farm = true;
+    from.from_plan = unchanged.save_plan; from.max_ram = args.max_ram;
+    auto source = farming_arguments(from);
+    require(!source.changed && farming_run(from, &keys, source)->state.revision == before.revision,
+        "unchanged saved preview invented a policy revision");
+
+    auto proposed = args; proposed.update = proposed.resume = true;
+    proposed.capacity = 96 * mib; proposed.capacity_set = true;
+    proposed.max_groups = 4; proposed.max_groups_set = true;
+    proposed.max_total_members = 10; proposed.max_total_members_set = true;
+    proposed.group_members = 3; proposed.strength = 3;
+    std::unique_ptr<FarmingRun> revised;
+    {
+        DirectoryLock writer(directory);
+        Construction held(group_path(directory, 0).string(), cfg, true);
+        revised = inspect(proposed);
+    }
+    auto const& after = revised->state; auto const& d = after.directories.front();
+    require(revised->feasible() && after.version == 8 && d.layout_first == 2 && d.policy_files == 2 && d.cohorts.size() == 1 &&
+        d.extents == std::vector<uint16_t>{2, 2, 3, 3} && d.sealed_files == 1 && valid_farming_policy_revision(before, after),
+        "future policy failed to preserve completed and active reservations");
+    require(after.estimate.max_eligible_families_per_resource == 2 && after.estimate.index_bytes && after.estimate.cpu_utilization > 0,
+        "mixed cohorts were not assessed together or lost their reported model");
+    for (uint64_t file = 0; file < 2; ++file)
+        same_identity(farming_identity(keys, before, before.directories.front(), file), revised->identity(keys, 0, file));
+    require(revised->identity(keys, 0, 2).params.get_strength() == 3 &&
+        revised->identity(keys, 0, 2).params.get_plot_group_id() != revised->identity(keys, 0, 0).params.get_plot_group_id(),
+        "new parameter cohort reused an existing group identity");
+    auto const text = farming_state_text(after);
+    require(farming_state_text(parse_farming_state(text, args.max_ram)) == text,
+        "cohort policy changed during canonical reload");
+    auto progress = after; ++progress.revision; ++progress.directories.front().sealed_files;
+    require(!valid_farming_policy_revision(after, progress) && valid_farming_extent_revision(after, progress),
+        "ordinary cohort progress was mistaken for authority to revise policy");
+    auto insufficient = after; insufficient.config.max_eligible_families_per_resource = 1;
+    require(!farming_assess_state(insufficient, {d.extents}, args.max_ram).feasible,
+        "independently feasible cohorts bypassed the joint eligible-group budget");
+    auto altered = after; ++altered.directories.front().cohorts.front().identity_epoch;
+    require(!valid_farming_policy_revision(before, altered), "policy revision changed a protected identity");
+    for (unsigned limit = 0; limit < 3; ++limit)
+    {
+        auto small = proposed;
+        if (!limit) small.capacity = 1;
+        else if (limit == 1) small.max_groups = 1;
+        else small.max_total_members = 3;
+        bool refused = false;
+        try
+        {
+            auto reduced = inspect(small);
+            require(limit && reduced->state.directories.front().extents == std::vector<uint16_t>{2, 2} &&
+                reduced->state.directories.front().sealed_files == 1 && valid_farming_policy_revision(before, reduced->state),
+                "lower future target changed committed reservations");
+        }
+        catch (std::runtime_error const&) { refused = true; }
+        require(refused == !limit, "future targets and hard storage limits were not handled separately");
+    }
+    require(contents(manifest) == original && contents(group_path(directory, 0)) == first_bytes &&
+        contents(group_path(directory, 1)) == second_bytes, "read-only policy review changed durable work");
+
+    proposed.destinations = {added};
+    auto pending_job = farming_arguments(proposed);
+    auto const id = queue_farming_update(proposed, pending_job);
+    {
+        group_grow::FarmingUpdateMailbox mailbox(before, false, true, args.max_ram);
+        auto requests = mailbox.pending(); require(requests.size() == 1, "queued update was lost or duplicated");
+        auto const& request = requests.front().file;
+        require(request.update.id == id && request.update.directory_identities.size() == 2 &&
+            request.update.directory_identities[1] == farming_directory_identity(added),
+            "queued addition lost its native directory binding");
+        auto advanced = before; ++advanced.revision; advanced.directories.front().sealed_files = 2;
+        require(farming_policy_digest(advanced) == request.update.source_policy,
+            "ordinary progress invalidated a queued policy request");
+        auto relocated = root / "evolving-added-old"; fs::rename(added, relocated); fs::create_directory(added);
+        pending_job.requested_identities = request.update.directory_identities;
+        auto check = proposed; check.plan_only = true;
+        bool refused = false;
+        try { (void)farming_run(check, &keys, pending_job); } catch (std::runtime_error const& error)
+        { refused = std::string(error.what()).find("queued destination") != std::string::npos; }
+        require(refused, "queued update adopted a substituted mount directory");
+        mailbox.finish(id, "refused", "replacement destination");
+        require(mailbox.receipt(id)->reason == "replacement destination", "queued refusal was not retained");
+        mailbox.compact();
+        require(mailbox.pending().empty() && mailbox.records().empty(), "compacted request retained stale policy authority");
     }
 }
 
@@ -6736,7 +7400,7 @@ void prepared_producer(fs::path const& root, Members input)
 int main(int argc, char** argv) try
 {
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--prefetch-only" ||
-        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
+        std::string(argv[1]) == "--farming-audit-only" || std::string(argv[1]) == "--farming-rebinding-only" || std::string(argv[1]) == "--replot-capacity-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--cancellation-only")), "usage: grow-merge-test [--prefetch-only|--farming-audit-only|--farming-rebinding-only|--replot-capacity-only|--prepared-input-only|--cancellation-only]");
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
@@ -6752,6 +7416,15 @@ int main(int argc, char** argv) try
     require(::mkdtemp(name.data()), "cannot create merge test directory");
     fs::path root(name); struct Cleanup { fs::path root; ~Cleanup() { fs::remove_all(root); } } cleanup{root};
     auto input = members(); auto cfg = configuration();
+    if (argc == 2 && std::string(argv[1]) == "--farming-rebinding-only")
+    {
+        auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
+        auto name = (parent / "farming-rebinding-XXXXXX").string();
+        require(::mkdtemp(name.data()), "cannot create farming rebinding test directory"); Cleanup bound_cleanup{fs::path(name)};
+        farming_path_rebinding(bound_cleanup.root, input, cfg);
+        published_retired_external(bound_cleanup.root, input, cfg);
+        std::cout << "persistent farming root rebinding and external recovery checks passed\n"; return 0;
+    }
     if (argc == 1 || std::string(argv[1]) == "--cancellation-only")
     {
         auto const parent = fs::absolute(argv[0]).parent_path(); require_disk_scratch(parent);
@@ -6812,6 +7485,9 @@ int main(int argc, char** argv) try
         farming_capacity_extents(external_cleanup.root);
         farming_extent_admission(external_cleanup.root);
         farming_preview_handoff(external_cleanup.root);
+        group_farm_progress_test::run(external_cleanup.root);
+        group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
+        farming_evolution(external_cleanup.root, input, cfg);
         farming_active_audit(external_cleanup.root, input, cfg);
         output_reservations(external_cleanup.root, input, cfg);
         published_retired_external(external_cleanup.root, input, cfg);
@@ -6850,6 +7526,9 @@ int main(int argc, char** argv) try
         farming_capacity_extents(external_cleanup.root);
         farming_extent_admission(external_cleanup.root);
         farming_preview_handoff(external_cleanup.root);
+        group_farm_progress_test::run(external_cleanup.root);
+        group_farm_progress_test::relocation(external_cleanup.root, input, cfg);
+        farming_evolution(external_cleanup.root, input, cfg);
         farming_active_audit(external_cleanup.root, input, cfg);
         output_reservations(external_cleanup.root, input, cfg);
         published_retired_external(external_cleanup.root, input, cfg);

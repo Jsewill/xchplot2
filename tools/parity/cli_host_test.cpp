@@ -235,7 +235,8 @@ int main(int argc, char** argv)
     for (auto const* shell : {"bash", "zsh", "fish"}) {
         auto const [code, script] = capture({"completions", shell, "--config", config.string()});
         assert(code == 0 && script.find("verify") != std::string::npos);
-        for (auto const* option : {"save-plan", "from-plan", "save-profile", "harvester", "help-all"})
+        for (auto const* option : {"save-plan", "from-plan", "save-profile", "harvester", "help-all",
+                "discover-drives", "mounts-under", "leave-free", "headroom-bytes", "watch", "inspect", "destination", "retire"})
             assert(script.find(option) != std::string::npos);
         assert(script.find("farming-detect-local") == std::string::npos && script.find("farming-profile") == std::string::npos);
         if (std::string(shell) == "zsh") {
@@ -527,6 +528,7 @@ int main(int argc, char** argv)
     assert(fill_help_code == 0 && fill_help.find("fill [OPTIONS] -F PLAN") != std::string::npos);
     assert(fill_help.find("-F, --from-plan") != std::string::npos && fill_help.find("-r --manifest FILE") != std::string::npos);
     assert(fill_help.find("fill farm.plan") != std::string::npos && fill_help.find("current member directory") != std::string::npos);
+    assert(fill_help.find("--discover-drives") != std::string::npos && fill_help.find("--leave-free") != std::string::npos);
     auto const [fill_all_code, fill_all] = capture({"fill", "--config", config.string(), "--help-all"});
     assert(fill_all_code == 0 && fill_all.find("--paths-from") != std::string::npos && fill_all.size() > fill_help.size());
     auto const [grow_help_code, grow_help] = capture({"grow", "--config", config.string(), "--help"});
@@ -600,7 +602,7 @@ int main(int argc, char** argv)
     put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     std::filesystem::current_path(previous_directory);
     assert(cli({"fill", "--config", config.string(), "-r", "--allow-missing", other.string()}) == 0);
-    assert(last_group_options.resume && last_group_options.allow_missing && last_group_options.target == other);
+    assert(last_group_options.resume && last_group_options.resume_set && last_group_options.allow_missing && last_group_options.target == other);
     assert(cli({"fill", "--config", config.string(), "--extend", other.string(), third.string()}) == 0);
     assert(last_group_options.resume && last_group_options.extend);
     assert(cli({"fill", "--config", config.string(), "--relocate", other.string(), third.string()}) == 0);
@@ -609,6 +611,79 @@ int main(int argc, char** argv)
     assert(last_group_options.resume && last_group_options.target.empty() && last_group_options.manifest == manifest);
     assert(cli({"plan", "--config", config.string()}) == 0 && last_group_options.target.empty());
     assert(cli({"fill", "--config", config.string(), "-r"}) == 0 && last_group_options.target.empty());
+    assert(cli({"fill", "--config", config.string(), "--no-resume", other.string()}) == 0);
+    assert(!last_group_options.resume && last_group_options.resume_set);
+    assert(cli({"fill", "--config", config.string(), other.string()}) == 0 && !last_group_options.resume_set);
+    assert(cli({"plan", "--config", config.string(), "--discover-drives", other.string(), "--mounts-under", third.string()}) == 0);
+    assert((last_group_options.mounts_under == std::vector{other, third}));
+    assert(cli({"plan", "--config", config.string(), other.string(), "--headroom-bytes", "32M", "--leave-free", "64MiB"}) == 0);
+    assert(last_group_options.headroom_set && last_group_options.headroom == 64ull * 1024 * 1024);
+    assert(cli({"plan", "--config", config.string(), other.string(), "--group-members", "auto"}) == 0);
+    assert(last_group_options.group_auto && last_group_options.group_members_set && !last_group_options.group_members);
+    assert(cli({"plan", "--config", config.string(), other.string()}) == 0 && !last_group_options.group_members_set);
+    assert(cli({"plan", "--config", config.string(), other.string(), "-k", "18", "-s", "3", "--meta-group", "7"}) == 0);
+    assert(last_group_options.k_set && last_group_options.strength_set && last_group_options.meta_set);
+    assert(cli({"plan", "--config", config.string(), other.string()}) == 0);
+    assert(!last_group_options.k_set && !last_group_options.strength_set && !last_group_options.meta_set);
+    auto const [status_help_code, status_help] = capture({"status", "--config", config.string(), "--help"});
+    assert(status_help_code == 0 && status_help.find("--watch") != std::string::npos && status_help.find("--inspect") != std::string::npos);
+    assert(status_help.find("--construction") == std::string::npos);
+    assert(cli({"status", "--config", config.string(), other.string(), "--watch", "--inspect", "--json"}) == 0);
+    assert(last_group_options.command == "status" && last_group_options.replot_status && last_group_options.plan_only &&
+        last_group_options.status_watch && last_group_options.status_inspect && last_group_options.json &&
+        last_group_options.target == other && !last_group_options.automatic_compute && !last_group_options.farming_profile);
+    assert(cli({"plan", "--config", config.string(), "--status", other.string(), "--watch", "--inspect"}) == 0);
+    assert(last_group_options.replot_status && last_group_options.status_watch && last_group_options.status_inspect);
+    put(config, "[status]\nwatch=true\ninspect=true\n");
+    assert(cli({"status", "--config", config.string(), "--no-watch", "--no-inspect"}) == 0);
+    assert(last_group_options.replot_status && !last_group_options.status_watch && !last_group_options.status_inspect && last_group_options.target.empty());
+    put(config, "");
+    assert(cli({"status", "--config", config.string(), "--manifest", "--help"}) == 0);
+    assert(last_group_options.manifest.filename() == "--help");
+    assert(cli({"status", "--config", config.string(), "--", "--help"}) == 0);
+    assert(last_group_options.target.filename() == "--help");
+    auto const status_plan = dir / "status.plan", status_manifest = dir / "status.manifest";
+    put(status_plan, "ordinary-group-farming-preview-v5\n");
+    put(status_manifest, "ordinary-group-farming-v11\n");
+    assert(cli({"status", "--config", config.string(), status_plan.string()}) == 0);
+    assert(last_group_options.from_plan == status_plan && last_group_options.manifest.empty());
+    assert(cli({"status", "--config", config.string(), status_manifest.string()}) == 0);
+    assert(last_group_options.from_plan.empty() && last_group_options.manifest == status_manifest);
+#ifndef _WIN32
+    auto const linked_status = dir / "linked-status.plan";
+    std::filesystem::create_symlink(status_plan, linked_status);
+    assert(cli({"status", "--config", config.string(), linked_status.string()}) != 0);
+    std::filesystem::remove(linked_status);
+#endif
+    assert(cli({"status", "--config", config.string(), other.string(), third.string()}) != 0);
+    assert(cli({"status", "--config", config.string(), "--discover-drives", other.string()}) != 0);
+    std::string status_scope_error;
+    int const status_scope_code = capture({"status", "--config", config.string(), "--paths-from", "missing-path-list"}, &status_scope_error).first;
+    assert(status_scope_code != 0 && status_scope_error.find("farm status accepts only") != std::string::npos);
+    assert(cli({"plan", "--config", config.string(), other.string(), "--watch"}) != 0);
+    for (auto const* action : {"pause", "drain", "resume", "retire"})
+    {
+        auto const [action_help_code, action_help] = capture({action, "--config", config.string(), "--help"});
+        assert(action_help_code == 0 && action_help.find("--destination") != std::string::npos && action_help.find("--construction") == std::string::npos);
+        assert(cli({action, "--config", config.string(), other.string(), "--destination", other.string(), "--destination", third.string()}) == 0);
+        assert(last_group_options.farm_action == action && last_group_options.target == other &&
+            last_group_options.directory_farm && last_group_options.resume && !last_group_options.resume_set &&
+            !last_group_options.plan_only && !last_group_options.replot_status &&
+            !last_group_options.automatic_compute && !last_group_options.farming_profile);
+        assert((last_group_options.action_destinations == std::vector{other, third}));
+        assert(cli({action, "--config", config.string(), "--manifest", status_manifest.string()}) == 0);
+        assert(last_group_options.action_destinations.empty() && last_group_options.manifest == status_manifest);
+        assert(cli({action, "--config", config.string()}) == 0 && last_group_options.target.empty());
+        assert(cli({action, "--config", config.string(), status_plan.string()}) != 0);
+        assert(cli({action, "--config", config.string(), other.string(), third.string()}) != 0);
+        assert(cli({action, "--config", config.string(), other.string(), "--status"}) != 0);
+        assert(cli({action, "--config", config.string(), "--paths-from", "missing-path-list"}) != 0);
+    }
+    assert(cli({"pause", "--config", config.string(), "--manifest", "--help", "--destination", "--config", "--destination", "@literal"}) == 0);
+    assert(last_group_options.manifest.filename() == "--help" && last_group_options.action_destinations.front().filename() == "--config" &&
+        last_group_options.action_destinations.back().filename() == "@literal");
+    assert(cli({"plan", "--config", config.string(), other.string(), "--destination", third.string()}) != 0);
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
@@ -618,7 +693,7 @@ int main(int argc, char** argv)
     assert(last_group_options.plan_only && last_group_options.group_members == 3 && last_group_options.max_ram == 768ull * 1024 * 1024);
     assert(cli({"plan", dir.string(), "--config", config.string(), "--devices", "all"}) != 0);
     int const before_missing_value = group_calls;
-    for (auto const* option : {"-d", "-M", "-j", "-t", "--paths-from", "--paths0-from", "--manifest", "--relocate"})
+    for (auto const* option : {"-d", "-M", "-j", "-t", "--paths-from", "--paths0-from", "--manifest", "--relocate", "--discover-drives", "--leave-free", "--destination"})
         assert(cli({"plan", dir.string(), "--config", config.string(), option}) != 0);
     assert(group_calls == before_missing_value);
     put(config, "[compute.worker]\nhost-bytes=\"1000000000\"\n");

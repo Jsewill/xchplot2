@@ -21,9 +21,13 @@ Linux and experimental native Windows builds include
 Use `plot --group-members N` for several members per file, or
 `plan DIR... --save-plan farm.plan` followed by `fill farm.plan` to review and
 execute a farming layout. Use the intended harvester's profile when plotting
-on another machine. `fill -r DIR` restores the keys and all
-destinations from any member; `fill --extend` adds storage while preserving
-existing plots. [Shared compute](REFERENCE.md#shared-compute)
+on another machine. Repeat `fill DIR` to continue through any member, or add
+options to change future work while keeping existing plots and reservations.
+`pause`, `drain`, `resume` and `retire` control a job or selected destinations;
+`status DIR --watch` follows saved progress.
+`--discover-drives DIR` selects supported drives mounted beneath a directory
+at any depth. See [drive filling](REFERENCE.md#grouped-plotting-and-drive-filling)
+for recovery and policy changes. [Shared compute](REFERENCE.md#shared-compute)
 lets enrolled machines contribute CPU/GPU capacity to multiple plotting hosts.
 These features are available in `main` source builds; the v0.14.1 release
 archives predate them. Follow the [installation guide](INSTALL.md) to build

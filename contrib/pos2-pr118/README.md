@@ -193,7 +193,7 @@ fixture needs network compute. These flags are unnecessary for the installed
 accepts `-DXCHPLOT2_BUILD_GROUP_POOL=ON` for its network tests.
 
 Use the installed commands and their [recovery guidance](../../REFERENCE.md#construction-and-recovery)
-for normal work. Construction checkpoints require the same build.
+for normal work, including checkpoint compatibility requirements.
 
 ## Streaming assembly prototype
 
@@ -250,8 +250,9 @@ Raw input filesystems must also support directory `fsync` when using this option
 To resume after an interruption or write failure, rerun the same command with
 `--resume`. Keep the same inputs, work directory, batch size, fan-in, buffer and
 segment sizes, and reclamation options. The RAM limit may be increased. Resume
-requires the same assembler/upstream source identity; rebuilding changed source
-invalidates its checkpoints. It checks required files before discarding
+requires matching checkpoint format, construction algorithm and native
+representation; legacy checkpoints retain their original source-build requirement.
+It checks required files before discarding
 uncommitted tails, restarts an unfinished raw batch, and continues merges at the
 saved chunk. A lock prevents simultaneous use of a work directory. If the first
 checkpoint was never created, all raw inputs remain and a new work directory is

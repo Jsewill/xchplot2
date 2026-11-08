@@ -477,7 +477,11 @@ std::string ownership_token(fs::path const& path)
     auto const checkpoint = contents(fs::path(path.string() + ".external") / "checkpoint");
     std::istringstream in(std::string(checkpoint.begin() + 65, checkpoint.end()), std::ios::binary);
     in.exceptions(std::ios::badbit | std::ios::failbit);
-    for (unsigned i = 0; i < 3; ++i) (void)external_detail::get_string(in);
+    auto const version = external_detail::get_string(in);
+    (void)external_detail::get_string(in);
+    if (version == "xchplot2-external-5" || version == "xchplot2-external-6")
+        (void)external_detail::get<ConstructionCompatibility>(in);
+    (void)external_detail::get_string(in);
     return external_detail::get_string(in);
 }
 fs::path retired_path(fs::path const& path)
@@ -2248,8 +2252,9 @@ std::vector<uint8_t> native_checkpoint(std::vector<uint8_t> const& record, bool 
     using namespace external_detail;
     CheckpointInput in(std::string_view(reinterpret_cast<char const*>(record.data() + 65), record.size() - 65));
     std::ostringstream out(std::ios::binary);
-    require(get_string(in) == "xchplot2-external-4", "native checkpoint fixture needs captured owner evidence");
-    put_string(out, legacy ? "xchplot2-external-3" : "xchplot2-external-4");
+    auto const version = get_string(in); bool const compatible = version == "xchplot2-external-6";
+    require(compatible || version == "xchplot2-external-4", "native checkpoint fixture needs captured owner evidence");
+    put_string(out, legacy ? "xchplot2-external-3" : version);
     auto text = [&] { auto value = get_string(in); put_string(out, value); return value; };
     auto copy = [&]<class T>() { auto value = get<T>(in); put(out, value); return value; };
     auto identity = [&]
@@ -2258,7 +2263,13 @@ std::vector<uint8_t> native_checkpoint(std::vector<uint8_t> const& record, bool 
         put(out, value); return value;
     };
     auto native = [&] { auto value = get_native_identity(in); if (!legacy) put_native_identity(out, value); };
-    text(); text(); text();
+    text();
+    if (compatible)
+    {
+        auto const compatibility = get<ConstructionCompatibility>(in);
+        if (!legacy) put(out, compatibility);
+    }
+    text(); text();
     for (unsigned owner = 0; owner < 3; ++owner) { identity(); native(); }
     auto checkpoint = get<ExternalEngine::FileIdentity>(in); if (changed_device) checkpoint.device ^= UINT64_C(0x80000000);
     auto checkpoint_native = get_native_identity(in); if (!legacy) { put(out, checkpoint); put_native_identity(out, checkpoint_native); }
@@ -2317,7 +2328,7 @@ void native_identity_recovery(fs::path const& root, Members input, ExternalConfi
         auto const checkpoint = fs::path(path.string() + ".external") / "checkpoint";
         auto const original = contents(checkpoint);
         external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(original.data() + 65), original.size() - 65));
-        if (external_detail::get_string(kind) != "xchplot2-external-4") continue;
+        if (external_detail::get_string(kind) != "xchplot2-external-6") continue;
         auto const rewritten = native_checkpoint(original, legacy, changed); replace(checkpoint, rewritten); auto const before = contents(path);
         bool inspected = false, resumed = false;
         try { inspected = ExternalEngine::inspect(path.string()).members == input.size(); } catch (std::exception const&) {}
@@ -2331,7 +2342,7 @@ void native_identity_recovery(fs::path const& root, Members input, ExternalConfi
     { ExternalEngine engine(substitute.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "checkpoint substitution fixture rejected"); }
     auto const checkpoint = fs::path(substitute.string() + ".external") / "checkpoint", held = fs::path(checkpoint.string() + ".held");
     auto const body = contents(checkpoint); external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(body.data() + 65), body.size() - 65));
-    if (external_detail::get_string(kind) == "xchplot2-external-4")
+    if (external_detail::get_string(kind) == "xchplot2-external-6")
     {
         fs::rename(checkpoint, held); replace(checkpoint, body); bool rejected = false;
         try { (void)ExternalEngine::inspect(substitute.string()); } catch (std::exception const&) { rejected = true; }
@@ -2365,7 +2376,7 @@ void native_identity_recovery(fs::path const& root, Members input, ExternalConfi
         { ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); }
         auto checkpoint = fs::path(path.string() + ".external") / "checkpoint"; auto const body = contents(checkpoint);
         external_detail::CheckpointInput kind(std::string_view(reinterpret_cast<char const*>(body.data() + 65), body.size() - 65));
-        if (external_detail::get_string(kind) != "xchplot2-external-4") continue;
+        if (external_detail::get_string(kind) != "xchplot2-external-6") continue;
         if (malformed == 4) { auto const partial = checkpoint.parent_path() / "checkpoint.partial.fixture"; fs::rename(checkpoint, partial); checkpoint = partial; }
         auto const invalid = native_checkpoint(body, false, false, 0, malformed); replace(checkpoint, invalid); auto const before = contents(path);
         ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};

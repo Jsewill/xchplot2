@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -21,7 +22,7 @@ class FarmingResourceError : public std::runtime_error
 {
 public:
     bool const memory_budget;
-    explicit FarmingResourceError(char const* message, bool memory = false) : std::runtime_error(message), memory_budget(memory) {}
+    explicit FarmingResourceError(std::string const& message, bool memory = false) : std::runtime_error(message), memory_budget(memory) {}
 };
 struct FarmingConfig
 {
@@ -108,6 +109,37 @@ struct FarmingPlan : FarmingAssessment
     long double cpu_utilization = 0, worker_utilization = 0;
     uint64_t candidates_evaluated = 0;
 };
+struct FarmingRequirements
+{
+    uint64_t memory_bytes = 0, eligible_families_per_resource = 0;
+    long double response_seconds = 0;
+    bool memory_limited = false, eligible_limited = false, deadline_limited = false, cadence_limited = false, overflow = false;
+};
+enum class FarmingAdjustmentKind : uint8_t { memory, eligible_families, deadline, cpu_cores, lookup_workers };
+struct FarmingAdjustment
+{
+    FarmingAdjustmentKind kind = FarmingAdjustmentKind::memory;
+    FarmingConfig config;
+    FarmingAssessment assessment;
+    FarmingRequirements remaining;
+};
+struct FarmingAdjustments
+{
+    FarmingAssessment baseline;
+    FarmingRequirements requirements;
+    std::vector<FarmingAdjustment> alternatives;
+    uint64_t evaluations = 0;
+    bool search_limited = false;
+};
+inline FarmingRequirements farming_requirements(FarmingConfig const& config, FarmingAssessment const& assessment)
+{
+    return {assessment.reader_memory_bytes, assessment.max_eligible_families_per_resource, assessment.response_bound_seconds,
+        assessment.reader_memory_bytes > config.memory_bytes,
+        assessment.max_eligible_families_per_resource > config.max_eligible_families_per_resource,
+        assessment.response_bound_seconds > config.deadline_seconds,
+        assessment.response_bound_seconds > config.challenge_seconds,
+        !std::isfinite(assessment.response_bound_seconds) || !std::isfinite(assessment.dynamic_work_seconds_per_sp)};
+}
 inline FarmingDestination farming_storage_profile(FarmingDestination value)
 {
     if (!value.read_bytes_per_second) value.read_bytes_per_second = !value.known_device ?
@@ -141,7 +173,9 @@ struct PlanningMemory
     uint64_t limit, used = 0, peak = 0;
     void add(uint64_t bytes)
     {
-        if (bytes > limit - used) throw FarmingResourceError("farming planner exceeds its planning memory budget", true);
+        if (bytes > limit - used) throw FarmingResourceError("farming planner needs " + std::to_string(bytes) +
+            " additional bytes with " + std::to_string(used) + " bytes in use; declared planning memory budget is " +
+            std::to_string(limit) + " bytes", true);
         used += bytes; peak = std::max(peak, used);
     }
 };
@@ -252,13 +286,255 @@ inline AssessmentTopology assessment_topology(Topology physical, std::vector<Far
     for (size_t lane = 0; lane < layouts.size(); ++lane) value.lanes[lane] = value.lanes[value.first[lane]];
     return value;
 }
+inline std::string service_amount(long double value)
+{
+    std::ostringstream out; out.precision(9); out << value; return out.str();
+}
+inline void certify(FarmingConfig const& config, std::vector<Resource> const& resources, FarmingAssessment& result)
+{
+    if (!std::isfinite(result.response_bound_seconds) || !std::isfinite(result.dynamic_work_seconds_per_sp))
+        result.reason = "farming service certificate overflows";
+    else if (result.max_eligible_families_per_resource > config.max_eligible_families_per_resource)
+    {
+        auto const resource = std::max_element(resources.begin(), resources.end(),
+            [](Resource const& a, Resource const& b) { return a.families < b.families; });
+        auto const identity = resource->storage.resource == UINT64_MAX ?
+            "unidentified storage resource" : "storage resource " + std::to_string(resource->storage.resource);
+        result.reason = "farming " + identity + " requires " + std::to_string(resource->families) +
+            " simultaneous eligible families; declared limit is " + std::to_string(config.max_eligible_families_per_resource);
+    }
+    else if (result.reader_memory_bytes > config.memory_bytes)
+        result.reason = "farming readers require " + std::to_string(result.reader_memory_bytes) +
+            " bytes of working memory; declared budget is " + std::to_string(config.memory_bytes) + " bytes";
+    else if (result.response_bound_seconds > config.deadline_seconds)
+        result.reason = "farming response bound is " + service_amount(result.response_bound_seconds) +
+            " seconds; declared response deadline is " + service_amount(config.deadline_seconds) + " seconds (" +
+            std::to_string(config.harvester_cores) + " shared CPU cores, " + std::to_string(config.lookup_workers) + " lookup workers)";
+    else if (result.response_bound_seconds > config.challenge_seconds)
+        result.reason = "farming response bound is " + service_amount(result.response_bound_seconds) +
+            " seconds; signage-point interval is " + service_amount(config.challenge_seconds) + " seconds";
+    else result.feasible = true;
+}
+inline bool same_service(FarmingConfig const& a, FarmingConfig const& b)
+{
+    return a.k == b.k && filter(a, false) == filter(b, false) && filter(a, true) == filter(b, true) &&
+        a.chain_seconds_per_member == b.chain_seconds_per_member && a.index_seconds_per_entry == b.index_seconds_per_entry &&
+        a.compressed_index_bytes_per_entry == b.compressed_index_bytes_per_entry &&
+        a.lookup_memory_per_member == b.lookup_memory_per_member;
+}
+inline FarmingAssessment assess_cohorts(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
+    std::vector<FarmingDrivePlan> const& layouts, std::vector<std::vector<uint16_t>> const* extents,
+    PlanningMemory& memory, AssessmentTopology const* prepared, std::span<FarmingConfig const> configs)
+{
+    struct CohortEvent { uint64_t family, schedule; uint32_t resource, lane; uint16_t members; bool end; };
+    struct Active { uint32_t lane; uint16_t members; uint64_t count; };
+    struct Work
+    {
+        uint64_t files = 0, members = 0;
+        long double expanded, compressed, index_cpu, chunk_per_member;
+    };
+    struct Demand
+    {
+        uint64_t count; uint32_t resource;
+        long double cpu = 0, stage = 0, transfer = 0, read = 0, scratch = 0;
+    };
+    struct DeviceWork { long double transfer = 0, read = 0; };
+    uint64_t event_count = 0, expanded_files = 0;
+    long double indexes = 0;
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    {
+        validate(configs[lane], {});
+        uint64_t const count = extents ? (*extents)[lane].size() : layouts[lane].files;
+        if (extents || layouts[lane].resource_lanes > layouts[lane].meta_slots)
+        {
+            resource_require(count <= maximum_files - expanded_files, "farming assessment exceeds its file work bound");
+            expanded_files += count; add(event_count, count * 2);
+        }
+        else add(event_count, 4);
+        indexes += count * std::ldexp(8.0L, configs[lane].k - 6);
+    }
+    PlanningReservation allocation(memory, 64 * 1024 + event_count *
+        (sizeof(CohortEvent) + sizeof(Demand) + sizeof(Active)) + destinations.size() * 1024);
+    AssessmentTopology local;
+    if (!prepared) { local = assessment_topology(topology(destinations), layouts); prepared = &local; }
+    auto resources = prepared->physical.resources;
+    std::vector<Work> work(layouts.size());
+    std::vector<DeviceWork> device_work(resources.size());
+    std::vector<CohortEvent> events; events.reserve(size_t(event_count));
+    long double const cache = config.reader == FarmingReader::cached ?
+        std::min(static_cast<long double>(config.index_cache_bytes), indexes) : 0;
+    bool const warm = config.reader == FarmingReader::cached && cache >= indexes;
+    unsigned const reads = warm ? 4 : 6;
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    {
+        auto const& plan = layouts[lane]; auto const& parameters = configs[lane];
+        unsigned const meta_bits = std::min({8u, filter(parameters, false), filter(parameters, true)});
+        farming_require(plan.resource_rank == prepared->ranks[lane] && plan.resource_lanes == prepared->lanes[lane] &&
+            plan.meta_slots && plan.meta_slots <= (1u << meta_bits) && plan.meta_bits == meta_bits &&
+            plan.meta_base == parameters.meta_group_override && (!parameters.fixed_meta || plan.meta_slots == 1) &&
+            (!parameters.meta_slots_override || plan.meta_slots == parameters.meta_slots_override),
+            "farming assessment layout aliases resource/meta identities");
+        auto const& first = layouts[prepared->first[lane]];
+        auto const& identity = configs[prepared->first[lane]];
+        farming_require(identity.k == parameters.k && identity.strength == parameters.strength,
+            "farming identity schedule combines incompatible plot parameters");
+        farming_require(first.meta_slots == plan.meta_slots && first.meta_bits == plan.meta_bits && first.meta_base == plan.meta_base,
+            "farming resource lanes use incompatible family schedules");
+        auto const resource = prepared->physical.resource[lane];
+        auto& item = work[lane];
+        long double const entries = std::ldexp(1.0L, parameters.k - 6);
+        item.expanded = entries * 8; item.compressed = entries * parameters.compressed_index_bytes_per_entry;
+        item.index_cpu = warm ? 0 : entries * parameters.index_seconds_per_entry;
+        item.chunk_per_member = 4 * 64 * (parameters.k + 1.45L) / 8;
+        item.files = extents ? (*extents)[lane].size() : plan.files;
+        add(resources[resource].files, item.files);
+        auto interval = [&](uint64_t begin_file, uint64_t end_file, uint16_t members)
+        {
+            if (begin_file == end_file) return;
+            farming_require(members && shape(parameters, members), "farming extent has an invalid modeled chunk shape");
+            uint64_t const begin = plan.family(begin_file), end = plan.family(end_file - 1);
+            farming_require(end != UINT64_MAX, "farming family extent overflows");
+            events.push_back({begin, plan.schedule, uint32_t(resource), uint32_t(lane), members, false});
+            events.push_back({end + 1, plan.schedule, uint32_t(resource), uint32_t(lane), members, true});
+        };
+        if (extents || plan.resource_lanes > plan.meta_slots)
+            for (uint64_t file = 0; file < item.files; ++file)
+            {
+                uint16_t const members = extents ? (*extents)[lane][size_t(file)] : plan.file_members(file);
+                interval(file, file + 1, members); add(item.members, members);
+            }
+        else if (item.files)
+        {
+            item.members = plan.total_members;
+            if (plan.fixed_members)
+            { interval(0, item.files - 1, plan.group_members); interval(item.files - 1, item.files, plan.file_members(item.files - 1)); }
+            else
+            {
+                uint64_t const extra = plan.total_members % item.files;
+                interval(0, extra, uint16_t(plan.total_members / item.files + 1));
+                interval(extra, item.files, uint16_t(plan.total_members / item.files));
+            }
+        }
+    }
+    std::sort(events.begin(), events.end(), [](CohortEvent const& a, CohortEvent const& b)
+    { return std::tie(a.resource, a.schedule, a.family, a.lane, a.members, a.end) <
+        std::tie(b.resource, b.schedule, b.family, b.lane, b.members, b.end); });
+    std::vector<Active> active; active.reserve(size_t(event_count / 2));
+    std::vector<Demand> demands; demands.reserve(size_t(event_count));
+    long double total_cpu = 0, largest_stage = 0;
+    size_t position = 0;
+    while (position < events.size())
+    {
+        auto const resource = events[position].resource; auto const schedule = events[position].schedule;
+        active.clear();
+        while (position < events.size() && events[position].resource == resource && events[position].schedule == schedule)
+        {
+            uint64_t const family = events[position].family;
+            do
+            {
+                auto const event = events[position++];
+                auto item = std::find_if(active.begin(), active.end(), [&](Active const& entry)
+                    { return entry.lane == event.lane && entry.members == event.members; });
+                if (item == active.end()) { active.push_back({event.lane, event.members, 0}); item = active.end() - 1; }
+                if (event.end) { farming_require(item->count, "farming family sweep underflows"); --item->count; }
+                else ++item->count;
+            } while (position < events.size() && events[position].resource == resource &&
+                events[position].schedule == schedule && events[position].family == family);
+            std::erase_if(active, [](Active const& entry) { return !entry.count; });
+            if (active.empty() || position == events.size() || events[position].resource != resource ||
+                events[position].schedule != schedule) continue;
+            Demand demand{events[position].family - family, resource};
+            for (auto const& entry : active)
+            {
+                auto const& item = work[entry.lane]; auto const& parameters = configs[entry.lane];
+                long double const chain = entry.members * parameters.chain_seconds_per_member;
+                long double const chunks = entry.members * item.chunk_per_member;
+                long double const index = warm ? 0 : item.compressed, header = warm ? 0 : 306;
+                // A family contributes one eligible lookup. Different cohort
+                // shapes can win different costs, so retain each component's
+                // maximum within the family rather than across the farm.
+                demand.cpu = std::max(demand.cpu, item.index_cpu + chain);
+                demand.stage = std::max({demand.stage, item.index_cpu, chain});
+                demand.transfer = std::max(demand.transfer, index + header + chunks);
+                demand.read = std::max({demand.read, index, header, chunks / 4});
+                demand.scratch = std::max(demand.scratch, item.expanded * !warm +
+                    std::max(item.compressed, static_cast<long double>(entry.members) * parameters.lookup_memory_per_member) + 1024 * 1024);
+            }
+            add(resources[resource].families, demand.count);
+            total_cpu += demand.count * demand.cpu; largest_stage = std::max(largest_stage, demand.stage);
+            device_work[resource].transfer += demand.count * demand.transfer;
+            device_work[resource].read = std::max(device_work[resource].read, demand.read);
+            demands.push_back(demand);
+        }
+    }
+    FarmingAssessment result;
+    uint64_t jobs = 0;
+    for (auto const& resource : resources)
+    {
+        add(jobs, resource.families);
+        result.max_eligible_families_per_resource = std::max(result.max_eligible_families_per_resource, resource.families);
+    }
+    if (!jobs) { result.feasible = true; result.planning_memory_bytes = memory.peak; return result; }
+    unsigned const workers = unsigned(std::min<uint64_t>(config.lookup_workers, jobs));
+    long double const cpu_wait = ((workers - 1) / config.harvester_cores) * largest_stage;
+    long double total = 0, largest = 0;
+    for (auto const& demand : demands)
+    {
+        auto const& resource = resources[demand.resource]; auto const& storage = resource.storage;
+        auto const& device = device_work[demand.resource];
+        uint64_t const outstanding = std::min<uint64_t>(workers, resource.families);
+        // FIFO waits cannot exceed either the outstanding-operation bound or
+        // all other families' work in this finite signage-point batch.
+        long double const cpu_interference = std::min(reads * cpu_wait, std::max(0.0L, total_cpu - demand.cpu));
+        long double const io_interference = std::min(reads * (outstanding - 1) * device.read,
+            std::max(0.0L, device.transfer - demand.transfer));
+        long double const duration = demand.cpu + cpu_interference +
+            reads * ceiling(outstanding, storage.read_concurrency) * storage.read_latency_seconds +
+            (demand.transfer + io_interference) / storage.read_bytes_per_second;
+        total += demand.count * duration; largest = std::max(largest, duration);
+    }
+    result.response_bound_seconds = std::min(total / workers + (1 - 1.0L / workers) * largest,
+        ceiling(jobs, workers) * largest);
+    result.response_bound_seconds = std::nextafter(result.response_bound_seconds *
+        (1 + 128 * (demands.size() + resources.size() + 1) * std::numeric_limits<long double>::epsilon()),
+        std::numeric_limits<long double>::infinity());
+    for (size_t lane = 0; lane < layouts.size(); ++lane)
+    {
+        auto const& item = work[lane]; auto const& parameters = configs[lane];
+        auto const& storage = resources[prepared->physical.resource[lane]].storage;
+        long double const eligibility = std::ldexp(1.0L, -int(std::min(filter(parameters, false), filter(parameters, true))));
+        long double const index = warm ? 0 : item.compressed, header = warm ? 0 : 306;
+        result.cpu_work_seconds_per_sp += eligibility * (item.members * parameters.chain_seconds_per_member + item.files * item.index_cpu);
+        result.io_work_seconds_per_sp += eligibility * (item.files * (reads * storage.read_latency_seconds +
+            (index + header) / storage.read_bytes_per_second) + item.members * item.chunk_per_member / storage.read_bytes_per_second);
+    }
+    result.dynamic_work_seconds_per_sp = config.cpu_work_weight * result.cpu_work_seconds_per_sp +
+        config.io_work_weight * result.io_work_seconds_per_sp;
+    // The common worker pool can hold only this many family lookups. Charge
+    // their largest possible workspaces, plus the shared resident cache.
+    std::sort(demands.begin(), demands.end(), [](Demand const& a, Demand const& b) { return a.scratch > b.scratch; });
+    long double scratch = cache; uint64_t remaining = workers;
+    for (auto const& demand : demands)
+    {
+        uint64_t const count = std::min(remaining, demand.count);
+        scratch += count * demand.scratch; remaining -= count;
+        if (!remaining) break;
+    }
+    result.reader_memory_bytes = size(scratch); result.planning_memory_bytes = memory.peak;
+    certify(config, resources, result); return result;
+}
 struct Event { uint64_t family, schedule; uint32_t resource; uint16_t members; bool end; };
 inline FarmingAssessment assess(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
     std::vector<FarmingDrivePlan> const& layouts, std::vector<std::vector<uint16_t>> const* extents,
-    PlanningMemory& memory, AssessmentTopology const* prepared = nullptr)
+    PlanningMemory& memory, AssessmentTopology const* prepared = nullptr,
+    std::span<FarmingConfig const> cohort_configs = {}, bool cohort_costs = true)
 {
     farming_require(layouts.size() == destinations.size() && (!extents || extents->size() == layouts.size()),
         "farming assessment lane count differs");
+    farming_require(cohort_configs.empty() || cohort_configs.size() == layouts.size(), "farming cohort count differs");
+    if (cohort_costs && !cohort_configs.empty() && std::any_of(cohort_configs.begin(), cohort_configs.end(),
+        [&](FarmingConfig const& cohort) { return !same_service(config, cohort); }))
+        return assess_cohorts(config, destinations, layouts, extents, memory, prepared, cohort_configs);
     uint64_t event_count = 0, files = 0, expanded_files = 0;
     for (size_t lane = 0; lane < layouts.size(); ++lane)
     {
@@ -277,17 +553,26 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
     if (!prepared) { local = assessment_topology(topology(destinations), layouts); prepared = &local; }
     auto resources = prepared->physical.resources;
     std::vector<Event> events; events.reserve(size_t(event_count));
-    unsigned const meta_bits = std::min({8u, filter(config, false), filter(config, true)});
     for (size_t lane = 0; lane < layouts.size(); ++lane)
     {
         auto const& plan = layouts[lane];
+        auto const& parameters = cohort_configs.empty() ? config : cohort_configs[lane];
+        unsigned const meta_bits = std::min({8u, filter(parameters, false), filter(parameters, true)});
         // A saved identity schedule can now span several physical resources.
         farming_require(plan.resource_rank == prepared->ranks[lane] && plan.resource_lanes == prepared->lanes[lane] &&
             plan.meta_slots && plan.meta_slots <= (1u << meta_bits) && plan.meta_bits == meta_bits &&
-            plan.meta_base == config.meta_group_override && (!config.fixed_meta || plan.meta_slots == 1) &&
-            (!config.meta_slots_override || plan.meta_slots == config.meta_slots_override),
+            plan.meta_base == parameters.meta_group_override && (!parameters.fixed_meta || plan.meta_slots == 1) &&
+            (!parameters.meta_slots_override || plan.meta_slots == parameters.meta_slots_override),
             "farming assessment layout aliases resource/meta identities");
-        farming_require(layouts[prepared->first[lane]].meta_slots == plan.meta_slots,
+        auto const& first = layouts[prepared->first[lane]];
+        if (cohort_costs && !cohort_configs.empty())
+        {
+            auto const& identity = cohort_configs[prepared->first[lane]];
+            farming_require(identity.k == parameters.k && identity.strength == parameters.strength,
+                "farming identity schedule combines incompatible plot parameters");
+        }
+        farming_require(first.meta_slots == plan.meta_slots && (!cohort_costs || cohort_configs.empty() ||
+            (first.meta_bits == plan.meta_bits && first.meta_base == plan.meta_base)),
             "farming resource lanes use incompatible family schedules");
         auto const resource_index = prepared->physical.resource[lane];
         auto& resource = resources[resource_index];
@@ -296,7 +581,7 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
         auto interval = [&](uint64_t first, uint64_t last, uint16_t members)
         {
             if (first == last) return;
-            farming_require(members && shape(config, members), "farming extent has an invalid modeled chunk shape");
+            farming_require(members && shape(parameters, members), "farming extent has an invalid modeled chunk shape");
             uint64_t const begin = plan.family(first), end = plan.family(last - 1);
             farming_require(end != UINT64_MAX, "farming family extent overflows");
             events.push_back({begin, plan.schedule, uint32_t(resource_index), members, false});
@@ -425,17 +710,7 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
     result.dynamic_work_seconds_per_sp = config.cpu_work_weight * result.cpu_work_seconds_per_sp +
         config.io_work_weight * result.io_work_seconds_per_sp;
     result.planning_memory_bytes = memory.peak;
-    if (!std::isfinite(result.response_bound_seconds) || !std::isfinite(result.dynamic_work_seconds_per_sp))
-        result.reason = "farming service certificate overflows";
-    else if (result.max_eligible_families_per_resource > config.max_eligible_families_per_resource)
-        result.reason = "farming layout exceeds the simultaneous eligible-group limit";
-    else if (result.reader_memory_bytes > config.memory_bytes)
-        result.reason = "farming reader profile exceeds its working memory budget";
-    else if (result.response_bound_seconds > config.deadline_seconds)
-        result.reason = "farming profile cannot certify the response deadline";
-    else if (result.response_bound_seconds > config.challenge_seconds)
-        result.reason = "farming profile cannot drain responses before the next signage point";
-    else result.feasible = true;
+    certify(config, resources, result);
     return result;
 }
 inline FarmingDrivePlan candidate(FarmingConfig const& config, FarmingDestination const& destination,
@@ -489,6 +764,94 @@ inline FarmingAssessment farming_assess(FarmingConfig const& config, std::vector
     farming_detail::validate(config, destinations);
     farming_detail::PlanningMemory memory{planning_memory_limit};
     return farming_detail::assess(config, destinations, layouts, &file_members, memory);
+}
+inline FarmingAdjustments farming_adjustments(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
+    std::vector<FarmingDrivePlan> const& layouts, std::vector<std::vector<uint16_t>> const& file_members,
+    uint64_t planning_memory_limit = 64ull * 1024 * 1024, std::span<FarmingConfig const> cohort_configs = {},
+    bool cohort_costs = true, unsigned maximum_evaluations = 32)
+{
+    using namespace farming_detail;
+    validate(config, {});
+    farming_require(maximum_evaluations && maximum_evaluations <= 1024, "invalid farming adjustment work bound");
+    PlanningMemory memory{planning_memory_limit};
+    memory.add(64 * 1024 + destinations.size() * 1024 + sizeof(FarmingAdjustment) * 5);
+    auto const prepared = assessment_topology(topology(destinations), layouts);
+    FarmingAdjustments result; result.alternatives.reserve(5);
+    auto evaluate = [&](FarmingConfig const& proposed)
+    {
+        ++result.evaluations;
+        return assess(proposed, destinations, layouts, &file_members, memory, &prepared, cohort_configs, cohort_costs);
+    };
+    auto available = [&]
+    {
+        if (result.evaluations < maximum_evaluations) return true;
+        result.search_limited = true; return false;
+    };
+    auto retain = [&](FarmingAdjustmentKind kind, FarmingConfig proposed, FarmingAssessment assessment)
+    {
+        auto remaining = farming_requirements(proposed, assessment);
+        result.alternatives.push_back({kind, std::move(proposed), std::move(assessment), remaining});
+    };
+    result.baseline = evaluate(config); result.requirements = farming_requirements(config, result.baseline);
+    if (result.requirements.memory_limited && available())
+    {
+        auto proposed = config; proposed.memory_bytes = result.requirements.memory_bytes;
+        auto assessed = evaluate(proposed);
+        if (assessed.reader_memory_bytes <= proposed.memory_bytes) retain(FarmingAdjustmentKind::memory, proposed, std::move(assessed));
+    }
+    if (result.requirements.eligible_limited && available())
+    {
+        auto proposed = config; proposed.max_eligible_families_per_resource = result.requirements.eligible_families_per_resource;
+        auto assessed = evaluate(proposed);
+        if (assessed.max_eligible_families_per_resource <= proposed.max_eligible_families_per_resource)
+            retain(FarmingAdjustmentKind::eligible_families, proposed, std::move(assessed));
+    }
+    if (result.requirements.deadline_limited && !result.requirements.overflow && available())
+    {
+        auto proposed = config; proposed.deadline_seconds = result.requirements.response_seconds;
+        auto assessed = evaluate(proposed);
+        if (assessed.response_bound_seconds <= proposed.deadline_seconds) retain(FarmingAdjustmentKind::deadline, proposed, std::move(assessed));
+    }
+    if ((!result.requirements.deadline_limited && !result.requirements.cadence_limited) || result.requirements.overflow) return result;
+    auto timely = [&](FarmingAssessment const& value)
+    { return std::isfinite(value.response_bound_seconds) && value.response_bound_seconds <= std::min(config.deadline_seconds, config.challenge_seconds); };
+    // At fixed worker count the FIFO CPU-wave bound is monotone in cores.
+    // No core beyond the worker count can remove additional CPU admission wait.
+    if (config.harvester_cores < config.lookup_workers && available())
+    {
+        auto proposed = config; proposed.harvester_cores = config.lookup_workers;
+        auto assessed = evaluate(proposed);
+        if (timely(assessed))
+        {
+            unsigned low = config.harvester_cores + 1, high = config.lookup_workers;
+            while (low < high && available())
+            {
+                unsigned const middle = low + (high - low) / 2;
+                auto trial = config; trial.harvester_cores = middle; auto checked = evaluate(trial);
+                if (timely(checked)) { high = middle; proposed = trial; assessed = std::move(checked); }
+                else low = middle + 1;
+            }
+            retain(FarmingAdjustmentKind::cpu_cores, proposed, std::move(assessed));
+            return result;
+        }
+    }
+    // More workers can increase device/CPU interference and working memory.
+    // Test each offered alternative with the same complete joint model. This
+    // bounded search makes no minimality or impossibility claim when stopped.
+    uint64_t files = 0;
+    for (auto const& lane : file_members) add(files, lane.size());
+    unsigned const worker_limit = unsigned(std::min<uint64_t>(1024, files));
+    for (unsigned workers = config.lookup_workers + 1; workers <= worker_limit; ++workers)
+    {
+        if (!available()) break;
+        auto proposed = config; proposed.lookup_workers = workers; auto assessed = evaluate(proposed);
+        if (timely(assessed)) { retain(FarmingAdjustmentKind::lookup_workers, proposed, std::move(assessed)); break; }
+        if (config.harvester_cores >= workers) continue;
+        if (!available()) break;
+        proposed.harvester_cores = workers; assessed = evaluate(proposed);
+        if (timely(assessed)) { retain(FarmingAdjustmentKind::lookup_workers, proposed, std::move(assessed)); break; }
+    }
+    return result;
 }
 inline FarmingPlan farming_plan(FarmingConfig const& config, std::vector<FarmingDestination> const& destinations,
     uint64_t planning_memory_limit = 64ull * 1024 * 1024, std::span<FarmingDrivePlan const> frozen = {})

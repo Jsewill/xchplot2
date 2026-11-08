@@ -34,16 +34,20 @@ The parity binaries under `tools/parity/` are the correctness gate:
 - `plot_file_parity` covers the writer/reader round-trip.
 - Host tests cover memory budgets, spill storage, recovery, and reporting.
 
-Farming plan compatibility uses its schema, `farming_model_identity` and
-`farming_key_derivation_identity` with matching numeric representation; the
+Farming plan compatibility uses its schema, farming model and key-derivation
+identities with matching numeric representation; the
 recorded source build is provenance for new plans. Bump the schema for
 incompatible saved-policy or plan-format changes,
 the model identity when assessment semantics change, and the key-derivation
 identity when owner/seed derivation, family/meta schedules or group-key
 derivation changes. Keep existing plan bytes and parent digests stable when
-loading compatible records. Transient construction checkpoints retain the exact
-source identity; do not relax them without cross-build recovery fixtures.
-Legacy plans retain their original exact-build requirement.
+loading compatible records. New construction checkpoints use explicit format,
+algorithm and native-representation identities; bump the affected identity when
+its recovery contract changes. Retain the original producer build as provenance.
+Cross-build recovery fixtures must cover interrupted construction and compare
+completed output with the pinned CPU reference. Legacy plans and checkpoints
+retain their original exact-build requirement, including after a compatible
+reader saves them again.
 
 Kernel, sort, and plot-format changes must pass parity at k=22 and k=28.
 Output bytes must remain identical to the pinned CPU reference. The

@@ -29,9 +29,8 @@ class MergeEngine
 {
     using Run = MergeState::Run;
     using Phase = MergeState::Phase;
-    struct Packet { uint16_t first, count; uint32_t bytes; };
-    static_assert(sizeof(Packet) == 8);
-    struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
+    using Packet = MergeState::Packet;
+    using Summary = MergeState::Summary;
     struct Admission
     {
         uint64_t live = 0, growth = 0, largest = 0, canonical = 0, minimum = 0, peak = 0, codec_required = 0;
@@ -364,6 +363,7 @@ public:
         ConstructionInspection result; std::array<uint8_t, 32> authority{};
         MergeEngine engine(path, cfg, ReadOnly{}, limits, initial, result.target, authority);
         result.identity = engine.identity(); result.checkpoint = engine.arena_.active;
+        result.checkpoint_identity = engine.arena_.checkpoint_identity();
         result.committed_members = engine.committed_member_count(); result.can_append = engine.can_append();
         result.inspection_memory_bytes = engine.arena_.active ? grow_add(MergeState::multiply(engine.arena_.state.slot_bytes, 4),
             grow_add(MergeState::multiply(engine.arena_.map.size(), 32), 65536)) : Engine::inspection_memory_bytes(engine.k());

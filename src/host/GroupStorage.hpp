@@ -6,6 +6,7 @@
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <set>
 #ifdef _WIN32
@@ -124,18 +125,37 @@ inline std::string farming_directory_identity(std::filesystem::path const& path)
     return value.str();
 }
 
-inline std::vector<std::filesystem::path> farming_destination_candidates()
+inline bool farming_mount_within(std::filesystem::path const& mount, std::filesystem::path const& root)
 {
-    namespace fs = std::filesystem;
-    std::vector<fs::path> candidates;
-#ifdef __linux__
-    std::ifstream mounts("/proc/self/mountinfo");
+    auto m = mount.begin(), r = root.begin();
+    for (; r != root.end(); ++r, ++m)
+    {
+        if (m == mount.end()) return false;
+#ifdef _WIN32
+        auto const a = m->native(), b = r->native();
+        if (::CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) != CSTR_EQUAL) return false;
+#else
+        if (*m != *r) return false;
+#endif
+    }
+    return true;
+}
+
+struct FarmingDestinationDiscovery
+{
+    std::vector<std::filesystem::path> selected;
+    std::vector<std::pair<std::filesystem::path, std::string>> skipped;
+};
+
+inline std::vector<std::filesystem::path> farming_mount_paths(std::istream& mounts,
+    std::vector<std::pair<std::filesystem::path, std::string>>* skipped = nullptr)
+{
+    std::vector<std::filesystem::path> paths;
     for (std::string line; std::getline(mounts, line);)
     {
         std::istringstream row(line);
         std::string id, parent, device, root, mount, options;
         if (!(row >> id >> parent >> device >> root >> mount >> options)) continue;
-        if (!(options == "rw" || options.starts_with("rw,"))) continue;
         std::string decoded;
         for (size_t i = 0; i < mount.size(); ++i)
         {
@@ -148,40 +168,131 @@ inline std::vector<std::filesystem::path> farming_destination_candidates()
             }
             else decoded.push_back(mount[i]);
         }
-        if (decoded == "/" || decoded == "/home" || decoded == "/usr" || decoded == "/var" ||
-            decoded == "/boot" || decoded.starts_with("/boot/") || decoded == "/efi") continue;
-        struct statfs filesystem{};
         auto path = file_io::native_path(decoded);
-        if (::statfs(path.c_str(), &filesystem) || ram_backed_filesystem(uint64_t(filesystem.f_type))) continue;
+        if (options == "rw" || options.starts_with("rw,")) paths.push_back(std::move(path));
+        else if (skipped) skipped->emplace_back(std::move(path), "read-only mount");
+    }
+    require(!mounts.bad(), "cannot read mounted filesystem list");
+    return paths;
+}
+
+inline FarmingDestinationDiscovery farming_destination_discovery(std::filesystem::path const& under = {})
+{
+    namespace fs = std::filesystem;
+    FarmingDestinationDiscovery result;
+    auto& candidates = result.selected;
+    std::optional<fs::path> scope;
+    if (!under.empty())
+    {
+        require(fs::is_directory(under), "--discover-drives requires an existing directory: " + file_io::path_text(under));
+        scope = fs::canonical(under).lexically_normal();
+    }
+    auto selected = [&](fs::path const& path) -> std::optional<fs::path>
+    {
+        std::error_code error;
+        auto const canonical = fs::canonical(path, error);
+        if (error)
+        {
+            if (!scope || farming_mount_within(path.lexically_normal(), *scope))
+                result.skipped.emplace_back(path, "cannot resolve mount path: " + error.message());
+            return {};
+        }
+        if (scope && !farming_mount_within(canonical, *scope)) return {};
+        return canonical;
+    };
+#ifdef __linux__
+    std::ifstream mounts("/proc/self/mountinfo");
+    require(mounts.is_open(), "cannot open mounted filesystem list");
+    std::vector<std::pair<fs::path, std::string>> skipped;
+    auto const paths = farming_mount_paths(mounts, &skipped);
+    for (auto const& [path, reason] : skipped)
+    {
+        if (auto const canonical = selected(path)) result.skipped.emplace_back(*canonical, reason);
+    }
+    for (auto const& path : paths)
+    {
+        auto const canonical = selected(path); if (!canonical) continue;
+        auto skip = [&](std::string reason) { result.skipped.emplace_back(*canonical, std::move(reason)); };
+        auto const decoded = file_io::path_text(*canonical);
+        if (!scope && (decoded == "/" || decoded == "/home" || decoded == "/usr" || decoded == "/var" ||
+            decoded == "/boot" || decoded.starts_with("/boot/") || decoded == "/efi"))
+        { skip("system storage omitted from automatic suggestions"); continue; }
+        struct statfs filesystem{};
+        if (::statfs(path.c_str(), &filesystem)) { skip("cannot inspect mounted filesystem"); continue; }
+        if (ram_backed_filesystem(uint64_t(filesystem.f_type))) { skip("RAM-backed filesystem"); continue; }
         // These are suggestions for persistent local plot storage. Explicit
         // destinations still go through the normal filesystem validation.
         if (unsigned(filesystem.f_type) != 0xef53u && unsigned(filesystem.f_type) != 0x58465342u &&
-            unsigned(filesystem.f_type) != 0x9123683eu && unsigned(filesystem.f_type) != 0x5346544eu) continue;
-        if (::access(path.c_str(), W_OK | X_OK)) continue;
-        candidates.push_back(std::move(path));
+            unsigned(filesystem.f_type) != 0x9123683eu && unsigned(filesystem.f_type) != 0x5346544eu)
+        { skip("unsupported filesystem for automatic discovery"); continue; }
+        if (::access(path.c_str(), W_OK | X_OK)) { skip("mount directory is not writable and searchable"); continue; }
+        candidates.push_back(*canonical);
     }
 #elif defined(_WIN32)
     std::array<wchar_t, 32768> windows{};
     auto const length = ::GetWindowsDirectoryW(windows.data(), DWORD(windows.size()));
     wchar_t const system = length && length < windows.size() ? wchar_t(std::towupper(windows[0])) : L'C';
-    DWORD const drives = ::GetLogicalDrives();
-    for (unsigned index = 0; index < 26; ++index)
+    std::array<wchar_t, 64> volume{};
+    HANDLE const volumes = ::FindFirstVolumeW(volume.data(), DWORD(volume.size()));
+    require(volumes != INVALID_HANDLE_VALUE, "cannot list mounted volumes");
+    struct Close { HANDLE handle; ~Close() { ::FindVolumeClose(handle); } } close{volumes};
+    do
     {
-        if (!(drives & (DWORD(1) << index)) || wchar_t(L'A' + index) == system) continue;
-        std::wstring path{wchar_t(L'A' + index), L':', L'\\'};
-        auto const kind = ::GetDriveTypeW(path.c_str());
-        if (kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE) continue;
+        auto const kind = ::GetDriveTypeW(volume.data());
         std::array<wchar_t, 32> filesystem{};
         DWORD flags = 0;
-        if (!::GetVolumeInformationW(path.c_str(), nullptr, 0, nullptr, nullptr, &flags,
-                filesystem.data(), DWORD(filesystem.size())) || (flags & FILE_READ_ONLY_VOLUME) ||
-            std::wstring_view(filesystem.data()) != L"NTFS") continue;
-        candidates.emplace_back(path);
-    }
+        bool const inspected = ::GetVolumeInformationW(volume.data(), nullptr, 0, nullptr, nullptr, &flags,
+            filesystem.data(), DWORD(filesystem.size()));
+        DWORD length = 0;
+        (void)::GetVolumePathNamesForVolumeNameW(volume.data(), nullptr, 0, &length);
+        require(length <= 1024 * 1024, "mounted volume path list exceeds its bound");
+        if (!length) continue;
+        std::vector<wchar_t> paths(length);
+        require(::GetVolumePathNamesForVolumeNameW(volume.data(), paths.data(), length, &length),
+            "cannot read mounted volume paths");
+        for (auto path = paths.data(); *path; path += std::wcslen(path) + 1)
+        {
+            fs::path const mounted(path);
+            auto const canonical = selected(mounted); if (!canonical) continue;
+            std::string reason;
+            if (!scope && std::towupper(path[0]) == system) reason = "system storage omitted from automatic suggestions";
+            else if (kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE) reason = "unsupported drive type for automatic discovery";
+            else if (!inspected) reason = "cannot inspect mounted filesystem";
+            else if (flags & FILE_READ_ONLY_VOLUME) reason = "read-only volume";
+            else if (std::wstring_view(filesystem.data()) != L"NTFS") reason = "automatic discovery requires NTFS";
+            if (!reason.empty()) result.skipped.emplace_back(*canonical, std::move(reason));
+            else candidates.push_back(*canonical);
+        }
+    } while (::FindNextVolumeW(volumes, volume.data(), DWORD(volume.size())));
+    require(::GetLastError() == ERROR_NO_MORE_FILES, "cannot finish listing mounted volumes");
+#else
+    require(!scope, "--discover-drives requires Linux or Windows mount discovery");
 #endif
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
-    return candidates;
+    // Bind mounts of the same directory must not become duplicate destinations.
+    std::map<std::string, fs::path> identities;
+    std::erase_if(candidates, [&](auto const& path)
+    {
+        try
+        {
+            auto const [previous, inserted] = identities.emplace(farming_directory_identity(path), path);
+            if (inserted) return false;
+            result.skipped.emplace_back(path, "same destination as " + file_io::path_text(previous->second));
+        }
+        catch (std::runtime_error const& error) { result.skipped.emplace_back(path, error.what()); }
+        return true;
+    });
+    std::sort(result.skipped.begin(), result.skipped.end());
+    result.skipped.erase(std::unique(result.skipped.begin(), result.skipped.end()), result.skipped.end());
+    return result;
+}
+
+inline std::vector<std::filesystem::path> farming_destination_candidates(std::filesystem::path const& under = {})
+{
+    auto result = farming_destination_discovery(under);
+    require(under.empty() || !result.selected.empty(), "no writable supported mounted storage at or below " + file_io::path_text(under));
+    return std::move(result.selected);
 }
 
 namespace storage_detail

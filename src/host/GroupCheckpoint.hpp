@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupFormat.hpp"
 #include "host/GroupFile.hpp"
+#include "host/GroupConstructionIdentity.hpp"
 
 #include <cerrno>
 #include <cstdlib>
@@ -196,6 +197,8 @@ struct Active
 };
 struct State
 {
+    unsigned version = 2;
+    std::string producer_build = STREAM_IDENTITY;
     Config config;
     Phase phase = Phase::stage;
     uint32_t staged = 0, next_id = 0, merge_first = 0;
@@ -271,7 +274,14 @@ void save_state(fs::path const& work, State const& state, std::string const& ide
                 std::string const& label)
 {
     std::ostringstream out;
-    out << "xchplot2-stream-1\n" << STREAM_IDENTITY << '\n' << identity << '\n';
+    out << "xchplot2-stream-" << state.version << '\n' << state.producer_build << '\n';
+    if (state.version == 2)
+    {
+        auto const compatibility = group_grow::construction_compatibility({});
+        out << group_grow::construction_build_text(compatibility.algorithm) << '\n'
+            << group_tools::hex(compatibility.representation) << '\n';
+    }
+    out << identity << '\n';
     write_fields(out, state.config);
     out << int(state.phase) << ' ' << state.staged << ' ' << state.next_id << ' '
         << state.merge_first << '\n';
@@ -320,11 +330,27 @@ State load_state(fs::path const& work, Config const& config, std::string const& 
     std::istringstream in(body);
     in.exceptions(std::ios::badbit | std::ios::failbit);
     std::string format, source, job;
-    in >> format >> source >> job;
-    require(format == "xchplot2-stream-1" && source == STREAM_IDENTITY,
-            "checkpoint source/version mismatch");
+    in >> format >> source;
+    bool const legacy = format == "xchplot2-stream-1";
+    group_grow::check_construction_format(legacy || format == "xchplot2-stream-2", "stream");
+    if (legacy) group_grow::check_construction_build(source, STREAM_IDENTITY, "stream");
+    else
+    {
+        std::string algorithm, representation;
+        in >> algorithm >> representation;
+        require(algorithm == group_grow::construction_algorithm_identity,
+            "stream checkpoint algorithm is incompatible; resume with a build supporting its recorded algorithm or restart this construction");
+        group_grow::ConstructionCompatibility compatibility;
+        compatibility.algorithm = group_grow::construction_build(algorithm);
+        auto const bytes = group_tools::hex(representation);
+        require(bytes.size() == compatibility.representation.size(), "invalid stream checkpoint representation identity");
+        std::copy(bytes.begin(), bytes.end(), compatibility.representation.begin());
+        group_grow::check_construction_compatibility(compatibility, group_grow::construction_compatibility({}), "stream");
+    }
+    in >> job;
     require(job == identity, "checkpoint group input identity mismatch");
     State state;
+    state.version = legacy ? 1 : 2; state.producer_build = source;
     read_fields(in, state.config);
     require(state.config == config, "checkpoint assembly settings mismatch");
     int phase;

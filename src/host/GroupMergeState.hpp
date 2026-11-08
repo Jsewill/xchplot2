@@ -21,6 +21,9 @@ public:
         uint16_t first = 0, count = 0;
         bool ordinary = false;
     };
+    struct Packet { uint16_t first, count; uint32_t bytes; };
+    static_assert(sizeof(Packet) == 8);
+    struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
     struct Record
     {
         std::array<char, 16> magic{};
@@ -47,6 +50,27 @@ public:
         std::array<uint8_t, 32> digest{};
     };
     static_assert(sizeof(Locator) == 64);
+    static bool compatible_record(Record const& record)
+    { return !std::memcmp(record.magic.data(), "XCHPLOT2MERGEv2", 16); }
+    static ConstructionCompatibility checkpoint_compatibility()
+    {
+        return construction_compatibility({sizeof(Record), alignof(Record), offsetof(Record, sequence),
+            offsetof(Record, alignment), offsetof(Record, block_bytes), offsetof(Record, slot_bytes),
+            offsetof(Record, anchor), offsetof(Record, storage_bytes), offsetof(Record, original_bytes),
+            offsetof(Record, live_bytes), offsetof(Record, growth_bound), offsetof(Record, chunk_bound),
+            offsetof(Record, codec_required), offsetof(Record, transaction_bytes), offsetof(Record, chunk),
+            offsetof(Record, final_bytes), offsetof(Record, layout_done), offsetof(Record, map_count),
+            offsetof(Record, block_limit), offsetof(Record, merge_first), offsetof(Record, layout_blocks),
+            offsetof(Record, members), offsetof(Record, run_count), offsetof(Record, merge_inputs),
+            offsetof(Record, merge_count), offsetof(Record, phase), offsetof(Record, finishing),
+            offsetof(Record, original), offsetof(Record, target), offsetof(Record, runs), offsetof(Record, summary),
+            offsetof(Record, output), offsetof(Record, summary_digest), offsetof(Record, memo), offsetof(Record, build),
+            sizeof(Phase), sizeof(Run), alignof(Run), offsetof(Run, consumed), offsetof(Run, released),
+            offsetof(Run, head), offsetof(Run, tail), offsetof(Run, first), offsetof(Run, count), offsetof(Run, ordinary),
+            sizeof(Packet), alignof(Packet), offsetof(Packet, count), offsetof(Packet, bytes), sizeof(Summary), alignof(Summary),
+            offsetof(Summary, bytes), sizeof(ChunkSummary), alignof(ChunkSummary), offsetof(ChunkSummary, low_bits),
+            offsetof(ChunkSummary, min_ans_bits), offsetof(ChunkSummary, max_ans_bits), offsetof(ChunkSummary, last)});
+    }
 
     Config config;
     Identity identity;
@@ -54,6 +78,11 @@ public:
     std::vector<uint32_t> map;
     mutable Stats stats{};
     bool active = false, tail_records = false;
+    ConstructionCheckpointIdentity checkpoint_identity() const
+    {
+        return active ? construction_checkpoint_identity(compatible_record(state) ? "xchplot2-merge-2" : "xchplot2-merge-1",
+            construction_build_text(state.build), !compatible_record(state), checkpoint_compatibility()) : ConstructionCheckpointIdentity{};
+    }
 
     explicit MergeState(std::string path, Config cfg, bool resume, std::optional<Identity> initial);
     ~MergeState();
@@ -394,8 +423,20 @@ MergeState::load(uint64_t slots, uint64_t slot_bytes, std::array<uint8_t, 32>* a
         auto const digest = grow_digest(std::span(bytes).first(bytes.size() - 32), config.cpu_scheduler.get());
         if (!std::equal(digest.begin(), digest.end(), bytes.end() - 32)) continue;
         Record saved{}; std::memcpy(&saved, bytes.data(), sizeof(saved));
-        if (std::memcmp(saved.magic.data(), "XCHPLOT2MERGEv1", 16) || saved.slot_bytes != slot_bytes ||
+        if (!std::string_view(saved.magic.data(), saved.magic.size()).starts_with("XCHPLOT2MERGEv")) continue;
+        bool const compatible = compatible_record(saved);
+        check_construction_format(compatible || !std::memcmp(saved.magic.data(), "XCHPLOT2MERGEv1", 16), "merge");
+        if (saved.slot_bytes != slot_bytes ||
             !saved.sequence || saved.map_count > (slot_bytes - sizeof(saved) - 32) / sizeof(uint32_t)) continue;
+        if (compatible)
+        {
+            auto const offset = sizeof(saved) + size_t(saved.map_count) * sizeof(uint32_t);
+            require(sizeof(ConstructionCompatibility) <= slot_bytes - offset - 32, "merge compatibility extension exceeds checkpoint");
+            ConstructionCompatibility compatibility{};
+            std::memcpy(&compatibility, bytes.data() + offset, sizeof(compatibility));
+            check_construction_compatibility(compatibility, checkpoint_compatibility(), "merge");
+        }
+        else check_construction_build(saved.build, GROW_IDENTITY, "merge");
         if (result && result->first.sequence >= saved.sequence) continue;
         std::vector<uint32_t> blocks(saved.map_count);
         std::memcpy(blocks.data(), bytes.data() + sizeof(saved), blocks.size() * sizeof(uint32_t));
@@ -556,9 +597,6 @@ inline void MergeState::discover(bool resume, std::optional<Identity> initial,
         require(resume, "in-progress merged group is not farmable; use --resume");
         state = saved->first; map = std::move(saved->second); active = true;
         tail_records = state.phase == Phase::layout;
-        std::array<char, 64> build{}; auto const name = std::string_view(GROW_IDENTITY);
-        std::copy_n(name.begin(), std::min(name.size(), build.size()), build.begin());
-        require(state.build == build, "merge checkpoint requires the same codec/build identity");
         validate();
         identity = {state.original, {state.memo.begin(), state.memo.begin() + state.original.memo_length},
             state.original_bytes, true, state.original.group_size, state.members, state.storage_bytes};
@@ -621,12 +659,12 @@ inline void MergeState::restore_extent()
 }
 inline MergeState::Record MergeState::layout(uint64_t block_bytes) const
 {
-    Record result{}; std::memcpy(result.magic.data(), "XCHPLOT2MERGEv1", 16);
+    Record result{}; std::memcpy(result.magic.data(), "XCHPLOT2MERGEv2", 16);
     result.alignment = alignment_; result.block_bytes = align(block_bytes, alignment_);
     uint64_t const count = config.capacity_bytes / result.block_bytes;
     require(count && count < reserved_block, "merge block map exceeds addressable capacity");
     result.map_count = uint32_t(count);
-    result.slot_bytes = align(grow_add(sizeof(Record) + 32, multiply(count, sizeof(uint32_t))), alignment_);
+    result.slot_bytes = align(grow_add(sizeof(Record) + sizeof(ConstructionCompatibility) + 32, multiply(count, sizeof(uint32_t))), alignment_);
     result.anchor = align(std::max<uint64_t>(identity.bytes, sizeof(Header) + identity.memo.size()), result.block_bytes);
     result.original = result.target = identity.header; result.original_bytes = identity.bytes;
     result.transaction_bytes = config.checkpoint_bytes;
@@ -746,6 +784,13 @@ inline void MergeState::checkpoint_bytes()
     require(sizeof(state) + map.size() * sizeof(uint32_t) + 32 <= bytes.size(), "merge checkpoint map overflow");
     std::memcpy(bytes.data(), &state, sizeof(state));
     std::memcpy(bytes.data() + sizeof(state), map.data(), map.size() * sizeof(uint32_t));
+    if (compatible_record(state))
+    {
+        auto const offset = sizeof(state) + map.size() * sizeof(uint32_t);
+        require(sizeof(ConstructionCompatibility) <= bytes.size() - offset - 32, "merge compatibility extension exceeds checkpoint");
+        auto const compatibility = checkpoint_compatibility();
+        std::memcpy(bytes.data() + offset, &compatibility, sizeof(compatibility));
+    }
     auto const digest = grow_digest(std::span(bytes).first(bytes.size() - 32), config.cpu_scheduler.get());
     std::copy(digest.begin(), digest.end(), bytes.end() - 32);
     uint64_t const base = tail_records ? footer_slots() : state.anchor + 2 * alignment_;

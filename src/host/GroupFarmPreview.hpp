@@ -8,40 +8,54 @@ namespace group_grow
 {
 struct FarmingPreview
 {
+    unsigned version = 1;
     FarmingState state;
     std::string source_digest;
+    std::string source_policy;
     std::filesystem::path source;
     std::vector<std::pair<std::filesystem::path, std::filesystem::path>> relocations;
 };
 inline std::string farming_preview_text(FarmingState const& state, std::string const& source_digest,
     std::filesystem::path const& source,
-    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> const& relocations)
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> const& relocations,
+    unsigned version = 1, std::string const& source_policy = {})
 {
+    require(version == 1 || version == 2, "unsupported farming preview version");
     std::ostringstream out;
-    out << "ordinary-group-farming-preview-v1\n"
+    out << "ordinary-group-farming-preview-v" << version << '\n'
         << std::quoted(source_digest) << ' ' << std::quoted(file_io::path_text(source))
         << ' ' << relocations.size() << '\n';
+    if (version >= 2) out << std::quoted(source_policy) << '\n';
     for (auto const& [old, replacement] : relocations)
         out << std::quoted(file_io::path_text(old)) << ' ' << std::quoted(file_io::path_text(replacement)) << '\n';
     out << std::quoted(farming_state_text(state, true)) << '\n';
     return out.str();
 }
 inline std::string farming_preview_text(FarmingPreview const& preview)
-{ return farming_preview_text(preview.state, preview.source_digest, preview.source, preview.relocations); }
+{ return farming_preview_text(preview.state, preview.source_digest, preview.source, preview.relocations, preview.version, preview.source_policy); }
 inline FarmingPreview parse_farming_preview(std::string const& body, uint64_t memory_limit = 256 * 1024 * 1024,
     FarmingStateLoad mode = FarmingStateLoad::recovery)
 {
     std::istringstream in(body);
     std::string version, source, state;
     std::getline(in, version);
-    require(version == "ordinary-group-farming-preview-v1", "expected a saved keyless farming preview");
+    require(version == "ordinary-group-farming-preview-v1" || version == "ordinary-group-farming-preview-v2",
+        "expected a saved keyless farming preview");
     FarmingPreview preview;
+    preview.version = version == "ordinary-group-farming-preview-v1" ? 1 : 2;
     size_t count = 0;
     in >> std::quoted(preview.source_digest) >> std::quoted(source) >> count;
     require(in && count <= 1024 && ((source.empty() && preview.source_digest.empty()) ||
         (!source.empty() && preview.source_digest.size() == 64 &&
             preview.source_digest.find_first_not_of("0123456789abcdef") == std::string::npos)),
         "invalid farming preview source");
+    if (preview.version >= 2)
+    {
+        in >> std::quoted(preview.source_policy);
+        require(in && (preview.source_digest.empty() ? preview.source_policy.empty() :
+            preview.source_policy.size() == 64 && preview.source_policy.find_first_not_of("0123456789abcdef") == std::string::npos),
+            "invalid farming preview policy identity");
+    }
     preview.source = file_io::native_path(source);
     require(source.empty() || preview.source.is_absolute(), "farming preview source must be absolute");
     for (size_t i = 0; i < count; ++i)

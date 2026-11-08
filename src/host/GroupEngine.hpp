@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupCodec.hpp"
 #include "host/GroupFile.hpp"
+#include "host/GroupConstructionIdentity.hpp"
 #include "pos2_keygen.h"
 
 #include <cerrno>
@@ -49,6 +50,9 @@ struct Config
     std::shared_ptr<RemoteEncoder> remote_encoder;
     unsigned merge_inputs = 2;
     uint64_t memory_limit_bytes = UINT64_MAX;
+    // Runtime aliases for the same persistent native directory after a mount
+    // path changes. Checkpoints retain authority over every owned object.
+    std::vector<ConstructionPathBinding> path_bindings;
     // Runtime controller authority, never serialized into a checkpoint. Check
     // only before bounded work or after a recoverable transaction, and join
     // borrowed windows before allowing the exception to leave their owner.
@@ -78,6 +82,7 @@ struct ConstructionStamp
 struct ConstructionInspection
 {
     Identity identity;
+    ConstructionCheckpointIdentity checkpoint_identity;
     ConstructionStamp target;
     std::array<uint8_t, 32> authority_digest{};
     uint64_t inspection_memory_bytes = 0, recovery_memory_bytes = 0;
@@ -280,6 +285,7 @@ private:
     static constexpr size_t max_tasks = 65536;
     static constexpr size_t digest_words = 1024;
     struct Record;
+    static ConstructionCompatibility checkpoint_compatibility();
     struct Window
     {
         uint64_t first = 0, count = 0, source_begin = 0;
@@ -441,7 +447,7 @@ struct Engine::Record
 {
     std::array<char, 16> magic{};
     uint64_t sequence = 0;
-    uint32_t format = 1;
+    uint32_t format = 2;
     uint8_t pending = 0, fresh = 0;
     Header original{}, target{};
     uint64_t original_bytes = 0, final_bytes = 0, storage_bytes = 0, record_alignment = 0;
@@ -452,6 +458,17 @@ struct Engine::Record
     std::array<uint8_t, 32> members_digest{}, redo_digest{};
     std::array<char, 64> build{};
 };
+
+inline ConstructionCompatibility Engine::checkpoint_compatibility()
+{
+    return construction_compatibility({sizeof(Record), alignof(Record), offsetof(Record, sequence), offsetof(Record, format),
+        offsetof(Record, pending), offsetof(Record, fresh), offsetof(Record, original), offsetof(Record, target),
+        offsetof(Record, original_bytes), offsetof(Record, final_bytes), offsetof(Record, storage_bytes),
+        offsetof(Record, record_alignment), offsetof(Record, redo_offset), offsetof(Record, redo_capacity),
+        offsetof(Record, redo_bytes), offsetof(Record, redo_chunks), offsetof(Record, remaining),
+        offsetof(Record, old_frontier), offsetof(Record, new_frontier), offsetof(Record, largest_chunk),
+        offsetof(Record, memo), offsetof(Record, members_digest), offsetof(Record, redo_digest), offsetof(Record, build)});
+}
 
 inline bool Engine::pending(std::string const& path)
 {
@@ -592,6 +609,9 @@ inline ConstructionInspection Engine::inspect(std::string const& path, Config co
     ConstructionInspection result; std::array<uint8_t, 32> authority{};
     Engine engine(path, config, ReadOnly{}, limits, initial, result.target, authority); result.identity = engine.identity_;
     result.checkpoint = bool(engine.record_); result.committed_members = engine.identity_.old_members;
+    if (engine.record_) result.checkpoint_identity = construction_checkpoint_identity(
+        "xchplot2-grow-" + std::to_string(engine.record_->format), construction_build_text(engine.record_->build),
+        engine.record_->format == 1, checkpoint_compatibility());
     result.can_append = !engine.identity_.pending;
     result.inspection_memory_bytes = inspection_memory_bytes(result.identity.header.k);
     result.recovery_memory_bytes = memory_bytes(result.identity.header.k, config,
@@ -818,7 +838,7 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
                              std::array<uint8_t, 32>* authority)
 {
     uint64_t const bytes = file_bytes();
-    static_assert(sizeof(Record) <= record_bytes - 32);
+    static_assert(sizeof(Record) + sizeof(ConstructionCompatibility) <= record_bytes - 32);
     auto valid_header = [&](Header const& header)
     {
         require(header.magic == PlotGroupFile::MAGIC && header.k >= 18 && header.k <= 28 &&
@@ -840,14 +860,17 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
             std::memcpy(&candidate, packed.data(), sizeof(candidate));
             if (std::string_view(candidate.magic.data(), candidate.magic.size()) !=
                 std::string_view("XCHPLOT2GROWv1\0\0\0", 16)) continue;
-            require(candidate.format == 1 && candidate.storage_bytes == bytes &&
+            check_construction_format(candidate.format == 1 || candidate.format == 2, "growth");
+            if (candidate.format == 1) check_construction_build(candidate.build, GROW_IDENTITY, "growth");
+            else
+            {
+                ConstructionCompatibility compatibility{};
+                std::memcpy(&compatibility, packed.data() + sizeof(candidate), sizeof(compatibility));
+                check_construction_compatibility(compatibility, checkpoint_compatibility(), "growth");
+            }
+            require(candidate.storage_bytes == bytes &&
                     candidate.record_alignment == record_alignment_,
                     "invalid growth checkpoint format or length");
-            std::array<char, 64> expected_build{};
-            auto const build = std::string_view(GROW_IDENTITY);
-            std::copy_n(build.begin(), std::min(build.size(), expected_build.size()), expected_build.begin());
-            require(candidate.build == expected_build,
-                "growth checkpoint requires the same codec/build identity");
             if (!record_ || candidate.sequence > record_->sequence)
             {
                 record_ = std::make_unique<Record>(candidate);
@@ -1505,6 +1528,11 @@ inline void Engine::checkpoint(Record& record)
     ++record.sequence;
     std::array<uint8_t, record_bytes> packed{};
     std::memcpy(packed.data(), &record, sizeof(record));
+    if (record.format == 2)
+    {
+        auto const compatibility = checkpoint_compatibility();
+        std::memcpy(packed.data() + sizeof(record), &compatibility, sizeof(compatibility));
+    }
     auto const checksum = grow_digest(std::span(packed).first(record_bytes - 32));
     std::copy(checksum.begin(), checksum.end(), packed.end() - 32);
     uint64_t const offset = record_offset(record.storage_bytes, unsigned(record.sequence % 2));

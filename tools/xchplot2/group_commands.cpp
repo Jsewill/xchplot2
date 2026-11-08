@@ -17,6 +17,16 @@ pos2gpu::GroupOptions command_arguments(std::string_view command, std::vector<st
 
 void command_usage(std::string_view command)
 {
+    if (command == "status")
+    {
+        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--watch] [--inspect]\n";
+        return;
+    }
+    if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
+    {
+        std::cout << "Usage: xchplot2 " << command << " [DIR | --manifest FILE] [--destination DIR]...\n";
+        return;
+    }
     if (command == "fill")
         std::cout << "Usage: xchplot2 fill [OPTIONS] DIR...\n"
             "       xchplot2 fill [OPTIONS] PLAN\n"
@@ -33,7 +43,7 @@ void command_usage(std::string_view command)
     if (command == "plan") std::cout << "       xchplot2 plan --inventory ROOT... [--save-plan inventory.plan]\n"
         "       xchplot2 plan DEST... --replot inventory.plan [--save-plan migration.plan]\n"
         "       xchplot2 plan --revalidate --from-plan migration.plan --harvester UPDATED_PROFILE --save-plan NEW\n";
-    if (command == "plan" || command == "fill") std::cout << "       xchplot2 " << command << " --status PLAN\n";
+    if (command == "plan" || command == "fill") std::cout << "       xchplot2 " << command << " --status [DIR | PLAN | --manifest FILE]\n";
 }
 
 void command_help_all(std::string_view command)
@@ -50,6 +60,8 @@ void command_help_all(std::string_view command)
     if (command != "grow") std::cout <<
         "  --paths-from FILE        literal destination paths, one per line; - reads stdin\n"
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"
+        "  --discover-drives DIR    select supported mounted storage at or below DIR; repeatable\n"
+        "  --mounts-under DIR       alias for --discover-drives\n"
         "  --manifest FILE          locate an existing farming job directly\n"
         "  --save-plan FILE         save a keyless plan, e.g. farm.plan\n"
         "  -F, --from-plan FILE     explicit alternative to supplying PLAN directly\n"
@@ -65,12 +77,16 @@ void command_help_all(std::string_view command)
         "  --replot-exclude-root ROOT  protect an exact inventory root; repeat for more roots\n"
         "  --replot-max-source-files N  maximum old files selected for this review\n"
         "  --replot-max-source-bytes SIZE  maximum allocated old-file bytes selected\n"
-        "  --status                 read saved migration progress without plotting or farm RPCs\n"
+        "  --status                 read ordinary job or migration progress without writer locks\n"
+        "  --watch                  refresh status until interrupted\n"
+        "  --inspect                status: include deep live checks\n"
         "  --revalidate             plan: save a successor for updated resources or verification policy\n"
         "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
         "  --farm-adapter-timeout-ms N  inventory/migration adapter operation deadline, default 30000\n"
-        "  --extend                 add destinations while preserving saved assignments\n"
+        "  --extend                 add destinations or refresh capacity, including during fill\n"
+        "  --update                 revise capacity and parameters for future groups\n"
+        "  --cancel-update          cancel a queued ordinary-job update\n"
         "  --allow-missing          with --resume, continue available members; incomplete exit 4\n"
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";
     std::cout <<
@@ -99,7 +115,7 @@ void command_help_all(std::string_view command)
         "  --batch-members N         maximum members generated per construction batch\n"
         << (command == "grow" ? "  --capacity-bytes N        output capacity for the group file\n" :
             "  --capacity-bytes N        aggregate output capacity per filesystem\n") <<
-        "  --headroom-bytes N        filesystem bytes to leave free\n"
+        "  --leave-free SIZE         filesystem space to leave free; --headroom-bytes is an alias\n"
         "  -t, --temp-dir DIR        contribution storage; repeat for more devices\n"
         "  --destination-temp off|on|ssd|hdd  destination scratch permission, default off\n"
         "  --temp-capacity-bytes N   temporary capacity per filesystem\n"
@@ -141,18 +157,48 @@ void command_help_all(std::string_view command)
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions, construction details and metrics\n"
         "  --progress / --no-progress  force aggregate progress on or off\n";
+    std::cout << "Construction recovery requires compatible checkpoint format, algorithm and\n"
+        "native representation. Legacy checkpoints need their original build.\n";
     if (command == "grow") std::cout <<
-        "Construction state is recovered with the same build. Keep the group file\n"
-        "and any owned temporary files together until completion.\n";
+        "Keep the group file and any owned temporary files together until completion.\n";
     else std::cout <<
-        "Construction state is recovered with the same build. Keep every private\n"
-        ".xchplot2/grow-farm.plan copy with its plots; it contains private plot seeds.\n"
-        "Keep .next copies and owned temporary files for recovery too.\n"
+        "Keep every private .xchplot2/grow-farm.plan copy with its plots; it contains\n"
+        "private plot seeds. Keep .next copies and owned temporary files for recovery too.\n"
         "Existing jobs retain their top-level metadata layout; leave those copies in place.\n";
 }
 
 void command_help(std::string_view command, bool all)
 {
+    if (command == "status")
+    {
+        command_usage(command);
+        std::cout << "Read saved farm progress through any member, a plan, or its manifest.\n"
+            "Without a selector, use the current member directory.\n\n"
+            "  --watch                  refresh until interrupted\n"
+            "  --inspect                include deep live checks\n"
+            "  -F, --from-plan FILE     inspect a saved plan\n"
+            "  --manifest FILE          locate a saved farming job directly\n"
+            "  -M, --max-host-ram SIZE   inspection memory budget\n"
+            "  --json                    machine-readable output; --watch emits one object per refresh\n"
+            "  -q, --quiet               suppress informational summaries\n"
+            "  -v, --verbose             show details\n";
+        return;
+    }
+    if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
+    {
+        command_usage(command);
+        std::cout << "Change saved plotting intent without removing completed plots.\n"
+            "Without a selector, use the current member directory.\n"
+            "Without --destination, apply the action to the whole job.\n\n"
+            "A running coordinator applies the action at its next recovery boundary.\n"
+            "An idle job records the action; use fill DIR to start plotting.\n\n"
+            "  --destination DIR        select a saved destination; repeat for more destinations\n"
+            "  --manifest FILE          locate the saved farming job directly\n"
+            "  --json                    machine-readable result\n"
+            "  -q, --quiet               suppress informational summaries\n"
+            "  -v, --verbose             show details\n";
+        return;
+    }
     if (command == "grow" || all) { command_help_all(command); return; }
     command_usage(command);
     if (command == "plan")
@@ -174,7 +220,7 @@ void command_help(std::string_view command, bool all)
             "  --replot-exclude-root ROOT  protect old files in this exact inventory root\n"
             "  --replot-max-source-files N  bound old-file selection for a trial run\n"
             "  --replot-max-source-bytes SIZE  bound selected allocated old-file bytes\n"
-            "  --status PLAN            inspect saved migration progress\n"
+            "  --status DIR|PLAN        inspect completed work, allowance and blocked reasons\n"
             "  --revalidate              review updated resources or verification; use --from-plan and --save-plan\n"
             "  --reclaim-before-bytes SIZE  explicit bytes retired before construction/readiness; default zero\n"
             "Early retirement is irreversible; later replacement checks cannot recover deleted plots.\n";
@@ -182,13 +228,17 @@ void command_help(std::string_view command, bool all)
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n"
             "  xchplot2 fill /disk-a/plots -f FARMER_KEY -c POOL_ADDRESS\n"
-            "  xchplot2 fill --resume /disk-a/plots\n"
-            "Run fill -r from the current member directory to resume without a path.\n"
+            "  xchplot2 fill /disk-a/plots\n"
+            "Repeat fill DIR to continue a saved job; explicit options revise future work.\n"
+            "Run fill -r from the current member directory to keep its saved policy without a path.\n"
             "New jobs require a farmer key and one pool source; saved jobs restore their keys.\n\n"
             "  -F, --from-plan FILE      execute a saved plan (also accepts positional PLAN)\n"
-            "  --status PLAN            inspect saved migration progress without plotting\n"
-            "  -r, --resume              recover the whole saved job through any member\n"
-            "  --extend                  add destinations to a saved job\n"
+            "  --status DIR|PLAN        inspect ordinary job or migration progress without plotting\n"
+            "  -r, --resume              recover the saved job without changing its future policy\n"
+            "  --no-resume               require a new job\n"
+            "  --extend                  add destinations or refresh capacity during fill\n"
+            "  --update                  revise capacity or future group parameters during fill\n"
+            "  --cancel-update           cancel a waiting update\n"
             "  --plan-only               preview without plotting\n"
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
@@ -202,9 +252,13 @@ void command_help(std::string_view command, bool all)
 #endif
     std::cout <<
         "  --harvester local|FILE    use this harvester or a profile from another machine\n"
+        "  --discover-drives DIR    select supported mounted storage at or below DIR, at any depth\n"
+        "  -k, --k N                 plot size, default 28\n"
+        "  -s, --strength N          plot strength, default 2\n"
         "  --group-members auto|N    automatic layout or a member limit per file\n"
         "  --capacity-bytes SIZE     budget per filesystem, e.g. 500G\n"
-        "  --headroom-bytes SIZE     leave this space free, default 64M\n"
+        "  --leave-free SIZE         leave this space free, default 64M; also --headroom-bytes\n"
+        "                           byte sizes accept K, M, G, T suffixes (binary units)\n"
         "  --json                    machine-readable output\n"
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions and construction details\n"

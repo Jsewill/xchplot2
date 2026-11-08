@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -305,29 +306,86 @@ def compatible_builds(original, replacement, root, maximum_ram):
     records = [farming_copy(path) for path in manifests]
     producers = [json.loads(record.splitlines()[1]) for record in records]
     assert producers[0] != producers[1], "compatibility fixture requires different source build identities"
-    assert all(record.startswith(b"ordinary-group-farming-v6\n") for record in records)
-    before = snapshot([original_job, replacement_job])
+    schemas = tuple(f"ordinary-group-farming-v{version}\n".encode() for version in (6, 7, 8))
+    assert all(record.startswith(schemas) for record in records)
+
+    def stable_snapshot():
+        result = snapshot([original_job, replacement_job])
+        for path in list(result):
+            if Path(path).name == "grow-farm.progress":
+                del result[path]
+            elif Path(path) in {manifest.parent for manifest in manifests} and Path(path).is_dir():
+                # Atomic progress observations can update only this directory's
+                # size/mtime; keep its native object, mode and every other file.
+                stamp = result[path]
+                result[path] = (stamp[0], None, None, *stamp[3:])
+        return result
+
+    def progress_snapshot():
+        result = {}
+        for manifest in manifests:
+            path = manifest.with_name("grow-farm.progress")
+            if not path.is_file():
+                continue
+            lines = farming_copy(path)[:-65].splitlines()
+            assert lines[0] == b"ordinary-group-farming-progress-v1", path
+            fields = lines[3].split()
+            assert len(fields) == 6 and all(value.isdigit() for value in fields), path
+            summary = shlex.split(lines[-1].decode())
+            assert len(summary) == 7 and summary[0].isdigit() and summary[1], path
+            completed, members, pending, charged, reserved = map(int, summary[2:])
+            assert min(completed, members, pending, charged, reserved) >= 0
+            assert charged + reserved <= int(fields[3]), path
+            immutable = (tuple(lines[:3]), tuple(fields[:2] + fields[3:]), tuple(lines[4:-1]))
+            result[path] = (immutable, int(fields[2]))
+        return result
+
+    before = stable_snapshot()
+    observations = progress_snapshot()
     resumed = run([replacement, original_job, "--resume", *limits, *policy])
     assert metrics(resumed)["generated_members"] == 0
-    assert snapshot([original_job, replacement_job]) == before, "compatible build changed completed job bytes or metadata"
+    assert stable_snapshot() == before, "compatible build changed stable completed-job files or native metadata owners"
+    current_observations = progress_snapshot()
+    for path, (immutable, sequence) in observations.items():
+        assert path in current_observations and current_observations[path][0] == immutable
+        assert current_observations[path][1] >= sequence, "compatible build rewound local progress observation"
     assert farming_copy(manifests[0]) == records[0], "compatible build rewrote provenance or canonical digest"
 
-    # This same-file checkpoint has no farming manifest. Its exact construction
-    # identity must independently refuse the replacement build before writes.
+    # Construction has its own compatibility contract, independent of the
+    # farming manifest. Older producers retain their exact-build guard; new
+    # formats must actually recover across the distinct compatible producers.
     pending = root / "pending.gplot"
     pending_options = [pending, *limits, "--group-id", "ab" * 32, "--memo", "00" * 112,
                        "--max-members", 1]
     run([original, *pending_options], 86, "initialized")
-    before = snapshot([root])
-    refused = run([replacement, *pending_options, "--resume"], 1)
-    assert "same codec/build identity" in refused.stderr, refused.stderr
-    assert snapshot([root]) == before, "incompatible checkpoint inspection modified pending data"
-    run([original, *pending_options, "--resume"])
+    saved = pending.read_bytes()
+    marker = b"XCHPLOT2GROWv1".ljust(16, b"\0")
+    offset = saved.find(marker)
+    formats = set()
+    while offset >= 0:
+        record = saved[offset:offset + 1024]
+        if len(record) == 1024 and hashlib.sha256(record[:-32]).digest() == record[-32:]:
+            formats.add(struct.unpack_from("<I", record, 24)[0])
+        offset = saved.find(marker, offset + len(marker))
+    assert len(formats) == 1 and formats <= {1, 2}, "interruption has no supported construction checkpoint"
+    checkpoint_format = formats.pop()
+    if checkpoint_format == 1:
+        before = snapshot([root])
+        refused = run([replacement, *pending_options, "--resume"], 1)
+        assert "original exact build" in refused.stderr, refused.stderr
+        assert snapshot([root]) == before, "legacy checkpoint refusal modified pending data"
+        run([original, *pending_options, "--resume"])
+    else:
+        expected = root / "construction-reference.gplot"
+        run([original, expected, *pending_options[1:]])
+        run([replacement, *pending_options, "--resume"])
+        assert digest(pending) == digest(expected), "compatible construction recovery changed canonical output bytes"
     completed = digest(pending)
     ordinary = run([replacement, *pending_options, "--resume"])
     assert metrics(ordinary)["generated_members"] == 0 and digest(pending) == completed
-    print("PASS compatible completed-job recovery, canonical provenance and strict transient checkpoint identity", flush=True)
+    print("PASS compatible completed-job recovery, canonical provenance and construction compatibility policy", flush=True)
     return {"original_producer": producers[0], "replacement_producer": producers[1],
+            "construction_checkpoint_format": checkpoint_format,
             "original_binary": digest(original), "replacement_binary": digest(replacement)}
 
 
