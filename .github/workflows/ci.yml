@@ -97,6 +97,27 @@ jobs:
       - name: Check compute network harness
         run: python3 scripts/test/compute-network-test.py
 
+  group-tests:
+    name: C++ construction and compute tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install TLS development headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure CPU reference tests
+        run: >-
+          cmake -S contrib/pos2-pr118 -B build-group-tests
+          -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DXCHPLOT2_BUILD_GROUP_POOL=ON
+      - name: Build CPU reference tests
+        run: cmake --build build-group-tests --parallel 2
+      - name: Run construction and compute tests
+        run: >-
+          ctest --test-dir build-group-tests --output-on-failure
+          --no-tests=error --timeout 900
+
   hadolint:
     name: hadolint Containerfile
     runs-on: ubuntu-latest

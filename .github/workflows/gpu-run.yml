@@ -3,6 +3,9 @@ name: GPU test runner
 on:
   workflow_call:
     inputs:
+      job-index:
+        required: true
+        type: number
       backend:
         required: true
         type: string
@@ -54,6 +57,14 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
+      - name: Record tested revision
+        shell: bash
+        env:
+          TEST_REF: ${{ inputs.ref }}
+          TEST_RUNNER: ${{ inputs.runner }}
+        run: |
+          printf 'ref=%s\nrunner=%s\ncommit=%s\n' \
+            "$TEST_REF" "$TEST_RUNNER" "$(git rev-parse HEAD)" > "$LOG_DIR/revision.txt"
       - name: Configure and build the installed GPU toolchain
         shell: bash
         run: |
@@ -85,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: gpu-${{ inputs.ref }}-${{ inputs.backend }}-${{ inputs.suite }}-${{ inputs.physical-vram-mib }}-${{ github.run_attempt }}
+          name: gpu-${{ inputs.suite }}-${{ inputs.job-index }}-${{ inputs.backend }}-${{ inputs.physical-vram-mib }}-${{ github.run_attempt }}
           path: ${{ env.LOG_DIR }}
           retention-days: 14
           if-no-files-found: error

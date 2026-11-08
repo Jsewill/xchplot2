@@ -28,6 +28,7 @@ jobs:
       matrix: ${{ fromJSON(vars.GPU_CORRECTNESS_MATRIX || '{"include":[{"backend":"cuda","ref":"main","runner":"gpu-cuda"},{"backend":"hip","ref":"main","runner":"gpu-hip"},{"backend":"level_zero","ref":"main","runner":"gpu-level-zero"},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda"}]}') }}
     uses: ./.github/workflows/gpu-run.yml
     with:
+      job-index: ${{ strategy.job-index }}
       backend: ${{ matrix.backend }}
       runner: ${{ matrix.runner }}
       ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}
@@ -46,6 +47,7 @@ jobs:
       matrix: ${{ fromJSON(vars.GPU_PHYSICAL_MATRIX || '{"include":[{"backend":"cuda","ref":"main","runner":"gpu-cuda-2gb","vram_mib":2048},{"backend":"cuda","ref":"main","runner":"gpu-cuda-4gb","vram_mib":4096},{"backend":"cuda","ref":"main","runner":"gpu-cuda-6gb","vram_mib":6144},{"backend":"cuda","ref":"main","runner":"gpu-cuda-8gb","vram_mib":8192},{"backend":"hip","ref":"main","runner":"gpu-hip-4gb","vram_mib":4096},{"backend":"level_zero","ref":"main","runner":"gpu-level-zero-8gb","vram_mib":8192},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-2gb","vram_mib":2048},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-4gb","vram_mib":4096},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-6gb","vram_mib":6144},{"backend":"cuda","ref":"cuda-only","runner":"gpu-cuda-8gb","vram_mib":8192}]}') }}
     uses: ./.github/workflows/gpu-run.yml
     with:
+      job-index: ${{ strategy.job-index }}
       backend: ${{ matrix.backend }}
       runner: ${{ matrix.runner }}
       ref: ${{ matrix.ref == 'main' && github.sha || matrix.ref }}

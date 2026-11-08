@@ -195,3 +195,5 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     target_compile_options(pos2_pr118_group PRIVATE -march=armv8-a+crypto)
 endif()
+
+include("${XCHPLOT2_SOURCE_DIR}/cmake/RegisterTests.cmake")

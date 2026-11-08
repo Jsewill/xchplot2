@@ -143,11 +143,18 @@ cmake -S . -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
 $hostTests = 'bench_stats_test', 'numa_topology_test', 'temp_file_test', 'spill_engine_test', `
     'spill_coverage_test', 'host_guard_test', 'host_spill_policy_test', 'vram_budget_test', `
     'cli_host_test', 'solver_filter_parity', 'pipeline_control_test', 'vram_probe_test', 'group_file_test', `
-    'compute_identity_test', 'compute_membership_test', 'compute_discovery_test', 'pos2_pr118_grow_pool_test'
+    'bounded_proof_sampling_test', 'group_harvester_profile_test', 'group_calibration_process_test', `
+    'group_farm_resources_test', 'group_farm_metadata_test', 'group_compute_resources_test', `
+    'compute_identity_test', 'compute_membership_test', 'compute_discovery_test', 'pos2_pr118_grow_pool_test', `
+    'pos2_pr118_grow_scratch_test', 'pos2_pr118_grow_inventory_test', 'pos2_pr118_grow_retirement_test', `
+    'pos2_pr118_grow_replot_resources_test', 'pos2_pr118_grow_farming_test', 'pos2_pr118_grow_gpu_output_test', `
+    'pos2_pr118_grow_worker_test', 'pos2_pr118_grow_worker_client_test', `
+    'pos2_pr118_grow_pool_codec_test', 'pos2_pr118_grow_pool_owner_test'
 cmake --build $BuildDir --parallel 2 --target $hostTests
-ctest --test-dir $BuildDir --output-on-failure --no-tests=error `
+ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
     -R ('^(' + ($hostTests -join '|') + ')$')
-ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^compute_membership_network_test$'
+ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
+    -R '^compute_(membership|worker)_network_test$'
 cmake --build $BuildDir --parallel 2
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test)$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

@@ -133,6 +133,23 @@ cmake -S . -B "$build_dir" -G Ninja \
     -DXCHPLOT2_PACKAGE=ON -DXCHPLOT2_PACKAGE_GPU=all \
     -DXCHPLOT2_LICENSE_DIR="$licenses" -DXCHPLOT2_RUNTIME_DIR="$runtime"
 cmake --build "$build_dir" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
-ACPP_VISIBILITY_MASK=omp ctest --test-dir "$build_dir" --output-on-failure --no-tests=error \
-    -R '^(bench_stats_test|numa_topology_test|temp_file_test|spill_engine_test|spill_coverage_test|host_guard_test|host_spill_policy_test|vram_budget_test|cli_host_test|pipeline_control_test|plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
+host_tests=(
+    bench_stats_test numa_topology_test temp_file_test spill_engine_test
+    spill_coverage_test host_guard_test host_spill_policy_test vram_budget_test
+    cli_host_test pipeline_control_test vram_probe_test bounded_proof_sampling_test
+    group_file_test group_harvester_profile_test group_calibration_process_test
+    group_farm_resources_test group_farm_metadata_test group_compute_resources_test
+    compute_identity_test compute_membership_test compute_discovery_test
+    compute_membership_network_test compute_worker_network_test
+    pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test pos2_pr118_grow_merge_test
+    pos2_pr118_grow_external_test pos2_pr118_grow_checkpoint_compatibility_test
+    pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test
+    pos2_pr118_grow_replot_resources_test pos2_pr118_grow_farming_test pos2_pr118_grow_gpu_output_test
+    pos2_pr118_grow_pool_test pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test
+    pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test
+    plot_file_parity sycl_twophase_budget_test solver_filter_parity
+)
+host_test_pattern=$(IFS='|'; printf '%s' "${host_tests[*]}")
+ACPP_VISIBILITY_MASK=omp ctest --test-dir "$build_dir" --output-on-failure --no-tests=error --timeout 900 \
+    -R "^($host_test_pattern)$"
 cpack --config "$build_dir/CPackConfig.cmake" -B "$build_dir/dist"

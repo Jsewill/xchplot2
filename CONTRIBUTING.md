@@ -27,6 +27,20 @@ and accepts `thread` or `address` for sanitizer runs.
 `xchplot2 parity-check --dir build/tools/parity` runs the available
 `*_parity` and `*_test` executables and reports each failure's output.
 
+Construction and compute fixtures use the same CMake test definitions in the
+independent CPU reference build. They need a C++20 compiler, CMake, Git, Cargo,
+and OpenSSL 3 development headers; no GPU toolchain is required:
+
+```bash
+cmake -S contrib/pos2-pr118 -B build-group-tests -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON -DXCHPLOT2_BUILD_GROUP_POOL=ON
+cmake --build build-group-tests --parallel 2
+ctest --test-dir build-group-tests --output-on-failure --no-tests=error --timeout 900
+```
+
+This Linux suite covers construction, crash recovery, cross-build checkpoints,
+compute admission, and authenticated loopback worker/membership operations.
+
 The parity binaries under `tools/parity/` are the correctness gate:
 
 - AES, Xs, T1, T2, and T3 tests check agreement with pos2-chip's CPU reference.
@@ -120,7 +134,7 @@ Keep each workflow focused on its own checks:
 
 | Workflow | Purpose |
 | --- | --- |
-| `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, Python harness checks, and container-installer fixtures |
+| `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
 | `arch-matrix` | Compile CUDA objects for the documented GPU architectures |
 | `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
 | `Binary release` | Package and test Linux and Windows archives on both host architectures |
@@ -369,6 +383,8 @@ python3 scripts/test/gpu-ci.py build --backend level_zero --suite physical --phy
 Actions retain build logs, device inventory, CTest JUnit results, per-tier
 boundary/rejection logs, proof logs, and a JSON summary for 14 days. Generated
 plots are temporary; byte comparisons and reference hashes are recorded.
+Artifact names use the matrix job index so separate runners do not collide;
+`revision.txt` records the requested ref, runner label and checked-out commit.
 The summary records failed stages, exception messages, and subprocess command
 and exit code when available, including archive and inventory failures.
 NVIDIA runs additionally retain best-effort driver XML snapshots at suite
@@ -484,6 +500,8 @@ makes library paths relative.
 
 PR and manual runs retain workflow artifacts. Manual runs can select one
 platform and host architecture; PR and tag runs build the full matrix.
+Only tag pushes attach archives to a draft release; manual checks against a
+tag retain their archives as workflow artifacts.
 Keep the version in `Cargo.toml`, `Cargo.lock`, and `CMakeLists.txt` identical
 on `main` and `cuda-only`. Tag `main` as `vVERSION` and native CUDA as
 `vVERSION-cuda-only`, and push both tags together. The CUDA tag identifies
