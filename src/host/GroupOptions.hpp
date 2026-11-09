@@ -28,11 +28,14 @@ struct GroupOptions
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
     std::filesystem::path replot_inventory;
+    bool replot = false, discover_farm = false, discover_farm_set = false;
+    std::vector<std::filesystem::path> farm_configs, excluded_destinations, inventory_roots;
     std::string farm_adapter = "chia";
     uint64_t farm_adapter_timeout_ms = 30000;
     bool farm_adapter_set = false, farm_adapter_timeout_set = false;
     bool chia_root_set = false, chia_executable_set = false, farming_profile_set = false;
     uint64_t reclaim_before_bytes = 0;
+    bool reclaim_before_set = false;
     std::vector<std::filesystem::path> replot_source_roots, replot_exclude_roots;
     uint64_t replot_max_source_files = 0, replot_max_source_bytes = 0;
     bool replot_status = false, replot_revalidate = false;
@@ -44,6 +47,7 @@ struct GroupOptions
     bool policy_only = false, upgrade_job = false;
     std::vector<std::filesystem::path> action_destinations;
     std::optional<std::string> replot_verification;
+    std::optional<std::string> replot_confirmation;
     std::optional<uint64_t> replot_proof_first_groups, replot_proof_every_groups;
     std::vector<std::filesystem::path> assessment_plans;
     std::vector<std::filesystem::path> calibration_plots;
@@ -88,6 +92,7 @@ struct GroupOptions
     std::filesystem::path farming_profile_path, chia_root, chia_executable;
     bool farming_detect_local = false;
     std::shared_ptr<group_grow::FarmingProfile const> farming_profile;
+    std::shared_ptr<std::string const> replot_local_profile;
     std::string pool_broker, pool_owner, pool_ca, pool_cert, pool_key, pool_listen, pool_advertise;
     std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
     bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;

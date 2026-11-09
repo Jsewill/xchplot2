@@ -215,6 +215,7 @@ struct ReplotReview
     std::vector<std::string> scratch_directories;
     // Absence retains the exact legacy review bytes and mandatory full proofs.
     std::optional<ReplotVerification> verification;
+    bool directory_confirmation = false;
 };
 inline uint64_t replot_native_root_memory(ReplotReview const& review)
 {
@@ -229,6 +230,7 @@ inline uint64_t replot_native_root_memory(ReplotReview const& review)
 inline void validate_replot_review(ReplotReview const& review)
 {
     if (review.verification) validate_replot_verification(*review.verification);
+    require(!review.directory_confirmation || review.verification.has_value(), "directory confirmation requires an explicit verification policy");
     auto const& state = review.farm;
     require(state.version == 6 && state.fixed_extent && !state.capacity_fill && state.estimate.feasible &&
         !state.directories.empty() && !review.inventory_json.empty() && !review.resources_json.empty(), "invalid replot review");
@@ -294,7 +296,7 @@ inline std::string replot_review_text(ReplotReview const& review)
 {
     validate_replot_review(review);
     std::ostringstream out;
-    out << (review.verification ? "ordinary-group-replot-review-v3\n" : review.owned_roots.empty() ? "ordinary-group-replot-review-v1\n" : "ordinary-group-replot-review-v2\n") << std::quoted(review.inventory_json) << '\n'
+    out << (review.directory_confirmation ? "ordinary-group-replot-review-v4\n" : review.verification ? "ordinary-group-replot-review-v3\n" : review.owned_roots.empty() ? "ordinary-group-replot-review-v1\n" : "ordinary-group-replot-review-v2\n") << std::quoted(review.inventory_json) << '\n'
         << std::quoted(review.resources_json) << '\n' << std::quoted(farming_state_text(review.farm, true)) << '\n'
         << review.reclaim_before_bytes << ' ' << review.memory_limit_bytes << ' ' << review.sources.size();
     for (auto index : review.sources) out << ' ' << index;
@@ -325,8 +327,9 @@ inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory
     require(body.size() < memory_limit / 16, "replot review exceeds its parsing memory budget");
     std::istringstream in(body); std::string version, farm; std::getline(in, version);
     require(version == "ordinary-group-replot-review-v1" || version == "ordinary-group-replot-review-v2" ||
-        version == "ordinary-group-replot-review-v3", "expected a saved replot review");
+        version == "ordinary-group-replot-review-v3" || version == "ordinary-group-replot-review-v4", "expected a saved replot review");
     ReplotReview result; size_t count = 0;
+    result.directory_confirmation = version == "ordinary-group-replot-review-v4";
     in >> std::quoted(result.inventory_json) >> std::quoted(result.resources_json) >> std::quoted(farm)
         >> result.reclaim_before_bytes >> result.memory_limit_bytes >> count;
     require(in && count && count <= farming_detail::maximum_files && count < memory_limit / 128, "invalid replot candidate count");
@@ -346,7 +349,7 @@ inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory
     {
         in >> count; require(in && count <= 1024 && count < memory_limit / 8192, "migration reviewed scratch scope exceeds its memory bound");
         result.scratch_directories.resize(count); for (auto& path : result.scratch_directories) in >> std::quoted(path);
-        in >> count; require(in && (count || version == "ordinary-group-replot-review-v3") && count <= 1024 && count < memory_limit / 32768, "migration native root scope exceeds its memory bound");
+        in >> count; require(in && (count || version == "ordinary-group-replot-review-v3" || result.directory_confirmation) && count <= 1024 && count < memory_limit / 32768, "migration native root scope exceeds its memory bound");
         result.owned_roots.resize(count);
         for (auto& root : result.owned_roots)
         {
@@ -359,7 +362,7 @@ inline ReplotReview parse_replot_review(std::string const& body, uint64_t memory
         }
         require(replot_native_root_memory(result) < memory_limit / 4, "migration native roots exceed their expanded parsing memory bound");
     }
-    if (version == "ordinary-group-replot-review-v3") result.verification = read_replot_verification(in);
+    if (version == "ordinary-group-replot-review-v3" || result.directory_confirmation) result.verification = read_replot_verification(in);
     require(bool(in), "incomplete replot review"); in >> std::ws; require(in.eof(), "unexpected replot review data");
     validate_replot_review(result); return result;
 }
@@ -429,7 +432,7 @@ inline std::string replot_revalidation_text(ReplotRevalidation const& value)
         value.journal_digest.size() == 64 && value.journal_digest.find_first_not_of("0123456789abcdef") == value.journal_digest.npos,
         "invalid reviewed replot revalidation");
     require(value.origin_review.starts_with("ordinary-group-replot-review-v1\n") || value.origin_review.starts_with("ordinary-group-replot-review-v2\n") ||
-        value.origin_review.starts_with("ordinary-group-replot-review-v3\n"),
+        value.origin_review.starts_with("ordinary-group-replot-review-v3\n") || value.origin_review.starts_with("ordinary-group-replot-review-v4\n"),
         "revalidation must embed one original review, never a nested successor");
     require(value.readers.size() <= 1024, "revalidation reader observations exceed their root bound");
     std::set<uint64_t> roots;
@@ -880,6 +883,43 @@ inline ReplotLocalBindings parse_replot_local_bindings(std::string const& body)
         >> std::quoted(result.adapter) >> std::quoted(result.root) >> std::quoted(result.executable) >> std::quoted(result.profile) >> std::quoted(result.policy_digest);
     require(bool(in), "incomplete private replot bindings"); in >> std::ws; require(in.eof(), "unexpected private replot binding data");
     (void)replot_local_bindings_text(result); return result;
+}
+// Direct fill keeps its immutable review and local connection defaults in one
+// owner-only record. A crash before the first journal cannot lose half of the
+// preparation. Portable reviews continue to exclude these local bindings.
+struct ReplotJob
+{
+    std::string review, profile;
+    ReplotLocalBindings bindings;
+    std::string seed, seed_owner, farmer, pool;
+    bool pool_public_key = false;
+};
+inline std::string replot_job_text(ReplotJob const& job)
+{
+    require(stream_state::digest(job.review) == job.bindings.review_digest && !job.profile.empty(),
+        "private migration job does not match its review");
+    require(replot_digest(job.seed) && farm::inventory_detail::hex(job.farmer, 48) &&
+        farm::inventory_detail::hex(job.pool, job.pool_public_key ? 48 : 32), "invalid private migration key identity");
+    std::ostringstream out; out << "ordinary-group-replot-job-v1\n" << std::quoted(job.review) << '\n'
+        << std::quoted(job.profile) << '\n' << std::quoted(replot_local_bindings_text(job.bindings)) << '\n'
+        << std::quoted(job.seed) << ' ' << std::quoted(job.seed_owner) << ' ' << std::quoted(job.farmer) << ' '
+        << std::quoted(job.pool) << ' ' << job.pool_public_key << '\n';
+    return out.str();
+}
+inline ReplotJob parse_replot_job(std::string const& body, uint64_t memory_limit)
+{
+    check_farming_state_size(body.size(), memory_limit);
+    std::istringstream in(body); std::string version, bindings; std::getline(in, version);
+    require(version == "ordinary-group-replot-job-v1", "unsupported private migration job version");
+    ReplotJob job; in >> std::quoted(job.review) >> std::quoted(job.profile) >> std::quoted(bindings)
+        >> std::quoted(job.seed) >> std::quoted(job.seed_owner) >> std::quoted(job.farmer) >> std::quoted(job.pool) >> job.pool_public_key;
+    require(bool(in), "incomplete private migration job"); in >> std::ws; require(in.eof(), "unexpected private migration job data");
+    job.bindings = parse_replot_local_bindings(bindings);
+    require(stream_state::digest(job.review) == job.bindings.review_digest && !job.profile.empty(),
+        "private migration job does not match its review");
+    require(replot_digest(job.seed) && farm::inventory_detail::hex(job.farmer, 48) &&
+        farm::inventory_detail::hex(job.pool, job.pool_public_key ? 48 : 32), "invalid private migration key identity");
+    return job;
 }
 struct ReplotJournalReplica
 {

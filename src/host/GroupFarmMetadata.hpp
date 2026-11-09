@@ -21,7 +21,7 @@ inline bool present(fs::path const& path)
 inline bool records(fs::path const& directory)
 {
     bool found = false;
-    for (auto const* name : {"grow-farm.plan", "grow-farm.plan.next", "grow-replot.plan", "grow-replot.plan.next"})
+    for (auto const* name : {"grow-farm.plan", "grow-farm.plan.next", "grow-replot.plan", "grow-replot.plan.next", "grow-replot.review"})
         found = present(directory / name) || found;
     return found;
 }

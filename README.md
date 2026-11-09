@@ -18,9 +18,11 @@ Only k28 plots are intended for farming; smaller supported sizes are for testing
 
 Linux and experimental native Windows builds include
 [grouped plotting, drive filling and growth](REFERENCE.md#grouped-plotting-and-drive-filling).
-Use `plot --group-members N` for several members per file, or
-`plan DIR... --save-plan farm.plan` followed by `fill farm.plan` to review and
-execute a farming layout. Use the intended harvester's profile when plotting
+Use `plot --group-members N` for several members per file, or `fill DIR...` to
+plan and fill drives. `plan DIR...` previews the operation and can optionally
+save a layout for later execution. Add `fill --replot` to
+[replace eligible old plots](REFERENCE.md#replacing-an-existing-farm), using
+configured farm directories and optional exclusions. Use the intended harvester's profile when plotting
 on another machine. Repeat `fill DIR` to continue through any member, or add
 options to change future work while keeping existing plots and reservations.
 `pause`, `drain`, `resume` and `retire` control a job or selected destinations;

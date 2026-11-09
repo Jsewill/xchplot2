@@ -7,6 +7,10 @@
 
 namespace group_grow::farm
 {
+struct FarmServiceUnavailable : std::runtime_error
+{ using std::runtime_error::runtime_error; };
+inline void require_service_available(bool condition, std::string const& reason)
+{ if (!condition) throw FarmServiceUnavailable(reason); }
 enum class HarvesterAdapterKind { chia, gigahorse, drchia };
 struct FarmServiceBinding
 {
@@ -199,13 +203,13 @@ struct ReplacementExpectation
 };
 struct ReplacementReadiness
 {
-    bool ready = false;
+    bool ready = false, retryable = false;
     std::string status = "unavailable", reason, version, network, host, captured_at, method;
     InventoryFileIdentity identity;
 };
 struct TargetNetworkReadiness
 {
-    bool ready = false;
+    bool ready = false, retryable = false;
     NetworkProjection observed;
     std::string reason;
 };
@@ -227,7 +231,7 @@ struct OtherHarvesterObservation
 };
 struct TargetPrerequisites
 {
-    bool ready = false;
+    bool ready = false, retryable = false;
     NetworkProjection observed;
     std::string reason, pool_mode;
     TargetPoolState pool;
@@ -539,7 +543,7 @@ public:
             charge(2 * line.capacity() + sizeof(Line) + 64); lines_.push_back({line.find_first_not_of(' '), std::string(text)});
         }
     }
-    RetirementConfig read()
+    RetirementConfig read(bool strict_paths = true)
     {
         require(!lines_.empty() && !lines_[0].indent, "unsupported YAML root"); auto root = block(0, 0);
         require(at_ == lines_.size() && root->kind == 'm', "unsupported YAML block structure");
@@ -549,7 +553,7 @@ public:
         for (auto const& dir : dirs->second->items)
         {
             require(dir->kind == 's' && dir->scalar.starts_with('s'), "plot directory is not text"); auto path = dir->scalar.substr(1);
-            require(file_io::native_path(path).is_absolute() && file_io::path_text(file_io::native_path(path).lexically_normal()) == path &&
+            if (strict_paths) require(file_io::native_path(path).is_absolute() && file_io::path_text(file_io::native_path(path).lexically_normal()) == path &&
                 std::find(result.directories.begin(), result.directories.end(), path) == result.directories.end(), "plot directories are not unique normalized absolute paths");
             result.directories.push_back(std::move(path));
         }
@@ -637,7 +641,10 @@ public:
         unchanged();
     }
     void running() const
-    { inventory_detail::check(options_.limits, until_); }
+    {
+        require(!options_.limits.cancelled || !options_.limits.cancelled(), "farm inventory cancelled");
+        require_service_available(std::chrono::steady_clock::now() < until_, "native farm adapter deadline expired");
+    }
     void unchanged() const
     {
         running();
@@ -672,8 +679,11 @@ public:
         // Reserve parent capture/JSON structure separately from the child OS cap.
         calibration_process::Limits limits{options_.limits.memory_bytes / 2, std::min(uint64_t(remaining), options_.limits.timeout_ms),
             std::min(options_.limits.max_output_bytes, options_.limits.memory_bytes / 64), options_.limits.cancelled};
-        auto result = run_farm_adapter(command, limits);
-        require(result.exit_code == 0, "native " + std::string(service) + " RPC failed (native output withheld)"); unchanged();
+        AdapterResult result;
+        try { result = run_farm_adapter(command, limits); }
+        catch (calibration_process::DeadlineExpired const&)
+        { throw FarmServiceUnavailable("native " + std::string(service) + " RPC deadline expired"); }
+        require_service_available(result.exit_code == 0, "native " + std::string(service) + " RPC failed (native output withheld)"); unchanged();
         if (command.operation == AdapterOperation::reader_cli_version)
         {
             auto text = std::string_view(result.output);
@@ -686,7 +696,7 @@ public:
         }
         auto parsed = profile_detail::JsonReader(result.output, options_.limits.memory_bytes / 8, options_.limits.memory_bytes / 4096).read();
         auto const* success = profile_detail::field(parsed, "success");
-        require(success && profile_detail::boolean(*success), "native " + std::string(service) + " RPC did not report success"); return parsed;
+        require_service_available(success && profile_detail::boolean(*success), "native " + std::string(service) + " RPC did not report success"); return parsed;
     }
     std::string source() const
     {
@@ -763,7 +773,7 @@ inline uint64_t active_network(Session& session, HarvesterAdapterOptions const& 
     require(inventory_detail::string(harvester_network, "network_name") == expected.network, "harvester and full node report different networks");
     auto response = session.rpc(AdapterOperation::full_node_state); auto const& state = inventory_detail::required_field(response, "blockchain_state");
     auto const& sync = inventory_detail::required_field(state, "sync");
-    require(inventory_detail::boolean(sync, "synced") && !inventory_detail::boolean(sync, "sync_mode"), "replacement requires a synced full node outside sync mode");
+    require_service_available(inventory_detail::boolean(sync, "synced") && !inventory_detail::boolean(sync, "sync_mode"), "replacement requires a synced full node outside sync mode");
     auto const& peak = inventory_detail::required_field(state, "peak");
     auto const last_transaction = inventory_detail::integer(peak, "prev_transaction_block_height");
     require(peak.kind == Json::object && last_transaction > projection.hard_fork2_height && last_transaction <= UINT32_MAX,
@@ -780,7 +790,7 @@ inline uint64_t active_network(Session& session, HarvesterAdapterOptions const& 
         timestamp = inventory_detail::integer(record, "timestamp");
     }
     auto const now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    require(options.max_peak_age_seconds && now >= 0 && timestamp <= uint64_t(now) && uint64_t(now) - timestamp <= options.max_peak_age_seconds,
+    require_service_available(options.max_peak_age_seconds && now >= 0 && timestamp <= uint64_t(now) && uint64_t(now) - timestamp <= options.max_peak_age_seconds,
         "replacement full-node peak has no sufficiently recent transaction timestamp");
     return timestamp;
 }
@@ -854,7 +864,7 @@ inline std::pair<ServiceConnection, ServiceConnection> service_pair(std::vector<
         {
             require(!result, "target service connection pairing is ambiguous"); result = std::pair{a, b};
         }
-    require(result.has_value(), "target services lack a matched active peer connection; remote links require explicit reciprocal TLS node identities"); return *result;
+    require_service_available(result.has_value(), "target services lack a matched active peer connection; remote links require explicit reciprocal TLS node identities"); return *result;
 }
 inline void service_network(Session& session, AdapterOperation operation, NetworkProjection const& reviewed)
 {
@@ -934,8 +944,8 @@ class TargetServices
                 inventory_detail::integer(connection, "port") == farmer_links_[0].peer,
                 "target farmer receiver differs from its matched live harvester connection"); found = &row;
         }
-        require(found, "target farmer has no synchronized receiver for the connected selected harvester");
-        require(inventory_detail::required_field(*found, "syncing").kind == Json::null, "target farmer harvester synchronization is still in progress");
+        require_service_available(found, "target farmer has no synchronized receiver for the connected selected harvester");
+        require_service_available(inventory_detail::required_field(*found, "syncing").kind == Json::null, "target farmer harvester synchronization is still in progress");
         (void)service_time(*found, "last_sync_time", true); return *found;
     }
 public:
@@ -976,7 +986,7 @@ public:
         farmer_links_[2] = pair(farmer, solver, 3, 8, "solver").first;
         {
             auto state = session.rpc(AdapterOperation::solver_state);
-            require(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver has not completed startup");
+            require_service_available(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver has not completed startup");
         }
         pool_route();
         harvesters_ = session.rpc(AdapterOperation::farmer_harvesters); receiver_ = &receiver(harvesters_);
@@ -987,7 +997,7 @@ public:
             auto const& plots = inventory_detail::required_field(row, "plots");
             require(plots.kind == Json::array && plots.items.size() <= options.limits.max_files, "target farmer plot view exceeds its bound");
             if (&row == receiver_) continue;
-            require(inventory_detail::required_field(row, "syncing").kind == Json::null,
+            require_service_available(inventory_detail::required_field(row, "syncing").kind == Json::null,
                 "another harvester synchronization is incomplete; even an empty partial view has unknown workload");
             (void)service_time(row, "last_sync_time", true);
             if (plots.items.empty()) continue;
@@ -1017,16 +1027,16 @@ public:
     {
         auto farmer = service_connections(session_, AdapterOperation::farmer_connections);
         for (auto const& link : farmer_links_)
-            require(std::find(farmer.begin(), farmer.end(), link) != farmer.end(), "target service connection changed during the readiness snapshot");
+            require_service_available(std::find(farmer.begin(), farmer.end(), link) != farmer.end(), "target service connection changed during the readiness snapshot");
         {
             auto summary = session_.rpc(AdapterOperation::farmer_harvesters_summary);
             auto const& selected = receiver(summary);
-            require(service_time(selected, "last_sync_time", true) == generation_, "target farmer synchronization generation changed during the readiness snapshot");
+            require_service_available(service_time(selected, "last_sync_time", true) == generation_, "target farmer synchronization generation changed during the readiness snapshot");
             size_t observed = 0;
             for (auto const& row : inventory_detail::required_field(summary, "harvesters").items)
             {
                 if (&row == &selected) continue;
-                require(inventory_detail::required_field(row, "syncing").kind == Json::null,
+                require_service_available(inventory_detail::required_field(row, "syncing").kind == Json::null,
                     "another harvester began synchronization during readiness observation; its workload is unknown");
                 (void)service_time(row, "last_sync_time", true);
                 auto const files = inventory_detail::integer(row, "plots"); if (!files) continue;
@@ -1043,7 +1053,7 @@ public:
         }
         {
             auto state = session_.rpc(AdapterOperation::solver_state);
-            require(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver stopped during readiness observation");
+            require_service_available(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver stopped during readiness observation");
         }
         pool_route();
         require(version(session_.rpc(AdapterOperation::farmer_version)) == farmer_version_ &&
@@ -1394,6 +1404,8 @@ inline TargetNetworkReadiness observe_target_network(HarvesterAdapterOptions con
         session.unchanged(); result.ready = true;
         result.reason = "same reviewed target reader/network is synced, active and compatible; this attests no replacement file";
     }
+    catch (FarmServiceUnavailable const& error)
+    { if (options.limits.cancelled && options.limits.cancelled()) throw; result.ready = false; result.retryable = true; result.reason = error.what(); }
     catch (std::exception const& error)
     { if (options.limits.cancelled && options.limits.cancelled()) throw; result.ready = false; result.reason = error.what(); }
     return result;
@@ -1411,6 +1423,8 @@ inline TargetPrerequisites observe_target_prerequisites(HarvesterAdapterOptions 
         result.ready = true; result.pool_mode = services.pool_mode; result.pool = services.pool; result.other_harvesters = services.other_harvesters;
         result.reason = result.observed.service_status + "; exact new plot/key acknowledgement awaits publication";
     }
+    catch (FarmServiceUnavailable const& error)
+    { if (options.limits.cancelled && options.limits.cancelled()) throw; result.ready = false; result.retryable = true; result.reason = error.what(); }
     catch (std::exception const& error)
     { if (options.limits.cancelled && options.limits.cancelled()) throw; result.reason = error.what(); }
     return result;
@@ -2016,7 +2030,7 @@ class TargetReadinessSnapshot
     {
         session_.running(); inventory_detail::require(healthy_, "target readiness snapshot contains a failed replacement check");
         auto const now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        inventory_detail::require(now >= 0 && peak_timestamp_ <= uint64_t(now) && uint64_t(now) - peak_timestamp_ <= options_.max_peak_age_seconds,
+        require_service_available(now >= 0 && peak_timestamp_ <= uint64_t(now) && uint64_t(now) - peak_timestamp_ <= options_.max_peak_age_seconds,
             "target readiness snapshot's transaction peak became stale");
     }
 public:
@@ -2099,8 +2113,8 @@ public:
                 "replacement file/header/public keys differ from the reviewed exact output");
             auto const at = loaded_.find(file_io::path_text(expected.path));
             auto const farmer_at = farmer_loaded_.find(file_io::path_text(expected.path));
-            inventory_detail::require(at != loaded_.end(), "exact replacement is not loaded by the configured harvester");
-            inventory_detail::require(farmer_at != farmer_loaded_.end(), "exact replacement has not reached the connected farmer's completed plot synchronization");
+            require_service_available(at != loaded_.end(), "exact replacement is not loaded by the configured harvester");
+            require_service_available(farmer_at != farmer_loaded_.end(), "exact replacement has not reached the connected farmer's completed plot synchronization");
             for (auto const* record : {at->second.plot, farmer_at->second})
             {
                 auto const& p = *record;
@@ -2127,6 +2141,8 @@ public:
             current(); result.identity = file.identity; result.ready = true; result.status = "ready";
             result.reason = "new immutable publication matches the live harvester and connected farmer's completed sync, key route and solver prerequisites; finish the complete audit before retirement";
         }
+        catch (FarmServiceUnavailable const& error)
+        { healthy_ = false; if (options_.limits.cancelled && options_.limits.cancelled()) throw; result.ready = false; result.retryable = true; result.reason = error.what(); }
         catch (std::exception const& error)
         { healthy_ = false; if (options_.limits.cancelled && options_.limits.cancelled()) throw; result.ready = false; result.status = "unavailable"; result.reason = error.what(); }
         return result;
@@ -2149,6 +2165,8 @@ inline ReplacementReadiness observe_replacement_readiness(HarvesterAdapterOption
         TargetReadinessSnapshot snapshot(options, reviewed, expected.k, expected.strength, service);
         result = snapshot.check(expected, *publication); if (result.ready) snapshot.finish();
     }
+    catch (FarmServiceUnavailable const& error)
+    { if (options.limits.cancelled && options.limits.cancelled()) throw; result.ready = false; result.retryable = true; result.reason = error.what(); }
     catch (std::exception const& error)
     { if (options.limits.cancelled && options.limits.cancelled()) throw; result.ready = false; result.status = "unavailable"; result.reason = error.what(); }
     return result;

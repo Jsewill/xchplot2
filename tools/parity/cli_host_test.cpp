@@ -572,6 +572,21 @@ int main(int argc, char** argv)
     assert(last_group_options.max_ram == 768ull * 1024 * 1024);
     assert((last_group_options.destinations == std::vector<std::filesystem::path>{other, third}));
     assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--replot", "--no-plan-only",
+                "--temp-dirs", other.string(), third.string(), "--exclude-destination", other.string(), third.string(),
+                "--farm-config", other.string(), third.string(), "--replot-confirmation", "directory",
+                "--reclaim-before-bytes", "0"}) == 0);
+    assert(last_group_options.replot && !last_group_options.plan_only && last_group_options.target == dir);
+    assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
+    assert(last_group_options.farm_configs == last_group_options.temporary &&
+        last_group_options.excluded_destinations == last_group_options.temporary);
+    assert(last_group_options.replot_confirmation == "directory" && last_group_options.reclaim_before_set && !last_group_options.reclaim_before_bytes);
+    assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
+    assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());
+    for (auto const* option : {"--temp-dirs", "--farm-config", "--exclude-destination"})
+        assert(cli({"fill", dir.string(), "--config", config.string(), option, "--json"}) != 0);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--replot-confirmation", "directory"}) != 0);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--replot", "--replot-confirmation", "none"}) != 0);
     auto const paths_file = dir / "destinations.txt";
     put(paths_file, other.string() + "\r\n" + third.string() + "\n");
     assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) == 0);
@@ -590,6 +605,11 @@ int main(int argc, char** argv)
     assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) != 0);
     auto const previous_directory = std::filesystem::current_path();
     std::filesystem::current_path(dir);
+    assert(cli({"plan", "--config", config.string(), "--temp-dirs", "@scratch", "another scratch-bytes",
+                "--exclude-destination", "@excluded", "--", "@destination"}) == 0);
+    assert(last_group_options.target == dir / "@destination" &&
+        (last_group_options.temporary == std::vector{dir / "@scratch", dir / "another scratch-bytes"}) &&
+        last_group_options.excluded_destinations == std::vector{dir / "@excluded"});
     auto const calls_before_literal = group_calls;
     assert(cli({"plan", "--config", config.string(), "--", "--help", "@literal", "--config"}) == 0);
     assert(group_calls == calls_before_literal + 1 && last_group_options.target == dir / "--help");

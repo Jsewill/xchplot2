@@ -320,6 +320,15 @@ void replot_external_projection(fs::path const& directory, group_grow::Identity 
     require(replot_external_capacity(args, requested, 4, capacity, directory / "projection.gplot", {target}, target, 0),
         "ordinary scratch policy could not admit a projected external migration");
     auto const fresh_root = directory / "fresh-private-external-projection"; fs::create_directory(fresh_root);
+    ReplotReview destinations;
+    for (auto const& path : {directory, fresh_root})
+    { FarmingDirectory output; output.directory = file_io::path_text(path); destinations.farm.directories.push_back(output); }
+    auto shared = args; shared.destination_temp = "on";
+    require(replot_temporary(shared, destinations) == std::vector<fs::path>{directory, fresh_root},
+        "migration scratch omitted a permitted destination other than the active output");
+    shared.destination_temp = "off"; shared.temporary = {fresh_root};
+    require(replot_temporary(shared, destinations) == shared.temporary,
+        "migration scratch ignored explicit roots or enabled unpermitted destinations");
     auto fresh = group_grow::ScratchRoot::inspect(fresh_root); fresh.available_bytes = target.available_bytes;
     auto const stage = migration_stage_path(fresh_root, std::string(64, 'a'), 0, false);
     require(replot_external_capacity(args, requested, 4, capacity, stage, {fresh}, fresh, 0, true) &&
@@ -3624,6 +3633,23 @@ void replot_journal_protocol(fs::path const& root)
     require(!valid_replot_revision(journal, invalid), "replot revision forgot outstanding retirement progress");
     auto reject = [](auto operation, char const* message)
     { bool failed = false; try { operation(); } catch (std::runtime_error const&) { failed = true; } require(failed, message); };
+    auto directory_review = review;
+    directory_review.verification = ReplotVerification{}; directory_review.directory_confirmation = true;
+    auto const directory_body = replot_review_text(directory_review);
+    auto const restored = parse_replot_review(directory_body, 16 * mib);
+    require(restored.directory_confirmation && replot_review_text(restored) == directory_body &&
+        !parse_replot_review(review_body, 16 * mib).directory_confirmation,
+        "directory farming confirmation changed during review recovery or changed legacy policy");
+    ReplotJob job; job.review = directory_body; job.profile = "{}";
+    job.bindings = {stream_state::digest(directory_body), review.farm.job_id, "test-host", "test-user", "chia", {}, {}, {}, {}};
+    job.seed = std::string(64, 'a'); job.farmer = std::string(96, 'b'); job.pool = std::string(64, 'c');
+    auto const job_body = replot_job_text(job);
+    require(replot_job_text(parse_replot_job(job_body, 16 * mib)) == job_body,
+        "private migration preparation lost its immutable policy, local bindings or keys");
+    reject([&] { (void)parse_replot_job(job_body, 64); }, "private migration preparation ignored its parser budget");
+    reject([&] { (void)parse_replot_job(job_body + "extra", 16 * mib); }, "private migration preparation accepted trailing data");
+    job.review += ' ';
+    reject([&] { (void)replot_job_text(job); }, "private migration preparation accepted a different review");
     reject([&] { (void)parse_replot_journal(replot_journal_text(journal), 64); }, "replot journal ignored parser budget");
     reject([&] { (void)parse_replot_receipt(body + "extra"); }, "replot receipt accepted trailing data");
     invalid = journal; invalid.retirements.resize(replot_maximum_batch_sources + 1);
@@ -4310,6 +4336,13 @@ void replot_source_selection(fs::path const& directory)
     require(limit_replot_sources(args, inventory, {2, 1}) == std::vector<uint64_t>{2}, "source file limit changed ranked order");
     require(replot_inventory_counts(inventory).front().count == inventory.plots.size(),
         "limiting retirement sources removed protected entries from farm resource accounting");
+    auto const protected_root = directory / "protected";
+    fs::create_directories(protected_root / "nested");
+    auto const alias = directory / "protected-alias"; fs::create_directory_symlink(protected_root, alias);
+    std::array<fs::path, 1> exclusions{protected_root};
+    require(farming_path_excluded(protected_root, exclusions) && farming_path_excluded(alias / "nested/old.plot", exclusions) &&
+        !farming_path_excluded(directory / "protected-other", exclusions),
+        "destination exclusions missed a descendant/alias or matched only a string prefix");
 }
 
 void replot_predelete_selection()

@@ -200,7 +200,10 @@ inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions cons
     result.batch = request.batch_members; result.backend = request.backend; result.backend_set = true;
     result.construction = request.engine;
     result.protected_resources = true; result.protected_gpu_bytes = request.gpu_bytes;
-    result.io_overlap = false; result.generation_overlap = false; result.generation_overlap_auto = false;
+    // The engine charges both I/O windows inside ram_bytes and only overlaps
+    // final output with physically independent scratch. Keep that ordinary
+    // disk pipeline while serializing generation under the farm envelope.
+    result.generation_overlap = false; result.generation_overlap_auto = false;
     result.cancelled = [cancelled = options.cancelled, until] { return (cancelled && cancelled()) || Clock::now() >= until; };
     return result;
 }

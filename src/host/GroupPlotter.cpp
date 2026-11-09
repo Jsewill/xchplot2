@@ -7897,6 +7897,11 @@ std::ifstream replot_text_file(fs::path const& path)
 }
 group_grow::farm::FarmAdapterTable replot_adapter_table(Arguments const& args)
 {
+    if (args.replot_local_profile)
+    {
+        std::istringstream file(*args.replot_local_profile);
+        return group_grow::farm::read_farm_adapters(file, replot_inventory_limits(args));
+    }
     if (args.farming_profile_path.empty()) return {};
     auto file = replot_text_file(args.farming_profile_path);
     return group_grow::farm::read_farm_adapters(file, replot_inventory_limits(args));
@@ -8122,10 +8127,12 @@ void record_replot_resource_settings(Arguments const& args, group_grow::farm::Re
     preparation.facts.push_back({"resource_settings", "explicit typed declarations", "declared", "command-line",
         "Only named policy fields were changed. Imported bounds remain declarations; local observations do not validate their whole-service scope or worst-case costs."});
 }
-int print_farm_inventory(Arguments const& args)
+group_grow::farm::FarmInventory inspect_farm_inventory(Arguments const& args)
 {
     using namespace group_grow::farm;
-    std::vector<fs::path> roots{args.target}; roots.insert(roots.end(), args.destinations.begin(), args.destinations.end());
+    auto roots = args.inventory_roots;
+    if (roots.empty())
+    { roots.push_back(args.target); roots.insert(roots.end(), args.destinations.begin(), args.destinations.end()); }
     auto inventory = scan_farm_inventory(roots, replot_inventory_limits(args));
     auto const adapters = replot_adapter_table(args);
     std::vector<ResourcePreparationFact> reader_facts;
@@ -8176,6 +8183,13 @@ int print_farm_inventory(Arguments const& args)
             }
         }
     }
+    return inventory;
+}
+int print_farm_inventory(Arguments const& args)
+{
+    using namespace group_grow::farm;
+    auto const inventory = inspect_farm_inventory(args);
+    auto const adapters = replot_adapter_table(args);
     auto const body = farm_inventory_text(inventory, replot_inventory_limits(args));
     require(body.size() < args.max_ram / 16, "saved farm inventory exceeds --max-ram");
     if (!args.save_plan.empty()) stream_state::atomic_save(args.save_plan, body, false);
@@ -8202,11 +8216,13 @@ int print_replot_setup(Arguments const& args)
 {
     using namespace group_grow; using namespace group_grow::farm;
     auto const limits = replot_inventory_limits(args);
-    auto const inventory_stamp = stream_state::stamp(args.replot_inventory);
+    std::optional<stream_state::Stamp> inventory_stamp;
+    if (!args.replot_inventory.empty()) inventory_stamp = stream_state::stamp(args.replot_inventory);
     std::optional<stream_state::Stamp> profile_stamp;
     if (!args.farming_profile_path.empty()) profile_stamp = stream_state::stamp(args.farming_profile_path);
     FarmInventory inventory;
-    { auto file = replot_text_file(args.replot_inventory); inventory = read_farm_inventory(file, limits); }
+    if (args.replot_inventory.empty()) inventory = inspect_farm_inventory(args);
+    else { auto file = replot_text_file(args.replot_inventory); inventory = read_farm_inventory(file, limits); }
     auto const adapters = replot_adapter_table(args); std::vector<ResourcePreparationFact> facts;
     std::string reader_error;
     try
@@ -8318,12 +8334,17 @@ int print_replot_setup(Arguments const& args)
     if (!inventory.network.available) preparation.missing.push_back({"network", "inventory.network",
         "Refresh inventory with the selected installed reader to observe the actual network and replacement plot parameters."});
     if (!inventory.complete) preparation.missing.push_back({"inventory", "inventory.complete", "Repeat inventory until the complete active farm scope is observed before saving an executable migration review."});
-    require(stream_state::stamp(args.replot_inventory) == inventory_stamp, "migration setup inventory changed while gathering its selections");
+    require(!inventory_stamp || stream_state::stamp(args.replot_inventory) == *inventory_stamp, "migration setup inventory changed while gathering its selections");
     if (profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *profile_stamp, "migration setup local profile changed while gathering its selections");
     save_replot_setup_profile(args, inventory, adapters);
     std::vector<std::string> command{"xchplot2", "plan"};
     for (auto const& path : directories) command.push_back(file_io::path_text(path));
-    command.insert(command.end(), {"--replot", file_io::path_text(args.replot_inventory), "--harvester", file_io::path_text(args.save_profile),
+    if (args.replot_inventory.empty()) command.push_back("--replot");
+    else command.insert(command.end(), {"--replot-inventory", file_io::path_text(args.replot_inventory)});
+    if (args.discover_farm_set) command.push_back(args.discover_farm ? "--discover-farm" : "--no-discover-farm");
+    for (auto const& path : args.farm_configs) command.insert(command.end(), {"--farm-config", file_io::path_text(path)});
+    for (auto const& path : args.excluded_destinations) command.insert(command.end(), {"--exclude-destination", file_io::path_text(path)});
+    command.insert(command.end(), {"--harvester", file_io::path_text(args.save_profile),
         "--k", std::to_string(config.k), "--strength", std::to_string(config.strength), "--max-ram", std::to_string(args.max_ram),
         "--headroom-bytes", std::to_string(args.headroom), "--batch-members", std::to_string(args.batch), "--destination-temp", args.destination_temp,
         "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", std::to_string(args.checkpoint_bytes), "--member-storage", args.member_storage,
@@ -8334,7 +8355,8 @@ int print_replot_setup(Arguments const& args)
     limit("--workers", args.workers, 0); limit("--capacity-bytes", args.capacity, 0);
     limit("--temp-capacity-bytes", args.temporary_capacity, 0);
     limit("--max-groups", args.max_groups, UINT64_MAX); limit("--max-total-members", args.max_total_members, UINT64_MAX);
-    limit("--group-members", args.group_members, 0); limit("--reclaim-before-bytes", args.reclaim_before_bytes, 0);
+    limit("--group-members", args.group_members, 0);
+    if (args.reclaim_before_set) command.insert(command.end(), {"--reclaim-before-bytes", std::to_string(args.reclaim_before_bytes)});
     limit("--replot-max-source-files", args.replot_max_source_files, 0); limit("--replot-max-source-bytes", args.replot_max_source_bytes, 0);
     if (args.backend != "auto") command.insert(command.end(), {"--backend", args.backend});
     if (!args.devices.empty()) command.insert(command.end(), {"--devices", args.devices});
@@ -8347,6 +8369,7 @@ int print_replot_setup(Arguments const& args)
     for (auto const& path : args.replot_source_roots) command.insert(command.end(), {"--replot-source-root", file_io::path_text(path)});
     for (auto const& path : args.replot_exclude_roots) command.insert(command.end(), {"--replot-exclude-root", file_io::path_text(path)});
     if (args.replot_verification) command.insert(command.end(), {"--replot-verification", *args.replot_verification});
+    if (args.replot_confirmation) command.insert(command.end(), {"--replot-confirmation", *args.replot_confirmation});
     if (args.replot_proof_first_groups) command.insert(command.end(), {"--replot-proof-first-groups", std::to_string(*args.replot_proof_first_groups)});
     if (args.replot_proof_every_groups) command.insert(command.end(), {"--replot-proof-every-groups", std::to_string(*args.replot_proof_every_groups)});
     auto setup_command = command; setup_command.insert(setup_command.end(), {"--save-profile", "UPDATED_PROFILE"});
@@ -8362,10 +8385,11 @@ int print_replot_setup(Arguments const& args)
     else if (!args.quiet)
     {
         std::cout << "Saved reusable local migration profile: " << file_io::path_text(args.save_profile)
-            << ". A setup profile requires a complete migration review before execution.\n";
+            << ". Complete its remaining resource declarations before execution.\n";
         print_replot_setup_decisions(preparation);
         if (!preparation.missing.empty()) std::cout << "Keep completed declarations and apply the remaining settings with:\n  " << continue_setup << " [--resource-setting ...]\n";
-        std::cout << "After the remaining declarations are reviewed, save a concrete migration plan with:\n  " << next << '\n';
+        std::cout << "After completing the declarations, use fill --replot with this profile and your farmer/pool keys.\n"
+            << "Optionally preview and save the migration first with:\n  " << next << '\n';
     }
     return 0;
 }
@@ -8391,9 +8415,30 @@ struct ReplotInputs
     std::string native_scope_error;
     std::optional<group_grow::ReplotRevalidation> revalidation;
     std::optional<stream_state::Stamp> stamp;
+    std::optional<group_grow::ReplotJob> job;
     uint64_t memory_bytes = 0;
     bool mapping_search_exhausted = false;
 };
+using ReplotStorageCapacity = std::function<bool(size_t, std::map<std::string, uint64_t> const&, std::span<uint64_t const>)>;
+ReplotStorageCapacity replot_storage_capacity(Arguments const&, ReplotInputs const&, group_grow::farm::NativeRequest const&);
+std::vector<fs::path> replot_temporary(Arguments const& args, group_grow::ReplotReview const& review,
+    fs::path const& output = {})
+{
+    auto paths = args.temporary;
+    for (auto const& directory : review.farm.directories)
+        add_destination_temporary(paths, args.destination_temp, file_io::native_path(directory.directory),
+            group_grow::storage_device(file_io::native_path(directory.directory)));
+    if (!output.empty())
+    {
+        auto const target = group_grow::storage_device(output);
+        std::stable_partition(paths.begin(), paths.end(), [&](auto const& path)
+        {
+            auto const source = group_grow::storage_device(path);
+            return group_grow::external_detail::independent_packing_io(target, {&source, 1});
+        });
+    }
+    return paths;
+}
 group_grow::farm::Profile const& replot_resources(ReplotInputs const& inputs)
 { return inputs.execution_resources ? *inputs.execution_resources : inputs.resources; }
 std::optional<group_grow::ReplotVerification> const& replot_verification_override(ReplotInputs const& inputs)
@@ -8593,11 +8638,31 @@ void replot_input_memory(ReplotInputs& inputs, Arguments const& args)
         inputs.memory_bytes = sum(inputs.memory_bytes, group_grow::farm::RevalidationReaderAllowance::memory_bound(
             inputs.inventory, value.readers, inputs.review.sources));
     }
+    if (inputs.job) inputs.memory_bytes = sum(inputs.memory_bytes,
+        product(sum(sum(inputs.job->review.capacity(), inputs.job->profile.capacity()), 8192), 4));
     require(inputs.memory_bytes < args.max_ram / 2, "retained migration review and planner inputs exceed --max-ram");
 }
 ReplotInputs load_replot_review(Arguments const& args)
 {
     ReplotInputs result; auto file = group_grow::read_farming_state(args.from_plan, args.max_ram);
+    if (file.body.starts_with("ordinary-group-replot-job-v1\n"))
+    {
+        group_grow::FarmingMetadataDirectory metadata(args.from_plan.parent_path().parent_path(), false);
+        require(metadata.path / "grow-replot.review" == args.from_plan && metadata.private_pin,
+            "private migration jobs must be opened through their destination's .xchplot2/grow-replot.review");
+        group_grow::farm::inventory_detail::SourceHandle source(*metadata.private_pin, "grow-replot.review");
+        auto const info = group_grow::farm::inventory_detail::stat(source.handle);
+#ifdef _WIN32
+        pos2gpu::validate_private_file_handle(file_io::handle(source.handle.fd), false);
+#else
+        require(info.st_uid == ::geteuid() && !(info.st_mode & 0077), "private migration job must have owner-only permissions");
+#endif
+        require(info.st_nlink == 1 && group_grow::farm::inventory_detail::stamp(info) == file.stamp,
+            "private migration job changed while loading");
+        result.job = group_grow::parse_replot_job(file.body, args.max_ram);
+        file.body = result.job->review; file.digest = result.job->bindings.review_digest;
+        metadata.check();
+    }
     if (file.body.starts_with("ordinary-group-replot-revalidation-v1\n") || file.body.starts_with("ordinary-group-replot-revalidation-v2\n") ||
         file.body.starts_with("ordinary-group-replot-revalidation-v3\n"))
     {
@@ -8619,6 +8684,13 @@ ReplotInputs load_replot_review(Arguments const& args)
     std::istringstream resources(result.revalidation ? result.revalidation->resources_json : result.review.resources_json);
     result.resources = group_grow::farm::read_profile(resources, args.max_ram / 8);
     result.stamp = file.stamp; replot_input_memory(result, args);
+    if (result.job)
+    {
+        require(result.job->bindings.job_id == result.review.farm.job_id &&
+            std::any_of(result.review.farm.directories.begin(), result.review.farm.directories.end(), [&](auto const& directory)
+            { return file_io::native_path(directory.directory) / ".xchplot2/grow-replot.review" == args.from_plan; }),
+            "private migration job is outside its saved destinations");
+    }
     for (auto index : result.review.sources) require(index < result.inventory.plots.size(), "replot review selects an absent inventory entry");
     group_grow::farm::validate_inventory_coverage(result.resources, replot_inventory_counts(result.inventory));
     return result;
@@ -8972,9 +9044,7 @@ void capture_replot_owned_roots(Arguments const& args, ReplotInputs& inputs)
     std::vector<InventoryRoot> owned_roots; std::vector<std::string> scratch_directories;
     for (auto const& directory : review.farm.directories)
     { paths.push_back(file_io::native_path(directory.directory)); seen.insert(directory.directory); }
-    auto scratch = args.temporary;
-    for (auto const& directory : review.farm.directories)
-        add_destination_temporary(scratch, args.destination_temp, file_io::native_path(directory.directory), storage_device(file_io::native_path(directory.directory)));
+    auto const scratch = replot_temporary(args, review);
     std::set<std::string> supplied;
     for (auto const& path : scratch)
     {
@@ -8999,10 +9069,12 @@ ReplotInputs make_replot_review(Arguments const& args)
 {
     using namespace group_grow; using namespace group_grow::farm;
     ReplotInputs result; auto const limits = replot_inventory_limits(args);
-    std::vector<ReplotMetadataFile> metadata{{args.replot_inventory, stream_state::stamp(args.replot_inventory)}};
+    std::vector<ReplotMetadataFile> metadata;
+    if (!args.replot_inventory.empty()) metadata.emplace_back(args.replot_inventory, stream_state::stamp(args.replot_inventory));
     if (!args.farming_profile_path.empty()) metadata.emplace_back(args.farming_profile_path, stream_state::stamp(args.farming_profile_path));
-    { auto file = replot_text_file(args.replot_inventory); result.inventory = read_farm_inventory(file, limits); }
-    require(result.inventory.complete, "replot review requires a complete explicit inventory");
+    if (args.replot_inventory.empty()) result.inventory = inspect_farm_inventory(args);
+    else { auto file = replot_text_file(args.replot_inventory); result.inventory = read_farm_inventory(file, limits); }
+    require(result.inventory.complete, "replot requires a complete inventory of the selected farm");
     auto const adapters = replot_adapter_table(args);
     if (!adapters.routes.empty())
     {
@@ -9026,6 +9098,7 @@ ReplotInputs make_replot_review(Arguments const& args)
         result.resources = apply_resource_settings(std::move(result.resources), args.farming_resource_settings);
     auto& review = result.review; auto& state = review.farm;
     review.verification = requested_replot_verification(args);
+    review.directory_confirmation = args.replot_confirmation != "file";
     state.config = farming_configuration(args); state.fixed_extent = true; state.capacity_fill = false;
     state.capacity = args.capacity; state.headroom = args.headroom; state.max_groups = args.max_groups; state.max_total_members = args.max_total_members;
     require(state.config.k == result.inventory.network.plot_size && state.config.strength >= result.inventory.network.min_strength &&
@@ -9070,7 +9143,9 @@ ReplotInputs make_replot_review(Arguments const& args)
     for (size_t index = 0; index < result.inventory.plots.size(); ++index)
     {
         auto const& plot = result.inventory.plots[index];
-        if (source_roots.at(plot.root) && replot_source_candidate(plot)) candidates.push_back(index);
+        auto const path = file_io::native_path(result.inventory.roots.at(plot.root).path) / file_io::native_path(plot.relative_path);
+        if (source_roots.at(plot.root) && replot_source_candidate(plot) && !farming_path_excluded(path, args.excluded_destinations))
+            candidates.push_back(index);
     }
     require(!candidates.empty(), "selected inventory roots have no supported PoS1 retirement candidates");
     auto const ranking_grant = args.max_ram / 2 - retained_selection;
@@ -9078,6 +9153,10 @@ ReplotInputs make_replot_review(Arguments const& args)
     candidates = limit_replot_sources(args, result.inventory, rank_replot_sources(result.resources, result.inventory, candidates, ranking_grant,
         args.replot_max_source_files ? args.replot_max_source_files : uint64_t(replot_maximum_batch_sources), args.replot_max_source_bytes));
     require(!candidates.empty(), "replot source limits do not select any whole eligible old files");
+    // Selecting --replot authorizes the existing bounded, whole-file bootstrap
+    // selector. An explicit zero retains replacement-first operation.
+    if (!args.reclaim_before_set) for (auto index : candidates)
+        review.reclaim_before_bytes = sum(review.reclaim_before_bytes, result.inventory.plots.at(size_t(index)).identity.allocated_bytes);
     auto const until = inventory_detail::catalog_deadline(limits, result.inventory.plots.size());
     for (auto index : candidates)
     {
@@ -9152,7 +9231,54 @@ ReplotInputs make_replot_review(Arguments const& args)
             // Preserve the existing request/count/lookup working allowance;
             // immutable preparation and its bounded cache are additional.
             resource_memory = sum(product(profile_memory(result.resources), 4), AssessmentCache::memory_bytes);
-            resource_capacity = replot_mapping_capacity(result.resources, result.inventory, review, std::move(request), [&] { check_cancel(args); });
+            resource_capacity = replot_mapping_capacity(result.resources, result.inventory, review, request, [&] { check_cancel(args); });
+            if (request.engine == "external")
+            {
+                auto storage = replot_storage_capacity(args, result, request);
+                std::map<std::string, uint64_t> available;
+                for (auto const& root : result.inventory.roots)
+                {
+                    auto const disk = ScratchRoot::inspect(file_io::native_path(root.path));
+                    auto [at, fresh] = available.emplace(disk.device.filesystem, disk.available_bytes);
+                    if (!fresh) at->second = std::min(at->second, disk.available_bytes);
+                }
+                for (size_t lane = 0; lane < review.space.size(); ++lane)
+                {
+                    auto const& filesystem = review.farm.directories[lane].filesystem;
+                    auto [at, fresh] = available.emplace(filesystem, review.space[lane].free_bytes);
+                    if (!fresh) at->second = std::min(at->second, review.space[lane].free_bytes);
+                }
+                for (size_t lane = 0; lane < review.space.size(); ++lane)
+                {
+                    auto& bytes = available.at(review.farm.directories[lane].filesystem);
+                    bytes -= std::min(bytes, review.space[lane].metadata_allowance_bytes);
+                }
+                resource_memory = sum(resource_memory, product(available.size(), 512));
+                resource_capacity = [&, resources = std::move(resource_capacity), storage = std::move(storage),
+                    available = std::move(available), consumed = size_t(0), outputs = size_t(0)]
+                    (size_t index, std::span<uint64_t const> completed, std::span<uint64_t const> early) mutable
+                {
+                    auto credit = [&](auto& space, uint64_t source)
+                    {
+                        auto const& plot = result.inventory.plots.at(size_t(source));
+                        auto& bytes = space[result.inventory.roots.at(plot.root).storage.filesystem];
+                        bytes = sum(bytes, plot.identity.allocated_bytes);
+                    };
+                    while (consumed < completed.size()) credit(available, completed[consumed++]);
+                    while (outputs < index)
+                    {
+                        auto const& batch = review.batches[outputs++];
+                        auto& bytes = available.at(review.farm.directories.at(size_t(batch.lane)).filesystem);
+                        bytes -= std::min(bytes, sum(batch.final_bound_bytes, batch.receipt_allowance_bytes));
+                    }
+                    auto projected = available; for (auto source : early) credit(projected, source);
+                    auto const& batch = review.batches.at(index);
+                    auto const needed = sum(review.farm.headroom, sum(sum(batch.final_bound_bytes, batch.workspace_bound_bytes),
+                        sum(batch.receipt_allowance_bytes, batch.receipt_staging_bytes)));
+                    return projected.at(review.farm.directories.at(size_t(batch.lane)).filesystem) >= needed &&
+                        storage(index, projected, early) && resources(index, completed, early);
+                };
+            }
         }
         catch (Interrupted const&) { throw; }
         catch (std::runtime_error const&)
@@ -9166,6 +9292,17 @@ ReplotInputs make_replot_review(Arguments const& args)
     require(sum(result.memory_bytes, resource_memory) < args.max_ram / 2, "resource-aware source mapping exceeds --max-ram");
     map_replot_sources(review, result.inventory, candidates, args.max_ram / 2 - result.memory_bytes - resource_memory,
         resource_capacity, &result.mapping_search_exhausted);
+    if (!args.reclaim_before_set)
+    {
+        review.reclaim_before_bytes = 0;
+        for (auto const& batch : review.batches)
+        {
+            uint64_t bytes = 0;
+            for (uint64_t n = 0; n < batch.sources; ++n)
+                bytes = sum(bytes, result.inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source + n)))).identity.allocated_bytes);
+            review.reclaim_before_bytes = std::max(review.reclaim_before_bytes, bytes);
+        }
+    }
     validate_replot_review(review); replot_input_memory(result, args); return result;
 }
 struct ReplotAssessment
@@ -9352,10 +9489,7 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
     // Match run_group's effective root selection and native argument checks
     // before any source can provide bootstrap credit. This does not reserve a
     // scratch grant: external construction retains ordinary live admission.
-    auto temporary = effective.temporary;
-    for (auto const& directory : inputs.review.farm.directories)
-        add_destination_temporary(temporary, effective.destination_temp, file_io::native_path(directory.directory),
-            group_grow::storage_device(file_io::native_path(directory.directory)));
+    auto temporary = replot_temporary(effective, inputs.review);
     std::unique_ptr<group_grow::ScratchPool> scratch_validation;
     if (!temporary.empty()) scratch_validation = std::make_unique<group_grow::ScratchPool>(temporary, effective.headroom, effective.temporary_capacity);
     if (!inputs.review.owned_roots.empty()) for (auto const& path : temporary)
@@ -9431,6 +9565,35 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
     require(minimum < request.ram_bytes, "migration cannot admit one generated member and its actual engine workspace before reclaiming sources");
     return request;
 }
+ReplotStorageCapacity replot_storage_capacity(Arguments const& args, ReplotInputs const& inputs,
+    group_grow::farm::NativeRequest const& request)
+{
+    auto const bounded = group_grow::farm::replot_execution_options(args, request);
+    return [&, bounded, generation_peak = request.generation_peak_bytes]
+        (size_t index, std::map<std::string, uint64_t> const& available, std::span<uint64_t const>)
+    {
+        using group_grow::ScratchRoot;
+        auto const& batch = inputs.review.batches.at(index);
+        auto const& directory = inputs.review.farm.directories.at(size_t(batch.lane));
+        auto const paths = replot_temporary(bounded, inputs.review, file_io::native_path(directory.directory));
+        auto project = [&](ScratchRoot root)
+        {
+            if (auto at = available.find(root.device.filesystem); at != available.end()) root.available_bytes = at->second;
+            if (root.device.filesystem == replot_filesystem(inputs, directory.filesystem))
+            {
+                auto const receipt = sum(batch.receipt_allowance_bytes, batch.receipt_staging_bytes);
+                root.available_bytes -= std::min(root.available_bytes, receipt);
+            }
+            return root;
+        };
+        std::vector<ScratchRoot> roots; roots.reserve(paths.size());
+        for (auto const& path : paths) roots.push_back(project(ScratchRoot::inspect(path)));
+        return replot_external_capacity(bounded, replot_bound_identity(inputs.review.farm.config),
+            directory.layout.file_members(batch.ordinal), sum(batch.final_bound_bytes, batch.workspace_bound_bytes),
+            migration_stage_path(file_io::native_path(directory.directory), inputs.review.farm.job_id, index), std::move(roots),
+            project(ScratchRoot::inspect(file_io::native_path(directory.directory))), generation_peak, true);
+    };
+}
 ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& inputs)
 {
     using namespace group_grow::farm;
@@ -9473,33 +9636,9 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
             auto const bounded = replot_execution_options(args, result.request);
             for (auto const& directory : inputs.review.farm.directories)
                 construction_filesystems.insert(replot_filesystem(inputs, directory.filesystem));
-            auto paths = bounded.temporary;
-            for (auto const& directory : inputs.review.farm.directories)
-                add_destination_temporary(paths, bounded.destination_temp, file_io::native_path(directory.directory),
-                    storage_device(file_io::native_path(directory.directory)));
+            auto const paths = replot_temporary(bounded, inputs.review);
             for (auto const& path : paths) construction_filesystems.insert(storage_device(path).filesystem);
-            external_capacity = [&, bounded](size_t index, std::map<std::string, uint64_t> const& available, std::span<uint64_t const>)
-            {
-                auto const& batch = inputs.review.batches.at(index);
-                auto const& directory = inputs.review.farm.directories.at(size_t(batch.lane));
-                auto paths = bounded.temporary;
-                add_destination_temporary(paths, bounded.destination_temp, file_io::native_path(directory.directory),
-                    storage_device(file_io::native_path(directory.directory)));
-                auto project = [&](ScratchRoot root)
-                {
-                    if (auto at = available.find(root.device.filesystem); at != available.end()) root.available_bytes = at->second;
-                    if (root.device.filesystem == replot_filesystem(inputs, directory.filesystem))
-                    { auto const receipt = sum(batch.receipt_allowance_bytes, batch.receipt_staging_bytes);
-                      root.available_bytes -= std::min(root.available_bytes, receipt); }
-                    return root;
-                };
-                std::vector<ScratchRoot> roots; roots.reserve(paths.size());
-                for (auto const& path : paths) roots.push_back(project(ScratchRoot::inspect(path)));
-                return replot_external_capacity(bounded, replot_bound_identity(inputs.review.farm.config),
-                    directory.layout.file_members(batch.ordinal), sum(batch.final_bound_bytes, batch.workspace_bound_bytes),
-                    migration_stage_path(file_io::native_path(directory.directory), inputs.review.farm.job_id, index), std::move(roots),
-                    project(ScratchRoot::inspect(file_io::native_path(directory.directory))), result.request.generation_peak_bytes, true);
-            };
+            external_capacity = replot_storage_capacity(args, inputs, result.request);
         }
         auto storage_capacity = std::move(external_capacity);
         AssessmentAccumulator accumulation(replot_resources(inputs));
@@ -9651,7 +9790,9 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
             << ",\"saved_successor\":" << (successor ? "true" : "false")
             << ",\"live_readiness_checked\":false,\"feasible\":" << (metadata ? "null" : assessment.feasible ? "true" : "false")
             << ",\"physical_release_conditional\":true,\"farming_value_preserved\":null,\"old_effective_value\":\"unknown\",\"new_effective_value\":\"unknown\""
-            << ",\"reclaim_before_bytes\":" << review.reclaim_before_bytes << ",\"job_id\":" << json_string(state.job_id)
+            << ",\"reclaim_before_bytes\":" << review.reclaim_before_bytes
+            << ",\"farming_confirmation\":" << json_string(review.directory_confirmation ? "directory" : "file")
+            << ",\"job_id\":" << json_string(state.job_id)
             << ",\"memory_limit_bytes\":" << review.memory_limit_bytes
             << ",\"inventory_entries\":" << inputs.inventory.plots.size() << ",\"selected_source_files\":" << review.sources.size()
             << ",\"selected_source_allocated_bytes\":" << selected_bytes << ",\"protected_inventory_entries\":" << protected_entries
@@ -9714,7 +9855,10 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
             << "No live farming readiness is implied. Physical release requires fresh free-space probes.\n";
         auto const verification = replot_verification(inputs);
         std::cout << "Verification policy: " << replot_verification_name(verification.mode)
-            << ". Headers and chunk index, durable publication and farming acknowledgement are checked for every replacement.\n";
+            << ". Headers, chunk index and durable publication are checked for every replacement.\n"
+            << (review.directory_confirmation ?
+                "Farming acknowledgement: the first replacement in each directory; temporary service outages retry automatically.\n" :
+                "Farming acknowledgement: every replacement file.\n");
         if (verification.mode == ReplotVerificationMode::structural)
             std::cout << "No full-proof samples are requested.\n";
         else
@@ -14241,6 +14385,7 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
                 << ",\"durable_phase\":" << json_string(phase) << ",\"journal_revision\":" << (saved.present ? saved.state.revision : 0)
                 << ",\"journal_digest\":" << json_string(saved.digest) << ",\"journal_snapshot_consistent\":true,\"all_replicas_available\":" << (available ? "true" : "false")
                 << ",\"replica_publication_pending\":" << (reconcile ? "true" : "false") << ",\"completed_replacements\":" << (saved.present ? saved.state.batch : 0)
+                << ",\"farming_confirmation\":" << json_string(review.directory_confirmation ? "directory" : "file")
                 << ",\"completed_retirements\":" << retired << ",\"outstanding_predelete_bytes\":" << debt << ",\"predelete_limit_bytes\":" << review.reclaim_before_bytes
                 << ",\"active_verified_stage\":" << (saved.present && saved.state.verified_stage ? "true" : "false")
                 << ",\"active_published\":" << (saved.present && saved.state.published ? "true" : "false") << ",\"active_ready_history\":" << (saved.present && saved.state.ready ? "true" : "false")
@@ -14265,6 +14410,7 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
             print_status_compute(std::cout, compute, false); print_status_services(std::cout, services, false);
             std::cout << "Migration durable phase: " << phase << "; " << (saved.present ? saved.state.batch : 0) << " replacements and " << retired << " retirements completed.\n"
                 << "Selected policy: " << policy_binding << ".\n"
+                << "Farming confirmation: " << (review.directory_confirmation ? "once per directory" : "every replacement file") << ".\n"
                 << "Verification policy: " << replot_verification_name(replot_verification(inputs).mode)
                 << "; completed groups with a validated full proof: " << (!saved.present || !saved.state.batch || receipts_verified ? std::to_string(completed_proof_groups) : "unknown") << ".\n"
                 << "Early-deletion allowance used: " << debt << " / " << review.reclaim_before_bytes
@@ -14422,6 +14568,37 @@ void apply_replot_local_bindings(Arguments& args, group_grow::ReplotLocalBinding
     if (!args.farming_profile_set && args.farming_profile_path.empty() && local.policy_digest == policy_digest)
         args.farming_profile_path = file_io::native_path(local.profile);
 }
+void apply_replot_job(Arguments& args, ReplotInputs const& inputs)
+{
+    if (!inputs.job) return;
+    auto const& local = inputs.job->bindings;
+    bool const same_host = local.host == group_grow::profile_detail::host_name() && local.user == replot_local_user();
+    bool const explicit_connections = (args.farm_adapter_set && args.chia_root_set && args.chia_executable_set) ||
+        (args.farming_profile_set && !replot_adapter_table(args).routes.empty());
+    require(same_host || explicit_connections, "private migration job belongs to another host or user; supply trusted local reader bindings");
+    if (!same_host) return;
+    apply_replot_local_bindings(args, local, inputs.policy_digest);
+    if (!args.seed) args.seed = inputs.job->seed;
+    if (!args.seed_owner) args.seed_owner = inputs.job->seed_owner;
+    if (!args.farmer) args.farmer = inputs.job->farmer;
+    if (!args.pool_pk && !args.pool_ph && !args.pool_address)
+    {
+        if (inputs.job->pool_public_key) args.pool_pk = inputs.job->pool;
+        else args.pool_ph = inputs.job->pool;
+    }
+    auto const keys = Keys(args);
+    auto saved_args = args; saved_args.seed = inputs.job->seed; saved_args.seed_owner = inputs.job->seed_owner;
+    saved_args.farmer = inputs.job->farmer; saved_args.pool_pk.reset(); saved_args.pool_ph.reset(); saved_args.pool_address.reset();
+    if (inputs.job->pool_public_key) saved_args.pool_pk = inputs.job->pool; else saved_args.pool_ph = inputs.job->pool;
+    require(farming_fingerprint(keys) == farming_fingerprint(Keys(saved_args)), "farmer, pool or seed differs from the private migration job");
+    if (!args.farming_profile_set && args.farming_profile_path.empty())
+    {
+        args.replot_local_profile = std::make_shared<std::string const>(inputs.job->profile);
+        std::istringstream file(*args.replot_local_profile);
+        auto profile = group_grow::read_replot_farming_profile(file, args.max_ram / 8);
+        if (profile) args.farming_profile = std::make_shared<group_grow::FarmingProfile const>(std::move(*profile));
+    }
+}
 struct ReplotAuditedOutput
 {
     uint64_t batch = 0;
@@ -14475,7 +14652,7 @@ StatusServiceObservation inspect_status_replot_services(Arguments const& supplie
     if (!supplied.status_live) return result;
     result.diagnosis.status = "unavailable";
     result.diagnosis.evidence = "bounded installed-reader and read-only service RPC attempts; failed probes do not establish readiness";
-    result.diagnosis.unknowns = "source registry load/unload, exact published replacement acknowledgements and protected-action resource admission remain execution checks";
+    result.diagnosis.unknowns = "source registry load/unload, the selected farming confirmation policy and protected-action resource admission remain execution checks";
     auto args = supplied;
     auto issue = [&](std::string const& reason)
     {
@@ -14486,7 +14663,8 @@ StatusServiceObservation inspect_status_replot_services(Arguments const& supplie
     try
     {
         bool const explicit_connections = (args.farm_adapter_set && args.chia_root_set && args.chia_executable_set) ||
-            (args.farming_profile_set && !args.farming_profile_path.empty() && !replot_adapter_table(args).routes.empty());
+            (args.farming_profile_set && !args.farming_profile_path.empty() && !replot_adapter_table(args).routes.empty()) ||
+            (inputs.job && inputs.job->bindings.host == profile_detail::host_name() && inputs.job->bindings.user == replot_local_user());
         auto local = load_replot_local_bindings(inputs, explicit_connections);
         if (local && local->usable) apply_replot_local_bindings(args, local->bindings, inputs.policy_digest);
         if (!explicit_connections && (!local || !local->usable))
@@ -14597,7 +14775,7 @@ StatusServiceObservation inspect_status_replot_services(Arguments const& supplie
             result.diagnosis.condition = result.complete ? "current reader bindings and target farming prerequisites were observed" :
                 "current reader/network observations do not establish the selected public farming service identity";
             result.diagnosis.evidence = "bounded installed-reader and read-only service RPC observations";
-            if (result.complete) result.diagnosis.next = "resume the active reviewed plan when intended; execution rechecks exact objects, replacement acknowledgement and resources before every protected action";
+            if (result.complete) result.diagnosis.next = "resume the active job when intended; execution rechecks exact objects, the selected farming confirmation policy and resources before protected actions";
         }
     }
     catch (std::exception const& error)
@@ -14934,6 +15112,7 @@ void replot_revalidate_target(Arguments const& args, ReplotInputs const& inputs,
     TargetServiceExpectation service; service.farmer_public_key = group_tools::hex(keys.farmer);
     if (keys.pool_kind == POS2_POOL_PK) service.pool_public_key = group_tools::hex(keys.pool); else service.pool_contract_puzzle_hash = group_tools::hex(keys.pool);
     auto prerequisites = observe_target_prerequisites(options, inputs.inventory.network, keys.k, keys.strength, service);
+    if (!prerequisites.ready && prerequisites.retryable) throw FarmServiceUnavailable(prerequisites.reason);
     require(prerequisites.ready, "revalidated target prerequisites are unavailable: " + prerequisites.reason);
     require_target_pool_difficulty(replot_resources(inputs), prerequisites.pool.difficulty, prerequisites.pool.external ? prerequisites.pool.protocol_version : 0);
     require_target_service_scope(replot_resources(inputs), target_service_hosts(options), prerequisites.other_harvesters);
@@ -14943,6 +15122,7 @@ void replot_revalidate_target(Arguments const& args, ReplotInputs const& inputs,
     for (auto const& output : audit.publications)
     {
         check_cancel(args); auto const& plan = inputs.review.batches.at(size_t(output.batch)); auto const& directory = inputs.review.farm.directories.at(size_t(plan.lane));
+        if (inputs.review.directory_confirmation && plan.ordinal) continue;
         auto const path = group_path(file_io::native_path(directory.directory), plan.ordinal, inputs.review.farm.job_id);
         inventory_detail::RootHandle pin(path.parent_path()); auto const native = inventory_detail::stat(pin.handle);
         InventoryRoot root{directory.directory, directory.directory_identity, storage_device(path.parent_path()), uint64_t(native.st_dev), uint64_t(native.st_ino)};
@@ -14956,6 +15136,7 @@ void replot_revalidate_target(Arguments const& args, ReplotInputs const& inputs,
         expected.target_route = network.target_route; expected.reader_version = network.reader_version; expected.reader_identity = network.reader_identity;
         expected.network_version = network.version; expected.farmer_version = network.farmer_version; expected.solver_version = network.solver_version;
         auto observed = snapshot.check(expected, {path, file.identity, inputs.digest, output.batch});
+        if (!observed.ready && observed.retryable) throw FarmServiceUnavailable(observed.reason);
         require(observed.ready, "revalidated replacement prefix is not currently ready: " + observed.reason);
     }
     snapshot.finish(); require_target_pool_difficulty(replot_resources(inputs), snapshot.pool_state().difficulty,
@@ -15131,12 +15312,15 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     else { bind_replot_execution_resources(args, inputs); replot_input_memory(inputs, args); validate_replot_physical_policy(args, inputs); }
     if (!args.farming_profile_path.empty())
     {
-        auto file = replot_text_file(args.farming_profile_path); auto const local = read_profile(file, args.max_ram / 8);
+        auto file = replot_text_file(args.farming_profile_path); auto local = read_profile(file, args.max_ram / 8);
+        if (!args.farming_resource_settings.empty()) local = apply_resource_settings(std::move(local), args.farming_resource_settings);
         std::ostringstream canonical; write_profile_json(canonical, local);
         require(canonical.str() == (inputs.revalidation ? inputs.revalidation->resources_json : inputs.review.resources_json), "local farm_resources policy differs from the reviewed migration");
     }
     auto const request = replot_request(args, inputs);
     auto effective = replot_execution_options(args, request);
+    effective.temporary = replot_temporary(args, inputs.review);
+    effective.destination_temp = "off";
     auto const& review = inputs.review; auto const& inventory = inputs.inventory;
     auto routes = replot_adapter_table(args);
     auto target_options = routes.routes.empty() ? replot_adapter(args) : resolve_target(routes, inventory.network.target_route);
@@ -15208,7 +15392,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     RegistryScopeIndex registry_index(inventory, index_limits);
     auto bounded_adapter = [&](HarvesterAdapterOptions options, std::chrono::steady_clock::time_point until)
     { auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
-      require(left > 0, "migration adapter phase exceeded its bounded deadline"); options.limits.timeout_ms = std::min<uint64_t>(options.limits.timeout_ms, uint64_t(left)); return options; };
+      require_service_available(left > 0, "migration adapter phase exceeded its bounded deadline"); options.limits.timeout_ms = std::min<uint64_t>(options.limits.timeout_ms, uint64_t(left)); return options; };
     auto target_route = [&](HarvesterAdapterOptions const& options)
     { return options.kind == target_options.kind && options.executable == target_options.executable &&
         options.root == target_options.root && options.harvester == target_options.harvester; };
@@ -15240,11 +15424,27 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     }
     std::vector<std::unique_ptr<DirectoryLock>> locks;
     for (auto const& [identity, path] : lock_paths) locks.push_back(std::make_unique<DirectoryLock>(path));
+    std::vector<ReplotMetadataFile> private_reviews;
+    if (inputs.job)
+    {
+        auto const body = replot_job_text(*inputs.job); auto const digest = stream_state::digest(body);
+        for (auto const& destination : destinations)
+        {
+            check_cancel(args); FarmingMetadataDirectory metadata(destination, false); metadata.require_fresh(); metadata.create();
+            auto const path = metadata.path / "grow-replot.review";
+            if (fs::exists(path)) require(read_farming_state(path, args.max_ram).digest == digest,
+                "private migration job copies conflict; preserve them and restore the matching job");
+            else stream_state::atomic_save(path, body + digest + '\n', false);
+            private_reviews.emplace_back(path, stream_state::stamp(path)); metadata.check();
+        }
+    }
     std::vector<std::unique_ptr<FarmingReplotDirectory>> bookkeeping;
     std::function<void()> journal_check;
     auto check = [&]
     {
         check_cancel(args); require(stream_state::stamp(args.from_plan) == *inputs.stamp, "migration review changed during execution");
+        for (auto const& [path, stamp] : private_reviews)
+            require(stream_state::stamp(path) == stamp, "private migration job copy changed during execution");
         if (local_profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *local_profile_stamp, "explicit local farm adapter profile changed during migration");
         if (local_bindings) require(stream_state::stamp(local_bindings->path) == local_bindings->stamp, "private migration bindings changed during execution");
         for (auto const& lock : locks) lock->check();
@@ -15371,6 +15571,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         }
         if (fresh) registry_scope(until, {});
         auto const prerequisites = observe_target_prerequisites(bounded_adapter(target_options, until), inventory.network, keys.k, keys.strength, service);
+        if (!prerequisites.ready && prerequisites.retryable) throw FarmServiceUnavailable(prerequisites.reason);
         require(prerequisites.ready, "target farming prerequisites are unavailable before migration preparation: " + prerequisites.reason);
         require_target_pool_difficulty(replot_resources(inputs), prerequisites.pool.difficulty, prerequisites.pool.external ? prerequisites.pool.protocol_version : 0);
         require_target_service_scope(replot_resources(inputs), target_service_hosts(target_options), prerequisites.other_harvesters);
@@ -15439,6 +15640,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     };
     auto const observation_deadline = replot_operation_deadline(request.adapter_timeout_us);
     auto network = observe_target_network(bounded_adapter(target_options, observation_deadline), inventory.network, review.farm.config.k, review.farm.config.strength);
+    if (!network.ready && network.retryable) throw FarmServiceUnavailable(network.reason);
     require(network.ready, "target reader/network is unavailable before migration preparation: " + network.reason);
     std::set<std::pair<size_t, std::string>> checked_readers;
     for (auto const& plot : inventory.plots) if (!plot.reader_identity.empty() && checked_readers.emplace(plot.root, plot.reader_identity).second)
@@ -15451,6 +15653,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     if (!journal.present)
     {
         std::vector<ReplotMetadataFile> metadata{{args.from_plan, *inputs.stamp}};
+        metadata.insert(metadata.end(), private_reviews.begin(), private_reviews.end());
         if (local_profile_stamp) metadata.emplace_back(args.farming_profile_path, *local_profile_stamp);
         std::set<std::string> checked_space;
         for (size_t lane = 0; lane < destinations.size(); ++lane)
@@ -15730,6 +15933,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             try { observations = observe_source_batches_retired(options, inventory, batches,
                 target ? published_allowance : PublishedPlotAllowance{}, &registry_index); }
             catch (Interrupted const&) { throw; }
+            catch (FarmServiceUnavailable const&) { throw; }
             catch (std::exception const& error)
             {
                 check_cancel(args);
@@ -15792,15 +15996,16 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             if (!pending_unload) break;
             try { refresh_source_registries(until); }
             catch (Interrupted const&) { throw; }
+            catch (FarmServiceUnavailable const&) { throw; }
             catch (std::runtime_error const&)
             {
-                require(unload_blocker.empty() || std::chrono::steady_clock::now() < until,
+                require_service_available(unload_blocker.empty() || std::chrono::steady_clock::now() < until,
                     "retired source readers have not unloaded before the reviewed phase deadline: " + unload_blocker);
                 throw;
             }
             counts = remaining();
             if (fits()) break;
-            check_cancel(args); require(std::chrono::steady_clock::now() < until,
+            check_cancel(args); require_service_available(std::chrono::steady_clock::now() < until,
                 "retired source readers have not unloaded before the reviewed phase deadline: " + unload_blocker);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -15819,13 +16024,16 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         auto const until = deadline.value_or(replot_operation_deadline(request.adapter_timeout_us));
         auto remaining_time = [&]
         { auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
-          require(left > 0, "migration readiness operation exceeded its bounded deadline"); options.limits.timeout_ms = std::min<uint64_t>(options.limits.timeout_ms, uint64_t(left)); };
+          require_service_available(left > 0, "migration readiness operation exceeded its bounded deadline"); options.limits.timeout_ms = std::min<uint64_t>(options.limits.timeout_ms, uint64_t(left)); };
         uint64_t const count = journal.state.batch + uint64_t(predelete ? journal.state.ready.has_value() : journal.state.published.has_value());
         remaining_time();
-        if (!count)
+        bool const directory_confirmed = journal.state.batch == review.batches.size() ||
+            review.batches[size_t(journal.state.batch)].ordinal > 0 || journal.state.ready.has_value();
+        if (!count || (review.directory_confirmation && (predelete || directory_confirmed)))
         {
             target_snapshot.reset();
             auto const prerequisites = observe_target_prerequisites(options, inventory.network, keys.k, keys.strength, service);
+            if (!prerequisites.ready && prerequisites.retryable) throw FarmServiceUnavailable(prerequisites.reason);
             require(prerequisites.ready, "target farming prerequisites are not ready: " + prerequisites.reason);
             require_target_pool_difficulty(replot_resources(inputs), prerequisites.pool.difficulty, prerequisites.pool.external ? prerequisites.pool.protocol_version : 0);
             require_target_service_scope(replot_resources(inputs), target_service_hosts(options), prerequisites.other_harvesters); return;
@@ -15851,10 +16059,12 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         snapshot_count = count;
         for (uint64_t batch = 0; batch < count; ++batch)
         {
+            if (review.directory_confirmation && batch + 1 != count) continue;
             remaining_time();
             auto const authorized = batch < journal.state.batch ? receipts.at(size_t(batch)).replacement : *journal.state.published;
             auto expectation = expected(batch, authorized); ReplacementPublication publication{expectation.path, expectation.identity, inputs.digest, batch};
             auto observed = target_snapshot->check(expectation, publication);
+            if (!observed.ready && observed.retryable) throw FarmServiceUnavailable(observed.reason);
             require(observed.ready, "ready replacement prefix is not currently available: " + observed.reason);
         }
         target_snapshot->finish();
@@ -16010,9 +16220,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             return bytes - std::min(bytes, reserved);
         };
         uint64_t const needed = sum(args.headroom, sum(sum(plan.final_bound_bytes, plan.workspace_bound_bytes), sum(plan.receipt_allowance_bytes, plan.receipt_staging_bytes)));
-        auto scratch_paths = effective.temporary;
-        add_destination_temporary(scratch_paths, effective.destination_temp, destinations[size_t(plan.lane)],
-            storage_device(destinations[size_t(plan.lane)]));
+        auto const scratch_paths = replot_temporary(effective, review, destinations[size_t(plan.lane)]);
         std::vector<ScratchRoot> scratch_identities;
         if (request.engine == "external") for (auto const& path : scratch_paths)
         { require_disk_scratch(path); scratch_identities.push_back(ScratchRoot::inspect(path)); }
@@ -16154,6 +16362,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             for (;;)
             {
                 auto bounded = replot_execution_options(effective, request, construction_until);
+                bounded.temporary = scratch_paths;
                 bounded.resume = fs::exists(stage_path(index)); bounded.report_metrics = false; bounded.on_output = {};
                 auto const original_cancel = bounded.cancelled; std::atomic<bool> resource_pause{false};
                 std::string pause_reason;
@@ -16285,12 +16494,15 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         }
         if (!journal.state.ready)
         {
+            // Directory confirmation uses a fresh bounded observation on each
+            // retry. Its outer recovery loop keeps the sealed publication and
+            // released scratch while a farmer is temporarily unavailable.
             auto const until = replot_operation_deadline(request.adapter_timeout_us);
             for (;;)
             {
                 supervised_preflight();
                 try { fresh_target(false, until); break; }
-                catch (std::runtime_error const&) { if (std::chrono::steady_clock::now() >= until) throw;
+                catch (FarmServiceUnavailable const&) { if (review.directory_confirmation || std::chrono::steady_clock::now() >= until) throw;
                     check_cancel(args); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
             }
             persist([](auto& state) { state.ready = state.published; state.ready_identity = state.published_identity; }); grow_failpoint("replot-replacement-ready");
@@ -16338,6 +16550,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     if (args.json)
     {
         std::cout << "{\"replot_complete\":true,\"completed_replacements\":" << journal.state.batch
+            << ",\"farming_confirmation\":" << json_string(review.directory_confirmation ? "directory" : "file")
             << ",\"completed_full_proof_validated_groups\":" << proof_groups << ",\"verification_policy\":";
         write_replot_verification_json(std::cout, inputs); std::cout << "}\n";
     }
@@ -16345,6 +16558,29 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         << replot_verification_name(replot_verification(inputs).mode) << ". Ordinary fixed assignments and private keys remain in "
         << file_io::path_text(journal.replicas.front().metadata->path / "grow-farm.plan") << '\n';
     return 0;
+}
+int execute_replot_resilient(Arguments args, ReplotInputs inputs)
+{
+    bool const retry_services = inputs.review.directory_confirmation;
+    auto const stamp = inputs.stamp;
+    auto const policy = replot_resources(inputs).gate;
+    uint64_t retry_ms = 0;
+    for (;;)
+    {
+        try { return execute_replot(args, std::move(inputs)); }
+        catch (group_grow::farm::FarmServiceUnavailable const& error)
+        {
+            check_cancel(args); if (!retry_services) throw;
+            retry_ms = group_grow::farm::replot_verification_retry_delay(policy, retry_ms);
+            if (!args.quiet) std::cerr << "[fill] waiting for farming services; saved work is retained and this job will retry: "
+                << error.what() << '\n';
+        }
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(retry_ms);
+        while (std::chrono::steady_clock::now() < until)
+        { check_cancel(args); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+        require(stamp && stream_state::stamp(args.from_plan) == *stamp, "migration review changed while waiting for farming services");
+        inputs = load_replot_review(args); apply_replot_job(args, inputs);
+    }
 }
 #endif
 
@@ -17119,43 +17355,208 @@ int run_farming(Arguments args)
 }
 
 #ifndef GROW_TEST_CONSTRUCTION
+#if defined(XCHPLOT2_GROUP_COMMANDS) && (defined(__linux__) || defined(_WIN32))
+int start_replot(Arguments args, ReplotInputs inputs)
+{
+    using namespace group_grow; using namespace group_grow::farm;
+    if (!args.seed)
+    { std::array<uint8_t, 32> seed{}; pos2gpu::read_random_bytes(seed.data(), seed.size()); args.seed = group_tools::hex(seed); }
+    Keys keys(args);
+    ReplotJob job;
+    job.seed = *args.seed; job.seed_owner = args.seed_owner.value_or(args.pool_broker.empty() ? "" : args.pool_owner);
+    job.farmer = group_tools::hex(keys.farmer); job.pool = group_tools::hex(keys.pool); job.pool_public_key = keys.pool_kind == POS2_POOL_PK;
+    std::ostringstream profile;
+    profile << "{\"farming_profile\":"; write_farming_profile_json(profile, farming_profile(args, inputs.review.farm.config));
+    profile << ",\"farm_resources\":"; write_profile_json(profile, inputs.resources);
+    auto const adapters = replot_adapter_table(args);
+    if (!adapters.routes.empty()) { profile << ",\"farm_adapters\":"; write_farm_adapters_json(profile, adapters); }
+    profile << "}\n"; job.profile = profile.str();
+    auto const options = replot_adapter(args);
+    job.review = replot_review_text(inputs.review);
+    job.bindings = {stream_state::digest(job.review), inputs.review.farm.job_id, profile_detail::host_name(), replot_local_user(),
+        args.farm_adapter, file_io::path_text(options.root), file_io::path_text(options.executable), {}, {}};
+    auto const initial_bytes = sum(replot_job_text(job).size(), 65536 + 65);
+    std::map<std::string, uint64_t> reserves;
+    for (auto const& directory : inputs.review.farm.directories)
+    {
+        file_io::Space space{}; require(!file_io::space_path(file_io::native_path(directory.directory), &space),
+            "cannot reserve private migration preparation");
+        uint64_t const unit = std::max({uint64_t(space.f_bsize), uint64_t(space.f_frsize), uint64_t(file_io::page_size())});
+        require(unit, "cannot establish private migration allocation alignment");
+        reserves[directory.filesystem] = sum(reserves[directory.filesystem], product(sum(initial_bytes, unit - 1) / unit, unit));
+    }
+    for (size_t lane = 0; lane < inputs.review.space.size(); ++lane)
+    {
+        auto& space = inputs.review.space[lane]; auto const bytes = reserves.at(inputs.review.farm.directories[lane].filesystem);
+        require(space.free_bytes >= bytes, "free space cannot hold private migration preparation before any plots are retired");
+        space.free_bytes -= bytes;
+    }
+    job.review = replot_review_text(inputs.review); job.bindings.review_digest = stream_state::digest(job.review);
+    inputs.digest = job.bindings.review_digest; inputs.job = std::move(job); replot_input_memory(inputs, args);
+    if (!assess_replot_review(args, inputs).feasible) return print_replot_review(args, std::move(inputs), false);
+    auto const body = replot_job_text(*inputs.job); auto const digest = stream_state::digest(body);
+    require(body.size() + 65 <= initial_bytes, "private migration preparation outgrew its reserved allocation");
+    check_farming_state_size(body.size() + 65, args.max_ram);
+    std::map<std::string, fs::path> paths;
+    for (auto const& directory : inputs.review.farm.directories) paths.emplace(directory.directory_identity, file_io::native_path(directory.directory));
+    {
+        std::vector<std::unique_ptr<DirectoryLock>> locks;
+        for (auto const& [identity, path] : paths) locks.push_back(std::make_unique<DirectoryLock>(path));
+        for (auto const& [identity, path] : paths)
+        {
+            check_cancel(args); FarmingMetadataDirectory metadata(path, false); metadata.require_fresh();
+            require(!metadata.recorded && farming_directory_identity(path) == identity,
+                "a saved farming job appeared during migration preparation; resume that job from its destination");
+        }
+        auto const root = file_io::native_path(inputs.review.farm.directories.front().directory);
+        FarmingMetadataDirectory metadata(root, false); metadata.create();
+        args.from_plan = metadata.path / "grow-replot.review";
+        stream_state::atomic_save(args.from_plan, body + digest + '\n', false); metadata.check();
+        grow_failpoint("replot-job-prepared");
+    }
+    args.target.clear(); args.destinations.clear(); args.inventory_roots.clear(); args.replot_inventory.clear(); args.replot = false;
+    args.farming_profile_path.clear(); args.farming_profile_set = false; args.farming_resource_settings.clear();
+    // Release the preparation copies before loading the exact durable record.
+    inputs = {}; inputs = load_replot_review(args); apply_replot_job(args, inputs);
+    if (!args.quiet && !args.json) std::cerr << "[fill] replot job saved; resume with xchplot2 fill "
+        << farming_next_command({inputs.review.farm.directories.front().directory}) << '\n';
+    return execute_replot_resilient(args, std::move(inputs));
+}
+#endif
+void discover_farm_destinations(Arguments& args)
+{
+    using namespace group_grow;
+    bool const configured = args.discover_farm || !args.farm_configs.empty() ||
+        (args.replot && args.replot_inventory.empty() && !args.discover_farm_set);
+    if (!configured && args.mounts_under.empty() && args.excluded_destinations.empty()) return;
+    std::vector<fs::path> roots;
+    std::set<std::string> identities;
+    auto add = [&](fs::path const& input)
+    {
+        check_cancel(args); auto const path = fs::weakly_canonical(input);
+        require(fs::is_directory(path), "farm directory is unavailable: " + file_io::path_text(input));
+        if (!identities.insert(farming_directory_identity(path)).second) return;
+        require(roots.size() < 1024, "too many farm directories; select a narrower discovery scope"); roots.push_back(path);
+    };
+    if (!args.target.empty()) add(args.target);
+    for (auto const& path : args.destinations) add(path);
+    if (configured)
+    {
+        std::map<fs::path, bool> configs;
+        auto config = [&](fs::path path, bool required)
+        {
+            if (fs::is_directory(path)) path /= "config/config.yaml";
+            path = fs::weakly_canonical(path); configs[path] = configs[path] || required;
+        };
+        for (auto const& path : args.farm_configs) config(path, true);
+        auto const adapters = replot_adapter_table(args);
+        for (auto const& route : adapters.routes) config(route.options.root, true);
+        if (!args.chia_root.empty()) config(args.chia_root, true);
+        else if (adapters.routes.empty() && args.farm_configs.empty())
+        {
+            auto const root = profile_detail::chia_root({});
+            if (!root.empty()) config(root / "config/config.yaml", false);
+        }
+        for (auto const& [path, required] : configs)
+        {
+            if (!required && !fs::exists(path)) continue;
+            auto input = replot_text_file(path);
+            auto const memory = std::min<uint64_t>(args.max_ram / 16, 16 * mib);
+            auto const text = profile_detail::read_text(input, std::min<uint64_t>(memory / 4, mib));
+            auto const dirs = farm::adapter_detail::RetirementConfigReader(text, memory).read(false);
+            for (auto const& directory : dirs.directories) add(profile_detail::chia_root(file_io::native_path(directory)));
+        }
+    }
+    for (auto const& root : args.mounts_under)
+    {
+        auto const found = farming_destination_discovery(root);
+        if (args.verbose) for (auto const& [path, reason] : found.skipped)
+            std::cerr << "[fill] skipped " << file_io::path_text(path) << ": " << reason << '\n';
+        for (auto const& path : found.selected) add(path);
+    }
+    args.inventory_roots = roots;
+    std::erase_if(roots, [&](auto const& path) { return farming_path_excluded(path, args.excluded_destinations); });
+    std::erase_if(args.temporary, [&](auto const& path) { return farming_path_excluded(path, args.excluded_destinations); });
+    require(!roots.empty() || (args.inventory && !args.inventory_roots.empty()),
+        !configured && args.excluded_destinations.empty() ?
+            "no eligible drives found; inspect plan --verbose or provide destination directories" :
+            "no eligible farm directories; supply destinations, --farm-config ROOT... or --discover-drives ROOT and check exclusions");
+    args.target = roots.empty() ? fs::path{} : roots.front();
+    args.destinations.assign(roots.empty() ? roots.end() : std::next(roots.begin()), roots.end());
+}
 int run(Arguments const& supplied)
 {
     Arguments args = supplied;
     require(std::endian::native == std::endian::little, "upstream format requires little endian");
     check_cancel(args);
-    if (!args.mounts_under.empty())
+    discover_farm_destinations(args);
+    if (args.from_plan.empty() && args.manifest.empty() && args.farm_action.empty() &&
+        (args.command == "fill" || args.command == "plan" || args.replot_status) && !args.inventory &&
+        !args.metadata_only && !args.assess_jobs && !args.calibrate)
     {
-        std::set<fs::path> selected;
-        if (!args.target.empty()) selected.insert(fs::weakly_canonical(args.target));
-        for (auto const& path : args.destinations) selected.insert(fs::weakly_canonical(path));
-        std::set<std::string> identities;
-        for (auto const& path : selected) if (fs::is_directory(path)) identities.insert(group_grow::farming_directory_identity(path));
-        for (auto const& root : args.mounts_under)
+        std::vector<fs::path> selectors = args.destinations;
+        if (!args.target.empty()) selectors.insert(selectors.begin(), args.target);
+        for (auto const& root : selectors)
         {
-            auto const found = group_grow::farming_destination_discovery(root);
-            if (args.verbose) for (auto const& [path, reason] : found.skipped)
-                std::cerr << "[fill] skipped " << file_io::path_text(path) << ": " << reason << '\n';
-            for (auto const& path : found.selected)
+            if (!fs::is_directory(root)) continue;
+            group_grow::FarmingMetadataDirectory metadata(fs::weakly_canonical(root));
+            auto const path = metadata.path / "grow-replot.review";
+            if (!fs::exists(path)) continue;
+            auto inspect = args; inspect.from_plan = path; auto const saved = load_replot_review(inspect);
+            std::vector<fs::path> destinations;
+            for (auto const& directory : saved.review.farm.directories)
+                destinations.push_back(file_io::native_path(directory.directory));
+            auto const journal = group_grow::load_replot_journals(destinations, saved.digest, args.max_ram - saved.memory_bytes, true);
+            if (!args.replot_status && journal.present && journal.state.phase == group_grow::ReplotPhase::complete &&
+                std::all_of(journal.replicas.begin(), journal.replicas.end(), [&](auto const& replica)
+                { return !replica.available || (replica.published && !replica.pending && replica.digest == journal.digest); }))
             {
-                if (!identities.insert(group_grow::farming_directory_identity(path)).second) continue;
-                if (!selected.insert(path).second) continue;
-                require(selected.size() <= 1024, "too many discovered destinations; select a narrower --discover-drives root");
-                if (args.target.empty()) args.target = path;
-                else args.destinations.push_back(path);
+                // The completed handoff belongs to ordinary fill recovery.
+                // Retain migration history for explicit status/plan inspection.
+                args.replot = false; args.replot_inventory.clear(); break;
             }
+            require(!args.extend && !args.update && !args.cancel_update && args.relocations.empty() && !args.allow_missing,
+                "migration jobs resume their saved scope; use a reviewed revalidation to change it");
+            args.from_plan = path;
+            for (auto const& selected : selectors)
+                require(std::any_of(saved.review.farm.directories.begin(), saved.review.farm.directories.end(), [&](auto const& directory)
+                { return group_grow::farming_directory_identity(selected) == directory.directory_identity; }),
+                    "supplied directories do not all belong to the saved migration job");
+            for (auto const& directory : saved.review.farm.directories)
+                require(!group_grow::farming_path_excluded(file_io::native_path(directory.directory), args.excluded_destinations),
+                    "a saved migration destination is excluded; resume its original selection or revalidate the job");
+            for (auto const& path : saved.review.scratch_directories)
+                require(!group_grow::farming_path_excluded(file_io::native_path(path), args.excluded_destinations),
+                    "saved migration scratch is excluded; resume its original selection or revalidate the job");
+            for (auto index : saved.review.sources)
+            {
+                auto const& plot = saved.inventory.plots.at(size_t(index));
+                require(!group_grow::farming_path_excluded(file_io::native_path(saved.inventory.roots.at(plot.root).path) /
+                    file_io::native_path(plot.relative_path), args.excluded_destinations),
+                    "a saved migration source is excluded; resume its original selection or revalidate the job");
+            }
+            args.target.clear(); args.destinations.clear(); args.replot = false; break;
         }
-        require(!selected.empty(), "no eligible drives found; inspect plan --verbose or provide destination directories");
     }
     if (args.inventory) return print_farm_inventory(args);
-    if (!args.replot_inventory.empty())
+    if (args.replot)
     {
         if (!args.save_profile.empty()) return print_replot_setup(args);
-        return print_replot_review(args, make_replot_review(args), false);
+        auto inputs = make_replot_review(args);
+        if (args.plan_only) return print_replot_review(args, std::move(inputs), false);
+#if defined(XCHPLOT2_GROUP_COMMANDS) && (defined(__linux__) || defined(_WIN32))
+        return start_replot(args, std::move(inputs));
+#else
+        throw std::runtime_error("migration execution requires an installed xchplot2 command with native retirement support");
+#endif
     }
     if (!args.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(args.from_plan))
     {
         auto migration = load_replot_review(args);
+#if defined(XCHPLOT2_GROUP_COMMANDS) && (defined(__linux__) || defined(_WIN32))
+        apply_replot_job(args, migration);
+#endif
+        require(args.local_devices.empty(), "migration uses a single producer; select --backend cpu or one GPU");
         if (args.replot_status)
         {
 #if defined(__linux__) || defined(_WIN32)
@@ -17174,7 +17575,7 @@ int run(Arguments const& supplied)
         }
         if (args.plan_only || args.metadata_only) return print_replot_review(args, std::move(migration), true);
 #if defined(XCHPLOT2_GROUP_COMMANDS) && (defined(__linux__) || defined(_WIN32))
-        return execute_replot(args, std::move(migration));
+        return execute_replot_resilient(args, std::move(migration));
 #else
         throw std::runtime_error("migration execution requires an installed xchplot2 command with a native handle-bound retirement protocol");
 #endif

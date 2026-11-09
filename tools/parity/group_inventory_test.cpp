@@ -710,7 +710,8 @@ void adapters(fs::path const& directory)
         { std::ofstream flag(root / "farmer-override"); flag << '1'; }
     };
     farmer_override(true, true);
-    require(!observe_replacement_readiness(options, expected, publication).ready, "local loaded plot substituted for missing farmer-side exact publication sync");
+    auto pending = observe_replacement_readiness(options, expected, publication);
+    require(!pending.ready && pending.retryable, "missing farmer synchronization was accepted or classified as a permanent failure");
     farmer_override(false, false);
     require(!observe_replacement_readiness(options, expected, publication).ready, "farmer without multi-member metadata attested an entire group");
     fs::remove(root / "farmer-override");
@@ -722,7 +723,8 @@ void adapters(fs::path const& directory)
         "single-member farmer compatibility incorrectly required new group metadata");
     fs::remove(root / "farmer-override"); expected = multiple; loaded(loaded_key);
     target_prefix_snapshot(options, projection, observed.roots[0], expected, bytes, loaded_key); loaded(loaded_key);
-    loaded(std::string(96, '7')); require(!observe_replacement_readiness(options, expected, publication).ready, "wrong loaded public key route accepted"); loaded(loaded_key);
+    loaded(std::string(96, '7')); auto mismatch = observe_replacement_readiness(options, expected, publication);
+    require(!mismatch.ready && !mismatch.retryable, "wrong loaded public key route was accepted or classified as a temporary outage"); loaded(loaded_key);
     { std::ofstream inactive(root / "inactive"); inactive << '1'; }
     require(!observe_replacement_readiness(options, expected, publication).ready, "preactivation last transaction height accepted"); fs::remove(root / "inactive");
     { std::ofstream inactive(root / "inactive"); inactive << '1'; }
@@ -892,6 +894,12 @@ void adapters(fs::path const& directory)
 }
 void retirement_configuration(fs::path const& directory)
 {
+    std::string const discovered = "harvester:\n  plot_directories:\n  - relative/plots\n  - relative/plots\n";
+    require(adapter_detail::RetirementConfigReader(discovered, 1024 * 1024).read(false).directories ==
+        std::vector<std::string>{"relative/plots", "relative/plots"},
+        "configuration discovery rejected paths before normalization and deduplication");
+    rejects([&] { (void)adapter_detail::RetirementConfigReader(discovered, 1024 * 1024).read(); },
+        "relaxed discovery changed strict retirement configuration authority");
     auto root = directory / "removal-config", old = directory / "removal-old", target = directory / "removal-target";
     fs::create_directories(root / "config"); fs::create_directory(old); fs::create_directory(target); write(old / "one.plot", legacy(false));
     HarvesterAdapterOptions options; options.root = root; options.executable = calibration_process::executable(); options.host = "fixture-host";

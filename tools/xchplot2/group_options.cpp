@@ -135,7 +135,7 @@ void load_harvester_profile(pos2gpu::GroupOptions& result)
     {
         std::ifstream input(result.farming_profile_path, std::ios::binary);
         require(input.is_open(), "cannot open farming profile: " + result.farming_profile_path.string());
-        bool const migration = !result.replot_inventory.empty() || (!result.from_plan.empty() &&
+        bool const migration = result.replot || (!result.from_plan.empty() &&
             group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
         if (migration)
         {
@@ -269,6 +269,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     auto destination = [&](std::string const& value)
     {
         require(!value.empty(), "empty destination path");
+        // Retain the existing `--replot INVENTORY` spelling. New jobs can
+        // omit the inventory; --replot-inventory selects one explicitly.
+        if (result.replot && fs::is_regular_file(path(value)))
+        {
+            require(result.replot_inventory.empty(), "supply only one replot inventory");
+            result.replot_inventory = path(value); return;
+        }
         if (result.target.empty()) result.target = path(value);
         else
         {
@@ -291,6 +298,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         else if (key == "--no-assess-jobs") assess_jobs = false;
         else if (key == "--inventory") inventory = true;
         else if (key == "--no-inventory") inventory = false;
+        else if (key == "--replot" || key == "--replot-inventory") result.replot = true;
+        else if (key == "--no-replot") result.replot = false;
         else if (key == "--status") replot_status = true;
         else if (key == "--no-status") replot_status = command == "status";
         else if (key == "--live") status_live = true;
@@ -352,7 +361,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             require(key == "--metadata-only" || key == "--no-metadata-only" || key == "--assess-jobs" || key == "--no-assess-jobs" ||
                 key == "--calibrate" || key == "--no-calibrate" || (calibrate && (worker_option || calibration_input)) ||
                 (inventory && (key == "--inventory" || key == "--no-inventory" || key == "--save-plan" ||
-                    key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable")) ||
+                    key == "--paths-from" || key == "--paths0-from" || key == "--harvester" || key == "--chia-root" || key == "--chia-executable" ||
+                    key == "--discover-farm" || key == "--no-discover-farm" || key == "--farm-config")) ||
                 (inventory && (key == "--resource-setting" || key == "--save-profile")) ||
                 (inventory && (key == "--farm-adapter" || key == "--farm-adapter-timeout-ms")) ||
                 (metadata_only && (key == "--from-plan" || key == "-F" || key == "--manifest")) ||
@@ -372,6 +382,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--help" && command.empty()) { reference_help(); std::exit(0); }
         if (key == "--resume" || key == "-r") { result.resume = result.resume_set = true; continue; }
         if (key == "--plan-only") { result.plan_only = true; continue; }
+        if (key == "--replot" || key == "--no-replot") continue;
+        if (key == "--discover-farm" || key == "--no-discover-farm")
+        { result.discover_farm = key == "--discover-farm"; result.discover_farm_set = true; continue; }
         if (key == "--metadata-only") { result.metadata_only = true; continue; }
         if (key == "--no-metadata-only") { result.metadata_only = false; continue; }
         if (key == "--assess-jobs") { result.assess_jobs = true; continue; }
@@ -421,6 +434,20 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
         if (key.starts_with("-"))
         {
+            if (group_path_list_option(key))
+            {
+                auto& paths = key == "--temp-dirs" ? result.temporary :
+                    key == "--farm-config" ? result.farm_configs : result.excluded_destinations;
+                size_t const before = paths.size();
+                while (i + 1 < argc && !std::string_view(argv[i + 1]).starts_with('-'))
+                {
+                    std::string const value = argv[++i];
+                    require(!value.empty() && paths.size() < 1024, "invalid path list for " + key);
+                    paths.push_back(path(value));
+                }
+                require(paths.size() > before, key + " requires one or more paths (use ./ for names starting with '-'); end the list with another option or --");
+                continue;
+            }
             require(i + 1 < argc, "missing value for " + key);
             std::string const value = argv[++i];
             if (key == "--group-id") result.group = value;
@@ -437,14 +464,16 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             }
             else if (key == "--save-plan") result.save_plan = path(value);
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
-            else if (key == "--replot") result.replot_inventory = path(value);
+            else if (key == "--replot-inventory") result.replot_inventory = path(value);
             else if (key == "--replot-verification") result.replot_verification = value;
+            else if (key == "--replot-confirmation") result.replot_confirmation = value;
             else if (key == "--replot-proof-first-groups") result.replot_proof_first_groups = number(value.c_str(), argv[i - 1]);
             else if (key == "--replot-proof-every-groups") result.replot_proof_every_groups = number(value.c_str(), argv[i - 1]);
             else if (key == "--farm-adapter") { result.farm_adapter = value; result.farm_adapter_set = true; }
             else if (key == "--farm-adapter-timeout-ms")
             { result.farm_adapter_timeout_ms = number(value.c_str(), argv[i - 1]); result.farm_adapter_timeout_set = true; }
-            else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str(), argv[i - 1]);
+            else if (key == "--reclaim-before-bytes")
+            { result.reclaim_before_bytes = number(value.c_str(), argv[i - 1]); result.reclaim_before_set = true; }
             else if (key == "--replot-source-root" || key == "--replot-exclude-root")
             {
                 require(!value.empty(), "empty replot source root selector");
@@ -639,14 +668,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(!result.status_live || result.replot_status, "--live requires status");
     require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
     require(result.status_timeout_ms >= 100 && result.status_timeout_ms <= 60000, "status timeout must be in 100..60000 ms");
-    require(result.farming_resource_settings.empty() || (command == "plan" && (result.inventory || !result.replot_inventory.empty()) &&
+    require(result.farming_resource_settings.empty() || (farm_command && (result.inventory || result.replot) &&
         result.from_plan.empty() && !result.replot_status && !result.metadata_only && !result.assess_jobs && !result.calibrate),
-        "--resource-setting requires plan --inventory or a fresh plan --replot setup");
+        "--resource-setting requires plan --inventory or a fresh --replot job");
     require(result.action_destinations.empty() || action, "--destination requires pause, drain, resume or retire");
     require(!result.policy_only || action, "--policy-only requires pause, drain, resume or retire");
     bool const guided = !result.farming_alternative.empty() || result.upgrade_job;
     require(!guided || (command == "plan" && result.from_plan.empty() && !result.replot_status && !result.metadata_only &&
-        !result.assess_jobs && !result.inventory && !result.calibrate && result.replot_inventory.empty() && !result.replot_revalidate &&
+        !result.assess_jobs && !result.inventory && !result.calibrate && !result.replot && !result.replot_revalidate &&
         !result.policy_only && !result.update && !result.extend && !result.cancel_update && result.relocations.empty() &&
         (!result.target.empty() || !result.manifest.empty() || !result.mounts_under.empty())),
         "--alternative and --upgrade-job require an ordinary plan with destinations or --manifest");
@@ -670,6 +699,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.mounts_under.empty() || (farm_command && result.from_plan.empty() && !result.inventory &&
         !result.metadata_only && !result.assess_jobs && !result.calibrate && !result.replot_status),
         "--discover-drives selects plan or fill destinations; omit saved previews and inspection modes");
+    require((!result.discover_farm_set && result.farm_configs.empty() && result.excluded_destinations.empty()) ||
+        (farm_command && result.from_plan.empty() && result.manifest.empty() && !result.metadata_only &&
+            !result.assess_jobs && !result.calibrate && !result.replot_status && !result.extend && !result.update && !result.resume),
+        "directory discovery and exclusions require a new plan or fill job");
     if (result.replot_status || action)
     {
         require(result.compute_mode == "auto" || result.compute_mode == "off", "--compute requires auto or off");
@@ -701,19 +734,20 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--farm-adapter-timeout-ms must be in 1..3600000");
     if (result.inventory)
     {
-        require(command == "plan" && !result.target.empty(), "plan --inventory requires explicit existing farm roots");
+        require(command == "plan" && !result.replot && (!result.target.empty() || result.discover_farm || !result.farm_configs.empty()),
+            "plan --inventory requires farm roots or --discover-farm");
         require(result.max_ram >= 16 * mib, command.empty() ? "--max-ram must be at least 16 MiB (16777216 bytes)" :
             "--max-host-ram must be at least 16 MiB (16M)");
         require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
         result.directory_farm = true;
         return result;
     }
-    require(result.replot_inventory.empty() || (command == "plan" && (!result.target.empty() || !result.mounts_under.empty()) &&
+    require(!result.replot || (farm_command &&
         result.from_plan.empty() && result.manifest.empty() && !result.resume && !result.extend && result.relocations.empty() && !result.allow_missing),
-        "replot review requires plan DEST... --replot INVENTORY, without an existing job selector");
-    require(!result.reclaim_before_bytes || !result.replot_inventory.empty(), "--reclaim-before-bytes belongs in a saved replot review");
+        "--replot requires plan or fill without an existing job selector");
+    require(!result.reclaim_before_set || result.replot, "--reclaim-before-bytes belongs in a fresh --replot job");
     require((result.replot_source_roots.empty() && result.replot_exclude_roots.empty() &&
-        !result.replot_max_source_files && !result.replot_max_source_bytes) || !result.replot_inventory.empty(),
+        !result.replot_max_source_files && !result.replot_max_source_bytes) || result.replot,
         "replot source selection belongs in a fresh --replot review");
     if (result.metadata_only || result.assess_jobs || result.calibrate)
     {
@@ -764,7 +798,10 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         result.from_plan = std::move(result.target); result.target.clear();
     }
     bool const verification_options = result.replot_verification || result.replot_proof_first_groups || result.replot_proof_every_groups;
-    require(!verification_options || (command == "plan" && (!result.replot_inventory.empty() || result.replot_revalidate)),
+    require(!result.replot_confirmation || (result.replot &&
+        (*result.replot_confirmation == "directory" || *result.replot_confirmation == "file")),
+        "--replot-confirmation requires directory or file on a fresh --replot job");
+    require(!verification_options || (farm_command && (result.replot || result.replot_revalidate)),
         "migration verification policy requires a fresh --replot review or saved --revalidate successor");
     require(!result.replot_verification || *result.replot_verification == "structural" || *result.replot_verification == "sampled" ||
         *result.replot_verification == "strict", "--replot-verification requires structural, sampled or strict");
@@ -772,16 +809,16 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "migration proof group schedules require --replot-verification sampled");
     require(result.replot_verification != "sampled" || result.replot_proof_first_groups.value_or(1) || result.replot_proof_every_groups.value_or(0),
         "sampled migration verification requires a nonzero first or periodic group count");
-    require(result.farm_adapter == "chia" || !result.replot_inventory.empty() || !result.from_plan.empty(),
+    require(result.farm_adapter == "chia" || result.replot || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
-    require(!result.farm_adapter_timeout_set || !result.replot_inventory.empty() ||
+    require(!result.farm_adapter_timeout_set || result.replot ||
         (farm_command && !result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan)),
         "--farm-adapter-timeout-ms requires inventory, replot review or a saved migration plan");
     if (result.extend || result.update || result.cancel_update || !result.relocations.empty()) result.resume = true;
     require(!result.cancel_update || (command == "fill" && !result.update && !result.extend && result.from_plan.empty() &&
         result.relocations.empty() && !result.plan_only && !result.allow_missing),
         "--cancel-update requires fill with one existing job, without another action");
-    require(!result.target.empty() || !result.mounts_under.empty() || (farm_command &&
+    require(!result.target.empty() || !result.mounts_under.empty() || result.discover_farm || !result.farm_configs.empty() || result.replot || (farm_command &&
         (result.plan_only || result.resume || !result.manifest.empty() || !result.from_plan.empty())), "destination required");
     require((!result.extend && !result.update && !result.allow_missing && result.manifest.empty() && result.relocations.empty()) || farm_command,
         "saved farming job options require plan or fill");
@@ -801,13 +838,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         result.manifest.empty() && result.relocations.empty() && !result.resume && !result.extend && !result.update && !result.allow_missing),
         "--from-plan supplies the saved destinations and action; omit other job selectors");
     require(result.save_profile.empty() || (command == "plan" && result.plan_only &&
-        (result.replot_inventory.empty() || result.save_plan.empty()) && result.from_plan.empty() && result.manifest.empty() &&
+        (!result.replot || result.save_plan.empty()) && result.from_plan.empty() && result.manifest.empty() &&
         result.relocations.empty() && !result.resume && !result.extend && !result.update && !result.allow_missing),
         "export a harvester profile with plan --save-profile FILE, without an existing job; migration setup cannot also save a reviewed plan");
     require((!result.farming_detect_local && result.farming_profile_path.empty() &&
         result.chia_root.empty() && result.chia_executable.empty()) || farm_command,
         "harvester profiles require plan or fill");
-    require(result.farming_detect_local || !result.replot_inventory.empty() || !result.from_plan.empty() ||
+    require(result.farming_detect_local || result.replot || !result.from_plan.empty() ||
         (result.chia_root.empty() && result.chia_executable.empty()),
         "--chia-root and --chia-executable require --harvester local");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
@@ -880,7 +917,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(!result.meta || *result.meta <= 255, "invalid meta group");
     load_harvester_profile(result);
     resolve_group_devices(result);
-    require(result.local_devices.empty() || (result.replot_inventory.empty() &&
+    require(result.local_devices.empty() || (!result.replot &&
         (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
         "migration uses its reviewed single-producer resources; select --backend cpu or --devices gpuN for migration");
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -915,7 +952,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         require(!offer || (result.pool_offer_cpus && result.pool_offer_cpus <= 1024 && result.pool_offer_slots && result.pool_offer_slots <= 1024),
             "local compute offer exceeds CPU or slot bounds");
         bool const shared = workers == 1 ? result.pool_offer_cpus == 1 : result.pool_offer_cpus < workers;
-        bool const migration = offer && !shared && (!result.replot_inventory.empty() || (farm_command && !result.from_plan.empty() &&
+        bool const migration = offer && !shared && (result.replot || (farm_command && !result.from_plan.empty() &&
             group_grow::farm::inventory_detail::is_replot_review(result.from_plan)));
         require(!offer || shared || migration,
             "local compute offer must leave CPU capacity for receiving and storage");

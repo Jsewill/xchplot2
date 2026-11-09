@@ -181,10 +181,12 @@ inline Clock::time_point deadline(uint64_t timeout_ms)
     check(timeout_ms && maximum > 0 && timeout_ms <= uint64_t(maximum), "invalid calibration deadline");
     return now + std::chrono::milliseconds(timeout_ms);
 }
+struct DeadlineExpired : std::runtime_error
+{ DeadlineExpired() : std::runtime_error("calibration deadline expired") {} };
 inline void check_running(Clock::time_point until, std::function<bool()> const& cancelled)
 {
     check(!cancelled || !cancelled(), "calibration cancelled");
-    check(Clock::now() < until, "calibration deadline expired");
+    if (Clock::now() >= until) throw DeadlineExpired{};
 }
 #ifdef _WIN32
 struct NativeHandle

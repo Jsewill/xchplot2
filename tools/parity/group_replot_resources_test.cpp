@@ -351,7 +351,7 @@ int main() try
     rejects([&] { replot_native_request(args, profile, larger_group, {}, 0, 16 * mib, supervision); }, "batch cap one admitted whole group two above reviewed phase bound one");
     auto execute = replot_execution_options(args, request, Clock::now() - std::chrono::milliseconds(1));
     require(execute.batch == 1 && execute.workers == 1 && execute.cancelled() && execute.protected_resources &&
-        !execute.io_overlap && !execute.generation_overlap && !execute.generation_overlap_auto, "effective protected options/deadline not applied");
+        execute.io_overlap == args.io_overlap && !execute.generation_overlap && !execute.generation_overlap_auto, "effective protected options/deadline not applied");
     require(replot_ready_members(state, 0) == 0 && replot_ready_members(state, 1) == 1 && replot_ready_members(state, 2) == 2, "ready prefix counted unpublished members");
     rejects([&] { replot_ready_members(state, 3); }, "excess ready prefix accepted");
     std::vector<Stage> stages{replot_stage(profile, request, {}, 0, false, false, false, "before"),

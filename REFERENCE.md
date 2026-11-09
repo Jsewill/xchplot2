@@ -631,7 +631,9 @@ needed. `--batch-members N` bounds construction batches independently of the
 final file membership. `--member-storage compact|raw` selects retained
 fragments; compact is the default.
 
-Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems.
+Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems, or use
+`--temp-dirs /scratch-a /scratch-b`. End a multi-directory list with another
+option or `--`; destinations after `--` are positional arguments.
 Destination directories are excluded from automatic scratch selection unless
 `--destination-temp on|ssd|hdd` permits them; the default is `off`. The media
 filters require known, uniformly matching drives. Explicit scratch directories
@@ -882,9 +884,46 @@ relying on a latency bound.
 
 ### Replacing an existing farm
 
-Ordinary `fill` uses available space without deleting existing plots. Replacing
-an existing farm requires an explicit inventory, a saved migration review and
-execution of that review. Execution needs a compatible Chia harvester, farmer,
+Ordinary `fill` uses available space without deleting existing plots. Add
+`--replot` to authorize replacement of eligible old plots. It inventories the
+selected farm, checks the replacement schedule and saves a private resumable
+job before retiring any source. `plan` and `fill --plan-only` preview the same
+operation without changing the farm; neither is a prerequisite for execution.
+For example, with a complete mixed-farm resource profile:
+
+```bash
+xchplot2 fill /disk-a/plots /disk-b/plots --replot \
+  --harvester mixed-farm.json --destination-temp on -M 60G \
+  --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
+  -f "$FARMER_PK" -c "$POOL_ADDRESS"
+```
+
+Resume an interrupted job with `xchplot2 fill /disk-a/plots`. Its private
+`.xchplot2/grow-replot.review` retains the selection, keys, profile and local
+reader bindings. Keep all of the job's destination and source drives available.
+After migration completes, `fill DIR` uses ordinary farming recovery without
+requiring migration service checks again.
+Construction and compute overrides follow the same rules as saved reviews
+described below.
+
+A fresh replot scan includes directories from the selected reader configurations
+and adds explicit destinations, path-list files and `--discover-drives` results.
+`--discover-farm` enables configuration discovery for ordinary `plan`/`fill` or
+`plan --inventory`; `--no-discover-farm` limits a replot scan to supplied roots.
+Use `--farm-config /path/to/config.yaml /other/reader/root` to include several
+Chia-family configurations. A root names its `config/config.yaml`. The selected
+profile's adapter roots and `--chia-root` are included; otherwise discovery uses
+`CHIA_ROOT` or the normal local Chia root when present. This reads configurations;
+it does not configure services or enroll other machines.
+
+Paths are normalized and deduplicated. `--exclude-destination /keep-a /keep-b`
+accepts several exclusions at once, including descendants and filesystem
+aliases. Excluded locations receive no output, scratch or source deletion.
+Their inventoried plots still count toward the active farm's resource demand.
+Like `--temp-dirs`, these lists end at another option or `--`; prefix names
+starting with `-` with `./`.
+
+Execution needs a compatible Chia harvester, farmer,
 started PoS2 solver and synced, activated full node, with complete resource
 bounds for the selected construction backend. Linux and native Windows use
 native file claims and bounded worker processes. A platform without the required
@@ -897,17 +936,19 @@ route, supported pooling protocol, initialized authentication parameters and
 current difficulty. The review must cover that protocol and a conservative
 minimum difficulty. These RPC observations do not prove pool registration, a
 current authentication token, possession of an OG signing key or acceptance of
-a future proof. The replacement's exact public-key route is acknowledged after
-publication; migration does not wait for a random winning proof or pool partial.
+a future proof. By default the first replacement in each destination establishes
+its exact public-key route after publication; migration does not wait for a
+random winning proof or pool partial.
 The selected membership and contract hash must already be appropriate for the
 pool. The [current Pool2 protocol](https://github.com/Chia-Network/pool2-reference#how-it-works)
 uses a RewardPuzzle route tied to the launcher ID and versioned authentication;
 an older contract address is not evidence of that membership. Migration does
 not create or upgrade a Plot NFT or change the wallet's pool membership.
 
-Inventory every loaded plot root of each configured source and target reader,
-and include existing destination data. The optional installed-reader arguments
-add authenticated observations from the existing services:
+Inventory must cover every loaded plot root of each configured source and target
+reader, including existing destination data. To inspect or save it separately,
+use `plan --inventory`. The optional installed-reader arguments add authenticated
+observations from the existing services:
 
 ```bash
 xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
@@ -921,6 +962,8 @@ seeds and starts no farming services. Without `--save-plan`, it only reports
 the inventory summary; use `--json` for the complete report. With `--save-plan`,
 the saved inventory includes resource observations and missing settings.
 Source files are unchanged in either case. Saving refuses an existing file.
+Pass `--replot-inventory inventory.plan` to reuse the saved inventory with
+`plan` or `fill --replot`; the older `--replot inventory.plan` spelling also works.
 Paths, public identifiers and
 hostnames remain in the report, so review those before sharing it.
 
@@ -1071,7 +1114,9 @@ resource/workload IDs; settings cannot create physical resources, alter catalog
 counts or select reader executables. JSON exposes `resource_settings`,
 `settings_limited`, `continue_setup_command` and `next_command`. Setup exports
 can remain incomplete and are not executable migration reviews. Once complete,
-use the suggested `--save-plan` command to run normal admission. An ordinary
+use the profile with `fill --replot`, or preview and optionally save a review
+with `plan --replot --save-plan`. `fill --replot` also accepts the same
+`--resource-setting` declarations. An ordinary
 harvester profile can also seed setup; missing migration declarations remain
 explicit. Keep profiles containing `farm_adapters` private and local to the
 machine where their executable and configuration paths are authorized.
@@ -1191,18 +1236,25 @@ permit it. Ordinary plotting retains its shared owner/worker gate.
 Local GPU worker reservations also cover the complete inherited CPU affinity
 for runtime helpers, as well as offered task CPUs and GPU allocation/residency.
 
-To delete old plots before constructing their replacement group, explicitly
-choose an allocated-byte limit for early deletion as `EARLY_DELETE_LIMIT`, then
-review and save the plan. The limit must cover the old files needed by the
-active replacement batch. When the plan uses this allowance, the old files
-are removed before construction. Later checks on the new group cannot protect
-or recover the deleted data.
+`fill --replot` permits the whole-file reclamation needed for the active
+replacement's output, scratch and farming resource budget. It selects a bounded
+set of sources and reserves the complete output on its destination before using
+the remaining space for scratch. With `--destination-temp on`, scratch can use
+the other selected destinations too; no dedicated temporary drive is required.
+Independent drives are preferred for scratch, and the ordinary I/O scheduler
+can overlap their work within the declared farm envelope. Shared drives retain
+their I/O serialization. This does not establish a measured farming latency
+guarantee on an unqualified HDD array.
+
+Use `--reclaim-before-bytes 0` to require replacement-first retirement, or a
+positive byte limit to cap early deletion more tightly. To preview and save
+that explicit limit before executing:
 
 ```bash
-xchplot2 plan /disk-a/plots /disk-b/plots --replot inventory.plan \
+xchplot2 plan /disk-a/plots /disk-b/plots --replot-inventory inventory.plan \
   --harvester mixed-farm.json --compute off --devices cpu \
   --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
-  --reclaim-before-bytes "$EARLY_DELETE_LIMIT" \
+  --reclaim-before-bytes "$EARLY_DELETE_LIMIT" --destination-temp on \
   --save-plan migration.plan --json
 xchplot2 fill migration.plan --compute off --devices cpu \
   --harvester mixed-farm.json \
@@ -1236,8 +1288,8 @@ for execution. A saved review's exact source list remains authoritative.
 
 Replacement outputs retain the destination order in the review. Source mapping
 first checks the reviewed construction and selected verification resource stages,
-placing needed early resource release in the current batch even when the source's own
-filesystem has a later destination. It then favors the same filesystem,
+placing needed early resource or scratch-space release in the current batch
+even when the source's own filesystem has a later destination. It then favors the same filesystem,
 spreads allocated bytes across replacement outputs, and keeps reader workload
 cohorts together when the active batch can hold them. Bootstrap sources are
 mapped to the output that needs their space.
@@ -1248,8 +1300,10 @@ early-deletion limit. A search-bound refusal does not establish that no feasible
 exists. It permits no additional retirement; existing pending commitments and
 used early-deletion allowance remain in the private journal.
 
-`--reclaim-before-bytes SIZE` belongs to the review and defaults to zero;
-the early-deletion example above requires an explicit positive allowance.
+`--reclaim-before-bytes SIZE` belongs to the saved policy. When omitted, its
+limit covers at most the largest mapped replacement batch; admission still
+reclaims only the whole files needed for that batch. The preview reports the
+resulting allocated-byte limit.
 Zero requires each mapped replacement to be ready before its sources are
 removed. A positive value permits that many allocated source bytes to be
 committed to removal or removed while their mapped replacements are not yet
@@ -1257,7 +1311,7 @@ ready. The used allowance includes pending committed removals and persists
 across interruptions and restarts. It is released when the mapped replacement
 is recorded ready. Removal is irreversible: the new plot cannot reconstruct an old
 one. This limit measures physical bytes, not lost income or equal farming
-value. Temporary space selected with `--temp-dir` is construction scratch;
+value. Temporary space selected with `--temp-dir` or `--temp-dirs` is construction scratch;
 it is not automatically a farmable replacement.
 External construction with an early-deletion allowance also requires a joint output and
 scratch admission. The review and execution check the actual temporary roots,
@@ -1298,32 +1352,48 @@ chain or prove every byte correct. Isolated check workers request lower CPU
 and I/O scheduling priority when supported. These preferences do not replace
 resource admission or impose service guarantees. Proof solving remains local.
 
-Without an early-deletion allowance, these checks and exact farming readiness precede
-retirement of the mapped old files. With an allowance, the same replacement checks
-complete the batch after its authorized early retirement.
-The configured harvester must report that exact path with matching plot
-identity, public-key route, size and modification time. The target network
-must be synced, active for PoS2 and compatible with the replacement parameters.
-The connected farmer must acknowledge the same exact plot and key route in a
-completed plot synchronization. Multi-member replacements require its exact
-reported group membership. Matched peer observations bind the selected
-harvester, farmer, full node and solver, using explicit reciprocal TLS identities
-for remote links. Other receivers must fit their reviewed service reservations.
-A bounded phase captures the complete loaded prefix once. Before each protected
-retirement action it rechecks network activation and sync, service connections,
-completed plot-sync generations, pool route/difficulty and native paths of all
-acknowledged replacements. Construction or proof work invalidates that phase;
-changed generations require a fresh exact prefix audit. Completed synchronization
-can remain valid while services are idle. Imported JSON cannot assert readiness.
-Missing capabilities, changed populations or stale observations pause work.
+The default `--replot-confirmation directory` checks the first published
+replacement in each destination against the configured harvester and connected
+farmer's completed plot synchronization. The exact path, plot identity, public-key
+route, size, modification time and group membership must match. Later files in
+that directory retain structural and selected proof checks, with fresh farming
+service checks before retirement, without requiring a separate plot-list
+acknowledgement for each file. Directory confirmation does not prove that every
+later file has already reached the farmer.
+
+Construction finishes and releases its scratch before waiting for the first
+directory acknowledgement. Temporary RPC failures, disconnects, synchronization
+and solver startup delays retain the sealed output and retry with bounded
+backoff until services recover or the user cancels. No further source retirement
+occurs while that confirmation is pending. This first-directory wait still
+holds the sequential migration at its current batch; it does not queue unlimited
+unconfirmed replacements. Identity, configuration and policy mismatches require
+correction or revalidation and are not retried as transient outages.
+
+Select `--replot-confirmation file` for exact acknowledgement of every
+replacement. This mode retains bounded readiness waits and audits the complete
+acknowledged prefix after construction or a synchronization-generation change.
+Older saved reviews retain their original file policy.
+
+Without an early-deletion allowance, the selected checks precede retirement of
+mapped old files. With an allowance, they complete the batch after its authorized
+early retirement. The target network must remain synced, active for PoS2 and
+compatible with the replacement parameters. Matched peer observations bind the
+selected harvester, farmer, full node and solver, using explicit reciprocal TLS
+identities for remote links. Other receivers must fit their reviewed service
+reservations. Protected retirement actions recheck service connections,
+completed plot synchronization, pool route/difficulty and native file identities.
+Completed synchronization can remain valid while services are idle. Imported
+JSON cannot assert readiness. Missing capabilities or changed populations block
+retirement.
 Pause messages report bounded resource causes and declared margins; source-unload
 waits identify the reviewed workload and reader route. These transient diagnostics
 do not change journal authority or make `--status` a live service-health check.
-An authorized pre-deletion still requires the live target network and fresh
-readiness of previously credited replacements.
+An authorized pre-deletion still requires the live target network and the
+saved confirmation policy's checks.
 General service and configured public pool-route prerequisites apply before private
-preparation and pre-deletion; exact new plot/key acknowledgement follows
-publication. Missing or changed reviewed farmer/solver versions block execution
+pre-deletion; exact new plot/key acknowledgement follows publication under the
+selected confirmation policy. Missing or changed reviewed farmer/solver versions block execution
 while network-only forecasts remain available.
 
 Resource admission includes the old farm, completed replacements, construction,
@@ -1344,7 +1414,8 @@ no replacement exists, covering the services that must already be running.
 An infeasible review requested with `--save-plan --json` still reports its
 structured reasons and leaves the requested save path unwritten.
 
-Keep the original `migration.plan`, any active reviewed successor, every private
+Keep the original `migration.plan` when one was exported, the private
+`grow-replot.review` for direct jobs, any active reviewed successor, every private
 `.xchplot2/grow-replot.plan` copy and any `.next` file, receipts and owned
 temporary files.
 The private journal contains the seed and assignments from preparation onward.
@@ -1355,7 +1426,8 @@ relevant destination. Existing jobs retain their original top-level journals,
 Source claims remain under `.xchplot2-retire-JOB/` in the source root.
 Ordinary construction recovery files remain beside their output file, and
 directory locks retain their existing paths.
-Resume with `xchplot2 fill --from-plan migration.plan`, using the active successor
+Resume a direct job with `xchplot2 fill DIR`, or an exported review with
+`xchplot2 fill --from-plan migration.plan`, using the active successor
 in place of that filename after revalidation. Private state restores the keys.
 Accepted local reader paths, adapter kind and profile selection are also saved
 privately on the first destination when its metadata allowance has room.

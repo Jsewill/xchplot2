@@ -16,6 +16,7 @@ inline unsigned group_option_values(std::string_view option)
         option == "--metadata-only" || option == "--no-metadata-only" ||
         option == "--assess-jobs" || option == "--no-assess-jobs" ||
         option == "--inventory" || option == "--no-inventory" ||
+        option == "--replot" || option == "--no-replot" || option == "--discover-farm" || option == "--no-discover-farm" ||
         option == "--status" || option == "--no-status" || option == "--revalidate" || option == "--no-revalidate" ||
         option == "--watch" || option == "--no-watch" || option == "--inspect" || option == "--no-inspect" ||
         option == "--live" || option == "--no-live" ||
@@ -28,6 +29,10 @@ inline unsigned group_option_values(std::string_view option)
         option == "--policy-only" || option == "--no-policy-only" || option == "--upgrade-job" || option == "--no-upgrade-job" ||
         option == "--allow-missing" || option == "--no-allow-missing") return 0;
     return 1;
+}
+inline bool group_path_list_option(std::string_view option)
+{
+    return option == "--temp-dirs" || option == "--exclude-destination" || option == "--farm-config";
 }
 GroupOptions parse_group_options(int argc, char** argv, std::string_view command = {});
 GroupOptions group_batch_options(BatchOptions const&, std::vector<std::string> const&);

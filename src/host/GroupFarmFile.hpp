@@ -157,6 +157,7 @@ inline bool is_replot_review(fs::path const& path)
 {
     auto const header = saved_plan_header(path);
     return header == "ordinary-group-replot-review-v1" || header == "ordinary-group-replot-review-v2" || header == "ordinary-group-replot-review-v3" ||
+        header == "ordinary-group-replot-review-v4" || header == "ordinary-group-replot-job-v1" ||
         header == "ordinary-group-replot-revalidation-v1" || header == "ordinary-group-replot-revalidation-v2" || header == "ordinary-group-replot-revalidation-v3";
 }
 } // namespace inventory_detail

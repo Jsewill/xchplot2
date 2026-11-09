@@ -9,6 +9,7 @@
 #include <map>
 #include <sstream>
 #include <set>
+#include <span>
 #ifdef _WIN32
 #include <winioctl.h>
 #include <nvme.h>
@@ -146,6 +147,17 @@ struct FarmingDestinationDiscovery
     std::vector<std::filesystem::path> selected;
     std::vector<std::pair<std::filesystem::path, std::string>> skipped;
 };
+
+inline bool farming_path_excluded(std::filesystem::path const& path,
+    std::span<std::filesystem::path const> exclusions)
+{
+    auto const absolute = std::filesystem::absolute(path).lexically_normal();
+    auto const canonical = std::filesystem::weakly_canonical(absolute);
+    for (auto const& excluded : exclusions)
+        if (farming_mount_within(absolute, std::filesystem::absolute(excluded).lexically_normal()) ||
+            farming_mount_within(canonical, std::filesystem::weakly_canonical(excluded))) return true;
+    return false;
+}
 
 inline std::vector<std::filesystem::path> farming_mount_paths(std::istream& mounts,
     std::vector<std::pair<std::filesystem::path, std::string>>* skipped = nullptr)

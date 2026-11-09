@@ -135,7 +135,8 @@ def replot_rpc_fixture(args):
                               "plot_public_key": fixture.get("legacy_plot_public_keys", {}).get(str(path), FARMER)})
             if fixture.get("unloaded") or fixture.get("source_only"):
                 continue
-            for path in sorted(directory.glob("*.plot2")):
+            replacements = sorted(directory.glob("*.plot2"))
+            for path in replacements[:1] if fixture.get("first_replacement_only") else replacements:
                 group, _, strength, members, meta, memo = header(path)
                 pooled = len(memo) == 224
                 assert pooled or len(memo) == 256
@@ -452,7 +453,7 @@ def check_farm_guided_plans(run, command, verify, root):
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy = run("plan", directory, "--upgrade-job", "--save-plan", upgrade, code=2)
-            assert "stopped coordinator" in busy.stdout + busy.stderr and not upgrade.exists()
+            assert "requires the running fill to stop" in busy.stdout + busy.stderr and not upgrade.exists()
         finally:
             os.close(descriptor)
         assert snapshot(directory) == before
@@ -2175,7 +2176,8 @@ def check_replot(binary, root, reference=None):
     farm.mkdir()
     reader = directory / "reader"
     (reader / "config").mkdir(parents=True)
-    (reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n", encoding="utf-8")
+    (reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 1\n  plot_directories:\n  - " +
+                                                  json.dumps(str(farm)) + "\n", encoding="utf-8")
     executable = directory / "chia-fixture"
     executable.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " +
                           shlex.quote(str(Path(__file__).resolve())) + ' --replot-rpc-fixture "$@"\n', encoding="utf-8")
@@ -2249,6 +2251,86 @@ def check_replot(binary, root, reference=None):
                "--workers", 1, "--batch-members", 1, "--construction", "incremental", "--destination-temp", "off",
                "--devices", "cpu", "--compute", "off", "-M", ram, "--headroom-bytes", 0,
                "--capacity-bytes", ram + 256 * mib, "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    # The normal fill command owns inventory, private preparation and resume.
+    # Configuration discovery is additive; exclusions still count as active
+    # farm scope but never receive output, temporary files or source deletion.
+    direct = directory / "direct fill"
+    excluded = directory / "excluded farm"
+    direct.mkdir()
+    excluded.mkdir()
+    (direct / "legacy.plot").write_bytes(legacy)
+    (excluded / "keep.txt").write_text("excluded directory remains unchanged", encoding="utf-8")
+    extra_config = directory / "other farmer.yaml"
+    extra_config.write_text("harvester:\n  plot_directories:\n  - " + json.dumps(str(direct)) + "\n  - " +
+                            json.dumps(str(excluded)) + "\n", encoding="utf-8")
+    flags(roots=[str(farm), str(direct), str(excluded)])
+    direct_profile = json.loads(json.dumps(profile))
+    direct_catalog = json.loads(run("plan", "--inventory", farm, direct, excluded, *adapter, "--json").stdout)
+    direct_profile["farm_resources"]["workloads"] = [
+        {**resources["workloads"][0], "id": workload["id"], "plot_count": workload["plot_count"]}
+        for workload in direct_catalog["farm_resources"]["workloads"]]
+    direct_profile_file = directory / "direct farm.json"
+    direct_profile_file.write_text(json.dumps(direct_profile), encoding="utf-8")
+    direct_args = [direct, "--replot", "--farm-config", extra_config, "--exclude-destination", farm, excluded,
+                   "--harvester", direct_profile_file, *adapter, *options, "--max-groups", 2, "--max-total-members", 2]
+    unchanged = snapshot(farm), snapshot(direct), snapshot(excluded)
+    preview = json.loads(run("plan", *direct_args, "--json").stdout)
+    assert preview["feasible"] and preview["farming_confirmation"] == "directory"
+    assert preview["selected_source_files"] == 1 and preview["protected_inventory_entries"] == 2
+    assert preview["reclaim_before_bytes"] == catalog["plots"][0]["identity"]["allocated_bytes"]
+    dry = json.loads(run("fill", *direct_args, "--plan-only", "--json").stdout)
+    assert dry["feasible"] and dry["selected_source_files"] == preview["selected_source_files"]
+    direct_setup = json.loads(run("plan", *direct_args, "--save-profile", directory / "direct setup.json", "--json").stdout)
+    guided_command = shlex.split(direct_setup["next_command"])[1:]
+    assert "" not in guided_command and "--replot" in guided_command and "--exclude-destination" in guided_command
+    guided_command[guided_command.index("--save-plan") + 1] = str(directory / "direct preview.plan")
+    guided_preview = json.loads(run(*guided_command, "--json").stdout)
+    assert guided_preview["feasible"] and guided_preview["selected_source_files"] == 1
+    assert (snapshot(farm), snapshot(direct), snapshot(excluded)) == unchanged
+    run("fill", *direct_args, "-f", FARMER, "--pool-ph", POOL, "-S", SEED, point="replot-job-prepared", code=86)
+    prepared = private_record(direct, "grow-replot.review")
+    assert prepared.is_file() and prepared.stat().st_mode & 0o077 == 0 and not private_record(direct, "grow-replot.plan").exists()
+    assert digest(direct / "legacy.plot") == source_hash and (snapshot(farm), snapshot(excluded)) == (unchanged[0], unchanged[2])
+    prepared_hash = digest(prepared)
+    status = json.loads(run("status", direct, "--json").stdout)
+    assert status["durable_phase"] == "no-journal-found" and digest(prepared) == prepared_hash
+    flags(roots=[str(farm), str(direct), str(excluded)], farmer_unloaded=True)
+    direct_alias = directory / "direct alias"
+    direct_alias.symlink_to(direct, target_is_directory=True)
+    waiting_log = directory / "direct waiting.log"
+    with waiting_log.open("w", encoding="utf-8") as output:
+        waiting = subprocess.Popen(command("fill", direct_alias, "--compute", "off", "--json"), stdout=output, stderr=output)
+        try:
+            until = time.monotonic() + 120
+            while "waiting for farming services" not in waiting_log.read_text(encoding="utf-8"):
+                assert waiting.poll() is None, waiting_log.read_text(encoding="utf-8")
+                assert time.monotonic() < until, "direct replot did not retain its published replacement while waiting"
+                time.sleep(0.1)
+            publications = list(direct.glob("*.plot2"))
+            assert len(publications) == 1 and digest(direct / "legacy.plot") == source_hash
+            published_hash = digest(publications[0])
+            assert not list(direct.rglob("*.building")), "farming confirmation retained construction scratch"
+            flags(roots=[str(farm), str(direct), str(excluded)], first_replacement_only=True)
+            assert waiting.wait(timeout=120) == 0, waiting_log.read_text(encoding="utf-8")
+            assert digest(publications[0]) == published_hash
+        finally:
+            if waiting.poll() is None:
+                waiting.terminate()
+                waiting.wait(timeout=30)
+    assert not (direct / "legacy.plot").exists() and private_record(direct, "grow-farm.plan").is_file()
+    direct_paths = list(direct.glob("*.plot2"))
+    assert len(direct_paths) == 2 and digest(prepared) == prepared_hash
+    for path in direct_paths:
+        run("verify", path, "--full", "--trials", 100)
+    assert (snapshot(farm), snapshot(excluded)) == (unchanged[0], unchanged[2])
+    completed_hashes = {path: digest(path) for path in direct_paths}
+    flags(roots=[str(farm), str(direct), str(excluded)], farmer_unavailable=True)
+    completed = json.loads(run("plan", direct_alias, "--compute", "off", "--devices", "cpu", "--json").stdout)
+    assert completed["migration_managed"] and not completed.get("replot_review")
+    run("fill", direct_alias, "--compute", "off", "--devices", "cpu", "--quiet")
+    assert {path: digest(path) for path in direct_paths} == completed_hashes
+    flags()
+    print("PASS direct replot, discovery, exclusions, read-only preview, private recovery and delayed farming confirmation", flush=True)
     # Complete the same synthetic envelope through guided stable-ID settings.
     # Its deliberately supplied bounds are fixture declarations, never local
     # OS measurements or inferred proof/queue service costs.
@@ -2437,7 +2519,7 @@ def check_replot(binary, root, reference=None):
     assert any("cannot inspect scratch/destination directory" in reason for reason in imported["infeasibility_reasons"])
     run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options, "--temp-dir", invalid_temp, *keys, code=2)
     assert snapshot(farm) == guarded, "invalid temporary root changed the farm before predelete admission"
-    if temporary_review.read_bytes().startswith((b"ordinary-group-replot-review-v2\n", b"ordinary-group-replot-review-v3\n")):
+    if temporary_review.read_bytes().startswith((b"ordinary-group-replot-review-v2\n", b"ordinary-group-replot-review-v3\n", b"ordinary-group-replot-review-v4\n")):
         temporary_before = snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)
         unreviewed = json.loads(run("plan", temporary_review, "--harvester", temporary_file, *adapter, *options,
                                    "--temp-dir", external_scratch, "--json", code=2).stdout)
@@ -2485,6 +2567,7 @@ def check_replot(binary, root, reference=None):
         assert snapshot(farm) == before, "source selection refusal changed the farm"
     review = json.loads(run("plan", farm, "--replot", inventory_file, "--harvester", profile_file,
                             *adapter, *options, *selection, "--replot-verification", "strict",
+                            "--replot-confirmation", "file", "--reclaim-before-bytes", 0,
                             "--save-plan", review_file, "--json").stdout)
     assert review["replot_review"] and review["feasible"] and not review["live_readiness_checked"]
     assert review["reclaim_before_bytes"] == 0 and review["farming_value_preserved"] is None
@@ -2624,7 +2707,7 @@ def check_replot(binary, root, reference=None):
     live_status = json.loads(run(*live_status_options, "--json").stdout)
     assert live_status["inspection_complete"] and live_status["live_service_health"] == "prerequisites-observed"
     assert live_status["diagnosis"]["status"] == "live-prerequisites-observed" and live_status["blocking_reason"] is None
-    assert "replacement acknowledgements" in live_status["services"]["diagnosis"]["unknowns"]
+    assert "farming confirmation policy" in live_status["services"]["diagnosis"]["unknowns"]
     human_status = run(*live_status_options).stdout
     assert live_status["diagnosis"]["condition"] in human_status and live_status["diagnosis"]["next_safe_action"] in human_status
     flags(rpc_delay_seconds=5)
@@ -2922,7 +3005,7 @@ def check_replot(binary, root, reference=None):
     assert chain_second["parent_policy_digest"] == chain_first["successor_digest"]
     assert chain_second["origin_review_digest"] == chain_first["origin_review_digest"] and chain_second["completed_replacements"] == 1
     successor_text = chain_second_file.read_text(encoding="utf-8")
-    assert sum(successor_text.count("ordinary-group-replot-review-v" + version) for version in ("1", "2", "3")) == 1
+    assert sum(successor_text.count("ordinary-group-replot-review-v" + version) for version in ("1", "2", "3", "4")) == 1
     embedded_origin = shlex.split(farming_plan_rows(chain_second_file.read_bytes()[:-65])[1].decode("utf-8"))[0].encode("utf-8")
     assert embedded_origin == chain_review_file.read_bytes()[:-65]
     assert hashlib.sha256(embedded_origin).hexdigest() == chain_second["origin_review_digest"]
@@ -3256,20 +3339,20 @@ def check_replot(binary, root, reference=None):
     resource_file.write_text(json.dumps(resource_profile), encoding="utf-8")
     before = snapshot(resource_farm)
     refused = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
-                            *resource_adapter, *options, "--replot-verification", "strict", "--json", code=2).stdout)
+                            *resource_adapter, *options, "--replot-verification", "strict", "--reclaim-before-bytes", 0, "--json", code=2).stdout)
     assert not refused["feasible"] and any("response-deadline-exceeded" in reason for reason in refused["infeasibility_reasons"])
     refused_file = directory / "infeasible resource review.plan"
     refused_saved = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
-                                  *resource_adapter, *options, "--replot-verification", "strict",
+                                  *resource_adapter, *options, "--replot-verification", "strict", "--reclaim-before-bytes", 0,
                                   "--save-plan", refused_file, "--json", code=2).stdout)
     assert refused_saved["infeasibility_reasons"] == refused["infeasibility_reasons"] and not refused_saved["saved_plan"]
     assert not refused_file.exists() and snapshot(resource_farm) == before, "infeasible saved review changed the farm"
     resource_credit = resource_catalog["plots"][0]["identity"]["allocated_bytes"]
     resource_review = directory / "resource-only migration.plan"
     reviewed_resource = json.loads(run("plan", resource_farm, "--replot", resource_inventory, "--harvester", resource_file,
-                                      *resource_adapter, *options, "--reclaim-before-bytes", resource_credit,
+                                      *resource_adapter, *options,
                                       "--replot-verification", "strict", "--save-plan", resource_review, "--json").stdout)
-    assert reviewed_resource["feasible"] and snapshot(resource_farm) == before
+    assert reviewed_resource["feasible"] and reviewed_resource["reclaim_before_bytes"] == resource_credit and snapshot(resource_farm) == before
     import shutil
     assert shutil.disk_usage(resource_farm).free > ram + 256 * mib, "resource-only fixture unexpectedly depends on disk pressure"
     resource_final = Path(reviewed_resource["batches"][0]["path"])
@@ -3345,7 +3428,7 @@ def check_replot(binary, root, reference=None):
     structural_review = directory / "structural predelete migration.plan"
     before = snapshot(structural_farm)
     no_credit = json.loads(run("plan", structural_farm, "--replot", structural_inventory, "--harvester", structural_profile_file,
-                              *structural_adapter, *options, "--json", code=2).stdout)
+                              *structural_adapter, *options, "--reclaim-before-bytes", 0, "--json", code=2).stdout)
     assert not no_credit["feasible"] and snapshot(structural_farm) == before
     planned = json.loads(run("plan", structural_farm, "--replot", structural_inventory, "--harvester", structural_profile_file,
                              *structural_adapter, *options, "--reclaim-before-bytes", structural_credit,

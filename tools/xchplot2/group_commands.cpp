@@ -36,12 +36,13 @@ void command_usage(std::string_view command)
             "       xchplot2 fill [OPTIONS] --extend DIR...\n"
             "       xchplot2 fill [OPTIONS] --relocate OLD NEW\n"
             "       xchplot2 fill [OPTIONS] (--paths-from FILE | --paths0-from FILE)\n"
+            "       xchplot2 fill --replot [OPTIONS] [DIR...]\n"
             "       xchplot2 fill --plan-only [OPTIONS] [DIR... | PLAN]\n";
     else std::cout << "Usage: xchplot2 " << command
         << (command == "grow" ? " FILE [OPTIONS]\n" : " [OPTIONS] [DIR... | PLAN]\n");
     if (command == "plan") std::cout << "       xchplot2 plan --assess-jobs [OPTIONS] PLAN...\n";
     if (command == "plan") std::cout << "       xchplot2 plan --inventory ROOT... [--save-plan inventory.plan]\n"
-        "       xchplot2 plan DEST... --replot inventory.plan [--save-plan migration.plan]\n"
+        "       xchplot2 plan --replot [DIR...] [--save-plan migration.plan]\n"
         "       xchplot2 plan --revalidate --from-plan migration.plan --harvester UPDATED_PROFILE --save-plan NEW\n";
     if (command == "plan" || command == "fill") std::cout << "       xchplot2 " << command << " --status [DIR | PLAN | --manifest FILE]\n";
 }
@@ -65,6 +66,9 @@ void command_help_all(std::string_view command)
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"
         "  --discover-drives DIR    select supported mounted storage at or below DIR; repeatable\n"
         "  --mounts-under DIR       alias for --discover-drives\n"
+        "  --discover-farm          merge plot directories from configured Chia-family readers\n"
+        "  --farm-config PATH...    additional reader roots or config.yaml files\n"
+        "  --exclude-destination DIR...  exclude these paths from output, scratch and retirement\n"
         "  --manifest FILE          locate an existing farming job directly\n"
         "  --save-plan FILE         save a plan without private plot keys, e.g. farm.plan\n"
         "  -F, --from-plan FILE     explicit alternative to supplying PLAN directly\n"
@@ -73,7 +77,9 @@ void command_help_all(std::string_view command)
         "  --metadata-only          plan: inspect saved metadata without checking destinations or recovery\n"
         "  --assess-jobs             plan: check saved plans together against one harvester budget\n"
         "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
-        "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
+        "  --replot                 replace eligible old plots; plan previews, fill authorizes execution\n"
+        "  --replot-inventory FILE  reuse a saved inventory instead of scanning selected roots\n"
+        "  --replot-confirmation directory|file  farming acknowledgement scope; default directory\n"
         "  --replot-verification MODE  replacement checks (default structural):\n"
         "                           structural: headers and chunk index\n"
         "                           sampled: also sample full proofs for selected groups\n"
@@ -90,7 +96,7 @@ void command_help_all(std::string_view command)
         "  --live                   status: query shared compute and migration service readiness\n"
         "  --timeout-ms N           status --live: total query time in milliseconds, 100..60000; default 5000\n"
         "  --revalidate             plan: save a successor for updated resources or verification policy\n"
-        "  --reclaim-before-bytes N  allocated-byte limit for early deletion; default zero\n"
+        "  --reclaim-before-bytes N  cap early deletion; default automatic for one replacement; 0 requires replacement first\n"
         "                           Early deletion is irreversible: old plots may be removed before replacements are ready.\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
         "  --farm-adapter-timeout-ms N  inventory/migration adapter operation deadline, default 30000\n"
@@ -128,6 +134,7 @@ void command_help_all(std::string_view command)
             "  --capacity-bytes N        aggregate output capacity per filesystem\n") <<
         "  --leave-free SIZE         filesystem space to leave free; --headroom-bytes is an alias\n"
         "  -t, --temp-dir DIR        temporary plotting storage; repeat for more devices\n"
+        "  --temp-dirs DIR...        supply several temporary directories with one flag\n"
         "  --destination-temp off|on|ssd|hdd  allow temporary files on destinations; default off\n"
         "  --temp-capacity-bytes N   temporary capacity per filesystem\n"
         "  --construction auto|incremental|staged|merged|external\n"
@@ -226,7 +233,7 @@ void command_help(std::string_view command, bool all)
     command_usage(command);
     if (command == "plan")
         std::cout << "Preview a layout for the selected destinations. Without directories, suggest mounted storage.\n"
-            "Save a plan once, then pass it directly to fill:\n\n"
+            "Optionally save a plan and pass it directly to fill:\n\n"
             "  xchplot2 plan /disk-a/plots /disk-b/plots --harvester local --save-plan farm.plan\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n\n"
             "  --save-plan FILE          save a plan for fill without private plot keys\n"
@@ -238,7 +245,8 @@ void command_help(std::string_view command, bool all)
             "  --metadata-only           read saved PLAN or --manifest FILE without live checks\n"
             "  --assess-jobs PLAN...      check saved plans together against one harvester budget\n"
             "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
-            "  --replot INVENTORY       review migration into DEST...; save with --save-plan\n"
+            "  --replot                 preview replacement of eligible old plots; inventory is automatic\n"
+            "  --replot-inventory FILE  optionally reuse a saved inventory\n"
             "  --replot-verification MODE  replacement checks (default structural):\n"
             "                           structural: headers and chunk index\n"
             "                           sampled: also sample full proofs for selected groups\n"
@@ -251,7 +259,7 @@ void command_help(std::string_view command, bool all)
             "  --replot-max-source-bytes SIZE  bound selected allocated old-file bytes\n"
             "  --status DIR|PLAN        inspect completed work, allowance and blocked reasons\n"
             "  --revalidate              review updated resources or verification; use --from-plan and --save-plan\n"
-            "  --reclaim-before-bytes SIZE  allocated-byte limit for early deletion; default zero\n"
+            "  --reclaim-before-bytes SIZE  cap automatic early deletion; 0 requires replacement first\n"
             "Early deletion is irreversible: old plots may be removed before replacements are ready.\n";
     else
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
@@ -269,11 +277,15 @@ void command_help(std::string_view command, bool all)
             "  --update                  revise capacity or future group parameters during fill\n"
             "  --cancel-update           cancel a waiting update\n"
             "  --plan-only               preview without plotting\n"
+            "  --replot                  replace eligible old plots; no separate plan command required\n"
+            "  --replot-inventory FILE   optionally reuse a saved inventory\n"
+            "  --replot-confirmation directory|file  acknowledge farming once per directory (default) or per file\n"
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
             "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
             "  -M, --max-host-ram SIZE   combined plotting RAM budget, e.g. 14G\n"
-            "  -t, --temp-dir DIR        temporary plotting storage\n";
+            "  -t, --temp-dir DIR        temporary plotting storage\n"
+            "  --temp-dirs DIR...        several temporary directories with one flag\n";
 #ifdef XCHPLOT2_GROUP_COMMANDS
     if (command == "plan") std::cout <<
         "  --calibrate FILE...       measure supplied plots; use --json or --save-profile FILE\n"
@@ -282,6 +294,10 @@ void command_help(std::string_view command, bool all)
     std::cout <<
         "  --harvester local|FILE    use this harvester or a profile from another machine\n"
         "  --discover-drives DIR    select supported mounted storage at or below DIR, at any depth\n"
+        "  --discover-farm          include configured farm directories; automatic with a fresh --replot scan\n"
+        "  --farm-config PATH...    additional Chia-family reader roots or config.yaml files\n"
+        "  --exclude-destination DIR...  protect paths from output, scratch and retirement\n"
+        "                           End path lists with another option or -- before positional destinations.\n"
         "  -k, --k N                 plot size, default 28\n"
         "  -s, --strength N          plot strength, default 2\n"
         "  --group-members auto|N    automatic layout or a member limit per file\n"
