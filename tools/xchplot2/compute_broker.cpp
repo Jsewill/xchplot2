@@ -18,12 +18,12 @@ namespace
 std::atomic<bool> stopping{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
 void stop(int) { stopping.store(true, std::memory_order_relaxed); }
-unsigned number(std::string_view value)
+unsigned number(std::string_view value, std::string const& option)
 {
     unsigned result = 0;
     auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
     if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !result)
-        throw std::runtime_error("option requires a positive integer");
+        throw std::runtime_error(option + " requires a positive integer");
     return result;
 }
 void help(bool all)
@@ -32,7 +32,7 @@ void help(bool all)
     all = true;
 #endif
     std::cout <<
-        "Network-compute broker for ordinary PoS2 group growth\n"
+        "Schedule shared compute tasks for plotting jobs\n"
 #ifdef XCHPLOT2_GROUP_COMMANDS
         "Usage: xchplot2 compute broker [OPTIONS]\n"
         "  --directory DIR      saved compute setup directory\n"
@@ -52,10 +52,10 @@ void help(bool all)
         "  --max-connections N  active and idle control channels, default 128\n"
         "  --idle-ms N          idle control channel timeout, default 30000\n"
         "  --owner-share ID:N   relative service share for a stable owner ID\n"
-        "  --max-workers N      registered compute nodes, default 128\n"
-        "  --max-owners N       coordinator namespaces, default 128\n"
+        "  --max-workers N      registered workers, default 128\n"
+        "  --max-owners N       plotting job owners, default 128\n"
         "  --max-tasks N        queued, active, and recent task records, default 4096\n"
-        "Every connection requires a trusted client certificate. Restarting fences old leases.\n";
+        "Every connection requires a trusted client certificate. Restarting invalidates existing task assignments.\n";
     else std::cout << "Use --help-all for TLS, scheduling and connection limits.\n";
     std::cout << pos2gpu::compute_output_help;
 }
@@ -89,22 +89,22 @@ int main(int argc, char** argv) try
         else if (key == "--tls-ca") options.tls.ca_file = value;
         else if (key == "--tls-cert") options.tls.cert_file = value;
         else if (key == "--tls-key") options.tls.key_file = value;
-        else if (key == "--timeout-ms") options.tls.timeout_ms = number(value);
-        else if (key == "--lease-ms") options.lease_ms = number(value);
-        else if (key == "--worker-ms") options.worker_ms = number(value);
-        else if (key == "--control-threads") options.control_threads = number(value);
-        else if (key == "--max-connections") options.max_connections = number(value);
-        else if (key == "--idle-ms") options.idle_ms = number(value);
+        else if (key == "--timeout-ms") options.tls.timeout_ms = number(value, key);
+        else if (key == "--lease-ms") options.lease_ms = number(value, key);
+        else if (key == "--worker-ms") options.worker_ms = number(value, key);
+        else if (key == "--control-threads") options.control_threads = number(value, key);
+        else if (key == "--max-connections") options.max_connections = number(value, key);
+        else if (key == "--idle-ms") options.idle_ms = number(value, key);
         else if (key == "--owner-share")
         {
             auto const separator = value.rfind(':');
             if (separator == std::string::npos || !separator) throw std::runtime_error("--owner-share requires ID:N");
             auto const id = value.substr(0, separator), share = value.substr(separator + 1);
-            if (!options.owner_shares.emplace(id, number(share)).second) throw std::runtime_error("duplicate owner share: " + id);
+            if (!options.owner_shares.emplace(id, number(share, key)).second) throw std::runtime_error("duplicate owner share: " + id);
         }
-        else if (key == "--max-workers") options.max_workers = number(value);
-        else if (key == "--max-owners") options.max_owners = number(value);
-        else if (key == "--max-tasks") options.max_tasks = number(value);
+        else if (key == "--max-workers") options.max_workers = number(value, key);
+        else if (key == "--max-owners") options.max_owners = number(value, key);
+        else if (key == "--max-tasks") options.max_tasks = number(value, key);
         else throw std::runtime_error("unknown option: " + key);
     }
     output.validate();

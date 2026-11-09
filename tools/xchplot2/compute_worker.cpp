@@ -15,17 +15,18 @@ namespace
 {
 volatile std::sig_atomic_t stopped = 0;
 void stop(int) { stopped = 1; }
-uint64_t number(char const* text)
+uint64_t number(char const* text, std::string const& option)
 {
     std::string value(text);
     if (value.empty() || value.find_first_not_of("0123456789") != value.npos)
-        throw std::runtime_error("invalid worker integer");
-    return std::stoull(value);
+        throw std::runtime_error(option + " requires a nonnegative integer");
+    try { return std::stoull(value); }
+    catch (std::out_of_range const&) { throw std::runtime_error(option + " exceeds the maximum integer value (18446744073709551615)"); }
 }
-unsigned small(char const* value)
+unsigned small(char const* value, std::string const& option)
 {
-    auto const result = number(value);
-    if (result > UINT32_MAX) throw std::runtime_error("worker integer exceeds supported range");
+    auto const result = number(value, option);
+    if (result > UINT32_MAX) throw std::runtime_error(option + " must be no greater than 4294967295");
     return unsigned(result);
 }
 void help(bool all)
@@ -45,21 +46,21 @@ void help(bool all)
 #else
         "Usage: pos2_pr118_grow_worker --broker HOST:PORT --listen HOST:PORT\n"
 #endif
-        "  --cpus N --host-bytes SIZE   offered CPU and host RAM limits\n"
+        "  --cpus N --host-bytes SIZE   offered CPU threads and host RAM limit\n"
         "  --backend cpu|gpu|auto   offered generation backend, default auto with saved setup\n"
-        "  --gpu-bytes N --device N --tier NAME   bounded GPU offer\n";
+        "  --gpu-bytes N --device N --tier NAME   GPU RAM limit in bytes, device and tier\n";
     if (all) std::cout <<
-        "  --advertise HOST:PORT     endpoint reachable by storage owners\n"
+        "  --advertise HOST:PORT     address reachable by plotting hosts\n"
         "  --ca FILE --cert FILE --key FILE  mutual TLS credentials\n"
         "  --slots N                maximum active tasks, default 1\n"
-        "  --generation-threads N   CPU permits per generation, default CPUs / slots\n"
-        "  --max-frame-bytes N      bounded transport frame\n"
-        "  --max-task-bytes N       bounded codec window and contribution scratch\n"
+        "  --generation-threads N   CPU threads per generation task, default CPUs / slots\n"
+        "  --max-frame-bytes N      maximum network message size in bytes\n"
+        "  --max-task-bytes N       codec window and temporary generation-data limit in bytes\n"
         "  --max-window-chunks N    maximum chunks per codec task\n"
-        "  --max-batch-members N    maximum coencoded generation members\n"
-        "  --task-timeout-ms N      maximum task duration\n"
-        "  --tls-timeout-ms N       deadline for each TLS operation\n"
-        "  --max-brokers N          bounded broker registrations, default 128\n";
+        "  --max-batch-members N    maximum members per generation task\n"
+        "  --task-timeout-ms N      maximum task duration in milliseconds\n"
+        "  --tls-timeout-ms N       timeout for each TLS operation in milliseconds\n"
+        "  --max-brokers N          maximum broker registrations, default 128\n";
     else std::cout << "Use --help-all for TLS, transport and task limits.\n";
     std::cout << pos2gpu::compute_output_help;
 }
@@ -83,7 +84,7 @@ int main(int argc, char** argv)
             if (option == "--help" || option == "-h" || option == "--help-all") { help(option == "--help-all"); return 0; }
             if (output.parse(option)) continue;
             if (option == "--no-discovery") { discover = false; discovery_set = true; continue; }
-            if (i + 1 == argc) throw std::runtime_error("missing worker option value");
+            if (i + 1 == argc) throw std::runtime_error("missing value for " + option);
             auto const value = argv[++i];
             if (option == "--broker") config.brokers.push_back(group_grow::pool::parse_endpoint(value));
             else if (option == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value));
@@ -99,22 +100,22 @@ int main(int argc, char** argv)
             else if (option == "--ca") config.tls.ca_file = value;
             else if (option == "--cert") config.tls.cert_file = value;
             else if (option == "--key") config.tls.key_file = value;
-            else if (option == "--cpus") config.capacity.cpu_threads = small(value);
-            else if (option == "--slots") config.capacity.slots = small(value);
-            else if (option == "--host-bytes") config.capacity.host_bytes = number(value);
-            else if (option == "--gpu-bytes") config.capacity.gpu_bytes = number(value);
-            else if (option == "--generation-threads") config.generation_threads = small(value);
+            else if (option == "--cpus") config.capacity.cpu_threads = small(value, option);
+            else if (option == "--slots") config.capacity.slots = small(value, option);
+            else if (option == "--host-bytes") config.capacity.host_bytes = number(value, option);
+            else if (option == "--gpu-bytes") config.capacity.gpu_bytes = number(value, option);
+            else if (option == "--generation-threads") config.generation_threads = small(value, option);
             else if (option == "--backend") { config.backend = value; backend_set = true; }
             else if (option == "--tier") config.tier = value;
             else if (option == "--device")
-            { auto const device = small(value); if (device > INT32_MAX) throw std::runtime_error("invalid worker device"); config.device = int(device); }
-            else if (option == "--max-frame-bytes") config.tls.max_frame_bytes = small(value);
-            else if (option == "--max-task-bytes") config.max_task_bytes = number(value);
-            else if (option == "--max-window-chunks") config.max_window_chunks = small(value);
-            else if (option == "--max-batch-members") config.max_batch_members = small(value);
-            else if (option == "--task-timeout-ms") config.task_timeout_ms = small(value);
-            else if (option == "--tls-timeout-ms") config.tls.timeout_ms = small(value);
-            else if (option == "--max-brokers") { config.max_brokers = small(value); brokers_set = true; }
+            { auto const device = small(value, option); if (device > INT32_MAX) throw std::runtime_error("--device must be between 0 and 2147483647"); config.device = int(device); }
+            else if (option == "--max-frame-bytes") config.tls.max_frame_bytes = small(value, option);
+            else if (option == "--max-task-bytes") config.max_task_bytes = number(value, option);
+            else if (option == "--max-window-chunks") config.max_window_chunks = small(value, option);
+            else if (option == "--max-batch-members") config.max_batch_members = small(value, option);
+            else if (option == "--task-timeout-ms") config.task_timeout_ms = small(value, option);
+            else if (option == "--tls-timeout-ms") config.tls.timeout_ms = small(value, option);
+            else if (option == "--max-brokers") { config.max_brokers = small(value, option); brokers_set = true; }
             else throw std::runtime_error("unknown worker option: " + option);
         }
         output.validate();

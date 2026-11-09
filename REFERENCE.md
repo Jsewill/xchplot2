@@ -33,7 +33,7 @@ xchplot2 plot -k 28 -n 10 \
 | `-d`, `--devices SPEC` | Select [GPUs and CPU workers](#devices-and-cpu-workers) |
 | `-M`, `--max-host-ram SIZE` | Host-memory budget, such as `8G` or `512M` |
 | `-t`, `--temp-dir DIR` | Temporary storage for spill or grouped construction |
-| `-j`, `--workers N` | Shared compression CPU allowance for grouped construction |
+| `-j`, `--workers N` | Shared plotting CPU budget for grouped construction |
 | `-r`, `--resume` | Recover the saved job and skip validated completed files |
 | `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
 | `-g`, `--meta-group N` | Meta-group field; default 0 |
@@ -163,7 +163,7 @@ Ordinary grouped plotting, filling and growth accept the same `--devices`
 selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
 combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
 Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
-CPU allowance and `--max-host-ram` budget. Three quarters of that RAM is divided
+CPU budget and `--max-host-ram` budget. Three quarters of that RAM is divided
 equally among the producers; the remainder covers receiving and construction.
 Each producer must fit its share. These explicit local executors need no pool
 enrollment or network listener and cannot be combined with shared compute
@@ -209,7 +209,7 @@ resource details; `--json` emits the machine-readable report. An infeasible
 layout reports its reason and exits unsuccessfully. `--help` shows the common workflow;
 `--help-all` includes recovery, tuning and shared-compute options.
 
-To execute a reviewed layout, save a keyless plan:
+To execute a reviewed layout, save a plan without private plot keys:
 
 ```bash
 xchplot2 plan /disk-a/plots /disk-b/plots --save-plan farm.plan
@@ -299,7 +299,7 @@ Read-only planning and status do not create `.xchplot2` directories.
 Save portable plans, migration reviews and successors outside this reserved
 recovery namespace. New plot and farm destinations must also stay outside `.xchplot2`.
 
-`plan --metadata-only PLAN` reads a saved keyless preview, and
+`plan --metadata-only PLAN` reads a saved plan without private plot keys, and
 `plan --metadata-only --manifest FILE` reads one private job copy. This mode
 reports saved assignments and compatibility without probing destinations,
 starting services or inspecting construction checkpoints. It can inspect a
@@ -311,8 +311,9 @@ beyond an original forecast. Status reports completed observations separately.
 Metadata-only inspection reads the supplied record; refresh a preview with
 `plan` to include validated local progress before inspecting that preview.
 
-To assess several managed jobs under one harvester budget, refresh a keyless
-summary for each job, then assess the summaries together:
+To assess several managed jobs under one harvester budget, save an updated
+plan for each job, then assess the plans together. These plans contain no
+private plot keys:
 
 ```bash
 xchplot2 plan --manifest /disk-a/plots/.xchplot2/grow-farm.plan --save-plan job-a.plan
@@ -427,7 +428,7 @@ report required resources and, where the bounded search finds them, assessed
 alternative settings with any remaining constraint failures. Suggestions do
 not change the declared harvester automatically.
 
-Select those settings by name to produce a normal keyless preview:
+Select those settings by name to produce a plan without private plot keys:
 
 ```bash
 xchplot2 plan /disk/plots --alternative memory,eligible-groups --save-plan resources.plan
@@ -452,17 +453,19 @@ remain. The selected result receives a fresh complete assessment before saving.
 Selected previews use the usual source-policy, native-directory and progress
 checks when applied with `fill`.
 
-During an active fill, requests and their receipts are saved on available
-matching job members. There is no required first destination. The coordinator
-reaches a recoverable construction boundary, applies the revision once all
-required members are available, and continues automatically. Repeating a request is
-idempotent; editing a waiting request preserves compatible earlier changes.
+During an active fill, requests and their results are saved on available
+destinations belonging to the job. There is no required first destination.
+The running fill reassesses a request at a safe checkpoint once all required
+destinations are available. It applies the revision and continues only if the
+checks pass. Repeating a request has the same effect as submitting it once;
+editing a waiting request preserves compatible earlier changes.
 Requests made on disconnected members are reconciled when the drives return.
 Conflicting edits receive a field-specific refusal. `status` reports waiting,
 applied, superseded, cancelled or refused requests and their reasons. A queued
 request is not a promise of feasibility; refusal leaves the active fill on its
-saved policy. To review an older job's recovery-metadata allowance, stop its
-foreground coordinator at a durable boundary, then use:
+saved policy. To review additional space for an older job's recovery records,
+press Ctrl-C in the running fill terminal and wait for the command to exit.
+Then use:
 
 ```bash
 xchplot2 plan /disk/plots --upgrade-job --save-plan upgrade.plan
@@ -497,14 +500,14 @@ xchplot2 retire /disk-a/plots --destination /disk-b/plots
 xchplot2 resume /disk-a/plots
 ```
 
-`pause` stops at a recoverable boundary. `drain` finishes started files without
-starting another. `resume` reopens paused or drained work and starts an idle job,
-or reports its current coordinator. It uses the normal execution defaults; use
+`pause` stops at the next safe checkpoint. `drain` finishes started files without
+starting another. `resume` allows paused or drained work to continue and starts
+an idle job, or reports the running fill. It uses the normal execution defaults; use
 `fill --resume` to supply backend, workspace or temporary-directory options.
 Add `--policy-only` to record intent without starting an idle job. A destination
 pause or drain remains in force until that destination is resumed.
-Available drives honor controls at the next recovery boundary even while other
-members are missing; unavailable destinations show pending intent. Controls use
+Available drives honor controls at the next safe checkpoint even while other
+destinations are missing; unavailable destinations show pending intent. Controls use
 a compact causal snapshot, so repeated actions do not fill the policy request
 queue. Concurrent conflicting actions remain restricted until the drives are
 reconnected and an explicit action resolves the affected scope.
@@ -550,7 +553,8 @@ xchplot2 status /disk/plots --live --timeout-ms 5000
 xchplot2 status migration.plan --live --harvester local-migration.json --json
 ```
 
-`--timeout-ms` is the overall live-query budget (`100..60000`, default `5000`).
+`--timeout-ms` is the total time allowed for live queries in milliseconds
+(`100..60000`, default `5000`).
 Reports distinguish saved intent, current observations, unavailable checks and
 remaining unknowns, with the affected work and next action. Compute inspection
 checks enrollment expiry, compatible advertised workers and admission state;
@@ -615,7 +619,7 @@ Use `plot` to create a new named job, or `fill` to manage a directory layout.
 
 `-M`/`--max-host-ram SIZE` bounds modeled construction, producer, transport and
 codec buffers across the job. The default is 14,000,000,000 bytes.
-`-j`/`--workers N` bounds the shared compression CPU allowance; zero or omission
+`-j`/`--workers N` sets the shared plotting CPU budget; zero or omission
 uses the available logical CPU count. The operating system, libraries and
 file cache are outside that buffer model. Separate plotting processes each
 have their own construction budget.
@@ -637,14 +641,15 @@ scratch per filesystem. External construction needs permitted scratch.
 Writers sharing a physical drive serialize their I/O. Independent drives can
 progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
-and clean-cache release. `--window-bytes SIZE` and `--checkpoint-bytes SIZE`
-set fixed I/O and durability windows instead of the automatic choices.
+and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
+`--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.
+These options override the automatic choices.
 
 Construction checkpoints are private. New records require a compatible format,
 algorithm and native representation; legacy records require their original build. Retain the
 in-progress file, plan and any owned scratch/checkpoint directory together;
 do not move or edit them during recovery. A file being constructed is not a
-farmable completed output. Stop gracefully with Ctrl-C, then repeat the
+farmable completed output. Press Ctrl-C and wait for the command to exit, then repeat the
 owning command with `--resume` (`grow` resumes implicitly). Completed output
 paths appear on stdout after publication or a successful resume audit.
 `--json` replaces human output with the plan or construction metrics;
@@ -913,7 +918,10 @@ xchplot2 plan --inventory /disk-a/plots /disk-b/plots \
 This reads native file identities, allocated and logical sizes, supported
 public headers and storage sharing. It exports no plot memos, private keys or
 seeds and starts no farming services. Without `--save-plan`, it only reports
-the inventory. Saving refuses an existing file. Paths, public identifiers and
+the inventory summary; use `--json` for the complete report. With `--save-plan`,
+the saved inventory includes resource observations and missing settings.
+Source files are unchanged in either case. Saving refuses an existing file.
+Paths, public identifiers and
 hostnames remain in the report, so review those before sharing it.
 
 File names and extensions do not establish a format or deletion eligibility.
@@ -1183,8 +1191,8 @@ permit it. Ordinary plotting retains its shared owner/worker gate.
 Local GPU worker reservations also cover the complete inherited CPU affinity
 for runtime helpers, as well as offered task CPUs and GPU allocation/residency.
 
-To retire old plots before constructing their replacement group, explicitly
-choose the allocated-byte deletion debt you accept as `PREDELETE_LIMIT`, then
+To delete old plots before constructing their replacement group, explicitly
+choose an allocated-byte limit for early deletion as `EARLY_DELETE_LIMIT`, then
 review and save the plan. The limit must cover the old files needed by the
 active replacement batch. When the plan uses this allowance, the old files
 are removed before construction. Later checks on the new group cannot protect
@@ -1194,7 +1202,7 @@ or recover the deleted data.
 xchplot2 plan /disk-a/plots /disk-b/plots --replot inventory.plan \
   --harvester mixed-farm.json --compute off --devices cpu \
   --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
-  --reclaim-before-bytes "$PREDELETE_LIMIT" \
+  --reclaim-before-bytes "$EARLY_DELETE_LIMIT" \
   --save-plan migration.plan --json
 xchplot2 fill migration.plan --compute off --devices cpu \
   --harvester mixed-farm.json \
@@ -1233,26 +1241,28 @@ filesystem has a later destination. It then favors the same filesystem,
 spreads allocated bytes across replacement outputs, and keeps reader workload
 cohorts together when the active batch can hold them. Bootstrap sources are
 mapped to the output that needs their space.
-Every prefix must still pass the resource, scratch-space and outstanding
-pre-delete checks; execution proceeds sequentially through that fixed mapping.
+Every prefix must still pass the resource, scratch-space and early-deletion
+checks; execution proceeds sequentially through that fixed mapping.
 Selection tries bounded alternatives when the ranked choice cannot fit the
-debt limit. A search-bound refusal does not establish that no feasible subset
+early-deletion limit. A search-bound refusal does not establish that no feasible subset
 exists. It permits no additional retirement; existing pending commitments and
-outstanding debt remain in the private journal.
+used early-deletion allowance remain in the private journal.
 
 `--reclaim-before-bytes SIZE` belongs to the review and defaults to zero;
-the pre-delete example above requires an explicit positive allowance.
+the early-deletion example above requires an explicit positive allowance.
 Zero requires each mapped replacement to be ready before its sources are
 removed. A positive value permits that many allocated source bytes to be
-retired while their mapped replacements are not yet ready, across interruptions
-and restarts. Removal is irreversible: the new plot cannot reconstruct an old
+committed to removal or removed while their mapped replacements are not yet
+ready. The used allowance includes pending committed removals and persists
+across interruptions and restarts. It is released when the mapped replacement
+is recorded ready. Removal is irreversible: the new plot cannot reconstruct an old
 one. This limit measures physical bytes, not lost income or equal farming
 value. Temporary space selected with `--temp-dir` is construction scratch;
 it is not automatically a farmable replacement.
-External construction with pre-delete credit also requires a joint output and
+External construction with an early-deletion allowance also requires a joint output and
 scratch admission. The review and execution check the actual temporary roots,
 filesystem sharing, full output/checkpoint reservations and outstanding deletion
-debt before claiming any source. An inadequate `--temp-capacity-bytes` or
+commitments before claiming any source. An inadequate `--temp-capacity-bytes` or
 unavailable scratch root refuses the deletion; credit cannot stand in for a
 complete scratch grant.
 
@@ -1271,24 +1281,25 @@ this workflow.
 
 Set `--replot-verification sampled` during review to add bounded full-proof
 checks for selected groups. It defaults to the first group only. Use
-`--replot-proof-first-groups N` for an initial prefix and
-`--replot-proof-every-groups N` for periodic checks; a periodic value of zero
+`--replot-proof-first-groups N` to check the first N groups and
+`--replot-proof-every-groups N` to check every Nth group; a periodic value of zero
 disables that part of the schedule. Group numbers are one-based across the
 entire reviewed output order, including all destinations. A group is selected
 if it belongs to the prefix or its number is divisible by the periodic value.
 The schedule is saved and remains the same across interruptions. A sampled
 policy must select a nonzero prefix or period. `--replot-verification strict`
-requires a positive bounded full-proof sample for every new group.
+requires full-proof samples for every new group. It still samples proofs;
+it does not check every payload byte.
 
 Each selected group must yield a valid complete proof within its challenge,
 solver, CPU, memory and time budgets. A failed or exhausted sample stops the
-replacement; it does not undo pre-deletion. Sampling does not inspect every
+replacement; it does not undo early deletion. Sampling does not inspect every
 chain or prove every byte correct. Isolated check workers request lower CPU
 and I/O scheduling priority when supported. These preferences do not replace
 resource admission or impose service guarantees. Proof solving remains local.
 
-Without pre-delete credit, these checks and exact farming readiness precede
-retirement of the mapped old files. With credit, the same replacement checks
+Without an early-deletion allowance, these checks and exact farming readiness precede
+retirement of the mapped old files. With an allowance, the same replacement checks
 complete the batch after its authorized early retirement.
 The configured harvester must report that exact path with matching plot
 identity, public-key route, size and modification time. The target network
@@ -1363,15 +1374,15 @@ begins. Ordinary supported public headers can identify unloaded files directly.
 
 Use `xchplot2 plan --status --from-plan migration.plan --json` for read-only
 progress. Status separates the durable phase, completed receipts, retirement
-states and outstanding pre-delete debt from current filesystem observations.
+states and used early-deletion allowance from current filesystem observations.
 It shows exact active claim and replacement paths, pending replica publication
 and the next safe action. It reports the selected verification policy and each
 group's actual full-proof evidence separately; structural completion never
 appears as a validated proof. It also distinguishes an active policy from a pending
 successor, a stale reviewed boundary or a different active policy, showing both
-the reviewed and current journal digests. It does not contact farming or compute
-services and does not diagnose their current health or the reason a previous
-process stopped.
+the reviewed and current journal digests. By default, it does not contact
+farming or compute services. Add `--live` for current service-readiness queries;
+these queries do not establish why a previous process stopped.
 Missing replicas are reported as incomplete observations. No journal found is
 not proof that the job never ran; preserve remaining artifacts before recovery.
 
@@ -1399,7 +1410,7 @@ receipts and sealed replacements, then refreshes reader observations and current
 farming acknowledgements. Review covers current and remaining phases; decoder
 residency or queues remain charged until fresh observations confirm unload.
 The successor preserves the original keys, fixed output identities and layout,
-selected native sources, completed receipts and pre-delete limit and debt.
+selected native sources, completed receipts and early-deletion limit and used allowance.
 Claimed or retired files retain their original identification; separate current
 reader observations do not identify them again. Active opaque files must still
 be loaded and freshly identified by the current reader.
@@ -1541,8 +1552,8 @@ xchplot2 compute drain
 xchplot2 compute resume
 ```
 
-`pause` stops new task admission while accepted tasks finish. `drain` also
-changes to `drained` after accepted work finishes; `resume` reopens admission.
+`pause` stops new tasks while accepted tasks finish. `drain` also
+changes to `drained` after accepted work finishes; `resume` allows new tasks.
 Only the worker's own enrolled identity can control it. Enrolled workers save
 pause/drain/resume intent privately before acknowledging it. Intent survives
 service restarts, automatic-executor replacement and certificate renewal; a
@@ -1563,9 +1574,9 @@ eligibility are checked separately; incompatible work is not scheduled.
 Compatible releases can be rolled through workers without rebuilding every
 machine together. A wire-protocol change requires upgrading brokers, workers
 and plotting hosts together. This version uses compute protocol 5 and does not
-interoperate with protocol 4. Drain before replacing services, preserve the
-saved enrollment directory, restart services, then explicitly resume workers
-whose drain intent is still saved.
+interoperate with protocol 4. Drain workers and wait for `drained` before
+replacing services. Preserve the saved enrollment directory, restart services,
+then run `compute resume` on the drained workers to accept new tasks.
 
 ### Background workers and brokers
 
@@ -1584,8 +1595,10 @@ The default role is `worker`; add `--role broker` for a dedicated broker.
 `print` displays the definition without installing or starting it. `install`
 starts the service and arranges subsequent startup. `start`, `stop`, `restart`
 and `remove` act only on the service generated for this identity. Use
-`compute drain` and wait for `drained` before stopping if accepted tasks should
-finish first. Restart after changing saved defaults or replacing the executable.
+`compute drain` on workers and wait for `drained` before stopping if accepted
+tasks should finish first. Restart after changing saved defaults or replacing
+the executable. After restarting a drained worker, run `compute resume` to
+accept new tasks; restarting alone does not clear its saved drain setting.
 
 Linux uses a systemd user service; logout behavior follows the system's user
 manager policy. Windows uses Task Scheduler at user login, without elevation,

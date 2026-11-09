@@ -93,7 +93,7 @@ inline bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             if (!tier_suffix.empty()) {
                 auto const it = opts.per_device_tier.find(id);
                 if (it != opts.per_device_tier.end() && it->second != tier_suffix) {
-                    return bad("same GPU id given two different :tier overrides");
+                    return bad("conflicting tiers for the same GPU; select one :tier per GPU");
                 }
                 opts.per_device_tier[id] = tier_suffix;
             }
@@ -110,14 +110,14 @@ inline bool parse_devices_arg(std::string const& s, pos2gpu::BatchOptions& opts)
             any_gpu_token = true;
             if (!tier_suffix.empty()) opts.all_gpus_tier = tier_suffix;
         } else if (selector == "cpu") {
-            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
+            if (!tier_suffix.empty()) return bad("CPU devices do not accept a :tier suffix");
             // Every CPU node, exactly as `gpu` means every GPU. It is a
             // SELECTION, not a count: --cpu-workers says how many plots run per
             // node. So repeats dedup — `cpu,cpu` names the same hardware twice
             // and cannot mean more of it, any more than `0,0` means two cards.
             opts.use_all_cpu_nodes = true;
         } else if (auto const node = indexed(selector, "cpu")) {
-            if (!tier_suffix.empty()) return bad("cpu token cannot carry a tier");
+            if (!tier_suffix.empty()) return bad("CPU devices do not accept a :tier suffix");
             opts.cpu_node_ids.push_back(*node);
         } else if (auto const id = indexed(selector, "gpu")) {
             if (!add_gpu(*id)) return false;

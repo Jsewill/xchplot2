@@ -73,9 +73,11 @@ inline void check_construction_compatibility(ConstructionCompatibility const& sa
     ConstructionCompatibility const& expected, std::string const& engine)
 {
     group_tools::require(saved.algorithm == expected.algorithm, engine +
-        " checkpoint algorithm is incompatible; resume with a build supporting its recorded algorithm or restart this construction");
+        " checkpoint algorithm is incompatible; preserve the plot, checkpoints and temporary files, "
+        "then resume with a build supporting the recorded algorithm. See REFERENCE.md, Grouped plotting and drive filling");
     group_tools::require(saved.representation == expected.representation, engine +
-        " checkpoint native representation is incompatible; resume on a matching platform/build or restart this construction");
+        " checkpoint native representation is incompatible; preserve the plot, checkpoints and temporary files, "
+        "then resume on a matching platform and build. See REFERENCE.md, Grouped plotting and drive filling");
 }
 class LegacyConstructionBuildError : public std::runtime_error
 {
@@ -83,7 +85,8 @@ public:
     std::string const producer_build, engine;
     LegacyConstructionBuildError(std::string saved, std::string source) :
         std::runtime_error(source + " legacy checkpoint requires its original exact build (" + saved +
-            "); resume with that binary or restart this construction"),
+            "); preserve the plot, checkpoints and temporary files, then resume with that binary. "
+            "See REFERENCE.md, Grouped plotting and drive filling"),
         producer_build(std::move(saved)), engine(std::move(source)) {}
 };
 inline void check_construction_build(std::string const& saved, std::string_view expected, std::string const& engine)
@@ -97,7 +100,8 @@ inline void check_construction_build(std::array<char, 64> const& saved, std::str
 inline void check_construction_format(bool supported, std::string const& engine)
 {
     group_tools::require(supported, engine +
-        " checkpoint format is unsupported; resume with a build supporting its recorded format or restart this construction");
+        " checkpoint format is unsupported; preserve the plot, checkpoints and temporary files, "
+        "then resume with a build supporting the recorded format. See REFERENCE.md, Grouped plotting and drive filling");
 }
 inline ConstructionCheckpointIdentity construction_checkpoint_identity(std::string format, std::string producer,
     bool legacy, ConstructionCompatibility const& compatibility)

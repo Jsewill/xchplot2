@@ -12,17 +12,18 @@
 namespace
 {
 namespace pool = group_grow::pool;
-void require(bool value, char const* message)
+void require(bool value, std::string const& message)
 { if (!value) throw std::invalid_argument(message); }
-uint64_t number(std::string const& text)
+uint64_t number(std::string const& text, std::string const& option)
 {
     uint64_t value = 0; auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-    require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size(), "compute resource limit requires a nonnegative integer");
+    require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size(),
+        option + " requires a nonnegative integer no greater than 18446744073709551615");
     return value;
 }
 bool enabled(std::string const& value)
 {
-    require(value == "on" || value == "off" || value == "true" || value == "false", "discovery requires on or off");
+    require(value == "on" || value == "off" || value == "true" || value == "false", "--discovery requires on or off");
     return value == "on" || value == "true";
 }
 std::string hostname()
@@ -47,7 +48,7 @@ void help(std::string_view command)
     else if (command == "invite")
         std::cout << "Create a private invitation for one additional machine. Transfer it privately.\n  --name NAME        invited machine's display name (required)\n";
     else if (command == "join")
-        std::cout << "Save this machine's invitation. Pool membership is shared with all enrolled machines.\n"
+        std::cout << "Enroll this machine using the invitation to join the shared compute pool.\n"
                      "Delete transferred invitation copies after joining; they contain this machine's private key.\n";
     else if (command == "configure")
         std::cout << "Save defaults used by subsequent plotting and compute commands.\n"
@@ -55,10 +56,10 @@ void help(std::string_view command)
                      "  --interface auto|NAME   LAN by default; repeat to select interfaces\n"
                      "  --discovery on|off      automatic LAN discovery, default on\n"
                      "  --cpus N                offered CPU cap; 0 selects half the logical CPUs\n"
-                     "  --host-bytes SIZE       offered RAM cap; 0 selects a bounded automatic budget\n"
-                     "  --gpu-bytes SIZE        offered GPU RAM cap; 0 selects 80% of available VRAM\n"
+                     "  --host-bytes SIZE       offered RAM limit, e.g. 8G; 0 selects an automatic limit\n"
+                     "  --gpu-bytes SIZE        offered GPU RAM limit, e.g. 8G; 0 selects 80% of available VRAM\n"
                      "  --backend auto|cpu|gpu  offered generation backend\n";
-    if (command == "configure") std::cout << "  --max-brokers N         bounded broker registrations, default 128\n";
+    if (command == "configure") std::cout << "  --max-brokers N         maximum broker registrations, default 128\n";
     std::cout << "  --directory DIR    saved compute setup directory\n";
     std::cout << pos2gpu::compute_output_help;
 #ifdef _WIN32
@@ -87,13 +88,13 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
             if (key == "--help" || key == "-h" || key == "--help-all") { help(command); return 0; }
             if (output.parse(key)) continue;
             if (!key.starts_with('-'))
-            { require((command == "invite" || command == "join") && file.empty(), "unexpected compute argument"); file = std::filesystem::path(reinterpret_cast<char8_t const*>(key.c_str())); continue; }
-            require(i + 1 < argc, "missing compute option value"); std::string value = argv[++i];
+            { require((command == "invite" || command == "join") && file.empty(), "unexpected argument: " + key + "; use compute " + command + " --help"); file = std::filesystem::path(reinterpret_cast<char8_t const*>(key.c_str())); continue; }
+            require(i + 1 < argc, "missing value for " + key); std::string value = argv[++i];
             if (key == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value.c_str()));
             else if (key == "--name")
             { require(command == "init" || command == "invite", "--name belongs to compute init or invite"); name = value; }
             else
-            { require(command == "configure", "unknown compute setup option"); settings.emplace_back(std::move(key), std::move(value)); }
+            { require(command == "configure", "unknown option: " + key + "; use compute " + command + " --help"); settings.emplace_back(std::move(key), std::move(value)); }
         }
         output.validate();
         if (command == "init")
@@ -137,12 +138,12 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
                 }
                 else if (key == "--discovery") defaults.discovery = enabled(value);
                 else if (key == "--cpus")
-                { auto cpus = number(value); require(cpus <= 1024, "compute CPU cap exceeds 1024"); defaults.cpus = uint32_t(cpus); }
-                else if (key == "--host-bytes") defaults.host_bytes = number(value);
-                else if (key == "--gpu-bytes") defaults.gpu_bytes = number(value);
+                { auto cpus = number(value, key); require(cpus <= 1024, "--cpus must be between 0 and 1024; 0 selects half the logical CPUs"); defaults.cpus = uint32_t(cpus); }
+                else if (key == "--host-bytes") defaults.host_bytes = number(value, key);
+                else if (key == "--gpu-bytes") defaults.gpu_bytes = number(value, key);
                 else if (key == "--backend") defaults.backend = value;
                 else if (key == "--max-brokers")
-                { auto count = number(value); require(count && count <= 4096, "broker limit must be in 1..4096"); defaults.max_brokers = uint32_t(count); }
+                { auto count = number(value, key); require(count && count <= 4096, "--max-brokers must be between 1 and 4096"); defaults.max_brokers = uint32_t(count); }
                 else throw std::invalid_argument("unknown compute setting: " + key);
             }
             pool::configure_pool(*identity, defaults); std::cout << "Saved compute defaults for " << identity->name << ".\n";

@@ -339,7 +339,8 @@ State load_state(fs::path const& work, Config const& config, std::string const& 
         std::string algorithm, representation;
         in >> algorithm >> representation;
         require(algorithm == group_grow::construction_algorithm_identity,
-            "stream checkpoint algorithm is incompatible; resume with a build supporting its recorded algorithm or restart this construction");
+            "stream checkpoint algorithm is incompatible; preserve the plot, checkpoints and temporary files, "
+            "then resume with a build supporting the recorded algorithm. See REFERENCE.md, Grouped plotting and drive filling");
         group_grow::ConstructionCompatibility compatibility;
         compatibility.algorithm = group_grow::construction_build(algorithm);
         auto const bytes = group_tools::hex(representation);

@@ -7822,8 +7822,8 @@ std::string queue_farming_update(Arguments const& args, FarmingJob const& job)
 int print_queued_farming_update(Arguments const& args, std::string const& id)
 {
     if (args.json) std::cout << "{\"farming_update\":true,\"status\":\"queued\",\"request_id\":" << json_string(id) << "}\n";
-    else if (!args.quiet) std::cout << "Farm update queued. The coordinator will apply it at a recovery boundary.\n"
-        << "Inspect with: xchplot2 status DIR\n";
+    else if (!args.quiet) std::cout << "Farm update queued. The running fill will reassess it at a safe checkpoint once required destinations are available.\n"
+        << "The update may be refused if its checks fail. Inspect the result with: xchplot2 status DIR\n";
     return 0;
 }
 std::string json_estimate(long double value)
@@ -8181,13 +8181,18 @@ int print_farm_inventory(Arguments const& args)
     if (!args.save_plan.empty()) stream_state::atomic_save(args.save_plan, body, false);
     if (!args.save_profile.empty()) save_replot_setup_profile(args, inventory, adapters);
     if (args.json) std::cout << body << '\n';
-    else if (!args.quiet) std::cout << "Farm inventory: " << inventory.roots.size() << " roots, " << inventory.plots.size()
-        << " entries. Public headers and native identities observed; no files changed.\n"
-        << "Resource preparation: " << inventory.resource_preparation->missing.size()
-        << " declaration items need review. Observations and exact missing fields are saved in resource_preparation.\n"
-        << "Reuse declarations with --harvester FILE and save a local profile with --save-profile FILE. Samples and OS availability do not grant capacity.\n";
     if (!args.json && !args.quiet)
     {
+        std::cout << "Farm inventory: inspected " << inventory.roots.size()
+            << (inventory.roots.size() == 1 ? " directory and " : " directories and ") << inventory.plots.size()
+            << (inventory.plots.size() == 1 ? " entry. " : " entries. ") << "Source files were not changed.\n"
+            << "Resource preparation: " << inventory.resource_preparation->missing.size()
+            << (inventory.resource_preparation->missing.size() == 1 ? " resource setting still needs review.\n" : " resource settings still need review.\n");
+        if (!args.save_plan.empty()) std::cout << "Saved inventory: " << file_io::path_text(args.save_plan)
+            << '\n';
+        else std::cout << "Use --save-plan FILE to save the inventory, or --json to print the complete report.\n";
+        std::cout << "Reuse declared limits with --harvester FILE and save a local profile with --save-profile FILE. "
+            "Observed availability and samples do not establish spare capacity.\n";
         print_replot_setup_decisions(*inventory.resource_preparation);
         if (!args.save_profile.empty()) std::cout << "Saved reusable local profile: " << file_io::path_text(args.save_profile) << '\n';
     }
@@ -9702,15 +9707,36 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
     else if (!args.quiet)
     {
         std::cout << "Replot review: " << (successor ? "saved successor metadata only" : metadata ? "saved metadata only" : assessment.feasible ? "conditionally feasible" : "infeasible")
-            << "; " << review.sources.size() << " explicit old files mapped to " << review.batches.size() << " sealed replacements.\n"
+            << "; " << review.sources.size() << " selected old files mapped to " << review.batches.size() << " planned replacement files.\n"
             << "Selected old files: " << review.sources.size() << ", " << selected_bytes << " allocated bytes. Protected/unselected inventory: "
             << protected_entries << " entries, " << protected_bytes << " allocated bytes (aliases counted once).\n"
-            << "Pre-delete limit: " << review.reclaim_before_bytes << " outstanding physical bytes. Effective farming/reward value change: unknown.\n"
+            << "Early-deletion limit: " << review.reclaim_before_bytes << " allocated bytes awaiting ready replacements. Farming/reward value change: unknown.\n"
             << "No live farming readiness is implied. Physical release requires fresh free-space probes.\n";
         auto const verification = replot_verification(inputs);
         std::cout << "Verification policy: " << replot_verification_name(verification.mode)
-            << "; first proof groups " << verification.first_groups << "; proof every " << verification.every_groups
-            << " groups. Structural checks, durable publication and farming acknowledgement are required for every replacement.\n";
+            << ". Headers and chunk index, durable publication and farming acknowledgement are checked for every replacement.\n";
+        if (verification.mode == ReplotVerificationMode::structural)
+            std::cout << "No full-proof samples are requested.\n";
+        else
+        {
+            if (verification.mode == ReplotVerificationMode::strict)
+                std::cout << "Full-proof samples are required for every new group.\n";
+            else
+            {
+                std::cout << "Full-proof samples: ";
+                if (verification.first_groups) std::cout << "first " << verification.first_groups
+                    << (verification.first_groups == 1 ? " group" : " groups");
+                if (verification.every_groups)
+                {
+                    if (verification.first_groups) std::cout << "; also ";
+                    std::cout << "every " << verification.every_groups
+                        << (verification.every_groups == 1 ? " group" : " groups") << " across all destinations";
+                }
+                else std::cout << "; periodic checks disabled";
+                std::cout << ".\n";
+            }
+            std::cout << "Proof sampling does not check every payload byte.\n";
+        }
         std::cout << "Receipt/directory metadata uses explicit allocation allowances, not portable filesystem upper bounds.\n";
         if (successor) std::cout << "Origin review " << inputs.digest << "; successor " << inputs.policy_digest << "; reviewed journal " << inputs.revalidation->journal_digest
             << ".\nUse --status for durable progress, fill --from-plan to activate its unchanged boundary, or --revalidate for a fresh suffix review.\n";
@@ -10079,11 +10105,11 @@ void print_farming_membership(std::ostream& out, group_grow::FarmingState const&
             << ",\"retained_obligation\":" << (retained ? "true" : "false");
         return;
     }
-    out << "  Membership: " << directory.membership << "; allocation grant " << grant.size() << " files, " << members << " members";
+    out << "  Membership: " << directory.membership << "; reserved allocation " << grant.size() << " files, " << members << " members";
     if (state.capacity_fill) out << "; saved targets " << directory.extents.size() << " files, " << admitted << " members";
     if (!group_grow::farming_member(directory)) out << "; detached at revision " << directory.detached_at
-        << (retained ? "; native acknowledgement pending, full obligation retained" : "; native detachment acknowledged");
-    if (directory.detached_reclaimed) out << "; unused grants reclaimed, retirement metadata frozen";
+        << (retained ? "; awaiting acknowledgement from this destination, resources remain reserved" : "; detachment acknowledged by this destination");
+    if (directory.detached_reclaimed) out << "; unused allocation released, retirement history retained";
     out << '\n';
 }
 void print_farming_recovery(std::ostream& out, group_grow::FarmingState const& state,
@@ -10154,10 +10180,10 @@ void print_farming_recovery(std::ostream& out, group_grow::FarmingState const& s
         if (!original.empty()) out << "Original-build continuation: " << original << '\n'
             << "If that binary supports drain, record drain intent before continuing: " << drain << '\n'
             << "Then use the continuation command above to finish started files under that policy.\n";
-        out << "If the original binary cannot drain, keep its durable checkpoint; this build cannot resume it. "
-            << "An explicit unfinished-work restart requires a separate reviewed recovery action.\n";
+        out << "If the original binary cannot drain, preserve the plot, checkpoints and temporary files; this build cannot resume that work. "
+            << "See REFERENCE.md, Grouped plotting and drive filling, for recovery guidance.\n";
         if (!compatible) out << "The plan itself also requires its original build after checkpoint completion. "
-            << "This build cannot upgrade it; use the original binary's supported upgrade/export path, or a separately reviewed recovery action.\n";
+            << "This build cannot upgrade it; use the original binary's supported upgrade/export path. See REFERENCE.md, Grouped plotting and drive filling.\n";
     }
     if (upgrade) out << "After stopping every coordinator and finishing incompatible checkpoints, review the metadata allowance with:\n  "
         << review << "\nApply that saved review only after it succeeds:\n  " << apply << '\n';
@@ -11018,9 +11044,9 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
                     << " bytes; response bound " << json_estimate(review.original_assessment.response_bound_seconds) << " -> "
                     << json_estimate(assessment.response_bound_seconds) << " seconds.\n";
                 if (review.alternative == "capacity")
-                    out << "Best assessed member cap per destination: " << review.selected_capacity_cap
-                        << ". Whole-interval probes and refinement retain started work; "
-                        << (review.capacity_search_limited ? "a larger feasible cap may exist.\n" : "every larger cap in the reviewed interval was assessed.\n");
+                    out << "Best assessed member limit per destination: " << review.selected_capacity_cap
+                        << ". Started work is retained. "
+                        << (review.capacity_search_limited ? "A larger feasible limit may exist.\n" : "Every larger limit in the reviewed range was assessed.\n");
                 else out << "This selection explicitly changes the declared harvester; provide these resources when farming the saved plan.\n";
             }
         }
@@ -11089,7 +11115,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             if (!adjustment_limit.empty()) out << "Alternative search: " << adjustment_limit << '\n';
             else if (adjustments && adjustments->search_limited) out << "Alternative search reached its work bound; other settings may also fit.\n";
         }
-        else if (!available) out << "Available members can spend their saved grants; new shared grants wait for required peers and retained obligations.\n";
+        else if (!available) out << "Available destinations can use their reserved allocations. New shared allocations wait for required destinations to return and retirement acknowledgements to complete.\n";
         else if (run.state.capacity_fill)
             out << "Fill uses remaining budget when another member fits; compressed sizes determine the final result.\n";
         if (args.plan_only && run.feasible() && available)
@@ -14241,7 +14267,8 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
                 << "Selected policy: " << policy_binding << ".\n"
                 << "Verification policy: " << replot_verification_name(replot_verification(inputs).mode)
                 << "; completed groups with a validated full proof: " << (!saved.present || !saved.state.batch || receipts_verified ? std::to_string(completed_proof_groups) : "unknown") << ".\n"
-                << "Outstanding pre-delete debt: " << debt << " bytes; limit " << review.reclaim_before_bytes << " bytes.\n"
+                << "Early-deletion allowance used: " << debt << " / " << review.reclaim_before_bytes
+                << " allocated bytes (including pending committed removals) awaiting ready replacements.\n"
                 << "Current filesystem observations are separate from saved history. "
                 << (args.status_live ? "Live prerequisite observations are bounded; execution still rechecks protected actions.\n" :
                     "Live service health and current compute admission have not been queried; use --live for bounded diagnostics.\n");
@@ -14643,7 +14670,7 @@ ReplotObjectAudit audit_replot_objects(Arguments const& args, ReplotInputs const
         uint64_t debt = 0; auto const& batch = review.batches[size_t(journal.batch)];
         for (size_t source = 0; source < journal.retirements.size(); ++source) if (journal.retirements[source].predelete)
             debt = sum(debt, inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source) + source))).identity.allocated_bytes);
-        require(debt <= review.reclaim_before_bytes, "revalidation cannot reset outstanding pre-delete debt");
+        require(debt <= review.reclaim_before_bytes, "revalidation cannot reset early-deletion allowance already used by pending or completed removals");
     }
     FarmingRun identities; identities.state = journal.farm; std::string previous; uint64_t retired = 0;
     auto output_path = [&](uint64_t batch)
@@ -15062,7 +15089,7 @@ int revalidate_replot(Arguments const& supplied, ReplotInputs inputs)
         << ",\"successor_digest\":" << json_string(digest) << ",\"completed_replacements\":" << journal.state.batch
         << ",\"saved_plan\":" << json_string(file_io::path_text(args.save_plan)) << ",\"activated\":false,\"verification_policy\":";
     if (args.json) { write_replot_verification_json(std::cout, inputs); std::cout << "}\n"; }
-    else if (!args.quiet) std::cout << "Saved reviewed successor " << args.save_plan << ". Original identities, receipts and pre-delete debt are retained.\n"
+    else if (!args.quiet) std::cout << "Saved reviewed successor " << args.save_plan << ". Original identities, receipts and early-deletion accounting are retained.\n"
         << "Activate with xchplot2 fill --from-plan " << args.save_plan << " while this stopped journal boundary is unchanged.\n";
     return 0;
 }
@@ -15849,7 +15876,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             auto const& batch = review.batches[size_t(journal.state.batch)]; uint64_t outstanding = 0;
             for (size_t source = 0; source < journal.state.retirements.size(); ++source) if (journal.state.retirements[source].predelete)
                 outstanding = sum(outstanding, inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source) + source))).identity.allocated_bytes);
-            require(outstanding <= review.reclaim_before_bytes, "saved migration exceeds its outstanding pre-delete limit");
+            require(outstanding <= review.reclaim_before_bytes, "saved migration exceeds its early-deletion limit for sources awaiting ready replacements");
         }
         uint64_t prefix = 0;
         if (complete) for (size_t lane = 0; lane < destinations.size(); ++lane)
@@ -16017,7 +16044,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             std::chrono::steady_clock::time_point until = std::chrono::steady_clock::time_point::max())
         {
             auto check_selection = [&]
-            { check_cancel(args); require(std::chrono::steady_clock::now() < until, "migration predelete selection exceeded its bounded deadline"); };
+            { check_cancel(args); require(std::chrono::steady_clock::now() < until, "migration early-deletion selection exceeded its time limit"); };
             check_selection();
             std::map<std::string, uint64_t> credit;
             for (auto source : prospective)
@@ -16104,8 +16131,8 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 return ReplotPredeleteCandidate{plot.identity.allocated_bytes, progress.state == ReplotRetirement::active &&
                     construction_filesystems.contains(replot_filesystem(inputs, inventory.roots[plot.root].storage.filesystem))};
             }, [&](std::span<size_t const> sources) { return construction_fits(sources, until); });
-            require(selection.feasible, selection.search_exhausted ? "migration predelete selection exhausted its bounded search; no source may be retired without a feasible committed projection" :
-                "no legal migration predelete selection and ordinary external scratch fit within actual space and the outstanding pre-delete limit");
+            require(selection.feasible, selection.search_exhausted ? "migration early-deletion search reached its limit; no additional source may be removed until a feasible selection is saved" :
+                "no reviewed source selection and external temporary storage fit within available space and the early-deletion limit");
             return selection.sources.size() > pending ? std::optional<size_t>{selection.sources[pending]} : std::nullopt;
         };
         early_admission = [&] { (void)viable_predelete(); };
@@ -16497,7 +16524,7 @@ std::unique_ptr<FarmingRun> farming_guided_plan(Arguments& args, FarmingJob& job
         catch (DirectoryBusy const&)
         {
             std::ostringstream guidance;
-            guidance << "metadata upgrade review needs a stopped coordinator; interrupt its foreground fill at a recovery boundary "
+            guidance << "metadata upgrade review requires the running fill to stop; press Ctrl-C in its terminal, wait for it to exit, "
                 "and preserve every plot and checkpoint.\n";
             print_farming_recovery(guidance, *job.saved, farming_recovery_source(args, job), args.save_plan, "", "", false);
             throw std::runtime_error(guidance.str());
@@ -16683,7 +16710,7 @@ int run_farming(Arguments args)
         catch (DirectoryBusy const&)
         {
             throw std::runtime_error("enabling temporary scratch requires a stopped coordinator; "
-                "stop at a durable recovery boundary, then repeat fill --update with the scratch options");
+                "press Ctrl-C in the running fill terminal and wait for it to exit, then repeat fill --update with the temporary-storage options");
         }
     }
     if (!args.plan_only && args.from_plan.empty() && held_locks.empty() &&
@@ -16694,7 +16721,7 @@ int run_farming(Arguments args)
         {
             if (control_command)
                 throw std::runtime_error(std::string(error.what()) +
-                    "; the control was not recorded. Preserve the saved job, stop its coordinator at a recovery boundary, "
+                    "; the control was not recorded. Preserve the saved job, press Ctrl-C in the running fill terminal and wait for it to exit, "
                     "review plan DIR --upgrade-job --save-plan UPGRADE, apply fill UPGRADE, then repeat the control action");
             // Legacy plans did not reserve replicated request history. A
             // stopped job can upgrade directly while all writers are fenced.
@@ -16702,7 +16729,7 @@ int run_farming(Arguments args)
             catch (DirectoryBusy const&)
             {
                 std::ostringstream guidance;
-                guidance << error.what() << "; stop the current coordinator at a durable recovery boundary before upgrading its metadata allowance.\n";
+                guidance << error.what() << "; press Ctrl-C in the running fill terminal and wait for it to exit before upgrading its recovery-record allowance.\n";
                 print_farming_recovery(guidance, *job.saved, farming_recovery_source(args, job), args.save_plan, "", "", false);
                 throw std::runtime_error(guidance.str());
             }
@@ -17081,7 +17108,7 @@ int run_farming(Arguments args)
             renewing_grants = true;
             args.update = true;
             job = farming_reload_arguments(args, *job.saved, job.directories);
-            if (!args.quiet && !args.json) std::cerr << "[fill] reassessing remaining capacity after the saved grants were used.\n";
+            if (!args.quiet && !args.json) std::cerr << "[fill] reassessing remaining capacity after the reserved allocations were used.\n";
             continue;
         }
         if (!pending && !interrupted) return !result && missing ? 4 : result;

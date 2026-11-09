@@ -531,7 +531,7 @@ int main(int argc, char** argv)
     auto const [fill_help_code, fill_help] = capture({"fill", "--config", config.string(), "--help"});
     assert(fill_help_code == 0 && fill_help.find("fill [OPTIONS] -F PLAN") != std::string::npos);
     assert(fill_help.find("-F, --from-plan") != std::string::npos && fill_help.find("-r --manifest FILE") != std::string::npos);
-    assert(fill_help.find("fill farm.plan") != std::string::npos && fill_help.find("current member directory") != std::string::npos);
+    assert(fill_help.find("fill farm.plan") != std::string::npos && fill_help.find("destination directory") != std::string::npos);
     assert(fill_help.find("--discover-drives") != std::string::npos && fill_help.find("--leave-free") != std::string::npos);
     auto const [fill_all_code, fill_all] = capture({"fill", "--config", config.string(), "--help-all"});
     assert(fill_all_code == 0 && fill_all.find("--paths-from") != std::string::npos && fill_all.size() > fill_help.size());
@@ -686,7 +686,7 @@ int main(int argc, char** argv)
     {
         auto const [action_help_code, action_help] = capture({action, "--config", config.string(), "--help"});
         assert(action_help_code == 0 && action_help.find("--destination") != std::string::npos && action_help.find("--construction") == std::string::npos);
-        assert(action_help.find("--policy-only") != std::string::npos && action_help.find("Resume starts an idle job") != std::string::npos);
+        assert(action_help.find("--policy-only") != std::string::npos && action_help.find("Without --destination") != std::string::npos);
         assert(cli({action, "--config", config.string(), other.string(), "--destination", other.string(), "--destination", third.string()}) == 0);
         assert(last_group_options.farm_action == action && last_group_options.target == other &&
             last_group_options.directory_farm && last_group_options.resume && !last_group_options.resume_set &&

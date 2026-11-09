@@ -187,8 +187,8 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
             auto const intent = pool::load_worker_intent(*identity);
             result.local_worker_intent = intent == pool::WorkerIntent::Paused ? "paused" : intent == pool::WorkerIntent::Draining ? "draining" : "active";
             result.local_worker_intent_action = intent == pool::WorkerIntent::Active ?
-                "saved local intent permits admission; it does not prove a running worker" :
-                "saved local pause/drain intent survives service restarts; use compute resume on the intended running local worker to reopen admission";
+                "saved local controls allow new tasks; this setting alone does not show whether a worker is running" :
+                "saved pause/drain settings survive service restarts; use compute resume on the intended worker to accept new tasks";
             if (identity->authority_expired || identity->certificate_expired)
             {
                 result.status = identity->authority_expired ? "authority-expired" : "renewal-required";
@@ -298,7 +298,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         else if (!result.accepting_generation || !result.accepting_codec)
         {
             result.status = "admission-closed"; result.blocking = true;
-            result.reason = "compatible workers were observed, but their paused or draining admission does not cover new generation and encoding work";
+            result.reason = "compatible workers were observed, but pause/drain settings leave generation or encoding tasks without an accepting worker";
             result.next_action = "use compute resume on the intended worker machine when it should accept new work; accepted tasks keep their reservations";
         }
         else

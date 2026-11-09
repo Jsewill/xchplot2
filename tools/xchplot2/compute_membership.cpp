@@ -5,7 +5,7 @@
 
 namespace
 {
-void require(bool condition, char const* message)
+void require(bool condition, std::string const& message)
 { if (!condition) throw std::invalid_argument(message); }
 std::filesystem::path path(std::string const& value)
 { return std::filesystem::path(reinterpret_cast<char8_t const*>(value.c_str())); }
@@ -45,7 +45,7 @@ int pos2gpu::run_compute_membership(int argc, char** argv)
             if (value == "--help" || value == "-h" || value == "--help-all") { help(command); return 0; }
             if (output.parse(value)) continue;
             if (value == "--directory") { require(i + 1 < argc, "missing --directory value"); directory = path(argv[++i]); }
-            else { require(!value.starts_with('-'), "unknown compute membership option"); arguments.push_back(std::move(value)); }
+            else { require(!value.starts_with('-'), "unknown option: " + value + "; use compute " + command + " --help"); arguments.push_back(std::move(value)); }
         }
         output.validate();
         auto expected = command == "members" ? 0 : command == "renew-sign" ? 2 : 1;

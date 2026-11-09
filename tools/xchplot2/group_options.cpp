@@ -32,11 +32,12 @@ namespace fs = std::filesystem;
 constexpr uint64_t mib = 1024 * 1024;
 void require(bool condition, std::string const& message)
 { if (!condition) throw std::runtime_error(message); }
-uint64_t number(char const* text)
+uint64_t number(char const* text, std::string const& option)
 {
     std::string value(text);
-    require(!value.empty() && value.find_first_not_of("0123456789") == value.npos, "invalid integer");
-    return std::stoull(value);
+    require(!value.empty() && value.find_first_not_of("0123456789") == value.npos, option + " requires a nonnegative integer");
+    try { return std::stoull(value); }
+    catch (std::out_of_range const&) { throw std::runtime_error(option + " exceeds the maximum integer value (18446744073709551615)"); }
 }
 uint64_t sum(uint64_t a, uint64_t b)
 { require(b <= UINT64_MAX - a, "byte count overflow"); return a + b; }
@@ -152,18 +153,18 @@ void validate_harvester_options(pos2gpu::GroupOptions const& result)
         "--farming-reader requires stateless or cached");
     require(!result.farming_objective || *result.farming_objective == "energy" || *result.farming_objective == "latency",
         "--farming-objective requires energy or latency");
-    require(!result.farming_cpu_work_weight || *result.farming_cpu_work_weight > 0, "farming CPU work weight must be positive");
-    require(!result.farming_io_work_weight || *result.farming_io_work_weight > 0, "farming I/O work weight must be positive");
+    require(!result.farming_cpu_work_weight || *result.farming_cpu_work_weight > 0, "--farming-cpu-work-weight must be greater than zero");
+    require(!result.farming_io_work_weight || *result.farming_io_work_weight > 0, "--farming-io-work-weight must be greater than zero");
     require(!result.farming_max_eligible_groups || *result.farming_max_eligible_groups > 0,
-        "farming eligible-group limit must be positive");
-    require(!result.farming_cores || (*result.farming_cores > 0 && *result.farming_cores <= 1024), "invalid farming CPU budget");
+        "--farming-max-eligible-groups must be greater than zero");
+    require(!result.farming_cores || (*result.farming_cores > 0 && *result.farming_cores <= 1024), "--farming-cores must be between 1 and 1024");
     require(!result.farming_lookup_workers || (*result.farming_lookup_workers > 0 && *result.farming_lookup_workers <= 1024),
-        "invalid farming reader concurrency");
-    require(!result.farming_memory || *result.farming_memory > 0, "farming memory must be positive");
-    require(!result.farming_filter_bits || *result.farming_filter_bits <= 13, "invalid farming filter");
-    require(!result.farming_future_filter_bits || *result.farming_future_filter_bits <= 13, "invalid future farming filter");
-    require(!result.farming_chain_us || *result.farming_chain_us > 0, "farming chain cost must be positive");
-    require(!result.farming_deadline_ms || *result.farming_deadline_ms > 0, "farming deadline must be positive");
+        "--farming-lookup-workers must be between 1 and 1024");
+    require(!result.farming_memory || *result.farming_memory > 0, "--farming-memory-bytes must be greater than zero bytes");
+    require(!result.farming_filter_bits || *result.farming_filter_bits <= 13, "--farming-filter-bits must be between 0 and 13");
+    require(!result.farming_future_filter_bits || *result.farming_future_filter_bits <= 13, "--farming-future-filter-bits must be between 0 and 13");
+    require(!result.farming_chain_us || *result.farming_chain_us > 0, "--farming-chain-us-per-member must be greater than zero microseconds");
+    require(!result.farming_deadline_ms || *result.farming_deadline_ms > 0, "--farming-deadline-ms must be greater than zero milliseconds");
 }
 void reference_help()
 {
@@ -171,8 +172,8 @@ void reference_help()
         "Ordinary PoS2 group construction reference runner\n"
         "Usage: pos2_pr118_grow TARGET [OPTIONS]\n"
         "      --destination FILE|DIR  additional key-derived destination; repeat for more drives\n"
-        "  -t, --temp-dir DIR        optional contribution storage; repeat for more devices\n"
-        "  --destination-temp off|on|ssd|hdd  destination scratch policy, default off\n"
+        "  -t, --temp-dir DIR        temporary plotting storage; repeat for more devices\n"
+        "  --destination-temp off|on|ssd|hdd  allow temporary files on destinations; default off\n"
         "                            on: any destination; ssd/hdd: only known drives of that type\n"
         "  --temp-capacity-bytes N    aggregate scratch cap per filesystem; default available space\n"
         "  --group-id HEX --memo HEX  identity for a new group (memo may be empty)\n"
@@ -438,12 +439,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--from-plan" || key == "-F") result.from_plan = path(value);
             else if (key == "--replot") result.replot_inventory = path(value);
             else if (key == "--replot-verification") result.replot_verification = value;
-            else if (key == "--replot-proof-first-groups") result.replot_proof_first_groups = number(value.c_str());
-            else if (key == "--replot-proof-every-groups") result.replot_proof_every_groups = number(value.c_str());
+            else if (key == "--replot-proof-first-groups") result.replot_proof_first_groups = number(value.c_str(), argv[i - 1]);
+            else if (key == "--replot-proof-every-groups") result.replot_proof_every_groups = number(value.c_str(), argv[i - 1]);
             else if (key == "--farm-adapter") { result.farm_adapter = value; result.farm_adapter_set = true; }
             else if (key == "--farm-adapter-timeout-ms")
-            { result.farm_adapter_timeout_ms = number(value.c_str()); result.farm_adapter_timeout_set = true; }
-            else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str());
+            { result.farm_adapter_timeout_ms = number(value.c_str(), argv[i - 1]); result.farm_adapter_timeout_set = true; }
+            else if (key == "--reclaim-before-bytes") result.reclaim_before_bytes = number(value.c_str(), argv[i - 1]);
             else if (key == "--replot-source-root" || key == "--replot-exclude-root")
             {
                 require(!value.empty(), "empty replot source root selector");
@@ -454,7 +455,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--replot-max-source-files" || key == "--replot-max-source-bytes")
             {
                 auto& limit = key == "--replot-max-source-files" ? result.replot_max_source_files : result.replot_max_source_bytes;
-                limit = number(value.c_str()); require(limit, key + " must be positive");
+                limit = number(value.c_str(), argv[i - 1]); require(limit, key + " must be positive");
             }
             else if (key == "--save-profile") result.save_profile = path(value);
             else if (key == "--resource-setting")
@@ -464,12 +465,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 result.farming_resource_settings.push_back(value);
             }
             else if (key == "--timeout-ms")
-            { result.status_timeout_ms = number(value.c_str()); status_timeout_set = true; }
-            else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str());
-            else if (key == "--replot-proof-cpus") result.replot_proof_cpus = number(value.c_str());
-            else if (key == "--replot-proof-solves") result.replot_proof_solves = number(value.c_str());
-            else if (key == "--calibration-timeout-ms") result.calibration_timeout_ms = number(value.c_str());
-            else if (key == "--calibration-memory-bytes") result.calibration_memory_bytes = number(value.c_str());
+            { result.status_timeout_ms = number(value.c_str(), argv[i - 1]); status_timeout_set = true; }
+            else if (key == "--calibration-samples") result.calibration_samples = number(value.c_str(), argv[i - 1]);
+            else if (key == "--replot-proof-cpus") result.replot_proof_cpus = number(value.c_str(), argv[i - 1]);
+            else if (key == "--replot-proof-solves") result.replot_proof_solves = number(value.c_str(), argv[i - 1]);
+            else if (key == "--calibration-timeout-ms") result.calibration_timeout_ms = number(value.c_str(), argv[i - 1]);
+            else if (key == "--calibration-memory-bytes") result.calibration_memory_bytes = number(value.c_str(), argv[i - 1]);
             else if (key == "--harvester")
             {
                 require(!value.empty(), "--harvester requires local or a profile file");
@@ -529,16 +530,16 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--pool-listen") result.pool_listen = value;
             else if (key == "--pool-advertise") result.pool_advertise = value;
             else if (key == "--pool-offer-backend") { result.pool_offer_backend = value; result.pool_offer_backend_set = true; }
-            else if (key == "--pool-offer-ram") result.pool_offer_ram = number(value.c_str());
-            else if (key == "--pool-offer-cpus") result.pool_offer_cpus = number(value.c_str());
-            else if (key == "--pool-offer-vram") result.pool_offer_vram = number(value.c_str());
-            else if (key == "--pool-offer-slots") result.pool_offer_slots = number(value.c_str());
-            else if (key == "--pool-inflight") result.pool_inflight = number(value.c_str());
-            else if (key == "--pool-timeout-ms") result.pool_timeout_ms = number(value.c_str());
-            else if (key == "--pool-socket-timeout-ms") result.pool_socket_timeout_ms = number(value.c_str());
-            else if (key == "--pool-frame-bytes") result.pool_frame_bytes = number(value.c_str());
+            else if (key == "--pool-offer-ram") result.pool_offer_ram = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-cpus") result.pool_offer_cpus = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-vram") result.pool_offer_vram = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-slots") result.pool_offer_slots = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-inflight") result.pool_inflight = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-timeout-ms") result.pool_timeout_ms = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-socket-timeout-ms") result.pool_socket_timeout_ms = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-frame-bytes") result.pool_frame_bytes = number(value.c_str(), argv[i - 1]);
             else if (key == "--pool-codec-ram")
-            { result.pool_codec_auto = value == "auto"; if (!result.pool_codec_auto) result.pool_codec_ram = number(value.c_str()); }
+            { result.pool_codec_auto = value == "auto"; if (!result.pool_codec_auto) result.pool_codec_ram = number(value.c_str(), argv[i - 1]); }
             else if (key == "--temp-dir" || key == "-t")
             {
                 require(result.temporary.size() < 1024, "too many temporary directories");
@@ -546,7 +547,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             }
             else if (key == "--temp-capacity-bytes")
             {
-                result.temporary_capacity = number(value.c_str());
+                result.temporary_capacity = number(value.c_str(), argv[i - 1]);
                 require(result.temporary_capacity > 0, "--temp-capacity-bytes must be positive");
             }
             else if (key == "--destination-temp") { result.destination_temp = value; result.destination_temp_set = true; }
@@ -555,21 +556,21 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(result.destinations.size() < 1023, "too many destinations");
                 result.destinations.push_back(fs::absolute(fs::path(reinterpret_cast<char8_t const*>(value.c_str()))).lexically_normal());
             }
-            else if (key == "--k" || key == "-k") { result.k = number(value.c_str()); result.k_set = true; }
-            else if (key == "--strength" || key == "-s") { result.strength = number(value.c_str()); result.strength_set = true; }
-            else if (key == "--meta-group" || key == "-g") { result.meta = number(value.c_str()); result.meta_set = true; }
+            else if (key == "--k" || key == "-k") { result.k = number(value.c_str(), argv[i - 1]); result.k_set = true; }
+            else if (key == "--strength" || key == "-s") { result.strength = number(value.c_str(), argv[i - 1]); result.strength_set = true; }
+            else if (key == "--meta-group" || key == "-g") { result.meta = number(value.c_str(), argv[i - 1]); result.meta_set = true; }
             else if (key == "--capacity-bytes")
             {
-                result.capacity = number(value.c_str());
+                result.capacity = number(value.c_str(), argv[i - 1]);
                 result.capacity_set = true;
                 require(result.capacity > 0, "--capacity-bytes must be positive");
             }
-            else if (key == "--leave-free" || key == "--headroom-bytes") { result.headroom = number(value.c_str()); result.headroom_set = true; }
-            else if (key == "--max-ram" || key == "-M") result.max_ram = number(value.c_str());
-            else if (key == "--window-bytes") { result.window = number(value.c_str()); result.window_set = true; }
-            else if (key == "--workers" || key == "-j") result.workers = number(value.c_str());
-            else if (key == "--batch-members") result.batch = number(value.c_str());
-            else if (key == "--max-members") result.max_members = number(value.c_str());
+            else if (key == "--leave-free" || key == "--headroom-bytes") { result.headroom = number(value.c_str(), argv[i - 1]); result.headroom_set = true; }
+            else if (key == "--max-ram" || key == "-M") result.max_ram = number(value.c_str(), argv[i - 1]);
+            else if (key == "--window-bytes") { result.window = number(value.c_str(), argv[i - 1]); result.window_set = true; }
+            else if (key == "--workers" || key == "-j") result.workers = number(value.c_str(), argv[i - 1]);
+            else if (key == "--batch-members") result.batch = number(value.c_str(), argv[i - 1]);
+            else if (key == "--max-members") result.max_members = number(value.c_str(), argv[i - 1]);
             else if (key == "--group-members")
             {
                 result.group_members_set = true;
@@ -577,29 +578,29 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 result.group_members = 0;
                 if (!result.group_auto)
                 {
-                    result.group_members = number(value.c_str());
+                    result.group_members = number(value.c_str(), argv[i - 1]);
                     require(result.group_members > 0, "--group-members must be positive");
                 }
             }
             else if (key == "--farming-reader") result.farming_reader = value;
             else if (key == "--farming-objective") result.farming_objective = value;
-            else if (key == "--farming-cpu-work-weight") result.farming_cpu_work_weight = number(value.c_str());
-            else if (key == "--farming-io-work-weight") result.farming_io_work_weight = number(value.c_str());
-            else if (key == "--farming-max-eligible-groups") result.farming_max_eligible_groups = number(value.c_str());
-            else if (key == "--farming-lookup-workers") result.farming_lookup_workers = number(value.c_str());
-            else if (key == "--farming-memory-bytes") result.farming_memory = number(value.c_str());
-            else if (key == "--farming-cores") result.farming_cores = number(value.c_str());
-            else if (key == "--farming-index-cache-bytes") result.farming_index_cache = number(value.c_str());
-            else if (key == "--farming-filter-bits") result.farming_filter_bits = number(value.c_str());
-            else if (key == "--farming-future-filter-bits") result.farming_future_filter_bits = number(value.c_str());
-            else if (key == "--farming-chain-us-per-member") result.farming_chain_us = number(value.c_str());
-            else if (key == "--farming-index-ns-per-entry") result.farming_index_ns = number(value.c_str());
-            else if (key == "--farming-deadline-ms") result.farming_deadline_ms = number(value.c_str());
-            else if (key == "--max-groups") { result.max_groups = number(value.c_str()); result.max_groups_set = true; }
-            else if (key == "--max-total-members") { result.max_total_members = number(value.c_str()); result.max_total_members_set = true; }
-            else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str()); result.checkpoint_set = true; }
+            else if (key == "--farming-cpu-work-weight") result.farming_cpu_work_weight = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-io-work-weight") result.farming_io_work_weight = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-max-eligible-groups") result.farming_max_eligible_groups = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-lookup-workers") result.farming_lookup_workers = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-memory-bytes") result.farming_memory = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-cores") result.farming_cores = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-index-cache-bytes") result.farming_index_cache = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-filter-bits") result.farming_filter_bits = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-future-filter-bits") result.farming_future_filter_bits = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-chain-us-per-member") result.farming_chain_us = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-index-ns-per-entry") result.farming_index_ns = number(value.c_str(), argv[i - 1]);
+            else if (key == "--farming-deadline-ms") result.farming_deadline_ms = number(value.c_str(), argv[i - 1]);
+            else if (key == "--max-groups") { result.max_groups = number(value.c_str(), argv[i - 1]); result.max_groups_set = true; }
+            else if (key == "--max-total-members") { result.max_total_members = number(value.c_str(), argv[i - 1]); result.max_total_members_set = true; }
+            else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str(), argv[i - 1]); result.checkpoint_set = true; }
             else if (key == "--backend") { result.backend = value; result.backend_set = true; result.devices.clear(); }
-            else if (key == "--device") { result.device = number(value.c_str()); result.devices.clear(); }
+            else if (key == "--device") { result.device = number(value.c_str(), argv[i - 1]); result.devices.clear(); }
             else if (key == "--devices" || key == "-d")
             {
                 BatchOptions selection;
@@ -688,7 +689,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             }
             result.target.clear();
         }
-        require(result.max_ram >= 16 * mib, "at least 16777216 budget bytes required");
+        require(result.max_ram >= 16 * mib, command.empty() ? "--max-ram must be at least 16 MiB (16777216 bytes)" :
+            "--max-host-ram must be at least 16 MiB (16M)");
         require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
         result.plan_only = result.replot_status;
         result.resume = result.directory_farm = true; return result;
@@ -700,7 +702,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     if (result.inventory)
     {
         require(command == "plan" && !result.target.empty(), "plan --inventory requires explicit existing farm roots");
-        require(result.max_ram >= 16 * mib, "at least 16777216 budget bytes required");
+        require(result.max_ram >= 16 * mib, command.empty() ? "--max-ram must be at least 16 MiB (16777216 bytes)" :
+            "--max-host-ram must be at least 16 MiB (16M)");
         require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
         result.directory_farm = true;
         return result;
@@ -732,7 +735,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         require(result.assess_jobs || result.calibrate || (result.from_plan.empty() != result.manifest.empty()),
             "--metadata-only requires one saved PLAN or --manifest FILE");
         require(!result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
-        require(result.max_ram >= 16 * mib, "at least 16777216 budget bytes required");
+        require(result.max_ram >= 16 * mib, command.empty() ? "--max-ram must be at least 16 MiB (16777216 bytes)" :
+            "--max-host-ram must be at least 16 MiB (16M)");
         result.directory_farm = true;
         if (result.calibrate)
         {
@@ -853,8 +857,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.tier == "auto" || result.tier == "pool" || result.tier == "plain" || result.tier == "compact" ||
                 result.tier == "minimal" || result.tier == "tiny" || result.tier == "pinned",
             "unknown GPU tier");
-    require(result.device <= INT_MAX && result.checkpoint_bytes > 0,
-            "invalid GPU device or checkpoint size");
+    require(result.device <= INT_MAX, "--device must be between 0 and 2147483647");
+    require(result.checkpoint_bytes > 0, "--checkpoint-bytes must be greater than zero bytes");
     require(result.member_storage == "raw" || result.member_storage == "compact",
             "--member-storage requires raw or compact");
     require(result.construction == "auto" || result.construction == "incremental" ||
@@ -868,8 +872,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.plan_only || result.construction != "external" || result.resume || !result.temporary.empty() || result.destination_temp != "off",
             "fresh external construction requires --temp-dir or --destination-temp");
     require(result.fixtures.empty() || result.backend != "gpu", "fixtures cannot use a GPU producer");
-    require(result.window > 0 && result.max_ram >= 16 * mib,
-            "positive window and at least 16777216 budget bytes required");
+    require(result.window > 0, "--window-bytes must be greater than zero bytes");
+    require(result.max_ram >= 16 * mib, command.empty() ? "--max-ram must be at least 16 MiB (16777216 bytes)" :
+        "--max-host-ram must be at least 16 MiB (16M)");
     require(!result.k || *result.k <= 255, "invalid k");
     require(!result.strength || *result.strength <= 255, "invalid strength");
     require(!result.meta || *result.meta <= 255, "invalid meta group");
@@ -919,7 +924,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         require(!offer || result.local_compute || result.automatic_compute || result.pool_offer_backend == "cpu" || result.pool_offer_vram,
             command.empty() ? "a local GPU offer requires --pool-offer-vram" : "a local GPU offer requires --compute-offer-vram");
         require(result.pool_offer_ram < result.max_ram && result.max_ram - result.pool_offer_ram >= 16 * mib,
-            "local compute offer leaves insufficient owner RAM");
+            "local compute offer must leave at least 16 MiB for receiving and assembling plots; reduce the offered RAM or raise -M");
         // Reserve the complete service partition before owner construction
         // admission. Its own gate covers sessions, transport and retained GPU
         // state; it cannot consume construction's remaining headroom.

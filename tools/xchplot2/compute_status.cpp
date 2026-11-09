@@ -13,14 +13,14 @@ namespace
 {
 namespace pool = group_grow::pool;
 using Clock = std::chrono::steady_clock;
-void require(bool value, char const* message)
+void require(bool value, std::string const& message)
 { if (!value) throw std::invalid_argument(message); }
-unsigned number(std::string_view value)
+unsigned number(std::string_view value, std::string const& option)
 {
     unsigned result = 0;
     auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
     require(parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && result,
-        "status option requires a positive integer");
+        option + " requires a positive integer");
     return result;
 }
 std::string address(pool::Endpoint const& endpoint)
@@ -152,8 +152,8 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
 void broker_text(BrokerSnapshot const& value, bool verbose)
 {
     std::cout << "Broker " << address(value.endpoint) << ": " << value.summary.workers << " workers, "
-        << value.summary.owners << " owners; " << value.summary.queued << " queued, " << value.summary.granted
-        << " granted, " << value.summary.running << " running\n";
+        << value.summary.owners << " plotting job owners; " << value.summary.queued << " queued, " << value.summary.granted
+        << " assigned, " << value.summary.running << " running\n";
     if (value.truncated) std::cerr << "Listing truncated; increase --limit to inspect more rows.\n";
     if (!verbose) return;
     for (auto const& worker : value.workers)
@@ -165,16 +165,16 @@ void broker_text(BrokerSnapshot const& value, bool verbose)
             << "    Generation: " << worker.compatibility << "; codec: " << worker.codec_compatibility
             << "; producer: " << worker.producer_build << '\n';
     for (auto const& owner : value.owners)
-        std::cout << "  Owner " << owner.owner_id << ": " << owner.queued << " queued, " << owner.granted
-            << " granted, " << owner.running << " running\n";
+        std::cout << "  Plotting job owner " << owner.owner_id << ": " << owner.queued << " queued, " << owner.granted
+            << " assigned, " << owner.running << " running\n";
     for (auto const& job : value.jobs)
-        std::cout << "  Job " << job.id << " owner=" << job.owner_id << ' ' << kind(job.kind) << " k=" << unsigned(job.k)
+        std::cout << "  Task " << job.id << " owner=" << job.owner_id << ' ' << kind(job.kind) << " k=" << unsigned(job.k)
             << ' ' << pool::job_state_name(job.state) << " waiting=" << pool::wait_reason_name(job.waiting) << '\n';
 }
 void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const& value, bool verbose)
 {
     std::cout << "Worker " << address(endpoint) << ' ' << pool::admission_name(value.admission)
-        << ": " << value.accepted_tasks << " accepted, " << value.waiting_cpu << " waiting for CPU; active "
+        << ": " << value.accepted_tasks << " accepted tasks, " << value.waiting_cpu << " waiting for CPU; active "
         << value.active.slots << '/' << value.capacity.slots << " slots, " << value.active.cpu_threads << '/' << value.capacity.cpu_threads
         << " CPUs";
     if (verbose)
@@ -183,10 +183,10 @@ void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
             << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
             << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes";
     std::cout << '\n';
-    std::cout << "  Admission intent " << (value.durable_control ? "survives service restarts." : "lasts for this process only (unmanaged TLS credentials).") << '\n';
+    std::cout << "  Worker control setting " << (value.durable_control ? "survives service restarts." : "lasts only for this process (explicit TLS credentials without enrollment).") << '\n';
     if (verbose) std::cout << "  Generation: " << value.compatibility << "; codec: " << value.codec_compatibility
         << "; producer: " << value.producer_build << '\n';
-    if (value.broker_saturated) std::cout << "  Broker limit reached; use compute worker --max-brokers to change the bounded limit.\n";
+    if (value.broker_saturated) std::cout << "  Broker limit reached; raise compute worker --max-brokers to register with more brokers.\n";
 }
 } // namespace
 
@@ -203,34 +203,37 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         std::string const option = argv[i];
         if (option == "--help" || option == "-h" || option == "--help-all")
         {
-            std::cout << "Usage: xchplot2 compute " << command << " [OPTIONS]\n"
-                << (control ? "Control this machine's running worker; accepted tasks finish normally.\n" :
-                    "Show saved setup and authenticated live worker, owner and task status.\n")
-                << "  --directory DIR     saved pool membership\n"
+            std::cout << "Usage: xchplot2 compute " << command << " [OPTIONS]\n";
+            if (command == "pause") std::cout << "Stop this machine's running worker from accepting new tasks. Accepted tasks finish normally.\n";
+            else if (command == "drain") std::cout << "Stop this machine's running worker from accepting new tasks. Its status becomes drained when accepted tasks finish.\n";
+            else if (command == "resume") std::cout << "Allow this machine's running worker to accept new tasks after a pause or drain.\n";
+            else std::cout << "Show saved setup and authenticated live worker, plotting job owner and task status.\n";
+            std::cout << "  --directory DIR     saved pool membership\n"
                    "  --broker HOST:PORT  query a broker; repeat for additional brokers\n"
                    "  --worker HOST:PORT  query or control a worker directly\n"
-                   "  --timeout-ms N      network query budget, default 5000\n"
+                   "  --timeout-ms N      network query time in milliseconds, 100..60000; default 5000\n"
                    "  --limit N           rows per broker section, default 128 (maximum 4096)\n"
                    "  --json              machine-readable status\n"
                 << compute_output_help
-                << "Without addresses, use saved broker and LAN discovery. Mutations require the worker's own identity.\n";
-            if (command == "drain") std::cout << "Draining becomes drained when all accepted tasks finish; resume reopens admission.\n";
-            if (control) std::cout << "Enrolled workers save pause, drain and resume across standalone and automatic service restarts.\n";
+                << "Without addresses, use saved broker settings and LAN discovery. Control commands require the worker's own enrollment.\n";
+            if (control) std::cout << "Enrolled workers keep their control setting across service restarts.\n";
+            if (command == "pause" || command == "drain") std::cout << "Use compute resume to accept new tasks again.\n";
             return 0;
         }
         if (option == "--json") { json = true; continue; }
         if (option == "--no-json") { json = false; continue; }
         if (output.parse(option)) continue;
-        require(i + 1 < argc, "missing compute status option value"); std::string value = argv[++i];
+        require(i + 1 < argc, "missing value for " + option); std::string value = argv[++i];
         if (option == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value.c_str()));
         else if (option == "--broker") brokers.push_back(pool::parse_endpoint(value));
         else if (option == "--worker") workers.push_back(pool::parse_endpoint(value));
-        else if (option == "--timeout-ms") timeout = number(value);
-        else if (option == "--limit") limit = number(value);
+        else if (option == "--timeout-ms") timeout = number(value, option);
+        else if (option == "--limit") limit = number(value, option);
         else throw std::invalid_argument("unknown compute status option: " + option);
     }
     output.validate();
-    require(timeout >= 100 && timeout <= 60000 && limit <= 4096, "status timeout must be 100..60000 ms and limit 1..4096");
+    require(timeout >= 100 && timeout <= 60000, "--timeout-ms must be between 100 and 60000 milliseconds");
+    require(limit <= 4096, "--limit must be between 1 and 4096");
     require(brokers.size() <= 128 && workers.size() <= 128, "too many explicit status endpoints");
     auto identity = pool::load_pool(directory);
     if (!identity)

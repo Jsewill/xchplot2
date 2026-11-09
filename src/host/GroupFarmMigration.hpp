@@ -80,7 +80,7 @@ inline constexpr size_t replot_predelete_fallback_candidate_visits =
     (replot_maximum_batch_sources + 1) * (replot_predelete_combination_checks + 1);
 inline uint64_t replot_predelete_memory_bound(size_t count)
 {
-    require(count <= replot_maximum_batch_sources, "migration predelete memory exceeds its batch bound");
+    require(count <= replot_maximum_batch_sources, "migration early-deletion memory exceeds its batch limit");
     return count * (sizeof(ReplotPredeleteCandidate) + 4 * sizeof(size_t)) +
         sizeof(std::array<bool, replot_maximum_batch_sources>) + 5 * sizeof(std::vector<size_t>) + sizeof(size_t);
 }
@@ -93,11 +93,11 @@ ReplotPredeleteSelection select_replot_predeletions(size_t count, uint64_t allow
     std::vector<size_t> selected, Candidate candidate, Fits fits)
 {
     require(count <= replot_maximum_batch_sources && outstanding <= allowance && selected.size() <= count,
-        "invalid migration predelete selection bounds");
+        "invalid migration early-deletion selection limits");
     std::array<bool, replot_maximum_batch_sources> included{};
     for (auto source : selected)
     {
-        require(source < count && !included[source], "migration pending predelete source is duplicated or exceeds its batch");
+        require(source < count && !included[source], "migration source pending early deletion is duplicated or outside its batch");
         included[source] = true;
     }
     selected.reserve(count);

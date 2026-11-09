@@ -11,7 +11,7 @@ namespace
 {
 namespace fs = std::filesystem;
 namespace pool = group_grow::pool;
-void require(bool value, char const* message)
+void require(bool value, std::string const& message)
 { if (!value) throw std::invalid_argument(message); }
 void checked(HRESULT result, char const* operation)
 { if (FAILED(result)) throw std::system_error(static_cast<int>(result), std::system_category(), operation); }
@@ -123,7 +123,8 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
             << pos2gpu::compute_output_help <<
             "The task starts at login and runs as this user, without elevation.\n"
             "Resource and network defaults come from compute configure.\n"
-            "Use compute drain before stop to let accepted work finish.\n";
+            "For workers, run compute drain and wait for drained before stopping.\n"
+            "After restarting a drained worker, run compute resume to accept new tasks.\n";
     };
     if (argc < 2) { help(); return 1; }
     std::string command, role = "worker"; auto directory = pool::pool_directory();
@@ -134,16 +135,16 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
         if (option == "--help" || option == "-h" || option == "--help-all") { help(); return 0; }
         if (output.parse(option)) continue;
         if (!option.starts_with('-'))
-        { require(command.empty(), "unexpected compute service argument"); command = option; continue; }
-        require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
+        { require(command.empty(), "unexpected compute service argument: " + option); command = option; continue; }
+        require(i + 1 < argc, "missing value for " + option); std::string value = argv[++i];
         if (option == "--role") role = value;
         else if (option == "--directory") directory = fs::path(reinterpret_cast<char8_t const*>(value.c_str()));
         else throw std::invalid_argument("unknown compute service option: " + option);
     }
     output.validate();
     require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
-        command == "status" || command == "remove" || command == "print", "unknown compute service command");
-    require(role == "worker" || role == "broker", "service role must be worker or broker");
+        command == "status" || command == "remove" || command == "print", "unknown compute service command: " + command + "; use compute service --help");
+    require(role == "worker" || role == "broker", "--role requires worker or broker");
     auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
     auto const name = wide("xchplot2-compute-" + role + '-' + identity->node_id);
     auto const marker = wide("xchplot2 compute service " + role + ' ' + identity->node_id);

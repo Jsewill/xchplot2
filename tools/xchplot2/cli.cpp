@@ -230,8 +230,8 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "         [-r|--resume] [--manifest FILE] [--continue-on-error]\n"
         << "         [--group-members N] [--construction auto|incremental|staged|merged|external]\n"
         << "         [--compute auto|off] [--compute-local on|off] [--compute-directory DIR]\n"
-        << "    Farmable plot groups: derives group_id + memo internally\n"
-        << "    from the keys via chia-rs. Saved pool membership enables automatic shared compute.\n"
+        << "    Create farmable plot groups from the supplied farmer and pool keys.\n"
+        << "    Saved pool membership enables automatic shared compute.\n"
         << "    -f, --farmer-pk HEX             : 96 hex chars (48 B G1 public key).\n"
         << "    -p, --pool-pk HEX               : 96 hex chars. Pool public key mode.\n"
         << "        --pool-ph HEX               : 64 hex chars (raw puzzle hash).\n"
@@ -241,7 +241,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    -n, --num N                     : number of plots to create.\n"
         << "    --group-members N               : members per file, 1..65535.\n"
         << "                                      -n still counts files; default is one member per file.\n"
-        << "    -j, --workers N                 : shared compression CPU allowance for grouped jobs.\n"
+        << "    -j, --workers N                 : shared plotting CPU budget for grouped jobs.\n"
         << "    -s, --strength S                : v2 PoS strength (default 2).\n"
         << "    -o, --out DIR                   : output directory.\n"
         << "    --manifest FILE                 : save/reuse this job manifest (default: unique\n"
@@ -1496,13 +1496,13 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                       << "  invite     Create a private invitation for another machine\n"
                       << "  join       Enroll this machine from an invitation\n"
                       << "  configure  Save resource, network and dedicated broker defaults\n"
-                      << "  status     Show authenticated live resources, owners and jobs\n"
+                      << "  status     Show live workers, plotting job owners and tasks\n"
                       << "  pause / drain / resume  Control this machine's running worker\n"
                       << "  service    Manage a background worker or broker\n"
                       << "  members / revoke  Inspect or revoke pool membership\n"
                       << "  renew-request / renew-sign / renew-import  Rotate a node's credentials\n"
                       << "  policy-export / policy-import  Synchronize signed membership offline\n"
-                      << "  broker  Assign shared compute leases to plotting hosts\n"
+                      << "  broker  Schedule shared compute tasks for plotting jobs\n"
                       << "  worker  Share CPU/GPU capacity with plotting hosts\n"
                       << "Use xchplot2 compute COMMAND --help for connection and resource options.\n";
             return argc < 3 ? 1 : 0;
@@ -1514,9 +1514,10 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             for (size_t i = 1; i < values.size(); ++i) {
                 if (values[i] != "--host-bytes" && values[i] != "--gpu-bytes" &&
                     values[i] != "--max-task-bytes" && values[i] != "--max-frame-bytes") continue;
+                auto const option = values[i];
                 uint64_t bytes = 0;
                 if (++i == values.size() || !parse_host_ram_arg(values[i], bytes))
-                    throw std::invalid_argument("compute memory option requires bytes or a size such as 8G");
+                    throw std::invalid_argument(option + " requires a byte count or a size such as 8G");
                 values[i] = std::to_string(bytes);
             }
             std::vector<char*> arguments; for (auto& value : values) arguments.push_back(value.data());
@@ -2993,7 +2994,7 @@ complete -F _xchplot2 xchplot2
 _xchplot2() {
     local -a subcmds
     local positional='*:: :->args'
-    subcmds=(plan:"Preview farming layout" fill:"Fill destination drives" status:"Inspect farm progress" pause:"Pause plotting" drain:"Drain plotting" resume:"Resume plotting" retire:"Retire plotting intent" grow:"Extend an existing group" compute:"Share compute" batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
+    subcmds=(plan:"Preview farming layout" fill:"Fill destination drives" status:"Inspect farm progress" pause:"Pause at a safe checkpoint" drain:"Finish started files, then stop" resume:"Continue paused or drained work" retire:"Detach destinations, keep plots" grow:"Extend an existing group" compute:"Share compute" batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
     if (( CURRENT == 2 )); then
         _describe 'subcommand' subcmds
         return
@@ -3033,29 +3034,29 @@ _xchplot2() {
         '--ca[Trusted worker CA]:value:' \
         '--cert[Worker certificate]:value:' \
         '--key[Worker private key]:value:' \
-        '--generation-threads[CPUs per generation]:value:' \
-        '--max-task-bytes[Task payload bound]:value:' \
-        '--max-window-chunks[Codec window chunks]:value:' \
-        '--max-batch-members[Coencoded generation members]:value:' \
-        '--task-timeout-ms[Task deadline]:value:' \
-        '--tls-timeout-ms[TLS operation deadline]:value:' \
+        '--generation-threads[CPU threads per generation task]:value:' \
+        '--max-task-bytes[Codec and generation scratch limit in bytes]:value:' \
+        '--max-window-chunks[Maximum chunks per codec task]:value:' \
+        '--max-batch-members[Maximum members per generation task]:value:' \
+        '--task-timeout-ms[Task timeout in milliseconds]:value:' \
+        '--tls-timeout-ms[TLS operation timeout in milliseconds]:value:' \
         '--group-members[Members per file]:value:' \
         '--plan-only[Preview without writing]' \
         '--metadata-only[Inspect saved plan metadata without live checks]' \
         '--no-metadata-only[Restore live plan checks]' \
-        '--assess-jobs[Jointly assess saved keyless job forecasts]' \
+        '--assess-jobs[Check saved plans together against one harvester budget]' \
         '--inventory[Inspect explicit existing farm roots]' \
         '--no-inventory[Restore ordinary plan mode]' \
         '--replot[Inventory to migrate into destinations]:file:_files' \
-        '--replot-verification[Replacement verification policy]:mode:(structural sampled strict)' \
-        '--replot-proof-first-groups[Sampled initial proof-checked groups]:count:' \
-        '--replot-proof-every-groups[Sampled global one-based proof period]:count:' \
+        '--replot-verification[Structural checks, plus proof samples for selected or all groups]:mode:(structural sampled strict)' \
+        '--replot-proof-first-groups[Proof-check the first N groups with the sampled policy]:count:' \
+        '--replot-proof-every-groups[Proof-check every Nth group across destinations with the sampled policy; 0 disables]:count:' \
         '--status[Inspect saved farm progress]' \
         '--watch[Refresh status until interrupted]' '--no-watch[Print status once]' \
-        '--inspect[Include deep live status checks]' '--no-inspect[Read saved status]' \
-        '--live[Inspect compute and migration service prerequisites]' '--no-live[Use saved status only]' \
+        '--inspect[Scan outputs and check recovery checkpoints]' '--no-inspect[Read saved status]' \
+        '--live[Query shared compute and migration service readiness]' '--no-live[Use saved status only]' \
         '*--destination[Saved destination to control]:directory:_files -/' \
-        '--policy-only[Record control intent without starting an idle job]' \
+        '--policy-only[Save the control setting without starting an idle job]' \
         '--revalidate[Review updated migration resources or verification policy]' \
         '*--replot-source-root[Exact inventory root to select]:dir:_files -/' \
         '*--replot-exclude-root[Exact inventory root to protect]:dir:_files -/' \
@@ -3063,7 +3064,7 @@ _xchplot2() {
         '--replot-max-source-bytes[Maximum selected allocated old-file bytes]:size:' \
         '--farm-adapter[Installed native farm adapter]:adapter:(chia gigahorse drchia)' \
         '--farm-adapter-timeout-ms[Inventory or migration adapter operation deadline]:milliseconds:' \
-        '--reclaim-before-bytes[Outstanding pre-delete limit]:size:' \
+        '--reclaim-before-bytes[Allocated-byte limit for early deletion before replacements are ready]:size:' \
         '--no-assess-jobs[Restore ordinary plan mode]' \
         '--calibrate[Measure explicitly supplied plot files]' \
         '--no-calibrate[Disable reader calibration]' \
@@ -3080,10 +3081,10 @@ _xchplot2() {
         '--allow-missing[Resume available destinations]' \
         '--relocate[Move a saved destination]:old directory:_files -/:new directory:_files -/' \
         '--construction[Group construction method]:value:' \
-        '--backend[Member producer]:value:' \
+        '--backend[CPU/GPU plot generation]:value:' \
         '--device[GPU device]:value:' \
-        '--max-ram[Construction RAM budget]:value:' \
-        '-j[Shared CPU allowance]:count:' '--workers[Shared CPU allowance]:count:' \
+        '--max-ram[Combined plotting RAM budget]:value:' \
+        '-j[Shared plotting CPU budget]:count:' '--workers[Shared plotting CPU budget]:count:' \
         '--batch-members[Construction batch limit]:value:' \
         '--max-members[Maximum total file membership]:value:' \
         '--max-groups[File limit per directory]:value:' \
@@ -3091,17 +3092,17 @@ _xchplot2() {
         '--capacity-bytes[Output capacity]:value:' \
         '--leave-free[Space to leave free; binary unit suffixes accepted]:size:' \
         '--headroom-bytes[Alias for leave-free]:size:' \
-        '--destination-temp[Destination scratch permission]:value:' \
-        '--temp-capacity-bytes[Scratch cap]:value:' \
-        '--member-storage[Retained fragment storage]:value:' \
-        '--window-bytes[I/O window]:value:' \
-        '--checkpoint-bytes[Durability window]:value:' \
+        '--destination-temp[Allow temporary files on destinations]:value:' \
+        '--temp-capacity-bytes[Temporary storage limit per filesystem]:value:' \
+        '--member-storage[Temporary member storage format]:value:' \
+        '--window-bytes[I/O window size in bytes]:value:' \
+        '--checkpoint-bytes[Target bytes between recovery checkpoints]:value:' \
         '--io-overlap[I/O overlap]:value:' \
-        '--generation-overlap[Producer overlap]:value:' \
+        '--generation-overlap[Overlap generation with construction]:value:' \
         '--cache-release[Release clean file cache]:value:' \
-        '--save-plan[Save a keyless plan]:file:_files' \
+        '--save-plan[Save a plan without private plot keys]:file:_files' \
         '--alternative[Review assessed resource choices, or capacity alone]:names:(memory eligible-groups deadline cpu-cores lookup-workers capacity)' \
-        '--upgrade-job[Review a stopped job recovery metadata upgrade]' \
+        '--upgrade-job[Review additional space for recovery records on a stopped job]' \
         '-F[Use a saved plan]:file:_files' '--from-plan[Use a saved plan]:file:_files' \
         '--save-profile[Export reusable harvester or migration setup]:file:_files' \
         '*--resource-setting[Declare a remaining inventory/replot bound by stable ID]:setting:' \
@@ -3111,56 +3112,56 @@ _xchplot2() {
         '--chia-executable[Installed Chia CLI]:file:_files' \
         '--farming-reader[Final reader profile]:value:' \
         '--farming-objective[Layout objective]:value:' \
-        '--farming-cores[Harvester CPU allowance]:value:' \
-        '--farming-lookup-workers[Harvester reader concurrency]:value:' \
-        '--farming-memory-bytes[Reader RAM]:value:' \
-        '--farming-index-cache-bytes[Reader index cache]:value:' \
+        '--farming-cores[Harvester CPU core limit]:value:' \
+        '--farming-lookup-workers[Concurrent harvester lookups]:value:' \
+        '--farming-memory-bytes[Reader RAM limit in bytes]:value:' \
+        '--farming-index-cache-bytes[Reader index cache in bytes]:value:' \
         '--farming-filter-bits[Current filter]:value:' \
         '--farming-future-filter-bits[Future filter]:value:' \
-        '--farming-deadline-ms[Response deadline]:value:' \
-        '--farming-chain-us-per-member[Per-member CPU cost]:value:' \
-        '--farming-index-ns-per-entry[Index decode cost]:value:' \
+        '--farming-deadline-ms[Response deadline in milliseconds]:value:' \
+        '--farming-chain-us-per-member[CPU cost per member in microseconds]:value:' \
+        '--farming-index-ns-per-entry[Index decode cost per entry in nanoseconds]:value:' \
         '--farming-cpu-work-weight[CPU work weight]:value:' \
         '--farming-io-work-weight[I/O work weight]:value:' \
         '--farming-max-eligible-groups[Eligible groups per resource]:value:' \
         '--compute-broker[Broker address]:value:' \
-        '--compute-owner-id[Storage owner identity]:value:' \
+        '--compute-owner-id[Stable plotting job owner ID]:value:' \
         '--compute-ca[Trusted compute CA]:value:' \
         '--compute-cert[Compute certificate]:value:' \
         '--compute-key[Compute private key]:value:' \
         '--compute-inflight[Task concurrency ceiling]:value:' \
         '--compute-codec-ram[Remote codec RAM]:value:' \
-        '--compute-timeout-ms[Task deadline]:value:' \
-        '--compute-socket-timeout-ms[Socket deadline]:value:' \
-        '--compute-frame-bytes[Transport window]:value:' \
+        '--compute-timeout-ms[Task timeout in milliseconds]:value:' \
+        '--compute-socket-timeout-ms[Socket timeout in milliseconds]:value:' \
+        '--compute-frame-bytes[Maximum network message size in bytes]:value:' \
         '--compute-listen[Local worker listener]:value:' \
         '--compute-advertise[Local worker address]:value:' \
         '--compute-offer-ram[Local shared RAM]:value:' \
         '--compute-offer-cpus[Local shared CPU]:value:' \
         '--compute-offer-vram[Local shared VRAM]:value:' \
         '--compute-offer-slots[Local task slots]:value:' \
-        '--compute-offer-backend[Local producer]:value:' \
-        '--listen[Compute service option]:value:' \
-        '--advertise[Compute service option]:value:' \
-        '--broker[Compute service option]:value:' \
-        '--tls-ca[Compute service option]:value:' \
-        '--tls-cert[Compute service option]:value:' \
-        '--tls-key[Compute service option]:value:' \
-        '--host-bytes[Compute service option]:value:' \
-        '--cpus[Compute service option]:value:' \
-        '--gpu-bytes[Compute service option]:value:' \
-        '--slots[Compute service option]:value:' \
-        '--timeout-ms[Compute service option]:value:' \
-        '--lease-ms[Compute service option]:value:' \
-        '--worker-ms[Compute service option]:value:' \
-        '--control-threads[Compute service option]:value:' \
-        '--max-connections[Compute service option]:value:' \
-        '--idle-ms[Compute service option]:value:' \
-        '--owner-share[Compute service option]:value:' \
-        '--max-workers[Compute service option]:value:' \
-        '--max-owners[Compute service option]:value:' \
-        '--max-tasks[Compute service option]:value:' \
-        '--max-frame-bytes[Compute service option]:value:' \
+        '--compute-offer-backend[Local CPU/GPU plot generation]:value:' \
+        '--listen[Listener address and port]:value:' \
+        '--advertise[Address and port reachable by plotting hosts]:value:' \
+        '--broker[Broker address and port]:value:' \
+        '--tls-ca[Trusted certificate authority file]:value:' \
+        '--tls-cert[Service certificate file]:value:' \
+        '--tls-key[Service private key file]:value:' \
+        '--host-bytes[Offered host RAM limit in bytes]:value:' \
+        '--cpus[Offered CPU thread limit]:value:' \
+        '--gpu-bytes[Offered GPU RAM limit in bytes]:value:' \
+        '--slots[Maximum active worker tasks]:value:' \
+        '--timeout-ms[Query or connection timeout in milliseconds]:value:' \
+        '--lease-ms[Renewable task assignment duration in milliseconds]:value:' \
+        '--worker-ms[Worker registration expiry in milliseconds]:value:' \
+        '--control-threads[Concurrent broker request handlers]:value:' \
+        '--max-connections[Maximum active and idle control connections]:value:' \
+        '--idle-ms[Idle connection timeout in milliseconds]:value:' \
+        '--owner-share[Relative scheduling share as owner-ID\:weight]:value:' \
+        '--max-workers[Maximum registered workers]:value:' \
+        '--max-owners[Maximum plotting job owners]:value:' \
+        '--max-tasks[Maximum queued, active and recent task records]:value:' \
+        '--max-frame-bytes[Maximum network message size in bytes]:value:' \
         '--tier[Streaming tier]:tier:(plain compact minimal tiny pinned auto)' \
         '-d[Device selector]:spec:(all gpu cpu 0 1 2 3)' '--devices[Device selector]:spec:(all gpu cpu 0 1 2 3)' \
         '--progress[Force aggregate progress line on]' \
@@ -3200,7 +3201,10 @@ complete -c xchplot2 -f
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plan' -d 'Preview farming layout'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'fill' -d 'Fill destination drives'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'status' -d 'Inspect farm progress'
-complete -c xchplot2 -n '__fish_use_subcommand' -a 'pause drain resume retire' -d 'Control saved plotting intent'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'pause' -d 'Pause at a safe checkpoint'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'drain' -d 'Finish started files, then stop'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'resume' -d 'Continue paused or drained work'
+complete -c xchplot2 -n '__fish_use_subcommand' -a 'retire' -d 'Detach destinations, keep plots'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'grow' -d 'Extend an existing group'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'compute' -d 'Share compute'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
@@ -3219,30 +3223,30 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l discovery -r -d
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l ca -r -d 'Trusted worker CA'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l cert -r -d 'Worker certificate'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l key -r -d 'Worker private key'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l generation-threads -r -d 'CPUs per generation'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-task-bytes -r -d 'Task payload bound'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-window-chunks -r -d 'Codec window chunks'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-batch-members -r -d 'Coencoded generation members'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l task-timeout-ms -r -d 'Task deadline'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-timeout-ms -r -d 'TLS operation deadline'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l generation-threads -r -d 'CPU threads per generation task'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-task-bytes -r -d 'Codec and generation scratch limit in bytes'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-window-chunks -r -d 'Maximum chunks per codec task'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-batch-members -r -d 'Maximum members per generation task'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l task-timeout-ms -r -d 'Task timeout in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-timeout-ms -r -d 'TLS operation timeout in milliseconds'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l group-members -r -d 'Members per file'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l plan-only -d 'Preview without writing'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l farm-adapter -r -a 'chia gigahorse drchia' -d 'Installed native farm adapter'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l farm-adapter-timeout-ms -r -d 'Inventory or migration adapter operation deadline'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l inventory -d 'Inspect explicit farm roots'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l alternative -r -a 'memory eligible-groups deadline cpu-cores lookup-workers capacity' -d 'Review assessed resource choices, or capacity alone'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l upgrade-job -d 'Review a stopped job recovery metadata upgrade'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l upgrade-job -d 'Review additional space for recovery records on a stopped job'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot -r -F -d 'Review migration from inventory'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-verification -r -a 'structural sampled strict' -d 'Replacement verification policy'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-first-groups -r -d 'Sampled initial proof-checked groups'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-every-groups -r -d 'Sampled global one-based proof period'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-verification -r -a 'structural sampled strict' -d 'Structural checks, plus proof samples for selected or all groups'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-first-groups -r -d 'Proof-check the first N groups with the sampled policy'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-proof-every-groups -r -d 'Proof-check every Nth group across destinations with the sampled policy; 0 disables'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l status -d 'Inspect saved farm progress'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l watch -d 'Refresh status until interrupted'
-complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l inspect -d 'Include deep live status checks'
-complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l live -d 'Inspect compute and migration service prerequisites'
-complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l timeout-ms -r -d 'Overall live inspection budget'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l inspect -d 'Scan outputs and check recovery checkpoints'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l live -d 'Query shared compute and migration service readiness'
+complete -c xchplot2 -n '__fish_seen_subcommand_from status plan fill; and not __fish_seen_subcommand_from compute' -l timeout-ms -r -d 'Total live query time in milliseconds'
 complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l destination -r -a '(__fish_complete_directories)' -d 'Saved destination to control'
-complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l policy-only -d 'Record control intent without starting an idle job'
+complete -c xchplot2 -n '__fish_seen_subcommand_from pause drain resume retire; and not __fish_seen_subcommand_from compute' -l policy-only -d 'Save the control setting without starting an idle job'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status pause drain resume retire; and not __fish_seen_subcommand_from compute' -l manifest -r -F -d 'Saved farming job'
 complete -c xchplot2 -n '__fish_seen_subcommand_from status pause drain resume retire; and not __fish_seen_subcommand_from compute' -a '(__fish_complete_path)' -d 'Saved job directory or plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l revalidate -d 'Review updated migration resources or verification policy'
@@ -3250,8 +3254,8 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-source-root
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-exclude-root -r -a '(__fish_complete_directories)' -d 'Exact inventory root to protect'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-max-source-files -r -d 'Maximum selected old files'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l replot-max-source-bytes -r -d 'Maximum selected allocated old-file bytes'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l reclaim-before-bytes -r -d 'Outstanding pre-delete limit'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-plan -r -F -d 'Save a keyless plan'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l reclaim-before-bytes -r -d 'Allocated-byte limit for early deletion before replacements are ready'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-plan -r -F -d 'Save a plan without private plot keys'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -s F -l from-plan -r -F -d 'Use a saved plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l save-profile -r -F -d 'Export reusable harvester or migration setup'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan' -l resource-setting -r -d 'Declare an inventory/replot bound by stable ID'
@@ -3270,10 +3274,10 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l allow-missing
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -l relocate -r -d 'Old and new destination directories'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill' -a '(__fish_complete_path)' -d 'Destination directory or saved plan'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l construction -r -d 'Group construction method'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l backend -r -d 'Member producer'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l backend -r -d 'CPU/GPU plot generation'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l device -r -d 'GPU device'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-ram -r -d 'Construction RAM budget'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -s j -l workers -r -d 'Shared CPU allowance'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-ram -r -d 'Combined plotting RAM budget'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -s j -l workers -r -d 'Shared plotting CPU budget'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l batch-members -r -d 'Construction batch limit'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-members -r -d 'Maximum total file membership'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l max-groups -r -d 'File limit per directory'
@@ -3281,68 +3285,68 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' 
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l capacity-bytes -r -d 'Output capacity'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l leave-free -r -d 'Space to leave free; binary unit suffixes accepted'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l headroom-bytes -r -d 'Alias for leave-free'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l destination-temp -r -d 'Destination scratch permission'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l temp-capacity-bytes -r -d 'Scratch cap'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l member-storage -r -d 'Retained fragment storage'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l window-bytes -r -d 'I/O window'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l checkpoint-bytes -r -d 'Durability window'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l destination-temp -r -d 'Allow temporary files on destinations'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l temp-capacity-bytes -r -d 'Temporary storage limit per filesystem'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l member-storage -r -d 'Temporary member storage format'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l window-bytes -r -d 'I/O window size in bytes'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l checkpoint-bytes -r -d 'Target bytes between recovery checkpoints'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l io-overlap -r -d 'I/O overlap'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l generation-overlap -r -d 'Producer overlap'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l generation-overlap -r -d 'Overlap generation with construction'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l cache-release -r -d 'Release clean file cache'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-reader -r -d 'Final reader profile'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-objective -r -d 'Layout objective'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-cores -r -d 'Harvester CPU allowance'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-lookup-workers -r -d 'Harvester reader concurrency'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-memory-bytes -r -d 'Reader RAM'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-index-cache-bytes -r -d 'Reader index cache'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-cores -r -d 'Harvester CPU core limit'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-lookup-workers -r -d 'Concurrent harvester lookups'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-memory-bytes -r -d 'Reader RAM limit in bytes'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-index-cache-bytes -r -d 'Reader index cache in bytes'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-filter-bits -r -d 'Current filter'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-future-filter-bits -r -d 'Future filter'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-deadline-ms -r -d 'Response deadline'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-chain-us-per-member -r -d 'Per-member CPU cost'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-index-ns-per-entry -r -d 'Index decode cost'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-deadline-ms -r -d 'Response deadline in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-chain-us-per-member -r -d 'CPU cost per member in microseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-index-ns-per-entry -r -d 'Index decode cost per entry in nanoseconds'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-cpu-work-weight -r -d 'CPU work weight'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-io-work-weight -r -d 'I/O work weight'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l farming-max-eligible-groups -r -d 'Eligible groups per resource'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-broker -r -d 'Broker address'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-owner-id -r -d 'Storage owner identity'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-owner-id -r -d 'Stable plotting job owner ID'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-ca -r -d 'Trusted compute CA'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-cert -r -d 'Compute certificate'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-key -r -d 'Compute private key'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-inflight -r -d 'Task concurrency ceiling'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-codec-ram -r -d 'Remote codec RAM'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-timeout-ms -r -d 'Task deadline'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-socket-timeout-ms -r -d 'Socket deadline'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-frame-bytes -r -d 'Transport window'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-timeout-ms -r -d 'Task timeout in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-socket-timeout-ms -r -d 'Socket timeout in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-frame-bytes -r -d 'Maximum network message size in bytes'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-listen -r -d 'Local worker listener'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-advertise -r -d 'Local worker address'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-ram -r -d 'Local shared RAM'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-cpus -r -d 'Local shared CPU'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-vram -r -d 'Local shared VRAM'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-slots -r -d 'Local task slots'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-backend -r -d 'Local producer'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l listen -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l advertise -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l broker -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-ca -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-cert -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-key -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l host-bytes -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l cpus -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l gpu-bytes -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l slots -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l backend -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l device -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l timeout-ms -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l lease-ms -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l worker-ms -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l control-threads -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-connections -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l idle-ms -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l owner-share -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-workers -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-owners -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-tasks -r -d 'Compute service option'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-frame-bytes -r -d 'Compute service option'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-offer-backend -r -d 'Local CPU/GPU plot generation'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l listen -r -d 'Listener address and port'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l advertise -r -d 'Address and port reachable by plotting hosts'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l broker -r -d 'Broker address and port'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-ca -r -d 'Trusted certificate authority file'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-cert -r -d 'Service certificate file'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l tls-key -r -d 'Service private key file'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l host-bytes -r -d 'Offered host RAM limit in bytes'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l cpus -r -d 'Offered CPU thread limit'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l gpu-bytes -r -d 'Offered GPU RAM limit in bytes'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l slots -r -d 'Maximum active worker tasks'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l backend -r -d 'CPU/GPU plot generation'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l device -r -d 'GPU device index'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l timeout-ms -r -d 'Query or connection timeout in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l lease-ms -r -d 'Renewable task assignment duration in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l worker-ms -r -d 'Worker registration expiry in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l control-threads -r -d 'Concurrent broker request handlers'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-connections -r -d 'Maximum active and idle control connections'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l idle-ms -r -d 'Idle connection timeout in milliseconds'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l owner-share -r -d 'Relative scheduling share as owner-ID:weight'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-workers -r -d 'Maximum registered workers'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-owners -r -d 'Maximum plotting job owners'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-tasks -r -d 'Maximum queued, active and recent task records'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-frame-bytes -r -d 'Maximum network message size in bytes'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'batch'         -d 'Run a manifest of plots'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plot'          -d 'Single-plot farmable mode'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'bench'         -d 'Measure plotting throughput'

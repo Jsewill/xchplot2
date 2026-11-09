@@ -56,44 +56,48 @@ void command_help_all(std::string_view command)
             "Writes only requested --save-plan or --save-profile files; no plotting services are started.\n";
     else
         std::cout << "Plan and populate destination directories. --plan-only is the same preview as plan.\n"
-            "Resume through any member, --manifest FILE, or the current member directory.\n";
+            "Resume through any destination in the job, --manifest FILE, or the current destination directory.\n";
     if (command == "plan") std::cout <<
         "  --alternative NAMES      review assessed resource changes, or capacity alone\n"
-        "  --upgrade-job            review a stopped job's recovery-metadata allowance upgrade\n";
+        "  --upgrade-job            review additional space for a stopped job's recovery records\n";
     if (command != "grow") std::cout <<
         "  --paths-from FILE        literal destination paths, one per line; - reads stdin\n"
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"
         "  --discover-drives DIR    select supported mounted storage at or below DIR; repeatable\n"
         "  --mounts-under DIR       alias for --discover-drives\n"
         "  --manifest FILE          locate an existing farming job directly\n"
-        "  --save-plan FILE         save a keyless plan, e.g. farm.plan\n"
+        "  --save-plan FILE         save a plan without private plot keys, e.g. farm.plan\n"
         "  -F, --from-plan FILE     explicit alternative to supplying PLAN directly\n"
         "  --save-profile FILE      export reusable harvester or migration setup\n"
         "  --resource-setting SETTING  inventory/replot setup: declare a resource bound by its stable ID; repeatable\n"
         "  --metadata-only          plan: inspect saved metadata without checking destinations or recovery\n"
-        "  --assess-jobs             plan: assess saved keyless job forecasts under one harvester budget\n"
+        "  --assess-jobs             plan: check saved plans together against one harvester budget\n"
         "  --inventory              plan: inspect explicit existing farm roots without changing files\n"
         "  --replot INVENTORY       plan: review migration of selected inventory into destinations\n"
-        "  --replot-verification MODE  plan/revalidate: structural (new default), sampled or strict\n"
-        "  --replot-proof-first-groups N  sampled: initial groups to proof-check; default 1\n"
-        "  --replot-proof-every-groups N  sampled: global one-based proof period; default 0\n"
+        "  --replot-verification MODE  replacement checks (default structural):\n"
+        "                           structural: headers and chunk index\n"
+        "                           sampled: also sample full proofs for selected groups\n"
+        "                           strict: also sample full proofs for every group\n"
+        "  --replot-proof-first-groups N  sampled: proof-check the first N groups; default 1\n"
+        "  --replot-proof-every-groups N  sampled: proof-check every Nth group across destinations; 0 disables (default)\n"
         "  --replot-source-root ROOT  select an exact inventory root; repeat for more roots\n"
         "  --replot-exclude-root ROOT  protect an exact inventory root; repeat for more roots\n"
         "  --replot-max-source-files N  maximum old files selected for this review\n"
         "  --replot-max-source-bytes SIZE  maximum allocated old-file bytes selected\n"
         "  --status                 read ordinary job or migration progress without writer locks\n"
         "  --watch                  refresh status until interrupted\n"
-        "  --inspect                status: include deep live checks\n"
-        "  --live                   status: also inspect compute and migration service prerequisites\n"
-        "  --timeout-ms N           status --live: overall query budget, default 5000\n"
+        "  --inspect                status: scan outputs and check recovery checkpoints\n"
+        "  --live                   status: query shared compute and migration service readiness\n"
+        "  --timeout-ms N           status --live: total query time in milliseconds, 100..60000; default 5000\n"
         "  --revalidate             plan: save a successor for updated resources or verification policy\n"
-        "  --reclaim-before-bytes N  reviewed outstanding pre-delete limit; default zero\n"
+        "  --reclaim-before-bytes N  allocated-byte limit for early deletion; default zero\n"
+        "                           Early deletion is irreversible: old plots may be removed before replacements are ready.\n"
         "  --farm-adapter chia|gigahorse|drchia  explicit installed inventory/reader adapter\n"
         "  --farm-adapter-timeout-ms N  inventory/migration adapter operation deadline, default 30000\n"
         "  --extend                 add destinations or refresh capacity, including during fill\n"
         "  --update                 revise capacity and parameters for future groups\n"
         "  --cancel-update          cancel a queued ordinary-job update\n"
-        "  --allow-missing          with --resume, continue available members; incomplete exit 4\n"
+        "  --allow-missing          with --resume, continue available destinations; incomplete exit 4\n"
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";
     std::cout <<
         "  -k, --k N                 default 28 for farming; even 18..26 for testing\n"
@@ -106,29 +110,30 @@ void command_help_all(std::string_view command)
         "  --max-groups N            per-directory file limit (fill)\n"
         "  --max-total-members N     per-directory member limit (fill)\n"
         "  --plan-only               preview a fill without writing\n"
-        "  -r, --resume              load keys and all destinations from any member directory\n"
+        "  -r, --resume              load keys and all destinations from any directory in the job\n"
         "  -f, --farmer-pk HEX        farmer public key (fill)\n"
         "  -p, --pool-pk HEX          pool public key; choose one pool source\n"
         "  --pool-ph HEX             pool contract puzzle hash\n"
         "  -c, --pool-contract-address ADDRESS  pool contract address\n"
         "  -S, --seed HEX            optional 32-byte seed; otherwise generated and saved privately\n";
     std::cout <<
-        "  --backend cpu|gpu|auto    producer selection, default auto\n"
+        "  --backend cpu|gpu|auto    CPU/GPU plot generation, default auto\n"
         "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
         "                           combine with commas; GPU selectors accept :tier\n"
         "  --device N --tier NAME    local GPU and production tier\n"
-        "  -M, --max-host-ram SIZE   shared construction/producer RAM budget (e.g. 14G)\n"
-        "  -j, --workers N           shared compression CPU allowance\n"
+        "  -M, --max-host-ram SIZE   combined plotting RAM budget (e.g. 14G)\n"
+        "  -j, --workers N           shared plotting CPU budget\n"
         "  --batch-members N         maximum members generated per construction batch\n"
         << (command == "grow" ? "  --capacity-bytes N        output capacity for the group file\n" :
             "  --capacity-bytes N        aggregate output capacity per filesystem\n") <<
         "  --leave-free SIZE         filesystem space to leave free; --headroom-bytes is an alias\n"
-        "  -t, --temp-dir DIR        contribution storage; repeat for more devices\n"
-        "  --destination-temp off|on|ssd|hdd  destination scratch permission, default off\n"
+        "  -t, --temp-dir DIR        temporary plotting storage; repeat for more devices\n"
+        "  --destination-temp off|on|ssd|hdd  allow temporary files on destinations; default off\n"
         "  --temp-capacity-bytes N   temporary capacity per filesystem\n"
         "  --construction auto|incremental|staged|merged|external\n"
-        "  --member-storage compact|raw  retained fragment representation\n"
-        "  --window-bytes N --checkpoint-bytes N  fixed I/O/durability windows\n"
+        "  --member-storage compact|raw  temporary member storage format\n"
+        "  --window-bytes N          I/O window size in bytes\n"
+        "  --checkpoint-bytes N      target bytes between recovery checkpoints\n"
         "  --io-overlap on|off --generation-overlap auto|on|off --cache-release on|off\n";
     if (command != "grow") std::cout <<
         "  --harvester local|FILE    use this harvester or import its saved profile\n"
@@ -171,7 +176,7 @@ void command_help_all(std::string_view command)
     else std::cout <<
         "Keep every private .xchplot2/grow-farm.plan copy with its plots; it contains\n"
         "private plot seeds. Keep .next copies and owned temporary files for recovery too.\n"
-        "Existing jobs retain their top-level metadata layout; leave those copies in place.\n";
+        "Older jobs keep recovery files beside their plots; leave those files in place.\n";
 }
 
 void command_help(std::string_view command, bool all)
@@ -179,15 +184,15 @@ void command_help(std::string_view command, bool all)
     if (command == "status")
     {
         command_usage(command);
-        std::cout << "Read saved farm progress through any member, a plan, or its manifest.\n"
-            "Without a selector, use the current member directory.\n\n"
+        std::cout << "Read saved farm progress through any destination in the job, a plan, or its manifest.\n"
+            "Without a selector, use the current destination directory.\n\n"
             "  --watch                  refresh until interrupted\n"
-            "  --inspect                include deep live checks\n"
-            "  --live                   also inspect compute and migration service prerequisites\n"
-            "  --timeout-ms N           overall live query budget, default 5000 (100..60000)\n"
+            "  --inspect                scan outputs and check recovery checkpoints\n"
+            "  --live                   query shared compute and migration service readiness\n"
+            "  --timeout-ms N           total live query time in milliseconds, 100..60000; default 5000\n"
             "  --compute off|auto       select whether live status inspects shared compute\n"
             "  --compute-directory DIR  saved pool to inspect\n"
-            "  --harvester FILE          local migration setup, including authorized reader bindings\n"
+            "  --harvester FILE          local migration profile with selected readers and service settings\n"
             "  -F, --from-plan FILE     inspect a saved plan\n"
             "  --manifest FILE          locate a saved farming job directly\n"
             "  -M, --max-host-ram SIZE   inspection memory budget\n"
@@ -199,14 +204,18 @@ void command_help(std::string_view command, bool all)
     if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
     {
         command_usage(command);
-        std::cout << "Change saved plotting intent without removing completed plots.\n"
-            "Without a selector, use the current member directory.\n"
+        if (command == "pause") std::cout << "Pause plotting at the next safe checkpoint. Keep completed plots.\n";
+        else if (command == "drain") std::cout << "Finish started files without starting new ones. Keep completed plots.\n";
+        else if (command == "resume") std::cout << "Allow paused or drained work to continue. Start the job if it is idle.\n";
+        else std::cout << "Detach destinations from this job, keeping their plots and recovery files.\n"
+            "Available started files finish before detachment. Resume cannot rejoin detached destinations.\n"
+            "Missing destinations keep their resources reserved until they return and acknowledge retirement.\n";
+        std::cout << "Without a selector, use the current destination directory.\n"
             "Without --destination, apply the action to the whole job.\n\n"
-            "A running coordinator applies the action at its next recovery boundary.\n"
-            "Available drives honor controls while unrelated drives are missing.\n"
-            "Resume starts an idle job, or shows the running coordinator.\n\n"
+            "The running fill applies controls at its next safe checkpoint.\n"
+            "Available destinations honor controls while other destinations are missing.\n\n"
             "  --destination DIR        select a saved destination; repeat for more destinations\n"
-            "  --policy-only            record the intent and return without starting an idle job\n"
+            "  --policy-only            save the control setting without starting an idle job\n"
             "  --manifest FILE          locate the saved farming job directly\n"
             "  --json                    machine-readable result\n"
             "  -q, --quiet               suppress informational summaries\n"
@@ -216,38 +225,41 @@ void command_help(std::string_view command, bool all)
     if (command == "grow" || all) { command_help_all(command); return; }
     command_usage(command);
     if (command == "plan")
-        std::cout << "Preview a layout for the selected destinations. No directories: suggest mounted storage.\n"
+        std::cout << "Preview a layout for the selected destinations. Without directories, suggest mounted storage.\n"
             "Save a plan once, then pass it directly to fill:\n\n"
             "  xchplot2 plan /disk-a/plots /disk-b/plots --harvester local --save-plan farm.plan\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n\n"
-            "  --save-plan FILE          save a keyless plan for fill\n"
+            "  --save-plan FILE          save a plan for fill without private plot keys\n"
             "  --alternative NAMES       review assessed memory, eligible-groups, deadline, cpu-cores or lookup-workers changes; capacity alone\n"
-            "  --upgrade-job             review a stopped job's recovery-metadata allowance upgrade\n"
+            "  --upgrade-job             review additional space for a stopped job's recovery records\n"
             "  -F, --from-plan FILE      inspect a saved plan (also accepts positional PLAN)\n"
             "  --save-profile FILE       export reusable harvester or migration setup\n"
             "  --resource-setting SETTING  declare a remaining inventory/replot resource bound; repeatable\n"
             "  --metadata-only           read saved PLAN or --manifest FILE without live checks\n"
-            "  --assess-jobs PLAN...      jointly assess saved keyless forecasts under one budget\n"
+            "  --assess-jobs PLAN...      check saved plans together against one harvester budget\n"
             "  --inventory ROOT...      inspect existing farms; optionally --save-plan inventory.plan\n"
             "  --replot INVENTORY       review migration into DEST...; save with --save-plan\n"
-            "  --replot-verification MODE  structural (new default), sampled or strict\n"
-            "  --replot-proof-first-groups N  sampled proof prefix; default 1\n"
-            "  --replot-proof-every-groups N  sampled global one-based proof period; default 0\n"
+            "  --replot-verification MODE  replacement checks (default structural):\n"
+            "                           structural: headers and chunk index\n"
+            "                           sampled: also sample full proofs for selected groups\n"
+            "                           strict: also sample full proofs for every group\n"
+            "  --replot-proof-first-groups N  sampled: proof-check the first N groups; default 1\n"
+            "  --replot-proof-every-groups N  sampled: proof-check every Nth group across destinations; 0 disables (default)\n"
             "  --replot-source-root ROOT  select old files from this exact inventory root\n"
             "  --replot-exclude-root ROOT  protect old files in this exact inventory root\n"
             "  --replot-max-source-files N  bound old-file selection for a trial run\n"
             "  --replot-max-source-bytes SIZE  bound selected allocated old-file bytes\n"
             "  --status DIR|PLAN        inspect completed work, allowance and blocked reasons\n"
             "  --revalidate              review updated resources or verification; use --from-plan and --save-plan\n"
-            "  --reclaim-before-bytes SIZE  explicit bytes retired before construction/readiness; default zero\n"
-            "Early retirement is irreversible; later replacement checks cannot recover deleted plots.\n";
+            "  --reclaim-before-bytes SIZE  allocated-byte limit for early deletion; default zero\n"
+            "Early deletion is irreversible: old plots may be removed before replacements are ready.\n";
     else
         std::cout << "Fill selected directories or execute a saved plan.\n\n"
             "  xchplot2 fill farm.plan -f FARMER_KEY -c POOL_ADDRESS\n"
             "  xchplot2 fill /disk-a/plots -f FARMER_KEY -c POOL_ADDRESS\n"
             "  xchplot2 fill /disk-a/plots\n"
             "Repeat fill DIR to continue a saved job; explicit options revise future work.\n"
-            "Run fill -r from the current member directory to keep its saved policy without a path.\n"
+            "Run fill -r from a destination directory to keep its saved policy without supplying a path.\n"
             "New jobs require a farmer key and one pool source; saved jobs restore their keys.\n\n"
             "  -F, --from-plan FILE      execute a saved plan (also accepts positional PLAN)\n"
             "  --status DIR|PLAN        inspect ordinary job or migration progress without plotting\n"
@@ -260,8 +272,8 @@ void command_help(std::string_view command, bool all)
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
             "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
-            "  -M, --max-host-ram SIZE   plotting buffer budget, e.g. 14G\n"
-            "  -t, --temp-dir DIR        optional construction scratch\n";
+            "  -M, --max-host-ram SIZE   combined plotting RAM budget, e.g. 14G\n"
+            "  -t, --temp-dir DIR        temporary plotting storage\n";
 #ifdef XCHPLOT2_GROUP_COMMANDS
     if (command == "plan") std::cout <<
         "  --calibrate FILE...       measure supplied plots; use --json or --save-profile FILE\n"
@@ -291,9 +303,9 @@ pos2gpu::GroupOptions pos2gpu::group_batch_options(pos2gpu::BatchOptions const& 
     require(!options.shard_plot && !options.pipeline_plot && options.pipeline_tiers.empty() &&
                 options.strategy == pos2gpu::BatchStrategy::Auto,
             "group construction does not use single-member sharding or pipeline strategies");
-    require(!options.continue_on_error, "group construction stops on errors to preserve the shared destination audit");
+    require(!options.continue_on_error, "group construction stops on errors so destinations can be rechecked safely; omit --continue-on-error");
     require(options.cpu_workers == pos2gpu::kCpuWorkersAuto,
-            "group construction uses --workers for its shared CPU allowance; omit --cpu-workers");
+            "group construction uses --workers for its shared CPU budget; omit --cpu-workers");
     require(!options.has_max_host_ram || options.max_host_ram,
             "group construction requires a positive --max-host-ram size; spill-to-min is only available for single-member plotting");
     std::vector<std::string> tokens{"xchplot2-group.gplot"};

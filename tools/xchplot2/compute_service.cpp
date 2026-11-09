@@ -17,7 +17,7 @@ namespace
 {
 namespace fs = std::filesystem;
 namespace pool = group_grow::pool;
-void require(bool value, char const* message)
+void require(bool value, std::string const& message)
 { if (!value) throw std::invalid_argument(message); }
 std::string quoted(std::string const& value)
 {
@@ -92,16 +92,17 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
         std::cout << "Usage: xchplot2 compute service COMMAND [OPTIONS]\n"
             "  install  Install and enable a systemd user service, and start it\n"
             "  start    Start an installed service\n"
-            "  stop     Stop it; owners retry unfinished tasks elsewhere\n"
+            "  stop     Stop it; plotting jobs retry unfinished tasks elsewhere\n"
             "  restart  Apply changed defaults or installed executable\n"
             "  status   Show whether the service is active; -v includes manager details and logs\n"
             "  remove   Stop, disable and remove this generated service\n"
-            "  print    Print the unit without writing files or starting work\n"
+            "  print    Print the service definition without writing files or starting work\n"
             "  --role worker|broker  Service role, default worker\n"
             "  --directory DIR       Saved pool membership\n"
             << pos2gpu::compute_output_help <<
             "Resources and network selection come from compute configure.\n"
-            "Use compute drain before stop to let accepted work finish.\n"
+            "For workers, run compute drain and wait for drained before stopping.\n"
+            "After restarting a drained worker, run compute resume to accept new tasks.\n"
             "User services run while the user manager is active; logout behavior follows the system's login policy.\n";
     };
     if (argc < 2) { help(); return 1; }
@@ -113,16 +114,16 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
         if (option == "--help" || option == "-h" || option == "--help-all") { help(); return 0; }
         if (output.parse(option)) continue;
         if (!option.starts_with('-'))
-        { require(command.empty(), "unexpected compute service argument"); command = option; continue; }
-        require(i + 1 < argc, "missing compute service option value"); std::string value = argv[++i];
+        { require(command.empty(), "unexpected compute service argument: " + option); command = option; continue; }
+        require(i + 1 < argc, "missing value for " + option); std::string value = argv[++i];
         if (option == "--role") role = value;
         else if (option == "--directory") directory = value;
         else throw std::invalid_argument("unknown compute service option: " + option);
     }
     output.validate();
     require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
-        command == "status" || command == "remove" || command == "print", "unknown compute service command");
-    require(role == "worker" || role == "broker", "service role must be worker or broker");
+        command == "status" || command == "remove" || command == "print", "unknown compute service command: " + command + "; use compute service --help");
+    require(role == "worker" || role == "broker", "--role requires worker or broker");
     auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
     auto const name = "xchplot2-compute-" + role + '-' + identity->node_id + ".service";
     auto const path = unit_directory() / name;
