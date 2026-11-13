@@ -68,6 +68,7 @@ BrokerSnapshot snapshot(pool::Endpoint const& endpoint, pool::TlsOptions const& 
         do
         {
             auto page = client.status({section, cursor, std::min(remaining, pool::max_status_page_size)});
+            result.summary.identity = page.identity; result.summary.host = page.host;
             result.summary.workers = page.workers; result.summary.owners = page.owners; result.summary.jobs = page.jobs;
             result.summary.queued = page.queued; result.summary.granted = page.granted;
             result.summary.running = page.running; result.summary.cancelled = page.cancelled;
@@ -83,9 +84,21 @@ BrokerSnapshot snapshot(pool::Endpoint const& endpoint, pool::TlsOptions const& 
     }
     return result;
 }
+void hardware_json(pool::WorkerHardware const& value)
+{
+    std::cout << "{\"host\":"; string(value.host);
+    std::cout << ",\"gpu_identity\":"; string(value.gpu_identity);
+    std::cout << ",\"partition\":"; resources(value.partition);
+    std::cout << ",\"logical_cpus\":" << value.logical_cpus << ",\"total_host_bytes\":" << value.total_host_bytes
+        << ",\"available_host_bytes\":" << value.available_host_bytes
+        << ",\"total_gpu_bytes\":" << value.total_gpu_bytes << ",\"standing_host_bytes\":" << value.standing_host_bytes
+        << ",\"observed_at_unix_ms\":" << value.observed_at_unix_ms << '}';
+}
 void broker_json(BrokerSnapshot const& value)
 {
     std::cout << "{\"endpoint\":"; string(address(value.endpoint));
+    std::cout << ",\"identity\":"; string(value.summary.identity);
+    std::cout << ",\"host\":"; string(value.summary.host);
     std::cout << ",\"authenticated\":true,\"summary\":{\"workers\":" << value.summary.workers
         << ",\"owners\":" << value.summary.owners << ",\"jobs\":" << value.summary.jobs
         << ",\"queued\":" << value.summary.queued << ",\"granted\":" << value.summary.granted
@@ -103,7 +116,7 @@ void broker_json(BrokerSnapshot const& value)
         std::cout << ",\"admission\":"; string(pool::admission_name(worker.admission));
         std::cout << ",\"capacity\":"; resources(worker.capacity);
         std::cout << ",\"reserved\":"; resources(worker.reserved);
-        std::cout << ",\"seen_ms\":" << worker.seen_ms << '}';
+        std::cout << ",\"seen_ms\":" << worker.seen_ms << ",\"hardware\":"; hardware_json(worker.hardware); std::cout << '}';
     }
     std::cout << "],\"owners\":["; comma = false;
     for (auto const& owner : value.owners)
@@ -142,6 +155,7 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
     std::cout << ",\"admission\":"; string(pool::admission_name(value.admission));
     std::cout << ",\"capacity\":"; resources(value.capacity);
     std::cout << ",\"active\":"; resources(value.active);
+    std::cout << ",\"hardware\":"; hardware_json(value.hardware);
     std::cout << ",\"accepted_tasks\":" << value.accepted_tasks << ",\"waiting_cpu\":" << value.waiting_cpu
         << ",\"baseline_host_bytes\":" << value.baseline_host_bytes
         << ",\"broker_limit\":" << value.broker_limit << ",\"known_brokers\":" << value.known_brokers

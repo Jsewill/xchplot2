@@ -461,6 +461,155 @@ void ssd_backlog(fs::path const& directory)
     require(io && !unknown.try_io(1), "backlog ranking weakened unknown-resource I/O exclusion");
     io.reset(); unknown.cancel(0); unknown.cancel(1);
 }
+void disk_feedback(fs::path const& directory)
+{
+    using Clock = DiskIoGovernor::Clock;
+    using namespace std::chrono;
+    auto const begin = Clock::time_point(seconds(100));
+    StorageDevice a{"a", {"disk-a"}}, alias{"alias", {"disk-a"}}, b{"b", {"disk-b"}}, c{"c", {"disk-c"}};
+    StorageDevice ssd{"ssd", {"ssd"}, true};
+    DiskIoGovernor governor([](std::string const&) { return std::optional<DiskIoGovernor::Counters>{}; });
+    for (auto const* device : {&a, &alias, &b, &c, &ssd}) governor.register_device(*device);
+    governor.observe_farming(10000000, 1000000000, false, begin);
+    auto first = governor.try_acquire(a, 8 * 1024 * 1024, begin);
+    require(first && first->bytes() <= 1024 * 1024 && !governor.try_acquire(b, unit, begin),
+        "cold disk feedback admitted an unbounded burst or an unmeasured working set");
+    first->complete(1024 * 1024, 10000000, begin + milliseconds(10));
+    governor.poll(begin + seconds(2));
+    require(governor.status(begin + seconds(2)).limit == 2, "completed throughput and independent backlog did not trial another HDD");
+    first = governor.try_acquire(a, unit, begin + seconds(2));
+    auto second = governor.try_acquire(b, unit, begin + seconds(2));
+    require(first && second && !governor.try_acquire(alias, unit, begin + seconds(2)),
+        "independent HDDs did not overlap or aliases doubled physical concurrency");
+    auto flash = governor.try_acquire(ssd, 8 * 1024 * 1024, begin + seconds(2));
+    require(flash && flash->bytes() == 8 * 1024 * 1024 && governor.status(begin + seconds(2)).drives == 3,
+        "farm disk feedback changed known SSD transfers or counted physical aliases twice");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(2));
+    second->complete(2 * 1024 * 1024, 10000000, begin + seconds(2));
+    governor.poll(begin + seconds(4));
+    require(governor.status(begin + seconds(4)).limit == 2, "a successful throughput trial was discarded");
+    first = governor.try_acquire(a, unit, begin + seconds(4));
+    second = governor.try_acquire(b, unit, begin + seconds(4));
+    require(first && second && !governor.try_acquire(c, unit, begin + seconds(4)), "HDD trial exceeded its current working set");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(4));
+    second->complete(2 * 1024 * 1024, 10000000, begin + seconds(4));
+    governor.poll(begin + seconds(6));
+    require(governor.status(begin + seconds(6)).limit == 3, "healthy farm feedback did not expand gradually");
+    governor.observe_farming(600000000, 1000000000, false, begin + seconds(6));
+    require(governor.status(begin + seconds(6)).limit == 1 && governor.status(begin + seconds(6)).pressured,
+        "real farming response pressure did not reduce rotating disk activity");
+    first = governor.try_acquire(a, unit, begin + seconds(7));
+    require(first && !governor.try_acquire(b, unit, begin + seconds(7)), "pressure blocked all forward progress or admitted another HDD");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(7));
+    governor.observe_farming(10000000, 1000000000, false, begin + seconds(8));
+    governor.poll(begin + seconds(8));
+    require(governor.status(begin + seconds(8)).limit == 1, "one healthy sample bypassed recovery hold");
+    first = governor.try_acquire(a, unit, begin + seconds(10));
+    require(first && !governor.try_acquire(b, unit, begin + seconds(10)), "recovery working set escaped its current bound");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(10));
+    governor.poll(begin + seconds(12));
+    require(governor.status(begin + seconds(12)).limit == 2, "safe completed work could not recover after pressure");
+    first = governor.try_acquire(a, unit, begin + seconds(12));
+    second = governor.try_acquire(b, unit, begin + seconds(12));
+    require(first && second, "recovered independent disks were not usable");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(12));
+    second->complete(2 * 1024 * 1024, 10000000, begin + seconds(12));
+    governor.poll(begin + seconds(14)); // Accept the recovery trial.
+    first = governor.try_acquire(a, unit, begin + seconds(14));
+    second = governor.try_acquire(b, unit, begin + seconds(14));
+    require(first && second && !governor.try_acquire(c, unit, begin + seconds(14)), "controller trial escaped its current bound");
+    first->complete(2 * 1024 * 1024, 10000000, begin + seconds(14));
+    second->complete(2 * 1024 * 1024, 10000000, begin + seconds(14));
+    governor.poll(begin + seconds(16));
+    first = governor.try_acquire(a, unit, begin + seconds(16));
+    second = governor.try_acquire(b, unit, begin + seconds(16));
+    auto third = governor.try_acquire(c, unit, begin + seconds(16));
+    require(first && second && third, "bounded controller throughput trial did not start");
+    first->complete(1024 * 1024, 10000000, begin + seconds(16));
+    second->complete(1024 * 1024, 10000000, begin + seconds(16));
+    third->complete(1024 * 1024, 10000000, begin + seconds(16));
+    governor.poll(begin + seconds(18));
+    require(governor.status(begin + seconds(18)).limit == 2, "additional disks without a throughput gain ignored a shared-controller ceiling");
+    governor.poll(begin + seconds(60));
+    require(!governor.status(begin + seconds(60)).farming_known && governor.status(begin + seconds(60)).limit <= 2,
+        "stale farming feedback retained an expanded disk working set");
+
+    DiskIoGovernor::Counters writeback;
+    DiskIoGovernor cached([&](std::string const&) { return std::optional(writeback); });
+    auto buffered = cached.try_acquire(a, 1024 * 1024, begin);
+    require(buffered.has_value(), "cached-write fixture was not admitted");
+    auto const initial_quantum = buffered->bytes(); buffered->complete(initial_quantum, 1000, begin + milliseconds(1));
+    writeback.busy_ms = 100; writeback.write_sectors = 2048; writeback.queue_ms = 100;
+    cached.poll(begin + milliseconds(250));
+    buffered = cached.try_acquire(a, 8 * 1024 * 1024, begin + milliseconds(250));
+    require(buffered && buffered->bytes() < initial_quantum && !cached.status(begin + milliseconds(250)).pressured,
+        "kernel service behind cached writes was ignored or our own I/O became foreign farm pressure");
+    buffered->complete(buffered->bytes(), 1000, begin + milliseconds(250));
+    require(!cached.try_acquire(a, unit, begin + milliseconds(251)) && cached.try_acquire(a, unit, begin + milliseconds(500)),
+        "cached writes bypassed physical service pacing or self-saturation blocked recovery indefinitely");
+
+    // Busy counters only on an inactive drive are foreign-load evidence.
+    // A continuously active own writer must not permanently throttle itself.
+    std::map<std::string, DiskIoGovernor::Counters> samples{{"disk-a", {}}, {"disk-b", {}}};
+    auto live = std::make_shared<DiskIoGovernor>([&](std::string const& name) -> std::optional<DiskIoGovernor::Counters>
+    { if (auto at = samples.find(name); at != samples.end()) return at->second; return {}; });
+    live->register_device(a); live->register_device(b); live->selected(a); live->selected(b); live->poll();
+    samples["disk-a"].busy_ms = 1000000; samples["disk-a"].queue_ms = 1000000;
+    std::this_thread::sleep_for(milliseconds(300)); live->poll();
+    require(live->routing_cost(a) > live->routing_cost(b),
+        "live foreign disk queue pressure did not change scratch routing");
+    auto ra = root(directory / "a", "a", a.drives), rb = root(directory / "b", "b", b.drives);
+    ScratchPool pool({ra, rb}, 0); pool.set_io_governor(live);
+    require(pool.try_reserve_output(0, root(directory / "c", "target", {"target"}), unit), "feedback output reservation failed");
+    pool.seal_recovery();
+    auto grant = pool.grant(0, 20 * unit, 20 * unit, unit, 2);
+    require(grant && quota(*grant) == 20 * unit && grant->scratch.front().directory == rb.directory && grant->io_governor == live,
+        "runtime disk feedback changed full scratch capacity or lost its actual-I/O hook");
+    auto const retained = quota(*grant); live->observe_pressure(true);
+    require(quota(*grant) == retained, "farming pressure changed retained checkpoint quotas");
+    for (size_t i = 0; i < 2 * live->status().drives; ++i) live->selected(b);
+    require(live->routing_cost(a) < live->routing_cost(b), "a slow/contended physical drive was permanently starved");
+    pool.cancel(0);
+
+    DiskIoGovernor cancellable;
+    auto held = cancellable.acquire(a, unit);
+    std::atomic<bool> cancel{false}; std::promise<void> waiting; bool signalled = false;
+    auto waiter = std::async(std::launch::async, [&]
+    {
+        try
+        {
+            auto permit = cancellable.acquire(b, unit, [&]
+            {
+                if (!signalled) { waiting.set_value(); signalled = true; }
+                if (cancel.load()) throw ConstructionInterrupted();
+            });
+            return false;
+        }
+        catch (ConstructionInterrupted const&) { return true; }
+    });
+    require(waiting.get_future().wait_for(seconds(5)) == std::future_status::ready, "disk cancellation waiter never started");
+    cancel.store(true);
+    require(waiter.wait_for(seconds(5)) == std::future_status::ready && waiter.get(), "queued disk I/O could not drain on cancellation");
+    held.complete(unit, 0);
+    require(cancellable.try_acquire(b, unit).has_value(), "cancelled FIFO disk ticket blocked its successor permanently");
+
+    DiskIoGovernor independent;
+    auto warm = independent.try_acquire(a, unit, begin);
+    require(warm && !independent.try_acquire(b, unit, begin), "independent FIFO fixture did not observe cold contention");
+    warm->complete(unit, 0, begin); independent.poll(begin + seconds(2));
+    auto slow = independent.acquire(a, unit);
+    std::promise<void> queued; bool notified = false;
+    auto same_disk = std::async(std::launch::async, [&]
+    {
+        auto permit = independent.acquire(alias, unit, [&]
+        { if (!notified) { queued.set_value(); notified = true; } });
+    });
+    require(queued.get_future().wait_for(seconds(5)) == std::future_status::ready, "slow-drive FIFO waiter never started");
+    auto other_disk = std::async(std::launch::async, [&] { auto permit = independent.acquire(b, unit); });
+    bool const progressed = other_disk.wait_for(seconds(5)) == std::future_status::ready;
+    slow.complete(unit, 0); same_disk.get(); other_disk.get();
+    require(progressed, "a queued slow-drive request stalled a ready independent HDD");
+}
 void nvme_topology()
 {
     auto field = [](std::string_view name)
@@ -565,7 +714,7 @@ int main() try
     topology(directory, true, false); topology(directory, false, false); topology(directory, true, true);
     staged_topology(directory, true, false); staged_topology(directory, false, false); staged_topology(directory, true, true);
     staged_aliases(directory); saved_staging(directory); staged_distributed(directory);
-    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory);
+    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory); disk_feedback(directory);
     for (std::string const name : {"a", "b", "c", "d", "e", "f"})
         require(fs::is_empty(directory / name), "capacity discovery or admission wrote to a supplied directory");
     fs::remove_all(directory);

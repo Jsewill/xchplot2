@@ -2,6 +2,7 @@
 // our admission gate; declarations are reservations, not hardware qualification.
 #pragma once
 #include "host/GroupHarvesterProfile.hpp"
+#include <memory>
 #include <set>
 #ifdef _WIN32
 #include <psapi.h>
@@ -12,6 +13,7 @@
 #include <time.h>
 #endif
 
+namespace group_grow { class WorkerIdentityReservation; }
 namespace group_grow::farm
 {
 using Clock = std::chrono::steady_clock;
@@ -138,6 +140,12 @@ struct NativeRequest
     uint64_t controller_ram_bytes = 0, adapter_ram_bytes = 0, adapter_cpu_threads = 0, adapter_timeout_us = 0;
     uint64_t generation_peak_bytes = 0, compute_session_ram_bytes = 0, compute_codec_ram_bytes = 0;
     bool compute_enabled = false;
+    bool adaptive_resources = false;
+    uint64_t compute_offer_ram_bytes = 0, compute_offer_cpu_threads = 0, compute_offer_gpu_bytes = 0;
+    std::string compute_offer_backend;
+    std::string compute_offer_identity;
+    bool compute_offer_owned = false;
+    std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
     std::vector<std::string> output_resources, scratch_resources, source_resources;
 };
 struct Profile
@@ -491,7 +499,35 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     stage.new_farming.clear(); stage.proof_reserve.clear(); stage.construction.clear(); stage.verification.clear(); stage.supervision.clear();
     stage.background = n.compute_services;
     for (auto const& worker : n.compute_workers)
+    {
+        auto const first = stage.background.size();
         stage.background.insert(stage.background.end(), worker.reservation.begin(), worker.reservation.end());
+        if (!request.adaptive_resources || !request.compute_offer_owned || worker.tls_identity != request.compute_offer_identity) continue;
+        require(worker.host == request.host && request.compute_offer_ram_bytes <= worker.host_bytes &&
+            request.compute_offer_cpu_threads <= worker.cpu_threads && request.compute_offer_gpu_bytes <= worker.gpu_bytes,
+            "owned local executor exceeds its reviewed whole-service maximum");
+        if (!request.compute_offer_ram_bytes)
+        { stage.background.resize(first); continue; } // identity is held, but this service has not been started
+        require(request.compute_offer_ram_bytes > worker.standing_host_bytes && request.compute_offer_cpu_threads,
+            "owned local executor cannot hold its standing service partition");
+        uint64_t host_release = worker.host_bytes - request.compute_offer_ram_bytes;
+        bool const cpu_only = request.compute_offer_backend == "cpu" && !request.compute_offer_gpu_bytes;
+        uint64_t cpu_release = worker.gpu_bytes && !cpu_only ? 0 :
+            (worker.gpu_bytes ? std::max(worker.cpu_threads, request.cpu_affinity_lanes) : worker.cpu_threads) - request.compute_offer_cpu_threads;
+        for (size_t index = first; index < stage.background.size(); ++index)
+        {
+            auto& demand = stage.background[index]; auto const& resource = graph.resources[graph.find(demand.resource)];
+            if (resource.host != request.host) continue;
+            if (resource.kind == ResourceKind::host_memory)
+            { auto const bytes = std::min(host_release, demand.transient_units); demand.transient_units -= bytes; host_release -= bytes; }
+            if (resource.kind == ResourceKind::cpu)
+            { auto const lanes = std::min(cpu_release, demand.reserved_units); demand.reserved_units -= lanes; cpu_release -= lanes; }
+            if (cpu_only && (resource.kind == ResourceKind::gpu_compute || resource.kind == ResourceKind::gpu_memory))
+                demand = Demand{};
+        }
+        stage.background.erase(std::remove_if(stage.background.begin() + first, stage.background.end(),
+            [](auto const& demand) { return demand.resource.empty(); }), stage.background.end());
+    }
     require(stage.background.size() <= max_resources * 4, "native compute background demands exceed their bounded stage size");
     // Target farming/solver services must already be live before replacement.
     // Reserve the first complete cohort even with no ready members, covering
@@ -633,6 +669,65 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
             require(selected && graph.resources[*selected].kind == ResourceKind::gpu_memory && graph.resources[*selected].host == worker.host && gpu &&
                 vram >= add(worker.gpu_bytes, worker.standing_gpu_bytes) && resident_vram >= worker.standing_gpu_bytes,
                 "whole compute worker reservation omits physical GPU allocation or standing residency");
+    }
+    if (request.adaptive_resources)
+    {
+        // The declaration is a maximum allocation, not a promise to allocate
+        // it at every boundary. Release only the app's transient buffer
+        // difference; declared resident/runtime overhead remains protected.
+        auto tighten_memory = [&](std::vector<Demand>& values, uint64_t selected)
+        {
+            uint64_t total = 0;
+            for (auto const& demand : values)
+            {
+                auto const& resource = graph.resources[graph.find(demand.resource)];
+                if (resource.host == request.host && resource.kind == ResourceKind::host_memory)
+                    total = add(total, add(demand.resident_units, demand.transient_units));
+            }
+            auto const overhead = std::max(request.controller_ram_bytes, total - std::min(total, n.max_ram_bytes));
+            uint64_t release = total - std::min(total, add(selected, overhead));
+            for (auto& demand : values)
+            {
+                auto const& resource = graph.resources[graph.find(demand.resource)];
+                if (resource.host != request.host || resource.kind != ResourceKind::host_memory) continue;
+                auto const bytes = std::min(release, demand.transient_units);
+                demand.transient_units -= bytes; release -= bytes;
+            }
+        };
+        if (building) tighten_memory(stage.construction, request.ram_bytes);
+        if (verifying) tighten_memory(stage.verification,
+            request.verification_ram_bytes ? request.verification_ram_bytes : request.ram_bytes);
+        // Modeled service times are conditional on their declared request
+        // shape and cannot be shrunk by an idle CPU sample. Only wholly
+        // opaque, capped executor reservations permit a smaller CPU partition.
+        if (building)
+        {
+            bool modeled = false;
+            for (auto const& demand : stage.construction)
+            {
+                auto const& resource = graph.resources[graph.find(demand.resource)];
+                if (resource.host == request.host && resource.kind == ResourceKind::cpu)
+                    modeled = modeled || demand.required_units || demand.work_us;
+            }
+            if (!modeled)
+            {
+                uint64_t total = 0;
+                for (auto const& demand : stage.construction)
+                {
+                    auto const& resource = graph.resources[graph.find(demand.resource)];
+                    if (resource.host == request.host && resource.kind == ResourceKind::cpu) total = add(total, demand.reserved_units);
+                }
+                auto const overhead = total - std::min(total, concurrent_cpu(n.max_cpu_threads));
+                uint64_t release = total - std::min(total, add(overhead, concurrent_cpu(request.cpu_threads)));
+                for (auto& demand : stage.construction)
+                {
+                    auto const& resource = graph.resources[graph.find(demand.resource)];
+                    if (resource.host != request.host || resource.kind != ResourceKind::cpu) continue;
+                    auto const lanes = std::min(release, demand.reserved_units);
+                    demand.reserved_units -= lanes; release -= lanes;
+                }
+            }
+        }
     }
     stage.scope_complete = true;
 }
@@ -1007,6 +1102,9 @@ inline void prepare_resource_settings(Profile const& profile, ResourcePreparatio
         }
     };
     demands("native.construction", n.construction); demands("native.verification", n.verification); demands("native.supervision", n.supervision);
+    demands("native.compute_services", n.compute_services);
+    for (auto const& worker : n.compute_workers)
+        demands("native.compute_workers[" + worker.tls_identity + "].reservation", worker.reservation);
     for (auto const& cohort : n.cohorts)
     {
         auto const target = "native.cohorts[" + std::to_string(cohort.max_members) + "]";
@@ -1101,6 +1199,19 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
     demands(native.construction, path + ".construction");
     if (!native.verification.empty() || native.max_verification_us) demands(native.verification, path + ".verification");
     demands(native.supervision, path + ".supervision");
+    if (!native.compute_workers.empty() || !native.compute_services.empty() || !native.compute_owner_identity.empty())
+    {
+        need(native.compute_owner_identity.empty() || native.compute_broker_identity.empty() || native.compute_broker_host.empty(),
+            "compute", path, "Select the enrolled owner and broker identities and the broker's physical host; repeat setup with the selected broker running or use its known local automatic broker.");
+        demands(native.compute_services, path + ".compute_services");
+        need(native.compute_workers.empty(), "compute", path + ".compute_workers",
+            "Start an enrolled helper with compute setup INVITATION, then repeat setup to import its authenticated hardware and executor partition.");
+        for (auto const& worker : native.compute_workers)
+            need(worker.host != native.host && std::none_of(worker.reservation.begin(), worker.reservation.end(), [&](auto const& demand)
+                { return graph.resources[graph.find(demand.resource)].kind == ResourceKind::network && demand.reserved_units && demand.bounded; }),
+                "compute-network", path + ".compute_workers[" + worker.tls_identity + "].reservation",
+                "Bind the worker's whole service to the existing physical network resource and its shared-service allowance; hardware discovery does not measure farming network demand.");
+    }
     need(native.cohorts.empty(), "farming-and-proofs", path + ".cohorts",
         "Declare increasing max_members cohorts, each with complete new_farming and separate proof_reserve demands for the harvester/farmer/full node/solver. Quality calibration cannot supply a full-proof reserve.");
     for (size_t i = 0; i < native.cohorts.size(); ++i)
@@ -1496,6 +1607,17 @@ inline Profile apply_resource_settings(Profile profile, std::span<std::string co
             else if (auto id = selector(path, "construction")) demand = demand_for(profile.native.construction, *id);
             else if (auto id = selector(path, "verification")) demand = demand_for(profile.native.verification, *id);
             else if (auto id = selector(path, "supervision")) demand = demand_for(profile.native.supervision, *id);
+            else if (auto id = selector(path, "compute_services")) demand = demand_for(profile.native.compute_services, *id);
+            else if (auto id = selector(path, "compute_workers"))
+            {
+                auto worker = std::find_if(profile.native.compute_workers.begin(), profile.native.compute_workers.end(),
+                    [&](auto const& value) { return value.tls_identity == *id; });
+                require(worker != profile.native.compute_workers.end(), "compute resource setting requires a discovered or saved worker identity");
+                require(path.starts_with('.'), "compute resource setting requires reservation[RESOURCE_ID]"); path.remove_prefix(1);
+                auto resource = selector(path, "reservation");
+                require(resource.has_value(), "compute resource setting requires reservation[RESOURCE_ID]");
+                demand = demand_for(worker->reservation, *resource);
+            }
             require(demand && path.empty(), "unsupported native resource setting target");
         }
         require(resource || workload || use || demand || native || metadata || gate, "unsupported resource setting target");
@@ -1536,6 +1658,8 @@ inline Profile apply_resource_settings(Profile profile, std::span<std::string co
                     set("standing_gpu_bytes", n.standing_gpu_bytes) || set("gpu_compute_resource", n.gpu_compute_resource) || set("gpu_memory_resource", n.gpu_memory_resource) ||
                     set("max_batch_members", n.max_batch_members) || set("max_group_members", n.max_group_members) ||
                     set("max_construction_us", n.max_construction_us) || set("max_verification_us", n.max_verification_us) ||
+                    set("compute_owner_identity", n.compute_owner_identity) || set("compute_broker_identity", n.compute_broker_identity) ||
+                    set("compute_broker_host", n.compute_broker_host) ||
                     set("verification_cpu_threads", n.verification_cpu_threads) || set("min_pool_difficulty", n.min_pool_difficulty) || set("pool_protocol_version", n.pool_protocol_version);
                 for (auto const& [name, mappings] : {std::pair{"output_resources", &n.output_resources},
                     {"scratch_resources", &n.scratch_resources}, {"source_resources", &n.source_resources}}) if (field == name)
@@ -2366,7 +2490,7 @@ public:
         auto const anon_before = active || observe_parent_memory ? kib_field("/proc/self/status", "RssAnon:") : std::optional<uint64_t>{};
         auto const child_path = proof ? "/proc/" + std::to_string(proof->pid) + "/status" : std::string{};
         auto const child_before = proof ? kib_field(child_path, "RssAnon:") : std::optional<uint64_t>{};
-        available = kib_field("/proc/meminfo", "MemAvailable:");
+        available = profile_detail::available_memory();
         if (active || observe_parent_memory)
         {
             auto const anon_after = kib_field("/proc/self/status", "RssAnon:");

@@ -1,4 +1,5 @@
 #include "host/ComputePool.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -13,6 +14,22 @@
 
 namespace group_grow::pool
 {
+void write_worker_hardware(Writer& out, WorkerHardware const& value)
+{
+    out.string(value.host); out.string(value.gpu_identity);
+    out.u32(value.partition.cpu_threads); out.u32(value.partition.slots);
+    out.u64(value.partition.host_bytes); out.u64(value.partition.gpu_bytes);
+    out.u32(value.logical_cpus); out.u64(value.total_host_bytes); out.u64(value.available_host_bytes); out.u64(value.total_gpu_bytes);
+    out.u64(value.standing_host_bytes); out.u64(value.observed_at_unix_ms);
+}
+WorkerHardware read_worker_hardware(Reader& in)
+{
+    WorkerHardware value; value.host = in.string(255); value.gpu_identity = in.string(255);
+    value.partition.cpu_threads = in.u32(); value.partition.slots = in.u32();
+    value.partition.host_bytes = in.u64(); value.partition.gpu_bytes = in.u64();
+    value.logical_cpus = in.u32(); value.total_host_bytes = in.u64(); value.available_host_bytes = in.u64(); value.total_gpu_bytes = in.u64();
+    value.standing_host_bytes = in.u64(); value.observed_at_unix_ms = in.u64(); return value;
+}
 namespace
 {
 using Clock = std::chrono::steady_clock;
@@ -81,6 +98,7 @@ void write_offer(Writer& writer, WorkerOffer const& offer)
     write_resources(writer, offer.capacity); writer.u64(offer.capacity_revision); writer.u32(offer.generation_threads); writer.u32(offer.capabilities); writer.u8(offer.min_k); writer.u8(offer.max_k);
     write_profiles(writer, offer.generation_profiles);
     writer.u32(offer.codec_limits.max_chunks); writer.u64(offer.codec_limits.max_task_bytes); writer.u8(uint8_t(offer.admission));
+    write_worker_hardware(writer, offer.hardware);
 }
 WorkerOffer read_offer(Reader& reader)
 {
@@ -89,7 +107,7 @@ WorkerOffer read_offer(Reader& reader)
     result.endpoint = read_endpoint(reader); result.capacity = read_resources(reader); result.capacity_revision = reader.u64(); result.generation_threads = reader.u32(); result.capabilities = reader.u32();
     result.min_k = reader.u8(); result.max_k = reader.u8(); result.generation_profiles = read_profiles(reader);
     result.codec_limits.max_chunks = reader.u32(); result.codec_limits.max_task_bytes = reader.u64();
-    result.admission = WorkerAdmission(reader.u8()); return result;
+    result.admission = WorkerAdmission(reader.u8()); result.hardware = read_worker_hardware(reader); return result;
 }
 void write_update(Writer& writer, std::optional<CapacityUpdate> const& update)
 {
@@ -341,8 +359,9 @@ void BrokerClient::worker_admission(std::string const& instance, WorkerAdmission
 BrokerStatusPage BrokerClient::status(StatusRequest const& query)
 {
     auto writer = request(Operation::Status); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
-    auto bytes = call(writer); Reader in(bytes); BrokerStatusPage result; result.section = StatusSection(in.u8());
+    BrokerStatusPage result; auto bytes = call(writer, &result.identity); Reader in(bytes); result.section = StatusSection(in.u8());
     require(result.section == query.section, "broker status section mismatch");
+    result.host = in.string(255);
     result.next_cursor = in.u64(); result.workers = in.u64(); result.owners = in.u64(); result.jobs = in.u64();
     result.queued = in.u64(); result.granted = in.u64(); result.running = in.u64(); result.cancelled = in.u64();
     auto const count = in.u32(); require(count <= query.limit && count <= max_status_page_size, "broker status page exceeds limit");
@@ -355,6 +374,7 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
             value.capabilities = in.u32();
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
+            value.hardware = read_worker_hardware(in);
             result.worker_records.push_back(std::move(value));
         }
         else if (result.section == StatusSection::Owners)
@@ -753,7 +773,7 @@ struct BrokerServer::Impl
             if (&job != releasing && reserved(job) && job.lease->worker_identity == identity)
                 subtract(capacity, job.lease->task.resources);
     }
-    void check_profiles(WorkerOffer const& offer, std::vector<GenerationProfile> const& profiles) const
+    void check_profiles(WorkerOffer const& offer, std::vector<GenerationProfile> const& profiles, uint32_t threads = 0) const
     {
         require(profiles.size() <= max_generation_profiles, "too many generation profiles");
         for (auto it = profiles.begin(); it != profiles.end(); ++it)
@@ -761,7 +781,7 @@ struct BrokerServer::Impl
             auto const& value = *it;
             require((value.kind == Kind::GenerateCpu || value.kind == Kind::GenerateGpu) &&
                 (offer.capabilities & capability(value.kind)) && value.k >= offer.min_k && value.k <= offer.max_k &&
-                !(value.k & 1) && value.strength <= 32 && value.cpu_threads == offer.generation_threads &&
+                !(value.k & 1) && value.strength <= 32 && value.cpu_threads == (threads ? threads : offer.generation_threads) &&
                 value.resources.cpu_threads == value.cpu_threads && value.resources.slots == 1 && value.resources.host_bytes &&
                 (value.kind == Kind::GenerateGpu || !value.resources.gpu_bytes) &&
                 value.max_batch_members && value.max_batch_members <= max_generation_batch_members,
@@ -785,10 +805,15 @@ struct BrokerServer::Impl
             require(update->capacity == offer.capacity && (!update->generation_profiles ||
                 *update->generation_profiles == offer.generation_profiles), "capacity revision changed its value"); return;
         }
-        require(update->capacity.cpu_threads >= offer.generation_threads, "capacity is below the worker generation CPU policy");
-        if (update->generation_profiles) check_profiles(offer, *update->generation_profiles);
+        auto const threads = update->generation_profiles && !update->generation_profiles->empty() ?
+            update->generation_profiles->front().cpu_threads : std::min(offer.generation_threads, update->capacity.cpu_threads);
+        require(threads && threads <= update->capacity.cpu_threads,
+            "capacity is below the worker generation CPU policy");
+        if (update->generation_profiles) check_profiles(offer, *update->generation_profiles, threads);
+        else check_profiles(offer, offer.generation_profiles, threads);
         check_capacity(lease.worker_identity, update->capacity, &releasing);
         offer.capacity = update->capacity; offer.capacity_revision = update->revision;
+        offer.generation_threads = threads;
         if (update->generation_profiles) offer.generation_profiles = *update->generation_profiles;
         worker->second.seen = Clock::now();
     }
@@ -849,7 +874,8 @@ struct BrokerServer::Impl
         }
         auto const total = section == StatusSection::Workers ? workers.size() : section == StatusSection::Owners ? owners.size() : jobs.size();
         auto const count = cursor >= total ? 0 : std::min<uint64_t>(limit, total - cursor);
-        response.u8(uint8_t(section)); response.u64(cursor < total && count < total - cursor ? cursor + count : 0);
+        response.u8(uint8_t(section)); response.string(profile_detail::host_name());
+        response.u64(cursor < total && count < total - cursor ? cursor + count : 0);
         response.u64(workers.size()); response.u64(owners.size()); response.u64(jobs.size());
         response.u64(queued); response.u64(granted); response.u64(running); response.u64(cancelled); response.u32(uint32_t(count));
         uint64_t index = 0;
@@ -866,6 +892,7 @@ struct BrokerServer::Impl
                 write_resources(response, worker.offer.capacity); write_resources(response, reserved_capacity);
                 response.u8(uint8_t(worker.offer.admission));
                 response.u64(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - worker.seen).count()));
+                write_worker_hardware(response, worker.offer.hardware);
             }
             ++index; if (index >= cursor && index - cursor >= count) break;
         }
@@ -1021,6 +1048,13 @@ struct BrokerServer::Impl
                 offer.codec_limits.max_task_bytes >= codec_window_header_bytes + codec_chunk_header_bytes &&
                 offer.codec_limits.max_task_bytes <= UINT32_MAX), "invalid worker codec limits");
             check_profiles(offer, offer.generation_profiles);
+            if (!offer.hardware.host.empty())
+                require(offer.hardware.logical_cpus && offer.hardware.partition.cpu_threads >= offer.capacity.cpu_threads &&
+                    offer.hardware.partition.slots >= offer.capacity.slots &&
+                    offer.hardware.partition.host_bytes >= offer.capacity.host_bytes &&
+                    offer.hardware.partition.gpu_bytes >= offer.capacity.gpu_bytes &&
+                    offer.hardware.standing_host_bytes < offer.hardware.partition.host_bytes &&
+                    offer.hardware.observed_at_unix_ms, "invalid worker hardware observation");
             require(!(offer.capabilities & capability(Kind::GenerateGpu)) ||
                 std::any_of(offer.generation_profiles.begin(), offer.generation_profiles.end(),
                     [](GenerationProfile const& profile) { return profile.kind == Kind::GenerateGpu; }),
@@ -1037,21 +1071,26 @@ struct BrokerServer::Impl
             {
                 auto& saved = it->second.offer;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
-                    saved.capabilities == offer.capabilities && saved.generation_threads == offer.generation_threads &&
+                    saved.capabilities == offer.capabilities &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
                     "worker registration changed without a new instance");
+                require(saved.hardware.host == offer.hardware.host && saved.hardware.gpu_identity == offer.hardware.gpu_identity,
+                    "worker physical binding changed without a new instance");
                 if (offer.capacity_revision > saved.capacity_revision)
                 {
                     check_capacity(identity, offer.capacity); saved.capacity = offer.capacity;
                     saved.capacity_revision = offer.capacity_revision; saved.generation_profiles = offer.generation_profiles;
+                    saved.generation_threads = offer.generation_threads;
                     // Existing leases retain their original route and identity.
                     // Only new grants use a worker's authenticated new address.
                     saved.endpoint = offer.endpoint;
                 }
                 else if (offer.capacity_revision == saved.capacity_revision)
                     require(saved.capacity == offer.capacity && saved.generation_profiles == offer.generation_profiles &&
+                        saved.generation_threads == offer.generation_threads &&
                         saved.endpoint == offer.endpoint, "capacity revision changed its value");
-                saved.admission = offer.admission; saved.producer_build = offer.producer_build; it->second.seen = Clock::now();
+                saved.admission = offer.admission; saved.producer_build = offer.producer_build;
+                saved.hardware = std::move(offer.hardware); it->second.seen = Clock::now();
             }
             response.string(epoch); schedule(); break;
         }

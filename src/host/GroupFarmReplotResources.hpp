@@ -8,6 +8,9 @@
 #include "host/ComputeSession.hpp"
 #include "host/GroupStorage.hpp"
 #include <type_traits>
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "gpu/SyclDeviceList.hpp"
+#endif
 
 namespace group_grow::farm
 {
@@ -18,7 +21,101 @@ struct ReplotSupervision
     // with construction/proof; native declarations are complete phase totals.
     uint64_t controller_ram_bytes = 0, adapter_ram_bytes = 0, adapter_cpu_threads = 0, adapter_timeout_us = 0;
     std::vector<std::filesystem::path> source_roots;
+    bool allow_missing_roots = false;
 };
+class ReplotResourcesUnavailable : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+struct ReplotLocalResources
+{
+    uint64_t ram_bytes = 0, cpu_threads = 0;
+};
+struct ReplotMemoryObservation { uint64_t available_bytes = 0, owned_resident_bytes = 0; };
+inline ReplotMemoryObservation replot_memory_observation()
+{
+    auto owned = []() -> std::optional<uint64_t>
+    {
+#ifdef __linux__
+        return resource_detail::kib_field("/proc/self/status", "RssAnon:");
+#elif defined(_WIN32)
+        return resource_detail::private_working_set();
+#else
+        return {};
+#endif
+    };
+    auto const before = owned(); ReplotMemoryObservation result;
+    result.available_bytes = profile_detail::available_memory(); auto const after = owned();
+    if (before && after) result.owned_resident_bytes = std::min(*before, *after);
+    return result;
+}
+// Tighten a maximum software allocation against the current reviewed cohort.
+// Current free RAM can reduce the grant, never remove a farming reservation or
+// promote an unbounded/unknown service declaration to an admitted policy.
+inline ReplotLocalResources replot_local_resources(Profile const& profile, NativeRequest const& maximum,
+    uint64_t available_memory_bytes, uint64_t inherited_cpu_lanes,
+    std::vector<Remaining> const* current_remaining = nullptr, uint64_t ready_members = 0)
+{
+    using namespace resource_detail;
+    AssessmentPreparation preparation(profile); auto const& graph = preparation.graph();
+    ReplotLocalResources result{maximum.ram_bytes, std::min(maximum.cpu_threads, inherited_cpu_lanes)};
+    std::vector<Remaining> remaining = current_remaining ? *current_remaining : std::vector<Remaining>{};
+    if (!current_remaining) for (auto const& workload : profile.workloads) if (workload.external_service_node_id.empty())
+        remaining.push_back({workload.id, workload.plot_count});
+    for (bool future : {false, true})
+    {
+        Stage stage; stage.name = "automatic-native-allocation"; stage.remaining = remaining; stage.future_filter = future;
+        bind_native_stage(preparation, maximum, ready_members, stage, true, false);
+        uint64_t construction_ram = 0;
+        for (auto const& demand : stage.construction)
+        {
+            auto const& resource = graph.resources[graph.find(demand.resource)];
+            if (resource.host == maximum.host && resource.kind == ResourceKind::host_memory)
+                construction_ram = add(construction_ram, add(demand.resident_units, demand.transient_units));
+        }
+        require(construction_ram >= maximum.ram_bytes, "native construction allocation exceeds its complete host demand");
+        auto const overhead = construction_ram - maximum.ram_bytes;
+        stage.construction.clear(); auto const protected_stage = assess_stage(preparation, stage);
+        uint64_t incremental = overhead;
+        for (auto const& workload : profile.workloads) for (auto const& use : workload.uses)
+        {
+            auto const& resource = graph.resources[graph.find(use.resource)];
+            if (resource.host == maximum.host && resource.kind == ResourceKind::host_memory)
+                incremental = add(incremental, use.transient_units);
+        }
+        for (auto const* values : {&stage.new_farming, &stage.proof_reserve, &stage.background})
+            for (auto const& demand : *values)
+            {
+                auto const& resource = graph.resources[graph.find(demand.resource)];
+                if (resource.host == maximum.host && resource.kind == ResourceKind::host_memory)
+                    incremental = add(incremental, add(demand.resident_units, demand.transient_units));
+            }
+        for (size_t index = 0; index < graph.resources.size(); ++index)
+        {
+            auto const& resource = graph.resources[index]; auto const& margin = protected_stage.margins[index];
+            if (resource.host != maximum.host) continue;
+            if (resource.kind == ResourceKind::host_memory)
+            {
+                auto const occupied = add(margin.occupied_units, overhead);
+                auto const static_room = resource.capacity_known && resource.capacity > occupied ? resource.capacity - occupied : 0;
+                auto const live_room = available_memory_bytes > incremental ? available_memory_bytes - incremental : 0;
+                result.ram_bytes = std::min({result.ram_bytes, static_room, live_room});
+            }
+            if (resource.kind == ResourceKind::cpu)
+            {
+                // Shared modeled queues keep their complete serialized timing
+                // bound. Only the available physical partition determines the
+                // capped producer fanout; an idle sample does not grant lanes.
+                auto const occupied = resource.conditional_shared ? margin.reserved_units : margin.occupied_units;
+                auto const room = resource.capacity_known && resource.capacity > occupied ? resource.capacity - occupied : 0;
+                auto const app_room = room >= inherited_cpu_lanes ? room : room > 1 ? room - 1 : 0;
+                result.cpu_threads = std::min(result.cpu_threads, app_room);
+            }
+        }
+    }
+    return result;
+}
 // Match authenticated service observations to a reviewed physical resource
 // scope. Remote addresses identify peers, never spare compute or host aliases.
 template<class Others>
@@ -124,6 +221,11 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
         !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_codec_ram), "compute service/client options have no reviewed broker scope");
     result.compute_session_ram_bytes = args.automatic_compute ? pos2gpu::ComputeSession::memory_bytes : 0;
     result.compute_codec_ram_bytes = args.pool_codec_ram;
+    result.compute_offer_ram_bytes = args.pool_offer_ram;
+    result.compute_offer_cpu_threads = args.pool_offer_cpus;
+    result.compute_offer_gpu_bytes = args.pool_offer_vram;
+    result.compute_offer_backend = args.pool_offer_backend;
+    result.compute_worker_reservation = args.compute_worker_reservation;
     require(!result.host.empty(), "cannot establish migration execution host");
     auto const cpus = profile_detail::logical_cpus(); require(cpus, "cannot establish inherited migration CPU affinity");
     result.cpu_affinity_lanes = cpus;
@@ -159,8 +261,10 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     for (auto const& directory : state.directories)
     {
         auto const path = file_io::native_path(directory.directory);
-        require(path.is_absolute() && !directory.directory_identity.empty() && farming_directory_identity(path) == directory.directory_identity,
-                "migration destination native identity changed");
+        require(path.is_absolute() && !directory.directory_identity.empty(), "migration destination has no absolute native identity");
+        std::error_code error;
+        if (!supervision.allow_missing_roots || std::filesystem::is_directory(path, error))
+            require(farming_directory_identity(path) == directory.directory_identity, "migration destination native identity changed");
         outputs.push_back(path);
         // Both supported fixed-forecast layouts put their largest membership
         // in the first file; later files can only have equal/fewer members.
@@ -169,9 +273,19 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
     // Destination staging can consume any output resource. Its existing
     // allocator still enforces free space; this accounts for its I/O envelope.
     if (args.destination_temp != "off") scratch.insert(scratch.end(), outputs.begin(), outputs.end());
-    result.output_resources = replot_physical_storage(profile, outputs, result.host);
-    result.scratch_resources = replot_physical_storage(profile, scratch, result.host);
-    result.source_resources = replot_physical_storage(profile, supervision.source_roots, result.host);
+    auto mappings = [&](std::vector<std::filesystem::path> paths, std::vector<std::string> const& expected)
+    {
+        if (!supervision.allow_missing_roots) return replot_physical_storage(profile, paths, result.host);
+        std::erase_if(paths, [](auto const& path) { std::error_code error; return !std::filesystem::is_directory(path, error); });
+        auto const observed = replot_physical_storage(profile, paths, result.host); Graph graph(profile);
+        for (auto const& id : observed)
+            require(std::any_of(expected.begin(), expected.end(), [&](auto const& saved) { return graph.find(saved) == graph.find(id); }),
+                "available migration root is outside its reviewed physical resource scope");
+        return expected;
+    };
+    result.output_resources = mappings(std::move(outputs), native.output_resources);
+    result.scratch_resources = mappings(std::move(scratch), native.scratch_resources);
+    result.source_resources = mappings(std::move(supervision.source_roots), native.source_resources);
     (void)replot_milliseconds(result.construction_us);
     Stage check; check.name = "native-execution-binding";
     bind_native_stage(profile, result, 0, check, true, false);
@@ -197,6 +311,22 @@ inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions cons
     Clock::time_point until = Clock::time_point::max())
 {
     auto result = options; result.max_ram = request.ram_bytes; result.workers = request.cpu_threads;
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (request.backend == "gpu" && !request.compute_enabled && !options.device_set)
+    {
+        auto const devices = pos2gpu::list_gpu_devices();
+        auto matches = [&](auto const& device)
+        { return !device.physical_identity.empty() && request.gpu_identity == "host:" + request.host + '/' + device.physical_identity; };
+        auto selected = std::find_if(devices.begin(), devices.end(), [&](auto const& device) { return device.auto_dispatchable && matches(device); });
+        if (selected == devices.end()) selected = std::find_if(devices.begin(), devices.end(), matches);
+        if (selected == devices.end()) throw ReplotResourcesUnavailable("migration is waiting for its reviewed physical GPU to become available");
+        result.device = selected->id;
+    }
+#endif
+    result.pool_offer_ram = request.compute_offer_ram_bytes; result.pool_offer_cpus = request.compute_offer_cpu_threads;
+    result.pool_offer_vram = request.compute_offer_gpu_bytes;
+    result.compute_worker_reservation = request.compute_worker_reservation;
+    if (!request.compute_offer_backend.empty()) result.pool_offer_backend = request.compute_offer_backend;
     result.batch = request.batch_members; result.backend = request.backend; result.backend_set = true;
     result.construction = request.engine;
     result.protected_resources = true; result.protected_gpu_bytes = request.gpu_bytes;
@@ -255,9 +385,22 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
         "remaining replot assessment exceeds its immutable boundary");
     require(journal.retired_prefix == (journal.batch < review.batches.size() ? review.batches[size_t(journal.batch)].first_source : review.sources.size()),
         "remaining replot assessment has a different retired source prefix");
-    auto const completed_members = replot_ready_members(review.farm, journal.batch);
-    auto const exposed_members = journal.batch < review.batches.size() && (journal.verified_stage || journal.published || journal.ready) ?
-        replot_ready_members(review.farm, journal.batch + 1) : completed_members;
+    auto members = [&](size_t batch)
+    { auto const& output = review.batches.at(batch); return review.farm.directories.at(size_t(output.lane)).layout.file_members(output.ordinal); };
+    auto const completed_members = journal.completed_lanes.empty() ? replot_ready_members(review.farm, journal.batch) : replot_completed_members(journal);
+    uint64_t exposed_members = completed_members, total_members = 0;
+    for (auto const& directory : review.farm.directories) total_members = add(total_members, directory.layout.total_members);
+    std::set<size_t> known_ready;
+    if (journal.batch < review.batches.size() && !replot_lane_completed(journal, journal.batch) && (journal.verified_stage || journal.published || journal.ready))
+    {
+        exposed_members = add(exposed_members, members(size_t(journal.batch)));
+        if (journal.published || journal.ready) known_ready.insert(size_t(journal.batch));
+    }
+    for (auto const& output : journal.queued) if (output.verified_stage || output.published || output.ready)
+    {
+        exposed_members = add(exposed_members, members(size_t(output.batch)));
+        if (output.published || output.ready) known_ready.insert(size_t(output.batch));
+    }
     require(ready_members >= completed_members && ready_members <= exposed_members,
         "remaining replot assessment has an unaudited ready member prefix");
     std::map<std::string, bool> can_confirm_unload;
@@ -268,6 +411,21 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
     }
     auto workload = [&](ReplotBatch const& batch, size_t source) -> InventoryPlot const&
     { return inventory.plots.at(size_t(review.sources.at(size_t(batch.first_source) + source))); };
+    auto progress = [&](size_t index) -> std::vector<ReplotCandidateProgress> const*
+    {
+        auto const queued = std::find_if(journal.queued.begin(), journal.queued.end(), [&](auto const& output) { return output.batch == index; });
+        if (queued != journal.queued.end()) return &queued->retirements;
+        return index == journal.batch ? &journal.retirements : nullptr;
+    };
+    auto debt = [&](size_t index)
+    {
+        uint64_t bytes = 0;
+        if (auto const values = progress(index)) for (size_t source = 0; source < values->size(); ++source)
+            if ((*values)[source].predelete) bytes = add(bytes, workload(review.batches.at(index), source).identity.allocated_bytes);
+        return bytes;
+    };
+    uint64_t outstanding_debt = journal.batch < review.batches.size() ? debt(size_t(journal.batch)) : 0;
+    for (auto const& output : journal.queued) if (output.batch != journal.batch) outstanding_debt = add(outstanding_debt, debt(size_t(output.batch)));
     auto reduce = [&](std::vector<Remaining>& counts, InventoryPlot const& plot)
     {
         auto at = std::find_if(counts.begin(), counts.end(), [&](auto const& item) { return item.workload == plot.workload_id; });
@@ -282,31 +440,30 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
     phase(remaining, ready_members, false, false, "current-confirmed-boundary-supervision");
     for (size_t index = size_t(journal.batch); index < review.batches.size(); ++index)
     {
+        if (replot_lane_completed(journal, index)) continue;
         auto const& batch = review.batches[index]; bool const current = index == journal.batch;
         bool const proof = replot_requires_proof(policy, index);
-        bool const sealed = current && (journal.verified_stage || journal.published || journal.ready);
-        require(!current || journal.retirements.size() == batch.sources, "remaining replot assessment lacks its exact current retirement ledger");
+        auto const queued = std::find_if(journal.queued.begin(), journal.queued.end(), [&](auto const& output) { return output.batch == index; });
+        bool const sealed = (current && (journal.verified_stage || journal.published || journal.ready)) ||
+            (queued != journal.queued.end() && (queued->verified_stage || queued->published || queued->ready));
+        auto const retirements = progress(index);
+        require(!retirements || retirements->size() == batch.sources, "remaining replot assessment lacks its exact pending retirement ledger");
         auto const prefix = "remaining-batch-" + std::to_string(index);
         phase(remaining, ready_members, false, false, prefix + "-conditional-before-retirement");
         std::vector<size_t> early;
         if (!sealed)
         {
-            uint64_t outstanding = 0;
-            if (current) for (size_t source = 0; source < journal.retirements.size(); ++source)
+            if (retirements) for (size_t source = 0; source < retirements->size(); ++source)
             {
-                auto const progress = journal.retirements[source];
-                require(progress.state == ReplotRetirement::active || progress.predelete,
+                auto const candidate = (*retirements)[source];
+                require(candidate.state == ReplotRetirement::active || candidate.predelete,
                     "unsealed remaining batch has an unauthorized post-publication retirement");
-                if (progress.predelete)
-                {
-                    outstanding = add(outstanding, workload(batch, source).identity.allocated_bytes);
-                    if (progress.state != ReplotRetirement::retired) early.push_back(source);
-                }
+                if (candidate.predelete && candidate.state != ReplotRetirement::retired) early.push_back(source);
             }
-            auto selected = select_replot_predeletions(size_t(batch.sources), review.reclaim_before_bytes, outstanding, std::move(early),
+            auto selected = select_replot_predeletions(size_t(batch.sources), review.reclaim_before_bytes, outstanding_debt, std::move(early),
                 [&](size_t source)
                 {
-                    bool const active = !current || journal.retirements[source].state == ReplotRetirement::active;
+                    bool const active = !retirements || (*retirements)[source].state == ReplotRetirement::active;
                     auto const& plot = workload(batch, source);
                     return ReplotPredeleteCandidate{plot.identity.allocated_bytes, active && plot.identity.links == 1 && !plot.alias_of};
                 }, [&](std::span<size_t const> prospective)
@@ -323,14 +480,16 @@ inline Assessment assess_replot_remaining(Profile const& profile, NativeRequest 
             phase(remaining, ready_members, true, false, prefix + "-conditional-build-after-confirmed-unload");
             phase(remaining, ready_members, false, proof, prefix + (proof ? "-conditional-proof" : "-conditional-structure") + "-after-confirmed-unload");
         }
-        ready_members = std::max(ready_members, replot_ready_members(review.farm, uint64_t(index) + 1));
+        if (journal.completed_lanes.empty()) ready_members = std::max(ready_members, replot_ready_members(review.farm, uint64_t(index) + 1));
+        else if (!known_ready.contains(index)) ready_members = std::min(total_members, add(ready_members, members(index)));
         phase(restart_counts, ready_members, false, false, prefix + "-restart-with-unconfirmed-future-registries");
         phase(remaining, ready_members, false, false, prefix + "-conditional-replacement-overlap");
         for (size_t source = 0; source < batch.sources; ++source)
         {
-            bool const retired = current && journal.retirements[source].state == ReplotRetirement::retired;
+            bool const retired = retirements && (*retirements)[source].state == ReplotRetirement::retired;
             if (!retired && std::find(early.begin(), early.end(), source) == early.end()) reduce(remaining, workload(batch, source));
         }
+        outstanding_debt -= debt(index);
     }
     accumulation.add(replot_stage(checks.preparation(), request, remaining, ready_members, false, false, true,
         "remaining-final-after-conditional-confirmed-source-unload"));
@@ -380,7 +539,12 @@ inline void write_replot_request_json(std::ostream& out, NativeRequest const& re
     if (request.generation_peak_bytes) out << ",\"generation_peak_bytes\":" << request.generation_peak_bytes;
     if (request.compute_enabled)
         out << ",\"compute_enabled\":true,\"compute_session_ram_bytes\":" << request.compute_session_ram_bytes
-            << ",\"compute_codec_ram_bytes\":" << request.compute_codec_ram_bytes;
+            << ",\"compute_codec_ram_bytes\":" << request.compute_codec_ram_bytes
+            << ",\"compute_offer_ram_bytes\":" << request.compute_offer_ram_bytes
+            << ",\"compute_offer_cpu_threads\":" << request.compute_offer_cpu_threads
+            << ",\"compute_offer_gpu_bytes\":" << request.compute_offer_gpu_bytes
+            << ",\"compute_offer_owned\":" << (request.compute_offer_owned && request.compute_worker_reservation ? "true" : "false")
+            << ",\"compute_offer_candidate\":" << (request.compute_offer_owned && !request.compute_worker_reservation ? "true" : "false");
     for (auto const& [name, values] : {std::pair{"output_resources", &request.output_resources}, {"scratch_resources", &request.scratch_resources}, {"source_resources", &request.source_resources}})
     {
         out << ",\"" << name << "\":["; bool comma = false;
@@ -478,7 +642,6 @@ public:
                    std::function<void(Admission const&)> const& on_pause = {})
     {
         resource_detail::require(timeout_ms && timeout_ms <= 3600000, "invalid migration admission wait deadline");
-        auto const until = Clock::now() + std::chrono::milliseconds(timeout_ms);
         auto const static_result = assess_stage(profile_, stage);
         if (!static_result.feasible)
         {
@@ -490,10 +653,11 @@ public:
         for (;;)
         {
             resource_detail::require(!cancelled || !cancelled(), "migration resource wait cancelled");
-            resource_detail::require(Clock::now() < until, "migration resource wait deadline exceeded");
             auto current = poll(stage); if (current.allowed) return current;
             if (!reported && on_pause) { on_pause(current); reported = true; }
-            std::this_thread::sleep_until(std::min(until, Clock::now() + std::chrono::milliseconds(50)));
+            // Resource pressure has no aggregate expiry. Individual work and
+            // RPC attempts retain their own bounded watchdogs after admission.
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min<uint64_t>(timeout_ms, 50)));
         }
     }
     static uint64_t memory_bytes(Profile const& profile)

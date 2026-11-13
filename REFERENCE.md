@@ -900,7 +900,9 @@ xchplot2 fill /disk-a/plots /disk-b/plots --replot \
 
 Resume an interrupted job with `xchplot2 fill /disk-a/plots`. Its private
 `.xchplot2/grow-replot.review` retains the selection, keys, profile and local
-reader bindings. Keep all of the job's destination and source drives available.
+reader bindings. All roots must be present when durable coordination is first
+established. Later, a missing drive waits while independent work can continue;
+resume through an available destination or the saved review.
 After migration completes, `fill DIR` uses ordinary farming recovery without
 requiring migration service checks again.
 Construction and compute overrides follow the same rules as saved reviews
@@ -1058,8 +1060,10 @@ parameters and selected reader/version provenance are filled when observed.
 It does not select destination or scratch paths or invent capacities and costs.
 The checklist groups missing declarations by purpose and gives their field
 paths and required inputs. Every fact identifies its source and scope as
-observed, declared or unknown. OS CPU/memory snapshots and configured lookup
-threads are diagnostics; they are not running service limits or spare capacity.
+observed, declared or unknown. Observed CPU affinity and effective
+physical/container memory supply local hardware ceilings during migration setup.
+Configured lookup threads and live free-memory snapshots do not establish
+another service's workload bounds.
 Saved quality-reader calibration retains its sample scope and cannot establish
 worst-case queues or a full-proof solver reserve.
 
@@ -1226,9 +1230,13 @@ its entire service, including work from other owners; idle status supplies no
 extra capacity. The host-memory partition already includes the worker baseline.
 `native.compute_owner_identity`, `compute_broker_identity` and
 `compute_broker_host` bind the owner and broker; `compute_services` reserves the
-persistent session/codec and broker resources. These are explicit reviewed
-physical mappings, not remote hardware discovery or permission to reconfigure a
-foreign worker. Missing mappings or grants beyond the envelope block admission.
+persistent session/codec and broker resources. Migration setup authenticates
+discovered workers, including workers advertised before a broker starts, and
+imports their physical host, configured CPU/RAM partition and known GPU identity.
+Existing declarations are preserved. Shared physical resources are counted once.
+Unknown network costs, GPU residency and foreign farming service bounds remain
+explicit setup requirements; observed idle capacity cannot supply those bounds.
+Missing mappings or grants beyond the reviewed envelope block admission.
 Protected migration gives the owner/client/codec and the worker independent
 CPU gates. Its reviewed envelope reserves both workloads in full, so a local
 offer may exceed `--workers` when physical capacity and complete phase bounds
@@ -1241,10 +1249,16 @@ replacement's output, scratch and farming resource budget. It selects a bounded
 set of sources and reserves the complete output on its destination before using
 the remaining space for scratch. With `--destination-temp on`, scratch can use
 the other selected destinations too; no dedicated temporary drive is required.
-Independent drives are preferred for scratch, and the ordinary I/O scheduler
-can overlap their work within the declared farm envelope. Shared drives retain
-their I/O serialization. This does not establish a measured farming latency
-guarantee on an unqualified HDD array.
+Independent drives are preferred for scratch. The disk scheduler adjusts its
+active drive count, transfer sizes and pacing from completed I/O and, on Linux,
+kernel block service. Physical aliases share one gate. When the installed local
+reader's configured log supplies recent farming completions, slow responses
+reduce construction pressure and healthy samples allow gradual recovery.
+Missing, disabled, remote or unsupported logs retain conservative tuning.
+Capacity reservations still cover complete outputs and checkpoints. These
+observations do not establish a farming latency guarantee on an unqualified HDD
+array; an allocation or synchronization call already running must return before
+the scheduler can yield that drive.
 
 Use `--reclaim-before-bytes 0` to require replacement-first retirement, or a
 positive byte limit to cap early deletion more tightly. To preview and save
@@ -1294,14 +1308,16 @@ spreads allocated bytes across replacement outputs, and keeps reader workload
 cohorts together when the active batch can hold them. Bootstrap sources are
 mapped to the output that needs their space.
 Every prefix must still pass the resource, scratch-space and early-deletion
-checks; execution proceeds sequentially through that fixed mapping.
+checks. The fixed mapping governs retirement even when an independent later
+output is constructed ahead of a delayed acknowledgement or missing drive.
 Selection tries bounded alternatives when the ranked choice cannot fit the
 early-deletion limit. A search-bound refusal does not establish that no feasible subset
 exists. It permits no additional retirement; existing pending commitments and
 used early-deletion allowance remain in the private journal.
 
 `--reclaim-before-bytes SIZE` belongs to the saved policy. When omitted, its
-limit covers at most the largest mapped replacement batch; admission still
+limit covers the source bytes assigned to the three largest mapped replacement
+batches, matching the pending-output bound; admission still
 reclaims only the whole files needed for that batch. The preview reports the
 resulting allocated-byte limit.
 Zero requires each mapped replacement to be ready before its sources are
@@ -1362,16 +1378,26 @@ acknowledgement for each file. Directory confirmation does not prove that every
 later file has already reached the farmer.
 
 Construction finishes and releases its scratch before waiting for the first
-directory acknowledgement. Temporary RPC failures, disconnects, synchronization
-and solver startup delays retain the sealed output and retry with bounded
-backoff until services recover or the user cancels. No further source retirement
-occurs while that confirmation is pending. This first-directory wait still
-holds the sequential migration at its current batch; it does not queue unlimited
-unconfirmed replacements. Identity, configuration and policy mismatches require
-correction or revalidation and are not retried as transient outages.
+directory acknowledgement. Up to three outputs, including the active output,
+can be under construction or awaiting confirmation. Independent later outputs
+can proceed within that bound, with their complete output and scratch costs
+reserved and all outstanding early-deletion debt charged together. Queued
+outputs retain their identity, verification and publication state across a
+restart. A confirmed output releases its pending slot after its mapped source
+retirements and completion record are durable, so a healthy destination can
+continue while another drive is absent. Sources still follow their mapped
+replacement's retirement rules.
+
+Temporary RPC failures, disconnects, synchronization and solver startup delays
+retain the owned executor and its sealed outputs. They retry with bounded
+backoff until services recover or the user cancels. Directory confirmation also
+reconciles later published outputs periodically; a failed reconciliation stops
+further retirement while bounded construction can continue. Identity,
+configuration and policy mismatches require correction or revalidation and are
+not retried as transient outages.
 
 Select `--replot-confirmation file` for exact acknowledgement of every
-replacement. This mode retains bounded readiness waits and audits the complete
+replacement. This mode retries transient readiness failures and audits the complete
 acknowledged prefix after construction or a synchronization-generation change.
 Older saved reviews retain their original file policy.
 
@@ -1404,9 +1430,16 @@ construction or verification work if protected headroom is lost. Construction
 stops at recoverable boundaries and resumes through checkpoint recovery; already-running
 native I/O must return before cancellation can be observed, and already-admitted
 backend work may finish at its existing completion or timeout boundary. A paused
-verification attempt restarts against the sealed replacement within its original
-verification deadline. Telemetry does not stop or
+verification attempt restarts against the sealed replacement within its remaining
+verification work allowance. Waiting and retry cooldown do not consume that
+allowance. Telemetry does not stop or
 reconfigure the farmer, harvester, remote solver or their services.
+Migration chooses RAM and CPU allocations from current availability on fresh
+execution, resume and safe construction boundaries, within the reviewed
+envelope. An explicit `--max-ram`, `--workers` or offered compute limit remains a
+cap. Resource pressure waits for recovery or cancellation; it has no fixed
+overall retry deadline. Retained checkpoints keep their full memory and storage
+requirements until recovery can safely proceed.
 The reviewed envelope must also allow fresh observations after a restart while
 conservatively retaining the original arrivals until their removal is confirmed.
 The first complete target farming and full-proof cohort is reserved even when
@@ -1418,10 +1451,18 @@ Keep the original `migration.plan` when one was exported, the private
 `grow-replot.review` for direct jobs, any active reviewed successor, every private
 `.xchplot2/grow-replot.plan` copy and any `.next` file, receipts and owned
 temporary files.
+New migrations also keep controller authority under
+`$XDG_STATE_HOME/xchplot2/migrations/` (normally
+`~/.local/state/xchplot2/migrations/`), or `%LOCALAPPDATA%\xchplot2\migrations\`
+on Windows. Preserve this directory with the destination metadata. Once
+established, it is required for recovery on the same host and user; destination
+copies alone cannot replace a missing controller record. Returning drives are
+reconciled against it, and conflicting or newer destination records require
+inspection before recovery.
 The private journal contains the seed and assignments from preparation onward.
-New jobs keep local reader bindings, `receipt-N` files and `stage-N.building`
-files with their construction sidecars under `.xchplot2/replot-JOB/` in each
-relevant destination. Existing jobs retain their original top-level journals,
+New jobs keep local reader bindings, `receipt-N` and `completion-N` records,
+and `stage-N.building` files with their construction sidecars under
+`.xchplot2/replot-JOB/` in each relevant destination. Existing jobs retain their original top-level journals,
 `.xchplot2-replot-JOB/` artifacts and `.xchplot2-stage-JOB-N.building` paths.
 Source claims remain under `.xchplot2-retire-JOB/` in the source root.
 Ordinary construction recovery files remain beside their output file, and
@@ -1434,8 +1475,12 @@ privately on the first destination when its metadata allowance has room.
 These defaults belong to the local host and user; explicit arguments override
 them, and a public review never supplies a local executable. Missing defaults
 require the original explicit local selections. Compute connection options remain
-explicit. All required source and destination roots must be available and must
-still identify the same directories. A source mismatch stops retirement while
+explicit. Work that needs a missing source, destination or retained scratch root
+waits until it returns with the same native identity. Other independent batches
+can proceed within the pending-output limit. If an unavailable drive holds a
+retained checkpoint whose scratch grants cannot be read, potentially shared
+scratch stays reserved and new construction may wait for that drive.
+A source mismatch stops retirement while
 preserving the claimed file for inspection. On Windows, a reader that holds a
 source without delete sharing must unload it before the native claim can open.
 Keep the reader's RPC service running. Recovery of a batch with durable
@@ -1457,6 +1502,14 @@ farming or compute services. Add `--live` for current service-readiness queries;
 these queries do not establish why a previous process stopped.
 Missing replicas are reported as incomplete observations. No journal found is
 not proof that the job never ran; preserve remaining artifacts before recovery.
+
+`xchplot2 pause DIR`, `drain DIR` and `resume DIR` also control migrations; a saved
+review can select the job instead. `--destination DIR` targets one destination.
+Pause fences new construction and retirement at safe boundaries, while drain
+allows admitted work to finish. Controls persist across restarts. Status shows
+the live coordinator, its wait reason, pending outputs, completed outputs per
+destination and controller authority separately from the global receipt prefix.
+Use `--policy-only` to save intent for a stopped coordinator; this does not start it.
 
 To review changed installed readers or resource declarations, stop the
 coordinator, keep the original source and replacement objects, and save an
@@ -1553,21 +1606,26 @@ plot memos. Enroll only machines you trust to compute correctly.
 On the first machine, create a pool and an invitation for another machine:
 
 ```bash
-xchplot2 compute init --name storage-a
+xchplot2 compute setup --name storage-a
 xchplot2 compute invite worker-b.invite --name worker-b
 ```
 
 Transfer the invitation privately to that machine, then run there:
 
 ```bash
-xchplot2 compute join worker-b.invite
-xchplot2 compute worker
+xchplot2 compute setup worker-b.invite
 ```
 
 Create a separate invitation for each additional machine. An invitation holds
 that machine's private TLS identity, not the pool's signing key. Delete
 transferred copies after joining. Enrollment is pool membership: every member
 can share with multiple plotting hosts. It is not an exclusive machine pair.
+`setup` reuses existing enrollment, accepts the same resource settings as
+`configure`, and installs and starts the helper's background worker. Use
+`--role plotter` or `--role worker` to choose that role explicitly. If service
+installation fails, enrollment and settings remain saved; the diagnostic gives
+the worker startup command. `init`, `join` and foreground `worker` remain
+available for separate setup steps.
 
 After enrollment, `plot`, `fill`, and `grow` use shared compute automatically.
 Each job starts an embedded broker unless a dedicated broker is configured.
@@ -1585,10 +1643,11 @@ xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
 xchplot2 compute status
 ```
 
-A standalone worker defaults to half the logical CPUs, half physical RAM
-capped at 16 GiB, one task slot, and automatic CPU/GPU selection. Automatic
-GPU capacity is 80% of the smaller of reported free and total VRAM. A plotting
-job partitions its own host budget between the embedded service, local work,
+A standalone worker adapts to its available CPU affinity and host RAM, with one
+task slot and automatic CPU/GPU selection. Saved or explicit limits remain
+caps. Automatic GPU allocation uses available VRAM at startup with the backend's
+required safety allowance; it does not infer spare GPU compute time from free
+memory. A plotting job partitions its host budget between the embedded service, local work,
 construction and optional remote encoding, honoring saved offered limits.
 A worker registers with up to 128 brokers by default. Save another limit with
 `compute configure --max-brokers N`, or override it with
@@ -1645,8 +1704,8 @@ agree. Source-build identity is diagnostic provenance. Generation and codec
 eligibility are checked separately; incompatible work is not scheduled.
 Compatible releases can be rolled through workers without rebuilding every
 machine together. A wire-protocol change requires upgrading brokers, workers
-and plotting hosts together. This version uses compute protocol 5 and does not
-interoperate with protocol 4. Drain workers and wait for `drained` before
+and plotting hosts together. This version uses compute protocol 6 and does not
+interoperate with protocol 5. Drain workers and wait for `drained` before
 replacing services. Preserve the saved enrollment directory, restart services,
 then run `compute resume` on the drained workers to accept new tasks.
 

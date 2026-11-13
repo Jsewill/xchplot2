@@ -110,9 +110,10 @@ for reusable options. `xchplot2 --help` prints command syntax.
 
 To replace an existing farm, use the separate
 [inventory and migration workflow](REFERENCE.md#replacing-an-existing-farm).
-Ordinary `fill` uses free space and does not remove existing plots. Retiring old
-plots before building their replacements requires an explicit saved review and
-`--reclaim-before-bytes` allowance, with complete farming resource bounds.
+Ordinary `fill` uses free space and does not remove existing plots. `fill --replot`
+prepares and saves its migration before removing selected old plots. It permits
+bounded early reclamation when needed; use `--reclaim-before-bytes 0` to require
+replacement-first retirement. Complete farming resource bounds are required.
 New reviews use bounded structural checks on replacement groups; optional
 `sampled` or `strict` verification adds full proofs. Those later checks cannot
 recover old plots already deleted under the allowance.
@@ -122,6 +123,10 @@ recover old plots already deleted under the allowance.
 | Command | Purpose and guide |
 |---|---|
 | [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
+
+Run `xchplot2 compute setup` on the first machine, then create an invitation for
+each helper. On a helper, `xchplot2 compute setup INVITATION` enrolls it and starts
+its persistent worker. Plotting jobs discover enrolled helpers automatically.
 
 ### Plotting jobs
 

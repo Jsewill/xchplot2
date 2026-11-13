@@ -26,6 +26,29 @@ profile_detail::ChiaConfig config(std::string const& text)
 { std::istringstream in(text); return profile_detail::read_chia_config(in); }
 void write(fs::path const& path, std::string const& text)
 { std::ofstream file(path, std::ios::binary); file << text; check(bool(file), "cannot write test fixture"); }
+void memory_bound_tests()
+{
+#ifdef __linux__
+    auto const root = fs::temp_directory_path() / ("xchplot2-memory-bound-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(root / "child" / "leaf");
+    struct Remove { fs::path path; ~Remove() { std::error_code error; fs::remove_all(path, error); } } remove{root};
+    write(root / "memory.max", "1024"); write(root / "memory.current", "256");
+    write(root / "child" / "memory.max", "768"); write(root / "child" / "memory.current", "512");
+    profile_detail::HostMemoryBound bound{4096, 4096};
+    profile_detail::tighten_memory_bound(bound, root / "child" / "leaf", root);
+    check(bound.capacity == 768 && bound.available == 768 - 512, "ancestor cgroup limits did not bound effective free memory");
+    write(root / "child" / "memory.max", "max");
+    bound = {4096, 4096}; profile_detail::tighten_memory_bound(bound, root / "child" / "leaf", root);
+    check(bound.capacity == 1024 && bound.available == 1024 - 256, "unlimited child hid an inherited cgroup limit");
+    fs::remove(root / "memory.current");
+    bound = {4096, 4096}; profile_detail::tighten_memory_bound(bound, root / "child", root);
+    check(bound.capacity == 1024 && !bound.available, "unobservable cgroup usage granted host headroom");
+    write(root / "memory.limit_in_bytes", "512"); write(root / "memory.usage_in_bytes", "128");
+    bound = {4096, 4096}; profile_detail::tighten_memory_bound(bound, root / "child", root, false);
+    check(bound.capacity == 512 && bound.available == 512 - 128, "legacy memory-controller limit was ignored");
+    check(profile_detail::cgroup_mount_path("/memory\\040limit\\134name") == "/memory limit\\name", "escaped cgroup mount path changed identity");
+#endif
+}
 fs::path utf8_path(std::string const& value)
 { return fs::path(reinterpret_cast<char8_t const*>(value.c_str())); }
 int fake_chia(int argc, char** argv)
@@ -228,7 +251,7 @@ int main(int argc, char** argv) try
 #else
     auto executable = fs::absolute(utf8_path(argv[0]));
 #endif
-    json_tests(); calibration_scope_tests(); config_tests(); process_tests(executable);
+    json_tests(); calibration_scope_tests(); config_tests(); memory_bound_tests(); process_tests(executable);
     std::cout << "Harvester profile parsing and local Chia detection passed\n"; return 0;
 }
 catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }

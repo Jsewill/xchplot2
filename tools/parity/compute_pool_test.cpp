@@ -615,6 +615,40 @@ void capacity_refresh(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
     require(!owner.acquire(session, last), "admission rejection did not atomically refresh capacity");
     owner.cancel(session, "still-large", 1);
 }
+void adaptive_generation_capacity(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
+{
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
+    auto original = offer("adaptive-generation", 47003); original.generation_threads = 2;
+    auto initial = profile(Kind::GenerateCpu); initial.cpu_threads = initial.resources.cpu_threads = 2;
+    original.generation_profiles = {initial}; worker.register_worker(original);
+    auto session = owner.open_owner("adaptive-generation");
+    auto request = task("before-pressure"); request.resources.cpu_threads = 0;
+    auto first = owner.acquire(session, request);
+    require(first && first->task.resources.cpu_threads == 2 && worker.begin(*first, first->owner_identity),
+        "worker did not start with its advertised generation fanout");
+    auto reduced = original.capacity; reduced.cpu_threads = 1;
+    auto reduced_profile = initial; reduced_profile.cpu_threads = reduced_profile.resources.cpu_threads = 1;
+    worker.finish(*first, CapacityUpdate{reduced, 2, std::vector{reduced_profile}});
+    worker.register_worker(original);
+    request = task("under-pressure", 2); request.resources.cpu_threads = 0;
+    auto smaller = owner.acquire(session, request);
+    require(smaller && smaller->task.resources.cpu_threads == 1 && worker.begin(*smaller, smaller->owner_identity),
+        "worker capacity revision did not lower generation fanout or stale registration restored it");
+    worker.finish(*smaller, CapacityUpdate{original.capacity, 3, std::vector{initial}});
+    request = task("after-pressure", 3); request.resources.cpu_threads = 0;
+    auto restored = owner.acquire(session, request);
+    require(restored && restored->task.resources.cpu_threads == 2, "worker capacity revision did not restore generation fanout");
+    require(worker.begin(*restored, restored->owner_identity), "restored generation lease did not begin"); worker.finish(*restored);
+    original.capacity_revision = 3; original.generation_threads = 1; original.generation_profiles = {reduced_profile};
+    rejects([&] { worker.register_worker(original); });
+    original.capacity_revision = 4; worker.register_worker(original);
+    request = task("registered-pressure", 4); request.resources.cpu_threads = 0;
+    auto registered = owner.acquire(session, request);
+    require(registered && registered->task.resources.cpu_threads == 1, "new registered capacity revision retained stale generation fanout");
+    owner.cancel(session, request.task_id, request.attempt);
+}
+
 void worker_route_change(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
 {
     RunningBroker running(options); auto endpoint = running.server.endpoint();
@@ -1216,6 +1250,7 @@ int main() try
     queued_eligibility(options, a_tls, tls(ca, wa), tls(ca, wb));
     automatic_generation_cpus(options, a_tls, tls(ca, wa), tls(ca, wb));
     capacity_refresh(options, a_tls, tls(ca, wa));
+    adaptive_generation_capacity(options, a_tls, tls(ca, wa));
     worker_route_change(options, a_tls, tls(ca, wa));
     listen_interfaces(options, a_tls);
     mixed_backend_selection(options, a_tls, tls(ca, wa));

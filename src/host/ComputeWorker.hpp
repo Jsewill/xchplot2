@@ -130,6 +130,10 @@ struct WorkerConfig
     // Optional embedding policy, called with finalized configuration before
     // service/GPU executor construction. Throws before unreviewed work starts.
     std::function<void(WorkerConfig const&)> admit_start;
+    // Optional embedding observation, bounded again by capacity. The CPU
+    // argument is this executor's currently held lanes; memory is fresh free
+    // headroom before its outstanding modeled allocations are charged.
+    std::function<pool::Resources(uint32_t)> available_resources;
 };
 
 enum class WorkerControl : uint8_t { Pause = 1, Drain, Resume };
@@ -146,6 +150,7 @@ struct WorkerStatus
     uint64_t broker_limit = 0, known_brokers = 0, healthy_brokers = 0, deferred_brokers = 0;
     uint64_t broker_transport_bytes = 0;
     bool broker_saturated = false;
+    pool::WorkerHardware hardware;
 };
 struct WorkerTaskAdmission
 {
@@ -155,6 +160,11 @@ struct WorkerTaskAdmission
     bool local_fallback = false;
 };
 class WorkerAdmissionRejected : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+class WorkerResourcesUnavailable : public std::runtime_error
 {
 public:
     using std::runtime_error::runtime_error;

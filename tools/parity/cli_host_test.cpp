@@ -570,6 +570,8 @@ int main(int argc, char** argv)
     assert(last_group_options.plan_only && last_group_options.resume && last_group_options.backend == "gpu");
     assert(last_group_options.device == 2 && last_group_options.tier == "tiny" && last_group_options.workers == 2);
     assert(last_group_options.max_ram == 768ull * 1024 * 1024);
+    assert(last_group_options.max_ram_set && last_group_options.max_ram_limit == last_group_options.max_ram &&
+        last_group_options.workers_set && last_group_options.device_set);
     assert((last_group_options.destinations == std::vector<std::filesystem::path>{other, third}));
     assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
     assert(cli({"fill", dir.string(), "--config", config.string(), "--replot", "--no-plan-only",
@@ -581,6 +583,13 @@ int main(int argc, char** argv)
     assert(last_group_options.farm_configs == last_group_options.temporary &&
         last_group_options.excluded_destinations == last_group_options.temporary);
     assert(last_group_options.replot_confirmation == "directory" && last_group_options.reclaim_before_set && !last_group_options.reclaim_before_bytes);
+    {
+        std::vector<std::string> arguments{"xchplot2", dir.string(), "--replot", "--compute", "off"};
+        std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data());
+        auto const automatic = pos2gpu::parse_group_options(int(argv.size()), argv.data(), "plan");
+        assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024 &&
+            automatic.max_ram != pos2gpu::GroupOptions{}.max_ram);
+    }
     assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
     assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());
     for (auto const* option : {"--temp-dirs", "--farm-config", "--exclude-destination"})

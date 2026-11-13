@@ -108,8 +108,9 @@ struct Heartbeat
 inline std::string text(Heartbeat const& value)
 {
     require(farming_update_digest(value.instance) && farming_update_digest(value.control) && value.at && value.sequence &&
-        (value.state == "running" || value.state == "stopped"), "invalid farming owner heartbeat");
-    std::ostringstream out; out << "ordinary-group-farming-heartbeat-v1\n" << std::quoted(value.instance) << ' '
+        !value.state.empty() && value.state.size() <= 256 &&
+        value.state.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-:") == value.state.npos, "invalid farming owner heartbeat");
+    std::ostringstream out; out << (value.state == "running" || value.state == "stopped" ? "ordinary-group-farming-heartbeat-v1\n" : "ordinary-group-farming-heartbeat-v2\n") << std::quoted(value.instance) << ' '
         << std::quoted(value.control) << ' ' << value.at << ' ' << value.sequence << ' ' << std::quoted(value.state) << '\n'; return out.str();
 }
 inline Heartbeat parse_heartbeat(std::string const& body)
@@ -117,7 +118,8 @@ inline Heartbeat parse_heartbeat(std::string const& body)
     require(body.size() <= farming_owner_record_bytes, "farming heartbeat exceeds its bound");
     std::istringstream in(body); std::string magic; std::getline(in, magic); Heartbeat result;
     in >> std::quoted(result.instance) >> std::quoted(result.control) >> result.at >> result.sequence >> std::quoted(result.state);
-    require(in && magic == "ordinary-group-farming-heartbeat-v1", "unsupported farming owner heartbeat");
+    require(in && (magic == "ordinary-group-farming-heartbeat-v1" || magic == "ordinary-group-farming-heartbeat-v2"), "unsupported farming owner heartbeat");
+    require(magic != "ordinary-group-farming-heartbeat-v1" || result.state == "running" || result.state == "stopped", "legacy farming heartbeat has an unsupported activity state");
     in >> std::ws; require(in.eof(), "unexpected farming heartbeat data"); (void)text(result); return result;
 }
 #if defined(__linux__)
@@ -365,6 +367,7 @@ class FarmingOwner
     std::condition_variable ready_;
     std::thread thread_;
     bool stopping_ = false;
+    std::string activity_ = "running";
 #ifdef _WIN32
     farming_owner_detail::LocalProof proof_;
 #endif
@@ -443,7 +446,7 @@ public:
             {
                 std::unique_lock lock(mutex_);
                 while (!ready_.wait_for(lock, std::chrono::seconds(1), [&] { return stopping_; }))
-                    try { publish_heartbeat("running"); } catch (...) { /* A failed heartbeat becomes visibly stale. */ }
+                    try { publish_heartbeat(activity_); } catch (...) { /* A failed heartbeat becomes visibly stale. */ }
             });
         }
         catch (...)
@@ -451,6 +454,11 @@ public:
             (void)file_io::unlink_file(temporary);
             throw;
         }
+    }
+    void activity(std::string_view state, std::string const& control_digest)
+    {
+        require(!state.empty() && state.size() <= 256 && farming_update_digest(control_digest), "invalid farming owner activity");
+        std::lock_guard lock(mutex_); activity_ = state; heartbeat_.control = control_digest;
     }
     FarmingOwner(FarmingOwner const&) = delete;
     FarmingOwner& operator=(FarmingOwner const&) = delete;

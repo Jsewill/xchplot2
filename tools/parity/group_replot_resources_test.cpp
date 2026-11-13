@@ -159,6 +159,180 @@ int main() try
                 ReplotVerification{ReplotVerificationMode::sampled, 1, 0}).feasible,
                 "already completed sample was charged again in a stopped suffix");
         }
+        {
+            auto queued_review = review; queued_review.verification = ReplotVerification{};
+            queued_review.farm.directories[0].layout.files = queued_review.farm.directories[0].layout.total_members = 2;
+            queued_review.sources = {0, 1}; auto next_batch = batch; next_batch.ordinal = 1; next_batch.first_source = 1;
+            queued_review.batches.push_back(next_batch);
+            auto head = journal; head.farm = queued_review.farm;
+            auto advance = [&](ReplotJournal const& before, auto change)
+            { return next_replot_revision(before, stream_state::digest(replot_journal_text(before)), change); };
+            auto pending = advance(head, [&](auto& state)
+            { state.queued_publications = true; ReplotQueuedOutput output; output.batch = 1; output.retirements.resize(1); state.queued.push_back(output); });
+            require(replot_journal_text(pending).starts_with("ordinary-group-replot-journal-v5\n") &&
+                replot_journal_text(parse_replot_journal(replot_journal_text(pending), 64 * mib)) == replot_journal_text(pending),
+                "durable queued publication lost its reservation across restart");
+            validate_replot_progress(queued_review, pending);
+            auto invalid = pending; invalid.queued.push_back(invalid.queued.front());
+            rejects([&] { validate_replot_journal(invalid); }, "duplicate queued output acquired construction authority");
+            invalid = pending; invalid.queued.resize(replot_pending_output_limit);
+            rejects([&] { validate_replot_journal(invalid); }, "queued output count escaped its durable bound");
+            pending = advance(pending, [&](auto& state) { state.queued[0].retirements[0] = {ReplotRetirement::claim_intent, true}; });
+            pending = advance(pending, [&](auto& state) { state.queued[0].retirements[0].state = ReplotRetirement::claimed; });
+            pending = advance(pending, [&](auto& state) { state.queued[0].retirements[0].state = ReplotRetirement::retired; });
+            require(parse_replot_journal(replot_journal_text(pending), 64 * mib).queued[0].retirements[0].predelete,
+                "queued early retirement lost its outstanding debt on restart");
+            stream_state::Stamp stamp; stamp.inode = stamp.bytes = 1;
+            pending = advance(pending, [&](auto& state) { auto& output = state.queued[0]; output.verified_stage = stamp; output.full_proof_validated = false; });
+            pending = advance(pending, [&](auto& state) { state.queued[0].published = stamp; });
+            require(parse_replot_journal(replot_journal_text(pending), 64 * mib).queued[0].published == stamp,
+                "queued renamed publication lost its exact durable stamp");
+            invalid = pending; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(pending));
+            invalid.queued[0].published->inode = 2;
+            require(!valid_replot_revision(pending, invalid), "queued publication accepted a different native object after restart");
+            invalid = pending; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(pending)); invalid.queued.clear();
+            require(!valid_replot_revision(pending, invalid), "queued authority disappeared before exact cursor adoption");
+            pending = advance(pending, [&](auto& state) { state.verified_stage = stamp; state.full_proof_validated = false; });
+            pending = advance(pending, [&](auto& state) { state.published = stamp; });
+            ReplotReceipt receipt{pending.review_digest, {}, 0, 0, 1, stamp, {}, false};
+            rejects([&] { auto state = pending; complete_replot_batch(queued_review, receipt, stream_state::digest(replot_receipt_text(receipt)), state); },
+                "queued publication allowed receipt advancement before first-directory readiness");
+            pending = advance(pending, [&](auto& state) { state.ready = stamp; });
+            pending = advance(pending, [&](auto& state) { state.retirements[0] = {ReplotRetirement::claim_intent, false}; });
+            pending = advance(pending, [&](auto& state) { state.retirements[0].state = ReplotRetirement::claimed; });
+            pending = advance(pending, [&](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
+            pending = advance(pending, [&](auto& state) { complete_replot_batch(queued_review, receipt, stream_state::digest(replot_receipt_text(receipt)), state); });
+            auto adopted = advance(pending, [&](auto& state)
+            { auto const output = state.queued.front(); state.verified_stage = output.verified_stage; state.published = output.published;
+              state.full_proof_validated = output.full_proof_validated; state.retirements = output.retirements; state.queued.clear(); });
+            require(adopted.batch == 1 && adopted.queued.empty() && adopted.published == stamp && !adopted.ready &&
+                adopted.retirements[0].state == ReplotRetirement::retired && adopted.retirements[0].predelete,
+                "receipt cursor adoption lost verification, publication or bounded early-retirement debt");
+            validate_replot_progress(queued_review, adopted);
+            auto authority = advance(adopted, [&](auto& state) { state.authority_directory = file_io::path_text(directory);
+                state.authority_identity = farming_directory_identity(directory); state.authority_host = host; state.authority_user = replot_authority_user(); state.authority_revision = state.revision; });
+            require(parse_replot_journal(replot_journal_text(authority), 64 * mib).authority_identity == authority.authority_identity,
+                "migration authority lost its native binding across restart");
+            invalid = authority; ++invalid.revision; invalid.parent_digest = stream_state::digest(replot_journal_text(authority)); invalid.authority_directory.clear();
+            require(!valid_replot_revision(authority, invalid), "migration reverted to drive-only authority after activation");
+        }
+        {
+            auto independent_review = review; independent_review.verification = ReplotVerification{};
+            independent_review.farm.directories.push_back(independent_review.farm.directories.front());
+            auto& right = independent_review.farm.directories.back();
+            right.directory += "-independent"; right.directory_identity += "-independent";
+            right.layout.files = right.layout.total_members = right.layout.families = 5;
+            independent_review.batches.clear(); independent_review.sources.clear(); independent_review.space.resize(2);
+            for (uint64_t batch = 0; batch < 6; ++batch)
+            {
+                ReplotBatch assignment; assignment.lane = batch ? 1 : 0; assignment.ordinal = batch ? batch - 1 : 0;
+                assignment.first_source = batch; assignment.sources = assignment.final_bound_bytes = 1;
+                independent_review.batches.push_back(assignment); independent_review.sources.push_back(batch);
+            }
+            auto independent = journal; independent.farm = independent_review.farm;
+            independent.queued_publications = true; independent.completed_lanes.resize(2);
+            auto advance = [&](auto change)
+            { independent = next_replot_revision(independent, stream_state::digest(replot_journal_text(independent)), change); };
+            stream_state::Stamp stamp; stamp.inode = stamp.bytes = 1;
+            for (uint64_t batch = 1; batch < 6; ++batch)
+            {
+                advance([&](auto& state) { ReplotQueuedOutput output; output.batch = batch; output.retirements.resize(1); state.queued.push_back(output); });
+                advance([&](auto& state) { state.queued[0].verified_stage = stamp; state.queued[0].full_proof_validated = false; });
+                advance([&](auto& state) { state.queued[0].published = stamp; });
+                advance([&](auto& state) { state.queued[0].ready = stamp; });
+                advance([&](auto& state) { state.queued[0].retirements[0] = {ReplotRetirement::claim_intent, false}; });
+                advance([&](auto& state) { state.queued[0].retirements[0].state = ReplotRetirement::claimed; });
+                advance([&](auto& state) { state.queued[0].retirements[0].state = ReplotRetirement::retired; });
+                ReplotReceipt completed{independent.review_digest, independent.completed_lanes[1].digest, batch, batch, 1, stamp, {}, false, true};
+                auto const body = replot_receipt_text(completed);
+                require(body.starts_with("ordinary-group-replot-receipt-v4\n") && replot_receipt_text(parse_replot_receipt(body)) == body,
+                    "independent completion lost its explicit destination chain");
+                validate_replot_completion(independent_review, independent, batch, independent.completed_lanes[1].digest, completed);
+                advance([&](auto& state) { ++state.completed_lanes[1].files; state.completed_lanes[1].digest = stream_state::digest(body); state.queued.clear(); });
+                require(independent.batch == 0 && independent.retired_prefix == 0 && independent.queued.empty() && !independent.ready,
+                    "independent destination completion changed the unavailable head or retained an unconfirmed slot");
+            }
+            require(independent.completed_lanes[1].files > replot_pending_output_limit && replot_completed_members(independent) == 5 &&
+                replot_lane_completed(independent, 5) && !replot_lane_completed(independent, 0),
+                "a missing head stopped confirmed destination work at the pending limit");
+            validate_replot_progress(independent_review, independent);
+            auto const text = replot_journal_text(independent);
+            require(text.starts_with("ordinary-group-replot-journal-v6\n") && replot_journal_text(parse_replot_journal(text, 64 * mib)) == text,
+                "independent destination prefixes lost their fixed-size canonical journal");
+            auto no_replay = profile; no_replay.native.cohorts[0].max_members = 6;
+            no_replay.native.construction[0].work_us = no_replay.native.verification[0].work_us = UINT64_MAX / 4;
+            auto sealed = independent; sealed.verified_stage = stamp; sealed.full_proof_validated = false;
+            auto six_sources = inventory; six_sources.plots.resize(6, source);
+            require(assess_replot_remaining(no_replay, request, six_sources, independent_review, sealed, {{"legacy", 1}}, 5).feasible,
+                "remaining assessment replayed completed destination construction/proof or retired its sources twice");
+            auto invalid = independent; ++invalid.revision; invalid.parent_digest = stream_state::digest(text);
+            --invalid.completed_lanes[1].files;
+            require(!valid_replot_revision(independent, invalid), "destination completion prefix rolled back after releasing queue slots");
+        }
+#if defined(__linux__)
+        {
+            auto const* previous_state = std::getenv("XDG_STATE_HOME");
+            std::optional<std::string> previous = previous_state ? std::optional<std::string>{previous_state} : std::nullopt;
+            struct RestoreState
+            {
+                std::optional<std::string> value;
+                ~RestoreState() { if (value) ::setenv("XDG_STATE_HOME", value->c_str(), 1); else ::unsetenv("XDG_STATE_HOME"); }
+            } restore{previous};
+            auto const state_home = directory / "controller-state";
+            require(!::setenv("XDG_STATE_HOME", state_home.c_str(), 1), "cannot isolate controller journal fixture");
+            std::vector<fs::path> drives{directory / "journal-drive-a", directory / "journal-drive-b"};
+            for (auto const& drive : drives) fs::create_directory(drive);
+            auto initial = journal; initial.phase = ReplotPhase::preparing;
+            initial.farm.directories.resize(drives.size(), initial.farm.directories.front());
+            for (size_t lane = 0; lane < drives.size(); ++lane)
+            {
+                initial.farm.directories[lane].directory = file_io::path_text(drives[lane]);
+                initial.farm.directories[lane].directory_identity = farming_directory_identity(drives[lane]);
+            }
+            auto replicas = load_replot_journals(drives, initial.review_digest, 64 * mib);
+            publish_replot_journals(replicas, initial, 64 * mib, [] {});
+            auto save = [&](auto change)
+            {
+                auto next = next_replot_revision(replicas.state, replicas.digest, change);
+                publish_replot_journals(replicas, next, 64 * mib, [] {});
+            };
+            save([](auto& state) { state.phase = ReplotPhase::replacing; });
+            auto const authority_root = replot_authority_directory(initial.review_digest);
+            fs::create_directories(authority_root);
+            ReplotJournalReplica authority; authority.metadata = std::make_shared<FarmingMetadataDirectory>(authority_root, false);
+            authority.metadata->create(); authority.path = authority.metadata->path / "grow-replot.plan";
+            replicas.authority = std::move(authority);
+            save([&](auto& state) { state.queued_publications = true; state.authority_directory = file_io::path_text(authority_root);
+                state.authority_identity = farming_directory_identity(authority_root); state.authority_host = host;
+                state.authority_user = replot_authority_user(); state.authority_revision = state.revision; });
+            auto const hidden = directory / "disconnected-drive";
+            fs::rename(drives.back(), hidden); replicas.replicas.back().available = false;
+            save([](auto& state) { state.retirements[0] = {ReplotRetirement::claim_intent, true}; });
+            save([](auto& state) { state.retirements[0].state = ReplotRetirement::claimed; });
+            save([](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
+            auto missing = load_replot_journals(drives, initial.review_digest, 64 * mib);
+            require(missing.authority && missing.digest == replicas.digest && !missing.replicas.back().available,
+                "unavailable drive concealed newer durable controller progress");
+            fs::rename(hidden, drives.back());
+            auto returning = load_replot_journals(drives, initial.review_digest, 64 * mib);
+            publish_replot_journals(returning, returning.state, 64 * mib, [] {});
+            require(returning.replicas.back().digest == returning.digest && replot_journals_unchanged(returning),
+                "returning stale drive did not reconcile from its native controller authority");
+            auto fork = next_replot_revision(returning.state, returning.digest, [](auto& state)
+            { stream_state::Stamp stamp; stamp.bytes = 1; state.verified_stage = stamp; });
+            auto const fork_body = replot_journal_text(fork);
+            stream_state::atomic_save(returning.replicas.back().path, fork_body + stream_state::digest(fork_body) + '\n');
+            rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },
+                "destination newer than controller authority was silently overwritten");
+            auto const body = replot_journal_text(returning.state);
+            stream_state::atomic_save(returning.replicas.back().path, body + stream_state::digest(body) + '\n');
+            fs::rename(authority_root, directory / "lost-controller");
+            rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },
+                "missing controller authority fell back to destination-only progress");
+            require(load_replot_journals(drives, initial.review_digest, 64 * mib, true).authority_missing,
+                "read-only status lost the missing controller authority diagnosis");
+        }
+#endif
         auto completed = profile; completed.native.construction[0].work_us = UINT64_MAX / 4;
         stream_state::Stamp sealed; sealed.bytes = 1; journal.verified_stage = sealed;
         {
@@ -343,6 +517,49 @@ int main() try
     require_target_service_scope(external_roundtrip, moved_service, outside);
     omitted = external; omitted.native.cohorts.front().proof_reserve[1].resource = "ram";
     rejects([&] { replot_stage(omitted, request, {}, 0, false, false, false); }, "remote solver CPU reused another host's memory envelope");
+    {
+        auto adaptive = profile; adaptive.resources[1].capacity = 64 * mib;
+        adaptive.native.max_ram_bytes = 32 * mib;
+        adaptive.native.construction[1].resident_units = 2 * mib;
+        adaptive.native.construction[1].transient_units = 34 * mib;
+        auto maximum = request; maximum.ram_bytes = 32 * mib; maximum.adaptive_resources = true;
+        auto const high = replot_local_resources(adaptive, maximum, 64 * mib, cpus);
+        auto const low = replot_local_resources(adaptive, maximum, 24 * mib, cpus);
+        require(high.ram_bytes == maximum.ram_bytes && low.ram_bytes < high.ram_bytes && low.ram_bytes >= 16 * mib,
+            "fresh lower and higher headroom did not adapt the native allocation");
+        auto selected = maximum; selected.ram_bytes = low.ram_bytes;
+        auto const stage = replot_stage(adaptive, selected, {}, 0, true, false, false);
+        require(stage.construction[1].resident_units == adaptive.native.construction[1].resident_units &&
+            stage.construction[1].transient_units == adaptive.native.construction[1].transient_units - (maximum.ram_bytes - selected.ram_bytes),
+            "adaptive app buffers either charged the saved maximum or released resident overhead");
+        auto capped = maximum; capped.ram_bytes = 16 * mib;
+        require(replot_local_resources(adaptive, capped, 64 * mib, cpus).ram_bytes == capped.ram_bytes,
+            "fresh RAM ignored an explicit smaller allocation cap");
+        auto future = adaptive.native.cohorts.front(); future.max_members = 4;
+        future.new_farming[1].transient_units = 64 * mib; adaptive.native.cohorts.push_back(future);
+        require(replot_local_resources(adaptive, maximum, 64 * mib, cpus).ram_bytes == high.ram_bytes &&
+            !replot_local_resources(adaptive, maximum, 64 * mib, cpus, nullptr, 3).ram_bytes,
+            "current allocation mixed an impossible full old farm with a future replacement cohort");
+        auto opaque = profile; opaque.native.construction[0].required_units = opaque.native.construction[0].work_us = 0;
+        opaque.native.construction[0].reserved_units = cpus;
+        auto smaller = request; smaller.adaptive_resources = true;
+        auto const native_stage = replot_stage(opaque, smaller, {}, 0, true, false, false);
+        require(native_stage.construction[0].reserved_units == std::min<uint64_t>(cpus, smaller.cpu_threads + 1),
+            "opaque native executor did not release its unused capped CPU partition");
+        require(stage.construction[0].required_units == adaptive.native.construction[0].required_units &&
+            stage.construction[0].work_us == adaptive.native.construction[0].work_us,
+            "CPU selection weakened a conditional modeled service bound");
+        auto bounded = adaptive; bounded.native.construction[1].transient_units = 19 * mib;
+        auto small = maximum; small.ram_bytes = 16 * mib; small.controller_ram_bytes = 3 * mib;
+        auto const retained_controller = replot_stage(bounded, small, {}, 0, true, false, false);
+        require(retained_controller.construction[1].resident_units + retained_controller.construction[1].transient_units ==
+            small.ram_bytes + small.controller_ram_bytes,
+            "an allocation ceiling larger than the phase shape released actual controller memory");
+        bounded = opaque; bounded.native.construction[0].reserved_units = std::min<uint64_t>(cpus, 2);
+        auto const retained_cpu = replot_stage(bounded, smaller, {}, 0, true, false, false);
+        require(retained_cpu.construction[0].reserved_units == bounded.native.construction[0].reserved_units,
+            "a CPU ceiling larger than its phase shape released controller concurrency");
+    }
     require(request.cpu_threads == 1 && request.batch_members == 1 && request.controller_ram_bytes == mib, "bridge did not bind actual execution caps");
     require(!request.gpu_bytes && !request.standing_gpu_bytes, "CPU migration acquired GPU residency demand");
     require(request.group_members == 1, "bridge did not derive maximum actual reviewed file membership");
@@ -413,6 +630,25 @@ int main() try
             "bridge released standing GPU residency at final future stage");
     auto no_gpu_standing = gpu_profile; no_gpu_standing.native.standing_gpu_bytes = 0;
     rejects([&] { replot_native_request(gpu_args, no_gpu_standing, state, gpu_id, 100, 16 * mib, supervision); }, "bridge admitted unknown standing GPU residency");
+    {
+        auto waiting = profile; waiting.gate.recovery_hold_ms = 50; waiting.gate.recovery_samples = 1;
+        waiting.gate.max_cpu_busy_permille = 1000;
+        auto const stage = replot_stage(waiting, request, {}, 0, false, false, false, "pressure-recovery");
+        ReplotGate gate(waiting, host); auto const began = Clock::now(); bool paused = false;
+        auto const admitted = gate.wait(stage, 1, [&] { return Clock::now() - began > std::chrono::seconds(5); },
+            [&](auto const&) { paused = true; });
+        require(admitted.allowed && paused && Clock::now() - began > std::chrono::milliseconds(1),
+            "resource wait expired instead of recovering after its old aggregate deadline");
+        auto blocked = stage; blocked.supervision[1].transient_units = profile_detail::physical_memory();
+        waiting.resources[1].capacity = UINT64_MAX;
+        ReplotGate cancellation(waiting, host); auto const stopped = Clock::now(); bool cancelled = false;
+        try { (void)cancellation.wait(blocked, 1, [&] { return Clock::now() - stopped >= std::chrono::milliseconds(50); }); }
+        catch (std::runtime_error const& error) { cancelled = std::string_view(error.what()) == "migration resource wait cancelled"; }
+        require(cancelled, "prolonged pressure wait did not remain cancellable");
+        waiting.resources[1].capacity = mib;
+        ReplotGate invalid(waiting, host);
+        rejects([&] { (void)invalid.wait(stage, 1); }, "invalid static resource policy entered an unattended pressure wait");
+    }
     std::cout << "migration physical mapping, phase budgets, one-lane coexistence and deadline checks passed\n";
     return 0;
 }

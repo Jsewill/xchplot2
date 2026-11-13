@@ -327,7 +327,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                     key == "--live" || key == "--no-live" || key == "--timeout-ms")) ||
                 (replot_status && status_live && (key == "--compute" || key == "--compute-directory" || key == "--compute-broker" ||
                     key == "--harvester" || key == "--farm-adapter" || key == "--chia-root" || key == "--chia-executable")) ||
-                (action && (key == "--destination" || key == "--policy-only" || key == "--no-policy-only")) || key == "--manifest" ||
+                (action && (key == "--destination" || key == "--policy-only" || key == "--no-policy-only" ||
+                    key == "--from-plan" || key == "-F")) || key == "--manifest" ||
                 key == "--max-ram" || key == "-M" || key == "--json" || key == "--no-json" ||
                 key == "--quiet" || key == "--no-quiet" || key == "-q" || key == "--verbose" || key == "--no-verbose" || key == "-v",
                 action ? "farm control accepts only one job selector, --destination, --policy-only and display or memory controls" :
@@ -559,9 +560,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--pool-listen") result.pool_listen = value;
             else if (key == "--pool-advertise") result.pool_advertise = value;
             else if (key == "--pool-offer-backend") { result.pool_offer_backend = value; result.pool_offer_backend_set = true; }
-            else if (key == "--pool-offer-ram") result.pool_offer_ram = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-offer-cpus") result.pool_offer_cpus = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-offer-vram") result.pool_offer_vram = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-ram") result.pool_offer_ram = result.pool_offer_ram_limit = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-cpus") result.pool_offer_cpus = result.pool_offer_cpu_limit = number(value.c_str(), argv[i - 1]);
+            else if (key == "--pool-offer-vram") result.pool_offer_vram = result.pool_offer_vram_limit = number(value.c_str(), argv[i - 1]);
             else if (key == "--pool-offer-slots") result.pool_offer_slots = number(value.c_str(), argv[i - 1]);
             else if (key == "--pool-inflight") result.pool_inflight = number(value.c_str(), argv[i - 1]);
             else if (key == "--pool-timeout-ms") result.pool_timeout_ms = number(value.c_str(), argv[i - 1]);
@@ -595,9 +596,11 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(result.capacity > 0, "--capacity-bytes must be positive");
             }
             else if (key == "--leave-free" || key == "--headroom-bytes") { result.headroom = number(value.c_str(), argv[i - 1]); result.headroom_set = true; }
-            else if (key == "--max-ram" || key == "-M") result.max_ram = number(value.c_str(), argv[i - 1]);
+            else if (key == "--max-ram" || key == "-M")
+            { result.max_ram = result.max_ram_limit = number(value.c_str(), argv[i - 1]); result.max_ram_set = true; }
             else if (key == "--window-bytes") { result.window = number(value.c_str(), argv[i - 1]); result.window_set = true; }
-            else if (key == "--workers" || key == "-j") result.workers = number(value.c_str(), argv[i - 1]);
+            else if (key == "--workers" || key == "-j")
+            { result.workers = number(value.c_str(), argv[i - 1]); result.workers_set = true; }
             else if (key == "--batch-members") result.batch = number(value.c_str(), argv[i - 1]);
             else if (key == "--max-members") result.max_members = number(value.c_str(), argv[i - 1]);
             else if (key == "--group-members")
@@ -629,12 +632,13 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--max-total-members") { result.max_total_members = number(value.c_str(), argv[i - 1]); result.max_total_members_set = true; }
             else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str(), argv[i - 1]); result.checkpoint_set = true; }
             else if (key == "--backend") { result.backend = value; result.backend_set = true; result.devices.clear(); }
-            else if (key == "--device") { result.device = number(value.c_str(), argv[i - 1]); result.devices.clear(); }
+            else if (key == "--device") { result.device = number(value.c_str(), argv[i - 1]); result.device_set = true; result.devices.clear(); }
             else if (key == "--devices" || key == "-d")
             {
                 BatchOptions selection;
                 require(parse_devices_arg(value, selection), "invalid --devices selection");
                 result.devices = value;
+                result.device_set = true;
             }
             else if (key == "--tier") result.tier = value;
             else if (key == "--member-storage") result.member_storage = value;
@@ -664,6 +668,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
     }
     bool const farm_command = command == "fill" || command == "plan";
+    bool const migration_resources = result.replot || !result.replot_inventory.empty() ||
+        (!result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
+    if (migration_resources && !result.max_ram_set)
+    {
+        auto const available = group_grow::profile_detail::available_memory();
+        require(available >= 16 * mib, "cannot determine an available migration RAM budget; retry when memory is available or set --max-host-ram");
+        result.max_ram = available;
+    }
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(!result.status_live || result.replot_status, "--live requires status");
     require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
@@ -717,7 +729,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             if (magic.starts_with("ordinary-group-farming-v")) result.manifest = std::move(result.target);
             else
             {
-                require(!action, "farm control requires an existing job destination or manifest");
+                require(!action || group_grow::farm::inventory_detail::is_replot_review(result.target),
+                    "farm control requires an existing job destination, manifest or migration review");
                 result.from_plan = std::move(result.target);
             }
             result.target.clear();

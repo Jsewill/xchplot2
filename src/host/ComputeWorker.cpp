@@ -1,10 +1,13 @@
 #include "host/ComputeWorker.hpp"
 #include "host/ComputeIdentity.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 #include "host/NumaTopology.hpp"
 #include "host/GroupCodec.hpp"
 #include "host/ComputeThreads.hpp"
+#include "host/GroupFarmResources.hpp"
 #include "plot/Plotter.hpp"
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "gpu/SyclDeviceList.hpp"
 #include "host/GroupGpu.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/GpuPipeline.hpp"
@@ -52,6 +55,7 @@ void write_worker_status(pool::Writer& out, WorkerStatus const& value)
     out.u64(value.accepted_tasks); out.u64(value.waiting_cpu); out.u64(value.baseline_host_bytes);
     out.u64(value.broker_limit); out.u64(value.known_brokers); out.u64(value.healthy_brokers); out.u64(value.deferred_brokers);
     out.u64(value.broker_transport_bytes); out.u8(value.broker_saturated);
+    pool::write_worker_hardware(out, value.hardware);
 }
 WorkerStatus read_worker_status(pool::Reader& in)
 {
@@ -63,7 +67,7 @@ WorkerStatus read_worker_status(pool::Reader& in)
     value.accepted_tasks = in.u64(); value.waiting_cpu = in.u64(); value.baseline_host_bytes = in.u64();
     value.broker_limit = in.u64(); value.known_brokers = in.u64(); value.healthy_brokers = in.u64(); value.deferred_brokers = in.u64();
     value.broker_transport_bytes = in.u64(); auto const saturated = in.u8(); require(saturated <= 1, "invalid worker saturation flag");
-    value.broker_saturated = saturated; in.finish(); return value;
+    value.broker_saturated = saturated; value.hardware = pool::read_worker_hardware(in); in.finish(); return value;
 }
 class TaskCancelled : public std::runtime_error
 {
@@ -131,6 +135,44 @@ uint64_t boundary_bytes(uint8_t k)
 
 // Host memory and task slots are independent of CPU compute permits. A blocked
 // owner holds its charged output, but never holds a CPU permit while sending it.
+class ResourceSampler
+{
+    farm::Profile profile_;
+    farm::LocalPressureSampler sampler_;
+    std::mutex mutex_;
+    std::optional<Clock::time_point> sampled_;
+    pool::Resources available_{0, 0, 0, 0};
+    uint64_t owned_host_bytes_ = 0;
+    uint32_t active_cpu_ = 0;
+public:
+    ResourceSampler() : sampler_(profile_detail::host_name())
+    {
+        profile_.native.host = profile_detail::host_name();
+        farm::Resource cpu; cpu.id = "cpu"; cpu.host = profile_.native.host;
+        cpu.kind = farm::ResourceKind::cpu; cpu.capacity = profile_detail::logical_cpus(); cpu.capacity_known = cpu.capacity != 0;
+        auto memory = cpu; memory.id = "ram"; memory.kind = farm::ResourceKind::host_memory;
+        memory.capacity = profile_detail::physical_memory(); memory.capacity_known = memory.capacity != 0;
+        profile_.resources = {std::move(cpu), std::move(memory)};
+    }
+    pool::Resources sample(uint32_t active_cpu)
+    {
+        std::lock_guard lock(mutex_); auto const now = Clock::now();
+        if (sampled_ && active_cpu_ == active_cpu && now - *sampled_ < std::chrono::milliseconds(50)) return available_;
+        available_ = {0, 0, 0, 0};
+        auto const reading = sampler_.sample(profile_, now, active_cpu, nullptr, true);
+        owned_host_bytes_ = sampler_.own_anon_bytes().value_or(0);
+        for (auto const& resource : reading.resources)
+        {
+            if (resource.resource == "ram" && resource.available_known) available_.host_bytes = resource.available_units;
+            if (resource.resource == "cpu" && resource.cpu_busy_known)
+                available_.cpu_threads = uint32_t(uint64_t(profile_detail::logical_cpus()) * (1000 - resource.cpu_busy_permille) / 1000);
+        }
+        sampled_ = now; active_cpu_ = active_cpu; return available_;
+    }
+    uint64_t owned_host_bytes()
+    { std::lock_guard lock(mutex_); return owned_host_bytes_; }
+};
+
 class Budget
 {
 public:
@@ -162,6 +204,8 @@ public:
             { std::lock_guard lock(budget->mutex_);
               require(value <= bytes || value - bytes <= budget->capacity_ - budget->used_,
                       "worker task exceeds available offered host memory");
+              if (value > bytes && value - bytes > budget->available_locked())
+                  throw pool::TransientTransport("worker host headroom changed while growing a task allocation");
               budget->used_ = budget->used_ - bytes + value;
               if (retained) budget->baseline_ = budget->baseline_ - bytes + value;
               bytes = value; }
@@ -179,8 +223,10 @@ public:
     };
     // Zero host capacity provides the same cancellation-safe task slots for
     // client admission, without reserving compute or a fictitious RAM budget.
-    Budget(uint64_t capacity, unsigned slots, uint64_t baseline)
-        : capacity_(capacity), used_(baseline), baseline_(baseline), max_slots_(slots)
+    Budget(uint64_t capacity, unsigned slots, uint64_t baseline, std::function<uint64_t()> available = {},
+        std::function<uint64_t()> owned_resident = {})
+        : capacity_(capacity), used_(baseline), baseline_(baseline), max_slots_(slots), available_(std::move(available)),
+          owned_resident_(std::move(owned_resident))
     { require(slots && ((!capacity && !baseline) || baseline < capacity), "worker offer cannot hold bounded transport buffers"); }
     Lease acquire(uint64_t bytes, bool slot, WorkerCancellation const& cancel, bool retained = false)
     {
@@ -192,13 +238,16 @@ public:
             // This check and retention updates share the allocation-state lock.
             if (bytes > capacity_ - baseline_)
                 throw pool::UnsupportedResources("worker task exceeds host memory after retained allocations");
-            if (bytes <= capacity_ - used_ && (!slot || slots_ < max_slots_))
+            if (bytes <= capacity_ - used_ && bytes <= available_locked() && (!slot || slots_ < max_slots_))
             { used_ += bytes; if (retained) baseline_ += bytes; if (slot) ++slots_; return Lease(this, bytes, slot, retained); }
             changed_.wait_for(lock, std::chrono::milliseconds(50));
         }
     }
     uint64_t task_capacity() const
-    { std::lock_guard lock(mutex_); return capacity_ - baseline_; }
+    {
+        std::lock_guard lock(mutex_);
+        return std::min(capacity_ - baseline_, add(used_ - baseline_, available_locked()));
+    }
     std::pair<uint64_t, unsigned> active() const
     { std::lock_guard lock(mutex_); return {used_ - baseline_, slots_}; }
     uint64_t baseline() const
@@ -208,6 +257,18 @@ private:
     unsigned max_slots_, slots_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
+    std::function<uint64_t()> available_;
+    std::function<uint64_t()> owned_resident_;
+    uint64_t available_locked() const
+    {
+        if (!available_) return capacity_ - used_;
+        auto const free = available_();
+        auto const bytes = add(free, owned_resident_ ? std::min(used_, owned_resident_()) : 0);
+        // Charge the complete outstanding model until release. Standalone
+        // services may credit bracket-observed own anonymous pages; embedded
+        // owner pages cannot be attributed to this worker's leases.
+        return std::min(capacity_ - used_, bytes - std::min(bytes, used_));
+    }
 };
 
 // Embedded workers share the owner's scheduler, which may be wider than the
@@ -215,12 +276,13 @@ private:
 class CpuAdmission
 {
 public:
-    explicit CpuAdmission(unsigned capacity) : capacity_(capacity)
+    explicit CpuAdmission(unsigned capacity, std::function<unsigned(unsigned)> available = {})
+        : capacity_(capacity), available_(std::move(available))
     { require(capacity, "worker CPU offer must be positive"); }
     class Lease
     {
     public:
-        Lease(CpuAdmission& owner, unsigned permits, WorkerCancellation const& cancel)
+        Lease(CpuAdmission& owner, unsigned permits, WorkerCancellation const& cancel, bool adaptive = false)
             : owner_(owner), permits_(permits)
         {
             require(permits && permits <= owner_.capacity_, "worker CPU request exceeds offered capacity");
@@ -230,8 +292,11 @@ public:
                 for (;;)
                 {
                     cancel.check();
-                    if (owner_.waiting_.front() == this && permits_ <= owner_.capacity_ - owner_.active_)
-                    { owner_.waiting_.pop_front(); owner_.active_ += permits_; break; }
+                    auto const available = owner_.available_ ? std::min(owner_.capacity_, owner_.available_(owner_.active_)) : owner_.capacity_;
+                    auto const room = available - std::min(available, owner_.active_);
+                    auto const grant = adaptive ? std::min(permits_, room) : permits_;
+                    if (owner_.waiting_.front() == this && grant && grant <= room)
+                    { owner_.waiting_.pop_front(); permits_ = grant; owner_.active_ += permits_; break; }
                     owner_.changed_.wait_for(lock, std::chrono::milliseconds(50));
                 }
             }
@@ -250,6 +315,7 @@ public:
         }
         Lease(Lease const&) = delete;
         Lease& operator=(Lease const&) = delete;
+        unsigned permits() const { return permits_; }
     private:
         CpuAdmission& owner_;
         unsigned permits_;
@@ -261,15 +327,17 @@ private:
     std::deque<Lease const*> waiting_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
+    std::function<unsigned(unsigned)> available_;
 };
 
 class CpuWork
 {
 public:
     CpuWork(CpuAdmission& offered, CodecScheduler* shared, WorkerCancellation const& cancel,
-            unsigned permits = 1)
-        : offered_(offered, permits, cancel), shared_(shared, permits, [cancel] { cancel.check(); })
+            unsigned permits = 1, bool adaptive = false)
+        : offered_(offered, permits, cancel, adaptive), shared_(shared, offered_.permits(), [cancel] { cancel.check(); })
     { cancel.check(); }
+    unsigned threads() const { return offered_.permits(); }
 private:
     CpuAdmission::Lease offered_;
     CodecScheduler::Lease shared_;
@@ -477,25 +545,18 @@ std::shared_ptr<WorkerIdentityReservation> WorkerService::reserve_identity(std::
 void default_worker_resources(WorkerConfig& config)
 {
     if (!config.capacity.cpu_threads)
-        config.capacity.cpu_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+        config.capacity.cpu_threads = std::max(1u, profile_detail::logical_cpus());
     if (!config.capacity.host_bytes)
     {
-#ifdef _WIN32
-        MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
-        require(::GlobalMemoryStatusEx(&memory), "cannot determine worker RAM; set --host-bytes");
-        config.capacity.host_bytes = std::min(uint64_t(memory.ullTotalPhys) / 2, uint64_t(16) << 30);
-#else
-        auto const pages = ::sysconf(_SC_PHYS_PAGES), page_size = ::sysconf(_SC_PAGESIZE);
-        require(pages > 0 && page_size > 0, "cannot determine worker RAM; set --host-bytes");
-        config.capacity.host_bytes = std::min(uint64_t(pages) * uint64_t(page_size) / 2, uint64_t(16) << 30);
-#endif
+        config.capacity.host_bytes = profile_detail::physical_memory();
+        require(config.capacity.host_bytes, "cannot determine worker RAM; set --host-bytes");
     }
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     if (config.backend != "cpu" && !config.capacity.gpu_bytes)
     {
         size_t available = 0, total = 0;
         if (pos2gpu::device_memory_probe(config.device, available, total))
-            config.capacity.gpu_bytes = std::min(available, total) / 5 * 4;
+            config.capacity.gpu_bytes = std::min(available, total);
         require(config.backend != "gpu" || config.capacity.gpu_bytes,
             "cannot determine worker GPU memory; set --gpu-bytes");
     }
@@ -540,6 +601,7 @@ struct WorkerService::Impl
     std::vector<std::shared_ptr<Registration>> brokers;
     size_t refresh_cursor = 0, discovery_cursor = 0, deferred_brokers = 0;
     uint64_t broker_transport_bytes = 0;
+    mutable ResourceSampler resource_sampler;
     CpuAdmission offered_cpu;
     std::shared_ptr<CodecScheduler> scheduler;
     std::unique_ptr<Budget> budget;
@@ -566,6 +628,7 @@ struct WorkerService::Impl
     uint64_t next_capacity_revision = 1;
     std::atomic<uint64_t> retained_gpu_host{0};
     uint64_t service_baseline = 0;
+    pool::WorkerHardware physical;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     std::unordered_map<unsigned, GpuProducerPreflight> gpu_profiles;
 #endif
@@ -577,7 +640,8 @@ struct WorkerService::Impl
     Budget::Lease gpu_retained;
 #endif
 
-    explicit Impl(WorkerConfig options) : config(std::move(options)), offered_cpu(config.capacity.cpu_threads)
+    explicit Impl(WorkerConfig options) : config(std::move(options)), offered_cpu(config.capacity.cpu_threads,
+        [this](unsigned active) { return available_resources(active).cpu_threads; })
     {
         require(config.capacity.cpu_threads && config.capacity.cpu_threads <= 1024 &&
             config.capacity.slots && config.capacity.slots <= 1024,
@@ -618,7 +682,10 @@ struct WorkerService::Impl
         if (baseline >= config.capacity.host_bytes)
             throw std::runtime_error("worker broker/transport budget requires more than " + std::to_string(baseline) +
                 " host bytes before task memory; reduce --max-brokers or increase --host-bytes");
-        budget = std::make_unique<Budget>(config.capacity.host_bytes, config.capacity.slots, baseline);
+        budget = std::make_unique<Budget>(config.capacity.host_bytes, config.capacity.slots, baseline,
+            [this] { return available_resources(offered_cpu.active().first).host_bytes; },
+            [this] { return !config.available_resources && !config.cpu_scheduler && !config.admit_start && !config.host_reservation ?
+                resource_sampler.owned_host_bytes() : 0; });
         service_baseline = baseline;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (config.backend != "cpu")
@@ -638,6 +705,16 @@ struct WorkerService::Impl
             retained_gpu_host.store(gpu_retained.bytes);
 #endif
         }
+        physical.host = profile_detail::host_name(); physical.logical_cpus = profile_detail::logical_cpus();
+        physical.total_host_bytes = profile_detail::physical_memory();
+        physical.partition = config.capacity;
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+        if (gpu_enabled)
+        {
+            for (auto const& device : pos2gpu::list_gpu_devices()) if (device.id == size_t(config.device))
+            { physical.gpu_identity = device.physical_identity; physical.total_gpu_bytes = device.vram_bytes; break; }
+        }
+#endif
         if (gpu_enabled) gpu_thread = std::thread([this] { gpu_loop(); });
         try
         {
@@ -657,7 +734,7 @@ struct WorkerService::Impl
 #endif
             });
             auto const capacity = current_capacity();
-            advertised_capacity = {capacity, 1, profiles(capacity.host_bytes)};
+            advertised_capacity = {capacity, 1, profiles(capacity)};
         }
         catch (...)
         { stopping.store(true); jobs_ready.notify_all(); if (gpu_thread.joinable()) gpu_thread.join(); throw; }
@@ -686,6 +763,14 @@ struct WorkerService::Impl
     private:
         Impl& owner_;
     };
+    pool::WorkerHardware hardware() const
+    {
+        auto value = physical; value.available_host_bytes = profile_detail::available_memory();
+        value.standing_host_bytes = budget->baseline();
+        auto const now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (now > 0) value.observed_at_unix_ms = uint64_t(now);
+        return value;
+    }
     WorkerStatus status() const
     {
         WorkerStatus value; value.identity = config.tls.cert_file.empty() ? "" : pool::certificate_identity(config.tls.cert_file); value.instance = instance;
@@ -700,7 +785,7 @@ struct WorkerService::Impl
         { std::lock_guard lock(brokers_mutex); value.known_brokers = brokers.size(); value.deferred_brokers = deferred_brokers;
           for (auto const& broker : brokers) value.healthy_brokers += broker->healthy; }
         value.broker_limit = config.max_brokers; value.broker_transport_bytes = broker_transport_bytes;
-        value.broker_saturated = value.deferred_brokers != 0; return value;
+        value.broker_saturated = value.deferred_brokers != 0; value.hardware = hardware(); return value;
     }
     WorkerStatus control(WorkerControl operation)
     {
@@ -723,12 +808,22 @@ struct WorkerService::Impl
         heartbeat_ready.notify_all(); return status();
     }
 
+    pool::Resources available_resources(unsigned active_cpu) const
+    {
+        auto available = config.available_resources ? config.available_resources(active_cpu) : resource_sampler.sample(active_cpu);
+        available.cpu_threads = std::min(available.cpu_threads, uint32_t(profile_detail::logical_cpus()));
+        return available;
+    }
     pool::Resources current_capacity() const
     {
         auto capacity = config.capacity;
         if (!gpu_enabled) capacity.gpu_bytes = 0;
-        capacity.host_bytes = budget->task_capacity();
-        require(capacity.host_bytes, "worker persistent state consumes its offered host capacity");
+        auto const active = offered_cpu.active().first;
+        auto const available = available_resources(active);
+        capacity.cpu_threads = std::min(capacity.cpu_threads, std::max(active, std::max(uint32_t(1), available.cpu_threads)));
+        // A positive unavailable partition carries no useful generation
+        // profile; existing active leases remain represented until release.
+        capacity.host_bytes = std::max(uint64_t(1), budget->task_capacity());
         return capacity;
     }
     pool::CapacityUpdate capacity_update(bool force = false)
@@ -738,7 +833,7 @@ struct WorkerService::Impl
         if (!force && capacity == advertised_capacity.capacity)
             return {capacity, advertised_capacity.revision, {}};
         require(next_capacity_revision < UINT64_MAX, "worker capacity revision exhausted");
-        return {capacity, ++next_capacity_revision, profiles(capacity.host_bytes)};
+        return {capacity, ++next_capacity_revision, profiles(capacity)};
     }
     void commit_capacity(pool::CapacityUpdate const& update)
     {
@@ -917,18 +1012,18 @@ struct WorkerService::Impl
         }
     }
 
-    std::vector<pool::GenerationProfile> profiles(uint64_t task_capacity) const
+    std::vector<pool::GenerationProfile> profiles(pool::Resources const& capacity) const
     {
         std::vector<pool::GenerationProfile> result;
-        auto const retained = config.capacity.host_bytes - service_baseline - task_capacity;
+        auto const retained = budget->baseline() - service_baseline;
         for (uint8_t k = 18; k <= 28; k += 2)
             for (uint8_t strength = STRENGTH_MIN;
                  strength <= std::min<unsigned>(STRENGTH_MAX, k - PlotProofParams::num_section_bits_for_k(k) - 1); ++strength)
             {
                 uint64_t const raw = multiply(fragment_count_bound(k, strength), sizeof(uint64_t));
                 pool::GenerationProfile cpu; cpu.kind = pool::Kind::GenerateCpu; cpu.k = k; cpu.strength = strength;
-                cpu.cpu_threads = config.generation_threads;
-                cpu.resources = {config.generation_threads, 1,
+                cpu.cpu_threads = std::min(config.generation_threads, capacity.cpu_threads);
+                cpu.resources = {cpu.cpu_threads, 1,
                     add(add(worker_cpu_generation_bytes(k, strength), boundary_bytes(k)), config.max_task_bytes), 0};
                 cpu.member_host_bytes = add(raw, boundary_bytes(k));
                 cpu.max_batch_members = config.max_batch_members;
@@ -1052,7 +1147,7 @@ struct WorkerService::Impl
                 multiply(raw_bytes, ids.size() - 1)), indexes), config.max_task_bytes);
         }
 #endif
-        unsigned const threads = grant ? grant->cpu_threads : config.generation_threads;
+        unsigned const threads = grant ? grant->cpu_threads : std::min(config.generation_threads, current_capacity().cpu_threads);
         require(threads && threads <= config.capacity.cpu_threads, "generation CPU allowance exceeds worker offer");
         uint64_t const dynamic_peak = use_gpu && peak > prior_retained ? peak - prior_retained : use_gpu ? indexes : peak;
         if (grant && dynamic_peak > grant->host_bytes)
@@ -1125,8 +1220,8 @@ struct WorkerService::Impl
                 for (auto const& id : ids)
                 {
                     cancel.check();
-                    CpuWork compute(offered_cpu, scheduler.get(), cancel, threads);
-                    worker_detail::CpuLimit limit(threads);
+                    CpuWork compute(offered_cpu, scheduler.get(), cancel, threads, true);
+                    worker_detail::CpuLimit limit(compute.threads());
                     WorkerReferencePlotter::Options options{}; options.validate = false; options.verbose = false;
                     CancelProgress progress(cancel); options.sink = &progress;
                     owned.push_back(WorkerReferencePlotter(parameters(k, strength, id)).run(options).t3_proof_fragments);
@@ -1498,11 +1593,11 @@ struct WorkerService::Impl
           value.capacity = advertised_capacity.capacity; value.capacity_revision = advertised_capacity.revision;
           if (advertised_capacity.generation_profiles) value.generation_profiles = *advertised_capacity.generation_profiles; }
         value.capabilities = pool::capability(pool::Kind::Pack) | pool::capability(pool::Kind::GenerateCpu);
-        value.generation_threads = config.generation_threads;
+        value.generation_threads = std::min(config.generation_threads, value.capacity.cpu_threads);
         value.codec_limits = {config.max_window_chunks, config.max_task_bytes};
         if (gpu_enabled) value.capabilities |= pool::capability(pool::Kind::GenerateGpu);
         { std::lock_guard lock(admission_mutex); value.admission = admission; }
-        value.min_k = 18; value.max_k = 28; return value;
+        value.min_k = 18; value.max_k = 28; value.hardware = hardware(); return value;
     }
     void start()
     {
@@ -2031,6 +2126,7 @@ struct WorkerClient::Impl
         if (!config.admit_task) return;
         try { config.admit_task(value); }
         catch (WorkerAdmissionRejected const&) { throw; }
+        catch (WorkerResourcesUnavailable const&) { throw; }
         catch (std::exception const& error) { throw WorkerAdmissionRejected(error.what()); }
         catch (...) { throw WorkerAdmissionRejected("compute admission policy failed"); }
     }

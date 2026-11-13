@@ -3,6 +3,7 @@
 #include "host/GroupEngine.hpp"
 #include "host/Utf8.hpp"
 #include <cstring>
+#include <condition_variable>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <set>
 #include <span>
+#include <utility>
 #ifdef _WIN32
 #include <winioctl.h>
 #include <nvme.h>
@@ -82,6 +84,357 @@ struct StorageDevice
     // Each flag requires every underlying drive to have that known type.
     // Both remain false for mixed media or an unknown rotation classification.
     bool nonrotating = false, rotating = false;
+};
+
+// Runtime feedback, never allocation authority or a saved scratch setting.
+// A permit covers one native I/O operation, so a recovered owner spanning many
+// drives can always drain without changing any of its retained capacity grants.
+class DiskIoGovernor
+{
+public:
+    using Clock = std::chrono::steady_clock;
+    struct Counters
+    {
+        uint64_t reads = 0, writes = 0, read_ms = 0, write_ms = 0;
+        uint64_t inflight = 0, busy_ms = 0, queue_ms = 0;
+        uint64_t read_sectors = 0, write_sectors = 0;
+    };
+    using Sampler = std::function<std::optional<Counters>(std::string const&)>;
+    struct Status
+    {
+        size_t drives = 0, active = 0, limit = 1;
+        bool farming_known = false, pressured = false;
+        uint64_t completed_bytes = 0, waits = 0;
+    };
+    explicit DiskIoGovernor(Sampler sampler = sample_device) : sampler_(std::move(sampler)) { pending_.reserve(4096); }
+
+    void register_device(StorageDevice const& device, std::optional<uint64_t> filesystem = {})
+    {
+        std::lock_guard lock(mutex_);
+        if (!(device.nonrotating && !device.drives.empty()))
+        {
+            if (device.drives.empty()) register_drive(unknown_drive);
+            else for (auto const& name : device.drives) register_drive(name);
+        }
+        if (filesystem)
+        { require(filesystems_.contains(*filesystem) || filesystems_.size() < 4096, "too many disk feedback filesystems"); filesystems_.try_emplace(*filesystem, device); }
+    }
+    void register_directory(std::filesystem::path const& directory);
+    // Fresh installed-reader challenge completion times, not RPC/process wall
+    // times. The declared deadline remains the resource gate's responsibility.
+    void observe_farming(uint64_t response_ns, uint64_t deadline_ns = 0, bool missed = false,
+                         Clock::time_point now = Clock::now())
+    {
+        std::lock_guard lock(mutex_);
+        farming_at_ = now; farming_response_ = response_ns; farming_deadline_ = deadline_ns;
+        bool const late = missed || (deadline_ns && response_ns >= deadline_ns / 2);
+        if (late) pressure(now);
+        changed_.notify_all();
+    }
+    void observe_pressure(bool pressured, Clock::time_point now = Clock::now())
+    {
+        std::lock_guard lock(mutex_);
+        if (pressured) pressure(now);
+        changed_.notify_all();
+    }
+    // Sampling and selection are bounded by the registered physical leaves.
+    // Inactive-drive pressure is distinguishable from our own traffic; busy
+    // counters during construction alone never prove a foreign farming load.
+    void poll(Clock::time_point now = Clock::now())
+    { std::lock_guard lock(mutex_); poll_locked(now); }
+
+    long double routing_cost(StorageDevice const& device, Clock::time_point now = Clock::now())
+    {
+        if (device.nonrotating || device.drives.empty()) return 0;
+        std::lock_guard lock(mutex_); poll_locked(now);
+        long double result = -1;
+        for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end())
+        {
+            auto const& drive = at->second;
+            // An unused/long-deferred physical drive receives a bounded probe,
+            // including a slow drive; observations are not permanent bans.
+            bool const busy = now < drive.foreign_until;
+            bool const probe = drive.selected ? selection_ - drive.selected >= 2 * drives_.size() : !busy;
+            result = std::max(result, probe ? -1.L : (busy ? 1000000.L : 0.L) + std::max(drive.ns_per_byte, drive.device_ns_per_byte));
+        }
+        return result;
+    }
+    void selected(StorageDevice const& device)
+    {
+        std::lock_guard lock(mutex_); ++selection_;
+        for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end()) at->second.selected = selection_;
+    }
+    class Permit
+    {
+    public:
+        Permit() = default;
+        Permit(Permit&& other) noexcept
+            : governor_(std::exchange(other.governor_, nullptr)), device_(other.device_), bytes_(other.bytes_) {}
+        Permit& operator=(Permit&& other) noexcept
+        {
+            if (this != &other)
+            {
+                if (governor_) governor_->complete(*device_, 0, 0);
+                governor_ = std::exchange(other.governor_, nullptr); device_ = other.device_; bytes_ = other.bytes_;
+            }
+            return *this;
+        }
+        ~Permit() { if (governor_) governor_->complete(*device_, 0, 0); }
+        Permit(Permit const&) = delete;
+        Permit& operator=(Permit const&) = delete;
+        size_t bytes() const { return bytes_; }
+        void complete(uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
+        { if (auto* governor = std::exchange(governor_, nullptr)) governor->complete(*device_, bytes, elapsed_ns, now); }
+    private:
+        friend class DiskIoGovernor;
+        Permit(DiskIoGovernor* governor, StorageDevice const* device, size_t bytes)
+            : governor_(governor), device_(device), bytes_(bytes) {}
+        DiskIoGovernor* governor_ = nullptr;
+        StorageDevice const* device_ = nullptr;
+        size_t bytes_ = 0;
+    };
+    Permit acquire(StorageDevice const& device, size_t requested, std::function<void()> const& check_running = {})
+    {
+        if (device.nonrotating && !device.drives.empty()) return Permit(nullptr, &device, requested);
+        register_device(device);
+        std::unique_lock lock(mutex_);
+        require(pending_.size() < 4096, "too many queued disk operations");
+        uint64_t const ticket = ++ticket_; pending_.push_back({ticket, &device});
+        try
+        {
+            for (;;)
+            {
+                if (check_running) { lock.unlock(); check_running(); lock.lock(); }
+                auto const now = Clock::now(); poll_locked(now);
+                if (queued_turn(ticket, now)) if (auto permit = try_acquire_locked(device, requested, now))
+                {
+                    erase_ticket(ticket); changed_.notify_all(); return std::move(*permit);
+                }
+                auto wake = now + std::chrono::milliseconds(10);
+                for_drives(device, [&](Drive& drive) { if (drive.next > now) wake = std::min(wake, drive.next); });
+                changed_.wait_until(lock, wake);
+            }
+        }
+        catch (...)
+        {
+            if (!lock.owns_lock()) lock.lock();
+            erase_ticket(ticket); changed_.notify_all(); throw;
+        }
+    }
+    std::optional<Permit> try_acquire(StorageDevice const& device, size_t requested, Clock::time_point now = Clock::now())
+    {
+        if (device.nonrotating && !device.drives.empty()) return Permit(nullptr, &device, requested);
+        register_device(device); std::lock_guard lock(mutex_); poll_locked(now);
+        if (!pending_.empty()) return {};
+        return try_acquire_locked(device, requested, now);
+    }
+    Permit acquire(int descriptor, size_t requested, std::function<void()> const& check_running = {})
+    {
+        file_io::Stat value{};
+        StorageDevice const* device = &unknown_device_;
+        {
+            std::lock_guard lock(mutex_);
+            if (!file_io::inspect_fd(descriptor, &value))
+                if (auto at = filesystems_.find(uint64_t(value.st_dev)); at != filesystems_.end()) device = &at->second;
+        }
+        return acquire(*device, requested, check_running);
+    }
+    Status status(Clock::time_point now = Clock::now()) const
+    {
+        std::lock_guard lock(mutex_);
+        return {drives_.size(), active_, limit_, farming_known(now), now < pressure_until_, completed_bytes_, waits_};
+    }
+    uint64_t memory_bytes() const
+    {
+        std::lock_guard lock(mutex_); uint64_t bytes = sizeof(*this) + 2 * pending_.capacity() * sizeof(Pending);
+        for (auto const& [name, drive] : drives_) { (void)drive; bytes += sizeof(Drive) + sizeof(std::string) + 4 * sizeof(void*) + name.capacity() + 1; }
+        for (auto const& [id, device] : filesystems_)
+        {
+            (void)id; bytes += sizeof(StorageDevice) + 5 * sizeof(void*) + device.filesystem.capacity() + 1 + device.drives.capacity() * sizeof(std::string);
+            for (auto const& drive : device.drives) bytes += drive.capacity() + 1;
+        }
+        return bytes;
+    }
+    static std::optional<Counters> sample_device(std::string const& name)
+    {
+#ifdef __linux__
+        // Only kernel-discovered major:minor leaves form sysfs paths. NVMe
+        // subsystem names and unresolved/foreign identities remain unknown.
+        if (name.empty() || name.find(':') == name.npos || name.find_first_not_of("0123456789:") != name.npos) return {};
+        std::ifstream input(file_io::native_path("/sys/dev/block") / name / "stat");
+        Counters value; uint64_t merged_reads, merged_writes;
+        if (!(input >> value.reads >> merged_reads >> value.read_sectors >> value.read_ms >> value.writes >> merged_writes >>
+              value.write_sectors >> value.write_ms >> value.inflight >> value.busy_ms >> value.queue_ms)) return {};
+        return value;
+#else
+        (void)name; return {};
+#endif
+    }
+private:
+    static constexpr char const* unknown_drive = "unresolved";
+    struct Drive
+    {
+        std::optional<Counters> counters;
+        Clock::time_point sampled{}, own_at{}, next{}, foreign_until{};
+        long double ns_per_byte = 0, device_ns_per_byte = 0;
+        uint64_t selected = 0;
+        size_t active = 0;
+    };
+    std::map<std::string, Drive> drives_;
+    std::map<uint64_t, StorageDevice> filesystems_;
+    StorageDevice unknown_device_;
+    Sampler sampler_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    struct Pending { uint64_t ticket; StorageDevice const* device; };
+    std::vector<Pending> pending_;
+    Clock::time_point sampled_{}, window_{}, pressure_until_{}, trial_after_{}, farming_at_{};
+    size_t active_ = 0, limit_ = 1;
+    uint64_t completed_bytes_ = 0, window_bytes_ = 0, waits_ = 0, selection_ = 0, ticket_ = 0;
+    uint64_t farming_response_ = 0, farming_deadline_ = 0;
+    long double baseline_rate_ = 0;
+    bool waiting_ = false, trial_ = false;
+    void register_drive(std::string const& name)
+    { require(drives_.contains(name) || drives_.size() < 4096, "too many disk feedback resources"); drives_.try_emplace(name); }
+    template<class Operation> void for_drives(StorageDevice const& device, Operation operation)
+    {
+        if (device.drives.empty()) operation(drives_.at(unknown_drive));
+        else for (auto const& name : device.drives) operation(drives_.at(name));
+    }
+    void erase_ticket(uint64_t ticket)
+    { pending_.erase(std::find_if(pending_.begin(), pending_.end(), [&](Pending const& p) { return p.ticket == ticket; })); }
+    bool ready(StorageDevice const& device, Clock::time_point now)
+    {
+        bool blocked = active_ >= limit_;
+        for_drives(device, [&](Drive& drive) { blocked = blocked || drive.active || now < drive.next; });
+        return !blocked;
+    }
+    bool queued_turn(uint64_t ticket, Clock::time_point now)
+    {
+        // An older eligible request wins. A waiter for one busy physical disk
+        // must not leave other independent disks idle behind it.
+        for (auto const& pending : pending_)
+        {
+            if (pending.ticket == ticket) return true;
+            if (ready(*pending.device, now)) return false;
+        }
+        return false;
+    }
+    std::optional<Permit> try_acquire_locked(StorageDevice const& device, size_t requested, Clock::time_point now)
+    {
+        bool local = false, foreign = false;
+        for_drives(device, [&](Drive& drive)
+        { local = local || drive.active || now < drive.next; foreign = foreign || now < drive.foreign_until; });
+        if (active_ >= limit_ || local)
+        {
+            ++waits_;
+            if (active_ >= limit_ && !local) waiting_ = true;
+            return {};
+        }
+        if (foreign && now >= pressure_until_) pressure(now);
+        ++active_; size_t bytes = requested;
+        for_drives(device, [&](Drive& drive)
+        {
+            ++drive.active; drive.own_at = now;
+            // Aim for a short syscall, bounded even before a measured rate
+            // exists. Cached timings are tuning evidence only.
+            uint64_t const quantum = now < pressure_until_ ? 5000000 : 20000000;
+            long double const service = std::max(drive.ns_per_byte, drive.device_ns_per_byte);
+            uint64_t const ceiling = drive.device_ns_per_byte ? 4 * 1024 * 1024 : 1024 * 1024;
+            uint64_t const measured = service > 0 ? uint64_t(std::clamp<long double>(
+                quantum / service, 65536, ceiling)) : ceiling;
+            bytes = std::min(bytes, size_t(measured));
+        });
+        return Permit(this, &device, bytes);
+    }
+    bool farming_known(Clock::time_point now) const
+    { return farming_at_ != Clock::time_point{} && now >= farming_at_ && now - farming_at_ <= std::chrono::seconds(30); }
+    bool farming_timely(Clock::time_point now) const
+    { return farming_known(now) && farming_deadline_ && farming_response_ < farming_deadline_ / 2; }
+    void pressure(Clock::time_point now)
+    {
+        // Multiplicative decrease and a hold avoid repeated grow/shrink cycles.
+        limit_ = std::max<size_t>(1, limit_ / 2); pressure_until_ = now + std::chrono::seconds(2);
+        trial_after_ = now + std::chrono::seconds(5); trial_ = false; baseline_rate_ = 0;
+    }
+    void poll_locked(Clock::time_point now)
+    {
+        if (sampled_ != Clock::time_point{} && now >= sampled_ && now - sampled_ < std::chrono::milliseconds(250)) return;
+        sampled_ = now;
+        if (!farming_timely(now)) limit_ = std::min<size_t>(limit_, 2);
+        for (auto& [name, drive] : drives_)
+        {
+            auto current = sampler_ ? sampler_(name) : std::optional<Counters>{};
+            if (current && drive.counters && current->busy_ms >= drive.counters->busy_ms &&
+                current->read_sectors >= drive.counters->read_sectors && current->write_sectors >= drive.counters->write_sectors)
+            {
+                // Sector and busy counters see completed block work below the
+                // page cache. Do not let fast cached writes erase that service
+                // cost or create an unbounded deferred writeback queue.
+                long double const sectors = static_cast<long double>(current->read_sectors - drive.counters->read_sectors) +
+                    (current->write_sectors - drive.counters->write_sectors);
+                if (sectors && current->busy_ms > drive.counters->busy_ms)
+                {
+                    long double const service = (current->busy_ms - drive.counters->busy_ms) * 1000000.L / (sectors * 512.L);
+                    drive.device_ns_per_byte = drive.device_ns_per_byte ? (drive.device_ns_per_byte * 3 + service) / 4 : service;
+                }
+            }
+            else drive.device_ns_per_byte = 0;
+            if (current && drive.counters && now > drive.sampled && drive.own_at < drive.sampled &&
+                !drive.active && now - drive.own_at > std::chrono::seconds(1) &&
+                current->busy_ms >= drive.counters->busy_ms && current->queue_ms >= drive.counters->queue_ms)
+            {
+                auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drive.sampled).count();
+                if (ms > 0 && (static_cast<long double>(current->busy_ms - drive.counters->busy_ms) / ms >= .75L ||
+                    static_cast<long double>(current->queue_ms - drive.counters->queue_ms) / ms >= 1.L))
+                    drive.foreign_until = now + std::chrono::seconds(1);
+            }
+            drive.counters = current; drive.sampled = now;
+        }
+        if (window_ == Clock::time_point{} || now < window_) { window_ = now; window_bytes_ = completed_bytes_; return; }
+        if (now - window_ < std::chrono::seconds(2)) return;
+        long double const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - window_).count();
+        long double const rate = (completed_bytes_ - window_bytes_) / ns;
+        if (now >= pressure_until_ && now >= trial_after_ && rate > 0)
+        {
+            if (trial_)
+            {
+                // Whole-window throughput also sees a shared HBA/controller
+                // ceiling without assuming one independent lane per disk.
+                if (rate < baseline_rate_ * 1.05L)
+                { limit_ = std::max<size_t>(1, limit_ - 1); trial_after_ = now + std::chrono::seconds(5); }
+                trial_ = false;
+            }
+            else if (waiting_ && limit_ < std::min(drives_.size(), farming_timely(now) ? drives_.size() : size_t(2)))
+            { baseline_rate_ = rate; ++limit_; trial_ = true; }
+        }
+        window_ = now; window_bytes_ = completed_bytes_; waiting_ = false;
+    }
+    void complete(StorageDevice const& device, uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
+    {
+        std::lock_guard lock(mutex_);
+        --active_; completed_bytes_ = grow_add(completed_bytes_, bytes);
+        for_drives(device, [&](Drive& drive)
+        {
+            --drive.active; drive.own_at = now;
+            if (bytes && elapsed_ns)
+            {
+                long double const rate = static_cast<long double>(elapsed_ns) / bytes;
+                drive.ns_per_byte = drive.ns_per_byte ? (drive.ns_per_byte * 3 + rate) / 4 : rate;
+            }
+            // Leave regular gaps for foreign random reads. Unknown farming
+            // feedback retains the larger reserve; pressure remains finite.
+            auto const divisor = now < pressure_until_ || now < drive.foreign_until ? 1 : farming_timely(now) ? 8 : 4;
+            long double const physical = bytes * drive.device_ns_per_byte;
+            long double const service = std::max(static_cast<long double>(elapsed_ns), physical);
+            long double const deferred = std::max(0.L, physical - elapsed_ns);
+            uint64_t const delay = bytes && !drive.device_ns_per_byte ?
+                uint64_t(std::min(50000000.L, bytes * 20000000.L / (1024 * 1024))) :
+                uint64_t(std::clamp<long double>(deferred + service / divisor, 0, 50000000));
+            drive.next = now + std::chrono::nanoseconds(delay);
+        });
+        changed_.notify_all();
+    }
 };
 
 // Paths and Linux device numbers can change across boots. Pair the persistent
@@ -552,6 +905,13 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
     result.drives = std::move(drives); result.nonrotating = nonrotating; result.rotating = all_rotating;
 #endif
     return result;
+}
+
+inline void DiskIoGovernor::register_directory(std::filesystem::path const& directory)
+{
+    file_io::Stat value{};
+    require(!file_io::inspect_path(directory.c_str(), &value), "cannot bind disk feedback directory");
+    register_device(storage_device(directory), uint64_t(value.st_dev));
 }
 
 inline std::vector<size_t> writer_groups(std::span<StorageDevice const> devices)

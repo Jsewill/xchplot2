@@ -57,6 +57,12 @@ int main() try
     task.task.kind = pool::Kind::GenerateCpu; task.task.k = 18; task.task.strength = 2; task.task.work_units = 1; task.task.resources = {1, 1, 128, 0};
     auto admit = [&](auto const& value) { require_compute_task(p, value, 512, 256, "cpu"); };
     admit(task);
+    {
+        auto pressure = task; pressure.worker.capacity.host_bytes = 64;
+        bool waiting = false;
+        try { admit(pressure); } catch (WorkerResourcesUnavailable const&) { waiting = true; }
+        check(waiting, "fresh executor pressure became a permanent reviewed-policy rejection");
+    }
     auto changed = task; changed.worker.identity = std::string(64, 'b'); rejects([&] { admit(changed); });
     changed = task; changed.owner_identity = std::string(64, 'b'); rejects([&] { admit(changed); });
     changed = task; changed.broker_identity = std::string(64, 'b'); rejects([&] { admit(changed); });
@@ -88,6 +94,34 @@ int main() try
     check(gpu_preparation.missing.empty() && std::any_of(gpu_preparation.facts.begin(), gpu_preparation.facts.end(), [](auto const& fact)
         { return fact.basis == "unknown" && fact.scope.find("Local GPU execution requires") != std::string::npos && fact.scope.find("Broker generation instead") != std::string::npos; }),
         "preparation mistook an unselected local GPU scope for a missing remote execution declaration");
+    auto discovered = p; discovered.native.compute_workers.clear();
+    pos2gpu::ComputeInspection observed; observed.configured = true; observed.status = "compatible-workers-observed";
+    pos2gpu::ComputeInspection::Worker hardware;
+    hardware.identity = worker.tls_identity; hardware.instance = "observed-instance"; hardware.host = "executor";
+    hardware.cpus = 1; hardware.slots = 2; hardware.host_bytes = 512; hardware.standing_host_bytes = 128;
+    hardware.logical_cpus = 2; hardware.total_host_bytes = 2000; hardware.available_host_bytes = 800;
+    hardware.capabilities = compute_generate_cpu | compute_encode; hardware.observed_at_unix_ms = 1234;
+    observed.worker_resources.push_back(hardware);
+    auto const resources_before = discovered.resources.size();
+    auto facts = prepare_compute_resources(discovered, observed);
+    check(discovered.resources.size() == resources_before && discovered.native.compute_workers.size() == 1 &&
+        discovered.native.compute_workers.front().reservation.front().resource == "remote-cpu" &&
+        discovered.resources[4].capacity == 1000 && !facts.facts.empty(),
+        "compute setup duplicated physical capacity or replaced a declared memory ceiling with hardware availability");
+    auto setup = prepare_resource_declarations(discovered);
+    check(std::any_of(setup.missing.begin(), setup.missing.end(), [](auto const& item) { return item.group == "compute-network"; }),
+        "compute discovery invented a remote network service bound");
+    std::vector<std::string> settings{"native.compute_workers[" + hardware.identity + "].reservation[network].reserved_units=1,bounded=true",
+        "native.compute_services[cpu].reserved_units=1,bounded=true"};
+    discovered = apply_resource_settings(discovered, settings);
+    setup = prepare_resource_declarations(discovered);
+    check(std::none_of(setup.missing.begin(), setup.missing.end(), [](auto const& item) { return item.group == "compute-network"; }),
+        "declared physical network reservation was not retained by guided compute setup");
+    auto mismatch = observed; mismatch.worker_resources.front().host = "different-host";
+    check(!prepare_compute_resources(discovered, mismatch).missing.empty() && discovered.native.compute_workers.front().host == "executor",
+        "compute setup silently rebound a saved worker to a different host");
+    settings = {"native.compute_workers[unknown].reservation[network].reserved_units=1,bounded=true"};
+    rejects([&] { (void)apply_resource_settings(discovered, settings); });
     auto unbound_local_request = gpu_request; unbound_local_request.compute_enabled = false;
     rejects([&] { Stage stage; bind_native_stage(gpu_profile, unbound_local_request, 0, stage, true, false); });
     auto gpu_task = task; gpu_task.task.kind = pool::Kind::GenerateGpu; gpu_task.task.resources.gpu_bytes = 100;
@@ -105,6 +139,27 @@ int main() try
     Stage local_stage; local_stage.name = "local-gpu-helpers";
     bind_native_stage(local_gpu, gpu_request, 0, local_stage, false, false);
     check(!assess_stage(local_gpu, local_stage).feasible, "local GPU runtime helpers were treated as spare CPU capacity for farming");
+    {
+        auto owned_profile = local_gpu; owned_profile.native.backend = "cpu";
+        owned_profile.native.compute_workers.front().cpu_threads = 4;
+        auto owned = request; owned.adaptive_resources = owned.compute_offer_owned = true;
+        owned.compute_offer_identity = local_worker.tls_identity; owned.compute_offer_backend = "cpu";
+        owned.compute_offer_ram_bytes = 256; owned.compute_offer_cpu_threads = 2;
+        Stage selected; selected.name = "owned-cpu-partition"; bind_native_stage(owned_profile, owned, 0, selected, true, false);
+        check(assess_stage(owned_profile, selected).feasible && selected.background.size() == 5 &&
+            selected.background[2].reserved_units == 2 && selected.background[3].resident_units == 128 &&
+            selected.background[3].transient_units == 256 - 128,
+            "owned CPU executor kept its maximum allocation or released its standing service residency");
+        auto foreign = owned; foreign.compute_offer_owned = false;
+        Stage retained; retained.name = "foreign-whole-executor"; bind_native_stage(owned_profile, foreign, 0, retained, true, false);
+        check(!assess_stage(owned_profile, retained).feasible && retained.background.size() == 7 &&
+            retained.background[2].reserved_units == request.cpu_affinity_lanes,
+            "candidate partition silently reduced a foreign executor or its retained GPU scope");
+        owned.compute_offer_ram_bytes = owned.compute_offer_cpu_threads = 0;
+        Stage inactive; inactive.name = "reserved-identity-no-executor"; bind_native_stage(owned_profile, owned, 0, inactive, false, false);
+        check(inactive.background.size() == owned_profile.native.compute_services.size(),
+            "unstarted identity-reserved executor charged an allocation it cannot own");
+    }
     gpu_profile.native.compute_workers.front().reservation.back().resident_units = 24;
     gpu_profile.native.compute_workers.front().reservation.back().transient_units = 101;
     rejects([&] { Stage stage; bind_native_stage(gpu_profile, gpu_request, 0, stage, false, false); });

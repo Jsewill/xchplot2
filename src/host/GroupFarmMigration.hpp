@@ -6,6 +6,7 @@
 #include "host/GroupFarmMetadata.hpp"
 #include <array>
 #include <functional>
+#include <cstdlib>
 
 namespace group_grow
 {
@@ -494,6 +495,26 @@ inline ReplotRevalidation parse_replot_revalidation(std::string const& body, uin
     require(bool(in), "incomplete replot revalidation"); in >> std::ws; require(in.eof(), "unexpected replot revalidation data");
     (void)replot_revalidation_text(result); return result;
 }
+// Keep the retirement/receipt prefix contiguous. Later admitted outputs retain
+// their own exact construction/publication evidence until that prefix reaches
+// them. Unconfirmed entries grant no ordinary source retirement authority;
+// durable readiness and immutable completion evidence fence retirement.
+inline constexpr size_t replot_pending_output_limit = 3;
+struct ReplotQueuedOutput
+{
+    uint64_t batch = 0;
+    std::optional<stream_state::Stamp> verified_stage, published, ready;
+    file_io::DurableIdentity verified_stage_identity, published_identity, ready_identity;
+    std::optional<bool> full_proof_validated;
+    std::vector<ReplotCandidateProgress> retirements;
+    bool operator==(ReplotQueuedOutput const&) const = default;
+};
+struct ReplotLaneProgress
+{
+    uint64_t baseline_files = 0, files = 0;
+    std::string baseline_digest, digest;
+    bool operator==(ReplotLaneProgress const&) const = default;
+};
 struct ReplotJournal
 {
     std::string review_digest, parent_digest, receipt_digest;
@@ -509,6 +530,16 @@ struct ReplotJournal
     // Legacy sealed records required a positive full proof. Explicit evidence
     // records the work actually completed, independently of successor policy.
     std::optional<bool> full_proof_validated;
+    // Once enabled, preserve the schema even after the queue drains so old
+    // bytes remain canonical and its authority never disappears on restart.
+    bool queued_publications = false;
+    std::vector<ReplotQueuedOutput> queued;
+    std::string authority_directory, authority_identity, authority_host, authority_user;
+    uint64_t authority_revision = 0;
+    // Each destination advances a contiguous immutable completion chain.
+    // Completed outputs leave the bounded unconfirmed queue, without forcing
+    // an unavailable earlier directory to advance the global receipt prefix.
+    std::vector<ReplotLaneProgress> completed_lanes;
 };
 inline bool replot_journal_native_evidence(ReplotJournal const& journal)
 { return file_io::has_durable_identity(journal.verified_stage_identity) || file_io::has_durable_identity(journal.published_identity) || file_io::has_durable_identity(journal.ready_identity); }
@@ -546,6 +577,50 @@ inline uint64_t replot_output_count(FarmingState const& state)
     }
     return count;
 }
+inline std::pair<size_t, uint64_t> replot_batch_position(FarmingState const& state, uint64_t batch)
+{
+    for (size_t lane = 0; lane < state.directories.size(); ++lane)
+    {
+        if (batch < state.directories[lane].layout.files) return {lane, batch};
+        batch -= state.directories[lane].layout.files;
+    }
+    throw std::runtime_error("migration batch exceeds its fixed destination assignments");
+}
+inline bool replot_lane_completed(ReplotJournal const& journal, uint64_t batch)
+{
+    if (journal.completed_lanes.empty() || batch >= replot_output_count(journal.farm)) return false;
+    auto const [lane, ordinal] = replot_batch_position(journal.farm, batch);
+    return ordinal < journal.completed_lanes.at(lane).files;
+}
+inline uint64_t replot_completed_members(ReplotJournal const& journal)
+{
+    using namespace farm::resource_detail;
+    uint64_t result = 0;
+    for (size_t lane = 0; lane < journal.completed_lanes.size(); ++lane)
+    {
+        auto const& layout = journal.farm.directories[lane].layout; auto const files = journal.completed_lanes[lane].files;
+        if (!files) continue;
+        if (layout.fixed_members) result = add(result, std::min(layout.total_members, multiply(files, layout.group_members)));
+        else { group_tools::require(layout.files, "completed migration destination has no fixed file layout");
+            result = add(result, add(multiply(files, layout.total_members / layout.files), std::min(files, layout.total_members % layout.files))); }
+    }
+    return result;
+}
+inline bool replot_source_completed(ReplotReview const& review, ReplotJournal const& journal, uint64_t position)
+{
+    uint64_t prefix = 0;
+    for (size_t lane = 0; lane < journal.completed_lanes.size(); ++lane)
+    {
+        auto const files = journal.completed_lanes[lane].files;
+        if (files)
+        {
+            auto const& first = review.batches.at(size_t(prefix)); auto const& last = review.batches.at(size_t(prefix + files - 1));
+            if (position >= first.first_source && position < last.first_source + last.sources) return true;
+        }
+        prefix += journal.farm.directories[lane].layout.files;
+    }
+    return false;
+}
 inline bool replot_output_matches(stream_state::Stamp const& saved, file_io::DurableIdentity const& saved_identity,
     stream_state::Stamp current, file_io::DurableIdentity const& current_identity, bool rename_allowed = false)
 {
@@ -559,6 +634,44 @@ inline bool replot_output_matches(stream_state::Stamp const& saved, file_io::Dur
 }
 inline void validate_replot_journal(ReplotJournal const& journal)
 {
+    require(journal.authority_directory.empty() ? (!journal.authority_revision && journal.authority_identity.empty() &&
+        journal.authority_host.empty() && journal.authority_user.empty()) : journal.queued_publications && journal.authority_revision &&
+        journal.authority_revision <= journal.revision && file_io::native_path(journal.authority_directory).is_absolute() &&
+        !journal.authority_identity.empty() && !journal.authority_host.empty() && !journal.authority_user.empty(), "invalid migration controller authority");
+    require(journal.queued.size() < replot_pending_output_limit && (journal.queued.empty() || journal.queued_publications),
+        "migration publication queue exceeds its durable bound");
+    require(journal.completed_lanes.empty() || (journal.queued_publications && journal.completed_lanes.size() == journal.farm.directories.size()), "migration completion lanes omit a fixed destination");
+    for (size_t lane = 0; lane < journal.completed_lanes.size(); ++lane)
+    {
+        auto const& progress = journal.completed_lanes[lane];
+        require(progress.baseline_files <= progress.files && progress.files <= journal.farm.directories[lane].layout.files &&
+            (progress.files ? replot_digest(progress.digest) : progress.digest.empty()) &&
+            (progress.baseline_files ? replot_digest(progress.baseline_digest) : progress.baseline_digest.empty()),
+            "invalid migration destination completion prefix");
+    }
+    uint64_t previous = journal.batch;
+    for (auto const& output : journal.queued)
+    {
+        require(journal.phase == ReplotPhase::replacing && output.batch >= journal.batch && output.batch < replot_output_count(journal.farm) &&
+            (&output == &journal.queued.front() || output.batch > previous) &&
+            (output.batch != journal.batch || (!journal.verified_stage && !journal.published && !journal.ready)),
+            "migration publication queue repeats or overlaps active authority");
+        require(!replot_lane_completed(journal, output.batch), "completed migration output retained an unconfirmed queue slot");
+        require(!output.full_proof_validated || output.verified_stage, "queued migration proof lacks its checked stage");
+        require(output.retirements.size() <= replot_maximum_batch_sources, "queued migration retirement count exceeds its bound");
+        for (auto const& progress : output.retirements)
+            require(unsigned(progress.state) <= unsigned(ReplotRetirement::retired) &&
+                (progress.state == ReplotRetirement::active ? !progress.predelete : output.ready || progress.predelete),
+                "queued migration source retirement lacks bounded early-deletion intent");
+        for (auto pair : {std::pair{&output.verified_stage, &output.verified_stage_identity}, std::pair{&output.published, &output.published_identity}, std::pair{&output.ready, &output.ready_identity}})
+            require(file_io::valid_durable_identity(*pair.second) && (!file_io::has_durable_identity(*pair.second) ||
+                (*pair.first && (**pair.first).inode)), "queued migration native evidence lacks its output stamp");
+        require(!output.published || (output.verified_stage && replot_output_matches(*output.verified_stage, output.verified_stage_identity,
+            *output.published, output.published_identity, true)), "queued migration publication lacks its checked stage");
+        require(!output.ready || (!journal.completed_lanes.empty() && output.published && replot_output_matches(*output.published, output.published_identity,
+            *output.ready, output.ready_identity)), "queued migration readiness lacks its exact immutable publication");
+        previous = output.batch;
+    }
     require(!journal.full_proof_validated || journal.verified_stage.has_value(), "migration proof evidence has no structurally checked stage");
     require(replot_digest(journal.review_digest) && (journal.policy_digest.empty() || (replot_digest(journal.policy_digest) && journal.revision > 1)) && journal.revision &&
         ((journal.revision == 1 && journal.parent_digest.empty()) ||
@@ -603,7 +716,7 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
     validate_replot_journal(journal);
     std::ostringstream out;
     bool const durable = replot_journal_native_evidence(journal);
-    out << (journal.full_proof_validated ? "ordinary-group-replot-journal-v4\n" : durable ? "ordinary-group-replot-journal-v3\n" : journal.policy_digest.empty() ? "ordinary-group-replot-journal-v1\n" : "ordinary-group-replot-journal-v2\n") << std::quoted(journal.review_digest) << ' '
+    out << (!journal.completed_lanes.empty() ? "ordinary-group-replot-journal-v6\n" : journal.queued_publications ? "ordinary-group-replot-journal-v5\n" : journal.full_proof_validated ? "ordinary-group-replot-journal-v4\n" : durable ? "ordinary-group-replot-journal-v3\n" : journal.policy_digest.empty() ? "ordinary-group-replot-journal-v1\n" : "ordinary-group-replot-journal-v2\n") << std::quoted(journal.review_digest) << ' '
         << journal.revision << ' ' << std::quoted(journal.parent_digest) << ' ' << unsigned(journal.phase) << ' ' << journal.batch << ' '
         << journal.retired_prefix << ' ' << std::quoted(journal.receipt_digest) << '\n'
         << std::quoted(farming_state_text(journal.farm)) << '\n' << journal.retirements.size();
@@ -616,10 +729,48 @@ inline std::string replot_journal_text(ReplotJournal const& journal)
             << stamp.mtime << ' ' << stamp.ctime << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns; }
         out << '\n';
     }
-    if (durable || !journal.policy_digest.empty() || journal.full_proof_validated) out << std::quoted(journal.policy_digest) << '\n';
-    if (durable || journal.full_proof_validated) for (auto const* identity : {&journal.verified_stage_identity, &journal.published_identity, &journal.ready_identity})
+    if (journal.queued_publications || durable || !journal.policy_digest.empty() || journal.full_proof_validated) out << std::quoted(journal.policy_digest) << '\n';
+    if (journal.queued_publications || durable || journal.full_proof_validated) for (auto const* identity : {&journal.verified_stage_identity, &journal.published_identity, &journal.ready_identity})
         write_replot_native_identity(out, *identity);
-    if (journal.full_proof_validated) out << *journal.full_proof_validated << '\n';
+    if (journal.queued_publications)
+    {
+        out << journal.full_proof_validated.has_value();
+        if (journal.full_proof_validated) out << ' ' << *journal.full_proof_validated;
+        out << '\n' << journal.queued.size() << '\n';
+        for (auto const& output : journal.queued)
+        {
+            out << output.batch << ' ' << output.retirements.size();
+            for (auto const& progress : output.retirements) out << ' ' << unsigned(progress.state) << ' ' << progress.predelete;
+            out << '\n';
+            for (auto const* value : {&output.verified_stage, &output.published})
+            {
+                out << value->has_value();
+                if (*value) { auto const& stamp = **value; out << ' ' << stamp.device << ' ' << stamp.inode << ' ' << stamp.bytes << ' '
+                    << stamp.mtime << ' ' << stamp.ctime << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns; }
+                out << '\n';
+            }
+            write_replot_native_identity(out, output.verified_stage_identity); write_replot_native_identity(out, output.published_identity);
+            out << output.full_proof_validated.has_value();
+            if (output.full_proof_validated) out << ' ' << *output.full_proof_validated;
+            out << '\n';
+            if (!journal.completed_lanes.empty())
+            {
+                out << output.ready.has_value();
+                if (output.ready) { auto const& stamp = *output.ready; out << ' ' << stamp.device << ' ' << stamp.inode << ' ' << stamp.bytes << ' '
+                    << stamp.mtime << ' ' << stamp.ctime << ' ' << stamp.mtime_ns << ' ' << stamp.ctime_ns; }
+                out << '\n'; write_replot_native_identity(out, output.ready_identity);
+            }
+        }
+        out << std::quoted(journal.authority_directory) << ' ' << std::quoted(journal.authority_identity) << ' '
+            << std::quoted(journal.authority_host) << ' ' << std::quoted(journal.authority_user) << ' ' << journal.authority_revision << '\n';
+        if (!journal.completed_lanes.empty())
+        {
+            out << journal.completed_lanes.size() << '\n';
+            for (auto const& lane : journal.completed_lanes) out << lane.baseline_files << ' ' << lane.files << ' '
+                << std::quoted(lane.baseline_digest) << ' ' << std::quoted(lane.digest) << '\n';
+        }
+    }
+    else if (journal.full_proof_validated) out << *journal.full_proof_validated << '\n';
     return out.str();
 }
 inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memory_limit)
@@ -627,7 +778,7 @@ inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memo
     require(body.size() < memory_limit / 8, "replot journal exceeds its parsing memory budget");
     std::istringstream in(body); std::string version, farm; unsigned phase = 0;
     std::getline(in, version); require(version == "ordinary-group-replot-journal-v1" || version == "ordinary-group-replot-journal-v2" ||
-        version == "ordinary-group-replot-journal-v3" || version == "ordinary-group-replot-journal-v4", "unsupported replot journal version");
+        version == "ordinary-group-replot-journal-v3" || version == "ordinary-group-replot-journal-v4" || version == "ordinary-group-replot-journal-v5" || version == "ordinary-group-replot-journal-v6", "unsupported replot journal version");
     ReplotJournal result; size_t count = 0;
     in >> std::quoted(result.review_digest) >> result.revision >> std::quoted(result.parent_digest) >> phase >> result.batch
         >> result.retired_prefix >> std::quoted(result.receipt_digest) >> std::quoted(farm);
@@ -657,13 +808,63 @@ inline ReplotJournal parse_replot_journal(std::string const& body, uint64_t memo
     require(bool(in), "incomplete replot readiness record");
     if (version != "ordinary-group-replot-journal-v1")
     { in >> std::quoted(result.policy_digest); require(in && (result.policy_digest.empty() ? version != "ordinary-group-replot-journal-v2" : replot_digest(result.policy_digest)), "invalid replot active policy digest"); }
-    if (version == "ordinary-group-replot-journal-v3" || version == "ordinary-group-replot-journal-v4")
+    if (version == "ordinary-group-replot-journal-v3" || version == "ordinary-group-replot-journal-v4" || version == "ordinary-group-replot-journal-v5" || version == "ordinary-group-replot-journal-v6")
     {
         for (auto* identity : {&result.verified_stage_identity, &result.published_identity, &result.ready_identity}) *identity = read_replot_native_identity(in);
-        require(version == "ordinary-group-replot-journal-v4" || replot_journal_native_evidence(result), "migration native journal schema has no object evidence");
+        require(version != "ordinary-group-replot-journal-v3" || replot_journal_native_evidence(result), "migration native journal schema has no object evidence");
     }
     if (version == "ordinary-group-replot-journal-v4")
     { unsigned proof = 0; in >> proof; require(in && proof <= 1, "invalid migration full-proof evidence"); result.full_proof_validated = bool(proof); }
+    if (version == "ordinary-group-replot-journal-v5" || version == "ordinary-group-replot-journal-v6")
+    {
+        result.queued_publications = true;
+        bool evidence = false; in >> evidence;
+        if (evidence) { bool proof = false; in >> proof; result.full_proof_validated = proof; }
+        in >> count; require(in && count < replot_pending_output_limit, "migration publication queue exceeds its parsing bound");
+        result.queued.resize(count);
+        for (auto& output : result.queued)
+        {
+            size_t retirements = 0; in >> output.batch >> retirements;
+            require(in && retirements <= replot_maximum_batch_sources && retirements < memory_limit / 64, "queued migration retirements exceed their parsing bound");
+            output.retirements.resize(retirements);
+            for (auto& progress : output.retirements)
+            {
+                unsigned value = 0; in >> value >> progress.predelete;
+                require(in && value <= unsigned(ReplotRetirement::retired), "invalid queued migration retirement"); progress.state = ReplotRetirement(value);
+            }
+            for (auto* value : {&output.verified_stage, &output.published})
+            {
+                bool present = false; in >> present;
+                if (present)
+                {
+                    stream_state::Stamp stamp;
+                    in >> stamp.device >> stamp.inode >> stamp.bytes >> stamp.mtime >> stamp.ctime >> stamp.mtime_ns >> stamp.ctime_ns;
+                    require(in && stamp.bytes && stamp.mtime_ns < 1000000000 && stamp.ctime_ns < 1000000000, "invalid queued migration output stamp");
+                    *value = stamp;
+                }
+            }
+            output.verified_stage_identity = read_replot_native_identity(in); output.published_identity = read_replot_native_identity(in);
+            in >> evidence; if (evidence) { bool proof = false; in >> proof; output.full_proof_validated = proof; }
+            if (version == "ordinary-group-replot-journal-v6")
+            {
+                bool ready = false; in >> ready;
+                if (ready) { stream_state::Stamp stamp; in >> stamp.device >> stamp.inode >> stamp.bytes >> stamp.mtime >> stamp.ctime >> stamp.mtime_ns >> stamp.ctime_ns;
+                    require(in && stamp.bytes && stamp.mtime_ns < 1000000000 && stamp.ctime_ns < 1000000000, "invalid queued migration ready stamp"); output.ready = stamp; }
+                output.ready_identity = read_replot_native_identity(in);
+            }
+            require(bool(in), "incomplete queued migration output");
+        }
+        in >> std::quoted(result.authority_directory) >> std::quoted(result.authority_identity) >> std::quoted(result.authority_host)
+            >> std::quoted(result.authority_user) >> result.authority_revision;
+        require(bool(in), "incomplete migration controller authority");
+        if (version == "ordinary-group-replot-journal-v6")
+        {
+            in >> count; require(in && count == result.farm.directories.size() && count < memory_limit / 256, "migration completion lanes exceed their parsing bound");
+            result.completed_lanes.resize(count);
+            for (auto& lane : result.completed_lanes) in >> lane.baseline_files >> lane.files >> std::quoted(lane.baseline_digest) >> std::quoted(lane.digest);
+            require(bool(in), "incomplete migration destination completion prefixes");
+        }
+    }
     in >> std::ws; require(in.eof(), "unexpected replot journal data");
     validate_replot_journal(result); return result;
 }
@@ -674,6 +875,132 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
     if (before.revision == UINT64_MAX || after.revision != before.revision + 1 ||
         after.parent_digest != stream_state::digest(replot_journal_text(before)) ||
         before.review_digest != after.review_digest || farming_state_text(before.farm) != farming_state_text(after.farm)) return false;
+    if (before.completed_lanes != after.completed_lanes)
+    {
+        auto unchanged = after; unchanged.revision = before.revision; unchanged.parent_digest = before.parent_digest;
+        if (before.completed_lanes.empty())
+        {
+            if (after.completed_lanes.size() != before.farm.directories.size()) return false;
+            uint64_t prefix = 0;
+            for (size_t lane = 0; lane < after.completed_lanes.size(); ++lane)
+            {
+                auto const& progress = after.completed_lanes[lane]; auto const files = before.farm.directories[lane].layout.files;
+                auto const completed = before.batch > prefix ? std::min(files, before.batch - prefix) : 0;
+                if (progress.baseline_files != completed || progress.files != completed || progress.baseline_digest != progress.digest) return false;
+                prefix += files;
+            }
+        }
+        else
+        {
+            if (before.completed_lanes.size() != after.completed_lanes.size()) return false;
+            std::optional<size_t> completed_lane;
+            for (size_t lane = 0; lane < before.completed_lanes.size(); ++lane)
+            {
+                auto const& a = before.completed_lanes[lane]; auto const& b = after.completed_lanes[lane];
+                if (a == b) continue;
+                if (completed_lane || a.files == UINT64_MAX || b.files != a.files + 1 || b.baseline_files != a.baseline_files ||
+                    b.baseline_digest != a.baseline_digest || b.digest == a.digest) return false;
+                completed_lane = lane;
+            }
+            if (!completed_lane) return false;
+            auto const lane = *completed_lane; uint64_t batch = before.completed_lanes[lane].files;
+            for (size_t previous = 0; previous < lane; ++previous) batch += before.farm.directories[previous].layout.files;
+            if (batch == before.batch && before.ready && std::all_of(before.retirements.begin(), before.retirements.end(), [](auto const& p) { return p.state == ReplotRetirement::retired; }))
+            { if (after.queued != before.queued) return false; }
+            else
+            {
+                auto const at = std::find_if(before.queued.begin(), before.queued.end(), [&](auto const& output) { return output.batch == batch; });
+                if (at == before.queued.end() || !at->ready || !std::all_of(at->retirements.begin(), at->retirements.end(), [](auto const& p) { return p.state == ReplotRetirement::retired; })) return false;
+                auto expected = before.queued; expected.erase(expected.begin() + (at - before.queued.begin()));
+                if (after.queued != expected) return false;
+                unchanged.queued = before.queued;
+            }
+        }
+        unchanged.completed_lanes = before.completed_lanes;
+        return replot_journal_text(unchanged) == replot_journal_text(before);
+    }
+    if (before.authority_directory != after.authority_directory || before.authority_identity != after.authority_identity ||
+        before.authority_host != after.authority_host || before.authority_user != after.authority_user || before.authority_revision != after.authority_revision)
+    {
+        if (!before.authority_directory.empty() || after.authority_directory.empty() || after.authority_revision != after.revision || before.phase >= ReplotPhase::handoff) return false;
+        auto unchanged = after; unchanged.revision = before.revision; unchanged.parent_digest = before.parent_digest;
+        unchanged.authority_directory.clear(); unchanged.authority_identity.clear(); unchanged.authority_host.clear(); unchanged.authority_user.clear(); unchanged.authority_revision = 0;
+        unchanged.queued_publications = before.queued_publications;
+        return replot_journal_text(unchanged) == replot_journal_text(before);
+    }
+    if (before.queued_publications && !after.queued_publications) return false;
+    if (before.queued != after.queued || before.queued_publications != after.queued_publications)
+    {
+        auto unchanged = after; unchanged.revision = before.revision; unchanged.parent_digest = before.parent_digest;
+        unchanged.queued_publications = before.queued_publications; unchanged.queued = before.queued;
+        // Adoption transfers exactly one queued object's evidence to the active
+        // batch; a crash before/after this revision retains one authority.
+        if (!before.queued.empty() && before.queued.front().batch == before.batch &&
+            after.queued.size() + 1 == before.queued.size() &&
+            std::equal(after.queued.begin(), after.queued.end(), before.queued.begin() + 1))
+        {
+            auto const& output = before.queued.front();
+            if (before.verified_stage || before.published || before.ready || after.ready != output.ready ||
+                after.verified_stage != output.verified_stage || after.published != output.published ||
+                after.verified_stage_identity != output.verified_stage_identity || after.published_identity != output.published_identity || after.ready_identity != output.ready_identity ||
+                after.full_proof_validated != output.full_proof_validated || after.retirements != output.retirements) return false;
+            unchanged.verified_stage = before.verified_stage; unchanged.published = before.published; unchanged.ready = before.ready;
+            unchanged.verified_stage_identity = before.verified_stage_identity; unchanged.published_identity = before.published_identity; unchanged.ready_identity = before.ready_identity;
+            unchanged.full_proof_validated = before.full_proof_validated; unchanged.retirements = before.retirements;
+        }
+        else if (after.queued.size() == before.queued.size() + 1)
+        {
+            auto expected = after.queued;
+            auto const added = std::find_if(expected.begin(), expected.end(), [&](auto const& output)
+                { return std::none_of(before.queued.begin(), before.queued.end(), [&](auto const& previous) { return previous.batch == output.batch; }); });
+            if (added == expected.end()) return false;
+            auto const output = *added; expected.erase(added);
+            if (expected != before.queued) return false;
+            if (output.batch <= before.batch || output.verified_stage || output.published || output.ready || output.full_proof_validated ||
+                std::any_of(output.retirements.begin(), output.retirements.end(), [](auto const& progress)
+                    { return progress.state != ReplotRetirement::active || progress.predelete; })) return false;
+        }
+        else if (after.queued.size() == before.queued.size())
+        {
+            size_t changes = 0;
+            for (size_t index = 0; index < before.queued.size(); ++index)
+            {
+                auto const& a = before.queued[index]; auto const& b = after.queued[index];
+                if (a == b) continue;
+                if (a.batch != b.batch || a.retirements.size() != b.retirements.size()) return false;
+                auto changed = b;
+                size_t retirement_changes = 0;
+                for (size_t source = 0; source < a.retirements.size(); ++source)
+                {
+                    auto const old = a.retirements[source], next = b.retirements[source];
+                    if (old == next) continue;
+                    if (unsigned(next.state) != unsigned(old.state) + 1 || (!next.predelete && !a.ready) ||
+                        (old.state != ReplotRetirement::active && old.predelete != next.predelete)) return false;
+                    ++retirement_changes;
+                }
+                if (retirement_changes)
+                {
+                    if (retirement_changes != 1) return false;
+                    changed.retirements = a.retirements;
+                    if (changed != a) return false;
+                }
+                else if (!a.ready && b.ready)
+                {
+                    changed.ready = a.ready; changed.ready_identity = a.ready_identity;
+                    if (changed != a) return false;
+                }
+                else if ((!a.verified_stage && b.published) || (a.verified_stage && (a.verified_stage != b.verified_stage ||
+                    a.verified_stage_identity != b.verified_stage_identity || a.full_proof_validated != b.full_proof_validated)) ||
+                    (a.published && (a.published != b.published || a.published_identity != b.published_identity)) || a.ready != b.ready || a.ready_identity != b.ready_identity ||
+                    (!a.verified_stage && !b.verified_stage) ||
+                    (a.verified_stage.has_value() == b.verified_stage.has_value() && a.published.has_value() == b.published.has_value())) return false;
+                ++changes;
+            }
+            if (changes != 1 && (before.queued_publications || !after.queued.empty())) return false;
+        }
+        else return false;
+        return replot_journal_text(unchanged) == replot_journal_text(before);
+    }
     if (before.policy_digest != after.policy_digest)
     {
         // The coordinator separately binds this one transition to an explicit
@@ -682,7 +1009,7 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
             after.batch == before.batch && after.retired_prefix == before.retired_prefix && after.receipt_digest == before.receipt_digest &&
             after.retirements == before.retirements && after.verified_stage == before.verified_stage && after.published == before.published && after.ready == before.ready &&
             after.verified_stage_identity == before.verified_stage_identity && after.published_identity == before.published_identity && after.ready_identity == before.ready_identity &&
-            after.full_proof_validated == before.full_proof_validated;
+            after.full_proof_validated == before.full_proof_validated && after.queued == before.queued;
     }
     if (after.phase < before.phase || unsigned(after.phase) > unsigned(before.phase) + 1 ||
         after.batch < before.batch || after.batch > before.batch + 1) return false;
@@ -690,10 +1017,11 @@ inline bool valid_replot_revision(ReplotJournal const& before, ReplotJournal con
     // and exact next batch come from the immutable review at the controller.
     if (after.batch == before.batch + 1)
     {
-        return before.phase == ReplotPhase::replacing && after.phase == before.phase && before.ready && !after.verified_stage && !after.published && !after.ready && !after.full_proof_validated &&
+        return before.phase == ReplotPhase::replacing && after.phase == before.phase && (before.ready || replot_lane_completed(before, before.batch)) && !after.verified_stage && !after.published && !after.ready && !after.full_proof_validated &&
             after.retired_prefix == before.retired_prefix + before.retirements.size() &&
             replot_digest(after.receipt_digest) && after.receipt_digest != before.receipt_digest &&
-            std::all_of(before.retirements.begin(), before.retirements.end(), [](auto value) { return value.state == ReplotRetirement::retired; }) &&
+            (std::all_of(before.retirements.begin(), before.retirements.end(), [](auto value) { return value.state == ReplotRetirement::retired; }) ||
+                (replot_lane_completed(before, before.batch) && std::all_of(before.retirements.begin(), before.retirements.end(), [](auto value) { return value.state == ReplotRetirement::active && !value.predelete; }))) &&
             std::all_of(after.retirements.begin(), after.retirements.end(), [](auto value) { return value.state == ReplotRetirement::active && !value.predelete; });
     }
     if (before.retired_prefix != after.retired_prefix || before.receipt_digest != after.receipt_digest ||
@@ -736,6 +1064,14 @@ inline void validate_replot_progress(ReplotReview const& review, ReplotJournal c
     policy.pool = std::string(policy.pool_public_key ? 96 : 64, '0');
     require(farming_state_text(policy) == farming_state_text(review.farm), "private migration assignments differ from the original review");
     require(journal.batch <= review.batches.size(), "private migration batch exceeds its reviewed assignment");
+    for (auto const& output : journal.queued)
+    {
+        require(output.batch < review.batches.size() && output.retirements.size() == review.batches[size_t(output.batch)].sources && (!review.verification || !output.verified_stage || output.full_proof_validated.has_value()),
+            "queued migration output lacks its reviewed verification evidence");
+        require(!review.verification || !output.verified_stage || !journal.policy_digest.empty() ||
+            !replot_requires_proof(*review.verification, output.batch) || output.full_proof_validated.value_or(false),
+            "queued migration sample lacks its completed full proof");
+    }
     bool const active = journal.batch < review.batches.size();
     auto const first = active ? review.batches[size_t(journal.batch)].first_source : review.sources.size();
     auto const count = active ? review.batches[size_t(journal.batch)].sources : 0;
@@ -793,17 +1129,19 @@ struct ReplotReceipt
     stream_state::Stamp replacement;
     file_io::DurableIdentity replacement_identity;
     std::optional<bool> full_proof_validated;
+    bool lane_chain = false;
 };
 inline std::string replot_receipt_text(ReplotReceipt const& receipt)
 {
-    require(replot_digest(receipt.review_digest) && (receipt.batch ? replot_digest(receipt.previous_digest) : receipt.previous_digest.empty()) &&
+    require(replot_digest(receipt.review_digest) && (receipt.lane_chain ? receipt.previous_digest.empty() || replot_digest(receipt.previous_digest) :
+            receipt.batch ? replot_digest(receipt.previous_digest) : receipt.previous_digest.empty()) && (!receipt.lane_chain || receipt.full_proof_validated.has_value()) &&
         receipt.candidates <= replot_maximum_batch_sources && receipt.first_candidate <= farming_detail::maximum_files - receipt.candidates &&
         receipt.replacement.bytes && file_io::valid_durable_identity(receipt.replacement_identity) &&
         (!file_io::has_durable_identity(receipt.replacement_identity) || receipt.replacement.inode), "invalid replot receipt");
     auto const& stamp = receipt.replacement;
     std::ostringstream out;
     bool const durable = file_io::has_durable_identity(receipt.replacement_identity);
-    out << (receipt.full_proof_validated ? "ordinary-group-replot-receipt-v3\n" : durable ? "ordinary-group-replot-receipt-v2\n" : "ordinary-group-replot-receipt-v1\n") << std::quoted(receipt.review_digest) << ' '
+    out << (receipt.lane_chain ? "ordinary-group-replot-receipt-v4\n" : receipt.full_proof_validated ? "ordinary-group-replot-receipt-v3\n" : durable ? "ordinary-group-replot-receipt-v2\n" : "ordinary-group-replot-receipt-v1\n") << std::quoted(receipt.review_digest) << ' '
         << receipt.batch << ' ' << std::quoted(receipt.previous_digest) << ' ' << receipt.first_candidate << ' ' << receipt.candidates << '\n'
         << stamp.device << ' ' << stamp.inode << ' ' << stamp.bytes << ' ' << stamp.mtime << ' ' << stamp.ctime << ' '
         << stamp.mtime_ns << ' ' << stamp.ctime_ns << '\n';
@@ -816,14 +1154,14 @@ inline ReplotReceipt parse_replot_receipt(std::string const& body)
     require(body.size() <= 4096, "replot receipt exceeds its bound");
     std::istringstream in(body); std::string version; std::getline(in, version);
     require(version == "ordinary-group-replot-receipt-v1" || version == "ordinary-group-replot-receipt-v2" ||
-        version == "ordinary-group-replot-receipt-v3", "unsupported replot receipt version");
-    ReplotReceipt result; auto& stamp = result.replacement;
+        version == "ordinary-group-replot-receipt-v3" || version == "ordinary-group-replot-receipt-v4", "unsupported replot receipt version");
+    ReplotReceipt result; result.lane_chain = version == "ordinary-group-replot-receipt-v4"; auto& stamp = result.replacement;
     in >> std::quoted(result.review_digest) >> result.batch >> std::quoted(result.previous_digest) >> result.first_candidate >> result.candidates
         >> stamp.device >> stamp.inode >> stamp.bytes >> stamp.mtime >> stamp.ctime >> stamp.mtime_ns >> stamp.ctime_ns;
     require(in && stamp.mtime_ns < 1000000000 && stamp.ctime_ns < 1000000000, "invalid replot receipt stamp");
     if (version != "ordinary-group-replot-receipt-v1")
-    { result.replacement_identity = read_replot_native_identity(in); require(version == "ordinary-group-replot-receipt-v3" || file_io::has_durable_identity(result.replacement_identity), "migration native receipt schema has no object evidence"); }
-    if (version == "ordinary-group-replot-receipt-v3")
+    { result.replacement_identity = read_replot_native_identity(in); require(version == "ordinary-group-replot-receipt-v3" || result.lane_chain || file_io::has_durable_identity(result.replacement_identity), "migration native receipt schema has no object evidence"); }
+    if (version == "ordinary-group-replot-receipt-v3" || result.lane_chain)
     { unsigned proof = 0; in >> proof; require(in && proof <= 1, "invalid migration receipt full-proof evidence"); result.full_proof_validated = bool(proof); }
     in >> std::ws; require(in.eof(), "unexpected replot receipt data");
     (void)replot_receipt_text(result); return result;
@@ -834,7 +1172,7 @@ inline void validate_replot_receipt(ReplotReview const& review, std::string cons
     auto const& plan = review.batches.at(size_t(batch));
     require(!review.verification || receipt.full_proof_validated.has_value(),
         "explicit migration receipt lacks its completed verification evidence");
-    require(receipt.review_digest == review_digest && receipt.batch == batch && receipt.previous_digest == previous &&
+    require(!receipt.lane_chain && receipt.review_digest == review_digest && receipt.batch == batch && receipt.previous_digest == previous &&
         receipt.first_candidate == plan.first_source && receipt.candidates == plan.sources,
         "migration receipt chain differs from the review");
 }
@@ -850,6 +1188,31 @@ inline void complete_replot_batch(ReplotReview const& review, ReplotReceipt cons
     state.retired_prefix += state.retirements.size(); ++state.batch; state.receipt_digest = receipt_digest;
     state.verified_stage.reset(); state.published.reset(); state.ready.reset(); state.retirements.clear();
     state.full_proof_validated.reset();
+    state.verified_stage_identity = {}; state.published_identity = {}; state.ready_identity = {};
+    if (state.batch < review.batches.size()) state.retirements.resize(size_t(review.batches[size_t(state.batch)].sources));
+}
+inline void validate_replot_completion(ReplotReview const& review, ReplotJournal const& state, uint64_t batch,
+    std::string const& previous, ReplotReceipt const& receipt)
+{
+    auto const& plan = review.batches.at(size_t(batch));
+    require(receipt.lane_chain && receipt.review_digest == state.review_digest && receipt.batch == batch &&
+        receipt.first_candidate == plan.first_source && receipt.candidates == plan.sources && receipt.previous_digest == previous &&
+        receipt.full_proof_validated.has_value(), "migration destination completion differs from its immutable assignment or receipt chain");
+}
+inline void complete_replot_deferred_batch(ReplotReview const& review, ReplotReceipt const& completed, ReplotReceipt const& receipt,
+    std::string const& receipt_digest, ReplotJournal& state)
+{
+    validate_replot_progress(review, state);
+    validate_replot_receipt(review, state.review_digest, state.batch, state.receipt_digest, receipt);
+    require(replot_lane_completed(state, state.batch) && completed.lane_chain && completed.batch == state.batch &&
+        completed.review_digest == state.review_digest && completed.first_candidate == receipt.first_candidate && completed.candidates == receipt.candidates &&
+        completed.replacement == receipt.replacement && completed.replacement_identity == receipt.replacement_identity &&
+        completed.full_proof_validated == receipt.full_proof_validated && replot_digest(receipt_digest),
+        "global migration receipt lacks its exact confirmed destination completion");
+    require(state.ready || (!state.verified_stage && !state.published && std::all_of(state.retirements.begin(), state.retirements.end(),
+        [](auto const& progress) { return progress.state == ReplotRetirement::active && !progress.predelete; })), "deferred completion contradicts active source retirement authority");
+    state.retired_prefix += state.retirements.size(); ++state.batch; state.receipt_digest = receipt_digest;
+    state.verified_stage.reset(); state.published.reset(); state.ready.reset(); state.retirements.clear(); state.full_proof_validated.reset();
     state.verified_stage_identity = {}; state.published_identity = {}; state.ready_identity = {};
     if (state.batch < review.batches.size()) state.retirements.resize(size_t(review.batches[size_t(state.batch)].sources));
 }
@@ -921,6 +1284,28 @@ inline ReplotJob parse_replot_job(std::string const& body, uint64_t memory_limit
         farm::inventory_detail::hex(job.pool, job.pool_public_key ? 48 : 32), "invalid private migration key identity");
     return job;
 }
+inline std::filesystem::path replot_authority_directory(std::string const& review_digest)
+{
+    require(replot_digest(review_digest), "invalid migration authority identity");
+#ifdef _WIN32
+    auto const* base = ::_wgetenv(L"LOCALAPPDATA");
+    require(base && *base, "LOCALAPPDATA is required for durable migration coordination");
+    return std::filesystem::path(base) / "xchplot2" / "migrations" / review_digest;
+#else
+    auto const* state = std::getenv("XDG_STATE_HOME");
+    if (state && *state) return file_io::native_path(state) / "xchplot2" / "migrations" / review_digest;
+    auto const* home = std::getenv("HOME"); require(home && *home, "HOME or XDG_STATE_HOME is required for durable migration coordination");
+    return file_io::native_path(home) / ".local" / "state" / "xchplot2" / "migrations" / review_digest;
+#endif
+}
+inline std::string replot_authority_user()
+{
+#ifdef _WIN32
+    pos2gpu::PrivateFileSecurity security; std::wstring const sid(security.sid_text); return {sid.begin(), sid.end()};
+#else
+    return std::to_string(::geteuid());
+#endif
+}
 struct ReplotJournalReplica
 {
     std::filesystem::path path;
@@ -934,7 +1319,8 @@ struct ReplotJournalSet
     ReplotJournal state;
     std::string digest;
     std::vector<ReplotJournalReplica> replicas;
-    bool present = false;
+    bool present = false, authority_missing = false;
+    std::optional<ReplotJournalReplica> authority;
 };
 inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path const> directories,
     std::string const& review_digest, uint64_t memory_limit, bool allow_missing = false)
@@ -942,6 +1328,30 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
     require(!directories.empty() && directories.size() <= 1024, "invalid replot replica scope");
     ReplotJournalSet result;
     bool const legacy = farming_metadata_legacy(directories);
+    auto authority_root = replot_authority_directory(review_digest);
+    auto authority_metadata = std::make_shared<FarmingMetadataDirectory>(authority_root, false);
+    if (authority_metadata->root_pin)
+    {
+        ReplotJournalReplica replica; replica.metadata = authority_metadata; replica.path = authority_metadata->path / "grow-replot.plan";
+        for (bool pending : {false, true})
+        {
+            auto const path = pending ? file_io::native_path(file_io::path_text(replica.path) + ".next") : replica.path;
+            file_io::Stat info{};
+            if (file_io::inspect_link(path, &info)) { require(errno == ENOENT, "cannot inspect migration controller journal"); continue; }
+            auto const file = read_farming_state(path, memory_limit / 4); auto state = parse_replot_journal(file.body, memory_limit / 4);
+            require(state.review_digest == review_digest && state.authority_directory == file_io::path_text(authority_root) &&
+                state.authority_identity == farming_directory_identity(authority_root) && state.authority_host == profile_detail::host_name() &&
+                state.authority_user == replot_authority_user(), "migration controller authority changed its native directory, host or user");
+            if (result.present)
+                require(state.revision == result.state.revision ? file.digest == result.digest : valid_replot_revision(result.state, state),
+                    "migration controller journal has conflicting or rolled-back revisions");
+            result.state = std::move(state); result.digest = file.digest; result.present = true;
+            if (pending) { replica.pending = file.stamp; replica.pending_digest = file.digest; }
+            else { replica.published = file.stamp; replica.digest = file.digest; }
+        }
+        if (result.present) result.authority = std::move(replica);
+    }
+    bool const authoritative = result.authority.has_value();
     std::optional<ReplotJournal> previous;
     uint64_t minimum = UINT64_MAX, maximum = 0;
     for (auto const& directory : directories)
@@ -950,7 +1360,7 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
         replica.metadata = std::make_shared<FarmingMetadataDirectory>(directory, legacy);
         replica.path = replica.metadata->path / "grow-replot.plan";
         replica.available = bool(replica.metadata->root_pin);
-        require(replica.available || allow_missing, "all replot destinations must be available");
+        require(replica.available || allow_missing || authoritative, "all replot destinations must be available before controller authority is established");
         if (!replica.available) { result.replicas.push_back(std::move(replica)); continue; }
         for (bool pending : {false, true})
         {
@@ -960,6 +1370,31 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
             auto file = read_farming_state(path, memory_limit / 4);
             auto state = parse_replot_journal(file.body, memory_limit / 4);
             require(state.review_digest == review_digest, "replot journal belongs to another reviewed migration");
+            if (authoritative)
+            {
+                require(state.revision <= result.state.revision, "destination journal is newer than its controller authority; preserve all copies and inspect the fork");
+                require(state.revision < result.state.authority_revision ? state.authority_directory.empty() :
+                    state.authority_directory == result.state.authority_directory && state.authority_identity == result.state.authority_identity &&
+                    state.authority_host == result.state.authority_host && state.authority_user == result.state.authority_user && state.authority_revision == result.state.authority_revision,
+                    "destination journal belongs to another migration controller authority");
+                require(state.revision != result.state.revision || file.digest == result.digest, "destination journal conflicts with its controller authority");
+                require(farming_state_text(state.farm) == farming_state_text(result.state.farm) && state.batch <= result.state.batch &&
+                    state.retired_prefix <= result.state.retired_prefix && state.phase <= result.state.phase, "destination journal contradicts controller progress");
+                if (!state.completed_lanes.empty())
+                {
+                    require(state.completed_lanes.size() == result.state.completed_lanes.size(), "destination completion authority is newer than its controller");
+                    for (size_t lane = 0; lane < state.completed_lanes.size(); ++lane)
+                    {
+                        auto const& prior = state.completed_lanes[lane]; auto const& current = result.state.completed_lanes[lane];
+                        require(prior.baseline_files == current.baseline_files && prior.baseline_digest == current.baseline_digest &&
+                            prior.files <= current.files && (prior.files != current.files || prior.digest == current.digest),
+                            "destination completion prefix conflicts with or is newer than its controller authority");
+                    }
+                }
+                if (pending) { replica.pending = file.stamp; replica.pending_digest = std::move(file.digest); }
+                else { replica.published = file.stamp; replica.digest = std::move(file.digest); }
+                continue;
+            }
             require(!result.present || state.revision == result.state.revision ||
                 (state.revision > result.state.revision ? state.revision - result.state.revision == 1 : result.state.revision - state.revision == 1),
                 "replot journal replicas have an invalid revision gap");
@@ -981,16 +1416,22 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
         result.replicas.push_back(std::move(replica));
     }
     if (previous) require(valid_replot_revision(*previous, result.state), "invalid replot journal parent transition");
+    result.authority_missing = result.present && !result.state.authority_directory.empty() && !result.authority;
+    require(!result.authority_missing || allow_missing, "migration controller authority is unavailable; restore its saved native state directory before recovery");
     return result;
 }
 inline bool replot_journals_unchanged(ReplotJournalSet const& saved)
 {
     try
     {
-        for (auto const& replica : saved.replicas)
+        std::vector<ReplotJournalReplica const*> replicas;
+        if (saved.authority) replicas.push_back(&*saved.authority);
+        for (auto const& replica : saved.replicas) replicas.push_back(&replica);
+        for (auto const* entry : replicas)
         {
-            replica.metadata->check();
+            auto const& replica = *entry;
             if (!replica.available) continue;
+            replica.metadata->check();
             for (bool pending : {false, true})
             {
                 auto const path = pending ? file_io::native_path(file_io::path_text(replica.path) + ".next") : replica.path;
@@ -1017,12 +1458,21 @@ inline void publish_replot_journals(ReplotJournalSet& saved, ReplotJournal const
         if (expected) require(stream_state::stamp(path) == *expected, "replot journal changed during migration");
         else require(file_io::inspect_link(path, &info) && errno == ENOENT, "unrelated replot journal appeared during migration");
     };
+    require(!saved.authority_missing && (state.authority_directory.empty() || saved.authority), "migration publication requires its durable controller authority");
     check();
-    for (auto& replica : saved.replicas)
+    std::vector<ReplotJournalReplica*> replicas;
+    if (saved.authority) replicas.push_back(&*saved.authority);
+    for (auto& replica : saved.replicas) if (replica.available) replicas.push_back(&replica);
+    for (auto* entry : replicas)
     {
-        replica.metadata->create();
+        auto& replica = *entry; replica.metadata->create();
         auto const pending = file_io::native_path(file_io::path_text(replica.path) + ".next");
         inspect(replica.path, replica.published); inspect(pending, replica.pending);
+        if (replica.pending && replica.pending_digest != digest && saved.authority && &replica != &*saved.authority)
+        {
+            require(!file_io::unlink_file(pending), "cannot reclaim stale destination journal staging after controller reconciliation");
+            stream_state::sync_path(pending.parent_path(), true); replica.pending.reset(); replica.pending_digest.clear();
+        }
         if (replica.pending)
             require(replica.pending_digest == digest, "recover pending replot journal before a new revision");
         else if (!replica.published || replica.digest != digest)
@@ -1032,8 +1482,9 @@ inline void publish_replot_journals(ReplotJournalSet& saved, ReplotJournal const
         }
     }
     grow_failpoint("replot-journal-all-staged");
-    for (auto& replica : saved.replicas) if (replica.pending)
+    for (auto* entry : replicas) if (entry->pending)
     {
+        auto& replica = *entry;
         check(); replica.metadata->check(); auto const pending = file_io::native_path(file_io::path_text(replica.path) + ".next");
         inspect(replica.path, replica.published); inspect(pending, replica.pending);
         publish_farming_state(pending, replica.path, replica.published.has_value());

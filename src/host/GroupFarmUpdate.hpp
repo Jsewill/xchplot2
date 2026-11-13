@@ -421,6 +421,8 @@ class FarmingUpdateMailbox
     uint64_t memory_;
     bool acquired_ = false;
     bool terminal_ = false;
+    bool migration_ = false;
+    std::filesystem::path migration_authority_;
     std::vector<std::unique_ptr<Replica>> replicas_;
     std::vector<FarmingControlNativeBinding> control_bindings_;
     mutable uint64_t floor_ = 0;
@@ -497,6 +499,19 @@ class FarmingUpdateMailbox
         uint64_t const updates = farming_update_allocation(replica.metadata->path);
         uint64_t used = grow_add(replica.metadata->allocation(), updates);
         uint64_t reserved = state_.manifest_reserved_bytes;
+        if (migration_)
+        {
+            require(control, "migration permits ordinary controls only; revalidate its saved policy separately");
+            auto const allowance = state_.update_reserved_bytes;
+            auto const needed = farming_update_aligned(bytes, alignment(replica));
+            require(updates <= allowance && needed <= allowance - updates, "migration control metadata exceeds its reserved allowance");
+            file_io::Space space{}; require(!file_io::space_path(replica.metadata->root, &space) && space.f_frsize &&
+                space.f_bavail <= UINT64_MAX / space.f_frsize, "cannot inspect migration control free space");
+            auto const free = space.f_bavail * space.f_frsize;
+            auto const headroom = replica.metadata->root == migration_authority_ ? 0 : state_.headroom;
+            require(headroom <= free && needed <= free - headroom, "migration controls would consume declared headroom");
+            return;
+        }
         uint64_t update_reserved = state_.update_reserved_bytes;
         uint64_t control_reserved = state_.version >= 9 ? farming_control_reservation(state_, alignment(replica)) : 0;
         bool control_separated = state_.version >= 9;
@@ -633,7 +648,7 @@ class FarmingUpdateMailbox
             file_io::Space staged_space{};
             require(!file_io::space_path(replica->metadata->root, &staged_space) && staged_space.f_frsize &&
                 staged_space.f_bavail <= UINT64_MAX / staged_space.f_frsize &&
-                staged_space.f_bavail * staged_space.f_frsize >= state_.headroom,
+                staged_space.f_bavail * staged_space.f_frsize >= (replica->metadata->root == migration_authority_ ? 0 : state_.headroom),
                 "staged farming controls consumed declared filesystem headroom");
             grow_failpoint("farm-control-before-publication");
             unchanged(); replica->metadata->check();
@@ -645,8 +660,9 @@ class FarmingUpdateMailbox
     }
 public:
     FarmingUpdateMailbox(FarmingState const& state, std::optional<bool> legacy, bool acquire, uint64_t memory = UINT64_MAX,
-        std::span<std::filesystem::path const> runtime_paths = {}, std::span<FarmingControlNativeBinding const> control_bindings = {}) :
-        state_(state), memory_(memory), control_bindings_(control_bindings.begin(), control_bindings.end())
+        std::span<std::filesystem::path const> runtime_paths = {}, std::span<FarmingControlNativeBinding const> control_bindings = {},
+        bool migration = false, std::filesystem::path migration_authority = {}) :
+        state_(state), memory_(memory), migration_(migration), migration_authority_(std::move(migration_authority)), control_bindings_(control_bindings.begin(), control_bindings.end())
     {
         if (!control_bindings_.empty()) (void)farming_control_source_shape(state_, control_bindings_);
         std::map<std::string, std::filesystem::path> ordered;
@@ -667,12 +683,24 @@ public:
             auto metadata = std::make_unique<FarmingMetadataDirectory>(root, legacy);
             if (!metadata->root_pin || !metadata->recorded) continue;
             if (farming_directory_identity(root) != identity) continue;
-            auto source = metadata->path / "grow-farm.plan";
-            if (!farm_metadata_detail::present(source)) source = metadata->path / "grow-farm.plan.next";
-            auto const saved = load_farming_state(source, memory_);
-            require(saved.job_id == state.job_id, "farming update member belongs to another job");
+            if (!migration_)
+            {
+                auto source = metadata->path / "grow-farm.plan";
+                if (!farm_metadata_detail::present(source)) source = metadata->path / "grow-farm.plan.next";
+                auto const saved = load_farming_state(source, memory_);
+                require(saved.job_id == state.job_id, "farming update member belongs to another job");
+            }
+            else require(farm_metadata_detail::present(metadata->path / "grow-replot.plan") ||
+                farm_metadata_detail::present(metadata->path / "grow-replot.plan.next"), "migration controls require its durable private journal");
             auto replica = std::make_unique<Replica>(); replica->metadata = std::move(metadata);
             replicas_.push_back(std::move(replica));
+        }
+        if (migration_ && !migration_authority_.empty())
+        {
+            auto metadata = std::make_unique<FarmingMetadataDirectory>(migration_authority_, false);
+            require(metadata->root_pin && (farm_metadata_detail::present(metadata->path / "grow-replot.plan") ||
+                farm_metadata_detail::present(metadata->path / "grow-replot.plan.next")), "migration controls require their controller authority");
+            auto replica = std::make_unique<Replica>(); replica->metadata = std::move(metadata); replicas_.push_back(std::move(replica));
         }
         require(!replicas_.empty(), "no available matching farming member can retain an update");
         if (acquire)
@@ -761,6 +789,8 @@ public:
                 [&](auto const& directory) { return directory.directory_identity == identity && farming_member(directory); });
             if (member != state_.directories.end() && (actor.empty() || identity < actor)) actor = identity;
         }
+        if (actor.empty() && migration_ && !migration_authority_.empty())
+            for (auto const& directory : state_.directories) if (actor.empty() || directory.directory_identity < actor) actor = directory.directory_identity;
         require(!actor.empty(), "no active native member can retain farming control intent");
         require(action == "pause" || action == "drain" || action == "resume" || action == "retire", "invalid local farming control action");
         auto const desired = farming_update_control(action);

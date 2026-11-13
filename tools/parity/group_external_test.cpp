@@ -2411,8 +2411,8 @@ try
         io_trace(std::string(argv[1]) == "--io-trace-enabled"); std::cout << "external I/O tracing tests passed\n"; return 0;
     }
     bool const independent_io_only = argc == 3 && std::string(argv[1]) == "--independent-io-only";
-    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--native-identity-only" || std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
-        "usage: grow-external-test [--native-identity-only|--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
+    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--native-identity-only" || std::string(argv[1]) == "--farm-io-only" || std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
+        "usage: grow-external-test [--native-identity-only|--farm-io-only|--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
     if (independent_io_only)
     {
 #ifdef GROW_TEST_WRAP_PWRITE
@@ -2445,6 +2445,50 @@ try
     auto raw = members(retirement_only || windows_only ? 2 : 8); Members input(raw);
     { Engine engine((root / "reference").string(), config(), false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "reference append rejected"); }
     auto const reference = contents(root / "reference"); auto ext = external(root);
+    if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--farm-io-only"))
+    {
+        auto governed = ext;
+        auto governor = std::make_shared<DiskIoGovernor>([](std::string const&) { return std::optional<DiskIoGovernor::Counters>{}; });
+        file_io::Stat filesystem{}; require(!file_io::inspect_path(root, &filesystem), "cannot inspect governed I/O fixture");
+        governor->register_device({"fixture", {"fixture-hdd"}}, uint64_t(filesystem.st_dev));
+        governor->observe_farming(10000000, 1000000000); governed.io_governor = governor;
+        auto const bootstrap = root / "farm-governed-bootstrap";
+        {
+            auto cancelled = config(); cancelled.cancelled = [] { return true; };
+            ExternalEngine engine(bootstrap.string(), cancelled, governed, false, initial_identity());
+            // A resource pause can arrive after native bootstrap directories
+            // are created. The initial checkpoint must still become durable.
+            engine.confirm_identity(); bool interrupted = false;
+            try { (void)engine.append(input.subspan(0, 1)); }
+            catch (ConstructionInterrupted const&) { interrupted = true; }
+            require(interrupted && !engine.committed_member_count(), "governed bootstrap ignored its next safe cancellation boundary");
+        }
+        {
+            auto const initial = ExternalEngine::inspect(bootstrap.string(), config().memory_limit_bytes);
+            require(!initial.members, "paused bootstrap changed its durable empty prefix");
+            ExternalEngine engine(bootstrap.string(), config(), governed, true); engine.confirm_identity();
+            require(engine.append(input).accepted, "paused governed bootstrap could not resume"); engine.finish();
+            require(engine.release_completed() && contents(bootstrap) == reference,
+                "governed bootstrap pause lost recoverability or changed ordinary bytes");
+        }
+        auto const path = root / "farm-governed";
+        { ExternalEngine engine(path.string(), config(), governed, false, initial_identity()); engine.confirm_identity();
+          require(engine.append(input.subspan(0, 1)).accepted, "governed external prefix rejected"); }
+        auto const saved = ExternalEngine::inspect(path.string(), config().memory_limit_bytes);
+        require(!saved.external.io_governor && saved.external.scratch.size() == ext.scratch.size(),
+            "runtime I/O feedback entered durable checkpoint settings");
+        for (size_t i = 0; i < ext.scratch.size(); ++i)
+            require(saved.external.scratch[i].capacity_bytes == ext.scratch[i].capacity_bytes,
+                "farming feedback changed a retained scratch capacity grant");
+        auto resumed = saved.external; resumed.io_governor = governor; governor->observe_pressure(true);
+        { ExternalEngine engine(path.string(), config(), resumed, true); engine.confirm_identity();
+          require(engine.append(input.subspan(1)).accepted, "governed external resume rejected"); engine.finish();
+          require(engine.release_completed(), "governed external retained scratch after completion"); }
+        require(contents(path) == reference && governor->status().completed_bytes && governor->status().waits,
+            "actual external I/O bypassed bounded feedback, stalled after pressure or changed ordinary bytes");
+    }
+    if (argc == 2 && std::string(argv[1]) == "--farm-io-only")
+    { fs::remove_all(root); std::cout << "external farm I/O feedback tests passed\n"; return 0; }
     if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--native-identity-only")) native_identity_recovery(root, input, ext, reference);
     if (argc == 2 && std::string(argv[1]) == "--native-identity-only")
     { fs::remove_all(root); std::cout << "external native identity tests passed\n"; return 0; }

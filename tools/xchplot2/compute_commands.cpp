@@ -26,6 +26,45 @@ bool enabled(std::string const& value)
     require(value == "on" || value == "off" || value == "true" || value == "false", "--discovery requires on or off");
     return value == "on" || value == "true";
 }
+std::string shell_path(std::filesystem::path const& path)
+{
+    auto const text = path.u8string(); std::string result = "'";
+    for (char8_t c : text)
+    {
+#ifdef _WIN32
+        if (c == '\'') result += '\'';
+#else
+        if (c == '\'') result += "'\\'";
+#endif
+        result += char(c);
+    }
+    return result + '\'';
+}
+pool::ComputeDefaults configured(pool::ComputeDefaults defaults,
+    std::vector<std::pair<std::string, std::string>> const& settings)
+{
+    bool interfaces = false;
+    for (auto const& [key, value] : settings)
+    {
+        if (key == "--broker") defaults.broker = value == "auto" ? "" : value;
+        else if (key == "--interface")
+        {
+            if (!interfaces) { defaults.interfaces.clear(); interfaces = true; }
+            if (value == "auto") defaults.interfaces.clear(); else defaults.interfaces.push_back(value);
+        }
+        else if (key == "--discovery") defaults.discovery = enabled(value);
+        else if (key == "--cpus")
+        { auto cpus = number(value, key); require(cpus <= 1024, "--cpus must be between 0 and 1024; 0 selects an automatic limit"); defaults.cpus = uint32_t(cpus); }
+        else if (key == "--host-bytes") defaults.host_bytes = number(value, key);
+        else if (key == "--gpu-bytes") defaults.gpu_bytes = number(value, key);
+        else if (key == "--backend")
+        { require(value == "cpu" || value == "gpu" || value == "auto", "--backend requires cpu, gpu or auto"); defaults.backend = value; }
+        else if (key == "--max-brokers")
+        { auto count = number(value, key); require(count && count <= 4096, "--max-brokers must be between 1 and 4096"); defaults.max_brokers = uint32_t(count); }
+        else throw std::invalid_argument("unknown compute setting: " + key);
+    }
+    pool::validate_compute_defaults(defaults); return defaults;
+}
 std::string hostname()
 {
 #ifdef _WIN32
@@ -42,24 +81,31 @@ void help(std::string_view command)
 {
     std::cout << "Usage: xchplot2 compute " << command;
     if (command == "invite" || command == "join") std::cout << " FILE";
+    else if (command == "setup") std::cout << " [INVITATION]";
     std::cout << " [OPTIONS]\n";
-    if (command == "init")
+    if (command == "setup")
+        std::cout << "Set up shared compute, reusing saved enrollment when present.\n"
+                     "Without an invitation, create a pool on the first plotting machine.\n"
+                     "With an invitation, join and start a persistent worker on this machine.\n"
+                     "  --role plotter|worker  choose whether to install and start the worker\n"
+                     "  --name NAME            first machine's display name\n";
+    else if (command == "init")
         std::cout << "Create a pool and enroll this machine. Run once on the first machine.\n  --name NAME        this machine's display name\n";
     else if (command == "invite")
         std::cout << "Create a private invitation for one additional machine. Transfer it privately.\n  --name NAME        invited machine's display name (required)\n";
     else if (command == "join")
         std::cout << "Enroll this machine using the invitation to join the shared compute pool.\n"
                      "Delete transferred invitation copies after joining; they contain this machine's private key.\n";
-    else if (command == "configure")
+    if (command == "configure" || command == "setup")
         std::cout << "Save defaults used by subsequent plotting and compute commands.\n"
                      "  --broker auto|HOST:PORT  automatic broker per job, or a dedicated broker\n"
                      "  --interface auto|NAME   LAN by default; repeat to select interfaces\n"
                      "  --discovery on|off      automatic LAN discovery, default on\n"
-                     "  --cpus N                offered CPU cap; 0 selects half the logical CPUs\n"
+                     "  --cpus N                CPU cap; 0 adapts within the available CPU affinity\n"
                      "  --host-bytes SIZE       offered RAM limit, e.g. 8G; 0 selects an automatic limit\n"
-                     "  --gpu-bytes SIZE        offered GPU RAM limit, e.g. 8G; 0 selects 80% of available VRAM\n"
+                     "  --gpu-bytes SIZE        GPU RAM cap, e.g. 8G; 0 uses available VRAM at startup\n"
                      "  --backend auto|cpu|gpu  offered generation backend\n";
-    if (command == "configure") std::cout << "  --max-brokers N         maximum broker registrations, default 128\n";
+    if (command == "configure" || command == "setup") std::cout << "  --max-brokers N         maximum broker registrations, default 128\n";
     std::cout << "  --directory DIR    saved compute setup directory\n";
     std::cout << pos2gpu::compute_output_help;
 #ifdef _WIN32
@@ -75,10 +121,10 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
     try
     {
         std::string const command = argv[0];
-        require(command == "init" || command == "invite" || command == "join" || command == "configure",
+        require(command == "setup" || command == "init" || command == "invite" || command == "join" || command == "configure",
             "unknown compute command; use compute --help");
         auto directory = pool::pool_directory();
-        std::string name = command == "init" ? hostname() : "";
+        std::string name = command == "init" || command == "setup" ? hostname() : "", role;
         std::filesystem::path file;
         std::vector<std::pair<std::string, std::string>> settings;
         ComputeOutputOptions output;
@@ -88,15 +134,48 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
             if (key == "--help" || key == "-h" || key == "--help-all") { help(command); return 0; }
             if (output.parse(key)) continue;
             if (!key.starts_with('-'))
-            { require((command == "invite" || command == "join") && file.empty(), "unexpected argument: " + key + "; use compute " + command + " --help"); file = std::filesystem::path(reinterpret_cast<char8_t const*>(key.c_str())); continue; }
+            { require((command == "setup" || command == "invite" || command == "join") && file.empty(), "unexpected argument: " + key + "; use compute " + command + " --help"); file = std::filesystem::path(reinterpret_cast<char8_t const*>(key.c_str())); continue; }
             require(i + 1 < argc, "missing value for " + key); std::string value = argv[++i];
             if (key == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value.c_str()));
             else if (key == "--name")
-            { require(command == "init" || command == "invite", "--name belongs to compute init or invite"); name = value; }
+            { require(command == "setup" || command == "init" || command == "invite", "--name belongs to compute setup, init or invite"); name = value; }
+            else if (key == "--role")
+            { require(command == "setup" && (value == "plotter" || value == "worker"), "--role requires plotter or worker on compute setup"); role = value; }
             else
-            { require(command == "configure", "unknown option: " + key + "; use compute " + command + " --help"); settings.emplace_back(std::move(key), std::move(value)); }
+            { require(command == "configure" || command == "setup", "unknown option: " + key + "; use compute " + command + " --help"); settings.emplace_back(std::move(key), std::move(value)); }
         }
         output.validate();
+        if (command == "setup")
+        {
+            auto identity = pool::load_pool(directory); bool const existed = identity.has_value();
+            require(file.empty() || !identity, "this machine is already enrolled; omit the invitation to reuse its setup");
+            auto defaults = configured(identity ? identity->defaults : pool::ComputeDefaults{}, settings);
+            if (!identity) identity = file.empty() ? pool::create_pool(directory, name) : pool::join_pool(file, directory);
+            if (!settings.empty()) pool::configure_pool(*identity, defaults);
+            if (role.empty()) role = identity->can_invite ? "plotter" : "worker";
+            std::cout << "Shared compute is configured for " << identity->name << ".\n";
+            if (!file.empty()) std::cout << "Delete the transferred invitation copies after joining.\n";
+            if (role == "worker")
+            {
+                auto service = [&](std::string action)
+                {
+                    auto const path = directory.u8string();
+                    std::vector<std::string> values{"service", std::move(action), "--role", "worker", "--directory",
+                        std::string(reinterpret_cast<char const*>(path.data()), path.size())};
+                    if (output.quiet) values.push_back("--quiet"); else if (output.verbose) values.push_back("--verbose");
+                    std::vector<char*> arguments; for (auto& value : values) arguments.push_back(value.data());
+                    return run_compute_service(int(arguments.size()), arguments.data());
+                };
+                auto result = service("install");
+                if (!result && existed && !settings.empty()) result = service("restart");
+                if (result) std::cerr << "Enrollment and resource settings are saved. Complete worker startup with xchplot2 compute service install --directory "
+                    << shell_path(directory) << '\n';
+                return result;
+            }
+            if (!output.quiet) std::cout << "Plot, fill and grow will discover enrolled workers automatically.\n"
+                << "Add a helper with xchplot2 compute invite FILE --name NAME, then run xchplot2 compute setup FILE on that machine.\n";
+            return 0;
+        }
         if (command == "init")
         {
             auto identity = pool::create_pool(directory, name);
@@ -116,36 +195,18 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
             return 0;
         }
         auto identity = pool::load_pool(directory);
-        require(bool(identity), "shared compute is not configured; use compute init or compute join");
+        require(bool(identity), "shared compute is not configured; use compute setup, or compute setup INVITATION to join");
         if (command == "invite")
         {
             require(!file.empty() && !name.empty(), "compute invite requires FILE and --name NAME");
             pool::invite_pool(*identity, file, name);
             std::cout << "Created a private invitation for " << name << ". Transfer it to that machine, then run:\n"
-                      << "  xchplot2 compute join " << file.filename().string() << '\n';
+                      << "  xchplot2 compute setup " << shell_path(file.filename()) << '\n';
         }
         else if (command == "configure")
         {
             require(!settings.empty(), "compute configure needs at least one setting");
-            auto defaults = identity->defaults; bool interfaces = false;
-            for (auto const& [key, value] : settings)
-            {
-                if (key == "--broker") defaults.broker = value == "auto" ? "" : value;
-                else if (key == "--interface")
-                {
-                    if (!interfaces) { defaults.interfaces.clear(); interfaces = true; }
-                    if (value == "auto") defaults.interfaces.clear(); else defaults.interfaces.push_back(value);
-                }
-                else if (key == "--discovery") defaults.discovery = enabled(value);
-                else if (key == "--cpus")
-                { auto cpus = number(value, key); require(cpus <= 1024, "--cpus must be between 0 and 1024; 0 selects half the logical CPUs"); defaults.cpus = uint32_t(cpus); }
-                else if (key == "--host-bytes") defaults.host_bytes = number(value, key);
-                else if (key == "--gpu-bytes") defaults.gpu_bytes = number(value, key);
-                else if (key == "--backend") defaults.backend = value;
-                else if (key == "--max-brokers")
-                { auto count = number(value, key); require(count && count <= 4096, "--max-brokers must be between 1 and 4096"); defaults.max_brokers = uint32_t(count); }
-                else throw std::invalid_argument("unknown compute setting: " + key);
-            }
+            auto defaults = configured(identity->defaults, settings);
             pool::configure_pool(*identity, defaults); std::cout << "Saved compute defaults for " << identity->name << ".\n";
         }
         return 0;

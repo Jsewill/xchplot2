@@ -25,6 +25,8 @@ struct IOContext
     char const* role = "unclassified";
     std::string const* owner = nullptr;
     ExecutionIO* service = nullptr;
+    DiskIoGovernor* governor = nullptr;
+    Config const* runtime = nullptr;
 };
 inline bool io_profile()
 {
@@ -111,6 +113,7 @@ struct ExternalConfig
     // Runtime target-resource ownership, shared by adjacent group engines.
     // It is not part of the persisted construction settings.
     std::shared_ptr<std::recursive_mutex> target_gate;
+    std::shared_ptr<DiskIoGovernor> io_governor;
 };
 
 class ExternalEngine
@@ -416,6 +419,8 @@ private:
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
+    external_detail::IOContext io_context(char const* role, ExecutionIO* service = nullptr)
+    { return {role, &path_, service, external_.io_governor.get(), &config_}; }
     void check_paths() const;
     void sync_target();
     void read_target(uint64_t offset, std::span<uint8_t> bytes);
@@ -466,14 +471,18 @@ struct Descriptor
     Descriptor(Descriptor const&) = delete;
     Descriptor& operator=(Descriptor const&) = delete;
 };
-inline void reserve_file(int fd, uint64_t bytes)
+inline void reserve_file(int fd, uint64_t bytes, IOContext context = {})
 {
 #if defined(__linux__) || defined(_WIN32)
-    int status;
+    auto permit = context.governor ? context.governor->acquire(fd, 0,
+        context.runtime ? std::function<void()>([&] { context.runtime->check_running(); }) : std::function<void()>{}) : DiskIoGovernor::Permit{};
+    auto const begin = std::chrono::steady_clock::now(); int status;
     do { status = file_io::allocate_file(fd, 0, 0, file_io::Offset(bytes)); } while (status && errno == EINTR);
-    require(!status, "cannot physically reserve external construction space: " + std::string(std::strerror(errno)));
+    int const error = status ? errno : 0;
+    permit.complete(0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count()));
+    require(!status, "cannot physically reserve external construction space: " + std::string(std::strerror(error)));
 #else
-    (void)fd; (void)bytes;
+    (void)fd; (void)bytes; (void)context;
     throw std::runtime_error("external construction requires supported native physical allocation");
 #endif
 }
@@ -489,7 +498,10 @@ inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats
 {
     while (!bytes.empty())
     {
-        auto const requested = std::min(bytes.size(), size_t(file_io::max_transfer));
+        // Writes can publish bootstrap/checkpoint/header transactions. Drain
+        // their bounded I/O before the engine's next safe cancellation check.
+        auto permit = context.governor ? context.governor->acquire(fd, bytes.size()) : DiskIoGovernor::Permit{};
+        auto const requested = std::min({bytes.size(), size_t(file_io::max_transfer), context.governor ? permit.bytes() : bytes.size()});
         IOTrace trace(fd, "pwrite", context, offset, requested);
         auto const begin = std::chrono::steady_clock::now();
         file_io::Count const n = file_io::write_at(fd, bytes.data(), requested, file_io::Offset(offset));
@@ -498,6 +510,7 @@ inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats
         if (stats) { stats->write_ns += elapsed; ++stats->write_calls; }
         if (context.service) { context.service->write_ns += elapsed; ++context.service->write_calls; }
         trace.report(begin, end, n, error);
+        permit.complete(n > 0 ? uint64_t(n) : 0, elapsed);
         if (n < 0 && error == EINTR) continue;
         require(n > 0, "external construction write failed: " + std::string(std::strerror(error)));
         if (stats) stats->written_bytes += uint64_t(n);
@@ -509,7 +522,9 @@ inline void read(int fd, uint64_t offset, std::span<uint8_t> bytes, Stats* stats
 {
     while (!bytes.empty())
     {
-        auto const requested = std::min(bytes.size(), size_t(file_io::max_transfer));
+        auto permit = context.governor ? context.governor->acquire(fd, bytes.size(),
+            context.runtime ? std::function<void()>([&] { context.runtime->check_running(); }) : std::function<void()>{}) : DiskIoGovernor::Permit{};
+        auto const requested = std::min({bytes.size(), size_t(file_io::max_transfer), context.governor ? permit.bytes() : bytes.size()});
         IOTrace trace(fd, "pread", context, offset, requested);
         auto const begin = std::chrono::steady_clock::now();
         file_io::Count const n = file_io::read_at(fd, bytes.data(), requested, file_io::Offset(offset));
@@ -518,6 +533,7 @@ inline void read(int fd, uint64_t offset, std::span<uint8_t> bytes, Stats* stats
         if (stats) { stats->read_ns += elapsed; ++stats->read_calls; }
         if (context.service) { context.service->read_ns += elapsed; ++context.service->read_calls; }
         trace.report(begin, end, n, error);
+        permit.complete(n > 0 ? uint64_t(n) : 0, elapsed);
         if (n < 0 && error == EINTR) continue;
         require(n > 0, "external construction read failed");
         if (stats) stats->read_bytes += uint64_t(n);
@@ -530,10 +546,12 @@ inline void sync(int fd, Stats* stats = nullptr, IOContext context = {})
     int result, error; uint64_t elapsed = 0;
     do
     {
+        auto permit = context.governor ? context.governor->acquire(fd, 0) : DiskIoGovernor::Permit{};
         IOTrace trace(fd, "fsync", context); auto const begin = std::chrono::steady_clock::now();
         result = file_io::flush(fd); error = result ? errno : 0; auto const end = std::chrono::steady_clock::now();
         elapsed += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
         trace.report(begin, end, result, error);
+        permit.complete(0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
     } while (result && error == EINTR);
     if (stats) { stats->sync_ns += elapsed; ++stats->syncs; }
     if (context.service) { context.service->sync_ns += elapsed; ++context.service->syncs; }
@@ -954,15 +972,15 @@ inline void ExternalEngine::check_paths() const
     }
 }
 inline void ExternalEngine::sync_target()
-{ auto target_guard = target_lock(); external_detail::sync(fd_, &stats_, {"final_output", &path_, &execution_destination_}); }
+{ auto target_guard = target_lock(); external_detail::sync(fd_, &stats_, io_context("final_output", &execution_destination_)); }
 inline void ExternalEngine::read_target(uint64_t offset, std::span<uint8_t> bytes)
-{ external_detail::read(fd_, offset, bytes, &stats_, {"final_output", &path_, &execution_destination_}); }
+{ external_detail::read(fd_, offset, bytes, &stats_, io_context("final_output", &execution_destination_)); }
 inline void ExternalEngine::write_target(uint64_t offset, std::span<uint8_t const> bytes)
 {
     auto target_guard = target_lock();
     require(offset <= config_.capacity_bytes && bytes.size() <= config_.capacity_bytes - offset,
         "external destination exceeds admitted capacity");
-    external_detail::write(fd_, offset, bytes, &stats_, {"final_output", &path_, &execution_destination_});
+    external_detail::write(fd_, offset, bytes, &stats_, io_context("final_output", &execution_destination_));
 }
 inline std::string ExternalEngine::segment_path(Run const& run, Segment const& segment) const
 {
@@ -1039,15 +1057,15 @@ inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
             size_t const count = size_t(std::min(config_.window_bytes, segment.bytes - offset));
-            write(file.fd, segment_header_bytes + offset, bytes.subspan(size_t(offset), count), &stats_, {"checkpoint_summary", &path_, &execution_scratch_}); offset += count;
+            write(file.fd, segment_header_bytes + offset, bytes.subspan(size_t(offset), count), &stats_, io_context("checkpoint_summary", &execution_scratch_)); offset += count;
         }
-        external_detail::sync(file.fd, &stats_, {"checkpoint_summary", &path_, &execution_scratch_});
+        external_detail::sync(file.fd, &stats_, io_context("checkpoint_summary", &execution_scratch_));
         require(stamp(path).file == segment.stamp.file, "external written summary path was replaced");
         segment.stamp = stamp(path); pending_summary_.bytes += segment.bytes; bytes = bytes.subspan(size_t(segment.bytes));
         if (config_.release_cache) external_detail::evict(file.fd);
     }
     require(bytes.empty(), "external summary exceeded its admitted reservation");
-    for (auto const& root : roots_) sync_directory(root.path, {"directory", &path_, &execution_scratch_});
+    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
     grow_failpoint("external-summary-flushed");
 }
 inline void ExternalEngine::save(std::string const& label, std::span<Summary const> summaries)
@@ -1127,8 +1145,8 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
             auto const record = serialize(out, durable, temporary_identity, native_checkpoint);
             require(alignment && grow_add(occupied, aligned(record.size(), alignment)) <= metadata_bytes(identity_.header.k, external_),
                 "external checkpoint directory exceeds its metadata reservation");
-            write(handle.fd, 0, record, &stats_, {"checkpoint_manifest", &path_, &execution_destination_});
-            external_detail::sync(handle.fd, &stats_, {"checkpoint_manifest", &path_, &execution_destination_});
+            write(handle.fd, 0, record, &stats_, io_context("checkpoint_manifest", &execution_destination_));
+            external_detail::sync(handle.fd, &stats_, io_context("checkpoint_manifest", &execution_destination_));
             auto const temporary_stamp = stamp(temporary); require(temporary_stamp.file == temporary_identity, "external temporary checkpoint was replaced");
             grow_failpoint(label + "-before-checkpoint"); check_paths(); check_summary();
             require(stamp(temporary) == temporary_stamp, "external temporary checkpoint changed before publication");
@@ -1141,7 +1159,7 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
             else require(exists && errno == ENOENT, "unrecognized file occupies external checkpoint path");
             require(!file_io::rename_file(temporary.c_str(), (work_ + "/checkpoint").c_str()), "cannot install external checkpoint");
             checkpoint_identity_ = temporary_identity; checkpoint_native_identity_ = native_checkpoint;
-            sync_directory(work_, {"directory", &path_, &execution_destination_}); ++stats_.checkpoints;
+            sync_directory(work_, io_context("directory", &execution_destination_)); ++stats_.checkpoints;
             grow_failpoint(label + "-after-checkpoint");
         }
         catch (...)
@@ -1177,7 +1195,7 @@ inline void ExternalEngine::load()
     require(file_identity(handle.fd) == info.file, "external checkpoint handle was replaced");
     if (!bootstrap_recovered_) checkpoint_identity_ = info.file;
     std::string record(size_t(info.bytes), '\0');
-    read(handle.fd, 0, {reinterpret_cast<uint8_t*>(record.data()), record.size()}, nullptr, {"checkpoint_manifest", &path_, &execution_destination_});
+    read(handle.fd, 0, {reinterpret_cast<uint8_t*>(record.data()), record.size()}, nullptr, io_context("checkpoint_manifest", &execution_destination_));
     require(record.size() >= 65 && record[64] == '\n' && std::string_view(record).substr(0, 64) == digest(std::string_view(record).substr(65)),
         "external checkpoint checksum mismatch");
     CheckpointInput in(std::string_view(record).substr(65));
@@ -1296,7 +1314,7 @@ inline void ExternalEngine::load()
     initialized_ = true; check_paths(); validate_runs();
     if (!summary_run_.segments.empty())
     {
-        read_summary(roots_, token_, summary_run_, summary_digest_, {}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
+        read_summary(roots_, token_, summary_run_, summary_digest_, {}, &stats_, io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
         for (auto const& segment : summary_run_.segments)
             roots_[segment.root].used = grow_add(roots_[segment.root].used, segment.capacity);
     }
@@ -1367,7 +1385,7 @@ inline void ExternalEngine::load()
         auto const saved = stamp(file_io::path_text(entry.path()));
         if (saved.bytes < 65 || saved.bytes > checkpoint_buffer_bytes(external_) || saved.bytes > config_.memory_limit_bytes / 8) continue;
         Descriptor file(file_io::open_file(entry.path().c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow));
-        std::string partial(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(partial.data()), partial.size()}, nullptr, {"checkpoint_manifest", &path_, &execution_destination_});
+        std::string partial(size_t(saved.bytes), '\0'); read(file.fd, 0, {reinterpret_cast<uint8_t*>(partial.data()), partial.size()}, nullptr, io_context("checkpoint_manifest", &execution_destination_));
         if (partial[64] != '\n' || std::string_view(partial).substr(0, 64) != digest(std::string_view(partial).substr(65))) continue;
         CheckpointInput candidate(std::string_view(partial).substr(65));
         auto const candidate_header = read_checkpoint_header(candidate, false, true); bool const durable = candidate_header.durable;
@@ -1429,6 +1447,11 @@ inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalC
         root_identities.push_back(root_identity);
         require(std::find(canonical_roots.begin(), canonical_roots.end(), grant.directory) == canonical_roots.end(), "duplicate external scratch directory grant");
         canonical_roots.push_back(grant.directory); require_disk_scratch(grant.directory);
+    }
+    if (external_.io_governor)
+    {
+        external_.io_governor->register_directory(file_io::native_path(path_).parent_path());
+        for (auto const& grant : external_.scratch) external_.io_governor->register_directory(file_io::native_path(grant.directory));
     }
     {
         auto target_guard = target_lock();
@@ -1511,7 +1534,7 @@ inline void ExternalEngine::initialize()
         write_target(0, {reinterpret_cast<uint8_t const*>(&header), sizeof(header)});
         write_target(sizeof(Header), identity_.memo); sync_target();
         output_bytes_ = sizeof(Header) + identity_.memo.size();
-        sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), {"directory", &path_, &execution_destination_});
+        sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), io_context("directory", &execution_destination_));
     }
     save("external-initialized");
 }
@@ -1529,11 +1552,11 @@ inline void ExternalEngine::confirm_identity()
         require(!file_io::unlink_file(path.c_str()), "cannot discard uncommitted external segment");
         if (orphan.root < roots_.size())
         {
-            auto& root = roots_[orphan.root]; root.used -= orphan.reserved; sync_directory(root.path, {"directory", &path_, &execution_scratch_});
+            auto& root = roots_[orphan.root]; root.used -= orphan.reserved; sync_directory(root.path, io_context("directory", &execution_scratch_));
         }
     }
     orphans_.clear();
-    { auto target_guard = target_lock(); sync_directory(work_, {"directory", &path_, &execution_destination_}); }
+    { auto target_guard = target_lock(); sync_directory(work_, io_context("directory", &execution_destination_)); }
 }
 inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
 {
@@ -1588,9 +1611,9 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600));
             segment.stamp = stamp(path); // Preserve ownership even if the first write fails.
             segment.identity = capture_identity(file.fd, path, segment.stamp.file);
-            auto const header = segment_header(run, segment); external_detail::write(file.fd, 0, header, &stats_, {role, &path_, &execution_scratch_});
-            external_detail::reserve_file(file.fd, segment.capacity);
-            external_detail::sync(file.fd, &stats_, {role, &path_, &execution_scratch_});
+            auto const header = segment_header(run, segment); external_detail::write(file.fd, 0, header, &stats_, io_context(role, &execution_scratch_));
+            external_detail::reserve_file(file.fd, segment.capacity, io_context(role, &execution_scratch_));
+            external_detail::sync(file.fd, &stats_, io_context(role, &execution_scratch_));
             auto const current = stamp(path); require(current.file == segment.stamp.file && file_identity(file.fd) == current.file,
                 "external reservation path was replaced");
             require(!file_io::has_durable_identity(segment.identity) || file_io::matches_durable_identity(file.fd, segment.identity),
@@ -1598,7 +1621,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             segment.stamp = current; roots_[segment.root].used += segment.capacity; ++charged;
             roots_[segment.root].peak = std::max(roots_[segment.root].peak, roots_[segment.root].used);
         }
-        for (auto const& root : roots_) sync_directory(root.path, {"directory", &path_, &execution_scratch_});
+        for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
     }
     catch (...)
     {
@@ -1612,7 +1635,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             if (i < charged) roots_[segment.root].used -= segment.capacity;
         }
         run.segments.clear(); run.bytes = 0;
-        for (auto const& root : roots_) sync_directory(root.path, {"directory", &path_, &execution_scratch_});
+        for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
         throw;
     }
     return true;
@@ -1631,7 +1654,7 @@ inline void ExternalEngine::discard(Run const& run)
         roots_[segment.root].used -= segment.capacity; stats_.reclaimed_bytes += segment.capacity;
         grow_failpoint("external-segment-unlinked");
     }
-    for (auto const& root : roots_) sync_directory(root.path, {"directory", &path_, &execution_scratch_});
+    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
 }
 class ExternalEngine::Writer
 {
@@ -1679,7 +1702,7 @@ public:
                     engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
                     file_io::matches_durable_identity(file_->fd, segment.identity)), "external output segment was replaced"); opened_ = segment_;
             }
-            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
+            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
             if (position_ == segment.bytes) { ++segment_; position_ = 0; }
         }
@@ -1704,13 +1727,13 @@ public:
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
             require(engine_.file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
                 file_io::matches_durable_identity(file.fd, segment.identity)), "external completed segment handle was replaced");
-            require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution"); external_detail::sync(file.fd, &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
+            require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution"); external_detail::sync(file.fd, &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
             engine_.roots_[segment.root].used -= segment.capacity - capacity; segment.capacity = capacity;
             segment.stamp = engine_.stamp(path); kept.push_back(segment);
             if (engine_.config_.release_cache) external_detail::evict(file.fd);
         }
         require(!remaining, "external contribution length exceeds segments"); run_.segments = std::move(kept);
-        for (auto const& root : engine_.roots_) sync_directory(root.path, {"directory", &engine_.path_, &engine_.execution_scratch_});
+        for (auto const& root : engine_.roots_) sync_directory(root.path, engine_.io_context("directory", &engine_.execution_scratch_));
     }
 private:
     std::vector<uint8_t> buffer_;
@@ -1771,7 +1794,7 @@ private:
                     file_io::matches_durable_identity(file_->fd, segment.identity)), "external input segment changed");
                 opened_ = segment_; file_end_ = read_position_ + segment.bytes - offset_;
             }
-            external_detail::read(file_->fd, segment_header_bytes + offset_, bytes.first(n), &engine_.stats_, {role_, &engine_.path_, &engine_.execution_scratch_});
+            external_detail::read(file_->fd, segment_header_bytes + offset_, bytes.first(n), &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
             if (activity_) *activity_ = grow_add(*activity_, n);
             bytes = bytes.subspan(n); offset_ += n; read_position_ += n;
             if (offset_ == segment.bytes) { offset_ = 0; ++segment_; }
@@ -2405,7 +2428,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     std::vector<Summary> summaries(size_t(chunks), Summary{});
     if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
         {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_,
-        {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
+        io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
     auto codec = std::make_unique<ChunkCodec>(identity_.header.k, config_.codec_bytes, config_.cpu_scheduler);
     std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
     std::vector<EncodedChunk> parts; parts.reserve(UINT16_MAX);
@@ -2538,7 +2561,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
     std::vector<Summary> summaries(size_t(chunks), Summary{});
     if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
-        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_, {"checkpoint_summary", &path_, &execution_scratch_}, config_.cpu_scheduler.get(), nullptr, &config_);
+        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_, io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
     std::vector<size_t> cursors(count, 0);
     std::vector<FragmentRegion> regions(count);
     std::unique_ptr<InputReader> input_reader;
@@ -2918,7 +2941,7 @@ inline void ExternalEngine::start_packing()
             index_name_ = file_io::path_text(file_io::native_path(name).filename()); index_identity_ = stamp(name).file;
             require(file_identity(index.fd) == index_identity_, "external initial index path was replaced");
             index_native_identity_ = capture_identity(index.fd, name, index_identity_);
-            external_detail::sync(index.fd, &stats_, {"index", &path_, &execution_destination_}); sync_directory(work_, {"directory", &path_, &execution_destination_});
+            external_detail::sync(index.fd, &stats_, io_context("index", &execution_destination_)); sync_directory(work_, io_context("directory", &execution_destination_));
         }
         // Persist ownership before any index write. An interrupted write can
         // then safely restore this inode; uncheckpointed files are preserved.
@@ -2948,7 +2971,7 @@ inline void ExternalEngine::pack()
     Run marker; marker.id = UINT64_MAX; Segment marker_segment; auto const expected = segment_header(marker, marker_segment);
     {
         auto target_guard = target_lock();
-        external_detail::write(index.fd, 0, expected, &stats_, {"index", &path_, &execution_destination_});
+        external_detail::write(index.fd, 0, expected, &stats_, io_context("index", &execution_destination_));
         require(!file_io::resize_file(index.fd, file_io::Offset(segment_header_bytes + index_bytes_)), "cannot discard uncommitted external index tail");
     }
     BitWriter index_bits; if (index_carry_bits_) index_bits.append(index_carry_value_, index_carry_bits_);
@@ -2958,18 +2981,18 @@ inline void ExternalEngine::pack()
         auto const bytes = index_bits.asBytes(); uint64_t const n = finish ? bytes.size() : index_bits.bitCount() / 8;
         uint32_t const carry = finish ? 0 : uint32_t(index_bits.bitCount() % 8);
         uint8_t const tail = carry ? bytes[size_t(n)] : 0;
-        external_detail::write(index.fd, segment_header_bytes + index_bytes_, bytes.first(size_t(n)), &stats_, {"index", &path_, &execution_destination_});
+        external_detail::write(index.fd, segment_header_bytes + index_bytes_, bytes.first(size_t(n)), &stats_, io_context("index", &execution_destination_));
         index_bytes_ += n; index_bits.clear(); if (carry) index_bits.append(tail, carry);
     };
     auto sync_index = [&]
     {
         auto target_guard = target_lock();
-        external_detail::sync(index.fd, &stats_, {"index", &path_, &execution_destination_});
+        external_detail::sync(index.fd, &stats_, io_context("index", &execution_destination_));
     };
     {
         auto target_guard = target_lock();
         require(!file_io::resize_file(fd_, file_io::Offset(output_bytes_)), "cannot discard uncommitted external output tail");
-        external_detail::reserve_file(fd_, final_bound_);
+        external_detail::reserve_file(fd_, final_bound_, io_context("final_output", &execution_destination_));
     }
     std::vector<std::unique_ptr<Reader>> readers;
     for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
@@ -3047,7 +3070,7 @@ inline void ExternalEngine::pack()
                 pending_output = output_worker->submit([&, offset = window_offset]
                 {
                     ThreadCpuTimer cpu(output_cpu);
-                    auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, {"final_output", &path_, &output_service});
+                    auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, io_context("final_output", &output_service));
                 });
             }
             else { write_target(window_offset, output_window); output_window.clear(); }
@@ -3106,7 +3129,7 @@ inline void ExternalEngine::pack()
                 released_bytes[i] = end; ++released_segments[i];
             }
         }
-        for (size_t i = 0; i < roots_.size(); ++i) if (changed[i]) sync_directory(roots_[i].path, {"directory", &path_, &execution_scratch_});
+        for (size_t i = 0; i < roots_.size(); ++i) if (changed[i]) sync_directory(roots_[i].path, io_context("directory", &execution_scratch_));
         if (checkpoint_ceiling_ && packed_chunks_ < chunks)
         {
             auto const checkpoint_ns = elapsed_ns(begin);
@@ -3216,7 +3239,7 @@ inline void ExternalEngine::pack()
         config_.check_running();
         size_t const n = size_t(std::min<uint64_t>(payload.size(), index_bytes_ - position));
         { auto target_guard = target_lock();
-          external_detail::read(index.fd, segment_header_bytes + position, std::span(payload).first(n), &stats_, {"index", &path_, &execution_destination_}); }
+          external_detail::read(index.fd, segment_header_bytes + position, std::span(payload).first(n), &stats_, io_context("index", &execution_destination_)); }
         write_target(output_bytes_, std::span(payload).first(n)); output_bytes_ += n; position += n;
     }
     require(output_bytes_ <= final_bound_, "external ordinary output exceeded its admitted bound");
@@ -3238,7 +3261,7 @@ inline void ExternalEngine::cleanup()
         if (!file_io::inspect_link(path.c_str(), &exists))
         {
             require(bind_identity(path, false, index_identity_, index_native_identity_) == index_identity_, "completed external index was replaced");
-            require(!file_io::unlink_file(path.c_str()), "cannot remove completed external index"); sync_directory(work_, {"directory", &path_, &execution_destination_});
+            require(!file_io::unlink_file(path.c_str()), "cannot remove completed external index"); sync_directory(work_, io_context("directory", &execution_destination_));
         }
         else require(errno == ENOENT, "cannot inspect completed external index");
     }
@@ -3271,7 +3294,7 @@ inline Result ExternalEngine::finish()
         grow_failpoint("external-header-flushed");
         identity_.header = header; identity_.bytes = output_bytes_; identity_.pending = false;
         completed_ = stamp(path_); phase_ = Phase::done; save("external-published");
-        sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), {"directory", &path_, &execution_destination_});
+        sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), io_context("directory", &execution_destination_));
     }
     cleanup();
     if (!runs_.empty())
@@ -3631,7 +3654,7 @@ inline bool ExternalEngine::release_completed()
 #endif
         released_ = true;
         require(file_identity(holder, true) == holder_identity, "retired external checkpoint directory was replaced");
-        sync_directory(holder, {"directory", &path_}); sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), {"directory", &path_, &execution_destination_});
+        sync_directory(holder, {"directory", &path_}); sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), io_context("directory", &execution_destination_));
         grow_failpoint("external-handoff-retired");
     }
     if (!clean) { measure_remaining_metadata(holder, holder_identity); return false; }
@@ -3653,7 +3676,7 @@ inline bool ExternalEngine::release_completed()
     require(!file_io::unlink_file((holder + "/checkpoint").c_str()), "cannot remove retired external checkpoint"); sync_directory(holder, {"directory", &path_});
     grow_failpoint("external-handoff-checkpoint-removed");
     require(file_identity(holder, true) == holder_identity && !file_io::remove_directory(holder.c_str()), "cannot remove external handoff directory");
-    sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), {"directory", &path_, &execution_destination_}); measure_remaining_metadata(holder, holder_identity); return true;
+    sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), io_context("directory", &execution_destination_)); measure_remaining_metadata(holder, holder_identity); return true;
 }
 }
 
@@ -3847,7 +3870,7 @@ inline bool ExternalEngine::save_retired_receipt(std::string const& holder, File
             errno == ENOSPC || errno == EEXIST || errno == E2BIG || errno == ERANGE, "cannot install external retired ownership receipt");
         return false;
     }
-    external_detail::sync(directory.fd, nullptr, {"checkpoint_manifest", &path_, &execution_destination_}); return true;
+    external_detail::sync(directory.fd, nullptr, io_context("checkpoint_manifest", &execution_destination_)); return true;
 #else
     (void)holder; (void)holder_identity; return false;
 #endif

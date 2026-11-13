@@ -605,6 +605,7 @@ PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory)
         "invitation is not an active member of its signed policy");
     return publish(directory, name, node, ca_text, identity, {}, policy);
 }
+void validate_compute_defaults(ComputeDefaults const& defaults) { validate_defaults(defaults); }
 void configure_pool(PoolIdentity const& pool, ComputeDefaults const& defaults)
 {
     auto encoded = profile(pool.name, pool.node_id, defaults);

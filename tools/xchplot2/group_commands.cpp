@@ -279,11 +279,11 @@ void command_help(std::string_view command, bool all)
             "  --plan-only               preview without plotting\n"
             "  --replot                  replace eligible old plots; no separate plan command required\n"
             "  --replot-inventory FILE   optionally reuse a saved inventory\n"
-            "  --replot-confirmation directory|file  acknowledge farming once per directory (default) or per file\n"
+            "  --replot-confirmation directory|file  confirm each directory, then reconcile (default), or every file\n"
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
             "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
-            "  -M, --max-host-ram SIZE   combined plotting RAM budget, e.g. 14G\n"
+            "  -M, --max-host-ram SIZE   cap plotting RAM; replot uses available RAM when omitted\n"
             "  -t, --temp-dir DIR        temporary plotting storage\n"
             "  --temp-dirs DIR...        several temporary directories with one flag\n";
 #ifdef XCHPLOT2_GROUP_COMMANDS

@@ -1500,6 +1500,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
         if (argc < 3 || help) {
             std::cout << "Usage: xchplot2 compute COMMAND [OPTIONS]\n"
+                      << "  setup      Enroll, configure and start a helper in one command\n"
                       << "  init       Create a pool on the first machine\n"
                       << "  invite     Create a private invitation for another machine\n"
                       << "  join       Enroll this machine from an invitation\n"
@@ -2982,9 +2983,9 @@ _xchplot2() {
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
-        compute)           COMPREPLY=( $(compgen -W "init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker" -- "$cur") ); return 0 ;;
+        compute)           COMPREPLY=( $(compgen -W "setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker" -- "$cur") ); return 0 ;;
         service)           if [[ "${COMP_WORDS[1]}" == compute ]]; then COMPREPLY=( $(compgen -W "install start stop restart status remove print" -- "$cur") ); return 0; fi ;;
-        --role)            COMPREPLY=( $(compgen -W "worker broker" -- "$cur") ); return 0 ;;
+        --role)            if [[ "${COMP_WORDS[2]}" == setup ]]; then COMPREPLY=( $(compgen -W "plotter worker" -- "$cur") ); else COMPREPLY=( $(compgen -W "worker broker" -- "$cur") ); fi; return 0 ;;
         completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
     esac
     if [ $COMP_CWORD -eq 1 ]; then
@@ -3020,7 +3021,7 @@ _xchplot2() {
         return
     fi
     if [[ "${words[2]}" == compute && $CURRENT -eq 3 ]]; then
-        _values 'compute command' init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker
+        _values 'compute command' setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker
         return
     fi
     if [[ "${words[2]}" == compute && "${words[3]}" == service && $CURRENT -eq 4 ]]; then
@@ -3044,7 +3045,7 @@ _xchplot2() {
         '--compute-directory[Saved compute setup directory]:value:' \
         '--compute-local[Offer local compute on or off]:value:' \
         '--directory[Saved compute setup directory]:value:' \
-        '--role[Background service role]:role:(worker broker)' \
+        '--role[Compute setup or background service role]:role:(plotter worker broker)' \
         '--worker[Worker status or control endpoint]:address:' \
         '--limit[Rows per broker status section]:count:' \
         '--max-brokers[Worker broker registration limit]:count:' \
@@ -3235,12 +3236,13 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'resume' -d 'Continue paused 
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'retire' -d 'Detach destinations, keep plots'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'grow' -d 'Extend an existing group'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'compute' -d 'Share compute'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute -r -d 'Shared compute auto or off'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-directory -r -d 'Saved compute setup directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-local -r -d 'Offer local compute on or off'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from service; and not __fish_seen_subcommand_from install start stop restart status remove print' -a 'install start stop restart status remove print'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l role -r -a 'worker broker' -d 'Background service role'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from setup' -l role -r -a 'plotter worker' -d 'Compute setup role'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from service' -l role -r -a 'worker broker' -d 'Background service role'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l worker -r -d 'Worker status or control endpoint'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l limit -r -d 'Rows per broker status section'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-brokers -r -d 'Worker broker registration limit'

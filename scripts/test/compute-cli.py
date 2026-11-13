@@ -79,7 +79,7 @@ def check(binary, root, service_manager=False):
         print("PASS native user service worker startup, control and removal", flush=True)
 
     try:
-        for name in ("members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import",
+        for name in ("setup", "members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import",
                      "status", "pause", "drain", "resume", "service"):
             assert "Usage:" in run("authority", name, "--help").stdout
         for name, advanced in (("worker", "--max-task-bytes"), ("broker", "--max-tasks")):
@@ -89,13 +89,21 @@ def check(binary, root, service_manager=False):
         assert not status("authority")["configured"]
         initialized = run("authority", "init", "--name", "authority", "--quiet")
         assert "Created pool" in initialized.stdout and "Plot, fill" not in initialized.stdout
+        original_node = status("authority")["node_id"]
+        assert "Shared compute is configured" in run("authority", "setup", "--quiet").stdout
+        assert status("authority")["node_id"] == original_node
+        run("authority", "setup", "--backend", "invalid", code=1)
+        assert status("authority")["node_id"] == original_node
+        directories["setup-plotter"] = root / "setup-plotter"
+        run("setup-plotter", "setup", "--name", "new-plotter", "--cpus", 1, "--host-bytes", "512M", "--backend", "cpu")
+        assert status("setup-plotter")["configured"]
         for name in ("worker", "owner"):
             invitation = root / (name + ".invite")
             run("authority", "invite", invitation, "--name", name)
             run(name, "join", invitation)
         broker_port, worker_port = pool.port(), pool.port()
         broker_address, worker_address = f"127.0.0.1:{broker_port}", f"127.0.0.1:{worker_port}"
-        for name in directories:
+        for name in ("authority", "worker", "owner"):
             run(name, "configure", "--discovery", "off", "--broker", broker_address,
                 "--backend", "cpu", "--cpus", 2, "--host-bytes", "1G", "--max-brokers", 32)
         config = root / "verbose.toml"
@@ -245,6 +253,22 @@ def check(binary, root, service_manager=False):
         run("authority", "service", "install", env=environment, code=1)
         assert units[0].read_text() == "[Service]\nExecStart=/bin/true\n"
         print("PASS generated user service, exact manager actions and unrelated-unit preservation", flush=True)
+        directories["setup-worker"] = root / "setup-worker"
+        invitation = root / "setup-worker.invite"
+        run("authority", "invite", invitation, "--name", "setup-worker")
+        run("setup-worker", "setup", invitation, "--backend", "cpu", "--cpus", 1, "--host-bytes", "512M",
+            "--discovery", "off", env=environment)
+        helper = status("setup-worker")
+        run("setup-worker", "setup", "--cpus", 2, env=environment)
+        assert status("setup-worker")["node_id"] == helper["node_id"]
+        helper_units = [path for path in units[0].parent.glob("*.service") if path != units[0]]
+        assert len(helper_units) == 1
+        setup_calls = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert ["--user", "--no-pager", "enable", "--now", helper_units[0].name] in setup_calls
+        assert ["--user", "--no-pager", "restart", helper_units[0].name] in setup_calls
+        run("setup-worker", "service", "remove", env=environment)
+        assert not helper_units[0].exists()
+        print("PASS combined helper enrollment, configuration, service startup and idempotent setup", flush=True)
         if service_manager:
             managed_service()
     except Exception:

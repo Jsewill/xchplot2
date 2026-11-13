@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; }
+namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; class DiskIoGovernor; class WorkerIdentityReservation; }
 
 namespace pos2gpu {
 class ComputeSession;
@@ -60,6 +60,10 @@ struct GroupOptions
     std::optional<uint64_t> k, strength, meta;
     bool k_set = false, strength_set = false, meta_set = false;
     uint64_t max_ram = 14000000000ull;
+    // Preserve an explicit combined budget while migration re-observes its
+    // effective allocation at stopped construction boundaries.
+    bool max_ram_set = false, workers_set = false, device_set = false;
+    uint64_t max_ram_limit = 0;
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024, temporary_capacity = 0;
     uint64_t window = 16 * 1024 * 1024, workers = 0, batch = 65535, max_members = 65535;
     uint64_t group_members = 0, max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
@@ -82,6 +86,7 @@ struct GroupOptions
     bool replot_proof_worker = false, replot_structure_worker = false;
     uint64_t replot_proof_cpus = 0, replot_proof_solves = 1;
     bool protected_resources = false;
+    std::shared_ptr<group_grow::DiskIoGovernor> disk_io;
     uint64_t protected_gpu_bytes = 0;
     bool inventory = false;
     bool extend = false, update = false, cancel_update = false, allow_missing = false;
@@ -97,11 +102,13 @@ struct GroupOptions
     std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
     bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;
     std::shared_ptr<ComputeSession> compute_session;
+    std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
     std::function<void()> compute_admit_session;
     std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
     std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
     std::string pool_offer_backend = "cpu";
     uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
+    uint64_t pool_offer_ram_limit = 0, pool_offer_cpu_limit = 0, pool_offer_vram_limit = 0;
     uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;
     uint64_t pool_codec_ram = 0;
     bool pool_codec_auto = true, pool_offer_backend_set = false;

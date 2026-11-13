@@ -582,6 +582,7 @@ struct ComputeDiscovery::Impl
         std::vector<Poll> polls;
         for (auto const& socket : sockets) polls.push_back({socket->fd, POLLIN, 0});
         auto next_query = Clock::now(), next_announce = Clock::now(), next_interfaces = Clock::now() + std::chrono::seconds(5);
+        bool first_query = true;
         while (!stopping.load())
         {
             if (Clock::now() >= next_interfaces)
@@ -593,6 +594,7 @@ struct ComputeDiscovery::Impl
                         polls.clear();
                         for (auto const& socket : sockets) polls.push_back({socket->fd, POLLIN, 0});
                         next_query = next_announce = Clock::now();
+                        first_query = true;
                     }
                 }
                 catch (std::exception const&) { /* Retry when the network inventory settles. */ }
@@ -603,7 +605,11 @@ struct ComputeDiscovery::Impl
                 for (auto const& socket : sockets)
                     for (auto service : {broker_service, worker_service})
                         socket->query(service);
-                next_query = Clock::now() + std::chrono::seconds(5);
+                // A bounded browser can miss the launch announcement and a
+                // throttled first reply. Retry at the initial DNS-SD interval
+                // before returning to the established refresh cadence.
+                next_query = Clock::now() + std::chrono::seconds(first_query ? 1 : 5);
+                first_query = false;
             }
             if (Clock::now() >= next_announce)
             {

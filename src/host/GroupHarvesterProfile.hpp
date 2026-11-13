@@ -638,18 +638,95 @@ inline unsigned logical_cpus()
 #endif
     return std::thread::hardware_concurrency();
 }
-inline uint64_t available_memory()
+struct HostMemoryBound { uint64_t capacity = 0, available = 0; };
+#ifdef __linux__
+inline std::optional<uint64_t> memory_counter(std::filesystem::path const& path)
 {
+    std::ifstream input(path); std::string text;
+    if (!(input >> text) || text == "max") return {};
+    uint64_t value = 0; auto const parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return {};
+    return value;
+}
+inline void tighten_memory_bound(HostMemoryBound& bound, std::filesystem::path directory,
+    std::filesystem::path const& mount, bool unified = true)
+{
+    for (;;)
+    {
+        auto const limit = memory_counter(directory / (unified ? "memory.max" : "memory.limit_in_bytes"));
+        if (limit)
+        {
+            bound.capacity = std::min(bound.capacity, *limit);
+            auto const before = memory_counter(directory / (unified ? "memory.current" : "memory.usage_in_bytes"));
+            auto const after = memory_counter(directory / (unified ? "memory.current" : "memory.usage_in_bytes"));
+            auto const used = before && after ? std::max(*before, *after) : *limit;
+            bound.available = std::min(bound.available, *limit - std::min(*limit, used));
+        }
+        if (directory == mount || directory == directory.parent_path()) break;
+        directory = directory.parent_path();
+    }
+}
+inline std::string cgroup_mount_path(std::string value)
+{
+    for (size_t at = 0; at + 3 < value.size(); ++at) if (value[at] == '\\')
+    {
+        auto const code = value.substr(at, 4);
+        char decoded = code == "\\040" ? ' ' : code == "\\011" ? '\t' : code == "\\012" ? '\n' : code == "\\134" ? '\\' : '\0';
+        if (decoded) value.replace(at, 4, 1, decoded);
+    }
+    return value;
+}
+#endif
+inline HostMemoryBound memory_bound()
+{
+    HostMemoryBound result;
 #ifdef _WIN32
     MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
-    if (::GlobalMemoryStatusEx(&memory)) return memory.ullAvailPhys;
+    if (::GlobalMemoryStatusEx(&memory)) result = {memory.ullTotalPhys, memory.ullAvailPhys};
 #elif defined(__linux__)
     std::ifstream in("/proc/meminfo"); std::string key, unit; uint64_t value;
     while (in >> key >> value >> unit)
-        if (key == "MemAvailable:" && value <= UINT64_MAX / 1024) return value * 1024;
+    {
+        if (value <= UINT64_MAX / 1024)
+        {
+            if (key == "MemTotal:") result.capacity = value * 1024;
+            if (key == "MemAvailable:") result.available = value * 1024;
+        }
+        if (result.capacity && result.available) break;
+    }
+    std::string unified, legacy, line;
+    std::ifstream memberships("/proc/self/cgroup");
+    while (std::getline(memberships, line))
+    {
+        auto const first = line.find(':'), second = first == line.npos ? line.npos : line.find(':', first + 1);
+        if (second == line.npos) continue;
+        auto const controllers = ',' + line.substr(first + 1, second - first - 1) + ',';
+        if (first == 1 && line[0] == '0' && second == first + 1) unified = line.substr(second + 1);
+        if (controllers.find(",memory,") != controllers.npos) legacy = line.substr(second + 1);
+    }
+    std::ifstream mounts("/proc/self/mountinfo");
+    while (std::getline(mounts, line))
+    {
+        auto const separator = line.find(" - "); if (separator == line.npos) continue;
+        std::istringstream fields(line.substr(0, separator)), system(line.substr(separator + 3));
+        std::string id, parent, device, root, mount, type, source, options;
+        if (!(fields >> id >> parent >> device >> root >> mount) || !(system >> type >> source >> options)) continue;
+        bool const current = type == "cgroup2";
+        if (!current && !(type == "cgroup" && (',' + options + ',').find(",memory,") != std::string::npos)) continue;
+        auto const& membership = current ? unified : legacy; if (membership.empty()) continue;
+        auto const mount_path = std::filesystem::path(cgroup_mount_path(mount)).lexically_normal();
+        auto const root_path = std::filesystem::path(cgroup_mount_path(root)).lexically_normal();
+        auto const member_path = std::filesystem::path(membership).lexically_normal();
+        auto relative = member_path.lexically_relative(root_path);
+        if (member_path == "/") relative = "."; // cgroup-namespace root
+        if (relative.empty() || *relative.begin() == "..") continue;
+        tighten_memory_bound(result, (mount_path / relative).lexically_normal(), mount_path, current);
+    }
 #endif
-    return 0;
+    return result;
 }
+inline uint64_t available_memory() { return memory_bound().available; }
+inline uint64_t physical_memory() { return memory_bound().capacity; }
 inline std::string host_name()
 {
 #ifdef _WIN32

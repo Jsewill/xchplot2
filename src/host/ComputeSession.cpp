@@ -2,6 +2,7 @@
 #include "host/ComputeDiscovery.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeWorker.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <iostream>
@@ -55,6 +56,7 @@ group_grow::WorkerConfig make_group_compute_offer(GroupOptions const& args, std:
     config.capacity = {uint32_t(args.pool_offer_cpus), uint32_t(args.pool_offer_slots), args.pool_offer_ram, args.pool_offer_vram};
     config.backend = args.pool_offer_backend; config.tier = args.tier; config.device = int(args.device);
     config.task_timeout_ms = unsigned(args.pool_timeout_ms);
+    config.identity_reservation = args.compute_worker_reservation;
     // Protected migration reserves the complete executor independently of its
     // owner/client/codec partition. Reuse the worker's own bounded CPU gate;
     // ordinary jobs retain their established shared owner scheduler.
@@ -75,6 +77,7 @@ bool saved_compute_available(std::filesystem::path const& directory)
 void prepare_group_compute(GroupOptions& args)
 {
     require(args.compute_mode == "auto" || args.compute_mode == "off", "--compute requires auto or off");
+    if (args.automatic_compute) return;
     if (!args.local_devices.empty())
     {
         require(args.pool_broker.empty() && args.pool_ca.empty() && args.pool_cert.empty() && args.pool_key.empty() &&
@@ -82,7 +85,7 @@ void prepare_group_compute(GroupOptions& args)
             !args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_offer_backend_set,
             "selected local producers cannot also use shared compute connection or offer options");
         args.local_compute = true;
-        auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency());
+        auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, group_grow::profile_detail::logical_cpus());
         args.pool_offer_cpus = std::max(1u, workers - 1);
         // The complete executor partition includes every service baseline,
         // retained device buffer and active task. Receiving/assembly keep the
@@ -126,11 +129,15 @@ void prepare_group_compute(GroupOptions& args)
         return;
     }
     if (!args.pool_offer_ram) args.pool_offer_ram = std::max(args.max_ram / 2, std::min(uint64_t(256) << 20, args.max_ram / 4 * 3));
-    if (identity->defaults.host_bytes) args.pool_offer_ram = std::min(args.pool_offer_ram, identity->defaults.host_bytes);
-    auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency());
-    if (!args.pool_offer_cpus) args.pool_offer_cpus = std::max(1u, workers / 2);
-    if (identity->defaults.cpus) args.pool_offer_cpus = std::min<uint64_t>(args.pool_offer_cpus, identity->defaults.cpus);
+    auto limit = [](uint64_t selected, uint64_t saved) { return !selected ? saved : !saved ? selected : std::min(selected, saved); };
+    args.pool_offer_ram_limit = limit(args.pool_offer_ram_limit, identity->defaults.host_bytes);
+    if (args.pool_offer_ram_limit) args.pool_offer_ram = std::min(args.pool_offer_ram, args.pool_offer_ram_limit);
+    auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, group_grow::profile_detail::logical_cpus());
+    if (!args.pool_offer_cpus) args.pool_offer_cpus = std::max(1u, workers - 1);
+    args.pool_offer_cpu_limit = limit(args.pool_offer_cpu_limit, identity->defaults.cpus);
+    if (args.pool_offer_cpu_limit) args.pool_offer_cpus = std::min(args.pool_offer_cpus, args.pool_offer_cpu_limit);
     if (!args.pool_offer_vram) args.pool_offer_vram = identity->defaults.gpu_bytes;
+    args.pool_offer_vram_limit = limit(args.pool_offer_vram_limit, identity->defaults.gpu_bytes);
     if (!args.pool_offer_backend_set) args.pool_offer_backend = args.backend_set ? args.backend : identity->defaults.backend;
 }
 
@@ -140,7 +147,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
     ComputeInspection result;
     auto const now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     if (now >= 0) result.observed_at_unix_ms = uint64_t(now);
-    result.unknowns = "direct worker reachability, exact plot parameters, resource fit and new lease admission are not tested; broker pages may advance during inspection";
+    result.unknowns = "exact plot parameters, resource fit and new lease admission are not tested; broker pages and direct worker observations may advance during inspection";
     result.next_action = "use compute status --verbose to inspect authenticated task wait reasons";
     auto expired = [&] { return Clock::now() >= deadline || (args.cancelled && args.cancelled()); };
     auto issue = [&](std::string endpoint, std::string reason)
@@ -207,7 +214,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         tls.timeout_ms = 1000;
         require(args.max_ram > pool::BrokerClient::memory_bytes(1) + (4ULL << 20),
             "compute inspection transport and bounded records exceed the available host memory");
-        std::vector<pool::Endpoint> brokers;
+        std::vector<pool::Endpoint> brokers, direct_workers;
         auto route = args.pool_broker;
         if (route.empty() && identity) route = identity->defaults.broker;
         if (!route.empty() && route != "auto") brokers.push_back(pool::parse_endpoint(route));
@@ -215,9 +222,14 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         if (brokers.empty() && identity && identity->defaults.discovery && !expired())
         {
             pool::ComputeDiscovery discovery(discovery_options(*identity));
-            auto const until = std::min(deadline, Clock::now() + std::chrono::seconds(1));
+            auto const until = std::min(deadline, Clock::now() + std::chrono::seconds(2));
             while (!expired() && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             brokers = discovery.brokers(); result.discovery = discovery.status();
+            for (auto const& service : discovery.services()) if (service.role == "worker")
+            {
+                if (direct_workers.size() == 128) { issue("", "worker discovery exceeded the bounded endpoint listing"); break; }
+                direct_workers.push_back(service.endpoint);
+            }
         }
         else if (brokers.empty()) result.discovery = "disabled in saved compute settings";
         if (brokers.size() > 128) { brokers.resize(128); issue("", "broker discovery exceeded the bounded endpoint listing"); }
@@ -226,6 +238,33 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         auto const generation_contract = group_grow::worker_compatibility(pool::Kind::GenerateAny);
         auto const codec_contract = group_grow::worker_compatibility(pool::Kind::Pack);
         require(!generation_contract.empty() && !codec_contract.empty(), "this build has no shared compute contract identities");
+        auto record_worker = [&](auto const& worker, pool::WorkerHardware const& hardware, uint64_t capabilities, uint64_t age_ms)
+        {
+            if (workers.size() >= 128 && !workers.contains(worker.identity + ':' + worker.instance))
+            { issue("", "worker listing exceeded the bounded combined row limit"); return; }
+            result.oldest_worker_registration_age_ms = std::max(result.oldest_worker_registration_age_ms, age_ms);
+            if (!workers.insert(worker.identity + ':' + worker.instance).second) return;
+            ++result.workers;
+            result.worker_resources.push_back({worker.identity, worker.instance, hardware.host, hardware.gpu_identity,
+                pool::admission_name(worker.admission), hardware.partition.cpu_threads, hardware.partition.slots,
+                hardware.partition.host_bytes, hardware.partition.gpu_bytes, hardware.standing_host_bytes,
+                hardware.logical_cpus, hardware.total_host_bytes, hardware.available_host_bytes, hardware.total_gpu_bytes, capabilities,
+                hardware.observed_at_unix_ms});
+            bool const offers_generation = capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu));
+            bool const offers_codec = capabilities & pool::capability(pool::Kind::Pack);
+            bool const generation = offers_generation && worker.compatibility == generation_contract;
+            bool const codec = offers_codec && worker.codec_compatibility == codec_contract;
+            result.worker_resources.back().capabilities =
+                (generation ? capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu)) : 0) |
+                (codec ? pool::capability(pool::Kind::Pack) : 0);
+            generation_compatible = generation_compatible || generation; codec_compatible = codec_compatible || codec;
+            if ((offers_generation && !generation) || (offers_codec && !codec)) ++result.incompatible;
+            if (worker.admission == pool::WorkerAdmission::Accepting)
+            { if (generation) ++result.accepting_generation; if (codec) ++result.accepting_codec; }
+            else if (worker.admission == pool::WorkerAdmission::Paused) ++result.paused;
+            else if (worker.admission == pool::WorkerAdmission::Draining) ++result.draining;
+            else if (worker.admission == pool::WorkerAdmission::Drained) ++result.drained;
+        };
         for (auto endpoint : brokers)
         {
             auto const address = endpoint_text(endpoint);
@@ -244,38 +283,46 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
                 {
                     if (expired()) { issue(address, "overall live inspection time budget exhausted"); break; }
                     auto page = client.status({pool::StatusSection::Workers, cursor, std::min(remaining, pool::max_status_page_size)});
-                    if (!cursor) { ++result.brokers; result.checked = true; }
+                    if (!cursor)
+                    {
+                        ++result.brokers; result.checked = true;
+                        result.broker_resources.push_back({page.identity, page.host});
+                    }
                     require(page.worker_records.size() <= remaining && (!page.next_cursor || page.next_cursor > cursor),
                         "broker inspection exceeded its bounded status page");
                     remaining -= unsigned(page.worker_records.size()); cursor = page.next_cursor;
                     for (auto const& worker : page.worker_records)
                     {
-                        if (workers.size() >= 128 && !workers.contains(worker.identity + ':' + worker.instance))
-                        { issue(address, "worker listing exceeded the bounded combined row limit"); break; }
-                        result.oldest_worker_registration_age_ms = std::max(result.oldest_worker_registration_age_ms, worker.seen_ms);
-                        if (!workers.insert(worker.identity + ':' + worker.instance).second) continue;
-                        ++result.workers;
-                        bool const offers_generation = worker.capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu));
-                        bool const offers_codec = worker.capabilities & pool::capability(pool::Kind::Pack);
-                        bool const generation = offers_generation && worker.compatibility == generation_contract;
-                        bool const codec = offers_codec && worker.codec_compatibility == codec_contract;
-                        generation_compatible = generation_compatible || generation; codec_compatible = codec_compatible || codec;
-                        if ((offers_generation && !generation) || (offers_codec && !codec)) ++result.incompatible;
-                        if (worker.admission == pool::WorkerAdmission::Accepting)
-                        { if (generation) ++result.accepting_generation; if (codec) ++result.accepting_codec; }
-                        else if (worker.admission == pool::WorkerAdmission::Paused) ++result.paused;
-                        else if (worker.admission == pool::WorkerAdmission::Draining) ++result.draining;
-                        else if (worker.admission == pool::WorkerAdmission::Drained) ++result.drained;
+                        record_worker(worker, worker.hardware, worker.capabilities, worker.seen_ms);
                     }
                     if (cursor && !remaining) issue(address, "worker listing truncated at the bounded row limit");
                 } while (cursor && remaining);
             }
             catch (std::exception const& error) { issue(address, error.what()); }
         }
+        endpoints.clear();
+        for (auto endpoint : direct_workers)
+        {
+            auto const address = endpoint_text(endpoint);
+            if (!endpoints.insert(address).second) continue;
+            if (expired()) { issue(address, "overall live inspection time budget exhausted"); break; }
+            if (!pool::numeric_host(endpoint.host))
+            { issue(address, "discovered worker has no numeric route"); continue; }
+            endpoint.server_name = args.pool_server_name.empty() && identity ? identity->server_name : args.pool_server_name;
+            try
+            {
+                auto worker = group_grow::WorkerService::remote_status(endpoint, tls);
+                result.checked = true;
+                uint64_t capabilities = pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::Pack);
+                if (worker.hardware.partition.gpu_bytes) capabilities |= pool::capability(pool::Kind::GenerateGpu);
+                record_worker(worker, worker.hardware, capabilities, 0);
+            }
+            catch (std::exception const& error) { issue(address, error.what()); }
+        }
         if (!result.checked)
         {
             result.status = "unavailable"; result.complete = false;
-            result.reason = brokers.empty() ? "no running broker route was observed; a future automatic session is not current availability" :
+            result.reason = brokers.empty() ? "no running broker or worker route was observed; a future automatic session is not current availability" :
                 "no selected broker supplied an authenticated live observation";
             result.next_action = "use compute service status and inspect the saved broker route, enrollment and network; retry status --live";
         }
@@ -304,7 +351,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         else
         {
             result.status = "compatible-workers-observed";
-            result.reason = "authenticated brokers report accepting workers with compatible generation and codec contracts";
+            result.reason = "authenticated observations report accepting workers with compatible generation and codec contracts";
         }
     }
     catch (std::exception const& error)
@@ -376,7 +423,7 @@ struct ComputeSession::Impl
     }
     bool start_worker(group_grow::WorkerConfig config)
     {
-        try { config.identity_reservation = group_grow::WorkerService::reserve_identity(config.tls.cert_file); }
+        try { if (!config.identity_reservation) config.identity_reservation = group_grow::WorkerService::reserve_identity(config.tls.cert_file); }
         catch (group_grow::WorkerAlreadyRunning const&) { return false; }
         group_grow::default_worker_resources(config);
         // capacity.host_bytes already includes the complete service baseline.

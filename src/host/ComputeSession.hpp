@@ -18,9 +18,18 @@ group_grow::WorkerConfig make_group_compute_offer(GroupOptions const&,
 struct ComputeInspection
 {
     struct Issue { std::string endpoint, reason; };
+    struct Worker
+    {
+        std::string identity, instance, host, gpu_identity, admission;
+        uint64_t cpus = 0, slots = 0, host_bytes = 0, gpu_bytes = 0, standing_host_bytes = 0;
+        uint64_t logical_cpus = 0, total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, capabilities = 0, observed_at_unix_ms = 0;
+    };
+    struct Broker { std::string identity, host; };
     std::string status = "not-queried", reason, next_action, unknowns, discovery = "not-queried";
     std::string certificate_expires, authority_expires, service_lifecycle, local_worker_intent = "not-selected", local_worker_intent_action;
     std::vector<Issue> issues;
+    std::vector<Worker> worker_resources;
+    std::vector<Broker> broker_resources;
     uint64_t observed_at_unix_ms = 0, brokers = 0, workers = 0, oldest_worker_registration_age_ms = 0;
     uint64_t accepting_generation = 0, accepting_codec = 0, paused = 0, draining = 0, drained = 0, incompatible = 0;
     bool configured = false, checked = false, complete = true, blocking = false;

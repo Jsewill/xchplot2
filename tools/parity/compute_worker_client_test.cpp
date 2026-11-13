@@ -3,6 +3,7 @@
 #include "host/ComputeWorker.cpp"
 #include "host/ComputeSession.hpp"
 #include "host/ComputeIdentity.hpp"
+#include "host/ComputeDiscovery.hpp"
 #include "compute_pool_fixture.hpp"
 #include <iostream>
 
@@ -639,12 +640,82 @@ void protected_admission()
     controller.unregister_worker(stale.instance); unregistered.stop();
 }
 
+void adaptive_resources()
+{
+    std::atomic<uint64_t> available{256};
+    worker_detail::Budget budget(1024, 1, 16, [&] { return available.load(); });
+    require(budget.task_capacity() == 256 - 16, "worker ignored its current host headroom");
+    auto held = budget.acquire(64, true, {});
+    available.store(32);
+    require(budget.task_capacity() == held.bytes, "worker capacity dropped an active memory lease under pressure");
+    available.store(16); held.release(); require(!budget.task_capacity(), "worker advertised free task memory under pressure");
+    available.store(512);
+    require(budget.task_capacity() == 512 - 16, "worker RAM offer did not recover after pressure cleared");
+    available.store(4096);
+    require(budget.task_capacity() == 1024 - 16, "worker RAM offer exceeded its explicit ceiling");
+    available.store(16);
+    auto waiting = std::async(std::launch::async, [&] { return budget.acquire(64, true, {}); });
+    require(waiting.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+        "worker admitted an allocation without current RAM");
+    available.store(512); auto resumed = waiting.get(); resumed.release();
+    available.store(16); std::atomic<bool> stop{false};
+    auto cancelled = std::async(std::launch::async, [&]
+    { try { (void)budget.acquire(64, true, WorkerCancellation{&stop}); return false; } catch (std::exception const&) { return true; } });
+    require(cancelled.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+        "worker pressure wait failed before cancellation");
+    stop.store(true); require(cancelled.get(), "worker pressure wait ignored cancellation");
+    std::atomic<unsigned> cpus{1};
+    worker_detail::CpuAdmission cpu(4, [&](unsigned) { return cpus.load(); });
+    auto fanout = std::async(std::launch::async, [&]
+    { worker_detail::CpuAdmission::Lease work(cpu, 2, {}); return true; });
+    require(fanout.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+        "worker CPU work exceeded current admitted lanes");
+    cpus.store(4); require(fanout.get(), "worker CPU work did not recover with available lanes");
+    cpus.store(1);
+    { worker_detail::CpuAdmission::Lease available_cpu(cpu, 4, {}, true);
+      require(available_cpu.permits() == 1 && cpu.active().first == 1,
+          "CPU generation waited for its saved ceiling instead of using currently available lanes"); }
+    cpus.store(0); stop.store(false);
+    auto no_cpu = std::async(std::launch::async, [&]
+    { try { worker_detail::CpuAdmission::Lease work(cpu, 4, WorkerCancellation{&stop}, true); return false; }
+      catch (std::exception const&) { return true; } });
+    require(no_cpu.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
+        "worker started CPU work with no current capacity");
+    stop.store(true); require(no_cpu.get(), "zero-capacity CPU wait ignored cancellation");
+    WorkerConfig config; config.capacity = {4, 1, uint64_t(512) << 20, 0};
+    std::atomic<uint64_t> ram{uint64_t(2) << 30}; cpus.store(4);
+    config.available_resources = [&](uint32_t) { return pool::Resources{cpus.load(), 1, ram.load(), 0}; };
+    WorkerService service(config); auto const high = service.status();
+    ram.store(uint64_t(64) << 20); cpus.store(1); auto const low = service.status();
+    require(low.capacity.host_bytes < high.capacity.host_bytes && low.capacity.cpu_threads == 1 &&
+        high.hardware.partition.host_bytes == config.capacity.host_bytes && low.hardware.partition == high.hardware.partition,
+        "worker confused live capacity with its stable complete service ceiling");
+    ram.store(uint64_t(2) << 30); cpus.store(4); auto const recovered = service.status();
+    require(recovered.capacity == high.capacity, "worker resource offer did not recover without restarting its identity");
+    WorkerConfig automatic; default_worker_resources(automatic);
+    require(automatic.capacity.cpu_threads == std::max(1u, profile_detail::logical_cpus()) &&
+        automatic.capacity.host_bytes == profile_detail::physical_memory(),
+        "automatic worker retained a fixed half-host or fixed RAM default");
+}
+
 void session_memory_ownership()
 {
     pool_test::Directory directory;
     auto identity = pool::create_pool(directory.path / "session", "owned-startup-fixture");
     auto defaults = identity.defaults; defaults.discovery = false; defaults.interfaces = {"lo"}; defaults.max_brokers = 16;
+    defaults.cpus = 2; defaults.host_bytes = uint64_t(1) << 30;
     pool::configure_pool(identity, defaults);
+    {
+        pos2gpu::GroupOptions remote; remote.pool_directory = pool_test::utf8_path(identity.directory);
+        remote.max_ram = uint64_t(512) << 20; remote.workers = 2; remote.backend = "cpu"; remote.backend_set = true;
+        remote.automatic_local_compute = false;
+        pos2gpu::prepare_group_compute(remote);
+        auto const remaining = remote.max_ram;
+        require(remote.automatic_compute && !remote.pool_offer_ram && !remote.pool_offer_cpus && !remote.pool_offer_vram,
+            "remote-only automatic compute inherited local offer defaults");
+        pos2gpu::prepare_group_compute(remote);
+        require(remote.max_ram == remaining, "re-reading automatic compute defaults charged the session twice");
+    }
     pos2gpu::GroupOptions args; args.pool_directory = pool_test::utf8_path(identity.directory);
     args.max_ram = uint64_t(2) << 30; args.workers = 1; args.backend = "cpu"; args.backend_set = true;
     args.pool_offer_ram = uint64_t(512) << 20; args.pool_offer_cpus = 1; args.pool_offer_backend_set = true;
@@ -951,12 +1022,44 @@ void status_inspection()
     }
     auto untouched = control.status();
     require(!untouched.owners && !untouched.jobs, "failed inspection changed broker owner or work state");
+    {
+        auto member = pool::create_pool(directory.path / "unbrokered-worker", "unbrokered-status");
+        auto settings = member.defaults; settings.discovery = true; settings.interfaces = {"lo"}; settings.broker.clear();
+        pool::configure_pool(member, settings);
+        WorkerConfig worker; worker.listen = {"::", 0}; worker.tls = member.tls;
+        worker.tls.listen_interfaces = {"lo"};
+        worker.tls.membership_directory = pool_test::utf8_path(member.directory);
+        worker.capacity = {1, 1, uint64_t(512) << 20, 0};
+        WorkerService service(worker); service.start();
+        pool::DiscoveryOptions announcement; announcement.pool_id = member.pool_id; announcement.node_id = member.node_id;
+        announcement.name = member.name; announcement.server_name = member.server_name;
+        announcement.interfaces = {"lo"}; announcement.role = "worker"; announcement.endpoint = service.endpoint();
+        pool::ComputeDiscovery advertised(announcement);
+        require(advertised.status() == "LAN discovery active", "unbrokered worker fixture cannot advertise over loopback multicast");
+        pos2gpu::GroupOptions observer; observer.max_ram = uint64_t(64) << 20;
+        observer.pool_directory = pool_test::utf8_path(member.directory);
+        auto const found = inspect_group_compute(observer, Clock::now() + std::chrono::seconds(3));
+        auto const idle = service.status();
+        if (!found.checked || found.status != "compatible-workers-observed" || found.workers != 1)
+        {
+            std::cerr << "unbrokered inspection: " << found.status << "; " << found.reason << "; discovery=" << found.discovery
+                << "; workers=" << found.workers << "; brokers=" << found.brokers << '\n';
+            for (auto const& issue : found.issues) std::cerr << issue.endpoint << ": " << issue.reason << '\n';
+        }
+        require(found.checked && found.status == "compatible-workers-observed" && !found.brokers && found.workers == 1 &&
+            found.worker_resources.size() == 1 && found.worker_resources.front().identity == pool::certificate_identity(member.tls.cert_file) &&
+            found.worker_resources.front().host == profile_detail::host_name() &&
+            found.worker_resources.front().host_bytes == worker.capacity.host_bytes &&
+            found.worker_resources.front().cpus == worker.capacity.cpu_threads &&
+            !idle.accepted_tasks && !idle.known_brokers && !idle.active.cpu_threads && !idle.active.slots && !idle.active.host_bytes,
+            "unbrokered discovery failed to authenticate hardware scope or started owner/task work");
+    }
 }
 } // namespace
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

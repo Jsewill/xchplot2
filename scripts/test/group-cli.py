@@ -306,7 +306,7 @@ def snapshot(root, *, observations=True):
         records = {
             "grow-farm.progress": (b"ordinary-group-farming-progress-v1\n", b"ordinary-group-farming-progress-v2\n"),
             "grow-farm.owner": (b"ordinary-group-farming-owner-v1\n", b"ordinary-group-farming-owner-v2\n"),
-            "grow-farm.heartbeat": (b"ordinary-group-farming-heartbeat-v1\n",),
+            "grow-farm.heartbeat": (b"ordinary-group-farming-heartbeat-v1\n", b"ordinary-group-farming-heartbeat-v2\n"),
         }
         for base, headers in records.items():
             for name in (base, ".xchplot2/" + base):
@@ -2136,6 +2136,33 @@ def check_replot(binary, root, reference=None):
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         return result
 
+    def wait_for_service(*args):
+        nonlocal counter
+        counter += 1
+        log = directory / f"{counter:03d}.log"
+        env = dict(os.environ)
+        env.pop("XCHPLOT2_GROW_FAILPOINT", None)
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(command(*args), stdout=output, stderr=output, env=env,
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+            try:
+                until = time.monotonic() + 60
+                while time.monotonic() < until:
+                    text = log.read_text(encoding="utf-8")
+                    assert process.poll() is None, text
+                    if "waiting for farming services" in text:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(("service outage did not enter retry", text))
+                process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+                assert process.wait(timeout=30) != 0
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=30)
+        assert SEED not in log.read_text(encoding="utf-8")
+
     # The caller's large memory grant must survive public serialization too.
     large_root = directory / "large inventory"
     large_root.mkdir()
@@ -2148,6 +2175,9 @@ def check_replot(binary, root, reference=None):
     assert len(large_catalog["plots"]) == 18000 and len(large_file.read_bytes()) > 16 * 1024 * 1024
     assert snapshot(large_root) == large_before, "large inventory serialization changed its source entries"
 
+    def private_replot_farm(path):
+        return shlex.split(path.read_bytes()[:-65].decode("utf-8"))[8].encode("utf-8")
+
     def saved_replacement_authority(path, phase=None):
         record = path.read_bytes()
         body = record[:-65]
@@ -2155,11 +2185,11 @@ def check_replot(binary, root, reference=None):
         rows = farming_plan_rows(body)
         if phase is not None:
             assert rows[0] in (b"ordinary-group-replot-journal-v1\n", b"ordinary-group-replot-journal-v2\n",
-                               b"ordinary-group-replot-journal-v3\n", b"ordinary-group-replot-journal-v4\n")
-            if rows[0] not in (b"ordinary-group-replot-journal-v3\n", b"ordinary-group-replot-journal-v4\n"):
+                               b"ordinary-group-replot-journal-v3\n", b"ordinary-group-replot-journal-v4\n",
+                               b"ordinary-group-replot-journal-v5\n", b"ordinary-group-replot-journal-v6\n")
+            if rows[0] in (b"ordinary-group-replot-journal-v1\n", b"ordinary-group-replot-journal-v2\n"):
                 return "stamp"
-            identities = dict(zip(("verified_stage", "published", "ready"),
-                                  rows[-4:-1] if rows[0] == b"ordinary-group-replot-journal-v4\n" else rows[-3:]))
+            identities = dict(zip(("verified_stage", "published", "ready"), rows[8:11]))
             identity = identities[phase]
         else:
             assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n", b"ordinary-group-replot-receipt-v3\n")
@@ -2307,7 +2337,7 @@ def check_replot(binary, root, reference=None):
                 assert time.monotonic() < until, "direct replot did not retain its published replacement while waiting"
                 time.sleep(0.1)
             publications = list(direct.glob("*.plot2"))
-            assert len(publications) == 1 and digest(direct / "legacy.plot") == source_hash
+            assert 1 <= len(publications) <= 2 and digest(direct / "legacy.plot") == source_hash
             published_hash = digest(publications[0])
             assert not list(direct.rglob("*.building")), "farming confirmation retained construction scratch"
             flags(roots=[str(farm), str(direct), str(excluded)], first_replacement_only=True)
@@ -2331,6 +2361,151 @@ def check_replot(binary, root, reference=None):
     assert {path: digest(path) for path in direct_paths} == completed_hashes
     flags()
     print("PASS direct replot, discovery, exclusions, read-only preview, private recovery and delayed farming confirmation", flush=True)
+    # The durable pending queue can make progress on another directory while
+    # one drive is absent. Exercise actual publication/crash recovery and the
+    # ordinary causal control mailbox with a stable controller authority.
+    queue_dirs = [directory / "queue left", directory / "queue right"]
+    for path in queue_dirs:
+        path.mkdir()
+    queue_source = queue_dirs[0] / "legacy.plot"
+    queue_source.write_bytes(legacy)
+    queue_reader = directory / "queue reader"
+    (queue_reader / "config").mkdir(parents=True)
+    (queue_reader / "config/config.yaml").write_text(
+        "self_hostname: localhost\nharvester:\n  num_threads: 1\n  plot_directories:\n" +
+        "".join("  - " + json.dumps(str(path)) + "\n" for path in queue_dirs), encoding="utf-8")
+
+    def queue_flags(**values):
+        temporary = queue_reader / "fixture.next"
+        temporary.write_text(json.dumps({"roots": list(map(str, queue_dirs)), **values}), encoding="utf-8")
+        temporary.replace(queue_reader / "fixture.json")
+
+    queue_flags()
+    queue_adapter = ["--chia-root", queue_reader, "--chia-executable", executable]
+    queue_inventory = directory / "queue inventory.plan"
+    queue_catalog = json.loads(run("plan", "--inventory", *queue_dirs, *queue_adapter,
+                                  "--save-plan", queue_inventory, "--json").stdout)
+    queue_profile = json.loads(json.dumps(profile))
+    queue_profile["farm_resources"]["workloads"] = [
+        {**resources["workloads"][0], "id": workload["id"], "plot_count": workload["plot_count"]}
+        for workload in queue_catalog["farm_resources"]["workloads"]]
+    queue_profile["farm_resources"]["native"]["cohorts"][0]["max_members"] = 10
+    queue_profile_file = directory / "queue profile.json"
+    queue_profile_file.write_text(json.dumps(queue_profile), encoding="utf-8")
+    queue_review = directory / "queue migration.plan"
+    queue_options = [*options, "--max-groups", 5, "--max-total-members", 5]
+    queue_plan = json.loads(run("plan", *queue_dirs, "--replot-inventory", queue_inventory,
+                               "--harvester", queue_profile_file, *queue_adapter, *queue_options,
+                               "--reclaim-before-bytes", 0, "--save-plan", queue_review, "--json").stdout)
+    assert queue_plan["feasible"] and len(queue_plan["batches"]) == 10
+    queue_execute = ["fill", "--from-plan", queue_review, *queue_options]
+    run(*queue_execute, "--harvester", queue_profile_file, *queue_adapter,
+        "-f", FARMER, "--pool-ph", POOL, "-S", SEED, point="replot-controller-authority-durable", code=86)
+    parked = queue_dirs[0].with_name("queue left offline")
+    queue_dirs[0].rename(parked)
+    queue_flags(farmer_unloaded=True)
+    for point in ("replot-queue-admitted", "replot-queue-verified", "replot-queue-publication-renamed", "replot-queue-published"):
+        run(*queue_execute, point=point, code=86)
+        assert digest(parked / "legacy.plot") == source_hash and not queue_dirs[0].exists()
+    queue_log = directory / "queue waiting.log"
+
+    def queue_status():
+        return json.loads(run("status", queue_review, "--json", code=0 if queue_dirs[0].exists() else 2).stdout)
+
+    def await_queue(process, predicate, timeout=120):
+        until = time.monotonic() + timeout
+        while time.monotonic() < until:
+            assert process.poll() is None, queue_log.read_text(encoding="utf-8")
+            value = queue_status()
+            if predicate(value):
+                return value
+            time.sleep(0.2)
+        raise AssertionError(("migration state did not converge", value, queue_log.read_text(encoding="utf-8")))
+
+    with queue_log.open("w", encoding="utf-8") as output:
+        process = subprocess.Popen(command(*queue_execute), stdout=output, stderr=output,
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+        try:
+            state = await_queue(process, lambda value: len(value["queued_outputs"]) == 2 and
+                                all(item["published"] for item in value["queued_outputs"]))
+            assert state["controller_authority"]["available"] and state["pending_output_limit"] == 3
+            healthy_hashes = {path: digest(path) for path in queue_dirs[1].glob("*.plot2")}
+            assert len(healthy_hashes) == 2 and digest(parked / "legacy.plot") == source_hash
+            run("pause", "--from-plan", queue_review)
+            await_queue(process, lambda value: value["effective_control"] == "paused")
+            process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            assert process.wait(timeout=30) != 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+    stopped = queue_status()
+    assert stopped["effective_control"] == "paused" and not queue_dirs[0].exists()
+    run("resume", "--from-plan", queue_review, "--policy-only")
+    # A reviewed successor must retain independent recovery too. Review and
+    # activate it with every original root present, then lose the same drive
+    # again while the two published queue entries remain owned by the job.
+    parked.rename(queue_dirs[0])
+    queue_flags()
+    queue_config = queue_reader / "config/config.yaml"
+    queue_config.write_text(queue_config.read_text(encoding="utf-8").replace("num_threads: 1", "num_threads: 2"), encoding="utf-8")
+    queue_successor = directory / "queue successor.plan"
+    queue_authority = Path(stopped["controller_authority"]["directory"])
+    queue_before = tuple(snapshot(path) for path in [*queue_dirs, queue_authority])
+    successor = json.loads(run("plan", "--revalidate", "--from-plan", queue_review, "--harvester", queue_profile_file,
+                               *queue_adapter, *queue_options, "--save-plan", queue_successor, "--json").stdout)
+    assert not successor["activated"] and tuple(snapshot(path) for path in [*queue_dirs, queue_authority]) == queue_before
+    queue_review = queue_successor
+    queue_execute = ["fill", "--from-plan", queue_review, *queue_options]
+    run(*queue_execute, "--harvester", queue_profile_file, *queue_adapter, point="replot-policy-activated", code=86)
+    assert {path: digest(path) for path in healthy_hashes} == healthy_hashes and digest(queue_source) == source_hash
+    queue_dirs[0].rename(parked)
+    # A healthy directory must continue past the pending-output limit while
+    # its peer stays absent, including crashes between readiness and the
+    # durable completion that releases the queue slot.
+    queue_flags()
+    for point in ("replot-queue-ready", "replot-independent-receipt-synced", "replot-independent-complete"):
+        run(*queue_execute, point=point, code=86)
+        assert not queue_dirs[0].exists() and digest(parked / "legacy.plot") == source_hash
+        assert {path: digest(path) for path in healthy_hashes} == healthy_hashes
+    with queue_log.open("a", encoding="utf-8") as output:
+        process = subprocess.Popen(command(*queue_execute), stdout=output, stderr=output,
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+        try:
+            completed = await_queue(process, lambda value: value["destination_completions"][1]["completed_files"] == 5)
+            assert completed["completed_farmable_replacements"] == 5
+            assert completed["unconfirmed_outputs"] <= completed["pending_output_limit"]
+            assert not queue_dirs[0].exists() and digest(parked / "legacy.plot") == source_hash
+            healthy_hashes = {path: digest(path) for path in queue_dirs[1].glob("*.plot2")}
+            assert len(healthy_hashes) == 5
+            queue_flags(farmer_unloaded=True)
+            parked.rename(queue_dirs[0])
+            bounded = await_queue(process, lambda value: value["unconfirmed_outputs"] == value["pending_output_limit"] and
+                                  value["active_published"] and all(item["published"] for item in value["queued_outputs"]))
+            assert bounded["outstanding_predelete_bytes"] == 0 and digest(queue_source) == source_hash
+            assert sum(len(list(path.glob("*.plot2"))) for path in queue_dirs) == 8
+            run("drain", "--from-plan", queue_review)
+            await_queue(process, lambda value: value["effective_control"] == "draining")
+            assert {path: digest(path) for path in healthy_hashes} == healthy_hashes
+            run("pause", "--from-plan", queue_review)
+            await_queue(process, lambda value: value["effective_control"] == "paused")
+            process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            assert process.wait(timeout=30) != 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+    run("resume", "--from-plan", queue_review, "--policy-only")
+    queue_flags()
+    run(*queue_execute, point="replot-independent-prefix-consolidated", code=86)
+    run(*queue_execute)
+    assert not queue_source.exists() and all(private_record(path, "grow-farm.plan").exists() for path in queue_dirs)
+    assert {path: digest(path) for path in healthy_hashes} == healthy_hashes
+    for path in queue_dirs:
+        assert len(list(path.glob("*.plot2"))) == 5
+        for output in path.glob("*.plot2"):
+            run("verify", output, "--full", "--trials", 100)
+    print("PASS bounded migration queue, publication crash recovery, missing/returning drives, controls and full proofs", flush=True)
     # Complete the same synthetic envelope through guided stable-ID settings.
     # Its deliberately supplied bounds are fixture declarations, never local
     # OS measurements or inferred proof/queue service costs.
@@ -2614,7 +2789,11 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == before
     public_only = run("fill", "--from-plan", review_file, *options, *keys, code=2)
     assert "explicit installed target reader" in public_only.stdout + public_only.stderr and snapshot(farm) == before
-    for failure in ("farmer_unavailable", "solver_unavailable", "farmer_disconnected", "solver_stopped", "pool_external", "pool_mismatch", "node_mismatch"):
+    for failure in ("farmer_unavailable", "solver_unavailable", "farmer_disconnected", "solver_stopped", "node_mismatch"):
+        flags(**{failure: True})
+        wait_for_service(*execute, *keys)
+        assert snapshot(farm) == before and not private_record(farm, "grow-replot.plan").exists()
+    for failure in ("pool_external", "pool_mismatch"):
         flags(**{failure: True})
         unavailable = run(*execute, *keys, code=2)
         assert snapshot(farm) == before and not private_record(farm, "grow-replot.plan").exists()
@@ -2644,10 +2823,6 @@ def check_replot(binary, root, reference=None):
     assert (snapshot(farm), snapshot(external_scratch), review_file.read_bytes(), review_file.stat().st_mtime_ns) == preparing_before
     run(*execute, "-f", FARMER, "--pool-pk", FARMER, "-S", SEED, code=2)
     assert snapshot(farm) == staged_private, "different supplied pool route changed a prepared NFT journal"
-    for failure in ("farmer_disconnected", "solver_stopped"):
-        flags(**{failure: True})
-        run(*execute, code=2)
-        assert snapshot(farm) == staged_private, "keyless service refusal changed an interrupted private journal or source"
     flags()
     # Continue through the original review; the saved preparing successor was
     # only inspected and remains unactivated.
@@ -2662,6 +2837,20 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == partial_before and saved_work.is_dir()
     assert digest(source) == source_hash and not (directory / "must-not-review-partial.plan").exists()
     saved_work.rmdir()
+    prepared_farm = private_replot_farm(private_record(farm, "grow-replot.plan"))
+    prepared_source = snapshot(farm)[source.name]
+    for failure in ("farmer_disconnected", "solver_stopped"):
+        flags(**{failure: True})
+        wait_for_service(*execute)
+        # Resuming can publish the staged journal and establish its controller
+        # and owner observations while the original farming services recover.
+        assert private_replot_farm(private_record(farm, "grow-replot.plan")) == prepared_farm
+        assert snapshot(farm)[source.name] == prepared_source and not final.exists()
+        assert not list(preparing_artifacts.glob("stage-*.building*")) and not private_record(farm, "grow-farm.plan").exists()
+        waiting_status = json.loads(run("status", review_file, "--json").stdout)
+        assert waiting_status["durable_phase"] == "preparing" and not waiting_status["completed_retirements"]
+        assert waiting_status["active_sources"][0]["durable_state"] == "active"
+    flags()
     run("fill", farm, "--resume", "--compute", "off", "--devices", "cpu", code=2)
     guarded = snapshot(farm)
     named = run("plot", "-k", 18, "-n", 1, *keys, "-o", farm, "--group-members", 1,
@@ -2687,8 +2876,8 @@ def check_replot(binary, root, reference=None):
     assert snapshot(farm) == guarded, "another group entrypoint changed the active migration"
     run(*execute, point="replot-replacement-verified", code=86)
     assert digest(source) == source_hash and not final.exists()
-    local_bindings, = farm.glob(".xchplot2/replot-*/local-bindings")
-    assert local_bindings.stat().st_mode & 0o777 == 0o600
+    destination_bindings, = farm.glob(".xchplot2/replot-*/local-bindings")
+    assert destination_bindings.stat().st_mode & 0o777 == 0o600
     assert not list(farm.glob(".xchplot2-stage-*")) and not list(farm.glob(".xchplot2-replot-*"))
     before_status = snapshot(farm)
     flags(farmer_unavailable=True, solver_unavailable=True)
@@ -2696,13 +2885,22 @@ def check_replot(binary, root, reference=None):
     assert status["durable_phase"] == "replacing" and status["active_verified_stage"]
     assert status["active_full_proof_validated"] and status["active_replacement"]["full_proof_validated"]
     assert status["live_service_health"] == "not-queried" and status["blocking_reason"] is None
+    assert snapshot(farm) == before_status
+    authority = Path(status["controller_authority"]["directory"])
+    local_bindings = private_record(authority, "local-bindings")
+    assert status["controller_authority"]["available"] and local_bindings.stat().st_mode & 0o777 == 0o600
+
+    def migration_snapshot():
+        return snapshot(farm), snapshot(authority)
+
+    before_status = migration_snapshot()
     live_status_options = [*status_options, "--live", "--compute", "off", "--timeout-ms", 10000]
     for failure, role in (("farmer_unavailable", "farmer"), ("solver_unavailable", "solver"), ("solver_stopped", "solver")):
         flags(**{failure: True})
         unavailable = json.loads(run(*live_status_options, "--json", code=2).stdout)
         assert unavailable["read_only"] and not unavailable["inspection_complete"] and unavailable["diagnosis"]["blocking"]
         assert role in unavailable["blocking_reason"] and unavailable["services"]["diagnosis"]["status"] == "unavailable"
-        assert unavailable["compute"]["diagnosis"]["status"] == "disabled" and snapshot(farm) == before_status
+        assert unavailable["compute"]["diagnosis"]["status"] == "disabled" and migration_snapshot() == before_status
     flags()
     live_status = json.loads(run(*live_status_options, "--json").stdout)
     assert live_status["inspection_complete"] and live_status["live_service_health"] == "prerequisites-observed"
@@ -2714,23 +2912,23 @@ def check_replot(binary, root, reference=None):
     began = time.monotonic()
     timed_out = json.loads(run(*status_options, "--live", "--compute", "off", "--timeout-ms", 100, "--json", code=2).stdout)
     assert time.monotonic() - began < 2 and not timed_out["inspection_complete"]
-    assert "budget" in timed_out["services"]["diagnosis"]["condition"] and snapshot(farm) == before_status
+    assert "budget" in timed_out["services"]["diagnosis"]["condition"] and migration_snapshot() == before_status
     flags(farmer_unavailable=True, solver_unavailable=True)
-    verified_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "verified_stage")
+    verified_authority = saved_replacement_authority(private_record(authority, "grow-replot.plan"), "verified_stage")
     assert status["active_replacement"]["current_native_observation"] == f"matching-verified-stage-native-{verified_authority}"
-    assert snapshot(farm) == before_status, "status changed saved progress or native objects"
+    assert migration_snapshot() == before_status, "status changed saved progress or native objects"
     samples = watch_status(command, directory / "migration-status-watch.log", "--from-plan", review_file)
     assert all(sample["replot_status"] and sample["durable_phase"] == "replacing" and sample["active_verified_stage"] and
                sample["live_service_health"] == "not-queried" for sample in samples)
-    assert snapshot(farm) == before_status, "migration status watch changed saved progress or native objects"
+    assert migration_snapshot() == before_status, "migration status watch changed saved progress or native objects"
     flags()
     run("fill", "--from-plan", review_file, "--chia-executable", directory / "missing-reader", *options, code=2)
-    assert snapshot(farm) == before_status, "explicit local override was ignored or changed progress on refusal"
+    assert migration_snapshot() == before_status, "explicit local override was ignored or changed progress on refusal"
     saved_local = local_bindings.read_bytes()
     local_bindings.chmod(0o644)
-    private_before = snapshot(farm)
+    private_before = migration_snapshot()
     private_refusal = run("fill", "--from-plan", review_file, *options, code=2)
-    assert "owner-only permissions" in private_refusal.stdout + private_refusal.stderr and snapshot(farm) == private_before
+    assert "owner-only permissions" in private_refusal.stdout + private_refusal.stderr and migration_snapshot() == private_before
     local_bindings.chmod(0o600)
     local_rows = saved_local[:-65].decode().splitlines(keepends=True)
     local_identity = shlex.split(local_rows[1])
@@ -2738,36 +2936,36 @@ def check_replot(binary, root, reference=None):
     local_rows[1] = " ".join(json.dumps(value) for value in local_identity) + "\n"
     foreign_body = "".join(local_rows).encode()
     local_bindings.write_bytes(foreign_body + hashlib.sha256(foreign_body).hexdigest().encode() + b"\n")
-    foreign_before = snapshot(farm)
+    foreign_before = migration_snapshot()
     foreign_refusal = run("fill", "--from-plan", review_file, *options, code=2)
-    assert "another host or user" in foreign_refusal.stdout + foreign_refusal.stderr and snapshot(farm) == foreign_before
+    assert "another host or user" in foreign_refusal.stdout + foreign_refusal.stderr and migration_snapshot() == foreign_before
     run("plan", "--revalidate", "--from-plan", review_file, "--harvester", profile_file, "--farm-adapter", "chia",
         *adapter, *options, "--save-plan", directory / "explicit foreign-default replacement.plan")
-    assert snapshot(farm) == foreign_before, "explicit local binding review trusted or changed foreign defaults"
+    assert migration_snapshot() == foreign_before, "explicit local binding review trusted or changed foreign defaults"
     local_bindings.write_bytes(saved_local)
-    before_status = snapshot(farm)
+    before_status = migration_snapshot()
     stale_successor = directory / "stale successor.plan"
     stale = json.loads(run("plan", "--revalidate", "--from-plan", review_file, "--harvester", profile_file,
                            *adapter, *options, "--save-plan", stale_successor, "--json").stdout)
-    assert not stale["activated"] and snapshot(farm) == before_status
+    assert not stale["activated"] and migration_snapshot() == before_status
     assert SEED not in stale_successor.read_text(encoding="utf-8")
     successor_metadata = json.loads(run("plan", "--from-plan", stale_successor, "--json").stdout)
     assert successor_metadata["saved_successor"] and successor_metadata["metadata_only"] and successor_metadata["feasible"] is None
     assert successor_metadata["selected_policy_digest"] == stale["successor_digest"]
-    assert successor_metadata["reviewed_journal_digest"] == stale["reviewed_journal_digest"] and snapshot(farm) == before_status
+    assert successor_metadata["reviewed_journal_digest"] == stale["reviewed_journal_digest"] and migration_snapshot() == before_status
     flags(legacy_plot_public_keys={str(source): "ab" * 48})
     imported_mismatch = run("fill", "--from-plan", stale_successor, "--harvester", profile_file, *adapter, *options, code=2)
     assert "original public key" in imported_mismatch.stdout + imported_mismatch.stderr
-    assert snapshot(farm) == before_status, "unverified imported source metadata activated a policy or changed saved local defaults"
+    assert migration_snapshot() == before_status, "unverified imported source metadata activated a policy or changed saved local defaults"
     flags()
     # Saved private defaults restore the accepted local profile and reader;
     # no keys, --harvester or installed-reader flags are repeated.
     execute = ["fill", "--from-plan", review_file, *options]
     staged, = farm.glob(".xchplot2/replot-*/stage-*.building")
-    guarded = snapshot(farm)
+    guarded = migration_snapshot()
     direct = run("grow", staged, "--max-members", 2, "--devices", "cpu", "--compute", "off", "-M", ram, code=2)
     assert "migration-managed directory" in direct.stdout + direct.stderr
-    assert snapshot(farm) == guarded, "direct growth changed an active migration's sealed stage"
+    assert migration_snapshot() == guarded, "direct growth changed an active migration's sealed stage"
     staged_group, staged_k, staged_strength, _, staged_meta, staged_memo = header(staged)
     for index, reserved in enumerate((farm / ".xchplot2", staged.parent)):
         assert reserved.is_dir()
@@ -2781,43 +2979,49 @@ def check_replot(binary, root, reference=None):
                 ("batch", raw_manifest, "--devices", "cpu", "--compute", "off", "-M", ram)):
             refused = run(*operation, code=2)
             assert "reserved .xchplot2" in refused.stdout + refused.stderr
-            assert snapshot(farm) == guarded, "ordinary fill, plot or raw batch changed reserved migration bookkeeping"
+            assert migration_snapshot() == guarded, "ordinary fill, plot or raw batch changed reserved migration bookkeeping"
     run(*execute, point="replot-replacement-published", code=86)
     replacement_hash = digest(final)
-    before_status = snapshot(farm)
+    before_status = migration_snapshot()
     renamed_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
     assert renamed_status["journal_digest"] == stale["reviewed_journal_digest"] and not renamed_status["active_published"]
     assert renamed_status["active_replacement"]["current_native_observation"] == "verified-object-renamed-publication-pending"
-    assert snapshot(farm) == before_status, "renamed replacement status changed saved progress or native objects"
+    assert migration_snapshot() == before_status, "renamed replacement status changed saved progress or native objects"
     # Native publication precedes the durable published stamp. Preserve that
     # supported rename recovery, then advance the journal before testing stale
     # successor refusal; readiness has not yet been acknowledged.
     run(*execute, point="replot-journal-one-published", code=86)
-    before_status = snapshot(farm)
+    before_status = migration_snapshot()
     published_status = json.loads(run("plan", "--status", "--from-plan", review_file, "--json").stdout)
     assert published_status["active_published"] and not published_status["active_ready_history"]
-    published_authority = saved_replacement_authority(private_record(farm, "grow-replot.plan"), "published")
+    # The controller committed before the destination replica at this crash
+    # boundary; status must use that newer authority for its native evidence.
+    assert published_status["replica_publication_pending"]
+    published_authority = saved_replacement_authority(private_record(authority, "grow-replot.plan"), "published")
     assert published_status["active_replacement"]["current_native_observation"] == f"matching-published-native-{published_authority}"
     assert published_status["journal_digest"] != stale["reviewed_journal_digest"] and digest(final) == replacement_hash
-    assert snapshot(farm) == before_status, "published replacement status changed saved progress or native objects"
-    guarded = snapshot(farm)
+    assert migration_snapshot() == before_status, "published replacement status changed saved progress or native objects"
+    guarded = migration_snapshot()
     stale_attempt = run("fill", "--from-plan", stale_successor, *options, code=2)
     assert "advanced after this successor was reviewed" in stale_attempt.stdout + stale_attempt.stderr
-    assert snapshot(farm) == guarded, "stale unactivated successor changed progress"
+    assert migration_snapshot() == guarded, "stale unactivated successor changed progress"
     stale_status = json.loads(run("plan", "--status", "--from-plan", stale_successor, "--json").stdout)
     assert stale_status["selected_policy_binding"] == "stale-boundary"
     assert stale_status["reviewed_journal_digest"] == stale["reviewed_journal_digest"] != stale_status["journal_digest"]
-    assert snapshot(farm) == guarded, "stale successor status changed progress"
+    assert migration_snapshot() == guarded, "stale successor status changed progress"
     immutable = run("grow", final, "--max-members", 2, "--devices", "cpu", "--compute", "off", "-M", ram, code=2)
     assert "published migration groups are immutable" in immutable.stdout + immutable.stderr
-    assert snapshot(farm) == guarded, "direct growth changed an immutable migration publication"
+    assert migration_snapshot() == guarded, "direct growth changed an immutable migration publication"
 
-    # Each refusal occurs with a real sealed replacement present. Saved review
-    # bytes cannot bypass fresh network and exact loaded-key observations.
+    # A real sealed replacement must remain intact during both retryable
+    # outages and permanent mismatches. Saved reviews cannot bypass live checks.
     for failure in ("unloaded", "wrong_key", "inactive", "stale", "farmer_disconnected", "farmer_unloaded",
                     "farmer_syncing", "farmer_mismatch", "solver_stopped", "solver_disconnected", "pool_external"):
         flags(**{failure: True})
-        run(*execute, code=2)
+        if failure in ("wrong_key", "inactive", "pool_external"):
+            run(*execute, code=2)
+        else:
+            wait_for_service(*execute)
         assert digest(source) == source_hash and digest(final) == replacement_hash
         assert not private_record(farm, "grow-farm.plan").exists()
     flags()
@@ -2825,7 +3029,7 @@ def check_replot(binary, root, reference=None):
     run(*execute, point="replot-retirement-intent", code=86)
     assert digest(source) == source_hash
     flags(farmer_disconnected=True)
-    run(*execute, code=2)
+    wait_for_service(*execute)
     assert source.exists() and digest(source) == source_hash and digest(final) == replacement_hash
     flags(inactive=True)
     run(*execute, code=2)
@@ -2843,18 +3047,18 @@ def check_replot(binary, root, reference=None):
     updated_file = directory / "updated local farm.json"
     updated_file.write_text(json.dumps(updated_profile), encoding="utf-8")
     (reader / "config" / "config.yaml").write_text("self_hostname: localhost\nharvester:\n  num_threads: 2\n", encoding="utf-8")
-    guarded = snapshot(farm)
+    guarded = migration_snapshot()
     run(*execute, code=2)
-    assert snapshot(farm) == guarded, "unreviewed reader drift changed a claimed source"
+    assert migration_snapshot() == guarded, "unreviewed reader drift changed a claimed source"
     successor_file = directory / "active successor.plan"
     successor = json.loads(run("plan", "--revalidate", "--from-plan", review_file, "--harvester", updated_file,
                                *adapter, *options, "--farm-adapter-timeout-ms", 120000, "--save-plan", successor_file, "--json").stdout)
-    assert not successor["activated"] and snapshot(farm) == guarded and SEED not in successor_file.read_text(encoding="utf-8")
+    assert not successor["activated"] and migration_snapshot() == guarded and SEED not in successor_file.read_text(encoding="utf-8")
     execute = ["fill", "--from-plan", successor_file, "--harvester", updated_file, *adapter, *options]
     run(*execute, point="replot-policy-durable", code=86)
-    activated = snapshot(farm)
+    activated = migration_snapshot()
     run("fill", "--from-plan", review_file, *options, code=2)
-    assert snapshot(farm) == activated, "original review dropped an active successor policy"
+    assert migration_snapshot() == activated, "original review dropped an active successor policy"
     active_status = json.loads(run("plan", "--status", "--from-plan", successor_file, "--json").stdout)
     assert active_status["active_policy_digest"] == successor["successor_digest"]
     assert active_status["origin_review_digest"] == successor["origin_review_digest"]
@@ -2871,7 +3075,7 @@ def check_replot(binary, root, reference=None):
     claims = list(farm.glob(".xchplot2-retire-*/**/*"))
     assert any(p.is_file() and digest(p) == source_hash for p in claims), "claim disappeared before unlink"
     flags(solver_stopped=True)
-    run(*execute, code=2)
+    wait_for_service(*execute)
     assert any(p.is_file() and digest(p) == source_hash for p in claims), "stopped solver removed a claimed source"
     flags(inactive=True)
     run(*execute, code=2)
@@ -2955,9 +3159,6 @@ def check_replot(binary, root, reference=None):
     run("fill", "--from-plan", chain_review_file, "--harvester", chain_profile_file, *chain_adapter, *chain_options, *keys,
         point=f"replot-journal-one-published:{len(replicas)}", code=86)
 
-    def private_replot_farm(path):
-        return shlex.split(path.read_bytes()[:-65].decode("utf-8"))[8].encode("utf-8")
-
     def chain_private_farms():
         return [private_replot_farm(path) for path in replicas]
 
@@ -2980,9 +3181,10 @@ def check_replot(binary, root, reference=None):
     receipt = replot_artifacts(chain_outputs[0].parent, chain_review["job_id"]) / "receipt-0"
     receipt_bytes, prefix_hash = receipt.read_bytes(), digest(chain_outputs[0])
     # Receipt publication precedes prefix advancement. Here the next journal
-    # update is exactly complete_replot_batch; stop after every replica commits.
+    # update is exactly complete_replot_batch; stop after the controller and
+    # every destination replica commit.
     run("fill", "--from-plan", chain_first_file, *chain_options,
-        point=f"replot-journal-one-published:{len(replicas)}", code=86)
+        point=f"replot-journal-one-published:{len(replicas) + 1}", code=86)
     prefix = json.loads(run("plan", "--status", "--from-plan", chain_first_file, "--json").stdout)
     assert prefix["completed_replacements"] == 1 and prefix["completed_retirements"] == len(chain_sources)
     assert prefix["completed_receipt_chain_verified"] and not prefix["replica_publication_pending"]
@@ -3010,8 +3212,10 @@ def check_replot(binary, root, reference=None):
     assert embedded_origin == chain_review_file.read_bytes()[:-65]
     assert hashlib.sha256(embedded_origin).hexdigest() == chain_second["origin_review_digest"]
     assert tuple(snapshot(path) for path in [chain_old, *chain_destinations]) == before
+    # Publish the authority and first destination, leaving the other replica
+    # staged so both old and new published destination records are exercised.
     run("fill", "--from-plan", chain_second_file, "--harvester", chain_second_profile, *chain_adapter, *chain_options,
-        point="replot-journal-one-published", code=86)
+        point="replot-journal-one-published:2", code=86)
     partial = json.loads(run("plan", "--status", "--from-plan", chain_second_file, "--json").stdout)
     assert partial["selected_policy_binding"] == "active" and partial["replica_publication_pending"]
     assert len({replica["published_digest"] for replica in partial["replicas"]}) > 1
@@ -3507,8 +3711,8 @@ def check_replot(binary, root, reference=None):
                                      "--save-plan", compute_inventory, "--json").stdout)
     membership = directory / "migration compute membership"
     run("compute", "init", "--directory", membership, "--name", "protected migration fixture")
-    # Leave saved caps unset so the explicit offers below reach the reviewed
-    # physical envelope rather than being clipped by membership defaults.
+    # Leave saved caps unset so command limits can exercise the reviewed
+    # physical envelope without additional membership limits.
     run("compute", "configure", "--directory", membership, "--interface", "lo", "--discovery", "off",
         "--backend", "cpu", "--cpus", 0, "--host-bytes", 0, "--max-brokers", 16)
     import ssl
@@ -3563,22 +3767,29 @@ def check_replot(binary, root, reference=None):
     uncovered_file.write_text(json.dumps(uncovered_profile), encoding="utf-8")
     uncovered = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", uncovered_file,
                               *compute_adapter, *compute_options, "--json", code=2).stdout)
-    assert not uncovered["feasible"] and any("compute requires reviewed" in reason for reason in uncovered["infeasibility_reasons"])
+    assert not uncovered["feasible"] and any("compute worker has no reviewed physical service reservation" in reason
+                                            for reason in uncovered["infeasibility_reasons"])
     assert snapshot(compute_farm) == before
     compute_credit = compute_catalog["plots"][0]["identity"]["allocated_bytes"]
     reviewed_compute = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", compute_file,
                                      *compute_adapter, *compute_options, "--reclaim-before-bytes", compute_credit,
                                      "--save-plan", compute_review, "--json").stdout)
     assert reviewed_compute["feasible"] and reviewed_compute["native_request"]["compute_enabled"] and snapshot(compute_farm) == before
+    raised_offer = list(compute_options)
+    raised_offer[raised_offer.index("--compute-offer-ram") + 1] = "2G"
+    capped = json.loads(run("plan", "--from-plan", compute_review, "--harvester", compute_file,
+                           *compute_adapter, *raised_offer, "--json").stdout)
+    assert capped["feasible"] and 0 < capped["native_request"]["compute_offer_ram_bytes"] <= native["compute_workers"][0]["host_bytes"]
+    assert snapshot(compute_farm) == before, "adaptive compute preview changed its destination"
     huge_offer = list(compute_options)
     huge_offer[huge_offer.index("--compute-offer-cpus") + 1] = 1025
     refused_huge = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *huge_offer, *keys, code=2)
     assert "local compute offer exceeds CPU or slot bounds" in refused_huge.stdout + refused_huge.stderr
     assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists()
     bad_offer = list(compute_options)
-    bad_offer[bad_offer.index("--compute-offer-ram") + 1] = "2G"
+    bad_offer[bad_offer.index("--compute-offer-ram") + 1] = "128M"
     refusal = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *bad_offer, *keys, code=2)
-    assert "local compute offer exceeds" in refusal.stdout + refusal.stderr
+    assert "infeasible under the current execution binding" in refusal.stdout + refusal.stderr
     assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
     run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options, *keys,
         point="replot-journal-all-staged", code=86)
@@ -3607,7 +3818,7 @@ def check_replot(binary, root, reference=None):
                                     capture_output=True, text=True, encoding="utf-8", timeout=180)
         assert comparison.returncode == 0, (comparison.stdout, comparison.stderr)
         assert digest(canonical) == digest(compute_final), "protected compute migration differs from the independent assembler"
-    print("PASS saved-pool protected migration, complete worker reservations, preclaim offer refusal, owner-key recovery, real multi-member contributions and full proofs", flush=True)
+    print("PASS saved-pool protected migration, adaptive offer caps, complete worker reservations, preclaim refusal, owner-key recovery, real multi-member contributions and full proofs", flush=True)
 
 
 def check_compute(binary, root):
@@ -3886,6 +4097,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="xchplot2 group é-", dir=args.scratch.resolve()) as work:
             os.environ["XDG_CONFIG_HOME"] = str(Path(work) / "empty-compute-settings")
+            os.environ["XDG_STATE_HOME"] = str(Path(work) / "migration-state")
             check(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)
             if sys.platform == "linux":
                 check_replot(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)

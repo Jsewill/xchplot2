@@ -1173,10 +1173,58 @@ void large_catalog(fs::path const& directory)
     tight = limits; tight.max_output_bytes = text.size() - 1;
     rejects([&] { (void)parse_farm_inventory(text, tight); }, "large catalog escaped its byte bound");
 }
+void farming_log(fs::path const& directory)
+{
+    using namespace std::chrono;
+    fs::create_directories(directory / "config"); fs::create_directory(directory / "logs");
+    auto const config = directory / "config/config.yaml", log = directory / "logs/harvester.log";
+    std::string const settings = "logging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
+    { std::ofstream out(config); out << settings; }
+    auto const wall = system_clock::now(); auto const begin = FarmingLogSampler::Clock::now();
+    auto record = [&](std::string_view elapsed, system_clock::time_point when = system_clock::now())
+    {
+        auto const epoch = system_clock::to_time_t(when); auto time = *std::localtime(&epoch); std::ostringstream out;
+        out << std::put_time(&time, "%Y-%m-%dT%H:%M:%S") << ".000 2.5.5 harvester chia.harvester.harvester: INFO     "
+            << "3 plots were eligible for farming challenge Found 0 proofs. Time: " << elapsed << " s. Total 500 plots\n";
+        return out.str();
+    };
+    auto write = [&](std::string const& text, bool append = true)
+    { std::ofstream out(log, append ? std::ios::app : std::ios::trunc); out << text; require(bool(out), "farming log fixture write failed"); };
+    write(record("9.00000", wall));
+    HarvesterAdapterOptions options; options.root = directory; options.host = profile_detail::host_name();
+    FarmingLogSampler sampler(options);
+    require(!sampler.sample(begin, wall), "historical farming log was accepted as a current observation");
+    write(record("0.25000", wall));
+    require(sampler.sample(begin + seconds(1), wall) == 250000000, "fresh completed farming lookup time was not observed");
+    require(!sampler.sample(begin + seconds(2), wall), "one farming completion was counted repeatedly");
+    auto partial = record("2.00000", wall); write(partial.substr(0, partial.size() - 1));
+    require(!sampler.sample(begin + seconds(3), wall), "partial farming log record was accepted");
+    write("\n"); require(sampler.sample(begin + seconds(4), wall) == 2000000000, "split farming record was lost");
+    write(record("8.00000", wall - minutes(2))); write(record("8.00000", wall + minutes(2)));
+    write(record("nan", wall)); write(record("-1", wall));
+    require(!sampler.sample(begin + seconds(5), wall), "stale, future or invalid log duration became farming feedback");
+    fs::rename(log, log.string() + ".1"); write(record("7.00000", wall));
+    require(!sampler.sample(begin + seconds(6), wall), "log rotation replayed an existing record");
+    write(record("0.50000", wall)); require(sampler.sample(begin + seconds(7), wall) == 500000000, "rotated log did not recover on a fresh append");
+    write("truncated\n", false); require(!sampler.sample(begin + seconds(8), wall), "truncation reused an old partial record");
+    write(record("0.75000", wall)); require(sampler.sample(begin + seconds(9), wall) == 750000000, "truncated log could not resume observations");
+    write(std::string(100000, 'x') + '\n' + record("1.00000", wall));
+    require(sampler.sample(begin + seconds(10), wall) == 1000000000, "bounded tail could not recover after unrelated log traffic");
+    auto remote = options; remote.host = "unreviewed-remote-host"; FarmingLogSampler remote_sampler(remote);
+    require(!remote_sampler.sample(begin, wall), "local CLI log became a remote farming observation");
+    auto retired = settings; auto const dirs = retired.find("plot_directories: []");
+    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - /remaining-plots");
+    { std::ofstream out(config); out << retired; }
+    write(record("1.25000", wall)); require(sampler.sample(begin + seconds(11), wall) == 1250000000,
+        "ordinary plot-directory retirement permanently disabled unchanged farming telemetry");
+    { std::ofstream out(config); out << settings << "changed: true\n"; }
+    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall), "changed reader logging configuration supplied old-context feedback");
+    fs::remove_all(directory);
+}
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string_view(argv[1]) == "--root-path") return fake_adapter(argc, argv);
     auto root = fs::temp_directory_path() / ("xchplot2-inventory-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); retired_workload_batches(root / "retired-batches"); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
+    try { fs::create_directory(root); durable_native_identity(root / "durable-native"); inventory(root); large_catalog(root); adapters(root); retirement_configuration(root); routes(root); retired_workload_batches(root / "retired-batches"); farming_log(root / "farming-log"); fs::remove_all(root); std::cout << "farm inventory tests passed\n"; return 0; }
     catch (std::exception const& error) { fs::remove_all(root); std::cerr << error.what() << '\n'; return 1; }
 }

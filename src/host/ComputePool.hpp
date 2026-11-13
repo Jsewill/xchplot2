@@ -9,7 +9,7 @@
 
 namespace group_grow::pool
 {
-inline constexpr uint32_t protocol_version = 5;
+inline constexpr uint32_t protocol_version = 6;
 inline constexpr size_t max_retry_failures = 16;
 inline constexpr uint32_t max_generation_batch_members = 8;
 inline constexpr size_t max_generation_profiles = 512;
@@ -73,6 +73,19 @@ struct CodecLimits
     bool operator==(CodecLimits const&) const = default;
 };
 enum class WorkerAdmission : uint8_t { Accepting = 1, Paused, Draining, Drained };
+// Authenticated worker observations used by farm setup. The configured
+// partition bounds this executor; hardware availability is a dated observation,
+// not a reservation or evidence about another service's workload.
+struct WorkerHardware
+{
+    std::string host, gpu_identity;
+    Resources partition;
+    uint32_t logical_cpus = 0;
+    uint64_t total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, standing_host_bytes = 0, observed_at_unix_ms = 0;
+    bool operator==(WorkerHardware const&) const = default;
+};
+void write_worker_hardware(Writer&, WorkerHardware const&);
+WorkerHardware read_worker_hardware(Reader&);
 struct WorkerOffer
 {
     std::string instance, compatibility;
@@ -87,6 +100,7 @@ struct WorkerOffer
     std::vector<GenerationProfile> generation_profiles;
     CodecLimits codec_limits;
     WorkerAdmission admission = WorkerAdmission::Accepting;
+    WorkerHardware hardware;
 };
 struct Task
 {
@@ -168,6 +182,7 @@ struct BrokerWorkerStatus
     Resources capacity, reserved{0, 0, 0, 0};
     WorkerAdmission admission = WorkerAdmission::Accepting;
     uint64_t seen_ms = 0;
+    WorkerHardware hardware;
 };
 struct BrokerOwnerStatus
 {
@@ -192,6 +207,7 @@ struct BrokerStatusPage
     StatusSection section = StatusSection::Workers;
     uint64_t next_cursor = 0, workers = 0, owners = 0, jobs = 0;
     uint64_t queued = 0, granted = 0, running = 0, cancelled = 0;
+    std::string identity, host;
     std::vector<BrokerWorkerStatus> worker_records;
     std::vector<BrokerOwnerStatus> owner_records;
     std::vector<BrokerJobStatus> job_records;

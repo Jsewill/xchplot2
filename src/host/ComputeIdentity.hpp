@@ -43,6 +43,7 @@ PoolIdentity create_pool(std::filesystem::path const&, std::string const& name);
 void invite_pool(PoolIdentity const&, std::filesystem::path const& invitation, std::string const& name);
 PoolIdentity join_pool(std::filesystem::path const& invitation, std::filesystem::path const& directory);
 void configure_pool(PoolIdentity const&, ComputeDefaults const&);
+void validate_compute_defaults(ComputeDefaults const&);
 std::vector<PoolMember> pool_members(PoolIdentity const&);
 void revoke_pool_member(PoolIdentity const&, std::string const& node);
 void export_pool_policy(PoolIdentity const&, std::filesystem::path const&);

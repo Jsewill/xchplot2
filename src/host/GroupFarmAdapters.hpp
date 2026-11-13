@@ -4,6 +4,7 @@
 #include "host/GroupFarmInventory.hpp"
 #include "host/GroupFarmAdapterProcess.hpp"
 #include <cctype>
+#include <ctime>
 
 namespace group_grow::farm
 {
@@ -543,6 +544,22 @@ public:
             charge(2 * line.capacity() + sizeof(Line) + 64); lines_.push_back({line.find_first_not_of(' '), std::string(text)});
         }
     }
+    std::optional<std::string> log_filename()
+    {
+        require(!lines_.empty() && !lines_[0].indent, "unsupported YAML root"); auto root = block(0, 0);
+        require(at_ == lines_.size() && root->kind == 'm', "unsupported YAML block structure");
+        auto harvester = root->fields.find("sharvester");
+        if (harvester == root->fields.end() || harvester->second->kind != 'm') return {};
+        auto logging = harvester->second->fields.find("slogging");
+        if (logging == harvester->second->fields.end() || logging->second->kind != 'm') return {};
+        auto const& fields = logging->second->fields;
+        if (auto stdout_log = fields.find("slog_stdout"); stdout_log != fields.end())
+            if (stdout_log->second->kind != 's' || stdout_log->second->scalar != "b0") return {};
+        auto filename = fields.find("slog_filename");
+        if (filename == fields.end()) return "log/debug.log";
+        if (filename->second->kind != 's' || !filename->second->scalar.starts_with('s') || filename->second->scalar.size() < 2) return {};
+        return filename->second->scalar.substr(1);
+    }
     RetirementConfig read(bool strict_paths = true)
     {
         require(!lines_.empty() && !lines_[0].indent, "unsupported YAML root"); auto root = block(0, 0);
@@ -1062,6 +1079,138 @@ public:
     }
 };
 } // namespace adapter_detail
+
+// Optional tuning observations from the explicitly selected local reader.
+// Read newly appended complete records only. A log is not service readiness,
+// resource capacity or a deadline guarantee; absent/stale formats stay unknown.
+// The supported message is emitted after real signage-point lookups finish:
+// chia/harvester/harvester_api.py, new_signage_point_harvester().
+class FarmingLogSampler
+{
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr uint64_t memory_bytes = 8 * 1024 * 1024;
+    static uint64_t memory_bound(size_t readers)
+    { return resource_detail::add(memory_bytes, resource_detail::multiply(readers, 4 * 65536)); }
+    explicit FarmingLogSampler(HarvesterAdapterOptions const& options)
+    {
+        try
+        {
+            // A local CLI configuration can bind a remote RPC service. Its
+            // local log is then not evidence about that remote harvester.
+            if (!options.host.empty() && options.host != profile_detail::host_name()) return;
+            if (!options.rpc_host.empty() && options.rpc_host != "localhost" && adapter_detail::loopback_peer(options.rpc_host).empty()) return;
+            auto const config = options.root / "config/config.yaml";
+            auto const stamp = stream_state::stamp(config);
+            if (stamp.bytes > 1024 * 1024) return;
+            std::ifstream input(config); if (!input) return;
+            auto contents = profile_detail::read_text(input, 1024 * 1024);
+            auto const filename = adapter_detail::RetirementConfigReader(contents, memory_bytes / 2).log_filename();
+            if (!filename || stream_state::stamp(config) != stamp) return;
+            inventory_detail::bounded_text(*filename);
+            auto path = file_io::native_path(*filename);
+            path_ = (path.is_absolute() ? path : options.root / path).lexically_normal();
+            inventory_detail::bounded_text(file_io::path_text(path_));
+            config_ = config; config_stamp_ = stamp;
+            config_identity_ = adapter_detail::retirement_config(contents, memory_bytes / 2).identity;
+        }
+        catch (std::exception const&) { path_.clear(); }
+    }
+    std::optional<uint64_t> sample(Clock::time_point now = Clock::now(),
+        std::chrono::system_clock::time_point wall = std::chrono::system_clock::now())
+    {
+        if (path_.empty() || (polled_ != Clock::time_point{} && now >= polled_ && now - polled_ < std::chrono::milliseconds(250))) return {};
+        polled_ = now;
+        try
+        {
+            auto const configuration = stream_state::stamp(config_);
+            if (configuration != config_stamp_)
+            {
+                // The existing retirement identity excludes only the plot
+                // directory list. Authorized directory retirement must not
+                // disable otherwise unchanged reader telemetry indefinitely.
+                if (config_identity_.empty() || configuration.bytes > 1024 * 1024) return {};
+                std::ifstream input(config_); if (!input) return {};
+                auto contents = profile_detail::read_text(input, 1024 * 1024);
+                if (adapter_detail::retirement_config(contents, memory_bytes / 2).identity != config_identity_ ||
+                    stream_state::stamp(config_) != configuration) return {};
+                config_stamp_ = configuration;
+            }
+            file_io::Stat named{};
+            if (file_io::inspect_link(path_, &named) || !file_io::is_regular(named.st_mode) || named.st_size < 0) return {};
+            auto const identity = std::pair{uint64_t(named.st_dev), uint64_t(named.st_ino)};
+            uint64_t const size = uint64_t(named.st_size);
+            if (!identity_ || *identity_ != identity || size < offset_)
+            {
+                // Starting/rotating logs may contain historical records.
+                // Establish a new end cursor and wait for an actual append.
+                identity_ = identity; offset_ = size; partial_.clear(); return {};
+            }
+            if (size == offset_) return {};
+            inventory_detail::Handle file(file_io::open_file(path_, file_io::read_only | file_io::no_follow | file_io::close_on_exec));
+            file_io::Stat opened{};
+            if (file_io::inspect_fd(file.fd, &opened) || !file_io::is_regular(opened.st_mode) ||
+                std::pair{uint64_t(opened.st_dev), uint64_t(opened.st_ino)} != identity) return {};
+            constexpr uint64_t tail = 65536;
+            bool const skipped = size - offset_ > tail;
+            if (skipped) { offset_ = size - tail; partial_.clear(); }
+            std::string bytes(size_t(size - offset_), '\0'); size_t read = 0;
+            while (read < bytes.size())
+            {
+                auto const count = file_io::read_at(file.fd, bytes.data() + read, bytes.size() - read, offset_ + read);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) return {};
+                read += size_t(count);
+            }
+            offset_ = size;
+            if (skipped)
+            {
+                auto const end = bytes.find('\n'); if (end == bytes.npos) return {};
+                bytes.erase(0, end + 1);
+            }
+            partial_ += bytes; std::optional<uint64_t> result; size_t first = 0;
+            for (auto end = partial_.find('\n'); end != partial_.npos; end = partial_.find('\n', first))
+            {
+                if (auto value = parse(std::string_view(partial_).substr(first, end - first), wall))
+                    result = std::max(result.value_or(0), *value);
+                first = end + 1;
+            }
+            partial_.erase(0, first);
+            if (partial_.size() > 4096) partial_.clear();
+            return result;
+        }
+        catch (std::exception const&) { return {}; }
+    }
+    static std::optional<uint64_t> parse(std::string_view line,
+        std::chrono::system_clock::time_point now = std::chrono::system_clock::now())
+    {
+        if (line.size() > 4096 || line.size() < 24 || line.find("harvester.harvester") == line.npos ||
+            line.find("plots were eligible for farming") == line.npos || line.find(" INFO ") == line.npos) return {};
+        auto at = line.find(" Time: "); if (at == line.npos) return {};
+        auto value = line.substr(at + 7); auto const end = value.find(" s."); if (end == value.npos) return {};
+        value = value.substr(0, end);
+        if (value.empty() || value.size() > 16 || value.find_first_not_of("0123456789.") != value.npos) return {};
+        long double seconds = 0; std::istringstream number{std::string(value)}; number.imbue(std::locale::classic());
+        number >> seconds;
+        if (!number || !number.eof() || !std::isfinite(seconds) || seconds < 0 || seconds > 3600) return {};
+        std::tm time{}; time.tm_isdst = -1;
+        std::istringstream timestamp{std::string(line.substr(0, 19))}; timestamp >> std::get_time(&time, "%Y-%m-%dT%H:%M:%S");
+        if (!timestamp || line[19] != '.' || line[23] != ' ' ||
+            line.substr(20, 3).find_first_not_of("0123456789") != line.npos) return {};
+        auto const epoch = std::mktime(&time); if (epoch < 0) return {};
+        auto const observed = std::chrono::system_clock::from_time_t(epoch);
+        if (observed > now || now - observed > std::chrono::seconds(30)) return {};
+        return uint64_t(seconds * 1000000000.L);
+    }
+private:
+    std::filesystem::path path_, config_;
+    stream_state::Stamp config_stamp_;
+    std::string config_identity_;
+    std::optional<std::pair<uint64_t, uint64_t>> identity_;
+    uint64_t offset_ = 0;
+    std::string partial_;
+    Clock::time_point polled_{};
+};
 
 // The catalog is immutable throughout an invocation. Keep its path and reader
 // lookups once while each protected observation still obtains fresh native RPC

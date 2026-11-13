@@ -63,6 +63,15 @@ public:
     ScratchPool(ScratchPool const&) = delete;
     ScratchPool& operator=(ScratchPool const&) = delete;
 
+    void set_io_governor(std::shared_ptr<DiskIoGovernor> governor)
+    {
+        std::lock_guard lock(mutex_);
+        require(!sealed_, "bind disk feedback before resource admission");
+        io_governor_ = std::move(governor);
+        if (io_governor_) for (auto const& root : roots_)
+            io_governor_->register_device(root.value.device, root.value.directory_device);
+    }
+
     // Register every saved output and its sidecar peak before seal_recovery().
     // Only physical blocks already owned at registration earn a free-space
     // credit. Newly allocated blocks remain covered by the original bound.
@@ -131,7 +140,7 @@ public:
                 "saved physical scratch allocation exceeds its grant");
             roots.push_back(root);
         }
-        entry.external = external; entry.roots = std::move(roots);
+        entry.external = external; entry.external.io_governor = io_governor_; entry.roots = std::move(roots);
         entry.allocated.assign(allocated.begin(), allocated.end()); entry.restored = true;
         if (entry.output) entry.output->saved = true;
         for (size_t i = 0; i < entry.roots.size(); ++i)
@@ -200,7 +209,7 @@ public:
         auto* entry = find(owner);
         require(entry && entry->output && entry->external.scratch.empty() && !entry->io,
             "fresh scratch requires an idle destination reservation");
-        ExternalConfig external; external.segment_bytes = segment_bytes; external.fan_in = fan_in;
+        ExternalConfig external; external.segment_bytes = segment_bytes; external.fan_in = fan_in; external.io_governor = io_governor_;
         std::vector<size_t> selected; std::vector<size_t> seen;
         std::vector<size_t> order, ssds;
         order.reserve(roots_.size()); ssds.reserve(roots_.size());
@@ -230,6 +239,19 @@ public:
         size_t next_ssd = 0;
         for (auto& index : order) if (roots_[index].value.device.nonrotating && !roots_[index].value.device.drives.empty())
             index = ssds[next_ssd++];
+        if (io_governor_)
+        {
+            // Keep SSD positions and their established backlog ranking. HDD
+            // capacity still comes from this ledger; live feedback orders only
+            // otherwise eligible physical roots, including periodic probes.
+            std::vector<size_t> rotating;
+            for (auto index : order) if (!roots_[index].value.device.nonrotating) rotating.push_back(index);
+            std::vector<long double> costs(roots_.size());
+            for (auto index : rotating) costs[index] = io_governor_->routing_cost(roots_[index].value.device);
+            std::stable_sort(rotating.begin(), rotating.end(), [&](size_t a, size_t b) { return costs[a] < costs[b]; });
+            size_t next = 0;
+            for (auto& index : order) if (!roots_[index].value.device.nonrotating) index = rotating[next++];
+        }
         // Prefer unused rotating drives before sharing a partial grant.
         for (unsigned speed : {0u, 1u}) for (bool sharing : {false, true})
             for (size_t const i : order)
@@ -261,6 +283,7 @@ public:
         {
             auto& filesystem = fs_for(selected[i]); uint64_t const quota = external.scratch[i].capacity_bytes;
             filesystem.reserved = grow_add(filesystem.reserved, quota); filesystem.scratch = grow_add(filesystem.scratch, quota);
+            if (io_governor_) io_governor_->selected(roots_[selected[i]].value.device);
         }
         entry->external = external; entry->roots = std::move(selected);
         entry->allocated.assign(entry->roots.size(), 0); return external;
@@ -336,6 +359,7 @@ public:
         // its entries. Owned strings/vectors transfer their storage separately.
         uint64_t bytes = sizeof(*this) + 2 * (roots_.capacity() * sizeof(Root) +
             filesystems_.capacity() * sizeof(Filesystem) + owners_.capacity() * sizeof(Owner));
+        if (io_governor_) bytes = grow_add(bytes, io_governor_->memory_bytes());
         for (auto const& root : roots_)
         {
             bytes = grow_add(bytes, root.value.directory.capacity() + 1 + root.value.device.filesystem.capacity() + 1 +
@@ -373,6 +397,7 @@ private:
     std::vector<Root> roots_;
     std::vector<Filesystem> filesystems_;
     std::vector<Owner> owners_;
+    std::shared_ptr<DiskIoGovernor> io_governor_;
     mutable std::mutex mutex_;
     static uint64_t free_bytes(Filesystem const& filesystem)
     { return filesystem.headroom_available && filesystem.budget > filesystem.reserved ? filesystem.budget - filesystem.reserved : 0; }
@@ -413,6 +438,7 @@ private:
             filesystems_[filesystem].budget = std::min(filesystems_[filesystem].budget, budget);
             filesystems_[filesystem].headroom_available = filesystems_[filesystem].headroom_available && root.available_bytes >= headroom_;
         }
+        if (io_governor_) io_governor_->register_device(root.device, root.directory_device);
         roots_.push_back({std::move(root), filesystem, supplied, supplied}); return roots_.size() - 1;
     }
     size_t supplied_root(std::string const& directory) const
