@@ -57,8 +57,8 @@ extern "C" void cancel_handler(int sig) noexcept
         return;
     }
     static char const msg[] =
-        "\n[xchplot2] cancel requested — finishing current plot then "
-        "stopping. Press Ctrl-C again to abort immediately.\n";
+        "\n[xchplot2] cancel requested — waiting for active work to stop "
+        "safely. Press Ctrl-C again to abort immediately.\n";
     write_stderr_safe(msg, sizeof(msg) - 1);
 }
 

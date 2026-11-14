@@ -173,7 +173,7 @@ class StagingEngine
     void check_path() const
     {
         file_io::Stat info{};
-        require(file_io::inspect_link(path_.c_str(), &info) == 0 && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
+        require(publication::inspect(path_.c_str(), &info) == 0 && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
             uint64_t(info.st_dev) == device_ && uint64_t(info.st_ino) == inode_,
             "staging target filename or links changed");
         require(size() == expected_bytes_, "staging target size changed while open");
@@ -193,6 +193,7 @@ class StagingEngine
             if (n < 0 && errno == EINTR) continue;
             require(n > 0, "cannot read staging target");
             stats_.read_bytes += uint64_t(n);
+            if (config_.progress) config_.progress->read_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
             offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
         }
     }
@@ -208,6 +209,7 @@ class StagingEngine
             if (n < 0 && errno == EINTR) continue;
             require(n > 0, "cannot write staging target; retain this file for resume");
             stats_.written_bytes += uint64_t(n);
+            if (config_.progress) config_.progress->written_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
             offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
         }
     }
@@ -503,8 +505,8 @@ public:
             if (!file_io::inspect_fd(fd_, &opened))
             {
                 if (!active_ && stats_.syncs && opened.st_size > 0) evict(0, uint64_t(opened.st_size), true);
-                if (created_ && !opened.st_size && !file_io::inspect_link(path_.c_str(), &named) &&
-                    uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_) file_io::unlink_file(path_.c_str());
+                if (created_ && !opened.st_size && !publication::inspect(path_.c_str(), &named) &&
+                    uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_) publication::remove(path_.c_str());
             }
             file_io::close_file(fd_);
         }
@@ -529,7 +531,7 @@ public:
     // this protocol, whose constructor then rejects them without changing data.
     static bool pending(std::string const& path)
     {
-        int fd = file_io::open_file(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+        int fd = publication::open(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
         if (fd < 0) return false;
         struct Close { int fd; ~Close() { file_io::close_file(fd); } } close{fd};
         file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
@@ -583,10 +585,10 @@ inline StagingEngine::StagingEngine(std::string path, Config config, bool resume
     require(config.window_bytes >= sizeof(Header) && config.window_bytes <= SIZE_MAX && config.codec_bytes && config.checkpoint_bytes && config.workers &&
         config.capacity_bytes <= uint64_t(INT64_MAX), "invalid staging budgets");
     if (initial && !resume)
-    { fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600); created_ = fd_ >= 0; }
-    else fd_ = file_io::open_file(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
+    { fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config_.private_output, 0600); created_ = fd_ >= 0; }
+    else fd_ = publication::open(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
     if (fd_ < 0 && errno == ENOENT && initial)
-    { fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600); created_ = fd_ >= 0; }
+    { fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config_.private_output, 0600); created_ = fd_ >= 0; }
     require(fd_ >= 0, "cannot open staging target: " + path_);
     try
     {
@@ -607,8 +609,8 @@ inline StagingEngine::StagingEngine(std::string path, Config config, bool resume
     catch (...)
     {
         file_io::Stat opened{}, named{};
-        if (created_ && !file_io::inspect_fd(fd_, &opened) && !opened.st_size && !file_io::inspect_link(path_.c_str(), &named) &&
-            uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_) file_io::unlink_file(path_.c_str());
+        if (created_ && !file_io::inspect_fd(fd_, &opened) && !opened.st_size && !publication::inspect(path_.c_str(), &named) &&
+            uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_) publication::remove(path_.c_str());
         file_io::close_file(fd_); fd_ = -1; throw;
     }
 }
@@ -620,7 +622,7 @@ inline StagingEngine::StagingEngine(std::string path, Config config, ReadOnly, C
     limits.check(65536);
     require(config.window_bytes >= sizeof(Header) && config.window_bytes <= SIZE_MAX && config.codec_bytes && config.checkpoint_bytes &&
         config.workers && config.capacity_bytes <= uint64_t(INT64_MAX), "invalid staging budgets");
-    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    fd_ = publication::open(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
     require(fd_ >= 0, "cannot inspect staging target: " + path_);
     try
     {
@@ -743,6 +745,7 @@ inline void StagingEngine::discover(bool resume, std::optional<Identity> const& 
 
 inline AppendResult StagingEngine::append(Members members)
 {
+    PhaseTimer timing(stats_, WorkPhase::encode, config_.progress);
     config_.check_running();
     require(confirmed_ && (!active_ || record_.phase == Phase::stage), "staging append requires confirmed stage phase");
     check_path();
@@ -1022,6 +1025,7 @@ inline AppendResult StagingEngine::append(Members members)
 
 inline Result StagingEngine::finish()
 {
+    PhaseTimer timing(stats_, WorkPhase::pack, config_.progress);
     config_.check_running();
     require(confirmed_, "staging finalization requires confirmed identity");
     check_path();

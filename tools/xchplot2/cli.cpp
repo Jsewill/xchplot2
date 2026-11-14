@@ -23,6 +23,7 @@
 #include "host/ConfigFile.hpp"
 #include "host/Random.hpp"
 #include "host/Json.hpp"
+#include "BuildVersion.hpp"
 #include "host/PlotFileWriterParallel.hpp"
 #include "pos2_keygen.h" // Rust shim for plot_id + memo derivation
 
@@ -379,6 +380,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    Print a shell completion script to stdout.\n"
         << "\n"
         << "  Reusable options:\n"
+        << "    -V, --version  print the version and source revision.\n"
         << "    --config FILE  load settings from named command sections. Default:\n"
 #ifdef _WIN32
         << "                   %APPDATA%/xchplot2/config.toml\n"
@@ -775,7 +777,8 @@ void print_run_summary(char const* prefix, pos2gpu::BatchResult const& res, bool
     double const per = res.plots_written
         ? res.total_wall_seconds / double(res.plots_written) : 0.0;
     std::cerr << prefix << " wrote " << res.plots_written << " plots in "
-              << res.total_wall_seconds << " s (" << per << " s/plot)";
+              << res.total_wall_seconds << " s";
+    if (res.plots_written) std::cerr << " (" << per << " s/plot)";
     if (res.plots_skipped) std::cerr << "; skipped " << res.plots_skipped;
     if (res.plots_failed)  std::cerr << "; failed "  << res.plots_failed;
     if (res.bytes_written > 0 && res.total_wall_seconds > 0.0) {
@@ -1328,6 +1331,10 @@ bool group_commands_available()
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
     pos2gpu::install_cancel_signal_handlers();
+    if (argc > 1 && (std::string_view(argv[1]) == "--version" || std::string_view(argv[1]) == "-V")) {
+        std::cout << "xchplot2 " << XCHPLOT2_VERSION << " (" << XCHPLOT2_REVISION << ")\n";
+        return 0;
+    }
     // Direct help must remain available when a saved config needs repair.
     // Inspect only the first option here; command parsers handle later options
     // without mistaking their values or literal filenames for help requests.
@@ -2989,7 +2996,7 @@ _xchplot2() {
         completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
     esac
     if [ $COMP_CWORD -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "${subcmds}" -- "$cur") )
+        COMPREPLY=( $(compgen -W "${subcmds} --version -V --help -h" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == verify ]]; then
@@ -3014,10 +3021,13 @@ complete -F _xchplot2 xchplot2
             std::cout << R"(#compdef xchplot2
 _xchplot2() {
     local -a subcmds
+    local state
     local positional='*:: :->args'
     subcmds=(plan:"Preview farming layout" fill:"Fill destination drives" status:"Inspect farm progress" pause:"Pause at a safe checkpoint" drain:"Finish started files, then stop" resume:"Continue paused or drained work" retire:"Detach destinations, keep plots" grow:"Extend an existing group" compute:"Share compute" batch:"Run a manifest of plots" plot:"Single-plot farmable mode" bench:"Measure plotting throughput" test:"Single test plot" devices:"List available GPU/CPU" verify:"Verify a plot file" parity-check:"Run parity tests" completions:"Emit shell completion script")
     if (( CURRENT == 2 )); then
-        _describe 'subcommand' subcmds
+        _arguments '-V[Print version and source revision]' '--version[Print version and source revision]' \
+            '-h[Show help]' '--help[Show help]' '1:subcommand:->command'
+        if [[ "$state" == command ]]; then _describe 'subcommand' subcmds; fi
         return
     fi
     if [[ "${words[2]}" == compute && $CURRENT -eq 3 ]]; then
@@ -3227,6 +3237,7 @@ _xchplot2 "$@"
             std::cout << R"(# fish completion for xchplot2 — install at:
 #     ~/.config/fish/completions/xchplot2.fish
 complete -c xchplot2 -f
+complete -c xchplot2 -n '__fish_use_subcommand' -s V -l version -d 'Print version and source revision'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'plan' -d 'Preview farming layout'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'fill' -d 'Fill destination drives'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'status' -d 'Inspect farm progress'

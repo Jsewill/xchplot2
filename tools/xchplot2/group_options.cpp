@@ -3,6 +3,7 @@
 #include "host/GroupHarvesterProfile.hpp"
 #include "host/GroupFarmFile.hpp"
 #include "host/GroupFarmMetadata.hpp"
+#include "host/GroupPublication.hpp"
 #ifdef XCHPLOT2_GROUP_COMMANDS
 #include "host/ComputeSession.hpp"
 #include "host/NumaTopology.hpp"
@@ -668,14 +669,6 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         }
     }
     bool const farm_command = command == "fill" || command == "plan";
-    bool const migration_resources = result.replot || !result.replot_inventory.empty() ||
-        (!result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
-    if (migration_resources && !result.max_ram_set)
-    {
-        auto const available = group_grow::profile_detail::available_memory();
-        require(available >= 16 * mib, "cannot determine an available migration RAM budget; retry when memory is available or set --max-host-ram");
-        result.max_ram = available;
-    }
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(!result.status_live || result.replot_status, "--live requires status");
     require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
@@ -810,6 +803,14 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();
     }
+    bool const migration_resources = result.replot || !result.replot_inventory.empty() ||
+        (!result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
+    if (migration_resources && !result.max_ram_set)
+    {
+        auto const available = group_grow::profile_detail::available_memory();
+        require(available >= 16 * mib, "cannot determine an available migration RAM budget; retry when memory is available or set --max-host-ram");
+        result.max_ram = available;
+    }
     bool const verification_options = result.replot_verification || result.replot_proof_first_groups || result.replot_proof_every_groups;
     require(!result.replot_confirmation || (result.replot &&
         (*result.replot_confirmation == "directory" || *result.replot_confirmation == "file")),
@@ -872,7 +873,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         result.farming_deadline_ms || result.farming_chain_us || result.farming_index_ns;
     bool const directory_target = fs::is_directory(result.target);
     if (command == "grow")
-        require(!directory_target && fs::exists(result.target), "grow requires an existing group file; use plot to create files");
+        require(!directory_target && group_grow::publication::exists(result.target), "grow requires an existing group file; use plot to create files");
     require(command.empty() || !result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
     // Match plot/batch: an explicit progress choice wins; otherwise use stderr
     // TTY detection, with quiet suppressing the automatic progress display.

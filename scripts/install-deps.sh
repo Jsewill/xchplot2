@@ -32,6 +32,7 @@ ACPP_PREFIX=${ACPP_PREFIX:-/opt/adaptivecpp}
 SKIP_ACPP=0
 REBUILD_ACPP=0
 GPU=""
+GPU_EXPLICIT=0
 # AdaptiveCpp 25.10's CMake hard-errors outside this range ("LLVM versions
 # greater than 20 are not yet tested/supported"). Single source of truth for
 # both the probe and the packages we install — bump together with $ACPP_REF.
@@ -45,7 +46,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-acpp)      SKIP_ACPP=1; shift ;;
         --rebuild-acpp) REBUILD_ACPP=1; shift ;;
-        --gpu)          GPU="$2"; shift 2 ;;
+        --gpu)          GPU="$2"; GPU_EXPLICIT=1; shift 2 ;;
         -h|--help)      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -133,18 +134,21 @@ if [[ -z "$GPU" ]]; then
     exit 1
 fi
 
-# Level Zero is installed whenever an Intel GPU is present, not only when it
-# won the $GPU slot. AdaptiveCpp enables the backends it can find at ITS
-# configure time, so the loader + headers have to be on disk before the build
-# below or the Intel card can never be driven — and on a multi-vendor host the
-# slot belongs to AMD or NVIDIA, so keying off it alone silently skips this.
+# Automatic setup includes the detected Intel GPU too. An explicit --gpu
+# selects that vendor's dependencies; a dormant iGPU must not add another
+# development stack to an explicitly selected NVIDIA or AMD build.
 WANT_INTEL=""
-if [[ "$GPU" == "intel" ]] || intel_gpu_present; then
+if [[ "$GPU" == "intel" ]] || { [[ $GPU_EXPLICIT -eq 0 ]] && intel_gpu_present; }; then
     WANT_INTEL=1
-    if [[ "$GPU" != "intel" ]]; then
-        echo "[install-deps] Intel GPU also present — adding the Level Zero stack"
-        echo "[install-deps] so AdaptiveCpp builds its Level Zero backend too."
-    fi
+fi
+case "${WITH_LEVEL_ZERO_BACKEND:-auto}" in
+    ON|on|TRUE|true|1) WANT_INTEL=1 ;;
+    OFF|off|FALSE|false|0) WANT_INTEL="" ;;
+    auto) ;;
+    *) echo "WITH_LEVEL_ZERO_BACKEND must be ON or OFF" >&2; exit 1 ;;
+esac
+if [[ -n "$WANT_INTEL" && "$GPU" != "intel" ]]; then
+    echo "[install-deps] Including Intel Level Zero support."
 fi
 echo "[install-deps] distro=$DISTRO, gpu=$GPU, acpp=${ACPP_REF}, prefix=${ACPP_PREFIX}"
 
@@ -663,9 +667,9 @@ done
 # produced a build with only librt-backend-omp.so, and an Intel GPU stayed
 # invisible with the packages sitting right there on disk. The backend links
 # -lze_loader directly, so the loader package is all it needs besides the flag.
-ACPP_INTEL_FLAGS=()
+ACPP_INTEL_FLAGS=(-DWITH_LEVEL_ZERO_BACKEND=OFF)
 if [[ -n "$WANT_INTEL" ]]; then
-    ACPP_INTEL_FLAGS+=(-DWITH_LEVEL_ZERO_BACKEND=ON)
+    ACPP_INTEL_FLAGS=(-DWITH_LEVEL_ZERO_BACKEND=ON)
     echo "[install-deps] Enabling AdaptiveCpp's Level Zero backend (Intel GPU)."
 fi
 
@@ -703,6 +707,12 @@ if [[ "$GPU" == "amd" ]]; then
         echo "[install-deps]   ROCM_DEVICE_LIBS_PATH=/path/to/amdgcn/bitcode" >&2
     fi
 fi
+
+ACPP_DEPS_CHECK=$(cd "$(dirname "${BASH_SOURCE[0]}")/../cmake" && pwd)/AdaptiveCppDependencies.cmake
+cmake -DXCHPLOT2_LLVM_ROOT="$LLVM_ROOT" \
+    -DXCHPLOT2_LLVM_VERSION="$(llvm_prefix_version "$LLVM_ROOT")" \
+    -DXCHPLOT2_PREREQUISITES_DIR="$ACPP_BUILD_DIR/prerequisites" \
+    "${ACPP_INTEL_FLAGS[@]}" -P "$ACPP_DEPS_CHECK"
 
 echo "[install-deps] Building AdaptiveCpp $ACPP_REF in $ACPP_BUILD_DIR"
 git clone --depth 1 --branch "$ACPP_REF" \

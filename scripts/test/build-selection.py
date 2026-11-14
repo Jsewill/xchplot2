@@ -73,4 +73,41 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             assert result.returncode == 0, result.stderr
             assert output.read_text() == expected, (requested, output.read_text())
-print("build selection: script/include policy and fake nvcc checks passed")
+    # Exercise the dependency bootstrap without downloading AdaptiveCpp or
+    # installing packages. A loader without headers must not select Intel on
+    # a mixed host, while an explicit Intel request must explain the failure.
+    compiler_root = work / "llvm"
+    (compiler_root / "bin").mkdir(parents=True)
+    compiler = compiler_root / "bin/clang++"
+    dependencies = work / "dependencies.cmake"
+    dependencies.write_text(
+        f'include("{ROOT / "cmake/AdaptiveCppDependencies.cmake"}")\n'
+        f'xchplot2_check_adaptivecpp_dependencies("{compiler_root}" 20)\n'
+        f'file(WRITE "{output}" "${{WITH_LEVEL_ZERO_BACKEND}}")\n')
+    for cxx, omp, ze, facts, expected, missing in (
+        (0, 0, 1, {"X2_HAVE_NVIDIA": "ON", "X2_HAVE_INTEL": "ON"}, "OFF", ()),
+        (0, 0, 1, {"X2_HAVE_INTEL": "ON"}, None, ("Level Zero loader and headers",)),
+        (0, 0, 1, {"WITH_LEVEL_ZERO_BACKEND": "ON"}, None, ("Level Zero loader and headers",)),
+        (0, 0, 1, {"WITH_LEVEL_ZERO_BACKEND": "OFF", "X2_HAVE_INTEL": "ON"}, "OFF", ()),
+        (0, 0, 0, {}, "ON", ()),
+        (0, 0, 0, {"ACPP_TARGETS": "omp"}, "OFF", ()),
+        (1, 1, 1, {"WITH_LEVEL_ZERO_BACKEND": "ON"}, None,
+         ("C++20 headers and libraries", "LLVM OpenMP headers and runtime", "Level Zero loader and headers")),
+    ):
+        compiler.write_text('#!/bin/sh\ncase "$*" in\n'
+                            f'*openmp.cpp*) echo "OpenMP probe" >&2; exit {omp} ;;\n'
+                            f'*level_zero.cpp*) echo "Level Zero header/link probe" >&2; exit {ze} ;;\n'
+                            f'*) echo "C++ library probe" >&2; exit {cxx} ;;\nesac\n')
+        compiler.chmod(0o755)
+        values = {"ACPP_TARGETS": "generic", **facts}
+        result = run([*[f"-D{k}={v}" for k, v in values.items()],
+                      f"-DXCHPLOT2_PREREQUISITES_DIR={work / 'probes'}",
+                      "-P", str(dependencies)], env)
+        if expected is None:
+            assert result.returncode != 0, result.stdout
+            assert all(message in result.stderr for message in missing), result.stderr
+            assert "install-deps.sh" in result.stderr, result.stderr
+        else:
+            assert result.returncode == 0, result.stderr
+            assert output.read_text() == expected, (facts, result.stdout)
+print("build selection: target policy, toolchain compatibility and dependency checks passed")

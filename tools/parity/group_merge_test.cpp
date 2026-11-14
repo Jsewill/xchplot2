@@ -810,7 +810,7 @@ void construction_cancellation(fs::path const& root, Members input, Config cfg)
         if (!offset || bytes <= 1024) return;
         std::array<char, PATH_MAX> name{};
         auto const count = ::readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), name.data(), name.size());
-        if (count > 0 && std::string_view(name.data(), size_t(count)) == controller_path.string())
+        if (count > 0 && std::string_view(name.data(), size_t(count)) == controller_path.string() + ".partial")
             deadline = Clock::now().time_since_epoch().count();
     };
     std::unique_ptr<Backend> backend; stopped = false;
@@ -818,9 +818,12 @@ void construction_cancellation(fs::path const& root, Members input, Config cfg)
     catch (ConstructionInterrupted const&) { stopped = true; }
     construction_write_observer = {};
     require(stopped, "run_group returned success after its construction deadline expired during payload packing");
+    require(!fs::exists(controller_path) && fs::is_regular_file(controller_path.string() + ".partial"),
+        "cancelled controller exposed an unfinished output");
     args.resume = true; args.cancelled = {}; backend.reset();
     auto const result = run_group(args, controller_path, &fixture, controller_identity, uint16_t(input.size()), cfg.capacity_bytes, 0, backend);
-    require(result.members == input.size() && contents(controller_path) == expected,
+    require(result.members == input.size() && contents(controller_path) == expected &&
+        !fs::exists(controller_path.string() + ".partial"),
         "controller deadline recovery changed canonical output");
 #endif
 }
@@ -7487,8 +7490,9 @@ void prepared_producer(fs::path const& root, Members input)
     auto scheduler = std::make_shared<CodecScheduler>(unsigned(args.workers));
     uint64_t const metadata = sum(fixture.bytes, sum(mib, CodecScheduler::memory_bytes(unsigned(args.workers))));
     auto cfg = grow_controller_test::configuration(args, 128 * mib, metadata); cfg.cpu_scheduler = scheduler;
+    auto reference_cfg = cfg; reference_cfg.private_output = false;
     auto const path = root / "prepared-producer.gplot", reference = root / "prepared-producer-reference.gplot";
-    { Engine engine(reference.string(), cfg, false, identity()); engine.confirm_identity();
+    { Engine engine(reference.string(), reference_cfg, false, identity()); engine.confirm_identity();
       require(engine.append(input.subspan(0, 4)).accepted, "prepared producer reference rejected"); }
     Construction construction(path.string(), cfg, false, identity(), "external", ext); construction.confirm_identity();
     auto const fixed = sum(metadata, sum(construction.memory_bytes(4, true), ExternalEngine::input_memory_bytes(cfg, 4)));
@@ -7503,9 +7507,12 @@ void prepared_producer(fs::path const& root, Members input)
     ready.get(); require(construction.staged_batches == 1 && !construction.shape_recorded,
         "prepared Construction append bypassed accounting");
     prepared.reset(); construction.finish();
+    require(!fs::exists(path) && fs::is_regular_file(path.string() + ".partial"),
+        "prepared producer exposed its output before publication");
+    construction.release_external(); construction.publish();
     require(contents(path) == contents(reference), "prepared fixture producer changed canonical group bytes");
     auto const prefix_path = root / "prepared-producer-prefix.gplot", prefix_reference = root / "prepared-producer-prefix-reference.gplot";
-    { Engine engine(prefix_reference.string(), cfg, false, identity()); engine.confirm_identity();
+    { Engine engine(prefix_reference.string(), reference_cfg, false, identity()); engine.confirm_identity();
       require(engine.append(input.subspan(0, 2)).accepted, "prepared producer prefix reference rejected"); }
     Construction prefix(prefix_path.string(), cfg, false, identity(), "external", ext); prefix.confirm_identity();
     Producer prefix_producer{requested, &fixture, backend, args, args.max_ram, fixed, fixed};
@@ -7517,6 +7524,9 @@ void prepared_producer(fs::path const& root, Members input)
     auto prefix_ready = worker.submit([&]
     { require(prefix.append(*prefix_input, 2).accepted, "prepared Construction prefix append rejected"); });
     prefix_ready.get(); prefix_input.reset(); prefix.finish();
+    require(!fs::exists(prefix_path) && fs::is_regular_file(prefix_path.string() + ".partial"),
+        "stopped prepared producer exposed its prefix before publication");
+    prefix.release_external(); prefix.publish();
     require(contents(prefix_path) == contents(prefix_reference), "stopped prepared producer changed prefix bytes");
 
 }

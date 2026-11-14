@@ -331,7 +331,7 @@ inline uint64_t MergeState::size() const
 inline void MergeState::check_path() const
 {
     file_io::Stat info{};
-    require(!file_io::inspect_link(path_.c_str(), &info) && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
+    require(!publication::inspect(path_.c_str(), &info) && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
         uint64_t(info.st_dev) == device_ && uint64_t(info.st_ino) == inode_ && size() == expected_bytes_,
         "merged destination path, links or size changed while open");
 }
@@ -347,7 +347,9 @@ inline void MergeState::read(uint64_t offset, std::span<uint8_t> bytes) const
         stats.read_ns += elapsed_ns(begin); ++stats.read_calls;
         if (n < 0 && errno == EINTR) continue;
         require(n > 0, "cannot read merged destination");
-        stats.read_bytes += uint64_t(n); offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
+        stats.read_bytes += uint64_t(n);
+        if (config.progress) config.progress->read_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
+        offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
     }
 }
 inline void MergeState::write(uint64_t offset, std::span<uint8_t const> bytes)
@@ -360,7 +362,9 @@ inline void MergeState::write(uint64_t offset, std::span<uint8_t const> bytes)
         stats.write_ns += elapsed_ns(begin); ++stats.write_calls;
         if (n < 0 && errno == EINTR) continue;
         require(n > 0, "cannot write merged destination; retain this file for resume");
-        stats.written_bytes += uint64_t(n); offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
+        stats.written_bytes += uint64_t(n);
+        if (config.progress) config.progress->written_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
+        offset += uint64_t(n); bytes = bytes.subspan(size_t(n));
     }
 }
 inline void MergeState::sync()
@@ -447,7 +451,7 @@ MergeState::load(uint64_t slots, uint64_t slot_bytes, std::array<uint8_t, 32>* a
 }
 inline bool MergeState::pending(std::string const& path)
 {
-    int fd = file_io::open_file(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    int fd = publication::open(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
     if (fd < 0) return false;
     struct Close { int fd; ~Close() { file_io::close_file(fd); } } close{fd};
     file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
@@ -514,10 +518,10 @@ inline MergeState::MergeState(std::string path, Config cfg, bool resume, std::op
     require(cfg.window_bytes >= sizeof(Header) && cfg.window_bytes <= SIZE_MAX && cfg.codec_bytes &&
         cfg.checkpoint_bytes && cfg.workers && cfg.capacity_bytes <= uint64_t(INT64_MAX), "invalid merge budgets");
     if (initial && !resume)
-    { fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600); created_ = fd_ >= 0; }
-    else fd_ = file_io::open_file(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
+    { fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config.private_output, 0600); created_ = fd_ >= 0; }
+    else fd_ = publication::open(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
     if (fd_ < 0 && errno == ENOENT && initial)
-    { fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600); created_ = fd_ >= 0; }
+    { fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config.private_output, 0600); created_ = fd_ >= 0; }
     require(fd_ >= 0, "cannot open merged destination: " + path_);
     try
     {
@@ -538,7 +542,7 @@ inline MergeState::MergeState(std::string path, Config cfg, bool resume, std::op
     }
     catch (...)
     {
-        if (created_ && !size()) file_io::unlink_file(path_.c_str());
+        if (created_ && !size()) publication::remove(path_.c_str());
         file_io::close_file(fd_); fd_ = -1; throw;
     }
 }
@@ -549,7 +553,7 @@ inline MergeState::MergeState(std::string path, Config cfg, ReadOnly, Constructi
     limits.check(65536);
     require(cfg.window_bytes >= sizeof(Header) && cfg.window_bytes <= SIZE_MAX && cfg.codec_bytes &&
         cfg.checkpoint_bytes && cfg.workers && cfg.capacity_bytes <= uint64_t(INT64_MAX), "invalid merge budgets");
-    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    fd_ = publication::open(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
     require(fd_ >= 0, "cannot inspect merged destination: " + path_);
     try
     {
@@ -632,8 +636,8 @@ inline MergeState::~MergeState()
     if (created_ && !size())
     {
         file_io::Stat named{};
-        if (!file_io::inspect_link(path_.c_str(), &named) && uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_)
-            file_io::unlink_file(path_.c_str());
+        if (!publication::inspect(path_.c_str(), &named) && uint64_t(named.st_dev) == device_ && uint64_t(named.st_ino) == inode_)
+            publication::remove(path_.c_str());
     }
     if (!active && stats.syncs) evict(0, size());
     file_io::close_file(fd_);

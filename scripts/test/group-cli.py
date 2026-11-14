@@ -518,8 +518,10 @@ def check_farm_guided_plans(run, command, verify, root):
     run("fill", legacy_dir, *limits, "--max-groups", 1, "--max-total-members", 1,
         "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime, "--construction", "incremental",
         point="initialized", code=86)
-    target = next(legacy_dir.glob("*.gplot"))
-    original = target.read_bytes()
+    partial = next(legacy_dir.glob("*.gplot.partial"))
+    target = partial.with_suffix("")
+    assert not target.exists()
+    original = partial.read_bytes()
     producer = json.loads(run("plan", "--metadata-only", "--manifest", private_record(legacy_dir, "grow-farm.plan"), "--json").stdout)["producer_build"]
     foreign = "guided-legacy-original"
     changed = bytearray(original)
@@ -544,7 +546,7 @@ def check_farm_guided_plans(run, command, verify, root):
             converted = True
         cursor = changed.find(marker, cursor + len(marker))
     assert converted
-    target.write_bytes(changed)
+    partial.write_bytes(changed)
     blocked_review = root / "blocked legacy upgrade.plan"
     before = snapshot(legacy_dir)
     blocked = json.loads(run("status", legacy_dir, "--inspect", "--json", code=2).stdout)
@@ -556,7 +558,7 @@ def check_farm_guided_plans(run, command, verify, root):
     assert recovery["original_drain_command_if_supported"] and not recovery["metadata_upgrade_applied"]
     refused = json.loads(run("plan", legacy_dir, "--upgrade-job", "--save-plan", blocked_review, "--json", code=2).stdout)
     assert refused["farming_status"] and not blocked_review.exists() and snapshot(legacy_dir) == before
-    target.write_bytes(original)
+    partial.write_bytes(original)
     run("fill", legacy_dir, "--resume", *runtime, "--quiet")
     verify(target)
     print("PASS selectable resource/capacity previews, native bindings, fenced metadata upgrade and stale-policy refusal", flush=True)
@@ -592,7 +594,7 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     run("fill", *options, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
         "--quiet", point="initialized", code=86)
     original = private_record(first, "grow-farm.plan").read_bytes()
-    offline_outputs = {path.name: digest(path) for path in first.glob("*.gplot")}
+    offline_outputs = {path.name: digest(path) for path in [*first.glob("*.gplot"), *first.glob("*.gplot.partial")]}
     first.rename(offline)
     try:
         run("fill", "--resume", "--allow-missing", second, *runtime, "--quiet", code=4)
@@ -603,7 +605,7 @@ def check_farm_membership_lifecycle(run, command, verify, root):
         status = json.loads(run("status", second, "--inspect", "--json", code=2).stdout)
         observed = next(item for item in status["destinations"] if item["directory"] == str(second))
         assert observed["completed_members"] == completed and observed["allocation_grant_members"] == initial["allocation_grant_members"]
-        assert {path.name: digest(path) for path in offline.glob("*.gplot")} == offline_outputs, "an absent member's outputs changed"
+        assert {path.name: digest(path) for path in [*offline.glob("*.gplot"), *offline.glob("*.gplot.partial")]} == offline_outputs, "an absent member's outputs changed"
     finally:
         offline.rename(first)
     run("fill", "--resume", second, *runtime, "--quiet")
@@ -988,12 +990,14 @@ def check_farm_updates(run, command, verify, root):
     run("fill", progressing, *runtime, "-k", 18, "--construction", "incremental", "--batch-members", 1,
         "--group-members", 3, "--max-groups", 1, "--max-total-members", 3, "--capacity-bytes", "32M", "--leave-free", 0,
         "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, "--quiet", point="published", code=86)
-    active = next(progressing.glob("*.gplot"))
+    active = next(progressing.glob("*.gplot.partial"))
+    assert not list(progressing.glob("*.gplot"))
     assert header(active)[3] < 3
     progress_review = root / "progress-tolerant.plan"
     run("plan", progressing, "--save-plan", progress_review, "--json")
     assert progress_review.read_text(encoding="utf-8").startswith("ordinary-group-farming-preview-v2\n")
     run("fill", "-r", progressing, *runtime, "--quiet")
+    active = active.with_suffix("")
     completed_hash = digest(active)
     assert header(active)[3] == 3
     run("fill", progress_review, *runtime, "--quiet")
@@ -1016,7 +1020,7 @@ def check_farm_updates(run, command, verify, root):
                 deadline = time.monotonic() + 30
                 started = False
                 while process.poll() is None and time.monotonic() < deadline:
-                    for path in live.glob("*.gplot"):
+                    for path in live.glob("*.gplot.partial"):
                         try:
                             started = header(path)[3] > 0
                         except (OSError, AssertionError, struct.error):
@@ -1115,7 +1119,7 @@ def check_farm_returning_drives(run, command, verify, root):
                         try:
                             observed = json.loads(run("status", second, "--json", code=(0, 2)).stdout)
                             return all(item["owner"]["status"] == "live" and item["owner"]["local_process_proven"]
-                                       for item in observed["destinations"]) and any(header(path)[3] > 0 for path in first.glob("*.gplot"))
+                                       for item in observed["destinations"]) and any(header(path)[3] > 0 for path in first.glob("*.gplot.partial"))
                         except (OSError, AssertionError, ValueError, struct.error):
                             return False
                     wait_for(active_started, process, log)
@@ -1634,13 +1638,46 @@ def check(binary, root, reference=None):
                   "--group-members", 3, "--batch-members", 2, "--construction", mode,
                   *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
         run(*engine, point=point, code=86)
+        directory = root / (mode + " recovered")
+        assert not list(directory.glob("*.gplot")), "unfinished group has a public filename"
+        partial, = directory.glob("*.gplot.partial")
+        if mode == "incremental":
+            # A competing final name must neither replace nor hide either file.
+            final = partial.with_suffix("")
+            final.write_bytes(b"occupied publication")
+            held = snapshot(directory)
+            run(*engine, "--resume", code=2)
+            assert snapshot(directory) == held
+            final.unlink()
         recovered = Path(run(*engine, "--resume").stdout.strip())
         assert header(recovered)[3] == 3
+        assert not list(directory.glob("*.partial"))
         if expected is None:
             expected = digest(recovered)
         assert digest(recovered) == expected, mode
         verify(recovered)
     print("PASS all construction engines recover to identical ordinary bytes and full proofs", flush=True)
+
+    # The final payload is durable before publication. A crash on either side
+    # of the rename must resume without exposing a prefix or changing bytes.
+    for mode in ("incremental", "staged", "merged", "external"):
+        for point in ("publication-ready", "publication-renamed"):
+            directory = root / (mode + " " + point)
+            publish = ["plot", "-k", 18, *keys, "-S", SEED, "-o", directory,
+                       "--group-members", 3, "--batch-members", 2, "--construction", mode,
+                       *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+            run(*publish, point=point, code=86)
+            private = point == "publication-ready"
+            output, = directory.glob("*.gplot.partial" if private else "*.gplot")
+            assert not list(directory.glob("*.gplot" if private else "*.gplot.partial"))
+            assert digest(output) == expected
+            before_publish = output.stat()
+            result = Path(run(*publish, "--resume").stdout.strip())
+            after_publish = result.stat()
+            assert digest(result) == expected and not list(directory.glob("*.gplot.partial"))
+            assert before_publish.st_ino == after_publish.st_ino, "publication copied or replaced the payload"
+            assert before_publish.st_mtime_ns == after_publish.st_mtime_ns, "publication rewrote a completed payload"
+    print("PASS atomic publication, occupied-name refusal and rename-boundary recovery", flush=True)
 
     # Explicit NUMA and mixed local selectors share the bounded executor path,
     # without changing plot identity or requiring enrollment/listeners.
@@ -1669,6 +1706,8 @@ def check(binary, root, reference=None):
     run("plan", *options, "--devices", cpu, "--compute-local", "off", code=2)
     print("PASS local device selection, shared limits, staged recovery and ordinary byte parity", flush=True)
 
+    run("grow", grouped_one, "--max-members", 3, *construction, point="publication-hidden", code=86)
+    assert not grouped_one.exists() and Path(str(grouped_one) + ".partial").is_file()
     concise_grow = run("grow", grouped_one, "--max-members", 3, *construction)
     assert "[grow] 3 members" in concise_grow.stderr
     assert "members assembled" not in concise_grow.stderr and "Buffers:" not in concise_grow.stderr
@@ -1706,14 +1745,14 @@ def check(binary, root, reference=None):
     cancelled = root / "cancelled"
     cancel_args = ["plot", "-k", 22, "-n", 6, *keys, "-o", cancelled,
                    "--group-members", 2, "--batch-members", 1, "--construction", "staged",
-                   *construction, "--capacity-bytes", "256M", "--verbose"]
+                   *construction, "--capacity-bytes", "256M", "--verbose", "--progress"]
     cancel_log = root / "cancel.log"
     with cancel_log.open("w+") as log:
         process = subprocess.Popen(command(*cancel_args), stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8",
                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
         try:
             deadline = time.monotonic() + 30
-            while ": generating cpu member" not in cancel_log.read_text(encoding="utf-8"):
+            while "files published;" not in cancel_log.read_text(encoding="utf-8"):
                 assert process.poll() is None, cancel_log.read_text(encoding="utf-8")
                 assert time.monotonic() < deadline, cancel_log.read_text(encoding="utf-8")
                 time.sleep(0.01)
@@ -1726,7 +1765,7 @@ def check(binary, root, reference=None):
                 process.wait()
     cancel_job, = cancelled.glob("xchplot2-job-*.tsv")
     cancel_manifest = cancel_job.read_bytes()
-    run(*cancel_args, "--resume", "--no-verbose", "--quiet")
+    run(*cancel_args, "--resume", "--no-verbose", "--quiet", "--no-progress")
     assert cancel_job.read_bytes() == cancel_manifest
     assert len(list(cancelled.glob("*.gplot"))) == 6
     verify(next(cancelled.glob("*.gplot")))

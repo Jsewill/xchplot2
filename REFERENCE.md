@@ -82,6 +82,8 @@ assumptions and worker details; `-q`/`--quiet` suppresses informational messages
 Quiet mode retains command results, output paths, warnings and errors. JSON
 reports retain their fields regardless of verbosity. Use `COMMAND --help`
 for common options and `COMMAND --help-all` for the extended plotting options.
+`xchplot2 --version` (or `-V`) prints the version and source revision without
+loading configuration or initializing plotting devices.
 
 An aggregate progress line updates after each plot completes:
 
@@ -104,13 +106,17 @@ a later plot fails. Exit status is 0 for completion, 1 for argument errors,
 2 for an exception, 3 for per-plot failures, or 4 for unfinished work.
 `-q` and `-v` are mutually exclusive.
 
-Plots are written to an exclusively created `<name>.gplot.partial.XXXXXX`
-file, flushed through its original file descriptor, and atomically renamed on
-completion. The final name is published only after writing succeeds.
-A first `Ctrl-C` asks the plotter to
-finish the plot in flight and stop; a second hard-kills. Concurrent writers
-use separate temporary files; the last completed rename wins. Resume checks
-the header identity, memo, chunk index, and file bounds before skipping a plot.
+The single-member batch engine writes to an exclusively created
+`<name>.gplot.partial.XXXXXX` file, flushes its original file descriptor, and
+atomically renames it on completion. Concurrent writers use separate temporary
+files; the last completed rename wins. Resume checks the header identity,
+memo, chunk index, and file bounds before skipping a plot.
+Grouped construction keeps its resumable output at `<name>.gplot.partial`
+until the whole group is complete, then renames it without replacing an
+occupied final path. `grow` also removes the final name while extending a file.
+A first `Ctrl-C` asks active work to stop safely; a second aborts immediately.
+The single-member engine finishes its current plot; grouped construction can
+stop at a recovery checkpoint before the file is complete.
 
 ### Batch manifests
 
@@ -649,15 +655,18 @@ These options override the automatic choices.
 
 Construction checkpoints are private. New records require a compatible format,
 algorithm and native representation; legacy records require their original build. Retain the
-in-progress file, plan and any owned scratch/checkpoint directory together;
-do not move or edit them during recovery. A file being constructed is not a
-farmable completed output. Press Ctrl-C and wait for the command to exit, then repeat the
+in-progress `.partial` file, plan and any owned scratch/checkpoint directory together;
+do not move or edit them during recovery. The completed output name appears only
+after finalization. Press Ctrl-C and wait for the command to exit, then repeat the
 owning command with `--resume` (`grow` resumes implicitly). Completed output
 paths appear on stdout after publication or a successful resume audit.
 `--json` replaces human output with the plan or construction metrics;
 `--quiet` suppresses informational stderr and `--verbose` adds construction
-details and final metrics. Aggregate member progress uses `--progress` and
-`--no-progress`, with the same terminal defaults as `plot`.
+details and final metrics. `--progress` reports assembled members separately
+from published files, and shows active generation, assembly, merging, packing
+and finalization phases with elapsed time and read/write totals. Output-file
+counts do not imply separate physical drives. `--no-progress` disables these
+updates; the terminal defaults match `plot`.
 
 ### Farming layout
 

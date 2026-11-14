@@ -61,12 +61,12 @@ class MergeEngine
     uint64_t header_bytes() const { return sizeof(Header) + arena_.identity.memo.size(); }
     void remember()
     {
-        file_io::Stat current{}; require(!file_io::inspect_path(arena_.path().c_str(), &current), "cannot inspect merge source stability"); trusted_ = current;
+        file_io::Stat current{}; require(!publication::inspect(arena_.path().c_str(), &current), "cannot inspect merge source stability"); trusted_ = current;
     }
     bool trusted() const
     {
         if (!trusted_) return false;
-        file_io::Stat now{}; require(!file_io::inspect_path(arena_.path().c_str(), &now), "cannot inspect merge source stability");
+        file_io::Stat now{}; require(!publication::inspect(arena_.path().c_str(), &now), "cannot inspect merge source stability");
         return now.st_size == trusted_->st_size && now.st_mtim.tv_sec == trusted_->st_mtim.tv_sec &&
             now.st_mtim.tv_nsec == trusted_->st_mtim.tv_nsec && now.st_ctim.tv_sec == trusted_->st_ctim.tv_sec &&
             now.st_ctim.tv_nsec == trusted_->st_ctim.tv_nsec;
@@ -849,7 +849,7 @@ inline AppendResult MergeEngine::append(Members members)
     validate_remaining();
     if (arena_.active && arena_.state.phase == Phase::merge)
     { arena_.restore_extent(); merge(arena_.state.merge_first); }
-    PhaseTimer planning(arena_.stats, WorkPhase::plan);
+    PhaseTimer planning(arena_.stats, WorkPhase::plan, config().progress);
     uint16_t const before = committed_member_count();
     require(!members.empty() && members.size() <= size_t(UINT16_MAX - before), "invalid merged batch membership");
     require(required_memory(uint16_t(members.size())) <= config().memory_limit_bytes,
@@ -892,7 +892,7 @@ inline AppendResult MergeEngine::append(Members members)
         result.reason = plan.buffers ? "merged run and recoverable working reserve exceed capacity" :
             "merged final chunk exceeds codec/window admission"; return result;
     }
-    planning.finish(); PhaseTimer encoding(arena_.stats, WorkPhase::encode);
+    planning.finish(); PhaseTimer encoding(arena_.stats, WorkPhase::encode, config().progress);
     if (!arena_.active) arena_.initialize(arena_.state, plan.peak);
     else { arena_.restore_extent(); arena_.reserve(std::max(plan.peak, arena_.state.storage_bytes)); }
     auto& state = arena_.state;
@@ -935,7 +935,7 @@ inline AppendResult MergeEngine::append(Members members)
 inline void MergeEngine::merge(size_t first, size_t count)
 {
     config().check_running();
-    PhaseTimer timing(arena_.stats, WorkPhase::merge);
+    PhaseTimer timing(arena_.stats, WorkPhase::merge, config().progress);
     auto& state = arena_.state;
     if (state.phase != Phase::merge)
     {
@@ -1184,7 +1184,7 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
 inline void MergeEngine::pack()
 {
     config().check_running();
-    PhaseTimer timing(arena_.stats, WorkPhase::pack);
+    PhaseTimer timing(arena_.stats, WorkPhase::pack, config().progress);
     auto& state = arena_.state;
     if (state.phase == Phase::stage)
     {
@@ -1238,7 +1238,7 @@ inline void MergeEngine::pack()
 inline void MergeEngine::arrange()
 {
     config().check_running();
-    PhaseTimer timing(arena_.stats, WorkPhase::layout);
+    PhaseTimer timing(arena_.stats, WorkPhase::layout, config().progress);
     auto& state = arena_.state;
     require(state.phase == Phase::layout, "invalid merged block arrangement");
     std::vector<uint32_t> owner(state.block_limit, MergeState::free_block);

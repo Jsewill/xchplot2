@@ -270,6 +270,25 @@ fallback then builds and installs AdaptiveCpp to `~/.local` (or
 Cargo uses these system dependencies; it does not run
 the system package manager itself.
 
+Use `./scripts/install-deps.sh --gpu nvidia` (or `amd`) to install that vendor's
+toolchain without adding Level Zero for an unused Intel GPU. Automatic setup
+includes detected Intel hardware. `WITH_LEVEL_ZERO_BACKEND=ON` or `OFF` overrides
+that choice for the installer and Cargo's automatic AdaptiveCpp build; direct
+CMake builds accept `-DWITH_LEVEL_ZERO_BACKEND=ON` or `OFF`.
+These settings affect a new AdaptiveCpp build; an existing installation retains
+its compiled backends.
+
+Before building AdaptiveCpp, Cargo, CMake and the installer check that the
+selected LLVM compiler can compile and link C++20 and OpenMP programs. Missing
+dependencies are reported together with package names and the installer path.
+For generic builds, optional Level Zero support requires usable headers and a
+loader; finding the loader alone does not require installing Intel headers.
+An explicit Intel request, or an Intel-only GPU host, requires that backend.
+
+Run `xchplot2 --version` after installation to see the version and source
+revision. A `-dirty` suffix identifies a build with modified tracked source;
+archives built without Git metadata report `unknown source`.
+
 Intel plotting requires the
 [Level Zero event-pool fix](https://github.com/AdaptiveCpp/AdaptiveCpp/commit/7bb430d5e04e497ac6b0e5b56f0f5e46f646b3af)
 and [event dependency lifetime correction](ci/release/adaptivecpp-level-zero-event-lifetime.patch).
@@ -502,7 +521,9 @@ Windows group and background-service ports remain experimental. The x86-64
 Task Scheduler worker can stop after rapid service restarts. See the
 [shared-compute reference](REFERENCE.md#shared-compute) for enrollment,
 services and firewall requirements.
-The first Ctrl-C or Ctrl-Break drains the current plot; a second aborts.
+The first Ctrl-C or Ctrl-Break asks active work to stop safely; a second aborts.
+Single-member plotting drains the current plot; grouped construction can stop
+at a recovery checkpoint before the file is complete.
 The default config is `%APPDATA%\xchplot2\config.toml`.
 For the original CUDA implementation, see the
 [`cuda-only` Windows recipe](https://github.com/Jsewill/xchplot2/blob/cuda-only/INSTALL.md#windows).

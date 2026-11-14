@@ -3,6 +3,7 @@
 #pragma once
 #include "host/GroupCodec.hpp"
 #include "host/GroupFile.hpp"
+#include "host/GroupPublication.hpp"
 #include "host/GroupConstructionIdentity.hpp"
 #include "pos2_keygen.h"
 
@@ -35,6 +36,43 @@ struct ConstructionInterrupted : std::runtime_error
     ConstructionInterrupted() : std::runtime_error("interrupted; repeat the command with --resume") {}
 };
 
+enum class ProgressPhase : size_t { idle, generate, plan, assemble, merge, pack, layout, finalize, publish, count };
+// Runtime observation only. Checkpoint stats retain their existing serialized
+// representation; the reporting thread never reads a working engine's stats.
+struct WorkProgress
+{
+    std::atomic<ProgressPhase> phase{ProgressPhase::idle};
+    std::atomic<uint64_t> began_ns{0}, read_bytes{0}, written_bytes{0};
+    static uint64_t now()
+    { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+    void begin(ProgressPhase value)
+    {
+        read_bytes.store(0, std::memory_order_relaxed); written_bytes.store(0, std::memory_order_relaxed);
+        began_ns.store(now(), std::memory_order_relaxed); phase.store(value, std::memory_order_release);
+    }
+};
+struct ProgressScope
+{
+    std::shared_ptr<WorkProgress> progress;
+    ProgressPhase previous = ProgressPhase::idle;
+    ProgressScope(std::shared_ptr<WorkProgress> value, ProgressPhase phase) : progress(std::move(value))
+    {
+        if (progress)
+        {
+            previous = progress->phase.load(std::memory_order_relaxed);
+            progress->begin(phase);
+        }
+    }
+    void finish()
+    {
+        if (!progress) return;
+        if (previous == ProgressPhase::idle) progress->phase.store(previous, std::memory_order_release);
+        else progress->begin(previous);
+        progress.reset();
+    }
+    ~ProgressScope() { finish(); }
+};
+
 struct Config
 {
     uint64_t capacity_bytes = uint64_t(std::numeric_limits<int64_t>::max());
@@ -43,6 +81,7 @@ struct Config
     uint64_t checkpoint_bytes = 256ull * 1024 * 1024;
     bool io_overlap = true;
     bool release_cache = false;
+    bool private_output = false;
     unsigned workers = 1;
     std::shared_ptr<CodecScheduler> cpu_scheduler;
     // Optional computation service; storage and durable acceptance stay local.
@@ -53,6 +92,7 @@ struct Config
     // Runtime aliases for the same persistent native directory after a mount
     // path changes. Checkpoints retain authority over every owned object.
     std::vector<ConstructionPathBinding> path_bindings;
+    std::shared_ptr<WorkProgress> progress;
     // Runtime controller authority, never serialized into a checkpoint. Check
     // only before bounded work or after a recoverable transaction, and join
     // borrowed windows before allowing the exception to leave their owner.
@@ -107,7 +147,7 @@ inline ConstructionStamp construction_stamp(int fd, std::string const& path, boo
     auto valid = [&](file_io::Stat const& value)
     { return directory ? file_io::is_directory(value.st_mode) : file_io::is_regular(value.st_mode) && value.st_nlink == 1; };
     require(!file_io::inspect_fd(fd, &opened) && valid(opened) &&
-        opened.st_size >= 0 && opened.st_blocks >= 0 && !file_io::inspect_link(path.c_str(), &named) &&
+        opened.st_size >= 0 && opened.st_blocks >= 0 && !(directory ? file_io::inspect_link(path.c_str(), &named) : publication::inspect(path, &named)) &&
         valid(named) && named.st_dev == opened.st_dev && named.st_ino == opened.st_ino,
         "construction target filename or links changed during inspection");
     require(uint64_t(opened.st_blocks) <= UINT64_MAX / 512, "construction allocation overflow");
@@ -181,7 +221,8 @@ inline uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin)
 class PhaseTimer
 {
 public:
-    PhaseTimer(Stats& stats, WorkPhase phase) : stats_(stats), phase_(phase),
+    PhaseTimer(Stats& stats, WorkPhase phase, std::shared_ptr<WorkProgress> progress = {}) : stats_(stats), phase_(phase),
+        progress_(std::move(progress), ProgressPhase(size_t(phase) + 2)),
         before_{0, stats.read_ns, stats.write_ns, stats.sync_ns, stats.codec_ns, stats.decode_ns,
             stats.read_bytes, stats.written_bytes, stats.read_calls, stats.write_calls, stats.syncs} {}
     ~PhaseTimer() { finish(); }
@@ -200,11 +241,13 @@ public:
         value.read_calls += stats_.read_calls - before_.read_calls;
         value.write_calls += stats_.write_calls - before_.write_calls;
         value.syncs += stats_.syncs - before_.syncs;
+        progress_.finish();
         finished_ = true;
     }
 private:
     Stats& stats_;
     WorkPhase phase_;
+    ProgressScope progress_;
     PhaseStats before_;
     std::chrono::steady_clock::time_point begin_ = std::chrono::steady_clock::now();
     bool finished_ = false;
@@ -472,7 +515,7 @@ inline ConstructionCompatibility Engine::checkpoint_compatibility()
 
 inline bool Engine::pending(std::string const& path)
 {
-    int fd = file_io::open_file(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    int fd = publication::open(path.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
     if (fd < 0) return true;
     struct Close { int fd; ~Close() { file_io::close_file(fd); } } close{fd};
     file_io::Stat info{}; file_io::Space allocation{}; long const page = file_io::page_size();
@@ -516,13 +559,13 @@ inline Engine::Engine(std::string path, Config config, bool allow_resume,
     reset_encoding();
     if (initial && !allow_resume)
     {
-        fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600);
+        fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config_.private_output, 0600);
         created_ = fd_ >= 0;
     }
-    else fd_ = file_io::open_file(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
+    else fd_ = publication::open(path_.c_str(), file_io::read_write | file_io::close_on_exec | file_io::no_follow);
     if (fd_ < 0 && errno == ENOENT && initial)
     {
-        fd_ = file_io::open_file(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600);
+        fd_ = publication::open(path_.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config_.private_output, 0600);
         created_ = fd_ >= 0;
     }
     require(fd_ >= 0, "cannot open growth target: " + path_ + ": " + std::strerror(errno));
@@ -549,7 +592,7 @@ inline Engine::Engine(std::string path, Config config, bool allow_resume,
     }
     catch (...)
     {
-        if (created_ && file_bytes() == 0) file_io::unlink_file(path_.c_str());
+        if (created_ && file_bytes() == 0) publication::remove(path_.c_str());
         file_io::close_file(fd_);
         fd_ = -1;
         throw;
@@ -569,8 +612,8 @@ inline Engine::~Engine()
         if (created_ && file_bytes() == 0)
         {
             file_io::Stat info{};
-            if (file_io::inspect_link(path_.c_str(), &info) == 0 && uint64_t(info.st_dev) == device_ &&
-                uint64_t(info.st_ino) == inode_) file_io::unlink_file(path_.c_str());
+            if (publication::inspect(path_.c_str(), &info) == 0 && uint64_t(info.st_dev) == device_ &&
+                uint64_t(info.st_ino) == inode_) publication::remove(path_.c_str());
         }
         file_io::close_file(fd_);
     }
@@ -583,7 +626,7 @@ inline Engine::Engine(std::string path, Config config, ReadOnly, ConstructionIns
     require(config_.window_bytes && config_.window_bytes <= SIZE_MAX && config_.codec_bytes && config_.checkpoint_bytes &&
         config_.workers && config_.capacity_bytes <= uint64_t(INT64_MAX), "invalid growth budget");
     require(config_.codec_bytes >= ChunkCodec::estimate_base(), "codec budget cannot hold one worker");
-    fd_ = file_io::open_file(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
+    fd_ = publication::open(path_.c_str(), file_io::read_only | file_io::close_on_exec | file_io::no_follow);
     require(fd_ >= 0, "cannot inspect growth target: " + path_);
     try
     {
@@ -629,7 +672,7 @@ inline uint64_t Engine::file_bytes() const
 inline void Engine::check_path() const
 {
     file_io::Stat info{};
-    require(file_io::inspect_link(path_.c_str(), &info) == 0 && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
+    require(publication::inspect(path_.c_str(), &info) == 0 && file_io::is_regular(info.st_mode) && info.st_nlink == 1 &&
                 uint64_t(info.st_dev) == device_ && uint64_t(info.st_ino) == inode_,
             "growth target filename or links changed while open");
 }
@@ -647,6 +690,7 @@ inline void Engine::read_at(uint64_t offset, std::span<uint8_t> bytes) const
         if (n < 0 && errno == EINTR) continue;
         require(n > 0, "cannot read growth target: " + std::string(std::strerror(errno)));
         stats_.read_bytes += uint64_t(n);
+        if (config_.progress) config_.progress->read_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
         offset += uint64_t(n);
         bytes = bytes.subspan(size_t(n));
     }
@@ -664,6 +708,7 @@ inline void Engine::write_at(uint64_t offset, std::span<uint8_t const> bytes) co
         require(n > 0, "cannot write growth target; retain this file and resume after resolving: " +
                        std::string(std::strerror(errno)));
         stats_.written_bytes += uint64_t(n);
+        if (config_.progress) config_.progress->written_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
         offset += uint64_t(n);
         bytes = bytes.subspan(size_t(n));
     }
@@ -691,6 +736,7 @@ inline void Engine::write_blocks(uint64_t offset, std::span<EncodedBlock const> 
             require(n > 0, "cannot write growth target; retain this file and resume after resolving: " +
                            std::string(std::strerror(errno)));
             stats_.written_bytes += uint64_t(n);
+            if (config_.progress) config_.progress->written_bytes.fetch_add(uint64_t(n), std::memory_order_relaxed);
             offset += uint64_t(n);
             written += uint64_t(n);
             size_t used = size_t(n);
@@ -1297,7 +1343,7 @@ inline uint64_t Engine::window_count(uint64_t edge, bool reverse, Members member
 inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
 {
     config_.check_running();
-    PhaseTimer timing(stats_, WorkPhase::plan);
+    PhaseTimer timing(stats_, WorkPhase::plan, config_.progress);
     require(confirmed_, "caller must confirm requested identity and budgets before planning");
     require(!identity_.pending, "pending construction requires resume with its saved batch");
     prepare_members(members, identity_.old_members);
@@ -1388,7 +1434,7 @@ inline std::optional<Plan> Engine::plan_fresh(Members members, MemberBatchHash c
     config_.check_running();
     require(confirmed_, "caller must confirm requested identity and budgets before planning");
     if (identity_.pending || identity_.old_members) return std::nullopt;
-    PhaseTimer timing(stats_, WorkPhase::plan);
+    PhaseTimer timing(stats_, WorkPhase::plan, config_.progress);
     prepare_members(members, 0);
     check_path();
     require(file_bytes() == 0 && identity_.bytes == 0, "fresh growth target size changed");
@@ -1582,7 +1628,7 @@ inline AppendResult Engine::append(Members members, MemberBatchHash const* hash,
 inline Result Engine::apply_prepared(Plan& plan, Members members)
 {
     config_.check_running();
-    PhaseTimer timing(stats_, WorkPhase::encode);
+    PhaseTimer timing(stats_, WorkPhase::encode, config_.progress);
     auto saved = std::make_unique<Record>();
     std::memcpy(saved->magic.data(), "XCHPLOT2GROWv1\0\0\0", saved->magic.size());
     saved->original = identity_.header;
@@ -1975,7 +2021,7 @@ inline void Engine::scan_sizes(Header const& header, uint64_t first, uint64_t co
 inline Result Engine::resume(Members members, MemberBatchHash const* hash)
 {
     config_.check_running();
-    PhaseTimer timing(stats_, WorkPhase::encode);
+    PhaseTimer timing(stats_, WorkPhase::encode, config_.progress);
     require(confirmed_, "caller must confirm requested identity and budgets before recovery");
     require(identity_.pending, "no saved construction requires resume");
     check_path();

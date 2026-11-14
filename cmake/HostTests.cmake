@@ -108,7 +108,7 @@ add_executable(cli_host_test tools/parity/cli_host_test.cpp tools/xchplot2/cli.c
     src/host/ConfigFile.cpp src/host/BatchManifest.cpp src/host/NumaTopology.cpp src/host/Cancel.cpp)
 target_include_directories(cli_host_test PRIVATE src keygen-rs/include)
 target_compile_features(cli_host_test PRIVATE cxx_std_20)
-target_compile_definitions(cli_host_test PRIVATE XCHPLOT2_VERSION="${PROJECT_VERSION}")
+xchplot2_target_version(cli_host_test)
 target_link_libraries(cli_host_test PRIVATE Threads::Threads)
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     target_sources(cli_host_test PRIVATE tools/xchplot2/group_options.cpp tools/xchplot2/group_commands.cpp)

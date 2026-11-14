@@ -180,6 +180,12 @@ int main(int argc, char** argv)
     put(config, "");
     assert(cli({"--help", "--config", config.string()}) == 0);
     assert(cli({"-h", "--config", config.string()}) == 0);
+    put(config, "this is not valid configuration\n");
+    auto const [version_code, version] = capture({"--version", "--config", config.string()});
+    assert(version_code == 0 && version.starts_with("xchplot2 ") && version.find(" (") != std::string::npos);
+    assert(capture({"-V", "--config", config.string()}).second == version);
+    assert(batch_calls == 0 && keygen_calls == 0);
+    put(config, "");
     assert(cli({"--config", config.string()}) != 0);
     assert(cli({"--unknown", "--config", config.string()}) != 0);
     for (auto const* command : {"plot", "batch", "bench", "test", "verify", "devices", "parity-check"}) {
@@ -239,6 +245,7 @@ int main(int argc, char** argv)
         auto const [code, script] = capture({"completions", shell, "--config", config.string()});
         assert(code == 0 && script.find("verify") != std::string::npos);
         for (auto const* option : {"save-plan", "from-plan", "save-profile", "harvester", "help-all",
+                "version",
                 "discover-drives", "mounts-under", "leave-free", "headroom-bytes", "watch", "inspect", "destination", "retire",
                 "policy-only", "alternative", "upgrade-job"})
             assert(script.find(option) != std::string::npos);

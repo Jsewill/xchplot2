@@ -55,7 +55,7 @@ function(pos2_grow_identity target upstream_dir)
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
                  GroupFarmPreview.hpp GroupFarmUpdate.hpp GroupFarmProgress.hpp GroupFarmControlState.hpp GroupFarmControl.hpp GroupFarmOwner.hpp GroupFarmMembership.hpp GroupFarmMetadata.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
-                 GroupCheckpoint.hpp GroupConstructionIdentity.hpp GroupFormat.hpp GroupFile.hpp GroupNativeIdentity.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
+                 GroupCheckpoint.hpp GroupConstructionIdentity.hpp GroupFormat.hpp GroupFile.hpp GroupPublication.hpp GroupNativeIdentity.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"

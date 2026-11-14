@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(pos2-gpu VERSION 0.14.1 LANGUAGES C CXX)
+include(cmake/BuildVersion.cmake)
 
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
@@ -435,12 +436,15 @@ if(NOT AdaptiveCpp_FOUND)
                 "from `clang20` and `lld20`.\n"
                 "  Fedora/RHEL:    sudo dnf install llvm20 llvm20-devel clang20 clang20-devel lld20\n"
                 "  Ubuntu/Debian:  sudo apt install llvm-20 llvm-20-dev clang-20 lld-20 libomp-20-dev\n"
-                "  Arch/CachyOS:   sudo pacman -S llvm20 llvm20-libs clang20 lld20\n"
+                "  Arch/CachyOS:   sudo pacman -S base-devel llvm20 llvm20-libs clang20 lld20 openmp\n"
                 "Better: scripts/install-deps.sh installs exactly that set and "
                 "then builds AdaptiveCpp against it at /opt/adaptivecpp, which "
                 "skips this 15-30 min FetchContent build entirely.\n"
                 "Override the probe with -DLLVM_DIR=… -DACPP_LLD_PATH=….")
         endif()
+
+        include(cmake/AdaptiveCppDependencies.cmake)
+        xchplot2_check_adaptivecpp_dependencies("${_x2_llvm_root}" "${_x2_llvm_ver}")
 
         # AdaptiveCpp's HIP backend needs ockl.bc / ocml.bc to compile amdgcn
         # kernels, and hard-errors with "ROCm device library path not found"
@@ -496,10 +500,6 @@ if(NOT AdaptiveCpp_FOUND)
             "-DCMAKE_CXX_COMPILER=${_x2_llvm_root}/bin/clang++"
             "-DLLVM_DIR=${LLVM_DIR}" "-DClang_DIR=${Clang_DIR}"
             "-DACPP_LLD_PATH=${ACPP_LLD_PATH}" "-DCLANG_INCLUDE_PATH=${CLANG_INCLUDE_PATH}")
-        find_library(_x2_ze_loader ze_loader)
-        if(_x2_ze_loader AND NOT DEFINED WITH_LEVEL_ZERO_BACKEND)
-            set(WITH_LEVEL_ZERO_BACKEND ON)
-        endif()
         foreach(_x2_var ROCM_PATH ROCM_DEVICE_LIBS_PATH WITH_LEVEL_ZERO_BACKEND)
             if(DEFINED ${_x2_var})
                 list(APPEND _x2_acpp_flags "-D${_x2_var}=${${_x2_var}}")
@@ -1119,7 +1119,7 @@ endif()
 # than on `pos2_gpu` so the parity tests (which reference device symbols
 # externally) keep working unchanged.
 add_library(xchplot2_cli STATIC tools/xchplot2/cli.cpp)
-target_compile_definitions(xchplot2_cli PRIVATE XCHPLOT2_VERSION="${PROJECT_VERSION}")
+xchplot2_target_version(xchplot2_cli)
 target_include_directories(xchplot2_cli PUBLIC tools/xchplot2)
 target_link_libraries(xchplot2_cli PUBLIC pos2_gpu_host pos2_keygen)
 # CUDA_RESOLVE_DEVICE_SYMBOLS=ON triggers an nvcc --device-link step at
