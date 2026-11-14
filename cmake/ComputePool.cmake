@@ -107,6 +107,7 @@ function(pos2_pool_targets upstream_dir grow_include)
     endforeach()
     add_executable(pos2_pr118_grow_pool_codec_test "${repo_dir}/tools/parity/compute_pool_codec_test.cpp")
     add_executable(pos2_pr118_grow_pool_owner_test "${repo_dir}/tools/parity/compute_pool_owner_test.cpp"
+        "${repo_dir}/src/host/ComputeSession.cpp"
         $<TARGET_OBJECTS:pos2_pr118_grow_worker_reference>)
     target_compile_definitions(pos2_pr118_grow_pool_owner_test PRIVATE GROW_TEST_CONSTRUCTION=1 GROW_POOL_NETWORK=1)
     target_include_directories(pos2_pr118_grow_pool_owner_test PRIVATE "${upstream_dir}/src/plot")

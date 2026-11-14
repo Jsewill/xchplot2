@@ -307,14 +307,14 @@ public:
         require(workers && memory_bytes(identity_.header.k, cfg) <= config_.memory_limit_bytes,
             "ordinary worker grant exceeds memory admission");
         if (workers == config_.workers) return;
-        encoder_.reset(); config_.workers = active_workers_ = workers;
+        planned_window_.reset(); encoder_.reset(); config_.workers = active_workers_ = workers;
     }
     uint64_t largest_chunk() const
     { return old_sizes_.empty() ? 0 : *std::max_element(old_sizes_.begin(), old_sizes_.end()); }
     void retune(uint64_t window, uint64_t checkpoint)
     {
         require(!identity_.pending && window && checkpoint, "only a complete ordinary group can change its I/O budgets");
-        encoder_.reset();
+        planned_window_.reset(); encoder_.reset();
         config_.window_bytes = window;
         config_.checkpoint_bytes = checkpoint;
     }
@@ -403,6 +403,11 @@ private:
     std::vector<FragmentBoundaries> member_boundaries_;
     std::unique_ptr<Record> record_;
     std::unique_ptr<ParallelEncoder> encoder_;
+    // The last sizing window is also the first backward rewrite window. Keep
+    // its encoded blocks in the existing codec allocation until apply starts.
+    // It is a runtime optimization only; recovery can always regenerate it.
+    std::unique_ptr<Window> planned_window_;
+    std::array<uint8_t, 32> planned_digest_{};
     bool cow_filesystem_ = false;
     bool overlap_ = false;
     unsigned active_workers_ = 0;
@@ -432,6 +437,8 @@ private:
     Result create(Plan& plan, Members members, Record& record);
     Result apply_prepared(Plan& plan, Members members);
     std::unique_ptr<Window> encode_owned(uint64_t first, uint64_t count, uint64_t source_begin, Members members);
+    void retain_planned_window(uint64_t first, uint64_t source_begin, std::span<EncodedBlock const> blocks,
+                               std::span<uint64_t const> sizes, std::array<uint8_t, 32> const& digest);
     void load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const;
     void scan_sizes(Header const& header, uint64_t first, uint64_t count, uint64_t begin,
                     uint64_t end, std::vector<uint64_t>& sizes) const;
@@ -1251,11 +1258,21 @@ inline std::span<EncodedBlock const> Engine::encode_window(uint64_t first, uint6
 
 inline void Engine::reset_encoding()
 {
-    encoder_.reset();
+    planned_window_.reset(); encoder_.reset();
     overlap_ = config_.io_overlap && config_.codec_bytes / 2 >= ChunkCodec::estimate_base();
     active_workers_ = unsigned(std::min<uint64_t>(config_.workers,
         window_codec_bytes() / ChunkCodec::estimate_base()));
     require(active_workers_, "codec budget cannot hold one worker");
+}
+
+inline void Engine::retain_planned_window(uint64_t first, uint64_t source_begin,
+    std::span<EncodedBlock const> blocks, std::span<uint64_t const> sizes, std::array<uint8_t, 32> const& digest)
+{
+    planned_window_ = std::make_unique<Window>();
+    planned_window_->first = first; planned_window_->count = sizes.size(); planned_window_->source_begin = source_begin;
+    planned_window_->blocks.assign(blocks.begin(), blocks.end());
+    planned_window_->sizes.assign(sizes.begin(), sizes.end());
+    planned_digest_ = digest;
 }
 
 inline void Engine::prepare_encoding(uint64_t edge, bool reverse, Members members, uint64_t stop)
@@ -1366,9 +1383,13 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
     {
         config_.check_running();
         uint64_t const count = window_count(first, false, members);
-        encode_window(first, count, old_offset,
+        bool const last = first + count == chunks;
+        auto const blocks = encode_window(first, count, old_offset,
             std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
-            source, tasks, regions, std::span(result.sizes).subspan(size_t(first), size_t(count)), true);
+            source, tasks, regions, std::span(result.sizes).subspan(size_t(first), size_t(count)), !last);
+        if (last)
+            retain_planned_window(first, old_offset, blocks,
+                std::span(result.sizes).subspan(size_t(first), size_t(count)), result.members_digest);
         for (uint64_t i = first; i < first + count; ++i)
         {
             auto const size = result.sizes[size_t(i)];
@@ -1787,7 +1808,12 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
 
 inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
 {
-    prepare_encoding(record.remaining, true, members);
+    // Sizing already visited every chunk and fixed the worker/overlap grant
+    // before retaining its last output. Recovery still performs admission
+    // before borrowing the first regenerated window.
+    bool const reuse = encoder_ && planned_window_ && planned_digest_ == plan.members_digest &&
+        planned_window_->first + planned_window_->count == record.remaining;
+    if (!reuse) prepare_encoding(record.remaining, true, members);
     std::future<std::unique_ptr<Window>> pending;
     auto worker = overlap_ ? std::make_unique<WindowWorker>(*this, members) : nullptr;
     std::vector<uint64_t> old_prefix, new_prefix;
@@ -1812,7 +1838,8 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
     {
         config_.check_running();
         std::unique_ptr<Window> window;
-        if (pending.valid()) window = pending.get();
+        if (planned_window_) window = std::move(planned_window_);
+        else if (pending.valid()) window = pending.get();
         else
         {
             uint64_t const count = window_count(record.remaining, true, members);
@@ -2109,9 +2136,13 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
     for (uint64_t first = 0; first < record.remaining;)
     {
         uint64_t const count = window_count(first, false, members, record.remaining);
-        encode_window(first, count, old_offset,
+        bool const last = first + count == record.remaining;
+        auto const blocks = encode_window(first, count, old_offset,
             std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
-            source, tasks, regions, std::span(plan.sizes).subspan(size_t(first), size_t(count)));
+            source, tasks, regions, std::span(plan.sizes).subspan(size_t(first), size_t(count)), !last);
+        if (last)
+            retain_planned_window(first, old_offset, blocks,
+                std::span(plan.sizes).subspan(size_t(first), size_t(count)), plan.members_digest);
         for (uint64_t i = first; i < first + count; ++i)
         {
             old_offset = grow_add(old_offset, old_sizes_[size_t(i)]);

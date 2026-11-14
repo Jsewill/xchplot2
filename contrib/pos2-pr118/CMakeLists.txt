@@ -88,6 +88,7 @@ if(XCHPLOT2_BUILD_GROUP_POOL)
     include("${XCHPLOT2_SOURCE_DIR}/cmake/ComputePool.cmake")
     pos2_pool_targets("${POS2_PR118_DIR}" "${grow_include}")
     target_compile_definitions(pos2_pr118_grow PRIVATE GROW_POOL_NETWORK=1)
+    target_sources(pos2_pr118_grow PRIVATE "${XCHPLOT2_SOURCE_DIR}/src/host/ComputeSession.cpp")
     target_link_libraries(pos2_pr118_grow PRIVATE pos2_pr118_grow_worker_host)
     # Unchanged upstream soft_aesenc/soft_aesdec are defined by both reference
     # translation units, as in the production host executable.
@@ -113,10 +114,13 @@ if(TARGET pos2_pr118_grow)
         target_link_libraries(${target} PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
     endforeach()
 endif()
-if(TARGET pos2_pr118_grow_pool_owner_test)
-    add_dependencies(pos2_pr118_grow_pool_owner_test pos2_pr118_keygen)
-    target_link_libraries(pos2_pr118_grow_pool_owner_test PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
-endif()
+foreach(target pos2_pr118_grow_pool_owner_test pos2_pr118_grow_worker_test
+               pos2_pr118_grow_worker_client_test compute_compatibility_test)
+    if(TARGET ${target})
+        add_dependencies(${target} pos2_pr118_keygen)
+        target_link_libraries(${target} PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
+    endif()
+endforeach()
 add_executable(pos2_pr118_group group.cpp "${POS2_PR118_DIR}/src/pos/sha/sha256.c")
 # Only the grouped-job tool reads the experimental persisted member-index range.
 # Keep pos2_pr118_check on the unmodified upstream file format and reader.

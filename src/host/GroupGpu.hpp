@@ -181,7 +181,7 @@ public:
     bool compact_transfer_available() const;
     // Same output ownership and ordering as generate_into_async. The prelude
     // follows completed device validation; payload tiles borrow packed words.
-    // Consumers precomputing the ordinary recovery digest must use raw output.
+    // A compact receiver may hash the reconstructed fields as tiles arrive.
     std::shared_future<uint64_t> generate_packed_into_async(std::array<uint8_t, 32> const& plot_id,
         std::function<void(PackedFragmentTile const&, uint64_t total_count)> consume);
     // Waits for the active output consumer and propagates its exception. Serial

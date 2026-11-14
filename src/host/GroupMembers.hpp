@@ -298,6 +298,7 @@ public:
     std::optional<std::array<uint8_t, 32>> digest_for(Members members) const;
 private:
     friend class CompactMemberBuilder;
+    friend class CompactMemberReceiver;
     State start(uint64_t count)
     {
         group_tools::require(!active_ && size_ < capacity_, "group hash builder capacity exceeded");
@@ -521,11 +522,14 @@ private:
 // Receives the same little-endian low-field words as CompactMemberBuilder,
 // without a second full member or a host packing scan. Only the internal GPU
 // producer may supply the validation summary, after its device work completes.
-// Precomputed recovery-hash consumers use CompactMemberBuilder and raw tiles.
+// A recovery hash reconstructs only each received tile's complete fields. It
+// uses the same native logical framing as raw input without retaining a raw
+// member or rescanning the completed compact allocation.
 class CompactMemberReceiver
 {
 public:
-    CompactMemberReceiver(uint8_t k, size_t count, bool trust_validation = true)
+    CompactMemberReceiver(uint8_t k, size_t count, bool trust_validation = true,
+                          MemberBatchHash* hash = nullptr)
         : trust_validation_(trust_validation)
     {
         static_assert(PlotGroupFile::PROOFS_PER_CHUNK_BITS == 6,
@@ -539,7 +543,13 @@ public:
         member_.packed_words_ = Member::packed_words(k, count);
         if (member_.packed_words_) member_.packed_.reset(new uint64_t[member_.packed_words_]);
         member_.boundaries_.reset(size_t(PlotGroupFile::getChunkCountForK(k)), count);
+        if (hash)
+        {
+            hash_state_ = hash->start(count);
+            hash_ = hash;
+        }
     }
+    ~CompactMemberReceiver() { if (hash_) hash_->active_ = false; }
     CompactMemberReceiver(CompactMemberReceiver const&) = delete;
     CompactMemberReceiver& operator=(CompactMemberReceiver const&) = delete;
     CompactMemberReceiver(CompactMemberReceiver&&) = delete;
@@ -578,6 +588,7 @@ public:
             if (!tile.words.empty())
                 std::copy(tile.words.begin(), tile.words.end(), member_.packed_.get() + written_);
             written_ += tile.words.size();
+            if (hash_) hash_received();
         }
         catch (...) { failed_ = true; throw; }
     }
@@ -614,14 +625,45 @@ public:
             failed_ = false;
         }
         member_.identify();
+        if (hash_)
+        {
+            group_tools::require(hashed_ == member_.count_, "incomplete packed member hash");
+            hash_->commit(member_.id_, std::move(hash_state_));
+            hash_ = nullptr;
+        }
         finished_ = true;
         return std::move(member_);
     }
 private:
+    void hash_received()
+    {
+        unsigned const width = member_.k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
+        size_t const available = std::min(member_.count_, written_ * 64 / width);
+        std::array<uint64_t, 512> values;
+        auto const view = member_.view();
+        while (hashed_ < available)
+        {
+            size_t count = 0;
+            while (count < values.size() && hashed_ < available)
+            {
+                while (member_.boundaries_[hash_chunk_ + 1] <= hashed_) ++hash_chunk_;
+                auto const region = view.region(hash_chunk_);
+                size_t const end = std::min({available, member_.boundaries_[hash_chunk_ + 1],
+                                            hashed_ + values.size() - count});
+                size_t index = hashed_ - member_.boundaries_[hash_chunk_];
+                while (hashed_ < end) { values[count++] = region[index++]; ++hashed_; }
+            }
+            group_tools::require(pos2_sha256_state_update(hash_state_.get(),
+                reinterpret_cast<uint8_t const*>(values.data()), count * sizeof(uint64_t)) == POS2_OK,
+                "cannot hash incoming member fragments");
+        }
+    }
     Member member_;
-    size_t written_ = 0;
+    size_t written_ = 0, hashed_ = 0, hash_chunk_ = 0;
     bool started_ = false, finished_ = false, failed_ = false;
     bool trust_validation_;
+    MemberBatchHash* hash_ = nullptr;
+    MemberBatchHash::State hash_state_;
 };
 
 inline void Member::compact(uint8_t k, MemberBatchHash* hash)

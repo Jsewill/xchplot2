@@ -1431,11 +1431,11 @@ struct Producer
             group_grow::CodecScheduler::Lease compute(cpu_scheduler.get());
             std::optional<group_grow::ThreadCpuTimer> timing;
             if (profile) timing.emplace(compact_cpu);
-            require(!hash && !builder && !member && total <= count_bound,
-                    "GPU packed member requires a hash-free compact consumer");
+            require(!builder && !member && total <= count_bound,
+                    "GPU packed member count exceeds admitted compact bound");
             if (!receiver)
             {
-                receiver.emplace(k, size_t(total));
+                receiver.emplace(k, size_t(total), true, hash);
                 packed_count = total;
             }
             require(total == packed_count, "GPU packed member count changed during transfer");
@@ -1473,7 +1473,7 @@ struct Producer
         pending->cpu_scheduler = backend.cpu_scheduler;
         auto const plot_id = identity.params.get_plot_params_for_index(index).get_plot_id().data();
         auto* const state = pending.get();
-        if (!hash && backend.gpu->compact_transfer_available())
+        if (backend.gpu->compact_transfer_available())
             pending->ready = backend.gpu->generate_packed_into_async(plot_id,
                 [state](group_grow::PackedFragmentTile const& tile, uint64_t total) { state->consume_packed(tile, total); });
         else
@@ -1499,8 +1499,8 @@ struct Producer
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (has_compute(args))
         {
-            // Packed network members use the engine's existing digest path.
-            // Only CompactMemberBuilder can commit a producer prefix cache.
+            // Packed network members use the engine's existing digest path;
+            // the local producer's ordered prefix cache is not populated.
             require(!hash, "pool producer cannot populate a compact-builder hash cache");
             backend.initialize(args, identity, sum(fixed, other_retained), false);
             return fill_pool(values, first, wanted, other_retained, progress, stop);
@@ -2950,21 +2950,24 @@ std::optional<AutomaticSelection> automatic_selection(Construction const& engine
                 std::min({uint64_t(cfg.workers), uint64_t(observed_workers),
                     cfg.window_bytes / std::max<uint64_t>(1, chunk * 2)})));
             auto const forecast = group_grow::construction_forecast(engine.identity().header.k, model,
-                engine.member_count(), engine.identity().bytes, uint16_t(batch), maximum, estimated_member_bytes);
+                engine.member_count(), engine.identity().bytes, uint16_t(batch), maximum, estimated_member_bytes,
+                producer.args.batch == UINT16_MAX && !incoming_retained);
             if (!forecast.batches || (merging && !group_grow::prefer_merged(forecast, model, engine.history))) continue;
             if (merging && model.merge_inputs == 4 && !engine.nonrotating)
             {
                 auto two = model; two.merge_inputs = 2;
                 auto const alternative = group_grow::construction_forecast(engine.identity().header.k, two,
-                    engine.member_count(), engine.identity().bytes, uint16_t(batch), maximum, estimated_member_bytes);
+                    engine.member_count(), engine.identity().bytes, uint16_t(batch), maximum, estimated_member_bytes,
+                    producer.args.batch == UINT16_MAX && !incoming_retained);
                 if (!group_grow::prefer_four_inputs(forecast, alternative, model, engine.history)) continue;
             }
             long double const assembly = merging ? group_grow::construction_merged_cost(forecast, model, engine.history) :
                 group_grow::construction_cost(forecast.incremental, model, rates);
             long double const finish = merging ? group_grow::construction_finalization_cost(forecast, model, engine.history) : 0;
             long double const streaming = std::max(0.0L, assembly - finish);
+            uint64_t const batches = merging ? forecast.batches : forecast.incremental_batches;
             long double const cost = overlap ? std::max(streaming, generation_cost) + finish +
-                generation_cost * batch / (maximum - engine.member_count()) + streaming / forecast.batches :
+                generation_cost * batch / (maximum - engine.member_count()) + streaming / batches :
                 assembly + generation_cost;
             if (original && !overlap) original_cost = cost;
             if (cost < best_cost)
@@ -2983,10 +2986,12 @@ std::optional<AutomaticSelection> automatic_selection(Construction const& engine
             ((producer.args.window_set || engine.window_failed) && window != engine.config.window_bytes) ||
             (producer.args.checkpoint_set && checkpoint != engine.config.checkpoint_bytes)) continue;
         auto cfg = engine.config; cfg.window_bytes = window; cfg.checkpoint_bytes = checkpoint;
-        // Ordinary recovery keeps its existing automatic ceiling. Merged
-        // construction can price a longer bounded transaction independently
-        // of its block size, with the same memory and space admission above.
-        if (checkpoint <= producer.args.checkpoint_bytes) consider(cfg, false, false);
+        // A measured HDD can amortize flushes over a longer transaction while
+        // keeping its original window and worker memory envelope. Exact
+        // admission and durable source frontiers still bound every rewrite.
+        // Unknown devices retain the original automatic recovery interval.
+        if (checkpoint <= producer.args.checkpoint_bytes ||
+            (engine.known_storage && !engine.nonrotating && engine.history.count)) consider(cfg, false, false);
         if (engine.can_select()) for (unsigned fan : {2u, 4u})
         {
             if (fan == 4 && !group_grow::four_input_candidate(cfg, engine.nonrotating,
@@ -3220,7 +3225,7 @@ uint16_t first_batch_members(Arguments const& args, Construction const& engine, 
     // their established ordering; all ordinary RAM admission still applies.
     if (args.batch != UINT16_MAX || !engine.incremental || engine.member_count() || engine.identity().pending ||
         maximum == UINT16_MAX || !admitted || admitted >= maximum) return admitted;
-    return uint16_t(1 + (maximum - 1) % admitted);
+    return group_grow::construction_initial_batch(maximum, admitted);
 }
 
 uint64_t allocated_bytes(fs::path const& path)
@@ -13014,7 +13019,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     group_grow::construction_shape(observed.execution_contributions), other->scratch->fan_in,
                     other->scratch->packing_inputs ? other->scratch->packing_inputs : other->scratch->fan_in, other->execution_runs) :
                     group_grow::construction_forecast(other->requested.params.get_k(), cfg, uint16_t(other->metrics.members),
-                        other->metrics.final_bytes, batch, other->maximum, shape);
+                        other->metrics.final_bytes, batch, other->maximum, shape,
+                        args.batch == UINT16_MAX && (prefetched.members.empty() || prefetched.owner != other->owner));
                 bool const merging = other->scratch || other->mode == "merged" ||
                     (args.construction == "auto" && group_grow::prefer_merged(forecast, cfg, observed));
                 auto work = group_grow::construction_execution_work(forecast, observed,
@@ -14095,7 +14101,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     d.scratch->fan_in, d.scratch->packing_inputs ? d.scratch->packing_inputs : d.scratch->fan_in, d.execution_runs) :
                     group_grow::construction_forecast(d.requested.params.get_k(), d.engine->config, uint16_t(d.metrics.members),
                         d.metrics.final_bytes, std::max(uint16_t(1), d.batch_cap), d.maximum,
-                        group_grow::construction_shape(observed.shapes));
+                        group_grow::construction_shape(observed.shapes),
+                        args.batch == UINT16_MAX && (prefetched.members.empty() || prefetched.owner != d.owner));
                 auto const work = group_grow::construction_execution_work(forecast, observed,
                     backend->generation_history.member_ns() * (forecast.members > d.metrics.members ? forecast.members - d.metrics.members : 0),
                     d.engine->is_staging(), bool(d.scratch), args.io_overlap);

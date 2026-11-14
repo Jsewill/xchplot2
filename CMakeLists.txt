@@ -1216,7 +1216,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     pos2_group_tests("${POS2_CHIP_DIR}" "${_pos2_grow_include}")
     foreach(target pos2_pr118_grow_codec_test pos2_pr118_grow_staging_test
                    pos2_pr118_grow_external_test pos2_pr118_grow_scratch_test pos2_pr118_grow_inventory_test pos2_pr118_grow_merge_test
-                   pos2_pr118_grow_checkpoint_fixture pos2_pr118_grow_checkpoint_compatibility_test)
+                   pos2_pr118_grow_checkpoint_fixture pos2_pr118_grow_checkpoint_compatibility_test
+                   pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test compute_compatibility_test)
         if(TARGET ${target})
             target_link_libraries(${target} PRIVATE pos2_keygen)
         endif()

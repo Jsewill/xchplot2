@@ -651,7 +651,10 @@ progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
 and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
 `--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.
-These options override the automatic choices.
+These options override the automatic choices. On known HDDs, automatic
+incremental construction can increase the checkpoint interval up to 1 GiB when
+completed work on that drive shows a benefit, within the same memory budget.
+Longer intervals can require more work to be repeated after interruption.
 
 Construction checkpoints are private. New records require a compatible format,
 algorithm and native representation; legacy records require their original build. Retain the

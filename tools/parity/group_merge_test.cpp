@@ -425,11 +425,11 @@ void test_construction_history(std::filesystem::path const& root, group_grow::Me
     auto source = histories.find(context);
     Backend backend;
     auto const requested = identity_from(initial);
-    auto select = [&](Construction& engine, Arguments const& options)
+    auto select = [&](Construction& engine, Arguments const& options, uint64_t retained = 0)
     {
         uint64_t const reserved = engine.memory_bytes(1, false), fixed = sum(reserved, mib);
         Producer producer{requested, nullptr, backend, options, options.max_ram, fixed, fixed};
-        return automatic_selection(engine, producer, 64, 1, reserved, 0, 0, true);
+        return automatic_selection(engine, producer, 64, 1, reserved, retained, 0, true);
     };
     Construction first((root / "history-first").string(), config, false, initial, "auto");
     first.attach_history(source); first.confirm_identity();
@@ -475,6 +475,40 @@ void test_construction_history(std::filesystem::path const& root, group_grow::Me
         require(constrained->config.window_bytes == config.window_bytes &&
             constrained->config.checkpoint_bytes == config.checkpoint_bytes,
             "inherited observations overrode explicit I/O constraints");
+
+    // Slow flushes justify longer HDD transactions without reserving more
+    // RAM or changing another writer's retained grant. Unknown media and
+    // explicit checkpoint requests keep their existing bounds.
+    {
+        auto hdd_args = args; auto hdd_config = config;
+        hdd_args.window = hdd_config.window_bytes = 16 * mib;
+        hdd_args.checkpoint_bytes = hdd_config.checkpoint_bytes = 256 * mib;
+        hdd_config.capacity_bytes = 96 * 1024 * mib;
+        Construction hdd((root / "history-hdd-tuning").string(), hdd_config, false, initial, "incremental");
+        hdd.confirm_identity(); hdd.known_storage = true; hdd.nonrotating = false;
+        group_grow::ConstructionSample sample;
+        sample.read_bytes = sample.written_bytes = 512 * mib;
+        sample.read_ns = sample.write_ns = sample.codec_ns = 1000000000;
+        sample.syncs = 100; sample.sync_ns = 900000000000;
+        sample.elapsed_ns = sample.sync_ns + sample.read_ns + sample.write_ns + sample.codec_ns;
+        sample.codec_bytes = 1024 * mib; sample.workers = config.workers;
+        sample.member_bytes = 1024 * mib; sample.chunk_bytes = 512 * 1024;
+        hdd.history.add(sample); hdd.history.shapes.add(sample);
+        uint64_t const reserved = hdd.memory_bytes(1, false);
+        auto const tuned = select(hdd, hdd_args, reserved);
+        require(tuned && !tuned->merged && tuned->config.checkpoint_bytes > hdd_args.checkpoint_bytes &&
+            tuned->config.checkpoint_bytes <= 1024 * mib && tuned->engine_bytes == reserved &&
+            tuned->config.window_bytes == hdd_config.window_bytes,
+            "HDD checkpoint tuning lost its window or another writer's memory grant");
+        hdd_args.checkpoint_set = true;
+        auto const fixed = select(hdd, hdd_args, reserved);
+        require(fixed && fixed->config.checkpoint_bytes == hdd_args.checkpoint_bytes,
+            "HDD tuning changed an explicit checkpoint interval");
+        hdd_args.checkpoint_set = false; hdd.known_storage = false;
+        auto const unknown = select(hdd, hdd_args, reserved);
+        require(unknown && unknown->config.checkpoint_bytes <= hdd_args.checkpoint_bytes,
+            "unknown storage inherited an HDD checkpoint interval");
+    }
     next.retune(selected->config); next.select_merged();
     require(next.append(members).accepted, "empty merged handoff lost exact append admission");
     auto const inherited = next.finish();
@@ -1172,7 +1206,7 @@ std::pair<uint64_t, uint64_t> layout_fixture(fs::path const& path, Config cfg,
     if (order < 2)
     {
         for (uint32_t i = 0; i < count; ++i) arena.map[i] = i ? i - 1 : order ? count : count - 1;
-        if (!order) { ++moves; bytes += state.block_bytes; }
+        if (!order) { ++moves; bytes += expected.size() % state.block_bytes; }
     }
     else if (order == 2)
     {
@@ -1205,7 +1239,7 @@ std::pair<uint64_t, uint64_t> layout_fixture(fs::path const& path, Config cfg,
             arena.map[count - 3] = count - 2; arena.map[count - 2] = count - 1; arena.map[count - 1] = count - 3;
         }
         moves += count / 2;
-        bytes += uint64_t(count / 2) * state.block_bytes;
+        bytes += uint64_t(count / 2 - 1) * state.block_bytes + expected.size() % state.block_bytes;
     }
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -1449,13 +1483,21 @@ void placement_bounds(fs::path const& root, Config cfg)
     Stats evidence; evidence.read_bytes = evidence.written_bytes = 1000000000;
     evidence.read_ns = 1000000000000000ull; evidence.write_ns = 40000000000000ull;
     evidence.syncs = evidence.sync_ns = 2;
-    for (unsigned mode : {0u, 1u, 2u})
+    for (unsigned mode : {0u, 1u, 2u, 3u})
     {
         auto path = root / "placement-bound.gplot";
+        if (mode == 3)
+        {
+            // One checkpoint must save several adjacent final copies to
+            // pay for these flushes. A single crossed block is insufficient.
+            evidence.write_ns = 0;
+            evidence.syncs = 1000000000; evidence.sync_ns = 2000000000000000000ull;
+        }
         {
             MergeState arena(path.string(), cfg, false, identity()); arena.confirm();
             auto const record = arena.layout(4096);
-            require(prefer_merge_placement(evidence, record.block_bytes, record.slot_bytes, 1) &&
+            require(prefer_merge_placement(evidence, record.block_bytes, record.slot_bytes, 1) == (mode != 3) &&
+                prefer_merge_placement(evidence, 2 * record.block_bytes, record.slot_bytes, 1) &&
                 !prefer_merge_placement(evidence, ordinary.largest_chunk(), record.slot_bytes, 1),
                     "placement bound fixture must distinguish whole-block and current-chunk savings");
             arena.initialize(record, arena.required_bytes(record, 0));
@@ -1495,9 +1537,10 @@ void placement_bounds(fs::path const& root, Config cfg)
             std::_Exit(0);
         }
         int status = 0;
-        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == (mode ? 0 : 86),
+        bool const retained = mode == 0 || mode == 3;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == (retained ? 86 : 0),
                 "placement used an invalidated bound or failed to retain its committed bound");
-        if (!mode) complete(path, dense, true, cfg);
+        if (retained) complete(path, dense, true, cfg);
         require(contents(path) == expected, "placement bound invalidation changed canonical bytes"); fs::remove(path);
     }
     fs::remove(reference);
@@ -2912,6 +2955,24 @@ void construction_histories()
     auto const fresh = construction_forecast(18, fresh_config, 0, 0, 1, 1, 654187);
     require(fresh.incremental.syncs == 11,
         "fresh ordinary forecast imposed a nonexistent old-source checkpoint frontier");
+    auto const full_first = construction_forecast(18, fresh_config, 0, 0, 9, 10, 654187);
+    auto const short_first = construction_forecast(18, fresh_config, 0, 0, 9, 10, 654187, true);
+    require(short_first.incremental_batches == 2 && full_first.incremental_batches == 2 &&
+        short_first.incremental.read == 2 * 654187 && full_first.incremental.read == 18 * 654187 &&
+        short_first.incremental.write < full_first.incremental.write &&
+        short_first.incremental.codec < full_first.incremental.codec &&
+        short_first.merged.read == full_first.merged.read && short_first.merged.write == full_first.merged.write,
+        "automatic first-batch order was omitted from ordinary costs or changed merged run balancing");
+    auto const continued = construction_forecast(18, fresh_config, 1, 654187, 9, 19, 0, true);
+    auto const fixed = construction_forecast(18, fresh_config, 1, 654187, 9, 19);
+    require(continued.incremental.read == fixed.incremental.read && continued.incremental.write == fixed.incremental.write &&
+        construction_initial_batch(UINT16_MAX, 9) == 9 && construction_initial_batch(10, 0) == 0 &&
+        construction_initial_batch(9, 9) == 9,
+        "automatic batch forecasting reordered an existing prefix, unbounded group or complete batch");
+    auto clipped = fresh_config; clipped.capacity_bytes = 9 * 654187;
+    auto const capacity = construction_forecast(18, clipped, 0, 0, 9, 10, 654187, true);
+    require(capacity.members == 9 && capacity.batches == 1 && capacity.incremental_batches == 2,
+        "capacity-limited forecasting lost the distinct incremental and merged schedules");
     ConstructionSample shape; shape.member_bytes = 654187; shape.chunk_bytes = 4096;
     for (size_t i = 0; i < first->history.shapes.samples.size(); ++i) first->history.shapes.add(shape);
     auto outlier = shape; outlier.member_bytes *= 100;

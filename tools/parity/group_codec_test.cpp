@@ -727,7 +727,7 @@ void compact_received_tiles()
         size_t const chunks = size_t(PlotGroupFile::getChunkCountForK(k));
         unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
         uint64_t const range = 1ull << width;
-        for (size_t count : {0, 1, 2, 3, 63, 64, 65, 129})
+        for (size_t count : {0, 1, 2, 3, 63, 64, 65, 129, 1025})
         {
             // Leave leading, interior and trailing empty chunks. Duplicates
             // and high fields exercise cross-word tails without large deltas.
@@ -735,7 +735,8 @@ void compact_received_tiles()
             for (size_t index = 0; index < count; ++index)
             {
                 size_t const chunk = index < 43 ? 1 : (index < 86 ? chunks / 2 : chunks - 1);
-                raw.push_back(chunk * range + (index % 43 / 2) * (range / 64));
+                size_t const offset = index < 86 ? index % 43 : index - 86;
+                raw.push_back(chunk * range + (offset / 2) * (range / (count > 512 ? 2048 : 64)));
             }
             BitWriter canonical;
             for (uint64_t value : raw) canonical.append(value & (range - 1), width);
@@ -748,15 +749,21 @@ void compact_received_tiles()
                 while (first < raw.size() && (raw[first] >> width) < chunk) ++first;
                 boundaries[chunk] = uint32_t(first);
             }
-            CompactMemberReceiver receiver(k, count);
+            MemberBatchHash hash(1);
+            CompactMemberReceiver receiver(k, count, true, &hash);
             receiver.append({boundaries, {}, {count, 0}});
             for (size_t word = 0; word < words.size();)
             {
-                size_t const tile = std::min(words.size() - word, size_t(1 + word % 7));
+                size_t const tile = std::min(words.size() - word,
+                    count > 512 ? size_t(1024) : size_t(1 + word % 7));
                 receiver.append({{}, std::span(words).subspan(word, tile), {}});
                 word += tile;
             }
             auto received = receiver.finish();
+            std::array<std::vector<uint64_t>, 1> const logical{raw};
+            require(hash.digest_for(Members(std::span<Member const>(&received, 1))) ==
+                    std::optional(framed_digest(logical)),
+                    "packed transfer changed the recovery hash across word or chunk boundaries");
             CompactMemberBuilder builder(k, raw.size());
             builder.append(raw);
             auto packed = builder.finish();
@@ -777,7 +784,7 @@ void compact_received_tiles()
                 uint64_t previous = UINT64_MAX;
                 for (uint64_t value : expected)
                     if (value != previous) { ++distinct; previous = value; }
-                if (distinct > 2)
+                if (distinct > 2 && count <= 129)
                 {
                     auto const reference = copy(codec.encode(chunk, {}, 0, {&expected, 1}));
                     require(copy(codec.encode(chunk, {}, 0, {&actual, 1})) == reference,
@@ -846,6 +853,30 @@ void compact_received_tiles()
     remote.append({{}, {&reversed, 1}, {}});
     rejects([&] { remote.finish(); });
     rejects([&] { remote.finish(); });
+    MemberBatchHash hash(2);
+    {
+        CompactMemberReceiver failed(k, 1, true, &hash);
+        failed.append({boundaries, {}, {1, 0}});
+        failed.append({{}, {&bad_tail, 1}, {}});
+        rejects([&] { failed.finish(); });
+        rejects([&] { hash.reset(); });
+        require(!hash.size(), "failed packed receiver committed a partial recovery hash");
+    }
+    std::array<Member, 2> hashed;
+    for (size_t i = 0; i < hashed.size(); ++i)
+    {
+        CompactMemberReceiver received(k, 1, true, &hash);
+        received.append({boundaries, {}, {1, 0}});
+        received.append({{}, words, {}});
+        hashed[i] = received.finish();
+    }
+    require(hash.digest_for(hashed) == std::optional(framed_digest(hashed)),
+            "packed transfers changed the ordered batch hash after a failed receiver");
+    hash.truncate(1);
+    CompactMemberBuilder following(k, 0, &hash);
+    hashed[1] = following.finish();
+    require(hash.digest_for(hashed) == std::optional(framed_digest(hashed)),
+            "packed hash truncation could not extend through the ordinary builder");
     if constexpr (sizeof(size_t) > sizeof(uint32_t))
         rejects([&] { CompactMemberReceiver too_wide(k, size_t(UINT32_MAX) + 1); });
 }
@@ -1103,9 +1134,16 @@ void indexed_members()
             auto batch = (staged ? Members(members) : Members(retained)).subspan(offset, count);
             if (staged)
             {
+                auto const before = engine.stats();
+                auto const payload = engine.identity().header.chunk_index_offset - sizeof(Header);
                 auto const result = engine.append(batch);
                 require(result.accepted && result.result.members == offset + count,
                         "closed append did not commit indexed members");
+                if (offset)
+                    require(engine.stats().sized_chunks - before.sized_chunks < chunks &&
+                        engine.stats().encode_chunks - before.encode_chunks == chunks &&
+                        engine.stats().read_bytes - before.read_bytes < 2 * payload,
+                        "incremental append reread and reencoded its retained planning window");
             }
             else
             {

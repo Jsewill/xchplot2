@@ -17,7 +17,7 @@ struct ConstructionCost
 struct ConstructionForecast
 {
     uint16_t members = 0;
-    uint64_t batches = 0;
+    uint64_t batches = 0, incremental_batches = 0;
     long double minimum_merge_bytes = 0;
     ConstructionCost incremental, merged, finalization, packing, layout;
 };
@@ -633,8 +633,17 @@ inline long double construction_codec_work(uint64_t before, uint64_t after, bool
         2 * static_cast<long double>(before) + 2 * static_cast<long double>(after);
 }
 
+// Only automatic fresh incremental work can reorder its first batch. A fixed
+// limit or an existing prefix keeps its established transaction boundaries.
+inline uint16_t construction_initial_batch(uint16_t maximum, uint16_t admitted)
+{
+    if (maximum == UINT16_MAX || !admitted || admitted >= maximum) return admitted;
+    return uint16_t(1 + (maximum - 1) % admitted);
+}
+
 inline ConstructionForecast construction_forecast(uint8_t k, Config const& config,
-    uint16_t current, uint64_t bytes, uint16_t batch, uint16_t maximum, long double estimated_member_bytes = 0)
+    uint16_t current, uint64_t bytes, uint16_t batch, uint16_t maximum, long double estimated_member_bytes = 0,
+    bool short_first = false)
 {
     ConstructionForecast result;
     if ((!current && !estimated_member_bytes) || (current && !bytes) || !batch || current >= maximum) return result;
@@ -698,22 +707,15 @@ inline ConstructionForecast construction_forecast(uint8_t k, Config const& confi
     long double old_bytes = bytes;
     for (uint32_t first = current; first < result.members;)
     {
-        uint32_t const added = std::min<uint32_t>(batch, result.members - first);
+        uint32_t const limit = !first && short_first ? construction_initial_batch(maximum, batch) : batch;
+        uint32_t const added = std::min<uint32_t>(limit, result.members - first);
         long double const growth = added * member_bytes, next_bytes = old_bytes + growth;
-        if (count == runs.size()) combine(std::min<size_t>(fan, count));
-        long double live = growth + framing;
-        for (size_t i = 0; i < count; ++i) live += runs[i].bytes;
-        while (count > 1 && workspace(live, count + 1) > config.capacity_bytes)
-            combine(std::min<size_t>(fan, count));
         auto& ordinary = result.incremental;
         // A backward window whose displacement is smaller than its length
         // needs redo. Disjoint writes also checkpoint before crossing the
         // previous durable source frontier, limiting coalescing by growth.
         long double const redo = first ? next_bytes * std::min(1.0L, window / growth) : 0;
-        // Exact ordinary admission reserves a whole redo window only when it
-        // fits beside the final payload and checkpoints. Otherwise it keeps
-        // the largest chunk plus alignment slack. Price that smaller reserve
-        // so a large window does not look cheap near a destination's limit.
+        // Near capacity the redo reserve can shrink to a single chunk.
         long double const redo_unit = next_bytes + window + 8192 <= config.capacity_bytes ?
             window / 2 : std::min(window / 2, std::max(4096.0L, 2 * next_bytes / chunks));
         ordinary.read += 2 * old_bytes;
@@ -722,7 +724,20 @@ inline ConstructionForecast construction_forecast(uint8_t k, Config const& confi
         long double const interval = first ? std::min(transaction, growth / 2) : transaction;
         ordinary.syncs += 9 + 2 * transactions(next_bytes - redo, interval) +
             4 * transactions(redo, redo_unit);
-
+        ++result.incremental_batches; first += added; old_bytes = next_bytes;
+    }
+    // Merged contributions keep their full-first schedule and rank balance.
+    // Price them independently of the incremental prefix rewrite order.
+    old_bytes = bytes;
+    for (uint32_t first = current; first < result.members;)
+    {
+        uint32_t const added = std::min<uint32_t>(batch, result.members - first);
+        long double const growth = added * member_bytes, next_bytes = old_bytes + growth;
+        if (count == runs.size()) combine(std::min<size_t>(fan, count));
+        long double live = growth + framing;
+        for (size_t i = 0; i < count; ++i) live += runs[i].bytes;
+        while (count > 1 && workspace(live, count + 1) > config.capacity_bytes)
+            combine(std::min<size_t>(fan, count));
         merged.read += table; merged.write += table + growth + framing;
         merged.read_calls += transactions(table, window * 8);
         merged.codec += 2 * growth + 2 * table;
@@ -928,8 +943,10 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
     ConstructionHistory const& history, long double generation, bool merging, bool external = false,
     bool io_overlap = false)
 {
-    ExecutionWork result; result.batches = forecast.batches; result.generation = generation; result.io_overlap = io_overlap;
-    if (!forecast.batches || generation <= 0) return result;
+    ExecutionWork result;
+    result.batches = !merging && forecast.incremental_batches ? forecast.incremental_batches : forecast.batches;
+    result.generation = generation; result.io_overlap = io_overlap;
+    if (!result.batches || generation <= 0) return result;
     auto io = [](ConstructionCost const& work, ConstructionRates const& rates)
     { return work.read * rates.read + work.write * rates.write + work.read_calls * rates.read_call +
         work.write_calls * rates.write_call + work.syncs * rates.sync; };
@@ -1001,7 +1018,8 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
 inline bool prefer_merged(ConstructionForecast const& forecast, Config const& config,
                           ConstructionSample const& sample = {})
 {
-    if (forecast.batches <= 1 || forecast.minimum_merge_bytes > config.capacity_bytes) return false;
+    if ((forecast.incremental_batches ? forecast.incremental_batches : forecast.batches) <= 1 ||
+        forecast.minimum_merge_bytes > config.capacity_bytes) return false;
     // A resumed ordinary file has no timed append yet. Use relative work
     // until a completed append supplies syscall latency and codec throughput.
     auto const rates = construction_rates(sample);
@@ -1011,7 +1029,8 @@ inline bool prefer_merged(ConstructionForecast const& forecast, Config const& co
 inline bool prefer_merged(ConstructionForecast const& forecast, Config const& config,
                           ConstructionHistory const& history)
 {
-    if (forecast.batches <= 1 || forecast.minimum_merge_bytes > config.capacity_bytes) return false;
+    if ((forecast.incremental_batches ? forecast.incremental_batches : forecast.batches) <= 1 ||
+        forecast.minimum_merge_bytes > config.capacity_bytes) return false;
     auto const rates = construction_rates(history);
     return construction_merged_cost(forecast, config, history) <
         construction_cost(forecast.incremental, config, rates) * (1 - construction_margin(history.count));

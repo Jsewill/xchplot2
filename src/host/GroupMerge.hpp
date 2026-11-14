@@ -1049,23 +1049,41 @@ inline void MergeEngine::pack_chunks(Inputs& input, MergeState::Writer& output, 
     };
     auto emit = [&](uint64_t chunk, std::span<uint8_t const> bytes, std::span<uint64_t const> frontiers)
     {
-        if (chunk > state.chunk)
+        if (chunk > state.chunk && checkpoints)
         {
             uint64_t const end = grow_add(output.position(), bytes.size());
             uint64_t placement_bytes = 0;
-            for (uint64_t boundary = MergeState::align(output.position(), state.block_bytes);
-                 boundary < end; boundary += state.block_bytes)
+            uint64_t const lookahead = std::max(end, std::min(minimum_final_bytes_,
+                grow_add(output.position(), transaction_bytes())));
+            uint64_t const first = MergeState::align(output.position(), state.block_bytes);
+            auto profitable = [&](uint64_t bytes)
+            { return prefer_merge_placement(arena_.stats, bytes, state.slot_bytes,
+                static_cast<long double>(checkpoint_ns) / checkpoints); };
+            uint64_t const bound = lookahead > first ?
+                std::min(std::max(end, minimum_final_bytes_), MergeState::align(lookahead, state.block_bytes)) - first : 0;
+            bool contiguous = first < end;
+            for (uint64_t boundary = first;
+                 boundary < lookahead && (boundary < end || contiguous) && profitable(bound); boundary += state.block_bytes)
             {
                 uint32_t const block = uint32_t(boundary / state.block_bytes);
+                bool releasing = false;
                 for (size_t i = 0; i < input.size(); ++i)
                     if (arena_.releasing(state.runs[i], completed[i], block))
-                    { placement_bytes += merge_placement_bytes(state.block_bytes, boundary, end, minimum_final_bytes_); break; }
+                    { releasing = true; break; }
+                if (releasing)
+                    placement_bytes += merge_placement_bytes(state.block_bytes, boundary, end, minimum_final_bytes_);
+                // Stop as soon as the checkpoint pays for itself; old saved
+                // layouts may contain many more, much smaller blocks.
+                if (profitable(placement_bytes)) break;
+                // Credit future placement only along a contiguous consumed
+                // prefix, reached by this chunk. A live or vacant block may
+                // cause a fallback allocation, so do not speculate past it.
+                if (!releasing) contiguous = false;
             }
             // Only already emitted chunks may free a destination. Publish
             // their output and consumed frontiers before the next allocation;
             // preread or encoded-but-unwritten input stays protected.
-            if (checkpoints && prefer_merge_placement(arena_.stats, placement_bytes, state.slot_bytes,
-                    static_cast<long double>(checkpoint_ns) / checkpoints))
+            if (profitable(placement_bytes))
                 checkpoint(chunk, std::span(completed).first(input.size()), "merge-pack-placement");
         }
         sizes[size_t(chunk)] = bytes.size(); output.write(bytes);
@@ -1254,16 +1272,23 @@ inline void MergeEngine::arrange()
     // after every commit. Placed blocks form cycles of length one.
     auto visit = [&](uint32_t block)
     {
+        uint32_t spare = block;
         while (block < state.layout_blocks && !visited[block])
-        { visited[block] = 1; block = arena_.map[block]; }
+        {
+            // The terminal block may be short. If it belongs to this cycle,
+            // use it for the one unavoidable extra copy through a tail spare.
+            if (block + 1 == state.layout_blocks) spare = block;
+            visited[block] = 1; block = arena_.map[block];
+        }
+        return spare;
     };
     for (uint32_t block = 0; block < state.layout_blocks; ++block)
         if (owner[block] == MergeState::free_block) { ready.push_back(block); visit(block); }
     for (uint32_t block = 0; block < state.layout_blocks; ++block)
         if (!visited[block])
         {
-            if (arena_.map[block] != block) cycles.push_back(block);
-            visit(block);
+            uint32_t const spare = visit(block);
+            if (arena_.map[block] != block) cycles.push_back(spare);
         }
     for (uint32_t block = state.block_limit; block > state.layout_blocks;)
     { --block; if (owner[block] == MergeState::free_block) spares.push_back(block); }
