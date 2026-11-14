@@ -1153,6 +1153,11 @@ void indexed_members()
                     uint64_t const windows = payload / config.window_bytes + (payload % config.window_bytes != 0);
                     require(engine.stats().read_calls - before.read_calls <= 3 * (windows + 1),
                         "incremental append read codec-sized fragments instead of bounded source windows");
+                    uint64_t const output = engine.identity().header.chunk_index_offset - sizeof(Header);
+                    uint64_t const output_windows = output / config.window_bytes + (output % config.window_bytes != 0);
+                    require(engine.stats().write_calls - before.write_calls <= 4 * (output_windows + 1) +
+                        8 * (engine.stats().checkpoints - before.checkpoints),
+                        "incremental append wrote codec-sized fragments instead of bounded output windows");
                 }
             }
             else
@@ -1265,13 +1270,13 @@ void indexed_members()
     auto const canonical = contents(name + "/fresh.gplot");
     require(contents(name + "/cached.gplot") == canonical, "cached digest changed canonical output bytes");
     for (bool overlap : {false, true})
-        for (auto const* point : {"pending", "target-partial"})
+        for (auto const* point : {"pending", "target-partial", "direct-target-partial", "direct-target", "direct-committed"})
         {
             auto cfg = config; cfg.io_overlap = overlap;
-            auto const path = name + "/source-recovery-" + point + (overlap ? "-overlap" : "-serial");
+            auto const path = name + "/window-recovery-" + point + (overlap ? "-overlap" : "-serial");
             auto const remaining = Members(members).subspan(2);
             pid_t const child = ::fork();
-            require(child >= 0, "cannot fork source-window recovery check");
+            require(child >= 0, "cannot fork window recovery check");
             if (!child)
             {
                 try
@@ -1286,10 +1291,10 @@ void indexed_members()
             }
             int status = 0;
             require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
-                    "source-window recovery did not reach its redo boundary");
+                    "window recovery did not reach its durable boundary");
             Engine engine(path, cfg, true); engine.confirm_identity();
             engine.resume(remaining);
-            require(contents(path) == canonical, "source-window recovery changed canonical bytes");
+            require(contents(path) == canonical, "window recovery changed canonical bytes");
         }
     hash.reset();
     for (size_t i = 0; i < moved.size(); ++i)

@@ -851,8 +851,7 @@ inline uint64_t Engine::memory_bytes(uint8_t k, Config const& config, uint16_t b
     // Fixed chunk-size tables, bounded source windows, aggregate codec scratch,
     // the packed index and its replacement writer, task descriptors and spans.
     uint64_t const lanes = config.io_overlap ? 2 : 1;
-    uint64_t result = grow_add(grow_add(config.window_bytes, config.io_overlap ? config.window_bytes : 0),
-                               config.codec_bytes);
+    uint64_t result = grow_add(grow_add(config.window_bytes, config.window_bytes), config.codec_bytes);
     result = grow_add(result, chunks * (sizeof(uint64_t) * 4));
     // Bounded logical-fragment decode buffer plus conservative SHA/FFI stack.
     result = grow_add(result, digest_words * sizeof(uint64_t) + 4096);
@@ -1856,9 +1855,65 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
     new_prefix.reserve(task_limit + 1);
     auto durable = record;
     uint64_t buffered = 0;
+    // Source reads and buffered writes each have one admitted I/O window,
+    // even without codec overlap. Output copies release borrowed codec storage.
+    std::unique_ptr<uint8_t[]> output;
+    uint64_t output_begin = 0, output_bytes = 0;
+    auto check_cow_space = [&](uint64_t bytes, bool redo)
+    {
+        if (!cow_filesystem_) return;
+        file_io::Space space{};
+        require(file_io::space_fd(fd_, &space) == 0 && space.f_frsize,
+                "cannot inspect copy-on-write working space");
+        uint64_t const needed = grow_add(redo ? grow_add(bytes, bytes) : bytes,
+                                        grow_add(record_alignment_, record_alignment_));
+        uint64_t const blocks_needed = needed / space.f_frsize + (needed % space.f_frsize != 0);
+        require(space.f_bavail >= blocks_needed,
+            "copy-on-write filesystem needs bounded overwrite headroom; free space and --resume this file");
+    };
+    auto flush_output = [&]
+    {
+        if (!output_bytes) return;
+        check_cow_space(output_bytes, false);
+        check_path();
+        std::span<uint8_t const> const bytes{output.get() + size_t(config_.window_bytes - output_bytes), size_t(output_bytes)};
+        size_t const partial = bytes.size() / 2;
+        write_at(output_begin, bytes.first(partial));
+        grow_failpoint("direct-target-partial");
+        write_at(output_begin + partial, bytes.subspan(partial));
+        output_bytes = 0;
+    };
+    auto write_direct = [&](uint64_t offset, std::span<EncodedBlock const> blocks, uint64_t length)
+    {
+        if (length > config_.window_bytes)
+        {
+            flush_output();
+            check_cow_space(length, false);
+            check_path();
+            uint64_t const partial = length / 2;
+            write_blocks(offset, blocks, 0, partial);
+            grow_failpoint("direct-target-partial");
+            write_blocks(offset + partial, blocks, partial, length - partial);
+            return;
+        }
+        if (output_bytes && (length > config_.window_bytes - output_bytes || grow_add(offset, length) != output_begin))
+            flush_output();
+        if (!output) output.reset(new uint8_t[size_t(config_.window_bytes)]);
+        auto* destination = output.get() + size_t(config_.window_bytes - output_bytes - length);
+        uint64_t copied = 0;
+        for (auto const& block : blocks)
+        {
+            require(block.bytes.size() <= length - copied, "encoded output block size mismatch");
+            std::memcpy(destination + size_t(copied), block.bytes.data(), block.bytes.size());
+            copied += block.bytes.size();
+        }
+        require(copied == length, "encoded output block size mismatch");
+        output_begin = offset; output_bytes += length;
+    };
     auto commit_direct = [&]
     {
         if (!buffered) return;
+        flush_output();
         sync();
         grow_failpoint("direct-target");
         checkpoint(record);
@@ -1923,18 +1978,6 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
             sha256_sum(&context, result.data());
             return result;
         };
-        auto check_cow_space = [&](uint64_t bytes, bool redo)
-        {
-            if (!cow_filesystem_) return;
-            file_io::Space space{};
-            require(file_io::space_fd(fd_, &space) == 0 && space.f_frsize,
-                    "cannot inspect copy-on-write working space");
-            uint64_t const needed = grow_add(redo ? grow_add(bytes, bytes) : bytes,
-                                            grow_add(record_alignment_, record_alignment_));
-            uint64_t const blocks_needed = needed / space.f_frsize + (needed % space.f_frsize != 0);
-            require(space.f_bavail >= blocks_needed,
-                "copy-on-write filesystem needs bounded overwrite headroom; free space and --resume this file");
-        };
         if (destination_begin >= record.old_frontier && destination_begin < durable.old_frontier)
             commit_direct();
         if (destination_begin >= durable.old_frontier)
@@ -1942,12 +1985,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
             // The entire target window lies beyond every unread old byte. Its
             // old source remains available until the advanced checkpoint is
             // durable, so a crash can regenerate this window without redo.
-            check_cow_space(new_prefix.back(), false);
-            check_path();
-            uint64_t const partial = new_prefix.back() / 2;
-            transfer(destination_begin, 0, partial);
-            grow_failpoint("direct-target-partial");
-            transfer(destination_begin + partial, partial, new_prefix.back() - partial);
+            write_direct(destination_begin, blocks, new_prefix.back());
             auto next = record;
             next.pending = 0;
             next.redo_bytes = next.redo_chunks = 0;
