@@ -315,6 +315,7 @@ public:
     {
         require(!identity_.pending && window && checkpoint, "only a complete ordinary group can change its I/O budgets");
         planned_window_.reset(); encoder_.reset();
+        source_.reset(); source_size_ = 0;
         config_.window_bytes = window;
         config_.checkpoint_bytes = checkpoint;
     }
@@ -332,7 +333,6 @@ private:
     struct Window
     {
         uint64_t first = 0, count = 0, source_begin = 0;
-        std::vector<uint8_t> source;
         std::vector<ChunkInput> tasks;
         std::vector<FragmentRegion> regions;
         std::vector<uint64_t> sizes;
@@ -401,6 +401,10 @@ private:
     bool initialization_orphan_ = false, confirmed_ = false;
     std::vector<uint64_t> old_sizes_;
     std::vector<FragmentBoundaries> member_boundaries_;
+    // The encoder alone borrows this source window. Completed codec output
+    // owns its bytes, so the next encode can reuse the buffer during writes.
+    std::unique_ptr<uint8_t[]> source_;
+    uint64_t source_begin_ = 0, source_size_ = 0;
     std::unique_ptr<Record> record_;
     std::unique_ptr<ParallelEncoder> encoder_;
     // The last sizing window is also the first backward rewrite window. Keep
@@ -419,6 +423,7 @@ private:
     mutable std::array<uint8_t, 32> digest_{};
 
     void read_at(uint64_t offset, std::span<uint8_t> bytes) const;
+    std::span<uint8_t const> source_window(uint64_t offset, uint64_t bytes, bool reverse);
     void write_at(uint64_t offset, std::span<uint8_t const> bytes) const;
     void write_blocks(uint64_t offset, std::span<EncodedBlock const> blocks,
                       uint64_t begin, uint64_t length) const;
@@ -451,9 +456,9 @@ private:
     uint64_t window_count(uint64_t edge, bool reverse, Members members, uint64_t stop = UINT64_MAX);
     std::span<EncodedBlock const> encode_window(uint64_t first, uint64_t count, uint64_t source_begin,
                        std::span<uint64_t const> source_sizes, Members members,
-                       std::vector<uint8_t>& source, std::vector<ChunkInput>& tasks,
+                       std::vector<ChunkInput>& tasks,
                        std::vector<FragmentRegion>& regions,
-                       std::span<uint64_t> sizes, bool size_only = false);
+                       std::span<uint64_t> sizes, bool size_only = false, bool reverse = false);
 };
 
 inline std::array<uint8_t, 32> grow_digest(std::span<uint8_t const> bytes, CodecScheduler* scheduler = nullptr)
@@ -701,6 +706,40 @@ inline void Engine::read_at(uint64_t offset, std::span<uint8_t> bytes) const
         offset += uint64_t(n);
         bytes = bytes.subspan(size_t(n));
     }
+}
+inline std::span<uint8_t const> Engine::source_window(uint64_t offset, uint64_t bytes, bool reverse)
+{
+    if (!bytes) return {};
+    config_.check_running();
+    uint64_t const begin = sizeof(Header) + identity_.memo.size(), end = grow_add(offset, bytes);
+    uint64_t const limit = reverse ? end :
+        (record_ && identity_.pending ? record_->old_frontier : uint64_t(identity_.header.chunk_index_offset));
+    require(offset >= begin && end <= limit && bytes <= config_.window_bytes, "invalid growth source window");
+    if (offset < source_begin_ || end - source_begin_ > source_size_)
+    {
+        // Codec admission may use only a fraction of the I/O window. Read
+        // adjacent source bytes together, including during backward growth,
+        // without another allocation or copying them into each codec task.
+        uint64_t const first = reverse ? end - std::min(config_.window_bytes, end - begin) : offset;
+        uint64_t const count = reverse ? end - first : std::min(config_.window_bytes, limit - first);
+        if (!source_) source_.reset(new uint8_t[size_t(config_.window_bytes)]);
+        uint64_t kept_begin = first, kept_end = first;
+        if (source_size_)
+        {
+            uint64_t const lo = std::max(first, source_begin_), hi = std::min(first + count, source_begin_ + source_size_);
+            if (lo < hi)
+            {
+                std::memmove(source_.get() + size_t(lo - first), source_.get() + size_t(lo - source_begin_), size_t(hi - lo));
+                kept_begin = lo; kept_end = hi;
+            }
+        }
+        source_size_ = 0;
+        if (kept_begin > first) read_at(first, {source_.get(), size_t(kept_begin - first)});
+        if (kept_end < first + count)
+            read_at(kept_end, {source_.get() + size_t(kept_end - first), size_t(first + count - kept_end)});
+        source_begin_ = first; source_size_ = count;
+    }
+    return {source_.get() + size_t(offset - source_begin_), size_t(bytes)};
 }
 inline void Engine::write_at(uint64_t offset, std::span<uint8_t const> bytes) const
 {
@@ -1209,16 +1248,15 @@ inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBat
 }
 
 inline std::span<EncodedBlock const> Engine::encode_window(uint64_t first, uint64_t count, uint64_t source_begin,
-    std::span<uint64_t const> source_sizes, Members members, std::vector<uint8_t>& source,
+    std::span<uint64_t const> source_sizes, Members members,
     std::vector<ChunkInput>& tasks, std::vector<FragmentRegion>& regions,
-    std::span<uint64_t> sizes, bool size_only)
+    std::span<uint64_t> sizes, bool size_only, bool reverse)
 {
     uint64_t total = 0;
     for (auto size : source_sizes) total = grow_add(total, size);
     require(count <= max_tasks && count == sizes.size() && total <= config_.window_bytes,
             "group source window exceeds budget");
-    source.resize(size_t(total));
-    if (total) read_at(source_begin, source);
+    auto const source = source_window(source_begin, total, reverse);
     tasks.clear();
     regions.clear();
     size_t const task_limit = size_t(std::min<uint64_t>(old_sizes_.size(), max_tasks));
@@ -1259,6 +1297,7 @@ inline std::span<EncodedBlock const> Engine::encode_window(uint64_t first, uint6
 inline void Engine::reset_encoding()
 {
     planned_window_.reset(); encoder_.reset();
+    source_size_ = 0;
     overlap_ = config_.io_overlap && config_.codec_bytes / 2 >= ChunkCodec::estimate_base();
     active_workers_ = unsigned(std::min<uint64_t>(config_.workers,
         window_codec_bytes() / ChunkCodec::estimate_base()));
@@ -1374,8 +1413,6 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
     result.members_digest = digest_members(members, hash);
     uint64_t const chunks = old_sizes_.size();
     result.sizes.resize(size_t(chunks));
-    std::vector<uint8_t> source;
-    source.reserve(size_t(config_.window_bytes));
     std::vector<ChunkInput> tasks;
     std::vector<FragmentRegion> regions;
     uint64_t old_offset = sizeof(Header) + identity_.memo.size(), new_offset = old_offset;
@@ -1386,7 +1423,7 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
         bool const last = first + count == chunks;
         auto const blocks = encode_window(first, count, old_offset,
             std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
-            source, tasks, regions, std::span(result.sizes).subspan(size_t(first), size_t(count)), !last);
+            tasks, regions, std::span(result.sizes).subspan(size_t(first), size_t(count)), !last);
         if (last)
             retain_planned_window(first, old_offset, blocks,
                 std::span(result.sizes).subspan(size_t(first), size_t(count)), result.members_digest);
@@ -1732,12 +1769,9 @@ inline std::unique_ptr<Engine::Window> Engine::encode_owned(uint64_t first, uint
     window->count = count;
     window->source_begin = source_begin;
     window->sizes.resize(size_t(count));
-    // Reserve the complete configured window so vector growth cannot leave an
-    // unaccounted replacement allocation live beside the prior source window.
-    window->source.reserve(size_t(config_.window_bytes));
     auto const blocks = encode_window(first, count, source_begin,
         std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
-        window->source, window->tasks, window->regions, window->sizes);
+        window->tasks, window->regions, window->sizes, false, true);
     window->blocks.assign(blocks.begin(), blocks.end());
     return window;
 }
@@ -2052,6 +2086,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
     require(confirmed_, "caller must confirm requested identity and budgets before recovery");
     require(identity_.pending, "no saved construction requires resume");
     check_path();
+    source_.reset(); source_size_ = 0;
     Plan plan;
     if (initialization_orphan_)
     {
@@ -2127,8 +2162,6 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
                    record.new_frontier + (record.pending ? record.redo_bytes : 0),
                    record.target.chunk_index_offset, plan.sizes);
     {
-    std::vector<uint8_t> source;
-    source.reserve(size_t(config_.window_bytes));
     std::vector<ChunkInput> tasks;
     std::vector<FragmentRegion> regions;
     uint64_t old_offset = sizeof(Header) + identity_.memo.size(), new_offset = old_offset;
@@ -2139,7 +2172,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
         bool const last = first + count == record.remaining;
         auto const blocks = encode_window(first, count, old_offset,
             std::span<uint64_t const>(old_sizes_).subspan(size_t(first), size_t(count)), members,
-            source, tasks, regions, std::span(plan.sizes).subspan(size_t(first), size_t(count)), !last);
+            tasks, regions, std::span(plan.sizes).subspan(size_t(first), size_t(count)), !last);
         if (last)
             retain_planned_window(first, old_offset, blocks,
                 std::span(plan.sizes).subspan(size_t(first), size_t(count)), plan.members_digest);
@@ -2158,6 +2191,8 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
     require(grow_add(plan.header.chunk_index_offset, index.asBytes().size()) == plan.final_bytes,
             "reconstructed index length differs from exact plan");
     }
+    // Redo replay uses the source-window reservation for its copy buffer.
+    if (record.pending) { source_.reset(); source_size_ = 0; }
     replay(record);
     rewrite(plan, members, record);
     return finish(plan);
@@ -2216,6 +2251,7 @@ inline Result Engine::finish(Plan const& plan)
     identity_.pending_peak_bytes = 0;
     old_sizes_ = plan.sizes;
     record_.reset();
+    source_.reset(); source_size_ = 0;
     finalizing_ = false;
     config_.check_running();
     return {plan.final_bytes, plan.peak_file_bytes, plan.workspace_bytes, plan.new_members};

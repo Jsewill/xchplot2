@@ -1093,6 +1093,8 @@ void indexed_members()
     Config config;
     config.capacity_bytes = 128ull * 1024 * 1024;
     config.memory_limit_bytes = 512ull * 1024 * 1024;
+    config.window_bytes = 65536;
+    config.codec_bytes = 512 * 1024;
     config.workers = 3;
     Identity identity;
     identity.header.magic = PlotGroupFile::MAGIC;
@@ -1108,9 +1110,12 @@ void indexed_members()
         builder.append(members[member]);
         retained.push_back(builder.finish());
     }
-    for (bool staged : {false, true})
+    for (unsigned mode : {0u, 1u, 2u})
     {
-        Engine engine(name + (staged ? "/staged.gplot" : "/fresh.gplot"), config, false, identity);
+        bool const staged = mode != 0;
+        config.io_overlap = mode != 1;
+        Engine engine(name + (mode == 0 ? "/fresh.gplot" : mode == 1 ? "/serial.gplot" : "/staged.gplot"),
+            config, false, identity);
         engine.confirm_identity();
         if (!staged)
         {
@@ -1140,10 +1145,15 @@ void indexed_members()
                 require(result.accepted && result.result.members == offset + count,
                         "closed append did not commit indexed members");
                 if (offset)
+                {
                     require(engine.stats().sized_chunks - before.sized_chunks < chunks &&
                         engine.stats().encode_chunks - before.encode_chunks == chunks &&
                         engine.stats().read_bytes - before.read_bytes < 2 * payload,
                         "incremental append reread and reencoded its retained planning window");
+                    uint64_t const windows = payload / config.window_bytes + (payload % config.window_bytes != 0);
+                    require(engine.stats().read_calls - before.read_calls <= 3 * (windows + 1),
+                        "incremental append read codec-sized fragments instead of bounded source windows");
+                }
             }
             else
             {
@@ -1172,12 +1182,15 @@ void indexed_members()
             offset += count;
         }
     }
-    std::ifstream fresh(name + "/fresh.gplot", std::ios::binary);
-    std::ifstream staged(name + "/staged.gplot", std::ios::binary);
-    require(std::filesystem::file_size(name + "/fresh.gplot") ==
-            std::filesystem::file_size(name + "/staged.gplot") &&
-            std::equal(std::istreambuf_iterator<char>(fresh), {}, std::istreambuf_iterator<char>(staged)),
-            "indexed-member batch changes altered canonical bytes");
+    for (auto const* path : {"/serial.gplot", "/staged.gplot"})
+    {
+        std::ifstream fresh(name + "/fresh.gplot", std::ios::binary);
+        std::ifstream staged(name + path, std::ios::binary);
+        require(std::filesystem::file_size(name + "/fresh.gplot") ==
+                std::filesystem::file_size(name + path) &&
+                std::equal(std::istreambuf_iterator<char>(fresh), {}, std::istreambuf_iterator<char>(staged)),
+                "indexed-member batch changes altered canonical bytes");
+    }
     MemberBatchHash hash(members.size());
     std::vector<Member> immutable;
     immutable.reserve(members.size());
@@ -1251,6 +1264,33 @@ void indexed_members()
     };
     auto const canonical = contents(name + "/fresh.gplot");
     require(contents(name + "/cached.gplot") == canonical, "cached digest changed canonical output bytes");
+    for (bool overlap : {false, true})
+        for (auto const* point : {"pending", "target-partial"})
+        {
+            auto cfg = config; cfg.io_overlap = overlap;
+            auto const path = name + "/source-recovery-" + point + (overlap ? "-overlap" : "-serial");
+            auto const remaining = Members(members).subspan(2);
+            pid_t const child = ::fork();
+            require(child >= 0, "cannot fork source-window recovery check");
+            if (!child)
+            {
+                try
+                {
+                    Engine engine(path, cfg, false, identity); engine.confirm_identity();
+                    require(engine.append(Members(members).subspan(0, 2)).accepted, "initial source-window batch rejected");
+                    ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
+                    engine.append(remaining);
+                }
+                catch (...) { std::_Exit(1); }
+                std::_Exit(0);
+            }
+            int status = 0;
+            require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+                    "source-window recovery did not reach its redo boundary");
+            Engine engine(path, cfg, true); engine.confirm_identity();
+            engine.resume(remaining);
+            require(contents(path) == canonical, "source-window recovery changed canonical bytes");
+        }
     hash.reset();
     for (size_t i = 0; i < moved.size(); ++i)
     {
